@@ -55,7 +55,7 @@ layout(binding = 1) uniform fs_params {
     vec4 light_color;
     vec4 ambient_color;
     vec4 base_color_factor;
-    vec4 pbr_factors; // x: metallic, y: roughness, z: occlusion_strength, w: unused
+    vec4 pbr_factors; // x: metallic, y: roughness, z: occlusion_strength, w: ibl_intensity
     vec4 emissive_factor; // xyz: emissive color, w: unused
     vec4 shadow_params; // x: bias, y: intensity, z/w: unused
 };
@@ -66,9 +66,10 @@ layout(binding = 2) uniform texture2D metallic_roughness_tex;
 layout(binding = 3) uniform texture2D emissive_tex;
 layout(binding = 4) uniform texture2D occlusion_tex;
 layout(binding = 5) uniform texture2D shadow_tex;
+layout(binding = 6) uniform textureCube env_tex;
 layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
-
+layout(binding = 2) uniform sampler env_smp;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -134,6 +135,19 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec2 envBRDFApprox(float roughness, float NoV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return AB;
+}
+
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), v_uv);
     vec4 albedo_rgba = v_color * base_color_factor * albedo_tex_val;
@@ -156,8 +170,9 @@ void main() {
     F0 = mix(F0, albedo, metallic);
 
     float NdotL = max(dot(N, L), 0.0);
-    float NdotV = max(dot(N, V), 0.0);
+    float NdotV = max(dot(N, V), 0.0001);
 
+    // Direct lighting (Cook-Torrance)
     float NDF = distributionGGX(N, H, roughness);
     float G = geometrySmith(N, V, L, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
@@ -177,17 +192,35 @@ void main() {
     // Ambient Occlusion
     float ao_sample = texture(sampler2D(occlusion_tex, smp), v_uv).r;
     float ao = 1.0 + pbr_factors.z * (ao_sample - 1.0);
+
+    // Image-Based Lighting (IBL)
+    float ibl_intensity = pbr_factors.w;
+    vec3 R = reflect(-V, N);
+    float max_lod = 7.0;
+    float lod = roughness * max_lod;
+    vec3 prefiltered_spec = textureLod(samplerCube(env_tex, env_smp), R, lod).rgb;
+    vec3 irradiance = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
+
+    vec3 F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
+    vec2 brdf = envBRDFApprox(roughness, NdotV);
+    vec3 specular_ibl = prefiltered_spec * (F0 * brdf.x + brdf.y);
+
+    vec3 kD_ibl = (vec3(1.0) - F_ibl) * (1.0 - metallic);
+    vec3 diffuse_ibl = kD_ibl * irradiance * albedo;
+
+    vec3 ibl = (diffuse_ibl + specular_ibl) * (ibl_intensity * ao);
+
+    // Directional ambient base
     vec3 ambient = ambient_color.rgb * ambient_color.a * albedo * ao;
 
     // Emissive
     vec4 emissive_sample = texture(sampler2D(emissive_tex, smp), v_uv);
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
-    vec3 final_color = ambient + Lo + emissive;
+    vec3 final_color = ambient + ibl + Lo + emissive;
 
     frag_color = vec4(final_color, albedo_rgba.a);
 }
-
 @end
 
 @program pbr vs fs

@@ -66,6 +66,19 @@ pub fn build(b: *Build) !void {
     });
     mod_shadow_shader.addImport("math", mod_math);
 
+    // Шейдер Skybox: src/zenderer/shaders/skybox.glsl -> Zig-модуль "skybox_shader"
+    const mod_skybox_shader = try sokol.shdc.createModule(b, "skybox_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/skybox.glsl",
+        .output = "skybox_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_skybox_shader.addImport("math", mod_math);
+
     // Главный модуль библиотеки zenderer
     const mod_zenderer = b.addModule("zenderer", .{
         .root_source_file = b.path("src/zenderer/root.zig"),
@@ -77,6 +90,7 @@ pub fn build(b: *Build) !void {
             .{ .name = "pbr_shader", .module = mod_pbr_shader },
             .{ .name = "instanced_shader", .module = mod_instanced_shader },
             .{ .name = "shadow_shader", .module = mod_shadow_shader },
+            .{ .name = "skybox_shader", .module = mod_skybox_shader },
             .{ .name = "math", .module = mod_math },
         },
     });

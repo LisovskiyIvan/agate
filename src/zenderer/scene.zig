@@ -7,6 +7,7 @@ const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const inst_shd = @import("instanced_shader");
 const shadow_shd = @import("shadow_shader");
+const sky_shd = @import("skybox_shader");
 
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -24,6 +25,8 @@ const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
 const Material = @import("material.zig").Material;
 const Texture = @import("texture.zig").Texture;
+const CubeTexture = @import("texture.zig").CubeTexture;
+const SkyboxConfig = @import("texture.zig").SkyboxConfig;
 
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
@@ -74,6 +77,16 @@ pub const Scene = struct {
     shadow_inst_pipeline_u16: sg.Pipeline = .{},
     shadow_inst_pipeline_u32: sg.Pipeline = .{},
 
+    // Skybox & IBL
+    default_cube_texture: CubeTexture,
+    skybox_texture: ?CubeTexture = null,
+    skybox_pipeline: sg.Pipeline = .{},
+    skybox_mesh_vb: sg.Buffer = .{},
+    skybox_mesh_ib: sg.Buffer = .{},
+    skybox_enabled: bool = false,
+    skybox_exposure: f32 = 1.0,
+    ibl_intensity: f32 = 1.0,
+
     pipeline_u16: sg.Pipeline = .{},
     pipeline_u32: sg.Pipeline = .{},
     pipeline_pbr_u16: sg.Pipeline = .{},
@@ -112,6 +125,7 @@ pub const Scene = struct {
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
             .default_black_texture = Texture.createBlack1x1(),
+            .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
             .shadow_image = depth_img,
             .shadow_attachment_view = att_view,
             .shadow_texture_view = tex_view,
@@ -271,6 +285,67 @@ pub const Scene = struct {
         self.shadow_inst_pipeline_u16 = sg.makePipeline(shadow_inst_desc);
         shadow_inst_desc.index_type = .UINT32;
         self.shadow_inst_pipeline_u32 = sg.makePipeline(shadow_inst_desc);
+
+        // 5. Skybox pipeline & cube geometry
+        const skybox_positions = [_][3]f32{
+            .{ -1.0, -1.0, -1.0 }, // 0
+            .{  1.0, -1.0, -1.0 }, // 1
+            .{  1.0,  1.0, -1.0 }, // 2
+            .{ -1.0,  1.0, -1.0 }, // 3
+            .{ -1.0, -1.0,  1.0 }, // 4
+            .{  1.0, -1.0,  1.0 }, // 5
+            .{  1.0,  1.0,  1.0 }, // 6
+            .{ -1.0,  1.0,  1.0 }, // 7
+        };
+
+        const skybox_indices = [_]u16{
+            // Front (-Z)
+            0, 2, 1,  0, 3, 2,
+            // Back (+Z)
+            4, 5, 6,  4, 6, 7,
+            // Left (-X)
+            0, 4, 7,  0, 7, 3,
+            // Right (+X)
+            1, 2, 6,  1, 6, 5,
+            // Top (+Y)
+            3, 7, 6,  3, 6, 2,
+            // Bottom (-Y)
+            0, 1, 5,  0, 5, 4,
+        };
+
+        self.skybox_mesh_vb = sg.makeBuffer(.{
+            .data = sg.asRange(&skybox_positions),
+        });
+        self.skybox_mesh_ib = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(&skybox_indices),
+        });
+
+        var sky_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(sky_shd.skyboxShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .depth = .{
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        sky_desc.layout.buffers[0] = .{ .stride = @sizeOf([3]f32) };
+        sky_desc.layout.attrs[sky_shd.ATTR_skybox_position] = .{
+            .format = .FLOAT3,
+            .offset = 0,
+        };
+        self.skybox_pipeline = sg.makePipeline(sky_desc);
+    }
+
+    pub fn setSkybox(self: *Scene, cube: CubeTexture) void {
+        self.skybox_texture = cube;
+        self.skybox_enabled = true;
+    }
+
+    pub fn createDefaultSkybox(self: *Scene, config: SkyboxConfig) !void {
+        const cube = try CubeTexture.createProceduralSkybox(self.allocator, config);
+        self.setSkybox(cube);
     }
 
     pub fn createHemisphericLight(self: *Scene, name: []const u8, options: @import("lights.zig").HemisphericLightOptions) HemisphericLight {
@@ -582,7 +657,12 @@ pub const Scene = struct {
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .base_color_factor = pbr_mat.getAlbedoColor4(),
-                    .pbr_factors = .{ pbr_mat.metallic, pbr_mat.roughness, pbr_mat.occlusion_strength, 0.0 },
+                    .pbr_factors = .{
+                        pbr_mat.metallic,
+                        pbr_mat.roughness,
+                        pbr_mat.occlusion_strength,
+                        pbr_mat.environment_intensity * self.ibl_intensity,
+                    },
                     .emissive_factor = pbr_mat.getEmissiveColor4(),
                     .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
                 };
@@ -592,6 +672,12 @@ pub const Scene = struct {
                 const mr_tex = if (pbr_mat.metallic_roughness_texture) |t| t else self.default_white_texture;
                 const emissive_tex = if (pbr_mat.emissive_texture) |t| t else self.default_white_texture;
                 const occlusion_tex = if (pbr_mat.occlusion_texture) |t| t else self.default_white_texture;
+                const env_cube = if (pbr_mat.environment_texture) |c|
+                    c
+                else if (self.skybox_texture) |c|
+                    c
+                else
+                    self.default_cube_texture;
 
                 bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
                 bind.views[pbr_shd.VIEW_normal_tex] = normal_tex.view;
@@ -599,8 +685,10 @@ pub const Scene = struct {
                 bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
                 bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
                 bind.views[pbr_shd.VIEW_shadow_tex] = self.shadow_texture_view;
+                bind.views[pbr_shd.VIEW_env_tex] = env_cube.view;
                 bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
                 bind.samplers[pbr_shd.SMP_shadow_smp] = self.shadow_sampler;
+                bind.samplers[pbr_shd.SMP_env_smp] = env_cube.sampler;
 
                 sg.applyBindings(bind);
                 sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
@@ -653,8 +741,41 @@ pub const Scene = struct {
             }
         }
 
+        if (self.skybox_enabled and self.skybox_texture != null and self.active_camera != null) {
+            self.renderSkybox(self.active_camera.?, aspect);
+        }
+
         sg.endPass();
         sg.commit();
+    }
+
+    fn renderSkybox(self: *Scene, camera: ArcRotateCamera, aspect: f32) void {
+        const cube = self.skybox_texture orelse return;
+
+        const view_no_trans = camera.getViewMatrix().removeTranslation();
+        const view_proj = Mat4.mul(camera.getProjectionMatrix(aspect), view_no_trans);
+
+        sg.applyPipeline(self.skybox_pipeline);
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = self.skybox_mesh_vb;
+        bind.index_buffer = self.skybox_mesh_ib;
+        bind.views[sky_shd.VIEW_sky_tex] = cube.view;
+        bind.samplers[sky_shd.SMP_smp] = cube.sampler;
+        sg.applyBindings(bind);
+
+        const vs_params = sky_shd.VsParams{
+            .view_proj = view_proj,
+        };
+        const fs_params = sky_shd.FsParams{
+            .params = .{ self.skybox_exposure, 0.0, 0.0, 0.0 },
+        };
+        sg.applyUniforms(sky_shd.UB_vs_params, sg.asRange(&vs_params));
+        sg.applyUniforms(sky_shd.UB_fs_params, sg.asRange(&fs_params));
+        sg.draw(0, 36, 1);
+
+        self.stats.draw_calls += 1;
+        self.stats.triangles += 12;
     }
 
     pub fn deinit(self: *Scene) void {
@@ -694,6 +815,10 @@ pub const Scene = struct {
         self.default_white_texture.deinit();
         self.default_normal_texture.deinit();
         self.default_black_texture.deinit();
+        self.default_cube_texture.deinit();
+        if (self.skybox_texture) |*c| {
+            c.deinit();
+        }
 
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
@@ -701,6 +826,10 @@ pub const Scene = struct {
         sg.destroyPipeline(self.pipeline_pbr_u32);
         sg.destroyPipeline(self.pipeline_instanced_u16);
         sg.destroyPipeline(self.pipeline_instanced_u32);
+
+        sg.destroyPipeline(self.skybox_pipeline);
+        sg.destroyBuffer(self.skybox_mesh_vb);
+        sg.destroyBuffer(self.skybox_mesh_ib);
 
         sg.destroyPipeline(self.shadow_pipeline_u16);
         sg.destroyPipeline(self.shadow_pipeline_u32);

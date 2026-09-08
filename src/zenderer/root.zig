@@ -22,6 +22,8 @@ pub const Material = material.Material;
 
 pub const texture = @import("texture.zig");
 pub const Texture = texture.Texture;
+pub const CubeTexture = texture.CubeTexture;
+pub const SkyboxConfig = texture.SkyboxConfig;
 
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;

@@ -164,3 +164,407 @@ pub const Texture = struct {
         sg.destroySampler(self.sampler);
     }
 };
+
+pub const SkyboxConfig = struct {
+    top_color: [4]u8 = .{ 35, 75, 155, 255 }, // Deep blue zenith
+    horizon_color: [4]u8 = .{ 175, 195, 220, 255 }, // Atmospheric horizon
+    bottom_color: [4]u8 = .{ 45, 42, 40, 255 }, // Ground nadir
+    sun_direction: [3]f32 = .{ 0.4, 0.7, 0.5 }, // Matching scene light
+    sun_color: [4]u8 = .{ 255, 250, 220, 255 },
+    sun_intensity: f32 = 2.5,
+    size: u32 = 128,
+};
+
+pub const CubeTexture = struct {
+    image: sg.Image,
+    view: sg.View,
+    sampler: sg.Sampler,
+    size: u32,
+    num_mipmaps: u32 = 1,
+
+    pub fn deinit(self: *CubeTexture) void {
+        sg.destroyView(self.view);
+        sg.destroyImage(self.image);
+        sg.destroySampler(self.sampler);
+    }
+
+    pub fn createDefault1x1(color: [4]u8) CubeTexture {
+        var raw: [24]u8 = undefined;
+        for (0..6) |face| {
+            raw[face * 4 + 0] = color[0];
+            raw[face * 4 + 1] = color[1];
+            raw[face * 4 + 2] = color[2];
+            raw[face * 4 + 3] = color[3];
+        }
+
+        var img_desc = sg.ImageDesc{
+            .type = .CUBE,
+            .width = 1,
+            .height = 1,
+            .num_slices = 6,
+            .num_mipmaps = 1,
+            .pixel_format = .RGBA8,
+            .sample_count = 1,
+        };
+        img_desc.data.mip_levels[0] = sg.asRange(&raw);
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .wrap_w = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .size = 1,
+            .num_mipmaps = 1,
+        };
+    }
+
+    pub fn initRawFaces(allocator: std.mem.Allocator, size: u32, faces: [6][]const u8, generate_mips: bool) !CubeTexture {
+        const face_bytes = size * size * 4;
+        for (faces) |face| {
+            if (face.len != face_bytes) return error.InvalidFaceBufferSize;
+        }
+
+        // Concatenate 6 faces for mip 0
+        const mip0_total_bytes = 6 * face_bytes;
+        const mip0_buffer = try allocator.alloc(u8, mip0_total_bytes);
+        defer allocator.free(mip0_buffer);
+
+        for (faces, 0..) |face, i| {
+            const dst_offset = i * face_bytes;
+            @memcpy(mip0_buffer[dst_offset .. dst_offset + face_bytes], face);
+        }
+
+        var num_mips: u32 = 1;
+        if (generate_mips and size > 1) {
+            var s = size;
+            while (s > 1) : (s /= 2) {
+                num_mips += 1;
+            }
+        }
+        if (num_mips > 16) num_mips = 16;
+
+        var img_desc = sg.ImageDesc{
+            .type = .CUBE,
+            .width = @intCast(size),
+            .height = @intCast(size),
+            .num_slices = 6,
+            .num_mipmaps = @intCast(num_mips),
+            .pixel_format = .RGBA8,
+            .sample_count = 1,
+        };
+        img_desc.data.mip_levels[0] = sg.asRange(mip0_buffer);
+
+        // Generate downsampled mipmaps
+        var mip_buffers: [16]?[]u8 = @splat(null);
+        defer {
+            for (1..num_mips) |m| {
+                if (mip_buffers[m]) |buf| allocator.free(buf);
+            }
+        }
+
+        var prev_size = size;
+        var prev_buf = mip0_buffer;
+        for (1..num_mips) |m| {
+            const cur_size = prev_size / 2;
+            const cur_total_bytes = 6 * cur_size * cur_size * 4;
+            const cur_buf = try allocator.alloc(u8, cur_total_bytes);
+            mip_buffers[m] = cur_buf;
+
+            for (0..6) |face| {
+                const src_face_offset = face * prev_size * prev_size * 4;
+                const dst_face_offset = face * cur_size * cur_size * 4;
+
+                var dy: u32 = 0;
+                while (dy < cur_size) : (dy += 1) {
+                    const sy = dy * 2;
+                    var dx: u32 = 0;
+                    while (dx < cur_size) : (dx += 1) {
+                        const sx = dx * 2;
+                        const idx00 = src_face_offset + (sy * prev_size + sx) * 4;
+                        const idx10 = src_face_offset + (sy * prev_size + sx + 1) * 4;
+                        const idx01 = src_face_offset + ((sy + 1) * prev_size + sx) * 4;
+                        const idx11 = src_face_offset + ((sy + 1) * prev_size + sx + 1) * 4;
+
+                        const out_i = dst_face_offset + (dy * cur_size + dx) * 4;
+                        inline for (0..4) |c_idx| {
+                            const sum: u32 = @as(u32, prev_buf[idx00 + c_idx]) +
+                                @as(u32, prev_buf[idx10 + c_idx]) +
+                                @as(u32, prev_buf[idx01 + c_idx]) +
+                                @as(u32, prev_buf[idx11 + c_idx]);
+                            cur_buf[out_i + c_idx] = @intCast((sum + 2) / 4);
+                        }
+                    }
+                }
+            }
+
+            img_desc.data.mip_levels[m] = sg.asRange(cur_buf);
+            prev_size = cur_size;
+            prev_buf = cur_buf;
+        }
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = if (num_mips > 1) .LINEAR else .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .wrap_w = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .size = size,
+            .num_mipmaps = num_mips,
+        };
+    }
+
+    pub fn createProceduralSkybox(allocator: std.mem.Allocator, config: SkyboxConfig) !CubeTexture {
+        const size = config.size;
+        const face_bytes = size * size * 4;
+
+        var face_slices: [6][]u8 = undefined;
+        for (0..6) |i| {
+            face_slices[i] = try allocator.alloc(u8, face_bytes);
+        }
+        defer {
+            for (0..6) |i| allocator.free(face_slices[i]);
+        }
+
+        // Normalize sun direction
+        const s_len = @sqrt(config.sun_direction[0] * config.sun_direction[0] +
+            config.sun_direction[1] * config.sun_direction[1] +
+            config.sun_direction[2] * config.sun_direction[2]);
+        const sun_dir: [3]f32 = if (s_len > 0.0001) .{
+            config.sun_direction[0] / s_len,
+            config.sun_direction[1] / s_len,
+            config.sun_direction[2] / s_len,
+        } else .{ 0.0, 1.0, 0.0 };
+
+        for (0..6) |face| {
+            const buf = face_slices[face];
+            var py: u32 = 0;
+            while (py < size) : (py += 1) {
+                const v = 2.0 * (@as(f32, @floatFromInt(py)) + 0.5) / @as(f32, @floatFromInt(size)) - 1.0;
+                var px: u32 = 0;
+                while (px < size) : (px += 1) {
+                    const u = 2.0 * (@as(f32, @floatFromInt(px)) + 0.5) / @as(f32, @floatFromInt(size)) - 1.0;
+
+                    const dir: [3]f32 = switch (face) {
+                        0 => .{ 1.0, -v, -u }, // +X
+                        1 => .{ -1.0, -v, u }, // -X
+                        2 => .{ u, 1.0, v }, // +Y
+                        3 => .{ u, -1.0, -v }, // -Y
+                        4 => .{ u, -v, 1.0 }, // +Z
+                        5 => .{ -u, -v, -1.0 }, // -Z
+                        else => unreachable,
+                    };
+
+                    const d_len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    const d: [3]f32 = .{ dir[0] / d_len, dir[1] / d_len, dir[2] / d_len };
+
+                    // Elevation gradient (d[1] is Y)
+                    var color: [3]f32 = undefined;
+                    if (d[1] >= 0.0) {
+                        const t = std.math.pow(f32, d[1], 0.65);
+                        for (0..3) |c_idx| {
+                            const horiz = @as(f32, @floatFromInt(config.horizon_color[c_idx])) / 255.0;
+                            const top = @as(f32, @floatFromInt(config.top_color[c_idx])) / 255.0;
+                            color[c_idx] = (1.0 - t) * horiz + t * top;
+                        }
+                    } else {
+                        const t = std.math.pow(f32, -d[1], 0.7);
+                        for (0..3) |c_idx| {
+                            const horiz = @as(f32, @floatFromInt(config.horizon_color[c_idx])) / 255.0;
+                            const bot = @as(f32, @floatFromInt(config.bottom_color[c_idx])) / 255.0;
+                            color[c_idx] = (1.0 - t) * horiz + t * bot;
+                        }
+                    }
+
+                    // Sun contribution
+                    const sun_dot = d[0] * sun_dir[0] + d[1] * sun_dir[1] + d[2] * sun_dir[2];
+                    if (sun_dot > 0.0) {
+                        const sun_disk = std.math.pow(f32, sun_dot, 512.0) * 3.5;
+                        const sun_halo = std.math.pow(f32, sun_dot, 16.0) * 0.45;
+                        const total_sun = (sun_disk + sun_halo) * config.sun_intensity;
+
+                        for (0..3) |c_idx| {
+                            const sc = @as(f32, @floatFromInt(config.sun_color[c_idx])) / 255.0;
+                            color[c_idx] += total_sun * sc;
+                        }
+                    }
+
+                    const out_idx = (py * size + px) * 4;
+                    inline for (0..3) |c_idx| {
+                        const byte_val = std.math.clamp(color[c_idx] * 255.0, 0.0, 255.0);
+                        buf[out_idx + c_idx] = @intFromFloat(byte_val);
+                    }
+                    buf[out_idx + 3] = 255;
+                }
+            }
+        }
+
+        const const_faces = [6][]const u8{
+            face_slices[0],
+            face_slices[1],
+            face_slices[2],
+            face_slices[3],
+            face_slices[4],
+            face_slices[5],
+        };
+
+        return initRawFaces(allocator, size, const_faces, true);
+    }
+
+    pub fn fromFiles(allocator: std.mem.Allocator, face_paths: [6][]const u8) !CubeTexture {
+        var face_data: [6][*c]u8 = undefined;
+        var size: u32 = 0;
+
+        for (face_paths, 0..) |path, i| {
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+
+            var w: c_int = 0;
+            var h: c_int = 0;
+            var comp: c_int = 0;
+            const data = c.stbi_load(path_z.ptr, &w, &h, &comp, 4);
+            if (data == null) {
+                // Free previously loaded
+                for (0..i) |prev| c.stbi_image_free(face_data[prev]);
+                return error.ImageDecodeFailed;
+            }
+            if (w != h) {
+                for (0..i + 1) |prev| c.stbi_image_free(face_data[prev]);
+                return error.CubeFaceMustBeSquare;
+            }
+            if (i == 0) {
+                size = @intCast(w);
+            } else if (@as(u32, @intCast(w)) != size) {
+                for (0..i + 1) |prev| c.stbi_image_free(face_data[prev]);
+                return error.CubeFacesMustHaveEqualSize;
+            }
+            face_data[i] = data;
+        }
+        defer {
+            for (0..6) |i| c.stbi_image_free(face_data[i]);
+        }
+
+        const face_bytes = size * size * 4;
+        var const_faces: [6][]const u8 = undefined;
+        for (0..6) |i| {
+            const_faces[i] = face_data[i][0..face_bytes];
+        }
+
+        return initRawFaces(allocator, size, const_faces, true);
+    }
+
+    pub fn fromEquirectangular(allocator: std.mem.Allocator, panorama_bytes: []const u8, face_size: u32) !CubeTexture {
+        var pw: c_int = 0;
+        var ph: c_int = 0;
+        var comp: c_int = 0;
+        const p_data = c.stbi_load_from_memory(
+            panorama_bytes.ptr,
+            @intCast(panorama_bytes.len),
+            &pw,
+            &ph,
+            &comp,
+            4,
+        );
+        if (p_data == null) return error.ImageDecodeFailed;
+        defer c.stbi_image_free(p_data);
+
+        const pano_w: u32 = @intCast(pw);
+        const pano_h: u32 = @intCast(ph);
+        const face_bytes = face_size * face_size * 4;
+
+        var face_slices: [6][]u8 = undefined;
+        for (0..6) |i| {
+            face_slices[i] = try allocator.alloc(u8, face_bytes);
+        }
+        defer {
+            for (0..6) |i| allocator.free(face_slices[i]);
+        }
+
+        for (0..6) |face| {
+            const buf = face_slices[face];
+            var py: u32 = 0;
+            while (py < face_size) : (py += 1) {
+                const v = 2.0 * (@as(f32, @floatFromInt(py)) + 0.5) / @as(f32, @floatFromInt(face_size)) - 1.0;
+                var px: u32 = 0;
+                while (px < face_size) : (px += 1) {
+                    const u = 2.0 * (@as(f32, @floatFromInt(px)) + 0.5) / @as(f32, @floatFromInt(face_size)) - 1.0;
+
+                    const dir: [3]f32 = switch (face) {
+                        0 => .{ 1.0, -v, -u }, // +X
+                        1 => .{ -1.0, -v, u }, // -X
+                        2 => .{ u, 1.0, v }, // +Y
+                        3 => .{ u, -1.0, -v }, // -Y
+                        4 => .{ u, -v, 1.0 }, // +Z
+                        5 => .{ -u, -v, -1.0 }, // -Z
+                        else => unreachable,
+                    };
+
+                    const len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    const d: [3]f32 = .{ dir[0] / len, dir[1] / len, dir[2] / len };
+
+                    // Spherical coordinates
+                    const phi = std.math.atan2(d[2], d[0]); // longitude [-pi, pi]
+                    const theta = std.math.asin(std.math.clamp(d[1], -1.0, 1.0)); // latitude [-pi/2, pi/2]
+
+                    const u_pano = (phi / (2.0 * std.math.pi)) + 0.5;
+                    const v_pano = 0.5 - (theta / std.math.pi);
+
+                    const sx_f = std.math.clamp(u_pano * @as(f32, @floatFromInt(pano_w)), 0.0, @as(f32, @floatFromInt(pano_w - 1)));
+                    const sy_f = std.math.clamp(v_pano * @as(f32, @floatFromInt(pano_h)), 0.0, @as(f32, @floatFromInt(pano_h - 1)));
+
+                    const sx: u32 = @intFromFloat(sx_f);
+                    const sy: u32 = @intFromFloat(sy_f);
+
+                    const p_idx = (sy * pano_w + sx) * 4;
+                    const out_idx = (py * face_size + px) * 4;
+
+                    @memcpy(buf[out_idx .. out_idx + 4], p_data[p_idx .. p_idx + 4]);
+                }
+            }
+        }
+
+        const const_faces = [6][]const u8{
+            face_slices[0],
+            face_slices[1],
+            face_slices[2],
+            face_slices[3],
+            face_slices[4],
+            face_slices[5],
+        };
+
+        return initRawFaces(allocator, face_size, const_faces, true);
+    }
+
+    pub fn fromEquirectangularFile(allocator: std.mem.Allocator, file_path: []const u8, face_size: u32) !CubeTexture {
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
+
+        const file_size = (try file.stat()).size;
+        const bytes = try allocator.alloc(u8, file_size);
+        defer allocator.free(bytes);
+
+        _ = try file.readAll(bytes);
+        return fromEquirectangular(allocator, bytes, face_size);
+    }
+};

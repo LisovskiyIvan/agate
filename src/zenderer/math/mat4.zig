@@ -160,4 +160,13 @@ pub const Mat4 = extern struct {
         const rot = mul(rz, mul(ry, rx));
         return mul(t, mul(rot, s));
     }
+
+    /// Returns a copy of the matrix with the translation components zeroed out
+    pub fn removeTranslation(self: Mat4) Mat4 {
+        var r = self;
+        r.m[12] = 0.0;
+        r.m[13] = 0.0;
+        r.m[14] = 0.0;
+        return r;
+    }
 };

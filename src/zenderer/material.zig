@@ -4,6 +4,7 @@ const math = @import("math");
 const Color3 = math.Color3;
 const Color4 = math.Color4;
 const Texture = @import("texture.zig").Texture;
+const CubeTexture = @import("texture.zig").CubeTexture;
 
 pub const StandardMaterial = struct {
     name: []const u8 = "StandardMaterial",
@@ -38,6 +39,9 @@ pub const PBRMaterial = struct {
     emissive_color: Color3 = Color3.black,
     occlusion_texture: ?Texture = null,
     occlusion_strength: f32 = 1.0,
+
+    environment_texture: ?CubeTexture = null,
+    environment_intensity: f32 = 1.0,
 
     pub fn init(name: []const u8) PBRMaterial {
         return .{
