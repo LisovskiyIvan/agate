@@ -14,6 +14,10 @@ pub const ArcRotateCamera = camera.ArcRotateCamera;
 pub const lights = @import("lights.zig");
 pub const HemisphericLight = lights.HemisphericLight;
 pub const DirectionalLight = lights.DirectionalLight;
+pub const PointLight = lights.PointLight;
+pub const PointLightOptions = lights.PointLightOptions;
+pub const SpotLight = lights.SpotLight;
+pub const SpotLightOptions = lights.SpotLightOptions;
 
 pub const material = @import("material.zig");
 pub const StandardMaterial = material.StandardMaterial;

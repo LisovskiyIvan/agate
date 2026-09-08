@@ -17,7 +17,12 @@ const BoundingBox = math.BoundingBox;
 const Frustum = math.Frustum;
 
 const ArcRotateCamera = @import("camera.zig").ArcRotateCamera;
-const HemisphericLight = @import("lights.zig").HemisphericLight;
+const lights = @import("lights.zig");
+const HemisphericLight = lights.HemisphericLight;
+const PointLight = lights.PointLight;
+const PointLightOptions = lights.PointLightOptions;
+const SpotLight = lights.SpotLight;
+const SpotLightOptions = lights.SpotLightOptions;
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
 const InstancedMesh = @import("mesh.zig").InstancedMesh;
@@ -53,6 +58,8 @@ pub const Scene = struct {
     active_camera: ?ArcRotateCamera = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
     light: HemisphericLight = .{},
+    point_lights: std.ArrayListUnmanaged(*PointLight) = .empty,
+    spot_lights: std.ArrayListUnmanaged(*SpotLight) = .empty,
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
     default_normal_texture: Texture,
@@ -348,9 +355,23 @@ pub const Scene = struct {
         self.setSkybox(cube);
     }
 
-    pub fn createHemisphericLight(self: *Scene, name: []const u8, options: @import("lights.zig").HemisphericLightOptions) HemisphericLight {
+    pub fn createHemisphericLight(self: *Scene, name: []const u8, options: lights.HemisphericLightOptions) HemisphericLight {
         const light = HemisphericLight.init(name, options);
         self.light = light;
+        return light;
+    }
+
+    pub fn createPointLight(self: *Scene, name: []const u8, options: PointLightOptions) !*PointLight {
+        const light = try self.allocator.create(PointLight);
+        light.* = PointLight.init(name, options);
+        try self.point_lights.append(self.allocator, light);
+        return light;
+    }
+
+    pub fn createSpotLight(self: *Scene, name: []const u8, options: SpotLightOptions) !*SpotLight {
+        const light = try self.allocator.create(SpotLight);
+        light.* = SpotLight.init(name, options);
+        try self.spot_lights.append(self.allocator, light);
         return light;
     }
 
@@ -567,6 +588,40 @@ pub const Scene = struct {
             },
         };
 
+        // Pack up to 4 Point Lights and 2 Spot Lights for fragment shaders
+        var light_counts = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
+        var point_pos_range = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var point_color_int = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var spot_pos_range = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_dir_inner = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_color_outer = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_intensity = [_][4]f32{[_]f32{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+
+        var num_point: usize = 0;
+        for (self.point_lights.items) |pl| {
+            if (!pl.is_enabled) continue;
+            if (num_point >= 4) break;
+            point_pos_range[num_point] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
+            point_color_int[num_point] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
+            num_point += 1;
+        }
+        light_counts[0] = @floatFromInt(num_point);
+
+        var num_spot: usize = 0;
+        for (self.spot_lights.items) |sl| {
+            if (!sl.is_enabled) continue;
+            if (num_spot >= 2) break;
+            const dir = sl.direction.normalize();
+            const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
+            const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
+            spot_pos_range[num_spot] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
+            spot_dir_inner[num_spot] = .{ dir.x, dir.y, dir.z, cos_inner };
+            spot_color_outer[num_spot] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
+            spot_intensity[num_spot] = .{ sl.intensity, 0.0, 0.0, 0.0 };
+            num_spot += 1;
+        }
+        light_counts[1] = @floatFromInt(num_spot);
+
         sg.beginPass(.{
             .action = self.pass_action,
             .swapchain = sglue.swapchain(),
@@ -601,6 +656,13 @@ pub const Scene = struct {
                 .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                 .diffuse_color = mat.getDiffuseColor4(),
                 .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
+                .light_counts = light_counts,
+                .point_pos_range = point_pos_range,
+                .point_color_int = point_color_int,
+                .spot_pos_range = spot_pos_range,
+                .spot_dir_inner = spot_dir_inner,
+                .spot_color_outer = spot_color_outer,
+                .spot_intensity = spot_intensity,
             };
 
             const tex = if (mat.diffuse_texture) |t| t else self.default_white_texture;
@@ -665,6 +727,13 @@ pub const Scene = struct {
                     },
                     .emissive_factor = pbr_mat.getEmissiveColor4(),
                     .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
+                    .light_counts = light_counts,
+                    .point_pos_range = point_pos_range,
+                    .point_color_int = point_color_int,
+                    .spot_pos_range = spot_pos_range,
+                    .spot_dir_inner = spot_dir_inner,
+                    .spot_color_outer = spot_color_outer,
+                    .spot_intensity = spot_intensity,
                 };
 
                 const albedo_tex = if (pbr_mat.albedo_texture) |t| t else self.default_white_texture;
@@ -723,6 +792,13 @@ pub const Scene = struct {
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .diffuse_color = mat.getDiffuseColor4(),
                     .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
+                    .light_counts = light_counts,
+                    .point_pos_range = point_pos_range,
+                    .point_color_int = point_color_int,
+                    .spot_pos_range = spot_pos_range,
+                    .spot_dir_inner = spot_dir_inner,
+                    .spot_color_outer = spot_color_outer,
+                    .spot_intensity = spot_intensity,
                 };
 
                 const tex = if (mat.diffuse_texture) |t| t else self.default_white_texture;
@@ -808,6 +884,16 @@ pub const Scene = struct {
             self.allocator.destroy(mat);
         }
         self.pbr_materials.deinit(self.allocator);
+
+        for (self.point_lights.items) |pl| {
+            self.allocator.destroy(pl);
+        }
+        self.point_lights.deinit(self.allocator);
+
+        for (self.spot_lights.items) |sl| {
+            self.allocator.destroy(sl);
+        }
+        self.spot_lights.deinit(self.allocator);
 
         self.render_queue.deinit(self.allocator);
         self.instance_matrices.deinit(self.allocator);
