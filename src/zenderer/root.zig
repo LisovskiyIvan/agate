@@ -43,4 +43,8 @@ pub const Scene = scene.Scene;
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
 
+pub const postprocess = @import("postprocess.zig");
+pub const PostProcessConfig = postprocess.PostProcessConfig;
+pub const TonemappingType = postprocess.TonemappingType;
+
 pub const sokol = @import("sokol");

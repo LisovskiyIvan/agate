@@ -79,6 +79,19 @@ pub fn build(b: *Build) !void {
     });
     mod_skybox_shader.addImport("math", mod_math);
 
+    // Шейдер PostProcess: src/zenderer/shaders/postprocess.glsl -> Zig-модуль "postprocess_shader"
+    const mod_postprocess_shader = try sokol.shdc.createModule(b, "postprocess_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/postprocess.glsl",
+        .output = "postprocess_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_postprocess_shader.addImport("math", mod_math);
+
     // Главный модуль библиотеки zenderer
     const mod_zenderer = b.addModule("zenderer", .{
         .root_source_file = b.path("src/zenderer/root.zig"),
@@ -91,6 +104,7 @@ pub fn build(b: *Build) !void {
             .{ .name = "instanced_shader", .module = mod_instanced_shader },
             .{ .name = "shadow_shader", .module = mod_shadow_shader },
             .{ .name = "skybox_shader", .module = mod_skybox_shader },
+            .{ .name = "postprocess_shader", .module = mod_postprocess_shader },
             .{ .name = "math", .module = mod_math },
         },
     });
