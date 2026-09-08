@@ -37,4 +37,13 @@ pub const Color4 = extern struct {
     pub fn toArray(self: Color4) [4]f32 {
         return .{ self.r, self.g, self.b, self.a };
     }
+
+    pub fn lerp(c1: Color4, c2: Color4, t: f32) Color4 {
+        return .{
+            .r = c1.r + (c2.r - c1.r) * t,
+            .g = c1.g + (c2.g - c1.g) * t,
+            .b = c1.b + (c2.b - c1.b) * t,
+            .a = c1.a + (c2.a - c1.a) * t,
+        };
+    }
 };

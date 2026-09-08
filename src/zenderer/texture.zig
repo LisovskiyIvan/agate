@@ -102,6 +102,74 @@ pub const Texture = struct {
         });
     }
 
+    pub fn createDefaultParticleDot32() Texture {
+        var buf: [32 * 32 * 4]u8 = undefined;
+        const size: usize = 32;
+        const center: f32 = 15.5;
+        const radius: f32 = 15.5;
+
+        var y: usize = 0;
+        while (y < size) : (y += 1) {
+            var x: usize = 0;
+            while (x < size) : (x += 1) {
+                const dx = @as(f32, @floatFromInt(x)) - center;
+                const dy = @as(f32, @floatFromInt(y)) - center;
+                const dist = @sqrt(dx * dx + dy * dy);
+                const norm_dist = @min(1.0, dist / radius);
+                const alpha_f = (1.0 - norm_dist) * (1.0 - norm_dist);
+                const alpha: u8 = @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
+
+                const idx = (y * size + x) * 4;
+                buf[idx + 0] = 255;
+                buf[idx + 1] = 255;
+                buf[idx + 2] = 255;
+                buf[idx + 3] = alpha;
+            }
+        }
+
+        return initRaw(32, 32, &buf, .{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+    }
+
+    pub fn createParticleDot(allocator: std.mem.Allocator, size: u32) !Texture {
+        const pixel_count = size * size;
+        const buffer = try allocator.alloc(u8, pixel_count * 4);
+        defer allocator.free(buffer);
+
+        const center: f32 = @as(f32, @floatFromInt(size)) * 0.5 - 0.5;
+        const radius: f32 = @as(f32, @floatFromInt(size)) * 0.5;
+
+        var y: u32 = 0;
+        while (y < size) : (y += 1) {
+            var x: u32 = 0;
+            while (x < size) : (x += 1) {
+                const dx = @as(f32, @floatFromInt(x)) - center;
+                const dy = @as(f32, @floatFromInt(y)) - center;
+                const dist = @sqrt(dx * dx + dy * dy);
+                const norm_dist = @min(1.0, dist / radius);
+                const alpha_f = (1.0 - norm_dist) * (1.0 - norm_dist);
+                const alpha: u8 = @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
+
+                const idx = (y * size + x) * 4;
+                buffer[idx + 0] = 255;
+                buffer[idx + 1] = 255;
+                buffer[idx + 2] = 255;
+                buffer[idx + 3] = alpha;
+            }
+        }
+
+        return initRaw(size, size, buffer, .{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+    }
+
     pub fn fromMemory(bytes: []const u8, options: Options) !Texture {
         var w: c_int = 0;
         var h: c_int = 0;

@@ -67,6 +67,14 @@ pub const Vec3 = extern struct {
         if (len == 0.0) return Vec3.zero;
         return v.scale(1.0 / len);
     }
+
+    pub fn lerp(a: Vec3, b: Vec3, t: f32) Vec3 {
+        return .{
+            .x = a.x + (b.x - a.x) * t,
+            .y = a.y + (b.y - a.y) * t,
+            .z = a.z + (b.z - a.z) * t,
+        };
+    }
 };
 
 pub const Vec4 = extern struct {

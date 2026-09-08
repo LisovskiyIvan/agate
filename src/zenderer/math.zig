@@ -16,3 +16,7 @@ pub const BoundingBox = bounding_box.BoundingBox;
 pub const frustum = @import("math/frustum.zig");
 pub const Frustum = frustum.Frustum;
 pub const FrustumPlane = frustum.FrustumPlane;
+
+pub inline fn lerp(a: f32, b: f32, t: f32) f32 {
+    return a + (b - a) * t;
+}

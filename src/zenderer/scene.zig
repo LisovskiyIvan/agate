@@ -9,9 +9,14 @@ const inst_shd = @import("instanced_shader");
 const shadow_shd = @import("shadow_shader");
 const sky_shd = @import("skybox_shader");
 const post_shd = @import("postprocess_shader");
+const part_shd = @import("particle_shader");
 const postprocess = @import("postprocess.zig");
 pub const PostProcessConfig = postprocess.PostProcessConfig;
 pub const TonemappingType = postprocess.TonemappingType;
+const particles = @import("particles.zig");
+pub const ParticleSystem = particles.ParticleSystem;
+pub const ParticleBlendMode = particles.ParticleBlendMode;
+pub const Particle = particles.Particle;
 
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -125,6 +130,14 @@ pub const Scene = struct {
     offscreen_depth_image: sg.Image = .{},
     offscreen_depth_att_view: sg.View = .{},
 
+    // Particle Systems
+    particle_systems: std.ArrayListUnmanaged(*particles.ParticleSystem) = .empty,
+    default_particle_texture: Texture,
+    particle_quad_vb: sg.Buffer = .{},
+    particle_quad_ib: sg.Buffer = .{},
+    particle_pipeline_additive: sg.Pipeline = .{},
+    particle_pipeline_alphablend: sg.Pipeline = .{},
+
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
 
@@ -156,6 +169,7 @@ pub const Scene = struct {
             .default_normal_texture = Texture.createFlatNormal1x1(),
             .default_black_texture = Texture.createBlack1x1(),
             .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
+            .default_particle_texture = Texture.createDefaultParticleDot32(),
             .shadow_image = depth_img,
             .shadow_attachment_view = att_view,
             .shadow_texture_view = tex_view,
@@ -412,6 +426,85 @@ pub const Scene = struct {
             .offset = 2 * @sizeOf(f32),
         };
         self.postprocess_pipeline = sg.makePipeline(pp_desc);
+
+        // 7. Particle Pipelines & Billboard Quad
+        const particle_quad_vertices = [_]f32{
+            // x,     y,     u,   v
+            -0.5, -0.5,  0.0, 0.0,
+             0.5, -0.5,  1.0, 0.0,
+             0.5,  0.5,  1.0, 1.0,
+            -0.5,  0.5,  0.0, 1.0,
+        };
+        const particle_quad_indices = [_]u16{
+            0, 1, 2,
+            0, 2, 3,
+        };
+        self.particle_quad_vb = sg.makeBuffer(.{
+            .data = sg.asRange(&particle_quad_vertices),
+        });
+        self.particle_quad_ib = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(&particle_quad_indices),
+        });
+
+        var part_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(part_shd.particleShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .depth = .{
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        // Buffer 0: Unit quad
+        part_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        part_desc.layout.attrs[part_shd.ATTR_particle_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        part_desc.layout.attrs[part_shd.ATTR_particle_texcoord0] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 2 * @sizeOf(f32),
+        };
+
+        // Buffer 1: Dynamic per-instance data
+        part_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(particles.ParticleInstanceData),
+        };
+        part_desc.layout.attrs[part_shd.ATTR_particle_inst_pos_size] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = 0,
+        };
+        part_desc.layout.attrs[part_shd.ATTR_particle_inst_color] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = 4 * @sizeOf(f32),
+        };
+
+        // Additive pipeline
+        part_desc.colors[0].blend = .{
+            .enabled = true,
+            .src_factor_rgb = .SRC_ALPHA,
+            .dst_factor_rgb = .ONE,
+            .src_factor_alpha = .ONE,
+            .dst_factor_alpha = .ONE,
+        };
+        self.particle_pipeline_additive = sg.makePipeline(part_desc);
+
+        // AlphaBlend pipeline
+        part_desc.colors[0].blend = .{
+            .enabled = true,
+            .src_factor_rgb = .SRC_ALPHA,
+            .dst_factor_rgb = .ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = .ONE,
+            .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
+        };
+        self.particle_pipeline_alphablend = sg.makePipeline(part_desc);
     }
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
@@ -539,6 +632,18 @@ pub const Scene = struct {
         mat.* = PBRMaterial.init(name);
         try self.pbr_materials.append(self.allocator, mat);
         return mat;
+    }
+
+    pub fn createParticleSystem(self: *Scene, name: []const u8, capacity: usize) !*particles.ParticleSystem {
+        const ps = try particles.ParticleSystem.init(self.allocator, name, capacity);
+        try self.particle_systems.append(self.allocator, ps);
+        return ps;
+    }
+
+    pub fn updateParticles(self: *Scene, dt: f32) void {
+        for (self.particle_systems.items) |ps| {
+            ps.update(dt);
+        }
     }
 
     pub fn handleEvent(self: *Scene, ev: [*c]const sapp.Event) void {
@@ -1017,6 +1122,10 @@ pub const Scene = struct {
             self.renderSkybox(self.active_camera.?, aspect);
         }
 
+        if (self.active_camera != null and self.particle_systems.items.len > 0) {
+            self.renderParticles(self.active_camera.?, aspect);
+        }
+
         sg.endPass();
 
         if (self.post_process.enabled) {
@@ -1104,6 +1213,50 @@ pub const Scene = struct {
 
         self.stats.draw_calls += 1;
         self.stats.triangles += 12;
+    }
+
+    fn renderParticles(self: *Scene, camera: ArcRotateCamera, aspect: f32) void {
+        const view = camera.getViewMatrix();
+        const proj = camera.getProjectionMatrix(aspect);
+        const view_proj = Mat4.mul(proj, view);
+
+        const cam_right = [4]f32{ view.m[0], view.m[4], view.m[8], 0.0 };
+        const cam_up = [4]f32{ view.m[1], view.m[5], view.m[9], 0.0 };
+
+        const vs_params = part_shd.VsParams{
+            .view_proj = view_proj,
+            .camera_right = cam_right,
+            .camera_up = cam_up,
+        };
+
+        var current_pip_id: u32 = 0;
+
+        for (self.particle_systems.items) |ps| {
+            if (ps.active_count == 0) continue;
+
+            const pip = if (ps.blend_mode == .additive) self.particle_pipeline_additive else self.particle_pipeline_alphablend;
+            if (pip.id != current_pip_id) {
+                sg.applyPipeline(pip);
+                current_pip_id = pip.id;
+                self.stats.pipeline_switches += 1;
+            }
+
+            const tex = if (ps.texture) |t| t else self.default_particle_texture;
+
+            var bind = sg.Bindings{};
+            bind.vertex_buffers[0] = self.particle_quad_vb;
+            bind.vertex_buffers[1] = ps.instance_buffer;
+            bind.index_buffer = self.particle_quad_ib;
+            bind.views[part_shd.VIEW_particle_tex] = tex.view;
+            bind.samplers[part_shd.SMP_smp] = tex.sampler;
+
+            sg.applyBindings(bind);
+            sg.applyUniforms(part_shd.UB_vs_params, sg.asRange(&vs_params));
+            sg.draw(0, 6, @intCast(ps.active_count));
+
+            self.stats.draw_calls += 1;
+            self.stats.triangles += 2 * @as(u32, @intCast(ps.active_count));
+        }
     }
 
     pub fn deinit(self: *Scene) void {
@@ -1195,6 +1348,17 @@ pub const Scene = struct {
         sg.destroySampler(self.postprocess_sampler);
         sg.destroyBuffer(self.postprocess_quad_vb);
         sg.destroyBuffer(self.postprocess_quad_ib);
+
+        for (self.particle_systems.items) |ps| {
+            ps.deinit();
+            self.allocator.destroy(ps);
+        }
+        self.particle_systems.deinit(self.allocator);
+        self.default_particle_texture.deinit();
+        sg.destroyPipeline(self.particle_pipeline_additive);
+        sg.destroyPipeline(self.particle_pipeline_alphablend);
+        sg.destroyBuffer(self.particle_quad_vb);
+        sg.destroyBuffer(self.particle_quad_ib);
     }
 
 };
