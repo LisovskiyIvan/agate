@@ -61,6 +61,18 @@ pub const Mat4 = extern struct {
         } };
     }
 
+    pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) Mat4 {
+        const w = right - left;
+        const h = top - bottom;
+        const d = far - near;
+        return .{ .m = .{
+            2.0 / w, 0.0, 0.0, 0.0,
+            0.0, 2.0 / h, 0.0, 0.0,
+            0.0, 0.0, -1.0 / d, 0.0,
+            -(right + left) / w, -(top + bottom) / h, -near / d, 1.0,
+        } };
+    }
+
     pub fn lookAt(eye: Vec3, target: Vec3, up_arg: Vec3) Mat4 {
         const f = target.sub(eye).normalize();
         const s = f.cross(up_arg).normalize();

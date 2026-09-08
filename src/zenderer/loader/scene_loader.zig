@@ -12,12 +12,56 @@ const BoundingBox = math.BoundingBox;
 const Scene = @import("../scene.zig").Scene;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
+const computeTangents = @import("../mesh.zig").computeTangents;
 const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Material = @import("../material.zig").Material;
 const Texture = @import("../texture.zig").Texture;
 
 pub const SceneLoader = struct {
+    fn loadTextureFromView(
+        _: *Scene,
+        gltf: *c.cgltf_data,
+        image_cache: []?Texture,
+        view: [*c]const c.cgltf_texture_view,
+    ) ?Texture {
+        if (view == null) return null;
+        if (view.*.texture == null) return null;
+        const tex = view.*.texture.?;
+        if (tex.*.image == null) return null;
+        const img = tex.*.image.?;
+
+        var img_idx: ?usize = null;
+        for (0..gltf.images_count) |im_i| {
+            if (&gltf.images[im_i] == img) {
+                img_idx = im_i;
+                break;
+            }
+        }
+
+        if (img_idx) |idx| {
+            if (image_cache[idx]) |cached| {
+                return cached;
+            }
+        }
+
+        if (img.*.buffer_view == null) return null;
+        const bv = img.*.buffer_view.?;
+        if (bv.*.buffer == null or bv.*.buffer.*.data == null) return null;
+
+        const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
+        const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
+
+        if (Texture.fromMemory(img_data, .{})) |loaded| {
+            if (img_idx) |idx| {
+                image_cache[idx] = loaded;
+            }
+            return loaded;
+        } else |_| {
+            return null;
+        }
+    }
+
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
         const path_z = try scene.allocator.dupeZ(u8, file_path);
         defer scene.allocator.free(path_z);
@@ -44,6 +88,10 @@ pub const SceneLoader = struct {
         defer scene.allocator.free(materials);
         @memset(materials, null);
 
+        const image_cache = try scene.allocator.alloc(?Texture, gltf.images_count);
+        defer scene.allocator.free(image_cache);
+        @memset(image_cache, null);
+
         for (0..gltf.materials_count) |i| {
             const src_mat = &gltf.materials[i];
             const mat_name = if (src_mat.name != null)
@@ -51,8 +99,9 @@ pub const SceneLoader = struct {
             else
                 "glb_material";
 
+            const pbr_mat = try scene.createPBRMaterial(mat_name);
+
             if (src_mat.has_pbr_metallic_roughness != 0) {
-                const pbr_mat = try scene.createPBRMaterial(mat_name);
                 const pbr = &src_mat.pbr_metallic_roughness;
                 pbr_mat.albedo_color = Color3.new(
                     pbr.base_color_factor[0],
@@ -63,27 +112,24 @@ pub const SceneLoader = struct {
                 pbr_mat.metallic = pbr.metallic_factor;
                 pbr_mat.roughness = pbr.roughness_factor;
 
-                if (pbr.base_color_texture.texture != null) {
-                    const tex = pbr.base_color_texture.texture;
-                    if (tex.*.image != null) {
-                        const img = tex.*.image;
-                        if (img.*.buffer_view != null) {
-                            const bv = img.*.buffer_view.?;
-                            const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
-                            const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
-
-                            if (Texture.fromMemory(img_data, .{})) |loaded_tex| {
-                                pbr_mat.albedo_texture = loaded_tex;
-                            } else |_| {}
-                        }
-                    }
-                }
-                materials[i] = .{ .pbr = pbr_mat };
-            } else {
-                const std_mat = try scene.createStandardMaterial(mat_name);
-                materials[i] = .{ .standard = std_mat };
+                pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.base_color_texture);
+                pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.metallic_roughness_texture);
             }
+
+            pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.normal_texture);
+            pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.occlusion_texture);
+            pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
+
+            pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.emissive_texture);
+            pbr_mat.emissive_color = Color3.new(
+                src_mat.emissive_factor[0],
+                src_mat.emissive_factor[1],
+                src_mat.emissive_factor[2],
+            );
+
+            materials[i] = .{ .pbr = pbr_mat };
         }
+
 
         // 2. Parse meshes and primitives (preserving glTF node transforms)
         var spawned_meshes = std.ArrayList(*Mesh).empty;
@@ -150,6 +196,7 @@ pub const SceneLoader = struct {
         var norm_accessor: ?*c.cgltf_accessor = null;
         var col_accessor: ?*c.cgltf_accessor = null;
         var uv_accessor: ?*c.cgltf_accessor = null;
+        var tan_accessor: ?*c.cgltf_accessor = null;
 
         for (0..prim.attributes_count) |attr_idx| {
             const attr = &prim.attributes[attr_idx];
@@ -157,6 +204,7 @@ pub const SceneLoader = struct {
                 c.cgltf_attribute_type_position => pos_accessor = attr.data,
                 c.cgltf_attribute_type_normal => norm_accessor = attr.data,
                 c.cgltf_attribute_type_color => col_accessor = attr.data,
+                c.cgltf_attribute_type_tangent => tan_accessor = attr.data,
                 c.cgltf_attribute_type_texcoord => {
                     if (attr.index == 0) uv_accessor = attr.data;
                 },
@@ -189,11 +237,17 @@ pub const SceneLoader = struct {
                 _ = c.cgltf_accessor_read_float(ua, i, &uv, 2);
             }
 
+            var tan: [4]f32 = .{ 1, 0, 0, 1 };
+            if (tan_accessor) |ta| {
+                _ = c.cgltf_accessor_read_float(ta, i, &tan, 4);
+            }
+
             vertices[i] = .{
                 .position = p,
                 .normal = n,
                 .color = col,
                 .uv = uv,
+                .tangent = tan,
             };
         }
 
@@ -213,6 +267,10 @@ pub const SceneLoader = struct {
                     indices[i] = @intCast(c.cgltf_accessor_read_index(ind_accessor, i));
                 }
 
+                if (tan_accessor == null) {
+                    computeTangents(vertices, indices, null);
+                }
+
                 ibuf = sg.makeBuffer(.{
                     .usage = .{ .index_buffer = true },
                     .data = sg.asRange(indices),
@@ -226,12 +284,21 @@ pub const SceneLoader = struct {
                     indices[i] = @intCast(c.cgltf_accessor_read_index(ind_accessor, i));
                 }
 
+                if (tan_accessor == null) {
+                    computeTangents(vertices, null, indices);
+                }
+
                 ibuf = sg.makeBuffer(.{
                     .usage = .{ .index_buffer = true },
                     .data = sg.asRange(indices),
                 });
             }
+        } else {
+            if (tan_accessor == null) {
+                computeTangents(vertices, null, null);
+            }
         }
+
 
         const vbuf = sg.makeBuffer(.{
             .data = sg.asRange(vertices),
@@ -280,3 +347,5 @@ pub const SceneLoader = struct {
         }
 
         return mesh_obj;
+    }
+};

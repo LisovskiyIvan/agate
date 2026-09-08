@@ -6,6 +6,7 @@ const sglue = sokol.glue;
 const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const inst_shd = @import("instanced_shader");
+const shadow_shd = @import("shadow_shader");
 
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -17,6 +18,7 @@ const Frustum = math.Frustum;
 const ArcRotateCamera = @import("camera.zig").ArcRotateCamera;
 const HemisphericLight = @import("lights.zig").HemisphericLight;
 const Mesh = @import("mesh.zig").Mesh;
+const Vertex = @import("mesh.zig").Vertex;
 const InstancedMesh = @import("mesh.zig").InstancedMesh;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
@@ -50,9 +52,27 @@ pub const Scene = struct {
     light: HemisphericLight = .{},
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
+    default_normal_texture: Texture,
+    default_black_texture: Texture,
 
     enable_frustum_culling: bool = true,
     stats: SceneStats = .{},
+
+    // Shadow Mapping
+    enable_shadows: bool = true,
+    shadow_bias: f32 = 0.003,
+    shadow_intensity: f32 = 0.75,
+    shadow_extent: f32 = 25.0,
+    shadow_near: f32 = 0.5,
+    shadow_far: f32 = 80.0,
+    shadow_image: sg.Image = .{},
+    shadow_attachment_view: sg.View = .{},
+    shadow_texture_view: sg.View = .{},
+    shadow_sampler: sg.Sampler = .{},
+    shadow_pipeline_u16: sg.Pipeline = .{},
+    shadow_pipeline_u32: sg.Pipeline = .{},
+    shadow_inst_pipeline_u16: sg.Pipeline = .{},
+    shadow_inst_pipeline_u32: sg.Pipeline = .{},
 
     pipeline_u16: sg.Pipeline = .{},
     pipeline_u32: sg.Pipeline = .{},
@@ -66,9 +86,36 @@ pub const Scene = struct {
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Scene {
+        const depth_img = sg.makeImage(.{
+            .usage = .{ .depth_stencil_attachment = true },
+            .width = 2048,
+            .height = 2048,
+            .pixel_format = .DEPTH,
+            .sample_count = 1,
+        });
+        const att_view = sg.makeView(.{
+            .depth_stencil_attachment = .{ .image = depth_img },
+        });
+        const tex_view = sg.makeView(.{
+            .texture = .{ .image = depth_img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .compare = .LESS_EQUAL,
+        });
+
         var self = Scene{
             .allocator = allocator,
             .default_white_texture = Texture.createWhite1x1(),
+            .default_normal_texture = Texture.createFlatNormal1x1(),
+            .default_black_texture = Texture.createBlack1x1(),
+            .shadow_image = depth_img,
+            .shadow_attachment_view = att_view,
+            .shadow_texture_view = tex_view,
+            .shadow_sampler = smp,
             .light = HemisphericLight.init("hemi", .{
                 .direction = math.Vec3.new(0.5, 1.0, 0.3),
                 .diffuse = Color3.white,
@@ -93,10 +140,11 @@ pub const Scene = struct {
             .face_winding = .CCW,
         };
 
-        pip_desc.layout.attrs[shd.ATTR_standard_position] = .{ .format = .FLOAT3 };
-        pip_desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3 };
-        pip_desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4 };
-        pip_desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2 };
+        pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        pip_desc.layout.attrs[shd.ATTR_standard_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+        pip_desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+        pip_desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+        pip_desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
 
         self.pipeline_u16 = sg.makePipeline(pip_desc);
 
@@ -115,10 +163,12 @@ pub const Scene = struct {
             .face_winding = .CCW,
         };
 
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_position] = .{ .format = .FLOAT3 };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_normal] = .{ .format = .FLOAT3 };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_color0] = .{ .format = .FLOAT4 };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2 };
+        pbr_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
 
         self.pipeline_pbr_u16 = sg.makePipeline(pbr_desc);
 
@@ -138,11 +188,11 @@ pub const Scene = struct {
         };
 
         // Buffer 0: Per-vertex attributes
-        inst_desc.layout.buffers[0] = .{};
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_position] = .{ .buffer_index = 0, .format = .FLOAT3 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2 };
+        inst_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        inst_desc.layout.attrs[inst_shd.ATTR_instanced_position] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+        inst_desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+        inst_desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+        inst_desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
 
         // Buffer 1: Per-instance 4x4 matrix
         inst_desc.layout.buffers[1] = .{
@@ -159,6 +209,68 @@ pub const Scene = struct {
 
         inst_desc.index_type = .UINT32;
         self.pipeline_instanced_u32 = sg.makePipeline(inst_desc);
+
+        // 4. Shadow Depth pipelines (regular meshes)
+        var shadow_pip_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(shadow_shd.shadowShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = .DEPTH,
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+                .bias = 2.0,
+                .bias_slope_scale = 2.0,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        shadow_pip_desc.colors[0].pixel_format = .NONE;
+        shadow_pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        shadow_pip_desc.layout.attrs[shadow_shd.ATTR_shadow_position] = .{
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+
+        self.shadow_pipeline_u16 = sg.makePipeline(shadow_pip_desc);
+        shadow_pip_desc.index_type = .UINT32;
+        self.shadow_pipeline_u32 = sg.makePipeline(shadow_pip_desc);
+
+        // 5. Shadow Depth pipelines (instanced meshes)
+        var shadow_inst_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(shadow_shd.shadowInstancedShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = .DEPTH,
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+                .bias = 2.0,
+                .bias_slope_scale = 2.0,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        shadow_inst_desc.colors[0].pixel_format = .NONE;
+        shadow_inst_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        shadow_inst_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(Mat4),
+        };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+
+        self.shadow_inst_pipeline_u16 = sg.makePipeline(shadow_inst_desc);
+        shadow_inst_desc.index_type = .UINT32;
+        self.shadow_inst_pipeline_u32 = sg.makePipeline(shadow_inst_desc);
     }
 
     pub fn createHemisphericLight(self: *Scene, name: []const u8, options: @import("lights.zig").HemisphericLightOptions) HemisphericLight {
@@ -204,16 +316,6 @@ pub const Scene = struct {
         self.stats = .{};
         self.render_queue.clearRetainingCapacity();
 
-        self.pass_action.colors[0] = .{
-            .load_action = .CLEAR,
-            .clear_value = .{
-                .r = self.clear_color.r,
-                .g = self.clear_color.g,
-                .b = self.clear_color.b,
-                .a = self.clear_color.a,
-            },
-        };
-
         const aspect = sapp.widthf() / sapp.heightf();
         const view_proj = if (self.active_camera) |cam|
             cam.getViewProjection(aspect)
@@ -223,17 +325,28 @@ pub const Scene = struct {
         const eye = if (self.active_camera) |cam| cam.getPosition() else math.Vec3.new(0, 0, 5);
         const frustum = Frustum.fromViewProjection(view_proj);
 
-        sg.beginPass(.{
-            .action = self.pass_action,
-            .swapchain = sglue.swapchain(),
-        });
+        // Directional Light View-Projection Matrix
+        const light_dir = self.light.direction.normalize();
+        const light_target = if (self.active_camera) |cam| cam.target else math.Vec3.zero;
+        const light_pos = light_target.add(light_dir.scale(35.0));
+        var light_up = math.Vec3.new(0.0, 1.0, 0.0);
+        if (@abs(light_dir.x) < 0.001 and @abs(light_dir.z) < 0.001) {
+            light_up = math.Vec3.new(0.0, 0.0, 1.0);
+        }
+        const light_view = Mat4.lookAt(light_pos, light_target, light_up);
+        const light_proj = Mat4.orthographic(
+            -self.shadow_extent,
+            self.shadow_extent,
+            -self.shadow_extent,
+            self.shadow_extent,
+            self.shadow_near,
+            self.shadow_far,
+        );
+        const light_view_proj = Mat4.mul(light_proj, light_view);
 
-        var current_pipeline: sg.Pipeline = .{};
-
-        // Phase 1: Process all meshes (Instanced meshes drawn directly; standard meshes queued & sorted)
+        // Phase 0: Pre-filter meshes and populate instance buffers
         for (self.meshes.items) |mesh| {
             if (mesh.instances.items.len > 0) {
-                // Instanced mesh rendering
                 self.instance_matrices.clearRetainingCapacity();
                 for (mesh.instances.items) |inst| {
                     self.stats.total_meshes += 1;
@@ -249,59 +362,22 @@ pub const Scene = struct {
                 }
 
                 const visible_count = self.instance_matrices.items.len;
-                if (visible_count == 0) continue;
-
-                if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < visible_count) {
-                    if (mesh.instance_buffer.id != 0) {
-                        sg.destroyBuffer(mesh.instance_buffer);
+                mesh.visible_instance_count = @intCast(visible_count);
+                if (visible_count > 0) {
+                    if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < visible_count) {
+                        if (mesh.instance_buffer.id != 0) {
+                            sg.destroyBuffer(mesh.instance_buffer);
+                        }
+                        const new_cap = @max(visible_count, mesh.instance_buffer_capacity * 2);
+                        mesh.instance_buffer = sg.makeBuffer(.{
+                            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                            .size = new_cap * @sizeOf(Mat4),
+                        });
+                        mesh.instance_buffer_capacity = new_cap;
                     }
-                    const new_cap = @max(visible_count, mesh.instance_buffer_capacity * 2);
-                    mesh.instance_buffer = sg.makeBuffer(.{
-                        .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                        .size = new_cap * @sizeOf(Mat4),
-                    });
-                    mesh.instance_buffer_capacity = new_cap;
+                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items));
                 }
-
-                sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items));
-
-                const pip = if (mesh.index_type == .UINT32) self.pipeline_instanced_u32 else self.pipeline_instanced_u16;
-                if (pip.id != current_pipeline.id) {
-                    sg.applyPipeline(pip);
-                    current_pipeline = pip;
-                    self.stats.pipeline_switches += 1;
-                }
-
-                const vs_params = inst_shd.VsParams{ .view_proj = view_proj };
-                const mat = if (mesh.material) |m| switch (m) {
-                    .standard => |s| s,
-                    else => &self.default_material,
-                } else &self.default_material;
-
-                const fs_params = inst_shd.FsParams{
-                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 0.0 },
-                    .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
-                    .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
-                    .diffuse_color = mat.getDiffuseColor4(),
-                };
-
-                const tex = if (mat.diffuse_texture) |t| t else self.default_white_texture;
-                var bind = sg.Bindings{};
-                bind.vertex_buffers[0] = mesh.vertex_buffer;
-                bind.vertex_buffers[1] = mesh.instance_buffer;
-                bind.index_buffer = mesh.index_buffer;
-                bind.views[inst_shd.VIEW_diffuse_tex] = tex.view;
-                bind.samplers[inst_shd.SMP_smp] = tex.sampler;
-
-                sg.applyBindings(bind);
-                sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&vs_params));
-                sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&fs_params));
-                sg.draw(0, mesh.index_count, @intCast(visible_count));
-
-                self.stats.draw_calls += 1;
-                self.stats.triangles += (mesh.index_count / 3) * @as(u32, @intCast(visible_count));
             } else {
-                // Non-instanced mesh
                 self.stats.total_meshes += 1;
                 if (!mesh.is_visible) continue;
 
@@ -334,14 +410,152 @@ pub const Scene = struct {
             }
         }
 
-        // Phase 2: State Sorting (Material & Early-Z front-to-back)
+        // ==============================================
+        // PASS 1: OFFSCREEN SHADOW DEPTH PASS
+        // ==============================================
+        if (self.enable_shadows) {
+            const shadow_pass = sg.Pass{
+                .action = .{
+                    .depth = .{
+                        .load_action = .CLEAR,
+                        .store_action = .STORE,
+                        .clear_value = 1.0,
+                    },
+                },
+                .attachments = .{
+                    .depth_stencil = self.shadow_attachment_view,
+                },
+            };
+            sg.beginPass(shadow_pass);
+
+            var cur_shadow_pip: sg.Pipeline = .{};
+
+            for (self.meshes.items) |mesh| {
+                if (!mesh.cast_shadows) continue;
+
+                if (mesh.instances.items.len > 0) {
+                    if (mesh.instance_buffer.id == 0 or mesh.visible_instance_count == 0) continue;
+
+                    const pip = if (mesh.index_type == .UINT32) self.shadow_inst_pipeline_u32 else self.shadow_inst_pipeline_u16;
+                    if (pip.id != cur_shadow_pip.id) {
+                        sg.applyPipeline(pip);
+                        cur_shadow_pip = pip;
+                    }
+
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.vertex_buffers[1] = mesh.instance_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const vs_inst_params = shadow_shd.VsInstParams{
+                        .light_view_proj = light_view_proj,
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&vs_inst_params));
+                    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                } else {
+                    const pip = if (mesh.index_type == .UINT32) self.shadow_pipeline_u32 else self.shadow_pipeline_u16;
+                    if (pip.id != cur_shadow_pip.id) {
+                        sg.applyPipeline(pip);
+                        cur_shadow_pip = pip;
+                    }
+
+                    const model = mesh.getWorldMatrix();
+                    const mvp = Mat4.mul(light_view_proj, model);
+
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const vs_params = shadow_shd.VsParams{
+                        .mvp = mvp,
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&vs_params));
+                    sg.draw(0, mesh.index_count, 1);
+                }
+            }
+
+            sg.endPass();
+        }
+
+        // ==============================================
+        // PASS 2: MAIN SWAPCHAIN RENDER PASS
+        // ==============================================
+        self.pass_action.colors[0] = .{
+            .load_action = .CLEAR,
+            .clear_value = .{
+                .r = self.clear_color.r,
+                .g = self.clear_color.g,
+                .b = self.clear_color.b,
+                .a = self.clear_color.a,
+            },
+        };
+
+        sg.beginPass(.{
+            .action = self.pass_action,
+            .swapchain = sglue.swapchain(),
+        });
+
+        var current_pipeline: sg.Pipeline = .{};
+
+        // Render instanced meshes
+        for (self.meshes.items) |mesh| {
+            if (mesh.instances.items.len == 0 or mesh.visible_instance_count == 0) continue;
+
+            const pip = if (mesh.index_type == .UINT32) self.pipeline_instanced_u32 else self.pipeline_instanced_u16;
+            if (pip.id != current_pipeline.id) {
+                sg.applyPipeline(pip);
+                current_pipeline = pip;
+                self.stats.pipeline_switches += 1;
+            }
+
+            const vs_params = inst_shd.VsParams{
+                .view_proj = view_proj,
+                .light_view_proj = light_view_proj,
+            };
+            const mat = if (mesh.material) |m| switch (m) {
+                .standard => |s| s,
+                else => &self.default_material,
+            } else &self.default_material;
+
+            const shadow_intensity_val: f32 = if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0;
+            const fs_params = inst_shd.FsParams{
+                .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 0.0 },
+                .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
+                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+                .diffuse_color = mat.getDiffuseColor4(),
+                .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
+            };
+
+            const tex = if (mat.diffuse_texture) |t| t else self.default_white_texture;
+            var bind = sg.Bindings{};
+            bind.vertex_buffers[0] = mesh.vertex_buffer;
+            bind.vertex_buffers[1] = mesh.instance_buffer;
+            bind.index_buffer = mesh.index_buffer;
+            bind.views[inst_shd.VIEW_diffuse_tex] = tex.view;
+            bind.samplers[inst_shd.SMP_smp] = tex.sampler;
+            bind.views[inst_shd.VIEW_shadow_tex] = self.shadow_texture_view;
+            bind.samplers[inst_shd.SMP_shadow_smp] = self.shadow_sampler;
+
+            sg.applyBindings(bind);
+            sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&vs_params));
+            sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&fs_params));
+            sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+
+            self.stats.draw_calls += 1;
+            self.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
+        }
+
+        // Sort non-instanced meshes
         std.mem.sort(RenderMeshItem, self.render_queue.items, {}, sortRenderItems);
 
-        // Phase 3: Render sorted non-instanced meshes
+        // Render sorted non-instanced meshes
         for (self.render_queue.items) |item| {
             const mesh = item.mesh;
             const model = item.model;
             const mvp = Mat4.mul(view_proj, model);
+            const shadow_intensity_val: f32 = if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0;
 
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = mesh.vertex_buffer;
@@ -359,6 +573,7 @@ pub const Scene = struct {
                 const vs_params = pbr_shd.VsParams{
                     .mvp = mvp,
                     .model = model,
+                    .light_view_proj = light_view_proj,
                 };
 
                 const fs_params = pbr_shd.FsParams{
@@ -367,12 +582,25 @@ pub const Scene = struct {
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .base_color_factor = pbr_mat.getAlbedoColor4(),
-                    .pbr_factors = .{ pbr_mat.metallic, pbr_mat.roughness, 1.0, 0.0 },
+                    .pbr_factors = .{ pbr_mat.metallic, pbr_mat.roughness, pbr_mat.occlusion_strength, 0.0 },
+                    .emissive_factor = pbr_mat.getEmissiveColor4(),
+                    .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
                 };
 
-                const tex = if (pbr_mat.albedo_texture) |t| t else self.default_white_texture;
-                bind.views[pbr_shd.VIEW_albedo_tex] = tex.view;
-                bind.samplers[pbr_shd.SMP_smp] = tex.sampler;
+                const albedo_tex = if (pbr_mat.albedo_texture) |t| t else self.default_white_texture;
+                const normal_tex = if (pbr_mat.normal_texture) |t| t else self.default_normal_texture;
+                const mr_tex = if (pbr_mat.metallic_roughness_texture) |t| t else self.default_white_texture;
+                const emissive_tex = if (pbr_mat.emissive_texture) |t| t else self.default_white_texture;
+                const occlusion_tex = if (pbr_mat.occlusion_texture) |t| t else self.default_white_texture;
+
+                bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
+                bind.views[pbr_shd.VIEW_normal_tex] = normal_tex.view;
+                bind.views[pbr_shd.VIEW_metallic_roughness_tex] = mr_tex.view;
+                bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
+                bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
+                bind.views[pbr_shd.VIEW_shadow_tex] = self.shadow_texture_view;
+                bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+                bind.samplers[pbr_shd.SMP_shadow_smp] = self.shadow_sampler;
 
                 sg.applyBindings(bind);
                 sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
@@ -393,6 +621,7 @@ pub const Scene = struct {
                 const vs_params = shd.VsParams{
                     .mvp = mvp,
                     .model = model,
+                    .light_view_proj = light_view_proj,
                 };
 
                 const mat = if (mesh.material) |m| switch (m) {
@@ -405,11 +634,14 @@ pub const Scene = struct {
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .diffuse_color = mat.getDiffuseColor4(),
+                    .shadow_params = .{ self.shadow_bias, shadow_intensity_val, 0.0, 0.0 },
                 };
 
                 const tex = if (mat.diffuse_texture) |t| t else self.default_white_texture;
                 bind.views[shd.VIEW_diffuse_tex] = tex.view;
                 bind.samplers[shd.SMP_smp] = tex.sampler;
+                bind.views[shd.VIEW_shadow_tex] = self.shadow_texture_view;
+                bind.samplers[shd.SMP_shadow_smp] = self.shadow_sampler;
 
                 sg.applyBindings(bind);
                 sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
@@ -440,9 +672,17 @@ pub const Scene = struct {
         }
         self.materials.deinit(self.allocator);
 
+        var destroyed_views = std.AutoHashMap(u32, void).init(self.allocator);
+        defer destroyed_views.deinit();
+
         for (self.pbr_materials.items) |mat| {
-            if (mat.albedo_texture) |*t| {
-                t.deinit();
+            inline for (.{"albedo_texture", "normal_texture", "metallic_roughness_texture", "emissive_texture", "occlusion_texture"}) |field| {
+                if (@field(mat, field)) |*t| {
+                    if (t.view.id != 0 and !destroyed_views.contains(t.view.id)) {
+                        destroyed_views.put(t.view.id, {}) catch {};
+                        t.deinit();
+                    }
+                }
             }
             self.allocator.destroy(mat);
         }
@@ -452,11 +692,24 @@ pub const Scene = struct {
         self.instance_matrices.deinit(self.allocator);
 
         self.default_white_texture.deinit();
+        self.default_normal_texture.deinit();
+        self.default_black_texture.deinit();
+
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.pipeline_pbr_u16);
         sg.destroyPipeline(self.pipeline_pbr_u32);
         sg.destroyPipeline(self.pipeline_instanced_u16);
         sg.destroyPipeline(self.pipeline_instanced_u32);
+
+        sg.destroyPipeline(self.shadow_pipeline_u16);
+        sg.destroyPipeline(self.shadow_pipeline_u32);
+        sg.destroyPipeline(self.shadow_inst_pipeline_u16);
+        sg.destroyPipeline(self.shadow_inst_pipeline_u32);
+        sg.destroyView(self.shadow_attachment_view);
+        sg.destroyView(self.shadow_texture_view);
+        sg.destroySampler(self.shadow_sampler);
+        sg.destroyImage(self.shadow_image);
     }
+
 };

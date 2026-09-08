@@ -53,6 +53,19 @@ pub fn build(b: *Build) !void {
     });
     mod_instanced_shader.addImport("math", mod_math);
 
+    // Шейдер Shadow: src/zenderer/shaders/shadow.glsl -> Zig-модуль "shadow_shader"
+    const mod_shadow_shader = try sokol.shdc.createModule(b, "shadow_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/shadow.glsl",
+        .output = "shadow_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_shadow_shader.addImport("math", mod_math);
+
     // Главный модуль библиотеки zenderer
     const mod_zenderer = b.addModule("zenderer", .{
         .root_source_file = b.path("src/zenderer/root.zig"),
@@ -63,6 +76,7 @@ pub fn build(b: *Build) !void {
             .{ .name = "shader", .module = mod_shader },
             .{ .name = "pbr_shader", .module = mod_pbr_shader },
             .{ .name = "instanced_shader", .module = mod_instanced_shader },
+            .{ .name = "shadow_shader", .module = mod_shadow_shader },
             .{ .name = "math", .module = mod_math },
         },
     });

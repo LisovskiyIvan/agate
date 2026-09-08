@@ -32,6 +32,13 @@ pub const PBRMaterial = struct {
     roughness: f32 = 0.5,
     albedo_texture: ?Texture = null,
 
+    normal_texture: ?Texture = null,
+    metallic_roughness_texture: ?Texture = null,
+    emissive_texture: ?Texture = null,
+    emissive_color: Color3 = Color3.black,
+    occlusion_texture: ?Texture = null,
+    occlusion_strength: f32 = 1.0,
+
     pub fn init(name: []const u8) PBRMaterial {
         return .{
             .name = name,
@@ -40,6 +47,10 @@ pub const PBRMaterial = struct {
 
     pub fn getAlbedoColor4(self: PBRMaterial) [4]f32 {
         return .{ self.albedo_color.r, self.albedo_color.g, self.albedo_color.b, self.alpha };
+    }
+
+    pub fn getEmissiveColor4(self: PBRMaterial) [4]f32 {
+        return .{ self.emissive_color.r, self.emissive_color.g, self.emissive_color.b, 1.0 };
     }
 };
 

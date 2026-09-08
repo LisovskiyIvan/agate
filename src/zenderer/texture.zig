@@ -54,6 +54,22 @@ pub const Texture = struct {
         });
     }
 
+    pub fn createBlack1x1() Texture {
+        const black = [_]u8{ 0, 0, 0, 255 };
+        return initRaw(1, 1, &black, .{
+            .min_filter = .NEAREST,
+            .mag_filter = .NEAREST,
+        });
+    }
+
+    pub fn createFlatNormal1x1() Texture {
+        const flat_normal = [_]u8{ 128, 128, 255, 255 };
+        return initRaw(1, 1, &flat_normal, .{
+            .min_filter = .NEAREST,
+            .mag_filter = .NEAREST,
+        });
+    }
+
     pub fn createCheckerboard(
         allocator: std.mem.Allocator,
         width: u32,
