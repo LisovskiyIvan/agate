@@ -153,6 +153,14 @@ pub const CylinderOptions = struct {
     color: Color4 = Color4.white,
 };
 
+pub const CapsuleOptions = struct {
+    radius: f32 = 0.5,
+    height: f32 = 2.0, // total height including hemisphere caps
+    tessellation: u32 = 16, // radial slices
+    cap_subdivisions: u32 = 8, // rings per cap
+    color: Color4 = Color4.white,
+};
+
 pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]const u16) void {
     for (vertices) |*v| {
         v.tangent = .{ 0, 0, 0, 1 };
@@ -673,6 +681,125 @@ pub const MeshBuilder = struct {
             .local_bounding_box = BoundingBox.init(
                 Vec3.new(-radius, -half_h, -radius),
                 Vec3.new(radius, half_h, radius),
+            ),
+        };
+
+        try scene.meshes.append(scene.allocator, mesh);
+        return mesh;
+    }
+
+    pub fn createCapsule(scene: *Scene, name: []const u8, options: CapsuleOptions) !*Mesh {
+        const radius = options.radius;
+        const total_height = @max(options.height, radius * 2.0);
+        const half_h = (total_height - radius * 2.0) * 0.5;
+        const slices = @max(4, options.tessellation);
+        const cap_rings = @max(2, options.cap_subdivisions);
+
+        // Ring layout from bottom to top:
+        // - Bottom hemisphere: cap_rings rings (from south pole to bottom equator)
+        // - Top of cylinder: 1 ring (bottom equator is at y = -half_h, top of cylinder is at y = +half_h)
+        // - Top hemisphere: cap_rings rings (from top equator to north pole)
+        // Total rings = (cap_rings + 1) + 1 + cap_rings = 2 * cap_rings + 2
+        const total_rings = 2 * cap_rings + 2;
+        const vert_count = total_rings * (slices + 1);
+        const quad_rows = total_rings - 1;
+        const index_count = quad_rows * slices * 6;
+
+        const vertices = try scene.allocator.alloc(Vertex, vert_count);
+        defer scene.allocator.free(vertices);
+
+        const indices = try scene.allocator.alloc(u16, index_count);
+        defer scene.allocator.free(indices);
+
+        const pi = std.math.pi;
+        var vi: usize = 0;
+
+        for (0..total_rings) |r| {
+            var phi: f32 = 0.0;
+            var center_y: f32 = 0.0;
+
+            if (r <= cap_rings) {
+                // Bottom hemisphere: phi in [-pi/2, 0]
+                const t = @as(f32, @floatFromInt(r)) / @as(f32, @floatFromInt(cap_rings));
+                phi = -pi * 0.5 + t * (pi * 0.5);
+                center_y = -half_h;
+            } else if (r == cap_rings + 1) {
+                // Top of cylinder body: phi = 0
+                phi = 0.0;
+                center_y = half_h;
+            } else {
+                // Top hemisphere: phi in [0, pi/2]
+                const t = @as(f32, @floatFromInt(r - cap_rings - 1)) / @as(f32, @floatFromInt(cap_rings));
+                phi = t * (pi * 0.5);
+                center_y = half_h;
+            }
+
+            const cos_phi = @cos(phi);
+            const sin_phi = @sin(phi);
+            const v = @as(f32, @floatFromInt(r)) / @as(f32, @floatFromInt(quad_rows));
+
+            for (0..slices + 1) |s| {
+                const u = @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(slices));
+                const theta = 2.0 * pi * u;
+                const cos_theta = @cos(theta);
+                const sin_theta = @sin(theta);
+
+                const nx = cos_phi * sin_theta;
+                const ny = sin_phi;
+                const nz = cos_phi * cos_theta;
+
+                vertices[vi] = .{
+                    .position = .{ nx * radius, center_y + ny * radius, nz * radius },
+                    .normal = .{ nx, ny, nz },
+                    .color = options.color.toArray(),
+                    .uv = .{ u, v },
+                    .tangent = .{ cos_theta, 0.0, -sin_theta, 1.0 },
+                };
+                vi += 1;
+            }
+        }
+
+        var ii: usize = 0;
+        const slice_stride: u16 = @intCast(slices + 1);
+        for (0..quad_rows) |r| {
+            const r_u16: u16 = @intCast(r);
+            for (0..slices) |s| {
+                const s_u16: u16 = @intCast(s);
+                const p0 = r_u16 * slice_stride + s_u16;
+                const p1 = r_u16 * slice_stride + (s_u16 + 1);
+                const p2 = (r_u16 + 1) * slice_stride + (s_u16 + 1);
+                const p3 = (r_u16 + 1) * slice_stride + s_u16;
+
+                // CCW winding
+                indices[ii + 0] = p0;
+                indices[ii + 1] = p1;
+                indices[ii + 2] = p2;
+                indices[ii + 3] = p0;
+                indices[ii + 4] = p2;
+                indices[ii + 5] = p3;
+                ii += 6;
+            }
+        }
+
+        const vbuf = sg.makeBuffer(.{
+            .data = sg.asRange(vertices),
+        });
+
+        const ibuf = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(indices),
+        });
+
+        const total_half = total_height * 0.5;
+        const mesh = try scene.allocator.create(Mesh);
+        mesh.* = .{
+            .name = name,
+            .vertex_buffer = vbuf,
+            .index_buffer = ibuf,
+            .index_count = @intCast(index_count),
+            .local_bounding_box = BoundingBox.init(
+                Vec3.new(-radius, -total_half, -radius),
+                Vec3.new(radius, total_half, radius),
             ),
         };
 

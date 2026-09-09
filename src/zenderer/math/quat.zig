@@ -65,4 +65,32 @@ pub const Quat = struct {
         const k = 180.0 / std.math.pi;
         return Vec3.new(roll * k, pitch * k, yaw * k);
     }
+
+    pub fn conjugate(q: Quat) Quat {
+        return .{ .x = -q.x, .y = -q.y, .z = -q.z, .w = q.w };
+    }
+
+    /// Rotates a 3D vector by this unit quaternion using the Rodrigues formula:
+    /// v' = v + 2*w*(q_v x v) + 2*(q_v x (q_v x v))
+    pub fn rotateVec(q: Quat, v: Vec3) Vec3 {
+        const qv = Vec3.new(q.x, q.y, q.z);
+        const t = qv.cross(v).scale(2.0);
+        return v.add(t.scale(q.w)).add(qv.cross(t));
+    }
 };
+
+test "Quat rotateVec and conjugate" {
+    const q = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+    const v = Vec3.new(1.0, 0.0, 0.0);
+    const rot = q.rotateVec(v);
+    // Rotating (1,0,0) by +90 deg around Y: in right-handed convention, maps to (0, 0, -1)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rot.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rot.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), rot.z, 1e-4);
+
+    // Inverse rotation restores original vector
+    const inv_rot = q.conjugate().rotateVec(rot);
+    try std.testing.expectApproxEqAbs(v.x, inv_rot.x, 1e-4);
+    try std.testing.expectApproxEqAbs(v.y, inv_rot.y, 1e-4);
+    try std.testing.expectApproxEqAbs(v.z, inv_rot.z, 1e-4);
+}

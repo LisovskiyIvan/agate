@@ -19,6 +19,28 @@ pub const PickingInfo = struct {
 pub const ColliderType = enum {
     box,
     sphere,
+    capsule,
+};
+
+pub const JointId = c.b3JointId;
+
+pub const DistanceJointOptions = struct {
+    collide_connected: bool = false,
+    length: ?f32 = null, // if null, auto-computed from anchor distance
+    enable_spring: bool = false,
+    hertz: f32 = 4.0,
+    damping_ratio: f32 = 0.5,
+    min_length: ?f32 = null,
+    max_length: ?f32 = null,
+};
+
+pub const SphericalJointOptions = struct {
+    collide_connected: bool = false,
+    enable_spring: bool = false,
+    hertz: f32 = 4.0,
+    damping_ratio: f32 = 0.5,
+    enable_cone_limit: bool = false,
+    cone_angle_rad: f32 = 0.0,
 };
 
 // Fixed simulation rate Box3D integrates at; step() accumulates frame dt
@@ -139,6 +161,13 @@ pub const RigidBody = struct {
                 const r = b.base_radius * scale.x;
                 break :blk 4.1887902 * r * r * r;
             },
+            .capsule => blk: {
+                const r = @max(b.base_radius * scale.x, min_half_extent);
+                const hh = @max(0.0, b.base_extents.y * scale.y - r);
+                const sph_vol = 4.1887902 * r * r * r;
+                const cyl_vol = 6.2831853 * r * r * hh;
+                break :blk sph_vol + cyl_vol;
+            },
         };
     }
 
@@ -181,6 +210,19 @@ pub const RigidBody = struct {
         self.inv_mass = if (mass > 0.0) 1.0 / mass else 0.0;
         // Density/type sync happens in pushBody() on the next step().
     }
+
+    /// Transforms a point in world space into the body's local space.
+    pub fn worldToLocal(self: *const RigidBody, world_point: Vec3) Vec3 {
+        const q = Quat.fromEulerDeg(self.mesh.rotation);
+        const rel = world_point.sub(self.mesh.position);
+        return q.conjugate().rotateVec(rel);
+    }
+
+    /// Transforms a point in the body's local space into world space.
+    pub fn localToWorld(self: *const RigidBody, local_point: Vec3) Vec3 {
+        const q = Quat.fromEulerDeg(self.mesh.rotation);
+        return self.mesh.position.add(q.rotateVec(local_point));
+    }
 };
 
 pub const PhysicsWorld = struct {
@@ -189,6 +231,7 @@ pub const PhysicsWorld = struct {
     ground_y: ?f32 = -1.2,
     substeps: u32 = 4,
     bodies: std.ArrayListUnmanaged(*RigidBody) = .empty,
+    joints: std.ArrayListUnmanaged(c.b3JointId) = .empty,
 
     world_id: c.b3WorldId,
     ground_body: ?c.b3BodyId = null,
@@ -206,6 +249,12 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn deinit(self: *PhysicsWorld) void {
+        for (self.joints.items) |j| {
+            if (c.b3Joint_IsValid(j)) {
+                c.b3DestroyJoint(j, false);
+            }
+        }
+        self.joints.deinit(self.allocator);
         for (self.bodies.items) |b| {
             self.allocator.destroy(b);
         }
@@ -238,6 +287,16 @@ pub const PhysicsWorld = struct {
                 c.b3DestroyBody(b.body_id);
                 _ = self.bodies.swapRemove(idx);
                 self.allocator.destroy(body);
+
+                // Prune any joints that Box3D destroyed when body was destroyed
+                var ji: usize = 0;
+                while (ji < self.joints.items.len) {
+                    if (!c.b3Joint_IsValid(self.joints.items[ji])) {
+                        _ = self.joints.swapRemove(ji);
+                    } else {
+                        ji += 1;
+                    }
+                }
                 return;
             }
         }
@@ -318,6 +377,16 @@ pub const PhysicsWorld = struct {
                     .radius = @max(b.base_radius * b.mesh.scaling.x, min_half_extent),
                 };
                 break :blk c.b3CreateSphereShape(b.body_id, &sdef, &sph);
+            },
+            .capsule => blk: {
+                const r = @max(b.base_radius * b.mesh.scaling.x, min_half_extent);
+                const hh = @max(0.0, b.base_extents.y * b.mesh.scaling.y - r);
+                const cap = c.b3Capsule{
+                    .center1 = .{ .x = 0.0, .y = -hh, .z = 0.0 },
+                    .center2 = .{ .x = 0.0, .y = hh, .z = 0.0 },
+                    .radius = r,
+                };
+                break :blk c.b3CreateCapsuleShape(b.body_id, &sdef, &cap);
             },
         };
     }
@@ -455,6 +524,150 @@ pub const PhysicsWorld = struct {
         }
         return false;
     }
+
+    pub fn createDistanceJoint(
+        self: *PhysicsWorld,
+        body_a: *RigidBody,
+        body_b: *RigidBody,
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+        options: DistanceJointOptions,
+    ) !JointId {
+        var def = c.b3DefaultDistanceJointDef();
+        def.base.bodyIdA = body_a.body_id;
+        def.base.bodyIdB = body_b.body_id;
+        def.base.collideConnected = options.collide_connected;
+        def.base.localFrameA.p = toB3Vec(local_anchor_a);
+        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
+        def.base.localFrameB.p = toB3Vec(local_anchor_b);
+        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
+
+        const rest_len = if (options.length) |l|
+            @max(l, 0.001)
+        else blk: {
+            const wa = body_a.localToWorld(local_anchor_a);
+            const wb = body_b.localToWorld(local_anchor_b);
+            break :blk @max(wa.sub(wb).length(), 0.001);
+        };
+        def.length = rest_len;
+        def.enableSpring = options.enable_spring;
+        def.hertz = options.hertz;
+        def.dampingRatio = options.damping_ratio;
+        if (options.min_length) |min_l| def.minLength = min_l;
+        if (options.max_length) |max_l| {
+            def.maxLength = max_l;
+            def.enableLimit = true;
+        }
+
+        const jid = c.b3CreateDistanceJoint(self.world_id, &def);
+        try self.joints.append(self.allocator, jid);
+        return jid;
+    }
+
+    pub fn createDistanceJointWorld(
+        self: *PhysicsWorld,
+        body_a: *RigidBody,
+        body_b: *RigidBody,
+        world_anchor_a: Vec3,
+        world_anchor_b: Vec3,
+        options: DistanceJointOptions,
+    ) !JointId {
+        return self.createDistanceJoint(
+            body_a,
+            body_b,
+            body_a.worldToLocal(world_anchor_a),
+            body_b.worldToLocal(world_anchor_b),
+            options,
+        );
+    }
+
+    pub fn createSphericalJoint(
+        self: *PhysicsWorld,
+        body_a: *RigidBody,
+        body_b: *RigidBody,
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+        options: SphericalJointOptions,
+    ) !JointId {
+        var def = c.b3DefaultSphericalJointDef();
+        def.base.bodyIdA = body_a.body_id;
+        def.base.bodyIdB = body_b.body_id;
+        def.base.collideConnected = options.collide_connected;
+        def.base.localFrameA.p = toB3Vec(local_anchor_a);
+        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
+        def.base.localFrameB.p = toB3Vec(local_anchor_b);
+        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
+        def.enableSpring = options.enable_spring;
+        def.hertz = options.hertz;
+        def.dampingRatio = options.damping_ratio;
+        def.enableConeLimit = options.enable_cone_limit;
+        def.coneAngle = options.cone_angle_rad;
+
+        const jid = c.b3CreateSphericalJoint(self.world_id, &def);
+        try self.joints.append(self.allocator, jid);
+        return jid;
+    }
+
+    pub fn createSphericalJointWorld(
+        self: *PhysicsWorld,
+        body_a: *RigidBody,
+        body_b: *RigidBody,
+        world_anchor: Vec3,
+        options: SphericalJointOptions,
+    ) !JointId {
+        return self.createSphericalJoint(
+            body_a,
+            body_b,
+            body_a.worldToLocal(world_anchor),
+            body_b.worldToLocal(world_anchor),
+            options,
+        );
+    }
+
+    pub fn destroyJoint(self: *PhysicsWorld, joint_id: JointId) void {
+        c.b3DestroyJoint(joint_id, true);
+        for (self.joints.items, 0..) |j, idx| {
+            if (j.index1 == joint_id.index1 and j.generation == joint_id.generation) {
+                _ = self.joints.swapRemove(idx);
+                break;
+            }
+        }
+    }
+
+    pub fn applyExplosion(
+        self: *PhysicsWorld,
+        epicenter: Vec3,
+        radius: f32,
+        max_impulse: f32,
+        upward_modifier: f32,
+    ) void {
+        if (radius <= 0.0 or max_impulse <= 0.0) return;
+        for (self.bodies.items) |b| {
+            if (!b.enabled or b.mass <= 0.0) continue;
+            const diff = b.mesh.position.sub(epicenter);
+            const dist = diff.length();
+            if (dist >= radius) continue;
+
+            // Quadratic smooth falloff [0..1]
+            const norm_dist = dist / radius;
+            const factor = (1.0 - norm_dist) * (1.0 - norm_dist);
+
+            // Upward biased impulse vector so debris lifts into the air
+            var dir = if (dist > 1e-4) diff.scale(1.0 / dist) else Vec3.up;
+            dir.y += upward_modifier;
+            const impulse_dir = dir.normalize();
+
+            b.applyImpulse(impulse_dir.scale(max_impulse * factor));
+
+            // Tumbling torque impulse around perpendicular axes
+            const torque = Vec3.new(
+                (dir.z - dir.y) * 0.7,
+                (dir.x + dir.z) * 0.4,
+                (dir.y - dir.x) * 0.7,
+            ).scale(max_impulse * factor * 0.8);
+            b.applyTorqueImpulse(torque);
+        }
+    }
 };
 
 test "PhysicsWorld ground collision and step" {
@@ -484,4 +697,100 @@ test "PhysicsWorld ground collision and step" {
     // Ground is at -1.2, bottom of sphere is position.y - radius
     const bottom_y = m.position.y - body.sphere_radius;
     try std.testing.expect(bottom_y >= -1.25);
+}
+
+test "PhysicsWorld capsule collision and landing" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "capsule_dummy",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0, 3.0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
+    };
+    const cap_body = try pw.createBody(&m, .capsule, 1.5);
+    cap_body.restitution = 0.2;
+
+    var step_i: usize = 0;
+    while (step_i < 150) : (step_i += 1) {
+        pw.step(0.016);
+    }
+    // Ground is at -1.2, bottom of vertical capsule (half-height 1.0) is position.y - 1.0
+    try std.testing.expect(m.position.y >= -0.25);
+}
+
+test "PhysicsWorld distance joint suspension" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var anchor_mesh = Mesh{
+        .name = "anchor",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0); // static
+
+    var bob_mesh = Mesh{
+        .name = "bob",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 3.0, 0.0),
+    };
+    const bob = try pw.createBody(&bob_mesh, .sphere, 2.0); // dynamic
+
+    const jid = try pw.createDistanceJoint(anchor, bob, Vec3.zero, Vec3.zero, .{ .length = 2.0 });
+    try std.testing.expect(jid.index1 > 0);
+
+    // Step physics under gravity
+    var step_i: usize = 0;
+    while (step_i < 60) : (step_i += 1) {
+        pw.step(0.016);
+    }
+
+    // Bob should hang around y = 3.0 (length 2.0 from anchor at 5.0), not fall to the ground (-1.2)
+    try std.testing.expect(bob_mesh.position.y >= 2.8 and bob_mesh.position.y <= 3.2);
+
+    // Destroy joint
+    pw.destroyJoint(jid);
+    try std.testing.expectEqual(@as(usize, 0), pw.joints.items.len);
+}
+
+test "PhysicsWorld radial explosion impulse" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var close_mesh = Mesh{
+        .name = "close",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(1.0, 0.0, 0.0),
+    };
+    const close_body = try pw.createBody(&close_mesh, .box, 1.0);
+
+    var far_mesh = Mesh{
+        .name = "far",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(20.0, 0.0, 0.0),
+    };
+    const far_body = try pw.createBody(&far_mesh, .box, 1.0);
+
+    // Epicenter at origin, radius 5.0
+    pw.applyExplosion(Vec3.zero, 5.0, 50.0, 0.5);
+
+    // Close body must receive linear velocity and upward boost
+    try std.testing.expect(close_body.velocity.x > 5.0);
+    try std.testing.expect(close_body.velocity.y > 1.0);
+
+    // Far body (at distance 20 > 5) should have zero velocity
+    try std.testing.expectEqual(@as(f32, 0.0), far_body.velocity.x);
+    try std.testing.expectEqual(@as(f32, 0.0), far_body.velocity.y);
 }

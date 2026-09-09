@@ -36,6 +36,10 @@ pub const CullingStrategy = mesh.CullingStrategy;
 pub const Vertex = mesh.Vertex;
 pub const MeshBuilder = mesh.MeshBuilder;
 pub const BoxOptions = mesh.BoxOptions;
+pub const SphereOptions = mesh.SphereOptions;
+pub const CylinderOptions = mesh.CylinderOptions;
+pub const CapsuleOptions = mesh.CapsuleOptions;
+pub const GroundOptions = mesh.GroundOptions;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
@@ -61,6 +65,9 @@ pub const RigidBody = physics.RigidBody;
 pub const PhysicsWorld = physics.PhysicsWorld;
 pub const PickingInfo = physics.PickingInfo;
 pub const ColliderType = physics.ColliderType;
+pub const JointId = physics.JointId;
+pub const DistanceJointOptions = physics.DistanceJointOptions;
+pub const SphericalJointOptions = physics.SphericalJointOptions;
 
 pub const ui = @import("ui.zig");
 pub const UICanvas = ui.UICanvas;
