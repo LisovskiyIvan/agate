@@ -77,6 +77,51 @@ pub const Quat = struct {
         const t = qv.cross(v).scale(2.0);
         return v.add(t.scale(q.w)).add(qv.cross(t));
     }
+
+    /// Normalized linear interpolation (fast spherical approximation)
+    pub fn nlerp(a: Quat, b: Quat, t: f32) Quat {
+        var b_adj = b;
+        var dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        if (dot < 0.0) {
+            b_adj = .{ .x = -b.x, .y = -b.y, .z = -b.z, .w = -b.w };
+            dot = -dot;
+        }
+        const inv_t = 1.0 - t;
+        const q = Quat{
+            .x = a.x * inv_t + b_adj.x * t,
+            .y = a.y * inv_t + b_adj.y * t,
+            .z = a.z * inv_t + b_adj.z * t,
+            .w = a.w * inv_t + b_adj.w * t,
+        };
+        return q.normalize();
+    }
+
+    /// Spherical linear interpolation with shortest-path guarantee
+    pub fn slerp(a: Quat, b: Quat, t: f32) Quat {
+        var b_adj = b;
+        var cos_half_theta = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        if (cos_half_theta < 0.0) {
+            b_adj = .{ .x = -b.x, .y = -b.y, .z = -b.z, .w = -b.w };
+            cos_half_theta = -cos_half_theta;
+        }
+        if (cos_half_theta >= 0.9995) {
+            return nlerp(a, b_adj, t);
+        }
+        const half_theta = std.math.acos(std.math.clamp(cos_half_theta, -1.0, 1.0));
+        const sin_half_theta = @sin(half_theta);
+        if (sin_half_theta < 1e-6) {
+            return nlerp(a, b_adj, t);
+        }
+        const ratio_a = @sin((1.0 - t) * half_theta) / sin_half_theta;
+        const ratio_b = @sin(t * half_theta) / sin_half_theta;
+        const res = Quat{
+            .x = a.x * ratio_a + b_adj.x * ratio_b,
+            .y = a.y * ratio_a + b_adj.y * ratio_b,
+            .z = a.z * ratio_a + b_adj.z * ratio_b,
+            .w = a.w * ratio_a + b_adj.w * ratio_b,
+        };
+        return res.normalize();
+    }
 };
 
 test "Quat rotateVec and conjugate" {
@@ -93,4 +138,17 @@ test "Quat rotateVec and conjugate" {
     try std.testing.expectApproxEqAbs(v.x, inv_rot.x, 1e-4);
     try std.testing.expectApproxEqAbs(v.y, inv_rot.y, 1e-4);
     try std.testing.expectApproxEqAbs(v.z, inv_rot.z, 1e-4);
+}
+
+test "Quat slerp and nlerp" {
+    const q0 = Quat.identity;
+    const q1 = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+
+    const slerp_mid = Quat.slerp(q0, q1, 0.5);
+    const euler_mid = slerp_mid.toEulerDeg();
+    try std.testing.expectApproxEqAbs(@as(f32, 45.0), euler_mid.y, 1e-2);
+
+    const nlerp_mid = Quat.nlerp(q0, q1, 0.5);
+    const euler_nlerp = nlerp_mid.toEulerDeg();
+    try std.testing.expectApproxEqAbs(@as(f32, 45.0), euler_nlerp.y, 1e-2);
 }

@@ -40,6 +40,19 @@ pub fn build(b: *Build) !void {
     });
     mod_pbr_shader.addImport("math", mod_math);
 
+    // Шейдер Skinned PBR: src/zenderer/shaders/skinned_pbr.glsl -> Zig-модуль "skinned_pbr_shader"
+    const mod_skinned_pbr_shader = try sokol.shdc.createModule(b, "skinned_pbr_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/skinned_pbr.glsl",
+        .output = "skinned_pbr_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_skinned_pbr_shader.addImport("math", mod_math);
+
     // Шейдер Instanced: src/zenderer/shaders/instanced.glsl -> Zig-модуль "instanced_shader"
     const mod_instanced_shader = try sokol.shdc.createModule(b, "instanced_shader", mod_sokol, .{
         .shdc_dep = dep_shdc,
@@ -127,6 +140,7 @@ pub fn build(b: *Build) !void {
             .{ .name = "sokol", .module = mod_sokol },
             .{ .name = "shader", .module = mod_shader },
             .{ .name = "pbr_shader", .module = mod_pbr_shader },
+            .{ .name = "skinned_pbr_shader", .module = mod_skinned_pbr_shader },
             .{ .name = "instanced_shader", .module = mod_instanced_shader },
             .{ .name = "shadow_shader", .module = mod_shadow_shader },
             .{ .name = "skybox_shader", .module = mod_skybox_shader },

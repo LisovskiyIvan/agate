@@ -75,4 +75,24 @@ pub const UIVertex = ui.UIVertex;
 
 pub const passes = @import("passes/mod.zig");
 
+pub const animation = struct {
+    pub const skeleton = @import("animation/skeleton.zig");
+    pub const anim = @import("animation/animation.zig");
+    pub const Skeleton = skeleton.Skeleton;
+    pub const Bone = skeleton.Bone;
+    pub const MAX_BONES = skeleton.MAX_BONES;
+    pub const AnimationGroup = anim.AnimationGroup;
+    pub const AnimationChannel = anim.AnimationChannel;
+    pub const AnimationSampler = anim.AnimationSampler;
+    pub const AnimationPath = anim.AnimationPath;
+    pub const AnimationInterpolation = anim.AnimationInterpolation;
+};
+pub const Skeleton = animation.Skeleton;
+pub const Bone = animation.Bone;
+pub const AnimationGroup = animation.AnimationGroup;
+pub const AnimationChannel = animation.AnimationChannel;
+pub const AnimationSampler = animation.AnimationSampler;
+pub const AnimationPath = animation.AnimationPath;
+pub const AnimationInterpolation = animation.AnimationInterpolation;
+
 pub const sokol = @import("sokol");

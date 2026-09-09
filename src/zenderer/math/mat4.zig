@@ -1,6 +1,7 @@
 const std = @import("std");
 const Vec3 = @import("vec.zig").Vec3;
 const Vec2 = @import("vec.zig").Vec2;
+const Quat = @import("quat.zig").Quat;
 
 pub const Mat4 = extern struct {
     // Column-major: m[col * 4 + row]
@@ -162,6 +163,41 @@ pub const Mat4 = extern struct {
         return mul(t, mul(rot, s));
     }
 
+    pub fn fromQuatTranslationScale(pos: Vec3, q_in: Quat, scale_v: Vec3) Mat4 {
+        const q = q_in.normalize();
+        const xx = q.x * q.x;
+        const yy = q.y * q.y;
+        const zz = q.z * q.z;
+        const xy = q.x * q.y;
+        const xz = q.x * q.z;
+        const yz = q.y * q.z;
+        const wx = q.w * q.x;
+        const wy = q.w * q.y;
+        const wz = q.w * q.z;
+
+        return .{ .m = .{
+            (1.0 - 2.0 * (yy + zz)) * scale_v.x,
+            (2.0 * (xy + wz)) * scale_v.x,
+            (2.0 * (xz - wy)) * scale_v.x,
+            0.0,
+
+            (2.0 * (xy - wz)) * scale_v.y,
+            (1.0 - 2.0 * (xx + zz)) * scale_v.y,
+            (2.0 * (yz + wx)) * scale_v.y,
+            0.0,
+
+            (2.0 * (xz + wy)) * scale_v.z,
+            (2.0 * (yz - wx)) * scale_v.z,
+            (1.0 - 2.0 * (xx + yy)) * scale_v.z,
+            0.0,
+
+            pos.x,
+            pos.y,
+            pos.z,
+            1.0,
+        } };
+    }
+
     /// Returns a copy of the matrix with the translation components zeroed out
     pub fn removeTranslation(self: Mat4) Mat4 {
         var r = self;
@@ -255,3 +291,17 @@ pub const Mat4 = extern struct {
         return Vec2.new(sx, sy);
     }
 };
+
+test "Mat4 fromQuatTranslationScale" {
+    const pos = Vec3.new(1.0, 2.0, 3.0);
+    const scale = Vec3.new(2.0, 0.5, 1.5);
+    const rot_deg = Vec3.new(30.0, 45.0, 60.0);
+    const q = Quat.fromEulerDeg(rot_deg);
+
+    const m_euler = Mat4.fromRotationTranslationScale(pos, rot_deg, scale);
+    const m_quat = Mat4.fromQuatTranslationScale(pos, q, scale);
+
+    for (0..16) |i| {
+        try std.testing.expectApproxEqAbs(m_euler.m[i], m_quat.m[i], 1e-4);
+    }
+}

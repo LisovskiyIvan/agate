@@ -5,6 +5,7 @@ const sapp = sokol.app;
 const sglue = sokol.glue;
 const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
+const skinned_pbr_shd = @import("skinned_pbr_shader");
 const inst_shd = @import("instanced_shader");
 const passes = @import("passes/mod.zig");
 const postprocess = @import("postprocess.zig");
@@ -14,6 +15,8 @@ const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
+const AnimationGroup = @import("animation/animation.zig").AnimationGroup;
+const Skeleton = @import("animation/skeleton.zig").Skeleton;
 
 const math = @import("math");
 const Vec3 = math.Vec3;
@@ -117,8 +120,14 @@ pub const Scene = struct {
     pipeline_u32: sg.Pipeline = .{},
     pipeline_pbr_u16: sg.Pipeline = .{},
     pipeline_pbr_u32: sg.Pipeline = .{},
+    pipeline_skinned_pbr_u16: sg.Pipeline = .{},
+    pipeline_skinned_pbr_u32: sg.Pipeline = .{},
     pipeline_instanced_u16: sg.Pipeline = .{},
     pipeline_instanced_u32: sg.Pipeline = .{},
+
+    // Skeletal Animation Groups & Skeletons
+    animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
+    skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
 
     // Post-Processing settings
     post_process: PostProcessConfig = .{},
@@ -240,10 +249,37 @@ pub const Scene = struct {
         inst_desc.index_type = .UINT32;
         self.pipeline_instanced_u32 = sg.makePipeline(inst_desc);
 
+        // 4. Skinned PBR pipelines
+        const skinned_shd_id = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend()));
+        var skinned_desc = sg.PipelineDesc{
+            .shader = skinned_shd_id,
+            .index_type = .UINT16,
+            .depth = .{
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        skinned_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_joints] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "joints") };
+        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_weights] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "weights") };
+
+        self.pipeline_skinned_pbr_u16 = sg.makePipeline(skinned_desc);
+        skinned_desc.index_type = .UINT32;
+        self.pipeline_skinned_pbr_u32 = sg.makePipeline(skinned_desc);
+
         if (self.pipeline_u16.id == 0) @panic("pipeline_u16 failed to create!");
         if (self.pipeline_u32.id == 0) @panic("pipeline_u32 failed to create!");
         if (self.pipeline_pbr_u16.id == 0) @panic("pipeline_pbr_u16 failed to create!");
         if (self.pipeline_pbr_u32.id == 0) @panic("pipeline_pbr_u32 failed to create!");
+        if (self.pipeline_skinned_pbr_u16.id == 0) @panic("pipeline_skinned_pbr_u16 failed to create!");
+        if (self.pipeline_skinned_pbr_u32.id == 0) @panic("pipeline_skinned_pbr_u32 failed to create!");
         if (self.pipeline_instanced_u16.id == 0) @panic("pipeline_instanced_u16 failed to create!");
         if (self.pipeline_instanced_u32.id == 0) @panic("pipeline_instanced_u32 failed to create!");
     }
@@ -308,6 +344,12 @@ pub const Scene = struct {
     pub fn updateParticles(self: *Scene, dt: f32) void {
         for (self.particle_systems.items) |ps| {
             ps.update(dt);
+        }
+    }
+
+    pub fn updateAnimations(self: *Scene, dt: f32) void {
+        for (self.animation_groups.items) |ag| {
+            ag.update(dt);
         }
     }
 
@@ -843,7 +885,10 @@ pub const Scene = struct {
             const mvp = Mat4.mul(view_proj, model);
 
             const pip_id = if (item.is_pbr)
-                (if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id)
+                (if (mesh.skeleton != null)
+                    (if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_u32.id else self.pipeline_skinned_pbr_u16.id)
+                else
+                    (if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id))
             else
                 (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
 
@@ -889,6 +934,13 @@ pub const Scene = struct {
                 };
                 sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
+                if (mesh.skeleton) |skel| {
+                    const vs_skin = skinned_pbr_shd.VsSkin{
+                        .bones = skel.skin_matrices,
+                    };
+                    sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
+                }
+
                 const mat_albedo = if (pbr_mat) |p| p.getAlbedoColor4() else [4]f32{ 1, 1, 1, 1 };
                 const metallic = if (pbr_mat) |p| p.metallic else 0.0;
                 const roughness = if (pbr_mat) |p| p.roughness else 0.5;
@@ -920,7 +972,11 @@ pub const Scene = struct {
                     .spot_color_outer = spot_color_outer,
                     .spot_intensity = spot_intensity,
                 };
-                sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+                if (mesh.skeleton != null) {
+                    sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+                } else {
+                    sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+                }
             } else {
                 const std_mat = if (mesh.material) |m| m.standard else &self.default_material;
                 const tex = if (std_mat.diffuse_texture) |t| t else self.default_white_texture;
@@ -1149,8 +1205,20 @@ pub const Scene = struct {
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.pipeline_pbr_u16);
         sg.destroyPipeline(self.pipeline_pbr_u32);
+        sg.destroyPipeline(self.pipeline_skinned_pbr_u16);
+        sg.destroyPipeline(self.pipeline_skinned_pbr_u32);
         sg.destroyPipeline(self.pipeline_instanced_u16);
         sg.destroyPipeline(self.pipeline_instanced_u32);
+
+        for (self.animation_groups.items) |ag| {
+            ag.deinit();
+        }
+        self.animation_groups.deinit(self.allocator);
+
+        for (self.skeletons.items) |skel| {
+            skel.deinit();
+        }
+        self.skeletons.deinit(self.allocator);
 
         // Deinitialize passes
         self.shadow_pass.deinit();

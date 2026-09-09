@@ -5,6 +5,7 @@ const sg = sokol.gfx;
 const c = @import("../c.zig").c;
 const math = @import("math");
 const Vec3 = math.Vec3;
+const Quat = math.Quat;
 const Color3 = math.Color3;
 const Mat4 = math.Mat4;
 const BoundingBox = math.BoundingBox;
@@ -17,6 +18,12 @@ const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Material = @import("../material.zig").Material;
 const Texture = @import("../texture.zig").Texture;
+const Skeleton = @import("../animation/skeleton.zig").Skeleton;
+const AnimationGroup = @import("../animation/animation.zig").AnimationGroup;
+const AnimationChannel = @import("../animation/animation.zig").AnimationChannel;
+const AnimationSampler = @import("../animation/animation.zig").AnimationSampler;
+const AnimationPath = @import("../animation/animation.zig").AnimationPath;
+const AnimationInterpolation = @import("../animation/animation.zig").AnimationInterpolation;
 
 pub const SceneLoader = struct {
     fn loadTextureFromView(
@@ -130,7 +137,101 @@ pub const SceneLoader = struct {
             materials[i] = .{ .pbr = pbr_mat };
         }
 
-        // 2. Parse meshes and primitives (preserving glTF node transforms)
+        // 2. Parse skeletons/skins
+        var skeletons = try scene.allocator.alloc(?*Skeleton, gltf.skins_count);
+        defer scene.allocator.free(skeletons);
+        @memset(skeletons, null);
+
+        for (0..gltf.skins_count) |skin_idx| {
+            const s = &gltf.skins[skin_idx];
+            const skel = try Skeleton.init(scene.allocator, s.joints_count);
+            if (s.name != null) {
+                skel.name = try scene.allocator.dupe(u8, std.mem.span(s.name));
+            }
+
+            // Inverse bind matrices
+            if (s.inverse_bind_matrices) |ibm_acc| {
+                for (0..s.joints_count) |ji| {
+                    var m_floats: [16]f32 = undefined;
+                    _ = c.cgltf_accessor_read_float(ibm_acc, ji, &m_floats, 16);
+                    skel.bones[ji].inverse_bind_matrix = Mat4{ .m = m_floats };
+                }
+            }
+
+            // Find the mesh node that uses this skin to compute root_transform
+            var mesh_node: ?*c.cgltf_node = null;
+            for (0..gltf.nodes_count) |ni| {
+                const n = &gltf.nodes[ni];
+                if (n.skin == s and n.mesh != null) {
+                    mesh_node = n;
+                    break;
+                }
+            }
+
+            var inv_mesh_w = Mat4.identity;
+            if (mesh_node) |mn| {
+                var mn_w: [16]f32 = undefined;
+                c.cgltf_node_transform_world(mn, &mn_w);
+                const mn_mat = Mat4{ .m = mn_w };
+                if (mn_mat.invert()) |inv| {
+                    inv_mesh_w = inv;
+                }
+            }
+
+            for (0..s.joints_count) |ji| {
+                const j_node = s.joints[ji] orelse continue;
+                const b = &skel.bones[ji];
+                if (j_node[0].name != null) {
+                    b.name = try scene.allocator.dupe(u8, std.mem.span(j_node[0].name));
+                }
+
+                // Parent within skin.joints
+                if (j_node[0].parent) |parent_node| {
+                    for (0..s.joints_count) |pi| {
+                        if (s.joints[pi] == parent_node) {
+                            b.parent_index = pi;
+                            break;
+                        }
+                    }
+                }
+
+                // If root joint (parent_index == null), compute root_transform
+                if (b.parent_index == null) {
+                    var p_world = Mat4.identity;
+                    if (j_node[0].parent) |parent_node| {
+                        var pw_floats: [16]f32 = undefined;
+                        c.cgltf_node_transform_world(parent_node, &pw_floats);
+                        p_world = Mat4{ .m = pw_floats };
+                    }
+                    skel.root_transform = inv_mesh_w.mul(p_world);
+                }
+
+                // Initial local TRS
+                if (j_node[0].has_translation != 0) {
+                    b.local_position = Vec3.new(j_node[0].translation[0], j_node[0].translation[1], j_node[0].translation[2]);
+                }
+                if (j_node[0].has_rotation != 0) {
+                    b.local_rotation = (Quat{
+                        .x = j_node[0].rotation[0],
+                        .y = j_node[0].rotation[1],
+                        .z = j_node[0].rotation[2],
+                        .w = j_node[0].rotation[3],
+                    }).normalize();
+                }
+                if (j_node[0].has_scale != 0) {
+                    b.local_scale = Vec3.new(j_node[0].scale[0], j_node[0].scale[1], j_node[0].scale[2]);
+                }
+                b.bind_position = b.local_position;
+                b.bind_rotation = b.local_rotation;
+                b.bind_scale = b.local_scale;
+            }
+
+            skel.update();
+            skeletons[skin_idx] = skel;
+            try scene.skeletons.append(scene.allocator, skel);
+        }
+
+        // 3. Parse meshes and primitives (preserving glTF node transforms)
         var spawned_meshes = std.ArrayList(*Mesh).empty;
 
         if (gltf.nodes_count > 0) {
@@ -149,9 +250,19 @@ pub const SceneLoader = struct {
                 c.cgltf_node_transform_world(node, &world_mat);
                 const base_matrix = Mat4{ .m = world_mat };
 
+                var node_skeleton: ?*Skeleton = null;
+                if (node.skin) |n_skin| {
+                    for (0..gltf.skins_count) |si| {
+                        if (&gltf.skins[si] == n_skin) {
+                            node_skeleton = skeletons[si];
+                            break;
+                        }
+                    }
+                }
+
                 for (0..src_mesh.*.primitives_count) |prim_idx| {
                     const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.*.primitives[prim_idx]);
-                    if (try parsePrimitive(scene, gltf, prim, mesh_name, base_matrix, materials)) |mesh_obj| {
+                    if (try parsePrimitive(scene, gltf, prim, mesh_name, base_matrix, materials, node_skeleton)) |mesh_obj| {
                         try scene.meshes.append(scene.allocator, mesh_obj);
                         try spawned_meshes.append(scene.allocator, mesh_obj);
                     }
@@ -170,12 +281,122 @@ pub const SceneLoader = struct {
 
                 for (0..src_mesh.primitives_count) |prim_idx| {
                     const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.primitives[prim_idx]);
-                    if (try parsePrimitive(scene, gltf, prim, mesh_name, Mat4.identity, materials)) |mesh_obj| {
+                    if (try parsePrimitive(scene, gltf, prim, mesh_name, Mat4.identity, materials, null)) |mesh_obj| {
                         try scene.meshes.append(scene.allocator, mesh_obj);
                         try spawned_meshes.append(scene.allocator, mesh_obj);
                     }
                 }
             }
+        }
+
+        // 4. Parse animations
+        for (0..gltf.animations_count) |anim_idx| {
+            const src_anim = &gltf.animations[anim_idx];
+            const anim_name = if (src_anim.name != null)
+                try scene.allocator.dupe(u8, std.mem.span(src_anim.name))
+            else
+                try std.fmt.allocPrint(scene.allocator, "anim_{d}", .{anim_idx});
+
+            // Find which skeleton this animation targets
+            var target_skel: ?*Skeleton = null;
+            var target_skin_idx: ?usize = null;
+            for (0..src_anim.channels_count) |ci| {
+                const ch = &src_anim.channels[ci];
+                if (ch.target_node == null) continue;
+                for (0..gltf.skins_count) |si| {
+                    const s = &gltf.skins[si];
+                    for (0..s.joints_count) |ji| {
+                        if (s.joints[ji] == ch.target_node) {
+                            target_skel = skeletons[si];
+                            target_skin_idx = si;
+                            break;
+                        }
+                    }
+                    if (target_skel != null) break;
+                }
+                if (target_skel != null) break;
+            }
+
+            if (target_skel == null and skeletons.len > 0) {
+                target_skel = skeletons[0];
+                target_skin_idx = 0;
+            }
+
+            const skel = target_skel orelse {
+                scene.allocator.free(anim_name);
+                continue;
+            };
+            const skin_ref = &gltf.skins[target_skin_idx.?];
+
+            var channels_list = std.ArrayList(AnimationChannel).empty;
+            var max_duration: f32 = 0.0;
+
+            for (0..src_anim.channels_count) |ci| {
+                const ch = &src_anim.channels[ci];
+                if (ch.target_node == null or ch.sampler == null) continue;
+
+                var bone_idx: ?usize = null;
+                for (0..skin_ref.joints_count) |ji| {
+                    if (skin_ref.joints[ji] == ch.target_node) {
+                        bone_idx = ji;
+                        break;
+                    }
+                }
+                const b_idx = bone_idx orelse continue;
+
+                const path_type: AnimationPath = switch (ch.target_path) {
+                    c.cgltf_animation_path_type_translation => .translation,
+                    c.cgltf_animation_path_type_rotation => .rotation,
+                    c.cgltf_animation_path_type_scale => .scale,
+                    c.cgltf_animation_path_type_weights => .weights,
+                    else => continue,
+                };
+
+                const samp = ch.sampler.?;
+                const in_acc = samp.*.input;
+                const out_acc = samp.*.output;
+                if (in_acc == null or out_acc == null or in_acc.*.count == 0) continue;
+
+                const key_count = in_acc.*.count;
+                const timestamps = try scene.allocator.alloc(f32, key_count);
+                for (0..key_count) |ki| {
+                    _ = c.cgltf_accessor_read_float(in_acc, ki, &timestamps[ki], 1);
+                }
+                if (timestamps[key_count - 1] > max_duration) {
+                    max_duration = timestamps[key_count - 1];
+                }
+
+                const stride: usize = switch (path_type) {
+                    .translation, .scale => 3,
+                    .rotation => 4,
+                    .weights => 1,
+                };
+                const outputs = try scene.allocator.alloc(f32, key_count * stride);
+                for (0..key_count) |ki| {
+                    _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
+                }
+
+                const interp: AnimationInterpolation = switch (samp.*.interpolation) {
+                    c.cgltf_interpolation_type_step => .step,
+                    c.cgltf_interpolation_type_cubic_spline => .cubic_spline,
+                    else => .linear,
+                };
+
+                try channels_list.append(scene.allocator, .{
+                    .bone_index = b_idx,
+                    .target_path = path_type,
+                    .sampler = .{
+                        .timestamps = timestamps,
+                        .outputs = outputs,
+                        .interpolation = interp,
+                    },
+                });
+            }
+
+            const ag = try AnimationGroup.init(scene.allocator, anim_name, try channels_list.toOwnedSlice(scene.allocator), max_duration);
+            scene.allocator.free(anim_name);
+            ag.skeleton = skel;
+            try scene.animation_groups.append(scene.allocator, ag);
         }
 
         return spawned_meshes.toOwnedSlice(scene.allocator);
@@ -188,6 +409,7 @@ pub const SceneLoader = struct {
         mesh_name: []const u8,
         base_matrix: Mat4,
         materials: []const ?Material,
+        skeleton: ?*Skeleton,
     ) !?*Mesh {
         if (prim.type != c.cgltf_primitive_type_triangles) return null;
 
@@ -196,6 +418,8 @@ pub const SceneLoader = struct {
         var col_accessor: ?*c.cgltf_accessor = null;
         var uv_accessor: ?*c.cgltf_accessor = null;
         var tan_accessor: ?*c.cgltf_accessor = null;
+        var joints_accessor: ?*c.cgltf_accessor = null;
+        var weights_accessor: ?*c.cgltf_accessor = null;
 
         for (0..prim.attributes_count) |attr_idx| {
             const attr = &prim.attributes[attr_idx];
@@ -206,6 +430,12 @@ pub const SceneLoader = struct {
                 c.cgltf_attribute_type_tangent => tan_accessor = attr.data,
                 c.cgltf_attribute_type_texcoord => {
                     if (attr.index == 0) uv_accessor = attr.data;
+                },
+                c.cgltf_attribute_type_joints => {
+                    if (attr.index == 0) joints_accessor = attr.data;
+                },
+                c.cgltf_attribute_type_weights => {
+                    if (attr.index == 0) weights_accessor = attr.data;
                 },
                 else => {},
             }
@@ -241,12 +471,24 @@ pub const SceneLoader = struct {
                 _ = c.cgltf_accessor_read_float(ta, i, &tan, 4);
             }
 
+            var j_val: [4]f32 = .{ 0, 0, 0, 0 };
+            if (joints_accessor) |ja| {
+                _ = c.cgltf_accessor_read_float(ja, i, &j_val, 4);
+            }
+
+            var w_val: [4]f32 = .{ 1, 0, 0, 0 };
+            if (weights_accessor) |wa| {
+                _ = c.cgltf_accessor_read_float(wa, i, &w_val, 4);
+            }
+
             vertices[i] = .{
                 .position = p,
                 .normal = n,
                 .color = col,
                 .uv = uv,
                 .tangent = tan,
+                .joints = j_val,
+                .weights = w_val,
             };
         }
 
@@ -293,8 +535,35 @@ pub const SceneLoader = struct {
                 });
             }
         } else {
-            if (tan_accessor == null) {
-                computeTangents(vertices, null, null);
+            index_count = @intCast(vert_count);
+            if (vert_count > 65535) {
+                index_type = .UINT32;
+                const indices = try scene.allocator.alloc(u32, vert_count);
+                defer scene.allocator.free(indices);
+                for (0..vert_count) |i| {
+                    indices[i] = @intCast(i);
+                }
+                if (tan_accessor == null) {
+                    computeTangents(vertices, indices, null);
+                }
+                ibuf = sg.makeBuffer(.{
+                    .usage = .{ .index_buffer = true },
+                    .data = sg.asRange(indices),
+                });
+            } else {
+                index_type = .UINT16;
+                const indices = try scene.allocator.alloc(u16, vert_count);
+                defer scene.allocator.free(indices);
+                for (0..vert_count) |i| {
+                    indices[i] = @intCast(i);
+                }
+                if (tan_accessor == null) {
+                    computeTangents(vertices, null, indices);
+                }
+                ibuf = sg.makeBuffer(.{
+                    .usage = .{ .index_buffer = true },
+                    .data = sg.asRange(indices),
+                });
             }
         }
 
@@ -324,13 +593,16 @@ pub const SceneLoader = struct {
             }
         }
 
+        const owned_name = try scene.allocator.dupe(u8, mesh_name);
         const mesh_obj = try scene.allocator.create(Mesh);
         mesh_obj.* = .{
-            .name = mesh_name,
+            .name = owned_name,
+            .owns_name = true,
             .vertex_buffer = vbuf,
             .index_buffer = ibuf,
             .index_count = index_count,
             .index_type = index_type,
+            .skeleton = skeleton,
             .base_matrix = base_matrix,
             .local_bounding_box = local_box,
         };

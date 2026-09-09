@@ -17,6 +17,8 @@ pub const ShadowPass = struct {
     pipeline_u32: sg.Pipeline,
     inst_pipeline_u16: sg.Pipeline,
     inst_pipeline_u32: sg.Pipeline,
+    skinned_pipeline_u16: sg.Pipeline,
+    skinned_pipeline_u32: sg.Pipeline,
 
     pub fn init() ShadowPass {
         // 2048 atlas holding 4x 1024 cascades (2x2). Was 4096/2048: same look
@@ -106,6 +108,39 @@ pub const ShadowPass = struct {
         shadow_inst_desc.index_type = .UINT32;
         const inst_pip_u32 = sg.makePipeline(shadow_inst_desc);
 
+        // 3. Skinned Shadow pipelines
+        var shadow_skinned_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(shadow_shd.shadowSkinnedShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = .DEPTH,
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+                .bias = 1.0,
+                .bias_slope_scale = 1.0,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        shadow_skinned_desc.colors[0].pixel_format = .NONE;
+        shadow_skinned_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        shadow_skinned_desc.layout.attrs[shadow_shd.ATTR_shadow_skinned_position] = .{
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        shadow_skinned_desc.layout.attrs[shadow_shd.ATTR_shadow_skinned_joints] = .{
+            .format = .FLOAT4,
+            .offset = @offsetOf(Vertex, "joints"),
+        };
+        shadow_skinned_desc.layout.attrs[shadow_shd.ATTR_shadow_skinned_weights] = .{
+            .format = .FLOAT4,
+            .offset = @offsetOf(Vertex, "weights"),
+        };
+        const skinned_pip_u16 = sg.makePipeline(shadow_skinned_desc);
+        shadow_skinned_desc.index_type = .UINT32;
+        const skinned_pip_u32 = sg.makePipeline(shadow_skinned_desc);
+
         return .{
             .image = depth_img,
             .attachment_view = att_view,
@@ -115,6 +150,8 @@ pub const ShadowPass = struct {
             .pipeline_u32 = pip_u32,
             .inst_pipeline_u16 = inst_pip_u16,
             .inst_pipeline_u32 = inst_pip_u32,
+            .skinned_pipeline_u16 = skinned_pip_u16,
+            .skinned_pipeline_u32 = skinned_pip_u32,
         };
     }
 
@@ -175,7 +212,10 @@ pub const ShadowPass = struct {
                     const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
                     if (!c_frustum.intersectsAABB(aabb_w)) continue;
 
-                    const pip_id = if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id;
+                    const pip_id = if (mesh.skeleton != null)
+                        (if (mesh.index_type == .UINT32) self.skinned_pipeline_u32.id else self.skinned_pipeline_u16.id)
+                    else
+                        (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
                     if (pip_id == 0) continue;
                     sg.applyPipeline(.{ .id = pip_id });
 
@@ -189,6 +229,14 @@ pub const ShadowPass = struct {
                         .mvp = Mat4.mul(light_view_proj, model),
                     };
                     sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
+
+                    if (mesh.skeleton) |skel| {
+                        const vs_skin = shadow_shd.VsSkin{
+                            .bones = skel.skin_matrices,
+                        };
+                        sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
+                    }
+
                     sg.draw(0, mesh.index_count, 1);
                 }
             }
@@ -202,6 +250,8 @@ pub const ShadowPass = struct {
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.inst_pipeline_u16);
         sg.destroyPipeline(self.inst_pipeline_u32);
+        sg.destroyPipeline(self.skinned_pipeline_u16);
+        sg.destroyPipeline(self.skinned_pipeline_u32);
         sg.destroyView(self.attachment_view);
         sg.destroyView(self.texture_view);
         sg.destroySampler(self.sampler);

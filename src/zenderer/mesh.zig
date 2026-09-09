@@ -12,6 +12,7 @@ const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
 const Material = @import("material.zig").Material;
 const Scene = @import("scene.zig").Scene;
+const Skeleton = @import("animation/skeleton.zig").Skeleton;
 
 pub const Vertex = extern struct {
     position: [3]f32,
@@ -19,6 +20,8 @@ pub const Vertex = extern struct {
     color: [4]f32,
     uv: [2]f32,
     tangent: [4]f32 = .{ 1.0, 0.0, 0.0, 1.0 },
+    joints: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
+    weights: [4]f32 = .{ 1.0, 0.0, 0.0, 0.0 },
 };
 
 pub const CullingStrategy = enum {
@@ -49,6 +52,7 @@ pub const InstancedMesh = struct {
 
 pub const Mesh = struct {
     name: []const u8,
+    owns_name: bool = false,
     position: Vec3 = Vec3.zero,
     rotation: Vec3 = Vec3.zero, // Euler angles in degrees
     scaling: Vec3 = Vec3.one,
@@ -59,6 +63,7 @@ pub const Mesh = struct {
     index_type: sg.IndexType = .UINT16,
     material: ?Material = null,
     parent: ?*Mesh = null,
+    skeleton: ?*Skeleton = null,
     base_matrix: Mat4 = Mat4.identity,
 
     // Culling, Shadows & Visibility
@@ -122,6 +127,9 @@ pub const Mesh = struct {
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
+        if (self.owns_name and self.name.len > 0) {
+            allocator.free(self.name);
+        }
     }
 };
 

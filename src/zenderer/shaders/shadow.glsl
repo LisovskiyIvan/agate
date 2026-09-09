@@ -33,6 +33,30 @@ void main() {
 }
 @end
 
+@vs vs_skinned
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_params {
+    mat4 mvp;
+};
+layout(binding = 1) uniform vs_skin {
+    mat4 bones[64];
+};
+
+in vec3 position;
+in vec4 joints;
+in vec4 weights;
+
+void main() {
+    ivec4 j = ivec4(joints);
+    mat4 skin_mat = weights.x * bones[j.x] +
+                    weights.y * bones[j.y] +
+                    weights.z * bones[j.z] +
+                    weights.w * bones[j.w];
+    vec4 skinned_pos = skin_mat * vec4(position, 1.0);
+    gl_Position = mvp * skinned_pos;
+}
+@end
+
 @fs fs
 void main() {
 }
@@ -40,3 +64,4 @@ void main() {
 
 @program shadow vs fs
 @program shadow_instanced vs_inst fs
+@program shadow_skinned vs_skinned fs
