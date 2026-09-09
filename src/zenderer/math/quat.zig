@@ -70,6 +70,10 @@ pub const Quat = struct {
         return .{ .x = -q.x, .y = -q.y, .z = -q.z, .w = q.w };
     }
 
+    pub fn invert(q: Quat) Quat {
+        return q.conjugate();
+    }
+
     /// Rotates a 3D vector by this unit quaternion using the Rodrigues formula:
     /// v' = v + 2*w*(q_v x v) + 2*(q_v x (q_v x v))
     pub fn rotateVec(q: Quat, v: Vec3) Vec3 {

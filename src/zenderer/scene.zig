@@ -16,6 +16,7 @@ pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
 const AnimationGroup = @import("animation/animation.zig").AnimationGroup;
+const evaluateSkeleton = @import("animation/animation.zig").evaluateSkeleton;
 const Skeleton = @import("animation/skeleton.zig").Skeleton;
 
 const math = @import("math");
@@ -350,6 +351,31 @@ pub const Scene = struct {
     pub fn updateAnimations(self: *Scene, dt: f32) void {
         for (self.animation_groups.items) |ag| {
             ag.update(dt);
+        }
+
+        for (self.skeletons.items) |skel| {
+            var active_base: [16]*AnimationGroup = undefined;
+            var base_count: usize = 0;
+            var active_add: [16]*AnimationGroup = undefined;
+            var add_count: usize = 0;
+
+            for (self.animation_groups.items) |ag| {
+                if (ag.skeleton == skel and ag.is_playing and ag.weight > 0.0001) {
+                    if (ag.is_additive) {
+                        if (add_count < active_add.len) {
+                            active_add[add_count] = ag;
+                            add_count += 1;
+                        }
+                    } else {
+                        if (base_count < active_base.len) {
+                            active_base[base_count] = ag;
+                            base_count += 1;
+                        }
+                    }
+                }
+            }
+
+            evaluateSkeleton(skel, active_base[0..base_count], active_add[0..add_count]);
         }
     }
 

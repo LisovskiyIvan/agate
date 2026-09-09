@@ -86,6 +86,7 @@ pub const animation = struct {
     pub const AnimationSampler = anim.AnimationSampler;
     pub const AnimationPath = anim.AnimationPath;
     pub const AnimationInterpolation = anim.AnimationInterpolation;
+    pub const evaluateSkeleton = anim.evaluateSkeleton;
 };
 pub const Skeleton = animation.Skeleton;
 pub const Bone = animation.Bone;
@@ -94,5 +95,6 @@ pub const AnimationChannel = animation.AnimationChannel;
 pub const AnimationSampler = animation.AnimationSampler;
 pub const AnimationPath = animation.AnimationPath;
 pub const AnimationInterpolation = animation.AnimationInterpolation;
+pub const evaluateSkeleton = animation.evaluateSkeleton;
 
 pub const sokol = @import("sokol");
