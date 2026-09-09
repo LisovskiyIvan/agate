@@ -19,11 +19,20 @@ pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
 
 const math = @import("math");
+const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Color3 = math.Color3;
 const Color4 = math.Color4;
 const BoundingBox = math.BoundingBox;
 const Frustum = math.Frustum;
+const Ray = math.Ray;
+const RayHit = math.RayHit;
+
+const physics = @import("physics.zig");
+pub const PhysicsWorld = physics.PhysicsWorld;
+pub const RigidBody = physics.RigidBody;
+pub const PickingInfo = physics.PickingInfo;
+pub const ColliderType = physics.ColliderType;
 
 const ArcRotateCamera = @import("camera.zig").ArcRotateCamera;
 const lights = @import("lights.zig");
@@ -137,6 +146,9 @@ pub const Scene = struct {
     particle_quad_ib: sg.Buffer = .{},
     particle_pipeline_additive: sg.Pipeline = .{},
     particle_pipeline_alphablend: sg.Pipeline = .{},
+
+    // Physics World
+    physics_world: ?PhysicsWorld = null,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
@@ -645,6 +657,124 @@ pub const Scene = struct {
             ps.update(dt);
         }
     }
+
+    // ==============================================
+    // PHYSICS & COLLISION SYSTEM
+    // ==============================================
+
+    pub fn enablePhysics(self: *Scene, gravity: ?Vec3) *PhysicsWorld {
+        if (self.physics_world == null) {
+            self.physics_world = PhysicsWorld.init(self.allocator);
+        }
+        if (gravity) |g| {
+            self.physics_world.?.gravity = g;
+        }
+        return &self.physics_world.?;
+    }
+
+    pub fn getPhysicsWorld(self: *Scene) ?*PhysicsWorld {
+        if (self.physics_world) |*pw| return pw;
+        return null;
+    }
+
+    pub fn getRigidBody(self: *Scene, mesh: *const Mesh) ?*RigidBody {
+        if (self.physics_world) |*pw| {
+            return pw.findBody(mesh);
+        }
+        return null;
+    }
+
+    pub fn createRigidBody(self: *Scene, mesh: *Mesh, collider: ColliderType, mass: f32) !*RigidBody {
+        const pw = self.enablePhysics(null);
+        return pw.createBody(mesh, collider, mass);
+    }
+
+    pub fn updatePhysics(self: *Scene, dt: f32) void {
+        if (self.physics_world) |*pw| {
+            pw.step(dt);
+        }
+    }
+
+    // ==============================================
+    // RAYCASTING & 3D MESH PICKING
+    // ==============================================
+
+    /// Unprojects a 2D screen coordinate (e.g. mouse click) into a 3D world space Ray
+    pub fn createPickingRay(self: *Scene, screen_x: f32, screen_y: f32) Ray {
+        const cam = self.active_camera orelse return Ray.new(Vec3.zero, Vec3.forward);
+        const w = sapp.widthf();
+        const h = sapp.heightf();
+        if (w <= 0.0 or h <= 0.0) return Ray.new(cam.getPosition(), Vec3.forward);
+
+        const aspect = w / h;
+        const vp = cam.getViewProjection(aspect);
+        const inv_vp = vp.invert() orelse return Ray.new(cam.getPosition(), Vec3.forward);
+
+        // Convert screen pixel coordinates to Normalized Device Coordinates [-1, 1]
+        const ndc_x = (2.0 * screen_x) / w - 1.0;
+        const ndc_y = 1.0 - (2.0 * screen_y) / h;
+
+        // Unproject near point (z = 0.0) and far point (z = 1.0)
+        const near_pt = inv_vp.transformPoint(Vec3.new(ndc_x, ndc_y, 0.0));
+        const far_pt = inv_vp.transformPoint(Vec3.new(ndc_x, ndc_y, 1.0));
+        const dir = far_pt.sub(near_pt).normalize();
+
+        return Ray.new(near_pt, dir);
+    }
+
+    /// Casts a 3D Ray against all visible meshes in the scene and returns the closest hit
+    pub fn pickWithRay(self: *Scene, r: Ray) PickingInfo {
+        var closest_dist: f32 = std.math.floatMax(f32);
+        var best_hit: ?RayHit = null;
+        var best_mesh: ?*Mesh = null;
+
+        for (self.meshes.items) |mesh| {
+            if (!mesh.is_visible) continue;
+
+            // Check if mesh has a sphere collider for exact sphere-ray picking
+            if (self.getRigidBody(mesh)) |body| {
+                if (body.collider == .sphere) {
+                    const radius = body.sphere_radius * mesh.scaling.x;
+                    if (r.intersectsSphereNormal(mesh.position, radius)) |hit| {
+                        if (hit.distance < closest_dist) {
+                            closest_dist = hit.distance;
+                            best_hit = hit;
+                            best_mesh = mesh;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            const world_aabb = mesh.getWorldBoundingBox();
+            if (r.intersectsAABBNormal(world_aabb)) |hit| {
+                if (hit.distance < closest_dist) {
+                    closest_dist = hit.distance;
+                    best_hit = hit;
+                    best_mesh = mesh;
+                }
+            }
+        }
+
+        if (best_hit) |hit| {
+            return PickingInfo{
+                .hit = true,
+                .distance = hit.distance,
+                .picked_point = hit.point,
+                .picked_normal = hit.normal,
+                .picked_mesh = best_mesh,
+            };
+        }
+
+        return PickingInfo{};
+    }
+
+    /// Convenience: Casts a picking ray from screen pixel coordinates (x, y)
+    pub fn pick(self: *Scene, screen_x: f32, screen_y: f32) PickingInfo {
+        const r = self.createPickingRay(screen_x, screen_y);
+        return self.pickWithRay(r);
+    }
+
 
     pub fn handleEvent(self: *Scene, ev: [*c]const sapp.Event) void {
         if (self.active_camera) |*cam| {
@@ -1229,15 +1359,15 @@ pub const Scene = struct {
             .camera_up = cam_up,
         };
 
-        var current_pip_id: u32 = 0;
+        var current_pipeline: sg.Pipeline = .{};
 
         for (self.particle_systems.items) |ps| {
             if (ps.active_count == 0) continue;
 
             const pip = if (ps.blend_mode == .additive) self.particle_pipeline_additive else self.particle_pipeline_alphablend;
-            if (pip.id != current_pip_id) {
+            if (pip.id != current_pipeline.id) {
                 sg.applyPipeline(pip);
-                current_pip_id = pip.id;
+                current_pipeline = pip;
                 self.stats.pipeline_switches += 1;
             }
 
@@ -1359,6 +1489,10 @@ pub const Scene = struct {
         sg.destroyPipeline(self.particle_pipeline_alphablend);
         sg.destroyBuffer(self.particle_quad_vb);
         sg.destroyBuffer(self.particle_quad_ib);
+
+        if (self.physics_world) |*pw| {
+            pw.deinit();
+        }
     }
 
 };

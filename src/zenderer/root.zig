@@ -52,4 +52,14 @@ pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
 
+pub const Ray = math.Ray;
+pub const RayHit = math.RayHit;
+pub const TriangleHit = math.TriangleHit;
+
+pub const physics = @import("physics.zig");
+pub const RigidBody = physics.RigidBody;
+pub const PhysicsWorld = physics.PhysicsWorld;
+pub const PickingInfo = physics.PickingInfo;
+pub const ColliderType = physics.ColliderType;
+
 pub const sokol = @import("sokol");

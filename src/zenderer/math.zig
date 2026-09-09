@@ -17,6 +17,11 @@ pub const frustum = @import("math/frustum.zig");
 pub const Frustum = frustum.Frustum;
 pub const FrustumPlane = frustum.FrustumPlane;
 
+pub const ray = @import("math/ray.zig");
+pub const Ray = ray.Ray;
+pub const RayHit = ray.RayHit;
+pub const TriangleHit = ray.TriangleHit;
+
 pub inline fn lerp(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
 }

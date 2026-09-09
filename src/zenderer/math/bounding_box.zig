@@ -53,4 +53,24 @@ pub const BoundingBox = struct {
             .max = Vec3.new(tc.x + ex, tc.y + ey, tc.z + ez),
         };
     }
+
+    pub fn intersects(self: BoundingBox, other: BoundingBox) bool {
+        return (self.min.x <= other.max.x and self.max.x >= other.min.x) and
+               (self.min.y <= other.max.y and self.max.y >= other.min.y) and
+               (self.min.z <= other.max.z and self.max.z >= other.min.z);
+    }
+
+    pub fn containsPoint(self: BoundingBox, pt: Vec3) bool {
+        return (pt.x >= self.min.x and pt.x <= self.max.x) and
+               (pt.y >= self.min.y and pt.y <= self.max.y) and
+               (pt.z >= self.min.z and pt.z <= self.max.z);
+    }
+
+    pub fn closestPoint(self: BoundingBox, pt: Vec3) Vec3 {
+        return Vec3.new(
+            std.math.clamp(pt.x, self.min.x, self.max.x),
+            std.math.clamp(pt.y, self.min.y, self.max.y),
+            std.math.clamp(pt.z, self.min.z, self.max.z),
+        );
+    }
 };

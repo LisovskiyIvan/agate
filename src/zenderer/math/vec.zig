@@ -75,6 +75,18 @@ pub const Vec3 = extern struct {
             .z = a.z + (b.z - a.z) * t,
         };
     }
+
+    pub fn distance(a: Vec3, b: Vec3) f32 {
+        return a.sub(b).length();
+    }
+
+    pub fn distanceSq(a: Vec3, b: Vec3) f32 {
+        return a.sub(b).lengthSq();
+    }
+
+    pub fn mul(a: Vec3, b: Vec3) Vec3 {
+        return .{ .x = a.x * b.x, .y = a.y * b.y, .z = a.z * b.z };
+    }
 };
 
 pub const Vec4 = extern struct {

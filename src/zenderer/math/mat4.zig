@@ -169,4 +169,71 @@ pub const Mat4 = extern struct {
         r.m[14] = 0.0;
         return r;
     }
+
+    /// Computes inverse of 4x4 matrix, returns null if singular (det ≈ 0)
+    pub fn invert(self: Mat4) ?Mat4 {
+        const a = self.m;
+        const s0 = a[0] * a[5] - a[4] * a[1];
+        const s1 = a[0] * a[6] - a[4] * a[2];
+        const s2 = a[0] * a[7] - a[4] * a[3];
+        const s3 = a[1] * a[6] - a[5] * a[2];
+        const s4 = a[1] * a[7] - a[5] * a[3];
+        const s5 = a[2] * a[7] - a[6] * a[3];
+
+        const c5 = a[10] * a[15] - a[14] * a[11];
+        const c4 = a[9] * a[15] - a[13] * a[11];
+        const c3 = a[9] * a[14] - a[13] * a[10];
+        const c2 = a[8] * a[15] - a[12] * a[11];
+        const c1 = a[8] * a[14] - a[12] * a[10];
+        const c0 = a[8] * a[13] - a[12] * a[9];
+
+        const det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+        if (@abs(det) < 1e-8) return null;
+
+        const inv_det = 1.0 / det;
+        var r: Mat4 = undefined;
+
+        r.m[0] = ( a[5] * c5 - a[6] * c4 + a[7] * c3) * inv_det;
+        r.m[1] = (-a[1] * c5 + a[2] * c4 - a[3] * c3) * inv_det;
+        r.m[2] = ( a[13] * s5 - a[14] * s4 + a[15] * s3) * inv_det;
+        r.m[3] = (-a[9] * s5 + a[10] * s4 - a[11] * s3) * inv_det;
+
+        r.m[4] = (-a[4] * c5 + a[6] * c2 - a[7] * c1) * inv_det;
+        r.m[5] = ( a[0] * c5 - a[2] * c2 + a[3] * c1) * inv_det;
+        r.m[6] = (-a[12] * s5 + a[14] * s2 - a[15] * s1) * inv_det;
+        r.m[7] = ( a[8] * s5 - a[10] * s2 + a[11] * s1) * inv_det;
+
+        r.m[8] = ( a[4] * c4 - a[5] * c2 + a[7] * c0) * inv_det;
+        r.m[9] = (-a[0] * c4 + a[1] * c2 - a[3] * c0) * inv_det;
+        r.m[10] = ( a[12] * s4 - a[13] * s2 + a[15] * s0) * inv_det;
+        r.m[11] = (-a[8] * s4 + a[9] * s2 - a[11] * s0) * inv_det;
+
+        r.m[12] = (-a[4] * c3 + a[5] * c1 - a[6] * c0) * inv_det;
+        r.m[13] = ( a[0] * c3 - a[1] * c1 + a[2] * c0) * inv_det;
+        r.m[14] = (-a[12] * s3 + a[13] * s1 - a[14] * s0) * inv_det;
+        r.m[15] = ( a[8] * s3 - a[9] * s1 + a[10] * s0) * inv_det;
+
+        return r;
+    }
+
+    /// Transforms a 3D point (w = 1.0) and applies perspective division
+    pub fn transformPoint(self: Mat4, p: Vec3) Vec3 {
+        const x = self.m[0] * p.x + self.m[4] * p.y + self.m[8] * p.z + self.m[12];
+        const y = self.m[1] * p.x + self.m[5] * p.y + self.m[9] * p.z + self.m[13];
+        const z = self.m[2] * p.x + self.m[6] * p.y + self.m[10] * p.z + self.m[14];
+        const w = self.m[3] * p.x + self.m[7] * p.y + self.m[11] * p.z + self.m[15];
+        if (w != 0.0 and w != 1.0) {
+            const inv_w = 1.0 / w;
+            return Vec3.new(x * inv_w, y * inv_w, z * inv_w);
+        }
+        return Vec3.new(x, y, z);
+    }
+
+    /// Transforms a 3D direction vector (w = 0.0) without translation
+    pub fn transformDirection(self: Mat4, d: Vec3) Vec3 {
+        const x = self.m[0] * d.x + self.m[4] * d.y + self.m[8] * d.z;
+        const y = self.m[1] * d.x + self.m[5] * d.y + self.m[9] * d.z;
+        const z = self.m[2] * d.x + self.m[6] * d.y + self.m[10] * d.z;
+        return Vec3.new(x, y, z).normalize();
+    }
 };
