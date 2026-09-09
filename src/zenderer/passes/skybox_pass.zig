@@ -91,6 +91,7 @@ pub const SkyboxPass = struct {
         const proj = camera.getProjectionMatrix(aspect);
         const view_proj = Mat4.mul(proj, rot_view);
 
+        if (self.pipeline.id == 0) return;
         sg.applyPipeline(self.pipeline);
 
         var bind = sg.Bindings{};

@@ -323,6 +323,7 @@ pub const UICanvas = struct {
         sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items));
         sg.updateBuffer(self.index_buffer, sg.asRange(self.indices.items));
 
+        if (self.pipeline.id == 0) return;
         sg.applyPipeline(self.pipeline);
 
         var bind = sg.Bindings{};

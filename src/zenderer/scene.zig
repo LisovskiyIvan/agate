@@ -94,13 +94,15 @@ pub const Scene = struct {
     particle_pass: passes.ParticlePass,
     postprocess_pass: passes.PostProcessPass,
 
-    // Shadow Mapping settings
+    // Shadow Mapping settings (Cascaded Shadow Maps with 16-sample Poisson PCF)
     enable_shadows: bool = true,
-    shadow_bias: f32 = 0.003,
+    shadow_bias: f32 = 0.0012,
+    shadow_normal_bias: f32 = 0.02,
     shadow_intensity: f32 = 0.75,
-    shadow_extent: f32 = 25.0,
-    shadow_near: f32 = 0.5,
-    shadow_far: f32 = 80.0,
+    shadow_softness: f32 = 1.5,
+    shadow_debug_cascades: bool = false,
+    cascade_splits: [4]f32 = .{ 10.0, 26.0, 65.0, 150.0 },
+    cascade_matrices: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
 
     // Skybox & IBL settings
     skybox_texture: ?CubeTexture = null,
@@ -131,8 +133,8 @@ pub const Scene = struct {
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) Scene {
-        var self = Scene{
+    pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
+        self.* = Scene{
             .allocator = allocator,
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
@@ -150,13 +152,19 @@ pub const Scene = struct {
             }),
         };
         self.initPipelines();
+    }
+
+    pub fn init(allocator: std.mem.Allocator) Scene {
+        var self: Scene = undefined;
+        self.initInto(allocator);
         return self;
     }
 
     fn initPipelines(self: *Scene) void {
         // 1. Standard Material pipelines (Phong / Blinn-Phong)
+        const std_shd_id = sg.makeShader(shd.standardShaderDesc(sg.queryBackend()));
         var pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
+            .shader = std_shd_id,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .LESS_EQUAL,
@@ -176,8 +184,9 @@ pub const Scene = struct {
         self.pipeline_u32 = sg.makePipeline(pip_desc);
 
         // 2. PBR Material pipelines (Cook-Torrance BRDF + Normal / MR / Emissive / AO)
+        const pbr_shd_id = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend()));
         var pbr_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
+            .shader = pbr_shd_id,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .LESS_EQUAL,
@@ -198,8 +207,9 @@ pub const Scene = struct {
         self.pipeline_pbr_u32 = sg.makePipeline(pbr_desc);
 
         // 3. Instanced Standard pipelines
+        const inst_shd_id = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend()));
         var inst_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+            .shader = inst_shd_id,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .LESS_EQUAL,
@@ -227,6 +237,13 @@ pub const Scene = struct {
         self.pipeline_instanced_u16 = sg.makePipeline(inst_desc);
         inst_desc.index_type = .UINT32;
         self.pipeline_instanced_u32 = sg.makePipeline(inst_desc);
+
+        if (self.pipeline_u16.id == 0) @panic("pipeline_u16 failed to create!");
+        if (self.pipeline_u32.id == 0) @panic("pipeline_u32 failed to create!");
+        if (self.pipeline_pbr_u16.id == 0) @panic("pipeline_pbr_u16 failed to create!");
+        if (self.pipeline_pbr_u32.id == 0) @panic("pipeline_pbr_u32 failed to create!");
+        if (self.pipeline_instanced_u16.id == 0) @panic("pipeline_instanced_u16 failed to create!");
+        if (self.pipeline_instanced_u32.id == 0) @panic("pipeline_instanced_u32 failed to create!");
     }
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
@@ -438,6 +455,93 @@ pub const Scene = struct {
         return a.distance_sq < b.distance_sq;
     }
 
+    pub fn computeCascades(self: *Scene, camera: ArcRotateCamera, aspect: f32) [4]Mat4 {
+        var result: [4]Mat4 = undefined;
+        const norm_light_dir = self.light.direction.normalize();
+
+        const cam_pos = camera.getPosition();
+        var forward = camera.target.sub(cam_pos);
+        const fwd_len = forward.length();
+        if (fwd_len > 0.0001) {
+            forward = forward.scale(1.0 / fwd_len);
+        } else {
+            forward = Vec3.new(0, 0, -1);
+        }
+
+        var right = forward.cross(Vec3.up);
+        const r_len = right.length();
+        if (r_len > 0.0001) {
+            right = right.scale(1.0 / r_len);
+        } else {
+            right = Vec3.new(1, 0, 0);
+        }
+        const up = right.cross(forward).normalize();
+
+        const fov_rad = camera.fov_deg * (std.math.pi / 180.0);
+        const tan_half_fov = @tan(fov_rad * 0.5);
+
+        var z_near = camera.near;
+        const cascade_res: f32 = 2048.0;
+
+        for (0..4) |i| {
+            const z_far = self.cascade_splits[i];
+
+            const h_near = 2.0 * tan_half_fov * z_near;
+            const w_near = h_near * aspect;
+            const h_far = 2.0 * tan_half_fov * z_far;
+            const w_far = h_far * aspect;
+
+            const c_near = cam_pos.add(forward.scale(z_near));
+            const c_far = cam_pos.add(forward.scale(z_far));
+
+            const corners = [8]Vec3{
+                c_near.add(up.scale(h_near * 0.5)).sub(right.scale(w_near * 0.5)),
+                c_near.add(up.scale(h_near * 0.5)).add(right.scale(w_near * 0.5)),
+                c_near.sub(up.scale(h_near * 0.5)).sub(right.scale(w_near * 0.5)),
+                c_near.sub(up.scale(h_near * 0.5)).add(right.scale(w_near * 0.5)),
+
+                c_far.add(up.scale(h_far * 0.5)).sub(right.scale(w_far * 0.5)),
+                c_far.add(up.scale(h_far * 0.5)).add(right.scale(w_far * 0.5)),
+                c_far.sub(up.scale(h_far * 0.5)).sub(right.scale(w_far * 0.5)),
+                c_far.sub(up.scale(h_far * 0.5)).add(right.scale(w_far * 0.5)),
+            };
+
+            var center = Vec3.zero;
+            for (corners) |c| {
+                center = center.add(c);
+            }
+            center = center.scale(1.0 / 8.0);
+
+            var radius: f32 = 0.0;
+            for (corners) |c| {
+                const d = c.sub(center).length();
+                if (d > radius) radius = d;
+            }
+            radius = @ceil(radius * 16.0) / 16.0;
+
+            const texel_size = (2.0 * radius) / cascade_res;
+
+            const light_up = if (@abs(norm_light_dir.y) > 0.99) Vec3.new(0, 0, 1) else Vec3.up;
+            const ref_light_view = Mat4.lookAt(Vec3.zero, norm_light_dir.scale(-1.0), light_up);
+
+            const c_ls = ref_light_view.transformPoint(center);
+            const snapped_x = @floor(c_ls.x / texel_size) * texel_size;
+            const snapped_y = @floor(c_ls.y / texel_size) * texel_size;
+
+            const inv_ref = ref_light_view.invert() orelse Mat4.identity;
+            const snapped_center_world = inv_ref.transformPoint(Vec3.new(snapped_x, snapped_y, c_ls.z));
+
+            const light_eye = snapped_center_world.add(norm_light_dir.scale(radius + 60.0));
+            const light_view = Mat4.lookAt(light_eye, snapped_center_world, light_up);
+            const light_proj = Mat4.orthographic(-radius, radius, -radius, radius, 1.0, 2.0 * radius + 120.0);
+
+            result[i] = Mat4.mul(light_proj, light_view);
+            z_near = z_far;
+        }
+
+        return result;
+    }
+
     pub fn render(self: *Scene) void {
         const camera = self.active_camera orelse return;
         const aspect = sapp.widthf() / sapp.heightf();
@@ -448,18 +552,9 @@ pub const Scene = struct {
         self.stats = .{};
         self.render_queue.clearRetainingCapacity();
 
-        // 1. Directional Light Shadow View-Projection
-        const light_pos = self.light.direction.scale(35.0);
-        const light_view = Mat4.lookAt(light_pos, Vec3.zero, Vec3.up);
-        const light_proj = Mat4.orthographic(
-            -self.shadow_extent,
-            self.shadow_extent,
-            -self.shadow_extent,
-            self.shadow_extent,
-            self.shadow_near,
-            self.shadow_far,
-        );
-        const light_view_proj = Mat4.mul(light_proj, light_view);
+        // 1. Directional Light Cascaded Shadow View-Projections
+        const cascades = self.computeCascades(camera, aspect);
+        self.cascade_matrices = cascades;
 
         // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
         for (self.meshes.items) |mesh| {
@@ -613,8 +708,8 @@ pub const Scene = struct {
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (self.enable_shadows) {
-            self.shadow_pass.render(self.meshes.items, light_view_proj);
-            self.stats.draw_calls += 1;
+            self.shadow_pass.render(self.meshes.items, cascades);
+            self.stats.draw_calls += 4;
         }
 
         // ==============================================
@@ -701,14 +796,15 @@ pub const Scene = struct {
             const model = item.model;
             const mvp = Mat4.mul(view_proj, model);
 
-            const pip = if (item.is_pbr)
-                (if (mesh.index_type == .UINT32) self.pipeline_pbr_u32 else self.pipeline_pbr_u16)
+            const pip_id = if (item.is_pbr)
+                (if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id)
             else
-                (if (mesh.index_type == .UINT32) self.pipeline_u32 else self.pipeline_u16);
+                (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
 
-            if (pip.id != current_pipeline_id) {
-                sg.applyPipeline(pip);
-                current_pipeline_id = pip.id;
+            if (pip_id == 0) continue;
+            if (pip_id != current_pipeline_id) {
+                sg.applyPipeline(.{ .id = pip_id });
+                current_pipeline_id = pip_id;
                 self.stats.pipeline_switches += 1;
             }
 
@@ -744,7 +840,6 @@ pub const Scene = struct {
                 const vs_params = pbr_shd.VsParams{
                     .mvp = mvp,
                     .model = model,
-                    .light_view_proj = light_view_proj,
                 };
                 sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
@@ -754,8 +849,8 @@ pub const Scene = struct {
                 const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
 
                 const fs_params = pbr_shd.FsParams{
-                    .eye_pos = .{ eye.x, eye.y, eye.z, 1.0 },
-                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 0.0 },
+                    .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
+                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .base_color_factor = mat_albedo,
@@ -764,9 +859,12 @@ pub const Scene = struct {
                     .shadow_params = .{
                         if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
                         if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                        0.0,
-                        0.0,
+                        self.shadow_normal_bias,
+                        self.shadow_softness,
                     },
+                    .shadow_splits = self.cascade_splits,
+                    .cascade_view_proj = cascades,
+                    .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
                     .light_counts = light_counts,
                     .point_pos_range = point_pos_range,
                     .point_color_int = point_color_int,
@@ -791,21 +889,24 @@ pub const Scene = struct {
                 const vs_params = shd.VsParams{
                     .mvp = mvp,
                     .model = model,
-                    .light_view_proj = light_view_proj,
                 };
                 sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
 
                 const fs_params = shd.FsParams{
-                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 0.0 },
+                    .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
+                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .diffuse_color = std_mat.getDiffuseColor4(),
                     .shadow_params = .{
                         if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
                         if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                        0.0,
-                        0.0,
+                        self.shadow_normal_bias,
+                        self.shadow_softness,
                     },
+                    .shadow_splits = self.cascade_splits,
+                    .cascade_view_proj = cascades,
+                    .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
                     .light_counts = light_counts,
                     .point_pos_range = point_pos_range,
                     .point_color_int = point_color_int,
@@ -827,10 +928,11 @@ pub const Scene = struct {
             if (mesh.instances.items.len == 0) continue;
             if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
 
-            const pip = if (mesh.index_type == .UINT32) self.pipeline_instanced_u32 else self.pipeline_instanced_u16;
-            if (pip.id != current_pipeline_id) {
-                sg.applyPipeline(pip);
-                current_pipeline_id = pip.id;
+            const pip_id = if (mesh.index_type == .UINT32) self.pipeline_instanced_u32.id else self.pipeline_instanced_u16.id;
+            if (pip_id == 0) continue;
+            if (pip_id != current_pipeline_id) {
+                sg.applyPipeline(.{ .id = pip_id });
+                current_pipeline_id = pip_id;
                 self.stats.pipeline_switches += 1;
             }
 
@@ -855,21 +957,24 @@ pub const Scene = struct {
 
             const inst_vs = inst_shd.VsParams{
                 .view_proj = view_proj,
-                .light_view_proj = light_view_proj,
             };
             sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
 
             const inst_fs = inst_shd.FsParams{
-                .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 0.0 },
+                .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
+                .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
                 .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                 .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                 .diffuse_color = std_mat.getDiffuseColor4(),
                 .shadow_params = .{
                     if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
                     if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                    0.0,
-                    0.0,
+                    self.shadow_normal_bias,
+                    self.shadow_softness,
                 },
+                .shadow_splits = self.cascade_splits,
+                .cascade_view_proj = cascades,
+                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
                 .light_counts = light_counts,
                 .point_pos_range = point_pos_range,
                 .point_color_int = point_color_int,

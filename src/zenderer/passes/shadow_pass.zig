@@ -22,8 +22,8 @@ pub const ShadowPass = struct {
         const depth_img = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
             .pixel_format = .DEPTH,
-            .width = 2048,
-            .height = 2048,
+            .width = 4096,
+            .height = 4096,
             .sample_count = 1,
         });
 
@@ -52,8 +52,8 @@ pub const ShadowPass = struct {
                 .pixel_format = .DEPTH,
                 .compare = .LESS_EQUAL,
                 .write_enabled = true,
-                .bias = 2.0,
-                .bias_slope_scale = 2.0,
+                .bias = 1.0,
+                .bias_slope_scale = 1.0,
             },
             .cull_mode = .BACK,
             .face_winding = .CCW,
@@ -78,8 +78,8 @@ pub const ShadowPass = struct {
                 .pixel_format = .DEPTH,
                 .compare = .LESS_EQUAL,
                 .write_enabled = true,
-                .bias = 2.0,
-                .bias_slope_scale = 2.0,
+                .bias = 1.0,
+                .bias_slope_scale = 1.0,
             },
             .cull_mode = .BACK,
             .face_winding = .CCW,
@@ -120,7 +120,7 @@ pub const ShadowPass = struct {
     pub fn render(
         self: *ShadowPass,
         meshes: []const *Mesh,
-        light_view_proj: Mat4,
+        cascades: [4]Mat4,
     ) void {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
@@ -133,43 +133,60 @@ pub const ShadowPass = struct {
         shadow_pass.attachments.depth_stencil = self.attachment_view;
         sg.beginPass(shadow_pass);
 
-        for (meshes) |mesh| {
-            if (!mesh.cast_shadows) continue;
+        const CASCADE_RES: i32 = 2048;
 
-            if (mesh.instances.items.len > 0) {
-                if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+        for (0..4) |c_idx| {
+            const light_view_proj = cascades[c_idx];
+            const vx: i32 = if (c_idx % 2 == 1) CASCADE_RES else 0;
+            const vy: i32 = if (c_idx >= 2) CASCADE_RES else 0;
 
-                const pip = if (mesh.index_type == .UINT32) self.inst_pipeline_u32 else self.inst_pipeline_u16;
-                sg.applyPipeline(pip);
+            sg.applyViewport(vx, vy, CASCADE_RES, CASCADE_RES, false);
+            sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
-                var bind = sg.Bindings{};
-                bind.vertex_buffers[0] = mesh.vertex_buffer;
-                bind.vertex_buffers[1] = mesh.instance_buffer;
-                bind.index_buffer = mesh.index_buffer;
-                sg.applyBindings(bind);
+            const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
 
-                const inst_vs = shadow_shd.VsInstParams{
-                    .light_view_proj = light_view_proj,
-                };
-                sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
-                sg.draw(0, mesh.index_count, mesh.visible_instance_count);
-            } else {
-                if (!mesh.is_visible) continue;
+            for (meshes) |mesh| {
+                if (!mesh.cast_shadows) continue;
 
-                const pip = if (mesh.index_type == .UINT32) self.pipeline_u32 else self.pipeline_u16;
-                sg.applyPipeline(pip);
+                if (mesh.instances.items.len > 0) {
+                    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
 
-                var bind = sg.Bindings{};
-                bind.vertex_buffers[0] = mesh.vertex_buffer;
-                bind.index_buffer = mesh.index_buffer;
-                sg.applyBindings(bind);
+                    const pip_id = if (mesh.index_type == .UINT32) self.inst_pipeline_u32.id else self.inst_pipeline_u16.id;
+                    if (pip_id == 0) continue;
+                    sg.applyPipeline(.{ .id = pip_id });
 
-                const model = mesh.getWorldMatrix();
-                const shadow_vs = shadow_shd.VsParams{
-                    .mvp = Mat4.mul(light_view_proj, model),
-                };
-                sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
-                sg.draw(0, mesh.index_count, 1);
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.vertex_buffers[1] = mesh.instance_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const inst_vs = shadow_shd.VsInstParams{
+                        .light_view_proj = light_view_proj,
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
+                    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                } else {
+                    if (!mesh.is_visible) continue;
+                    const aabb_w = mesh.getWorldBoundingBox();
+                    if (!c_frustum.intersectsAABB(aabb_w)) continue;
+
+                    const pip_id = if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id;
+                    if (pip_id == 0) continue;
+                    sg.applyPipeline(.{ .id = pip_id });
+
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const model = mesh.getWorldMatrix();
+                    const shadow_vs = shadow_shd.VsParams{
+                        .mvp = Mat4.mul(light_view_proj, model),
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
+                    sg.draw(0, mesh.index_count, 1);
+                }
             }
         }
 

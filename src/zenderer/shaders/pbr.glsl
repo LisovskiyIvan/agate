@@ -7,14 +7,13 @@
 layout(binding = 0) uniform vs_params {
     mat4 mvp;
     mat4 model;
-    mat4 light_view_proj;
 };
 
 in vec3 position;
 in vec3 normal;
+in vec4 tangent;
 in vec4 color0;
 in vec2 texcoord0;
-in vec4 tangent;
 
 out vec3 v_world_pos;
 out vec3 v_normal;
@@ -22,17 +21,11 @@ out vec3 v_tangent;
 out vec3 v_bitangent;
 out vec4 v_color;
 out vec2 v_uv;
-out vec4 v_light_space_pos;
 
 void main() {
     vec4 world_pos = model * vec4(position, 1.0);
     v_world_pos = world_pos.xyz;
     gl_Position = mvp * vec4(position, 1.0);
-    vec4 lpos = light_view_proj * world_pos;
-    #if !SOKOL_GLSL
-        lpos.y = -lpos.y;
-    #endif
-    v_light_space_pos = lpos;
 
     vec3 N = normalize(mat3(model) * normal);
     vec3 T = normalize(mat3(model) * tangent.xyz);
@@ -57,7 +50,10 @@ layout(binding = 1) uniform fs_params {
     vec4 base_color_factor;
     vec4 pbr_factors; // x: metallic, y: roughness, z: occlusion_strength, w: ibl_intensity
     vec4 emissive_factor; // xyz: emissive color, w: unused
-    vec4 shadow_params; // x: bias, y: intensity, z/w: unused
+    vec4 shadow_params; // x: bias, y: intensity, z: normal_bias, w: filter_radius
+    vec4 shadow_splits; // x: split0, y: split1, z: split2, w: split3
+    mat4 cascade_view_proj[4]; // 4 cascade light view-projection matrices
+    vec4 cascade_debug; // x: debug_cascades, y/z/w: unused
     vec4 light_counts; // x: num_point_lights, y: num_spot_lights, z/w: unused
     vec4 point_pos_range[4];
     vec4 point_color_int[4];
@@ -84,31 +80,106 @@ in vec3 v_tangent;
 in vec3 v_bitangent;
 in vec4 v_color;
 in vec2 v_uv;
-in vec4 v_light_space_pos;
 
 out vec4 frag_color;
 
 const float PI = 3.14159265359;
 
-float calculateShadow(vec4 light_space_pos, vec3 N, vec3 L) {
+const vec2 POISSON_DISK[16] = vec2[](
+    vec2(-0.94201624, -0.39906216),
+    vec2( 0.94558609, -0.76890725),
+    vec2(-0.09418410, -0.92938870),
+    vec2( 0.34495938,  0.29387760),
+    vec2(-0.91588581,  0.45771432),
+    vec2(-0.81544232, -0.87912464),
+    vec2(-0.38277543,  0.27676845),
+    vec2( 0.97484398,  0.75648379),
+    vec2( 0.44323325, -0.97511554),
+    vec2( 0.53742981, -0.47373420),
+    vec2(-0.26496911, -0.41893023),
+    vec2( 0.79197514,  0.19090188),
+    vec2(-0.24188840,  0.99706507),
+    vec2(-0.81409955,  0.91437590),
+    vec2( 0.19984126,  0.78641367),
+    vec2( 0.14383161, -0.14100790)
+);
+
+const vec2 CASCADE_OFFSETS[4] = vec2[](
+    vec2(0.0, 0.0),
+    vec2(0.5, 0.0),
+    vec2(0.0, 0.5),
+    vec2(0.5, 0.5)
+);
+
+float hashScreen(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z) * 6.28318530718;
+}
+
+float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
+    float cos_theta = max(dot(N, L), 0.0);
+    float depth_bias = max(shadow_params.x * (1.0 - cos_theta), shadow_params.x * 0.2);
+    vec3 normal_offset = N * (shadow_params.z * (1.0 - cos_theta));
+
+    vec4 lpos = cascade_view_proj[cascade_idx] * vec4(world_pos + normal_offset, 1.0);
+    #if !SOKOL_GLSL
+        lpos.y = -lpos.y;
+    #endif
+
+    vec3 proj = lpos.xyz / lpos.w;
+    if (proj.z > 1.0 || proj.z < 0.0) return 1.0;
+
+    vec2 local_uv = (proj.xy + 1.0) * 0.5;
+    if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) return 1.0;
+
+    vec2 clamped_local_uv = clamp(local_uv, 0.003, 0.997);
+    vec2 atlas_uv = clamped_local_uv * 0.5 + CASCADE_OFFSETS[cascade_idx];
+    float depth = proj.z - depth_bias;
+
+    float angle = hashScreen(gl_FragCoord.xy);
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+    mat2 rot = mat2(cos_a, sin_a, -sin_a, cos_a);
+
+    float filter_radius = (shadow_params.w / 4096.0) * 0.5;
+
+    float lit = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec2 offset = rot * POISSON_DISK[i] * filter_radius;
+        lit += texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(atlas_uv + offset, depth));
+    }
+    return lit * (1.0 / 16.0);
+}
+
+float calculateShadow(vec3 world_pos, vec3 N, vec3 L, out vec3 debug_color) {
+    debug_color = vec3(0.0);
     if (shadow_params.y <= 0.001) return 0.0;
 
-    vec3 proj = light_space_pos.xyz / light_space_pos.w;
-    if (proj.z > 1.0 || proj.z < 0.0) return 0.0;
+    float view_dist = length(world_pos - eye_pos.xyz);
+    int cascade_idx = 3;
+    if (view_dist < shadow_splits.x) {
+        cascade_idx = 0;
+    } else if (view_dist < shadow_splits.y) {
+        cascade_idx = 1;
+    } else if (view_dist < shadow_splits.z) {
+        cascade_idx = 2;
+    }
 
-    vec2 uv = (proj.xy + 1.0) * 0.5;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+    if (cascade_debug.x > 0.5) {
+        if (cascade_idx == 0) debug_color = vec3(0.25, 0.05, 0.05);
+        else if (cascade_idx == 1) debug_color = vec3(0.05, 0.25, 0.05);
+        else if (cascade_idx == 2) debug_color = vec3(0.05, 0.05, 0.25);
+        else debug_color = vec3(0.25, 0.25, 0.05);
+    }
 
-    float cos_theta = max(dot(N, L), 0.0);
-    float bias = max(shadow_params.x * (1.0 - cos_theta), shadow_params.x * 0.2);
-    float depth = proj.z - bias;
+    float lit = sampleCascade(cascade_idx, world_pos, N, L);
 
-    vec2 texel_size = vec2(1.0 / 2048.0);
-    float s0 = texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(uv + vec2(-0.75, -0.75) * texel_size, depth));
-    float s1 = texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(uv + vec2( 0.75, -0.75) * texel_size, depth));
-    float s2 = texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(uv + vec2(-0.75,  0.75) * texel_size, depth));
-    float s3 = texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(uv + vec2( 0.75,  0.75) * texel_size, depth));
-    float lit = (s0 + s1 + s2 + s3) * 0.25;
+    float fade_start = shadow_splits.w * 0.85;
+    if (view_dist > fade_start) {
+        float fade = clamp((view_dist - fade_start) / max(shadow_splits.w - fade_start, 0.001), 0.0, 1.0);
+        lit = mix(lit, 1.0, fade);
+    }
 
     return (1.0 - lit) * shadow_params.y;
 }
@@ -187,7 +258,8 @@ void main() {
     vec3 specular = (NDF * G * F) / (4.0 * NdotV * NdotL + 0.0001);
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
 
-    float shadow = calculateShadow(v_light_space_pos, N, L);
+    vec3 debug_tint = vec3(0.0);
+    float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 radiance = light_color.rgb * light_color.a;
     vec3 Lo = (kD * albedo / PI + specular) * radiance * NdotL * (1.0 - shadow);
 
@@ -300,7 +372,7 @@ void main() {
     vec4 emissive_sample = texture(sampler2D(emissive_tex, smp), v_uv);
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
-    vec3 final_color = ambient + ibl + Lo + emissive;
+    vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;
 
     frag_color = vec4(final_color, albedo_rgba.a);
 }

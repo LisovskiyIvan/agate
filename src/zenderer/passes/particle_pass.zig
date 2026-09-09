@@ -131,10 +131,11 @@ pub const ParticlePass = struct {
         for (systems) |ps| {
             if (ps.active_count == 0 or ps.instance_buffer.id == 0) continue;
 
-            const pip = if (ps.blend_mode == .additive) self.pipeline_additive else self.pipeline_alphablend;
-            if (current_pipeline.id != pip.id) {
-                current_pipeline = pip;
-                sg.applyPipeline(pip);
+            const pip_id = if (ps.blend_mode == .additive) self.pipeline_additive.id else self.pipeline_alphablend.id;
+            if (pip_id == 0) continue;
+            if (current_pipeline.id != pip_id) {
+                current_pipeline.id = pip_id;
+                sg.applyPipeline(.{ .id = pip_id });
             }
 
             var bind = sg.Bindings{};

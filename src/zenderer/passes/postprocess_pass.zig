@@ -160,6 +160,7 @@ pub const PostProcessPass = struct {
     }
 
     pub fn render(self: *PostProcessPass, config: PostProcessConfig, cur_w: i32, cur_h: i32) void {
+        if (self.postprocess_pipeline.id == 0) return;
         sg.applyPipeline(self.postprocess_pipeline);
         var post_bind = sg.Bindings{};
         post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
