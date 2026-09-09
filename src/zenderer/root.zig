@@ -32,6 +32,7 @@ pub const SkyboxConfig = texture.SkyboxConfig;
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;
 pub const InstancedMesh = mesh.InstancedMesh;
+pub const BoneAttachment = mesh.BoneAttachment;
 pub const CullingStrategy = mesh.CullingStrategy;
 pub const Vertex = mesh.Vertex;
 pub const MeshBuilder = mesh.MeshBuilder;

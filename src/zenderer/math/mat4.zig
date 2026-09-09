@@ -207,6 +207,11 @@ pub const Mat4 = extern struct {
         return r;
     }
 
+    /// Extracts the translation column as a 3D vector
+    pub fn getTranslation(self: Mat4) Vec3 {
+        return Vec3.new(self.m[12], self.m[13], self.m[14]);
+    }
+
     /// Computes inverse of 4x4 matrix, returns null if singular (det ≈ 0)
     pub fn invert(self: Mat4) ?Mat4 {
         const a = self.m;

@@ -133,6 +133,13 @@ pub const AnimationGroup = struct {
     is_playing: bool = false,
     loop: bool = true,
 
+    // Weight transition / Cross-fading
+    fade_start_weight: f32 = 1.0,
+    fade_target_weight: f32 = 1.0,
+    fade_duration: f32 = 0.0,
+    fade_timer: f32 = 0.0,
+    stop_on_fade_out: bool = true,
+
     pub fn init(allocator: std.mem.Allocator, name: []const u8, channels: []AnimationChannel, duration: f32) !*AnimationGroup {
         const ag = try allocator.create(AnimationGroup);
         ag.* = .{
@@ -163,6 +170,7 @@ pub const AnimationGroup = struct {
         self.to = self.duration;
         self.loop = loop;
         self.is_playing = true;
+        self.fade_duration = 0.0;
     }
 
     pub fn playRange(self: *AnimationGroup, from: f32, to: f32, loop: bool, speed: ?f32) void {
@@ -170,6 +178,7 @@ pub const AnimationGroup = struct {
         self.to = std.math.clamp(to, self.from, self.duration);
         if (self.to <= self.from) self.to = self.duration;
         self.loop = loop;
+        self.fade_duration = 0.0;
         if (speed) |s| self.speed_ratio = s;
         if (self.speed_ratio >= 0.0) {
             if (self.current_time < self.from or self.current_time > self.to) {
@@ -189,10 +198,44 @@ pub const AnimationGroup = struct {
 
     pub fn setWeight(self: *AnimationGroup, w: f32) void {
         self.weight = std.math.clamp(w, 0.0, 1.0);
+        self.fade_duration = 0.0;
     }
 
     pub fn setAdditive(self: *AnimationGroup, additive: bool) void {
         self.is_additive = additive;
+    }
+
+    /// Fades the animation weight towards target_weight over duration seconds.
+    pub fn fadeTo(self: *AnimationGroup, target_weight: f32, duration: f32, stop_if_zero: bool) void {
+        self.fade_start_weight = self.weight;
+        self.fade_target_weight = std.math.clamp(target_weight, 0.0, 1.0);
+        self.fade_duration = @max(duration, 0.0001);
+        self.fade_timer = 0.0;
+        self.stop_on_fade_out = stop_if_zero;
+        if (!self.is_playing and self.fade_target_weight > 0.0) {
+            self.is_playing = true;
+        }
+    }
+
+    /// Smoothly fades in this animation to weight 1.0 over duration seconds.
+    pub fn fadeIn(self: *AnimationGroup, duration: f32) void {
+        if (!self.is_playing) {
+            self.weight = 0.0;
+            self.is_playing = true;
+        }
+        self.fadeTo(1.0, duration, false);
+    }
+
+    /// Smoothly fades out this animation to weight 0.0 over duration seconds, then stops it.
+    pub fn fadeOut(self: *AnimationGroup, duration: f32) void {
+        self.fadeTo(0.0, duration, true);
+    }
+
+    /// Smoothly cross-fades from this animation to target over duration seconds.
+    pub fn crossFadeTo(self: *AnimationGroup, target: *AnimationGroup, duration: f32) void {
+        if (self == target) return;
+        self.fadeOut(duration);
+        target.fadeIn(duration);
     }
 
     pub fn pause(self: *AnimationGroup) void {
@@ -202,6 +245,7 @@ pub const AnimationGroup = struct {
     pub fn stop(self: *AnimationGroup) void {
         self.is_playing = false;
         self.current_time = self.from;
+        self.fade_duration = 0.0;
         if (self.skeleton) |skel| {
             skel.resetToBindPose();
         }
@@ -214,6 +258,24 @@ pub const AnimationGroup = struct {
 
     pub fn update(self: *AnimationGroup, dt: f32) void {
         if (!self.is_playing) return;
+
+        // Process weight fading
+        if (self.fade_duration > 0.00001) {
+            self.fade_timer += dt;
+            const t = std.math.clamp(self.fade_timer / self.fade_duration, 0.0, 1.0);
+            self.weight = self.fade_start_weight + (self.fade_target_weight - self.fade_start_weight) * t;
+
+            if (self.fade_timer >= self.fade_duration) {
+                self.weight = self.fade_target_weight;
+                self.fade_duration = 0.0;
+                self.fade_timer = 0.0;
+                if (self.weight <= 0.0001 and self.stop_on_fade_out) {
+                    self.is_playing = false;
+                    self.current_time = self.from;
+                    return;
+                }
+            }
+        }
         const range = self.to - self.from;
         if (range <= 0.0) return;
 
@@ -331,7 +393,8 @@ pub fn evaluateSkeleton(skel: *Skeleton, active_base: []const *AnimationGroup, a
                 const br1 = r1 orelse bone.bind_rotation;
                 const bs1 = s1 orelse bone.bind_scale;
 
-                const alpha = ag1.weight / (ag0.weight + ag1.weight);
+                const sum_w = ag0.weight + ag1.weight;
+                const alpha = if (sum_w > 0.0001) ag1.weight / sum_w else 0.5;
                 blended_pos = Vec3.lerp(bp0, bp1, alpha);
                 blended_rot = Quat.slerp(br0, br1, alpha);
                 blended_scale = Vec3.lerp(bs0, bs1, alpha);
@@ -510,4 +573,47 @@ test "evaluateSkeleton blending and additive layer" {
     // Blended z should still be 15.0, and y should now be 5.0!
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), skel.bones[0].local_position.z, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), skel.bones[0].local_position.y, 1e-4);
+}
+
+test "AnimationGroup crossFadeTo, fadeIn, and fadeOut" {
+    const allocator = std.testing.allocator;
+
+    const times1 = try allocator.alloc(f32, 1); times1[0] = 0.0;
+    const out1 = try allocator.alloc(f32, 3); out1[0] = 0; out1[1] = 0; out1[2] = 0;
+    const ch1 = try allocator.alloc(AnimationChannel, 1);
+    ch1[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times1, .outputs = out1 } };
+    const ag1 = try AnimationGroup.init(allocator, "clip1", ch1, 1.0);
+    defer ag1.deinit();
+
+    const times2 = try allocator.alloc(f32, 1); times2[0] = 0.0;
+    const out2 = try allocator.alloc(f32, 3); out2[0] = 0; out2[1] = 0; out2[2] = 0;
+    const ch2 = try allocator.alloc(AnimationChannel, 1);
+    ch2[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times2, .outputs = out2 } };
+    const ag2 = try AnimationGroup.init(allocator, "clip2", ch2, 1.0);
+    defer ag2.deinit();
+
+    ag1.play(true);
+    ag1.setWeight(1.0);
+
+    // Cross-fade ag1 -> ag2 over 1.0 second
+    ag1.crossFadeTo(ag2, 1.0);
+
+    try std.testing.expect(ag1.is_playing);
+    try std.testing.expect(ag2.is_playing);
+    try std.testing.expectEqual(@as(f32, 1.0), ag1.weight);
+    try std.testing.expectEqual(@as(f32, 0.0), ag2.weight);
+
+    // Advance 0.5s: 50% through cross-fade
+    ag1.update(0.5);
+    ag2.update(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), ag1.weight, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), ag2.weight, 1e-4);
+
+    // Advance another 0.5s (total 1.0s): cross-fade completed
+    ag1.update(0.5);
+    ag2.update(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ag1.weight, 1e-4);
+    try std.testing.expect(!ag1.is_playing); // ag1 automatically stopped
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), ag2.weight, 1e-4);
+    try std.testing.expect(ag2.is_playing); // ag2 continues playing at full weight
 }

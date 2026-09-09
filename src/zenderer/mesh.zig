@@ -50,6 +50,12 @@ pub const InstancedMesh = struct {
     }
 };
 
+pub const BoneAttachment = struct {
+    host_mesh: *Mesh,
+    bone_index: usize,
+    offset_matrix: Mat4 = Mat4.identity,
+};
+
 pub const Mesh = struct {
     name: []const u8,
     owns_name: bool = false,
@@ -64,6 +70,7 @@ pub const Mesh = struct {
     material: ?Material = null,
     parent: ?*Mesh = null,
     skeleton: ?*Skeleton = null,
+    attach_bone: ?BoneAttachment = null,
     base_matrix: Mat4 = Mat4.identity,
 
     // Culling, Shadows & Visibility
@@ -104,9 +111,38 @@ pub const Mesh = struct {
         self.material = .{ .pbr = mat };
     }
 
+    /// Attaches this mesh to a specific bone socket of host_mesh.
+    pub fn attachToBone(self: *Mesh, host_mesh: *Mesh, bone_index: usize) void {
+        self.attach_bone = .{
+            .host_mesh = host_mesh,
+            .bone_index = bone_index,
+            .offset_matrix = Mat4.identity,
+        };
+    }
+
+    /// Attaches this mesh to a bone identified by name on host_mesh.
+    pub fn attachToBoneByName(self: *Mesh, host_mesh: *Mesh, bone_name: []const u8) !void {
+        const skel = host_mesh.skeleton orelse return error.NoSkeletonOnMesh;
+        const idx = skel.findBoneIndex(bone_name) orelse return error.BoneNotFound;
+        self.attachToBone(host_mesh, idx);
+    }
+
+    /// Detaches this mesh from its bone socket.
+    pub fn detachFromBone(self: *Mesh) void {
+        self.attach_bone = null;
+    }
+
     pub fn getWorldMatrix(self: Mesh) Mat4 {
         const trs = Mat4.fromRotationTranslationScale(self.position, self.rotation, self.scaling);
         const local = Mat4.mul(trs, self.base_matrix);
+        if (self.attach_bone) |att| {
+            if (att.host_mesh.skeleton) |skel| {
+                const host_mat = att.host_mesh.getWorldMatrix();
+                const bone_mat = skel.getBoneWorldMatrix(att.bone_index, host_mat);
+                const with_offset = Mat4.mul(bone_mat, att.offset_matrix);
+                return Mat4.mul(with_offset, local);
+            }
+        }
         if (self.parent) |p| {
             return Mat4.mul(p.getWorldMatrix(), local);
         }
@@ -815,3 +851,47 @@ pub const MeshBuilder = struct {
         return mesh;
     }
 };
+
+test "Mesh attachToBone world matrix computation" {
+    const ally = std.testing.allocator;
+    const skel = try Skeleton.init(ally, 2);
+    defer skel.deinit();
+
+    skel.bones[0].local_position = Vec3.new(2, 0, 0);
+    skel.bones[1].parent_index = 0;
+    skel.bones[1].local_position = Vec3.new(0, 3, 0);
+    skel.update();
+
+    var host_mesh: Mesh = undefined;
+    host_mesh = .{
+        .name = "host",
+        .position = Vec3.new(10, 20, 30),
+        .rotation = Vec3.zero,
+        .scaling = Vec3.one,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .skeleton = skel,
+    };
+
+    var attached_mesh: Mesh = undefined;
+    attached_mesh = .{
+        .name = "sword",
+        .position = Vec3.new(0, 0, 1), // local offset relative to bone
+        .rotation = Vec3.zero,
+        .scaling = Vec3.one,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+
+    attached_mesh.attachToBone(&host_mesh, 1);
+
+    const world = attached_mesh.getWorldMatrix();
+    const pos = world.getTranslation();
+
+    // host (10, 20, 30) + bone1 (2, 3, 0) + local (0, 0, 1) = (12, 23, 31)
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), pos.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 23.0), pos.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.0), pos.z, 1e-4);
+}
