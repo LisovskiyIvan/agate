@@ -34,6 +34,10 @@ pub const RigidBody = physics.RigidBody;
 pub const PickingInfo = physics.PickingInfo;
 pub const ColliderType = physics.ColliderType;
 
+const ui = @import("ui.zig");
+pub const UICanvas = ui.UICanvas;
+pub const UIVertex = ui.UIVertex;
+
 const ArcRotateCamera = @import("camera.zig").ArcRotateCamera;
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
@@ -149,6 +153,9 @@ pub const Scene = struct {
 
     // Physics World
     physics_world: ?PhysicsWorld = null,
+
+    // 2D & 3D UI Canvas
+    ui_canvas: ?UICanvas = null,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
@@ -775,6 +782,32 @@ pub const Scene = struct {
         return self.pickWithRay(r);
     }
 
+    // ==============================================
+    // 2D & 3D UI CANVAS SYSTEM
+    // ==============================================
+
+    pub fn createUI(self: *Scene) !*UICanvas {
+        if (self.ui_canvas == null) {
+            self.ui_canvas = try UICanvas.init(self.allocator);
+        }
+        return &self.ui_canvas.?;
+    }
+
+    pub fn getUI(self: *Scene) ?*UICanvas {
+        if (self.ui_canvas) |*u| return u;
+        return null;
+    }
+
+    /// Projects a 3D world-space position to 2D screen pixels (top-left is (0,0)).
+    /// Returns null if the point is behind the camera or outside view limits.
+    pub fn projectPoint(self: *Scene, world_pos: Vec3) ?math.Vec2 {
+        const cam = self.active_camera orelse return null;
+        const w = sapp.widthf();
+        const h = sapp.heightf();
+        if (w <= 0.0 or h <= 0.0) return null;
+        const vp = cam.getViewProjection(w / h);
+        return vp.projectPoint(world_pos, w, h);
+    }
 
     pub fn handleEvent(self: *Scene, ev: [*c]const sapp.Event) void {
         if (self.active_camera) |*cam| {
@@ -1256,6 +1289,13 @@ pub const Scene = struct {
             self.renderParticles(self.active_camera.?, aspect);
         }
 
+        if (!self.post_process.enabled) {
+            if (self.ui_canvas) |*ui_c| {
+                ui_c.render(sapp.widthf(), sapp.heightf());
+                self.stats.draw_calls += 1;
+            }
+        }
+
         sg.endPass();
 
         if (self.post_process.enabled) {
@@ -1309,6 +1349,12 @@ pub const Scene = struct {
             sg.draw(0, 6, 1);
             self.stats.draw_calls += 1;
             self.stats.triangles += 2;
+
+            // Render 2D UI overlay on top of the post-processed swapchain
+            if (self.ui_canvas) |*ui_c| {
+                ui_c.render(@floatFromInt(cur_w), @floatFromInt(cur_h));
+                self.stats.draw_calls += 1;
+            }
 
             sg.endPass();
         }
@@ -1492,6 +1538,10 @@ pub const Scene = struct {
 
         if (self.physics_world) |*pw| {
             pw.deinit();
+        }
+
+        if (self.ui_canvas) |*u| {
+            u.deinit();
         }
     }
 

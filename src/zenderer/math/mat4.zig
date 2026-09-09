@@ -1,5 +1,6 @@
 const std = @import("std");
 const Vec3 = @import("vec.zig").Vec3;
+const Vec2 = @import("vec.zig").Vec2;
 
 pub const Mat4 = extern struct {
     // Column-major: m[col * 4 + row]
@@ -235,5 +236,22 @@ pub const Mat4 = extern struct {
         const y = self.m[1] * d.x + self.m[5] * d.y + self.m[9] * d.z;
         const z = self.m[2] * d.x + self.m[6] * d.y + self.m[10] * d.z;
         return Vec3.new(x, y, z).normalize();
+    }
+
+    /// Projects a 3D world space point into 2D screen pixel space (top-left is (0,0)).
+    /// Returns null if the point is behind the camera.
+    pub fn projectPoint(self: Mat4, p: Vec3, screen_w: f32, screen_h: f32) ?Vec2 {
+        const x = self.m[0] * p.x + self.m[4] * p.y + self.m[8] * p.z + self.m[12];
+        const y = self.m[1] * p.x + self.m[5] * p.y + self.m[9] * p.z + self.m[13];
+        const w = self.m[3] * p.x + self.m[7] * p.y + self.m[11] * p.z + self.m[15];
+        if (w <= 0.001) return null;
+
+        const inv_w = 1.0 / w;
+        const ndc_x = x * inv_w;
+        const ndc_y = y * inv_w;
+
+        const sx = (ndc_x * 0.5 + 0.5) * screen_w;
+        const sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
+        return Vec2.new(sx, sy);
     }
 };

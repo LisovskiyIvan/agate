@@ -62,4 +62,8 @@ pub const PhysicsWorld = physics.PhysicsWorld;
 pub const PickingInfo = physics.PickingInfo;
 pub const ColliderType = physics.ColliderType;
 
+pub const ui = @import("ui.zig");
+pub const UICanvas = ui.UICanvas;
+pub const UIVertex = ui.UIVertex;
+
 pub const sokol = @import("sokol");
