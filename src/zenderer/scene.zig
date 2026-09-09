@@ -87,6 +87,8 @@ pub const Scene = struct {
 
     enable_frustum_culling: bool = true,
     stats: SceneStats = .{},
+    // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
+    frame_id: u64 = 0,
 
     // Render Passes
     shadow_pass: passes.ShadowPass,
@@ -454,6 +456,24 @@ pub const Scene = struct {
         }
         return a.distance_sq < b.distance_sq;
     }
+    /// World matrix computed at most once per render() call.
+    /// Parent chains resolve through the same cache, so hierarchies stay O(depth) total.
+    fn worldMatrixCached(self: *Scene, mesh: *Mesh) Mat4 {
+        if (mesh.cached_frame == self.frame_id) return mesh.cached_matrix;
+        const trs = Mat4.fromRotationTranslationScale(mesh.position, mesh.rotation, mesh.scaling);
+        const local = Mat4.mul(trs, mesh.base_matrix);
+        const world = if (mesh.parent) |p| Mat4.mul(self.worldMatrixCached(p), local) else local;
+        mesh.cached_matrix = world;
+        mesh.cached_aabb = mesh.local_bounding_box.transform(world);
+        mesh.cached_frame = self.frame_id;
+        return world;
+    }
+
+    fn worldAABBCached(self: *Scene, mesh: *Mesh) BoundingBox {
+        if (mesh.cached_frame == self.frame_id) return mesh.cached_aabb;
+        _ = self.worldMatrixCached(mesh);
+        return mesh.cached_aabb;
+    }
 
     pub fn computeCascades(self: *Scene, camera: ArcRotateCamera, aspect: f32) [4]Mat4 {
         var result: [4]Mat4 = undefined;
@@ -481,7 +501,7 @@ pub const Scene = struct {
         const tan_half_fov = @tan(fov_rad * 0.5);
 
         var z_near = camera.near;
-        const cascade_res: f32 = 2048.0;
+        const cascade_res: f32 = 1024.0;
 
         for (0..4) |i| {
             const z_far = self.cascade_splits[i];
@@ -550,6 +570,7 @@ pub const Scene = struct {
         const eye = camera.getPosition();
 
         self.stats = .{};
+        self.frame_id +%= 1;
         self.render_queue.clearRetainingCapacity();
 
         // 1. Directional Light Cascaded Shadow View-Projections
@@ -631,10 +652,22 @@ pub const Scene = struct {
                             self.stats.culled_meshes += 1;
                         }
                     } else {
-                        if (inst0.is_visible) { self.stats.rendered_meshes += 1; self.instance_matrices.append(self.allocator, m0) catch {}; }
-                        if (inst1.is_visible) { self.stats.rendered_meshes += 1; self.instance_matrices.append(self.allocator, m1) catch {}; }
-                        if (inst2.is_visible) { self.stats.rendered_meshes += 1; self.instance_matrices.append(self.allocator, m2) catch {}; }
-                        if (inst3.is_visible) { self.stats.rendered_meshes += 1; self.instance_matrices.append(self.allocator, m3) catch {}; }
+                        if (inst0.is_visible) {
+                            self.stats.rendered_meshes += 1;
+                            self.instance_matrices.append(self.allocator, m0) catch {};
+                        }
+                        if (inst1.is_visible) {
+                            self.stats.rendered_meshes += 1;
+                            self.instance_matrices.append(self.allocator, m1) catch {};
+                        }
+                        if (inst2.is_visible) {
+                            self.stats.rendered_meshes += 1;
+                            self.instance_matrices.append(self.allocator, m2) catch {};
+                        }
+                        if (inst3.is_visible) {
+                            self.stats.rendered_meshes += 1;
+                            self.instance_matrices.append(self.allocator, m3) catch {};
+                        }
                     }
                 }
 
@@ -668,15 +701,26 @@ pub const Scene = struct {
                             .size = new_cap * @sizeOf(Mat4),
                         });
                         mesh.instance_buffer_capacity = new_cap;
+                        // Fresh buffer: must upload, then record hash.
+                        sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items[0..visible_count]));
+                        mesh.instance_hash = std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
+                        mesh.instance_uploaded_count = visible_count;
+                    } else {
+                        // Static instance sets skip the driver upload entirely.
+                        const h = std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
+                        if (visible_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
+                            sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items[0..visible_count]));
+                            mesh.instance_hash = h;
+                            mesh.instance_uploaded_count = visible_count;
+                        }
                     }
-                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items));
                 }
             } else {
                 self.stats.total_meshes += 1;
                 if (!mesh.is_visible) continue;
 
-                const model = mesh.getWorldMatrix();
-                const world_aabb = mesh.local_bounding_box.transform(model);
+                const model = self.worldMatrixCached(mesh);
+                const world_aabb = mesh.cached_aabb;
 
                 if (self.enable_frustum_culling and mesh.culling_strategy == .frustum) {
                     if (!frustum.intersectsAABB(world_aabb)) {
@@ -708,7 +752,7 @@ pub const Scene = struct {
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (self.enable_shadows) {
-            self.shadow_pass.render(self.meshes.items, cascades);
+            self.shadow_pass.render(self.meshes.items, self.frame_id, cascades);
             self.stats.draw_calls += 4;
         }
 
@@ -754,14 +798,16 @@ pub const Scene = struct {
         // State sorting: Group by shader type and textures, Front-to-Back Early-Z
         std.mem.sort(RenderMeshItem, self.render_queue.items, {}, sortRenderItems);
 
-        // Pack Point & Spot Lights
+        // Pack Point & Spot Lights. Directions are normalized once here so the
+        // fragment shaders can use them raw (no per-pixel normalize()).
+        const hemi_dir = self.light.direction.normalize();
         var light_counts = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
-        var point_pos_range = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 4;
-        var point_color_int = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 4;
-        var spot_pos_range = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 2;
-        var spot_dir_inner = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 2;
-        var spot_color_outer = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 2;
-        var spot_intensity = [_][4]f32{ .{ 0.0, 0.0, 0.0, 0.0 } } ** 2;
+        var point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var spot_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_dir_inner = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_color_outer = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_intensity = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
 
         var num_point: usize = 0;
         for (self.point_lights.items) |pl| {
@@ -847,14 +893,15 @@ pub const Scene = struct {
                 const metallic = if (pbr_mat) |p| p.metallic else 0.0;
                 const roughness = if (pbr_mat) |p| p.roughness else 0.5;
                 const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
+                const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
 
                 const fs_params = pbr_shd.FsParams{
                     .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
+                    .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .base_color_factor = mat_albedo,
-                    .pbr_factors = .{ metallic, roughness, self.ibl_intensity, 0.0 },
+                    .pbr_factors = .{ metallic, roughness, occlusion_strength, self.ibl_intensity },
                     .emissive_factor = emissive_col,
                     .shadow_params = .{
                         if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
@@ -894,7 +941,7 @@ pub const Scene = struct {
 
                 const fs_params = shd.FsParams{
                     .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                    .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
+                    .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
                     .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                     .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                     .diffuse_color = std_mat.getDiffuseColor4(),
@@ -962,7 +1009,7 @@ pub const Scene = struct {
 
             const inst_fs = inst_shd.FsParams{
                 .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                .light_dir = .{ self.light.direction.x, self.light.direction.y, self.light.direction.z, 4096.0 },
+                .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
                 .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
                 .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
                 .diffuse_color = std_mat.getDiffuseColor4(),
@@ -1065,7 +1112,7 @@ pub const Scene = struct {
         defer destroyed_views.deinit();
 
         for (self.pbr_materials.items) |mat| {
-            inline for (.{"albedo_texture", "normal_texture", "metallic_roughness_texture", "emissive_texture", "occlusion_texture"}) |field| {
+            inline for (.{ "albedo_texture", "normal_texture", "metallic_roughness_texture", "emissive_texture", "occlusion_texture" }) |field| {
                 if (@field(mat, field)) |*t| {
                     if (t.view.id != 0 and !destroyed_views.contains(t.view.id)) {
                         destroyed_views.put(t.view.id, {}) catch {};

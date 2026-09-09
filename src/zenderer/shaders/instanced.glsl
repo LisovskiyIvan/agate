@@ -94,10 +94,10 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
     vec2(0.5, 0.5)
 );
 
-float hashScreen(vec2 p) {
+float hash01(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z) * 6.28318530718;
+    return fract((p3.x + p3.y) * p3.z);
 }
 
 float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
@@ -120,19 +120,28 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     vec2 atlas_uv = clamped_local_uv * 0.5 + CASCADE_OFFSETS[cascade_idx];
     float depth = proj.z - depth_bias;
 
-    float angle = hashScreen(gl_FragCoord.xy);
-    float cos_a = cos(angle);
-    float sin_a = sin(angle);
-    mat2 rot = mat2(cos_a, sin_a, -sin_a, cos_a);
+    float h = hash01(gl_FragCoord.xy);
+    mat2 rot = mat2(1.0, 0.0, 0.0, 1.0);
+    if (h > 0.75) {
+        rot = mat2(0.0, 1.0, -1.0, 0.0);
+    } else if (h > 0.5) {
+        rot = mat2(-1.0, 0.0, 0.0, -1.0);
+    } else if (h > 0.25) {
+        rot = mat2(0.0, -1.0, 1.0, 0.0);
+    }
 
-    float filter_radius = (shadow_params.w / 4096.0) * 0.5;
+    float filter_radius = (shadow_params.w / 2048.0) * 0.5;
+
+    int taps = 16;
+    if (cascade_idx > 0) taps = 8;
 
     float lit = 0.0;
     for (int i = 0; i < 16; i++) {
+        if (i >= taps) break;
         vec2 offset = rot * POISSON_DISK[i] * filter_radius;
         lit += texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(atlas_uv + offset, depth));
     }
-    return lit * (1.0 / 16.0);
+    return lit / float(taps);
 }
 
 float calculateShadow(vec3 world_pos, vec3 N, vec3 L, out vec3 debug_color) {
@@ -171,7 +180,7 @@ void main() {
     vec3 N = normalize(v_normal);
 
     // Primary directional light
-    vec3 L = normalize(light_dir.xyz);
+    vec3 L = light_dir.xyz;
     float NdotL = max(dot(N, L), 0.0);
     vec3 debug_tint = vec3(0.0);
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
@@ -206,7 +215,7 @@ void main() {
         if (i >= num_spots) break;
         vec3 s_pos = spot_pos_range[i].xyz;
         float s_range = spot_pos_range[i].w;
-        vec3 s_dir = normalize(spot_dir_inner[i].xyz);
+        vec3 s_dir = spot_dir_inner[i].xyz;
         float cos_inner = spot_dir_inner[i].w;
         vec3 s_col = spot_color_outer[i].rgb;
         float cos_outer = spot_color_outer[i].w;

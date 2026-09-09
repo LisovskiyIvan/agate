@@ -45,6 +45,98 @@ pub const Texture = struct {
             .height = height,
         };
     }
+    /// Box-filter downsample of one RGBA8 level. Dims floor at 1, source coords
+    /// clamp at edges (handles NPOT).
+    fn downsampleLevel(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
+        var y: u32 = 0;
+        while (y < dst_h) : (y += 1) {
+            const sy0 = @min(y * 2, src_h - 1);
+            const sy1 = @min(y * 2 + 1, src_h - 1);
+            var x: u32 = 0;
+            while (x < dst_w) : (x += 1) {
+                const sx0 = @min(x * 2, src_w - 1);
+                const sx1 = @min(x * 2 + 1, src_w - 1);
+                const q00 = (sy0 * src_w + sx0) * 4;
+                const q10 = (sy0 * src_w + sx1) * 4;
+                const q01 = (sy1 * src_w + sx0) * 4;
+                const q11 = (sy1 * src_w + sx1) * 4;
+                const o = (y * dst_w + x) * 4;
+                inline for (0..4) |ch| {
+                    const sum: u32 = @as(u32, src[q00 + ch]) + @as(u32, src[q10 + ch]) + @as(u32, src[q01 + ch]) + @as(u32, src[q11 + ch]);
+                    dst[o + ch] = @intCast((sum + 2) / 4);
+                }
+            }
+        }
+    }
+
+    pub fn mipLevelCount(width: u32, height: u32) u32 {
+        var levels: u32 = 1;
+        var w = width;
+        var h = height;
+        while ((w > 1 or h > 1) and levels < 16) {
+            w = @max(1, w / 2);
+            h = @max(1, h / 2);
+            levels += 1;
+        }
+        return levels;
+    }
+
+    /// initRaw plus a full CPU mipmap chain. Load-time cost only; minification
+    /// becomes a trilinear fetch instead of cache-thrashing level 0.
+    pub fn initRawMipped(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, options: Options) !Texture {
+        const levels = mipLevelCount(width, height);
+        if (levels == 1) return initRaw(width, height, rgba_pixels, options);
+
+        var img_desc = sg.ImageDesc{
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .pixel_format = .RGBA8,
+            .num_mipmaps = @intCast(levels),
+        };
+        img_desc.data.mip_levels[0] = sg.asRange(rgba_pixels);
+
+        var mip_bufs: [16]?[]u8 = @splat(null);
+        defer {
+            for (1..levels) |m| {
+                if (mip_bufs[m]) |buf| allocator.free(buf);
+            }
+        }
+
+        var prev_w = width;
+        var prev_h = height;
+        var prev: []const u8 = rgba_pixels;
+        for (1..levels) |m| {
+            const cur_w: u32 = @max(1, prev_w / 2);
+            const cur_h: u32 = @max(1, prev_h / 2);
+            const cur = try allocator.alloc(u8, @as(usize, cur_w) * cur_h * 4);
+            mip_bufs[m] = cur;
+            downsampleLevel(prev, prev_w, prev_h, cur, cur_w, cur_h);
+            img_desc.data.mip_levels[m] = sg.asRange(cur);
+            prev_w = cur_w;
+            prev_h = cur_h;
+            prev = cur;
+        }
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = options.min_filter,
+            .mag_filter = options.mag_filter,
+            .mipmap_filter = .LINEAR,
+            .wrap_u = options.wrap_u,
+            .wrap_v = options.wrap_v,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .width = width,
+            .height = height,
+        };
+    }
 
     pub fn createWhite1x1() Texture {
         const white = [_]u8{ 255, 255, 255, 255 };
@@ -170,7 +262,7 @@ pub const Texture = struct {
         });
     }
 
-    pub fn fromMemory(bytes: []const u8, options: Options) !Texture {
+    pub fn fromMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
         var w: c_int = 0;
         var h: c_int = 0;
         var channels_in_file: c_int = 0;
@@ -195,7 +287,7 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         const slice = data[0..size_bytes];
 
-        return initRaw(width, height, slice, options);
+        return initRawMipped(allocator, width, height, slice, options);
     }
 
     pub fn fromFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
@@ -223,7 +315,7 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         const slice = data[0..size_bytes];
 
-        return initRaw(width, height, slice, options);
+        return initRawMipped(allocator, width, height, slice, options);
     }
 
     pub fn deinit(self: *Texture) void {
@@ -636,3 +728,19 @@ pub const CubeTexture = struct {
         return fromEquirectangular(allocator, bytes, face_size);
     }
 };
+
+test "mipLevelCount covers powers of two and minimums" {
+    try std.testing.expectEqual(@as(u32, 1), Texture.mipLevelCount(1, 1));
+    try std.testing.expectEqual(@as(u32, 2), Texture.mipLevelCount(2, 2));
+    try std.testing.expectEqual(@as(u32, 10), Texture.mipLevelCount(512, 512));
+    try std.testing.expectEqual(@as(u32, 3), Texture.mipLevelCount(5, 3));
+}
+
+test "downsampleLevel handles odd dimensions and averages correctly" {
+    var src: [3 * 5 * 4]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @intCast(i % 251);
+    var dst: [1 * 2 * 4]u8 = undefined;
+    Texture.downsampleLevel(&src, 3, 5, &dst, 1, 2);
+    // Top-left texel averages src bytes {0,4,12,16}: (0+4+12+16+2)/4 = 8.
+    try std.testing.expectEqual(@as(u8, 8), dst[0]);
+}

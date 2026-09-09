@@ -55,7 +55,7 @@ pub const UICanvas = struct {
     capacity_indices: usize = 24576,
 
     pub fn init(allocator: std.mem.Allocator) !UICanvas {
-        const tex = try Texture.fromMemory(font_png_data, .{
+        const tex = try Texture.fromMemory(allocator, font_png_data, .{
             .min_filter = .LINEAR,
             .mag_filter = .LINEAR,
             .wrap_u = .CLAMP_TO_EDGE,

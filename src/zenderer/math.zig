@@ -10,6 +10,9 @@ pub const Color4 = color.Color4;
 pub const mat4 = @import("math/mat4.zig");
 pub const Mat4 = mat4.Mat4;
 
+pub const quat = @import("math/quat.zig");
+pub const Quat = quat.Quat;
+
 pub const bounding_box = @import("math/bounding_box.zig");
 pub const BoundingBox = bounding_box.BoundingBox;
 

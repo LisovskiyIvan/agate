@@ -19,14 +19,15 @@ pub const ShadowPass = struct {
     inst_pipeline_u32: sg.Pipeline,
 
     pub fn init() ShadowPass {
+        // 2048 atlas holding 4x 1024 cascades (2x2). Was 4096/2048: same look
+        // for near geometry, 4x fewer depth texels rasterized per frame.
         const depth_img = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
             .pixel_format = .DEPTH,
-            .width = 4096,
-            .height = 4096,
+            .width = 2048,
+            .height = 2048,
             .sample_count = 1,
         });
-
         const att_view = sg.makeView(.{
             .depth_stencil_attachment = .{ .image = depth_img },
         });
@@ -120,6 +121,7 @@ pub const ShadowPass = struct {
     pub fn render(
         self: *ShadowPass,
         meshes: []const *Mesh,
+        frame_id: u64,
         cascades: [4]Mat4,
     ) void {
         var shadow_action = sg.PassAction{};
@@ -133,7 +135,7 @@ pub const ShadowPass = struct {
         shadow_pass.attachments.depth_stencil = self.attachment_view;
         sg.beginPass(shadow_pass);
 
-        const CASCADE_RES: i32 = 2048;
+        const CASCADE_RES: i32 = 1024;
 
         for (0..4) |c_idx| {
             const light_view_proj = cascades[c_idx];
@@ -168,7 +170,9 @@ pub const ShadowPass = struct {
                     sg.draw(0, mesh.index_count, mesh.visible_instance_count);
                 } else {
                     if (!mesh.is_visible) continue;
-                    const aabb_w = mesh.getWorldBoundingBox();
+                    // Scene.render() already cached world matrix + AABB this frame;
+                    // fall back to direct computation if it didn't (stale or external call).
+                    const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
                     if (!c_frustum.intersectsAABB(aabb_w)) continue;
 
                     const pip_id = if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id;
@@ -180,7 +184,7 @@ pub const ShadowPass = struct {
                     bind.index_buffer = mesh.index_buffer;
                     sg.applyBindings(bind);
 
-                    const model = mesh.getWorldMatrix();
+                    const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
                     const shadow_vs = shadow_shd.VsParams{
                         .mvp = Mat4.mul(light_view_proj, model),
                     };

@@ -20,7 +20,7 @@ const Texture = @import("../texture.zig").Texture;
 
 pub const SceneLoader = struct {
     fn loadTextureFromView(
-        _: *Scene,
+        scene: *Scene,
         gltf: *c.cgltf_data,
         image_cache: []?Texture,
         view: [*c]const c.cgltf_texture_view,
@@ -52,7 +52,7 @@ pub const SceneLoader = struct {
         const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
         const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
 
-        if (Texture.fromMemory(img_data, .{})) |loaded| {
+        if (Texture.fromMemory(scene.allocator, img_data, .{})) |loaded| {
             if (img_idx) |idx| {
                 image_cache[idx] = loaded;
             }
@@ -129,7 +129,6 @@ pub const SceneLoader = struct {
 
             materials[i] = .{ .pbr = pbr_mat };
         }
-
 
         // 2. Parse meshes and primitives (preserving glTF node transforms)
         var spawned_meshes = std.ArrayList(*Mesh).empty;
@@ -298,7 +297,6 @@ pub const SceneLoader = struct {
                 computeTangents(vertices, null, null);
             }
         }
-
 
         const vbuf = sg.makeBuffer(.{
             .data = sg.asRange(vertices),

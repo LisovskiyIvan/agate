@@ -73,6 +73,13 @@ pub const Mesh = struct {
     instance_buffer: sg.Buffer = .{},
     instance_buffer_capacity: usize = 0,
     visible_instance_count: u32 = 0,
+    // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
+    cached_matrix: Mat4 = Mat4.identity,
+    cached_aabb: BoundingBox = BoundingBox.zero,
+    cached_frame: u64 = std.math.maxInt(u64),
+    // Instance buffer upload dedup: skip sg.updateBuffer when data unchanged.
+    instance_hash: u64 = 0,
+    instance_uploaded_count: usize = 0,
 
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
@@ -673,4 +680,3 @@ pub const MeshBuilder = struct {
         return mesh;
     }
 };
-

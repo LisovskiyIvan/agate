@@ -137,11 +137,70 @@ pub fn build(b: *Build) !void {
         },
     });
     mod_zenderer.addIncludePath(b.path("src/zenderer/c"));
+    mod_zenderer.addIncludePath(b.path("src/zenderer/c/box3d/include"));
     mod_zenderer.addCSourceFile(.{
         .file = b.path("src/zenderer/c/c_impl.c"),
         .flags = &.{"-std=c99"},
     });
+    // Box3D v0.1.0, vendored C17 sources (MIT). Public headers under
+    // src/zenderer/c/box3d/include, internal headers resolve inside src/.
+    mod_zenderer.addCSourceFiles(.{
+        .files = &.{
+            "src/zenderer/c/box3d/src/aabb.c",
+            "src/zenderer/c/box3d/src/arena_allocator.c",
+            "src/zenderer/c/box3d/src/bitset.c",
+            "src/zenderer/c/box3d/src/block_allocator.c",
+            "src/zenderer/c/box3d/src/body.c",
+            "src/zenderer/c/box3d/src/broad_phase.c",
+            "src/zenderer/c/box3d/src/capsule.c",
+            "src/zenderer/c/box3d/src/compound.c",
+            "src/zenderer/c/box3d/src/constraint_graph.c",
+            "src/zenderer/c/box3d/src/contact.c",
+            "src/zenderer/c/box3d/src/contact_solver.c",
+            "src/zenderer/c/box3d/src/convex_manifold.c",
+            "src/zenderer/c/box3d/src/core.c",
+            "src/zenderer/c/box3d/src/distance.c",
+            "src/zenderer/c/box3d/src/distance_joint.c",
+            "src/zenderer/c/box3d/src/dynamic_tree.c",
+            "src/zenderer/c/box3d/src/height_field.c",
+            "src/zenderer/c/box3d/src/hull.c",
+            "src/zenderer/c/box3d/src/id_pool.c",
+            "src/zenderer/c/box3d/src/island.c",
+            "src/zenderer/c/box3d/src/joint.c",
+            "src/zenderer/c/box3d/src/manifold.c",
+            "src/zenderer/c/box3d/src/math_functions.c",
+            "src/zenderer/c/box3d/src/mesh.c",
+            "src/zenderer/c/box3d/src/mesh_contact.c",
+            "src/zenderer/c/box3d/src/motor_joint.c",
+            "src/zenderer/c/box3d/src/mover.c",
+            "src/zenderer/c/box3d/src/name_cache.c",
+            "src/zenderer/c/box3d/src/parallel_for.c",
+            "src/zenderer/c/box3d/src/parallel_joint.c",
+            "src/zenderer/c/box3d/src/physics_world.c",
+            "src/zenderer/c/box3d/src/prismatic_joint.c",
+            "src/zenderer/c/box3d/src/recording.c",
+            "src/zenderer/c/box3d/src/recording_replay.c",
+            "src/zenderer/c/box3d/src/revolute_joint.c",
+            "src/zenderer/c/box3d/src/scheduler.c",
+            "src/zenderer/c/box3d/src/sensor.c",
+            "src/zenderer/c/box3d/src/shape.c",
+            "src/zenderer/c/box3d/src/simd.c",
+            "src/zenderer/c/box3d/src/solver.c",
+            "src/zenderer/c/box3d/src/solver_set.c",
+            "src/zenderer/c/box3d/src/sphere.c",
+            "src/zenderer/c/box3d/src/spherical_joint.c",
+            "src/zenderer/c/box3d/src/table.c",
+            "src/zenderer/c/box3d/src/timer.c",
+            "src/zenderer/c/box3d/src/triangle_manifold.c",
+            "src/zenderer/c/box3d/src/types.c",
+            "src/zenderer/c/box3d/src/weld_joint.c",
+            "src/zenderer/c/box3d/src/wheel_joint.c",
+            "src/zenderer/c/box3d/src/world_snapshot.c",
+        },
+        .flags = &.{"-std=c17"},
+    });
     mod_zenderer.link_libc = true;
+    mod_zenderer.linkSystemLibrary("m", .{});
 
     const exe = b.addExecutable(.{
         .name = "zenderer",
@@ -159,7 +218,6 @@ pub fn build(b: *Build) !void {
 
     const run = b.addRunArtifact(exe);
     b.step("run", "Run the window").dependOn(&run.step);
-
     const lib_tests = b.addTest(.{
         .root_module = mod_zenderer,
     });
