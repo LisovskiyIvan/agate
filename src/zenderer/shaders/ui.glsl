@@ -44,14 +44,14 @@ void main() {
         // Mode 1: Crisp bold SDF text with screen-space anti-aliasing
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
         float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
-        float edge = clamp(0.35 - v_params.z, 0.12, 0.48);
+        float edge = clamp(0.32 - v_params.z, 0.10, 0.48);
         float alpha = smoothstep(edge - w, edge + w, dist);
         frag_color = vec4(v_color.rgb, v_color.a * alpha);
     } else {
         // Mode 2: SDF text with dark outline / drop shadow
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
         float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
-        float edge = clamp(0.35 - v_params.z, 0.12, 0.48);
+        float edge = clamp(0.32 - v_params.z, 0.10, 0.48);
         float text_alpha = smoothstep(edge - w, edge + w, dist);
         float outline_edge = clamp(edge - v_params.y, 0.05, edge - 0.02);
         float outline_alpha = smoothstep(outline_edge - w, outline_edge + w, dist);
