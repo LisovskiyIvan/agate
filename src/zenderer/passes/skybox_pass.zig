@@ -60,7 +60,7 @@ pub const SkyboxPass = struct {
             .shader = sg.makeShader(skybox_shd.skyboxShaderDesc(sg.queryBackend())),
             .index_type = .UINT16,
             .depth = .{
-                .compare = .EQUAL, // Skybox rendered only at maximum depth (depth = 1.0)
+                .compare = .LESS_EQUAL, // Skybox rendered at maximum depth (depth = 1.0) behind scene geometry
                 .write_enabled = false,
             },
             .cull_mode = .NONE,

@@ -41,23 +41,23 @@ void main() {
         // Mode 0: Solid UI quad / button / panel / border
         frag_color = v_color;
     } else if (v_params.x < 1.5) {
-        // Mode 1: Crisp SDF text with screen-space anti-aliasing
+        // Mode 1: Crisp bold SDF text with screen-space anti-aliasing
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
-        float w = fwidth(dist);
-        if (w < 0.001) w = 0.05;
-        float alpha = smoothstep(0.5 - w, 0.5 + w, dist);
+        float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
+        float edge = clamp(0.35 - v_params.z, 0.12, 0.48);
+        float alpha = smoothstep(edge - w, edge + w, dist);
         frag_color = vec4(v_color.rgb, v_color.a * alpha);
     } else {
         // Mode 2: SDF text with dark outline / drop shadow
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
-        float w = fwidth(dist);
-        if (w < 0.001) w = 0.05;
-        float text_alpha = smoothstep(0.5 - w, 0.5 + w, dist);
-        float outline_edge = clamp(0.5 - v_params.y, 0.05, 0.48);
+        float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
+        float edge = clamp(0.35 - v_params.z, 0.12, 0.48);
+        float text_alpha = smoothstep(edge - w, edge + w, dist);
+        float outline_edge = clamp(edge - v_params.y, 0.05, edge - 0.02);
         float outline_alpha = smoothstep(outline_edge - w, outline_edge + w, dist);
-        vec3 outline_col = vec3(0.0, 0.0, 0.0);
+        vec3 outline_col = vec3(0.02, 0.03, 0.05);
         vec3 col = mix(outline_col, v_color.rgb, text_alpha);
-        frag_color = vec4(col, max(text_alpha, outline_alpha * 0.85) * v_color.a);
+        frag_color = vec4(col, max(text_alpha, outline_alpha * 0.90) * v_color.a);
     }
 }
 @end

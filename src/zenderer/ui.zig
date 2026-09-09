@@ -202,15 +202,20 @@ pub const UICanvas = struct {
 
     /// Draws crisp Signed Distance Field (SDF) text
     pub fn drawText(self: *UICanvas, text: []const u8, x: f32, y: f32, font_size: f32, color: Color4) void {
-        self.drawTextInternal(text, x, y, font_size, color, 1.0, 0.0);
+        self.drawTextInternal(text, x, y, font_size, color, 1.0, 0.0, 0.0);
+    }
+
+    /// Draws bold Signed Distance Field (SDF) text
+    pub fn drawTextBold(self: *UICanvas, text: []const u8, x: f32, y: f32, font_size: f32, color: Color4, extra_boldness: f32) void {
+        self.drawTextInternal(text, x, y, font_size, color, 1.0, 0.0, extra_boldness);
     }
 
     /// Draws SDF text with a high-contrast dark outline / shadow
     pub fn drawTextWithOutline(self: *UICanvas, text: []const u8, x: f32, y: f32, font_size: f32, color: Color4, outline_width: f32) void {
-        self.drawTextInternal(text, x, y, font_size, color, 2.0, outline_width);
+        self.drawTextInternal(text, x, y, font_size, color, 2.0, outline_width, 0.0);
     }
 
-    fn drawTextInternal(self: *UICanvas, text: []const u8, start_x: f32, start_y: f32, font_size: f32, color: Color4, mode: f32, outline_width: f32) void {
+    fn drawTextInternal(self: *UICanvas, text: []const u8, start_x: f32, start_y: f32, font_size: f32, color: Color4, mode: f32, outline_width: f32, boldness: f32) void {
         const char_w = font_size * 0.5;
         const char_h = font_size;
         var cur_x = start_x;
@@ -237,7 +242,7 @@ pub const UICanvas = struct {
                 uv.u_max,
                 uv.v_max,
                 color,
-                .{ mode, outline_width, 0.0, 0.0 },
+                .{ mode, outline_width, boldness, 0.0 },
             );
             cur_x += char_w;
         }
