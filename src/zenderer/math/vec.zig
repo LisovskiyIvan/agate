@@ -84,8 +84,16 @@ pub const Vec3 = extern struct {
         return a.sub(b).lengthSq();
     }
 
-    pub fn mul(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x * b.x, .y = a.y * b.y, .z = a.z * b.z };
+    pub inline fn toSimd(v: Vec3) @Vector(4, f32) {
+        return .{ v.x, v.y, v.z, 0.0 };
+    }
+
+    pub inline fn fromSimd(v: @Vector(4, f32)) Vec3 {
+        return .{ .x = v[0], .y = v[1], .z = v[2] };
+    }
+
+    pub inline fn toArray(v: Vec3) [3]f32 {
+        return .{ v.x, v.y, v.z };
     }
 };
 
@@ -96,8 +104,41 @@ pub const Vec4 = extern struct {
     w: f32 = 0.0,
 
     pub const zero = Vec4{ .x = 0, .y = 0, .z = 0, .w = 0 };
+    pub const one = Vec4{ .x = 1, .y = 1, .z = 1, .w = 1 };
 
     pub fn new(x: f32, y: f32, z: f32, w: f32) Vec4 {
         return .{ .x = x, .y = y, .z = z, .w = w };
+    }
+
+    pub inline fn toSimd(v: Vec4) @Vector(4, f32) {
+        return .{ v.x, v.y, v.z, v.w };
+    }
+
+    pub inline fn fromSimd(v: @Vector(4, f32)) Vec4 {
+        return .{ .x = v[0], .y = v[1], .z = v[2], .w = v[3] };
+    }
+
+    pub inline fn toArray(v: Vec4) [4]f32 {
+        return .{ v.x, v.y, v.z, v.w };
+    }
+
+    pub inline fn add(a: Vec4, b: Vec4) Vec4 {
+        return fromSimd(a.toSimd() + b.toSimd());
+    }
+
+    pub inline fn sub(a: Vec4, b: Vec4) Vec4 {
+        return fromSimd(a.toSimd() - b.toSimd());
+    }
+
+    pub inline fn scale(v: Vec4, s: f32) Vec4 {
+        const vs: @Vector(4, f32) = @splat(s);
+        return fromSimd(v.toSimd() * vs);
+    }
+
+    pub inline fn lerp(a: Vec4, b: Vec4, t: f32) Vec4 {
+        const va = a.toSimd();
+        const vb = b.toSimd();
+        const vt: @Vector(4, f32) = @splat(t);
+        return fromSimd(va + (vb - va) * vt);
     }
 };

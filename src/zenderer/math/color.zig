@@ -34,16 +34,28 @@ pub const Color4 = extern struct {
         return .{ .r = r, .g = g, .b = b, .a = a };
     }
 
-    pub fn toArray(self: Color4) [4]f32 {
+    pub inline fn toSimd(self: Color4) @Vector(4, f32) {
         return .{ self.r, self.g, self.b, self.a };
     }
 
-    pub fn lerp(c1: Color4, c2: Color4, t: f32) Color4 {
-        return .{
-            .r = c1.r + (c2.r - c1.r) * t,
-            .g = c1.g + (c2.g - c1.g) * t,
-            .b = c1.b + (c2.b - c1.b) * t,
-            .a = c1.a + (c2.a - c1.a) * t,
-        };
+    pub inline fn fromSimd(v: @Vector(4, f32)) Color4 {
+        return .{ .r = v[0], .g = v[1], .b = v[2], .a = v[3] };
+    }
+
+    pub inline fn toArray(self: Color4) [4]f32 {
+        return .{ self.r, self.g, self.b, self.a };
+    }
+
+    pub inline fn lerp(c1: Color4, c2: Color4, t: f32) Color4 {
+        const v1 = c1.toSimd();
+        const v2 = c2.toSimd();
+        const vt: @Vector(4, f32) = @splat(t);
+        return fromSimd(v1 + (v2 - v1) * vt);
+    }
+
+    pub inline fn scale(c: Color4, s: f32) Color4 {
+        const v = c.toSimd();
+        const vs: @Vector(4, f32) = @splat(s);
+        return fromSimd(v * vs);
     }
 };

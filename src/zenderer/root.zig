@@ -66,4 +66,6 @@ pub const ui = @import("ui.zig");
 pub const UICanvas = ui.UICanvas;
 pub const UIVertex = ui.UIVertex;
 
+pub const passes = @import("passes/mod.zig");
+
 pub const sokol = @import("sokol");

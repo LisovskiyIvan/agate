@@ -1,0 +1,220 @@
+const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
+const sglue = sokol.glue;
+const post_shd = @import("postprocess_shader");
+const PostProcessConfig = @import("../postprocess.zig").PostProcessConfig;
+
+pub const PostProcessPass = struct {
+    offscreen_color_image: sg.Image = .{},
+    offscreen_color_att_view: sg.View = .{},
+    offscreen_depth_image: sg.Image = .{},
+    offscreen_depth_att_view: sg.View = .{},
+    offscreen_resolve_image: sg.Image = .{},
+    offscreen_resolve_att_view: sg.View = .{},
+    offscreen_resolve_tex_view: sg.View = .{},
+    postprocess_sampler: sg.Sampler = .{},
+    postprocess_pipeline: sg.Pipeline = .{},
+    postprocess_quad_vb: sg.Buffer = .{},
+    postprocess_quad_ib: sg.Buffer = .{},
+    width: i32 = 0,
+    height: i32 = 0,
+    sample_count: i32 = 1,
+
+    pub fn init() PostProcessPass {
+        // Fullscreen Quad (XY, UV)
+        const quad_vertices = [_]f32{
+            // x,     y,    u,   v
+            -1.0, -1.0,  0.0, 0.0,
+             1.0, -1.0,  1.0, 0.0,
+             1.0,  1.0,  1.0, 1.0,
+            -1.0,  1.0,  0.0, 1.0,
+        };
+        const quad_indices = [_]u16{
+            0, 1, 2,
+            0, 2, 3,
+        };
+
+        const vb = sg.makeBuffer(.{
+            .data = sg.asRange(&quad_vertices),
+        });
+        const ib = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(&quad_indices),
+        });
+
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+
+        var pp_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .depth = .{
+                .compare = .ALWAYS,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        pp_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        pp_desc.layout.attrs[post_shd.ATTR_postprocess_position] = .{
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        pp_desc.layout.attrs[post_shd.ATTR_postprocess_texcoord0] = .{
+            .format = .FLOAT2,
+            .offset = 2 * @sizeOf(f32),
+        };
+        const pip = sg.makePipeline(pp_desc);
+
+        return .{
+            .postprocess_sampler = smp,
+            .postprocess_pipeline = pip,
+            .postprocess_quad_vb = vb,
+            .postprocess_quad_ib = ib,
+        };
+    }
+
+    pub fn resize(self: *PostProcessPass, width: i32, height: i32) void {
+        if (width <= 0 or height <= 0) return;
+        if (self.width == width and self.height == height) return;
+
+        if (self.offscreen_color_image.id != 0) {
+            sg.destroyImage(self.offscreen_color_image);
+            sg.destroyView(self.offscreen_color_att_view);
+            if (self.offscreen_resolve_image.id != 0) {
+                sg.destroyImage(self.offscreen_resolve_image);
+                sg.destroyView(self.offscreen_resolve_att_view);
+                sg.destroyView(self.offscreen_resolve_tex_view);
+            } else {
+                sg.destroyView(self.offscreen_resolve_tex_view);
+            }
+            sg.destroyImage(self.offscreen_depth_image);
+            sg.destroyView(self.offscreen_depth_att_view);
+            self.offscreen_resolve_image = .{};
+            self.offscreen_resolve_att_view = .{};
+            self.offscreen_resolve_tex_view = .{};
+        }
+
+        const sw = sglue.swapchain();
+        const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
+        const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
+        const samples: i32 = if (sw.sample_count > 1) sw.sample_count else 1;
+
+        const col_img = sg.makeImage(.{
+            .usage = .{ .color_attachment = true },
+            .width = width,
+            .height = height,
+            .pixel_format = color_fmt,
+            .sample_count = samples,
+        });
+        const col_att = sg.makeView(.{
+            .color_attachment = .{ .image = col_img },
+        });
+
+        if (samples > 1) {
+            const res_img = sg.makeImage(.{
+                .usage = .{ .resolve_attachment = true },
+                .width = width,
+                .height = height,
+                .pixel_format = color_fmt,
+                .sample_count = 1,
+            });
+            const res_att = sg.makeView(.{
+                .resolve_attachment = .{ .image = res_img },
+            });
+            const res_tex = sg.makeView(.{
+                .texture = .{ .image = res_img },
+            });
+            self.offscreen_resolve_image = res_img;
+            self.offscreen_resolve_att_view = res_att;
+            self.offscreen_resolve_tex_view = res_tex;
+        } else {
+            const col_tex = sg.makeView(.{
+                .texture = .{ .image = col_img },
+            });
+            self.offscreen_resolve_tex_view = col_tex;
+        }
+
+        const depth_img = sg.makeImage(.{
+            .usage = .{ .depth_stencil_attachment = true },
+            .width = width,
+            .height = height,
+            .pixel_format = depth_fmt,
+            .sample_count = samples,
+        });
+        const depth_att = sg.makeView(.{
+            .depth_stencil_attachment = .{ .image = depth_img },
+        });
+
+        self.width = width;
+        self.height = height;
+        self.sample_count = samples;
+        self.offscreen_color_image = col_img;
+        self.offscreen_color_att_view = col_att;
+        self.offscreen_depth_image = depth_img;
+        self.offscreen_depth_att_view = depth_att;
+    }
+
+    pub fn render(self: *PostProcessPass, config: PostProcessConfig, cur_w: i32, cur_h: i32) void {
+        sg.applyPipeline(self.postprocess_pipeline);
+        var post_bind = sg.Bindings{};
+        post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
+        post_bind.index_buffer = self.postprocess_quad_ib;
+        post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
+        post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
+        sg.applyBindings(post_bind);
+
+        const pp_params = post_shd.FsParams{
+            .params1 = .{
+                config.exposure,
+                config.bloom_threshold,
+                config.bloom_intensity,
+                config.bloom_radius,
+            },
+            .params2 = .{
+                config.vignette_intensity,
+                config.vignette_radius,
+                config.saturation,
+                config.contrast,
+            },
+            .params3 = .{
+                @floatFromInt(@intFromEnum(config.tonemapping)),
+                config.chromatic_aberration,
+                if (config.bloom_enabled) 1.0 else 0.0,
+                if (config.vignette_enabled) 1.0 else 0.0,
+            },
+            .resolution = .{
+                @floatFromInt(cur_w),
+                @floatFromInt(cur_h),
+                1.0 / @as(f32, @floatFromInt(cur_w)),
+                1.0 / @as(f32, @floatFromInt(cur_h)),
+            },
+        };
+        sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
+        sg.draw(0, 6, 1);
+    }
+
+    pub fn deinit(self: *PostProcessPass) void {
+        if (self.offscreen_color_image.id != 0) {
+            sg.destroyImage(self.offscreen_color_image);
+            sg.destroyView(self.offscreen_color_att_view);
+            if (self.offscreen_resolve_image.id != 0) {
+                sg.destroyImage(self.offscreen_resolve_image);
+                sg.destroyView(self.offscreen_resolve_att_view);
+                sg.destroyView(self.offscreen_resolve_tex_view);
+            } else {
+                sg.destroyView(self.offscreen_resolve_tex_view);
+            }
+            sg.destroyImage(self.offscreen_depth_image);
+            sg.destroyView(self.offscreen_depth_att_view);
+        }
+        sg.destroySampler(self.postprocess_sampler);
+        sg.destroyPipeline(self.postprocess_pipeline);
+        sg.destroyBuffer(self.postprocess_quad_vb);
+        sg.destroyBuffer(self.postprocess_quad_ib);
+    }
+};

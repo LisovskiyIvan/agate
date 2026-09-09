@@ -1,0 +1,189 @@
+const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
+const shadow_shd = @import("shadow_shader");
+const math = @import("math");
+const Mat4 = math.Mat4;
+const mesh_mod = @import("../mesh.zig");
+const Mesh = mesh_mod.Mesh;
+const Vertex = mesh_mod.Vertex;
+
+pub const ShadowPass = struct {
+    image: sg.Image,
+    attachment_view: sg.View,
+    texture_view: sg.View,
+    sampler: sg.Sampler,
+    pipeline_u16: sg.Pipeline,
+    pipeline_u32: sg.Pipeline,
+    inst_pipeline_u16: sg.Pipeline,
+    inst_pipeline_u32: sg.Pipeline,
+
+    pub fn init() ShadowPass {
+        const depth_img = sg.makeImage(.{
+            .usage = .{ .depth_stencil_attachment = true },
+            .pixel_format = .DEPTH,
+            .width = 2048,
+            .height = 2048,
+            .sample_count = 1,
+        });
+
+        const att_view = sg.makeView(.{
+            .depth_stencil_attachment = .{ .image = depth_img },
+        });
+
+        const tex_view = sg.makeView(.{
+            .texture = .{ .image = depth_img },
+        });
+
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .compare = .LESS_EQUAL,
+        });
+
+        // 1. Shadow Depth pipelines (regular meshes)
+        var shadow_pip_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(shadow_shd.shadowShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = .DEPTH,
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+                .bias = 2.0,
+                .bias_slope_scale = 2.0,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        shadow_pip_desc.colors[0].pixel_format = .NONE;
+        shadow_pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        shadow_pip_desc.layout.attrs[shadow_shd.ATTR_shadow_position] = .{
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+
+        const pip_u16 = sg.makePipeline(shadow_pip_desc);
+        shadow_pip_desc.index_type = .UINT32;
+        const pip_u32 = sg.makePipeline(shadow_pip_desc);
+
+        // 2. Shadow Depth pipelines (instanced meshes)
+        var shadow_inst_desc = sg.PipelineDesc{
+            .shader = sg.makeShader(shadow_shd.shadowInstancedShaderDesc(sg.queryBackend())),
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = .DEPTH,
+                .compare = .LESS_EQUAL,
+                .write_enabled = true,
+                .bias = 2.0,
+                .bias_slope_scale = 2.0,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        shadow_inst_desc.colors[0].pixel_format = .NONE;
+        shadow_inst_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        shadow_inst_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(Mat4),
+        };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+        shadow_inst_desc.layout.attrs[shadow_shd.ATTR_shadow_instanced_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+
+        const inst_pip_u16 = sg.makePipeline(shadow_inst_desc);
+        shadow_inst_desc.index_type = .UINT32;
+        const inst_pip_u32 = sg.makePipeline(shadow_inst_desc);
+
+        return .{
+            .image = depth_img,
+            .attachment_view = att_view,
+            .texture_view = tex_view,
+            .sampler = smp,
+            .pipeline_u16 = pip_u16,
+            .pipeline_u32 = pip_u32,
+            .inst_pipeline_u16 = inst_pip_u16,
+            .inst_pipeline_u32 = inst_pip_u32,
+        };
+    }
+
+    pub fn render(
+        self: *ShadowPass,
+        meshes: []const *Mesh,
+        light_view_proj: Mat4,
+    ) void {
+        var shadow_action = sg.PassAction{};
+        shadow_action.depth = .{
+            .load_action = .CLEAR,
+            .clear_value = 1.0,
+        };
+        var shadow_pass = sg.Pass{
+            .action = shadow_action,
+        };
+        shadow_pass.attachments.depth_stencil = self.attachment_view;
+        sg.beginPass(shadow_pass);
+
+        for (meshes) |mesh| {
+            if (!mesh.cast_shadows) continue;
+
+            if (mesh.instances.items.len > 0) {
+                if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+
+                const pip = if (mesh.index_type == .UINT32) self.inst_pipeline_u32 else self.inst_pipeline_u16;
+                sg.applyPipeline(pip);
+
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = mesh.vertex_buffer;
+                bind.vertex_buffers[1] = mesh.instance_buffer;
+                bind.index_buffer = mesh.index_buffer;
+                sg.applyBindings(bind);
+
+                const inst_vs = shadow_shd.VsInstParams{
+                    .light_view_proj = light_view_proj,
+                };
+                sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
+                sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+            } else {
+                if (!mesh.is_visible) continue;
+
+                const pip = if (mesh.index_type == .UINT32) self.pipeline_u32 else self.pipeline_u16;
+                sg.applyPipeline(pip);
+
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = mesh.vertex_buffer;
+                bind.index_buffer = mesh.index_buffer;
+                sg.applyBindings(bind);
+
+                const model = mesh.getWorldMatrix();
+                const shadow_vs = shadow_shd.VsParams{
+                    .mvp = Mat4.mul(light_view_proj, model),
+                };
+                sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
+                sg.draw(0, mesh.index_count, 1);
+            }
+        }
+
+        sg.endPass();
+    }
+
+    pub fn deinit(self: *ShadowPass) void {
+        sg.destroyPipeline(self.pipeline_u16);
+        sg.destroyPipeline(self.pipeline_u32);
+        sg.destroyPipeline(self.inst_pipeline_u16);
+        sg.destroyPipeline(self.inst_pipeline_u32);
+        sg.destroyView(self.attachment_view);
+        sg.destroyView(self.texture_view);
+        sg.destroySampler(self.sampler);
+        sg.destroyImage(self.image);
+    }
+};

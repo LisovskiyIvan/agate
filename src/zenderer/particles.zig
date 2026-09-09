@@ -176,6 +176,7 @@ pub const ParticleSystem = struct {
             }
         }
 
+        const grav_dt = self.gravity.scale(dt);
         var i: usize = 0;
         while (i < self.active_count) {
             var p = &self.particles[i];
@@ -191,22 +192,17 @@ pub const ParticleSystem = struct {
                 }
             }
 
-            // Physics update
-            p.velocity = p.velocity.add(self.gravity.scale(dt));
+            // Physics update (hoisted gravity delta + scaled velocity)
+            p.velocity = p.velocity.add(grav_dt);
             p.position = p.position.add(p.velocity.scale(dt));
 
             const t = p.age / p.lifetime;
-            const current_size = math.lerp(p.size, p.size_end, t);
-            const current_color = Color4.new(
-                math.lerp(p.color.r, p.color_end.r, t),
-                math.lerp(p.color.g, p.color_end.g, t),
-                math.lerp(p.color.b, p.color_end.b, t),
-                math.lerp(p.color.a, p.color_end.a, t),
-            );
+            const current_size = p.size + (p.size_end - p.size) * t;
+            const current_color = Color4.lerp(p.color, p.color_end, t);
 
             self.instances[i] = .{
                 .pos_size = .{ p.position.x, p.position.y, p.position.z, current_size },
-                .color = .{ current_color.r, current_color.g, current_color.b, current_color.a },
+                .color = current_color.toArray(),
             };
             i += 1;
         }

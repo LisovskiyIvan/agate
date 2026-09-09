@@ -204,19 +204,26 @@ pub const PhysicsWorld = struct {
     }
 
     fn resolveCollision(_: *PhysicsWorld, a: *RigidBody, b: *RigidBody) void {
+        const pos_a = a.mesh.position;
+        const pos_b = b.mesh.position;
+        const center_delta = pos_b.sub(pos_a);
+        const center_dist_sq = center_delta.lengthSq();
+
+        // Broadphase early rejection
+        const bound_r_a = if (a.collider == .sphere) a.sphere_radius * a.mesh.scaling.x else a.box_extents.length() * a.mesh.scaling.x;
+        const bound_r_b = if (b.collider == .sphere) b.sphere_radius * b.mesh.scaling.x else b.box_extents.length() * b.mesh.scaling.x;
+        const max_dist = bound_r_a + bound_r_b;
+        if (center_dist_sq > max_dist * max_dist or center_dist_sq < 1e-8) return;
+
         if (a.collider == .sphere and b.collider == .sphere) {
             // Sphere vs Sphere
-            const pos_a = a.mesh.position;
-            const pos_b = b.mesh.position;
             const r_a = a.sphere_radius * a.mesh.scaling.x;
             const r_b = b.sphere_radius * b.mesh.scaling.x;
-            const delta = pos_b.sub(pos_a);
-            const dist_sq = delta.lengthSq();
             const min_dist = r_a + r_b;
 
-            if (dist_sq < min_dist * min_dist and dist_sq > 1e-8) {
-                const dist = @sqrt(dist_sq);
-                const normal = delta.scale(1.0 / dist);
+            if (center_dist_sq < min_dist * min_dist) {
+                const dist = @sqrt(center_dist_sq);
+                const normal = center_delta.scale(1.0 / dist);
                 const penetration = min_dist - dist;
                 const total_inv = a.inv_mass + b.inv_mass;
 
