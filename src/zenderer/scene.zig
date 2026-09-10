@@ -1189,6 +1189,10 @@ pub const Scene = struct {
                 .swapchain = sglue.swapchain(),
             });
 
+            const inv_view_proj = view_proj.invert() orelse Mat4.identity;
+            const sun_d = self.light.direction.normalize();
+            const sun_c = self.light.diffuse;
+
             self.postprocess_pass.render(
                 self.post_process,
                 ssao_view,
@@ -1197,6 +1201,13 @@ pub const Scene = struct {
                 self.ssao.intensity,
                 cur_w,
                 cur_h,
+                view_proj,
+                inv_view_proj,
+                eye,
+                sun_d,
+                sun_c,
+                camera.near,
+                camera.far,
             );
             self.stats.draw_calls += 1;
             self.stats.triangles += 2;

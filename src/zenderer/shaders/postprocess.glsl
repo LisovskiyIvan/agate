@@ -1,6 +1,7 @@
 // Fullscreen Post-Processing Shader for zenderer
 // Supports ACES Filmic & Reinhard Tone Mapping, Bloom, Vignette, Chromatic Aberration, Saturation & Contrast
 @header const m = @import("math")
+@ctype mat4 m.Mat4
 
 @vs vs
 @glsl_options fixup_clipspace
@@ -26,11 +27,25 @@ layout(binding = 0) uniform fs_params {
     vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_enabled (1/0), w: vignette_enabled (1/0)
     vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: fxaa_enabled (1/0)
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
+    vec4 camera_params; // x: near_z, y: far_z, z/w: unused
+    vec4 camera_pos; // xyz: camera world pos, w: unused
+    vec4 sun_dir; // xyz: sun direction (normalized), w: unused
+    vec4 sun_color; // xyz: sun color, w: unused
+    vec4 fog_params; // x: fog_enabled (1/0), y: fog_density, z: fog_height_falloff, w: fog_start_distance
+    vec4 fog_color; // xyz: fog_color, w: fog_sun_scattering
+    vec4 ssr_params; // x: ssr_enabled (1/0), y: ssr_intensity, z: ssr_thickness, w: ssr_max_distance
+    mat4 view_proj; // camera view-projection matrix
+    mat4 inv_view_proj; // inverse view-projection matrix
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
 layout(binding = 1) uniform texture2D ssao_tex;
+@image_sample_type depth_tex unfilterable_float
+layout(binding = 2) uniform texture2D depth_tex;
+
 layout(binding = 0) uniform sampler smp;
+@sampler_type depth_smp nonfiltering
+layout(binding = 1) uniform sampler depth_smp;
 
 in vec2 v_uv;
 out vec4 frag_color;
@@ -54,7 +69,129 @@ vec3 extractBright(vec3 c, float thresh) {
     return c * (factor / max(luma, 0.0001));
 }
 
-// Sample scene HDR color, apply chromatic aberration and SSAO
+vec3 reconstructWorldPos(vec2 uv, float depth) {
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 world = inv_view_proj * clip;
+    return world.xyz / world.w;
+}
+
+vec2 projectWorldToUv(vec3 world_pos) {
+    vec4 clip = view_proj * vec4(world_pos, 1.0);
+    if (clip.w <= 0.0001) return vec2(-1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
+    if (ssr_params.x < 0.5) return scene_color;
+    if (raw_depth >= 0.9999) return scene_color;
+
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec3 V = normalize(world_pos - camera_pos.xyz);
+
+    // Reconstruct world normal from depth buffer
+    vec2 texel = resolution.zw;
+    float d_r = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
+    float d_l = texture(sampler2D(depth_tex, depth_smp), uv - vec2(texel.x, 0.0)).r;
+    float d_u = texture(sampler2D(depth_tex, depth_smp), uv - vec2(0.0, texel.y)).r;
+    float d_d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, texel.y)).r;
+
+    vec3 p_r = reconstructWorldPos(uv + vec2(texel.x, 0.0), d_r);
+    vec3 p_l = reconstructWorldPos(uv - vec2(texel.x, 0.0), d_l);
+    vec3 p_u = reconstructWorldPos(uv - vec2(0.0, texel.y), d_u);
+    vec3 p_d = reconstructWorldPos(uv + vec2(0.0, texel.y), d_d);
+
+    vec3 dx = (abs(p_r.z - world_pos.z) < abs(p_l.z - world_pos.z)) ? (p_r - world_pos) : (world_pos - p_l);
+    vec3 dy = (abs(p_u.z - world_pos.z) < abs(p_d.z - world_pos.z)) ? (p_u - world_pos) : (world_pos - p_d);
+    vec3 N = normalize(cross(dx, dy));
+
+    // Only reflect on upward horizontal surfaces (floor/ground)
+    if (N.y < 0.45) return scene_color;
+
+    vec3 R = reflect(V, N);
+    if (R.y < 0.02) return scene_color;
+
+    float max_dist = ssr_params.w;
+    float thickness = ssr_params.z;
+    const int SSR_STEPS = 28;
+    float step_size = max_dist / float(SSR_STEPS);
+
+    vec3 ray_pos = world_pos + N * 0.08;
+
+    for (int i = 0; i < SSR_STEPS; i++) {
+        ray_pos += R * step_size;
+
+        vec2 march_uv = projectWorldToUv(ray_pos);
+        if (march_uv.x < 0.01 || march_uv.x > 0.99 || march_uv.y < 0.01 || march_uv.y > 0.99) {
+            break;
+        }
+
+        float scene_d = texture(sampler2D(depth_tex, depth_smp), march_uv).r;
+        if (scene_d >= 0.9999) continue;
+
+        vec3 scene_pos = reconstructWorldPos(march_uv, scene_d);
+
+        float depth_diff = ray_pos.z - scene_pos.z;
+        float dist_to_surface = length(ray_pos - scene_pos);
+
+        if (depth_diff >= 0.0 && dist_to_surface < thickness) {
+            float edge_dist_x = min(march_uv.x, 1.0 - march_uv.x);
+            float edge_dist_y = min(march_uv.y, 1.0 - march_uv.y);
+            float edge_fade = clamp(min(edge_dist_x, edge_dist_y) * 10.0, 0.0, 1.0);
+
+            float dist_fade = 1.0 - (float(i) / float(SSR_STEPS));
+            dist_fade *= dist_fade;
+
+            float fresnel = 0.04 + 0.96 * pow(1.0 - max(0.0, dot(-V, N)), 5.0);
+            fresnel = clamp(fresnel * 1.8, 0.15, 0.9);
+
+            vec3 refl_color = texture(sampler2D(scene_tex, smp), march_uv).rgb;
+            scene_color = mix(scene_color, refl_color, ssr_params.y * edge_fade * dist_fade * fresnel);
+            break;
+        }
+    }
+
+    return scene_color;
+}
+
+vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
+    if (fog_params.x < 0.5) return scene_color;
+
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec3 to_pixel = world_pos - camera_pos.xyz;
+    float dist = length(to_pixel);
+    vec3 ray_dir = (dist > 0.0001) ? (to_pixel / dist) : vec3(0.0, 0.0, 1.0);
+
+    // Directional Sun Inscattering (atmospheric Mie glow)
+    float sun_dot = max(0.0, dot(ray_dir, -sun_dir.xyz));
+    float sun_inscatter = pow(sun_dot, 8.0) * fog_color.w;
+    vec3 current_fog_color = mix(fog_color.rgb, sun_color.rgb * 1.5, sun_inscatter);
+
+    // Skybox horizon haze
+    if (raw_depth >= 0.9999) {
+        float horizon_haze = clamp(1.0 - abs(ray_dir.y) * 4.0, 0.0, 1.0);
+        float sky_fog = horizon_haze * clamp(fog_params.y * 15.0, 0.0, 0.7);
+        return mix(scene_color, current_fog_color, sky_fog);
+    }
+
+    // Distance attenuation
+    float fog_start = fog_params.w;
+    float eff_dist = max(0.0, dist - fog_start);
+    float dist_factor = 1.0 - exp(-eff_dist * fog_params.y);
+
+    // Exponential Height Falloff
+    float falloff = fog_params.z;
+    float delta_y = world_pos.y - camera_pos.y;
+    float height_density = (abs(delta_y) > 0.001)
+        ? (exp(-camera_pos.y * falloff) - exp(-world_pos.y * falloff)) / (delta_y * falloff)
+        : exp(-camera_pos.y * falloff);
+    height_density = clamp(height_density, 0.0, 5.0);
+
+    float fog_amount = clamp(dist_factor * height_density, 0.0, 1.0);
+    return mix(scene_color, current_fog_color, fog_amount);
+}
+
+// Sample scene HDR color, apply chromatic aberration, SSAO, SSR, and Fog
 vec3 sampleSceneRaw(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
@@ -77,6 +214,15 @@ vec3 sampleSceneRaw(vec2 uv) {
         float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
         color *= ao_factor;
     }
+
+    // Depth-dependent passes: SSR and Atmospheric Fog
+    float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
+
+    // Screen-Space Reflections (SSR)
+    color = applySSR(color, uv, raw_depth);
+
+    // Atmospheric Depth & Height Fog
+    color = applyAtmosphericFog(color, uv, raw_depth);
 
     return color;
 }

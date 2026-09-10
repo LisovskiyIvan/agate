@@ -29,4 +29,18 @@ pub const PostProcessConfig = struct {
 
     // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
     fxaa_enabled: bool = true,
+
+    // Atmospheric Depth & Height Fog
+    fog_enabled: bool = true,
+    fog_density: f32 = 0.015,
+    fog_height_falloff: f32 = 0.08,
+    fog_start_distance: f32 = 5.0,
+    fog_color: [3]f32 = .{ 0.72, 0.82, 0.92 },
+    fog_sun_scattering: f32 = 0.8,
+
+    // Screen-Space Reflections (SSR)
+    ssr_enabled: bool = true,
+    ssr_intensity: f32 = 0.55,
+    ssr_max_distance: f32 = 25.0,
+    ssr_thickness: f32 = 0.4,
 };

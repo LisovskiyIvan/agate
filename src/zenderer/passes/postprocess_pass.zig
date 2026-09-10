@@ -4,6 +4,10 @@ const sg = sokol.gfx;
 const sglue = sokol.glue;
 const post_shd = @import("postprocess_shader");
 const PostProcessConfig = @import("../postprocess.zig").PostProcessConfig;
+const math = @import("math");
+const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
+const Color3 = math.Color3;
 
 pub const PostProcessPass = struct {
     offscreen_color_image: sg.Image = .{},
@@ -15,6 +19,7 @@ pub const PostProcessPass = struct {
     offscreen_resolve_att_view: sg.View = .{},
     offscreen_resolve_tex_view: sg.View = .{},
     postprocess_sampler: sg.Sampler = .{},
+    depth_sampler: sg.Sampler = .{},
     postprocess_pipeline: sg.Pipeline = .{},
     postprocess_quad_vb: sg.Buffer = .{},
     postprocess_quad_ib: sg.Buffer = .{},
@@ -51,6 +56,13 @@ pub const PostProcessPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
+        const depth_smp = sg.makeSampler(.{
+            .min_filter = .NEAREST,
+            .mag_filter = .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+
         var pp_desc = sg.PipelineDesc{
             .shader = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend())),
             .index_type = .UINT16,
@@ -73,6 +85,7 @@ pub const PostProcessPass = struct {
 
         return .{
             .postprocess_sampler = smp,
+            .depth_sampler = depth_smp,
             .postprocess_pipeline = pip,
             .postprocess_quad_vb = vb,
             .postprocess_quad_ib = ib,
@@ -158,6 +171,13 @@ pub const PostProcessPass = struct {
         ssao_intensity: f32,
         cur_w: i32,
         cur_h: i32,
+        view_proj: Mat4,
+        inv_view_proj: Mat4,
+        camera_pos: Vec3,
+        sun_dir: Vec3,
+        sun_color: Color3,
+        near_z: f32,
+        far_z: f32,
     ) void {
         if (self.postprocess_pipeline.id == 0) return;
         sg.applyPipeline(self.postprocess_pipeline);
@@ -166,7 +186,9 @@ pub const PostProcessPass = struct {
         post_bind.index_buffer = self.postprocess_quad_ib;
         post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
         post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
+        post_bind.views[post_shd.VIEW_depth_tex] = self.offscreen_depth_tex_view;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
+        post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
         sg.applyBindings(post_bind);
 
         const pp_params = post_shd.FsParams{
@@ -200,6 +222,50 @@ pub const PostProcessPass = struct {
                 1.0 / @as(f32, @floatFromInt(cur_w)),
                 1.0 / @as(f32, @floatFromInt(cur_h)),
             },
+            .camera_params = .{
+                near_z,
+                far_z,
+                0.0,
+                0.0,
+            },
+            .camera_pos = .{
+                camera_pos.x,
+                camera_pos.y,
+                camera_pos.z,
+                0.0,
+            },
+            .sun_dir = .{
+                sun_dir.x,
+                sun_dir.y,
+                sun_dir.z,
+                0.0,
+            },
+            .sun_color = .{
+                sun_color.r,
+                sun_color.g,
+                sun_color.b,
+                0.0,
+            },
+            .fog_params = .{
+                if (config.fog_enabled) 1.0 else 0.0,
+                config.fog_density,
+                config.fog_height_falloff,
+                config.fog_start_distance,
+            },
+            .fog_color = .{
+                config.fog_color[0],
+                config.fog_color[1],
+                config.fog_color[2],
+                config.fog_sun_scattering,
+            },
+            .ssr_params = .{
+                if (config.ssr_enabled) 1.0 else 0.0,
+                config.ssr_intensity,
+                config.ssr_thickness,
+                config.ssr_max_distance,
+            },
+            .view_proj = view_proj,
+            .inv_view_proj = inv_view_proj,
         };
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
@@ -224,6 +290,7 @@ pub const PostProcessPass = struct {
             }
         }
         sg.destroySampler(self.postprocess_sampler);
+        sg.destroySampler(self.depth_sampler);
         sg.destroyPipeline(self.postprocess_pipeline);
         sg.destroyBuffer(self.postprocess_quad_vb);
         sg.destroyBuffer(self.postprocess_quad_ib);
