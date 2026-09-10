@@ -24,10 +24,12 @@ layout(binding = 0) uniform fs_params {
     vec4 params1; // x: exposure, y: bloom_threshold, z: bloom_intensity, w: bloom_radius
     vec4 params2; // x: vignette_intensity, y: vignette_radius, z: saturation, w: contrast
     vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_enabled (1/0), w: vignette_enabled (1/0)
+    vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: unused
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
+layout(binding = 1) uniform texture2D ssao_tex;
 layout(binding = 0) uniform sampler smp;
 
 in vec2 v_uv;
@@ -98,6 +100,18 @@ void main() {
 
     // Exposure
     color *= params1.x;
+
+    // SSAO Occlusion & Debug view
+    if (params4.y > 0.5) {
+        float ao_dbg = texture(sampler2D(ssao_tex, smp), uv).r;
+        frag_color = vec4(ao_dbg, ao_dbg, ao_dbg, 1.0);
+        return;
+    }
+    if (params4.x > 0.5) {
+        float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
+        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
+        color *= ao_factor;
+    }
 
     // Tone Mapping
     float tonemap_mode = params3.x;

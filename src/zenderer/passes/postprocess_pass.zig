@@ -10,6 +10,7 @@ pub const PostProcessPass = struct {
     offscreen_color_att_view: sg.View = .{},
     offscreen_depth_image: sg.Image = .{},
     offscreen_depth_att_view: sg.View = .{},
+    offscreen_depth_tex_view: sg.View = .{},
     offscreen_resolve_image: sg.Image = .{},
     offscreen_resolve_att_view: sg.View = .{},
     offscreen_resolve_tex_view: sg.View = .{},
@@ -94,6 +95,10 @@ pub const PostProcessPass = struct {
             }
             sg.destroyImage(self.offscreen_depth_image);
             sg.destroyView(self.offscreen_depth_att_view);
+            if (self.offscreen_depth_tex_view.id != 0) {
+                sg.destroyView(self.offscreen_depth_tex_view);
+                self.offscreen_depth_tex_view = .{};
+            }
             self.offscreen_resolve_image = .{};
             self.offscreen_resolve_att_view = .{};
             self.offscreen_resolve_tex_view = .{};
@@ -102,7 +107,7 @@ pub const PostProcessPass = struct {
         const sw = sglue.swapchain();
         const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
         const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
-        const samples: i32 = if (sw.sample_count > 1) sw.sample_count else 1;
+        const samples: i32 = 1; // Offscreen targets must be sample_count=1 to allow depth sampling as a texture view
 
         const col_img = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
@@ -115,29 +120,10 @@ pub const PostProcessPass = struct {
             .color_attachment = .{ .image = col_img },
         });
 
-        if (samples > 1) {
-            const res_img = sg.makeImage(.{
-                .usage = .{ .resolve_attachment = true },
-                .width = width,
-                .height = height,
-                .pixel_format = color_fmt,
-                .sample_count = 1,
-            });
-            const res_att = sg.makeView(.{
-                .resolve_attachment = .{ .image = res_img },
-            });
-            const res_tex = sg.makeView(.{
-                .texture = .{ .image = res_img },
-            });
-            self.offscreen_resolve_image = res_img;
-            self.offscreen_resolve_att_view = res_att;
-            self.offscreen_resolve_tex_view = res_tex;
-        } else {
-            const col_tex = sg.makeView(.{
-                .texture = .{ .image = col_img },
-            });
-            self.offscreen_resolve_tex_view = col_tex;
-        }
+        const col_tex = sg.makeView(.{
+            .texture = .{ .image = col_img },
+        });
+        self.offscreen_resolve_tex_view = col_tex;
 
         const depth_img = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
@@ -149,6 +135,9 @@ pub const PostProcessPass = struct {
         const depth_att = sg.makeView(.{
             .depth_stencil_attachment = .{ .image = depth_img },
         });
+        const depth_tex = sg.makeView(.{
+            .texture = .{ .image = depth_img },
+        });
 
         self.width = width;
         self.height = height;
@@ -157,15 +146,26 @@ pub const PostProcessPass = struct {
         self.offscreen_color_att_view = col_att;
         self.offscreen_depth_image = depth_img;
         self.offscreen_depth_att_view = depth_att;
+        self.offscreen_depth_tex_view = depth_tex;
     }
 
-    pub fn render(self: *PostProcessPass, config: PostProcessConfig, cur_w: i32, cur_h: i32) void {
+    pub fn render(
+        self: *PostProcessPass,
+        config: PostProcessConfig,
+        ssao_tex: sg.View,
+        ssao_enabled: bool,
+        ssao_debug: bool,
+        ssao_intensity: f32,
+        cur_w: i32,
+        cur_h: i32,
+    ) void {
         if (self.postprocess_pipeline.id == 0) return;
         sg.applyPipeline(self.postprocess_pipeline);
         var post_bind = sg.Bindings{};
         post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
         post_bind.index_buffer = self.postprocess_quad_ib;
         post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
+        post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
         sg.applyBindings(post_bind);
 
@@ -187,6 +187,12 @@ pub const PostProcessPass = struct {
                 config.chromatic_aberration,
                 if (config.bloom_enabled) 1.0 else 0.0,
                 if (config.vignette_enabled) 1.0 else 0.0,
+            },
+            .params4 = .{
+                if (ssao_enabled) 1.0 else 0.0,
+                if (ssao_debug) 1.0 else 0.0,
+                ssao_intensity,
+                0.0,
             },
             .resolution = .{
                 @floatFromInt(cur_w),
@@ -212,6 +218,10 @@ pub const PostProcessPass = struct {
             }
             sg.destroyImage(self.offscreen_depth_image);
             sg.destroyView(self.offscreen_depth_att_view);
+            if (self.offscreen_depth_tex_view.id != 0) {
+                sg.destroyView(self.offscreen_depth_tex_view);
+                self.offscreen_depth_tex_view = .{};
+            }
         }
         sg.destroySampler(self.postprocess_sampler);
         sg.destroyPipeline(self.postprocess_pipeline);

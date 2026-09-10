@@ -165,6 +165,7 @@ pub const ShadowPass = struct {
         shadow_action.depth = .{
             .load_action = .CLEAR,
             .clear_value = 1.0,
+            .store_action = .STORE,
         };
         var shadow_pass = sg.Pass{
             .action = shadow_action,

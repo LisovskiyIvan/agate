@@ -131,6 +131,32 @@ pub fn build(b: *Build) !void {
     });
     mod_ui_shader.addImport("math", mod_math);
 
+    // Шейдер SSAO: src/zenderer/shaders/ssao.glsl -> Zig-модуль "ssao_shader"
+    const mod_ssao_shader = try sokol.shdc.createModule(b, "ssao_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/ssao.glsl",
+        .output = "ssao_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_ssao_shader.addImport("math", mod_math);
+
+    // Шейдер SSAO Blur: src/zenderer/shaders/ssao_blur.glsl -> Zig-модуль "ssao_blur_shader"
+    const mod_ssao_blur_shader = try sokol.shdc.createModule(b, "ssao_blur_shader", mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = "src/zenderer/shaders/ssao_blur.glsl",
+        .output = "ssao_blur_shader.zig",
+        .slang = .{
+            .glsl410 = true,
+            .metal_macos = true,
+            .hlsl5 = true,
+        },
+    });
+    mod_ssao_blur_shader.addImport("math", mod_math);
+
     // Главный модуль библиотеки zenderer
     const mod_zenderer = b.addModule("zenderer", .{
         .root_source_file = b.path("src/zenderer/root.zig"),
@@ -147,6 +173,8 @@ pub fn build(b: *Build) !void {
             .{ .name = "postprocess_shader", .module = mod_postprocess_shader },
             .{ .name = "particle_shader", .module = mod_particle_shader },
             .{ .name = "ui_shader", .module = mod_ui_shader },
+            .{ .name = "ssao_shader", .module = mod_ssao_shader },
+            .{ .name = "ssao_blur_shader", .module = mod_ssao_blur_shader },
             .{ .name = "math", .module = mod_math },
         },
     });

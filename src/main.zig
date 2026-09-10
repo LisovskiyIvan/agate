@@ -96,7 +96,7 @@ pub fn main() void {
         .window_title = "zenderer (Babylon.js-style 3D in Zig)",
         .width = 800,
         .height = 600,
-        .sample_count = 4, // MSAA 4x
+        .sample_count = 1,
         .logger = .{ .func = slog.func },
     });
 }

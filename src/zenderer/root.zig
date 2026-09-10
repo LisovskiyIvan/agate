@@ -52,6 +52,9 @@ pub const postprocess = @import("postprocess.zig");
 pub const PostProcessConfig = postprocess.PostProcessConfig;
 pub const TonemappingType = postprocess.TonemappingType;
 
+pub const ssao = @import("ssao.zig");
+pub const SSAOConfig = ssao.SSAOConfig;
+
 pub const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;

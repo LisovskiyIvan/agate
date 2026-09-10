@@ -11,6 +11,8 @@ const passes = @import("passes/mod.zig");
 const postprocess = @import("postprocess.zig");
 pub const PostProcessConfig = postprocess.PostProcessConfig;
 pub const TonemappingType = postprocess.TonemappingType;
+const ssao = @import("ssao.zig");
+pub const SSAOConfig = ssao.SSAOConfig;
 const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
@@ -99,6 +101,7 @@ pub const Scene = struct {
     skybox_pass: passes.SkyboxPass,
     particle_pass: passes.ParticlePass,
     postprocess_pass: passes.PostProcessPass,
+    ssao_pass: passes.SSAOPass,
 
     // Shadow Mapping settings (Cascaded Shadow Maps with 16-sample Poisson PCF)
     enable_shadows: bool = true,
@@ -130,8 +133,9 @@ pub const Scene = struct {
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
 
-    // Post-Processing settings
+    // Post-Processing & SSAO settings
     post_process: PostProcessConfig = .{},
+    ssao: SSAOConfig = .{},
 
     // Particle Systems
     particle_systems: std.ArrayListUnmanaged(*particles.ParticleSystem) = .empty,
@@ -156,6 +160,7 @@ pub const Scene = struct {
             .skybox_pass = passes.SkyboxPass.init(),
             .particle_pass = passes.ParticlePass.init(),
             .postprocess_pass = passes.PostProcessPass.init(),
+            .ssao_pass = passes.SSAOPass.init(),
             .light = HemisphericLight.init("hemi", .{
                 .direction = math.Vec3.new(0.5, 1.0, 0.3),
                 .diffuse = Color3.white,
@@ -287,10 +292,15 @@ pub const Scene = struct {
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
         self.postprocess_pass.resize(width, height);
+        self.ssao_pass.resize(width, height);
     }
 
     pub fn setPostProcess(self: *Scene, config: PostProcessConfig) void {
         self.post_process = config;
+    }
+
+    pub fn setSSAO(self: *Scene, config: SSAOConfig) void {
+        self.ssao = config;
     }
 
     pub fn setSkybox(self: *Scene, cube: CubeTexture) void {
@@ -843,6 +853,7 @@ pub const Scene = struct {
         main_pass_action.depth = .{
             .load_action = .CLEAR,
             .clear_value = 1.0,
+            .store_action = .STORE,
         };
 
         if (self.post_process.enabled) {
@@ -1147,6 +1158,25 @@ pub const Scene = struct {
         sg.endPass();
 
         // ==============================================
+        // PASS 2.5: SCREEN-SPACE AMBIENT OCCLUSION (SSAO)
+        // ==============================================
+        var ssao_view = self.default_white_texture.view;
+        const ssao_active = self.ssao.enabled or self.ssao.debug_mode;
+        if (self.post_process.enabled and ssao_active) {
+            self.ssao_pass.render(
+                camera,
+                aspect,
+                self.postprocess_pass.offscreen_depth_tex_view,
+                self.ssao,
+                cur_w,
+                cur_h,
+            );
+            ssao_view = self.ssao_pass.ssao_blur_tex_view;
+            self.stats.draw_calls += 2;
+            self.stats.triangles += 4;
+        }
+
+        // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
         // ==============================================
         if (self.post_process.enabled) {
@@ -1159,7 +1189,15 @@ pub const Scene = struct {
                 .swapchain = sglue.swapchain(),
             });
 
-            self.postprocess_pass.render(self.post_process, cur_w, cur_h);
+            self.postprocess_pass.render(
+                self.post_process,
+                ssao_view,
+                self.ssao.enabled,
+                self.ssao.debug_mode,
+                self.ssao.intensity,
+                cur_w,
+                cur_h,
+            );
             self.stats.draw_calls += 1;
             self.stats.triangles += 2;
 
@@ -1251,6 +1289,7 @@ pub const Scene = struct {
         self.skybox_pass.deinit();
         self.particle_pass.deinit();
         self.postprocess_pass.deinit();
+        self.ssao_pass.deinit();
 
         for (self.particle_systems.items) |ps| {
             ps.deinit();
