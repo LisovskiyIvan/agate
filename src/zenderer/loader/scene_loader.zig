@@ -31,6 +31,7 @@ pub const SceneLoader = struct {
         gltf: *c.cgltf_data,
         image_cache: []?Texture,
         view: [*c]const c.cgltf_texture_view,
+        base_dir: ?[]const u8,
     ) ?Texture {
         if (view == null) return null;
         if (view.*.texture == null) return null;
@@ -52,22 +53,74 @@ pub const SceneLoader = struct {
             }
         }
 
-        if (img.*.buffer_view == null) return null;
-        const bv = img.*.buffer_view.?;
-        if (bv.*.buffer == null or bv.*.buffer.*.data == null) return null;
-
-        const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
-        const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
-
-        if (Texture.fromMemory(scene.allocator, img_data, .{})) |loaded| {
-            if (img_idx) |idx| {
-                image_cache[idx] = loaded;
+        var tex_options: Texture.Options = .{};
+        if (tex.*.sampler) |smp| {
+            switch (smp.*.wrap_s) {
+                33071 => tex_options.wrap_u = .CLAMP_TO_EDGE,
+                33648 => tex_options.wrap_u = .MIRRORED_REPEAT,
+                10497 => tex_options.wrap_u = .REPEAT,
+                else => {},
             }
-            return loaded;
-        } else |_| {
-            return null;
+            switch (smp.*.wrap_t) {
+                33071 => tex_options.wrap_v = .CLAMP_TO_EDGE,
+                33648 => tex_options.wrap_v = .MIRRORED_REPEAT,
+                10497 => tex_options.wrap_v = .REPEAT,
+                else => {},
+            }
+            switch (smp.*.mag_filter) {
+                9728 => tex_options.mag_filter = .NEAREST,
+                9729 => tex_options.mag_filter = .LINEAR,
+                else => {},
+            }
+            switch (smp.*.min_filter) {
+                9728, 9984, 9986 => tex_options.min_filter = .NEAREST,
+                9729, 9985, 9987 => tex_options.min_filter = .LINEAR,
+                else => {},
+            }
         }
+
+        // 1. Embedded buffer view (typical in GLB or embedded GLTF)
+        if (img.*.buffer_view) |bv| {
+            if (bv.*.buffer != null and bv.*.buffer.*.data != null) {
+                const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
+                const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
+                if (Texture.fromMemory(scene.allocator, img_data, tex_options)) |loaded| {
+                    if (img_idx) |idx| {
+                        image_cache[idx] = loaded;
+                    }
+                    return loaded;
+                } else |_| {}
+            }
+        }
+
+        // 2. External URI (typical in standard GLTF with external textures)
+        if (img.*.uri) |uri_c| {
+            const uri = std.mem.span(uri_c);
+            if (base_dir) |dir| {
+                const full_path = std.fs.path.join(scene.allocator, &.{ dir, uri }) catch null;
+                if (full_path) |fp| {
+                    defer scene.allocator.free(fp);
+                    if (Texture.fromFile(scene.allocator, fp, tex_options)) |loaded| {
+                        if (img_idx) |idx| {
+                            image_cache[idx] = loaded;
+                        }
+                        return loaded;
+                    } else |_| {}
+                }
+            } else {
+                if (Texture.fromFile(scene.allocator, uri, tex_options)) |loaded| {
+                    if (img_idx) |idx| {
+                        image_cache[idx] = loaded;
+                    }
+                    return loaded;
+                } else |_| {}
+            }
+        }
+
+        return null;
     }
+
+    pub const appendGltf = appendGlb;
 
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
         const path_z = try scene.allocator.dupeZ(u8, file_path);
@@ -82,13 +135,14 @@ pub const SceneLoader = struct {
         }
         defer c.cgltf_free(data);
 
-        // Load binary buffers (in GLB they are inside the buffer itself)
+        // Load binary buffers (in GLB they are inside the buffer itself, in GLTF from .bin on disk)
         const load_buf_res = c.cgltf_load_buffers(&options, data, path_z.ptr);
         if (load_buf_res != c.cgltf_result_success) {
             return error.GltfLoadBuffersFailed;
         }
 
         const gltf = data.?;
+        const base_dir = std.fs.path.dirname(file_path);
 
         // 1. Parse materials
         var materials = try scene.allocator.alloc(?Material, gltf.materials_count);
@@ -119,20 +173,28 @@ pub const SceneLoader = struct {
                 pbr_mat.metallic = pbr.metallic_factor;
                 pbr_mat.roughness = pbr.roughness_factor;
 
-                pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.base_color_texture);
-                pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.metallic_roughness_texture);
+                pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.base_color_texture, base_dir);
+                pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, &pbr.metallic_roughness_texture, base_dir);
             }
 
-            pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.normal_texture);
-            pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.occlusion_texture);
+            pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.normal_texture, base_dir);
+            pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.occlusion_texture, base_dir);
             pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
 
-            pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.emissive_texture);
-            pbr_mat.emissive_color = Color3.new(
-                src_mat.emissive_factor[0],
-                src_mat.emissive_factor[1],
-                src_mat.emissive_factor[2],
-            );
+            pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, &src_mat.emissive_texture, base_dir);
+            if (pbr_mat.emissive_texture != null and
+                src_mat.emissive_factor[0] == 0.0 and
+                src_mat.emissive_factor[1] == 0.0 and
+                src_mat.emissive_factor[2] == 0.0)
+            {
+                pbr_mat.emissive_color = Color3.white;
+            } else {
+                pbr_mat.emissive_color = Color3.new(
+                    src_mat.emissive_factor[0],
+                    src_mat.emissive_factor[1],
+                    src_mat.emissive_factor[2],
+                );
+            }
 
             materials[i] = .{ .pbr = pbr_mat };
         }
