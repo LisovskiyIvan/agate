@@ -24,7 +24,7 @@ layout(binding = 0) uniform fs_params {
     vec4 params1; // x: exposure, y: bloom_threshold, z: bloom_intensity, w: bloom_radius
     vec4 params2; // x: vignette_intensity, y: vignette_radius, z: saturation, w: contrast
     vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_enabled (1/0), w: vignette_enabled (1/0)
-    vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: unused
+    vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: fxaa_enabled (1/0)
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
 };
 
@@ -54,10 +54,8 @@ vec3 extractBright(vec3 c, float thresh) {
     return c * (factor / max(luma, 0.0001));
 }
 
-void main() {
-    vec2 uv = v_uv;
-
-    // Chromatic Aberration
+// Sample scene HDR color, apply chromatic aberration and SSAO
+vec3 sampleSceneRaw(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
     if (ca > 0.00001) {
@@ -72,6 +70,189 @@ void main() {
     }
 
     vec3 color = base_color;
+
+    // SSAO Occlusion
+    if (params4.x > 0.5) {
+        float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
+        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
+        color *= ao_factor;
+    }
+
+    return color;
+}
+
+// Sample tonemapped LDR color for perceptual FXAA edge detection
+vec3 sampleSceneLDR(vec2 uv) {
+    vec3 color = sampleSceneRaw(uv);
+    color *= params1.x; // Exposure
+
+    float tonemap_mode = params3.x;
+    if (tonemap_mode > 1.5) {
+        color = Reinhard(color);
+    } else if (tonemap_mode > 0.5) {
+        color = ACESFilm(color);
+    }
+    return clamp(color, 0.0, 1.0);
+}
+
+float rgbToLuma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// FXAA 3.11 Quality Anti-Aliasing
+#define FXAA_EDGE_THRESHOLD_MIN 0.0312
+#define FXAA_EDGE_THRESHOLD     0.125
+#define FXAA_SUBPIX_CAP         0.75
+#define FXAA_SEARCH_STEPS       10
+
+vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
+    vec3 colorCenter = sampleSceneLDR(uv);
+    float lumaCenter = rgbToLuma(colorCenter);
+
+    // 4 cross neighbors
+    float lumaDown  = rgbToLuma(sampleSceneLDR(uv + vec2(0.0, -rcpFrame.y)));
+    float lumaUp    = rgbToLuma(sampleSceneLDR(uv + vec2(0.0,  rcpFrame.y)));
+    float lumaLeft  = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x, 0.0)));
+    float lumaRight = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x, 0.0)));
+
+    float lumaMin = min(lumaCenter, min(min(lumaDown, lumaUp), min(lumaLeft, lumaRight)));
+    float lumaMax = max(lumaCenter, max(max(lumaDown, lumaUp), max(lumaLeft, lumaRight)));
+    float lumaRange = lumaMax - lumaMin;
+
+    // Early exit if contrast is below threshold
+    if (lumaRange < max(FXAA_EDGE_THRESHOLD_MIN, lumaMax * FXAA_EDGE_THRESHOLD)) {
+        return colorCenter;
+    }
+
+    // 4 corner neighbors
+    float lumaDownLeft  = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x, -rcpFrame.y)));
+    float lumaUpRight   = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x,  rcpFrame.y)));
+    float lumaUpLeft    = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x,  rcpFrame.y)));
+    float lumaDownRight = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x, -rcpFrame.y)));
+
+    // Edge orientation detection (horizontal vs vertical)
+    float lumaDownUp = lumaDown + lumaUp;
+    float lumaLeftRight = lumaLeft + lumaRight;
+
+    float lumaLeftCorners = lumaDownLeft + lumaUpLeft;
+    float lumaDownCorners = lumaDownLeft + lumaDownRight;
+    float lumaRightCorners = lumaDownRight + lumaUpRight;
+    float lumaUpCorners = lumaUpRight + lumaUpLeft;
+
+    float edgeHorizontal = abs(-2.0 * lumaLeft + lumaLeftCorners) +
+                           abs(-2.0 * lumaCenter + lumaDownUp) * 2.0 +
+                           abs(-2.0 * lumaRight + lumaRightCorners);
+    float edgeVertical   = abs(-2.0 * lumaUp + lumaUpCorners) +
+                           abs(-2.0 * lumaCenter + lumaLeftRight) * 2.0 +
+                           abs(-2.0 * lumaDown + lumaDownCorners);
+
+    bool isHorizontal = (edgeHorizontal >= edgeVertical);
+
+    // Select gradient perpendicular to edge
+    float luma1 = isHorizontal ? lumaDown : lumaLeft;
+    float luma2 = isHorizontal ? lumaUp : lumaRight;
+    float gradient1 = abs(luma1 - lumaCenter);
+    float gradient2 = abs(luma2 - lumaCenter);
+
+    bool is1Steeper = gradient1 >= gradient2;
+    float gradientScaled = 0.25 * max(gradient1, gradient2);
+
+    float stepLength = isHorizontal ? rcpFrame.y : rcpFrame.x;
+    float lumaLocalAverage = 0.0;
+
+    if (is1Steeper) {
+        stepLength = -stepLength;
+        lumaLocalAverage = 0.5 * (luma1 + lumaCenter);
+    } else {
+        lumaLocalAverage = 0.5 * (luma2 + lumaCenter);
+    }
+
+    vec2 currentUv = uv;
+    if (isHorizontal) {
+        currentUv.y += stepLength * 0.5;
+    } else {
+        currentUv.x += stepLength * 0.5;
+    }
+
+    // Search along edge tangent
+    vec2 offset = isHorizontal ? vec2(rcpFrame.x, 0.0) : vec2(0.0, rcpFrame.y);
+    vec2 uv1 = currentUv - offset;
+    vec2 uv2 = currentUv + offset;
+
+    float lumaEnd1 = rgbToLuma(sampleSceneLDR(uv1)) - lumaLocalAverage;
+    float lumaEnd2 = rgbToLuma(sampleSceneLDR(uv2)) - lumaLocalAverage;
+
+    bool reached1 = abs(lumaEnd1) >= gradientScaled;
+    bool reached2 = abs(lumaEnd2) >= gradientScaled;
+
+    if (!reached1) uv1 -= offset;
+    if (!reached2) uv2 += offset;
+
+    for (int i = 2; i < FXAA_SEARCH_STEPS; i++) {
+        if (!reached1) {
+            lumaEnd1 = rgbToLuma(sampleSceneLDR(uv1)) - lumaLocalAverage;
+            reached1 = abs(lumaEnd1) >= gradientScaled;
+        }
+        if (!reached2) {
+            lumaEnd2 = rgbToLuma(sampleSceneLDR(uv2)) - lumaLocalAverage;
+            reached2 = abs(lumaEnd2) >= gradientScaled;
+        }
+        if (reached1 && reached2) break;
+        if (!reached1) uv1 -= offset;
+        if (!reached2) uv2 += offset;
+    }
+
+    // Distance to edge ends
+    float distance1 = isHorizontal ? (uv.x - uv1.x) : (uv.y - uv1.y);
+    float distance2 = isHorizontal ? (uv2.x - uv.x) : (uv2.y - uv.y);
+
+    bool isDirection1 = distance1 < distance2;
+    float distanceFinal = min(distance1, distance2);
+    float edgeThickness = distance1 + distance2;
+
+    float lumaNearEnd = isDirection1 ? lumaEnd1 : lumaEnd2;
+    bool isOpposite = (lumaNearEnd < 0.0) != ((lumaCenter - lumaLocalAverage) < 0.0);
+
+    float pixelOffset = -distanceFinal / edgeThickness + 0.5;
+    float finalEdgeOffset = isOpposite ? pixelOffset : 0.0;
+
+    // Subpixel antialiasing
+    float lumaAverageCorners = lumaLeftCorners + lumaRightCorners;
+    float subpixLuma = (2.0 * (lumaDownUp + lumaLeftRight) + lumaAverageCorners) * (1.0 / 12.0);
+    float subpixRange = abs(subpixLuma - lumaCenter);
+    float subpixFactor = clamp(subpixRange / lumaRange, 0.0, 1.0);
+    float subpixBlend = (-2.0 * subpixFactor + 3.0) * subpixFactor * subpixFactor;
+    float subpixBlendFinal = subpixBlend * subpixBlend * FXAA_SUBPIX_CAP;
+
+    float finalOffset = max(finalEdgeOffset, subpixBlendFinal);
+
+    vec2 finalUv = uv;
+    if (isHorizontal) {
+        finalUv.y += finalOffset * stepLength;
+    } else {
+        finalUv.x += finalOffset * stepLength;
+    }
+
+    return sampleSceneLDR(finalUv);
+}
+
+void main() {
+    vec2 uv = v_uv;
+
+    // SSAO Debug view early exit
+    if (params4.y > 0.5) {
+        float ao_dbg = texture(sampler2D(ssao_tex, smp), uv).r;
+        frag_color = vec4(ao_dbg, ao_dbg, ao_dbg, 1.0);
+        return;
+    }
+
+    // Anti-Aliasing (FXAA 3.11) or Direct Tonemapped Sample
+    vec3 color;
+    if (params4.w > 0.5) {
+        color = applyFXAA(uv, resolution.zw);
+    } else {
+        color = sampleSceneLDR(uv);
+    }
 
     // Bloom glow pass (multi-tap bright pass blur)
     if (params3.z > 0.5 && params1.z > 0.001) {
@@ -95,30 +276,14 @@ void main() {
         bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0, -1.0) * texel2).rgb, thresh) * 0.1000;
         bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0,  1.0) * texel2).rgb, thresh) * 0.1000;
 
-        color += bloom * params1.z;
-    }
-
-    // Exposure
-    color *= params1.x;
-
-    // SSAO Occlusion & Debug view
-    if (params4.y > 0.5) {
-        float ao_dbg = texture(sampler2D(ssao_tex, smp), uv).r;
-        frag_color = vec4(ao_dbg, ao_dbg, ao_dbg, 1.0);
-        return;
-    }
-    if (params4.x > 0.5) {
-        float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
-        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
-        color *= ao_factor;
-    }
-
-    // Tone Mapping
-    float tonemap_mode = params3.x;
-    if (tonemap_mode > 1.5) {
-        color = Reinhard(color);
-    } else if (tonemap_mode > 0.5) {
-        color = ACESFilm(color);
+        vec3 bloom_scaled = bloom * params1.z * params1.x;
+        float tonemap_mode = params3.x;
+        if (tonemap_mode > 1.5) {
+            bloom_scaled = Reinhard(bloom_scaled);
+        } else if (tonemap_mode > 0.5) {
+            bloom_scaled = ACESFilm(bloom_scaled);
+        }
+        color += bloom_scaled;
     }
 
     // Contrast

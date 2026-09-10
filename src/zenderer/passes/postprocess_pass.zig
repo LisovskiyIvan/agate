@@ -192,7 +192,7 @@ pub const PostProcessPass = struct {
                 if (ssao_enabled) 1.0 else 0.0,
                 if (ssao_debug) 1.0 else 0.0,
                 ssao_intensity,
-                0.0,
+                if (config.fxaa_enabled) 1.0 else 0.0,
             },
             .resolution = .{
                 @floatFromInt(cur_w),

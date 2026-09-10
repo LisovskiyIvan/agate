@@ -26,4 +26,7 @@ pub const PostProcessConfig = struct {
     saturation: f32 = 1.05,
     contrast: f32 = 1.05,
     chromatic_aberration: f32 = 0.0,
+
+    // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
+    fxaa_enabled: bool = true,
 };
