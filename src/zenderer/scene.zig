@@ -416,6 +416,12 @@ pub const Scene = struct {
         return pw.createBody(mesh, collider, mass);
     }
 
+    /// Creates a rigid body with collision filter / sensor / event options.
+    pub fn createRigidBodyWith(self: *Scene, mesh: *Mesh, collider: ColliderType, mass: f32, options: physics.BodyOptions) !*RigidBody {
+        const pw = if (self.physics_world) |*p| p else self.enablePhysics(null);
+        return pw.createBodyWith(mesh, collider, mass, options);
+    }
+
     pub fn updatePhysics(self: *Scene, dt: f32) void {
         if (self.physics_world) |*pw| {
             pw.step(dt);
@@ -830,8 +836,8 @@ pub const Scene = struct {
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (self.enable_shadows) {
-            self.shadow_pass.render(self.meshes.items, self.frame_id, cascades);
-            self.stats.draw_calls += 4;
+            const shadow_draws = self.shadow_pass.render(self.meshes.items, self.frame_id, cascades);
+            self.stats.draw_calls += shadow_draws;
         }
 
         // ==============================================

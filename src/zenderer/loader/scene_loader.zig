@@ -678,6 +678,22 @@ pub const SceneLoader = struct {
             }
         }
 
+        // Retain CPU geometry so physics colliders (convex hull / triangle mesh)
+        // can be built from loaded models.
+        const cpu_positions = try scene.allocator.alloc(Vec3, vert_count);
+        for (vertices, 0..) |v, i| {
+            cpu_positions[i] = Vec3.new(v.position[0], v.position[1], v.position[2]);
+        }
+        const cpu_indices = try scene.allocator.alloc(u32, index_count);
+        for (0..index_count) |i| {
+            cpu_indices[i] = if (prim.indices) |ind_accessor|
+                @intCast(c.cgltf_accessor_read_index(ind_accessor, i))
+            else
+                @intCast(i);
+        }
+        mesh_obj.cpu_positions = cpu_positions;
+        mesh_obj.cpu_indices = cpu_indices;
+
         return mesh_obj;
     }
 };

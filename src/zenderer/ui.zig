@@ -60,6 +60,8 @@ pub const UICanvas = struct {
             .mag_filter = .LINEAR,
             .wrap_u = .CLAMP_TO_EDGE,
             .wrap_v = .CLAMP_TO_EDGE,
+            // Box-filtered mips blur the distance field beyond legibility.
+            .mipmaps = false,
         });
 
         const max_v: usize = 16384;

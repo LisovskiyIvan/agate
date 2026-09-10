@@ -40,10 +40,10 @@ pub const SSAOPass = struct {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
             // x,     y,    u,   v
-            -1.0, -1.0,  0.0, 0.0,
-             1.0, -1.0,  1.0, 0.0,
-             1.0,  1.0,  1.0, 1.0,
-            -1.0,  1.0,  0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0,
+            1.0,  -1.0, 1.0, 0.0,
+            1.0,  1.0,  1.0, 1.0,
+            -1.0, 1.0,  0.0, 1.0,
         };
         const quad_indices = [_]u16{
             0, 1, 2,
@@ -58,34 +58,34 @@ pub const SSAOPass = struct {
             .data = sg.asRange(&quad_indices),
         });
 
-        // 1. Generate 32 hemisphere samples
+        // 1. Generate 32 hemisphere samples using Fermat spiral (uniform solid angle)
         var kernel: [32][4]f32 = undefined;
-        var prng = std.Random.DefaultPrng.init(1337);
-        const rand = prng.random();
+        const golden_angle: f32 = 2.0 * std.math.pi * (1.0 - 0.618033988749895);
 
         for (0..32) |i| {
-            var sample = Vec3.new(
-                rand.float(f32) * 2.0 - 1.0,
-                rand.float(f32) * 2.0 - 1.0,
-                rand.float(f32) * 0.85 + 0.15, // z > 0 hemisphere
-            ).normalize();
+            const fi = @as(f32, @floatFromInt(i));
+            const theta = fi * golden_angle;
+            // Distribute z evenly in hemisphere [0.12, 1.0]
+            const z = (fi + 0.5) / 32.0 * 0.88 + 0.12;
+            const r = @sqrt(@max(0.0, 1.0 - z * z));
+            const x = r * @cos(theta);
+            const y = r * @sin(theta);
 
             // Accelerating scale factor towards origin
-            var scale = @as(f32, @floatFromInt(i)) / 32.0;
-            scale = std.math.lerp(0.1, 1.0, scale * scale);
-            sample = sample.scale(scale);
+            const norm_i = (fi + 1.0) / 32.0;
+            const scale = std.math.lerp(0.12, 1.0, norm_i * norm_i);
 
-            kernel[i] = .{ sample.x, sample.y, sample.z, 0.0 };
+            kernel[i] = .{ x * scale, y * scale, z * scale, 0.0 };
         }
 
-        // 2. Generate 4x4 random rotation noise texture (16 pixels)
-        var noise_pixels: [16 * 4]u8 = undefined;
-        for (0..16) |i| {
-            const rx = rand.float(f32) * 2.0 - 1.0;
-            const ry = rand.float(f32) * 2.0 - 1.0;
-            const len = @sqrt(rx * rx + ry * ry);
-            const nx = if (len > 0.001) rx / len else 1.0;
-            const ny = if (len > 0.001) ry / len else 0.0;
+        // 2. Generate 8x8 random rotation noise texture (64 pixels)
+        var noise_pixels: [64 * 4]u8 = undefined;
+        var prng = std.Random.DefaultPrng.init(1337);
+        const rand = prng.random();
+        for (0..64) |i| {
+            const angle = rand.float(f32) * 2.0 * std.math.pi;
+            const nx = @cos(angle);
+            const ny = @sin(angle);
 
             noise_pixels[i * 4 + 0] = @intFromFloat((nx * 0.5 + 0.5) * 255.0);
             noise_pixels[i * 4 + 1] = @intFromFloat((ny * 0.5 + 0.5) * 255.0);
@@ -94,8 +94,8 @@ pub const SSAOPass = struct {
         }
 
         var noise_img_desc = sg.ImageDesc{
-            .width = 4,
-            .height = 4,
+            .width = 8,
+            .height = 8,
             .pixel_format = .RGBA8,
         };
         noise_img_desc.data.mip_levels[0] = sg.asRange(&noise_pixels);
@@ -105,8 +105,8 @@ pub const SSAOPass = struct {
         });
 
         const noise_smp = sg.makeSampler(.{
-            .min_filter = .NEAREST,
-            .mag_filter = .NEAREST,
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
             .wrap_u = .REPEAT,
             .wrap_v = .REPEAT,
         });
@@ -189,11 +189,11 @@ pub const SSAOPass = struct {
             sg.destroyView(self.ssao_blur_tex_view);
         }
 
-        // SSAO Raw Target (RGBA8)
+        // Trace at half resolution; the bilateral pass upsamples to full size.
         const raw_img = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
-            .width = width,
-            .height = height,
+            .width = @divTrunc(width, 2) + @mod(width, 2),
+            .height = @divTrunc(height, 2) + @mod(height, 2),
             .pixel_format = .RGBA8,
             .sample_count = 1,
         });
@@ -238,7 +238,8 @@ pub const SSAOPass = struct {
         cur_w: i32,
         cur_h: i32,
     ) void {
-        if (!config.enabled) return;
+        if (!config.enabled and !config.debug_mode) return;
+        if (cur_w <= 0 or cur_h <= 0) return;
         if (self.ssao_pipeline.id == 0 or self.ssao_blur_pipeline.id == 0) return;
         if (depth_tex_view.id == 0) return;
 
@@ -308,12 +309,20 @@ pub const SSAOPass = struct {
         bind2.samplers[blur_shd.SMP_smp] = self.blur_sampler;
         sg.applyBindings(bind2);
 
+        const ao_w: f32 = @floatFromInt(@divTrunc(cur_w, 2) + @mod(cur_w, 2));
+        const ao_h: f32 = @floatFromInt(@divTrunc(cur_h, 2) + @mod(cur_h, 2));
         const blur_params = blur_shd.FsParams{
             .resolution = .{
-                @floatFromInt(cur_w),
-                @floatFromInt(cur_h),
-                1.0 / @as(f32, @floatFromInt(cur_w)),
-                1.0 / @as(f32, @floatFromInt(cur_h)),
+                ao_w,
+                ao_h,
+                1.0 / ao_w,
+                1.0 / ao_h,
+            },
+            .camera_params = .{
+                camera.near,
+                camera.far,
+                config.radius,
+                0.0,
             },
         };
         sg.applyUniforms(blur_shd.UB_fs_params, sg.asRange(&blur_params));

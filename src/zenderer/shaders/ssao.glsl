@@ -33,24 +33,29 @@ layout(binding = 0) uniform texture2D depth_tex;
 layout(binding = 1) uniform texture2D noise_tex;
 @sampler_type smp_depth nonfiltering
 layout(binding = 0) uniform sampler smp_depth;
-@sampler_type smp_noise nonfiltering
 layout(binding = 1) uniform sampler smp_noise;
 
 in vec2 v_uv;
 out vec4 frag_color;
 
 vec3 reconstructViewPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec2 ndc = uv * 2.0 - 1.0;
+    #if !SOKOL_GLSL
+        ndc.y = -ndc.y;
+    #endif
+    vec4 clip = vec4(ndc, depth, 1.0);
     vec4 view = inv_projection * clip;
     return view.xyz / view.w;
 }
 
 void main() {
-    vec2 uv = v_uv;
+    // Nearest depth comes from a full-resolution texel, not the AO pixel's
+    // interpolated UV. Reconstruct at that texel centre to avoid false slopes.
+    vec2 uv = (floor(v_uv * resolution.xy) + 0.5) * resolution.zw;
     float raw_depth = texture(sampler2D(depth_tex, smp_depth), uv).r;
 
     // Background / Skybox: no occlusion
-    if (raw_depth >= 0.9999) {
+    if (raw_depth >= 1.0 || params.x <= 0.0) {
         frag_color = vec4(1.0, 1.0, 1.0, 1.0);
         return;
     }
@@ -58,7 +63,7 @@ void main() {
     vec3 pos = reconstructViewPos(uv, raw_depth);
     vec2 texel = resolution.zw;
 
-    // Reconstruct view-space normal using depth-aware cross product
+    // Reconstruct view-space normal with edge-preserving centered difference
     vec3 p_r = reconstructViewPos(uv + vec2(texel.x, 0.0), texture(sampler2D(depth_tex, smp_depth), uv + vec2(texel.x, 0.0)).r);
     vec3 p_l = reconstructViewPos(uv - vec2(texel.x, 0.0), texture(sampler2D(depth_tex, smp_depth), uv - vec2(texel.x, 0.0)).r);
     vec3 p_u = reconstructViewPos(uv - vec2(0.0, texel.y), texture(sampler2D(depth_tex, smp_depth), uv - vec2(0.0, texel.y)).r);
@@ -67,14 +72,17 @@ void main() {
     vec3 dx = (abs(p_r.z - pos.z) < abs(p_l.z - pos.z)) ? (p_r - pos) : (pos - p_l);
     vec3 dy = (abs(p_u.z - pos.z) < abs(p_d.z - pos.z)) ? (p_u - pos) : (pos - p_d);
 
-    vec3 normal = normalize(cross(dx, dy));
-    if (normal.z < 0.0) {
+    vec3 normal_cross = cross(dx, dy);
+    vec3 normal = dot(normal_cross, normal_cross) > 1e-20 ? normalize(normal_cross) : normalize(-pos);
+    if (dot(normal, -pos) < 0.0) {
         normal = -normal;
     }
 
-    // Tiled 4x4 noise rotation vector
-    vec2 noise_scale = resolution.xy / 4.0;
-    vec3 random_vec = vec3(texture(sampler2D(noise_tex, smp_noise), uv * noise_scale).xy * 2.0 - 1.0, 0.0);
+    // High-frequency Interleaved Gradient Noise (IGN)
+    // Eliminates all macro-tiling, 8x8 square blocks, and triangular bilinear saddle singularities
+    float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float angle = ign * 6.28318530718;
+    vec3 random_vec = vec3(cos(angle), sin(angle), 0.0) + texture(sampler2D(noise_tex, smp_noise), uv).xyz * 0.000001;
 
     // Tangent basis
     vec3 tangent = normalize(random_vec - normal * dot(random_vec, normal));
@@ -86,30 +94,48 @@ void main() {
     float occlusion = 0.0;
 
     for (int i = 0; i < 32; i++) {
-        vec3 sample_view = pos + (tbn * kernel_samples[i].xyz) * radius;
+        vec3 sample_dir = tbn * kernel_samples[i].xyz;
+        vec3 sample_view = pos + sample_dir * radius;
 
         vec4 sample_clip = projection * vec4(sample_view, 1.0);
+        if (sample_clip.w <= 0.0) continue;
         sample_clip.xyz /= sample_clip.w;
-        vec2 sample_uv = vec2(sample_clip.x * 0.5 + 0.5, 0.5 - sample_clip.y * 0.5);
+        vec2 sample_uv = sample_clip.xy * 0.5 + 0.5;
+        #if !SOKOL_GLSL
+            sample_uv.y = 1.0 - sample_uv.y;
+        #endif
 
         if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
             continue;
         }
 
+        sample_uv = (floor(sample_uv * resolution.xy) + 0.5) * resolution.zw;
         float sample_raw_depth = texture(sampler2D(depth_tex, smp_depth), sample_uv).r;
+        if (sample_raw_depth >= 1.0) continue;
         vec3 sample_frag_view = reconstructViewPos(sample_uv, sample_raw_depth);
 
-        // Range check to avoid haloing on distant backgrounds
-        float range_check = smoothstep(0.0, 1.0, radius / (abs(pos.z - sample_frag_view.z) + 0.001));
+        // Vector from current shading position to sampled surface geometry
+        vec3 diff = sample_frag_view - pos;
+        float dist = length(diff);
 
-        // In view space, camera looks down -Z. A surface closer to camera has higher z value (e.g. -2.0 > -5.0).
+        // Skip immediate local neighborhood (< 3cm) to eliminate triangle mesh self-occlusion
+        if (dist < 0.03) continue;
+
+        // Angle above horizon: only occlude if geometry sticks up at least ~9 degrees above tangent plane
+        float n_dot_v = max(0.0, dot(normal, diff / dist) - 0.15);
+
+        // Smooth linear distance attenuation
+        float falloff = clamp(1.0 - (dist / radius), 0.0, 1.0);
+
+        // In view space, camera looks down -Z. A surface closer to camera has higher z value.
         if (sample_frag_view.z >= sample_view.z + bias) {
-            occlusion += range_check;
+            occlusion += n_dot_v * falloff;
         }
     }
 
-    occlusion = 1.0 - (occlusion / 32.0);
-    float ao = clamp(pow(occlusion, params.w), 0.0, 1.0);
+    // Normalize with solid angle factor for 32 hemisphere samples
+    float norm_occ = clamp(occlusion / 2.8, 0.0, 1.0);
+    float ao = clamp(pow(1.0 - norm_occ, params.w), 0.0, 1.0);
 
     frag_color = vec4(ao, ao, ao, 1.0);
 }

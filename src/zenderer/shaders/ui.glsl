@@ -36,28 +36,41 @@ in vec4 v_params;
 
 out vec4 frag_color;
 
+// The atlas stores distances with the glyph edge at 0.5. Slightly below that
+// keeps thin strokes readable without closing counters at small sizes.
+float sdfEdge(float boldness) {
+    return clamp(0.45 - boldness, 0.15, 0.5);
+}
+
+// Half a screen pixel of anti-aliasing on each side of the edge. Do not cap
+// this at one texel: UI text is heavily minified, so fwidth is the real
+// screen-space gradient.
+float sdfWidth(float dist) {
+    return clamp(0.5 * fwidth(dist), 0.002, 0.25);
+}
+
 void main() {
     if (v_params.x < 0.5) {
         // Mode 0: Solid UI quad / button / panel / border
         frag_color = v_color;
     } else if (v_params.x < 1.5) {
-        // Mode 1: Crisp bold SDF text with screen-space anti-aliasing
+        // Mode 1: Crisp clean SDF text with screen-space anti-aliasing
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
-        float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
-        float edge = clamp(0.32 - v_params.z, 0.10, 0.48);
+        float w = sdfWidth(dist);
+        float edge = sdfEdge(v_params.z);
         float alpha = smoothstep(edge - w, edge + w, dist);
         frag_color = vec4(v_color.rgb, v_color.a * alpha);
     } else {
         // Mode 2: SDF text with dark outline / drop shadow
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
-        float w = clamp(0.75 * fwidth(dist), 0.012, 0.045);
-        float edge = clamp(0.32 - v_params.z, 0.10, 0.48);
+        float w = sdfWidth(dist);
+        float edge = sdfEdge(v_params.z);
         float text_alpha = smoothstep(edge - w, edge + w, dist);
-        float outline_edge = clamp(edge - v_params.y, 0.05, edge - 0.02);
+        float outline_edge = clamp(edge - v_params.y, 0.08, edge - 0.02);
         float outline_alpha = smoothstep(outline_edge - w, outline_edge + w, dist);
         vec3 outline_col = vec3(0.02, 0.03, 0.05);
         vec3 col = mix(outline_col, v_color.rgb, text_alpha);
-        frag_color = vec4(col, max(text_alpha, outline_alpha * 0.90) * v_color.a);
+        frag_color = vec4(col, max(text_alpha, outline_alpha * 0.85) * v_color.a);
     }
 }
 @end

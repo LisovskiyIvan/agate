@@ -82,6 +82,13 @@ vec2 projectWorldToUv(vec3 world_pos) {
     return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
+vec3 projectWorldToUvDepth(vec3 world_pos) {
+    vec4 clip = view_proj * vec4(world_pos, 1.0);
+    if (clip.w <= 0.0001) return vec3(-1.0, -1.0, 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    return vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
+}
+
 vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
     if (ssr_params.x < 0.5) return scene_color;
     if (raw_depth >= 0.9999) return scene_color;
@@ -113,7 +120,7 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
     float max_dist = ssr_params.w;
     float thickness = ssr_params.z;
-    const int SSR_STEPS = 28;
+    const int SSR_STEPS = 16;
     float step_size = max_dist / float(SSR_STEPS);
 
     vec3 ray_pos = world_pos + N * 0.08;
@@ -121,13 +128,15 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
     for (int i = 0; i < SSR_STEPS; i++) {
         ray_pos += R * step_size;
 
-        vec2 march_uv = projectWorldToUv(ray_pos);
+        vec3 march_proj = projectWorldToUvDepth(ray_pos);
+        vec2 march_uv = march_proj.xy;
         if (march_uv.x < 0.01 || march_uv.x > 0.99 || march_uv.y < 0.01 || march_uv.y > 0.99) {
             break;
         }
 
         float scene_d = texture(sampler2D(depth_tex, depth_smp), march_uv).r;
         if (scene_d >= 0.9999) continue;
+        if (march_proj.z < scene_d) continue;
 
         vec3 scene_pos = reconstructWorldPos(march_uv, scene_d);
 
@@ -245,6 +254,40 @@ float rgbToLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
+// Fast LDR sample for FXAA edge detection and tangent searching
+// Includes scene_tex, chromatic aberration, and SSAO (from pre-rendered ssao_tex)
+// Skips heavy raymarching SSR and atmospheric fog on neighbor taps
+vec3 sampleSceneFastLDR(vec2 uv) {
+    vec3 color;
+    float ca = params3.y;
+    if (ca > 0.00001) {
+        vec2 dist_from_center = uv - 0.5;
+        vec2 ca_offset = dist_from_center * ca;
+        float r = texture(sampler2D(scene_tex, smp), uv + ca_offset).r;
+        float g = texture(sampler2D(scene_tex, smp), uv).g;
+        float b = texture(sampler2D(scene_tex, smp), uv - ca_offset).b;
+        color = vec3(r, g, b);
+    } else {
+        color = texture(sampler2D(scene_tex, smp), uv).rgb;
+    }
+
+    // SSAO Occlusion (fast texture fetch from pre-rendered pass)
+    if (params4.x > 0.5) {
+        float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
+        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
+        color *= ao_factor;
+    }
+
+    color *= params1.x; // Exposure
+    float tonemap_mode = params3.x;
+    if (tonemap_mode > 1.5) {
+        color = Reinhard(color);
+    } else if (tonemap_mode > 0.5) {
+        color = ACESFilm(color);
+    }
+    return clamp(color, 0.0, 1.0);
+}
+
 // FXAA 3.11 Quality Anti-Aliasing
 #define FXAA_EDGE_THRESHOLD_MIN 0.0312
 #define FXAA_EDGE_THRESHOLD     0.125
@@ -255,11 +298,11 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     vec3 colorCenter = sampleSceneLDR(uv);
     float lumaCenter = rgbToLuma(colorCenter);
 
-    // 4 cross neighbors
-    float lumaDown  = rgbToLuma(sampleSceneLDR(uv + vec2(0.0, -rcpFrame.y)));
-    float lumaUp    = rgbToLuma(sampleSceneLDR(uv + vec2(0.0,  rcpFrame.y)));
-    float lumaLeft  = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x, 0.0)));
-    float lumaRight = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x, 0.0)));
+    // 4 cross neighbors (fast sampling: avoids re-evaluating SSR / Fog on neighbors)
+    float lumaDown  = rgbToLuma(sampleSceneFastLDR(uv + vec2(0.0, -rcpFrame.y)));
+    float lumaUp    = rgbToLuma(sampleSceneFastLDR(uv + vec2(0.0,  rcpFrame.y)));
+    float lumaLeft  = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x, 0.0)));
+    float lumaRight = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x, 0.0)));
 
     float lumaMin = min(lumaCenter, min(min(lumaDown, lumaUp), min(lumaLeft, lumaRight)));
     float lumaMax = max(lumaCenter, max(max(lumaDown, lumaUp), max(lumaLeft, lumaRight)));
@@ -271,10 +314,10 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     }
 
     // 4 corner neighbors
-    float lumaDownLeft  = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x, -rcpFrame.y)));
-    float lumaUpRight   = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x,  rcpFrame.y)));
-    float lumaUpLeft    = rgbToLuma(sampleSceneLDR(uv + vec2(-rcpFrame.x,  rcpFrame.y)));
-    float lumaDownRight = rgbToLuma(sampleSceneLDR(uv + vec2( rcpFrame.x, -rcpFrame.y)));
+    float lumaDownLeft  = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x, -rcpFrame.y)));
+    float lumaUpRight   = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x,  rcpFrame.y)));
+    float lumaUpLeft    = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x,  rcpFrame.y)));
+    float lumaDownRight = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x, -rcpFrame.y)));
 
     // Edge orientation detection (horizontal vs vertical)
     float lumaDownUp = lumaDown + lumaUp;
@@ -325,8 +368,8 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     vec2 uv1 = currentUv - offset;
     vec2 uv2 = currentUv + offset;
 
-    float lumaEnd1 = rgbToLuma(sampleSceneLDR(uv1)) - lumaLocalAverage;
-    float lumaEnd2 = rgbToLuma(sampleSceneLDR(uv2)) - lumaLocalAverage;
+    float lumaEnd1 = rgbToLuma(sampleSceneFastLDR(uv1)) - lumaLocalAverage;
+    float lumaEnd2 = rgbToLuma(sampleSceneFastLDR(uv2)) - lumaLocalAverage;
 
     bool reached1 = abs(lumaEnd1) >= gradientScaled;
     bool reached2 = abs(lumaEnd2) >= gradientScaled;
@@ -336,11 +379,11 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
 
     for (int i = 2; i < FXAA_SEARCH_STEPS; i++) {
         if (!reached1) {
-            lumaEnd1 = rgbToLuma(sampleSceneLDR(uv1)) - lumaLocalAverage;
+            lumaEnd1 = rgbToLuma(sampleSceneFastLDR(uv1)) - lumaLocalAverage;
             reached1 = abs(lumaEnd1) >= gradientScaled;
         }
         if (!reached2) {
-            lumaEnd2 = rgbToLuma(sampleSceneLDR(uv2)) - lumaLocalAverage;
+            lumaEnd2 = rgbToLuma(sampleSceneFastLDR(uv2)) - lumaLocalAverage;
             reached2 = abs(lumaEnd2) >= gradientScaled;
         }
         if (reached1 && reached2) break;
@@ -379,7 +422,9 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
         finalUv.x += finalOffset * stepLength;
     }
 
-    return sampleSceneLDR(finalUv);
+    vec3 edgeColor = sampleSceneFastLDR(finalUv);
+    vec3 centerFast = sampleSceneFastLDR(uv);
+    return clamp(colorCenter + (edgeColor - centerFast), 0.0, 1.0);
 }
 
 void main() {

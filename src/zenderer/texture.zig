@@ -15,6 +15,9 @@ pub const Texture = struct {
         mag_filter: sg.Filter = .LINEAR,
         wrap_u: sg.Wrap = .REPEAT,
         wrap_v: sg.Wrap = .REPEAT,
+        /// Signed distance fields must not be box-downsampled: the mip chain
+        /// dilutes thin strokes and the shader edge drifts. Disable for fonts.
+        mipmaps: bool = true,
     };
 
     pub fn initRaw(width: u32, height: u32, rgba_pixels: []const u8, options: Options) Texture {
@@ -48,6 +51,31 @@ pub const Texture = struct {
     /// Box-filter downsample of one RGBA8 level. Dims floor at 1, source coords
     /// clamp at edges (handles NPOT).
     fn downsampleLevel(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
+        @setRuntimeSafety(false);
+        if (src_w == dst_w * 2 and src_h == dst_h * 2) {
+            const src_stride: usize = @as(usize, src_w) * 4;
+            const dst_stride: usize = @as(usize, dst_w) * 4;
+            var y: usize = 0;
+            while (y < dst_h) : (y += 1) {
+                const r0 = src[(y * 2) * src_stride ..];
+                const r1 = src[(y * 2 + 1) * src_stride ..];
+                const out_row = dst[y * dst_stride ..];
+                var x: usize = 0;
+                while (x < dst_w) : (x += 1) {
+                    const si = x * 8;
+                    const di = x * 4;
+                    inline for (0..4) |ch| {
+                        const sum: u32 = @as(u32, r0[si + ch]) +
+                            @as(u32, r0[si + 4 + ch]) +
+                            @as(u32, r1[si + ch]) +
+                            @as(u32, r1[si + 4 + ch]);
+                        out_row[di + ch] = @intCast((sum + 2) >> 2);
+                    }
+                }
+            }
+            return;
+        }
+
         var y: u32 = 0;
         while (y < dst_h) : (y += 1) {
             const sy0 = @min(y * 2, src_h - 1);
@@ -63,7 +91,7 @@ pub const Texture = struct {
                 const o = (y * dst_w + x) * 4;
                 inline for (0..4) |ch| {
                     const sum: u32 = @as(u32, src[q00 + ch]) + @as(u32, src[q10 + ch]) + @as(u32, src[q01 + ch]) + @as(u32, src[q11 + ch]);
-                    dst[o + ch] = @intCast((sum + 2) / 4);
+                    dst[o + ch] = @intCast((sum + 2) >> 2);
                 }
             }
         }
@@ -268,6 +296,7 @@ pub const Texture = struct {
         var channels_in_file: c_int = 0;
 
         const desired_channels = 4; // Always load as RGBA
+        const t0 = sokol.time.now();
         const data = c.stbi_load_from_memory(
             bytes.ptr,
             @intCast(bytes.len),
@@ -276,6 +305,7 @@ pub const Texture = struct {
             &channels_in_file,
             desired_channels,
         );
+        const t1 = sokol.time.now();
 
         if (data == null) {
             return error.ImageDecodeFailed;
@@ -287,7 +317,17 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         const slice = data[0..size_bytes];
 
-        return initRawMipped(allocator, width, height, slice, options);
+        const res = if (options.mipmaps)
+            try initRawMipped(allocator, width, height, slice, options)
+        else
+            initRaw(width, height, slice, options);
+        const t2 = sokol.time.now();
+        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
+            width,                                  height,
+            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
+            sokol.time.ms(sokol.time.diff(t2, t0)),
+        });
+        return res;
     }
 
     pub fn fromFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
@@ -315,6 +355,9 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         const slice = data[0..size_bytes];
 
+        if (!options.mipmaps) {
+            return initRaw(width, height, slice, options);
+        }
         return initRawMipped(allocator, width, height, slice, options);
     }
 

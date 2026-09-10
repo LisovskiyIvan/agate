@@ -80,6 +80,11 @@ pub const Mesh = struct {
     culling_strategy: CullingStrategy = .frustum,
     local_bounding_box: BoundingBox = BoundingBox.zero,
 
+    // Optional CPU-side geometry retained for physics collider creation
+    // (convex hull / triangle mesh shapes). Owned by the scene allocator.
+    cpu_positions: []Vec3 = &.{},
+    cpu_indices: []u32 = &.{},
+
     // Instancing support
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
     instance_buffer: sg.Buffer = .{},
@@ -153,6 +158,39 @@ pub const Mesh = struct {
         return self.local_bounding_box.transform(self.getWorldMatrix());
     }
 
+    /// Retains a CPU copy of the geometry so physics colliders (convex hull,
+    /// triangle mesh) can be built from it later. Owned by the allocator.
+    pub fn retainCpuGeometry(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex, indices: []const u16) !void {
+        const positions = try allocator.alloc(Vec3, vertices.len);
+        errdefer allocator.free(positions);
+        for (vertices, 0..) |v, i| {
+            positions[i] = Vec3.new(v.position[0], v.position[1], v.position[2]);
+        }
+
+        const index_u32 = try allocator.alloc(u32, indices.len);
+        for (indices, 0..) |ix, i| {
+            index_u32[i] = ix;
+        }
+
+        self.cpu_positions = positions;
+        self.cpu_indices = index_u32;
+    }
+
+    /// Same as retainCpuGeometry but for sources that are already 32-bit indexed.
+    pub fn retainCpuGeometryU32(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex, indices: []const u32) !void {
+        const positions = try allocator.alloc(Vec3, vertices.len);
+        errdefer allocator.free(positions);
+        for (vertices, 0..) |v, i| {
+            positions[i] = Vec3.new(v.position[0], v.position[1], v.position[2]);
+        }
+
+        const index_copy = try allocator.alloc(u32, indices.len);
+        @memcpy(index_copy, indices);
+
+        self.cpu_positions = positions;
+        self.cpu_indices = index_copy;
+    }
+
     pub fn deinit(self: *Mesh, allocator: std.mem.Allocator) void {
         sg.destroyBuffer(self.vertex_buffer);
         sg.destroyBuffer(self.index_buffer);
@@ -163,6 +201,12 @@ pub const Mesh = struct {
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
+        if (self.cpu_positions.len > 0) {
+            allocator.free(self.cpu_positions);
+        }
+        if (self.cpu_indices.len > 0) {
+            allocator.free(self.cpu_indices);
+        }
         if (self.owns_name and self.name.len > 0) {
             allocator.free(self.name);
         }
@@ -187,6 +231,12 @@ pub const GroundOptions = struct {
     width: f32 = 10.0,
     height: f32 = 10.0,
     subdivisions: u32 = 1,
+    color: Color4 = Color4.white,
+};
+
+pub const TerrainOptions = struct {
+    /// x/z cell size and y height multiplier (matches HeightFieldOptions).
+    scale: Vec3 = Vec3.new(1.0, 1.0, 1.0),
     color: Color4 = Color4.white,
 };
 
@@ -399,6 +449,7 @@ pub const MeshBuilder = struct {
                 Vec3.new(w, h, d),
             ),
         };
+        try mesh.retainCpuGeometry(scene.allocator, &vertices, &indices);
 
         try scene.meshes.append(scene.allocator, mesh);
         return mesh;
@@ -476,6 +527,124 @@ pub const MeshBuilder = struct {
                 Vec3.new(half_w, 0.0, half_h),
             ),
         };
+        try mesh.retainCpuGeometry(scene.allocator, vertices, indices);
+
+        try scene.meshes.append(scene.allocator, mesh);
+        return mesh;
+    }
+
+    /// Builds a height-map grid mesh. `heights` is row-major:
+    /// index = row * count_x + column, matching the Box3D height field layout.
+    /// The local origin is the (0, min_height, 0) corner.
+    pub fn createTerrain(
+        scene: *Scene,
+        name: []const u8,
+        heights: []const f32,
+        count_x: u32,
+        count_z: u32,
+        options: TerrainOptions,
+    ) !*Mesh {
+        const expected = @as(usize, count_x) * count_z;
+        if (count_x < 2 or count_z < 2 or heights.len != expected) {
+            return error.InvalidTerrainDimensions;
+        }
+
+        const vert_count = expected;
+        const index_count = (count_x - 1) * (count_z - 1) * 6;
+        const sx = options.scale.x;
+        const sy = options.scale.y;
+        const sz = options.scale.z;
+
+        const vertices = try scene.allocator.alloc(Vertex, vert_count);
+        defer scene.allocator.free(vertices);
+
+        var min_y: f32 = heights[0] * sy;
+        var max_y: f32 = heights[0] * sy;
+
+        var vi: usize = 0;
+        for (0..count_z) |row| {
+            for (0..count_x) |col| {
+                const x = @as(f32, @floatFromInt(col)) * sx;
+                const z = @as(f32, @floatFromInt(row)) * sz;
+                const h = heights[row * count_x + col] * sy;
+                min_y = @min(min_y, h);
+                max_y = @max(max_y, h);
+
+                // Central-difference normal.
+                const col_l = if (col > 0) col - 1 else col;
+                const col_r = if (col + 1 < count_x) col + 1 else col;
+                const row_u = if (row > 0) row - 1 else row;
+                const row_d = if (row + 1 < count_z) row + 1 else row;
+                const dh_dx = (heights[row * count_x + col_r] - heights[row * count_x + col_l]) * sy;
+                const dh_dz = (heights[row_d * count_x + col] - heights[row_u * count_x + col]) * sy;
+                const dx = @as(f32, @floatFromInt(col_r - col_l)) * sx;
+                const dz = @as(f32, @floatFromInt(row_d - row_u)) * sz;
+                const tx = Vec3.new(if (dx > 0.0) dx else 1.0, dh_dx, 0.0);
+                const tz = Vec3.new(0.0, dh_dz, if (dz > 0.0) dz else 1.0);
+                const normal = Vec3.new(
+                    tz.y * tx.z - tz.z * tx.y,
+                    tz.z * tx.x - tz.x * tx.z,
+                    tz.x * tx.y - tz.y * tx.x,
+                ).normalize();
+
+                vertices[vi] = .{
+                    .position = .{ x, h, z },
+                    .normal = .{ normal.x, normal.y, normal.z },
+                    .color = options.color.toArray(),
+                    .uv = .{
+                        @as(f32, @floatFromInt(col)) / @as(f32, @floatFromInt(count_x - 1)),
+                        @as(f32, @floatFromInt(row)) / @as(f32, @floatFromInt(count_z - 1)),
+                    },
+                    .tangent = .{ 1.0, 0.0, 0.0, 1.0 },
+                };
+                vi += 1;
+            }
+        }
+
+        const indices = try scene.allocator.alloc(u32, index_count);
+        defer scene.allocator.free(indices);
+        var ii: usize = 0;
+        const row_stride = count_x;
+        for (0..count_z - 1) |row| {
+            for (0..count_x - 1) |col| {
+                const p0: u32 = @intCast(row * row_stride + col);
+                const p1: u32 = @intCast(row * row_stride + col + 1);
+                const p2: u32 = @intCast((row + 1) * row_stride + col + 1);
+                const p3: u32 = @intCast((row + 1) * row_stride + col);
+
+                // CCW winding for +Y normal.
+                indices[ii + 0] = p0;
+                indices[ii + 1] = p2;
+                indices[ii + 2] = p1;
+                indices[ii + 3] = p0;
+                indices[ii + 4] = p3;
+                indices[ii + 5] = p2;
+                ii += 6;
+            }
+        }
+
+        const vbuf = sg.makeBuffer(.{
+            .data = sg.asRange(vertices),
+        });
+
+        const ibuf = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(indices),
+        });
+
+        const mesh = try scene.allocator.create(Mesh);
+        mesh.* = .{
+            .name = name,
+            .vertex_buffer = vbuf,
+            .index_buffer = ibuf,
+            .index_count = index_count,
+            .index_type = .UINT32,
+            .local_bounding_box = BoundingBox.init(
+                Vec3.new(0.0, min_y, 0.0),
+                Vec3.new(@as(f32, @floatFromInt(count_x - 1)) * sx, max_y, @as(f32, @floatFromInt(count_z - 1)) * sz),
+            ),
+        };
+        try mesh.retainCpuGeometryU32(scene.allocator, vertices, indices);
 
         try scene.meshes.append(scene.allocator, mesh);
         return mesh;
@@ -565,6 +734,7 @@ pub const MeshBuilder = struct {
                 Vec3.new(radius, radius, radius),
             ),
         };
+        try mesh.retainCpuGeometry(scene.allocator, vertices, indices);
 
         try scene.meshes.append(scene.allocator, mesh);
         return mesh;
@@ -727,6 +897,7 @@ pub const MeshBuilder = struct {
                 Vec3.new(radius, half_h, radius),
             ),
         };
+        try mesh.retainCpuGeometry(scene.allocator, vertices, indices);
 
         try scene.meshes.append(scene.allocator, mesh);
         return mesh;
@@ -846,6 +1017,7 @@ pub const MeshBuilder = struct {
                 Vec3.new(radius, total_half, radius),
             ),
         };
+        try mesh.retainCpuGeometry(scene.allocator, vertices, indices);
 
         try scene.meshes.append(scene.allocator, mesh);
         return mesh;

@@ -160,7 +160,7 @@ pub const ShadowPass = struct {
         meshes: []const *Mesh,
         frame_id: u64,
         cascades: [4]Mat4,
-    ) void {
+    ) u32 {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
             .load_action = .CLEAR,
@@ -174,6 +174,7 @@ pub const ShadowPass = struct {
         sg.beginPass(shadow_pass);
 
         const CASCADE_RES: i32 = 1024;
+        var draw_calls: u32 = 0;
 
         for (0..4) |c_idx| {
             const light_view_proj = cascades[c_idx];
@@ -184,6 +185,7 @@ pub const ShadowPass = struct {
             sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
             const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
+            var last_pipeline_id: u32 = 0;
 
             for (meshes) |mesh| {
                 if (!mesh.cast_shadows) continue;
@@ -193,7 +195,10 @@ pub const ShadowPass = struct {
 
                     const pip_id = if (mesh.index_type == .UINT32) self.inst_pipeline_u32.id else self.inst_pipeline_u16.id;
                     if (pip_id == 0) continue;
-                    sg.applyPipeline(.{ .id = pip_id });
+                    if (pip_id != last_pipeline_id) {
+                        sg.applyPipeline(.{ .id = pip_id });
+                        last_pipeline_id = pip_id;
+                    }
 
                     var bind = sg.Bindings{};
                     bind.vertex_buffers[0] = mesh.vertex_buffer;
@@ -206,6 +211,7 @@ pub const ShadowPass = struct {
                     };
                     sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
                     sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                    draw_calls += 1;
                 } else {
                     if (!mesh.is_visible) continue;
                     // Scene.render() already cached world matrix + AABB this frame;
@@ -213,12 +219,21 @@ pub const ShadowPass = struct {
                     const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
                     if (!c_frustum.intersectsAABB(aabb_w)) continue;
 
+                    // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
+                    const ext = aabb_w.extents();
+                    const max_dim = @max(ext.x, @max(ext.y, ext.z));
+                    if (c_idx == 2 and max_dim < 0.35) continue;
+                    if (c_idx == 3 and max_dim < 0.75) continue;
+
                     const pip_id = if (mesh.skeleton != null)
                         (if (mesh.index_type == .UINT32) self.skinned_pipeline_u32.id else self.skinned_pipeline_u16.id)
                     else
                         (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
                     if (pip_id == 0) continue;
-                    sg.applyPipeline(.{ .id = pip_id });
+                    if (pip_id != last_pipeline_id) {
+                        sg.applyPipeline(.{ .id = pip_id });
+                        last_pipeline_id = pip_id;
+                    }
 
                     var bind = sg.Bindings{};
                     bind.vertex_buffers[0] = mesh.vertex_buffer;
@@ -239,11 +254,13 @@ pub const ShadowPass = struct {
                     }
 
                     sg.draw(0, mesh.index_count, 1);
+                    draw_calls += 1;
                 }
             }
         }
 
         sg.endPass();
+        return draw_calls;
     }
 
     pub fn deinit(self: *ShadowPass) void {
