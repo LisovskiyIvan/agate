@@ -109,40 +109,74 @@ pub const Texture = struct {
         return levels;
     }
 
-    /// initRaw plus a full CPU mipmap chain. Load-time cost only; minification
-    /// becomes a trilinear fetch instead of cache-thrashing level 0.
+    /// initRaw plus a full CPU mipmap chain. Uploads immediately on the
+    /// calling (main) thread; use decodeMemory + fromRaw for parallel loads.
     pub fn initRawMipped(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, options: Options) !Texture {
-        const levels = mipLevelCount(width, height);
-        if (levels == 1) return initRaw(width, height, rgba_pixels, options);
+        if (mipLevelCount(width, height) == 1) return initRaw(width, height, rgba_pixels, options);
 
-        var img_desc = sg.ImageDesc{
-            .width = @intCast(width),
-            .height = @intCast(height),
-            .pixel_format = .RGBA8,
-            .num_mipmaps = @intCast(levels),
-        };
-        img_desc.data.mip_levels[0] = sg.asRange(rgba_pixels);
+        var raw = try buildRaw(allocator, width, height, rgba_pixels, true);
+        defer raw.deinit(allocator);
+        return fromRaw(&raw, options);
+    }
 
-        var mip_bufs: [16]?[]u8 = @splat(null);
-        defer {
+    /// CPU-decoded RGBA pixels plus an optional mip chain. Decoding and mip
+    /// generation are GPU-free, so they can run on worker threads; the
+    /// sg.Image must be created later with `fromRaw` on the main thread.
+    pub const RawTexture = struct {
+        width: u32 = 0,
+        height: u32 = 0,
+        num_levels: u32 = 0,
+        levels: [16]?[]u8 = @splat(null),
+
+        pub fn deinit(self: *RawTexture, allocator: std.mem.Allocator) void {
+            for (self.levels[0..self.num_levels]) |level| {
+                if (level) |buf| allocator.free(buf);
+            }
+            self.* = .{};
+        }
+    };
+
+    /// Copies `rgba_pixels` and optionally builds the box-filtered mip chain.
+    fn buildRaw(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
+        var raw = RawTexture{ .width = width, .height = height, .num_levels = 1 };
+        errdefer raw.deinit(allocator);
+
+        const level0 = try allocator.alloc(u8, rgba_pixels.len);
+        @memcpy(level0, rgba_pixels);
+        raw.levels[0] = level0;
+
+        if (gen_mipmaps) {
+            var prev_w = width;
+            var prev_h = height;
+            var prev: []const u8 = level0;
+            const levels = mipLevelCount(width, height);
             for (1..levels) |m| {
-                if (mip_bufs[m]) |buf| allocator.free(buf);
+                const cur_w: u32 = @max(1, prev_w / 2);
+                const cur_h: u32 = @max(1, prev_h / 2);
+                const cur = try allocator.alloc(u8, @as(usize, cur_w) * cur_h * 4);
+                raw.levels[m] = cur;
+                downsampleLevel(prev, prev_w, prev_h, cur, cur_w, cur_h);
+                raw.num_levels = @intCast(m + 1);
+                prev_w = cur_w;
+                prev_h = cur_h;
+                prev = cur;
             }
         }
+        return raw;
+    }
 
-        var prev_w = width;
-        var prev_h = height;
-        var prev: []const u8 = rgba_pixels;
-        for (1..levels) |m| {
-            const cur_w: u32 = @max(1, prev_w / 2);
-            const cur_h: u32 = @max(1, prev_h / 2);
-            const cur = try allocator.alloc(u8, @as(usize, cur_w) * cur_h * 4);
-            mip_bufs[m] = cur;
-            downsampleLevel(prev, prev_w, prev_h, cur, cur_w, cur_h);
-            img_desc.data.mip_levels[m] = sg.asRange(cur);
-            prev_w = cur_w;
-            prev_h = cur_h;
-            prev = cur;
+    /// Creates the GPU image from CPU-decoded pixels. Main thread only.
+    pub fn fromRaw(raw: *const RawTexture, options: Options) Texture {
+        var img_desc = sg.ImageDesc{
+            .width = @intCast(raw.width),
+            .height = @intCast(raw.height),
+            .pixel_format = .RGBA8,
+            .num_mipmaps = @intCast(raw.num_levels),
+        };
+        for (0..raw.num_levels) |m| {
+            if (raw.levels[m]) |level| {
+                img_desc.data.mip_levels[m] = sg.asRange(level);
+            }
         }
 
         const img = sg.makeImage(img_desc);
@@ -152,7 +186,7 @@ pub const Texture = struct {
         const smp = sg.makeSampler(.{
             .min_filter = options.min_filter,
             .mag_filter = options.mag_filter,
-            .mipmap_filter = .LINEAR,
+            .mipmap_filter = if (raw.num_levels > 1) .LINEAR else .NEAREST,
             .wrap_u = options.wrap_u,
             .wrap_v = options.wrap_v,
         });
@@ -161,9 +195,72 @@ pub const Texture = struct {
             .image = img,
             .view = view,
             .sampler = smp,
-            .width = width,
-            .height = height,
+            .width = raw.width,
+            .height = raw.height,
         };
+    }
+
+    /// Decodes an in-memory image (PNG/JPEG/...) to RGBA without touching the
+    /// GPU. Thread-safe; pair with `fromRaw`.
+    pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, gen_mipmaps: bool) !RawTexture {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var channels_in_file: c_int = 0;
+
+        const t0 = sokol.time.now();
+        const data = c.stbi_load_from_memory(
+            bytes.ptr,
+            @intCast(bytes.len),
+            &w,
+            &h,
+            &channels_in_file,
+            4,
+        );
+        const t1 = sokol.time.now();
+        if (data == null) return error.ImageDecodeFailed;
+        defer c.stbi_image_free(data);
+
+        const width: u32 = @intCast(w);
+        const height: u32 = @intCast(h);
+        const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
+        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], gen_mipmaps);
+
+        const t2 = sokol.time.now();
+        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
+            width,                                  height,
+            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
+            sokol.time.ms(sokol.time.diff(t2, t0)),
+        });
+        return raw;
+    }
+
+    /// File variant of `decodeMemory`. Thread-safe; pair with `fromRaw`.
+    pub fn decodeFile(allocator: std.mem.Allocator, file_path: []const u8, gen_mipmaps: bool) !RawTexture {
+        const path_z = try allocator.dupeZ(u8, file_path);
+        defer allocator.free(path_z);
+
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var channels_in_file: c_int = 0;
+
+        const t0 = sokol.time.now();
+        const data = c.stbi_load(path_z.ptr, &w, &h, &channels_in_file, 4);
+        const t1 = sokol.time.now();
+        if (data == null) return error.ImageDecodeFailed;
+        defer c.stbi_image_free(data);
+
+        const width: u32 = @intCast(w);
+        const height: u32 = @intCast(h);
+        const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
+        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], gen_mipmaps);
+
+        const t2 = sokol.time.now();
+        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
+            width,                                  height,
+            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
+            sokol.time.ms(sokol.time.diff(t2, t0)),
+        });
+        return raw;
     }
 
     pub fn createWhite1x1() Texture {
@@ -291,74 +388,15 @@ pub const Texture = struct {
     }
 
     pub fn fromMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
-        var w: c_int = 0;
-        var h: c_int = 0;
-        var channels_in_file: c_int = 0;
-
-        const desired_channels = 4; // Always load as RGBA
-        const t0 = sokol.time.now();
-        const data = c.stbi_load_from_memory(
-            bytes.ptr,
-            @intCast(bytes.len),
-            &w,
-            &h,
-            &channels_in_file,
-            desired_channels,
-        );
-        const t1 = sokol.time.now();
-
-        if (data == null) {
-            return error.ImageDecodeFailed;
-        }
-        defer c.stbi_image_free(data);
-
-        const width: u32 = @intCast(w);
-        const height: u32 = @intCast(h);
-        const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        const slice = data[0..size_bytes];
-
-        const res = if (options.mipmaps)
-            try initRawMipped(allocator, width, height, slice, options)
-        else
-            initRaw(width, height, slice, options);
-        const t2 = sokol.time.now();
-        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
-            width,                                  height,
-            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
-            sokol.time.ms(sokol.time.diff(t2, t0)),
-        });
-        return res;
+        var raw = try decodeMemory(allocator, bytes, options.mipmaps);
+        defer raw.deinit(allocator);
+        return fromRaw(&raw, options);
     }
 
     pub fn fromFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
-        const path_z = try allocator.dupeZ(u8, file_path);
-        defer allocator.free(path_z);
-
-        var w: c_int = 0;
-        var h: c_int = 0;
-        var channels_in_file: c_int = 0;
-
-        const data = c.stbi_load(
-            path_z.ptr,
-            &w,
-            &h,
-            &channels_in_file,
-            4,
-        );
-        if (data == null) {
-            return error.ImageDecodeFailed;
-        }
-        defer c.stbi_image_free(data);
-
-        const width: u32 = @intCast(w);
-        const height: u32 = @intCast(h);
-        const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        const slice = data[0..size_bytes];
-
-        if (!options.mipmaps) {
-            return initRaw(width, height, slice, options);
-        }
-        return initRawMipped(allocator, width, height, slice, options);
+        var raw = try decodeFile(allocator, file_path, options.mipmaps);
+        defer raw.deinit(allocator);
+        return fromRaw(&raw, options);
     }
 
     pub fn deinit(self: *Texture) void {
@@ -786,4 +824,21 @@ test "downsampleLevel handles odd dimensions and averages correctly" {
     Texture.downsampleLevel(&src, 3, 5, &dst, 1, 2);
     // Top-left texel averages src bytes {0,4,12,16}: (0+4+12+16+2)/4 = 8.
     try std.testing.expectEqual(@as(u8, 8), dst[0]);
+}
+
+test "decodeMemory returns RGBA levels and owns its mip chain" {
+    const png = @embedFile("assets/font_sdf.png");
+    const allocator = std.testing.allocator;
+
+    var single = try Texture.decodeMemory(allocator, png, false);
+    defer single.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 512), single.width);
+    try std.testing.expectEqual(@as(u32, 512), single.height);
+    try std.testing.expectEqual(@as(u32, 1), single.num_levels);
+    try std.testing.expectEqual(@as(usize, 512 * 512 * 4), single.levels[0].?.len);
+
+    var mipped = try Texture.decodeMemory(allocator, png, true);
+    defer mipped.deinit(allocator);
+    try std.testing.expectEqual(Texture.mipLevelCount(512, 512), mipped.num_levels);
+    try std.testing.expectEqual(@as(usize, 4), mipped.levels[mipped.num_levels - 1].?.len);
 }

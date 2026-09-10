@@ -184,7 +184,15 @@ pub fn build(b: *Build) !void {
         .file = b.path("src/zenderer/c/c_impl.c"),
         // Asset decoding dominates scene startup at -O0. Keep Zig debug checks
         // and the selected release optimization mode unchanged.
-        .flags = if (optimize == .Debug) &.{ "-std=c99", "-O2" } else &.{"-std=c99"},
+        // stb_image only compiles its NEON paths when asked; without the define
+        // JPEG decode runs scalar on Apple Silicon (measured ~2x slower).
+        .flags = blk: {
+            const neon = target.result.cpu.arch == .aarch64;
+            if (optimize == .Debug) {
+                break :blk if (neon) &.{ "-std=c99", "-O2", "-DSTBI_NEON" } else &.{ "-std=c99", "-O2" };
+            }
+            break :blk if (neon) &.{ "-std=c99", "-DSTBI_NEON" } else &.{"-std=c99"};
+        },
     });
     // Box3D v0.1.0, vendored C17 sources (MIT). Public headers under
     // src/zenderer/c/box3d/include, internal headers resolve inside src/.
