@@ -20,6 +20,30 @@ pub const ShadowPass = struct {
     skinned_pipeline_u16: sg.Pipeline,
     skinned_pipeline_u32: sg.Pipeline,
 
+    // Pipeline buckets in fixed order; the grouping key is defined once per
+    // render so each cascade issues at most one applyPipeline per bucket.
+    const Bucket = enum { regular_u16, regular_u32, inst_u16, inst_u32, skinned_u16, skinned_u32 };
+    const bucket_order: [6]Bucket = .{ .regular_u16, .regular_u32, .inst_u16, .inst_u32, .skinned_u16, .skinned_u32 };
+
+    // Matches Scene.render's pipeline pick: instanced wins over skinned.
+    fn bucketFor(mesh: *const Mesh) Bucket {
+        const is_32 = mesh.index_type == .UINT32;
+        if (mesh.instances.items.len > 0) return if (is_32) .inst_u32 else .inst_u16;
+        if (mesh.skeleton != null) return if (is_32) .skinned_u32 else .skinned_u16;
+        return if (is_32) .regular_u32 else .regular_u16;
+    }
+
+    fn pipelineFor(self: *const ShadowPass, bucket: Bucket) u32 {
+        return switch (bucket) {
+            .regular_u16 => self.pipeline_u16.id,
+            .regular_u32 => self.pipeline_u32.id,
+            .inst_u16 => self.inst_pipeline_u16.id,
+            .inst_u32 => self.inst_pipeline_u32.id,
+            .skinned_u16 => self.skinned_pipeline_u16.id,
+            .skinned_u32 => self.skinned_pipeline_u32.id,
+        };
+    }
+
     pub fn init() ShadowPass {
         // 2048 atlas holding 4x 1024 cascades (2x2). Was 4096/2048: same look
         // for near geometry, 4x fewer depth texels rasterized per frame.
@@ -175,6 +199,8 @@ pub const ShadowPass = struct {
 
         const CASCADE_RES: i32 = 1024;
         var draw_calls: u32 = 0;
+        // Kept across cascades: identical re-applies are skipped.
+        var last_pipeline_id: u32 = 0;
 
         for (0..4) |c_idx| {
             const light_view_proj = cascades[c_idx];
@@ -185,76 +211,76 @@ pub const ShadowPass = struct {
             sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
             const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
-            var last_pipeline_id: u32 = 0;
 
-            for (meshes) |mesh| {
-                if (!mesh.cast_shadows) continue;
+            // Grouped by pipeline: intra-cascade draw order changes, but the
+            // depth-only output is order-independent (no color, no blending).
+            for (bucket_order) |bucket| {
+                const pip_id = self.pipelineFor(bucket);
+                if (pip_id == 0) continue;
 
-                if (mesh.instances.items.len > 0) {
-                    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+                for (meshes) |mesh| {
+                    if (bucketFor(mesh) != bucket) continue;
+                    if (!mesh.cast_shadows) continue;
 
-                    const pip_id = if (mesh.index_type == .UINT32) self.inst_pipeline_u32.id else self.inst_pipeline_u16.id;
-                    if (pip_id == 0) continue;
-                    if (pip_id != last_pipeline_id) {
-                        sg.applyPipeline(.{ .id = pip_id });
-                        last_pipeline_id = pip_id;
-                    }
+                    if (mesh.instances.items.len > 0) {
+                        if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
 
-                    var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = mesh.vertex_buffer;
-                    bind.vertex_buffers[1] = mesh.instance_buffer;
-                    bind.index_buffer = mesh.index_buffer;
-                    sg.applyBindings(bind);
+                        if (pip_id != last_pipeline_id) {
+                            sg.applyPipeline(.{ .id = pip_id });
+                            last_pipeline_id = pip_id;
+                        }
 
-                    const inst_vs = shadow_shd.VsInstParams{
-                        .light_view_proj = light_view_proj,
-                    };
-                    sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
-                    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
-                    draw_calls += 1;
-                } else {
-                    if (!mesh.is_visible) continue;
-                    // Scene.render() already cached world matrix + AABB this frame;
-                    // fall back to direct computation if it didn't (stale or external call).
-                    const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
-                    if (!c_frustum.intersectsAABB(aabb_w)) continue;
+                        var bind = sg.Bindings{};
+                        bind.vertex_buffers[0] = mesh.vertex_buffer;
+                        bind.vertex_buffers[1] = mesh.instance_buffer;
+                        bind.index_buffer = mesh.index_buffer;
+                        sg.applyBindings(bind);
 
-                    // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
-                    const ext = aabb_w.extents();
-                    const max_dim = @max(ext.x, @max(ext.y, ext.z));
-                    if (c_idx == 2 and max_dim < 0.35) continue;
-                    if (c_idx == 3 and max_dim < 0.75) continue;
-
-                    const pip_id = if (mesh.skeleton != null)
-                        (if (mesh.index_type == .UINT32) self.skinned_pipeline_u32.id else self.skinned_pipeline_u16.id)
-                    else
-                        (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
-                    if (pip_id == 0) continue;
-                    if (pip_id != last_pipeline_id) {
-                        sg.applyPipeline(.{ .id = pip_id });
-                        last_pipeline_id = pip_id;
-                    }
-
-                    var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = mesh.vertex_buffer;
-                    bind.index_buffer = mesh.index_buffer;
-                    sg.applyBindings(bind);
-
-                    const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
-                    const shadow_vs = shadow_shd.VsParams{
-                        .mvp = Mat4.mul(light_view_proj, model),
-                    };
-                    sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
-
-                    if (mesh.skeleton) |skel| {
-                        const vs_skin = shadow_shd.VsSkin{
-                            .bones = skel.skin_matrices,
+                        const inst_vs = shadow_shd.VsInstParams{
+                            .light_view_proj = light_view_proj,
                         };
-                        sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
-                    }
+                        sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
+                        sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                        draw_calls += 1;
+                    } else {
+                        if (!mesh.is_visible) continue;
+                        // Scene.render() already cached world matrix + AABB this frame;
+                        // fall back to direct computation if it didn't (stale or external call).
+                        const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
+                        if (!c_frustum.intersectsAABB(aabb_w)) continue;
 
-                    sg.draw(0, mesh.index_count, 1);
-                    draw_calls += 1;
+                        // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
+                        const ext = aabb_w.extents();
+                        const max_dim = @max(ext.x, @max(ext.y, ext.z));
+                        if (c_idx == 2 and max_dim < 0.35) continue;
+                        if (c_idx == 3 and max_dim < 0.75) continue;
+
+                        if (pip_id != last_pipeline_id) {
+                            sg.applyPipeline(.{ .id = pip_id });
+                            last_pipeline_id = pip_id;
+                        }
+
+                        var bind = sg.Bindings{};
+                        bind.vertex_buffers[0] = mesh.vertex_buffer;
+                        bind.index_buffer = mesh.index_buffer;
+                        sg.applyBindings(bind);
+
+                        const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
+                        const shadow_vs = shadow_shd.VsParams{
+                            .mvp = Mat4.mul(light_view_proj, model),
+                        };
+                        sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
+
+                        if (mesh.skeleton) |skel| {
+                            const vs_skin = shadow_shd.VsSkin{
+                                .bones = skel.skin_matrices,
+                            };
+                            sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
+                        }
+
+                        sg.draw(0, mesh.index_count, 1);
+                        draw_calls += 1;
+                    }
                 }
             }
         }

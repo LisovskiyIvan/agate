@@ -11,10 +11,16 @@ pub const Frustum = math.Frustum;
 
 pub const camera = @import("camera.zig");
 pub const ArcRotateCamera = camera.ArcRotateCamera;
+pub const Camera = camera.Camera;
+pub const FreeCamera = camera.FreeCamera;
+pub const FreeCameraOptions = camera.FreeCameraOptions;
+pub const FollowCamera = camera.FollowCamera;
+pub const FollowCameraOptions = camera.FollowCameraOptions;
 
 pub const lights = @import("lights.zig");
 pub const HemisphericLight = lights.HemisphericLight;
 pub const DirectionalLight = lights.DirectionalLight;
+pub const DirectionalLightOptions = lights.DirectionalLightOptions;
 pub const PointLight = lights.PointLight;
 pub const PointLightOptions = lights.PointLightOptions;
 pub const SpotLight = lights.SpotLight;
@@ -24,6 +30,7 @@ pub const material = @import("material.zig");
 pub const StandardMaterial = material.StandardMaterial;
 pub const PBRMaterial = material.PBRMaterial;
 pub const Material = material.Material;
+pub const AlphaMode = material.AlphaMode;
 
 pub const texture = @import("texture.zig");
 pub const Texture = texture.Texture;
@@ -43,6 +50,15 @@ pub const CylinderOptions = mesh.CylinderOptions;
 pub const CapsuleOptions = mesh.CapsuleOptions;
 pub const GroundOptions = mesh.GroundOptions;
 pub const TerrainOptions = mesh.TerrainOptions;
+pub const TorusOptions = mesh.TorusOptions;
+pub const TorusKnotOptions = mesh.TorusKnotOptions;
+pub const DiscOptions = mesh.DiscOptions;
+pub const RibbonOptions = mesh.RibbonOptions;
+pub const LatheOptions = mesh.LatheOptions;
+pub const PlaneOptions = mesh.PlaneOptions;
+pub const TubeOptions = mesh.TubeOptions;
+pub const LinesOptions = mesh.LinesOptions;
+pub const ExtrudeOptions = mesh.ExtrudeOptions;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
@@ -102,6 +118,7 @@ pub const passes = @import("passes/mod.zig");
 pub const animation = struct {
     pub const skeleton = @import("animation/skeleton.zig");
     pub const anim = @import("animation/animation.zig");
+    pub const easing = @import("animation/easing.zig");
     pub const Skeleton = skeleton.Skeleton;
     pub const Bone = skeleton.Bone;
     pub const MAX_BONES = skeleton.MAX_BONES;
@@ -110,6 +127,12 @@ pub const animation = struct {
     pub const AnimationSampler = anim.AnimationSampler;
     pub const AnimationPath = anim.AnimationPath;
     pub const AnimationInterpolation = anim.AnimationInterpolation;
+    pub const NodeChannel = anim.NodeChannel;
+    pub const NodeTarget = anim.NodeTarget;
+    pub const EasingType = easing.EasingType;
+    pub const evaluateEasing = easing.evaluate;
+    pub const easingName = easing.easingName;
+    pub const easingFromName = easing.easingFromName;
     pub const evaluateSkeleton = anim.evaluateSkeleton;
 };
 pub const Skeleton = animation.Skeleton;
@@ -119,10 +142,23 @@ pub const AnimationChannel = animation.AnimationChannel;
 pub const AnimationSampler = animation.AnimationSampler;
 pub const AnimationPath = animation.AnimationPath;
 pub const AnimationInterpolation = animation.AnimationInterpolation;
+pub const NodeChannel = animation.NodeChannel;
+pub const NodeTarget = animation.NodeTarget;
+pub const EasingType = animation.EasingType;
+pub const evaluateEasing = animation.evaluateEasing;
+pub const easingName = animation.easingName;
+pub const easingFromName = animation.easingFromName;
 pub const evaluateSkeleton = animation.evaluateSkeleton;
+
+pub const Ragdoll = @import("ragdoll.zig").Ragdoll;
+pub const RagdollOptions = @import("ragdoll.zig").RagdollOptions;
+pub const RagdollPart = @import("ragdoll.zig").RagdollPart;
+pub const RaycastVehicle = @import("vehicle.zig").RaycastVehicle;
+pub const VehicleOptions = @import("vehicle.zig").VehicleOptions;
 
 pub const audio = @import("audio.zig");
 pub const AudioEngine = audio.AudioEngine;
+pub const AudioClip = audio.AudioClip;
 pub const VoiceKind = audio.VoiceKind;
 pub const Voice = audio.Voice;
 

@@ -43,4 +43,16 @@ pub const PostProcessConfig = struct {
     ssr_intensity: f32 = 0.55,
     ssr_max_distance: f32 = 25.0,
     ssr_thickness: f32 = 0.4,
+
+    // Sharpen (post-tonemap unsharp mask)
+    sharpen_enabled: bool = false,
+    sharpen_amount: f32 = 0.3,
+
+    // Film Grain (post-tonemap hash noise, luminance-masked)
+    grain_enabled: bool = false,
+    grain_intensity: f32 = 0.05,
+
+    // White Balance (post-tonemap channel gains, 0 = neutral)
+    temperature: f32 = 0.0,
+    tint: f32 = 0.0,
 };

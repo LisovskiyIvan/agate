@@ -9,6 +9,11 @@ pub const Texture = struct {
     sampler: sg.Sampler,
     width: u32,
     height: u32,
+    /// Pixel format of the GPU image. LDR loaders leave the default RGBA8;
+    /// HDR loaders set RGBA16F. Defaults keep existing call sites unchanged.
+    format: sg.PixelFormat = .RGBA8,
+    /// True for float (HDR) textures: no gamma correction, linear sampling.
+    is_hdr: bool = false,
 
     pub const Options = struct {
         min_filter: sg.Filter = .LINEAR,
@@ -399,6 +404,163 @@ pub const Texture = struct {
         return fromRaw(&raw, options);
     }
 
+    /// Converts one f32 channel to an IEEE-754 half-precision bit pattern.
+    /// Out-of-range magnitudes become half infinity, NaN stays NaN.
+    /// Content above 65504 loses detail: tone-map before upload if it matters.
+    pub fn floatToHalfBits(value: f32) u16 {
+        return @bitCast(@as(f16, @floatCast(value)));
+    }
+
+    /// Converts an IEEE-754 half-precision bit pattern back to f32.
+    /// Used by tests and debugging; the GPU upload path never needs it.
+    pub fn halfBitsToFloat(bits: u16) f32 {
+        return @floatCast(@as(f16, @bitCast(bits)));
+    }
+
+    /// CPU-decoded HDR pixels in half-float RGBA. Decoding and the f32->f16
+    /// conversion are GPU-free, so they can run on worker threads; the
+    /// sg.Image must be created later with `fromRawHdr` on the main thread.
+    /// Single mip level only: HDR images upload without mipmaps (linear
+    /// min/mag, clamp wrap, no gamma correction).
+    pub const RawHdrTexture = struct {
+        width: u32 = 0,
+        height: u32 = 0,
+        /// RGBA half-float bit patterns, width*height*4 entries.
+        pixels: []u16 = &.{},
+
+        pub fn deinit(self: *RawHdrTexture, allocator: std.mem.Allocator) void {
+            if (self.pixels.len > 0) allocator.free(self.pixels);
+            self.* = .{};
+        }
+    };
+
+    /// Copies f32 RGBA samples and converts them to half-float bits.
+    /// Rejects empty dimensions and short sample buffers.
+    fn buildRawHdr(allocator: std.mem.Allocator, width: u32, height: u32, samples: []const f32) !RawHdrTexture {
+        const pixel_count = std.math.mul(usize, width, height) catch return error.ImageTooLarge;
+        const channel_count = std.math.mul(usize, pixel_count, 4) catch return error.ImageTooLarge;
+        if (channel_count == 0 or samples.len < channel_count) return error.InvalidDimensions;
+
+        const pixels = try allocator.alloc(u16, channel_count);
+        errdefer allocator.free(pixels);
+        for (samples[0..channel_count], 0..) |sample, i| {
+            pixels[i] = floatToHalfBits(sample);
+        }
+        return .{ .width = width, .height = height, .pixels = pixels };
+    }
+
+    /// Decodes an image to half-float RGBA via stbi_loadf: Radiance .hdr
+    /// natively, LDR formats (PNG/JPEG/...) upconverted to float.
+    /// Thread-safe; pair with `fromRawHdr`. Foreign or corrupt
+    /// data yields error.ImageDecodeFailed, empty sizes error.InvalidDimensions.
+    pub fn decodeHDRMemory(allocator: std.mem.Allocator, bytes: []const u8) !RawHdrTexture {
+        if (bytes.len == 0) return error.ImageDecodeFailed;
+        if (bytes.len > std.math.maxInt(c_int)) return error.ImageTooLarge;
+
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var channels_in_file: c_int = 0;
+
+        const data = c.stbi_loadf_from_memory(
+            bytes.ptr,
+            @intCast(bytes.len),
+            &w,
+            &h,
+            &channels_in_file,
+            4,
+        );
+        if (data == null) return error.ImageDecodeFailed;
+        defer c.stbi_image_free(data);
+        if (w <= 0 or h <= 0) return error.InvalidDimensions;
+
+        const width: u32 = @intCast(w);
+        const height: u32 = @intCast(h);
+        const channel_count = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+        return buildRawHdr(allocator, width, height, data[0..channel_count]);
+    }
+
+    /// File variant of `decodeHDRMemory`. Thread-safe; pair with `fromRawHdr`.
+    pub fn decodeHDRFile(allocator: std.mem.Allocator, file_path: []const u8) !RawHdrTexture {
+        const path_z = try allocator.dupeZ(u8, file_path);
+        defer allocator.free(path_z);
+
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var channels_in_file: c_int = 0;
+
+        const data = c.stbi_loadf(path_z.ptr, &w, &h, &channels_in_file, 4);
+        if (data == null) return error.ImageDecodeFailed;
+        defer c.stbi_image_free(data);
+        if (w <= 0 or h <= 0) return error.InvalidDimensions;
+
+        const width: u32 = @intCast(w);
+        const height: u32 = @intCast(h);
+        const channel_count = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+        return buildRawHdr(allocator, width, height, data[0..channel_count]);
+    }
+
+    /// Thin GPU uploader for RGBA half-float data. Main thread only.
+    /// Precondition: rgba_f16.len == width*height*4.
+    pub fn initRawHdr(width: u32, height: u32, rgba_f16: []const u16) Texture {
+        var img_desc = sg.ImageDesc{
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .pixel_format = .RGBA16F,
+            .num_mipmaps = 1,
+        };
+        img_desc.data.mip_levels[0] = sg.asRange(rgba_f16);
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .width = width,
+            .height = height,
+            .format = .RGBA16F,
+            .is_hdr = true,
+        };
+    }
+
+    /// Creates the GPU image from CPU-decoded half-float pixels.
+    /// Main thread only. Always uploads single-level RGBA16F with LINEAR
+    /// min/mag and CLAMP_TO_EDGE: `options` is accepted for call symmetry
+    /// but its filter/wrap/mipmap fields are ignored for HDR (no gamma
+    /// correction, no mip chain).
+    pub fn fromRawHdr(raw: *const RawHdrTexture, options: Options) Texture {
+        _ = options;
+        return initRawHdr(raw.width, raw.height, raw.pixels);
+    }
+
+    /// Decodes Radiance .hdr from memory and uploads an RGBA16F texture.
+    /// Main thread only (GPU upload); use decodeHDRMemory + fromRawHdr to
+    /// split worker-thread decode from main-thread upload.
+    pub fn fromHDRMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
+        var raw = try decodeHDRMemory(allocator, bytes);
+        defer raw.deinit(allocator);
+        return fromRawHdr(&raw, options);
+    }
+
+    /// Loads a Radiance .hdr file and uploads an RGBA16F texture.
+    /// Main thread only (GPU upload); use decodeHDRFile + fromRawHdr to
+    /// split worker-thread decode from main-thread upload.
+    pub fn loadHDRFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
+        var raw = try decodeHDRFile(allocator, file_path);
+        defer raw.deinit(allocator);
+        return fromRawHdr(&raw, options);
+    }
+
     pub fn deinit(self: *Texture) void {
         sg.destroyView(self.view);
         sg.destroyImage(self.image);
@@ -422,6 +584,11 @@ pub const CubeTexture = struct {
     sampler: sg.Sampler,
     size: u32,
     num_mipmaps: u32 = 1,
+    /// Pixel format of the GPU cube image. Defaults keep LDR call sites
+    /// unchanged; HDR uploaders set RGBA16F.
+    format: sg.PixelFormat = .RGBA8,
+    /// True for float (HDR) cubes: no gamma correction, linear sampling.
+    is_hdr: bool = false,
 
     pub fn deinit(self: *CubeTexture) void {
         sg.destroyView(self.view);
@@ -746,38 +913,11 @@ pub const CubeTexture = struct {
             const buf = face_slices[face];
             var py: u32 = 0;
             while (py < face_size) : (py += 1) {
-                const v = 2.0 * (@as(f32, @floatFromInt(py)) + 0.5) / @as(f32, @floatFromInt(face_size)) - 1.0;
                 var px: u32 = 0;
                 while (px < face_size) : (px += 1) {
-                    const u = 2.0 * (@as(f32, @floatFromInt(px)) + 0.5) / @as(f32, @floatFromInt(face_size)) - 1.0;
-
-                    const dir: [3]f32 = switch (face) {
-                        0 => .{ 1.0, -v, -u }, // +X
-                        1 => .{ -1.0, -v, u }, // -X
-                        2 => .{ u, 1.0, v }, // +Y
-                        3 => .{ u, -1.0, -v }, // -Y
-                        4 => .{ u, -v, 1.0 }, // +Z
-                        5 => .{ -u, -v, -1.0 }, // -Z
-                        else => unreachable,
-                    };
-
-                    const len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-                    const d: [3]f32 = .{ dir[0] / len, dir[1] / len, dir[2] / len };
-
-                    // Spherical coordinates
-                    const phi = std.math.atan2(d[2], d[0]); // longitude [-pi, pi]
-                    const theta = std.math.asin(std.math.clamp(d[1], -1.0, 1.0)); // latitude [-pi/2, pi/2]
-
-                    const u_pano = (phi / (2.0 * std.math.pi)) + 0.5;
-                    const v_pano = 0.5 - (theta / std.math.pi);
-
-                    const sx_f = std.math.clamp(u_pano * @as(f32, @floatFromInt(pano_w)), 0.0, @as(f32, @floatFromInt(pano_w - 1)));
-                    const sy_f = std.math.clamp(v_pano * @as(f32, @floatFromInt(pano_h)), 0.0, @as(f32, @floatFromInt(pano_h - 1)));
-
-                    const sx: u32 = @intFromFloat(sx_f);
-                    const sy: u32 = @intFromFloat(sy_f);
-
-                    const p_idx = (sy * pano_w + sx) * 4;
+                    const d = cubeTexelDirection(face, px, py, face_size);
+                    const t = panoramaTexel(d, pano_w, pano_h);
+                    const p_idx = (t.y * pano_w + t.x) * 4;
                     const out_idx = (py * face_size + px) * 4;
 
                     @memcpy(buf[out_idx .. out_idx + 4], p_data[p_idx .. p_idx + 4]);
@@ -807,6 +947,169 @@ pub const CubeTexture = struct {
 
         _ = try file.readAll(bytes);
         return fromEquirectangular(allocator, bytes, face_size);
+    }
+
+    /// Normalized cube-face direction for texel (px, py). Shared by the LDR
+    /// and HDR equirectangular converters so both sample the same texels.
+    fn cubeTexelDirection(face: usize, px: u32, py: u32, size: u32) [3]f32 {
+        const size_f: f32 = @floatFromInt(size);
+        const u = 2.0 * (@as(f32, @floatFromInt(px)) + 0.5) / size_f - 1.0;
+        const v = 2.0 * (@as(f32, @floatFromInt(py)) + 0.5) / size_f - 1.0;
+
+        const dir: [3]f32 = switch (face) {
+            0 => .{ 1.0, -v, -u }, // +X
+            1 => .{ -1.0, -v, u }, // -X
+            2 => .{ u, 1.0, v }, // +Y
+            3 => .{ u, -1.0, -v }, // -Y
+            4 => .{ u, -v, 1.0 }, // +Z
+            5 => .{ -u, -v, -1.0 }, // -Z
+            else => unreachable,
+        };
+
+        const len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        return .{ dir[0] / len, dir[1] / len, dir[2] / len };
+    }
+
+    /// Nearest panorama texel for a normalized direction (spherical mapping).
+    /// Shared by the LDR and HDR equirectangular converters.
+    fn panoramaTexel(d: [3]f32, pano_w: u32, pano_h: u32) struct { x: u32, y: u32 } {
+        // Spherical coordinates
+        const phi = std.math.atan2(d[2], d[0]); // longitude [-pi, pi]
+        const theta = std.math.asin(std.math.clamp(d[1], -1.0, 1.0)); // latitude [-pi/2, pi/2]
+
+        const u_pano = (phi / (2.0 * std.math.pi)) + 0.5;
+        const v_pano = 0.5 - (theta / std.math.pi);
+
+        const sx_f = std.math.clamp(u_pano * @as(f32, @floatFromInt(pano_w)), 0.0, @as(f32, @floatFromInt(pano_w - 1)));
+        const sy_f = std.math.clamp(v_pano * @as(f32, @floatFromInt(pano_h)), 0.0, @as(f32, @floatFromInt(pano_h - 1)));
+
+        return .{ .x = @intFromFloat(sx_f), .y = @intFromFloat(sy_f) };
+    }
+
+    /// GPU-free half-float cube faces converted from an HDR panorama.
+    /// Owns six size*size*4 half-float bit patterns; free with deinit.
+    /// Single mip level only: HDR cubes upload without mipmaps.
+    pub const RawHdrCube = struct {
+        size: u32 = 0,
+        faces: [6]?[]u16 = @splat(null),
+
+        pub fn deinit(self: *RawHdrCube, allocator: std.mem.Allocator) void {
+            for (&self.faces) |*face| {
+                if (face.*) |buf| allocator.free(buf);
+                face.* = null;
+            }
+            self.size = 0;
+        }
+    };
+
+    /// Converts an f32 RGBA equirectangular panorama to six half-float cube
+    /// faces using the same texel math as `fromEquirectangular`. GPU-free and
+    /// safe for worker threads; pair with `initRawFacesHdr`. Nearest sampling,
+    /// no gamma correction. Rejects zero dimensions and short buffers.
+    pub fn convertEquirectangularHDR(
+        allocator: std.mem.Allocator,
+        width: u32,
+        height: u32,
+        rgba: []const f32,
+        size: u32,
+    ) !RawHdrCube {
+        if (size == 0 or width == 0 or height == 0) return error.InvalidDimensions;
+        const pano_pixels = std.math.mul(usize, width, height) catch return error.ImageTooLarge;
+        const pano_channels = std.math.mul(usize, pano_pixels, 4) catch return error.ImageTooLarge;
+        if (rgba.len != pano_channels) return error.InvalidPanoramaSize;
+
+        const face_pixels = std.math.mul(usize, std.math.mul(usize, size, size) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+
+        var raw = RawHdrCube{ .size = size };
+        errdefer raw.deinit(allocator);
+
+        for (0..6) |face| {
+            const out = try allocator.alloc(u16, face_pixels);
+            raw.faces[face] = out;
+            var py: u32 = 0;
+            while (py < size) : (py += 1) {
+                var px: u32 = 0;
+                while (px < size) : (px += 1) {
+                    const d = cubeTexelDirection(face, px, py, size);
+                    const t = panoramaTexel(d, width, height);
+                    const p_idx = (t.y * width + t.x) * 4;
+                    const out_idx = (py * size + px) * 4;
+                    for (0..4) |ch| {
+                        out[out_idx + ch] = Texture.floatToHalfBits(rgba[p_idx + ch]);
+                    }
+                }
+            }
+        }
+        return raw;
+    }
+
+    /// Uploads six half-float RGBA faces as a single-level RGBA16F cube.
+    /// Main thread only. Each face must hold size*size*4 half patterns.
+    /// Linear min/mag, clamp on all axes, no mipmaps, no gamma correction.
+    pub fn initRawFacesHdr(allocator: std.mem.Allocator, size: u32, faces: [6][]const u16) !CubeTexture {
+        if (size == 0) return error.InvalidDimensions;
+        const face_pixels = std.math.mul(usize, std.math.mul(usize, size, size) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+        for (faces) |face| {
+            if (face.len != face_pixels) return error.InvalidFaceBufferSize;
+        }
+
+        // Concatenate the 6 faces: sokol expects one contiguous cube upload.
+        const mip0 = try allocator.alloc(u16, std.math.mul(usize, 6, face_pixels) catch return error.ImageTooLarge);
+        defer allocator.free(mip0);
+        for (faces, 0..) |face, i| {
+            @memcpy(mip0[i * face_pixels .. (i + 1) * face_pixels], face);
+        }
+
+        var img_desc = sg.ImageDesc{
+            .type = .CUBE,
+            .width = @intCast(size),
+            .height = @intCast(size),
+            .num_slices = 6,
+            .num_mipmaps = 1,
+            .pixel_format = .RGBA16F,
+            .sample_count = 1,
+        };
+        img_desc.data.mip_levels[0] = sg.asRange(mip0);
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .wrap_w = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .size = size,
+            .num_mipmaps = 1,
+            .format = .RGBA16F,
+            .is_hdr = true,
+        };
+    }
+
+    /// Converts an in-memory f32 RGBA equirectangular panorama to an RGBA16F
+    /// cube for IBL/skybox. Main thread only (GPU upload); use
+    /// convertEquirectangularHDR alone to stay GPU-free (worker threads).
+    pub fn fromEquirectangularHDR(
+        allocator: std.mem.Allocator,
+        width: u32,
+        height: u32,
+        rgba: []const f32,
+        size: u32,
+    ) !CubeTexture {
+        var raw = try convertEquirectangularHDR(allocator, width, height, rgba, size);
+        defer raw.deinit(allocator);
+        var faces: [6][]const u16 = undefined;
+        for (0..6) |i| faces[i] = raw.faces[i].?;
+        return initRawFacesHdr(allocator, size, faces);
     }
 };
 
@@ -841,4 +1144,139 @@ test "decodeMemory returns RGBA levels and owns its mip chain" {
     defer mipped.deinit(allocator);
     try std.testing.expectEqual(Texture.mipLevelCount(512, 512), mipped.num_levels);
     try std.testing.expectEqual(@as(usize, 4), mipped.levels[mipped.num_levels - 1].?.len);
+}
+
+// Minimal 1x1 Radiance .hdr with flat (non-RLE) RGBE data. Width < 8 takes
+// the flat decode path in stb_image. RGBE {128,128,128,128} decodes to
+// 128 * 2^(128-136) = 0.5 per channel, alpha forced to 1.0.
+const hdr_1x1_flat: []const u8 = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n\x80\x80\x80\x80";
+
+// Minimal 8x1 Radiance .hdr exercising the RLE scanline path: scanline
+// header {2, 2, 0, 8} (width 8), then each of the 4 channels as one run of
+// 8 pixels with value 128 (count byte 128+8 = 0x88). Same 0.5 gray texels.
+const hdr_8x1_rle: []const u8 = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 8\n\x02\x02\x00\x08\x88\x80\x88\x80\x88\x80\x88\x80";
+
+test "decodeHDRMemory decodes minimal flat Radiance .hdr" {
+    const allocator = std.testing.allocator;
+
+    var raw = try Texture.decodeHDRMemory(allocator, hdr_1x1_flat);
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), raw.width);
+    try std.testing.expectEqual(@as(u32, 1), raw.height);
+    try std.testing.expectEqual(@as(usize, 4), raw.pixels.len);
+    // Exact half patterns: 0.5 -> 0x3800, 1.0 -> 0x3C00.
+    try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[0]);
+    try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[1]);
+    try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[2]);
+    try std.testing.expectEqual(@as(u16, 0x3C00), raw.pixels[3]);
+}
+
+test "decodeHDRMemory decodes RLE Radiance scanlines" {
+    const allocator = std.testing.allocator;
+
+    var raw = try Texture.decodeHDRMemory(allocator, hdr_8x1_rle);
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 8), raw.width);
+    try std.testing.expectEqual(@as(u32, 1), raw.height);
+    try std.testing.expectEqual(@as(usize, 8 * 1 * 4), raw.pixels.len);
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[i * 4 + 0]);
+        try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[i * 4 + 1]);
+        try std.testing.expectEqual(@as(u16, 0x3800), raw.pixels[i * 4 + 2]);
+        try std.testing.expectEqual(@as(u16, 0x3C00), raw.pixels[i * 4 + 3]);
+    }
+}
+
+test "decodeHDRMemory rejects foreign, truncated and empty data" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        Texture.decodeHDRMemory(allocator, "hello world, this is not an image"),
+    );
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        Texture.decodeHDRMemory(allocator, "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n"),
+    );
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        Texture.decodeHDRMemory(allocator, hdr_1x1_flat[0 .. hdr_1x1_flat.len - 2]),
+    );
+    const empty: []const u8 = &[_]u8{};
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        Texture.decodeHDRMemory(allocator, empty),
+    );
+}
+
+test "floatToHalfBits covers exact values, overflow and NaN" {
+    try std.testing.expectEqual(@as(u16, 0x3C00), Texture.floatToHalfBits(1.0));
+    try std.testing.expectEqual(@as(u16, 0x3800), Texture.floatToHalfBits(0.5));
+    try std.testing.expectEqual(@as(u16, 0x0000), Texture.floatToHalfBits(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), Texture.halfBitsToFloat(0x3C00));
+
+    // Beyond f16 max (65504): documents the half-float precision ceiling.
+    try std.testing.expect(std.math.isInf(Texture.halfBitsToFloat(Texture.floatToHalfBits(1.0e10))));
+    try std.testing.expect(std.math.isNan(Texture.halfBitsToFloat(Texture.floatToHalfBits(std.math.nan(f32)))));
+}
+
+test "convertEquirectangularHDR maps gradient faces without NaN" {
+    const allocator = std.testing.allocator;
+    const pano_w: u32 = 4;
+    const pano_h: u32 = 2;
+    const face_size: u32 = 4;
+
+    var pano: [4 * 2 * 4]f32 = undefined;
+    for (0..pano_h) |y| {
+        for (0..pano_w) |x| {
+            const o = (y * pano_w + x) * 4;
+            pano[o + 0] = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(pano_w - 1));
+            pano[o + 1] = @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(pano_h - 1));
+            pano[o + 2] = 0.5;
+            pano[o + 3] = 1.0;
+        }
+    }
+
+    var cube = try CubeTexture.convertEquirectangularHDR(allocator, pano_w, pano_h, &pano, face_size);
+    defer cube.deinit(allocator);
+
+    try std.testing.expectEqual(face_size, cube.size);
+    for (cube.faces) |maybe_face| {
+        const face = maybe_face.?;
+        try std.testing.expectEqual(@as(usize, face_size * face_size * 4), face.len);
+        for (face) |bits| {
+            const v = Texture.halfBitsToFloat(bits);
+            try std.testing.expect(!std.math.isNan(v));
+            try std.testing.expect(std.math.isFinite(v));
+        }
+    }
+}
+
+test "convertEquirectangularHDR validates dimensions and buffer size" {
+    const allocator = std.testing.allocator;
+    var pano: [2 * 1 * 4]f32 = [_]f32{0.0} ** (2 * 1 * 4);
+
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.convertEquirectangularHDR(allocator, 0, 1, &pano, 2),
+    );
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.convertEquirectangularHDR(allocator, 2, 1, &pano, 0),
+    );
+    try std.testing.expectError(
+        error.InvalidPanoramaSize,
+        CubeTexture.convertEquirectangularHDR(allocator, 2, 1, pano[0..4], 2),
+    );
+}
+
+test "decodeHDRFile reports missing files without leaking" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        Texture.decodeHDRFile(allocator, "definitely/missing/file.hdr"),
+    );
 }

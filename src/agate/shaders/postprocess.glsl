@@ -1,5 +1,6 @@
 // Fullscreen Post-Processing Shader for agate
-// Supports ACES Filmic & Reinhard Tone Mapping, Bloom, Vignette, Chromatic Aberration, Saturation & Contrast
+// Supports ACES Filmic & Reinhard Tone Mapping, Bloom, Vignette, Chromatic Aberration, Saturation & Contrast,
+// White Balance, Sharpen, Film Grain
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 
@@ -34,6 +35,7 @@ layout(binding = 0) uniform fs_params {
     vec4 fog_params; // x: fog_enabled (1/0), y: fog_density, z: fog_height_falloff, w: fog_start_distance
     vec4 fog_color; // xyz: fog_color, w: fog_sun_scattering
     vec4 ssr_params; // x: ssr_enabled (1/0), y: ssr_intensity, z: ssr_thickness, w: ssr_max_distance
+    vec4 params5; // x: sharpen_amount (0=off), y: grain_intensity (0=off), z: temperature [-1,1], w: tint [-1,1]
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
 };
@@ -254,6 +256,14 @@ float rgbToLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
+// Sin-free integer-style hash (David Hoskins) for film grain.
+// Stable per screen-space pixel; static (no time input).
+float grainHash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
 // Fast LDR sample for FXAA edge detection and tangent searching
 // Includes scene_tex, chromatic aberration, and SSAO (from pre-rendered ssao_tex)
 // Skips heavy raymarching SSR and atmospheric fog on neighbor taps
@@ -445,6 +455,33 @@ void main() {
         color = sampleSceneLDR(uv);
     }
 
+    // White Balance (post-tonemap channel gains, 0 = neutral)
+    float wb_temp = params5.z;
+    float wb_tint = params5.w;
+    if (abs(wb_temp) > 0.0001 || abs(wb_tint) > 0.0001) {
+        // Positive temperature warms (boosts red, cuts blue), negative cools.
+        // Positive tint pushes magenta (cuts green), negative pushes green.
+        vec3 wb_gains = vec3(1.0 + wb_temp * 0.20, 1.0 - wb_tint * 0.12, 1.0 - wb_temp * 0.20);
+        color = clamp(color * wb_gains, 0.0, 1.0);
+    }
+
+    // Sharpen (unsharp mask on tonemapped LDR, 5-tap cross kernel)
+    float sharpen_amt = params5.x;
+    if (sharpen_amt > 0.0001) {
+        // Neighbor taps reuse the fast LDR path (skips SSR/fog re-evaluation,
+        // same approximation FXAA itself uses for its neighbor taps).
+        vec2 texel = resolution.zw;
+        vec3 tap_up = sampleSceneFastLDR(uv + vec2(0.0, texel.y));
+        vec3 tap_down = sampleSceneFastLDR(uv - vec2(0.0, texel.y));
+        vec3 tap_left = sampleSceneFastLDR(uv - vec2(texel.x, 0.0));
+        vec3 tap_right = sampleSceneFastLDR(uv + vec2(texel.x, 0.0));
+        vec3 blur = (tap_up + tap_down + tap_left + tap_right) * 0.25;
+        // Clamp to the center+taps neighborhood so low amounts cannot ring.
+        vec3 n_min = min(min(tap_up, tap_down), min(min(tap_left, tap_right), color));
+        vec3 n_max = max(max(tap_up, tap_down), max(max(tap_left, tap_right), color));
+        color = clamp(color + (color - blur) * sharpen_amt, n_min, n_max);
+    }
+
     // Bloom glow pass (multi-tap bright pass blur)
     if (params3.z > 0.5 && params1.z > 0.001) {
         float thresh = params1.y;
@@ -496,6 +533,18 @@ void main() {
         float vig = v_coord.x * v_coord.y * 15.0;
         vig = clamp(pow(vig, params2.y * 0.5), 0.0, 1.0);
         color = mix(color * vig, color, 1.0 - params2.x);
+    }
+
+    // Film Grain (static screen-space hash, last so FXAA never sees the noise
+    // and sharpen never amplifies it; applied after vignette so grain stays uniform)
+    float grain_amt = params5.y;
+    if (grain_amt > 0.00001) {
+        vec2 grain_pixel = floor(v_uv * resolution.xy);
+        float grain_n = grainHash(grain_pixel) - 0.5;
+        // Luminance mask: full strength in shadows/midtones, tapered in highlights.
+        float grain_luma = rgbToLuma(color);
+        float lum_mask = clamp(1.0 - grain_luma * 1.2, 0.15, 1.0);
+        color += grain_n * grain_amt * 2.0 * lum_mask;
     }
 
     frag_color = vec4(clamp(color, 0.0, 1.0), 1.0);

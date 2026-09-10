@@ -4,7 +4,7 @@ const sg = sokol.gfx;
 const skybox_shd = @import("skybox_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
-const ArcRotateCamera = @import("../camera.zig").ArcRotateCamera;
+const Camera = @import("../camera.zig").Camera;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 
 pub const SkyboxPass = struct {
@@ -16,28 +16,28 @@ pub const SkyboxPass = struct {
     pub fn init() SkyboxPass {
         const skybox_positions = [_][3]f32{
             .{ -1.0, -1.0, -1.0 }, // 0
-            .{  1.0, -1.0, -1.0 }, // 1
-            .{  1.0,  1.0, -1.0 }, // 2
-            .{ -1.0,  1.0, -1.0 }, // 3
-            .{ -1.0, -1.0,  1.0 }, // 4
-            .{  1.0, -1.0,  1.0 }, // 5
-            .{  1.0,  1.0,  1.0 }, // 6
-            .{ -1.0,  1.0,  1.0 }, // 7
+            .{ 1.0, -1.0, -1.0 }, // 1
+            .{ 1.0, 1.0, -1.0 }, // 2
+            .{ -1.0, 1.0, -1.0 }, // 3
+            .{ -1.0, -1.0, 1.0 }, // 4
+            .{ 1.0, -1.0, 1.0 }, // 5
+            .{ 1.0, 1.0, 1.0 }, // 6
+            .{ -1.0, 1.0, 1.0 }, // 7
         };
 
         const skybox_indices = [_]u16{
             // Front (-Z)
-            0, 2, 1,  0, 3, 2,
+            0, 2, 1, 0, 3, 2,
             // Back (+Z)
-            4, 5, 6,  4, 6, 7,
+            4, 5, 6, 4, 6, 7,
             // Left (-X)
-            0, 4, 7,  0, 7, 3,
+            0, 4, 7, 0, 7, 3,
             // Right (+X)
-            1, 2, 6,  1, 6, 5,
+            1, 2, 6, 1, 6, 5,
             // Top (+Y)
-            3, 7, 6,  3, 6, 2,
+            3, 7, 6, 3, 6, 2,
             // Bottom (-Y)
-            0, 1, 5,  0, 5, 4,
+            0, 1, 5, 0, 5, 4,
         };
 
         const vb = sg.makeBuffer(.{
@@ -81,7 +81,7 @@ pub const SkyboxPass = struct {
         };
     }
 
-    pub fn render(self: *SkyboxPass, camera: ArcRotateCamera, aspect: f32, cube_tex: CubeTexture, exposure: f32) void {
+    pub fn render(self: *SkyboxPass, camera: Camera, aspect: f32, cube_tex: CubeTexture, exposure: f32) void {
         const view = camera.getViewMatrix();
         var rot_view = view;
         rot_view.m[12] = 0.0;

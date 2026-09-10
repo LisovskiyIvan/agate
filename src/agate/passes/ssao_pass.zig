@@ -7,7 +7,7 @@ const Vec3 = math.Vec3;
 const ssao_shd = @import("ssao_shader");
 const blur_shd = @import("ssao_blur_shader");
 const SSAOConfig = @import("../ssao.zig").SSAOConfig;
-const ArcRotateCamera = @import("../camera.zig").ArcRotateCamera;
+const Camera = @import("../camera.zig").Camera;
 
 pub const SSAOPass = struct {
     ssao_raw_image: sg.Image = .{},
@@ -231,7 +231,7 @@ pub const SSAOPass = struct {
 
     pub fn render(
         self: *SSAOPass,
-        camera: ArcRotateCamera,
+        camera: Camera,
         aspect: f32,
         depth_tex_view: sg.View,
         config: SSAOConfig,
@@ -319,8 +319,8 @@ pub const SSAOPass = struct {
                 1.0 / ao_h,
             },
             .camera_params = .{
-                camera.near,
-                camera.far,
+                camera.getNear(),
+                camera.getFar(),
                 config.radius,
                 0.0,
             },

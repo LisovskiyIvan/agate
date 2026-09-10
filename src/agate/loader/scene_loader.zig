@@ -21,6 +21,8 @@ const Texture = @import("../texture.zig").Texture;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const AnimationGroup = @import("../animation/animation.zig").AnimationGroup;
 const AnimationChannel = @import("../animation/animation.zig").AnimationChannel;
+const NodeChannel = @import("../animation/animation.zig").NodeChannel;
+const NodeTarget = @import("../animation/animation.zig").NodeTarget;
 const AnimationSampler = @import("../animation/animation.zig").AnimationSampler;
 const AnimationPath = @import("../animation/animation.zig").AnimationPath;
 const AnimationInterpolation = @import("../animation/animation.zig").AnimationInterpolation;
@@ -228,6 +230,137 @@ pub const SceneLoader = struct {
 
     pub const appendGltf = appendGlb;
 
+    /// Converts a glTF node pointer into its node index, or null for foreign pointers.
+    fn gltfNodeIndex(gltf: *c.cgltf_data, node: *c.cgltf_node) ?usize {
+        if (gltf.nodes_count == 0) return null;
+        const base = @intFromPtr(&gltf.nodes[0]);
+        const ptr = @intFromPtr(node);
+        if (ptr < base) return null;
+        const idx = (ptr - base) / @sizeOf(c.cgltf_node);
+        if (idx >= gltf.nodes_count) return null;
+        return idx;
+    }
+
+    /// Rotation matrix columns (orthonormal basis) -> unit quaternion.
+    fn quatFromBasis(x: Vec3, y: Vec3, z: Vec3) Quat {
+        const trace = x.x + y.y + z.z;
+        if (trace > 0.0) {
+            const s = 0.5 / @sqrt(trace + 1.0);
+            return (Quat{
+                .x = (y.z - z.y) * s,
+                .y = (z.x - x.z) * s,
+                .z = (x.y - y.x) * s,
+                .w = 0.25 / s,
+            }).normalize();
+        }
+        if (x.x > y.y and x.x > z.z) {
+            const s = 2.0 * @sqrt(1.0 + x.x - y.y - z.z);
+            return (Quat{
+                .x = 0.25 * s,
+                .y = (x.y + y.x) / s,
+                .z = (x.z + z.x) / s,
+                .w = (y.z - z.y) / s,
+            }).normalize();
+        }
+        if (y.y > z.z) {
+            const s = 2.0 * @sqrt(1.0 + y.y - x.x - z.z);
+            return (Quat{
+                .x = (x.y + y.x) / s,
+                .y = 0.25 * s,
+                .z = (y.z + z.y) / s,
+                .w = (z.x - x.z) / s,
+            }).normalize();
+        }
+        const s = 2.0 * @sqrt(1.0 + z.z - x.x - y.y);
+        return (Quat{
+            .x = (x.z + z.x) / s,
+            .y = (y.z + z.y) / s,
+            .z = 0.25 * s,
+            .w = (x.y - y.x) / s,
+        }).normalize();
+    }
+
+    /// Reads a node's local TRS. Prefers the explicit TRS fields and
+    /// decomposes the raw matrix when the node uses has_matrix instead.
+    fn nodeLocalTRS(node: *const c.cgltf_node) struct { pos: Vec3, rot: Quat, scale: Vec3 } {
+        var pos = Vec3.zero;
+        var rot = Quat.identity;
+        var scale = Vec3.one;
+        if (node.has_translation != 0) {
+            pos = Vec3.new(node.translation[0], node.translation[1], node.translation[2]);
+        }
+        if (node.has_rotation != 0) {
+            rot = (Quat{
+                .x = node.rotation[0],
+                .y = node.rotation[1],
+                .z = node.rotation[2],
+                .w = node.rotation[3],
+            }).normalize();
+        }
+        if (node.has_scale != 0) {
+            scale = Vec3.new(node.scale[0], node.scale[1], node.scale[2]);
+        }
+        if (node.has_translation == 0 and node.has_rotation == 0 and node.has_scale == 0 and node.has_matrix != 0) {
+            const m = Mat4{ .m = node.matrix };
+            pos = m.getTranslation();
+            const sx = Vec3.new(m.m[0], m.m[1], m.m[2]).length();
+            const sy = Vec3.new(m.m[4], m.m[5], m.m[6]).length();
+            const sz = Vec3.new(m.m[8], m.m[9], m.m[10]).length();
+            if (sx > 1e-9 and sy > 1e-9 and sz > 1e-9) {
+                scale = Vec3.new(sx, sy, sz);
+                rot = quatFromBasis(
+                    Vec3.new(m.m[0] / sx, m.m[1] / sx, m.m[2] / sx),
+                    Vec3.new(m.m[4] / sy, m.m[5] / sy, m.m[6] / sy),
+                    Vec3.new(m.m[8] / sz, m.m[9] / sz, m.m[10] / sz),
+                );
+            }
+        }
+        return .{ .pos = pos, .rot = rot, .scale = scale };
+    }
+
+    /// World matrix of the node's parent (identity for root nodes).
+    fn nodeParentWorld(node: *const c.cgltf_node) Mat4 {
+        if (node.parent) |p| {
+            var pw: [16]f32 = undefined;
+            c.cgltf_node_transform_world(p, &pw);
+            return Mat4{ .m = pw };
+        }
+        return Mat4.identity;
+    }
+
+    /// Reads one animation sampler into owned buffers. Returns null for
+    /// empty/missing accessors. CUBICSPLINE is preserved as-is; the runtime
+    /// treats it as (eased) linear, documented in animation.zig.
+    const SamplerData = struct {
+        timestamps: []f32,
+        outputs: []f32,
+        interpolation: AnimationInterpolation,
+    };
+    fn readSampler(allocator: std.mem.Allocator, samp: *c.cgltf_animation_sampler, stride: usize) !?SamplerData {
+        const in_acc = samp.*.input;
+        const out_acc = samp.*.output;
+        if (in_acc == null or out_acc == null or in_acc.*.count == 0) return null;
+
+        const key_count = in_acc.*.count;
+        const timestamps = try allocator.alloc(f32, key_count);
+        errdefer allocator.free(timestamps);
+        for (0..key_count) |ki| {
+            _ = c.cgltf_accessor_read_float(in_acc, ki, &timestamps[ki], 1);
+        }
+        const outputs = try allocator.alloc(f32, key_count * stride);
+        errdefer allocator.free(outputs);
+        for (0..key_count) |ki| {
+            _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
+        }
+
+        const interp: AnimationInterpolation = switch (samp.*.interpolation) {
+            c.cgltf_interpolation_type_step => .step,
+            c.cgltf_interpolation_type_cubic_spline => .cubic_spline,
+            else => .linear,
+        };
+        return .{ .timestamps = timestamps, .outputs = outputs, .interpolation = interp };
+    }
+
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
         const path_z = try scene.allocator.dupeZ(u8, file_path);
         defer scene.allocator.free(path_z);
@@ -411,8 +544,32 @@ pub const SceneLoader = struct {
             try scene.skeletons.append(scene.allocator, skel);
         }
 
+        // Marks every glTF node used as a skeleton joint. Node tracks that
+        // target such joints of skinned meshes are skipped (the skeleton
+        // path already drives them).
+        var is_joint_node = try scene.allocator.alloc(bool, gltf.nodes_count);
+        defer scene.allocator.free(is_joint_node);
+        @memset(is_joint_node, false);
+        for (0..gltf.skins_count) |si| {
+            const skin_joints = &gltf.skins[si];
+            for (0..skin_joints.joints_count) |ji| {
+                if (skin_joints.joints[ji]) |joint| {
+                    if (gltfNodeIndex(gltf, joint)) |ni| is_joint_node[ni] = true;
+                }
+            }
+        }
+
         // 3. Parse meshes and primitives (preserving glTF node transforms)
         var spawned_meshes = std.ArrayList(*Mesh).empty;
+
+        // Maps each glTF node to the contiguous range of meshes spawned from
+        // it, so node animation channels can find their target meshes below.
+        var node_mesh_start = try scene.allocator.alloc(usize, gltf.nodes_count);
+        defer scene.allocator.free(node_mesh_start);
+        var node_mesh_count = try scene.allocator.alloc(usize, gltf.nodes_count);
+        defer scene.allocator.free(node_mesh_count);
+        @memset(node_mesh_start, 0);
+        @memset(node_mesh_count, 0);
 
         if (gltf.nodes_count > 0) {
             for (0..gltf.nodes_count) |node_idx| {
@@ -429,6 +586,7 @@ pub const SceneLoader = struct {
                 var world_mat: [16]f32 = undefined;
                 c.cgltf_node_transform_world(node, &world_mat);
                 const base_matrix = Mat4{ .m = world_mat };
+                const range_start = spawned_meshes.items.len;
 
                 var node_skeleton: ?*Skeleton = null;
                 if (node.skin) |n_skin| {
@@ -447,6 +605,8 @@ pub const SceneLoader = struct {
                         try spawned_meshes.append(scene.allocator, mesh_obj);
                     }
                 }
+                node_mesh_start[node_idx] = range_start;
+                node_mesh_count[node_idx] = spawned_meshes.items.len - range_start;
             }
         }
 
@@ -469,7 +629,9 @@ pub const SceneLoader = struct {
             }
         }
 
-        // 4. Parse animations
+        // 4. Parse animations (skeleton tracks + plain node tracks).
+        // Group names come from gltf animation.name so UI code can enumerate
+        // them via scene.animation_groups.
         for (0..gltf.animations_count) |anim_idx| {
             const src_anim = &gltf.animations[anim_idx];
             const anim_name = if (src_anim.name != null)
@@ -477,7 +639,7 @@ pub const SceneLoader = struct {
             else
                 try std.fmt.allocPrint(scene.allocator, "anim_{d}", .{anim_idx});
 
-            // Find which skeleton this animation targets
+            // Find which skeleton this animation targets (joint channels only)
             var target_skel: ?*Skeleton = null;
             var target_skin_idx: ?usize = null;
             for (0..src_anim.channels_count) |ci| {
@@ -497,85 +659,164 @@ pub const SceneLoader = struct {
                 if (target_skel != null) break;
             }
 
-            if (target_skel == null and skeletons.len > 0) {
-                target_skel = skeletons[0];
-                target_skin_idx = 0;
-            }
-
-            const skel = target_skel orelse {
-                scene.allocator.free(anim_name);
-                continue;
-            };
-            const skin_ref = &gltf.skins[target_skin_idx.?];
+            // NOTE: no fallback to skeletons[0] here. Clips that only drive
+            // plain nodes get a skeleton-less group below instead of an empty
+            // bone track on an unrelated skeleton.
+            var skin_ref: ?*c.cgltf_skin = null;
+            if (target_skin_idx) |si| skin_ref = &gltf.skins[si];
 
             var channels_list = std.ArrayList(AnimationChannel).empty;
+            var node_channels_list = std.ArrayList(NodeChannel).empty;
+            var node_targets_list = std.ArrayList(NodeTarget).empty;
             var max_duration: f32 = 0.0;
+
+            // Dedupes NodeTargets when several channels drive one node.
+            const node_target_for_node = try scene.allocator.alloc(?usize, gltf.nodes_count);
+            defer scene.allocator.free(node_target_for_node);
+            @memset(node_target_for_node, null);
 
             for (0..src_anim.channels_count) |ci| {
                 const ch = &src_anim.channels[ci];
                 if (ch.target_node == null or ch.sampler == null) continue;
 
                 var bone_idx: ?usize = null;
-                for (0..skin_ref.joints_count) |ji| {
-                    if (skin_ref.joints[ji] == ch.target_node) {
-                        bone_idx = ji;
-                        break;
+                if (skin_ref) |skin| {
+                    for (0..skin.joints_count) |ji| {
+                        if (skin.joints[ji] == ch.target_node) {
+                            bone_idx = ji;
+                            break;
+                        }
                     }
                 }
-                const b_idx = bone_idx orelse continue;
 
+                if (bone_idx) |b_idx| {
+                    const path_type: AnimationPath = switch (ch.target_path) {
+                        c.cgltf_animation_path_type_translation => .translation,
+                        c.cgltf_animation_path_type_rotation => .rotation,
+                        c.cgltf_animation_path_type_scale => .scale,
+                        c.cgltf_animation_path_type_weights => .weights,
+                        else => continue,
+                    };
+
+                    const stride: usize = switch (path_type) {
+                        .translation, .scale => 3,
+                        .rotation => 4,
+                        .weights => 1,
+                    };
+                    const samp_data = try readSampler(scene.allocator, ch.sampler.?, stride) orelse continue;
+                    if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {
+                        max_duration = samp_data.timestamps[samp_data.timestamps.len - 1];
+                    }
+
+                    try channels_list.append(scene.allocator, .{
+                        .bone_index = b_idx,
+                        .target_path = path_type,
+                        .sampler = .{
+                            .timestamps = samp_data.timestamps,
+                            .outputs = samp_data.outputs,
+                            .interpolation = samp_data.interpolation,
+                        },
+                    });
+                    continue;
+                }
+
+                // Node path: translation/rotation/scale of a non-joint node
+                // drives the spawned meshes of that node. Morph weights need
+                // morph-target support and are skipped for plain nodes.
                 const path_type: AnimationPath = switch (ch.target_path) {
                     c.cgltf_animation_path_type_translation => .translation,
                     c.cgltf_animation_path_type_rotation => .rotation,
                     c.cgltf_animation_path_type_scale => .scale,
-                    c.cgltf_animation_path_type_weights => .weights,
                     else => continue,
                 };
-
-                const samp = ch.sampler.?;
-                const in_acc = samp.*.input;
-                const out_acc = samp.*.output;
-                if (in_acc == null or out_acc == null or in_acc.*.count == 0) continue;
-
-                const key_count = in_acc.*.count;
-                const timestamps = try scene.allocator.alloc(f32, key_count);
-                for (0..key_count) |ki| {
-                    _ = c.cgltf_accessor_read_float(in_acc, ki, &timestamps[ki], 1);
-                }
-                if (timestamps[key_count - 1] > max_duration) {
-                    max_duration = timestamps[key_count - 1];
-                }
+                const node_idx = gltfNodeIndex(gltf, ch.target_node.?) orelse continue;
+                const range_start = node_mesh_start[node_idx];
+                const range_count = node_mesh_count[node_idx];
+                if (range_count == 0) continue; // joint-only or mesh-less node
 
                 const stride: usize = switch (path_type) {
                     .translation, .scale => 3,
                     .rotation => 4,
                     .weights => 1,
                 };
-                const outputs = try scene.allocator.alloc(f32, key_count * stride);
-                for (0..key_count) |ki| {
-                    _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
+                const samp_data = try readSampler(scene.allocator, ch.sampler.?, stride) orelse continue;
+                if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {
+                    max_duration = samp_data.timestamps[samp_data.timestamps.len - 1];
                 }
 
-                const interp: AnimationInterpolation = switch (samp.*.interpolation) {
-                    c.cgltf_interpolation_type_step => .step,
-                    c.cgltf_interpolation_type_cubic_spline => .cubic_spline,
-                    else => .linear,
-                };
+                for (0..range_count) |mi| {
+                    const mesh_obj = spawned_meshes.items[range_start + mi];
+                    // A joint transform of a skinned mesh is already driven by
+                    // the skeleton path; applying the node track on top would
+                    // double-apply it, so such targets are skipped.
+                    if (is_joint_node[node_idx] and mesh_obj.skeleton != null) continue;
 
-                try channels_list.append(scene.allocator, .{
-                    .bone_index = b_idx,
-                    .target_path = path_type,
-                    .sampler = .{
-                        .timestamps = timestamps,
-                        .outputs = outputs,
-                        .interpolation = interp,
-                    },
-                });
+                    var target_idx: usize = undefined;
+                    if (node_target_for_node[node_idx]) |existing| {
+                        target_idx = existing;
+                    } else {
+                        // Split the baked world matrix: the animated local TRS
+                        // moves into the mesh fields while the static parent
+                        // world stays in base_matrix, so TRS(t) * base ==
+                        // world(t) and the rest pose renders unchanged.
+                        // Limitation: an animated parent node is baked into
+                        // the child base_matrix once, so nested animated
+                        // hierarchies do not follow their parents at runtime.
+                        const node_ptr: *const c.cgltf_node = @ptrCast(&gltf.nodes[node_idx]);
+                        const trs = nodeLocalTRS(node_ptr);
+                        mesh_obj.position = trs.pos;
+                        mesh_obj.rotation = trs.rot.toEulerDeg();
+                        mesh_obj.scaling = trs.scale;
+                        mesh_obj.base_matrix = nodeParentWorld(node_ptr);
+                        target_idx = node_targets_list.items.len;
+                        try node_targets_list.append(scene.allocator, .{
+                            .position = &mesh_obj.position,
+                            .rotation_euler = &mesh_obj.rotation,
+                            .scaling = &mesh_obj.scaling,
+                            .rest_position = trs.pos,
+                            .rest_rotation = trs.rot,
+                            .rest_scale = trs.scale,
+                        });
+                        node_target_for_node[node_idx] = target_idx;
+                    }
+
+                    // One owned buffer copy per mesh: several primitives of a
+                    // node share the track but must free independently.
+                    const ts_copy = try scene.allocator.dupe(f32, samp_data.timestamps);
+                    errdefer scene.allocator.free(ts_copy);
+                    const out_copy = try scene.allocator.dupe(f32, samp_data.outputs);
+                    errdefer scene.allocator.free(out_copy);
+                    try node_channels_list.append(scene.allocator, .{
+                        .target = target_idx,
+                        .target_path = path_type,
+                        .sampler = .{
+                            .timestamps = ts_copy,
+                            .outputs = out_copy,
+                            .interpolation = samp_data.interpolation,
+                        },
+                    });
+                }
+
+                scene.allocator.free(samp_data.timestamps);
+                scene.allocator.free(samp_data.outputs);
             }
 
-            const ag = try AnimationGroup.init(scene.allocator, anim_name, try channels_list.toOwnedSlice(scene.allocator), max_duration);
+            const bone_slice = try channels_list.toOwnedSlice(scene.allocator);
+            const node_ch_slice = try node_channels_list.toOwnedSlice(scene.allocator);
+            const node_tg_slice = try node_targets_list.toOwnedSlice(scene.allocator);
+            if (bone_slice.len == 0 and node_ch_slice.len == 0) {
+                if (bone_slice.len > 0) scene.allocator.free(bone_slice);
+                if (node_ch_slice.len > 0) scene.allocator.free(node_ch_slice);
+                if (node_tg_slice.len > 0) scene.allocator.free(node_tg_slice);
+                scene.allocator.free(anim_name);
+                continue;
+            }
+
+            const ag = try AnimationGroup.init(scene.allocator, anim_name, bone_slice, max_duration);
             scene.allocator.free(anim_name);
-            ag.skeleton = skel;
+            ag.skeleton = target_skel; // null for node-only clips
+            ag.node_channels = node_ch_slice;
+            ag.node_targets = node_tg_slice;
             try scene.animation_groups.append(scene.allocator, ag);
         }
 

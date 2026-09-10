@@ -51,8 +51,34 @@ pub const UICanvas = struct {
     pipeline: sg.Pipeline = .{},
     font_texture: Texture,
 
-    capacity_vertices: usize = 16384,
-    capacity_indices: usize = 24576,
+    capacity_vertices: usize = 32768,
+    capacity_indices: usize = 49152,
+
+    // Shared solid-quad constants (same values as the previous per-call literals).
+    const solid_mode: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
+    const solid_uv: f32 = 1.0 / 512.0;
+
+    // Corner math using the already-computed segment length (single sqrt per line).
+    fn lineCornersWithLen(x0: f32, y0: f32, x1: f32, y1: f32, dx: f32, dy: f32, len: f32, thickness: f32) [4][2]f32 {
+        if (len < 1e-6 or thickness <= 0.0) {
+            return .{
+                .{ x0, y0 },
+                .{ x0, y0 },
+                .{ x1, y1 },
+                .{ x1, y1 },
+            };
+        }
+        const nx = -dy / len;
+        const ny = dx / len;
+        const hx = nx * thickness * 0.5;
+        const hy = ny * thickness * 0.5;
+        return .{
+            .{ x0 - hx, y0 - hy },
+            .{ x0 + hx, y0 + hy },
+            .{ x1 + hx, y1 + hy },
+            .{ x1 - hx, y1 - hy },
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator) !UICanvas {
         const tex = try Texture.fromMemory(allocator, font_png_data, .{
@@ -64,8 +90,8 @@ pub const UICanvas = struct {
             .mipmaps = false,
         });
 
-        const max_v: usize = 16384;
-        const max_i: usize = 24576;
+        const max_v: usize = 32768;
+        const max_i: usize = 49152;
 
         const vb = sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
@@ -180,9 +206,7 @@ pub const UICanvas = struct {
 
     /// Draws a solid rectangle in screen pixel coordinates
     pub fn drawRect(self: *UICanvas, x: f32, y: f32, w: f32, h: f32, color: Color4) void {
-        const u = 1.0 / 512.0;
-        const v = 1.0 / 512.0;
-        self.addQuad(x, y, w, h, u, v, u, v, color, .{ 0.0, 0.0, 0.0, 0.0 });
+        self.addQuad(x, y, w, h, solid_uv, solid_uv, solid_uv, solid_uv, color, solid_mode);
     }
 
     /// Draws a rectangle outline with specified border thickness
@@ -296,6 +320,120 @@ pub const UICanvas = struct {
         self.drawText(text, x + pad_x, y + pad_y, font_size, text_col);
     }
 
+    /// Draws a stateless checkbox box with an optional label to the right
+    pub fn drawCheckbox(self: *UICanvas, x: f32, y: f32, size: f32, checked: bool, is_hovered: bool, label: ?[]const u8, label_size: f32) void {
+        const bg = if (checked)
+            (if (is_hovered) Color4.new(0.24, 0.50, 0.86, 0.95) else Color4.new(0.18, 0.42, 0.78, 0.95))
+        else
+            (if (is_hovered) Color4.new(0.24, 0.32, 0.44, 0.92) else Color4.new(0.14, 0.18, 0.25, 0.85));
+        const border = if (is_hovered)
+            Color4.new(0.65, 0.85, 1.0, 0.95)
+        else
+            Color4.new(0.3, 0.4, 0.52, 0.75);
+
+        self.drawPanel(x, y, size, size, bg, border, 1.5);
+        if (checked) {
+            const m = size * 0.25;
+            self.drawRect(x + m, y + m, size - 2.0 * m, size - 2.0 * m, Color4.white);
+        }
+        if (label) |text| {
+            const ty = y + (size - label_size) * 0.5;
+            self.drawText(text, x + size + 8.0, ty, label_size, Color4.white);
+        }
+    }
+
+    /// Draws a stateless horizontal slider, returns the clamped value
+    pub fn drawSlider(self: *UICanvas, x: f32, y: f32, w: f32, h: f32, value: f32, is_hovered: bool, is_dragging: bool) f32 {
+        const v = std.math.clamp(value, 0.0, 1.0);
+        const track_bg = Color4.new(0.10, 0.12, 0.18, 0.9);
+        const fill_col = if (is_dragging)
+            Color4.new(0.30, 0.62, 1.0, 1.0)
+        else if (is_hovered)
+            Color4.new(0.26, 0.56, 0.94, 1.0)
+        else
+            Color4.new(0.20, 0.46, 0.82, 0.95);
+
+        self.drawRect(x, y, w, h, track_bg);
+        if (v > 0.001) {
+            self.drawRect(x, y, w * v, h, fill_col);
+        }
+        self.drawRectOutline(x, y, w, h, 1.0, Color4.new(0.45, 0.5, 0.6, 0.7));
+
+        // Knob: small square centered on the fill edge, slightly taller than the track
+        const knob_size = @max(h + 6.0, 10.0);
+        const cx = x + v * w;
+        const kx = if (w <= knob_size)
+            x + (w - knob_size) * 0.5
+        else
+            std.math.clamp(cx - knob_size * 0.5, x, x + w - knob_size);
+        const ky = y + h * 0.5 - knob_size * 0.5;
+        const knob_bg = if (is_dragging)
+            Color4.new(0.75, 0.87, 1.0, 1.0)
+        else if (is_hovered)
+            Color4.new(0.62, 0.72, 0.86, 1.0)
+        else
+            Color4.new(0.52, 0.60, 0.72, 1.0);
+        const knob_border = if (is_dragging or is_hovered) Color4.white else Color4.new(0.3, 0.36, 0.46, 0.9);
+        self.drawPanel(kx, ky, knob_size, knob_size, knob_bg, knob_border, 1.5);
+        return v;
+    }
+
+    /// Draws a thin horizontal separator line
+    pub fn drawDivider(self: *UICanvas, x: f32, y: f32, w: f32, thickness: f32, color: Color4) void {
+        if (w <= 0.0 or thickness <= 0.0) return;
+        self.drawRect(x, y, w, thickness, color);
+    }
+
+    /// Pure corner math for drawLine: returns the 4 quad corners
+    /// (p0-left, p0-right, p1-right, p1-left) offset perpendicular
+    /// to the segment by half the thickness. Zero-area on degenerate input.
+    pub fn lineCorners(x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32) [4][2]f32 {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len = @sqrt(dx * dx + dy * dy);
+        return lineCornersWithLen(x0, y0, x1, y1, dx, dy, len, thickness);
+    }
+
+    /// Draws a solid thick line in screen pixel coordinates (no depth test).
+    pub fn drawLine(self: *UICanvas, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: Color4) void {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len = @sqrt(dx * dx + dy * dy);
+        if (len < 1e-6 or thickness <= 0.0) return;
+        if (self.vertices.items.len + 4 > self.capacity_vertices) return;
+        if (self.indices.items.len + 6 > self.capacity_indices) return;
+
+        const corners = lineCornersWithLen(x0, y0, x1, y1, dx, dy, len, thickness);
+        const base_idx: u16 = @intCast(self.vertices.items.len);
+        const col_arr = color.toArray();
+
+        self.vertices.appendSlice(self.allocator, &[_]UIVertex{
+            .{ .position = corners[0], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
+            .{ .position = corners[1], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
+            .{ .position = corners[2], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
+            .{ .position = corners[3], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
+        }) catch return;
+
+        self.indices.appendSlice(self.allocator, &[_]u16{
+            base_idx + 0, base_idx + 1, base_idx + 2,
+            base_idx + 0, base_idx + 2, base_idx + 3,
+        }) catch return;
+    }
+
+    /// Draws a small down-triangle arrow (dropdown chevron) from stacked solid quads
+    pub fn drawArrowDown(self: *UICanvas, x: f32, y: f32, size: f32, color: Color4) void {
+        if (size <= 0.0) return;
+        const n: usize = 4;
+        const nf: f32 = @floatFromInt(n);
+        const row_h = size / nf;
+        for (0..n) |i| {
+            const fi: f32 = @floatFromInt(i);
+            const row_w = size * (1.0 - fi / nf);
+            const ox = (size - row_w) * 0.5;
+            self.drawRect(x + ox, y + fi * row_h, row_w, row_h, color);
+        }
+    }
+
     /// Returns the pixel dimensions of a text string
     pub fn measureText(text: []const u8, font_size: f32) Vec2 {
         const char_w = font_size * 0.5;
@@ -320,6 +458,17 @@ pub const UICanvas = struct {
     /// Hit test helper: checks if a 2D screen coordinate (e.g. mouse cursor) is inside a rectangle
     pub fn isPointInRect(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32) bool {
         return px >= x and px <= (x + w) and py >= y and py <= (y + h);
+    }
+
+    /// Maps a mouse x coordinate to a 0..1 slider value, clamped
+    pub fn sliderValueAt(x: f32, w: f32, mouse_x: f32) f32 {
+        if (w <= 0.0) return 0.0;
+        return std.math.clamp((mouse_x - x) / w, 0.0, 1.0);
+    }
+
+    /// Returns the checkbox hit rect as [x, y, w, h] for use with isPointInRect
+    pub fn checkboxHitRect(x: f32, y: f32, size: f32) [4]f32 {
+        return .{ x, y, size, size };
     }
 
     /// Uploads dynamic batch buffers and executes the UI render pass
@@ -370,4 +519,56 @@ test "UICanvas measureText" {
 test "UICanvas isPointInRect" {
     try std.testing.expect(UICanvas.isPointInRect(50, 50, 0, 0, 100, 100));
     try std.testing.expect(!UICanvas.isPointInRect(150, 50, 0, 0, 100, 100));
+}
+
+test "UICanvas sliderValueAt" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), UICanvas.sliderValueAt(10, 100, 60), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), UICanvas.sliderValueAt(10, 100, 10), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), UICanvas.sliderValueAt(10, 100, 110), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), UICanvas.sliderValueAt(10, 100, -50), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), UICanvas.sliderValueAt(10, 100, 500), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), UICanvas.sliderValueAt(10, 0, 60), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), UICanvas.sliderValueAt(10, -20, 60), 1e-5);
+}
+
+test "UICanvas checkboxHitRect" {
+    const r = UICanvas.checkboxHitRect(10, 20, 24);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), r[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), r[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), r[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), r[3], 1e-5);
+    try std.testing.expect(UICanvas.isPointInRect(15, 25, r[0], r[1], r[2], r[3]));
+    try std.testing.expect(!UICanvas.isPointInRect(100, 100, r[0], r[1], r[2], r[3]));
+}
+
+test "UICanvas lineCorners" {
+    // Horizontal segment: thickness extends along +/-Y.
+    const h = UICanvas.lineCorners(0, 0, 10, 0, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), h[0][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), h[0][1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), h[1][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), h[1][1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), h[2][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), h[2][1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), h[3][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), h[3][1], 1e-5);
+
+    // Vertical segment: thickness extends along +/-X.
+    const v = UICanvas.lineCorners(0, 0, 0, 8, 4.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), v[0][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v[0][1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), v[1][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), v[2][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), v[2][1], 1e-5);
+
+    // Quad width matches thickness (diagonal case).
+    const d = UICanvas.lineCorners(0, 0, 3, 4, 2.0);
+    const w0x = d[1][0] - d[0][0];
+    const w0y = d[1][1] - d[0][1];
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), @sqrt(w0x * w0x + w0y * w0y), 1e-5);
+
+    // Degenerate segment collapses to the endpoints.
+    const z = UICanvas.lineCorners(5, 5, 5, 5, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), z[0][0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), z[2][0], 1e-5);
 }

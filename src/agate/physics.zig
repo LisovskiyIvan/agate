@@ -5,6 +5,7 @@ const BoundingBox = math.BoundingBox;
 const Ray = math.Ray;
 const RayHit = math.RayHit;
 const Quat = math.Quat;
+const Mat4 = math.Mat4;
 const Mesh = @import("mesh.zig").Mesh;
 const c = @import("c.zig").c;
 
@@ -784,6 +785,249 @@ pub const RigidBody = struct {
     }
 };
 
+/// One CPU-side debug line segment (a line list for an external renderer or
+/// a future debug pass). The default color is dynamic-body green.
+pub const DebugLine = struct {
+    a: Vec3,
+    b: Vec3,
+    color: [3]f32 = .{ 0.1, 0.9, 0.3 },
+};
+
+// Debug wireframe colors: dynamic bodies green, static/kinematic
+// (mass <= 0) white, sensors yellow. The sensor tint wins over the other two.
+const debug_dynamic_color: [3]f32 = .{ 0.1, 0.9, 0.3 };
+const debug_static_color: [3]f32 = .{ 0.9, 0.9, 0.9 };
+const debug_sensor_color: [3]f32 = .{ 0.95, 0.8, 0.15 };
+
+// Default segments per debug circle (sphere great circles, capsule cap
+// rings); override per world with PhysicsWorld.debug_circle_segments.
+const default_debug_circle_segments: usize = 24;
+const min_debug_circle_segments: usize = 4;
+// Unit-circle samples precomputed on the stack per appendDebugLines call.
+// Larger counts use per-segment trig instead (same angles, same points).
+const debug_unit_stack_max: usize = 128;
+
+// 12 edges of a box, shared by the scaled-box and world-AABB wireframes.
+const debug_box_edges: [12][2]usize = .{
+    .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 0 },
+    .{ 4, 5 }, .{ 5, 6 }, .{ 6, 7 }, .{ 7, 4 },
+    .{ 0, 4 }, .{ 1, 5 }, .{ 2, 6 }, .{ 3, 7 },
+};
+
+const DebugCirclePlane = enum { xy, xz, yz };
+
+// One unit-circle sample shared by every debug ring in a single
+// appendDebugLines call; scaled by the shape radius when emitting.
+const DebugUnit = struct { c: f32, s: f32 };
+
+// Ring source for the circle helpers: the precomputed unit table when the
+// segment count fits the stack buffer, otherwise direct per-segment trig.
+// Both evaluate the same angles, so the emitted points match exactly.
+const DebugRings = struct {
+    segs: usize,
+    unit: ?[]const DebugUnit,
+};
+
+// Local Y-capsule dims in body units, mirroring RigidBody.shapeVolume:
+// radius is the horizontal extent, half height is the leftover Y extent.
+fn debugCapsuleRadius(base_extents: Vec3) f32 {
+    return @min(base_extents.x, base_extents.z);
+}
+
+fn debugCapsuleHalfHeight(base_extents: Vec3) f32 {
+    return @max(0.0, base_extents.y - @min(base_extents.x, base_extents.z));
+}
+
+// Appends the 12 edges of the box (center, half extents) in body units,
+// transformed to world space by the mesh world matrix (which carries the
+// body scale, so callers pass unscaled dims). Allocation-free: the caller
+// reserves debugLineCount() entries up front.
+fn appendDebugBoxLines(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    wm: Mat4,
+    center: Vec3,
+    half_extents: Vec3,
+    color: [3]f32,
+) void {
+    const hx = half_extents.x;
+    const hy = half_extents.y;
+    const hz = half_extents.z;
+    const corners = [8]Vec3{
+        Vec3.new(center.x - hx, center.y - hy, center.z - hz),
+        Vec3.new(center.x + hx, center.y - hy, center.z - hz),
+        Vec3.new(center.x + hx, center.y + hy, center.z - hz),
+        Vec3.new(center.x - hx, center.y + hy, center.z - hz),
+        Vec3.new(center.x - hx, center.y - hy, center.z + hz),
+        Vec3.new(center.x + hx, center.y - hy, center.z + hz),
+        Vec3.new(center.x + hx, center.y + hy, center.z + hz),
+        Vec3.new(center.x - hx, center.y + hy, center.z + hz),
+    };
+    for (debug_box_edges) |e| {
+        out.appendAssumeCapacity(.{
+            .a = wm.transformPoint(corners[e[0]]),
+            .b = wm.transformPoint(corners[e[1]]),
+            .color = color,
+        });
+    }
+}
+
+fn debugCirclePoint(center: Vec3, radius: f32, plane: DebugCirclePlane, angle: f32) Vec3 {
+    const cx = @cos(angle) * radius;
+    const sx = @sin(angle) * radius;
+    return switch (plane) {
+        .xy => Vec3.new(center.x + cx, center.y + sx, center.z),
+        .xz => Vec3.new(center.x + cx, center.y, center.z + sx),
+        .yz => Vec3.new(center.x, center.y + cx, center.z + sx),
+    };
+}
+
+// Same math as debugCirclePoint but from a precomputed unit sample, so
+// shared ring endpoints reuse one cos/sin pair instead of recomputing it.
+fn debugCirclePointUnit(center: Vec3, radius: f32, plane: DebugCirclePlane, u: DebugUnit) Vec3 {
+    const cx = u.c * radius;
+    const sx = u.s * radius;
+    return switch (plane) {
+        .xy => Vec3.new(center.x + cx, center.y + sx, center.z),
+        .xz => Vec3.new(center.x + cx, center.y, center.z + sx),
+        .yz => Vec3.new(center.x, center.y + cx, center.z + sx),
+    };
+}
+
+// Appends one ring of segs lines in the given local plane, transformed to
+// world space by the mesh world matrix. Allocation-free (see above).
+fn appendDebugCircleLines(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    wm: Mat4,
+    center: Vec3,
+    radius: f32,
+    plane: DebugCirclePlane,
+    color: [3]f32,
+    rings: DebugRings,
+) void {
+    if (rings.unit) |unit| {
+        var i: usize = 0;
+        while (i < rings.segs) : (i += 1) {
+            out.appendAssumeCapacity(.{
+                .a = wm.transformPoint(debugCirclePointUnit(center, radius, plane, unit[i])),
+                .b = wm.transformPoint(debugCirclePointUnit(center, radius, plane, unit[i + 1])),
+                .color = color,
+            });
+        }
+        return;
+    }
+    var i: usize = 0;
+    while (i < rings.segs) : (i += 1) {
+        const t0 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rings.segs)) * 2.0 * std.math.pi;
+        const t1 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(rings.segs)) * 2.0 * std.math.pi;
+        out.appendAssumeCapacity(.{
+            .a = wm.transformPoint(debugCirclePoint(center, radius, plane, t0)),
+            .b = wm.transformPoint(debugCirclePoint(center, radius, plane, t1)),
+            .color = color,
+        });
+    }
+}
+
+// 3 orthogonal great circles: 3 * segs lines.
+fn appendDebugSphereLines(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    wm: Mat4,
+    center: Vec3,
+    radius: f32,
+    color: [3]f32,
+    rings: DebugRings,
+) void {
+    appendDebugCircleLines(out, wm, center, radius, .xy, color, rings);
+    appendDebugCircleLines(out, wm, center, radius, .xz, color, rings);
+    appendDebugCircleLines(out, wm, center, radius, .yz, color, rings);
+}
+
+// 4 side lines joining the capsule cap rings at the cardinal points. Kept
+// on the exact k * pi/2 angles (not the unit table) so points stay
+// bit-identical to the historical output.
+fn appendDebugCapsuleSides(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    wm: Mat4,
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    color: [3]f32,
+) void {
+    var k: usize = 0;
+    while (k < 4) : (k += 1) {
+        const t = @as(f32, @floatFromInt(k)) * 0.5 * std.math.pi;
+        const x = @cos(t) * radius;
+        const z = @sin(t) * radius;
+        out.appendAssumeCapacity(.{
+            .a = wm.transformPoint(Vec3.new(center.x + x, center.y + half_height, center.z + z)),
+            .b = wm.transformPoint(Vec3.new(center.x + x, center.y - half_height, center.z + z)),
+            .color = color,
+        });
+    }
+}
+
+// Y-capsule: top/bottom cap rings plus 4 side lines joining them at the
+// cardinal points: 2 * segs + 4 lines.
+fn appendDebugCapsuleLines(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    wm: Mat4,
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    color: [3]f32,
+    rings: DebugRings,
+) void {
+    const top = Vec3.new(center.x, center.y + half_height, center.z);
+    const bottom = Vec3.new(center.x, center.y - half_height, center.z);
+    appendDebugCircleLines(out, wm, top, radius, .xz, color, rings);
+    appendDebugCircleLines(out, wm, bottom, radius, .xz, color, rings);
+    appendDebugCapsuleSides(out, wm, center, radius, half_height, color);
+}
+
+// Wireframe box of a shape's world AABB (already world space, no transform).
+// Invalid shapes are skipped.
+fn appendDebugAabbLines(
+    out: *std.ArrayListUnmanaged(DebugLine),
+    shape_id: c.b3ShapeId,
+    color: [3]f32,
+) void {
+    if (shape_id.index1 == 0) return;
+    const aabb = c.b3Shape_GetAABB(shape_id);
+    const lo = fromB3Vec(aabb.lowerBound);
+    const hi = fromB3Vec(aabb.upperBound);
+    const corners = [8]Vec3{
+        Vec3.new(lo.x, lo.y, lo.z),
+        Vec3.new(hi.x, lo.y, lo.z),
+        Vec3.new(hi.x, hi.y, lo.z),
+        Vec3.new(lo.x, hi.y, lo.z),
+        Vec3.new(lo.x, lo.y, hi.z),
+        Vec3.new(hi.x, lo.y, hi.z),
+        Vec3.new(hi.x, hi.y, hi.z),
+        Vec3.new(lo.x, hi.y, hi.z),
+    };
+    for (debug_box_edges) |e| {
+        out.appendAssumeCapacity(.{ .a = corners[e[0]], .b = corners[e[1]], .color = color });
+    }
+}
+
+fn primaryDebugLineCount(collider: ColliderType, segs: usize) usize {
+    return switch (collider) {
+        .box => 12,
+        .sphere => 3 * segs,
+        .capsule => 2 * segs + 4,
+        .hull, .mesh, .heightfield => 12,
+    };
+}
+
+fn childDebugLineCount(kind: ChildShape.Kind, segs: usize) usize {
+    return switch (kind) {
+        .box => 12,
+        .sphere => 3 * segs,
+        .capsule => 2 * segs + 4,
+        // No cheap wireframe; skipped gracefully.
+        .hull => 0,
+    };
+}
+
 pub const PhysicsWorld = struct {
     allocator: std.mem.Allocator,
     gravity: Vec3 = Vec3.new(0.0, -9.81, 0.0),
@@ -791,6 +1035,10 @@ pub const PhysicsWorld = struct {
     substeps: u32 = 4,
     /// Minimum approach speed (m/s) for contact hit events.
     hit_event_threshold: f32 = 1.0,
+    /// Debug wireframe density: segments per circle ring (sphere great
+    /// circles, capsule cap rings). Clamped to a minimum of 4. Default 24
+    /// keeps the historical counts (sphere 72 lines, capsule 52 lines).
+    debug_circle_segments: usize = default_debug_circle_segments,
     bodies: std.ArrayListUnmanaged(*RigidBody) = .empty,
     joints: std.ArrayListUnmanaged(c.b3JointId) = .empty,
 
@@ -1244,6 +1492,229 @@ pub const PhysicsWorld = struct {
             .normal = fromB3Vec(result.normal),
             .distance = max_distance * result.fraction,
             .body = self.findBodyByShape(result.shapeId),
+        };
+    }
+
+    /// Maps a `CollisionFilter` onto a Box3D query filter, exactly like
+    /// `raycastWithFilter` does (category/mask bits; recorder id/name stay default).
+    fn toB3QueryFilter(f: CollisionFilter) c.b3QueryFilter {
+        var q = c.b3DefaultQueryFilter();
+        q.categoryBits = f.category_bits;
+        q.maskBits = f.mask_bits;
+        return q;
+    }
+
+    /// Shared context for the overlap-query callbacks below.
+    const OverlapCollectCtx = struct {
+        world: *PhysicsWorld,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+        /// When set (queryPoint), only accept shapes whose world AABB contains this point.
+        point: ?Vec3 = null,
+        /// Last reported body: Box3D often reports a compound body's shapes
+        /// back to back, so re-check it before the full body scan.
+        last: ?*RigidBody = null,
+        /// Set when `results.append` runs out of memory; the query is aborted
+        /// (callback returns false) and the caller converts this to `error.OutOfMemory`.
+        oom: bool = false,
+    };
+
+    /// `b3OverlapResultFcn`: maps each reported shape to its body, skips
+    /// untracked shapes (e.g. the internal ground plane) and `!enabled`
+    /// bodies, and appends each body at most once (compound bodies report
+    /// one shape per child).
+    fn overlapCollectFcn(shape_id: c.b3ShapeId, context: ?*anyopaque) callconv(.c) bool {
+        const ctx_ptr = context orelse return true;
+        const ctx: *OverlapCollectCtx = @ptrCast(@alignCast(ctx_ptr));
+        // Fast path for consecutive shapes of one compound body; the
+        // ownsShape check returns the same body findBodyByShape would.
+        var cached: ?*RigidBody = null;
+        if (ctx.last) |last| {
+            if (ctx.world.ownsShape(last, shape_id)) cached = last;
+        }
+        const body = cached orelse ctx.world.findBodyByShape(shape_id) orelse return true;
+        ctx.last = body;
+        if (!body.enabled) return true;
+        if (ctx.point) |p| {
+            const aabb = c.b3Shape_GetAABB(shape_id);
+            if (p.x < aabb.lowerBound.x or p.x > aabb.upperBound.x or
+                p.y < aabb.lowerBound.y or p.y > aabb.upperBound.y or
+                p.z < aabb.lowerBound.z or p.z > aabb.upperBound.z) return true;
+        }
+        // Fast path: a repeat report lands at the end of the list, which the
+        // scan below would find anyway; same ordering and contents.
+        if (ctx.results.items.len > 0 and ctx.results.items[ctx.results.items.len - 1] == body) return true;
+        for (ctx.results.items) |b| {
+            if (b == body) return true;
+        }
+        ctx.results.append(ctx.world.allocator, body) catch {
+            ctx.oom = true;
+            return false;
+        };
+        return true;
+    }
+
+    /// Appends every enabled body with a shape potentially overlapping the
+    /// box `[min, max]` (broadphase `b3World_OverlapAABB`). Each body is
+    /// appended at most once. Results are APPENDED, not cleared.
+    pub fn queryAABB(
+        self: *PhysicsWorld,
+        min: Vec3,
+        max: Vec3,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        return self.queryAABBWithFilter(min, max, .{}, results);
+    }
+
+    /// Same as `queryAABB` but only accepts shapes matching the filter mask
+    /// (mapped exactly like `raycastWithFilter`).
+    pub fn queryAABBWithFilter(
+        self: *PhysicsWorld,
+        min: Vec3,
+        max: Vec3,
+        filter: CollisionFilter,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        const aabb = c.b3AABB{
+            .lowerBound = toB3Vec(Vec3.new(@min(min.x, max.x), @min(min.y, max.y), @min(min.z, max.z))),
+            .upperBound = toB3Vec(Vec3.new(@max(min.x, max.x), @max(min.y, max.y), @max(min.z, max.z))),
+        };
+        var ctx = OverlapCollectCtx{ .world = self, .results = results };
+        _ = c.b3World_OverlapAABB(self.world_id, aabb, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
+        if (ctx.oom) return error.OutOfMemory;
+    }
+
+    /// Appends every enabled body overlapping the sphere (`center`, `radius`)
+    /// via an exact `b3World_OverlapShape` query. The sphere proxy is a single
+    /// point with a non-zero radius (see `b3ShapeCastInput` docs), so this is
+    /// precise for all collider types — no AABB approximation. Each body is
+    /// appended at most once. Results are APPENDED, not cleared.
+    pub fn querySphere(
+        self: *PhysicsWorld,
+        center: Vec3,
+        radius: f32,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        return self.querySphereWithFilter(center, radius, .{}, results);
+    }
+
+    /// Same as `querySphere` but only accepts shapes matching the filter mask
+    /// (mapped exactly like `raycastWithFilter`).
+    pub fn querySphereWithFilter(
+        self: *PhysicsWorld,
+        center: Vec3,
+        radius: f32,
+        filter: CollisionFilter,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        if (!(radius > 0.0)) return;
+        // Proxy points are relative to `origin`, so a sphere is one
+        // origin-centered point plus the radius.
+        var point = c.b3Vec3{ .x = 0.0, .y = 0.0, .z = 0.0 };
+        var proxy = c.b3ShapeProxy{ .points = &point, .count = 1, .radius = radius };
+        var ctx = OverlapCollectCtx{ .world = self, .results = results };
+        _ = c.b3World_OverlapShape(self.world_id, toB3Pos(center), &proxy, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
+        if (ctx.oom) return error.OutOfMemory;
+    }
+
+    /// Appends every enabled body whose shape world AABB (`b3Shape_GetAABB`)
+    /// contains `point`. Broadphase is a zero-extent `b3World_OverlapAABB`
+    /// query; the per-shape AABB check is the precise test, so rotated/thin
+    /// shapes report AABB containment, not exact surface containment. Each
+    /// body is appended at most once. Results are APPENDED, not cleared.
+    pub fn queryPoint(
+        self: *PhysicsWorld,
+        point: Vec3,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        return self.queryPointWithFilter(point, .{}, results);
+    }
+
+    /// Same as `queryPoint` but only accepts shapes matching the filter mask
+    /// (mapped exactly like `raycastWithFilter`).
+    pub fn queryPointWithFilter(
+        self: *PhysicsWorld,
+        point: Vec3,
+        filter: CollisionFilter,
+        results: *std.ArrayListUnmanaged(*RigidBody),
+    ) !void {
+        const p = toB3Vec(point);
+        const aabb = c.b3AABB{ .lowerBound = p, .upperBound = p };
+        var ctx = OverlapCollectCtx{ .world = self, .results = results, .point = point };
+        _ = c.b3World_OverlapAABB(self.world_id, aabb, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
+        if (ctx.oom) return error.OutOfMemory;
+    }
+
+    const SphereCastCtx = struct {
+        world: *PhysicsWorld,
+        travel: f32,
+        best_fraction: f32 = std.math.floatMax(f32),
+        body: ?*RigidBody = null,
+        point: Vec3 = Vec3.zero,
+        normal: Vec3 = Vec3.up,
+        /// Last reported body (same consecutive-shape fast path as above).
+        last: ?*RigidBody = null,
+    };
+
+    /// `b3CastResultFcn`: keeps the closest accepted hit, scanning all shapes
+    /// (returns 1.0 to continue). Untracked shapes and `!enabled` bodies are
+    /// ignored (return -1.0).
+    fn sphereCastCollectFcn(
+        shape_id: c.b3ShapeId,
+        point: c.b3Pos,
+        normal: c.b3Vec3,
+        fraction: f32,
+        _: u64,
+        _: c_int,
+        _: c_int,
+        context: ?*anyopaque,
+    ) callconv(.c) f32 {
+        const ctx_ptr = context orelse return 1.0;
+        const ctx: *SphereCastCtx = @ptrCast(@alignCast(ctx_ptr));
+        var cached: ?*RigidBody = null;
+        if (ctx.last) |last| {
+            if (ctx.world.ownsShape(last, shape_id)) cached = last;
+        }
+        const body = cached orelse ctx.world.findBodyByShape(shape_id) orelse return -1.0;
+        ctx.last = body;
+        if (!body.enabled) return -1.0;
+        if (fraction < ctx.best_fraction) {
+            ctx.best_fraction = fraction;
+            ctx.body = body;
+            ctx.point = fromB3Pos(point);
+            ctx.normal = fromB3Vec(normal);
+        }
+        return 1.0;
+    }
+
+    /// Sweeps a sphere (`origin`, `radius`) along `translation` and returns
+    /// the closest hit, or null on a miss. Implemented with `b3World_CastShape`
+    /// and a single-point sphere proxy (same construction as `querySphere`).
+    pub fn spherecast(self: *PhysicsWorld, origin: Vec3, radius: f32, translation: Vec3) ?PhysicsRayHit {
+        return self.spherecastWithFilter(origin, radius, translation, .{});
+    }
+
+    /// Same as `spherecast` but only accepts shapes matching the filter mask
+    /// (mapped exactly like `raycastWithFilter`).
+    pub fn spherecastWithFilter(
+        self: *PhysicsWorld,
+        origin: Vec3,
+        radius: f32,
+        translation: Vec3,
+        filter: CollisionFilter,
+    ) ?PhysicsRayHit {
+        const travel = translation.length();
+        if (!(radius > 0.0) or travel < 1e-6) return null;
+        var point = c.b3Vec3{ .x = 0.0, .y = 0.0, .z = 0.0 };
+        var proxy = c.b3ShapeProxy{ .points = &point, .count = 1, .radius = radius };
+        var ctx = SphereCastCtx{ .world = self, .travel = travel };
+        _ = c.b3World_CastShape(self.world_id, toB3Pos(origin), &proxy, toB3Vec(translation), toB3QueryFilter(filter), &sphereCastCollectFcn, &ctx);
+        const body = ctx.body orelse return null;
+        return .{
+            .hit = true,
+            .point = ctx.point,
+            .normal = ctx.normal,
+            .distance = travel * ctx.best_fraction,
+            .body = body,
         };
     }
 
@@ -2348,6 +2819,90 @@ pub const PhysicsWorld = struct {
             ).scale(max_impulse * factor * 0.8);
             b.applyTorqueImpulse(torque);
         }
+    }
+
+    /// Clamped ring segment count used by the debug wireframe helpers.
+    pub fn debugCircleSegments(self: *const PhysicsWorld) usize {
+        return @max(min_debug_circle_segments, self.debug_circle_segments);
+    }
+
+    /// Builds a CPU-side wireframe for every enabled body and appends it to
+    /// `out` (never cleared) for an external/debug line renderer. Local
+    /// wireframes live in body units; the mesh world matrix
+    /// (`Mesh.getWorldMatrix`, carrying scale/rotation/translation) moves
+    /// them to world space, so uniform scales land exactly on the collider
+    /// dims (non-uniform scales approximate circles as ellipses).
+    /// Hull/mesh/heightfield colliders fall back to the shape's world AABB
+    /// (`b3Shape_GetAABB`); hull child shapes are skipped. Colors: dynamic
+    /// green, static/kinematic (mass <= 0) white, sensors yellow (sensor
+    /// wins). No global state; allocation failures surface as
+    /// `error.OutOfMemory`.
+    /// Line counts: box 12, sphere 3 * debugCircleSegments() (72 at the
+    /// default 24), capsule 2 * debugCircleSegments() + 4 (52 at default),
+    /// hull/mesh/heightfield 12 (AABB box). Capacity for the exact count is
+    /// reserved once up front, so steady-state appends never reallocate;
+    /// circle trig is computed once per call into a shared unit table.
+    pub fn appendDebugLines(self: *PhysicsWorld, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DebugLine)) !void {
+        // Reserve once; every helper below uses appendAssumeCapacity.
+        try out.ensureUnusedCapacity(allocator, self.debugLineCount());
+        const segs = self.debugCircleSegments();
+        var rings = DebugRings{ .segs = segs, .unit = null };
+        // segs + 1 samples so consecutive segments share endpoints.
+        var unit_buf: [debug_unit_stack_max + 1]DebugUnit = undefined;
+        if (segs <= debug_unit_stack_max) {
+            var j: usize = 0;
+            while (j <= segs) : (j += 1) {
+                const t = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(segs)) * 2.0 * std.math.pi;
+                unit_buf[j] = .{ .c = @cos(t), .s = @sin(t) };
+            }
+            rings.unit = unit_buf[0 .. segs + 1];
+        }
+        for (self.bodies.items) |body| {
+            if (!body.enabled) continue;
+            const color: [3]f32 = if (body.is_sensor)
+                debug_sensor_color
+            else if (body.mass <= 0.0)
+                debug_static_color
+            else
+                debug_dynamic_color;
+            const wm = body.mesh.getWorldMatrix();
+            switch (body.collider) {
+                .box => appendDebugBoxLines(out, wm, Vec3.zero, body.base_extents, color),
+                .sphere => appendDebugSphereLines(out, wm, Vec3.zero, body.base_radius, color, rings),
+                .capsule => appendDebugCapsuleLines(
+                    out,
+                    wm,
+                    Vec3.zero,
+                    debugCapsuleRadius(body.base_extents),
+                    debugCapsuleHalfHeight(body.base_extents),
+                    color,
+                    rings,
+                ),
+                .hull, .mesh, .heightfield => appendDebugAabbLines(out, body.shape_id, color),
+            }
+            for (body.child_shapes.items) |child| {
+                switch (child.kind) {
+                    .box => |he| appendDebugBoxLines(out, wm, child.offset, he, color),
+                    .sphere => |r| appendDebugSphereLines(out, wm, child.offset, r, color, rings),
+                    .capsule => |cp| appendDebugCapsuleLines(out, wm, child.offset, cp.radius, cp.half_height, color, rings),
+                    .hull => {},
+                }
+            }
+        }
+    }
+
+    /// Exact line count `appendDebugLines` would add (no allocation).
+    pub fn debugLineCount(self: *PhysicsWorld) usize {
+        const segs = self.debugCircleSegments();
+        var n: usize = 0;
+        for (self.bodies.items) |body| {
+            if (!body.enabled) continue;
+            n += primaryDebugLineCount(body.collider, segs);
+            for (body.child_shapes.items) |child| {
+                n += childDebugLineCount(child.kind, segs);
+            }
+        }
+        return n;
     }
 };
 
@@ -3827,4 +4382,442 @@ test "PhysicsWorld parallel spring retunes at runtime" {
         pw.step(0.016);
     }
     try std.testing.expect(@abs(tilt_mesh.rotation.x) < 10.0);
+}
+
+test "PhysicsWorld queryAABB finds bodies in box" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var mesh_a = Mesh{
+        .name = "qa_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 0.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const body_a = try pw.createBody(&mesh_a, .box, 0.0);
+
+    var mesh_b = Mesh{
+        .name = "qa_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(10.0, 0.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const body_b = try pw.createBody(&mesh_b, .box, 0.0);
+
+    var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
+    defer results.deinit(std.testing.allocator);
+
+    // Box around A only.
+    try pw.queryAABB(Vec3.new(-2.0, -2.0, -2.0), Vec3.new(2.0, 2.0, 2.0), &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0] == body_a);
+
+    // Box around B only (results accumulate across calls).
+    results.clearRetainingCapacity();
+    try pw.queryAABB(Vec3.new(8.0, -2.0, -2.0), Vec3.new(12.0, 2.0, 2.0), &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0] == body_b);
+
+    // Huge box finds both.
+    results.clearRetainingCapacity();
+    try pw.queryAABB(Vec3.new(-20.0, -20.0, -20.0), Vec3.new(20.0, 20.0, 20.0), &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+
+    // Disabled bodies are excluded even before the next step pushes the flag.
+    body_b.enabled = false;
+    results.clearRetainingCapacity();
+    try pw.queryAABB(Vec3.new(-20.0, -20.0, -20.0), Vec3.new(20.0, 20.0, 20.0), &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0] == body_a);
+    body_b.enabled = true;
+
+    // A compound body (2 shapes) is still returned exactly once.
+    try pw.addBoxShape(body_a, Vec3.new(0.5, 0.5, 0.5), .{ .offset = Vec3.new(0.0, 1.5, 0.0) });
+    results.clearRetainingCapacity();
+    try pw.queryAABB(Vec3.new(-20.0, -20.0, -20.0), Vec3.new(20.0, 20.0, 20.0), &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+}
+
+test "PhysicsWorld querySphere finds bodies by distance" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var mesh = Mesh{
+        .name = "qs_ball",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.zero,
+    };
+    const body = try pw.createBody(&mesh, .sphere, 0.0);
+
+    var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
+    defer results.deinit(std.testing.allocator);
+
+    // Body surface (r=0.5) at distance 2 is well inside query radius 3.
+    try pw.querySphere(Vec3.new(2.0, 0.0, 0.0), 3.0, &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0] == body);
+
+    // Same body is far outside a radius-3 query centered 10 units away.
+    results.clearRetainingCapacity();
+    try pw.querySphere(Vec3.new(10.0, 0.0, 0.0), 3.0, &results);
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+}
+
+test "PhysicsWorld queryPoint finds bodies by containment" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var mesh = Mesh{
+        .name = "qp_box",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const body = try pw.createBody(&mesh, .box, 0.0);
+
+    var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
+    defer results.deinit(std.testing.allocator);
+
+    try pw.queryPoint(Vec3.new(0.5, 0.0, 0.0), &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0] == body);
+
+    results.clearRetainingCapacity();
+    try pw.queryPoint(Vec3.new(5.0, 0.0, 0.0), &results);
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+}
+
+test "PhysicsWorld spatial queries honor collision filters" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var mesh_a = Mesh{
+        .name = "qf_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 0.0, 0.0),
+    };
+    _ = try pw.createBody(&mesh_a, .box, 0.0); // default: category 1
+
+    var mesh_b = Mesh{
+        .name = "qf_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(5.0, 0.0, 0.0),
+    };
+    _ = try pw.createBodyWith(&mesh_b, .box, 0.0, .{ .filter = .{ .category_bits = 0b10 } });
+    pw.step(0.016); // push the baked-in filters through change detection
+
+    var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
+    defer results.deinit(std.testing.allocator);
+
+    // Unfiltered: both bodies.
+    try pw.queryAABB(Vec3.new(-20.0, -20.0, -20.0), Vec3.new(20.0, 20.0, 20.0), &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+
+    // Layer-1-only query mask excludes the layer-2 body.
+    results.clearRetainingCapacity();
+    try pw.queryAABBWithFilter(
+        Vec3.new(-20.0, -20.0, -20.0),
+        Vec3.new(20.0, 20.0, 20.0),
+        .{ .category_bits = 0b01, .mask_bits = 0b01 },
+        &results,
+    );
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(results.items[0].mesh == &mesh_a);
+
+    // Same exclusion applies to sphere and point queries.
+    results.clearRetainingCapacity();
+    try pw.querySphereWithFilter(Vec3.new(5.0, 0.0, 0.0), 3.0, .{ .category_bits = 0b01, .mask_bits = 0b01 }, &results);
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+
+    results.clearRetainingCapacity();
+    try pw.queryPointWithFilter(Vec3.new(5.0, 0.0, 0.0), .{ .category_bits = 0b01, .mask_bits = 0b01 }, &results);
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+}
+
+test "PhysicsWorld spherecast hits and misses" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var mesh = Mesh{
+        .name = "sc_ball",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.zero,
+    };
+    const body = try pw.createBody(&mesh, .sphere, 0.0); // radius 0.5
+
+    // Cast sphere (r=0.25) from x=5 toward -x: contact at x=0.75, travel 4.25.
+    const hit = pw.spherecast(Vec3.new(5.0, 0.0, 0.0), 0.25, Vec3.new(-10.0, 0.0, 0.0));
+    try std.testing.expect(hit != null);
+    try std.testing.expect(hit.?.body == body);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.25), hit.?.distance, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), hit.?.point.x, 0.05);
+
+    // Parallel lane misses.
+    try std.testing.expect(pw.spherecast(Vec3.new(5.0, 0.0, 0.0), 0.25, Vec3.new(0.0, 10.0, 0.0)) == null);
+}
+
+test "PhysicsWorld debug box lines match the collider AABB" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_box",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(1.0, 2.0, 3.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.25), Vec3.new(0.5, 1.0, 0.25)),
+    };
+    _ = try pw.createBody(&m, .box, 0.0);
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 12), lines.items.len);
+    try std.testing.expectEqual(pw.debugLineCount(), lines.items.len);
+
+    const he = pw.bodies.items[0].base_extents;
+    for (lines.items) |ln| {
+        // Static bodies draw white.
+        try std.testing.expectEqual([3]f32{ 0.9, 0.9, 0.9 }, ln.color);
+        const pts = [2]Vec3{ ln.a, ln.b };
+        for (pts) |p| {
+            try std.testing.expect(@abs(p.x - m.position.x) <= he.x + 1e-4);
+            try std.testing.expect(@abs(p.y - m.position.y) <= he.y + 1e-4);
+            try std.testing.expect(@abs(p.z - m.position.z) <= he.z + 1e-4);
+        }
+    }
+}
+
+test "PhysicsWorld debug sensor lines use the sensor color" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_sensor",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+    _ = try pw.createBodyWith(&m, .box, 0.0, .{ .is_sensor = true });
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 12), lines.items.len);
+    for (lines.items) |ln| {
+        try std.testing.expectEqual([3]f32{ 0.95, 0.8, 0.15 }, ln.color);
+    }
+
+    // Lines accumulate across calls; the list is never cleared.
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 24), lines.items.len);
+}
+
+test "PhysicsWorld debug lines include compound children" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_compound",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+    const body = try pw.createBody(&m, .box, 1.0);
+    const base_count = pw.debugLineCount();
+    try std.testing.expectEqual(@as(usize, 12), base_count);
+
+    try pw.addBoxShape(body, Vec3.new(0.2, 0.2, 0.2), .{});
+    try std.testing.expect(pw.debugLineCount() > base_count);
+    try std.testing.expectEqual(base_count + 12, pw.debugLineCount());
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(pw.debugLineCount(), lines.items.len);
+}
+
+test "PhysicsWorld debug lines skip disabled bodies" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_disabled",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+    const body = try pw.createBody(&m, .sphere, 1.0);
+    body.enabled = false;
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 0), lines.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pw.debugLineCount());
+}
+
+test "PhysicsWorld debug sphere lines trace the surface" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_sphere",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(2.0, 3.0, 4.0),
+    };
+    const body = try pw.createBody(&m, .sphere, 1.0);
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expect(lines.items.len > 12);
+
+    const r = body.base_radius;
+    for (lines.items) |ln| {
+        // Dynamic bodies draw green.
+        try std.testing.expectEqual([3]f32{ 0.1, 0.9, 0.3 }, ln.color);
+        const pts = [2]Vec3{ ln.a, ln.b };
+        for (pts) |p| {
+            try std.testing.expect(p.sub(m.position).length() <= r + 1e-3);
+        }
+    }
+}
+
+test "PhysicsWorld debug default ring counts stay 72 and 52" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var sm = Mesh{
+        .name = "dbg_def_sphere",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(2.0, 3.0, 4.0),
+    };
+    const sbody = try pw.createBody(&sm, .sphere, 1.0);
+    try std.testing.expectEqual(@as(usize, 24), pw.debugCircleSegments());
+    try std.testing.expectEqual(@as(usize, 72), pw.debugLineCount());
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 72), lines.items.len);
+
+    // First xy ring starts at angle 0: exact golden points prove the shared
+    // unit table matches the historical per-segment trig.
+    const r = sbody.base_radius;
+    try std.testing.expectEqual(Vec3.new(sm.position.x + r, sm.position.y, sm.position.z), lines.items[0].a);
+    const t1 = @as(f32, 1) / @as(f32, 24) * 2.0 * std.math.pi;
+    try std.testing.expectEqual(
+        Vec3.new(sm.position.x + @cos(t1) * r, sm.position.y + @sin(t1) * r, sm.position.z),
+        lines.items[0].b,
+    );
+
+    var pw2 = PhysicsWorld.init(std.testing.allocator);
+    defer pw2.deinit();
+    var cm = Mesh{
+        .name = "dbg_def_capsule",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
+    };
+    _ = try pw2.createBody(&cm, .capsule, 1.0);
+    try std.testing.expectEqual(@as(usize, 52), pw2.debugLineCount());
+}
+
+test "PhysicsWorld debug circle segments are configurable" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+    pw.debug_circle_segments = 8;
+
+    var sm = Mesh{
+        .name = "dbg_cfg_sphere",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+    _ = try pw.createBody(&sm, .sphere, 1.0);
+    try std.testing.expectEqual(@as(usize, 24), pw.debugLineCount());
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 24), lines.items.len);
+
+    // Below-minimum settings clamp to 4 segments (sphere: 12 lines).
+    pw.debug_circle_segments = 0;
+    try std.testing.expectEqual(@as(usize, 4), pw.debugCircleSegments());
+    try std.testing.expectEqual(@as(usize, 12), pw.debugLineCount());
+    lines.clearRetainingCapacity();
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 12), lines.items.len);
+}
+
+test "PhysicsWorld debug capsule segments are configurable" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+    pw.debug_circle_segments = 8;
+
+    var cm = Mesh{
+        .name = "dbg_cfg_capsule",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
+    };
+    _ = try pw.createBody(&cm, .capsule, 1.0);
+    try std.testing.expectEqual(@as(usize, 20), pw.debugLineCount());
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(@as(usize, 20), lines.items.len);
+}
+
+test "PhysicsWorld debug lines reserve once and repeat identically" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "dbg_reserve",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(1.0, 2.0, 3.0),
+    };
+    _ = try pw.createBody(&m, .sphere, 1.0);
+    const n = pw.debugLineCount();
+
+    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    try lines.ensureTotalCapacity(std.testing.allocator, n);
+    const cap = lines.capacity;
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(n, lines.items.len);
+    // No growth: the call reserved everything it needed up front.
+    try std.testing.expectEqual(cap, lines.capacity);
+
+    // Same world state appends byte-identical lines.
+    try pw.appendDebugLines(std.testing.allocator, &lines);
+    try std.testing.expectEqual(2 * n, lines.items.len);
+    try std.testing.expectEqualSlices(DebugLine, lines.items[0..n], lines.items[n .. 2 * n]);
 }

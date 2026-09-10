@@ -27,7 +27,7 @@ export fn init() callconv(.c) void {
         .radius = 5.5,
         .target = z.Vec3.zero,
     });
-    scene.active_camera = camera;
+    scene.active_camera = .{ .arc_rotate = camera };
 
     // Babylon.js style: свет HemisphericLight (небо + земля)
     _ = scene.createHemisphericLight("hemiLight", .{

@@ -31,10 +31,10 @@ pub const PostProcessPass = struct {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
             // x,     y,    u,   v
-            -1.0, -1.0,  0.0, 0.0,
-             1.0, -1.0,  1.0, 0.0,
-             1.0,  1.0,  1.0, 1.0,
-            -1.0,  1.0,  0.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0,
+            1.0,  -1.0, 1.0, 0.0,
+            1.0,  1.0,  1.0, 1.0,
+            -1.0, 1.0,  0.0, 1.0,
         };
         const quad_indices = [_]u16{
             0, 1, 2,
@@ -263,6 +263,12 @@ pub const PostProcessPass = struct {
                 config.ssr_intensity,
                 config.ssr_thickness,
                 config.ssr_max_distance,
+            },
+            .params5 = .{
+                if (config.sharpen_enabled) config.sharpen_amount else 0.0,
+                if (config.grain_enabled) config.grain_intensity else 0.0,
+                config.temperature,
+                config.tint,
             },
             .view_proj = view_proj,
             .inv_view_proj = inv_view_proj,

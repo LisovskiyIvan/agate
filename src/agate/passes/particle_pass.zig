@@ -5,7 +5,7 @@ const part_shd = @import("particle_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
-const ArcRotateCamera = @import("../camera.zig").ArcRotateCamera;
+const Camera = @import("../camera.zig").Camera;
 const particles = @import("../particles.zig");
 const ParticleSystem = particles.ParticleSystem;
 const Texture = @import("../texture.zig").Texture;
@@ -21,10 +21,10 @@ pub const ParticlePass = struct {
     pub fn init() ParticlePass {
         const particle_quad_vertices = [_]f32{
             // x,     y,     u,   v
-            -0.5, -0.5,  0.0, 0.0,
-             0.5, -0.5,  1.0, 0.0,
-             0.5,  0.5,  1.0, 1.0,
-            -0.5,  0.5,  0.0, 1.0,
+            -0.5, -0.5, 0.0, 0.0,
+            0.5,  -0.5, 1.0, 0.0,
+            0.5,  0.5,  1.0, 1.0,
+            -0.5, 0.5,  0.0, 1.0,
         };
         const particle_quad_indices = [_]u16{
             0, 1, 2,
@@ -118,7 +118,7 @@ pub const ParticlePass = struct {
     pub fn render(
         self: *ParticlePass,
         systems: []const *ParticleSystem,
-        camera: ArcRotateCamera,
+        camera: Camera,
         aspect: f32,
     ) void {
         const view_proj = camera.getViewProjection(aspect);

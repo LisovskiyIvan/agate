@@ -41,9 +41,11 @@ const ui = @import("ui.zig");
 pub const UICanvas = ui.UICanvas;
 pub const UIVertex = ui.UIVertex;
 
-const ArcRotateCamera = @import("camera.zig").ArcRotateCamera;
+const Camera = @import("camera.zig").Camera;
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
+const DirectionalLight = lights.DirectionalLight;
+const DirectionalLightOptions = lights.DirectionalLightOptions;
 const PointLight = lights.PointLight;
 const PointLightOptions = lights.PointLightOptions;
 const SpotLight = lights.SpotLight;
@@ -73,6 +75,9 @@ pub const RenderMeshItem = struct {
     distance_sq: f32,
     is_pbr: bool,
     texture_id: u32,
+    // True when the mesh material uses .blend alpha mode. Set at queue
+    // build time; defaults to false so opaque behavior is unchanged.
+    transparent: bool = false,
 };
 
 pub const Scene = struct {
@@ -80,9 +85,11 @@ pub const Scene = struct {
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
     materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
-    active_camera: ?ArcRotateCamera = null,
+    active_camera: ?Camera = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
     light: HemisphericLight = .{},
+    // Optional scene sun. Null keeps the legacy hemispheric sun exactly.
+    directional_light: ?*DirectionalLight = null,
     point_lights: std.ArrayListUnmanaged(*PointLight) = .empty,
     spot_lights: std.ArrayListUnmanaged(*SpotLight) = .empty,
     default_material: StandardMaterial = StandardMaterial.init("default"),
@@ -95,6 +102,13 @@ pub const Scene = struct {
     stats: SceneStats = .{},
     // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
     frame_id: u64 = 0,
+
+    // Cached view-projection for projectPoint (physics overlay calls it ~4k/frame).
+    project_vp_valid: bool = false,
+    project_vp: Mat4 = Mat4.identity,
+    project_cam: ?Camera = null,
+    project_w: f32 = 0.0,
+    project_h: f32 = 0.0,
 
     // Render Passes
     shadow_pass: passes.ShadowPass,
@@ -129,6 +143,18 @@ pub const Scene = struct {
     pipeline_instanced_u16: sg.Pipeline = .{},
     pipeline_instanced_u32: sg.Pipeline = .{},
 
+    // Transparent twin pipelines: same shaders/layouts as above, but with
+    // alpha blending (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), depth test on and
+    // depth write off. Selected per item when item.transparent is true.
+    pipeline_blend_u16: sg.Pipeline = .{},
+    pipeline_blend_u32: sg.Pipeline = .{},
+    pipeline_pbr_blend_u16: sg.Pipeline = .{},
+    pipeline_pbr_blend_u32: sg.Pipeline = .{},
+    pipeline_skinned_pbr_blend_u16: sg.Pipeline = .{},
+    pipeline_skinned_pbr_blend_u32: sg.Pipeline = .{},
+    pipeline_instanced_blend_u16: sg.Pipeline = .{},
+    pipeline_instanced_blend_u32: sg.Pipeline = .{},
+
     // Skeletal Animation Groups & Skeletons
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
@@ -147,6 +173,9 @@ pub const Scene = struct {
     ui_canvas: ?UICanvas = null,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
+    // Transparent meshes (material alpha_mode == .blend), sorted strictly
+    // back-to-front and drawn after every opaque mesh and instanced mesh.
+    transparent_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
 
     pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
@@ -200,6 +229,12 @@ pub const Scene = struct {
         pip_desc.index_type = .UINT32;
         self.pipeline_u32 = sg.makePipeline(pip_desc);
 
+        // Transparent twins for the Standard pipelines.
+        pip_desc.index_type = .UINT16;
+        self.pipeline_blend_u16 = sg.makePipeline(blendDescFor(pip_desc));
+        pip_desc.index_type = .UINT32;
+        self.pipeline_blend_u32 = sg.makePipeline(blendDescFor(pip_desc));
+
         // 2. PBR Material pipelines (Cook-Torrance BRDF + Normal / MR / Emissive / AO)
         const pbr_shd_id = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend()));
         var pbr_desc = sg.PipelineDesc{
@@ -222,6 +257,12 @@ pub const Scene = struct {
         self.pipeline_pbr_u16 = sg.makePipeline(pbr_desc);
         pbr_desc.index_type = .UINT32;
         self.pipeline_pbr_u32 = sg.makePipeline(pbr_desc);
+
+        // Transparent twins for the PBR pipelines.
+        pbr_desc.index_type = .UINT16;
+        self.pipeline_pbr_blend_u16 = sg.makePipeline(blendDescFor(pbr_desc));
+        pbr_desc.index_type = .UINT32;
+        self.pipeline_pbr_blend_u32 = sg.makePipeline(blendDescFor(pbr_desc));
 
         // 3. Instanced Standard pipelines
         const inst_shd_id = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend()));
@@ -255,6 +296,12 @@ pub const Scene = struct {
         inst_desc.index_type = .UINT32;
         self.pipeline_instanced_u32 = sg.makePipeline(inst_desc);
 
+        // Transparent twins for the Instanced Standard pipelines.
+        inst_desc.index_type = .UINT16;
+        self.pipeline_instanced_blend_u16 = sg.makePipeline(blendDescFor(inst_desc));
+        inst_desc.index_type = .UINT32;
+        self.pipeline_instanced_blend_u32 = sg.makePipeline(blendDescFor(inst_desc));
+
         // 4. Skinned PBR pipelines
         const skinned_shd_id = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend()));
         var skinned_desc = sg.PipelineDesc{
@@ -280,6 +327,12 @@ pub const Scene = struct {
         skinned_desc.index_type = .UINT32;
         self.pipeline_skinned_pbr_u32 = sg.makePipeline(skinned_desc);
 
+        // Transparent twins for the Skinned PBR pipelines.
+        skinned_desc.index_type = .UINT16;
+        self.pipeline_skinned_pbr_blend_u16 = sg.makePipeline(blendDescFor(skinned_desc));
+        skinned_desc.index_type = .UINT32;
+        self.pipeline_skinned_pbr_blend_u32 = sg.makePipeline(blendDescFor(skinned_desc));
+
         if (self.pipeline_u16.id == 0) @panic("pipeline_u16 failed to create!");
         if (self.pipeline_u32.id == 0) @panic("pipeline_u32 failed to create!");
         if (self.pipeline_pbr_u16.id == 0) @panic("pipeline_pbr_u16 failed to create!");
@@ -288,6 +341,14 @@ pub const Scene = struct {
         if (self.pipeline_skinned_pbr_u32.id == 0) @panic("pipeline_skinned_pbr_u32 failed to create!");
         if (self.pipeline_instanced_u16.id == 0) @panic("pipeline_instanced_u16 failed to create!");
         if (self.pipeline_instanced_u32.id == 0) @panic("pipeline_instanced_u32 failed to create!");
+        if (self.pipeline_blend_u16.id == 0) @panic("pipeline_blend_u16 failed to create!");
+        if (self.pipeline_blend_u32.id == 0) @panic("pipeline_blend_u32 failed to create!");
+        if (self.pipeline_pbr_blend_u16.id == 0) @panic("pipeline_pbr_blend_u16 failed to create!");
+        if (self.pipeline_pbr_blend_u32.id == 0) @panic("pipeline_pbr_blend_u32 failed to create!");
+        if (self.pipeline_skinned_pbr_blend_u16.id == 0) @panic("pipeline_skinned_pbr_blend_u16 failed to create!");
+        if (self.pipeline_skinned_pbr_blend_u32.id == 0) @panic("pipeline_skinned_pbr_blend_u32 failed to create!");
+        if (self.pipeline_instanced_blend_u16.id == 0) @panic("pipeline_instanced_blend_u16 failed to create!");
+        if (self.pipeline_instanced_blend_u32.id == 0) @panic("pipeline_instanced_blend_u32 failed to create!");
     }
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
@@ -330,6 +391,19 @@ pub const Scene = struct {
         sl.* = SpotLight.init(name, options);
         try self.spot_lights.append(self.allocator, sl);
         return sl;
+    }
+
+    // Creates (or replaces) the single scene sun. Replacing destroys the
+    // previous light so at most one directional light is owned at a time.
+    pub fn createDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
+        if (self.directional_light) |old| {
+            self.allocator.destroy(old);
+            self.directional_light = null;
+        }
+        const dl = try self.allocator.create(DirectionalLight);
+        dl.* = DirectionalLight.init(name, options);
+        self.directional_light = dl;
+        return dl;
     }
 
     pub fn createStandardMaterial(self: *Scene, name: []const u8) !*StandardMaterial {
@@ -428,6 +502,12 @@ pub const Scene = struct {
         }
     }
 
+    pub fn updateCamera(self: *Scene, dt: f32) void {
+        if (self.active_camera) |*cam| {
+            cam.update(dt);
+        }
+    }
+
     pub fn createPickingRay(self: *Scene, screen_x: f32, screen_y: f32) Ray {
         const cam = self.active_camera orelse return Ray.new(Vec3.zero, Vec3.forward);
         const w = sapp.widthf();
@@ -516,12 +596,65 @@ pub const Scene = struct {
         return null;
     }
 
+    // Pure view/projection snapshot compare. Only fields that affect the
+    // matrices are compared; name pointers, input state, and tuning fields
+    // (limits, sensitivity, speeds, lerp) are excluded.
+    fn camerasEqualForProjection(a: Camera, b: Camera) bool {
+        switch (a) {
+            .arc_rotate => |ac| switch (b) {
+                .arc_rotate => |bc| {
+                    return ac.alpha == bc.alpha and ac.beta == bc.beta and ac.radius == bc.radius and
+                        ac.target.x == bc.target.x and ac.target.y == bc.target.y and ac.target.z == bc.target.z and
+                        ac.fov_deg == bc.fov_deg and ac.near == bc.near and ac.far == bc.far;
+                },
+                else => return false,
+            },
+            .free => |ac| switch (b) {
+                .free => |bc| {
+                    return ac.position.x == bc.position.x and ac.position.y == bc.position.y and ac.position.z == bc.position.z and
+                        ac.rotation.x == bc.rotation.x and ac.rotation.y == bc.rotation.y and ac.rotation.z == bc.rotation.z and
+                        ac.fov_deg == bc.fov_deg and ac.near == bc.near and ac.far == bc.far;
+                },
+                else => return false,
+            },
+            .follow => |ac| switch (b) {
+                .follow => |bc| {
+                    return ac.target_mesh == bc.target_mesh and
+                        ac.position.x == bc.position.x and ac.position.y == bc.position.y and ac.position.z == bc.position.z and
+                        ac.target_position.x == bc.target_position.x and ac.target_position.y == bc.target_position.y and ac.target_position.z == bc.target_position.z and
+                        ac.radius == bc.radius and ac.height_offset == bc.height_offset and
+                        ac.rotation_offset_deg == bc.rotation_offset_deg and
+                        ac.fov_deg == bc.fov_deg and ac.near == bc.near and ac.far == bc.far;
+                },
+                else => return false,
+            },
+        }
+    }
+
+    // Cached VP reuse for projectPoint; bit-identical to getViewProjection.
+    fn cachedProjectViewProjection(self: *Scene, cam: Camera, w: f32, h: f32) Mat4 {
+        if (self.project_vp_valid) {
+            if (self.project_cam) |pc| {
+                if (w == self.project_w and h == self.project_h and camerasEqualForProjection(pc, cam)) {
+                    return self.project_vp;
+                }
+            }
+        }
+        const vp = cam.getViewProjection(w / h);
+        self.project_vp = vp;
+        self.project_cam = cam;
+        self.project_w = w;
+        self.project_h = h;
+        self.project_vp_valid = true;
+        return vp;
+    }
+
     pub fn projectPoint(self: *Scene, world_pos: Vec3) ?math.Vec2 {
         const cam = self.active_camera orelse return null;
         const w = sapp.widthf();
         const h = sapp.heightf();
         if (w <= 0.0 or h <= 0.0) return null;
-        const vp = cam.getViewProjection(w / h);
+        const vp = self.cachedProjectViewProjection(cam, w, h);
         return vp.projectPoint(world_pos, w, h);
     }
 
@@ -539,6 +672,58 @@ pub const Scene = struct {
             return a.texture_id < b.texture_id;
         }
         return a.distance_sq < b.distance_sq;
+    }
+
+    // Transparent items sort strictly back-to-front (by squared camera
+    // distance) so alpha blending composites in the correct order.
+    fn sortTransparentBackToFront(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
+        return a.distance_sq > b.distance_sq;
+    }
+
+    // A mesh is transparent when its material opts into .blend alpha mode.
+    // Meshes without a material render opaque (legacy behavior).
+    pub fn materialIsTransparent(mat: ?Material) bool {
+        if (mat) |m| return m.isTransparent();
+        return false;
+    }
+
+    // Derives a transparent twin pipeline desc from an opaque base desc:
+    // same shader/layout/depth test, but SRC_ALPHA/ONE_MINUS_SRC_ALPHA
+    // blending with depth write disabled. Pure function (no GPU calls).
+    fn blendDescFor(base: sg.PipelineDesc) sg.PipelineDesc {
+        var desc = base;
+        desc.depth.write_enabled = false;
+        desc.colors[0].blend = .{
+            .enabled = true,
+            .src_factor_rgb = .SRC_ALPHA,
+            .dst_factor_rgb = .ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = .ONE,
+            .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
+        };
+        return desc;
+    }
+
+    // Selects the forward pipeline for a regular (non-instanced) queue item.
+    // Transparent items resolve to the blend twins; opaque selection is
+    // identical to the legacy logic, so existing pipeline ids are untouched.
+    fn pipelineForRegularItem(self: *Scene, item: RenderMeshItem) u32 {
+        const mesh = item.mesh;
+        if (item.is_pbr) {
+            if (mesh.skeleton != null) {
+                if (item.transparent) {
+                    return if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_blend_u32.id else self.pipeline_skinned_pbr_blend_u16.id;
+                }
+                return if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_u32.id else self.pipeline_skinned_pbr_u16.id;
+            }
+            if (item.transparent) {
+                return if (mesh.index_type == .UINT32) self.pipeline_pbr_blend_u32.id else self.pipeline_pbr_blend_u16.id;
+            }
+            return if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id;
+        }
+        if (item.transparent) {
+            return if (mesh.index_type == .UINT32) self.pipeline_blend_u32.id else self.pipeline_blend_u16.id;
+        }
+        return if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id;
     }
     /// World matrix computed at most once per render() call.
     /// Parent chains resolve through the same cache, so hierarchies stay O(depth) total.
@@ -559,12 +744,17 @@ pub const Scene = struct {
         return mesh.cached_aabb;
     }
 
-    pub fn computeCascades(self: *Scene, camera: ArcRotateCamera, aspect: f32) [4]Mat4 {
+    pub fn computeCascades(self: *Scene, camera: Camera, aspect: f32) [4]Mat4 {
+        const sun_dir = lights.resolveSunDirection(self.directional_light, self.light);
+        return self.computeCascadesWithSun(camera, aspect, sun_dir);
+    }
+
+    // Hoisted-sun variant: norm_light_dir must be resolveSunDirection output.
+    fn computeCascadesWithSun(self: *Scene, camera: Camera, aspect: f32, norm_light_dir: Vec3) [4]Mat4 {
         var result: [4]Mat4 = undefined;
-        const norm_light_dir = self.light.direction.normalize();
 
         const cam_pos = camera.getPosition();
-        var forward = camera.target.sub(cam_pos);
+        var forward = camera.getForward();
         const fwd_len = forward.length();
         if (fwd_len > 0.0001) {
             forward = forward.scale(1.0 / fwd_len);
@@ -581,10 +771,10 @@ pub const Scene = struct {
         }
         const up = right.cross(forward).normalize();
 
-        const fov_rad = camera.fov_deg * (std.math.pi / 180.0);
+        const fov_rad = camera.getFovDeg() * (std.math.pi / 180.0);
         const tan_half_fov = @tan(fov_rad * 0.5);
 
-        var z_near = camera.near;
+        var z_near = camera.getNear();
         const cascade_res: f32 = 1024.0;
 
         for (0..4) |i| {
@@ -646,9 +836,250 @@ pub const Scene = struct {
         return result;
     }
 
+    // Per-frame constants shared by the regular and instanced draw helpers.
+    const FrameContext = struct {
+        view_proj: Mat4,
+        eye: Vec3,
+        sun_dir: Vec3,
+        sun_color: Color3,
+        sun_intensity: f32,
+        cascades: [4]Mat4,
+        light_counts: [4]f32,
+        point_pos_range: [4][4]f32,
+        point_color_int: [4][4]f32,
+        spot_pos_range: [2][4]f32,
+        spot_dir_inner: [2][4]f32,
+        spot_color_outer: [2][4]f32,
+        spot_intensity: [2][4]f32,
+    };
+
+    // Draws one regular (non-instanced) queue item: pipeline select, bind,
+    // uniforms, draw. Shared by the opaque pass and the transparent pass
+    // (pipeline choice follows item.transparent). Updates stats.
+    fn drawRegularItem(self: *Scene, item: RenderMeshItem, ctx: FrameContext, current_pipeline_id: *u32) void {
+        const mesh = item.mesh;
+        const model = item.model;
+        const mvp = Mat4.mul(ctx.view_proj, model);
+
+        const pip_id = self.pipelineForRegularItem(item);
+
+        if (pip_id == 0) return;
+        if (pip_id != current_pipeline_id.*) {
+            sg.applyPipeline(.{ .id = pip_id });
+            current_pipeline_id.* = pip_id;
+            self.stats.pipeline_switches += 1;
+        }
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = mesh.vertex_buffer;
+        bind.index_buffer = mesh.index_buffer;
+
+        if (item.is_pbr) {
+            const pbr_mat = if (mesh.material) |m| m.pbr else null;
+            const albedo_tex = if (pbr_mat) |p| (p.albedo_texture orelse self.default_white_texture) else self.default_white_texture;
+            const normal_tex = if (pbr_mat) |p| (p.normal_texture orelse self.default_normal_texture) else self.default_normal_texture;
+            const mr_tex = if (pbr_mat) |p| (p.metallic_roughness_texture orelse self.default_white_texture) else self.default_white_texture;
+            const emissive_tex = if (pbr_mat) |p| (p.emissive_texture orelse self.default_white_texture) else self.default_white_texture;
+            const occlusion_tex = if (pbr_mat) |p| (p.occlusion_texture orelse self.default_white_texture) else self.default_white_texture;
+
+            bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
+            bind.views[pbr_shd.VIEW_normal_tex] = normal_tex.view;
+            bind.views[pbr_shd.VIEW_metallic_roughness_tex] = mr_tex.view;
+            bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
+            bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
+            bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+
+            // Environment IBL Cubemap & Shadow Depth Map: a material-level
+            // environment texture (e.g. an HDR probe) overrides the skybox.
+            const cube = (if (pbr_mat) |p| p.environment_texture else null) orelse self.skybox_texture orelse self.default_cube_texture;
+            bind.views[pbr_shd.VIEW_env_tex] = cube.view;
+            bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
+
+            bind.views[pbr_shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
+            bind.samplers[pbr_shd.SMP_shadow_smp] = self.shadow_pass.sampler;
+
+            sg.applyBindings(bind);
+
+            const vs_params = pbr_shd.VsParams{
+                .mvp = mvp,
+                .model = model,
+            };
+            sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
+
+            if (mesh.skeleton) |skel| {
+                const vs_skin = skinned_pbr_shd.VsSkin{
+                    .bones = skel.skin_matrices,
+                };
+                sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
+            }
+
+            const mat_albedo = if (pbr_mat) |p| p.getAlbedoColor4() else [4]f32{ 1, 1, 1, 1 };
+            const metallic = if (pbr_mat) |p| p.metallic else 0.0;
+            const roughness = if (pbr_mat) |p| p.roughness else 0.5;
+            const env_intensity = if (pbr_mat) |p| self.ibl_intensity * p.environment_intensity else self.ibl_intensity;
+            const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
+            const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
+
+            const fs_params = pbr_shd.FsParams{
+                .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
+                .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
+                .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
+                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+                .base_color_factor = mat_albedo,
+                .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
+                .emissive_factor = emissive_col,
+                .shadow_params = .{
+                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
+                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
+                    self.shadow_normal_bias,
+                    self.shadow_softness,
+                },
+                .shadow_splits = self.cascade_splits,
+                .cascade_view_proj = ctx.cascades,
+                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
+                .light_counts = ctx.light_counts,
+                .point_pos_range = ctx.point_pos_range,
+                .point_color_int = ctx.point_color_int,
+                .spot_pos_range = ctx.spot_pos_range,
+                .spot_dir_inner = ctx.spot_dir_inner,
+                .spot_color_outer = ctx.spot_color_outer,
+                .spot_intensity = ctx.spot_intensity,
+            };
+            if (mesh.skeleton != null) {
+                sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+            } else {
+                sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+            }
+        } else {
+            const std_mat = if (mesh.material) |m| m.standard else &self.default_material;
+            const tex = if (std_mat.diffuse_texture) |t| t else self.default_white_texture;
+
+            bind.views[shd.VIEW_diffuse_tex] = tex.view;
+            bind.samplers[shd.SMP_smp] = tex.sampler;
+
+            bind.views[shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
+            bind.samplers[shd.SMP_shadow_smp] = self.shadow_pass.sampler;
+
+            sg.applyBindings(bind);
+
+            const vs_params = shd.VsParams{
+                .mvp = mvp,
+                .model = model,
+            };
+            sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
+
+            const fs_params = shd.FsParams{
+                .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
+                .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
+                .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
+                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+                .diffuse_color = std_mat.getDiffuseColor4(),
+                .shadow_params = .{
+                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
+                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
+                    self.shadow_normal_bias,
+                    self.shadow_softness,
+                },
+                .shadow_splits = self.cascade_splits,
+                .cascade_view_proj = ctx.cascades,
+                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
+                .light_counts = ctx.light_counts,
+                .point_pos_range = ctx.point_pos_range,
+                .point_color_int = ctx.point_color_int,
+                .spot_pos_range = ctx.spot_pos_range,
+                .spot_dir_inner = ctx.spot_dir_inner,
+                .spot_color_outer = ctx.spot_color_outer,
+                .spot_intensity = ctx.spot_intensity,
+            };
+            sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
+        }
+
+        sg.draw(0, mesh.index_count, 1);
+        self.stats.draw_calls += 1;
+        self.stats.triangles += mesh.index_count / 3;
+    }
+
+    // Draws one instanced mesh with the currently visible instance buffer.
+    // Transparent instanced meshes use the blend twin pipeline and are drawn
+    // as-is (no per-instance back-to-front sort); the caller draws them
+    // after all opaque geometry. Updates stats.
+    fn drawInstancedMesh(self: *Scene, mesh: *Mesh, ctx: FrameContext, current_pipeline_id: *u32) void {
+        if (mesh.instances.items.len == 0) return;
+        if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
+
+        const transparent = materialIsTransparent(mesh.material);
+        const pip_id = if (transparent)
+            (if (mesh.index_type == .UINT32) self.pipeline_instanced_blend_u32.id else self.pipeline_instanced_blend_u16.id)
+        else
+            (if (mesh.index_type == .UINT32) self.pipeline_instanced_u32.id else self.pipeline_instanced_u16.id);
+        if (pip_id == 0) return;
+        if (pip_id != current_pipeline_id.*) {
+            sg.applyPipeline(.{ .id = pip_id });
+            current_pipeline_id.* = pip_id;
+            self.stats.pipeline_switches += 1;
+        }
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = mesh.vertex_buffer;
+        bind.vertex_buffers[1] = mesh.instance_buffer;
+        bind.index_buffer = mesh.index_buffer;
+
+        const std_mat = if (mesh.material) |m| switch (m) {
+            .standard => |s| s,
+            .pbr => &self.default_material,
+        } else &self.default_material;
+        const tex = if (std_mat.diffuse_texture) |t| t else self.default_white_texture;
+
+        bind.views[inst_shd.VIEW_diffuse_tex] = tex.view;
+        bind.samplers[inst_shd.SMP_smp] = tex.sampler;
+
+        bind.views[inst_shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
+        bind.samplers[inst_shd.SMP_shadow_smp] = self.shadow_pass.sampler;
+
+        sg.applyBindings(bind);
+
+        const inst_vs = inst_shd.VsParams{
+            .view_proj = ctx.view_proj,
+        };
+        sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
+
+        const inst_fs = inst_shd.FsParams{
+            .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
+            .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
+            .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
+            .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+            .diffuse_color = std_mat.getDiffuseColor4(),
+            .shadow_params = .{
+                if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
+                if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
+                self.shadow_normal_bias,
+                self.shadow_softness,
+            },
+            .shadow_splits = self.cascade_splits,
+            .cascade_view_proj = ctx.cascades,
+            .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
+            .light_counts = ctx.light_counts,
+            .point_pos_range = ctx.point_pos_range,
+            .point_color_int = ctx.point_color_int,
+            .spot_pos_range = ctx.spot_pos_range,
+            .spot_dir_inner = ctx.spot_dir_inner,
+            .spot_color_outer = ctx.spot_color_outer,
+            .spot_intensity = ctx.spot_intensity,
+        };
+        sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
+
+        sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+        self.stats.draw_calls += 1;
+        self.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
+    }
+
     pub fn render(self: *Scene) void {
         const camera = self.active_camera orelse return;
         const aspect = sapp.widthf() / sapp.heightf();
+        // Sun resolved once per frame; reused by cascades, mesh uniforms, postprocess.
+        const sun_dir = lights.resolveSunDirection(self.directional_light, self.light);
+        const sun_color = lights.resolveSunColor(self.directional_light, self.light);
+        const sun_intensity = lights.resolveSunIntensity(self.directional_light, self.light);
         const view_proj = camera.getViewProjection(aspect);
         const frustum = Frustum.fromViewProjection(view_proj);
         const eye = camera.getPosition();
@@ -656,9 +1087,10 @@ pub const Scene = struct {
         self.stats = .{};
         self.frame_id +%= 1;
         self.render_queue.clearRetainingCapacity();
+        self.transparent_queue.clearRetainingCapacity();
 
         // 1. Directional Light Cascaded Shadow View-Projections
-        const cascades = self.computeCascades(camera, aspect);
+        const cascades = self.computeCascadesWithSun(camera, aspect, sun_dir);
         self.cascade_matrices = cascades;
 
         // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
@@ -822,12 +1254,15 @@ pub const Scene = struct {
                 } else self.default_white_texture.view.id;
 
                 const d_sq = world_aabb.center().sub(eye).lengthSq();
-                self.render_queue.append(self.allocator, .{
+                const transparent = materialIsTransparent(mesh.material);
+                const target_queue = if (transparent) &self.transparent_queue else &self.render_queue;
+                target_queue.append(self.allocator, .{
                     .mesh = mesh,
                     .model = model,
                     .distance_sq = d_sq,
                     .is_pbr = is_pbr,
                     .texture_id = tex_id,
+                    .transparent = transparent,
                 }) catch continue;
             }
         }
@@ -880,12 +1315,16 @@ pub const Scene = struct {
             });
         }
 
-        // State sorting: Group by shader type and textures, Front-to-Back Early-Z
+        // State sorting: opaque items group by shader type and textures,
+        // Front-to-Back Early-Z. Transparent items sort strictly
+        // back-to-front in their own queue and draw after all opaque work.
         std.mem.sort(RenderMeshItem, self.render_queue.items, {}, sortRenderItems);
+        std.mem.sort(RenderMeshItem, self.transparent_queue.items, {}, sortTransparentBackToFront);
 
         // Pack Point & Spot Lights. Directions are normalized once here so the
         // fragment shaders can use them raw (no per-pixel normalize()).
-        const hemi_dir = self.light.direction.normalize();
+        // The directional light overrides the legacy hemispheric sun here;
+        // ambient stays hemispheric ground_color below.
         var light_counts = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
         var point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
         var point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
@@ -919,221 +1358,47 @@ pub const Scene = struct {
         }
         light_counts[1] = @floatFromInt(num_spot);
 
+        const frame_ctx = FrameContext{
+            .view_proj = view_proj,
+            .eye = eye,
+            .sun_dir = sun_dir,
+            .sun_color = sun_color,
+            .sun_intensity = sun_intensity,
+            .cascades = cascades,
+            .light_counts = light_counts,
+            .point_pos_range = point_pos_range,
+            .point_color_int = point_color_int,
+            .spot_pos_range = spot_pos_range,
+            .spot_dir_inner = spot_dir_inner,
+            .spot_color_outer = spot_color_outer,
+            .spot_intensity = spot_intensity,
+        };
+
         var current_pipeline_id: u32 = 0;
 
-        // Render Regular Meshes
+        // Opaque regular meshes first (front-to-back, early-Z). Transparent
+        // items live in transparent_queue and are drawn below, after every
+        // opaque mesh including instanced ones.
         for (self.render_queue.items) |item| {
-            const mesh = item.mesh;
-            const model = item.model;
-            const mvp = Mat4.mul(view_proj, model);
-
-            const pip_id = if (item.is_pbr)
-                (if (mesh.skeleton != null)
-                    (if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_u32.id else self.pipeline_skinned_pbr_u16.id)
-                else
-                    (if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id))
-            else
-                (if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id);
-
-            if (pip_id == 0) continue;
-            if (pip_id != current_pipeline_id) {
-                sg.applyPipeline(.{ .id = pip_id });
-                current_pipeline_id = pip_id;
-                self.stats.pipeline_switches += 1;
-            }
-
-            var bind = sg.Bindings{};
-            bind.vertex_buffers[0] = mesh.vertex_buffer;
-            bind.index_buffer = mesh.index_buffer;
-
-            if (item.is_pbr) {
-                const pbr_mat = if (mesh.material) |m| m.pbr else null;
-                const albedo_tex = if (pbr_mat) |p| (p.albedo_texture orelse self.default_white_texture) else self.default_white_texture;
-                const normal_tex = if (pbr_mat) |p| (p.normal_texture orelse self.default_normal_texture) else self.default_normal_texture;
-                const mr_tex = if (pbr_mat) |p| (p.metallic_roughness_texture orelse self.default_white_texture) else self.default_white_texture;
-                const emissive_tex = if (pbr_mat) |p| (p.emissive_texture orelse self.default_white_texture) else self.default_white_texture;
-                const occlusion_tex = if (pbr_mat) |p| (p.occlusion_texture orelse self.default_white_texture) else self.default_white_texture;
-
-                bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
-                bind.views[pbr_shd.VIEW_normal_tex] = normal_tex.view;
-                bind.views[pbr_shd.VIEW_metallic_roughness_tex] = mr_tex.view;
-                bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
-                bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
-                bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
-
-                // Environment IBL Cubemap & Shadow Depth Map
-                const cube = self.skybox_texture orelse self.default_cube_texture;
-                bind.views[pbr_shd.VIEW_env_tex] = cube.view;
-                bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
-
-                bind.views[pbr_shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
-                bind.samplers[pbr_shd.SMP_shadow_smp] = self.shadow_pass.sampler;
-
-                sg.applyBindings(bind);
-
-                const vs_params = pbr_shd.VsParams{
-                    .mvp = mvp,
-                    .model = model,
-                };
-                sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
-
-                if (mesh.skeleton) |skel| {
-                    const vs_skin = skinned_pbr_shd.VsSkin{
-                        .bones = skel.skin_matrices,
-                    };
-                    sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
-                }
-
-                const mat_albedo = if (pbr_mat) |p| p.getAlbedoColor4() else [4]f32{ 1, 1, 1, 1 };
-                const metallic = if (pbr_mat) |p| p.metallic else 0.0;
-                const roughness = if (pbr_mat) |p| p.roughness else 0.5;
-                const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
-                const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
-
-                const fs_params = pbr_shd.FsParams{
-                    .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                    .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
-                    .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
-                    .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
-                    .base_color_factor = mat_albedo,
-                    .pbr_factors = .{ metallic, roughness, occlusion_strength, self.ibl_intensity },
-                    .emissive_factor = emissive_col,
-                    .shadow_params = .{
-                        if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                        if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                        self.shadow_normal_bias,
-                        self.shadow_softness,
-                    },
-                    .shadow_splits = self.cascade_splits,
-                    .cascade_view_proj = cascades,
-                    .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-                    .light_counts = light_counts,
-                    .point_pos_range = point_pos_range,
-                    .point_color_int = point_color_int,
-                    .spot_pos_range = spot_pos_range,
-                    .spot_dir_inner = spot_dir_inner,
-                    .spot_color_outer = spot_color_outer,
-                    .spot_intensity = spot_intensity,
-                };
-                if (mesh.skeleton != null) {
-                    sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
-                } else {
-                    sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
-                }
-            } else {
-                const std_mat = if (mesh.material) |m| m.standard else &self.default_material;
-                const tex = if (std_mat.diffuse_texture) |t| t else self.default_white_texture;
-
-                bind.views[shd.VIEW_diffuse_tex] = tex.view;
-                bind.samplers[shd.SMP_smp] = tex.sampler;
-
-                bind.views[shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
-                bind.samplers[shd.SMP_shadow_smp] = self.shadow_pass.sampler;
-
-                sg.applyBindings(bind);
-
-                const vs_params = shd.VsParams{
-                    .mvp = mvp,
-                    .model = model,
-                };
-                sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
-
-                const fs_params = shd.FsParams{
-                    .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                    .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
-                    .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
-                    .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
-                    .diffuse_color = std_mat.getDiffuseColor4(),
-                    .shadow_params = .{
-                        if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                        if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                        self.shadow_normal_bias,
-                        self.shadow_softness,
-                    },
-                    .shadow_splits = self.cascade_splits,
-                    .cascade_view_proj = cascades,
-                    .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-                    .light_counts = light_counts,
-                    .point_pos_range = point_pos_range,
-                    .point_color_int = point_color_int,
-                    .spot_pos_range = spot_pos_range,
-                    .spot_dir_inner = spot_dir_inner,
-                    .spot_color_outer = spot_color_outer,
-                    .spot_intensity = spot_intensity,
-                };
-                sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
-            }
-
-            sg.draw(0, mesh.index_count, 1);
-            self.stats.draw_calls += 1;
-            self.stats.triangles += mesh.index_count / 3;
+            self.drawRegularItem(item, frame_ctx, &current_pipeline_id);
         }
 
-        // Render Instanced Meshes
+        // Opaque instanced meshes.
         for (self.meshes.items) |mesh| {
-            if (mesh.instances.items.len == 0) continue;
-            if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+            if (materialIsTransparent(mesh.material)) continue;
+            self.drawInstancedMesh(mesh, frame_ctx, &current_pipeline_id);
+        }
 
-            const pip_id = if (mesh.index_type == .UINT32) self.pipeline_instanced_u32.id else self.pipeline_instanced_u16.id;
-            if (pip_id == 0) continue;
-            if (pip_id != current_pipeline_id) {
-                sg.applyPipeline(.{ .id = pip_id });
-                current_pipeline_id = pip_id;
-                self.stats.pipeline_switches += 1;
-            }
+        // Transparent regular meshes (strict back-to-front, blended).
+        for (self.transparent_queue.items) |item| {
+            self.drawRegularItem(item, frame_ctx, &current_pipeline_id);
+        }
 
-            var bind = sg.Bindings{};
-            bind.vertex_buffers[0] = mesh.vertex_buffer;
-            bind.vertex_buffers[1] = mesh.instance_buffer;
-            bind.index_buffer = mesh.index_buffer;
-
-            const std_mat = if (mesh.material) |m| switch (m) {
-                .standard => |s| s,
-                .pbr => &self.default_material,
-            } else &self.default_material;
-            const tex = if (std_mat.diffuse_texture) |t| t else self.default_white_texture;
-
-            bind.views[inst_shd.VIEW_diffuse_tex] = tex.view;
-            bind.samplers[inst_shd.SMP_smp] = tex.sampler;
-
-            bind.views[inst_shd.VIEW_shadow_tex] = self.shadow_pass.texture_view;
-            bind.samplers[inst_shd.SMP_shadow_smp] = self.shadow_pass.sampler;
-
-            sg.applyBindings(bind);
-
-            const inst_vs = inst_shd.VsParams{
-                .view_proj = view_proj,
-            };
-            sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
-
-            const inst_fs = inst_shd.FsParams{
-                .eye_pos = .{ eye.x, eye.y, eye.z, 4.0 },
-                .light_dir = .{ hemi_dir.x, hemi_dir.y, hemi_dir.z, 2048.0 },
-                .light_color = .{ self.light.diffuse.r, self.light.diffuse.g, self.light.diffuse.b, self.light.intensity },
-                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
-                .diffuse_color = std_mat.getDiffuseColor4(),
-                .shadow_params = .{
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                    self.shadow_normal_bias,
-                    self.shadow_softness,
-                },
-                .shadow_splits = self.cascade_splits,
-                .cascade_view_proj = cascades,
-                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-                .light_counts = light_counts,
-                .point_pos_range = point_pos_range,
-                .point_color_int = point_color_int,
-                .spot_pos_range = spot_pos_range,
-                .spot_dir_inner = spot_dir_inner,
-                .spot_color_outer = spot_color_outer,
-                .spot_intensity = spot_intensity,
-            };
-            sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
-
-            sg.draw(0, mesh.index_count, mesh.visible_instance_count);
-            self.stats.draw_calls += 1;
-            self.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
+        // Transparent instanced meshes last, drawn as-is (no per-instance
+        // sorting; documented limitation).
+        for (self.meshes.items) |mesh| {
+            if (!materialIsTransparent(mesh.material)) continue;
+            self.drawInstancedMesh(mesh, frame_ctx, &current_pipeline_id);
         }
 
         // Skybox Pass
@@ -1196,8 +1461,6 @@ pub const Scene = struct {
             });
 
             const inv_view_proj = view_proj.invert() orelse Mat4.identity;
-            const sun_d = self.light.direction.normalize();
-            const sun_c = self.light.diffuse;
 
             self.postprocess_pass.render(
                 self.post_process,
@@ -1210,10 +1473,10 @@ pub const Scene = struct {
                 view_proj,
                 inv_view_proj,
                 eye,
-                sun_d,
-                sun_c,
-                camera.near,
-                camera.far,
+                sun_dir,
+                sun_color,
+                camera.getNear(),
+                camera.getFar(),
             );
             self.stats.draw_calls += 1;
             self.stats.triangles += 2;
@@ -1271,7 +1534,13 @@ pub const Scene = struct {
         }
         self.spot_lights.deinit(self.allocator);
 
+        if (self.directional_light) |dl| {
+            self.allocator.destroy(dl);
+            self.directional_light = null;
+        }
+
         self.render_queue.deinit(self.allocator);
+        self.transparent_queue.deinit(self.allocator);
         self.instance_matrices.deinit(self.allocator);
 
         self.default_white_texture.deinit();
@@ -1290,6 +1559,14 @@ pub const Scene = struct {
         sg.destroyPipeline(self.pipeline_skinned_pbr_u32);
         sg.destroyPipeline(self.pipeline_instanced_u16);
         sg.destroyPipeline(self.pipeline_instanced_u32);
+        sg.destroyPipeline(self.pipeline_blend_u16);
+        sg.destroyPipeline(self.pipeline_blend_u32);
+        sg.destroyPipeline(self.pipeline_pbr_blend_u16);
+        sg.destroyPipeline(self.pipeline_pbr_blend_u32);
+        sg.destroyPipeline(self.pipeline_skinned_pbr_blend_u16);
+        sg.destroyPipeline(self.pipeline_skinned_pbr_blend_u32);
+        sg.destroyPipeline(self.pipeline_instanced_blend_u16);
+        sg.destroyPipeline(self.pipeline_instanced_blend_u32);
 
         for (self.animation_groups.items) |ag| {
             ag.deinit();
@@ -1323,3 +1600,158 @@ pub const Scene = struct {
         }
     }
 };
+
+test "project VP cache: equal cameras hit" {
+    const a: Camera = .{ .arc_rotate = .{ .alpha = 0.5, .beta = 1.0, .radius = 8.0 } };
+    const b: Camera = .{ .arc_rotate = .{ .alpha = 0.5, .beta = 1.0, .radius = 8.0 } };
+    try std.testing.expect(Scene.camerasEqualForProjection(a, b));
+    // Name pointers and input state do not affect the matrices.
+    const c: Camera = .{ .arc_rotate = .{ .alpha = 0.5, .beta = 1.0, .radius = 8.0, .name = "other", .is_dragging = true } };
+    try std.testing.expect(Scene.camerasEqualForProjection(a, c));
+
+    const fa: Camera = .{ .free = .{ .position = Vec3.new(1.0, 2.0, 3.0) } };
+    const fb: Camera = .{ .free = .{ .position = Vec3.new(1.0, 2.0, 3.0) } };
+    try std.testing.expect(Scene.camerasEqualForProjection(fa, fb));
+
+    const ga: Camera = .{ .follow = .{ .target_position = Vec3.new(1.0, 0.0, 0.0), .radius = 5.0 } };
+    const gb: Camera = .{ .follow = .{ .target_position = Vec3.new(1.0, 0.0, 0.0), .radius = 5.0 } };
+    try std.testing.expect(Scene.camerasEqualForProjection(ga, gb));
+}
+
+test "project VP cache: changed field misses" {
+    const a: Camera = .{ .arc_rotate = .{ .radius = 8.0 } };
+    const b: Camera = .{ .arc_rotate = .{ .radius = 9.0 } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(a, b));
+
+    const fa: Camera = .{ .free = .{ .position = Vec3.new(1.0, 2.0, 3.0) } };
+    const fb: Camera = .{ .free = .{ .position = Vec3.new(1.0, 2.0, 4.0) } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, fb));
+
+    const ga: Camera = .{ .follow = .{ .radius = 5.0 } };
+    const gb: Camera = .{ .follow = .{ .radius = 6.0 } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(ga, gb));
+
+    // Distinct target meshes miss even when every scalar matches.
+    var m1: Mesh = undefined;
+    var m2: Mesh = undefined;
+    const ha: Camera = .{ .follow = .{ .target_mesh = &m1 } };
+    const hb: Camera = .{ .follow = .{ .target_mesh = &m2 } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(ha, hb));
+}
+
+test "project VP cache: different union variants miss" {
+    const arc: Camera = .{ .arc_rotate = .{} };
+    const free: Camera = .{ .free = .{} };
+    const follow: Camera = .{ .follow = .{} };
+    try std.testing.expect(!Scene.camerasEqualForProjection(arc, free));
+    try std.testing.expect(!Scene.camerasEqualForProjection(free, follow));
+    try std.testing.expect(!Scene.camerasEqualForProjection(follow, arc));
+}
+
+test "transparent classification follows material alpha mode" {
+    try std.testing.expect(!Scene.materialIsTransparent(null));
+    var std_mat = StandardMaterial.init("s");
+    var pbr_mat = PBRMaterial.init("p");
+    try std.testing.expect(!Scene.materialIsTransparent(Material{ .standard = &std_mat }));
+    try std.testing.expect(!Scene.materialIsTransparent(Material{ .pbr = &pbr_mat }));
+    std_mat.alpha_mode = .blend;
+    pbr_mat.alpha_mode = .blend;
+    try std.testing.expect(Scene.materialIsTransparent(Material{ .standard = &std_mat }));
+    try std.testing.expect(Scene.materialIsTransparent(Material{ .pbr = &pbr_mat }));
+}
+
+test "transparent queue sorts strictly back-to-front" {
+    var m: Mesh = undefined;
+    var items = [_]RenderMeshItem{
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = true },
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 0, .transparent = true },
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 4.0, .is_pbr = true, .texture_id = 1, .transparent = true },
+    };
+    std.mem.sort(RenderMeshItem, &items, {}, Scene.sortTransparentBackToFront);
+    try std.testing.expect(items[0].distance_sq == 9.0);
+    try std.testing.expect(items[1].distance_sq == 4.0);
+    try std.testing.expect(items[2].distance_sq == 1.0);
+}
+
+test "opaque sort unchanged: state groups, front-to-back" {
+    var m: Mesh = undefined;
+    var items = [_]RenderMeshItem{
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 2 },
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
+        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
+    };
+    // Default transparent flag is false, so legacy items sort as before.
+    try std.testing.expect(!items[0].transparent);
+    std.mem.sort(RenderMeshItem, &items, {}, Scene.sortRenderItems);
+    // Standard before PBR, texture id ascending, front-to-back within a group.
+    try std.testing.expect(!items[0].is_pbr and items[0].texture_id == 1 and items[0].distance_sq == 3.0);
+    try std.testing.expect(!items[1].is_pbr and items[1].texture_id == 2 and items[1].distance_sq == 1.0);
+    try std.testing.expect(!items[2].is_pbr and items[2].texture_id == 2 and items[2].distance_sq == 9.0);
+    try std.testing.expect(items[3].is_pbr and items[3].distance_sq == 5.0);
+}
+
+test "blendDescFor enables alpha blending without depth write" {
+    const base = sg.PipelineDesc{
+        .shader = .{},
+        .index_type = .UINT32,
+        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+    };
+    const blended = Scene.blendDescFor(base);
+    try std.testing.expect(blended.colors[0].blend.enabled);
+    try std.testing.expect(blended.colors[0].blend.src_factor_rgb == .SRC_ALPHA);
+    try std.testing.expect(blended.colors[0].blend.dst_factor_rgb == .ONE_MINUS_SRC_ALPHA);
+    try std.testing.expect(!blended.depth.write_enabled);
+    try std.testing.expect(blended.depth.compare == .LESS_EQUAL);
+    try std.testing.expect(blended.index_type == .UINT32);
+    try std.testing.expect(blended.cull_mode == .BACK);
+    // Pure function: the base desc is left untouched.
+    try std.testing.expect(!base.colors[0].blend.enabled);
+    try std.testing.expect(base.depth.write_enabled);
+}
+
+test "pipeline selection follows transparency flag" {
+    var scene: Scene = undefined;
+    scene.pipeline_u16.id = 11;
+    scene.pipeline_u32.id = 12;
+    scene.pipeline_blend_u16.id = 13;
+    scene.pipeline_blend_u32.id = 14;
+    scene.pipeline_pbr_u16.id = 21;
+    scene.pipeline_pbr_u32.id = 22;
+    scene.pipeline_pbr_blend_u16.id = 23;
+    scene.pipeline_pbr_blend_u32.id = 24;
+    scene.pipeline_skinned_pbr_u16.id = 31;
+    scene.pipeline_skinned_pbr_u32.id = 32;
+    scene.pipeline_skinned_pbr_blend_u16.id = 33;
+    scene.pipeline_skinned_pbr_blend_u32.id = 34;
+
+    var mesh_obj: Mesh = undefined;
+    mesh_obj.index_type = .UINT16;
+    mesh_obj.skeleton = null;
+
+    const opaque_std = RenderMeshItem{ .mesh = &mesh_obj, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = false };
+    var blend_std = opaque_std;
+    blend_std.transparent = true;
+    try std.testing.expect(scene.pipelineForRegularItem(opaque_std) == 11);
+    try std.testing.expect(scene.pipelineForRegularItem(blend_std) == 13);
+
+    mesh_obj.index_type = .UINT32;
+    try std.testing.expect(scene.pipelineForRegularItem(opaque_std) == 12);
+    try std.testing.expect(scene.pipelineForRegularItem(blend_std) == 14);
+
+    const opaque_pbr = RenderMeshItem{ .mesh = &mesh_obj, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = true, .texture_id = 0, .transparent = false };
+    var blend_pbr = opaque_pbr;
+    blend_pbr.transparent = true;
+    try std.testing.expect(scene.pipelineForRegularItem(opaque_pbr) == 22);
+    try std.testing.expect(scene.pipelineForRegularItem(blend_pbr) == 24);
+
+    var skel: Skeleton = undefined;
+    mesh_obj.skeleton = &skel;
+    try std.testing.expect(scene.pipelineForRegularItem(opaque_pbr) == 32);
+    try std.testing.expect(scene.pipelineForRegularItem(blend_pbr) == 34);
+    mesh_obj.index_type = .UINT16;
+    try std.testing.expect(scene.pipelineForRegularItem(opaque_pbr) == 31);
+    try std.testing.expect(scene.pipelineForRegularItem(blend_pbr) == 33);
+}

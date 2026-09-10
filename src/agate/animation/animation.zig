@@ -3,6 +3,8 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const Quat = math.Quat;
 const Skeleton = @import("skeleton.zig").Skeleton;
+const easing_mod = @import("easing.zig");
+pub const EasingType = easing_mod.EasingType;
 
 pub const AnimationPath = enum {
     translation,
@@ -23,6 +25,13 @@ pub const AnimationSampler = struct {
     interpolation: AnimationInterpolation = .linear,
 
     pub fn sampleVec3(self: AnimationSampler, time: f32) Vec3 {
+        return self.sampleVec3Eased(time, .linear);
+    }
+
+    /// Samples a vec3 track, warping the intra-keyframe factor with an easing
+    /// curve. STEP ignores easing. CUBICSPLINE has no tangent support here and
+    /// falls back to (eased) linear interpolation; it never crashes.
+    pub fn sampleVec3Eased(self: AnimationSampler, time: f32, easing: EasingType) Vec3 {
         if (self.timestamps.len == 0) return Vec3.zero;
         if (time <= self.timestamps[0]) {
             return Vec3.new(self.outputs[0], self.outputs[1], self.outputs[2]);
@@ -36,19 +45,26 @@ pub const AnimationSampler = struct {
         const idx = self.findKeyframeIndex(time);
         const t0 = self.timestamps[idx];
         const t1 = self.timestamps[idx + 1];
-        const factor = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
+        const raw = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
 
         const base0 = idx * 3;
         const v0 = Vec3.new(self.outputs[base0], self.outputs[base0 + 1], self.outputs[base0 + 2]);
 
         if (self.interpolation == .step) return v0;
 
+        const factor = easing_mod.evaluate(easing, raw);
         const base1 = (idx + 1) * 3;
         const v1 = Vec3.new(self.outputs[base1], self.outputs[base1 + 1], self.outputs[base1 + 2]);
         return Vec3.lerp(v0, v1, factor);
     }
 
     pub fn sampleQuat(self: AnimationSampler, time: f32) Quat {
+        return self.sampleQuatEased(time, .linear);
+    }
+
+    /// Quaternion variant of sampleVec3Eased: slerp factor is eased, STEP
+    /// ignores easing, CUBICSPLINE falls back to (eased) linear blending.
+    pub fn sampleQuatEased(self: AnimationSampler, time: f32, easing: EasingType) Quat {
         if (self.timestamps.len == 0) return Quat.identity;
         if (time <= self.timestamps[0]) {
             const q = Quat{
@@ -74,7 +90,7 @@ pub const AnimationSampler = struct {
         const idx = self.findKeyframeIndex(time);
         const t0 = self.timestamps[idx];
         const t1 = self.timestamps[idx + 1];
-        const factor = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
+        const raw = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
 
         const base0 = idx * 4;
         const q0 = Quat{
@@ -86,6 +102,7 @@ pub const AnimationSampler = struct {
 
         if (self.interpolation == .step) return q0.normalize();
 
+        const factor = easing_mod.evaluate(easing, raw);
         const base1 = (idx + 1) * 4;
         const q1 = Quat{
             .x = self.outputs[base1],
@@ -117,12 +134,63 @@ pub const AnimationChannel = struct {
     sampler: AnimationSampler,
 };
 
+/// Live binding between a node animation track and a mesh transform.
+/// Raw Vec3 pointers (instead of a Mesh pointer) keep this module free of
+/// import cycles: mesh.zig -> scene.zig -> animation.zig. The loader binds
+/// &mesh.position / &mesh.rotation / &mesh.scale here; unit tests bind plain
+/// Vec3 fields of a local struct. rotation_euler uses degrees to match Mesh.
+/// Pointers must stay valid for the group lifetime (both are scene-owned).
+pub const NodeTarget = struct {
+    position: *Vec3,
+    rotation_euler: *Vec3,
+    scaling: *Vec3,
+    rest_position: Vec3 = Vec3.zero,
+    rest_rotation: Quat = Quat.identity,
+    rest_scale: Vec3 = Vec3.one,
+    /// When true the channel is parsed but never applied. The loader sets it
+    /// when the target glTF node is a skeleton joint of a skinned mesh: the
+    /// skeleton path already drives that transform, applying the node track
+    /// on top would double-apply it.
+    skip: bool = false,
+};
+
+/// One glTF node animation channel (target node, not a skeleton joint).
+/// Only translation/rotation/scale paths are applied; weights (morph targets)
+/// are parsed but ignored because plain meshes have no morph support.
+pub const NodeChannel = struct {
+    target: usize,
+    target_path: AnimationPath,
+    sampler: AnimationSampler,
+    easing: EasingType = .linear,
+};
+
+/// Guards sampler reads: true when timestamps exist and outputs holds at
+/// least one full frame per keyframe for the given path. Invalid channels are
+/// skipped by the node applier instead of crashing on out-of-bounds access.
+fn samplerHasFrames(sampler: AnimationSampler, path: AnimationPath) bool {
+    if (sampler.timestamps.len == 0) return false;
+    const stride: usize = switch (path) {
+        .translation, .scale => 3,
+        .rotation => 4,
+        .weights => 1,
+    };
+    return sampler.outputs.len >= sampler.timestamps.len * stride;
+}
+
 pub const AnimationGroup = struct {
     allocator: std.mem.Allocator,
     name: []const u8 = "",
     channels: []AnimationChannel,
     skeleton: ?*Skeleton = null,
     duration: f32 = 0.0,
+    /// Plain-node (non-skeleton) tracks. update() applies them directly to the
+    /// bound mesh transforms, so Scene.updateAnimations needs no changes.
+    /// Limitation: node tracks are NOT cross-group blended. Every playing
+    /// group blends its own sample with the captured rest pose by its own
+    /// weight; when several groups drive the same mesh, the last updated
+    /// group wins.
+    node_channels: []NodeChannel = &.{},
+    node_targets: []NodeTarget = &.{},
 
     from: f32 = 0.0,
     to: f32 = 0.0,
@@ -155,10 +223,16 @@ pub const AnimationGroup = struct {
 
     pub fn deinit(self: *AnimationGroup) void {
         for (self.channels) |ch| {
-            self.allocator.free(ch.sampler.timestamps);
-            self.allocator.free(ch.sampler.outputs);
+            if (ch.sampler.timestamps.len > 0) self.allocator.free(ch.sampler.timestamps);
+            if (ch.sampler.outputs.len > 0) self.allocator.free(ch.sampler.outputs);
         }
-        self.allocator.free(self.channels);
+        if (self.channels.len > 0) self.allocator.free(self.channels);
+        for (self.node_channels) |ch| {
+            if (ch.sampler.timestamps.len > 0) self.allocator.free(ch.sampler.timestamps);
+            if (ch.sampler.outputs.len > 0) self.allocator.free(ch.sampler.outputs);
+        }
+        if (self.node_channels.len > 0) self.allocator.free(self.node_channels);
+        if (self.node_targets.len > 0) self.allocator.free(self.node_targets);
         if (self.name.len > 0) {
             self.allocator.free(self.name);
         }
@@ -249,6 +323,7 @@ pub const AnimationGroup = struct {
         if (self.skeleton) |skel| {
             skel.resetToBindPose();
         }
+        self.restoreNodeRestPose();
     }
 
     pub fn goToFrame(self: *AnimationGroup, time: f32) void {
@@ -272,12 +347,18 @@ pub const AnimationGroup = struct {
                 if (self.weight <= 0.0001 and self.stop_on_fade_out) {
                     self.is_playing = false;
                     self.current_time = self.from;
+                    // Weight is zero so this restores the rest pose.
+                    self.applyNodesAtTime(self.current_time);
                     return;
                 }
             }
         }
         const range = self.to - self.from;
-        if (range <= 0.0) return;
+        if (range <= 0.0) {
+            // Zero-length clips (e.g. a single keyframe) still drive nodes.
+            self.applyNodesAtTime(self.current_time);
+            return;
+        }
 
         self.current_time += dt * self.speed_ratio;
 
@@ -300,6 +381,99 @@ pub const AnimationGroup = struct {
                 }
             }
         }
+
+        self.applyNodesAtTime(self.current_time);
+    }
+
+    /// Binds a mesh transform to this group and snapshots its current TRS as
+    /// the rest pose used for weight blending. Returns the target index for
+    /// NodeChannel.target. The pointed-to Vec3s must outlive the group.
+    pub fn bindNodeTarget(self: *AnimationGroup, position: *Vec3, rotation_euler: *Vec3, scaling: *Vec3, skip: bool) !usize {
+        const idx = self.node_targets.len;
+        const grown = try self.allocator.alloc(NodeTarget, idx + 1);
+        if (idx > 0) {
+            @memcpy(grown[0..idx], self.node_targets);
+            self.allocator.free(self.node_targets);
+        }
+        grown[idx] = .{
+            .position = position,
+            .rotation_euler = rotation_euler,
+            .scaling = scaling,
+            .rest_position = position.*,
+            .rest_rotation = Quat.fromEulerDeg(rotation_euler.*),
+            .rest_scale = scaling.*,
+            .skip = skip,
+        };
+        self.node_targets = grown;
+        return idx;
+    }
+
+    /// Appends a node channel. The group takes ownership of the sampler
+    /// buffers and frees them in deinit.
+    pub fn addNodeChannel(self: *AnimationGroup, channel: NodeChannel) !void {
+        const old_len = self.node_channels.len;
+        const grown = try self.allocator.alloc(NodeChannel, old_len + 1);
+        if (old_len > 0) {
+            @memcpy(grown[0..old_len], self.node_channels);
+            self.allocator.free(self.node_channels);
+        }
+        grown[old_len] = channel;
+        self.node_channels = grown;
+    }
+
+    /// Re-snapshots the rest pose of all bound targets from their current
+    /// live values. Useful when the mesh transform changed after binding.
+    pub fn captureNodeRestPoses(self: *AnimationGroup) void {
+        for (self.node_targets) |*t| {
+            t.rest_position = t.position.*;
+            t.rest_rotation = Quat.fromEulerDeg(t.rotation_euler.*);
+            t.rest_scale = t.scaling.*;
+        }
+    }
+
+    /// Restores every bound (non-skipped) target to its rest pose.
+    pub fn restoreNodeRestPose(self: *AnimationGroup) void {
+        for (self.node_targets) |*t| {
+            if (t.skip) continue;
+            t.position.* = t.rest_position;
+            t.rotation_euler.* = t.rest_rotation.normalize().toEulerDeg();
+            t.scaling.* = t.rest_scale;
+        }
+    }
+
+    /// Samples all node channels at the given time and writes the result into
+    /// the bound transforms, blended with the rest pose by the group weight:
+    /// lerp for translation/scale, slerp (via quaternion round-trip) for
+    /// rotation. Called automatically by update() and applyAtTime().
+    pub fn applyNodesAtTime(self: *AnimationGroup, time: f32) void {
+        if (self.node_channels.len == 0 or self.node_targets.len == 0) return;
+        const w = std.math.clamp(self.weight, 0.0, 1.0);
+        for (self.node_channels) |ch| {
+            if (ch.target >= self.node_targets.len) continue;
+            if (!samplerHasFrames(ch.sampler, ch.target_path)) continue;
+            const t = &self.node_targets[ch.target];
+            if (t.skip) continue;
+            switch (ch.target_path) {
+                .translation => {
+                    const sampled = ch.sampler.sampleVec3Eased(time, ch.easing);
+                    t.position.* = if (w >= 0.999) sampled else Vec3.lerp(t.rest_position, sampled, w);
+                },
+                .scale => {
+                    const sampled = ch.sampler.sampleVec3Eased(time, ch.easing);
+                    t.scaling.* = if (w >= 0.999) sampled else Vec3.lerp(t.rest_scale, sampled, w);
+                },
+                .rotation => {
+                    const sampled = ch.sampler.sampleQuatEased(time, ch.easing);
+                    if (w >= 0.999) {
+                        t.rotation_euler.* = sampled.normalize().toEulerDeg();
+                    } else {
+                        const blended = Quat.slerp(t.rest_rotation, sampled, w);
+                        t.rotation_euler.* = blended.normalize().toEulerDeg();
+                    }
+                },
+                .weights => {},
+            }
+        }
     }
 
     pub fn sampleBoneAtTime(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
@@ -316,20 +490,40 @@ pub const AnimationGroup = struct {
     }
 
     pub fn applyAtTime(self: *AnimationGroup, time: f32) void {
-        const skel = self.skeleton orelse return;
+        if (self.skeleton) |skel| {
+            for (self.channels) |ch| {
+                if (ch.bone_index >= skel.bones.len) continue;
+                const bone = &skel.bones[ch.bone_index];
+                switch (ch.target_path) {
+                    .translation => bone.local_position = ch.sampler.sampleVec3(time),
+                    .rotation => bone.local_rotation = ch.sampler.sampleQuat(time),
+                    .scale => bone.local_scale = ch.sampler.sampleVec3(time),
+                    .weights => {},
+                }
+            }
 
-        for (self.channels) |ch| {
-            if (ch.bone_index >= skel.bones.len) continue;
-            const bone = &skel.bones[ch.bone_index];
+            skel.update();
+        }
+
+        self.applyNodesAtTime(time);
+    }
+
+    /// Node counterpart of sampleBoneAtTime: samples every channel driving
+    /// target_idx at the given time (with easing). Missing paths stay null.
+    /// Out-of-range targets and invalid samplers yield nulls, never a crash.
+    pub fn sampleNodeAtTime(self: *const AnimationGroup, target_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+        if (target_idx >= self.node_targets.len) return;
+        if (self.node_targets[target_idx].skip) return;
+        for (self.node_channels) |ch| {
+            if (ch.target != target_idx) continue;
+            if (!samplerHasFrames(ch.sampler, ch.target_path)) continue;
             switch (ch.target_path) {
-                .translation => bone.local_position = ch.sampler.sampleVec3(time),
-                .rotation => bone.local_rotation = ch.sampler.sampleQuat(time),
-                .scale => bone.local_scale = ch.sampler.sampleVec3(time),
+                .translation => out_pos.* = ch.sampler.sampleVec3Eased(time, ch.easing),
+                .rotation => out_rot.* = ch.sampler.sampleQuatEased(time, ch.easing),
+                .scale => out_scale.* = ch.sampler.sampleVec3Eased(time, ch.easing),
                 .weights => {},
             }
         }
-
-        skel.update();
     }
 };
 
@@ -490,8 +684,12 @@ test "AnimationGroup playRange, speed, and reverse looping" {
     times[0] = 0.0;
     times[1] = 4.0;
     const outputs = try allocator.alloc(f32, 6);
-    outputs[0] = 0.0; outputs[1] = 0.0; outputs[2] = 0.0;
-    outputs[3] = 4.0; outputs[4] = 8.0; outputs[5] = 12.0;
+    outputs[0] = 0.0;
+    outputs[1] = 0.0;
+    outputs[2] = 0.0;
+    outputs[3] = 4.0;
+    outputs[4] = 8.0;
+    outputs[5] = 12.0;
 
     const channels = try allocator.alloc(AnimationChannel, 1);
     channels[0] = .{
@@ -532,8 +730,12 @@ test "evaluateSkeleton blending and additive layer" {
     skel.bones[0].bind_scale = Vec3.one;
 
     // Clip 1: Walk (pos: 0, 0, 10)
-    const times1 = try allocator.alloc(f32, 1); times1[0] = 0.0;
-    const out1 = try allocator.alloc(f32, 3); out1[0] = 0.0; out1[1] = 0.0; out1[2] = 10.0;
+    const times1 = try allocator.alloc(f32, 1);
+    times1[0] = 0.0;
+    const out1 = try allocator.alloc(f32, 3);
+    out1[0] = 0.0;
+    out1[1] = 0.0;
+    out1[2] = 10.0;
     const ch1 = try allocator.alloc(AnimationChannel, 1);
     ch1[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times1, .outputs = out1 } };
     const ag1 = try AnimationGroup.init(allocator, "walk", ch1, 1.0);
@@ -541,8 +743,12 @@ test "evaluateSkeleton blending and additive layer" {
     ag1.play(true);
 
     // Clip 2: Run (pos: 0, 0, 20)
-    const times2 = try allocator.alloc(f32, 1); times2[0] = 0.0;
-    const out2 = try allocator.alloc(f32, 3); out2[0] = 0.0; out2[1] = 0.0; out2[2] = 20.0;
+    const times2 = try allocator.alloc(f32, 1);
+    times2[0] = 0.0;
+    const out2 = try allocator.alloc(f32, 3);
+    out2[0] = 0.0;
+    out2[1] = 0.0;
+    out2[2] = 20.0;
     const ch2 = try allocator.alloc(AnimationChannel, 1);
     ch2[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times2, .outputs = out2 } };
     const ag2 = try AnimationGroup.init(allocator, "run", ch2, 1.0);
@@ -557,8 +763,12 @@ test "evaluateSkeleton blending and additive layer" {
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), skel.bones[0].local_position.z, 1e-4);
 
     // Test Additive: Add layer (pos: 0, 5, 0)
-    const times3 = try allocator.alloc(f32, 1); times3[0] = 0.0;
-    const out3 = try allocator.alloc(f32, 3); out3[0] = 0.0; out3[1] = 5.0; out3[2] = 0.0;
+    const times3 = try allocator.alloc(f32, 1);
+    times3[0] = 0.0;
+    const out3 = try allocator.alloc(f32, 3);
+    out3[0] = 0.0;
+    out3[1] = 5.0;
+    out3[2] = 0.0;
     const ch3 = try allocator.alloc(AnimationChannel, 1);
     ch3[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times3, .outputs = out3 } };
     const ag3 = try AnimationGroup.init(allocator, "jump_add", ch3, 1.0);
@@ -578,15 +788,23 @@ test "evaluateSkeleton blending and additive layer" {
 test "AnimationGroup crossFadeTo, fadeIn, and fadeOut" {
     const allocator = std.testing.allocator;
 
-    const times1 = try allocator.alloc(f32, 1); times1[0] = 0.0;
-    const out1 = try allocator.alloc(f32, 3); out1[0] = 0; out1[1] = 0; out1[2] = 0;
+    const times1 = try allocator.alloc(f32, 1);
+    times1[0] = 0.0;
+    const out1 = try allocator.alloc(f32, 3);
+    out1[0] = 0;
+    out1[1] = 0;
+    out1[2] = 0;
     const ch1 = try allocator.alloc(AnimationChannel, 1);
     ch1[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times1, .outputs = out1 } };
     const ag1 = try AnimationGroup.init(allocator, "clip1", ch1, 1.0);
     defer ag1.deinit();
 
-    const times2 = try allocator.alloc(f32, 1); times2[0] = 0.0;
-    const out2 = try allocator.alloc(f32, 3); out2[0] = 0; out2[1] = 0; out2[2] = 0;
+    const times2 = try allocator.alloc(f32, 1);
+    times2[0] = 0.0;
+    const out2 = try allocator.alloc(f32, 3);
+    out2[0] = 0;
+    out2[1] = 0;
+    out2[2] = 0;
     const ch2 = try allocator.alloc(AnimationChannel, 1);
     ch2[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times2, .outputs = out2 } };
     const ag2 = try AnimationGroup.init(allocator, "clip2", ch2, 1.0);
@@ -616,4 +834,335 @@ test "AnimationGroup crossFadeTo, fadeIn, and fadeOut" {
     try std.testing.expect(!ag1.is_playing); // ag1 automatically stopped
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), ag2.weight, 1e-4);
     try std.testing.expect(ag2.is_playing); // ag2 continues playing at full weight
+}
+
+// Stand-in for Mesh in node tests: animation.zig cannot import mesh.zig
+// (mesh -> scene -> animation cycle), so tests bind plain Vec3 fields.
+const TestNode = struct {
+    position: Vec3 = Vec3.zero,
+    rotation: Vec3 = Vec3.zero, // Euler degrees, matches Mesh.rotation
+    scaling: Vec3 = Vec3.one,
+};
+
+fn makeNodeGroup(allocator: std.mem.Allocator, name: []const u8, duration: f32) !*AnimationGroup {
+    return AnimationGroup.init(allocator, name, &[_]AnimationChannel{}, duration);
+}
+
+test "NodeChannel translation applies over time with loop" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{};
+
+    const times = try allocator.alloc(f32, 2);
+    times[0] = 0.0;
+    times[1] = 2.0;
+    const outputs = try allocator.alloc(f32, 6);
+    outputs[0] = 0.0;
+    outputs[1] = 0.0;
+    outputs[2] = 0.0;
+    outputs[3] = 10.0;
+    outputs[4] = 0.0;
+    outputs[5] = 0.0;
+
+    const ag = try makeNodeGroup(allocator, "node_move", 2.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+    });
+
+    ag.play(true);
+    ag.update(1.0); // t = 1.0 -> halfway
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), node.position.x, 1e-4);
+
+    ag.update(1.5); // t = 2.5 -> wraps to 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), node.position.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), ag.current_time, 1e-4);
+}
+
+test "NodeChannel rotation slerp and scale lerp" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{};
+
+    const q0 = Quat.identity;
+    const q1 = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+
+    const r_times = try allocator.alloc(f32, 2);
+    r_times[0] = 0.0;
+    r_times[1] = 1.0;
+    const r_out = try allocator.alloc(f32, 8);
+    r_out[0] = q0.x;
+    r_out[1] = q0.y;
+    r_out[2] = q0.z;
+    r_out[3] = q0.w;
+    r_out[4] = q1.x;
+    r_out[5] = q1.y;
+    r_out[6] = q1.z;
+    r_out[7] = q1.w;
+
+    const s_times = try allocator.alloc(f32, 2);
+    s_times[0] = 0.0;
+    s_times[1] = 1.0;
+    const s_out = try allocator.alloc(f32, 6);
+    s_out[0] = 1.0;
+    s_out[1] = 1.0;
+    s_out[2] = 1.0;
+    s_out[3] = 2.0;
+    s_out[4] = 2.0;
+    s_out[5] = 2.0;
+
+    const ag = try makeNodeGroup(allocator, "node_rot_scale", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .rotation,
+        .sampler = .{ .timestamps = r_times, .outputs = r_out, .interpolation = .linear },
+    });
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .scale,
+        .sampler = .{ .timestamps = s_times, .outputs = s_out, .interpolation = .linear },
+    });
+
+    ag.play(true);
+    ag.goToFrame(0.5);
+
+    // Slerp halfway between identity and 90 deg Y -> 45 deg Y.
+    try std.testing.expectApproxEqAbs(@as(f32, 45.0), node.rotation.y, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.rotation.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.rotation.z, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), node.scaling.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), node.scaling.y, 1e-4);
+}
+
+test "NodeChannel STEP holds keyframe while LINEAR blends" {
+    const allocator = std.testing.allocator;
+    var step_node = TestNode{};
+    var linear_node = TestNode{};
+
+    const mk_track = struct {
+        fn mk(alloc: std.mem.Allocator) !struct { t: []f32, o: []f32 } {
+            const t = try alloc.alloc(f32, 2);
+            t[0] = 0.0;
+            t[1] = 1.0;
+            const o = try alloc.alloc(f32, 6);
+            o[0] = 0.0;
+            o[1] = 0.0;
+            o[2] = 0.0;
+            o[3] = 10.0;
+            o[4] = 0.0;
+            o[5] = 0.0;
+            return .{ .t = t, .o = o };
+        }
+    }.mk;
+
+    const step_track = try mk_track(allocator);
+    const ag_step = try makeNodeGroup(allocator, "node_step", 1.0);
+    defer ag_step.deinit();
+    const step_target = try ag_step.bindNodeTarget(&step_node.position, &step_node.rotation, &step_node.scaling, false);
+    try ag_step.addNodeChannel(.{
+        .target = step_target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = step_track.t, .outputs = step_track.o, .interpolation = .step },
+    });
+
+    const lin_track = try mk_track(allocator);
+    const ag_lin = try makeNodeGroup(allocator, "node_lin", 1.0);
+    defer ag_lin.deinit();
+    const lin_target = try ag_lin.bindNodeTarget(&linear_node.position, &linear_node.rotation, &linear_node.scaling, false);
+    try ag_lin.addNodeChannel(.{
+        .target = lin_target,
+        .target_path = .translation,
+        // Default easing (.linear) must behave as plain linear interpolation.
+        .sampler = .{ .timestamps = lin_track.t, .outputs = lin_track.o, .interpolation = .linear },
+    });
+
+    ag_step.play(true);
+    ag_lin.play(true);
+    ag_step.goToFrame(0.5);
+    ag_lin.goToFrame(0.5);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), step_node.position.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), linear_node.position.x, 1e-4);
+}
+
+test "NodeChannel weight blends sample with rest pose" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{
+        .position = Vec3.new(0.0, 10.0, 0.0),
+    };
+
+    const times = try allocator.alloc(f32, 2);
+    times[0] = 0.0;
+    times[1] = 1.0;
+    const outputs = try allocator.alloc(f32, 6);
+    outputs[0] = 0.0;
+    outputs[1] = 0.0;
+    outputs[2] = 0.0;
+    outputs[3] = 0.0;
+    outputs[4] = 0.0;
+    outputs[5] = 20.0;
+
+    const ag = try makeNodeGroup(allocator, "node_weight", 1.0);
+    defer ag.deinit();
+    // Rest pose (0, 10, 0) is captured at bind time.
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+    });
+
+    ag.play(true);
+    ag.setWeight(0.5);
+    ag.goToFrame(1.0); // sampled (0, 0, 20), blended with rest (0, 10, 0)
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), node.position.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), node.position.z, 1e-4);
+
+    // Zero weight fully restores the rest pose.
+    ag.setWeight(0.0);
+    ag.goToFrame(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), node.position.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.z, 1e-4);
+}
+
+test "NodeChannel invalid targets and samplers never crash" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{
+        .position = Vec3.new(1.0, 2.0, 3.0),
+    };
+
+    const times = try allocator.alloc(f32, 1);
+    times[0] = 0.0;
+    const outputs = try allocator.alloc(f32, 3);
+    outputs[0] = 9.0;
+    outputs[1] = 9.0;
+    outputs[2] = 9.0;
+
+    const w_out = try allocator.alloc(f32, 1);
+    w_out[0] = 0.5;
+
+    const ag = try makeNodeGroup(allocator, "node_invalid", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+
+    // Out-of-range target index.
+    try ag.addNodeChannel(.{
+        .target = target + 7,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = times, .outputs = outputs },
+    });
+    // Weights path on a plain node is ignored.
+    const w_times = try allocator.alloc(f32, 1);
+    w_times[0] = 0.0;
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .weights,
+        .sampler = .{ .timestamps = w_times, .outputs = w_out },
+    });
+    // Empty sampler (static slices, never freed).
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = &.{}, .outputs = &.{} },
+    });
+    // Truncated outputs (1 float for a vec3 track) are skipped.
+    const bad_out = try allocator.alloc(f32, 1);
+    bad_out[0] = 42.0;
+    const bad_times = try allocator.alloc(f32, 1);
+    bad_times[0] = 0.0;
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = bad_times, .outputs = bad_out },
+    });
+
+    ag.play(true);
+    ag.update(0.5);
+    ag.goToFrame(0.0);
+
+    var p: ?Vec3 = null;
+    var r: ?Quat = null;
+    var s: ?Vec3 = null;
+    ag.sampleNodeAtTime(target + 99, 0.0, &p, &r, &s);
+    try std.testing.expect(p == null and r == null and s == null);
+
+    // Nothing valid applied, transform untouched.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), node.position.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), node.position.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), node.position.z, 1e-4);
+}
+
+test "NodeChannel skipped target is parsed but not applied" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{};
+
+    const times = try allocator.alloc(f32, 1);
+    times[0] = 0.0;
+    const outputs = try allocator.alloc(f32, 3);
+    outputs[0] = 5.0;
+    outputs[1] = 6.0;
+    outputs[2] = 7.0;
+
+    const ag = try makeNodeGroup(allocator, "node_skip", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, true);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = times, .outputs = outputs },
+    });
+
+    ag.play(true);
+    ag.update(0.5);
+    ag.stop(); // skipped targets are not restored either
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.z, 1e-4);
+}
+
+test "NodeChannel easing warps interpolation and stop restores rest" {
+    const allocator = std.testing.allocator;
+    var node = TestNode{};
+
+    const times = try allocator.alloc(f32, 2);
+    times[0] = 0.0;
+    times[1] = 1.0;
+    const outputs = try allocator.alloc(f32, 6);
+    outputs[0] = 0.0;
+    outputs[1] = 0.0;
+    outputs[2] = 0.0;
+    outputs[3] = 10.0;
+    outputs[4] = 0.0;
+    outputs[5] = 0.0;
+
+    const ag = try makeNodeGroup(allocator, "node_ease", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+        .easing = .ease_in_quad,
+    });
+
+    ag.play(true);
+    ag.goToFrame(0.5); // ease_in_quad(0.5) = 0.25 -> x = 2.5
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), node.position.x, 1e-4);
+
+    var p: ?Vec3 = null;
+    var r: ?Quat = null;
+    var s: ?Vec3 = null;
+    ag.sampleNodeAtTime(target, 0.5, &p, &r, &s);
+    try std.testing.expect(p != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), p.?.x, 1e-4);
+
+    ag.stop();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.x, 1e-4);
+    try std.testing.expect(!ag.is_playing);
 }
