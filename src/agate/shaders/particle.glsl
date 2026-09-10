@@ -1,4 +1,4 @@
-// Instanced Camera-Facing Billboard Particle Shader for zenderer
+// Instanced Camera-Facing Billboard Particle Shader for agate
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 

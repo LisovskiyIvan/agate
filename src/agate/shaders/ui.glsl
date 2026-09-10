@@ -1,4 +1,4 @@
-// Screen-Space UI & Signed Distance Field (SDF) Text Shader for zenderer
+// Screen-Space UI & Signed Distance Field (SDF) Text Shader for agate
 @header const m = @import("math")
 
 @vs vs

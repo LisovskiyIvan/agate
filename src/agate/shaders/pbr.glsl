@@ -1,4 +1,4 @@
-// Standard Cook-Torrance PBR (Physically Based Rendering) with Multi-Lights for zenderer
+// Standard Cook-Torrance PBR (Physically Based Rendering) with Multi-Lights for agate
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 

@@ -1,4 +1,4 @@
-// Fullscreen Post-Processing Shader for zenderer
+// Fullscreen Post-Processing Shader for agate
 // Supports ACES Filmic & Reinhard Tone Mapping, Bloom, Vignette, Chromatic Aberration, Saturation & Contrast
 @header const m = @import("math")
 @ctype mat4 m.Mat4

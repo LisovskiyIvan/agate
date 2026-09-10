@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the 512x512 ASCII SDF font atlas embedded by zenderer (ui.zig).
+"""Generate the 512x512 ASCII SDF font atlas embedded by agate (ui.zig).
 
 Layout matches UICanvas.getGlyphUV: 16 columns x 8 rows of 32x64 cells,
 ASCII 32..126. The glyph edge is encoded at 0.5 (128) and the distance
@@ -9,7 +9,7 @@ UI shader (shaders/ui.glsl) expects.
 Usage:
     python3 tools/generate_font_sdf.py \
         --font ~/Library/Fonts/SauceCodeProNerdFontMono-SemiBold.ttf \
-        --size 50 --spread 5 --out src/zenderer/assets/font_sdf.png
+        --size 50 --spread 5 --out src/agate/assets/font_sdf.png
 
 The atlas was generated with SauceCodePro Nerd Font Mono SemiBold (a patched
 Source Code Pro, SIL OFL 1.1); any monospace TTF/OTF works. Re-run with a

@@ -4,7 +4,7 @@ const sapp = sokol.app;
 const sg = sokol.gfx;
 const slog = sokol.log;
 const sglue = sokol.glue;
-const z = @import("zenderer");
+const z = @import("agate");
 
 var gpa = std.heap.DebugAllocator(.{}){};
 var scene: z.Scene = undefined;
@@ -93,7 +93,7 @@ pub fn main() void {
         .frame_cb = frame,
         .cleanup_cb = cleanup,
         .event_cb = event,
-        .window_title = "zenderer (Babylon.js-style 3D in Zig)",
+        .window_title = "agate (Babylon.js-style 3D in Zig)",
         .width = 800,
         .height = 600,
         .sample_count = 1,

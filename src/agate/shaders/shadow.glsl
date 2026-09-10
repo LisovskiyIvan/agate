@@ -1,4 +1,4 @@
-// Depth-only shadow mapping shader for zenderer
+// Depth-only shadow mapping shader for agate
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 

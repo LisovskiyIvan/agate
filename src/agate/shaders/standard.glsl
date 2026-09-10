@@ -1,4 +1,4 @@
-// Standard Blinn-Phong/Diffuse shader with CSM and Multi-Lights for zenderer
+// Standard Blinn-Phong/Diffuse shader with CSM and Multi-Lights for agate
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 

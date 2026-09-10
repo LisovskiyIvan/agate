@@ -1,4 +1,4 @@
-// Screen-Space Ambient Occlusion (SSAO) Generation Shader for zenderer
+// Screen-Space Ambient Occlusion (SSAO) Generation Shader for agate
 @header const m = @import("math")
 @ctype mat4 m.Mat4
 
