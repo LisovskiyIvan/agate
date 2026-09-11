@@ -56,10 +56,10 @@ pub const Mat4 = extern struct {
     pub fn perspective(fov_y_deg: f32, aspect: f32, near: f32, far: f32) Mat4 {
         const f = 1.0 / std.math.tan(fov_y_deg * 0.5 * std.math.pi / 180.0);
         return .{ .m = .{
-            f / aspect, 0, 0, 0,
-            0, f, 0, 0,
-            0, 0, far / (near - far), -1,
-            0, 0, (far * near) / (near - far), 0,
+            f / aspect, 0, 0,                           0,
+            0,          f, 0,                           0,
+            0,          0, far / (near - far),          -1,
+            0,          0, (far * near) / (near - far), 0,
         } };
     }
 
@@ -68,9 +68,9 @@ pub const Mat4 = extern struct {
         const h = top - bottom;
         const d = far - near;
         return .{ .m = .{
-            2.0 / w, 0.0, 0.0, 0.0,
-            0.0, 2.0 / h, 0.0, 0.0,
-            0.0, 0.0, -1.0 / d, 0.0,
+            2.0 / w,             0.0,                 0.0,       0.0,
+            0.0,                 2.0 / h,             0.0,       0.0,
+            0.0,                 0.0,                 -1.0 / d,  0.0,
             -(right + left) / w, -(top + bottom) / h, -near / d, 1.0,
         } };
     }
@@ -235,25 +235,25 @@ pub const Mat4 = extern struct {
         const inv_det = 1.0 / det;
         var r: Mat4 = undefined;
 
-        r.m[0] = ( a[5] * c5 - a[6] * c4 + a[7] * c3) * inv_det;
+        r.m[0] = (a[5] * c5 - a[6] * c4 + a[7] * c3) * inv_det;
         r.m[1] = (-a[1] * c5 + a[2] * c4 - a[3] * c3) * inv_det;
-        r.m[2] = ( a[13] * s5 - a[14] * s4 + a[15] * s3) * inv_det;
+        r.m[2] = (a[13] * s5 - a[14] * s4 + a[15] * s3) * inv_det;
         r.m[3] = (-a[9] * s5 + a[10] * s4 - a[11] * s3) * inv_det;
 
         r.m[4] = (-a[4] * c5 + a[6] * c2 - a[7] * c1) * inv_det;
-        r.m[5] = ( a[0] * c5 - a[2] * c2 + a[3] * c1) * inv_det;
+        r.m[5] = (a[0] * c5 - a[2] * c2 + a[3] * c1) * inv_det;
         r.m[6] = (-a[12] * s5 + a[14] * s2 - a[15] * s1) * inv_det;
-        r.m[7] = ( a[8] * s5 - a[10] * s2 + a[11] * s1) * inv_det;
+        r.m[7] = (a[8] * s5 - a[10] * s2 + a[11] * s1) * inv_det;
 
-        r.m[8] = ( a[4] * c4 - a[5] * c2 + a[7] * c0) * inv_det;
+        r.m[8] = (a[4] * c4 - a[5] * c2 + a[7] * c0) * inv_det;
         r.m[9] = (-a[0] * c4 + a[1] * c2 - a[3] * c0) * inv_det;
-        r.m[10] = ( a[12] * s4 - a[13] * s2 + a[15] * s0) * inv_det;
+        r.m[10] = (a[12] * s4 - a[13] * s2 + a[15] * s0) * inv_det;
         r.m[11] = (-a[8] * s4 + a[9] * s2 - a[11] * s0) * inv_det;
 
         r.m[12] = (-a[4] * c3 + a[5] * c1 - a[6] * c0) * inv_det;
-        r.m[13] = ( a[0] * c3 - a[1] * c1 + a[2] * c0) * inv_det;
+        r.m[13] = (a[0] * c3 - a[1] * c1 + a[2] * c0) * inv_det;
         r.m[14] = (-a[12] * s3 + a[13] * s1 - a[14] * s0) * inv_det;
-        r.m[15] = ( a[8] * s3 - a[9] * s1 + a[10] * s0) * inv_det;
+        r.m[15] = (a[8] * s3 - a[9] * s1 + a[10] * s0) * inv_det;
 
         return r;
     }

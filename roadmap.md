@@ -59,7 +59,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 149 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 161 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -70,7 +70,7 @@
 
 ## Журнал реализации (итерация 10.09.2026)
 
-Выполнено и проверено: `zig build test` (149 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
+Выполнено и проверено: `zig build test` (161 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
 
 | Фича | Файлы | Статус |
 |---|---|---|
@@ -99,6 +99,17 @@
 
 Sandbox: всё UI сведено в **одну панель** (HUD + «NEW FEATURES WAVE 2» + CONTROLS); в сцену добавлены Plane/Tube/Lines/Extrude, стеклянная сфера (blend-очередь), HDR-env сфера с процедурной equirect-панорамой, node-анимация тора с easing.
 
+### Рефакторинг-волна (10.09.2026)
+
+- `scene.zig`: data-driven pipeline-фабрика (16 пайплайнов из таблицы) + единый `FrameUniforms` (убрано троирование ~30 полей); удалено мёртвое поле `default_black_texture`.
+- `root.zig`: устранено дублирование экспортов `animation`, добавлены забытые публичные типы (`HemisphericLightOptions`, `ArcRotateCameraOptions`, `FrustumPlane`, `ParticleInstanceData`, `GlyphUV`, `easing_names`, `SceneStats` и др.).
+- `mesh.zig`: общие `storeQuad/appendGridQuad` (14 билдеров), `buildTrigTable`, `pickOrthogonal`/`resolveFrameSeed`; Disc переведён на общую таблицу.
+- `ragdoll.zig`/`vehicle.zig`: общий `physics_mesh.zig` (create/free/sync/teardown), удалены мёртвые `owns_meshes` и неиспользуемые параметры `world`.
+- `texture.zig`: общий `boxDownsampleU8` для 2D и cube-мипов (+NPOT-безопасность), проверки переполнения checkerboard, валидация `face_size`; `fromEquirectangularFile` мигрирован на `std.Io` (в Zig 0.16 `std.fs.cwd` удалён — латентный баг пойман агентом).
+- `audio.zig`: векторные WAV-пути u8/i24/i32, потоковый `fromWavFile` (пик памяти файл+f32 → f32+64КБ), общие декодеры.
+- `build.zig`: таблица 11 шейдерных модулей, шаг `zig build fmt`, макрос `SHADOW_ATLAS_SIZE` в шейдерах + `pub const SHADOW_ATLAS_SIZE` в `shadow_pass.zig` (sokol-shdc `#include` не поддерживает).
+- Итог: 161 тест, `zig fmt --check src` чистый, runtime smoke без утечек; перф без регрессий (~2.6 мс).
+
 Sandbox-демо (все новые фичи выведены в интерфейс): галерея из 5 новых примитивов; панель New Features с чекбоксами Sharpen/Grain и слайдерами Sharpen/Grain/Temperature/Tint; кнопки Camera/WAV/Lines; клавиши `4` — смена камеры Arc→Free→Follow, `5` — debug-линии физики + счётчик `querySphere`, `6` — проигрывание WAV из памяти. DirectionalLight включён в сцену.
 
 Оптимизация движка (замерено): кэш view-projection в `Scene.projectPoint` + hoist солнца, резерв `appendDebugLines` (без роста списка) + опциональный `debug_circle_segments`, единичный `sqrt` в `ui.drawLine` и запас буфера UI, блочный микшер аудио с предвычисленными гейнами + быстрый декод WAV, предвычисление trig-таблиц в билдерах. Оверлей физики: 4.08–4.49 → 3.13–3.24 мс/кадр (~25%), база без оверлея не изменилась (~2.4 мс, ~420 FPS). Найден и исправлен leak в `uploadGeometry` (затирание `cpu_positions/cpu_indices`). Отложено: GPU-оптимизации bloom/SSR (нужна визуальная проверка).
@@ -113,7 +124,7 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
 * Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов (`SceneStats`).
-* 149 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
+* 161 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
 
 ### Рендеринг
 

@@ -56,14 +56,14 @@ pub const BoundingBox = struct {
 
     pub fn intersects(self: BoundingBox, other: BoundingBox) bool {
         return (self.min.x <= other.max.x and self.max.x >= other.min.x) and
-               (self.min.y <= other.max.y and self.max.y >= other.min.y) and
-               (self.min.z <= other.max.z and self.max.z >= other.min.z);
+            (self.min.y <= other.max.y and self.max.y >= other.min.y) and
+            (self.min.z <= other.max.z and self.max.z >= other.min.z);
     }
 
     pub fn containsPoint(self: BoundingBox, pt: Vec3) bool {
         return (pt.x >= self.min.x and pt.x <= self.max.x) and
-               (pt.y >= self.min.y and pt.y <= self.max.y) and
-               (pt.z >= self.min.z and pt.z <= self.max.z);
+            (pt.y >= self.min.y and pt.y <= self.max.y) and
+            (pt.z >= self.min.z and pt.z <= self.max.z);
     }
 
     pub fn closestPoint(self: BoundingBox, pt: Vec3) Vec3 {

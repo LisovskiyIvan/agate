@@ -11,7 +11,6 @@ const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Quat = math.Quat;
-const BoundingBox = math.BoundingBox;
 const physics = @import("physics.zig");
 const PhysicsWorld = physics.PhysicsWorld;
 const RigidBody = physics.RigidBody;
@@ -19,7 +18,8 @@ const ColliderType = physics.ColliderType;
 const JointId = physics.JointId;
 const mesh_mod = @import("mesh.zig");
 const Mesh = mesh_mod.Mesh;
-const MeshBuilder = mesh_mod.MeshBuilder;
+const physics_mesh = @import("physics_mesh.zig");
+const MeshKind = physics_mesh.MeshKind;
 const Scene = @import("scene.zig").Scene;
 
 /// One of the 11 ragdoll bodies, in creation order.
@@ -70,11 +70,9 @@ pub const RagdollOptions = struct {
     restitution: f32 = 0.1,
 };
 
-const PartKind = enum { box, sphere, capsule };
-
 const PartSpec = struct {
     name: []const u8,
-    kind: PartKind,
+    kind: MeshKind,
     // Box: full extents. Sphere: diameter in x. Capsule: (radius, total height).
     size: Vec3,
     // Unit-space offset from the spawn position (multiplied by scale).
@@ -83,82 +81,9 @@ const PartSpec = struct {
     collider: ColliderType,
 };
 
-fn freeMesh(allocator: std.mem.Allocator, scene: ?*Scene, mesh: *Mesh) void {
-    if (scene) |sc| {
-        // Unlink from the scene first: the scene owns its mesh list and would
-        // otherwise keep a dangling pointer (double free in Scene.deinit).
-        var i: usize = 0;
-        while (i < sc.meshes.items.len) {
-            if (sc.meshes.items[i] == mesh) {
-                _ = sc.meshes.swapRemove(i);
-                break;
-            }
-            i += 1;
-        }
-        mesh.deinit(sc.allocator);
-        sc.allocator.destroy(mesh);
-    } else {
-        // Bare physics-only mesh: no GPU buffers, no CPU geometry.
-        allocator.destroy(mesh);
-    }
-}
-
-fn createPartMesh(
-    allocator: std.mem.Allocator,
-    scene: ?*Scene,
-    name: []const u8,
-    kind: PartKind,
-    size: Vec3,
-    pos: Vec3,
-) !*Mesh {
-    if (scene) |sc| {
-        const mesh = switch (kind) {
-            .box => try MeshBuilder.createBox(sc, name, .{
-                .width = size.x,
-                .height = size.y,
-                .depth = size.z,
-            }),
-            .sphere => try MeshBuilder.createSphere(sc, name, .{
-                .diameter = size.x,
-                .segments = 18,
-            }),
-            .capsule => try MeshBuilder.createCapsule(sc, name, .{
-                .radius = size.x,
-                .height = size.y,
-                .tessellation = 12,
-                .cap_subdivisions = 4,
-            }),
-        };
-        mesh.position = pos;
-        return mesh;
-    }
-    const mesh = try allocator.create(Mesh);
-    const bounds = switch (kind) {
-        .box => BoundingBox.init(size.scale(-0.5), size.scale(0.5)),
-        .sphere => BoundingBox.init(
-            Vec3.new(-size.x * 0.5, -size.x * 0.5, -size.x * 0.5),
-            Vec3.new(size.x * 0.5, size.x * 0.5, size.x * 0.5),
-        ),
-        .capsule => BoundingBox.init(
-            Vec3.new(-size.x, -size.y * 0.5, -size.x),
-            Vec3.new(size.x, size.y * 0.5, size.x),
-        ),
-    };
-    mesh.* = .{
-        .name = name,
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = pos,
-        .local_bounding_box = bounds,
-    };
-    return mesh;
-}
-
 pub const Ragdoll = struct {
     allocator: std.mem.Allocator,
     scene: ?*Scene,
-    owns_meshes: bool,
     bodies: std.ArrayListUnmanaged(*RigidBody) = .empty,
     joints: std.ArrayListUnmanaged(JointId) = .empty,
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
@@ -179,7 +104,6 @@ pub const Ragdoll = struct {
         var self = Ragdoll{
             .allocator = allocator,
             .scene = scene,
-            .owns_meshes = scene == null,
         };
         errdefer self.deinit(world);
 
@@ -201,9 +125,9 @@ pub const Ragdoll = struct {
         for (specs) |spec| {
             const pos = options.position.add(spec.offset.scale(s));
             const scaled_size = spec.size.scale(s);
-            const mesh = try createPartMesh(allocator, scene, spec.name, spec.kind, scaled_size, pos);
+            const mesh = try physics_mesh.createMesh(allocator, scene, spec.name, spec.kind, scaled_size, pos);
             var mesh_tracked = false;
-            defer if (!mesh_tracked) freeMesh(allocator, scene, mesh);
+            defer if (!mesh_tracked) physics_mesh.freeMesh(allocator, scene, mesh);
             try self.meshes.append(allocator, mesh);
             mesh_tracked = true;
 
@@ -279,8 +203,7 @@ pub const Ragdoll = struct {
     }
 
     /// Kicks every part with the same impulse (e.g. an explosion push).
-    pub fn applyImpulse(self: *Ragdoll, world: *PhysicsWorld, impulse: Vec3) void {
-        _ = world;
+    pub fn applyImpulse(self: *Ragdoll, impulse: Vec3) void {
         for (self.bodies.items) |body| {
             body.applyImpulse(impulse);
         }
@@ -288,8 +211,7 @@ pub const Ragdoll = struct {
 
     /// Teleports every part back to its spawn pose with zero velocity.
     /// The change is picked up by the solver on the next `step`.
-    pub fn reset(self: *Ragdoll, world: *PhysicsWorld) void {
-        _ = world;
+    pub fn reset(self: *Ragdoll) void {
         for (self.bodies.items, 0..) |body, i| {
             body.mesh.position = self.home_positions.items[i];
             body.mesh.rotation = self.home_rotations.items[i];
@@ -302,28 +224,21 @@ pub const Ragdoll = struct {
     /// Normally `step` already does this; use it to refresh meshes after
     /// teleporting bodies or before rendering without stepping.
     pub fn syncMeshes(self: *Ragdoll) void {
-        for (self.bodies.items) |body| {
-            body.mesh.position = body.last_pos;
-            body.mesh.rotation = body.last_rot;
-        }
+        physics_mesh.syncMeshes(self.bodies.items);
     }
 
     /// Destroys joints, removes bodies from the world and frees meshes/lists.
     /// Scene meshes are unlinked from the scene first. Call before destroying
     /// the scene and the world.
     pub fn deinit(self: *Ragdoll, world: *PhysicsWorld) void {
-        for (self.joints.items) |jid| {
-            if (world.isJointValid(jid)) world.destroyJoint(jid);
-        }
-        self.joints.deinit(self.allocator);
-        for (self.bodies.items) |body| {
-            world.removeBody(body);
-        }
-        self.bodies.deinit(self.allocator);
-        for (self.meshes.items) |mesh| {
-            freeMesh(self.allocator, self.scene, mesh);
-        }
-        self.meshes.deinit(self.allocator);
+        physics_mesh.teardown(
+            self.allocator,
+            world,
+            self.scene,
+            &self.joints,
+            &self.bodies,
+            &self.meshes,
+        );
         self.home_positions.deinit(self.allocator);
         self.home_rotations.deinit(self.allocator);
     }
@@ -375,7 +290,7 @@ test "Ragdoll applyImpulse moves bodies" {
     defer doll.deinit(&world);
 
     const before = doll.getPart(.pelvis).mesh.position;
-    doll.applyImpulse(&world, Vec3.new(20.0, 5.0, 0.0));
+    doll.applyImpulse(Vec3.new(20.0, 5.0, 0.0));
     for (0..10) |_| world.step(0.016);
     const after = doll.getPart(.pelvis).mesh.position;
     try std.testing.expect(before.sub(after).length() > 0.1);
@@ -389,7 +304,7 @@ test "Ragdoll reset restores spawn pose" {
     defer doll.deinit(&world);
 
     for (0..90) |_| world.step(0.016);
-    doll.reset(&world);
+    doll.reset();
     for (doll.bodies.items, 0..) |body, i| {
         try std.testing.expectEqual(doll.home_positions.items[i], body.mesh.position);
         try std.testing.expectEqual(doll.home_rotations.items[i], body.mesh.rotation);

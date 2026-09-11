@@ -95,7 +95,6 @@ pub const Scene = struct {
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
     default_normal_texture: Texture,
-    default_black_texture: Texture,
     default_cube_texture: CubeTexture,
 
     enable_frustum_culling: bool = true,
@@ -183,7 +182,6 @@ pub const Scene = struct {
             .allocator = allocator,
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
-            .default_black_texture = Texture.createBlack1x1(),
             .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
             .shadow_pass = passes.ShadowPass.init(),
             .skybox_pass = passes.SkyboxPass.init(),
@@ -206,149 +204,152 @@ pub const Scene = struct {
         return self;
     }
 
+    // One shader + one vertex layout feeds an opaque u16/u32 pair plus its
+    // transparent blend twins. Only initPipelines uses this table.
+    const PipelineFamily = enum { standard, pbr, instanced, skinned_pbr };
+
+    // Fills the vertex layout for a family exactly as the legacy hand-written
+    // descs did (same buffers, attr slots, formats, offsets). Any shader-side
+    // layout risk lives here: attr changes must mirror the matching *.glsl.
+    fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
+        switch (family) {
+            .standard => {
+                desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+                desc.layout.attrs[shd.ATTR_standard_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+                desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+                desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+                desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            },
+            .pbr => {
+                desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+                desc.layout.attrs[pbr_shd.ATTR_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+                desc.layout.attrs[pbr_shd.ATTR_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+                desc.layout.attrs[pbr_shd.ATTR_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+                desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+                desc.layout.attrs[pbr_shd.ATTR_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
+            },
+            .instanced => {
+                desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+                desc.layout.attrs[inst_shd.ATTR_instanced_position] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+                desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+                desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+                desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+
+                desc.layout.buffers[1] = .{
+                    .step_func = .PER_INSTANCE,
+                    .step_rate = 1,
+                    .stride = @sizeOf(Mat4),
+                };
+                desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+                desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+                desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+                desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+            },
+            .skinned_pbr => {
+                desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_joints] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "joints") };
+                desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_weights] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "weights") };
+            },
+        }
+    }
+
+    // Creates an opaque u16/u32 pair plus transparent blend twins from one
+    // base desc. Order and index_type switches match the legacy code.
+    fn makePipelinePair(base: sg.PipelineDesc, opaque_u16: *sg.Pipeline, opaque_u32: *sg.Pipeline, blend_u16: *sg.Pipeline, blend_u32: *sg.Pipeline) void {
+        var desc = base;
+        desc.index_type = .UINT16;
+        opaque_u16.* = sg.makePipeline(desc);
+        desc.index_type = .UINT32;
+        opaque_u32.* = sg.makePipeline(desc);
+        desc.index_type = .UINT16;
+        blend_u16.* = sg.makePipeline(blendDescFor(desc));
+        desc.index_type = .UINT32;
+        blend_u32.* = sg.makePipeline(blendDescFor(desc));
+    }
+
     fn initPipelines(self: *Scene) void {
-        // 1. Standard Material pipelines (Phong / Blinn-Phong)
-        const std_shd_id = sg.makeShader(shd.standardShaderDesc(sg.queryBackend()));
-        var pip_desc = sg.PipelineDesc{
-            .shader = std_shd_id,
-            .index_type = .UINT16,
-            .depth = .{
-                .compare = .LESS_EQUAL,
-                .write_enabled = true,
+        const specs = [_]struct {
+            shader: sg.Shader,
+            family: PipelineFamily,
+            opaque_u16: *sg.Pipeline,
+            opaque_u32: *sg.Pipeline,
+            blend_u16: *sg.Pipeline,
+            blend_u32: *sg.Pipeline,
+        }{
+            .{
+                .shader = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
+                .family = .standard,
+                .opaque_u16 = &self.pipeline_u16,
+                .opaque_u32 = &self.pipeline_u32,
+                .blend_u16 = &self.pipeline_blend_u16,
+                .blend_u32 = &self.pipeline_blend_u32,
             },
-            .cull_mode = .BACK,
-            .face_winding = .CCW,
-        };
-        pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-        pip_desc.layout.attrs[shd.ATTR_standard_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-        pip_desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-        pip_desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-        pip_desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-
-        self.pipeline_u16 = sg.makePipeline(pip_desc);
-        pip_desc.index_type = .UINT32;
-        self.pipeline_u32 = sg.makePipeline(pip_desc);
-
-        // Transparent twins for the Standard pipelines.
-        pip_desc.index_type = .UINT16;
-        self.pipeline_blend_u16 = sg.makePipeline(blendDescFor(pip_desc));
-        pip_desc.index_type = .UINT32;
-        self.pipeline_blend_u32 = sg.makePipeline(blendDescFor(pip_desc));
-
-        // 2. PBR Material pipelines (Cook-Torrance BRDF + Normal / MR / Emissive / AO)
-        const pbr_shd_id = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend()));
-        var pbr_desc = sg.PipelineDesc{
-            .shader = pbr_shd_id,
-            .index_type = .UINT16,
-            .depth = .{
-                .compare = .LESS_EQUAL,
-                .write_enabled = true,
+            .{
+                .shader = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
+                .family = .pbr,
+                .opaque_u16 = &self.pipeline_pbr_u16,
+                .opaque_u32 = &self.pipeline_pbr_u32,
+                .blend_u16 = &self.pipeline_pbr_blend_u16,
+                .blend_u32 = &self.pipeline_pbr_blend_u32,
             },
-            .cull_mode = .BACK,
-            .face_winding = .CCW,
-        };
-        pbr_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-        pbr_desc.layout.attrs[pbr_shd.ATTR_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
-
-        self.pipeline_pbr_u16 = sg.makePipeline(pbr_desc);
-        pbr_desc.index_type = .UINT32;
-        self.pipeline_pbr_u32 = sg.makePipeline(pbr_desc);
-
-        // Transparent twins for the PBR pipelines.
-        pbr_desc.index_type = .UINT16;
-        self.pipeline_pbr_blend_u16 = sg.makePipeline(blendDescFor(pbr_desc));
-        pbr_desc.index_type = .UINT32;
-        self.pipeline_pbr_blend_u32 = sg.makePipeline(blendDescFor(pbr_desc));
-
-        // 3. Instanced Standard pipelines
-        const inst_shd_id = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend()));
-        var inst_desc = sg.PipelineDesc{
-            .shader = inst_shd_id,
-            .index_type = .UINT16,
-            .depth = .{
-                .compare = .LESS_EQUAL,
-                .write_enabled = true,
+            .{
+                .shader = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+                .family = .instanced,
+                .opaque_u16 = &self.pipeline_instanced_u16,
+                .opaque_u32 = &self.pipeline_instanced_u32,
+                .blend_u16 = &self.pipeline_instanced_blend_u16,
+                .blend_u32 = &self.pipeline_instanced_blend_u32,
             },
-            .cull_mode = .BACK,
-            .face_winding = .CCW,
-        };
-        inst_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_position] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-
-        inst_desc.layout.buffers[1] = .{
-            .step_func = .PER_INSTANCE,
-            .step_rate = 1,
-            .stride = @sizeOf(Mat4),
-        };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
-        inst_desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
-
-        self.pipeline_instanced_u16 = sg.makePipeline(inst_desc);
-        inst_desc.index_type = .UINT32;
-        self.pipeline_instanced_u32 = sg.makePipeline(inst_desc);
-
-        // Transparent twins for the Instanced Standard pipelines.
-        inst_desc.index_type = .UINT16;
-        self.pipeline_instanced_blend_u16 = sg.makePipeline(blendDescFor(inst_desc));
-        inst_desc.index_type = .UINT32;
-        self.pipeline_instanced_blend_u32 = sg.makePipeline(blendDescFor(inst_desc));
-
-        // 4. Skinned PBR pipelines
-        const skinned_shd_id = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend()));
-        var skinned_desc = sg.PipelineDesc{
-            .shader = skinned_shd_id,
-            .index_type = .UINT16,
-            .depth = .{
-                .compare = .LESS_EQUAL,
-                .write_enabled = true,
+            .{
+                .shader = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
+                .family = .skinned_pbr,
+                .opaque_u16 = &self.pipeline_skinned_pbr_u16,
+                .opaque_u32 = &self.pipeline_skinned_pbr_u32,
+                .blend_u16 = &self.pipeline_skinned_pbr_blend_u16,
+                .blend_u32 = &self.pipeline_skinned_pbr_blend_u32,
             },
-            .cull_mode = .BACK,
-            .face_winding = .CCW,
         };
-        skinned_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_joints] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "joints") };
-        skinned_desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_weights] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "weights") };
 
-        self.pipeline_skinned_pbr_u16 = sg.makePipeline(skinned_desc);
-        skinned_desc.index_type = .UINT32;
-        self.pipeline_skinned_pbr_u32 = sg.makePipeline(skinned_desc);
+        for (specs) |spec| {
+            var desc = sg.PipelineDesc{
+                .shader = spec.shader,
+                .index_type = .UINT16,
+                .depth = .{
+                    .compare = .LESS_EQUAL,
+                    .write_enabled = true,
+                },
+                .cull_mode = .BACK,
+                .face_winding = .CCW,
+            };
+            pipelineLayoutFor(spec.family, &desc);
+            makePipelinePair(desc, spec.opaque_u16, spec.opaque_u32, spec.blend_u16, spec.blend_u32);
+        }
 
-        // Transparent twins for the Skinned PBR pipelines.
-        skinned_desc.index_type = .UINT16;
-        self.pipeline_skinned_pbr_blend_u16 = sg.makePipeline(blendDescFor(skinned_desc));
-        skinned_desc.index_type = .UINT32;
-        self.pipeline_skinned_pbr_blend_u32 = sg.makePipeline(blendDescFor(skinned_desc));
-
-        if (self.pipeline_u16.id == 0) @panic("pipeline_u16 failed to create!");
-        if (self.pipeline_u32.id == 0) @panic("pipeline_u32 failed to create!");
-        if (self.pipeline_pbr_u16.id == 0) @panic("pipeline_pbr_u16 failed to create!");
-        if (self.pipeline_pbr_u32.id == 0) @panic("pipeline_pbr_u32 failed to create!");
-        if (self.pipeline_skinned_pbr_u16.id == 0) @panic("pipeline_skinned_pbr_u16 failed to create!");
-        if (self.pipeline_skinned_pbr_u32.id == 0) @panic("pipeline_skinned_pbr_u32 failed to create!");
-        if (self.pipeline_instanced_u16.id == 0) @panic("pipeline_instanced_u16 failed to create!");
-        if (self.pipeline_instanced_u32.id == 0) @panic("pipeline_instanced_u32 failed to create!");
-        if (self.pipeline_blend_u16.id == 0) @panic("pipeline_blend_u16 failed to create!");
-        if (self.pipeline_blend_u32.id == 0) @panic("pipeline_blend_u32 failed to create!");
-        if (self.pipeline_pbr_blend_u16.id == 0) @panic("pipeline_pbr_blend_u16 failed to create!");
-        if (self.pipeline_pbr_blend_u32.id == 0) @panic("pipeline_pbr_blend_u32 failed to create!");
-        if (self.pipeline_skinned_pbr_blend_u16.id == 0) @panic("pipeline_skinned_pbr_blend_u16 failed to create!");
-        if (self.pipeline_skinned_pbr_blend_u32.id == 0) @panic("pipeline_skinned_pbr_blend_u32 failed to create!");
-        if (self.pipeline_instanced_blend_u16.id == 0) @panic("pipeline_instanced_blend_u16 failed to create!");
-        if (self.pipeline_instanced_blend_u32.id == 0) @panic("pipeline_instanced_blend_u32 failed to create!");
+        inline for (.{
+            .{ .pipe = self.pipeline_u16, .msg = "pipeline_u16 failed to create!" },
+            .{ .pipe = self.pipeline_u32, .msg = "pipeline_u32 failed to create!" },
+            .{ .pipe = self.pipeline_pbr_u16, .msg = "pipeline_pbr_u16 failed to create!" },
+            .{ .pipe = self.pipeline_pbr_u32, .msg = "pipeline_pbr_u32 failed to create!" },
+            .{ .pipe = self.pipeline_skinned_pbr_u16, .msg = "pipeline_skinned_pbr_u16 failed to create!" },
+            .{ .pipe = self.pipeline_skinned_pbr_u32, .msg = "pipeline_skinned_pbr_u32 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_u16, .msg = "pipeline_instanced_u16 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_u32, .msg = "pipeline_instanced_u32 failed to create!" },
+            .{ .pipe = self.pipeline_blend_u16, .msg = "pipeline_blend_u16 failed to create!" },
+            .{ .pipe = self.pipeline_blend_u32, .msg = "pipeline_blend_u32 failed to create!" },
+            .{ .pipe = self.pipeline_pbr_blend_u16, .msg = "pipeline_pbr_blend_u16 failed to create!" },
+            .{ .pipe = self.pipeline_pbr_blend_u32, .msg = "pipeline_pbr_blend_u32 failed to create!" },
+            .{ .pipe = self.pipeline_skinned_pbr_blend_u16, .msg = "pipeline_skinned_pbr_blend_u16 failed to create!" },
+            .{ .pipe = self.pipeline_skinned_pbr_blend_u32, .msg = "pipeline_skinned_pbr_blend_u32 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_blend_u16, .msg = "pipeline_instanced_blend_u16 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_blend_u32, .msg = "pipeline_instanced_blend_u32 failed to create!" },
+        }) |entry| {
+            if (entry.pipe.id == 0) @panic(entry.msg);
+        }
     }
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
@@ -708,22 +709,23 @@ pub const Scene = struct {
     // identical to the legacy logic, so existing pipeline ids are untouched.
     fn pipelineForRegularItem(self: *Scene, item: RenderMeshItem) u32 {
         const mesh = item.mesh;
+        const is_u32 = mesh.index_type == .UINT32;
         if (item.is_pbr) {
             if (mesh.skeleton != null) {
                 if (item.transparent) {
-                    return if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_blend_u32.id else self.pipeline_skinned_pbr_blend_u16.id;
+                    return if (is_u32) self.pipeline_skinned_pbr_blend_u32.id else self.pipeline_skinned_pbr_blend_u16.id;
                 }
-                return if (mesh.index_type == .UINT32) self.pipeline_skinned_pbr_u32.id else self.pipeline_skinned_pbr_u16.id;
+                return if (is_u32) self.pipeline_skinned_pbr_u32.id else self.pipeline_skinned_pbr_u16.id;
             }
             if (item.transparent) {
-                return if (mesh.index_type == .UINT32) self.pipeline_pbr_blend_u32.id else self.pipeline_pbr_blend_u16.id;
+                return if (is_u32) self.pipeline_pbr_blend_u32.id else self.pipeline_pbr_blend_u16.id;
             }
-            return if (mesh.index_type == .UINT32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id;
+            return if (is_u32) self.pipeline_pbr_u32.id else self.pipeline_pbr_u16.id;
         }
         if (item.transparent) {
-            return if (mesh.index_type == .UINT32) self.pipeline_blend_u32.id else self.pipeline_blend_u16.id;
+            return if (is_u32) self.pipeline_blend_u32.id else self.pipeline_blend_u16.id;
         }
-        return if (mesh.index_type == .UINT32) self.pipeline_u32.id else self.pipeline_u16.id;
+        return if (is_u32) self.pipeline_u32.id else self.pipeline_u16.id;
     }
     /// World matrix computed at most once per render() call.
     /// Parent chains resolve through the same cache, so hierarchies stay O(depth) total.
@@ -853,6 +855,55 @@ pub const Scene = struct {
         spot_intensity: [2][4]f32,
     };
 
+    // Fragment uniforms shared by the standard, PBR and instanced shaders:
+    // identical names, types and values in all three FsParams structs.
+    // Material-specific factors (diffuse_color / base_color_factor /
+    // pbr_factors / emissive_factor) stay with the caller.
+    const FrameUniforms = struct {
+        eye_pos: [4]f32,
+        light_dir: [4]f32,
+        light_color: [4]f32,
+        ambient_color: [4]f32,
+        shadow_params: [4]f32,
+        shadow_splits: [4]f32,
+        cascade_view_proj: [4]Mat4,
+        cascade_debug: [4]f32,
+        light_counts: [4]f32,
+        point_pos_range: [4][4]f32,
+        point_color_int: [4][4]f32,
+        spot_pos_range: [2][4]f32,
+        spot_dir_inner: [2][4]f32,
+        spot_color_outer: [2][4]f32,
+        spot_intensity: [2][4]f32,
+    };
+
+    // Packs the shared fragment uniforms once per draw. Values are
+    // bit-identical to the legacy per-shader literals.
+    fn frameUniforms(self: *Scene, mesh: *const Mesh, ctx: FrameContext) FrameUniforms {
+        return .{
+            .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
+            .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
+            .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
+            .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+            .shadow_params = .{
+                if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
+                if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
+                self.shadow_normal_bias,
+                self.shadow_softness,
+            },
+            .shadow_splits = self.cascade_splits,
+            .cascade_view_proj = ctx.cascades,
+            .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
+            .light_counts = ctx.light_counts,
+            .point_pos_range = ctx.point_pos_range,
+            .point_color_int = ctx.point_color_int,
+            .spot_pos_range = ctx.spot_pos_range,
+            .spot_dir_inner = ctx.spot_dir_inner,
+            .spot_color_outer = ctx.spot_color_outer,
+            .spot_intensity = ctx.spot_intensity,
+        };
+    }
+
     // Draws one regular (non-instanced) queue item: pipeline select, bind,
     // uniforms, draw. Shared by the opaque pass and the transparent pass
     // (pipeline choice follows item.transparent). Updates stats.
@@ -920,30 +971,26 @@ pub const Scene = struct {
             const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
             const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
 
+            const f = self.frameUniforms(mesh, ctx);
             const fs_params = pbr_shd.FsParams{
-                .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
-                .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
-                .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
-                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+                .eye_pos = f.eye_pos,
+                .light_dir = f.light_dir,
+                .light_color = f.light_color,
+                .ambient_color = f.ambient_color,
                 .base_color_factor = mat_albedo,
                 .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
                 .emissive_factor = emissive_col,
-                .shadow_params = .{
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                    self.shadow_normal_bias,
-                    self.shadow_softness,
-                },
-                .shadow_splits = self.cascade_splits,
-                .cascade_view_proj = ctx.cascades,
-                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-                .light_counts = ctx.light_counts,
-                .point_pos_range = ctx.point_pos_range,
-                .point_color_int = ctx.point_color_int,
-                .spot_pos_range = ctx.spot_pos_range,
-                .spot_dir_inner = ctx.spot_dir_inner,
-                .spot_color_outer = ctx.spot_color_outer,
-                .spot_intensity = ctx.spot_intensity,
+                .shadow_params = f.shadow_params,
+                .shadow_splits = f.shadow_splits,
+                .cascade_view_proj = f.cascade_view_proj,
+                .cascade_debug = f.cascade_debug,
+                .light_counts = f.light_counts,
+                .point_pos_range = f.point_pos_range,
+                .point_color_int = f.point_color_int,
+                .spot_pos_range = f.spot_pos_range,
+                .spot_dir_inner = f.spot_dir_inner,
+                .spot_color_outer = f.spot_color_outer,
+                .spot_intensity = f.spot_intensity,
             };
             if (mesh.skeleton != null) {
                 sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -968,28 +1015,24 @@ pub const Scene = struct {
             };
             sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
 
+            const f = self.frameUniforms(mesh, ctx);
             const fs_params = shd.FsParams{
-                .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
-                .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
-                .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
-                .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+                .eye_pos = f.eye_pos,
+                .light_dir = f.light_dir,
+                .light_color = f.light_color,
+                .ambient_color = f.ambient_color,
                 .diffuse_color = std_mat.getDiffuseColor4(),
-                .shadow_params = .{
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                    if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                    self.shadow_normal_bias,
-                    self.shadow_softness,
-                },
-                .shadow_splits = self.cascade_splits,
-                .cascade_view_proj = ctx.cascades,
-                .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-                .light_counts = ctx.light_counts,
-                .point_pos_range = ctx.point_pos_range,
-                .point_color_int = ctx.point_color_int,
-                .spot_pos_range = ctx.spot_pos_range,
-                .spot_dir_inner = ctx.spot_dir_inner,
-                .spot_color_outer = ctx.spot_color_outer,
-                .spot_intensity = ctx.spot_intensity,
+                .shadow_params = f.shadow_params,
+                .shadow_splits = f.shadow_splits,
+                .cascade_view_proj = f.cascade_view_proj,
+                .cascade_debug = f.cascade_debug,
+                .light_counts = f.light_counts,
+                .point_pos_range = f.point_pos_range,
+                .point_color_int = f.point_color_int,
+                .spot_pos_range = f.spot_pos_range,
+                .spot_dir_inner = f.spot_dir_inner,
+                .spot_color_outer = f.spot_color_outer,
+                .spot_intensity = f.spot_intensity,
             };
             sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
         }
@@ -1008,10 +1051,11 @@ pub const Scene = struct {
         if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
 
         const transparent = materialIsTransparent(mesh.material);
+        const is_u32 = mesh.index_type == .UINT32;
         const pip_id = if (transparent)
-            (if (mesh.index_type == .UINT32) self.pipeline_instanced_blend_u32.id else self.pipeline_instanced_blend_u16.id)
+            (if (is_u32) self.pipeline_instanced_blend_u32.id else self.pipeline_instanced_blend_u16.id)
         else
-            (if (mesh.index_type == .UINT32) self.pipeline_instanced_u32.id else self.pipeline_instanced_u16.id);
+            (if (is_u32) self.pipeline_instanced_u32.id else self.pipeline_instanced_u16.id);
         if (pip_id == 0) return;
         if (pip_id != current_pipeline_id.*) {
             sg.applyPipeline(.{ .id = pip_id });
@@ -1043,28 +1087,24 @@ pub const Scene = struct {
         };
         sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
 
+        const f = self.frameUniforms(mesh, ctx);
         const inst_fs = inst_shd.FsParams{
-            .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
-            .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },
-            .light_color = .{ ctx.sun_color.r, ctx.sun_color.g, ctx.sun_color.b, ctx.sun_intensity },
-            .ambient_color = .{ self.light.ground_color.r, self.light.ground_color.g, self.light.ground_color.b, 1.0 },
+            .eye_pos = f.eye_pos,
+            .light_dir = f.light_dir,
+            .light_color = f.light_color,
+            .ambient_color = f.ambient_color,
             .diffuse_color = std_mat.getDiffuseColor4(),
-            .shadow_params = .{
-                if (self.enable_shadows and mesh.receive_shadows) self.shadow_bias else 0.0,
-                if (self.enable_shadows and mesh.receive_shadows) self.shadow_intensity else 0.0,
-                self.shadow_normal_bias,
-                self.shadow_softness,
-            },
-            .shadow_splits = self.cascade_splits,
-            .cascade_view_proj = ctx.cascades,
-            .cascade_debug = .{ if (self.shadow_debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-            .light_counts = ctx.light_counts,
-            .point_pos_range = ctx.point_pos_range,
-            .point_color_int = ctx.point_color_int,
-            .spot_pos_range = ctx.spot_pos_range,
-            .spot_dir_inner = ctx.spot_dir_inner,
-            .spot_color_outer = ctx.spot_color_outer,
-            .spot_intensity = ctx.spot_intensity,
+            .shadow_params = f.shadow_params,
+            .shadow_splits = f.shadow_splits,
+            .cascade_view_proj = f.cascade_view_proj,
+            .cascade_debug = f.cascade_debug,
+            .light_counts = f.light_counts,
+            .point_pos_range = f.point_pos_range,
+            .point_color_int = f.point_color_int,
+            .spot_pos_range = f.spot_pos_range,
+            .spot_dir_inner = f.spot_dir_inner,
+            .spot_color_outer = f.spot_color_outer,
+            .spot_intensity = f.spot_intensity,
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
 
@@ -1545,7 +1585,6 @@ pub const Scene = struct {
 
         self.default_white_texture.deinit();
         self.default_normal_texture.deinit();
-        self.default_black_texture.deinit();
         self.default_cube_texture.deinit();
         if (self.skybox_texture) |*c| {
             c.deinit();
@@ -1754,4 +1793,110 @@ test "pipeline selection follows transparency flag" {
     mesh_obj.index_type = .UINT16;
     try std.testing.expect(scene.pipelineForRegularItem(opaque_pbr) == 31);
     try std.testing.expect(scene.pipelineForRegularItem(blend_pbr) == 33);
+}
+
+test "frameUniforms packs shared lighting state verbatim" {
+    var scene: Scene = undefined;
+    scene.light.ground_color = Color3.new(0.2, 0.25, 0.3);
+    scene.enable_shadows = true;
+    scene.shadow_bias = 0.0012;
+    scene.shadow_intensity = 0.75;
+    scene.shadow_normal_bias = 0.02;
+    scene.shadow_softness = 1.5;
+    scene.shadow_debug_cascades = true;
+    scene.cascade_splits = .{ 10.0, 26.0, 65.0, 150.0 };
+
+    var mesh_obj: Mesh = undefined;
+    mesh_obj.receive_shadows = true;
+
+    const cascades = [_]Mat4{ Mat4.identity, Mat4.identity, Mat4.identity, Mat4.identity };
+    const ctx = Scene.FrameContext{
+        .view_proj = Mat4.identity,
+        .eye = Vec3.new(1.0, 2.0, 3.0),
+        .sun_dir = Vec3.new(0.5, 1.0, 0.3),
+        .sun_color = Color3.new(1.0, 0.9, 0.8),
+        .sun_intensity = 2.0,
+        .cascades = cascades,
+        .light_counts = .{ 1.0, 0.0, 0.0, 0.0 },
+        .point_pos_range = [_][4]f32{.{ 1, 2, 3, 10 }} ** 4,
+        .point_color_int = [_][4]f32{.{ 1, 1, 1, 1 }} ** 4,
+        .spot_pos_range = [_][4]f32{.{ 4, 5, 6, 20 }} ** 2,
+        .spot_dir_inner = [_][4]f32{.{ 0, -1, 0, 0.9 }} ** 2,
+        .spot_color_outer = [_][4]f32{.{ 1, 1, 1, 0.7 }} ** 2,
+        .spot_intensity = [_][4]f32{.{ 3, 0, 0, 0 }} ** 2,
+    };
+
+    const f = scene.frameUniforms(&mesh_obj, ctx);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 4.0 }, f.eye_pos);
+    try std.testing.expectEqual([4]f32{ 0.5, 1.0, 0.3, 2048.0 }, f.light_dir);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.9, 0.8, 2.0 }, f.light_color);
+    try std.testing.expectEqual([4]f32{ 0.2, 0.25, 0.3, 1.0 }, f.ambient_color);
+    try std.testing.expectEqual([4]f32{ 0.0012, 0.75, 0.02, 1.5 }, f.shadow_params);
+    try std.testing.expectEqual([4]f32{ 10.0, 26.0, 65.0, 150.0 }, f.shadow_splits);
+    try std.testing.expectEqual(cascades, f.cascade_view_proj);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, f.cascade_debug);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, f.light_counts);
+    try std.testing.expectEqual(ctx.point_pos_range, f.point_pos_range);
+    try std.testing.expectEqual(ctx.spot_intensity, f.spot_intensity);
+
+    // Disabled shadows (globally or per-mesh) zero the bias/intensity lanes
+    // but keep normal bias and softness, exactly like the legacy literals.
+    scene.enable_shadows = false;
+    const off = scene.frameUniforms(&mesh_obj, ctx);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.02, 1.5 }, off.shadow_params);
+    scene.enable_shadows = true;
+    mesh_obj.receive_shadows = false;
+    const skipped = scene.frameUniforms(&mesh_obj, ctx);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.02, 1.5 }, skipped.shadow_params);
+}
+
+test "pipeline layout table preserves per-family vertex layouts" {
+    var desc = sg.PipelineDesc{
+        .shader = .{},
+        .index_type = .UINT16,
+        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+    };
+
+    Scene.pipelineLayoutFor(.standard, &desc);
+    try std.testing.expect(desc.layout.buffers[0].stride == @as(i32, @intCast(@sizeOf(Vertex))));
+    try std.testing.expect(desc.layout.attrs[shd.ATTR_standard_position].format == .FLOAT3);
+    try std.testing.expect(desc.layout.attrs[shd.ATTR_standard_position].offset == @as(i32, @intCast(@offsetOf(Vertex, "position"))));
+    try std.testing.expect(desc.layout.attrs[shd.ATTR_standard_texcoord0].format == .FLOAT2);
+
+    desc = sg.PipelineDesc{
+        .shader = .{},
+        .index_type = .UINT16,
+        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+    };
+    Scene.pipelineLayoutFor(.pbr, &desc);
+    try std.testing.expect(desc.layout.attrs[pbr_shd.ATTR_pbr_tangent].format == .FLOAT4);
+    try std.testing.expect(desc.layout.attrs[pbr_shd.ATTR_pbr_tangent].offset == @as(i32, @intCast(@offsetOf(Vertex, "tangent"))));
+
+    desc = sg.PipelineDesc{
+        .shader = .{},
+        .index_type = .UINT16,
+        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+    };
+    Scene.pipelineLayoutFor(.instanced, &desc);
+    try std.testing.expect(desc.layout.buffers[1].stride == @as(i32, @intCast(@sizeOf(Mat4))));
+    try std.testing.expect(desc.layout.buffers[1].step_func == .PER_INSTANCE);
+    try std.testing.expect(desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat0].offset == 0);
+    try std.testing.expect(desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat3].offset == 48);
+
+    desc = sg.PipelineDesc{
+        .shader = .{},
+        .index_type = .UINT16,
+        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+    };
+    Scene.pipelineLayoutFor(.skinned_pbr, &desc);
+    try std.testing.expect(desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_joints].offset == @as(i32, @intCast(@offsetOf(Vertex, "joints"))));
+    try std.testing.expect(desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_weights].offset == @as(i32, @intCast(@offsetOf(Vertex, "weights"))));
 }

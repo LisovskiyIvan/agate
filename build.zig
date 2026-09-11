@@ -13,170 +13,60 @@ pub fn build(b: *Build) !void {
     const mod_sokol = dep_sokol.module("sokol");
     const mod_math = b.createModule(.{ .root_source_file = b.path("src/agate/math.zig") });
 
-    // Шейдер: src/agate/shaders/standard.glsl -> Zig-модуль "shader"
+    // Шейдеры: единая таблица "имя модуля -> вход/выход", slang общий для всех.
+    // NOTE: SHADOW_ATLAS_SIZE не передаётся через .defines: sokol-shdc этой
+    // версии разворачивает любой дефайн в `#define NAME (1)` (проверено запуском
+    // бинарника в /tmp: форма NAME=VALUE игнорируется с варнингом, форма
+    // NAME VALUE даёт пустой макрос). Значение 2048.0 живёт как fallback в
+    // самих .glsl и как ShadowPass.SHADOW_ATLAS_SIZE в passes/shadow_pass.zig.
+    const ShaderSpec = struct {
+        name: []const u8,
+        input: []const u8,
+        output: []const u8,
+    };
+    const shader_specs = [_]ShaderSpec{
+        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig" },
+        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig" },
+        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig" },
+        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig" },
+        .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
+        .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
+        .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
+        .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
+        .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
+        .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
+        .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },
+    };
+
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});
-    const mod_shader = try sokol.shdc.createModule(b, "shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/standard.glsl",
-        .output = "standard_shader.zig",
-        .slang = .{
-            .glsl410 = true, // Linux (GL)
-            .metal_macos = true, // macOS (Metal)
-            .hlsl5 = true, // Windows (D3D11)
-        },
-    });
-    mod_shader.addImport("math", mod_math);
-
-    // Шейдер PBR: src/agate/shaders/pbr.glsl -> Zig-модуль "pbr_shader"
-    const mod_pbr_shader = try sokol.shdc.createModule(b, "pbr_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/pbr.glsl",
-        .output = "pbr_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_pbr_shader.addImport("math", mod_math);
-
-    // Шейдер Skinned PBR: src/agate/shaders/skinned_pbr.glsl -> Zig-модуль "skinned_pbr_shader"
-    const mod_skinned_pbr_shader = try sokol.shdc.createModule(b, "skinned_pbr_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/skinned_pbr.glsl",
-        .output = "skinned_pbr_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_skinned_pbr_shader.addImport("math", mod_math);
-
-    // Шейдер Instanced: src/agate/shaders/instanced.glsl -> Zig-модуль "instanced_shader"
-    const mod_instanced_shader = try sokol.shdc.createModule(b, "instanced_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/instanced.glsl",
-        .output = "instanced_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_instanced_shader.addImport("math", mod_math);
-
-    // Шейдер Shadow: src/agate/shaders/shadow.glsl -> Zig-модуль "shadow_shader"
-    const mod_shadow_shader = try sokol.shdc.createModule(b, "shadow_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/shadow.glsl",
-        .output = "shadow_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_shadow_shader.addImport("math", mod_math);
-
-    // Шейдер Skybox: src/agate/shaders/skybox.glsl -> Zig-модуль "skybox_shader"
-    const mod_skybox_shader = try sokol.shdc.createModule(b, "skybox_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/skybox.glsl",
-        .output = "skybox_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_skybox_shader.addImport("math", mod_math);
-
-    // Шейдер PostProcess: src/agate/shaders/postprocess.glsl -> Zig-модуль "postprocess_shader"
-    const mod_postprocess_shader = try sokol.shdc.createModule(b, "postprocess_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/postprocess.glsl",
-        .output = "postprocess_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_postprocess_shader.addImport("math", mod_math);
-
-    // Шейдер Particle: src/agate/shaders/particle.glsl -> Zig-модуль "particle_shader"
-    const mod_particle_shader = try sokol.shdc.createModule(b, "particle_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/particle.glsl",
-        .output = "particle_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_particle_shader.addImport("math", mod_math);
-
-    // Шейдер UI & Text: src/agate/shaders/ui.glsl -> Zig-модуль "ui_shader"
-    const mod_ui_shader = try sokol.shdc.createModule(b, "ui_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/ui.glsl",
-        .output = "ui_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_ui_shader.addImport("math", mod_math);
-
-    // Шейдер SSAO: src/agate/shaders/ssao.glsl -> Zig-модуль "ssao_shader"
-    const mod_ssao_shader = try sokol.shdc.createModule(b, "ssao_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/ssao.glsl",
-        .output = "ssao_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_ssao_shader.addImport("math", mod_math);
-
-    // Шейдер SSAO Blur: src/agate/shaders/ssao_blur.glsl -> Zig-модуль "ssao_blur_shader"
-    const mod_ssao_blur_shader = try sokol.shdc.createModule(b, "ssao_blur_shader", mod_sokol, .{
-        .shdc_dep = dep_shdc,
-        .input = "src/agate/shaders/ssao_blur.glsl",
-        .output = "ssao_blur_shader.zig",
-        .slang = .{
-            .glsl410 = true,
-            .metal_macos = true,
-            .hlsl5 = true,
-        },
-    });
-    mod_ssao_blur_shader.addImport("math", mod_math);
+    var shader_modules: [shader_specs.len]*Build.Module = undefined;
+    for (shader_specs, 0..) |spec, i| {
+        const shader_mod = try sokol.shdc.createModule(b, spec.name, mod_sokol, .{
+            .shdc_dep = dep_shdc,
+            .input = spec.input,
+            .output = spec.output,
+            .slang = .{
+                .glsl410 = true, // Linux (GL)
+                .metal_macos = true, // macOS (Metal)
+                .hlsl5 = true, // Windows (D3D11)
+            },
+        });
+        shader_mod.addImport("math", mod_math);
+        shader_modules[i] = shader_mod;
+    }
 
     // Главный модуль библиотеки agate
+    var agate_imports: [2 + shader_specs.len]Build.Module.Import = undefined;
+    agate_imports[0] = .{ .name = "sokol", .module = mod_sokol };
+    for (shader_specs, 0..) |spec, i| {
+        agate_imports[1 + i] = .{ .name = spec.name, .module = shader_modules[i] };
+    }
+    agate_imports[1 + shader_specs.len] = .{ .name = "math", .module = mod_math };
     const mod_agate = b.addModule("agate", .{
         .root_source_file = b.path("src/agate/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sokol", .module = mod_sokol },
-            .{ .name = "shader", .module = mod_shader },
-            .{ .name = "pbr_shader", .module = mod_pbr_shader },
-            .{ .name = "skinned_pbr_shader", .module = mod_skinned_pbr_shader },
-            .{ .name = "instanced_shader", .module = mod_instanced_shader },
-            .{ .name = "shadow_shader", .module = mod_shadow_shader },
-            .{ .name = "skybox_shader", .module = mod_skybox_shader },
-            .{ .name = "postprocess_shader", .module = mod_postprocess_shader },
-            .{ .name = "particle_shader", .module = mod_particle_shader },
-            .{ .name = "ui_shader", .module = mod_ui_shader },
-            .{ .name = "ssao_shader", .module = mod_ssao_shader },
-            .{ .name = "ssao_blur_shader", .module = mod_ssao_blur_shader },
-            .{ .name = "math", .module = mod_math },
-        },
+        .imports = &agate_imports,
     });
     mod_agate.addIncludePath(b.path("src/agate/c"));
     mod_agate.addIncludePath(b.path("src/agate/c/box3d/include"));
@@ -276,4 +166,7 @@ pub fn build(b: *Build) !void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    const fmt = b.addFmt(.{ .paths = &.{"src"}, .check = true });
+    b.step("fmt", "Check formatting with zig fmt").dependOn(&fmt.step);
 }

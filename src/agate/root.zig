@@ -8,8 +8,11 @@ pub const Color3 = math.Color3;
 pub const Color4 = math.Color4;
 pub const BoundingBox = math.BoundingBox;
 pub const Frustum = math.Frustum;
+pub const FrustumPlane = math.FrustumPlane;
+pub const lerp = math.lerp;
 
 pub const camera = @import("camera.zig");
+pub const ArcRotateCameraOptions = camera.ArcRotateCameraOptions;
 pub const ArcRotateCamera = camera.ArcRotateCamera;
 pub const Camera = camera.Camera;
 pub const FreeCamera = camera.FreeCamera;
@@ -18,6 +21,7 @@ pub const FollowCamera = camera.FollowCamera;
 pub const FollowCameraOptions = camera.FollowCameraOptions;
 
 pub const lights = @import("lights.zig");
+pub const HemisphericLightOptions = lights.HemisphericLightOptions;
 pub const HemisphericLight = lights.HemisphericLight;
 pub const DirectionalLight = lights.DirectionalLight;
 pub const DirectionalLightOptions = lights.DirectionalLightOptions;
@@ -25,6 +29,9 @@ pub const PointLight = lights.PointLight;
 pub const PointLightOptions = lights.PointLightOptions;
 pub const SpotLight = lights.SpotLight;
 pub const SpotLightOptions = lights.SpotLightOptions;
+pub const resolveSunDirection = lights.resolveSunDirection;
+pub const resolveSunColor = lights.resolveSunColor;
+pub const resolveSunIntensity = lights.resolveSunIntensity;
 
 pub const material = @import("material.zig");
 pub const StandardMaterial = material.StandardMaterial;
@@ -44,6 +51,7 @@ pub const BoneAttachment = mesh.BoneAttachment;
 pub const CullingStrategy = mesh.CullingStrategy;
 pub const Vertex = mesh.Vertex;
 pub const MeshBuilder = mesh.MeshBuilder;
+pub const computeTangents = mesh.computeTangents;
 pub const BoxOptions = mesh.BoxOptions;
 pub const SphereOptions = mesh.SphereOptions;
 pub const CylinderOptions = mesh.CylinderOptions;
@@ -62,6 +70,8 @@ pub const ExtrudeOptions = mesh.ExtrudeOptions;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
+pub const SceneStats = scene.SceneStats;
+pub const RenderMeshItem = scene.RenderMeshItem;
 
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
@@ -77,6 +87,7 @@ pub const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
+pub const ParticleInstanceData = particles.ParticleInstanceData;
 
 pub const Ray = math.Ray;
 pub const RayHit = math.RayHit;
@@ -84,6 +95,7 @@ pub const TriangleHit = math.TriangleHit;
 
 pub const physics = @import("physics.zig");
 pub const RigidBody = physics.RigidBody;
+pub const DebugLine = physics.DebugLine;
 pub const PhysicsWorld = physics.PhysicsWorld;
 pub const PickingInfo = physics.PickingInfo;
 pub const ColliderType = physics.ColliderType;
@@ -112,6 +124,8 @@ pub const ContactHitEvent = physics.ContactHitEvent;
 pub const ui = @import("ui.zig");
 pub const UICanvas = ui.UICanvas;
 pub const UIVertex = ui.UIVertex;
+pub const GlyphUV = ui.GlyphUV;
+pub const getGlyphUV = ui.getGlyphUV;
 
 pub const passes = @import("passes/mod.zig");
 
@@ -130,6 +144,7 @@ pub const animation = struct {
     pub const NodeChannel = anim.NodeChannel;
     pub const NodeTarget = anim.NodeTarget;
     pub const EasingType = easing.EasingType;
+    pub const easing_names = easing.easing_names;
     pub const evaluateEasing = easing.evaluate;
     pub const easingName = easing.easingName;
     pub const easingFromName = easing.easingFromName;
@@ -137,6 +152,7 @@ pub const animation = struct {
 };
 pub const Skeleton = animation.Skeleton;
 pub const Bone = animation.Bone;
+pub const MAX_BONES = animation.MAX_BONES;
 pub const AnimationGroup = animation.AnimationGroup;
 pub const AnimationChannel = animation.AnimationChannel;
 pub const AnimationSampler = animation.AnimationSampler;
@@ -145,6 +161,7 @@ pub const AnimationInterpolation = animation.AnimationInterpolation;
 pub const NodeChannel = animation.NodeChannel;
 pub const NodeTarget = animation.NodeTarget;
 pub const EasingType = animation.EasingType;
+pub const easing_names = animation.easing_names;
 pub const evaluateEasing = animation.evaluateEasing;
 pub const easingName = animation.easingName;
 pub const easingFromName = animation.easingFromName;

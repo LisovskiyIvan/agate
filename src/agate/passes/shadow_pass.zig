@@ -8,6 +8,12 @@ const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
 const Vertex = mesh_mod.Vertex;
 
+// Resolution of the shadow atlas texture (square). Must match the
+// SHADOW_ATLAS_SIZE fallback in shaders/{standard,pbr,instanced,skinned_pbr}.glsl:
+// sokol-shdc --defines only supports valueless macros, so the value cannot be
+// injected from the build and lives in these two places by convention.
+pub const SHADOW_ATLAS_SIZE: u32 = 2048;
+
 pub const ShadowPass = struct {
     image: sg.Image,
     attachment_view: sg.View,
@@ -45,13 +51,13 @@ pub const ShadowPass = struct {
     }
 
     pub fn init() ShadowPass {
-        // 2048 atlas holding 4x 1024 cascades (2x2). Was 4096/2048: same look
-        // for near geometry, 4x fewer depth texels rasterized per frame.
+        // SHADOW_ATLAS_SIZE atlas holding 4x (SHADOW_ATLAS_SIZE/2) cascades (2x2).
+        // Was 4096/2048: same look for near geometry, 4x fewer depth texels rasterized per frame.
         const depth_img = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
             .pixel_format = .DEPTH,
-            .width = 2048,
-            .height = 2048,
+            .width = SHADOW_ATLAS_SIZE,
+            .height = SHADOW_ATLAS_SIZE,
             .sample_count = 1,
         });
         const att_view = sg.makeView(.{
@@ -197,7 +203,7 @@ pub const ShadowPass = struct {
         shadow_pass.attachments.depth_stencil = self.attachment_view;
         sg.beginPass(shadow_pass);
 
-        const CASCADE_RES: i32 = 1024;
+        const CASCADE_RES: i32 = @intCast(SHADOW_ATLAS_SIZE / 2);
         var draw_calls: u32 = 0;
         // Kept across cascades: identical re-applies are skipped.
         var last_pipeline_id: u32 = 0;

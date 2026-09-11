@@ -3,6 +3,70 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const c = @import("c.zig").c;
 
+/// Shared RGBA8 box-filter downsample of one mip level. Dims floor at 1,
+/// source coords clamp at edges (handles NPOT). Fast path for the exact
+/// 2:1 case keeps power-of-two results bit-identical to the old inline
+/// loops; the generic path covers odd/NPOT sizes.
+/// Precondition: src.len >= src_w*src_h*4, dst.len >= dst_w*dst_h*4.
+fn boxDownsampleU8(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
+    @setRuntimeSafety(false);
+    if (src_w == dst_w * 2 and src_h == dst_h * 2) {
+        const src_stride: usize = @as(usize, src_w) * 4;
+        const dst_stride: usize = @as(usize, dst_w) * 4;
+        var y: usize = 0;
+        while (y < dst_h) : (y += 1) {
+            const r0 = src[(y * 2) * src_stride ..];
+            const r1 = src[(y * 2 + 1) * src_stride ..];
+            const out_row = dst[y * dst_stride ..];
+            var x: usize = 0;
+            while (x < dst_w) : (x += 1) {
+                const si = x * 8;
+                const di = x * 4;
+                inline for (0..4) |ch| {
+                    const sum: u32 = @as(u32, r0[si + ch]) +
+                        @as(u32, r0[si + 4 + ch]) +
+                        @as(u32, r1[si + ch]) +
+                        @as(u32, r1[si + 4 + ch]);
+                    out_row[di + ch] = @intCast((sum + 2) >> 2);
+                }
+            }
+        }
+        return;
+    }
+
+    var y: u32 = 0;
+    while (y < dst_h) : (y += 1) {
+        const sy0 = @min(y * 2, src_h - 1);
+        const sy1 = @min(y * 2 + 1, src_h - 1);
+        var x: u32 = 0;
+        while (x < dst_w) : (x += 1) {
+            const sx0 = @min(x * 2, src_w - 1);
+            const sx1 = @min(x * 2 + 1, src_w - 1);
+            const q00 = (sy0 * src_w + sx0) * 4;
+            const q10 = (sy0 * src_w + sx1) * 4;
+            const q01 = (sy1 * src_w + sx0) * 4;
+            const q11 = (sy1 * src_w + sx1) * 4;
+            const o = (y * dst_w + x) * 4;
+            inline for (0..4) |ch| {
+                const sum: u32 = @as(u32, src[q00 + ch]) + @as(u32, src[q10 + ch]) + @as(u32, src[q01 + ch]) + @as(u32, src[q11 + ch]);
+                dst[o + ch] = @intCast((sum + 2) >> 2);
+            }
+        }
+    }
+}
+
+/// Radial particle-dot falloff shared by createDefaultParticleDot32 and
+/// createParticleDot. Takes already-computed center/radius so both callers
+/// keep their exact historic parameters and output is unchanged.
+fn particleDotAlpha(x: u32, y: u32, center: f32, radius: f32) u8 {
+    const dx = @as(f32, @floatFromInt(x)) - center;
+    const dy = @as(f32, @floatFromInt(y)) - center;
+    const dist = @sqrt(dx * dx + dy * dy);
+    const norm_dist = @min(1.0, dist / radius);
+    const alpha_f = (1.0 - norm_dist) * (1.0 - norm_dist);
+    return @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
+}
+
 pub const Texture = struct {
     image: sg.Image,
     view: sg.View,
@@ -54,52 +118,10 @@ pub const Texture = struct {
         };
     }
     /// Box-filter downsample of one RGBA8 level. Dims floor at 1, source coords
-    /// clamp at edges (handles NPOT).
+    /// clamp at edges (handles NPOT). Thin wrapper over the shared
+    /// file-private `boxDownsampleU8` so 2D and cube paths stay in sync.
     fn downsampleLevel(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
-        @setRuntimeSafety(false);
-        if (src_w == dst_w * 2 and src_h == dst_h * 2) {
-            const src_stride: usize = @as(usize, src_w) * 4;
-            const dst_stride: usize = @as(usize, dst_w) * 4;
-            var y: usize = 0;
-            while (y < dst_h) : (y += 1) {
-                const r0 = src[(y * 2) * src_stride ..];
-                const r1 = src[(y * 2 + 1) * src_stride ..];
-                const out_row = dst[y * dst_stride ..];
-                var x: usize = 0;
-                while (x < dst_w) : (x += 1) {
-                    const si = x * 8;
-                    const di = x * 4;
-                    inline for (0..4) |ch| {
-                        const sum: u32 = @as(u32, r0[si + ch]) +
-                            @as(u32, r0[si + 4 + ch]) +
-                            @as(u32, r1[si + ch]) +
-                            @as(u32, r1[si + 4 + ch]);
-                        out_row[di + ch] = @intCast((sum + 2) >> 2);
-                    }
-                }
-            }
-            return;
-        }
-
-        var y: u32 = 0;
-        while (y < dst_h) : (y += 1) {
-            const sy0 = @min(y * 2, src_h - 1);
-            const sy1 = @min(y * 2 + 1, src_h - 1);
-            var x: u32 = 0;
-            while (x < dst_w) : (x += 1) {
-                const sx0 = @min(x * 2, src_w - 1);
-                const sx1 = @min(x * 2 + 1, src_w - 1);
-                const q00 = (sy0 * src_w + sx0) * 4;
-                const q10 = (sy0 * src_w + sx1) * 4;
-                const q01 = (sy1 * src_w + sx0) * 4;
-                const q11 = (sy1 * src_w + sx1) * 4;
-                const o = (y * dst_w + x) * 4;
-                inline for (0..4) |ch| {
-                    const sum: u32 = @as(u32, src[q00 + ch]) + @as(u32, src[q10 + ch]) + @as(u32, src[q01 + ch]) + @as(u32, src[q11 + ch]);
-                    dst[o + ch] = @intCast((sum + 2) >> 2);
-                }
-            }
-        }
+        boxDownsampleU8(src, src_w, src_h, dst, dst_w, dst_h);
     }
 
     pub fn mipLevelCount(width: u32, height: u32) u32 {
@@ -300,8 +322,12 @@ pub const Texture = struct {
         color1: [4]u8,
         color2: [4]u8,
     ) !Texture {
-        const pixel_count = width * height;
-        const buffer = try allocator.alloc(u8, pixel_count * 4);
+        // Checked arithmetic: on 64-bit, mul(usize, u32, u32) never fails,
+        // so check u32 range explicitly to avoid a 16 GiB alloc attempt and
+        // to turn the old `width * height` debug-mode panic into an error.
+        const pixel_count = std.math.mul(u32, width, height) catch return error.ImageTooLarge;
+        const byte_count = std.math.mul(u32, pixel_count, 4) catch return error.ImageTooLarge;
+        const buffer = try allocator.alloc(u8, byte_count);
         defer allocator.free(buffer);
 
         var y: u32 = 0;
@@ -310,7 +336,7 @@ pub const Texture = struct {
             while (x < width) : (x += 1) {
                 const is_even = (((x / cell_size) + (y / cell_size)) % 2) == 0;
                 const c_val = if (is_even) color1 else color2;
-                const idx = (y * width + x) * 4;
+                const idx: usize = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
                 buffer[idx + 0] = c_val[0];
                 buffer[idx + 1] = c_val[1];
                 buffer[idx + 2] = c_val[2];
@@ -334,12 +360,7 @@ pub const Texture = struct {
         while (y < size) : (y += 1) {
             var x: usize = 0;
             while (x < size) : (x += 1) {
-                const dx = @as(f32, @floatFromInt(x)) - center;
-                const dy = @as(f32, @floatFromInt(y)) - center;
-                const dist = @sqrt(dx * dx + dy * dy);
-                const norm_dist = @min(1.0, dist / radius);
-                const alpha_f = (1.0 - norm_dist) * (1.0 - norm_dist);
-                const alpha: u8 = @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
+                const alpha = particleDotAlpha(@intCast(x), @intCast(y), center, radius);
 
                 const idx = (y * size + x) * 4;
                 buf[idx + 0] = 255;
@@ -369,12 +390,7 @@ pub const Texture = struct {
         while (y < size) : (y += 1) {
             var x: u32 = 0;
             while (x < size) : (x += 1) {
-                const dx = @as(f32, @floatFromInt(x)) - center;
-                const dy = @as(f32, @floatFromInt(y)) - center;
-                const dist = @sqrt(dx * dx + dy * dy);
-                const norm_dist = @min(1.0, dist / radius);
-                const alpha_f = (1.0 - norm_dist) * (1.0 - norm_dist);
-                const alpha: u8 = @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
+                const alpha = particleDotAlpha(x, y, center, radius);
 
                 const idx = (y * size + x) * 4;
                 buffer[idx + 0] = 255;
@@ -655,10 +671,9 @@ pub const CubeTexture = struct {
 
         var num_mips: u32 = 1;
         if (generate_mips and size > 1) {
-            var s = size;
-            while (s > 1) : (s /= 2) {
-                num_mips += 1;
-            }
+            // Same chain length as the 2D path; identical to the old
+            // divide-by-2 loop for powers of two, NPOT-safe otherwise.
+            num_mips = Texture.mipLevelCount(size, size);
         }
         if (num_mips > 16) num_mips = 16;
 
@@ -684,36 +699,21 @@ pub const CubeTexture = struct {
         var prev_size = size;
         var prev_buf = mip0_buffer;
         for (1..num_mips) |m| {
-            const cur_size = prev_size / 2;
+            // @max(1, ...) keeps NPOT chains alive (e.g. 3 -> 1) instead of
+            // hitting a zero-sized level; POT chains are unchanged.
+            const cur_size: u32 = @max(1, prev_size / 2);
             const cur_total_bytes = 6 * cur_size * cur_size * 4;
             const cur_buf = try allocator.alloc(u8, cur_total_bytes);
             mip_buffers[m] = cur_buf;
 
+            const prev_face_bytes: usize = @as(usize, prev_size) * @as(usize, prev_size) * 4;
+            const cur_face_bytes: usize = @as(usize, cur_size) * @as(usize, cur_size) * 4;
             for (0..6) |face| {
-                const src_face_offset = face * prev_size * prev_size * 4;
-                const dst_face_offset = face * cur_size * cur_size * 4;
-
-                var dy: u32 = 0;
-                while (dy < cur_size) : (dy += 1) {
-                    const sy = dy * 2;
-                    var dx: u32 = 0;
-                    while (dx < cur_size) : (dx += 1) {
-                        const sx = dx * 2;
-                        const idx00 = src_face_offset + (sy * prev_size + sx) * 4;
-                        const idx10 = src_face_offset + (sy * prev_size + sx + 1) * 4;
-                        const idx01 = src_face_offset + ((sy + 1) * prev_size + sx) * 4;
-                        const idx11 = src_face_offset + ((sy + 1) * prev_size + sx + 1) * 4;
-
-                        const out_i = dst_face_offset + (dy * cur_size + dx) * 4;
-                        inline for (0..4) |c_idx| {
-                            const sum: u32 = @as(u32, prev_buf[idx00 + c_idx]) +
-                                @as(u32, prev_buf[idx10 + c_idx]) +
-                                @as(u32, prev_buf[idx01 + c_idx]) +
-                                @as(u32, prev_buf[idx11 + c_idx]);
-                            cur_buf[out_i + c_idx] = @intCast((sum + 2) / 4);
-                        }
-                    }
-                }
+                const src_face = prev_buf[face * prev_face_bytes .. (face + 1) * prev_face_bytes];
+                const dst_face = cur_buf[face * cur_face_bytes .. (face + 1) * cur_face_bytes];
+                // Shared NPOT-safe box filter; bit-identical to the old
+                // inline loop when prev == cur*2 (all POT levels).
+                boxDownsampleU8(src_face, prev_size, prev_size, dst_face, cur_size, cur_size);
             }
 
             img_desc.data.mip_levels[m] = sg.asRange(cur_buf);
@@ -883,6 +883,9 @@ pub const CubeTexture = struct {
     }
 
     pub fn fromEquirectangular(allocator: std.mem.Allocator, panorama_bytes: []const u8, face_size: u32) !CubeTexture {
+        // Same guard as the HDR converter: zero face size would divide by
+        // zero in cubeTexelDirection and produce zero-byte faces.
+        if (face_size == 0) return error.InvalidDimensions;
         var pw: c_int = 0;
         var ph: c_int = 0;
         var comp: c_int = 0;
@@ -938,14 +941,19 @@ pub const CubeTexture = struct {
     }
 
     pub fn fromEquirectangularFile(allocator: std.mem.Allocator, file_path: []const u8, face_size: u32) !CubeTexture {
-        const file = try std.fs.cwd().openFile(file_path, .{});
-        defer file.close();
+        if (face_size == 0) return error.InvalidDimensions;
+        // Zig 0.16 removed std.fs.cwd(); read through the global single-threaded
+        // Io so the public (allocator, path) signature stays unchanged.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
 
-        const file_size = (try file.stat()).size;
-        const bytes = try allocator.alloc(u8, file_size);
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
         defer allocator.free(bytes);
 
-        _ = try file.readAll(bytes);
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
         return fromEquirectangular(allocator, bytes, face_size);
     }
 
@@ -1278,5 +1286,62 @@ test "decodeHDRFile reports missing files without leaking" {
     try std.testing.expectError(
         error.ImageDecodeFailed,
         Texture.decodeHDRFile(allocator, "definitely/missing/file.hdr"),
+    );
+}
+
+test "fromEquirectangularFile validates input and missing files" {
+    const allocator = std.testing.allocator;
+
+    // face_size = 0 fails before any file IO.
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.fromEquirectangularFile(allocator, "definitely/missing/file.png", 0),
+    );
+    // Missing file must fail cleanly (this also keeps the std.Io read path
+    // analyzed, so future Zig API churn is caught by `zig build test`).
+    try std.testing.expectError(
+        error.FileNotFound,
+        CubeTexture.fromEquirectangularFile(allocator, "definitely/missing/file.png", 4),
+    );
+}
+
+test "boxDownsampleU8 handles NPOT cube-face steps without OOB" {
+    // 3x3 -> 1x1 is the exact mip step of a size-3 NPOT cube face
+    // (cur = max(1, prev / 2)). R channel holds the texel index.
+    var src: [3 * 3 * 4]u8 = undefined;
+    for (0..9) |i| {
+        src[i * 4 + 0] = @intCast(i);
+        src[i * 4 + 1] = 0;
+        src[i * 4 + 2] = 0;
+        src[i * 4 + 3] = 255;
+    }
+    var dst: [1 * 1 * 4]u8 = undefined;
+    boxDownsampleU8(&src, 3, 3, &dst, 1, 1);
+    // Averages top-left quad {0,1,3,4}: (0+1+3+4+2)>>2 = 2.
+    try std.testing.expectEqual(@as(u8, 2), dst[0]);
+    try std.testing.expectEqual(@as(u8, 255), dst[3]);
+    // Same dims through the 2D wrapper must agree (shared helper).
+    var dst2: [1 * 1 * 4]u8 = undefined;
+    Texture.downsampleLevel(&src, 3, 3, &dst2, 1, 1);
+    try std.testing.expectEqualSlices(u8, &dst, &dst2);
+
+    // 2x1 -> 1x1 exercises edge clamping (sy1 clamps to 0): the single
+    // source row is sampled twice, i.e. a plain average, no OOB read.
+    var edge_src: [2 * 1 * 4]u8 = .{ 10, 0, 0, 255, 20, 0, 0, 255 };
+    var edge_dst: [1 * 1 * 4]u8 = undefined;
+    boxDownsampleU8(&edge_src, 2, 1, &edge_dst, 1, 1);
+    // (10+20+10+20+2)>>2 = 15.
+    try std.testing.expectEqual(@as(u8, 15), edge_dst[0]);
+}
+
+test "createCheckerboard overflow returns error instead of panicking" {
+    const allocator = std.testing.allocator;
+    const c1 = [4]u8{ 0, 0, 0, 255 };
+    const c2 = [4]u8{ 255, 255, 255, 255 };
+    // 100000^2 overflows u32: old `width * height` panicked in debug;
+    // now returns ImageTooLarge before any allocation or GPU upload.
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        Texture.createCheckerboard(allocator, 100000, 100000, 8, c1, c2),
     );
 }

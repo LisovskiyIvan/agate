@@ -13,14 +13,13 @@ const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Quat = math.Quat;
-const BoundingBox = math.BoundingBox;
 const physics = @import("physics.zig");
 const PhysicsWorld = physics.PhysicsWorld;
 const RigidBody = physics.RigidBody;
 const JointId = physics.JointId;
 const mesh_mod = @import("mesh.zig");
 const Mesh = mesh_mod.Mesh;
-const MeshBuilder = mesh_mod.MeshBuilder;
+const physics_mesh = @import("physics_mesh.zig");
 const Scene = @import("scene.zig").Scene;
 
 /// Number of wheels. Indices 0..3 follow `VehicleOptions.wheel_offsets`.
@@ -68,31 +67,10 @@ pub const VehicleOptions = struct {
     wheel_restitution: f32 = 0.1,
 };
 
-fn freeMesh(allocator: std.mem.Allocator, scene: ?*Scene, mesh: *Mesh) void {
-    if (scene) |sc| {
-        // Unlink from the scene first: the scene owns its mesh list and would
-        // otherwise keep a dangling pointer (double free in Scene.deinit).
-        var i: usize = 0;
-        while (i < sc.meshes.items.len) {
-            if (sc.meshes.items[i] == mesh) {
-                _ = sc.meshes.swapRemove(i);
-                break;
-            }
-            i += 1;
-        }
-        mesh.deinit(sc.allocator);
-        sc.allocator.destroy(mesh);
-    } else {
-        // Bare physics-only mesh: no GPU buffers, no CPU geometry.
-        allocator.destroy(mesh);
-    }
-}
-
 pub const RaycastVehicle = struct {
     allocator: std.mem.Allocator,
     world: *PhysicsWorld,
     scene: ?*Scene,
-    owns_meshes: bool,
     /// Bodies in order: chassis first, then the four wheels.
     bodies: std.ArrayListUnmanaged(*RigidBody) = .empty,
     /// One wheel joint per wheel, in wheel order.
@@ -122,7 +100,6 @@ pub const RaycastVehicle = struct {
             .allocator = allocator,
             .world = world,
             .scene = scene,
-            .owns_meshes = scene == null,
             .drive_speed = options.drive_speed,
             .drive_torque = options.drive_torque,
             .max_steer_angle = options.max_steer_angle,
@@ -138,7 +115,7 @@ pub const RaycastVehicle = struct {
         }
 
         // Chassis body.
-        const chassis_mesh = try createBoxMesh(
+        const chassis_mesh = try physics_mesh.createBoxMesh(
             allocator,
             scene,
             "vehicle_chassis",
@@ -146,7 +123,7 @@ pub const RaycastVehicle = struct {
             options.position,
         );
         var chassis_mesh_tracked = false;
-        defer if (!chassis_mesh_tracked) freeMesh(allocator, scene, chassis_mesh);
+        defer if (!chassis_mesh_tracked) physics_mesh.freeMesh(allocator, scene, chassis_mesh);
         try self.meshes.append(allocator, chassis_mesh);
         chassis_mesh_tracked = true;
 
@@ -164,7 +141,7 @@ pub const RaycastVehicle = struct {
 
         for (0..wheel_count) |i| {
             const wheel_pos = options.position.add(options.wheel_offsets[i]);
-            const wheel_mesh = try createSphereMesh(
+            const wheel_mesh = try physics_mesh.createSphereMesh(
                 allocator,
                 scene,
                 wheelMeshName(i),
@@ -172,7 +149,7 @@ pub const RaycastVehicle = struct {
                 wheel_pos,
             );
             var wheel_mesh_tracked = false;
-            defer if (!wheel_mesh_tracked) freeMesh(allocator, scene, wheel_mesh);
+            defer if (!wheel_mesh_tracked) physics_mesh.freeMesh(allocator, scene, wheel_mesh);
             try self.meshes.append(allocator, wheel_mesh);
             wheel_mesh_tracked = true;
 
@@ -266,28 +243,21 @@ pub const RaycastVehicle = struct {
 
     /// Copies the last solver-synced body transforms into the meshes.
     pub fn syncMeshes(self: *RaycastVehicle) void {
-        for (self.bodies.items) |body| {
-            body.mesh.position = body.last_pos;
-            body.mesh.rotation = body.last_rot;
-        }
+        physics_mesh.syncMeshes(self.bodies.items);
     }
 
     /// Destroys joints, removes bodies from the world and frees meshes/lists.
     /// Scene meshes are unlinked from the scene first. Call before destroying
     /// the scene and the world.
     pub fn deinit(self: *RaycastVehicle, world: *PhysicsWorld) void {
-        for (self.joints.items) |jid| {
-            if (world.isJointValid(jid)) world.destroyJoint(jid);
-        }
-        self.joints.deinit(self.allocator);
-        for (self.bodies.items) |body| {
-            world.removeBody(body);
-        }
-        self.bodies.deinit(self.allocator);
-        for (self.meshes.items) |mesh| {
-            freeMesh(self.allocator, self.scene, mesh);
-        }
-        self.meshes.deinit(self.allocator);
+        physics_mesh.teardown(
+            self.allocator,
+            world,
+            self.scene,
+            &self.joints,
+            &self.bodies,
+            &self.meshes,
+        );
     }
 };
 
@@ -298,62 +268,6 @@ fn wheelMeshName(index: usize) []const u8 {
         2 => "vehicle_wheel_2",
         else => "vehicle_wheel_3",
     };
-}
-
-fn createBoxMesh(
-    allocator: std.mem.Allocator,
-    scene: ?*Scene,
-    name: []const u8,
-    size: Vec3,
-    pos: Vec3,
-) !*Mesh {
-    if (scene) |sc| {
-        const mesh = try MeshBuilder.createBox(sc, name, .{
-            .width = size.x,
-            .height = size.y,
-            .depth = size.z,
-        });
-        mesh.position = pos;
-        return mesh;
-    }
-    const mesh = try allocator.create(Mesh);
-    mesh.* = .{
-        .name = name,
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = pos,
-        .local_bounding_box = BoundingBox.init(size.scale(-0.5), size.scale(0.5)),
-    };
-    return mesh;
-}
-
-fn createSphereMesh(
-    allocator: std.mem.Allocator,
-    scene: ?*Scene,
-    name: []const u8,
-    diameter: f32,
-    pos: Vec3,
-) !*Mesh {
-    if (scene) |sc| {
-        const mesh = try MeshBuilder.createSphere(sc, name, .{
-            .diameter = diameter,
-            .segments = 18,
-        });
-        mesh.position = pos;
-        return mesh;
-    }
-    const r = diameter * 0.5;
-    const mesh = try allocator.create(Mesh);
-    mesh.* = .{
-        .name = name,
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = pos,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-r, -r, -r), Vec3.new(r, r, r)),
-    };
-    return mesh;
 }
 
 fn isFiniteVec(v: Vec3) bool {

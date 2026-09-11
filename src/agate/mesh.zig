@@ -404,7 +404,7 @@ pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]
         var t = Vec3.new(v.tangent[0], v.tangent[1], v.tangent[2]);
 
         if (t.lengthSq() < 1e-6) {
-            t = if (@abs(n.x) > 0.9) Vec3.new(0, 1, 0) else Vec3.new(1, 0, 0);
+            t = pickOrthogonal(n);
         }
 
         const t_proj = t.sub(n.scale(n.dot(t)));
@@ -442,6 +442,86 @@ const TrigEntry = struct {
     f: f32,
 };
 
+// Thresholds for frame fallbacks: a reference counts as "parallel" when the
+// absolute alignment exceeds this; an axis counts as "clear" when the matching
+// component stays below it.
+const orthogonal_dot_threshold: f32 = 0.9;
+
+// Single revolution entry: f = index / count, angle = f * 2π. Used directly by
+// Disc (one angle per rim vertex, no table needed) and by buildTrigTable.
+inline fn trigEntry(count: u32, index: usize) TrigEntry {
+    const count_f: f32 = @floatFromInt(count);
+    const f = @as(f32, @floatFromInt(index)) / count_f;
+    const a = f * 2.0 * std.math.pi;
+    return .{ .cos = @cos(a), .sin = @sin(a), .f = f };
+}
+
+// One shared revolution table (count + 1 entries) for the builders that
+// revolve a profile around an axis or sweep a ring along a path: Torus
+// (single table reused for ring and tube), TorusKnot, Lathe, Tube, Sphere,
+// Cylinder, Capsule.
+fn buildTrigTable(allocator: std.mem.Allocator, tessellation: u32) ![]TrigEntry {
+    const tab = try allocator.alloc(TrigEntry, tessellation + 1);
+    for (0..tessellation + 1) |j| tab[j] = trigEntry(tessellation, j);
+    return tab;
+}
+
+// Standard grid quad (a, b, c) + (a, c, d) with
+// a = row * stride + col, b = a + 1, c = (row + 1) * stride + col + 1,
+// d = (row + 1) * stride + col. Accepts both []u16 and []u32 slices.
+inline fn storeQuad(indices: anytype, ii: usize, a: u32, b: u32, c: u32, d: u32) void {
+    indices[ii + 0] = @intCast(a);
+    indices[ii + 1] = @intCast(b);
+    indices[ii + 2] = @intCast(c);
+    indices[ii + 3] = @intCast(a);
+    indices[ii + 4] = @intCast(c);
+    indices[ii + 5] = @intCast(d);
+}
+
+// Flipped grid quad (a, c, b) + (a, d, c): the Ground/Terrain winding for the
+// +Y normal. Same slice polymorphism as storeQuad.
+inline fn storeQuadFlipped(indices: anytype, ii: usize, a: u32, b: u32, c: u32, d: u32) void {
+    indices[ii + 0] = @intCast(a);
+    indices[ii + 1] = @intCast(c);
+    indices[ii + 2] = @intCast(b);
+    indices[ii + 3] = @intCast(a);
+    indices[ii + 4] = @intCast(d);
+    indices[ii + 5] = @intCast(c);
+}
+
+inline fn appendGridQuad(indices: anytype, ii: usize, stride: usize, row: usize, col: usize) void {
+    const s: u32 = @intCast(stride);
+    const r: u32 = @intCast(row);
+    const c: u32 = @intCast(col);
+    storeQuad(indices, ii, r * s + c, r * s + c + 1, (r + 1) * s + c + 1, (r + 1) * s + c);
+}
+
+inline fn appendGridQuadFlipped(indices: anytype, ii: usize, stride: usize, row: usize, col: usize) void {
+    const s: u32 = @intCast(stride);
+    const r: u32 = @intCast(row);
+    const c: u32 = @intCast(col);
+    storeQuadFlipped(indices, ii, r * s + c, r * s + c + 1, (r + 1) * s + c + 1, (r + 1) * s + c);
+}
+
+// Fallback axis when a normal is degenerate: up when the normal is near ±X,
+// right otherwise. Replaces the duplicated inline conditional in
+// computeTangents and Ribbon.
+inline fn pickOrthogonal(n: Vec3) Vec3 {
+    return if (@abs(n.x) > orthogonal_dot_threshold) Vec3.up else Vec3.right;
+}
+
+// Seed reference for parallel-transport frames: the hint unless it is
+// degenerate or near-parallel to the first tangent, in which case the first
+// clear world axis wins. Shared by parallelTransportFrames and TorusKnot.
+inline fn resolveFrameSeed(tangent: Vec3, hint: Vec3) Vec3 {
+    var ref = hint;
+    if (ref.lengthSq() < 1e-12) ref = Vec3.up;
+    if (@abs(tangent.dot(ref)) > orthogonal_dot_threshold) {
+        ref = if (@abs(tangent.x) < orthogonal_dot_threshold) Vec3.right else Vec3.forward;
+    }
+    return ref;
+}
+
 fn buildTorusData(allocator: std.mem.Allocator, options: TorusOptions) !GeometryData {
     const tess = @max(3, options.tessellation);
     const ring_radius = @max(0.0, options.diameter) * 0.5;
@@ -454,22 +534,12 @@ fn buildTorusData(allocator: std.mem.Allocator, options: TorusOptions) !Geometry
     const indices = try allocator.alloc(u32, tess * tess * 6);
     errdefer allocator.free(indices);
 
-    const pi = std.math.pi;
-    const tess_f: f32 = @floatFromInt(tess);
-    const ring_tab = try allocator.alloc(TrigEntry, side);
-    defer allocator.free(ring_tab);
-    for (0..side) |j| {
-        const u = @as(f32, @floatFromInt(j)) / tess_f;
-        const a = u * 2.0 * pi;
-        ring_tab[j] = .{ .cos = @cos(a), .sin = @sin(a), .f = u };
-    }
-    const tube_tab = try allocator.alloc(TrigEntry, side);
-    defer allocator.free(tube_tab);
-    for (0..side) |i| {
-        const v = @as(f32, @floatFromInt(i)) / tess_f;
-        const a = v * 2.0 * pi;
-        tube_tab[i] = .{ .cos = @cos(a), .sin = @sin(a), .f = v };
-    }
+    // One shared table: ring and tube use the same tessellation, so a single
+    // buildTrigTable call feeds both loops (was two identical allocations).
+    const trig = try buildTrigTable(allocator, tess);
+    defer allocator.free(trig);
+    const ring_tab = trig;
+    const tube_tab = trig;
 
     var vi: usize = 0;
     for (0..side) |j| {
@@ -494,16 +564,7 @@ fn buildTorusData(allocator: std.mem.Allocator, options: TorusOptions) !Geometry
     var ii: usize = 0;
     for (0..tess) |j| {
         for (0..tess) |i| {
-            const a: u32 = @intCast(j * side + i);
-            const b: u32 = @intCast(j * side + (i + 1));
-            const c: u32 = @intCast((j + 1) * side + (i + 1));
-            const d: u32 = @intCast((j + 1) * side + i);
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            appendGridQuad(indices, ii, side, j, i);
             ii += 6;
         }
     }
@@ -574,8 +635,7 @@ fn buildTorusKnotData(allocator: std.mem.Allocator, options: TorusKnotOptions) !
     }
 
     // Parallel-transport frames keep the tube twist-free along the knot.
-    var ref = Vec3.up;
-    if (@abs(frames[0].tangent.dot(ref)) > 0.9) ref = Vec3.right;
+    const ref = resolveFrameSeed(frames[0].tangent, Vec3.up);
     var n0 = ref.sub(frames[0].tangent.scale(frames[0].tangent.dot(ref)));
     if (n0.lengthSq() < 1e-12) n0 = Vec3.forward;
     n0 = n0.normalize();
@@ -594,14 +654,8 @@ fn buildTorusKnotData(allocator: std.mem.Allocator, options: TorusKnotOptions) !
     }
 
     // Each unique tube angle computed once, shared by all rings.
-    const radial_f: f32 = @floatFromInt(radial);
-    const tube_tab = try allocator.alloc(TrigEntry, ring);
+    const tube_tab = try buildTrigTable(allocator, radial);
     defer allocator.free(tube_tab);
-    for (0..ring) |j| {
-        const v = @as(f32, @floatFromInt(j)) / radial_f;
-        const a = v * 2.0 * pi;
-        tube_tab[j] = .{ .cos = @cos(a), .sin = @sin(a), .f = v };
-    }
 
     var min_v = Vec3.new(std.math.inf(f32), std.math.inf(f32), std.math.inf(f32));
     var max_v = Vec3.new(-std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32));
@@ -631,16 +685,7 @@ fn buildTorusKnotData(allocator: std.mem.Allocator, options: TorusKnotOptions) !
     var ii: usize = 0;
     for (0..tubular) |i| {
         for (0..radial) |j| {
-            const a: u32 = @intCast(i * ring + j);
-            const b: u32 = @intCast(i * ring + (j + 1));
-            const c: u32 = @intCast((i + 1) * ring + (j + 1));
-            const d: u32 = @intCast((i + 1) * ring + j);
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            appendGridQuad(indices, ii, ring, i, j);
             ii += 6;
         }
     }
@@ -670,11 +715,10 @@ fn buildDiscData(allocator: std.mem.Allocator, options: DiscOptions) !GeometryDa
         .tangent = .{ 1.0, 0.0, 0.0, 1.0 },
     };
 
-    const pi = std.math.pi;
     for (0..tess + 1) |j| {
-        const theta = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(tess)) * 2.0 * pi;
-        const x = @sin(theta);
-        const z = @cos(theta);
+        const e = trigEntry(tess, j);
+        const x = e.sin;
+        const z = e.cos;
         vertices[1 + j] = .{
             .position = .{ x * radius, 0.0, z * radius },
             .normal = .{ 0.0, 1.0, 0.0 },
@@ -748,16 +792,14 @@ fn buildRibbonData(allocator: std.mem.Allocator, options: RibbonOptions) !Geomet
         const qi = if (close_array) (pi_ + 1) % num_paths else pi_ + 1;
         for (0..col_quads) |ci| {
             const cj = if (close_path) (ci + 1) % count else ci + 1;
-            const a: u32 = @intCast(pi_ * count + ci);
-            const b: u32 = @intCast(pi_ * count + cj);
-            const c: u32 = @intCast(qi * count + cj);
-            const d: u32 = @intCast(qi * count + ci);
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            storeQuad(
+                indices,
+                ii,
+                @intCast(pi_ * count + ci),
+                @intCast(pi_ * count + cj),
+                @intCast(qi * count + cj),
+                @intCast(qi * count + ci),
+            );
             ii += 6;
         }
     }
@@ -795,7 +837,7 @@ fn buildRibbonData(allocator: std.mem.Allocator, options: RibbonOptions) !Geomet
             var t = path[c1].sub(path[c0]);
             t = t.sub(n.scale(n.dot(t)));
             if (t.lengthSq() < 1e-12) {
-                t = if (@abs(n.x) > 0.9) Vec3.new(0, 1, 0) else Vec3.new(1, 0, 0);
+                t = pickOrthogonal(n);
             } else {
                 t = t.normalize();
             }
@@ -840,16 +882,9 @@ fn buildLatheData(allocator: std.mem.Allocator, options: LatheOptions) !Geometry
     const indices = try allocator.alloc(u32, quads * tess * 6);
     errdefer allocator.free(indices);
 
-    const pi = std.math.pi;
     // Each unique revolution angle computed once, shared by all profile rows.
-    const trig = try allocator.alloc(TrigEntry, side);
+    const trig = try buildTrigTable(allocator, tess);
     defer allocator.free(trig);
-    const tess_f: f32 = @floatFromInt(tess);
-    for (0..side) |j| {
-        const f = @as(f32, @floatFromInt(j)) / tess_f;
-        const theta = f * 2.0 * pi;
-        trig[j] = .{ .cos = @cos(theta), .sin = @sin(theta), .f = f };
-    }
     const v_denom: f32 = @floatFromInt(shape.len - 1);
 
     for (shape, 0..) |pt, i| {
@@ -885,16 +920,7 @@ fn buildLatheData(allocator: std.mem.Allocator, options: LatheOptions) !Geometry
     for (0..shape.len - 1) |i| {
         if (@abs(shape[i].x) < eps and @abs(shape[i + 1].x) < eps) continue;
         for (0..tess) |j| {
-            const a: u32 = @intCast(i * side + j);
-            const b: u32 = @intCast(i * side + (j + 1));
-            const c: u32 = @intCast((i + 1) * side + (j + 1));
-            const d: u32 = @intCast((i + 1) * side + j);
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            appendGridQuad(indices, ii, side, i, j);
             ii += 6;
         }
     }
@@ -946,17 +972,8 @@ fn buildPlaneData(allocator: std.mem.Allocator, options: PlaneOptions) !Geometry
     var ii: usize = 0;
     for (0..sy) |iy| {
         for (0..sx) |ix| {
-            const a: u32 = @intCast(iy * cols + ix);
-            const b: u32 = @intCast(iy * cols + (ix + 1));
-            const c: u32 = @intCast((iy + 1) * cols + (ix + 1));
-            const d: u32 = @intCast((iy + 1) * cols + ix);
             // CCW winding for the +Z normal.
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            appendGridQuad(indices, ii, cols, iy, ix);
             ii += 6;
         }
     }
@@ -997,11 +1014,7 @@ fn computePathTangents(points: []const Vec3, closed: bool, out: []Vec3) void {
 // last ring meets the first seamlessly.
 fn parallelTransportFrames(tangents: []const Vec3, closed: bool, up_hint: Vec3, normals: []Vec3, binormals: []Vec3) void {
     const n = tangents.len;
-    var ref = up_hint;
-    if (ref.lengthSq() < 1e-12) ref = Vec3.up;
-    if (@abs(tangents[0].dot(ref)) > 0.9) {
-        ref = if (@abs(tangents[0].x) < 0.9) Vec3.right else Vec3.forward;
-    }
+    const ref = resolveFrameSeed(tangents[0], up_hint);
     var n0 = ref.sub(tangents[0].scale(tangents[0].dot(ref)));
     if (n0.lengthSq() < 1e-12) n0 = Vec3.forward;
     normals[0] = n0.normalize();
@@ -1099,14 +1112,8 @@ fn buildTubeData(allocator: std.mem.Allocator, options: TubeOptions) !GeometryDa
     const total_len = computePathLengths(points, closed, cumulative);
 
     // Each unique ring angle computed once, shared by all rows.
-    const tube_tab = try allocator.alloc(TrigEntry, ring);
+    const tube_tab = try buildTrigTable(allocator, tess);
     defer allocator.free(tube_tab);
-    const tess_f: f32 = @floatFromInt(tess);
-    for (0..ring) |j| {
-        const v = @as(f32, @floatFromInt(j)) / tess_f;
-        const a = v * 2.0 * std.math.pi;
-        tube_tab[j] = .{ .cos = @cos(a), .sin = @sin(a), .f = v };
-    }
 
     const cap_verts = if (capped) 2 * ring + 2 else 0;
     const vertices = try allocator.alloc(Vertex, n * ring + cap_verts);
@@ -1142,16 +1149,14 @@ fn buildTubeData(allocator: std.mem.Allocator, options: TubeOptions) !GeometryDa
     for (0..side_quads) |i| {
         const ni = if (closed) (i + 1) % n else i + 1;
         for (0..tess) |j| {
-            const a: u32 = @intCast(i * ring + j);
-            const b: u32 = @intCast(i * ring + (j + 1));
-            const c: u32 = @intCast(ni * ring + (j + 1));
-            const d: u32 = @intCast(ni * ring + j);
-            indices[ii + 0] = a;
-            indices[ii + 1] = b;
-            indices[ii + 2] = c;
-            indices[ii + 3] = a;
-            indices[ii + 4] = c;
-            indices[ii + 5] = d;
+            storeQuad(
+                indices,
+                ii,
+                @intCast(i * ring + j),
+                @intCast(i * ring + (j + 1)),
+                @intCast(ni * ring + (j + 1)),
+                @intCast(ni * ring + j),
+            );
             ii += 6;
         }
     }
@@ -1488,12 +1493,7 @@ fn buildExtrudeData(allocator: std.mem.Allocator, options: ExtrudeOptions) !Geom
         vertices[vi + 3] = .{ .position = .{ a.x, a.y, depth }, .normal = normal, .color = color, .uv = .{ us, ve }, .tangent = tangent };
         vi += 4;
         // CCW winding for the outward normal.
-        indices[ii + 0] = base + 0;
-        indices[ii + 1] = base + 1;
-        indices[ii + 2] = base + 2;
-        indices[ii + 3] = base + 0;
-        indices[ii + 4] = base + 2;
-        indices[ii + 5] = base + 3;
+        storeQuad(indices, ii, base, base + 1, base + 2, base + 3);
         ii += 6;
     }
 
@@ -1710,13 +1710,8 @@ pub const MeshBuilder = struct {
         var indices: [36]u16 = undefined;
         var ii: usize = 0;
         for (0..6) |face| {
-            const base: u16 = @intCast(face * 4);
-            indices[ii + 0] = base + 0;
-            indices[ii + 1] = base + 1;
-            indices[ii + 2] = base + 2;
-            indices[ii + 3] = base + 0;
-            indices[ii + 4] = base + 2;
-            indices[ii + 5] = base + 3;
+            const base: u32 = @intCast(face * 4);
+            storeQuad(indices[0..], ii, base, base + 1, base + 2, base + 3);
             ii += 6;
         }
 
@@ -1783,18 +1778,8 @@ pub const MeshBuilder = struct {
         const row_stride = subs + 1;
         for (0..subs) |iz| {
             for (0..subs) |ix| {
-                const p0: u16 = @intCast(iz * row_stride + ix);
-                const p1: u16 = @intCast(iz * row_stride + (ix + 1));
-                const p2: u16 = @intCast((iz + 1) * row_stride + (ix + 1));
-                const p3: u16 = @intCast((iz + 1) * row_stride + ix);
-
                 // CCW winding for +Y normal: (p0, p2, p1) and (p0, p3, p2)
-                indices[ii + 0] = p0;
-                indices[ii + 1] = p2;
-                indices[ii + 2] = p1;
-                indices[ii + 3] = p0;
-                indices[ii + 4] = p3;
-                indices[ii + 5] = p2;
+                appendGridQuadFlipped(indices, ii, row_stride, iz, ix);
                 ii += 6;
             }
         }
@@ -1902,18 +1887,8 @@ pub const MeshBuilder = struct {
         const row_stride = count_x;
         for (0..count_z - 1) |row| {
             for (0..count_x - 1) |col| {
-                const p0: u32 = @intCast(row * row_stride + col);
-                const p1: u32 = @intCast(row * row_stride + col + 1);
-                const p2: u32 = @intCast((row + 1) * row_stride + col + 1);
-                const p3: u32 = @intCast((row + 1) * row_stride + col);
-
                 // CCW winding for +Y normal.
-                indices[ii + 0] = p0;
-                indices[ii + 1] = p2;
-                indices[ii + 2] = p1;
-                indices[ii + 3] = p0;
-                indices[ii + 4] = p3;
-                indices[ii + 5] = p2;
+                appendGridQuadFlipped(indices, ii, row_stride, row, col);
                 ii += 6;
             }
         }
@@ -1963,14 +1938,8 @@ pub const MeshBuilder = struct {
         const pi = std.math.pi;
         const color = options.color.toArray();
         // Each unique slice angle computed once, shared by all rings.
-        const slice_tab = try scene.allocator.alloc(TrigEntry, slices + 1);
+        const slice_tab = try buildTrigTable(scene.allocator, slices);
         defer scene.allocator.free(slice_tab);
-        const slices_f: f32 = @floatFromInt(slices);
-        for (0..slices + 1) |s| {
-            const u = @as(f32, @floatFromInt(s)) / slices_f;
-            const theta = 2.0 * pi * u;
-            slice_tab[s] = .{ .cos = @cos(theta), .sin = @sin(theta), .f = u };
-        }
 
         var vi: usize = 0;
         for (0..rings + 1) |r| {
@@ -2003,18 +1972,8 @@ pub const MeshBuilder = struct {
         const slice_stride = slices + 1;
         for (0..rings) |r| {
             for (0..slices) |s| {
-                const p0: u16 = @intCast(r * slice_stride + s);
-                const p1: u16 = @intCast(r * slice_stride + (s + 1));
-                const p2: u16 = @intCast((r + 1) * slice_stride + (s + 1));
-                const p3: u16 = @intCast((r + 1) * slice_stride + s);
-
                 // CCW winding
-                indices[ii + 0] = p0;
-                indices[ii + 1] = p1;
-                indices[ii + 2] = p2;
-                indices[ii + 3] = p0;
-                indices[ii + 4] = p2;
-                indices[ii + 5] = p3;
+                appendGridQuad(indices, ii, slice_stride, r, s);
                 ii += 6;
             }
         }
@@ -2067,17 +2026,10 @@ pub const MeshBuilder = struct {
         const indices = try scene.allocator.alloc(u16, total_indices);
         defer scene.allocator.free(indices);
 
-        const pi = std.math.pi;
         const color = options.color.toArray();
         // One ring table shared by the side and both cap loops.
-        const ring_tab = try scene.allocator.alloc(TrigEntry, tess + 1);
+        const ring_tab = try buildTrigTable(scene.allocator, tess);
         defer scene.allocator.free(ring_tab);
-        const tess_f: f32 = @floatFromInt(tess);
-        for (0..tess + 1) |i| {
-            const u = @as(f32, @floatFromInt(i)) / tess_f;
-            const theta = 2.0 * pi * u;
-            ring_tab[i] = .{ .cos = @cos(theta), .sin = @sin(theta), .f = u };
-        }
         var vi: usize = 0;
 
         // 1. Sides
@@ -2109,17 +2061,12 @@ pub const MeshBuilder = struct {
 
         var ii: usize = 0;
         for (0..tess) |i| {
-            const b0: u16 = @intCast(i * 2);
-            const t0: u16 = @intCast(i * 2 + 1);
-            const b1: u16 = @intCast((i + 1) * 2);
-            const t1: u16 = @intCast((i + 1) * 2 + 1);
+            const b0: u32 = @intCast(i * 2);
+            const t0: u32 = @intCast(i * 2 + 1);
+            const b1: u32 = @intCast((i + 1) * 2);
+            const t1: u32 = @intCast((i + 1) * 2 + 1);
 
-            indices[ii + 0] = b0;
-            indices[ii + 1] = b1;
-            indices[ii + 2] = t1;
-            indices[ii + 3] = b0;
-            indices[ii + 4] = t1;
-            indices[ii + 5] = t0;
+            storeQuad(indices, ii, b0, b1, t1, t0);
             ii += 6;
         }
 
@@ -2239,14 +2186,8 @@ pub const MeshBuilder = struct {
         const pi = std.math.pi;
         const color = options.color.toArray();
         // Each unique slice angle computed once, shared by all rings.
-        const slice_tab = try scene.allocator.alloc(TrigEntry, slices + 1);
+        const slice_tab = try buildTrigTable(scene.allocator, slices);
         defer scene.allocator.free(slice_tab);
-        const slices_f: f32 = @floatFromInt(slices);
-        for (0..slices + 1) |s| {
-            const u = @as(f32, @floatFromInt(s)) / slices_f;
-            const theta = 2.0 * pi * u;
-            slice_tab[s] = .{ .cos = @cos(theta), .sin = @sin(theta), .f = u };
-        }
         var vi: usize = 0;
 
         for (0..total_rings) |r| {
@@ -2294,23 +2235,11 @@ pub const MeshBuilder = struct {
         }
 
         var ii: usize = 0;
-        const slice_stride: u16 = @intCast(slices + 1);
+        const slice_stride: usize = @intCast(slices + 1);
         for (0..quad_rows) |r| {
-            const r_u16: u16 = @intCast(r);
             for (0..slices) |s| {
-                const s_u16: u16 = @intCast(s);
-                const p0 = r_u16 * slice_stride + s_u16;
-                const p1 = r_u16 * slice_stride + (s_u16 + 1);
-                const p2 = (r_u16 + 1) * slice_stride + (s_u16 + 1);
-                const p3 = (r_u16 + 1) * slice_stride + s_u16;
-
                 // CCW winding
-                indices[ii + 0] = p0;
-                indices[ii + 1] = p1;
-                indices[ii + 2] = p2;
-                indices[ii + 3] = p0;
-                indices[ii + 4] = p2;
-                indices[ii + 5] = p3;
+                appendGridQuad(indices, ii, slice_stride, r, s);
                 ii += 6;
             }
         }
@@ -2898,6 +2827,30 @@ test "MeshBuilder extrude concave L-shape geometry" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.bounds.max.z, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), data.bounds.max.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), data.bounds.max.y, 1e-4);
+}
+
+test "grid quad helpers preserve winding" {
+    // stride 4, row 1, col 2: a = 6, b = 7, c = 11, d = 10.
+    var buf: [6]u32 = undefined;
+    appendGridQuad(buf[0..], 0, 4, 1, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 7, 11, 6, 11, 10 }, &buf);
+
+    // Flipped variant matches the Ground/Terrain order (a, c, b) + (a, d, c).
+    var flipped: [6]u32 = undefined;
+    appendGridQuadFlipped(flipped[0..], 0, 4, 1, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 11, 7, 6, 10, 11 }, &flipped);
+
+    // storeQuad narrows to u16 for the Box/Sphere/Capsule paths.
+    var narrow: [6]u16 = undefined;
+    storeQuad(narrow[0..], 0, 4, 5, 6, 7);
+    try std.testing.expectEqualSlices(u16, &.{ 4, 5, 6, 4, 6, 7 }, &narrow);
+
+    // Orthogonal fallback picks the clear axis.
+    try std.testing.expectEqual(Vec3.up, pickOrthogonal(Vec3.new(1, 0, 0)));
+    try std.testing.expectEqual(Vec3.right, pickOrthogonal(Vec3.new(0, 1, 0)));
+    // Seed reference keeps a clear hint and replaces a parallel one.
+    try std.testing.expectEqual(Vec3.up, resolveFrameSeed(Vec3.forward, Vec3.up));
+    try std.testing.expectEqual(Vec3.right, resolveFrameSeed(Vec3.up, Vec3.up));
 }
 
 test "MeshBuilder extrude rejects invalid input" {

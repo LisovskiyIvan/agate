@@ -42,6 +42,11 @@ void main() {
 @end
 
 @fs fs
+// Shadow atlas resolution. Must match ShadowPass.SHADOW_ATLAS_SIZE in
+// passes/shadow_pass.zig (sokol-shdc --defines cannot carry a value).
+#ifndef SHADOW_ATLAS_SIZE
+#define SHADOW_ATLAS_SIZE 2048.0
+#endif
 layout(binding = 1) uniform fs_params {
     vec4 eye_pos;
     vec4 light_dir;
@@ -149,7 +154,7 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
         rot = mat2(0.0, -1.0, 1.0, 0.0);
     }
 
-    float filter_radius = (shadow_params.w / 2048.0) * 0.5;
+    float filter_radius = (shadow_params.w / SHADOW_ATLAS_SIZE) * 0.5;
 
     // Full 16-tap PCF only for the near cascade; far cascades cover huge texels
     // where extra taps cost without visible quality.
