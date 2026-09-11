@@ -19,20 +19,126 @@ pub const AnimationInterpolation = enum {
     cubic_spline,
 };
 
+/// Scalar cubic Hermite basis: interpolates p0 -> p1 over s in [0, 1] with
+/// endpoint slopes m0 (at p0) and m1 (at p1). Callers pre-scale glTF
+/// per-second tangents by the keyframe interval: m = tangent * dt.
+/// Exact on the endpoints: hermite(p0, m0, p1, m1, 0) == p0, (... , 1) == p1.
+fn hermiteScalar(p0: f32, m0: f32, p1: f32, m1: f32, s: f32) f32 {
+    const s2 = s * s;
+    const s3 = s2 * s;
+    return (2.0 * s3 - 3.0 * s2 + 1.0) * p0 +
+        (s3 - 2.0 * s2 + s) * m0 +
+        (-2.0 * s3 + 3.0 * s2) * p1 +
+        (s3 - s2) * m1;
+}
+
+/// A named timestamp marker on an animation timeline. Owned by the group via
+/// setEvents (names are duplicated); the slice passed to setEvents is only
+/// borrowed. Events outside the group's [from, to] range never fire.
+pub const AnimationEvent = struct {
+    time: f32,
+    name: []const u8,
+};
+
 pub const AnimationSampler = struct {
     timestamps: []const f32,
     outputs: []const f32,
     interpolation: AnimationInterpolation = .linear,
+
+    /// Cubic (glTF CUBICSPLINE) layout: outputs hold stride*3 floats per key
+    /// in (in-tangent, value, out-tangent) order, so a valid track needs at
+    /// least keys * stride * 3 floats. Returns the number of keyframes that
+    /// can actually be sampled (timestamps capped by the outputs capacity).
+    /// LINEAR/STEP tracks do not use this helper.
+    fn cubicFrames(self: AnimationSampler, stride: usize) usize {
+        if (self.timestamps.len == 0 or stride == 0) return 0;
+        return @min(self.timestamps.len, self.outputs.len / (stride * 3));
+    }
+
+    fn cubicValue3(self: AnimationSampler, key: usize) Vec3 {
+        const base = (key * 3 + 1) * 3;
+        return Vec3.new(self.outputs[base], self.outputs[base + 1], self.outputs[base + 2]);
+    }
+
+    fn cubicQuatValue(self: AnimationSampler, key: usize) Quat {
+        const base = (key * 3 + 1) * 4;
+        return (Quat{
+            .x = self.outputs[base],
+            .y = self.outputs[base + 1],
+            .z = self.outputs[base + 2],
+            .w = self.outputs[base + 3],
+        }).normalize();
+    }
+
+    /// True cubic-spline (Hermite) evaluation for a vec3 track. Tangents are
+    /// per-second slopes scaled by the keyframe interval dt, per the glTF
+    /// spec. Easing is ignored here on purpose: the Hermite curve already
+    /// defines the intra-keyframe shape, easing only warps the LINEAR/STEP
+    /// factor. Short/truncated buffers never crash: sampling degrades to the
+    /// closest usable keyframe value (or zero when nothing is usable).
+    fn sampleVec3Cubic(self: AnimationSampler, time: f32) Vec3 {
+        const usable = self.cubicFrames(3);
+        if (usable == 0) return Vec3.zero;
+        if (usable == 1 or time <= self.timestamps[0]) return self.cubicValue3(0);
+        if (time >= self.timestamps[usable - 1]) return self.cubicValue3(usable - 1);
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= usable - 1) idx = usable - 2;
+        const t0 = self.timestamps[idx];
+        const t1 = self.timestamps[idx + 1];
+        const dt = t1 - t0;
+        if (dt <= 0.0) return self.cubicValue3(idx);
+        const s = std.math.clamp((time - t0) / dt, 0.0, 1.0);
+        const k0 = idx * 9;
+        const k1 = (idx + 1) * 9;
+        return Vec3.new(
+            hermiteScalar(self.outputs[k0 + 3], self.outputs[k0 + 6] * dt, self.outputs[k1 + 3], self.outputs[k1] * dt, s),
+            hermiteScalar(self.outputs[k0 + 4], self.outputs[k0 + 7] * dt, self.outputs[k1 + 4], self.outputs[k1 + 1] * dt, s),
+            hermiteScalar(self.outputs[k0 + 5], self.outputs[k0 + 8] * dt, self.outputs[k1 + 5], self.outputs[k1 + 2] * dt, s),
+        );
+    }
+
+    /// Quaternion cubic-spline: component-wise Hermite on the vec4 track,
+    /// then normalized (glTF-correct). Antipodal keyframes (dot < 0) take the
+    /// short path by negating the next value and its in-tangent together,
+    /// which preserves the derivative direction.
+    fn sampleQuatCubic(self: AnimationSampler, time: f32) Quat {
+        const usable = self.cubicFrames(4);
+        if (usable == 0) return Quat.identity;
+        if (usable == 1 or time <= self.timestamps[0]) return self.cubicQuatValue(0);
+        if (time >= self.timestamps[usable - 1]) return self.cubicQuatValue(usable - 1);
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= usable - 1) idx = usable - 2;
+        const t0 = self.timestamps[idx];
+        const t1 = self.timestamps[idx + 1];
+        const dt = t1 - t0;
+        if (dt <= 0.0) return self.cubicQuatValue(idx);
+        const s = std.math.clamp((time - t0) / dt, 0.0, 1.0);
+        const k0 = idx * 12;
+        const k1 = (idx + 1) * 12;
+        const dot = self.outputs[k0 + 4] * self.outputs[k1 + 4] +
+            self.outputs[k0 + 5] * self.outputs[k1 + 5] +
+            self.outputs[k0 + 6] * self.outputs[k1 + 6] +
+            self.outputs[k0 + 7] * self.outputs[k1 + 7];
+        const flip: f32 = if (dot < 0.0) -1.0 else 1.0;
+        return (Quat{
+            .x = hermiteScalar(self.outputs[k0 + 4], self.outputs[k0 + 8] * dt, flip * self.outputs[k1 + 4], flip * self.outputs[k1] * dt, s),
+            .y = hermiteScalar(self.outputs[k0 + 5], self.outputs[k0 + 9] * dt, flip * self.outputs[k1 + 5], flip * self.outputs[k1 + 1] * dt, s),
+            .z = hermiteScalar(self.outputs[k0 + 6], self.outputs[k0 + 10] * dt, flip * self.outputs[k1 + 6], flip * self.outputs[k1 + 2] * dt, s),
+            .w = hermiteScalar(self.outputs[k0 + 7], self.outputs[k0 + 11] * dt, flip * self.outputs[k1 + 7], flip * self.outputs[k1 + 3] * dt, s),
+        }).normalize();
+    }
 
     pub fn sampleVec3(self: AnimationSampler, time: f32) Vec3 {
         return self.sampleVec3Eased(time, .linear);
     }
 
     /// Samples a vec3 track, warping the intra-keyframe factor with an easing
-    /// curve. STEP ignores easing. CUBICSPLINE has no tangent support here and
-    /// falls back to (eased) linear interpolation; it never crashes.
+    /// curve. STEP ignores easing. CUBICSPLINE evaluates the true Hermite
+    /// spline (easing intentionally ignored: it only warps the linear
+    /// factor, never the Hermite shape).
     pub fn sampleVec3Eased(self: AnimationSampler, time: f32, easing: EasingType) Vec3 {
         if (self.timestamps.len == 0) return Vec3.zero;
+        if (self.interpolation == .cubic_spline) return self.sampleVec3Cubic(time);
         if (time <= self.timestamps[0]) {
             return Vec3.new(self.outputs[0], self.outputs[1], self.outputs[2]);
         }
@@ -63,9 +169,11 @@ pub const AnimationSampler = struct {
     }
 
     /// Quaternion variant of sampleVec3Eased: slerp factor is eased, STEP
-    /// ignores easing, CUBICSPLINE falls back to (eased) linear blending.
+    /// ignores easing, CUBICSPLINE evaluates component-wise Hermite plus
+    /// normalize (easing ignored, same rule as for vec3).
     pub fn sampleQuatEased(self: AnimationSampler, time: f32, easing: EasingType) Quat {
         if (self.timestamps.len == 0) return Quat.identity;
+        if (self.interpolation == .cubic_spline) return self.sampleQuatCubic(time);
         if (time <= self.timestamps[0]) {
             const q = Quat{
                 .x = self.outputs[0],
@@ -115,11 +223,16 @@ pub const AnimationSampler = struct {
 
     /// Samples a weights (morph) track with out.len values per keyframe.
     /// Per-component mirror of sampleVec3Eased: STEP holds the keyframe,
-    /// other modes lerp with the eased factor; CUBICSPLINE falls back to
-    /// (eased) linear. Undersized outputs or missing keys leave out untouched.
+    /// LINEAR lerps with the eased factor, CUBICSPLINE runs Hermite per
+    /// target (easing ignored). Undersized outputs or missing keys leave out
+    /// untouched; truncated cubic buffers clamp to the closest usable value.
     pub fn sampleWeightsInto(self: AnimationSampler, time: f32, out: []f32, easing: EasingType) void {
         const n = out.len;
         if (n == 0 or self.timestamps.len == 0) return;
+        if (self.interpolation == .cubic_spline) {
+            self.sampleWeightsCubic(time, out);
+            return;
+        }
         const frames = self.outputs.len / n;
         if (frames == 0) return;
         const keys = @min(self.timestamps.len, frames);
@@ -151,7 +264,47 @@ pub const AnimationSampler = struct {
         }
     }
 
+    /// Per-target Hermite mirror of sampleVec3Cubic: each keyframe holds
+    /// (in-tangent, value, out-tangent) per morph target, i.e. 3*n floats.
+    fn sampleWeightsCubic(self: AnimationSampler, time: f32, out: []f32) void {
+        const n = out.len;
+        const usable = self.cubicFrames(n);
+        if (usable == 0) return;
+        if (usable == 1 or time <= self.timestamps[0]) {
+            @memcpy(out, self.outputs[n .. n + n]);
+            return;
+        }
+        if (time >= self.timestamps[usable - 1]) {
+            const base = ((usable - 1) * 3 + 1) * n;
+            @memcpy(out, self.outputs[base .. base + n]);
+            return;
+        }
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= usable - 1) idx = usable - 2;
+        const t0 = self.timestamps[idx];
+        const t1 = self.timestamps[idx + 1];
+        const dt = t1 - t0;
+        if (dt <= 0.0) {
+            const base = (idx * 3 + 1) * n;
+            @memcpy(out, self.outputs[base .. base + n]);
+            return;
+        }
+        const s = std.math.clamp((time - t0) / dt, 0.0, 1.0);
+        const k0 = idx * n * 3;
+        const k1 = (idx + 1) * n * 3;
+        for (0..n) |j| {
+            out[j] = hermiteScalar(
+                self.outputs[k0 + n + j],
+                self.outputs[k0 + 2 * n + j] * dt,
+                self.outputs[k1 + n + j],
+                self.outputs[k1 + j] * dt,
+                s,
+            );
+        }
+    }
+
     fn findKeyframeIndex(self: AnimationSampler, time: f32) usize {
+        if (self.timestamps.len < 2) return 0;
         var low: usize = 0;
         var high: usize = self.timestamps.len - 1;
         while (low < high - 1) {
@@ -219,8 +372,9 @@ pub const MorphWeightsTarget = struct {
 /// Guards sampler reads: true when timestamps exist and outputs holds at
 /// least one full frame per keyframe for the given path. For weights a frame
 /// is weight_count values (the bound mesh's morph target count), not 1.
-/// Invalid channels are skipped by the node applier instead of crashing on
-/// out-of-bounds access.
+/// CUBICSPLINE tracks store (in-tangent, value, out-tangent) per key, so they
+/// need 3x the floats. Invalid channels are skipped by the node applier
+/// instead of crashing on out-of-bounds access.
 fn samplerHasFrames(sampler: AnimationSampler, path: AnimationPath, weight_count: usize) bool {
     if (sampler.timestamps.len == 0) return false;
     const stride: usize = switch (path) {
@@ -228,7 +382,8 @@ fn samplerHasFrames(sampler: AnimationSampler, path: AnimationPath, weight_count
         .rotation => 4,
         .weights => @max(weight_count, 1),
     };
-    return sampler.outputs.len >= sampler.timestamps.len * stride;
+    const mult: usize = if (sampler.interpolation == .cubic_spline) 3 else 1;
+    return sampler.outputs.len >= sampler.timestamps.len * stride * mult;
 }
 
 pub const AnimationGroup = struct {
@@ -257,6 +412,25 @@ pub const AnimationGroup = struct {
     is_additive: bool = false,
     is_playing: bool = false,
     loop: bool = true,
+
+    /// Timeline event markers (owned: setEvents duplicates every name).
+    /// Fired only by update() when playback time advances past an event;
+    /// seeks (goToFrame/applyAtTime), stop() and fade-out completion never
+    /// fire. Forward playback fires events in (prev, curr], wrapping around
+    /// the loop as (prev, to] + [from, curr]; backward playback mirrors it
+    /// as [curr, prev) and [from, prev) + (curr, to]. A single update that
+    /// spans the whole range fires each in-range event exactly once.
+    events: []AnimationEvent = &.{},
+    /// Snapshot of the names fired by the most recent update() that advanced
+    /// time. Borrowed views into events names; read via drainFiredEvents().
+    /// Capacity always equals events.len (each event fires at most once per
+    /// update), so update() itself never allocates.
+    fired_names: [][]const u8 = &.{},
+    fired_len: usize = 0,
+    /// Optional synchronous callback invoked once per fired event, after the
+    /// pose for the new time has been applied.
+    on_event: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    event_context: ?*anyopaque = null,
 
     // Weight transition / Cross-fading
     fade_start_weight: f32 = 1.0,
@@ -294,10 +468,115 @@ pub const AnimationGroup = struct {
             if (mt.rest_weights.len > 0) self.allocator.free(mt.rest_weights);
         }
         if (self.morph_targets.len > 0) self.allocator.free(self.morph_targets);
+        for (self.events) |ev| {
+            if (ev.name.len > 0) self.allocator.free(ev.name);
+        }
+        if (self.events.len > 0) self.allocator.free(self.events);
+        if (self.fired_names.len > 0) self.allocator.free(self.fired_names);
         if (self.name.len > 0) {
             self.allocator.free(self.name);
         }
         self.allocator.destroy(self);
+    }
+
+    /// Replaces the group's timeline events. The input slice is borrowed:
+    /// every name is duplicated with the given allocator (normally the
+    /// group's own allocator) and owned by the group afterwards. Any
+    /// previously fired-but-undrained snapshot is discarded.
+    pub fn setEvents(self: *AnimationGroup, allocator: std.mem.Allocator, events: []const AnimationEvent) !void {
+        const new_events = try allocator.alloc(AnimationEvent, events.len);
+        var done: usize = 0;
+        errdefer {
+            for (new_events[0..done]) |ev| {
+                if (ev.name.len > 0) allocator.free(ev.name);
+            }
+            if (new_events.len > 0) allocator.free(new_events);
+        }
+        for (events, 0..) |ev, i| {
+            new_events[i] = .{ .time = ev.time, .name = try allocator.dupe(u8, ev.name) };
+            done += 1;
+        }
+        const new_fired = try allocator.alloc([]const u8, events.len);
+        errdefer {
+            if (new_fired.len > 0) allocator.free(new_fired);
+        }
+
+        for (self.events) |ev| {
+            if (ev.name.len > 0) self.allocator.free(ev.name);
+        }
+        if (self.events.len > 0) self.allocator.free(self.events);
+        if (self.fired_names.len > 0) self.allocator.free(self.fired_names);
+        self.events = new_events;
+        self.fired_names = new_fired;
+        self.fired_len = 0;
+    }
+
+    /// Returns the event names fired by the most recent update() that
+    /// advanced time, then clears the queue (a second call without an
+    /// intervening firing update returns an empty slice). The slice is only
+    /// valid until the next update()/setEvents()/deinit().
+    pub fn drainFiredEvents(self: *AnimationGroup) []const []const u8 {
+        defer self.fired_len = 0;
+        return self.fired_names[0..self.fired_len];
+    }
+
+    fn pushFired(self: *AnimationGroup, name: []const u8) void {
+        if (self.fired_len < self.fired_names.len) {
+            self.fired_names[self.fired_len] = name;
+            self.fired_len += 1;
+        }
+    }
+
+    /// Fires in-range events with the given endpoint inclusivity. Events
+    /// outside the group's [from, to] range never fire. Each matching event
+    /// fires at most once per call (the caller splits wraparound windows).
+    fn fireInRange(self: *AnimationGroup, lo: f32, hi: f32, lo_inclusive: bool, hi_inclusive: bool) void {
+        for (self.events) |ev| {
+            if (ev.time < self.from or ev.time > self.to) continue;
+            const ok_lo = if (lo_inclusive) ev.time >= lo else ev.time > lo;
+            const ok_hi = if (hi_inclusive) ev.time <= hi else ev.time < hi;
+            if (ok_lo and ok_hi) self.pushFired(ev.name);
+        }
+    }
+
+    /// Collects the events crossed when advancing from prev_time by advance
+    /// seconds into self.current_time (already wrapped/clamped by update()).
+    /// Resets the fired snapshot first, so it always reflects this update.
+    fn collectEvents(self: *AnimationGroup, prev_time: f32, advance: f32) void {
+        self.fired_len = 0;
+        if (self.events.len == 0 or advance == 0.0) return;
+        const range = self.to - self.from; // > 0, checked by update()
+        if (self.speed_ratio >= 0.0) {
+            if (advance >= range) {
+                self.fireInRange(self.from, self.to, true, true);
+                return;
+            }
+            const curr = self.current_time;
+            if (curr >= prev_time) {
+                self.fireInRange(prev_time, curr, false, true);
+            } else {
+                self.fireInRange(prev_time, self.to, false, true);
+                self.fireInRange(self.from, curr, true, true);
+            }
+        } else {
+            if (-advance >= range) {
+                self.fireInRange(self.from, self.to, true, true);
+                return;
+            }
+            const curr = self.current_time;
+            if (curr <= prev_time) {
+                self.fireInRange(curr, prev_time, true, false);
+            } else {
+                self.fireInRange(self.from, prev_time, true, false);
+                self.fireInRange(curr, self.to, false, true);
+            }
+        }
+    }
+
+    fn fireEventCallbacks(self: *AnimationGroup) void {
+        if (self.on_event) |cb| {
+            for (self.fired_names[0..self.fired_len]) |nm| cb(self.event_context, nm);
+        }
     }
 
     pub fn play(self: *AnimationGroup, loop: bool) void {
@@ -306,6 +585,7 @@ pub const AnimationGroup = struct {
         self.loop = loop;
         self.is_playing = true;
         self.fade_duration = 0.0;
+        self.fired_len = 0;
     }
 
     pub fn playRange(self: *AnimationGroup, from: f32, to: f32, loop: bool, speed: ?f32) void {
@@ -314,6 +594,7 @@ pub const AnimationGroup = struct {
         if (self.to <= self.from) self.to = self.duration;
         self.loop = loop;
         self.fade_duration = 0.0;
+        self.fired_len = 0;
         if (speed) |s| self.speed_ratio = s;
         if (self.speed_ratio >= 0.0) {
             if (self.current_time < self.from or self.current_time > self.to) {
@@ -381,6 +662,7 @@ pub const AnimationGroup = struct {
         self.is_playing = false;
         self.current_time = self.from;
         self.fade_duration = 0.0;
+        self.fired_len = 0;
         if (self.skeleton) |skel| {
             skel.resetToBindPose();
         }
@@ -390,6 +672,8 @@ pub const AnimationGroup = struct {
 
     pub fn goToFrame(self: *AnimationGroup, time: f32) void {
         self.current_time = std.math.clamp(time, self.from, self.to);
+        // A seek never fires events; it also discards any pending snapshot.
+        self.fired_len = 0;
         self.applyAtTime(self.current_time);
     }
 
@@ -422,7 +706,9 @@ pub const AnimationGroup = struct {
             return;
         }
 
-        self.current_time += dt * self.speed_ratio;
+        const prev_time = self.current_time;
+        const advance = dt * self.speed_ratio;
+        self.current_time += advance;
 
         if (self.speed_ratio >= 0.0) {
             if (self.current_time > self.to) {
@@ -444,7 +730,9 @@ pub const AnimationGroup = struct {
             }
         }
 
+        self.collectEvents(prev_time, advance);
         self.applyNodesAtTime(self.current_time);
+        self.fireEventCallbacks();
     }
 
     /// Binds a mesh transform to this group and snapshots its current TRS as
@@ -1355,4 +1643,327 @@ test "Morph weights channel with truncated outputs is skipped" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), weights[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), weights[1], 1e-6);
     try std.testing.expect(!dirty);
+}
+
+// Cubic-spline (Hermite) tests. Per-key layout everywhere below:
+// (in-tangent, value, out-tangent); tangents are per-second slopes.
+
+test "Cubic spline vec3 hits keyframe values exactly and clamps" {
+    const times = [_]f32{ 0.0, 1.0 };
+    // k0: in=(100,0,0) value=(0,0,0) out=(0,0,0);
+    // k1: in=(0,0,0) value=(1,2,3) out=(200,0,0).
+    const values = [_]f32{
+        100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   0.0, 0.0,
+        0.0,   0.0, 0.0, 1.0, 2.0, 3.0, 200.0, 0.0, 0.0,
+    };
+    const sampler = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &values,
+        .interpolation = .cubic_spline,
+    };
+
+    const v0 = sampler.sampleVec3(0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.z, 1e-6);
+
+    const v1 = sampler.sampleVec3(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v1.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), v1.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), v1.z, 1e-6);
+
+    // Zero tangents on both sides of the segment -> smoothstep midpoint.
+    const mid = sampler.sampleVec3(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mid.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mid.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), mid.z, 1e-5);
+
+    const clo = sampler.sampleVec3(-5.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), clo.x, 1e-6);
+    const chi = sampler.sampleVec3(99.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), chi.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), chi.z, 1e-6);
+}
+
+test "Cubic spline midpoint follows Hermite basis with dt-scaled tangents" {
+    const times = [_]f32{ 0.0, 2.0 };
+    // x: p0=0, out0=3 (m0 = 3*dt = 6), p1=1, in1=0. At s=0.5:
+    // 0.5*0 + 0.125*6 + 0.5*1 - 0.125*0 = 1.25, well above linear 0.5.
+    // (Without the dt scaling the answer would be 0.875, not 1.25.)
+    const values = [_]f32{
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    };
+    const sampler = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &values,
+        .interpolation = .cubic_spline,
+    };
+    const mid = sampler.sampleVec3(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), mid.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mid.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mid.z, 1e-6);
+}
+
+test "Cubic spline rotation is normalized and smooth" {
+    const q0 = Quat.identity;
+    const q1 = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+    const times = [_]f32{ 0.0, 1.0 };
+    const values = [_]f32{
+        0.0, 0.0, 0.0, 0.0, q0.x, q0.y, q0.z, q0.w, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, q1.x, q1.y, q1.z, q1.w, 0.0, 0.0, 0.0, 0.0,
+    };
+    const sampler = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &values,
+        .interpolation = .cubic_spline,
+    };
+
+    const start = sampler.sampleQuat(0.0);
+    const dot0 = start.x * q0.x + start.y * q0.y + start.z * q0.z + start.w * q0.w;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), @abs(dot0), 1e-5);
+
+    const end = sampler.sampleQuat(1.0);
+    const dot1 = end.x * q1.x + end.y * q1.y + end.z * q1.z + end.w * q1.w;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), @abs(dot1), 1e-5);
+
+    // Zero tangents: midpoint is normalize((q0+q1)/2), a ~45 deg Y turn.
+    const mid = sampler.sampleQuat(0.5);
+    const len_sq = mid.x * mid.x + mid.y * mid.y + mid.z * mid.z + mid.w * mid.w;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), len_sq, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 45.0), mid.toEulerDeg().y, 0.5);
+}
+
+test "Cubic spline morph weights interpolate per target" {
+    const allocator = std.testing.allocator;
+    var weights = [_]f32{ 0.0, 0.0 };
+    var dirty = false;
+
+    const times = try allocator.alloc(f32, 2);
+    times[0] = 0.0;
+    times[1] = 1.0;
+    // n=2: k0 in=[9,9] val=[0,0] out=[3,0]; k1 in=[0,0] val=[1,0.5] out=[9,9].
+    const outputs = try allocator.alloc(f32, 12);
+    outputs[0] = 9.0;
+    outputs[1] = 9.0;
+    outputs[2] = 0.0;
+    outputs[3] = 0.0;
+    outputs[4] = 3.0;
+    outputs[5] = 0.0;
+    outputs[6] = 0.0;
+    outputs[7] = 0.0;
+    outputs[8] = 1.0;
+    outputs[9] = 0.5;
+    outputs[10] = 9.0;
+    outputs[11] = 9.0;
+
+    const ag = try makeNodeGroup(allocator, "morph_cubic", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindMorphTarget(&weights, &dirty);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .weights,
+        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .cubic_spline },
+    });
+
+    ag.play(true);
+    ag.goToFrame(0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weights[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weights[1], 1e-6);
+
+    ag.goToFrame(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), weights[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weights[1], 1e-6);
+
+    // Target 0: 0.5*0 + 0.125*3 + 0.5*1 = 0.875; target 1: 0.5*0.5 = 0.25.
+    ag.goToFrame(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.875), weights[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), weights[1], 1e-5);
+    try std.testing.expect(dirty);
+}
+
+test "Truncated cubic sampler never crashes and degrades gracefully" {
+    const allocator = std.testing.allocator;
+    const times = [_]f32{ 0.0, 1.0 };
+    const tiny = [_]f32{ 1.0, 2.0, 3.0 };
+    const bad = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &tiny,
+        .interpolation = .cubic_spline,
+    };
+    // Zero usable frames: vec3 degrades to zero, quat to identity.
+    const v = bad.sampleVec3(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v.x, 1e-6);
+    const q = bad.sampleQuat(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), q.w, 1e-6);
+    var w = [_]f32{ 0.7, 0.8 };
+    bad.sampleWeightsInto(0.5, &w, .linear);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), w[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), w[1], 1e-6);
+
+    // Exactly one usable frame: every sample clamps to that key's value.
+    const one = [_]f32{ 9.0, 9.0, 9.0, 4.0, 5.0, 6.0, 9.0, 9.0, 9.0 };
+    const single = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &one,
+        .interpolation = .cubic_spline,
+    };
+    const sv = single.sampleVec3(0.75);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), sv.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), sv.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), sv.z, 1e-6);
+
+    // Group path: truncated cubic channels are skipped, never applied.
+    var node = TestNode{ .position = Vec3.new(1.0, 2.0, 3.0) };
+    const bad_times = try allocator.alloc(f32, 2);
+    bad_times[0] = 0.0;
+    bad_times[1] = 1.0;
+    const bad_out = try allocator.alloc(f32, 3);
+    bad_out[0] = 42.0;
+    bad_out[1] = 42.0;
+    bad_out[2] = 42.0;
+    const ag = try makeNodeGroup(allocator, "cubic_guard", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = bad_times, .outputs = bad_out, .interpolation = .cubic_spline },
+    });
+    ag.play(true);
+    ag.goToFrame(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), node.position.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), node.position.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), node.position.z, 1e-6);
+}
+
+// Event tests: counts callback invocations alongside drainFiredEvents().
+const EventCounter = struct {
+    count: usize = 0,
+    last_name: []const u8 = "",
+    fn handler(ctx: ?*anyopaque, name: []const u8) void {
+        const self: *EventCounter = @ptrCast(@alignCast(ctx.?));
+        self.count += 1;
+        self.last_name = name;
+    }
+};
+
+test "Animation events fire once on crossing and drain clears" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "ev_once", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{.{ .time = 1.0, .name = "hit" }});
+    var counter = EventCounter{};
+    ag.on_event = &EventCounter.handler;
+    ag.event_context = &counter;
+
+    ag.play(false);
+    ag.update(0.6); // t = 0.6, no crossing
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+
+    ag.update(0.6); // t = 1.2, crosses 1.0 exactly once
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqualStrings("hit", counter.last_name);
+    const fired = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 1), fired.len);
+    try std.testing.expectEqualStrings("hit", fired[0]);
+
+    // Draining clears: a second drain is empty, and later updates refire nothing.
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+    ag.update(0.5); // t = 1.7, no new crossing
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+}
+
+test "Animation events fire across a loop wraparound" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "ev_loop", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{
+        .{ .time = 0.25, .name = "wrapped" },
+        .{ .time = 1.5, .name = "end" },
+        .{ .time = 0.0, .name = "start" },
+    });
+
+    ag.play(true);
+    ag.update(1.0); // t = 1.0, crosses nothing
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+
+    ag.update(1.0); // t = 2.0, window (1, 2] fires "end"
+    const f1 = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 1), f1.len);
+    try std.testing.expectEqualStrings("end", f1[0]);
+
+    // Wraps to t = 1.0: windows (2, 2] (empty) + [0, 1] fire "wrapped" and
+    // the zero-boundary "start", each exactly once, in stored order.
+    ag.update(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), ag.current_time, 1e-4);
+    const f2 = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 2), f2.len);
+    try std.testing.expectEqualStrings("wrapped", f2[0]);
+    try std.testing.expectEqualStrings("start", f2[1]);
+}
+
+test "Animation events fire when playing backward" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "ev_back", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{.{ .time = 1.0, .name = "hit" }});
+
+    ag.play(true);
+    ag.setSpeed(-1.0);
+    ag.goToFrame(1.5); // seek: must not fire
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+
+    ag.update(1.0); // t = 0.5, window [0.5, 1.5) fires "hit" once
+    const f1 = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 1), f1.len);
+    try std.testing.expectEqualStrings("hit", f1[0]);
+
+    // Wraps to t = 1.5: windows [0, 0.5) + (1.5, 2] miss 1.0, no refire.
+    ag.update(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), ag.current_time, 1e-4);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+}
+
+test "Animation events fire on the duration boundary" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "ev_edge", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{.{ .time = 2.0, .name = "end" }});
+
+    ag.play(false);
+    ag.update(2.5); // overshoots to == 2.0, non-loop stops and still fires
+    try std.testing.expect(!ag.is_playing);
+    const f1 = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 1), f1.len);
+    try std.testing.expectEqualStrings("end", f1[0]);
+
+    ag.update(1.0); // stopped: nothing may fire afterwards
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+}
+
+test "stop and fade-out never fire events" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "ev_nofire", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{
+        .{ .time = 0.5, .name = "early" },
+        .{ .time = 1.0, .name = "late" },
+    });
+
+    ag.play(true);
+    ag.update(0.4); // t = 0.4, no crossing yet
+    ag.stop(); // must not fire and must drop the pending snapshot
+    try std.testing.expect(!ag.is_playing);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+
+    // A fade-out that completes inside this update stops playback via the
+    // early-return path: time would cross both events, but none may fire.
+    ag.play(true);
+    ag.fadeOut(0.5);
+    ag.update(1.5);
+    try std.testing.expect(!ag.is_playing);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
 }

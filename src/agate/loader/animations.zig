@@ -150,8 +150,12 @@ pub fn loadAnimations(
                 const output_acc: *const c.cgltf_accessor = @ptrCast(samp_ptr.output);
                 const key_count: usize = input_acc.count;
                 if (key_count == 0) continue;
-                // Mirrors samplerHasFrames(.weights): one value per target per key.
-                if (output_acc.count < key_count * want_count) continue;
+                // Mirrors samplerHasFrames(.weights): one value per target
+                // per key; CUBICSPLINE carries (in, value, out) per key, so
+                // the output accessor must hold 3x the floats. readSampler
+                // below preserves the full tangent buffer for the runtime.
+                const need_mult: usize = if (samp_ptr.interpolation == c.cgltf_interpolation_type_cubic_spline) 3 else 1;
+                if (output_acc.count < key_count * want_count * need_mult) continue;
 
                 const samp_data = try gltf_util.readSampler(scene.allocator, @constCast(samp_ptr), want_count) orelse continue;
                 if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {

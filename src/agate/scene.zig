@@ -112,6 +112,10 @@ pub const Scene = struct {
     particle_pass: passes.ParticlePass,
     postprocess_pass: passes.PostProcessPass,
     ssao_pass: passes.SSAOPass,
+    // Lazily created on first use; renders physics debug wireframes in 3D.
+    debug_pass: ?passes.DebugPass = null,
+    show_physics_debug: bool = false,
+    debug_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty,
 
     // Shadow Mapping settings (Cascaded Shadow Maps with 16-sample Poisson PCF)
     enable_shadows: bool = true,
@@ -150,6 +154,10 @@ pub const Scene = struct {
     pipeline_skinned_pbr_blend_u32: sg.Pipeline = .{},
     pipeline_instanced_blend_u16: sg.Pipeline = .{},
     pipeline_instanced_blend_u32: sg.Pipeline = .{},
+
+    // Double-sided (cull-off) twins for every family; selected per item when
+    // the material sets double_sided. Created in initPipelines, freed in deinit.
+    ds_pipelines: scene_pipelines.DoubleSidedPipelines = .{},
 
     // Skeletal Animation Groups & Skeletons
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
@@ -220,6 +228,14 @@ pub const Scene = struct {
     }
 
     fn initPipelines(self: *Scene) void {
+        // One shader handle per family, shared by the opaque/blend pairs and
+        // the double-sided twins.
+        const family_shaders = scene_pipelines.DoubleSidedSourceShaders{
+            .standard = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
+            .pbr = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
+            .instanced = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+            .skinned_pbr = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
+        };
         const specs = [_]struct {
             shader: sg.Shader,
             family: PipelineFamily,
@@ -229,7 +245,7 @@ pub const Scene = struct {
             blend_u32: *sg.Pipeline,
         }{
             .{
-                .shader = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
+                .shader = family_shaders.standard,
                 .family = .standard,
                 .opaque_u16 = &self.pipeline_u16,
                 .opaque_u32 = &self.pipeline_u32,
@@ -237,7 +253,7 @@ pub const Scene = struct {
                 .blend_u32 = &self.pipeline_blend_u32,
             },
             .{
-                .shader = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
+                .shader = family_shaders.pbr,
                 .family = .pbr,
                 .opaque_u16 = &self.pipeline_pbr_u16,
                 .opaque_u32 = &self.pipeline_pbr_u32,
@@ -245,7 +261,7 @@ pub const Scene = struct {
                 .blend_u32 = &self.pipeline_pbr_blend_u32,
             },
             .{
-                .shader = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+                .shader = family_shaders.instanced,
                 .family = .instanced,
                 .opaque_u16 = &self.pipeline_instanced_u16,
                 .opaque_u32 = &self.pipeline_instanced_u32,
@@ -253,7 +269,7 @@ pub const Scene = struct {
                 .blend_u32 = &self.pipeline_instanced_blend_u32,
             },
             .{
-                .shader = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
+                .shader = family_shaders.skinned_pbr,
                 .family = .skinned_pbr,
                 .opaque_u16 = &self.pipeline_skinned_pbr_u16,
                 .opaque_u32 = &self.pipeline_skinned_pbr_u32,
@@ -276,6 +292,8 @@ pub const Scene = struct {
             pipelineLayoutFor(spec.family, &desc);
             makePipelinePair(desc, spec.opaque_u16, spec.opaque_u32, spec.blend_u16, spec.blend_u32);
         }
+
+        self.ds_pipelines.initFromShaders(family_shaders);
 
         inline for (.{
             .{ .pipe = self.pipeline_u16, .msg = "pipeline_u16 failed to create!" },
@@ -886,6 +904,7 @@ pub const Scene = struct {
                     .is_pbr = is_pbr,
                     .texture_id = tex_id,
                     .transparent = transparent,
+                    .double_sided = scene_render_queue.materialIsDoubleSided(mesh.material),
                 }) catch continue;
             }
         }
@@ -1022,6 +1041,23 @@ pub const Scene = struct {
         for (self.meshes.items) |mesh| {
             if (!materialIsTransparent(mesh.material)) continue;
             self.drawInstancedMesh(mesh, frame_ctx, &current_pipeline_id);
+        }
+
+        // Physics debug lines (3D pass, depth-tested, no depth write).
+        if (self.show_physics_debug) {
+            if (self.physics_world) |*pw| {
+                self.debug_lines.clearRetainingCapacity();
+                pw.appendDebugLines(self.allocator, &self.debug_lines) catch {};
+                if (self.debug_lines.items.len > 0) {
+                    if (self.debug_pass == null) {
+                        self.debug_pass = passes.DebugPass.init(self.allocator) catch null;
+                    }
+                    if (self.debug_pass) |*dp| {
+                        dp.render(view_proj, self.debug_lines.items);
+                        self.stats.draw_calls += 1;
+                    }
+                }
+            }
         }
 
         // Skybox Pass
@@ -1165,6 +1201,7 @@ pub const Scene = struct {
         self.render_queue.deinit(self.allocator);
         self.transparent_queue.deinit(self.allocator);
         self.instance_matrices.deinit(self.allocator);
+        self.debug_lines.deinit(self.allocator);
 
         self.default_white_texture.deinit();
         self.default_normal_texture.deinit();
@@ -1206,6 +1243,8 @@ pub const Scene = struct {
         self.particle_pass.deinit();
         self.postprocess_pass.deinit();
         self.ssao_pass.deinit();
+        if (self.debug_pass) |*dp| dp.deinit();
+        self.ds_pipelines.deinit();
 
         for (self.particle_systems.items) |ps| {
             ps.deinit();
@@ -1268,6 +1307,49 @@ test "project VP cache: different union variants miss" {
     try std.testing.expect(!Scene.camerasEqualForProjection(arc, free));
     try std.testing.expect(!Scene.camerasEqualForProjection(free, follow));
     try std.testing.expect(!Scene.camerasEqualForProjection(follow, arc));
+}
+
+test "project VP cache: target and fly cameras" {
+    // Equal target pairs hit; tuning-only (smoothing) differences still hit.
+    const ta: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };
+    const tb: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };
+    try std.testing.expect(Scene.camerasEqualForProjection(ta, tb));
+    const tc: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero, .smoothing = 0.0 } };
+    try std.testing.expect(Scene.camerasEqualForProjection(ta, tc));
+
+    // Moved target point, moved position, pending goal, and changed up miss.
+    const td: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.new(1.0, 0.0, 0.0) } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(ta, td));
+    const te: Camera = .{ .target = .{ .position = Vec3.new(0.0, 1.0, 5.0), .target = Vec3.zero } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(ta, te));
+    var tf: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };
+    tf.target.desired_target = Vec3.new(0.0, 1.0, 0.0);
+    try std.testing.expect(!Scene.camerasEqualForProjection(ta, tf));
+    const tg: Camera = .{ .target = .{ .position = Vec3.new(0.0, 5.0, 0.0), .target = Vec3.zero, .up = Vec3.new(0.0, 0.0, 1.0) } };
+    const th: Camera = .{ .target = .{ .position = Vec3.new(0.0, 5.0, 0.0), .target = Vec3.zero } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(tg, th));
+
+    // Equal fly pairs hit; roll-only differences miss (roll tilts view up).
+    const fa: Camera = .{ .fly = .{ .position = Vec3.new(1.0, 2.0, 3.0) } };
+    const fb: Camera = .{ .fly = .{ .position = Vec3.new(1.0, 2.0, 3.0) } };
+    try std.testing.expect(Scene.camerasEqualForProjection(fa, fb));
+    const fc: Camera = .{ .fly = .{ .position = Vec3.new(1.0, 2.0, 3.0), .rotation = Vec3.new(0.0, 0.0, 90.0) } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, fc));
+    const fd: Camera = .{ .fly = .{ .position = Vec3.new(1.0, 2.0, 4.0) } };
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, fd));
+
+    // Cross-variant pairs (old and new) always miss.
+    const arc: Camera = .{ .arc_rotate = .{} };
+    const free: Camera = .{ .free = .{} };
+    const follow: Camera = .{ .follow = .{} };
+    try std.testing.expect(!Scene.camerasEqualForProjection(ta, fa));
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, ta));
+    try std.testing.expect(!Scene.camerasEqualForProjection(arc, ta));
+    try std.testing.expect(!Scene.camerasEqualForProjection(ta, arc));
+    try std.testing.expect(!Scene.camerasEqualForProjection(free, fa));
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, free));
+    try std.testing.expect(!Scene.camerasEqualForProjection(follow, ta));
+    try std.testing.expect(!Scene.camerasEqualForProjection(fa, follow));
 }
 
 test "transparent classification follows material alpha mode" {

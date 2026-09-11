@@ -106,8 +106,10 @@ pub fn nodeParentWorld(node: *const c.cgltf_node) Mat4 {
 }
 
 /// Reads one animation sampler into owned buffers. Returns null for
-/// empty/missing accessors. CUBICSPLINE is preserved as-is; the runtime
-/// treats it as (eased) linear, documented in animation.zig.
+/// empty/missing accessors. CUBICSPLINE keeps the full glTF layout: per key
+/// (in-tangent, value, out-tangent), i.e. stride*3 floats per keyframe read
+/// from accessor elements ki*3+j, matching the spec's 3x output count.
+/// LINEAR/STEP keep the historical single-element read bit-for-bit.
 pub const SamplerData = struct {
     timestamps: []f32,
     outputs: []f32,
@@ -125,10 +127,19 @@ pub fn readSampler(allocator: std.mem.Allocator, samp: *c.cgltf_animation_sample
     for (0..key_count) |ki| {
         _ = c.cgltf_accessor_read_float(in_acc, ki, &timestamps[ki], 1);
     }
-    const outputs = try allocator.alloc(f32, key_count * stride);
+    const is_cubic = samp.*.interpolation == c.cgltf_interpolation_type_cubic_spline;
+    const per_key: usize = if (is_cubic) stride * 3 else stride;
+    const outputs = try allocator.alloc(f32, key_count * per_key);
     errdefer allocator.free(outputs);
     for (0..key_count) |ki| {
-        _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
+        if (is_cubic) {
+            for (0..3) |j| {
+                const dst = outputs[ki * per_key + j * stride .. ki * per_key + (j + 1) * stride];
+                _ = c.cgltf_accessor_read_float(out_acc, ki * 3 + j, dst.ptr, @intCast(stride));
+            }
+        } else {
+            _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
+        }
     }
 
     const interp: AnimationInterpolation = switch (samp.*.interpolation) {

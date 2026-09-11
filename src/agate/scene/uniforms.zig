@@ -2,6 +2,7 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Color3 = math.Color3;
+const Material = @import("../material.zig").Material;
 
 // Per-frame constants shared by the regular and instanced draw helpers.
 pub const FrameContext = struct {
@@ -82,4 +83,46 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: FrameContext) FrameUniforms 
         .spot_color_outer = ctx.spot_color_outer,
         .spot_intensity = ctx.spot_intensity,
     };
+}
+
+// Value for the per-shader `alpha_cutoff` fragment uniform (appended last
+// to every fs_params block). Only cutout materials upload a live cutoff;
+// opaque/blend upload 0.0 so the shader alpha test never fires and their
+// rendering is bit-identical to before. Meshes without a material render
+// opaque legacy, so they upload 0.0 as well. Pure function (no GPU calls).
+pub fn alphaCutoffFor(mat: ?Material) f32 {
+    const m = mat orelse return 0.0;
+    if (!m.isCutout()) return 0.0;
+    return m.alphaCutoff();
+}
+
+test "alphaCutoffFor gates the cutoff on cutout mode" {
+    const std = @import("std");
+    const material = @import("../material.zig");
+
+    // No material: opaque legacy, test disabled.
+    try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(null));
+
+    var std_mat = material.StandardMaterial.init("m");
+    var pbr_mat = material.PBRMaterial.init("p");
+
+    // Opaque and blend upload 0.0 even with a customized cutoff stored.
+    std_mat.alpha_cutoff = 0.3;
+    pbr_mat.alpha_cutoff = 0.7;
+    for ([_]material.AlphaMode{ .@"opaque", .blend }) |mode| {
+        std_mat.alpha_mode = mode;
+        pbr_mat.alpha_mode = mode;
+        try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(.{ .standard = &std_mat }));
+        try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(.{ .pbr = &pbr_mat }));
+    }
+
+    // Cutout uploads the material value (default 0.5).
+    std_mat.alpha_mode = .cutout;
+    pbr_mat.alpha_mode = .cutout;
+    try std.testing.expectEqual(@as(f32, 0.3), alphaCutoffFor(.{ .standard = &std_mat }));
+    try std.testing.expectEqual(@as(f32, 0.7), alphaCutoffFor(.{ .pbr = &pbr_mat }));
+
+    var std_default = material.StandardMaterial.init("d");
+    std_default.alpha_mode = .cutout;
+    try std.testing.expectEqual(@as(f32, 0.5), alphaCutoffFor(.{ .standard = &std_default }));
 }

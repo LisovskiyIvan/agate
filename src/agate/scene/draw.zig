@@ -16,7 +16,10 @@ pub const FrameContext = uniforms.FrameContext;
 
 // Draws one regular (non-instanced) queue item: pipeline select, bind,
 // uniforms, draw. Shared by the opaque pass and the transparent pass
-// (pipeline choice follows item.transparent). Updates stats.
+// (pipeline choice follows item.transparent; double-sided items additionally
+// resolve to the cull-off twins via pipelines.pipelineForRegularItem).
+// Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
+// in-shader discard. Updates stats.
 // `scene` is generic (anytype) to avoid a scene.zig import cycle; it must
 // expose the Scene render state (pipelines, default textures, shadow pass,
 // stats, frameUniforms, default_material, skybox/ibl fields).
@@ -93,6 +96,7 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
             .base_color_factor = mat_albedo,
             .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
             .emissive_factor = emissive_col,
+            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -135,6 +139,7 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
             .diffuse_color = std_mat.getDiffuseColor4(),
+            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -158,17 +163,17 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
 // Draws one instanced mesh with the currently visible instance buffer.
 // Transparent instanced meshes use the blend twin pipeline and are drawn
 // as-is (no per-instance back-to-front sort); the caller draws them
-// after all opaque geometry. Updates stats.
+// after all opaque geometry. Double-sided materials select the cull-off
+// twins (opaque or blend) when the scene provides them. Updates stats.
 pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, current_pipeline_id: *u32) void {
     if (mesh.instances.items.len == 0) return;
     if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
 
     const transparent = render_queue.materialIsTransparent(mesh.material);
     const is_u32 = mesh.index_type == .UINT32;
-    const pip_id = if (transparent)
-        (if (is_u32) scene.pipeline_instanced_blend_u32.id else scene.pipeline_instanced_blend_u16.id)
-    else
-        (if (is_u32) scene.pipeline_instanced_u32.id else scene.pipeline_instanced_u16.id);
+    // Double-sided instanced meshes use the cull-off twins when the scene
+    // provides them; otherwise the regular pipelines (legacy behavior).
+    const pip_id = pipelines.pipelineForInstancedMesh(scene, transparent, is_u32, render_queue.materialIsDoubleSided(mesh.material));
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
         sg.applyPipeline(.{ .id = pip_id });
@@ -207,6 +212,7 @@ pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, curre
         .light_color = f.light_color,
         .ambient_color = f.ambient_color,
         .diffuse_color = std_mat.getDiffuseColor4(),
+        .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
         .shadow_params = f.shadow_params,
         .shadow_splits = f.shadow_splits,
         .cascade_view_proj = f.cascade_view_proj,

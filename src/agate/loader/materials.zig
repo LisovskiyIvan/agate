@@ -259,6 +259,65 @@ pub fn loadMaterials(
             );
         }
 
+        // glTF alphaMode/doubleSided mapping (cgltf has no has_alpha_cutoff:
+        // alpha_cutoff always parses, defaulting to 0.5 when absent).
+        if (src_mat.alpha_mode == c.cgltf_alpha_mode_mask) {
+            pbr_mat.alpha_mode = .cutout;
+            pbr_mat.alpha_cutoff = std.math.clamp(src_mat.alpha_cutoff, 0.0, 1.0);
+        } else if (src_mat.alpha_mode == c.cgltf_alpha_mode_blend) {
+            pbr_mat.alpha_mode = .blend;
+        } else {
+            pbr_mat.alpha_mode = .@"opaque";
+        }
+        pbr_mat.double_sided = src_mat.double_sided != 0;
+
         materials[i] = .{ .pbr = pbr_mat };
     }
+}
+
+test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene: Scene = std.mem.zeroes(Scene);
+    scene.allocator = alloc;
+
+    var src: [3]c.cgltf_material = .{
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+    };
+    // [0] default zero: OPAQUE, single-sided.
+    // [1] MASK with cutoff + double-sided.
+    src[1].alpha_mode = c.cgltf_alpha_mode_mask;
+    src[1].alpha_cutoff = 0.2;
+    src[1].double_sided = 1;
+    // [2] BLEND, single-sided, out-of-range cutoff must be ignored.
+    src[2].alpha_mode = c.cgltf_alpha_mode_blend;
+    src[2].alpha_cutoff = 42.0;
+    // Out-of-range MASK cutoff clamps to [0,1] (checked on a copy below).
+    const clamped = std.math.clamp(@as(f32, 1.7), 0.0, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), clamped);
+
+    var data: c.cgltf_data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [3]?Material = .{ null, null, null };
+    const empty_tex: []?Texture = &.{};
+    const empty_raw: []?Texture.RawTexture = &.{};
+    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_raw);
+
+    try std.testing.expect(out[0].? == .pbr);
+    try std.testing.expect(out[0].?.pbr.alpha_mode == .@"opaque");
+    try std.testing.expectEqual(@as(f32, 0.5), out[0].?.pbr.alpha_cutoff);
+    try std.testing.expect(!out[0].?.pbr.double_sided);
+
+    try std.testing.expect(out[1].?.pbr.alpha_mode == .cutout);
+    try std.testing.expectEqual(@as(f32, 0.2), out[1].?.pbr.alpha_cutoff);
+    try std.testing.expect(out[1].?.pbr.double_sided);
+
+    try std.testing.expect(out[2].?.pbr.alpha_mode == .blend);
+    try std.testing.expectEqual(@as(f32, 0.5), out[2].?.pbr.alpha_cutoff);
+    try std.testing.expect(!out[2].?.pbr.double_sided);
 }

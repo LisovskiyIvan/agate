@@ -27,7 +27,7 @@
 | Рендер | Forward, 8 пайплайнов, opaque, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайн | ✅ |
-| Камеры | ArcRotate (орбита) + Free + Follow, объединяющая union Camera | 🟡 |
+| Камеры | ArcRotate + Free + Fly + Follow + Target, объединяющая union Camera | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
 | Тени | 4-каскадный CSM для солнца, 16× Poisson PCF | 🟡 |
 | Материал Standard | Diffuse-цвет/текстура | ✅ |
@@ -48,7 +48,7 @@
 | Draco/meshopt/KTX2, экспорт | — | ❌ |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
-| Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`), рендера пока нет | 🟡 |
+| Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
 | Layout-контейнеры, 3D GUI | — | ❌ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, панорама/затухание | 🟡 |
@@ -59,7 +59,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 195 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 244 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -70,7 +70,7 @@
 
 ## Журнал реализации (итерация 10.09.2026)
 
-Выполнено и проверено: `zig build test` (195 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
+Выполнено и проверено: `zig build test` (244 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
 
 | Фича | Файлы | Статус |
 |---|---|---|
@@ -132,7 +132,20 @@ Sandbox: всё UI сведено в **одну панель** (HUD + «NEW FEAT
 | glTF-свет (`KHR_lights_punctual`) и камеры | `loader/lights.zig`, `scene_loader.zig` | ✅ |
 | Частицы: локальное пространство эмиттера, спрайт-листы, поворот/angular velocity | `particles.zig`, `passes/particle_pass.zig`, `shaders/particle.glsl` | ✅ |
 
-Sandbox: dropdown камеры, кнопки/клавиши Save State [7] / Load State [8] (in-memory снимок), обновлённый CONTROLS. Итог: 195 тестов, `zig build test`/agate/sandbox зелёные, runtime smoke без утечек (~2.6 мс, init ~390 мс).
+Sandbox: dropdown камеры, кнопки/клавиши Save State [7] / Load State [8] (in-memory снимок), обновлённый CONTROLS. Итог: 244 теста, `zig build test`/agate/sandbox зелёные, runtime smoke без утечек (~2.6 мс, init ~390 мс).
+
+### Волна 4: фичи (10.09.2026, вечер)
+
+| Фича | Файлы | Статус |
+|---|---|---|
+| Alpha-test (cutout) + double-sided (cull-off твины, +16 пайплайнов) | `material.zig`, `scene/{pipelines,uniforms,draw,render_queue}.zig`, шейдеры | ✅ |
+| Камеры `TargetCamera` (look-at со сглаживанием) и `FlyCamera` (крен) + union | `camera.zig`, `scene/projection.zig` | ✅ |
+| Анимация: cubic-spline Hermite (TRS/quat/weights) + события/колбэки | `animation.zig`, `loader/{gltf_util,animations}.zig` | ✅ |
+| Debug-рендер физики: 3D-пасс линий (depth-test, без записи) | `passes/debug_pass.zig`, `passes/mod.zig`, `shaders/debug.glsl`, `scene.zig` | ✅ |
+| Импорт OBJ и STL (ASCII/бинарный, дедуп, триангуляция, нормали) | `loader/obj.zig`, `loader/stl.zig` | ✅ |
+| Сериализация v2: target/fly-камеры, cutout/cutoff/double_sided; glTF alphaMode/doubleSided | `serialization.zig`, `loader/materials.zig` | ✅ |
+
+Sandbox: debug-линии рисует движковый 3D-пасс (UI-проекция удалена), в dropdown камер добавлены Fly/Target, OBJ-пирамида в галерее, Save/Load работает с новым форматом v2. Итог: 244 теста (+49), сборки/бенч/смоук зелёные (~2.6 мс, init ~380 мс).
 
 Sandbox-демо (все новые фичи выведены в интерфейс): галерея из 5 новых примитивов; панель New Features с чекбоксами Sharpen/Grain и слайдерами Sharpen/Grain/Temperature/Tint; кнопки Camera/WAV/Lines; клавиши `4` — смена камеры Arc→Free→Follow, `5` — debug-линии физики + счётчик `querySphere`, `6` — проигрывание WAV из памяти. DirectionalLight включён в сцену.
 
@@ -148,7 +161,7 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
 * Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов (`SceneStats`).
-* 195 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
+* 244 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
 
 ### Рендеринг
 
@@ -260,14 +273,14 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 
 | Возможность Babylon.js | В Agate есть | Чего не хватает |
 |---|---|---|
-| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Follow + union Camera | Universal/Target/Fly-камер, камера-ригов, мультикамеры и viewport'ов, touch/pinch, инерции |
+| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera | Камера-ригов, мультикамеры и viewport'ов, touch/pinch, инерции |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + 1 directional (солнце) + 4 point + 2 spot | Area-света, кластерного освещения, light probes, нескольких directional |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF | Теней от point/spot, PCSS/contact hardening, ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL | Расширенных слоёв PBR, OpenPBR, unlit-режима |
-| Прозрачность | `AlphaMode.blend` у материалов: blend-пайплайны, back-to-front очередь прозрачных | Alpha-test (cutout), double-sided, сортировки прозрачных инстансов |
+| Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), back-to-front очередь | Сортировки прозрачных инстансов; back-face освещение по геометрическим нормалям |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео, anisotropy) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter | EXR/сжатых форматов, видеотекстур, анизотропии, render-target/reflection probe текстур |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | DoF, motion blur, TAA, MSAA, glow/highlight, LUT/color curves; bloom упрощённый (в одном шейдере), MSAA выключен (sample_count=1) |
-| Анимация (morph targets, события, retargeting) | Скелетная + node-анимации glTF TRS, easing (10 кривых), блендинг/crossfade | Морф-таргетов, cubic-spline-тангенсов (fallback linear), событий/колбэков, ретаргетинга |
+| Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер | GPU-симуляции, sub-emitters, flow maps, спрайт-листов, коллизий, локального пространства |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 15 примитивов + terrain (вкл. Plane/Tube/Extrude/Lines) | Polygon/N-gon, Decals, CSG, LOD, упрощения |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры, скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры | Draco/meshopt/KTX2, экспорта |
@@ -323,8 +336,8 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 * mp3/ogg (WAV уже поддержан), стриминг, музыкальные циклы, шины/эффекты, doppler, окклюзия.
 
 **Ассеты и данные**
-* Сериализация сцены (аналог `.babylon`), сохранение/загрузка, экспорт glTF/OBJ/STL, AssetManager с прогрессом и кэшем.
-* Draco/meshopt/KTX2, OBJ/STL/PLY-импорт, 3D Tiles.
+* Экспорт сцены (glTF/OBJ/STL), AssetManager с прогрессом и кэшем.
+* Draco/meshopt/KTX2, PLY-импорт, 3D Tiles.
 
 **Архитектура рендера**
 * Frame graph / node render graph, кастомные rendering pipelines, compute-шейдеры.

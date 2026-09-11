@@ -1,0 +1,372 @@
+//! Minimal STL importer (ASCII + binary): pure parser plus an optional
+//! Scene upload helper modelled on loader/mesh_spawn.zig.
+//!
+//! Binary detection: 80-byte header + u32 LE facet count; binary iff
+//! `bytes.len == 84 + count * 50`, ASCII otherwise.
+
+const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
+
+const math = @import("math");
+const Vec3 = math.Vec3;
+const BoundingBox = math.BoundingBox;
+
+const Scene = @import("../scene.zig").Scene;
+const Mesh = @import("../mesh.zig").Mesh;
+const Vertex = @import("../mesh.zig").Vertex;
+const computeTangents = @import("../mesh.zig").computeTangents;
+
+/// Flat triangle soup with per-vertex normals, deduplicated on import.
+/// All slices are owned (allocator passed to parse) and freed by deinit.
+pub const StlData = struct {
+    positions: []f32 = &.{},
+    normals: []f32 = &.{},
+    indices: []u32 = &.{},
+    vertex_count: usize = 0,
+
+    pub fn deinit(self: *StlData, allocator: std.mem.Allocator) void {
+        if (self.positions.len > 0) allocator.free(self.positions);
+        if (self.normals.len > 0) allocator.free(self.normals);
+        if (self.indices.len > 0) allocator.free(self.indices);
+        self.* = .{};
+    }
+};
+
+/// Hard cap on facet count (binary header or ASCII triangles).
+pub const max_facets: usize = 10_000_000;
+/// Dedup quantization: 1e-5 on position and normal components.
+const quant_scale: f32 = 100000.0;
+
+const VertKey = struct {
+    p: [3]i32,
+    n: [3]i32,
+};
+
+fn quantize(x: f32) i32 {
+    return @intFromFloat(@round(x * quant_scale));
+}
+
+fn keyFor(pos: [3]f32, nrm: [3]f32) VertKey {
+    return .{
+        .p = .{ quantize(pos[0]), quantize(pos[1]), quantize(pos[2]) },
+        .n = .{ quantize(nrm[0]), quantize(nrm[1]), quantize(nrm[2]) },
+    };
+}
+
+const Builder = struct {
+    positions: std.ArrayListUnmanaged(f32) = .empty,
+    normals: std.ArrayListUnmanaged(f32) = .empty,
+    indices: std.ArrayListUnmanaged(u32) = .empty,
+    map: std.AutoHashMap(VertKey, u32),
+    tri_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) Builder {
+        return .{ .map = std.AutoHashMap(VertKey, u32).init(allocator) };
+    }
+
+    fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
+        self.positions.deinit(allocator);
+        self.normals.deinit(allocator);
+        self.indices.deinit(allocator);
+        self.map.deinit();
+    }
+
+    fn addFacet(self: *Builder, allocator: std.mem.Allocator, n: [3]f32, v: [3][3]f32) !void {
+        if (self.tri_count >= max_facets) return error.TooLarge;
+        self.tri_count += 1;
+        for (v) |p| {
+            const k = keyFor(p, n);
+            const entry = try self.map.getOrPut(k);
+            if (!entry.found_existing) {
+                if (self.positions.items.len / 3 > std.math.maxInt(u32)) return error.TooLarge;
+                entry.value_ptr.* = @intCast(self.positions.items.len / 3);
+                try self.positions.appendSlice(allocator, &p);
+                try self.normals.appendSlice(allocator, &n);
+            }
+            try self.indices.append(allocator, entry.value_ptr.*);
+        }
+    }
+
+    fn toData(self: *Builder, allocator: std.mem.Allocator) !StlData {
+        var d: StlData = .{};
+        errdefer d.deinit(allocator);
+        d.positions = try self.positions.toOwnedSlice(allocator);
+        d.normals = try self.normals.toOwnedSlice(allocator);
+        d.indices = try self.indices.toOwnedSlice(allocator);
+        d.vertex_count = d.positions.len / 3;
+        return d;
+    }
+};
+
+fn isWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+fn parseF32(tok: []const u8) !f32 {
+    return std.fmt.parseFloat(f32, tok) catch return error.InvalidFormat;
+}
+
+fn readF32LE(bytes: []const u8) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes[0..4], .little));
+}
+
+/// Returns the binary facet count when the size matches exactly, else null.
+fn binaryCount(bytes: []const u8) ?u32 {
+    if (bytes.len < 84) return null;
+    const count = std.mem.readInt(u32, bytes[80..84], .little);
+    const want: usize = 84 + @as(usize, count) * 50;
+    if (bytes.len == want) return count;
+    return null;
+}
+
+fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8, count: u32) !StlData {
+    if (count == 0) return error.NoGeometry;
+    if (count > max_facets) return error.TooLarge;
+    var b = Builder.init(allocator);
+    errdefer b.deinit(allocator);
+    var off: usize = 84;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (off + 50 > bytes.len) return error.Truncated;
+        const n: [3]f32 = .{ readF32LE(bytes[off..]), readF32LE(bytes[off + 4 ..]), readF32LE(bytes[off + 8 ..]) };
+        var v: [3][3]f32 = undefined;
+        var k: usize = 0;
+        while (k < 3) : (k += 1) {
+            const base = off + 12 + k * 12;
+            v[k] = .{ readF32LE(bytes[base..]), readF32LE(bytes[base + 4 ..]), readF32LE(bytes[base + 8 ..]) };
+        }
+        // u16 attribute at off+48 is intentionally ignored.
+        try b.addFacet(allocator, n, v);
+        off += 50;
+    }
+    const data = try b.toData(allocator);
+    b.map.deinit();
+    return data;
+}
+
+const Tokenizer = struct {
+    s: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *Tokenizer) ?[]const u8 {
+        while (self.pos < self.s.len and isWs(self.s[self.pos])) : (self.pos += 1) {}
+        if (self.pos >= self.s.len) return null;
+        const start = self.pos;
+        while (self.pos < self.s.len and !isWs(self.s[self.pos])) : (self.pos += 1) {}
+        return self.s[start..self.pos];
+    }
+};
+
+fn parseAscii(allocator: std.mem.Allocator, bytes: []const u8) !StlData {
+    var b = Builder.init(allocator);
+    errdefer b.deinit(allocator);
+    var t = Tokenizer{ .s = bytes };
+    var n: [3]f32 = .{ 0, 0, 0 };
+    var v: [3][3]f32 = undefined;
+    var nv: usize = 0;
+    var in_facet = false;
+    var saw_any = false;
+    while (t.next()) |tok| {
+        if (std.mem.eql(u8, tok, "solid")) {
+            saw_any = true;
+        } else if (std.mem.eql(u8, tok, "facet")) {
+            const w = t.next() orelse return error.Truncated;
+            if (!std.mem.eql(u8, w, "normal")) return error.InvalidFormat;
+            n[0] = try parseF32(t.next() orelse return error.Truncated);
+            n[1] = try parseF32(t.next() orelse return error.Truncated);
+            n[2] = try parseF32(t.next() orelse return error.Truncated);
+            in_facet = true;
+            nv = 0;
+            saw_any = true;
+        } else if (std.mem.eql(u8, tok, "vertex")) {
+            if (!in_facet or nv >= 3) return error.InvalidFormat;
+            v[nv][0] = try parseF32(t.next() orelse return error.Truncated);
+            v[nv][1] = try parseF32(t.next() orelse return error.Truncated);
+            v[nv][2] = try parseF32(t.next() orelse return error.Truncated);
+            nv += 1;
+            saw_any = true;
+        } else if (std.mem.eql(u8, tok, "endfacet")) {
+            if (!in_facet or nv != 3) return error.Truncated;
+            try b.addFacet(allocator, n, v);
+            in_facet = false;
+        } else {
+            // outer/loop/endloop/endsolid/solid names: ignored.
+        }
+    }
+    if (in_facet) return error.Truncated;
+    if (b.tri_count == 0) {
+        if (!saw_any) return error.NoGeometry;
+        return error.InvalidFormat;
+    }
+    const data = try b.toData(allocator);
+    b.map.deinit();
+    return data;
+}
+
+/// Parses ASCII or binary STL. Errors: InvalidFormat, Truncated, TooLarge,
+/// NoGeometry (plus allocator errors).
+pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !StlData {
+    if (bytes.len == 0) return error.NoGeometry;
+    if (binaryCount(bytes)) |count| return parseBinary(allocator, bytes, count);
+    return parseAscii(allocator, bytes);
+}
+
+/// Uploads parsed STL as one Mesh (white, zero UVs) and returns the
+/// single-element spawn list. The CALLER owns the returned slice and must
+/// free it with allocator. GPU call — not unit tested; type-checked via
+/// ast-check.
+pub fn appendToScene(scene: *Scene, allocator: std.mem.Allocator, name: []const u8, bytes: []const u8) ![]*Mesh {
+    var data = try parse(allocator, bytes);
+    defer data.deinit(allocator);
+    const n = data.vertex_count;
+
+    const vertices = try scene.allocator.alloc(Vertex, n);
+    // Staging copy only: geometry is retained separately below.
+    defer scene.allocator.free(vertices);
+    for (0..n) |i| {
+        vertices[i] = .{
+            .position = .{ data.positions[3 * i], data.positions[3 * i + 1], data.positions[3 * i + 2] },
+            .normal = .{ data.normals[3 * i], data.normals[3 * i + 1], data.normals[3 * i + 2] },
+            .color = .{ 1, 1, 1, 1 },
+            .uv = .{ 0, 0 },
+        };
+    }
+
+    var min_p = Vec3.new(vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]);
+    var max_p = min_p;
+    for (vertices) |vert| {
+        min_p.x = @min(min_p.x, vert.position[0]);
+        min_p.y = @min(min_p.y, vert.position[1]);
+        min_p.z = @min(min_p.z, vert.position[2]);
+        max_p.x = @max(max_p.x, vert.position[0]);
+        max_p.y = @max(max_p.y, vert.position[1]);
+        max_p.z = @max(max_p.z, vert.position[2]);
+    }
+
+    const use32 = n > std.math.maxInt(u16) or data.indices.len > std.math.maxInt(u16);
+    var ibuf: sg.Buffer = .{};
+    if (use32) {
+        const idx = try scene.allocator.alloc(u32, data.indices.len);
+        defer scene.allocator.free(idx);
+        @memcpy(idx, data.indices);
+        computeTangents(vertices, idx, null);
+        ibuf = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(idx),
+        });
+    } else {
+        const idx = try scene.allocator.alloc(u16, data.indices.len);
+        defer scene.allocator.free(idx);
+        for (data.indices, 0..) |src, i| idx[i] = @intCast(src);
+        computeTangents(vertices, null, idx);
+        ibuf = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(idx),
+        });
+    }
+
+    const vbuf = sg.makeBuffer(.{
+        .data = sg.asRange(vertices),
+    });
+
+    const owned_name = try scene.allocator.dupe(u8, name);
+    errdefer scene.allocator.free(owned_name);
+    const mesh_obj = try scene.allocator.create(Mesh);
+    errdefer scene.allocator.destroy(mesh_obj);
+    mesh_obj.* = .{
+        .name = owned_name,
+        .owns_name = true,
+        .vertex_buffer = vbuf,
+        .index_buffer = ibuf,
+        .index_count = @intCast(data.indices.len),
+        .index_type = if (use32) .UINT32 else .UINT16,
+        .local_bounding_box = BoundingBox.init(min_p, max_p),
+    };
+    try mesh_obj.retainCpuGeometryU32(scene.allocator, vertices, data.indices);
+    try mesh_obj.retainMorphBase(scene.allocator, vertices);
+
+    try scene.meshes.append(scene.allocator, mesh_obj);
+    const out = try allocator.alloc(*Mesh, 1);
+    out[0] = mesh_obj;
+    return out;
+}
+
+// ---- tests (GPU-free) ----
+
+fn writeF32LE(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, f: f32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, @bitCast(f), .little);
+    try list.appendSlice(allocator, &buf);
+}
+
+fn writeU16LE(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf, v, .little);
+    try list.appendSlice(allocator, &buf);
+}
+
+test "stl binary two facets with shared edge dedup" {
+    const alloc = std.testing.allocator;
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try bytes.appendNTimes(alloc, 0, 80);
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, 2, .little);
+    try bytes.appendSlice(alloc, &count_buf);
+    // facet 1: (0,0,0) (1,0,0) (0,1,0), normal (0,0,1)
+    for ([3]f32{ 0, 0, 1 }) |f| try writeF32LE(&bytes, alloc, f);
+    for ([9]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 }) |f| try writeF32LE(&bytes, alloc, f);
+    try writeU16LE(&bytes, alloc, 0);
+    // facet 2: (1,0,0) (1,1,0) (0,1,0), same normal
+    for ([3]f32{ 0, 0, 1 }) |f| try writeF32LE(&bytes, alloc, f);
+    for ([9]f32{ 1, 0, 0, 1, 1, 0, 0, 1, 0 }) |f| try writeF32LE(&bytes, alloc, f);
+    try writeU16LE(&bytes, alloc, 0);
+
+    var data = try parse(alloc, bytes.items);
+    defer data.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), data.vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), data.indices.len);
+    try std.testing.expectEqual(@as(f32, 1), data.positions[3]);
+    try std.testing.expectEqual(@as(f32, 1), data.normals[2]);
+}
+
+test "stl ascii single triangle" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\solid test
+        \\  facet normal 0 0 1
+        \\    outer loop
+        \\      vertex 0 0 0
+        \\      vertex 1 0 0
+        \\      vertex 0 1 0
+        \\    endloop
+        \\  endfacet
+        \\endsolid test
+    ;
+    var data = try parse(alloc, text);
+    defer data.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), data.vertex_count);
+    try std.testing.expectEqual(@as(usize, 3), data.indices.len);
+    try std.testing.expectEqual(@as(f32, 1), data.positions[3]);
+    try std.testing.expectEqual(@as(f32, 1), data.normals[2]);
+}
+
+test "stl garbage is InvalidFormat" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, "this is not a mesh {{{ }}}"));
+}
+
+test "stl truncated ascii is Truncated" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.Truncated, parse(alloc, "solid t\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\n"));
+}
+
+test "stl empty is NoGeometry" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.NoGeometry, parse(alloc, ""));
+}
+
+test "stl appendToScene links (type check)" {
+    _ = appendToScene;
+}

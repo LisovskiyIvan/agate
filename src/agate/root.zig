@@ -19,6 +19,10 @@ pub const FreeCamera = camera.FreeCamera;
 pub const FreeCameraOptions = camera.FreeCameraOptions;
 pub const FollowCamera = camera.FollowCamera;
 pub const FollowCameraOptions = camera.FollowCameraOptions;
+pub const TargetCamera = camera.TargetCamera;
+pub const TargetCameraOptions = camera.TargetCameraOptions;
+pub const FlyCamera = camera.FlyCamera;
+pub const FlyCameraOptions = camera.FlyCameraOptions;
 
 pub const lights = @import("lights.zig");
 pub const HemisphericLightOptions = lights.HemisphericLightOptions;
@@ -132,6 +136,7 @@ pub const ScrollState = ui.ScrollState;
 pub const TextInputState = ui.TextInputState;
 
 pub const passes = @import("passes/mod.zig");
+pub const DebugPass = passes.DebugPass;
 
 pub const animation = struct {
     pub const skeleton = @import("animation/skeleton.zig");
@@ -148,6 +153,7 @@ pub const animation = struct {
     pub const NodeChannel = anim.NodeChannel;
     pub const NodeTarget = anim.NodeTarget;
     pub const MorphWeightsTarget = anim.MorphWeightsTarget;
+    pub const AnimationEvent = anim.AnimationEvent;
     pub const EasingType = easing.EasingType;
     pub const easing_names = easing.easing_names;
     pub const evaluateEasing = easing.evaluate;
@@ -166,6 +172,7 @@ pub const AnimationInterpolation = animation.AnimationInterpolation;
 pub const NodeChannel = animation.NodeChannel;
 pub const NodeTarget = animation.NodeTarget;
 pub const MorphWeightsTarget = animation.MorphWeightsTarget;
+pub const AnimationEvent = animation.AnimationEvent;
 pub const EasingType = animation.EasingType;
 pub const easing_names = animation.easing_names;
 pub const evaluateEasing = animation.evaluateEasing;
@@ -195,6 +202,14 @@ pub const saveSceneStateFile = serialization.saveFile;
 pub const loadSceneStateFile = serialization.loadFile;
 
 pub const loader_lights = @import("loader/lights.zig");
+pub const obj_loader = @import("loader/obj.zig");
+pub const stl_loader = @import("loader/stl.zig");
+pub const ObjData = obj_loader.ObjData;
+pub const StlData = stl_loader.StlData;
+pub const parseObj = obj_loader.parse;
+pub const parseStl = stl_loader.parse;
+pub const appendObjToScene = obj_loader.appendToScene;
+pub const appendStlToScene = stl_loader.appendToScene;
 pub const loadGltfLights = loader_lights.loadLights;
 pub const loadGltfCameras = loader_lights.loadCameras;
 

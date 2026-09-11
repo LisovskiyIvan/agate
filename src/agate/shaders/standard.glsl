@@ -52,6 +52,8 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_dir_inner[2];
     vec4 spot_color_outer[2];
     vec4 spot_intensity[2];
+    // APPENDED LAST: existing offsets above must not shift for old bindings.
+    float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -177,6 +179,13 @@ float calculateShadow(vec3 world_pos, vec3 N, vec3 L, out vec3 debug_color) {
 void main() {
     vec3 N = normalize(v_normal);
 
+    // Alpha test (cutout): cutout materials discard sub-cutoff fragments
+    // before any lighting work. Opaque/blend materials upload 0.0, so this
+    // never fires for them (alpha is always >= 0.0).
+    vec4 tex_val = texture(sampler2D(diffuse_tex, smp), v_uv);
+    vec4 base = v_color * diffuse_color * tex_val;
+    if (base.a < alpha_cutoff) discard;
+
     // Primary directional light
     vec3 L = light_dir.xyz;
     float NdotL = max(dot(N, L), 0.0);
@@ -240,8 +249,6 @@ void main() {
 
     vec3 ambient = ambient_color.rgb * ambient_color.a;
 
-    vec4 tex_val = texture(sampler2D(diffuse_tex, smp), v_uv);
-    vec4 base = v_color * diffuse_color * tex_val;
     vec3 final_rgb = base.rgb * (ambient + diffuse) + debug_tint;
     frag_color = vec4(final_rgb, base.a);
 }

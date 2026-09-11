@@ -66,6 +66,8 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_dir_inner[2];
     vec4 spot_color_outer[2];
     vec4 spot_intensity[2];
+    // APPENDED LAST: existing offsets above must not shift for old bindings.
+    float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -247,6 +249,10 @@ vec2 envBRDFApprox(float roughness, float NoV) {
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), v_uv);
     vec4 albedo_rgba = v_color * base_color_factor * albedo_tex_val;
+    // Alpha test (cutout): cutout materials discard sub-cutoff fragments
+    // before any lighting work. Opaque/blend materials upload 0.0, so this
+    // never fires for them (alpha is always >= 0.0).
+    if (albedo_rgba.a < alpha_cutoff) discard;
     vec3 albedo = albedo_rgba.rgb;
 
     vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, smp), v_uv);

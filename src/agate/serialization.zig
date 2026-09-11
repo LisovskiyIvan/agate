@@ -11,9 +11,11 @@
 //!     per mesh: name str, position[3]f32, rotation[3]f32 (euler deg),
 //!       scaling[3]f32, flags u8 (bit0 visible, bit1 cast, bit2 receive),
 //!       material_kind u8 (0 standard, 1 pbr),
-//!       standard: diffuse[3]f32, alpha f32, alpha_mode u8 (0 opaque, 1 blend)
+//!       standard: diffuse[3]f32, alpha f32, alpha_mode u8 (0 opaque, 1 blend,
+//!         2 cutout), alpha_cutoff f32, double_sided u8,
 //!       pbr: albedo[3]f32, metallic f32, roughness f32, emissive[3]f32,
-//!         alpha f32, alpha_mode u8
+//!         alpha f32, alpha_mode u8 (0 opaque, 1 blend, 2 cutout),
+//!         alpha_cutoff f32, double_sided u8,
 //!   hemi: name str, direction[3]f32, diffuse[3]f32, ground[3]f32,
 //!     intensity f32,
 //!   directional_present u8, [direction[3]f32, diffuse[3]f32, intensity f32],
@@ -21,7 +23,7 @@
 //!     intensity f32, range f32,
 //!   spot_count u32, per spot: name str, position[3]f32, direction[3]f32,
 //!     diffuse[3]f32, intensity f32, range f32, inner_deg f32, outer_deg f32,
-//!   camera_kind u8 (0 none, 1 arc_rotate, 2 free, 3 follow),
+//!   camera_kind u8 (0 none, 1 arc_rotate, 2 free, 3 follow, 4 target, 5 fly),
 //!     arc_rotate: name str, alpha f32, beta f32, radius f32, target[3]f32,
 //!       fov f32, near f32, far f32,
 //!     free: name str, position[3]f32, rotation[3]f32 (euler deg), fov f32,
@@ -29,6 +31,14 @@
 //!     follow: name str, position[3]f32, target_position[3]f32, radius f32,
 //!       height_offset f32, rotation_offset_deg f32, fov f32, near f32,
 //!       far f32, lerp_speed f32,
+//!     target: name str, position[3]f32, target[3]f32, up[3]f32, fov f32,
+//!       near f32, far f32, smoothing f32,
+//!     fly: name str, position[3]f32, rotation[3]f32 (euler deg), fov f32,
+//!       near f32, far f32, speed f32, boost_multiplier f32,
+//!       angular_sensitivity f32, roll_speed_deg f32,
+//!   (v2 layout: camera kinds appended as 4 target, 5 fly; material tails
+//!   extended with alpha_cutoff + double_sided. v1 bytes are NOT readable:
+//!   any version != 2 reports UnsupportedVersion.)
 //!   render: skybox_enabled u8, skybox_exposure f32, shadows_enabled u8,
 //!     shadow_softness f32, ibl_intensity f32,
 //!   postprocess (PostProcessConfig field order): enabled u8, exposure f32,
@@ -60,6 +70,8 @@ const PostProcessConfig = @import("postprocess.zig").PostProcessConfig;
 const TonemappingType = @import("postprocess.zig").TonemappingType;
 const CameraModule = @import("camera.zig");
 const Camera = CameraModule.Camera;
+const TargetCamera = CameraModule.TargetCamera;
+const FlyCamera = CameraModule.FlyCamera;
 const Lights = @import("lights.zig");
 const HemisphericLight = Lights.HemisphericLight;
 const MaterialModule = @import("material.zig");
@@ -69,7 +81,9 @@ const AlphaMode = MaterialModule.AlphaMode;
 const Mesh = @import("mesh.zig").Mesh;
 
 pub const MAGIC: [4]u8 = .{ 'A', 'G', 'S', 'C' };
-pub const VERSION: u32 = 1;
+/// v2: adds target/fly cameras (kinds 4/5) and material alpha cutout mode
+/// (alpha_mode 2) with alpha_cutoff + double_sided tails. v1 is rejected.
+pub const VERSION: u32 = 2;
 
 /// Hard caps for untrusted input. Counts above max_entries and strings above
 /// max_string_bytes report TooLarge instead of driving wild allocations.
@@ -91,7 +105,9 @@ pub const DecodeError = error{
 pub const StandardEntry = struct {
     diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
     alpha: f32 = 1.0,
-    alpha_mode: u8 = 0, // 0 opaque, 1 blend
+    alpha_mode: u8 = 0, // 0 opaque, 1 blend, 2 cutout
+    alpha_cutoff: f32 = 0.5,
+    double_sided: bool = false,
 };
 
 pub const PbrEntry = struct {
@@ -100,7 +116,9 @@ pub const PbrEntry = struct {
     roughness: f32 = 0.5,
     emissive: [3]f32 = .{ 0.0, 0.0, 0.0 },
     alpha: f32 = 1.0,
-    alpha_mode: u8 = 0,
+    alpha_mode: u8 = 0, // 0 opaque, 1 blend, 2 cutout
+    alpha_cutoff: f32 = 0.5,
+    double_sided: bool = false,
 };
 
 pub const MaterialEntry = union(enum) {
@@ -208,13 +226,40 @@ pub const FollowEntry = struct {
     lerp_speed: f32 = 8.0,
 };
 
+pub const TargetEntry = struct {
+    name: []const u8 = "",
+    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
+    target: [3]f32 = .{ 0.0, 0.0, 0.0 },
+    up: [3]f32 = .{ 0.0, 1.0, 0.0 },
+    fov_deg: f32 = 60.0,
+    near: f32 = 0.1,
+    far: f32 = 100.0,
+    smoothing: f32 = 8.0,
+};
+
+pub const FlyEntry = struct {
+    name: []const u8 = "",
+    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
+    rotation: [3]f32 = .{ 0.0, 0.0, 0.0 },
+    fov_deg: f32 = 60.0,
+    near: f32 = 0.1,
+    far: f32 = 100.0,
+    speed: f32 = 6.0,
+    boost_multiplier: f32 = 4.0,
+    angular_sensitivity: f32 = 0.25,
+    roll_speed_deg: f32 = 90.0,
+};
+
 /// Camera snapshot, one variant per Camera union type (follow target_mesh
-/// link is dropped, target_position is kept).
+/// link is dropped, target_position is kept; target desired goals are
+/// transient and not stored).
 pub const CameraEntry = union(enum) {
     none,
     arc_rotate: ArcRotateEntry,
     free: FreeEntry,
     follow: FollowEntry,
+    target: TargetEntry,
+    fly: FlyEntry,
 
     pub fn deinit(self: *CameraEntry, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -222,6 +267,8 @@ pub const CameraEntry = union(enum) {
             .arc_rotate => |*c| if (c.name.len > 0) allocator.free(c.name),
             .free => |*c| if (c.name.len > 0) allocator.free(c.name),
             .follow => |*c| if (c.name.len > 0) allocator.free(c.name),
+            .target => |*c| if (c.name.len > 0) allocator.free(c.name),
+            .fly => |*c| if (c.name.len > 0) allocator.free(c.name),
         }
     }
 };
@@ -263,11 +310,20 @@ pub const SceneState = struct {
 // ---------------------------------------------------------------------------
 
 fn alphaModeToU8(mode: AlphaMode) u8 {
-    return if (mode == .blend) 1 else 0;
+    return switch (mode) {
+        .@"opaque" => 0,
+        .blend => 1,
+        .cutout => 2,
+    };
 }
 
 fn alphaModeFromU8(v: u8) AlphaMode {
-    return if (v == 1) .blend else .@"opaque";
+    return switch (v) {
+        0 => .@"opaque",
+        1 => .blend,
+        2 => .cutout,
+        else => .@"opaque",
+    };
 }
 
 /// POD snapshot of a live scene. Meshes without a material snapshot as the
@@ -289,6 +345,8 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .diffuse = .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b },
                 .alpha = s.alpha,
                 .alpha_mode = alphaModeToU8(s.alpha_mode),
+                .alpha_cutoff = s.alpha_cutoff,
+                .double_sided = s.double_sided,
             } },
             .pbr => |p| .{ .pbr = .{
                 .albedo = .{ p.albedo_color.r, p.albedo_color.g, p.albedo_color.b },
@@ -297,6 +355,8 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .emissive = .{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b },
                 .alpha = p.alpha,
                 .alpha_mode = alphaModeToU8(p.alpha_mode),
+                .alpha_cutoff = p.alpha_cutoff,
+                .double_sided = p.double_sided,
             } },
         } else .{ .standard = .{} };
         try meshes.append(allocator, .{
@@ -402,6 +462,28 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .far = c.far,
                 .lerp_speed = c.lerp_speed,
             } },
+            .target => |c| .{ .target = .{
+                .name = try allocator.dupe(u8, c.name),
+                .position = .{ c.position.x, c.position.y, c.position.z },
+                .target = .{ c.target.x, c.target.y, c.target.z },
+                .up = .{ c.up.x, c.up.y, c.up.z },
+                .fov_deg = c.fov_deg,
+                .near = c.near,
+                .far = c.far,
+                .smoothing = c.smoothing,
+            } },
+            .fly => |c| .{ .fly = .{
+                .name = try allocator.dupe(u8, c.name),
+                .position = .{ c.position.x, c.position.y, c.position.z },
+                .rotation = .{ c.rotation.x, c.rotation.y, c.rotation.z },
+                .fov_deg = c.fov_deg,
+                .near = c.near,
+                .far = c.far,
+                .speed = c.speed,
+                .boost_multiplier = c.boost_multiplier,
+                .angular_sensitivity = c.angular_sensitivity,
+                .roll_speed_deg = c.roll_speed_deg,
+            } },
         };
     }
 
@@ -445,6 +527,8 @@ fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) vo
             sm.diffuse_color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]);
             sm.alpha = s.alpha;
             sm.alpha_mode = alphaModeFromU8(s.alpha_mode);
+            sm.alpha_cutoff = s.alpha_cutoff;
+            sm.double_sided = s.double_sided;
             mesh.material = .{ .standard = sm };
         },
         .pbr => |*p| {
@@ -465,6 +549,8 @@ fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) vo
             pm.emissive_color = Color3.new(p.emissive[0], p.emissive[1], p.emissive[2]);
             pm.alpha = p.alpha;
             pm.alpha_mode = alphaModeFromU8(p.alpha_mode);
+            pm.alpha_cutoff = p.alpha_cutoff;
+            pm.double_sided = p.double_sided;
             mesh.material = .{ .pbr = pm };
         },
     }
@@ -589,6 +675,32 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .far = c.far,
                 .lerp_speed = c.lerp_speed,
             } };
+        },
+        .target => |*c| {
+            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
+            scene.active_camera = .{ .target = TargetCamera.init(owned orelse c.name, .{
+                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
+                .up = Vec3.new(c.up[0], c.up[1], c.up[2]),
+                .fov_deg = c.fov_deg,
+                .near = c.near,
+                .far = c.far,
+                .smoothing = c.smoothing,
+            }) };
+        },
+        .fly => |*c| {
+            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
+            scene.active_camera = .{ .fly = FlyCamera.init(owned orelse c.name, .{
+                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
+                .fov_deg = c.fov_deg,
+                .near = c.near,
+                .far = c.far,
+                .speed = c.speed,
+                .boost_multiplier = c.boost_multiplier,
+                .angular_sensitivity = c.angular_sensitivity,
+                .roll_speed_deg = c.roll_speed_deg,
+            }) };
         },
     }
 
@@ -802,6 +914,8 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
                 try w.vec3(s.diffuse);
                 try w.f32le(s.alpha);
                 try w.byte(s.alpha_mode);
+                try w.f32le(s.alpha_cutoff);
+                try w.bool8(s.double_sided);
             },
             .pbr => |*p| {
                 try w.byte(1);
@@ -811,6 +925,8 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
                 try w.vec3(p.emissive);
                 try w.f32le(p.alpha);
                 try w.byte(p.alpha_mode);
+                try w.f32le(p.alpha_cutoff);
+                try w.bool8(p.double_sided);
             },
         }
     }
@@ -889,6 +1005,30 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
             try w.f32le(c.far);
             try w.f32le(c.lerp_speed);
         },
+        .target => |*c| {
+            try w.byte(4);
+            try w.str(c.name);
+            try w.vec3(c.position);
+            try w.vec3(c.target);
+            try w.vec3(c.up);
+            try w.f32le(c.fov_deg);
+            try w.f32le(c.near);
+            try w.f32le(c.far);
+            try w.f32le(c.smoothing);
+        },
+        .fly => |*c| {
+            try w.byte(5);
+            try w.str(c.name);
+            try w.vec3(c.position);
+            try w.vec3(c.rotation);
+            try w.f32le(c.fov_deg);
+            try w.f32le(c.near);
+            try w.f32le(c.far);
+            try w.f32le(c.speed);
+            try w.f32le(c.boost_multiplier);
+            try w.f32le(c.angular_sensitivity);
+            try w.f32le(c.roll_speed_deg);
+        },
     }
 
     try w.bool8(state.render.skybox_enabled);
@@ -927,6 +1067,8 @@ fn readMeshes(allocator: std.mem.Allocator, r: *Reader) ![]MeshEntry {
                 .diffuse = try r.readVec3(),
                 .alpha = try r.readF32(),
                 .alpha_mode = try r.readU8(),
+                .alpha_cutoff = try r.readF32(),
+                .double_sided = try r.readBool(),
             } },
             1 => entry.material = .{ .pbr = .{
                 .albedo = try r.readVec3(),
@@ -935,11 +1077,13 @@ fn readMeshes(allocator: std.mem.Allocator, r: *Reader) ![]MeshEntry {
                 .emissive = try r.readVec3(),
                 .alpha = try r.readF32(),
                 .alpha_mode = try r.readU8(),
+                .alpha_cutoff = try r.readF32(),
+                .double_sided = try r.readBool(),
             } },
             else => return error.Truncated,
         }
-        if (entry.material == .standard and entry.material.standard.alpha_mode > 1) return error.Truncated;
-        if (entry.material == .pbr and entry.material.pbr.alpha_mode > 1) return error.Truncated;
+        if (entry.material == .standard and entry.material.standard.alpha_mode > 2) return error.Truncated;
+        if (entry.material == .pbr and entry.material.pbr.alpha_mode > 2) return error.Truncated;
         try list.append(allocator, entry);
     }
     return list.toOwnedSlice(allocator);
@@ -1043,6 +1187,34 @@ fn readCamera(allocator: std.mem.Allocator, r: *Reader) !CameraEntry {
             c.far = try r.readF32();
             c.lerp_speed = try r.readF32();
             return .{ .follow = c };
+        },
+        4 => {
+            var c = TargetEntry{};
+            errdefer if (c.name.len > 0) allocator.free(c.name);
+            c.name = try r.readString(allocator);
+            c.position = try r.readVec3();
+            c.target = try r.readVec3();
+            c.up = try r.readVec3();
+            c.fov_deg = try r.readF32();
+            c.near = try r.readF32();
+            c.far = try r.readF32();
+            c.smoothing = try r.readF32();
+            return .{ .target = c };
+        },
+        5 => {
+            var c = FlyEntry{};
+            errdefer if (c.name.len > 0) allocator.free(c.name);
+            c.name = try r.readString(allocator);
+            c.position = try r.readVec3();
+            c.rotation = try r.readVec3();
+            c.fov_deg = try r.readF32();
+            c.near = try r.readF32();
+            c.far = try r.readF32();
+            c.speed = try r.readF32();
+            c.boost_multiplier = try r.readF32();
+            c.angular_sensitivity = try r.readF32();
+            c.roll_speed_deg = try r.readF32();
+            return .{ .fly = c };
         },
         else => return error.Truncated,
     }
@@ -1264,6 +1436,8 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
                 try std.testing.expectEqual(s.diffuse, bm.material.standard.diffuse);
                 try std.testing.expectEqual(s.alpha, bm.material.standard.alpha);
                 try std.testing.expectEqual(s.alpha_mode, bm.material.standard.alpha_mode);
+                try std.testing.expectEqual(s.alpha_cutoff, bm.material.standard.alpha_cutoff);
+                try std.testing.expectEqual(s.double_sided, bm.material.standard.double_sided);
             },
             .pbr => |*p| {
                 try std.testing.expectEqual(p.albedo, bm.material.pbr.albedo);
@@ -1272,6 +1446,8 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
                 try std.testing.expectEqual(p.emissive, bm.material.pbr.emissive);
                 try std.testing.expectEqual(p.alpha, bm.material.pbr.alpha);
                 try std.testing.expectEqual(p.alpha_mode, bm.material.pbr.alpha_mode);
+                try std.testing.expectEqual(p.alpha_cutoff, bm.material.pbr.alpha_cutoff);
+                try std.testing.expectEqual(p.double_sided, bm.material.pbr.double_sided);
             },
         }
     }
@@ -1344,6 +1520,30 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
             try std.testing.expectEqual(c.near, o.near);
             try std.testing.expectEqual(c.far, o.far);
             try std.testing.expectEqual(c.lerp_speed, o.lerp_speed);
+        },
+        .target => |*c| {
+            const o = b.camera.target;
+            try std.testing.expectEqualStrings(c.name, o.name);
+            try std.testing.expectEqual(c.position, o.position);
+            try std.testing.expectEqual(c.target, o.target);
+            try std.testing.expectEqual(c.up, o.up);
+            try std.testing.expectEqual(c.fov_deg, o.fov_deg);
+            try std.testing.expectEqual(c.near, o.near);
+            try std.testing.expectEqual(c.far, o.far);
+            try std.testing.expectEqual(c.smoothing, o.smoothing);
+        },
+        .fly => |*c| {
+            const o = b.camera.fly;
+            try std.testing.expectEqualStrings(c.name, o.name);
+            try std.testing.expectEqual(c.position, o.position);
+            try std.testing.expectEqual(c.rotation, o.rotation);
+            try std.testing.expectEqual(c.fov_deg, o.fov_deg);
+            try std.testing.expectEqual(c.near, o.near);
+            try std.testing.expectEqual(c.far, o.far);
+            try std.testing.expectEqual(c.speed, o.speed);
+            try std.testing.expectEqual(c.boost_multiplier, o.boost_multiplier);
+            try std.testing.expectEqual(c.angular_sensitivity, o.angular_sensitivity);
+            try std.testing.expectEqual(c.roll_speed_deg, o.roll_speed_deg);
         },
     }
     try std.testing.expectEqual(a.render.skybox_enabled, b.render.skybox_enabled);
@@ -1419,11 +1619,17 @@ test "serialization rejects unsupported version" {
     const bytes = try serializeAlloc(alloc, &original);
     defer alloc.free(bytes);
 
+    // Current VERSION must parse; anything else (incl. legacy v1) is rejected.
+    var ok = try deserializeAlloc(alloc, bytes);
+    ok.deinit(alloc);
+
     var bad = try alloc.dupe(u8, bytes);
     defer alloc.free(bad);
-    std.mem.writeInt(u32, bad[4..8], 2, .little);
+    std.mem.writeInt(u32, bad[4..8], 1, .little);
     try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, bad));
     std.mem.writeInt(u32, bad[4..8], 0, .little);
+    try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, bad));
+    std.mem.writeInt(u32, bad[4..8], VERSION + 1, .little);
     try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, bad));
 }
 
@@ -1568,4 +1774,208 @@ test "restore applies by name and ignores missing" {
     // Camera union import is exercised (keeps the Camera symbol referenced).
     const _cam: ?Camera = scene.active_camera;
     try std.testing.expect(_cam != null);
+}
+
+fn roundTripState(alloc: std.mem.Allocator, original: *const SceneState) !SceneState {
+    const bytes = try serializeAlloc(alloc, original);
+    defer alloc.free(bytes);
+    return deserializeAlloc(alloc, bytes);
+}
+
+test "serialization target camera round-trips exactly" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    original.camera = .{ .target = .{
+        .name = try dupeStr(alloc, "watcher"),
+        .position = .{ 1.0, 2.0, 5.0 },
+        .target = .{ 0.0, 1.0, 0.0 },
+        .up = .{ 0.0, 1.0, 0.0 },
+        .fov_deg = 50.0,
+        .near = 0.5,
+        .far = 200.0,
+        .smoothing = 4.0,
+    } };
+    defer original.deinit(alloc);
+
+    var parsed = try roundTripState(alloc, &original);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+}
+
+test "serialization fly camera round-trips exactly" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    original.camera = .{ .fly = .{
+        .name = try dupeStr(alloc, "pilot"),
+        .position = .{ -3.0, 1.5, 7.0 },
+        .rotation = .{ 10.0, 45.0, 30.0 },
+        .fov_deg = 70.0,
+        .near = 0.2,
+        .far = 300.0,
+        .speed = 9.0,
+        .boost_multiplier = 3.0,
+        .angular_sensitivity = 0.4,
+        .roll_speed_deg = 120.0,
+    } };
+    defer original.deinit(alloc);
+
+    var parsed = try roundTripState(alloc, &original);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+}
+
+test "serialization cutout standard material round-trips cutoff and double-sided" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    defer original.deinit(alloc);
+    const meshes = try alloc.alloc(MeshEntry, 1);
+    meshes[0] = .{
+        .name = try dupeStr(alloc, "fence"),
+        .material = .{ .standard = .{
+            .diffuse = .{ 0.8, 0.7, 0.6 },
+            .alpha = 0.9,
+            .alpha_mode = 2,
+            .alpha_cutoff = 0.2,
+            .double_sided = true,
+        } },
+    };
+    original.meshes = meshes;
+
+    var parsed = try roundTripState(alloc, &original);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+    try std.testing.expectEqual(@as(u8, 2), parsed.meshes[0].material.standard.alpha_mode);
+    try std.testing.expectEqual(@as(f32, 0.2), parsed.meshes[0].material.standard.alpha_cutoff);
+    try std.testing.expect(parsed.meshes[0].material.standard.double_sided);
+}
+
+test "serialization cutout pbr material round-trips cutoff and double-sided" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    defer original.deinit(alloc);
+    const meshes = try alloc.alloc(MeshEntry, 1);
+    meshes[0] = .{
+        .name = try dupeStr(alloc, "grate"),
+        .material = .{ .pbr = .{
+            .albedo = .{ 0.3, 0.4, 0.5 },
+            .metallic = 0.1,
+            .roughness = 0.8,
+            .emissive = .{ 0.0, 0.0, 0.0 },
+            .alpha = 1.0,
+            .alpha_mode = 2,
+            .alpha_cutoff = 0.2,
+            .double_sided = true,
+        } },
+    };
+    original.meshes = meshes;
+
+    var parsed = try roundTripState(alloc, &original);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+    try std.testing.expectEqual(@as(u8, 2), parsed.meshes[0].material.pbr.alpha_mode);
+    try std.testing.expectEqual(@as(f32, 0.2), parsed.meshes[0].material.pbr.alpha_cutoff);
+    try std.testing.expect(parsed.meshes[0].material.pbr.double_sided);
+}
+
+test "serialization opaque and blend modes round-trip" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    defer original.deinit(alloc);
+    const meshes = try alloc.alloc(MeshEntry, 2);
+    meshes[0] = .{
+        .name = try dupeStr(alloc, "solid"),
+        .material = .{ .standard = .{ .diffuse = .{ 1.0, 0.0, 0.0 }, .alpha = 1.0, .alpha_mode = 0 } },
+    };
+    meshes[1] = .{
+        .name = try dupeStr(alloc, "glass"),
+        .material = .{ .pbr = .{
+            .albedo = .{ 0.9, 0.9, 1.0 },
+            .metallic = 0.0,
+            .roughness = 0.1,
+            .emissive = .{ 0.0, 0.0, 0.0 },
+            .alpha = 0.35,
+            .alpha_mode = 1,
+        } },
+    };
+    original.meshes = meshes;
+
+    var parsed = try roundTripState(alloc, &original);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+    try std.testing.expectEqual(@as(u8, 0), parsed.meshes[0].material.standard.alpha_mode);
+    try std.testing.expectEqual(@as(u8, 1), parsed.meshes[1].material.pbr.alpha_mode);
+}
+
+test "capture and restore target and fly cameras" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var scene: Scene = std.mem.zeroes(Scene);
+    scene.allocator = alloc;
+    scene.active_camera = .{ .target = TargetCamera.init("watcher", .{
+        .position = Vec3.new(0.0, 0.0, 5.0),
+        .target = Vec3.zero,
+        .fov_deg = 50.0,
+        .near = 0.5,
+        .far = 200.0,
+        .smoothing = 4.0,
+    }) };
+
+    var state = try capture(alloc, &scene);
+    try std.testing.expect(state.camera == .target);
+    try std.testing.expectEqual(@as(f32, 4.0), state.camera.target.smoothing);
+
+    restore(&scene, &state);
+    try std.testing.expect(scene.active_camera != null);
+    try std.testing.expect(scene.active_camera.? == .target);
+    try std.testing.expectEqual(@as(f32, 50.0), scene.active_camera.?.target.fov_deg);
+    try std.testing.expectEqual(@as(f32, 4.0), scene.active_camera.?.target.smoothing);
+
+    scene.active_camera = .{ .fly = FlyCamera.init("pilot", .{
+        .position = Vec3.new(1.0, 2.0, 3.0),
+        .rotation = Vec3.new(10.0, 20.0, 30.0),
+        .speed = 9.0,
+        .boost_multiplier = 3.0,
+        .angular_sensitivity = 0.4,
+        .roll_speed_deg = 120.0,
+    }) };
+    var state2 = try capture(alloc, &scene);
+    try std.testing.expect(state2.camera == .fly);
+    restore(&scene, &state2);
+    try std.testing.expect(scene.active_camera.? == .fly);
+    try std.testing.expectEqual(@as(f32, 3.0), scene.active_camera.?.fly.boost_multiplier);
+    try std.testing.expectEqual(@as(f32, 120.0), scene.active_camera.?.fly.roll_speed_deg);
+}
+
+test "capture and restore cutout material fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var scene: Scene = std.mem.zeroes(Scene);
+    scene.allocator = alloc;
+
+    var std_mat = StandardMaterial.init("cut");
+    std_mat.alpha_mode = .cutout;
+    std_mat.alpha_cutoff = 0.2;
+    std_mat.double_sided = true;
+    var mesh = std.mem.zeroes(Mesh);
+    mesh.name = "fence";
+    mesh.material = .{ .standard = &std_mat };
+    try scene.meshes.append(alloc, &mesh);
+
+    var state = try capture(alloc, &scene);
+    try std.testing.expectEqual(@as(u8, 2), state.meshes[0].material.standard.alpha_mode);
+    try std.testing.expectEqual(@as(f32, 0.2), state.meshes[0].material.standard.alpha_cutoff);
+    try std.testing.expect(state.meshes[0].material.standard.double_sided);
+
+    // Mutate live, restore must bring the snapshot values back.
+    std_mat.alpha_cutoff = 0.9;
+    std_mat.double_sided = false;
+    std_mat.alpha_mode = .@"opaque";
+    restore(&scene, &state);
+    try std.testing.expect(std_mat.alpha_mode == .cutout);
+    try std.testing.expectEqual(@as(f32, 0.2), std_mat.alpha_cutoff);
+    try std.testing.expect(std_mat.double_sided);
 }
