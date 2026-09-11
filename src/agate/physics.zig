@@ -2,186 +2,58 @@ const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const BoundingBox = math.BoundingBox;
-const Ray = math.Ray;
-const RayHit = math.RayHit;
 const Quat = math.Quat;
-const Mat4 = math.Mat4;
 const Mesh = @import("mesh.zig").Mesh;
 const c = @import("c.zig").c;
 
-pub const PickingInfo = struct {
-    hit: bool = false,
-    distance: f32 = 0.0,
-    picked_point: Vec3 = Vec3.zero,
-    picked_normal: Vec3 = Vec3.up,
-    picked_mesh: ?*Mesh = null,
-};
+const convert = @import("physics/convert.zig");
+const types = @import("physics/types.zig");
+const body_mod = @import("physics/body.zig");
+const debug_geo = @import("physics/debug_geo.zig");
+const physics_queries = @import("physics/queries.zig");
+const physics_joints = @import("physics/joints.zig");
+const physics_debug = @import("physics/debug.zig");
+const physics_events = @import("physics/events.zig");
 
-pub const ColliderType = enum {
-    box,
-    sphere,
-    capsule,
-    /// Convex hull computed from `Mesh.cpu_positions`.
-    hull,
-    /// Triangle mesh collider from `Mesh.cpu_positions` + `Mesh.cpu_indices`.
-    /// Static bodies only (Box3D restriction).
-    mesh,
-    /// Terrain collider. Create via `PhysicsWorld.createHeightField`.
-    heightfield,
-};
+// Re-exports of the extracted leaf modules (public API unchanged).
+pub const PickingInfo = types.PickingInfo;
+pub const ColliderType = types.ColliderType;
+pub const HeightFieldOptions = types.HeightFieldOptions;
+pub const PhysicsRayHit = body_mod.PhysicsRayHit;
+pub const CollisionFilter = types.CollisionFilter;
+pub const BodyOptions = types.BodyOptions;
+pub const SensorEvent = body_mod.SensorEvent;
+pub const ContactEvent = body_mod.ContactEvent;
+pub const ContactHitEvent = body_mod.ContactHitEvent;
+pub const ChildShape = body_mod.ChildShape;
+pub const ChildShapeOptions = types.ChildShapeOptions;
+pub const JointId = types.JointId;
+pub const DistanceJointOptions = types.DistanceJointOptions;
+pub const SphericalJointOptions = types.SphericalJointOptions;
+pub const RevoluteJointOptions = types.RevoluteJointOptions;
+pub const WheelJointOptions = types.WheelJointOptions;
+pub const MotorJointOptions = types.MotorJointOptions;
+pub const WeldJointOptions = types.WeldJointOptions;
+pub const ParallelJointOptions = types.ParallelJointOptions;
+pub const PrismaticJointOptions = types.PrismaticJointOptions;
+pub const RigidBody = body_mod.RigidBody;
+pub const DebugLine = types.DebugLine;
 
-pub const HeightFieldOptions = struct {
-    /// x/z cell size and y height multiplier.
-    scale: Vec3 = Vec3.new(1.0, 1.0, 1.0),
-    clockwise_winding: bool = false,
-};
-
-pub const PhysicsRayHit = struct {
-    hit: bool = false,
-    point: Vec3 = Vec3.zero,
-    normal: Vec3 = Vec3.up,
-    distance: f32 = 0.0,
-    body: ?*RigidBody = null,
-};
-
-/// Shape collision filter (Box3D b3Filter). Category/mask use bit sets;
-/// two shapes collide when (catA & maskB) != 0 and (catB & maskA) != 0.
-/// A non-zero group_index overrides the mask: negative never collides,
-/// positive always collides.
-pub const CollisionFilter = struct {
-    category_bits: u64 = 0x0000000000000001,
-    mask_bits: u64 = 0xFFFFFFFFFFFFFFFF,
-    group_index: i32 = 0,
-};
-
-fn toB3Filter(f: CollisionFilter) c.b3Filter {
-    return .{
-        .categoryBits = f.category_bits,
-        .maskBits = f.mask_bits,
-        .groupIndex = f.group_index,
-    };
-}
-
-fn sameFilter(a: CollisionFilter, b: CollisionFilter) bool {
-    return a.category_bits == b.category_bits and
-        a.mask_bits == b.mask_bits and
-        a.group_index == b.group_index;
-}
-
-/// Optional body setup for `PhysicsWorld.createBodyWith`.
-pub const BodyOptions = struct {
-    filter: CollisionFilter = .{},
-    is_sensor: bool = false,
-    enable_sensor_events: bool = false,
-    enable_contact_events: bool = false,
-    enable_hit_events: bool = false,
-};
-
-/// Sensor overlap event. `began` reports begin/end of the overlap.
-/// `visitor` is null when the other shape does not belong to a tracked body.
-pub const SensorEvent = struct {
-    sensor: ?*RigidBody,
-    visitor: ?*RigidBody,
-    began: bool,
-};
-
-/// Contact begin/end event between two shapes.
-pub const ContactEvent = struct {
-    a: ?*RigidBody,
-    b: ?*RigidBody,
-    began: bool,
-};
-
-/// Contact hit event, reported when the approach speed exceeds
-/// `PhysicsWorld.hit_event_threshold`.
-pub const ContactHitEvent = struct {
-    a: ?*RigidBody,
-    b: ?*RigidBody,
-    point: Vec3 = Vec3.zero,
-    normal: Vec3 = Vec3.up,
-    approach_speed: f32 = 0.0,
-};
-
-/// An extra collision shape attached to a `RigidBody` (compound collider).
-/// Dimensions are in the body's local (unscaled) units and are rebaked when
-/// the mesh scale changes.
-pub const ChildShape = struct {
-    pub const Kind = union(enum) {
-        box: Vec3, // half extents
-        sphere: f32, // radius (center = offset)
-        capsule: struct { half_height: f32, radius: f32 }, // Y axis around offset
-        hull: []Vec3, // owned copy of local points
-    };
-
-    kind: Kind,
-    offset: Vec3 = Vec3.zero,
-    shape_id: c.b3ShapeId = .{ .index1 = 0, .world0 = 0, .generation = 0 },
-    scaled_volume: f32 = 0.0,
-
-    // Optional per-shape overrides (null = inherit the body value live).
-    friction: ?f32 = null,
-    restitution: ?f32 = null,
-    filter: ?CollisionFilter = null,
-    is_sensor: ?bool = null,
-    sensor_events: ?bool = null,
-    contact_events: ?bool = null,
-    hit_events: ?bool = null,
-
-    // Last applied resolved values (for change detection).
-    last_friction: f32 = 0.0,
-    last_restitution: f32 = 0.0,
-    last_filter: CollisionFilter = .{},
-    last_sensor: bool = false,
-    last_sensor_events: bool = false,
-    last_contact_events: bool = false,
-    last_hit_events: bool = false,
-
-    fn freeOwned(self: *ChildShape, allocator: std.mem.Allocator) void {
-        if (self.kind == .hull) {
-            allocator.free(self.kind.hull);
-        }
-    }
-
-    fn resolvedFriction(self: *const ChildShape, body: *const RigidBody) f32 {
-        return self.friction orelse body.friction;
-    }
-
-    fn resolvedRestitution(self: *const ChildShape, body: *const RigidBody) f32 {
-        return self.restitution orelse body.restitution;
-    }
-
-    fn resolvedFilter(self: *const ChildShape, body: *const RigidBody) CollisionFilter {
-        return self.filter orelse body.filter;
-    }
-
-    fn resolvedIsSensor(self: *const ChildShape, body: *const RigidBody) bool {
-        return self.is_sensor orelse body.is_sensor;
-    }
-
-    fn resolvedSensorEvents(self: *const ChildShape, body: *const RigidBody) bool {
-        return self.resolvedIsSensor(body) or (self.sensor_events orelse body.enable_sensor_events);
-    }
-
-    fn resolvedContactEvents(self: *const ChildShape, body: *const RigidBody) bool {
-        return self.contact_events orelse body.enable_contact_events;
-    }
-
-    fn resolvedHitEvents(self: *const ChildShape, body: *const RigidBody) bool {
-        return self.hit_events orelse body.enable_hit_events;
-    }
-};
-
-/// Options for the `PhysicsWorld.add*Shape` compound helpers.
-pub const ChildShapeOptions = struct {
-    offset: Vec3 = Vec3.zero,
-    friction: ?f32 = null,
-    restitution: ?f32 = null,
-    filter: ?CollisionFilter = null,
-    is_sensor: ?bool = null,
-    enable_sensor_events: ?bool = null,
-    enable_contact_events: ?bool = null,
-    enable_hit_events: ?bool = null,
-};
+// Private aliases to the extracted helpers (behavior unchanged).
+const step_h = convert.step_h;
+const damp_scale = convert.damp_scale;
+const deg2rad = convert.deg2rad;
+const rad2deg = convert.rad2deg;
+const min_half_extent = convert.min_half_extent;
+const toB3Vec = convert.toB3Vec;
+const fromB3Vec = convert.fromB3Vec;
+const toB3Pos = convert.toB3Pos;
+const fromB3Pos = convert.fromB3Pos;
+const toB3Quat = convert.toB3Quat;
+const fromB3Quat = convert.fromB3Quat;
+const toB3Filter = types.toB3Filter;
+const sameFilter = types.sameFilter;
+const default_debug_circle_segments = debug_geo.default_debug_circle_segments;
 
 /// Kinematic capsule character controller built on Box3D's mover API
 /// (collide + plane solve + velocity clip). It is NOT a rigid body: it
@@ -448,585 +320,6 @@ pub const Rope = struct {
         };
     }
 };
-
-pub const JointId = c.b3JointId;
-
-pub const DistanceJointOptions = struct {
-    collide_connected: bool = false,
-    length: ?f32 = null, // if null, auto-computed from anchor distance
-    enable_spring: bool = false,
-    hertz: f32 = 4.0,
-    damping_ratio: f32 = 0.5,
-    min_length: ?f32 = null,
-    max_length: ?f32 = null,
-};
-
-pub const SphericalJointOptions = struct {
-    collide_connected: bool = false,
-    enable_spring: bool = false,
-    hertz: f32 = 4.0,
-    damping_ratio: f32 = 0.5,
-    enable_cone_limit: bool = false,
-    cone_angle_rad: f32 = 0.0,
-    enable_twist_limit: bool = false,
-    lower_twist_angle_rad: f32 = 0.0,
-    upper_twist_angle_rad: f32 = 0.0,
-};
-
-pub const RevoluteJointOptions = struct {
-    collide_connected: bool = false,
-    /// Joint frames. Rotation happens around frame A z-axis (world z when
-    /// both bodies are unrotated and frames are identity).
-    frame_a: Quat = Quat.identity,
-    frame_b: Quat = Quat.identity,
-    enable_spring: bool = false,
-    hertz: f32 = 4.0,
-    damping_ratio: f32 = 0.5,
-    enable_limit: bool = false,
-    lower_angle_rad: f32 = 0.0,
-    upper_angle_rad: f32 = 0.0,
-    enable_motor: bool = false,
-    motor_speed_rad: f32 = 0.0,
-    max_motor_torque: f32 = 0.0,
-};
-
-/// Options for `PhysicsWorld.createWheelJoint` (body A = chassis).
-pub const WheelJointOptions = struct {
-    collide_connected: bool = false,
-    /// Joint frames. Suspension/steering act around frame A x-axis, the wheel
-    /// spins around frame B z-axis.
-    frame_a: Quat = Quat.identity,
-    frame_b: Quat = Quat.identity,
-    enable_suspension: bool = true,
-    suspension_hertz: f32 = 7.0,
-    suspension_damping: f32 = 0.7,
-    enable_suspension_limit: bool = true,
-    lower_suspension_limit: f32 = -0.25,
-    upper_suspension_limit: f32 = 0.25,
-    enable_spin_motor: bool = false,
-    spin_speed_rad: f32 = 0.0,
-    max_spin_torque: f32 = 0.0,
-    enable_steering: bool = false,
-    steering_hertz: f32 = 8.0,
-    steering_damping: f32 = 1.0,
-    target_steering_angle_rad: f32 = 0.0,
-    max_steering_torque: f32 = 0.0,
-    enable_steering_limit: bool = false,
-    lower_steering_limit_rad: f32 = 0.0,
-    upper_steering_limit_rad: f32 = 0.0,
-};
-
-/// Options for `PhysicsWorld.createMotorJoint`. A motor joint drives body B
-/// with a velocity motor plus an optional pose spring. With zero spring and
-/// force settings it is inert; set a linear velocity every frame to drag a
-/// body toward a target (see SandboxScene drag interaction for the pattern).
-pub const MotorJointOptions = struct {
-    collide_connected: bool = false,
-    linear_velocity: Vec3 = Vec3.zero,
-    max_velocity_force: f32 = 0.0,
-    angular_velocity_rad: Vec3 = Vec3.zero,
-    max_velocity_torque: f32 = 0.0,
-    linear_hertz: f32 = 0.0,
-    linear_damping: f32 = 0.0,
-    max_spring_force: f32 = 0.0,
-    angular_hertz: f32 = 0.0,
-    angular_damping: f32 = 0.0,
-    max_spring_torque: f32 = 0.0,
-};
-
-/// Options for `PhysicsWorld.createWeldJoint`. Rigidly attaches two bodies
-/// at their creation relative pose (zero hertz = maximum stiffness, springs
-/// mimic soft-body behavior). Pair with `jointConstraintForce` polling to
-/// implement breakable joints.
-pub const WeldJointOptions = struct {
-    collide_connected: bool = false,
-    linear_hertz: f32 = 0.0,
-    angular_hertz: f32 = 0.0,
-    linear_damping: f32 = 0.0,
-    angular_damping: f32 = 0.0,
-};
-
-/// Options for `PhysicsWorld.createParallelJoint`. Constrains the angle
-/// between the z-axis of body A and the z-axis of body B with a spring.
-/// Useful to keep a body upright.
-pub const ParallelJointOptions = struct {
-    collide_connected: bool = false,
-    hertz: f32 = 4.0,
-    damping_ratio: f32 = 0.7,
-    max_torque: f32 = 0.0,
-};
-
-/// Options for `PhysicsWorld.createPrismaticJoint` (slider along frame A
-/// x-axis, rotation locked). Translation is measured in meters from the
-/// creation pose.
-pub const PrismaticJointOptions = struct {
-    collide_connected: bool = false,
-    frame_a: Quat = Quat.identity,
-    frame_b: Quat = Quat.identity,
-    enable_spring: bool = false,
-    hertz: f32 = 4.0,
-    damping_ratio: f32 = 0.5,
-    enable_limit: bool = false,
-    lower_translation: f32 = 0.0,
-    upper_translation: f32 = 0.0,
-    enable_motor: bool = false,
-    motor_speed: f32 = 0.0,
-    max_motor_force: f32 = 0.0,
-};
-
-// Fixed simulation rate Box3D integrates at; step() accumulates frame dt
-// towards it (Fix Your Timestep) instead of feeding variable dt to the solver.
-const step_h: f32 = 1.0 / 60.0;
-// Our damping fields are ~per-1/60-step velocity retention factors;
-// Box3D damping is per-second. 60x maps one to the other.
-const damp_scale: f32 = 60.0;
-const deg2rad: f32 = std.math.pi / 180.0;
-const rad2deg: f32 = 180.0 / std.math.pi;
-// Thin-shape guard: Box3D hulls dislike degenerate half-extents.
-const min_half_extent: f32 = 0.01;
-
-fn toB3Vec(v: Vec3) c.b3Vec3 {
-    return .{ .x = v.x, .y = v.y, .z = v.z };
-}
-
-fn fromB3Vec(v: c.b3Vec3) Vec3 {
-    return Vec3.new(v.x, v.y, v.z);
-}
-
-fn toB3Pos(v: Vec3) c.b3Pos {
-    return .{ .x = @floatCast(v.x), .y = @floatCast(v.y), .z = @floatCast(v.z) };
-}
-
-fn fromB3Pos(p: c.b3Pos) Vec3 {
-    return Vec3.new(@floatCast(p.x), @floatCast(p.y), @floatCast(p.z));
-}
-
-fn toB3Quat(q: Quat) c.b3Quat {
-    return .{ .v = .{ .x = q.x, .y = q.y, .z = q.z }, .s = q.w };
-}
-
-fn fromB3Quat(q: c.b3Quat) Quat {
-    return .{ .x = q.v.x, .y = q.v.y, .z = q.v.z, .w = q.s };
-}
-
-pub const RigidBody = struct {
-    mesh: *Mesh,
-    collider: ColliderType = .box,
-    mass: f32 = 1.0,
-    inv_mass: f32 = 1.0,
-
-    // Live state, mirrored with the solver:
-    // - solver -> fields on every stepped frame (pull)
-    // - field writes are picked up and pushed on the next step()
-    // So `body.velocity = ...` and `mesh.position = ...` keep working,
-    // including teleport-style resets. Pushes canonicalize through the
-    // solver (rotation re-extracted as Euler), keeping change detection stable.
-    velocity: Vec3 = Vec3.zero, // m/s
-    angular_velocity: Vec3 = Vec3.zero, // deg/s
-
-    restitution: f32 = 0.6, // Bounciness [0..1]
-    friction: f32 = 0.25,
-    linear_damping: f32 = 0.015,
-    angular_damping: f32 = 0.04,
-
-    use_gravity: bool = true,
-    is_grounded: bool = false,
-    enabled: bool = true,
-
-    // Collision filtering & events.
-    filter: CollisionFilter = .{},
-    is_sensor: bool = false,
-    /// Enable overlap events for this shape. Required on BOTH the sensor and
-    /// the visitor for sensor events to fire (Box3D rule).
-    enable_sensor_events: bool = false,
-    enable_contact_events: bool = false,
-    enable_hit_events: bool = false,
-
-    // Base (unscaled) shape dims; live dims = base * mesh.scaling.
-    base_extents: Vec3 = Vec3.new(0.5, 0.5, 0.5),
-    base_radius: f32 = 0.5,
-    // Picking helpers (base dims, like before).
-    box_extents: Vec3 = Vec3.new(0.5, 0.5, 0.5),
-    sphere_radius: f32 = 0.5,
-
-    body_id: c.b3BodyId = .{ .index1 = 0, .world0 = 0, .generation = 0 },
-    shape_id: c.b3ShapeId = .{ .index1 = 0, .world0 = 0, .generation = 0 },
-
-    // Geometry owned by us whose lifetime must cover the shape:
-    // triangle mesh and height field shapes reference this data directly.
-    // (Hull shape data is cloned into the Box3D world database.)
-    mesh_data: ?*c.b3MeshData = null,
-    heightfield_data: ?*c.b3HeightFieldData = null,
-
-    // Extra collision shapes on this body (compound collider).
-    child_shapes: std.ArrayListUnmanaged(ChildShape) = .empty,
-
-    // Change-detection shadows; always equal the last solver-synced values.
-    last_pos: Vec3 = Vec3.zero,
-    last_rot: Vec3 = Vec3.zero,
-    last_scale: Vec3 = Vec3.one,
-    last_vel: Vec3 = Vec3.zero,
-    last_angvel: Vec3 = Vec3.zero, // deg/s, canonical
-    last_rest: f32 = 0.6,
-    last_fric: f32 = 0.25,
-    last_damp_l: f32 = 0.015,
-    last_damp_a: f32 = 0.04,
-    last_grav: bool = true,
-    last_enabled: bool = true,
-    last_mass: f32 = 1.0,
-    last_filter: CollisionFilter = .{},
-    last_sensor_events: bool = false,
-    last_contact_events: bool = false,
-    last_hit_events: bool = false,
-
-    pub fn init(mesh: *Mesh, collider: ColliderType, mass: f32) RigidBody {
-        const inv_m = if (mass > 0.0) 1.0 / mass else 0.0;
-        const aabb = mesh.local_bounding_box;
-        const ext = aabb.extents();
-        const rad = @max(ext.x, @max(ext.y, ext.z));
-        const base_ext = if (ext.lengthSq() > 1e-6) ext else Vec3.new(0.5, 0.5, 0.5);
-        const base_rad = if (rad > 1e-4) rad else 0.5;
-
-        return .{
-            .mesh = mesh,
-            .collider = collider,
-            .mass = mass,
-            .inv_mass = inv_m,
-            .base_extents = base_ext,
-            .base_radius = base_rad,
-            .box_extents = base_ext,
-            .sphere_radius = base_rad,
-            .restitution = 0.6,
-            .friction = 0.25,
-            .linear_damping = 0.015,
-            .angular_damping = 0.04,
-            .last_pos = mesh.position,
-            .last_rot = mesh.rotation,
-            .last_scale = mesh.scaling,
-            .last_mass = mass,
-        };
-    }
-
-    fn shapeVolume(b: *const RigidBody, scale: Vec3) f32 {
-        return switch (b.collider) {
-            .box => 8.0 * (b.base_extents.x * scale.x) * (b.base_extents.y * scale.y) * (b.base_extents.z * scale.z),
-            .sphere => blk: {
-                const r = b.base_radius * scale.x;
-                break :blk 4.1887902 * r * r * r;
-            },
-            .capsule => blk: {
-                // Y-capsule: radius is the horizontal extent, not base_radius
-                // (which stores the max extent for spheres).
-                const r = @max(@min(b.base_extents.x, b.base_extents.z) * scale.x, min_half_extent);
-                const hh = @max(0.0, b.base_extents.y * scale.y - r);
-                const sph_vol = 4.1887902 * r * r * r;
-                const cyl_vol = 6.2831853 * r * r * hh;
-                break :blk sph_vol + cyl_vol;
-            },
-            .hull => blk: {
-                const hull = c.b3Shape_GetHull(b.shape_id);
-                break :blk if (hull != null) hull.*.volume else 0.0;
-            },
-            .mesh, .heightfield => 0.0,
-        };
-    }
-
-    fn densityForMass(mass: f32, volume: f32) f32 {
-        if (mass <= 0.0) return 0.0;
-        return mass / @max(volume, 1e-6);
-    }
-
-    pub fn applyImpulse(self: *RigidBody, impulse: Vec3) void {
-        if (self.mass <= 0.0) return;
-        c.b3Body_ApplyLinearImpulseToCenter(self.body_id, toB3Vec(impulse), true);
-        self.velocity = fromB3Vec(c.b3Body_GetLinearVelocity(self.body_id));
-        self.last_vel = self.velocity;
-        self.is_grounded = false;
-    }
-
-    pub fn applyTorqueImpulse(self: *RigidBody, torque_impulse: Vec3) void {
-        if (self.mass <= 0.0) return;
-        const m = c.b3Body_GetMass(self.body_id);
-        if (m <= 0.0) return;
-        const w = fromB3Vec(c.b3Body_GetAngularVelocity(self.body_id));
-        c.b3Body_SetAngularVelocity(self.body_id, toB3Vec(w.add(torque_impulse.scale(deg2rad / m))));
-        const got = fromB3Vec(c.b3Body_GetAngularVelocity(self.body_id)).scale(rad2deg);
-        self.angular_velocity = got;
-        self.last_angvel = got;
-    }
-
-    pub fn applyForce(self: *RigidBody, force: Vec3, dt: f32) void {
-        if (self.mass <= 0.0) return;
-        const m = @max(c.b3Body_GetMass(self.body_id), 1e-6);
-        const v = fromB3Vec(c.b3Body_GetLinearVelocity(self.body_id)).add(force.scale(dt / m));
-        c.b3Body_SetLinearVelocity(self.body_id, toB3Vec(v));
-        c.b3Body_SetAwake(self.body_id, true);
-        self.velocity = fromB3Vec(c.b3Body_GetLinearVelocity(self.body_id));
-        self.last_vel = self.velocity;
-    }
-
-    pub fn setMass(self: *RigidBody, mass: f32) void {
-        self.mass = mass;
-        self.inv_mass = if (mass > 0.0) 1.0 / mass else 0.0;
-        // Density/type sync happens in pushBody() on the next step().
-    }
-
-    /// Transforms a point in world space into the body's local space.
-    pub fn worldToLocal(self: *const RigidBody, world_point: Vec3) Vec3 {
-        const q = Quat.fromEulerDeg(self.mesh.rotation);
-        const rel = world_point.sub(self.mesh.position);
-        return q.conjugate().rotateVec(rel);
-    }
-
-    /// Transforms a point in the body's local space into world space.
-    pub fn localToWorld(self: *const RigidBody, local_point: Vec3) Vec3 {
-        const q = Quat.fromEulerDeg(self.mesh.rotation);
-        return self.mesh.position.add(q.rotateVec(local_point));
-    }
-};
-
-/// One CPU-side debug line segment (a line list for an external renderer or
-/// a future debug pass). The default color is dynamic-body green.
-pub const DebugLine = struct {
-    a: Vec3,
-    b: Vec3,
-    color: [3]f32 = .{ 0.1, 0.9, 0.3 },
-};
-
-// Debug wireframe colors: dynamic bodies green, static/kinematic
-// (mass <= 0) white, sensors yellow. The sensor tint wins over the other two.
-const debug_dynamic_color: [3]f32 = .{ 0.1, 0.9, 0.3 };
-const debug_static_color: [3]f32 = .{ 0.9, 0.9, 0.9 };
-const debug_sensor_color: [3]f32 = .{ 0.95, 0.8, 0.15 };
-
-// Default segments per debug circle (sphere great circles, capsule cap
-// rings); override per world with PhysicsWorld.debug_circle_segments.
-const default_debug_circle_segments: usize = 24;
-const min_debug_circle_segments: usize = 4;
-// Unit-circle samples precomputed on the stack per appendDebugLines call.
-// Larger counts use per-segment trig instead (same angles, same points).
-const debug_unit_stack_max: usize = 128;
-
-// 12 edges of a box, shared by the scaled-box and world-AABB wireframes.
-const debug_box_edges: [12][2]usize = .{
-    .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 0 },
-    .{ 4, 5 }, .{ 5, 6 }, .{ 6, 7 }, .{ 7, 4 },
-    .{ 0, 4 }, .{ 1, 5 }, .{ 2, 6 }, .{ 3, 7 },
-};
-
-const DebugCirclePlane = enum { xy, xz, yz };
-
-// One unit-circle sample shared by every debug ring in a single
-// appendDebugLines call; scaled by the shape radius when emitting.
-const DebugUnit = struct { c: f32, s: f32 };
-
-// Ring source for the circle helpers: the precomputed unit table when the
-// segment count fits the stack buffer, otherwise direct per-segment trig.
-// Both evaluate the same angles, so the emitted points match exactly.
-const DebugRings = struct {
-    segs: usize,
-    unit: ?[]const DebugUnit,
-};
-
-// Local Y-capsule dims in body units, mirroring RigidBody.shapeVolume:
-// radius is the horizontal extent, half height is the leftover Y extent.
-fn debugCapsuleRadius(base_extents: Vec3) f32 {
-    return @min(base_extents.x, base_extents.z);
-}
-
-fn debugCapsuleHalfHeight(base_extents: Vec3) f32 {
-    return @max(0.0, base_extents.y - @min(base_extents.x, base_extents.z));
-}
-
-// Appends the 12 edges of the box (center, half extents) in body units,
-// transformed to world space by the mesh world matrix (which carries the
-// body scale, so callers pass unscaled dims). Allocation-free: the caller
-// reserves debugLineCount() entries up front.
-fn appendDebugBoxLines(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    wm: Mat4,
-    center: Vec3,
-    half_extents: Vec3,
-    color: [3]f32,
-) void {
-    const hx = half_extents.x;
-    const hy = half_extents.y;
-    const hz = half_extents.z;
-    const corners = [8]Vec3{
-        Vec3.new(center.x - hx, center.y - hy, center.z - hz),
-        Vec3.new(center.x + hx, center.y - hy, center.z - hz),
-        Vec3.new(center.x + hx, center.y + hy, center.z - hz),
-        Vec3.new(center.x - hx, center.y + hy, center.z - hz),
-        Vec3.new(center.x - hx, center.y - hy, center.z + hz),
-        Vec3.new(center.x + hx, center.y - hy, center.z + hz),
-        Vec3.new(center.x + hx, center.y + hy, center.z + hz),
-        Vec3.new(center.x - hx, center.y + hy, center.z + hz),
-    };
-    for (debug_box_edges) |e| {
-        out.appendAssumeCapacity(.{
-            .a = wm.transformPoint(corners[e[0]]),
-            .b = wm.transformPoint(corners[e[1]]),
-            .color = color,
-        });
-    }
-}
-
-fn debugCirclePoint(center: Vec3, radius: f32, plane: DebugCirclePlane, angle: f32) Vec3 {
-    const cx = @cos(angle) * radius;
-    const sx = @sin(angle) * radius;
-    return switch (plane) {
-        .xy => Vec3.new(center.x + cx, center.y + sx, center.z),
-        .xz => Vec3.new(center.x + cx, center.y, center.z + sx),
-        .yz => Vec3.new(center.x, center.y + cx, center.z + sx),
-    };
-}
-
-// Same math as debugCirclePoint but from a precomputed unit sample, so
-// shared ring endpoints reuse one cos/sin pair instead of recomputing it.
-fn debugCirclePointUnit(center: Vec3, radius: f32, plane: DebugCirclePlane, u: DebugUnit) Vec3 {
-    const cx = u.c * radius;
-    const sx = u.s * radius;
-    return switch (plane) {
-        .xy => Vec3.new(center.x + cx, center.y + sx, center.z),
-        .xz => Vec3.new(center.x + cx, center.y, center.z + sx),
-        .yz => Vec3.new(center.x, center.y + cx, center.z + sx),
-    };
-}
-
-// Appends one ring of segs lines in the given local plane, transformed to
-// world space by the mesh world matrix. Allocation-free (see above).
-fn appendDebugCircleLines(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    wm: Mat4,
-    center: Vec3,
-    radius: f32,
-    plane: DebugCirclePlane,
-    color: [3]f32,
-    rings: DebugRings,
-) void {
-    if (rings.unit) |unit| {
-        var i: usize = 0;
-        while (i < rings.segs) : (i += 1) {
-            out.appendAssumeCapacity(.{
-                .a = wm.transformPoint(debugCirclePointUnit(center, radius, plane, unit[i])),
-                .b = wm.transformPoint(debugCirclePointUnit(center, radius, plane, unit[i + 1])),
-                .color = color,
-            });
-        }
-        return;
-    }
-    var i: usize = 0;
-    while (i < rings.segs) : (i += 1) {
-        const t0 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rings.segs)) * 2.0 * std.math.pi;
-        const t1 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(rings.segs)) * 2.0 * std.math.pi;
-        out.appendAssumeCapacity(.{
-            .a = wm.transformPoint(debugCirclePoint(center, radius, plane, t0)),
-            .b = wm.transformPoint(debugCirclePoint(center, radius, plane, t1)),
-            .color = color,
-        });
-    }
-}
-
-// 3 orthogonal great circles: 3 * segs lines.
-fn appendDebugSphereLines(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    wm: Mat4,
-    center: Vec3,
-    radius: f32,
-    color: [3]f32,
-    rings: DebugRings,
-) void {
-    appendDebugCircleLines(out, wm, center, radius, .xy, color, rings);
-    appendDebugCircleLines(out, wm, center, radius, .xz, color, rings);
-    appendDebugCircleLines(out, wm, center, radius, .yz, color, rings);
-}
-
-// 4 side lines joining the capsule cap rings at the cardinal points. Kept
-// on the exact k * pi/2 angles (not the unit table) so points stay
-// bit-identical to the historical output.
-fn appendDebugCapsuleSides(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    wm: Mat4,
-    center: Vec3,
-    radius: f32,
-    half_height: f32,
-    color: [3]f32,
-) void {
-    var k: usize = 0;
-    while (k < 4) : (k += 1) {
-        const t = @as(f32, @floatFromInt(k)) * 0.5 * std.math.pi;
-        const x = @cos(t) * radius;
-        const z = @sin(t) * radius;
-        out.appendAssumeCapacity(.{
-            .a = wm.transformPoint(Vec3.new(center.x + x, center.y + half_height, center.z + z)),
-            .b = wm.transformPoint(Vec3.new(center.x + x, center.y - half_height, center.z + z)),
-            .color = color,
-        });
-    }
-}
-
-// Y-capsule: top/bottom cap rings plus 4 side lines joining them at the
-// cardinal points: 2 * segs + 4 lines.
-fn appendDebugCapsuleLines(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    wm: Mat4,
-    center: Vec3,
-    radius: f32,
-    half_height: f32,
-    color: [3]f32,
-    rings: DebugRings,
-) void {
-    const top = Vec3.new(center.x, center.y + half_height, center.z);
-    const bottom = Vec3.new(center.x, center.y - half_height, center.z);
-    appendDebugCircleLines(out, wm, top, radius, .xz, color, rings);
-    appendDebugCircleLines(out, wm, bottom, radius, .xz, color, rings);
-    appendDebugCapsuleSides(out, wm, center, radius, half_height, color);
-}
-
-// Wireframe box of a shape's world AABB (already world space, no transform).
-// Invalid shapes are skipped.
-fn appendDebugAabbLines(
-    out: *std.ArrayListUnmanaged(DebugLine),
-    shape_id: c.b3ShapeId,
-    color: [3]f32,
-) void {
-    if (shape_id.index1 == 0) return;
-    const aabb = c.b3Shape_GetAABB(shape_id);
-    const lo = fromB3Vec(aabb.lowerBound);
-    const hi = fromB3Vec(aabb.upperBound);
-    const corners = [8]Vec3{
-        Vec3.new(lo.x, lo.y, lo.z),
-        Vec3.new(hi.x, lo.y, lo.z),
-        Vec3.new(hi.x, hi.y, lo.z),
-        Vec3.new(lo.x, hi.y, lo.z),
-        Vec3.new(lo.x, lo.y, hi.z),
-        Vec3.new(hi.x, lo.y, hi.z),
-        Vec3.new(hi.x, hi.y, hi.z),
-        Vec3.new(lo.x, hi.y, hi.z),
-    };
-    for (debug_box_edges) |e| {
-        out.appendAssumeCapacity(.{ .a = corners[e[0]], .b = corners[e[1]], .color = color });
-    }
-}
-
-fn primaryDebugLineCount(collider: ColliderType, segs: usize) usize {
-    return switch (collider) {
-        .box => 12,
-        .sphere => 3 * segs,
-        .capsule => 2 * segs + 4,
-        .hull, .mesh, .heightfield => 12,
-    };
-}
-
-fn childDebugLineCount(kind: ChildShape.Kind, segs: usize) usize {
-    return switch (kind) {
-        .box => 12,
-        .sphere => 3 * segs,
-        .capsule => 2 * segs + 4,
-        // No cheap wireframe; skipped gracefully.
-        .hull => 0,
-    };
-}
 
 pub const PhysicsWorld = struct {
     allocator: std.mem.Allocator,
@@ -1464,10 +757,9 @@ pub const PhysicsWorld = struct {
     /// Casts a ray through the physics world and returns the closest hit.
     /// Unlike mesh picking this also hits hull, mesh and height-field colliders.
     pub fn raycast(self: *PhysicsWorld, origin: Vec3, direction: Vec3, max_distance: f32) PhysicsRayHit {
-        return self.raycastWithFilter(origin, direction, max_distance, .{});
+        return physics_queries.raycast(self, origin, direction, max_distance);
     }
 
-    /// Same as raycast but only accepts shapes matching the filter mask.
     pub fn raycastWithFilter(
         self: *PhysicsWorld,
         origin: Vec3,
@@ -1475,98 +767,18 @@ pub const PhysicsWorld = struct {
         max_distance: f32,
         filter: CollisionFilter,
     ) PhysicsRayHit {
-        if (max_distance <= 0.0) return .{};
-        const len = direction.length();
-        if (len < 1e-6) return .{};
-
-        const translation = direction.scale(max_distance / len);
-        var query_filter = c.b3DefaultQueryFilter();
-        query_filter.categoryBits = filter.category_bits;
-        query_filter.maskBits = filter.mask_bits;
-        const result = c.b3World_CastRayClosest(self.world_id, toB3Pos(origin), toB3Vec(translation), query_filter);
-        if (!result.hit) return .{};
-
-        return .{
-            .hit = true,
-            .point = fromB3Pos(result.point),
-            .normal = fromB3Vec(result.normal),
-            .distance = max_distance * result.fraction,
-            .body = self.findBodyByShape(result.shapeId),
-        };
+        return physics_queries.raycastWithFilter(self, origin, direction, max_distance, filter);
     }
 
-    /// Maps a `CollisionFilter` onto a Box3D query filter, exactly like
-    /// `raycastWithFilter` does (category/mask bits; recorder id/name stay default).
-    fn toB3QueryFilter(f: CollisionFilter) c.b3QueryFilter {
-        var q = c.b3DefaultQueryFilter();
-        q.categoryBits = f.category_bits;
-        q.maskBits = f.mask_bits;
-        return q;
-    }
-
-    /// Shared context for the overlap-query callbacks below.
-    const OverlapCollectCtx = struct {
-        world: *PhysicsWorld,
-        results: *std.ArrayListUnmanaged(*RigidBody),
-        /// When set (queryPoint), only accept shapes whose world AABB contains this point.
-        point: ?Vec3 = null,
-        /// Last reported body: Box3D often reports a compound body's shapes
-        /// back to back, so re-check it before the full body scan.
-        last: ?*RigidBody = null,
-        /// Set when `results.append` runs out of memory; the query is aborted
-        /// (callback returns false) and the caller converts this to `error.OutOfMemory`.
-        oom: bool = false,
-    };
-
-    /// `b3OverlapResultFcn`: maps each reported shape to its body, skips
-    /// untracked shapes (e.g. the internal ground plane) and `!enabled`
-    /// bodies, and appends each body at most once (compound bodies report
-    /// one shape per child).
-    fn overlapCollectFcn(shape_id: c.b3ShapeId, context: ?*anyopaque) callconv(.c) bool {
-        const ctx_ptr = context orelse return true;
-        const ctx: *OverlapCollectCtx = @ptrCast(@alignCast(ctx_ptr));
-        // Fast path for consecutive shapes of one compound body; the
-        // ownsShape check returns the same body findBodyByShape would.
-        var cached: ?*RigidBody = null;
-        if (ctx.last) |last| {
-            if (ctx.world.ownsShape(last, shape_id)) cached = last;
-        }
-        const body = cached orelse ctx.world.findBodyByShape(shape_id) orelse return true;
-        ctx.last = body;
-        if (!body.enabled) return true;
-        if (ctx.point) |p| {
-            const aabb = c.b3Shape_GetAABB(shape_id);
-            if (p.x < aabb.lowerBound.x or p.x > aabb.upperBound.x or
-                p.y < aabb.lowerBound.y or p.y > aabb.upperBound.y or
-                p.z < aabb.lowerBound.z or p.z > aabb.upperBound.z) return true;
-        }
-        // Fast path: a repeat report lands at the end of the list, which the
-        // scan below would find anyway; same ordering and contents.
-        if (ctx.results.items.len > 0 and ctx.results.items[ctx.results.items.len - 1] == body) return true;
-        for (ctx.results.items) |b| {
-            if (b == body) return true;
-        }
-        ctx.results.append(ctx.world.allocator, body) catch {
-            ctx.oom = true;
-            return false;
-        };
-        return true;
-    }
-
-    /// Appends every enabled body with a shape potentially overlapping the
-    /// box `[min, max]` (broadphase `b3World_OverlapAABB`). Each body is
-    /// appended at most once. Results are APPENDED, not cleared.
     pub fn queryAABB(
         self: *PhysicsWorld,
         min: Vec3,
         max: Vec3,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        return self.queryAABBWithFilter(min, max, .{}, results);
+        return physics_queries.queryAABB(self, min, max, results);
     }
 
-    /// Same as `queryAABB` but only accepts shapes matching the filter mask
-    /// (mapped exactly like `raycastWithFilter`).
     pub fn queryAABBWithFilter(
         self: *PhysicsWorld,
         min: Vec3,
@@ -1574,31 +786,18 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        const aabb = c.b3AABB{
-            .lowerBound = toB3Vec(Vec3.new(@min(min.x, max.x), @min(min.y, max.y), @min(min.z, max.z))),
-            .upperBound = toB3Vec(Vec3.new(@max(min.x, max.x), @max(min.y, max.y), @max(min.z, max.z))),
-        };
-        var ctx = OverlapCollectCtx{ .world = self, .results = results };
-        _ = c.b3World_OverlapAABB(self.world_id, aabb, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
-        if (ctx.oom) return error.OutOfMemory;
+        return physics_queries.queryAABBWithFilter(self, min, max, filter, results);
     }
 
-    /// Appends every enabled body overlapping the sphere (`center`, `radius`)
-    /// via an exact `b3World_OverlapShape` query. The sphere proxy is a single
-    /// point with a non-zero radius (see `b3ShapeCastInput` docs), so this is
-    /// precise for all collider types — no AABB approximation. Each body is
-    /// appended at most once. Results are APPENDED, not cleared.
     pub fn querySphere(
         self: *PhysicsWorld,
         center: Vec3,
         radius: f32,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        return self.querySphereWithFilter(center, radius, .{}, results);
+        return physics_queries.querySphere(self, center, radius, results);
     }
 
-    /// Same as `querySphere` but only accepts shapes matching the filter mask
-    /// (mapped exactly like `raycastWithFilter`).
     pub fn querySphereWithFilter(
         self: *PhysicsWorld,
         center: Vec3,
@@ -1606,95 +805,30 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        if (!(radius > 0.0)) return;
-        // Proxy points are relative to `origin`, so a sphere is one
-        // origin-centered point plus the radius.
-        var point = c.b3Vec3{ .x = 0.0, .y = 0.0, .z = 0.0 };
-        var proxy = c.b3ShapeProxy{ .points = &point, .count = 1, .radius = radius };
-        var ctx = OverlapCollectCtx{ .world = self, .results = results };
-        _ = c.b3World_OverlapShape(self.world_id, toB3Pos(center), &proxy, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
-        if (ctx.oom) return error.OutOfMemory;
+        return physics_queries.querySphereWithFilter(self, center, radius, filter, results);
     }
 
-    /// Appends every enabled body whose shape world AABB (`b3Shape_GetAABB`)
-    /// contains `point`. Broadphase is a zero-extent `b3World_OverlapAABB`
-    /// query; the per-shape AABB check is the precise test, so rotated/thin
-    /// shapes report AABB containment, not exact surface containment. Each
-    /// body is appended at most once. Results are APPENDED, not cleared.
     pub fn queryPoint(
         self: *PhysicsWorld,
         point: Vec3,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        return self.queryPointWithFilter(point, .{}, results);
+        return physics_queries.queryPoint(self, point, results);
     }
 
-    /// Same as `queryPoint` but only accepts shapes matching the filter mask
-    /// (mapped exactly like `raycastWithFilter`).
     pub fn queryPointWithFilter(
         self: *PhysicsWorld,
         point: Vec3,
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
-        const p = toB3Vec(point);
-        const aabb = c.b3AABB{ .lowerBound = p, .upperBound = p };
-        var ctx = OverlapCollectCtx{ .world = self, .results = results, .point = point };
-        _ = c.b3World_OverlapAABB(self.world_id, aabb, toB3QueryFilter(filter), &overlapCollectFcn, &ctx);
-        if (ctx.oom) return error.OutOfMemory;
+        return physics_queries.queryPointWithFilter(self, point, filter, results);
     }
 
-    const SphereCastCtx = struct {
-        world: *PhysicsWorld,
-        travel: f32,
-        best_fraction: f32 = std.math.floatMax(f32),
-        body: ?*RigidBody = null,
-        point: Vec3 = Vec3.zero,
-        normal: Vec3 = Vec3.up,
-        /// Last reported body (same consecutive-shape fast path as above).
-        last: ?*RigidBody = null,
-    };
-
-    /// `b3CastResultFcn`: keeps the closest accepted hit, scanning all shapes
-    /// (returns 1.0 to continue). Untracked shapes and `!enabled` bodies are
-    /// ignored (return -1.0).
-    fn sphereCastCollectFcn(
-        shape_id: c.b3ShapeId,
-        point: c.b3Pos,
-        normal: c.b3Vec3,
-        fraction: f32,
-        _: u64,
-        _: c_int,
-        _: c_int,
-        context: ?*anyopaque,
-    ) callconv(.c) f32 {
-        const ctx_ptr = context orelse return 1.0;
-        const ctx: *SphereCastCtx = @ptrCast(@alignCast(ctx_ptr));
-        var cached: ?*RigidBody = null;
-        if (ctx.last) |last| {
-            if (ctx.world.ownsShape(last, shape_id)) cached = last;
-        }
-        const body = cached orelse ctx.world.findBodyByShape(shape_id) orelse return -1.0;
-        ctx.last = body;
-        if (!body.enabled) return -1.0;
-        if (fraction < ctx.best_fraction) {
-            ctx.best_fraction = fraction;
-            ctx.body = body;
-            ctx.point = fromB3Pos(point);
-            ctx.normal = fromB3Vec(normal);
-        }
-        return 1.0;
-    }
-
-    /// Sweeps a sphere (`origin`, `radius`) along `translation` and returns
-    /// the closest hit, or null on a miss. Implemented with `b3World_CastShape`
-    /// and a single-point sphere proxy (same construction as `querySphere`).
     pub fn spherecast(self: *PhysicsWorld, origin: Vec3, radius: f32, translation: Vec3) ?PhysicsRayHit {
-        return self.spherecastWithFilter(origin, radius, translation, .{});
+        return physics_queries.spherecast(self, origin, radius, translation);
     }
 
-    /// Same as `spherecast` but only accepts shapes matching the filter mask
-    /// (mapped exactly like `raycastWithFilter`).
     pub fn spherecastWithFilter(
         self: *PhysicsWorld,
         origin: Vec3,
@@ -1702,103 +836,19 @@ pub const PhysicsWorld = struct {
         translation: Vec3,
         filter: CollisionFilter,
     ) ?PhysicsRayHit {
-        const travel = translation.length();
-        if (!(radius > 0.0) or travel < 1e-6) return null;
-        var point = c.b3Vec3{ .x = 0.0, .y = 0.0, .z = 0.0 };
-        var proxy = c.b3ShapeProxy{ .points = &point, .count = 1, .radius = radius };
-        var ctx = SphereCastCtx{ .world = self, .travel = travel };
-        _ = c.b3World_CastShape(self.world_id, toB3Pos(origin), &proxy, toB3Vec(translation), toB3QueryFilter(filter), &sphereCastCollectFcn, &ctx);
-        const body = ctx.body orelse return null;
-        return .{
-            .hit = true,
-            .point = ctx.point,
-            .normal = ctx.normal,
-            .distance = travel * ctx.best_fraction,
-            .body = body,
-        };
+        return physics_queries.spherecastWithFilter(self, origin, radius, translation, filter);
     }
 
     pub fn findBodyByShape(self: *PhysicsWorld, shape_id: c.b3ShapeId) ?*RigidBody {
-        for (self.bodies.items) |b| {
-            if (self.ownsShape(b, shape_id)) {
-                return b;
-            }
-        }
-        return null;
+        return physics_queries.findBodyByShape(self, shape_id);
     }
 
-    /// True when the shape is the body's primary shape or one of its children.
     pub fn ownsShape(_: *PhysicsWorld, body: *RigidBody, shape_id: c.b3ShapeId) bool {
-        if (body.shape_id.index1 == shape_id.index1 and body.shape_id.generation == shape_id.generation) {
-            return true;
-        }
-        for (body.child_shapes.items) |ch| {
-            if (ch.shape_id.index1 == shape_id.index1 and ch.shape_id.generation == shape_id.generation) {
-                return true;
-            }
-        }
-        return false;
+        return physics_queries.ownsShape(body, shape_id);
     }
 
-    /// Events are collected inside step() and cleared at the start of each
-    /// call, so they describe the most recent frame only.
     pub fn clearEvents(self: *PhysicsWorld) void {
-        self.sensor_events.clearRetainingCapacity();
-        self.contact_events.clearRetainingCapacity();
-        self.contact_hit_events.clearRetainingCapacity();
-    }
-
-    fn drainEvents(self: *PhysicsWorld) void {
-        const sensor = c.b3World_GetSensorEvents(self.world_id);
-        var i: i32 = 0;
-        while (i < sensor.beginCount) : (i += 1) {
-            const ev = sensor.beginEvents[@intCast(i)];
-            self.sensor_events.append(self.allocator, .{
-                .sensor = self.findBodyByShape(ev.sensorShapeId),
-                .visitor = self.findBodyByShape(ev.visitorShapeId),
-                .began = true,
-            }) catch {};
-        }
-        i = 0;
-        while (i < sensor.endCount) : (i += 1) {
-            const ev = sensor.endEvents[@intCast(i)];
-            self.sensor_events.append(self.allocator, .{
-                .sensor = self.findBodyByShape(ev.sensorShapeId),
-                .visitor = self.findBodyByShape(ev.visitorShapeId),
-                .began = false,
-            }) catch {};
-        }
-
-        const contacts = c.b3World_GetContactEvents(self.world_id);
-        i = 0;
-        while (i < contacts.beginCount) : (i += 1) {
-            const ev = contacts.beginEvents[@intCast(i)];
-            self.contact_events.append(self.allocator, .{
-                .a = self.findBodyByShape(ev.shapeIdA),
-                .b = self.findBodyByShape(ev.shapeIdB),
-                .began = true,
-            }) catch {};
-        }
-        i = 0;
-        while (i < contacts.endCount) : (i += 1) {
-            const ev = contacts.endEvents[@intCast(i)];
-            self.contact_events.append(self.allocator, .{
-                .a = self.findBodyByShape(ev.shapeIdA),
-                .b = self.findBodyByShape(ev.shapeIdB),
-                .began = false,
-            }) catch {};
-        }
-        i = 0;
-        while (i < contacts.hitCount) : (i += 1) {
-            const ev = contacts.hitEvents[@intCast(i)];
-            self.contact_hit_events.append(self.allocator, .{
-                .a = self.findBodyByShape(ev.shapeIdA),
-                .b = self.findBodyByShape(ev.shapeIdB),
-                .point = fromB3Pos(ev.point),
-                .normal = fromB3Vec(ev.normal),
-                .approach_speed = ev.approachSpeed,
-            }) catch {};
-        }
+        return physics_events.clearEvents(self);
     }
 
     pub fn removeBody(self: *PhysicsWorld, body: *RigidBody) void {
@@ -1849,7 +899,7 @@ pub const PhysicsWorld = struct {
         var n: u32 = 0;
         while (self.acc >= step_h and n < 4) : (n += 1) {
             c.b3World_Step(self.world_id, step_h, @intCast(self.substeps));
-            self.drainEvents();
+            physics_events.drainEvents(self);
             self.acc -= step_h;
         }
         if (n == 4) self.acc = 0.0; // drop backlog instead of spiraling
@@ -2192,35 +1242,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: DistanceJointOptions,
     ) !JointId {
-        var def = c.b3DefaultDistanceJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-
-        const rest_len = if (options.length) |l|
-            @max(l, 0.001)
-        else blk: {
-            const wa = body_a.localToWorld(local_anchor_a);
-            const wb = body_b.localToWorld(local_anchor_b);
-            break :blk @max(wa.sub(wb).length(), 0.001);
-        };
-        def.length = rest_len;
-        def.enableSpring = options.enable_spring;
-        def.hertz = options.hertz;
-        def.dampingRatio = options.damping_ratio;
-        if (options.min_length) |min_l| def.minLength = min_l;
-        if (options.max_length) |max_l| {
-            def.maxLength = max_l;
-            def.enableLimit = true;
-        }
-
-        const jid = c.b3CreateDistanceJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createDistanceJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
     pub fn createDistanceJointWorld(
@@ -2231,13 +1253,7 @@ pub const PhysicsWorld = struct {
         world_anchor_b: Vec3,
         options: DistanceJointOptions,
     ) !JointId {
-        return self.createDistanceJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor_a),
-            body_b.worldToLocal(world_anchor_b),
-            options,
-        );
+        return physics_joints.createDistanceJointWorld(self, body_a, body_b, world_anchor_a, world_anchor_b, options);
     }
 
     pub fn createSphericalJoint(
@@ -2248,26 +1264,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: SphericalJointOptions,
     ) !JointId {
-        var def = c.b3DefaultSphericalJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.enableSpring = options.enable_spring;
-        def.hertz = options.hertz;
-        def.dampingRatio = options.damping_ratio;
-        def.enableConeLimit = options.enable_cone_limit;
-        def.coneAngle = options.cone_angle_rad;
-        def.enableTwistLimit = options.enable_twist_limit;
-        def.lowerTwistAngle = options.lower_twist_angle_rad;
-        def.upperTwistAngle = options.upper_twist_angle_rad;
-
-        const jid = c.b3CreateSphericalJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createSphericalJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
     pub fn createSphericalJointWorld(
@@ -2277,18 +1274,9 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: SphericalJointOptions,
     ) !JointId {
-        return self.createSphericalJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createSphericalJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Creates a hinge (revolute) joint. Relative rotation happens around the
-    /// z-axis of the joint frame, which is the world z-axis when both bodies
-    /// are unrotated at creation time.
     pub fn createRevoluteJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2297,30 +1285,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: RevoluteJointOptions,
     ) !JointId {
-        var def = c.b3DefaultRevoluteJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = toB3Quat(options.frame_a);
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = toB3Quat(options.frame_b);
-        def.enableSpring = options.enable_spring;
-        def.hertz = options.hertz;
-        def.dampingRatio = options.damping_ratio;
-        def.enableLimit = options.enable_limit;
-        def.lowerAngle = options.lower_angle_rad;
-        def.upperAngle = options.upper_angle_rad;
-        def.enableMotor = options.enable_motor;
-        def.motorSpeed = options.motor_speed_rad;
-        def.maxMotorTorque = options.max_motor_torque;
-
-        const jid = c.b3CreateRevoluteJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createRevoluteJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a hinge joint from a shared world-space pivot point.
     pub fn createRevoluteJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2328,17 +1295,9 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: RevoluteJointOptions,
     ) !JointId {
-        return self.createRevoluteJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createRevoluteJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Enables/disables a hinge motor and sets its target speed (rad/s) and
-    /// torque budget. Wakes the bodies so the change applies immediately.
     pub fn setRevoluteMotor(
         self: *PhysicsWorld,
         joint_id: JointId,
@@ -2346,42 +1305,26 @@ pub const PhysicsWorld = struct {
         motor_speed_rad: f32,
         max_motor_torque: f32,
     ) void {
-        _ = self;
-        c.b3RevoluteJoint_EnableMotor(joint_id, enabled);
-        c.b3RevoluteJoint_SetMotorSpeed(joint_id, motor_speed_rad);
-        c.b3RevoluteJoint_SetMaxMotorTorque(joint_id, max_motor_torque);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setRevoluteMotor(self, joint_id, enabled, motor_speed_rad, max_motor_torque);
     }
 
-    /// Enables and sets the hinge angular limits (radians, [-0.99*pi .. 0.99*pi]).
     pub fn setRevoluteLimits(
         self: *PhysicsWorld,
         joint_id: JointId,
         lower_angle_rad: f32,
         upper_angle_rad: f32,
     ) void {
-        _ = self;
-        c.b3RevoluteJoint_SetLimits(joint_id, lower_angle_rad, upper_angle_rad);
-        c.b3RevoluteJoint_EnableLimit(joint_id, true);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setRevoluteLimits(self, joint_id, lower_angle_rad, upper_angle_rad);
     }
 
-    /// Current hinge angle (radians), relative to the reference angle at creation.
     pub fn revoluteAngleRad(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3RevoluteJoint_GetAngle(joint_id);
+        return physics_joints.revoluteAngleRad(self, joint_id);
     }
 
-    /// Current hinge angle in degrees.
     pub fn revoluteAngleDeg(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3RevoluteJoint_GetAngle(joint_id) * rad2deg;
+        return physics_joints.revoluteAngleDeg(self, joint_id);
     }
 
-    /// Creates a wheel joint (body A = chassis, body B = wheel). The wheel
-    /// spins around the z-axis of frame B and suspends/steers around the
-    /// x-axis of frame A. Suspension travel is measured from the creation
-    /// pose, so build the vehicle at rest ride height.
     pub fn createWheelJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2390,38 +1333,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: WheelJointOptions,
     ) !JointId {
-        var def = c.b3DefaultWheelJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = toB3Quat(options.frame_a);
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = toB3Quat(options.frame_b);
-        def.enableSuspensionSpring = options.enable_suspension;
-        def.suspensionHertz = options.suspension_hertz;
-        def.suspensionDampingRatio = options.suspension_damping;
-        def.enableSuspensionLimit = options.enable_suspension_limit;
-        def.lowerSuspensionLimit = options.lower_suspension_limit;
-        def.upperSuspensionLimit = options.upper_suspension_limit;
-        def.enableSpinMotor = options.enable_spin_motor;
-        def.spinSpeed = options.spin_speed_rad;
-        def.maxSpinTorque = options.max_spin_torque;
-        def.enableSteering = options.enable_steering;
-        def.steeringHertz = options.steering_hertz;
-        def.steeringDampingRatio = options.steering_damping;
-        def.targetSteeringAngle = options.target_steering_angle_rad;
-        def.maxSteeringTorque = options.max_steering_torque;
-        def.enableSteeringLimit = options.enable_steering_limit;
-        def.lowerSteeringLimit = options.lower_steering_limit_rad;
-        def.upperSteeringLimit = options.upper_steering_limit_rad;
-
-        const jid = c.b3CreateWheelJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createWheelJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a wheel joint from a shared world-space anchor point.
     pub fn createWheelJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2429,18 +1343,9 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: WheelJointOptions,
     ) !JointId {
-        return self.createWheelJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createWheelJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Enables/disables the spin motor and sets target speed (rad/s) and
-    /// torque budget. Negative speed drives forward when the wheel axle is
-    /// +Z and forward is +X. Wakes the bodies so it applies immediately.
     pub fn setWheelSpin(
         self: *PhysicsWorld,
         joint_id: JointId,
@@ -2448,14 +1353,9 @@ pub const PhysicsWorld = struct {
         spin_speed_rad: f32,
         max_spin_torque: f32,
     ) void {
-        _ = self;
-        c.b3WheelJoint_EnableSpinMotor(joint_id, enabled);
-        c.b3WheelJoint_SetSpinMotorSpeed(joint_id, spin_speed_rad);
-        c.b3WheelJoint_SetMaxSpinTorque(joint_id, max_spin_torque);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setWheelSpin(self, joint_id, enabled, spin_speed_rad, max_spin_torque);
     }
 
-    /// Enables/disables steering and sets the target angle (radians).
     pub fn setWheelSteering(
         self: *PhysicsWorld,
         joint_id: JointId,
@@ -2463,28 +1363,17 @@ pub const PhysicsWorld = struct {
         target_angle_rad: f32,
         max_steering_torque: f32,
     ) void {
-        _ = self;
-        c.b3WheelJoint_EnableSteering(joint_id, enabled);
-        c.b3WheelJoint_SetTargetSteeringAngle(joint_id, target_angle_rad);
-        c.b3WheelJoint_SetMaxSteeringTorque(joint_id, max_steering_torque);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setWheelSteering(self, joint_id, enabled, target_angle_rad, max_steering_torque);
     }
 
-    /// Current wheel spin speed (rad/s), relative between wheel and chassis.
     pub fn wheelSpinSpeed(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3WheelJoint_GetSpinSpeed(joint_id);
+        return physics_joints.wheelSpinSpeed(self, joint_id);
     }
 
-    /// Current steering angle (radians).
     pub fn wheelSteeringAngle(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3WheelJoint_GetSteeringAngle(joint_id);
+        return physics_joints.wheelSteeringAngle(self, joint_id);
     }
 
-    /// Creates a prismatic (slider) joint. Body B translates along frame A
-    /// x-axis with rotation locked. Build it in the rest pose: limits and the
-    /// reported translation are relative to creation.
     pub fn createPrismaticJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2493,30 +1382,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: PrismaticJointOptions,
     ) !JointId {
-        var def = c.b3DefaultPrismaticJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = toB3Quat(options.frame_a);
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = toB3Quat(options.frame_b);
-        def.enableSpring = options.enable_spring;
-        def.hertz = options.hertz;
-        def.dampingRatio = options.damping_ratio;
-        def.enableLimit = options.enable_limit;
-        def.lowerTranslation = options.lower_translation;
-        def.upperTranslation = options.upper_translation;
-        def.enableMotor = options.enable_motor;
-        def.motorSpeed = options.motor_speed;
-        def.maxMotorForce = options.max_motor_force;
-
-        const jid = c.b3CreatePrismaticJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createPrismaticJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a slider joint from a shared world-space anchor point.
     pub fn createPrismaticJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2524,17 +1392,9 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: PrismaticJointOptions,
     ) !JointId {
-        return self.createPrismaticJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createPrismaticJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Enables/disables the slider motor and sets target speed (m/s along
-    /// frame A x-axis) and force budget. Wakes the bodies.
     pub fn setPrismaticMotor(
         self: *PhysicsWorld,
         joint_id: JointId,
@@ -2542,41 +1402,26 @@ pub const PhysicsWorld = struct {
         motor_speed: f32,
         max_motor_force: f32,
     ) void {
-        _ = self;
-        c.b3PrismaticJoint_EnableMotor(joint_id, enabled);
-        c.b3PrismaticJoint_SetMotorSpeed(joint_id, motor_speed);
-        c.b3PrismaticJoint_SetMaxMotorForce(joint_id, max_motor_force);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setPrismaticMotor(self, joint_id, enabled, motor_speed, max_motor_force);
     }
 
-    /// Enables and sets the slider travel limits (meters, from rest pose).
     pub fn setPrismaticLimits(
         self: *PhysicsWorld,
         joint_id: JointId,
         lower_translation: f32,
         upper_translation: f32,
     ) void {
-        _ = self;
-        c.b3PrismaticJoint_SetLimits(joint_id, lower_translation, upper_translation);
-        c.b3PrismaticJoint_EnableLimit(joint_id, true);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setPrismaticLimits(self, joint_id, lower_translation, upper_translation);
     }
 
-    /// Current slider translation (meters) relative to the creation pose.
     pub fn prismaticTranslation(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3PrismaticJoint_GetTranslation(joint_id);
+        return physics_joints.prismaticTranslation(self, joint_id);
     }
 
-    /// Current slider speed (m/s).
     pub fn prismaticSpeed(self: *PhysicsWorld, joint_id: JointId) f32 {
-        _ = self;
-        return c.b3PrismaticJoint_GetSpeed(joint_id);
+        return physics_joints.prismaticSpeed(self, joint_id);
     }
 
-    /// Creates a motor joint driving body B with a velocity motor and an
-    /// optional pose spring. With no spring/force configured the joint is
-    /// inert until per-frame velocity targets are set.
     pub fn createMotorJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2585,31 +1430,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: MotorJointOptions,
     ) !JointId {
-        var def = c.b3DefaultMotorJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.linearVelocity = toB3Vec(options.linear_velocity);
-        def.maxVelocityForce = options.max_velocity_force;
-        def.angularVelocity = toB3Vec(options.angular_velocity_rad);
-        def.maxVelocityTorque = options.max_velocity_torque;
-        def.linearHertz = options.linear_hertz;
-        def.linearDampingRatio = options.linear_damping;
-        def.maxSpringForce = options.max_spring_force;
-        def.angularHertz = options.angular_hertz;
-        def.angularDampingRatio = options.angular_damping;
-        def.maxSpringTorque = options.max_spring_torque;
-
-        const jid = c.b3CreateMotorJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createMotorJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a motor joint from a shared world-space anchor point.
     pub fn createMotorJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2617,44 +1440,25 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: MotorJointOptions,
     ) !JointId {
-        return self.createMotorJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createMotorJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Sets the motor linear velocity target (m/s). Wakes the bodies.
     pub fn setMotorLinearVelocity(self: *PhysicsWorld, joint_id: JointId, velocity: Vec3) void {
-        _ = self;
-        c.b3MotorJoint_SetLinearVelocity(joint_id, toB3Vec(velocity));
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setMotorLinearVelocity(self, joint_id, velocity);
     }
 
-    /// Sets the motor angular velocity target (rad/s). Wakes the bodies.
     pub fn setMotorAngularVelocity(self: *PhysicsWorld, joint_id: JointId, velocity_rad: Vec3) void {
-        _ = self;
-        c.b3MotorJoint_SetAngularVelocity(joint_id, toB3Vec(velocity_rad));
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setMotorAngularVelocity(self, joint_id, velocity_rad);
     }
 
-    /// Sets the linear motor force budget (N). Wakes the bodies.
     pub fn setMotorMaxVelocityForce(self: *PhysicsWorld, joint_id: JointId, max_force: f32) void {
-        _ = self;
-        c.b3MotorJoint_SetMaxVelocityForce(joint_id, max_force);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setMotorMaxVelocityForce(self, joint_id, max_force);
     }
 
-    /// Sets the angular motor torque budget (N*m). Wakes the bodies.
     pub fn setMotorMaxVelocityTorque(self: *PhysicsWorld, joint_id: JointId, max_torque: f32) void {
-        _ = self;
-        c.b3MotorJoint_SetMaxVelocityTorque(joint_id, max_torque);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setMotorMaxVelocityTorque(self, joint_id, max_torque);
     }
 
-    /// Creates a weld joint holding the creation relative pose of two bodies.
     pub fn createWeldJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2663,25 +1467,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: WeldJointOptions,
     ) !JointId {
-        var def = c.b3DefaultWeldJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.linearHertz = options.linear_hertz;
-        def.angularHertz = options.angular_hertz;
-        def.linearDampingRatio = options.linear_damping;
-        def.angularDampingRatio = options.angular_damping;
-
-        const jid = c.b3CreateWeldJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createWeldJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a weld joint from a shared world-space anchor point.
     pub fn createWeldJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2689,31 +1477,17 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: WeldJointOptions,
     ) !JointId {
-        return self.createWeldJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createWeldJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Current joint constraint force (N). Poll it to implement breakable
-    /// joints: destroy the joint once the load exceeds a threshold.
     pub fn jointConstraintForce(self: *PhysicsWorld, joint_id: JointId) Vec3 {
-        _ = self;
-        return fromB3Vec(c.b3Joint_GetConstraintForce(joint_id));
+        return physics_joints.jointConstraintForce(self, joint_id);
     }
 
-    /// Current joint constraint torque (N*m).
     pub fn jointConstraintTorque(self: *PhysicsWorld, joint_id: JointId) Vec3 {
-        _ = self;
-        return fromB3Vec(c.b3Joint_GetConstraintTorque(joint_id));
+        return physics_joints.jointConstraintTorque(self, joint_id);
     }
 
-    /// Creates a parallel joint: a spring pulling the z-axis of body B
-    /// parallel to the z-axis of body A. Anchor points only define the
-    /// joint frames, not a position constraint.
     pub fn createParallelJoint(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2722,24 +1496,9 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: ParallelJointOptions,
     ) !JointId {
-        var def = c.b3DefaultParallelJointDef();
-        def.base.bodyIdA = body_a.body_id;
-        def.base.bodyIdB = body_b.body_id;
-        def.base.collideConnected = options.collide_connected;
-        def.base.localFrameA.p = toB3Vec(local_anchor_a);
-        def.base.localFrameA.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.base.localFrameB.p = toB3Vec(local_anchor_b);
-        def.base.localFrameB.q = .{ .v = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .s = 1.0 };
-        def.hertz = options.hertz;
-        def.dampingRatio = options.damping_ratio;
-        def.maxTorque = options.max_torque;
-
-        const jid = c.b3CreateParallelJoint(self.world_id, &def);
-        try self.joints.append(self.allocator, jid);
-        return jid;
+        return physics_joints.createParallelJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
-    /// Creates a parallel joint from a shared world-space anchor point.
     pub fn createParallelJointWorld(
         self: *PhysicsWorld,
         body_a: *RigidBody,
@@ -2747,16 +1506,9 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: ParallelJointOptions,
     ) !JointId {
-        return self.createParallelJoint(
-            body_a,
-            body_b,
-            body_a.worldToLocal(world_anchor),
-            body_b.worldToLocal(world_anchor),
-            options,
-        );
+        return physics_joints.createParallelJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
-    /// Retunes the parallel spring at runtime. Wakes the bodies.
     pub fn setParallelSpring(
         self: *PhysicsWorld,
         joint_id: JointId,
@@ -2764,26 +1516,15 @@ pub const PhysicsWorld = struct {
         damping_ratio: f32,
         max_torque: f32,
     ) void {
-        _ = self;
-        c.b3ParallelJoint_SetSpringHertz(joint_id, hertz);
-        c.b3ParallelJoint_SetSpringDampingRatio(joint_id, damping_ratio);
-        c.b3ParallelJoint_SetMaxTorque(joint_id, max_torque);
-        c.b3Joint_WakeBodies(joint_id);
+        return physics_joints.setParallelSpring(self, joint_id, hertz, damping_ratio, max_torque);
     }
 
-    /// True when the joint still exists in the world.
     pub fn isJointValid(_: *PhysicsWorld, joint_id: JointId) bool {
-        return c.b3Joint_IsValid(joint_id);
+        return physics_joints.isJointValid(joint_id);
     }
 
     pub fn destroyJoint(self: *PhysicsWorld, joint_id: JointId) void {
-        c.b3DestroyJoint(joint_id, true);
-        for (self.joints.items, 0..) |j, idx| {
-            if (j.index1 == joint_id.index1 and j.generation == joint_id.generation) {
-                _ = self.joints.swapRemove(idx);
-                break;
-            }
-        }
+        return physics_joints.destroyJoint(self, joint_id);
     }
 
     pub fn applyExplosion(
@@ -2821,88 +1562,16 @@ pub const PhysicsWorld = struct {
         }
     }
 
-    /// Clamped ring segment count used by the debug wireframe helpers.
     pub fn debugCircleSegments(self: *const PhysicsWorld) usize {
-        return @max(min_debug_circle_segments, self.debug_circle_segments);
+        return physics_debug.debugCircleSegments(self);
     }
 
-    /// Builds a CPU-side wireframe for every enabled body and appends it to
-    /// `out` (never cleared) for an external/debug line renderer. Local
-    /// wireframes live in body units; the mesh world matrix
-    /// (`Mesh.getWorldMatrix`, carrying scale/rotation/translation) moves
-    /// them to world space, so uniform scales land exactly on the collider
-    /// dims (non-uniform scales approximate circles as ellipses).
-    /// Hull/mesh/heightfield colliders fall back to the shape's world AABB
-    /// (`b3Shape_GetAABB`); hull child shapes are skipped. Colors: dynamic
-    /// green, static/kinematic (mass <= 0) white, sensors yellow (sensor
-    /// wins). No global state; allocation failures surface as
-    /// `error.OutOfMemory`.
-    /// Line counts: box 12, sphere 3 * debugCircleSegments() (72 at the
-    /// default 24), capsule 2 * debugCircleSegments() + 4 (52 at default),
-    /// hull/mesh/heightfield 12 (AABB box). Capacity for the exact count is
-    /// reserved once up front, so steady-state appends never reallocate;
-    /// circle trig is computed once per call into a shared unit table.
     pub fn appendDebugLines(self: *PhysicsWorld, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DebugLine)) !void {
-        // Reserve once; every helper below uses appendAssumeCapacity.
-        try out.ensureUnusedCapacity(allocator, self.debugLineCount());
-        const segs = self.debugCircleSegments();
-        var rings = DebugRings{ .segs = segs, .unit = null };
-        // segs + 1 samples so consecutive segments share endpoints.
-        var unit_buf: [debug_unit_stack_max + 1]DebugUnit = undefined;
-        if (segs <= debug_unit_stack_max) {
-            var j: usize = 0;
-            while (j <= segs) : (j += 1) {
-                const t = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(segs)) * 2.0 * std.math.pi;
-                unit_buf[j] = .{ .c = @cos(t), .s = @sin(t) };
-            }
-            rings.unit = unit_buf[0 .. segs + 1];
-        }
-        for (self.bodies.items) |body| {
-            if (!body.enabled) continue;
-            const color: [3]f32 = if (body.is_sensor)
-                debug_sensor_color
-            else if (body.mass <= 0.0)
-                debug_static_color
-            else
-                debug_dynamic_color;
-            const wm = body.mesh.getWorldMatrix();
-            switch (body.collider) {
-                .box => appendDebugBoxLines(out, wm, Vec3.zero, body.base_extents, color),
-                .sphere => appendDebugSphereLines(out, wm, Vec3.zero, body.base_radius, color, rings),
-                .capsule => appendDebugCapsuleLines(
-                    out,
-                    wm,
-                    Vec3.zero,
-                    debugCapsuleRadius(body.base_extents),
-                    debugCapsuleHalfHeight(body.base_extents),
-                    color,
-                    rings,
-                ),
-                .hull, .mesh, .heightfield => appendDebugAabbLines(out, body.shape_id, color),
-            }
-            for (body.child_shapes.items) |child| {
-                switch (child.kind) {
-                    .box => |he| appendDebugBoxLines(out, wm, child.offset, he, color),
-                    .sphere => |r| appendDebugSphereLines(out, wm, child.offset, r, color, rings),
-                    .capsule => |cp| appendDebugCapsuleLines(out, wm, child.offset, cp.radius, cp.half_height, color, rings),
-                    .hull => {},
-                }
-            }
-        }
+        return physics_debug.appendDebugLines(self, allocator, out);
     }
 
-    /// Exact line count `appendDebugLines` would add (no allocation).
     pub fn debugLineCount(self: *PhysicsWorld) usize {
-        const segs = self.debugCircleSegments();
-        var n: usize = 0;
-        for (self.bodies.items) |body| {
-            if (!body.enabled) continue;
-            n += primaryDebugLineCount(body.collider, segs);
-            for (body.child_shapes.items) |child| {
-                n += childDebugLineCount(child.kind, segs);
-            }
-        }
-        return n;
+        return physics_debug.debugLineCount(self);
     }
 };
 

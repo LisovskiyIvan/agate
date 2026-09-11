@@ -110,6 +110,18 @@ Sandbox: всё UI сведено в **одну панель** (HUD + «NEW FEAT
 - `build.zig`: таблица 11 шейдерных модулей, шаг `zig build fmt`, макрос `SHADOW_ATLAS_SIZE` в шейдерах + `pub const SHADOW_ATLAS_SIZE` в `shadow_pass.zig` (sokol-shdc `#include` не поддерживает).
 - Итог: 161 тест, `zig fmt --check src` чистый, runtime smoke без утечек; перф без регрессий (~2.6 мс).
 
+### Распил структуры (10.09.2026)
+
+Публичный API сохранён полностью (сверено списками `pub` до/после: 73 метода `PhysicsWorld`, 34 метода/поля `Scene`, 26 публичных типов physics, `SceneLoader.appendGlb/appendGltf`).
+
+| Было | Стало | Новые модули |
+|---|---|---|
+| `physics.zig` 4823 строки (логика 2908 + тесты 1915) | 3492 (логика 1577 + тесты) | `physics/{convert,types,body,debug_geo,queries,joints,debug,events}.zig` |
+| `loader/scene_loader.zig` 1058 | 96 (оркестратор) | `loader/{gltf_util,materials,skins,mesh_spawn,animations}.zig` |
+| `scene.zig` 1902 | 1477 (логика 1217 + тесты) | `scene/{render_queue,pipelines,cascades,uniforms,projection,draw}.zig` |
+
+Ограничение Zig 0.16: `usingnamespace` отсутствует, mixin-паттерн не работает. Методы вынесены свободными generic-функциями (`world: anytype` / `scene: anytype`) + тонкими форвардинг-обёртками в исходном файле; C-колбэки запросов — фабрики `OverlapQuery(comptime World)`/`SphereCastQuery(World)` без цикла импортов. В `physics.zig` остались `CharacterController`, `Rope` и ядро `PhysicsWorld` (цикл на приватных хелперах). Проверки: 161 тест, `zig build` agate/sandbox, runtime smoke без утечек, `--bench` зелёный.
+
 Sandbox-демо (все новые фичи выведены в интерфейс): галерея из 5 новых примитивов; панель New Features с чекбоксами Sharpen/Grain и слайдерами Sharpen/Grain/Temperature/Tint; кнопки Camera/WAV/Lines; клавиши `4` — смена камеры Arc→Free→Follow, `5` — debug-линии физики + счётчик `querySphere`, `6` — проигрывание WAV из памяти. DirectionalLight включён в сцену.
 
 Оптимизация движка (замерено): кэш view-projection в `Scene.projectPoint` + hoist солнца, резерв `appendDebugLines` (без роста списка) + опциональный `debug_circle_segments`, единичный `sqrt` в `ui.drawLine` и запас буфера UI, блочный микшер аудио с предвычисленными гейнами + быстрый декод WAV, предвычисление trig-таблиц в билдерах. Оверлей физики: 4.08–4.49 → 3.13–3.24 мс/кадр (~25%), база без оверлея не изменилась (~2.4 мс, ~420 FPS). Найден и исправлен leak в `uploadGeometry` (затирание `cpu_positions/cpu_indices`). Отложено: GPU-оптимизации bloom/SSR (нужна визуальная проверка).
