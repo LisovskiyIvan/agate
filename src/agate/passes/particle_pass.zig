@@ -84,6 +84,16 @@ pub const ParticlePass = struct {
             .format = .FLOAT4,
             .offset = 4 * @sizeOf(f32),
         };
+        part_desc.layout.attrs[part_shd.ATTR_particle_inst_uv_rect] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = 8 * @sizeOf(f32),
+        };
+        part_desc.layout.attrs[part_shd.ATTR_particle_inst_rotation] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = 12 * @sizeOf(f32),
+        };
 
         // Additive pipeline
         part_desc.colors[0].blend = .{

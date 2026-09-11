@@ -9,6 +9,8 @@ const AnimationGroup = @import("../animation/animation.zig").AnimationGroup;
 const AnimationChannel = @import("../animation/animation.zig").AnimationChannel;
 const NodeChannel = @import("../animation/animation.zig").NodeChannel;
 const NodeTarget = @import("../animation/animation.zig").NodeTarget;
+const MorphWeightsTarget = @import("../animation/animation.zig").MorphWeightsTarget;
+const MAX_MORPH_TARGETS = @import("../mesh.zig").MAX_MORPH_TARGETS;
 const AnimationPath = @import("../animation/animation.zig").AnimationPath;
 const gltf_util = @import("gltf_util.zig");
 
@@ -60,6 +62,7 @@ pub fn loadAnimations(
         var channels_list = std.ArrayList(AnimationChannel).empty;
         var node_channels_list = std.ArrayList(NodeChannel).empty;
         var node_targets_list = std.ArrayList(NodeTarget).empty;
+        var morph_targets_list = std.ArrayList(MorphWeightsTarget).empty;
         var max_duration: f32 = 0.0;
 
         // Dedupes NodeTargets when several channels drive one node.
@@ -95,7 +98,8 @@ pub fn loadAnimations(
                     .rotation => 4,
                     .weights => 1,
                 };
-                const samp_data = try gltf_util.readSampler(scene.allocator, ch.sampler.?, stride) orelse continue;
+                const samp_ptr: *const c.cgltf_animation_sampler = @ptrCast(ch.sampler.?);
+                const samp_data = try gltf_util.readSampler(scene.allocator, @constCast(samp_ptr), stride) orelse continue;
                 if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {
                     max_duration = samp_data.timestamps[samp_data.timestamps.len - 1];
                 }
@@ -113,25 +117,91 @@ pub fn loadAnimations(
             }
 
             // Node path: translation/rotation/scale of a non-joint node
-            // drives the spawned meshes of that node. Morph weights need
-            // morph-target support and are skipped for plain nodes.
+            // drives the spawned meshes of that node; weights drives their
+            // morph targets (one binding + channel copy per mesh, since
+            // weights slices are per-mesh state).
             const path_type: AnimationPath = switch (ch.target_path) {
                 c.cgltf_animation_path_type_translation => .translation,
                 c.cgltf_animation_path_type_rotation => .rotation,
                 c.cgltf_animation_path_type_scale => .scale,
+                c.cgltf_animation_path_type_weights => .weights,
                 else => continue,
             };
-            const node_idx = gltf_util.gltfNodeIndex(gltf, ch.target_node.?) orelse continue;
+            const node_idx = gltf_util.gltfNodeIndex(gltf, @ptrCast(ch.target_node.?)) orelse continue;
             const range_start = node_mesh_start[node_idx];
             const range_count = node_mesh_count[node_idx];
             if (range_count == 0) continue; // joint-only or mesh-less node
+
+            if (path_type == .weights) {
+                // Target count comes from the glTF primitive: cgltf
+                // guarantees every primitive of a mesh shares it. Spawned
+                // meshes keep at most MAX_MORPH_TARGETS of them.
+                const target_node: *const c.cgltf_node = @ptrCast(ch.target_node.?);
+                if (target_node.mesh == null) continue;
+                const src_mesh: *const c.cgltf_mesh = @ptrCast(target_node.mesh);
+                if (src_mesh.primitives_count == 0) continue;
+                const prim0: *const c.cgltf_primitive = @ptrCast(&src_mesh.primitives[0]);
+                const want_count: usize = @min(prim0.targets_count, MAX_MORPH_TARGETS);
+                if (want_count == 0) continue;
+
+                const samp_ptr: *const c.cgltf_animation_sampler = @ptrCast(ch.sampler.?);
+                if (samp_ptr.input == null or samp_ptr.output == null) continue;
+                const input_acc: *const c.cgltf_accessor = @ptrCast(samp_ptr.input);
+                const output_acc: *const c.cgltf_accessor = @ptrCast(samp_ptr.output);
+                const key_count: usize = input_acc.count;
+                if (key_count == 0) continue;
+                // Mirrors samplerHasFrames(.weights): one value per target per key.
+                if (output_acc.count < key_count * want_count) continue;
+
+                const samp_data = try gltf_util.readSampler(scene.allocator, @constCast(samp_ptr), want_count) orelse continue;
+                if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {
+                    max_duration = samp_data.timestamps[samp_data.timestamps.len - 1];
+                }
+
+                for (0..range_count) |mi| {
+                    const mesh_obj = spawned_meshes.items[range_start + mi];
+                    // NOTE: no is_joint_node skip here. The skeleton drives
+                    // joint transforms, never morph weights.
+                    if (mesh_obj.morph_weights.len < want_count) continue;
+
+                    const rest = try scene.allocator.dupe(f32, mesh_obj.morph_weights[0..want_count]);
+                    errdefer scene.allocator.free(rest);
+                    const morph_idx = morph_targets_list.items.len;
+                    try morph_targets_list.append(scene.allocator, .{
+                        .weights = mesh_obj.morph_weights[0..want_count],
+                        .rest_weights = rest,
+                        .dirty = &mesh_obj.morph_dirty,
+                    });
+
+                    // One owned buffer copy per mesh: several primitives of
+                    // a node share the track but must free independently.
+                    const ts_copy = try scene.allocator.dupe(f32, samp_data.timestamps);
+                    errdefer scene.allocator.free(ts_copy);
+                    const out_copy = try scene.allocator.dupe(f32, samp_data.outputs);
+                    errdefer scene.allocator.free(out_copy);
+                    try node_channels_list.append(scene.allocator, .{
+                        .target = morph_idx,
+                        .target_path = .weights,
+                        .sampler = .{
+                            .timestamps = ts_copy,
+                            .outputs = out_copy,
+                            .interpolation = samp_data.interpolation,
+                        },
+                    });
+                }
+
+                scene.allocator.free(samp_data.timestamps);
+                scene.allocator.free(samp_data.outputs);
+                continue;
+            }
 
             const stride: usize = switch (path_type) {
                 .translation, .scale => 3,
                 .rotation => 4,
                 .weights => 1,
             };
-            const samp_data = try gltf_util.readSampler(scene.allocator, ch.sampler.?, stride) orelse continue;
+            const samp_ptr = @as(*const c.cgltf_animation_sampler, @ptrCast(ch.sampler.?));
+            const samp_data = try gltf_util.readSampler(scene.allocator, @constCast(samp_ptr), stride) orelse continue;
             if (samp_data.timestamps[samp_data.timestamps.len - 1] > max_duration) {
                 max_duration = samp_data.timestamps[samp_data.timestamps.len - 1];
             }
@@ -196,10 +266,13 @@ pub fn loadAnimations(
         const bone_slice = try channels_list.toOwnedSlice(scene.allocator);
         const node_ch_slice = try node_channels_list.toOwnedSlice(scene.allocator);
         const node_tg_slice = try node_targets_list.toOwnedSlice(scene.allocator);
-        if (bone_slice.len == 0 and node_ch_slice.len == 0) {
+        const morph_tg_slice = try morph_targets_list.toOwnedSlice(scene.allocator);
+        if (bone_slice.len == 0 and node_ch_slice.len == 0 and morph_tg_slice.len == 0) {
             if (bone_slice.len > 0) scene.allocator.free(bone_slice);
             if (node_ch_slice.len > 0) scene.allocator.free(node_ch_slice);
             if (node_tg_slice.len > 0) scene.allocator.free(node_tg_slice);
+            // morph_tg_slice is empty here: no rest_weights to free.
+            if (morph_tg_slice.len > 0) scene.allocator.free(morph_tg_slice);
             scene.allocator.free(anim_name);
             continue;
         }
@@ -209,6 +282,7 @@ pub fn loadAnimations(
         ag.skeleton = target_skel; // null for node-only clips
         ag.node_channels = node_ch_slice;
         ag.node_targets = node_tg_slice;
+        ag.morph_targets = morph_tg_slice;
         try scene.animation_groups.append(scene.allocator, ag);
     }
 }

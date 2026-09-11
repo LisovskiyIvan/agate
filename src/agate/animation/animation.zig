@@ -113,6 +113,44 @@ pub const AnimationSampler = struct {
         return Quat.slerp(q0, q1, factor);
     }
 
+    /// Samples a weights (morph) track with out.len values per keyframe.
+    /// Per-component mirror of sampleVec3Eased: STEP holds the keyframe,
+    /// other modes lerp with the eased factor; CUBICSPLINE falls back to
+    /// (eased) linear. Undersized outputs or missing keys leave out untouched.
+    pub fn sampleWeightsInto(self: AnimationSampler, time: f32, out: []f32, easing: EasingType) void {
+        const n = out.len;
+        if (n == 0 or self.timestamps.len == 0) return;
+        const frames = self.outputs.len / n;
+        if (frames == 0) return;
+        const keys = @min(self.timestamps.len, frames);
+        if (keys == 0) return;
+        if (time <= self.timestamps[0]) {
+            @memcpy(out, self.outputs[0..n]);
+            return;
+        }
+        const last = keys - 1;
+        if (time >= self.timestamps[last]) {
+            @memcpy(out, self.outputs[last * n .. last * n + n]);
+            return;
+        }
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= last) idx = last - 1;
+        const t0 = self.timestamps[idx];
+        const t1 = self.timestamps[idx + 1];
+        const raw = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
+
+        const base0 = idx * n;
+        if (self.interpolation == .step) {
+            @memcpy(out, self.outputs[base0 .. base0 + n]);
+            return;
+        }
+        const factor = easing_mod.evaluate(easing, raw);
+        const base1 = (idx + 1) * n;
+        for (0..n) |j| {
+            out[j] = self.outputs[base0 + j] + (self.outputs[base1 + j] - self.outputs[base0 + j]) * factor;
+        }
+    }
+
     fn findKeyframeIndex(self: AnimationSampler, time: f32) usize {
         var low: usize = 0;
         var high: usize = self.timestamps.len - 1;
@@ -155,8 +193,9 @@ pub const NodeTarget = struct {
 };
 
 /// One glTF node animation channel (target node, not a skeleton joint).
-/// Only translation/rotation/scale paths are applied; weights (morph targets)
-/// are parsed but ignored because plain meshes have no morph support.
+/// translation/rotation/scale targets index AnimationGroup.node_targets;
+/// weights (morph) targets index AnimationGroup.morph_targets and write the
+/// bound mesh weights via bindMorphTarget (mesh.zig owns the blend).
 pub const NodeChannel = struct {
     target: usize,
     target_path: AnimationPath,
@@ -164,15 +203,30 @@ pub const NodeChannel = struct {
     easing: EasingType = .linear,
 };
 
+/// Live binding between a node weights track and a mesh's morph weights.
+/// Raw slice/pointer (instead of a Mesh pointer) keeps this module free of
+/// import cycles: mesh.zig -> scene.zig -> animation.zig. The loader binds
+/// mesh.morph_weights and &mesh.morph_dirty; unit tests bind plain arrays.
+/// rest_weights is an owned snapshot for group-weight blending and stop()
+/// restore; the group frees it in deinit. All three must stay valid for the
+/// group lifetime (weights/dirty are scene-owned).
+pub const MorphWeightsTarget = struct {
+    weights: []f32 = &.{},
+    rest_weights: []f32 = &.{},
+    dirty: ?*bool = null,
+};
+
 /// Guards sampler reads: true when timestamps exist and outputs holds at
-/// least one full frame per keyframe for the given path. Invalid channels are
-/// skipped by the node applier instead of crashing on out-of-bounds access.
-fn samplerHasFrames(sampler: AnimationSampler, path: AnimationPath) bool {
+/// least one full frame per keyframe for the given path. For weights a frame
+/// is weight_count values (the bound mesh's morph target count), not 1.
+/// Invalid channels are skipped by the node applier instead of crashing on
+/// out-of-bounds access.
+fn samplerHasFrames(sampler: AnimationSampler, path: AnimationPath, weight_count: usize) bool {
     if (sampler.timestamps.len == 0) return false;
     const stride: usize = switch (path) {
         .translation, .scale => 3,
         .rotation => 4,
-        .weights => 1,
+        .weights => @max(weight_count, 1),
     };
     return sampler.outputs.len >= sampler.timestamps.len * stride;
 }
@@ -191,6 +245,9 @@ pub const AnimationGroup = struct {
     /// group wins.
     node_channels: []NodeChannel = &.{},
     node_targets: []NodeTarget = &.{},
+    /// Morph-weight bindings for weights channels. NodeChannel.target indexes
+    /// this list when target_path == .weights (TRS paths index node_targets).
+    morph_targets: []MorphWeightsTarget = &.{},
 
     from: f32 = 0.0,
     to: f32 = 0.0,
@@ -233,6 +290,10 @@ pub const AnimationGroup = struct {
         }
         if (self.node_channels.len > 0) self.allocator.free(self.node_channels);
         if (self.node_targets.len > 0) self.allocator.free(self.node_targets);
+        for (self.morph_targets) |mt| {
+            if (mt.rest_weights.len > 0) self.allocator.free(mt.rest_weights);
+        }
+        if (self.morph_targets.len > 0) self.allocator.free(self.morph_targets);
         if (self.name.len > 0) {
             self.allocator.free(self.name);
         }
@@ -324,6 +385,7 @@ pub const AnimationGroup = struct {
             skel.resetToBindPose();
         }
         self.restoreNodeRestPose();
+        self.restoreMorphRestWeights();
     }
 
     pub fn goToFrame(self: *AnimationGroup, time: f32) void {
@@ -408,6 +470,28 @@ pub const AnimationGroup = struct {
         return idx;
     }
 
+    /// Binds a mesh morph-weights slice to this group and snapshots its
+    /// current values as the rest pose used for weight blending and stop()
+    /// restore. Returns the morph target index for weights NodeChannels.
+    /// The slice and dirty flag must outlive the group (both scene-owned).
+    pub fn bindMorphTarget(self: *AnimationGroup, weights: []f32, dirty: *bool) !usize {
+        const rest = try self.allocator.dupe(f32, weights);
+        errdefer self.allocator.free(rest);
+        const idx = self.morph_targets.len;
+        const grown = try self.allocator.alloc(MorphWeightsTarget, idx + 1);
+        if (idx > 0) {
+            @memcpy(grown[0..idx], self.morph_targets);
+            self.allocator.free(self.morph_targets);
+        }
+        grown[idx] = .{
+            .weights = weights,
+            .rest_weights = rest,
+            .dirty = dirty,
+        };
+        self.morph_targets = grown;
+        return idx;
+    }
+
     /// Appends a node channel. The group takes ownership of the sampler
     /// buffers and frees them in deinit.
     pub fn addNodeChannel(self: *AnimationGroup, channel: NodeChannel) !void {
@@ -431,6 +515,16 @@ pub const AnimationGroup = struct {
         }
     }
 
+    /// Restores every bound morph target to its rest weights and flags it
+    /// dirty so the next scene update re-blends the mesh.
+    pub fn restoreMorphRestWeights(self: *AnimationGroup) void {
+        for (self.morph_targets) |*mt| {
+            const n = @min(mt.weights.len, mt.rest_weights.len);
+            @memcpy(mt.weights[0..n], mt.rest_weights[0..n]);
+            if (mt.dirty) |d| d.* = true;
+        }
+    }
+
     /// Restores every bound (non-skipped) target to its rest pose.
     pub fn restoreNodeRestPose(self: *AnimationGroup) void {
         for (self.node_targets) |*t| {
@@ -444,13 +538,34 @@ pub const AnimationGroup = struct {
     /// Samples all node channels at the given time and writes the result into
     /// the bound transforms, blended with the rest pose by the group weight:
     /// lerp for translation/scale, slerp (via quaternion round-trip) for
-    /// rotation. Called automatically by update() and applyAtTime().
+    /// rotation, lerp with rest weights for morph weights (clamped to
+    /// [0, 1], mesh flagged dirty for the scene blend). Called automatically
+    /// by update() and applyAtTime().
     pub fn applyNodesAtTime(self: *AnimationGroup, time: f32) void {
-        if (self.node_channels.len == 0 or self.node_targets.len == 0) return;
+        if (self.node_channels.len == 0) return;
         const w = std.math.clamp(self.weight, 0.0, 1.0);
         for (self.node_channels) |ch| {
+            // Weights channels index morph_targets, not node_targets, and
+            // write per-mesh state (each mesh owns its weights slice).
+            if (ch.target_path == .weights) {
+                if (ch.target >= self.morph_targets.len) continue;
+                const mt = &self.morph_targets[ch.target];
+                if (mt.weights.len == 0) continue;
+                if (!samplerHasFrames(ch.sampler, ch.target_path, mt.weights.len)) continue;
+                ch.sampler.sampleWeightsInto(time, mt.weights, ch.easing);
+                const rn = @min(mt.weights.len, mt.rest_weights.len);
+                for (mt.weights, 0..) |*slot, j| {
+                    var v = slot.*;
+                    if (w < 0.999 and j < rn) {
+                        v = mt.rest_weights[j] + (v - mt.rest_weights[j]) * w;
+                    }
+                    slot.* = std.math.clamp(v, 0.0, 1.0);
+                }
+                if (mt.dirty) |d| d.* = true;
+                continue;
+            }
             if (ch.target >= self.node_targets.len) continue;
-            if (!samplerHasFrames(ch.sampler, ch.target_path)) continue;
+            if (!samplerHasFrames(ch.sampler, ch.target_path, 0)) continue;
             const t = &self.node_targets[ch.target];
             if (t.skip) continue;
             switch (ch.target_path) {
@@ -471,6 +586,7 @@ pub const AnimationGroup = struct {
                         t.rotation_euler.* = blended.normalize().toEulerDeg();
                     }
                 },
+                // Handled above; kept for exhaustiveness.
                 .weights => {},
             }
         }
@@ -516,7 +632,7 @@ pub const AnimationGroup = struct {
         if (self.node_targets[target_idx].skip) return;
         for (self.node_channels) |ch| {
             if (ch.target != target_idx) continue;
-            if (!samplerHasFrames(ch.sampler, ch.target_path)) continue;
+            if (!samplerHasFrames(ch.sampler, ch.target_path, 0)) continue;
             switch (ch.target_path) {
                 .translation => out_pos.* = ch.sampler.sampleVec3Eased(time, ch.easing),
                 .rotation => out_rot.* = ch.sampler.sampleQuatEased(time, ch.easing),
@@ -1165,4 +1281,78 @@ test "NodeChannel easing warps interpolation and stop restores rest" {
     ag.stop();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), node.position.x, 1e-4);
     try std.testing.expect(!ag.is_playing);
+}
+
+test "Morph weights channel samples N values per key" {
+    const allocator = std.testing.allocator;
+    var weights = [_]f32{ 0.0, 0.0 };
+    var dirty = false;
+
+    const times = try allocator.alloc(f32, 2);
+    times[0] = 0.0;
+    times[1] = 1.0;
+    const outputs = try allocator.alloc(f32, 4);
+    outputs[0] = 0.0;
+    outputs[1] = 0.0;
+    outputs[2] = 1.0;
+    outputs[3] = 0.5;
+
+    const ag = try makeNodeGroup(allocator, "morph_weights", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindMorphTarget(&weights, &dirty);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .weights,
+        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+    });
+
+    ag.play(true);
+    ag.goToFrame(0.5); // linear midpoint between [0,0] and [1,0.5]
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weights[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), weights[1], 1e-4);
+    try std.testing.expect(dirty);
+
+    // Group weight blends the sample with the rest pose ([0,0] here).
+    dirty = false;
+    ag.setWeight(0.5);
+    ag.goToFrame(1.0); // sampled [1,0.5] -> [0.5,0.25]
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weights[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), weights[1], 1e-4);
+    try std.testing.expect(dirty);
+
+    // stop() restores rest weights and flags dirty for the scene re-blend.
+    dirty = false;
+    ag.stop();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weights[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weights[1], 1e-6);
+    try std.testing.expect(dirty);
+}
+
+test "Morph weights channel with truncated outputs is skipped" {
+    const allocator = std.testing.allocator;
+    var weights = [_]f32{ 0.2, 0.3 };
+    var dirty = false;
+
+    // 2 keys but only 2 outputs for 2 targets (needs 4): skipped entirely.
+    const bad_times = try allocator.alloc(f32, 2);
+    bad_times[0] = 0.0;
+    bad_times[1] = 1.0;
+    const bad_out = try allocator.alloc(f32, 2);
+    bad_out[0] = 0.9;
+    bad_out[1] = 0.9;
+
+    const ag = try makeNodeGroup(allocator, "morph_guard", 1.0);
+    defer ag.deinit();
+    const target = try ag.bindMorphTarget(&weights, &dirty);
+    try ag.addNodeChannel(.{
+        .target = target,
+        .target_path = .weights,
+        .sampler = .{ .timestamps = bad_times, .outputs = bad_out, .interpolation = .linear },
+    });
+
+    ag.play(true);
+    ag.goToFrame(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), weights[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), weights[1], 1e-6);
+    try std.testing.expect(!dirty);
 }

@@ -409,6 +409,13 @@ pub const Scene = struct {
 
             evaluateSkeleton(skel, active_base[0..base_count], active_add[0..add_count]);
         }
+
+        // CPU morph targets: weights tracks only flag meshes dirty above;
+        // blend base + deltas here once per frame (applyMorphs early-outs
+        // when clean), before the render queue is built in render().
+        for (self.meshes.items) |mesh| {
+            if (mesh.hasMorphTargets()) mesh.applyMorphs();
+        }
     }
 
     pub fn enablePhysics(self: *Scene, gravity: ?Vec3) *PhysicsWorld {

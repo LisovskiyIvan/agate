@@ -11,6 +11,8 @@ const BoundingBox = math.BoundingBox;
 const Scene = @import("../scene.zig").Scene;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
+const MorphTarget = @import("../mesh.zig").MorphTarget;
+const MAX_MORPH_TARGETS = @import("../mesh.zig").MAX_MORPH_TARGETS;
 const computeTangents = @import("../mesh.zig").computeTangents;
 const Material = @import("../material.zig").Material;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
@@ -53,7 +55,7 @@ pub fn spawnMeshes(
 
             for (0..src_mesh.*.primitives_count) |prim_idx| {
                 const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.*.primitives[prim_idx]);
-                if (try parsePrimitive(scene, gltf, prim, mesh_name, base_matrix, materials, node_skeleton)) |mesh_obj| {
+                if (try parsePrimitive(scene, gltf, prim, src_mesh, node, mesh_name, base_matrix, materials, node_skeleton)) |mesh_obj| {
                     try scene.meshes.append(scene.allocator, mesh_obj);
                     try spawned_meshes.append(scene.allocator, mesh_obj);
                 }
@@ -66,7 +68,7 @@ pub fn spawnMeshes(
     // Fallback for files without node hierarchy
     if (spawned_meshes.items.len == 0) {
         for (0..gltf.meshes_count) |mesh_idx| {
-            const src_mesh = &gltf.meshes[mesh_idx];
+            const src_mesh: *const c.cgltf_mesh = @ptrCast(&gltf.meshes[mesh_idx]);
             const mesh_name = if (src_mesh.name != null)
                 std.mem.span(src_mesh.name)
             else
@@ -74,7 +76,7 @@ pub fn spawnMeshes(
 
             for (0..src_mesh.primitives_count) |prim_idx| {
                 const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.primitives[prim_idx]);
-                if (try parsePrimitive(scene, gltf, prim, mesh_name, Mat4.identity, materials, null)) |mesh_obj| {
+                if (try parsePrimitive(scene, gltf, prim, src_mesh, null, mesh_name, Mat4.identity, materials, null)) |mesh_obj| {
                     try scene.meshes.append(scene.allocator, mesh_obj);
                     try spawned_meshes.append(scene.allocator, mesh_obj);
                 }
@@ -83,10 +85,71 @@ pub fn spawnMeshes(
     }
 }
 
+/// Reads one glTF morph target (POSITION/NORMAL/TANGENT delta attributes)
+/// into owned slices. Missing attributes stay empty (no delta); tangents are
+/// often absent. Short accessors read as zeros past their end.
+fn parseMorphTarget(allocator: std.mem.Allocator, src: *const c.cgltf_morph_target, vert_count: usize) !MorphTarget {
+    var pos_accessor: ?*c.cgltf_accessor = null;
+    var norm_accessor: ?*c.cgltf_accessor = null;
+    var tan_accessor: ?*c.cgltf_accessor = null;
+
+    for (0..src.attributes_count) |attr_idx| {
+        const attr = &src.attributes[attr_idx];
+        switch (attr.type) {
+            c.cgltf_attribute_type_position => pos_accessor = attr.data,
+            c.cgltf_attribute_type_normal => norm_accessor = attr.data,
+            c.cgltf_attribute_type_tangent => tan_accessor = attr.data,
+            else => {},
+        }
+    }
+
+    var mt: MorphTarget = .{};
+    errdefer freeMorphTarget(allocator, &mt);
+
+    // glTF morph tangents are vec3 (xyz); the base tangent w is preserved.
+    if (pos_accessor) |pa| {
+        const deltas = try allocator.alloc([3]f32, vert_count);
+        for (0..vert_count) |i| {
+            var d: [3]f32 = .{ 0, 0, 0 };
+            _ = c.cgltf_accessor_read_float(pa, i, &d, 3);
+            deltas[i] = d;
+        }
+        mt.position_deltas = deltas;
+    }
+    if (norm_accessor) |na| {
+        const deltas = try allocator.alloc([3]f32, vert_count);
+        for (0..vert_count) |i| {
+            var d: [3]f32 = .{ 0, 0, 0 };
+            _ = c.cgltf_accessor_read_float(na, i, &d, 3);
+            deltas[i] = d;
+        }
+        mt.normal_deltas = deltas;
+    }
+    if (tan_accessor) |ta| {
+        const deltas = try allocator.alloc([3]f32, vert_count);
+        for (0..vert_count) |i| {
+            var d: [3]f32 = .{ 0, 0, 0 };
+            _ = c.cgltf_accessor_read_float(ta, i, &d, 3);
+            deltas[i] = d;
+        }
+        mt.tangent_deltas = deltas;
+    }
+    return mt;
+}
+
+fn freeMorphTarget(allocator: std.mem.Allocator, mt: *MorphTarget) void {
+    if (mt.position_deltas.len > 0) allocator.free(mt.position_deltas);
+    if (mt.normal_deltas.len > 0) allocator.free(mt.normal_deltas);
+    if (mt.tangent_deltas.len > 0) allocator.free(mt.tangent_deltas);
+    mt.* = .{};
+}
+
 pub fn parsePrimitive(
     scene: *Scene,
     gltf: *c.cgltf_data,
     prim: *const c.cgltf_primitive,
+    src_mesh: *const c.cgltf_mesh,
+    node: ?*const c.cgltf_node,
     mesh_name: []const u8,
     base_matrix: Mat4,
     materials: []const ?Material,
@@ -287,6 +350,60 @@ pub fn parsePrimitive(
         .base_matrix = base_matrix,
         .local_bounding_box = local_box,
     };
+
+    // Morph targets (blend shapes): per-vertex POSITION/NORMAL/TANGENT
+    // deltas. Only the first MAX_MORPH_TARGETS are kept; extras are dropped
+    // (documented engine limit). usize ranges: vertex counts above u16 need
+    // no special handling; absent tangent deltas stay empty slices.
+    if (prim.targets_count > 0 and prim.targets != null) {
+        const want: usize = @min(prim.targets_count, MAX_MORPH_TARGETS);
+        const list = try scene.allocator.alloc(MorphTarget, want);
+        for (list) |*mt| mt.* = .{};
+        var done: usize = 0;
+        errdefer {
+            for (list[0..done]) |*mt| freeMorphTarget(scene.allocator, mt);
+            scene.allocator.free(list);
+        }
+        for (0..want) |ti| {
+            const target_ptr: *const c.cgltf_morph_target = @ptrCast(&prim.targets[ti]);
+            list[ti] = try parseMorphTarget(scene.allocator, target_ptr, vert_count);
+            done += 1;
+        }
+        mesh_obj.morph_targets = list;
+
+        // Default morph weights: mesh.weights first, node.weights overrides
+        // (glTF: the instantiated node's weights win). cgltf exposes no
+        // per-primitive weights; missing entries stay 0.
+        const weights = try scene.allocator.alloc(f32, want);
+        for (weights) |*wgt| wgt.* = 0.0;
+        if (src_mesh.weights != null) {
+            const n = @min(src_mesh.weights_count, want);
+            for (0..n) |i| weights[i] = src_mesh.weights[i];
+        }
+        if (node) |nd| {
+            if (nd.weights != null) {
+                const n = @min(nd.weights_count, want);
+                for (0..n) |i| weights[i] = nd.weights[i];
+            }
+        }
+        mesh_obj.morph_weights = weights;
+    }
+
+    try mesh_obj.retainMorphBase(scene.allocator, vertices);
+
+    // Blend once when defaults are nonzero so the GPU buffer matches the
+    // morphed state; all-zero weights already equal base (no upload).
+    var any_morph_weight = false;
+    for (mesh_obj.morph_weights) |wgt| {
+        if (wgt != 0.0) {
+            any_morph_weight = true;
+            break;
+        }
+    }
+    if (any_morph_weight) {
+        mesh_obj.morph_dirty = true;
+        mesh_obj.applyMorphs();
+    }
 
     if (prim.material) |pm| {
         for (0..gltf.materials_count) |mat_i| {

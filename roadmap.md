@@ -38,28 +38,28 @@
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO | 🟡 |
 | DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | — | ❌ |
-| Частицы | CPU-симуляция + GPU-инстансы, additive/alpha | 🟡 |
+| Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот | 🟡 |
 | GPU-симуляция, sub-emitters, flow maps | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
-| Морф-таргеты, события анимаций, ретаргетинг | — | ❌ |
+| События анимаций, ретаргетинг | — | ❌ |
 | Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines | 🟡 |
 | Polygon/Decals/CSG/LOD | — | ❌ |
-| glTF/GLB | PBR, сэмплеры, скины, анимации, внешние URI | 🟡 |
-| Draco/meshopt/KTX2, glTF-свет/камеры, экспорт | — | ❌ |
+| glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
+| Draco/meshopt/KTX2, экспорт | — | ❌ |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`), рендера пока нет | 🟡 |
-| UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider | 🟡 |
-| GUI-контролы, layout, 3D GUI | — | ❌ |
+| UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
+| Layout-контейнеры, 3D GUI | — | ❌ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, панорама/затухание | 🟡 |
 | mp3/ogg, стриминг, шины, эффекты | — | ❌ |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике | ✅ |
-| Сериализация сцены (.babylon), экспорт | — | ❌ |
+| Сериализация сцены (бинарный AGSC: TRS/материалы/свет/камера/post FX), экспорт | ✅ |
 | Навигация/crowd/pathfinding | — | ❌ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 161 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 195 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -70,7 +70,7 @@
 
 ## Журнал реализации (итерация 10.09.2026)
 
-Выполнено и проверено: `zig build test` (161 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
+Выполнено и проверено: `zig build test` (195 тестов), `zig build` (agate), `zig build` + runtime smoke в sandbox (Metal, 10–30 кадров, с принудительно включённым пост-процессом и оверлеем физики).
 
 | Фича | Файлы | Статус |
 |---|---|---|
@@ -122,6 +122,18 @@ Sandbox: всё UI сведено в **одну панель** (HUD + «NEW FEAT
 
 Ограничение Zig 0.16: `usingnamespace` отсутствует, mixin-паттерн не работает. Методы вынесены свободными generic-функциями (`world: anytype` / `scene: anytype`) + тонкими форвардинг-обёртками в исходном файле; C-колбэки запросов — фабрики `OverlapQuery(comptime World)`/`SphereCastQuery(World)` без цикла импортов. В `physics.zig` остались `CharacterController`, `Rope` и ядро `PhysicsWorld` (цикл на приватных хелперах). Проверки: 161 тест, `zig build` agate/sandbox, runtime smoke без утечек, `--bench` зелёный.
 
+### Волна 3: фичи (10.09.2026)
+
+| Фича | Файлы | Статус |
+|---|---|---|
+| Морф-таргеты glTF (до 8, CPU-блендинг с dirty-tracking, weights-каналы + easing) | `mesh.zig`, `animation.zig`, `loader/{mesh_spawn,animations}.zig`, `scene.zig` | ✅ |
+| Сериализация состояния сцены (бинарный `AGSC` v1: TRS/материалы/свет/камера/post FX; save/load в память и файл) | `serialization.zig` | ✅ |
+| UI: dropdown, скролл (`ScrollState`), text input (`TextInputState`, UTF-8-редактирование) | `ui.zig` | ✅ |
+| glTF-свет (`KHR_lights_punctual`) и камеры | `loader/lights.zig`, `scene_loader.zig` | ✅ |
+| Частицы: локальное пространство эмиттера, спрайт-листы, поворот/angular velocity | `particles.zig`, `passes/particle_pass.zig`, `shaders/particle.glsl` | ✅ |
+
+Sandbox: dropdown камеры, кнопки/клавиши Save State [7] / Load State [8] (in-memory снимок), обновлённый CONTROLS. Итог: 195 тестов, `zig build test`/agate/sandbox зелёные, runtime smoke без утечек (~2.6 мс, init ~390 мс).
+
 Sandbox-демо (все новые фичи выведены в интерфейс): галерея из 5 новых примитивов; панель New Features с чекбоксами Sharpen/Grain и слайдерами Sharpen/Grain/Temperature/Tint; кнопки Camera/WAV/Lines; клавиши `4` — смена камеры Arc→Free→Follow, `5` — debug-линии физики + счётчик `querySphere`, `6` — проигрывание WAV из памяти. DirectionalLight включён в сцену.
 
 Оптимизация движка (замерено): кэш view-projection в `Scene.projectPoint` + hoist солнца, резерв `appendDebugLines` (без роста списка) + опциональный `debug_circle_segments`, единичный `sqrt` в `ui.drawLine` и запас буфера UI, блочный микшер аудио с предвычисленными гейнами + быстрый декод WAV, предвычисление trig-таблиц в билдерах. Оверлей физики: 4.08–4.49 → 3.13–3.24 мс/кадр (~25%), база без оверлея не изменилась (~2.4 мс, ~420 FPS). Найден и исправлен leak в `uploadGeometry` (затирание `cpu_positions/cpu_indices`). Отложено: GPU-оптимизации bloom/SSR (нужна визуальная проверка).
@@ -136,7 +148,7 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
 * Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов (`SceneStats`).
-* 161 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
+* 195 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
 
 ### Рендеринг
 
@@ -258,7 +270,7 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 | Анимация (morph targets, события, retargeting) | Скелетная + node-анимации glTF TRS, easing (10 кривых), блендинг/crossfade | Морф-таргетов, cubic-spline-тангенсов (fallback linear), событий/колбэков, ретаргетинга |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер | GPU-симуляции, sub-emitters, flow maps, спрайт-листов, коллизий, локального пространства |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 15 примитивов + terrain (вкл. Plane/Tube/Extrude/Lines) | Polygon/N-gon, Decals, CSG, LOD, упрощения |
-| glTF (Draco/meshopt/KTX2, расширения, lights/cameras, morph) | GLB/GLTF, PBR-текстур, скины, анимации | Draco/meshopt/KTX2, glTF-света/камер, морф-анимации, экспорта |
+| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры, скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры | Draco/meshopt/KTX2, экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider | Инпутов, скроллов, dropdown, гридов/layout, 3D-виджетов, загрузки шрифтов, фокуса/состояния |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, позиционирование | mp3/ogg, стриминга, шин/эффектов, doppler/окклюзии |
@@ -291,7 +303,7 @@ Sandbox-демо (все новые фичи выведены в интерфе�
 **Геометрия**
 * Polygon/N-gon-билдеры, толстые GreasedLine-линии, decals, trail.
 * CSG/CSG2, LOD, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг отсутствует, instancing только для Standard).
-* Морф-таргеты (атрибут weights парсится, но шейдеры и анимация его не используют), blend shapes.
+* Blend shapes с GPU-скиннингом (сейчас CPU-блендинг морфов), морфы >8 таргетов.
 
 **Анимация**
 * События в таймлайне, animation retargeting, ретаргетинг скелетов, редактор анимаций.

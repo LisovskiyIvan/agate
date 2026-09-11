@@ -67,6 +67,8 @@ pub const PlaneOptions = mesh.PlaneOptions;
 pub const TubeOptions = mesh.TubeOptions;
 pub const LinesOptions = mesh.LinesOptions;
 pub const ExtrudeOptions = mesh.ExtrudeOptions;
+pub const MorphTarget = mesh.MorphTarget;
+pub const MAX_MORPH_TARGETS = mesh.MAX_MORPH_TARGETS;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
@@ -126,6 +128,8 @@ pub const UICanvas = ui.UICanvas;
 pub const UIVertex = ui.UIVertex;
 pub const GlyphUV = ui.GlyphUV;
 pub const getGlyphUV = ui.getGlyphUV;
+pub const ScrollState = ui.ScrollState;
+pub const TextInputState = ui.TextInputState;
 
 pub const passes = @import("passes/mod.zig");
 
@@ -143,6 +147,7 @@ pub const animation = struct {
     pub const AnimationInterpolation = anim.AnimationInterpolation;
     pub const NodeChannel = anim.NodeChannel;
     pub const NodeTarget = anim.NodeTarget;
+    pub const MorphWeightsTarget = anim.MorphWeightsTarget;
     pub const EasingType = easing.EasingType;
     pub const easing_names = easing.easing_names;
     pub const evaluateEasing = easing.evaluate;
@@ -160,6 +165,7 @@ pub const AnimationPath = animation.AnimationPath;
 pub const AnimationInterpolation = animation.AnimationInterpolation;
 pub const NodeChannel = animation.NodeChannel;
 pub const NodeTarget = animation.NodeTarget;
+pub const MorphWeightsTarget = animation.MorphWeightsTarget;
 pub const EasingType = animation.EasingType;
 pub const easing_names = animation.easing_names;
 pub const evaluateEasing = animation.evaluateEasing;
@@ -178,5 +184,18 @@ pub const AudioEngine = audio.AudioEngine;
 pub const AudioClip = audio.AudioClip;
 pub const VoiceKind = audio.VoiceKind;
 pub const Voice = audio.Voice;
+
+pub const serialization = @import("serialization.zig");
+pub const SceneState = serialization.SceneState;
+pub const captureSceneState = serialization.capture;
+pub const restoreSceneState = serialization.restore;
+pub const serializeSceneState = serialization.serializeAlloc;
+pub const deserializeSceneState = serialization.deserializeAlloc;
+pub const saveSceneStateFile = serialization.saveFile;
+pub const loadSceneStateFile = serialization.loadFile;
+
+pub const loader_lights = @import("loader/lights.zig");
+pub const loadGltfLights = loader_lights.loadLights;
+pub const loadGltfCameras = loader_lights.loadCameras;
 
 pub const sokol = @import("sokol");

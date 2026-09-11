@@ -30,6 +30,26 @@ pub const CullingStrategy = enum {
     always_render,
 };
 
+/// Maximum morph targets (blend shapes) per mesh.
+/// glTF files with more targets load only the first MAX_MORPH_TARGETS;
+/// extras are dropped at import (documented loader behavior).
+/// Blending is CPU-side with dirty tracking; GPU morphing is future work
+/// (no shader/pipeline changes — applyMorphs rewrites the vertex buffer
+/// from the CPU staging copy).
+pub const MAX_MORPH_TARGETS: usize = 8;
+
+/// One glTF morph target: per-vertex deltas added to the base attributes,
+/// scaled by the matching entry of Mesh.morph_weights.
+/// All slices are owned (scene allocator) and freed in Mesh.deinit.
+/// Any slice may be empty when the glTF target omits that attribute
+/// (tangents are often absent); empty means "no delta".
+pub const MorphTarget = struct {
+    position_deltas: [][3]f32 = &.{},
+    normal_deltas: [][3]f32 = &.{},
+    /// Vec3 deltas applied to tangent xyz; tangent w is preserved.
+    tangent_deltas: [][3]f32 = &.{},
+};
+
 pub const InstancedMesh = struct {
     name: []const u8,
     position: Vec3 = Vec3.zero,
@@ -85,6 +105,18 @@ pub const Mesh = struct {
     // (convex hull / triangle mesh shapes). Owned by the scene allocator.
     cpu_positions: []Vec3 = &.{},
     cpu_indices: []u32 = &.{},
+
+    // Morph targets (blend shapes), CPU-blended with dirty tracking.
+    // morph_targets/morph_weights/morph_base/morph_staging are owned by the
+    // scene allocator; Mesh.deinit frees them. GPU morphing is future work.
+    morph_targets: []MorphTarget = &.{},
+    morph_weights: []f32 = &.{},
+    /// Base (unmorphed) vertices: the blend source. See retainMorphBase.
+    morph_base: []Vertex = &.{},
+    /// Current blended result; uploaded to vertex_buffer when dirty.
+    /// Without a GPU buffer (unit tests, id == 0) this is the output.
+    morph_staging: []Vertex = &.{},
+    morph_dirty: bool = false,
 
     // Instancing support
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
@@ -201,6 +233,106 @@ pub const Mesh = struct {
         self.cpu_indices = index_copy;
     }
 
+    pub fn hasMorphTargets(self: *const Mesh) bool {
+        return self.morph_targets.len > 0;
+    }
+
+    /// Sets one morph weight, clamped to [0, 1]. Out-of-range indices are
+    /// ignored (never crash on animation data). Marks the mesh dirty.
+    pub fn setMorphWeight(self: *Mesh, index: usize, weight: f32) void {
+        if (index >= self.morph_weights.len) return;
+        self.morph_weights[index] = std.math.clamp(weight, 0.0, 1.0);
+        self.morph_dirty = true;
+    }
+
+    /// Sets all morph weights (up to min(dst, src)), each clamped to
+    /// [0, 1]. Extra inputs are ignored; missing inputs keep their value.
+    /// No-op (stays clean) when the mesh has no weights. Marks dirty.
+    pub fn setMorphWeights(self: *Mesh, weights: []const f32) void {
+        if (self.morph_weights.len == 0) return;
+        const n = @min(self.morph_weights.len, weights.len);
+        for (0..n) |i| {
+            self.morph_weights[i] = std.math.clamp(weights[i], 0.0, 1.0);
+        }
+        self.morph_dirty = true;
+    }
+
+    /// Retains a CPU copy of the base vertices for morph blending.
+    /// Base and staging start identical; dirty is cleared.
+    /// Owned by the allocator; previous copies are freed.
+    pub fn retainMorphBase(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex) !void {
+        const base = try allocator.dupe(Vertex, vertices);
+        errdefer allocator.free(base);
+        const staging = try allocator.dupe(Vertex, vertices);
+        errdefer allocator.free(staging);
+        if (self.morph_base.len > 0) allocator.free(self.morph_base);
+        if (self.morph_staging.len > 0) allocator.free(self.morph_staging);
+        self.morph_base = base;
+        self.morph_staging = staging;
+        self.morph_dirty = false;
+    }
+
+    /// CPU blend: staging = base + Σ weight_i * delta_i (positions, normals,
+    /// tangent xyz; colors/uv/joints/weights and tangent w untouched).
+    /// Normals are NOT renormalized: keeps the blend exact and cheap;
+    /// shaders consume them as-is (documented limitation, revisited with
+    /// GPU morphs). No-op when dirty == false. Zero weights (or empty
+    /// targets) restore base. Uploads via sg.updateBuffer only when the
+    /// vertex buffer exists (id != 0), so unit tests run without GPU.
+    /// Index-type independent: blending is per-vertex over usize ranges.
+    pub fn applyMorphs(self: *Mesh) void {
+        if (!self.morph_dirty) return;
+        self.morph_dirty = false;
+        if (self.morph_base.len == 0 or self.morph_staging.len == 0) return;
+        const n = @min(self.morph_base.len, self.morph_staging.len);
+
+        const target_count = @min(self.morph_targets.len, self.morph_weights.len);
+        var active = false;
+        for (0..target_count) |t| {
+            const w = self.morph_weights[t];
+            if (w == 0.0) continue;
+            const mt = &self.morph_targets[t];
+            if (mt.position_deltas.len > 0 or mt.normal_deltas.len > 0 or mt.tangent_deltas.len > 0) {
+                active = true;
+                break;
+            }
+        }
+
+        @memcpy(self.morph_staging[0..n], self.morph_base[0..n]);
+        if (active) {
+            for (0..target_count) |t| {
+                const w = self.morph_weights[t];
+                if (w == 0.0) continue;
+                const mt = &self.morph_targets[t];
+                const pn = @min(n, mt.position_deltas.len);
+                for (0..pn) |i| {
+                    const d = mt.position_deltas[i];
+                    self.morph_staging[i].position[0] += w * d[0];
+                    self.morph_staging[i].position[1] += w * d[1];
+                    self.morph_staging[i].position[2] += w * d[2];
+                }
+                const nn = @min(n, mt.normal_deltas.len);
+                for (0..nn) |i| {
+                    const d = mt.normal_deltas[i];
+                    self.morph_staging[i].normal[0] += w * d[0];
+                    self.morph_staging[i].normal[1] += w * d[1];
+                    self.morph_staging[i].normal[2] += w * d[2];
+                }
+                const tn = @min(n, mt.tangent_deltas.len);
+                for (0..tn) |i| {
+                    const d = mt.tangent_deltas[i];
+                    self.morph_staging[i].tangent[0] += w * d[0];
+                    self.morph_staging[i].tangent[1] += w * d[1];
+                    self.morph_staging[i].tangent[2] += w * d[2];
+                }
+            }
+        }
+
+        if (self.vertex_buffer.id != 0) {
+            sg.updateBuffer(self.vertex_buffer, sg.asRange(self.morph_staging[0..n]));
+        }
+    }
+
     pub fn deinit(self: *Mesh, allocator: std.mem.Allocator) void {
         sg.destroyBuffer(self.vertex_buffer);
         sg.destroyBuffer(self.index_buffer);
@@ -211,6 +343,15 @@ pub const Mesh = struct {
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
+        for (self.morph_targets) |*mt| {
+            if (mt.position_deltas.len > 0) allocator.free(mt.position_deltas);
+            if (mt.normal_deltas.len > 0) allocator.free(mt.normal_deltas);
+            if (mt.tangent_deltas.len > 0) allocator.free(mt.tangent_deltas);
+        }
+        if (self.morph_targets.len > 0) allocator.free(self.morph_targets);
+        if (self.morph_weights.len > 0) allocator.free(self.morph_weights);
+        if (self.morph_base.len > 0) allocator.free(self.morph_base);
+        if (self.morph_staging.len > 0) allocator.free(self.morph_staging);
         if (self.cpu_positions.len > 0) {
             allocator.free(self.cpu_positions);
         }
@@ -2865,4 +3006,213 @@ test "MeshBuilder extrude rejects invalid input" {
     // Bow-tie outline self-intersects.
     const bowtie = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 1), Vec2.new(1, 0), Vec2.new(0, 1) };
     try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &bowtie }));
+}
+
+// CPU morph-target tests run without GPU: vertex_buffer.id == 0, so
+// applyMorphs only rewrites the staging copy (no sg.updateBuffer).
+// Mesh.deinit is intentionally NOT used here (it destroys GPU buffers);
+// freeMorphTestMesh below mirrors its morph cleanup.
+fn freeMorphTestMesh(ally: std.mem.Allocator, mesh: *Mesh) void {
+    for (mesh.morph_targets) |*mt| {
+        if (mt.position_deltas.len > 0) ally.free(mt.position_deltas);
+        if (mt.normal_deltas.len > 0) ally.free(mt.normal_deltas);
+        if (mt.tangent_deltas.len > 0) ally.free(mt.tangent_deltas);
+    }
+    if (mesh.morph_targets.len > 0) ally.free(mesh.morph_targets);
+    if (mesh.morph_weights.len > 0) ally.free(mesh.morph_weights);
+    if (mesh.morph_base.len > 0) ally.free(mesh.morph_base);
+    if (mesh.morph_staging.len > 0) ally.free(mesh.morph_staging);
+}
+
+fn makeMorphTestMesh(ally: std.mem.Allocator) !Mesh {
+    const base = [_]Vertex{
+        .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 1, 0 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 0, 0 } },
+        .{ .position = .{ 1, 0, 0 }, .normal = .{ 0, 1, 0 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 1, 0 } },
+    };
+    var mesh: Mesh = .{ .name = "morph_test", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    try mesh.retainMorphBase(ally, &base);
+    return mesh;
+}
+
+test "MorphTarget single-target blend exact values" {
+    const ally = std.testing.allocator;
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    const pos = try ally.alloc([3]f32, 2);
+    pos[0] = .{ 0, 2, 0 };
+    pos[1] = .{ 0, 0, 4 };
+    const nrm = try ally.alloc([3]f32, 2);
+    nrm[0] = .{ 0, 1, 0 };
+    nrm[1] = .{ 1, 0, 0 };
+    mesh.morph_targets = try ally.alloc(MorphTarget, 1);
+    mesh.morph_targets[0] = .{ .position_deltas = pos, .normal_deltas = nrm };
+    mesh.morph_weights = try ally.alloc(f32, 1);
+    mesh.morph_weights[0] = 0.0;
+
+    try std.testing.expect(mesh.hasMorphTargets());
+    mesh.setMorphWeight(0, 0.5);
+    try std.testing.expect(mesh.morph_dirty);
+    mesh.applyMorphs();
+    try std.testing.expect(!mesh.morph_dirty);
+
+    // staging = base + 0.5 * delta (normals NOT renormalized, by design).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[0].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[0].position[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[0].position[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[1].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[1].position[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), mesh.morph_staging[1].position[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[0].normal[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), mesh.morph_staging[0].normal[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mesh.morph_staging[1].normal[0], 1e-6);
+    // Untouched attributes stay at base.
+    try std.testing.expectEqual([2]f32{ 0, 0 }, mesh.morph_staging[0].uv);
+    try std.testing.expectEqual([4]f32{ 1, 0, 0, 1 }, mesh.morph_staging[0].tangent);
+}
+
+test "MorphTarget two-target blend combines deltas" {
+    const ally = std.testing.allocator;
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    const pos_a = try ally.alloc([3]f32, 2);
+    pos_a[0] = .{ 1, 0, 0 };
+    pos_a[1] = .{ 0, 0, 0 };
+    const pos_b = try ally.alloc([3]f32, 2);
+    pos_b[0] = .{ 0, 0, 10 };
+    pos_b[1] = .{ 0, 4, 0 };
+    const tan_b = try ally.alloc([3]f32, 2);
+    tan_b[0] = .{ 0, 1, 0 };
+    tan_b[1] = .{ 0, 0, 0 };
+    mesh.morph_targets = try ally.alloc(MorphTarget, 2);
+    mesh.morph_targets[0] = .{ .position_deltas = pos_a };
+    mesh.morph_targets[1] = .{ .position_deltas = pos_b, .tangent_deltas = tan_b };
+    mesh.morph_weights = try ally.alloc(f32, 2);
+    mesh.morph_weights[0] = 0.0;
+    mesh.morph_weights[1] = 0.0;
+
+    mesh.setMorphWeights(&.{ 1.0, 0.5 });
+    mesh.applyMorphs();
+
+    // v0: (0,0,0) + 1*(1,0,0) + 0.5*(0,0,10) = (1,0,5).
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[0].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[0].position[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), mesh.morph_staging[0].position[2], 1e-6);
+    // v1: (1,0,0) + 1*(0,0,0) + 0.5*(0,4,0) = (1,2,0).
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[1].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), mesh.morph_staging[1].position[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_staging[1].position[2], 1e-6);
+    // Tangent xyz blended, w preserved.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[0].tangent[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mesh.morph_staging[0].tangent[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_staging[0].tangent[3], 1e-6);
+}
+
+test "MorphTarget weight clamp and reset to base" {
+    const ally = std.testing.allocator;
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    const pos = try ally.alloc([3]f32, 2);
+    pos[0] = .{ 5, 5, 5 };
+    pos[1] = .{ 5, 5, 5 };
+    mesh.morph_targets = try ally.alloc(MorphTarget, 1);
+    mesh.morph_targets[0] = .{ .position_deltas = pos };
+    mesh.morph_weights = try ally.alloc(f32, 1);
+    mesh.morph_weights[0] = 0.0;
+
+    // Out-of-range index is ignored, mesh stays clean.
+    mesh.setMorphWeight(7, 1.0);
+    try std.testing.expect(!mesh.morph_dirty);
+    // Clamp to [0, 1].
+    mesh.setMorphWeight(0, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh.morph_weights[0], 1e-6);
+    mesh.setMorphWeight(0, -3.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mesh.morph_weights[0], 1e-6);
+
+    // Full weight then reset via setMorphWeights restores base exactly.
+    mesh.setMorphWeight(0, 1.0);
+    mesh.applyMorphs();
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), mesh.morph_staging[0].position[0], 1e-6);
+    mesh.setMorphWeights(&.{0.0});
+    mesh.applyMorphs();
+    try std.testing.expectEqual(mesh.morph_base[0].position, mesh.morph_staging[0].position);
+    try std.testing.expectEqual(mesh.morph_base[1].position, mesh.morph_staging[1].position);
+    // setMorphWeights on a mesh without weights is a clean no-op.
+    var bare: Mesh = .{ .name = "bare", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    try std.testing.expect(!bare.hasMorphTargets());
+    bare.setMorphWeights(&.{1.0});
+    try std.testing.expect(!bare.morph_dirty);
+    bare.applyMorphs(); // no base: no crash, stays clean
+    try std.testing.expect(!bare.morph_dirty);
+}
+
+test "MorphTarget apply is dirty-idempotent" {
+    const ally = std.testing.allocator;
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    const pos = try ally.alloc([3]f32, 2);
+    pos[0] = .{ 0, 8, 0 };
+    pos[1] = .{ 0, 0, 0 };
+    mesh.morph_targets = try ally.alloc(MorphTarget, 1);
+    mesh.morph_targets[0] = .{ .position_deltas = pos };
+    mesh.morph_weights = try ally.alloc(f32, 1);
+    mesh.morph_weights[0] = 0.0;
+
+    mesh.setMorphWeight(0, 0.25);
+    mesh.applyMorphs();
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), mesh.morph_staging[0].position[1], 1e-6);
+    // Second apply with dirty == false does no work: a manual edit survives.
+    mesh.morph_staging[0].position[1] = 42.0;
+    mesh.applyMorphs();
+    try std.testing.expectApproxEqAbs(@as(f32, 42.0), mesh.morph_staging[0].position[1], 1e-6);
+}
+
+test "MorphTarget empty deltas are a base-preserving no-op" {
+    const ally = std.testing.allocator;
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    // Target present but every delta slice empty (e.g. glTF target without
+    // readable attributes): full weight must still reproduce base.
+    mesh.morph_targets = try ally.alloc(MorphTarget, 1);
+    mesh.morph_targets[0] = .{};
+    mesh.morph_weights = try ally.alloc(f32, 1);
+    mesh.morph_weights[0] = 0.0;
+
+    try std.testing.expect(mesh.hasMorphTargets());
+    mesh.setMorphWeight(0, 1.0);
+    mesh.applyMorphs();
+    try std.testing.expectEqual(mesh.morph_base[0].position, mesh.morph_staging[0].position);
+    try std.testing.expectEqual(mesh.morph_base[1].position, mesh.morph_staging[1].position);
+}
+
+test "MorphTarget blend is u16/u32 index-type independent" {
+    const ally = std.testing.allocator;
+    var mesh16 = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh16);
+    var mesh32 = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh32);
+    mesh16.index_type = .UINT16;
+    mesh32.index_type = .UINT32;
+
+    for ([2]*Mesh{ &mesh16, &mesh32 }) |m| {
+        const pos = try ally.alloc([3]f32, 2);
+        pos[0] = .{ 1, 2, 3 };
+        pos[1] = .{ -1, -2, -3 };
+        m.morph_targets = try ally.alloc(MorphTarget, 1);
+        m.morph_targets[0] = .{ .position_deltas = pos };
+        m.morph_weights = try ally.alloc(f32, 1);
+        m.morph_weights[0] = 0.0;
+        m.setMorphWeight(0, 0.5);
+        m.applyMorphs();
+    }
+
+    try std.testing.expectEqual(mesh16.morph_staging[0].position, mesh32.morph_staging[0].position);
+    try std.testing.expectEqual(mesh16.morph_staging[1].position, mesh32.morph_staging[1].position);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mesh32.morph_staging[0].position[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh32.morph_staging[0].position[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), mesh32.morph_staging[0].position[2], 1e-6);
 }

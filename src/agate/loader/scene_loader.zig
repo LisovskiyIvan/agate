@@ -12,6 +12,9 @@ const materials_mod = @import("materials.zig");
 const skins_mod = @import("skins.zig");
 const mesh_spawn_mod = @import("mesh_spawn.zig");
 const animations_mod = @import("animations.zig");
+const lights_mod = @import("lights.zig");
+const math = @import("math");
+const Mat4 = math.Mat4;
 
 pub const SceneLoader = struct {
     pub const appendGltf = appendGlb;
@@ -90,6 +93,11 @@ pub const SceneLoader = struct {
         // Group names come from gltf animation.name so UI code can enumerate
         // them via scene.animation_groups.
         try animations_mod.loadAnimations(scene, gltf, skeletons, &spawned_meshes, node_mesh_start, node_mesh_count, is_joint_node);
+
+        // 5. Parse punctual lights (KHR_lights_punctual) and cameras.
+        // No scene-level transform exists at this level, so identity is used.
+        try lights_mod.loadLights(scene, gltf, Mat4.identity);
+        _ = try lights_mod.loadCameras(scene, gltf, Mat4.identity);
 
         return spawned_meshes.toOwnedSlice(scene.allocator);
     }

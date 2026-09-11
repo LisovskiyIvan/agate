@@ -14,15 +14,22 @@ in vec2 position;
 in vec2 texcoord0;
 in vec4 inst_pos_size;
 in vec4 inst_color;
+// xy = UV offset of the spritesheet cell, zw = UV scale (1/columns, 1/rows).
+in vec4 inst_uv_rect;
+// x = billboard rotation in radians (counter-clockwise in billboard plane).
+in vec4 inst_rotation;
 
 out vec2 v_uv;
 out vec4 v_color;
 
 void main() {
+    float c = cos(inst_rotation.x);
+    float s = sin(inst_rotation.x);
+    vec2 rotated = vec2(c * position.x - s * position.y, s * position.x + c * position.y);
     vec3 world_pos = inst_pos_size.xyz +
-        (camera_right.xyz * position.x + camera_up.xyz * position.y) * inst_pos_size.w;
+        (camera_right.xyz * rotated.x + camera_up.xyz * rotated.y) * inst_pos_size.w;
     gl_Position = view_proj * vec4(world_pos, 1.0);
-    v_uv = texcoord0;
+    v_uv = inst_uv_rect.xy + texcoord0 * inst_uv_rect.zw;
     v_color = inst_color;
 }
 @end
