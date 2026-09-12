@@ -991,3 +991,26 @@ test "Mesh decal rotation angle and transformation" {
     }
 }
 
+test "Mesh decal depth bias anti-z-fighting properties" {
+    const ally = std.testing.allocator;
+    const opts = DecalOptions{
+        .position = Vec3.zero,
+        .normal = Vec3.up,
+    };
+    // Default depth_bias should be >= 0.003 (3mm) to prevent z-fighting at distances
+    try std.testing.expect(opts.depth_bias >= 0.003);
+
+    var dummy_mesh = Mesh{
+        .name = "decal_test",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .is_decal = true,
+        .cast_shadows = false,
+    };
+    defer dummy_mesh.deinit(ally);
+
+    try std.testing.expect(dummy_mesh.is_decal);
+    try std.testing.expect(!dummy_mesh.cast_shadows);
+}
+

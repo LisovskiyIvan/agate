@@ -20,6 +20,10 @@ pub const RenderMeshItem = struct {
     // stale/missing, pipeline selection re-derives it from mesh.material.
     // Defaults to false so single-sided behavior is unchanged.
     double_sided: bool = false,
+    // True when the mesh is a projected decal. Decals route to the transparent
+    // queue so they render after all opaque geometry with depth writes disabled,
+    // eliminating depth-buffer z-fighting against the underlying surface.
+    is_decal: bool = false,
 };
 
 pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
@@ -34,7 +38,14 @@ pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
 
 // Transparent items sort strictly back-to-front (by squared camera
 // distance) so alpha blending composites in the correct order.
+// When two coplanar surfaces are at the same distance, decals sort after
+// (drawn on top of) non-decals.
 pub fn sortTransparentBackToFront(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
+    if (@abs(a.distance_sq - b.distance_sq) < 1e-4) {
+        if (a.is_decal != b.is_decal) {
+            return !a.is_decal;
+        }
+    }
     return a.distance_sq > b.distance_sq;
 }
 

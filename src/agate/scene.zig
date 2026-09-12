@@ -528,7 +528,7 @@ pub const Scene = struct {
         var best_mesh: ?*Mesh = null;
 
         for (self.meshes.items) |mesh| {
-            if (!mesh.is_visible or mesh.is_lod_child) continue;
+            if (!mesh.is_visible or mesh.is_lod_child or mesh.is_decal) continue;
 
             if (mesh.instances.items.len > 0) {
                 continue;
@@ -957,7 +957,7 @@ pub const Scene = struct {
                 } else self.default_white_texture.view.id;
 
                 const d_sq = world_aabb.center().sub(eye).lengthSq();
-                const transparent = materialIsTransparent(render_mesh.material);
+                const transparent = materialIsTransparent(render_mesh.material) or render_mesh.is_decal;
                 const target_queue = if (transparent) &self.transparent_queue else &self.render_queue;
                 target_queue.append(self.allocator, .{
                     .mesh = render_mesh,
@@ -966,7 +966,8 @@ pub const Scene = struct {
                     .is_pbr = is_pbr,
                     .texture_id = tex_id,
                     .transparent = transparent,
-                    .double_sided = scene_render_queue.materialIsDoubleSided(render_mesh.material),
+                    .double_sided = scene_render_queue.materialIsDoubleSided(render_mesh.material) or render_mesh.is_decal,
+                    .is_decal = render_mesh.is_decal,
                 }) catch continue;
             }
         }

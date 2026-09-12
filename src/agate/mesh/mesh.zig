@@ -81,6 +81,9 @@ pub const Mesh = struct {
     lod_levels: std.ArrayListUnmanaged(LODLevel) = .empty,
     is_lod_child: bool = false,
 
+    // Decal
+    is_decal: bool = false,
+
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
         inst.* = .{

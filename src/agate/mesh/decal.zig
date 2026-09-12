@@ -18,7 +18,7 @@ pub const DecalOptions = struct {
     size: Vec3 = Vec3.new(1.0, 1.0, 1.0),
     angle: f32 = 0.0,
     cull_backfaces: bool = true,
-    depth_bias: f32 = 0.002,
+    depth_bias: f32 = 0.004,
 };
 
 const DecalVertex = struct {
@@ -282,5 +282,7 @@ pub fn createDecal(
     defer data.deinit(scene.allocator);
     const decal_mesh = try mesh_mod.uploadGeometry(scene, name, data);
     decal_mesh.culling_strategy = .frustum;
+    decal_mesh.is_decal = true;
+    decal_mesh.cast_shadows = false;
     return decal_mesh;
 }
