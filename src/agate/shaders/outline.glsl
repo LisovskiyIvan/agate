@@ -1,9 +1,12 @@
 // Inverse-hull outline/highlight shader for agate (renders inside the main
 // pass, after opaque geometry, like DebugPass/SkyboxPass).
-// Three vertex stages share the same rim expansion and fragment stage:
 // - outline:         rigid meshes (view_proj * model pre-multiplied into mvp)
 // - outline_inst:    instanced meshes (per-instance model matrix, buffer 1)
 // - outline_skinned: skinned meshes (matrix-palette skinning, joints/weights)
+// - outline_cutout:  alpha-cutout cards (foliage): the projected quad is
+//   dilated away from its screen-space center and alpha-tested against the
+//   albedo texture, so the halo follows the leaf silhouette, not the quad
+//   border.
 // The rim is a constant screen-space width by construction: the normal tip
 // is projected next to the base vertex, the NDC delta is renormalized in
 // pixel space, and the offset is scaled by clip depth, so the width does
@@ -152,3 +155,64 @@ void main() {
 @program outline vs fs
 @program outline_inst vs_inst fs
 @program outline_skinned vs_skinned fs
+
+
+@vs vs_cutout
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_params {
+    mat4 mvp; // view_proj * model
+    mat4 model; // unused: kept so every stage shares one uniform layout
+    vec4 color;
+    vec4 params; // x: width_px, y: viewport_w, z: viewport_h, w: depth push-away bias (NDC)
+};
+layout(binding = 2) uniform vs_center {
+    vec4 center_ndc; // xy: projected bounds center in NDC, z: unused, w: >0 when valid
+};
+
+in vec3 position;
+in vec2 texcoord0;
+
+out vec2 v_uv;
+out vec4 v_color;
+
+void main() {
+    vec4 clip0 = mvp * vec4(position, 1.0);
+    float w0 = max(clip0.w, 1e-6);
+    vec2 vp = max(params.yz, vec2(1.0));
+    vec2 px = params.x * 2.0 / vp;
+
+    // Dilate the projected card away from its screen-space center. A flat
+    // card has no interior silhouette for the inverse hull to grip, so the
+    // expansion direction comes from the projected bounds center instead.
+    vec2 dir = clip0.xy / w0 - center_ndc.xy;
+    float len = max(length(dir), 1e-5);
+    clip0.xy += (dir / len) * px * w0;
+
+    // Push the dilated copy behind the card: the alpha-tested leaf wins the
+    // depth test, so only the halo ring outside the leaf silhouette shows.
+    clip0.z += params.w * w0;
+    gl_Position = clip0;
+    v_uv = texcoord0;
+    v_color = color;
+}
+@end
+@fs fs_cutout
+layout(binding = 3) uniform fs_cutout_params {
+    vec4 cutout; // x: alpha cutoff
+};
+layout(binding = 0) uniform texture2D albedo_tex;
+layout(binding = 0) uniform sampler smp;
+
+in vec2 v_uv;
+in vec4 v_color;
+
+out vec4 frag_color;
+
+void main() {
+    float a = texture(sampler2D(albedo_tex, smp), v_uv).a;
+    if (a < cutout.x) discard;
+    frag_color = v_color;
+}
+@end
+
+@program outline_cutout vs_cutout fs_cutout

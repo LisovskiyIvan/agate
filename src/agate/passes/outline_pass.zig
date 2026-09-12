@@ -9,6 +9,7 @@ const Color4 = math.Color4;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
+const uniforms = @import("../scene/uniforms.zig");
 
 // Inverse-hull outline/highlight layer: highlighted meshes are redrawn with
 // front-face culling (the inflated "inside out" hull), LESS_EQUAL depth
@@ -17,9 +18,11 @@ const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 // pass whose depth attachment is reused). The constant screen-space width
 // comes from the shader (clip-depth-scaled NDC offset along the projected
 // normal); no extra geometry or render targets are needed.
-// All three mesh flavors are supported: rigid meshes, instanced meshes
-// (per-instance model matrix, only the visible instance prefix is drawn)
-// and skinned meshes (matrix-palette skinning, matching skinned_pbr.glsl).
+// All four mesh flavors are supported: rigid meshes, instanced meshes
+// (per-instance model matrix, only the visible instance prefix is drawn),
+// skinned meshes (matrix-palette skinning, matching skinned_pbr.glsl) and
+// alpha-cutout cards (foliage: dilated from the projected bounds center and
+// alpha-tested, so the halo follows the leaf silhouette, not the quad).
 
 // Upper bound for the rim width; larger values would swallow small meshes.
 pub const max_width_px: f32 = 16.0;
@@ -28,6 +31,11 @@ pub const max_width_px: f32 = 16.0;
 // grazing angles). Zero by default: the LESS_EQUAL test already hides the
 // covered hull interior.
 pub const default_depth_bias: f32 = 0.0;
+
+// Depth push-away for the cutout halo: the dilated card is offset behind the
+// source card so the alpha-tested leaf wins the depth test and only the halo
+// ring outside the leaf silhouette stays visible.
+pub const cutout_depth_bias: f32 = 0.002;
 
 // Viewport used for the px->NDC conversion, set via resize(). Starts at a
 // guarded 1x1 so a forgotten resize() cannot divide by zero (the rim would
@@ -78,6 +86,47 @@ pub fn shouldOutlineMesh(mesh: *const Mesh) bool {
     if (mesh.index_count == 0) return false;
     if (mesh.vertex_buffer.id == 0 or mesh.index_buffer.id == 0) return false;
     return true;
+}
+
+/// Alpha-cutout outline info for a rigid mesh: the albedo texture providing
+/// the mask and the material's cutoff threshold.
+pub const CutoutInfo = struct {
+    texture: @import("../texture.zig").Texture,
+    cutoff: f32,
+};
+
+/// Rigid meshes with an alpha-cutout material outline through the dedicated
+/// dilate + alpha-test path (a flat card has no interior silhouette for the
+/// inverse hull). Null for every other mesh flavor.
+pub fn cutoutInfoFor(mesh: *const Mesh) ?CutoutInfo {
+    const cutoff = uniforms.alphaCutoffFor(mesh.material);
+    if (cutoff <= 0.0) return null;
+    const tex = switch (mesh.material.?) {
+        .standard => |s| s.diffuse_texture,
+        .pbr => |p| p.albedo_texture,
+    } orelse return null;
+    return .{ .texture = tex, .cutoff = cutoff };
+}
+
+/// Full clip-space transform (no perspective division) of a world point.
+fn toClip(m: Mat4, p: Vec3) [4]f32 {
+    return .{
+        m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12],
+        m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+        m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14],
+        m.m[3] * p.x + m.m[7] * p.y + m.m[11] * p.z + m.m[15],
+    };
+}
+
+/// Projects the mesh's world-bounds center to NDC for the cutout dilation
+/// direction. w <= 0 marks the center as behind the camera: the shader then
+/// skips the dilation (a degenerate direction would smear the card).
+fn projectedCenterNdc(view_proj: Mat4, mesh: *const Mesh) [4]f32 {
+    const aabb = mesh.cached_aabb;
+    const center = if (aabb.isValid()) aabb.center() else mesh.position;
+    const clip = toClip(view_proj, center);
+    if (clip[3] <= 0.001) return .{ 0, 0, 0, -1.0 };
+    return .{ clip[0] / clip[3], clip[1] / clip[3], 0, 1.0 };
 }
 
 /// Shared inverse-hull pipeline state (culling, depth, blend). Vertex layout
@@ -140,6 +189,22 @@ pub fn configureOutlineInstDesc(desc: *sg.PipelineDesc) void {
     desc.layout.attrs[outline_shd.ATTR_outline_inst_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
 }
 
+/// Alpha-cutout cards: position + uv from the mesh vertex buffer; no face
+/// culling (the dilated halo must show from both sides of the card).
+pub fn configureOutlineCutoutDesc(desc: *sg.PipelineDesc) void {
+    setInverseHullState(desc);
+    desc.cull_mode = .NONE;
+    desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+    desc.layout.attrs[outline_shd.ATTR_outline_cutout_position] = .{
+        .format = .FLOAT3,
+        .offset = @offsetOf(Vertex, "position"),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_cutout_texcoord0] = .{
+        .format = .FLOAT2,
+        .offset = @offsetOf(Vertex, "uv"),
+    };
+}
+
 /// Skinned meshes: full Mesh.Vertex layout (position/normal/joints/weights)
 /// plus the vs_skin bone palette uniform applied per draw.
 pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
@@ -168,16 +233,20 @@ pub const OutlinePass = struct {
     pipeline_u32: sg.Pipeline = .{},
     pipeline_inst_u16: sg.Pipeline = .{},
     pipeline_inst_u32: sg.Pipeline = .{},
+    pipeline_cutout_u16: sg.Pipeline = .{},
+    pipeline_cutout_u32: sg.Pipeline = .{},
     pipeline_skinned_u16: sg.Pipeline = .{},
     pipeline_skinned_u32: sg.Pipeline = .{},
 
     pub fn init() OutlinePass {
-        // One shader object per program family: the three @program entries in
+        // One shader object per program family: the @program entries in
         // outline.glsl generate separate desc functions, each with its own
-        // uniform block table (only the skinned program declares vs_skin).
+        // uniform block table (only the skinned program declares vs_skin,
+        // only the cutout program declares the albedo mask binding).
         const shd_rigid = sg.makeShader(outline_shd.outlineShaderDesc(sg.queryBackend()));
         const shd_inst = sg.makeShader(outline_shd.outlineInstShaderDesc(sg.queryBackend()));
         const shd_skin = sg.makeShader(outline_shd.outlineSkinnedShaderDesc(sg.queryBackend()));
+        const shd_cutout = sg.makeShader(outline_shd.outlineCutoutShaderDesc(sg.queryBackend()));
 
         var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16 };
         configureOutlineDesc(&desc_u16);
@@ -203,11 +272,21 @@ pub const OutlinePass = struct {
         configureOutlineSkinnedDesc(&desc_skin_u32);
         const pip_skin_u32 = sg.makePipeline(desc_skin_u32);
 
+        var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16 };
+        configureOutlineCutoutDesc(&desc_cut_u16);
+        const pip_cut_u16 = sg.makePipeline(desc_cut_u16);
+
+        var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32 };
+        configureOutlineCutoutDesc(&desc_cut_u32);
+        const pip_cut_u32 = sg.makePipeline(desc_cut_u32);
+
         return .{
             .pipeline_u16 = pip_u16,
             .pipeline_u32 = pip_u32,
             .pipeline_inst_u16 = pip_inst_u16,
             .pipeline_inst_u32 = pip_inst_u32,
+            .pipeline_cutout_u16 = pip_cut_u16,
+            .pipeline_cutout_u32 = pip_cut_u32,
             .pipeline_skinned_u16 = pip_skin_u16,
             .pipeline_skinned_u32 = pip_skin_u32,
         };
@@ -221,9 +300,9 @@ pub const OutlinePass = struct {
     }
 
     /// Draws the outline rim for `meshes` into the currently open main pass.
-    /// Each mesh routes to its pipeline family (rigid / instanced / skinned);
-    /// meshes failing shouldOutlineMesh are skipped silently. Empty list and
-    /// zero width are GPU-free no-ops.
+    /// Each mesh routes to its pipeline family (rigid / instanced / skinned /
+    /// alpha-cutout); meshes failing shouldOutlineMesh are skipped silently.
+    /// Empty list and zero width are GPU-free no-ops.
     pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
         // Reserved for view-dependent effects (distance fade); the width is
         // depth-invariant by construction (clip-scaled NDC offset).
@@ -237,11 +316,14 @@ pub const OutlinePass = struct {
             if (!shouldOutlineMesh(mesh)) continue;
             const skinned = mesh.skeleton != null;
             const instanced = !skinned and mesh.instances.items.len > 0;
+            const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
             const is_u32 = mesh.index_type == .UINT32;
             const pip = if (skinned)
                 (if (is_u32) self.pipeline_skinned_u32 else self.pipeline_skinned_u16)
             else if (instanced)
                 (if (is_u32) self.pipeline_inst_u32 else self.pipeline_inst_u16)
+            else if (cutout != null)
+                (if (is_u32) self.pipeline_cutout_u32 else self.pipeline_cutout_u16)
             else
                 (if (is_u32) self.pipeline_u32 else self.pipeline_u16);
             if (pip.id == 0) continue;
@@ -254,6 +336,11 @@ pub const OutlinePass = struct {
                 if (mesh.instance_buffer.id == 0 or mesh.visible_instance_count == 0) continue;
                 bind.vertex_buffers[1] = mesh.instance_buffer;
             }
+            if (cutout != null) {
+                // Dilate + alpha-test: the halo is masked by the leaf texture.
+                bind.views[outline_shd.VIEW_albedo_tex] = cutout.?.texture.view;
+                bind.samplers[outline_shd.SMP_smp] = cutout.?.texture.sampler;
+            }
             bind.index_buffer = mesh.index_buffer;
             sg.applyPipeline(pip);
             sg.applyBindings(bind);
@@ -264,7 +351,11 @@ pub const OutlinePass = struct {
                 .mvp = mvp,
                 .model = model,
                 .color = color.toArray(),
-                .params = outlineParamsFor(width),
+                .params = if (cutout != null) blk: {
+                    var p = outlineParamsFor(width);
+                    p[3] = cutout_depth_bias;
+                    break :blk p;
+                } else outlineParamsFor(width),
             };
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
             if (skinned) {
@@ -272,6 +363,16 @@ pub const OutlinePass = struct {
                     .bones = mesh.skeleton.?.skin_matrices,
                 };
                 sg.applyUniforms(outline_shd.UB_vs_skin, sg.asRange(&vs_skin));
+            }
+            if (cutout) |ci| {
+                const vs_center = outline_shd.VsCenter{
+                    .center_ndc = projectedCenterNdc(view_proj, mesh),
+                };
+                sg.applyUniforms(outline_shd.UB_vs_center, sg.asRange(&vs_center));
+                const fs_cutout = outline_shd.FsCutoutParams{
+                    .cutout = .{ ci.cutoff, 0, 0, 0 },
+                };
+                sg.applyUniforms(outline_shd.UB_fs_cutout_params, sg.asRange(&fs_cutout));
             }
 
             const instance_count: u32 = if (instanced) mesh.visible_instance_count else 1;
@@ -284,6 +385,8 @@ pub const OutlinePass = struct {
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.pipeline_inst_u16);
         sg.destroyPipeline(self.pipeline_inst_u32);
+        sg.destroyPipeline(self.pipeline_cutout_u16);
+        sg.destroyPipeline(self.pipeline_cutout_u32);
         sg.destroyPipeline(self.pipeline_skinned_u16);
         sg.destroyPipeline(self.pipeline_skinned_u32);
         self.* = undefined;
@@ -434,4 +537,23 @@ test "outlineParamsFor packs clamped width and current viewport" {
     try std.testing.expectEqual([4]f32{ 2.0, 800.0, 600.0, default_depth_bias }, p);
     const clamped = outlineParamsFor(max_width_px + 100.0);
     try std.testing.expectEqual(max_width_px, clamped[0]);
+}
+
+test "configureOutlineCutoutDesc binds position and uv without culling" {
+    var desc = std.mem.zeroes(sg.PipelineDesc);
+    configureOutlineCutoutDesc(&desc);
+    try std.testing.expect(desc.cull_mode == .NONE);
+    try std.testing.expect(desc.depth.compare == .LESS_EQUAL);
+    try std.testing.expect(!desc.depth.write_enabled);
+    try std.testing.expectEqual(@sizeOf(Vertex), desc.layout.buffers[0].stride);
+    try std.testing.expect(desc.layout.attrs[outline_shd.ATTR_outline_cutout_position].format == .FLOAT3);
+    try std.testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(Vertex, "position"))),
+        desc.layout.attrs[outline_shd.ATTR_outline_cutout_position].offset,
+    );
+    try std.testing.expect(desc.layout.attrs[outline_shd.ATTR_outline_cutout_texcoord0].format == .FLOAT2);
+    try std.testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(Vertex, "uv"))),
+        desc.layout.attrs[outline_shd.ATTR_outline_cutout_texcoord0].offset,
+    );
 }
