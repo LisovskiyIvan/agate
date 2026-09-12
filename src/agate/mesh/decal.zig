@@ -302,6 +302,12 @@ pub fn buildDecalData(
     const target_mat = @constCast(target_mesh).getWorldMatrix();
     const inv_target_mat = if (options.parent_to_target) (target_mat.invert() orelse Mat4.identity) else Mat4.identity;
 
+    const col0 = Vec3.new(target_mat.m[0], target_mat.m[1], target_mat.m[2]);
+    const col1 = Vec3.new(target_mat.m[4], target_mat.m[5], target_mat.m[6]);
+    const col2 = Vec3.new(target_mat.m[8], target_mat.m[9], target_mat.m[10]);
+    const avg_scale = (col0.length() + col1.length() + col2.length()) / 3.0;
+    const skinned_local_bias = if (avg_scale > 1e-5) options.depth_bias / avg_scale else options.depth_bias;
+
     const is_skinned = target_mesh.skeleton != null and
         target_mesh.cpu_skin.len == target_mesh.cpu_positions.len;
 
@@ -403,7 +409,7 @@ pub fn buildDecalData(
                 const bind_norm = if (bind_cross.lengthSq() > 1e-8) bind_cross.normalize() else Vec3.up;
 
                 const pos_bind = p0_bind.scale(bary[0]).add(p1_bind.scale(bary[1])).add(p2_bind.scale(bary[2]));
-                const pos_biased = pos_bind.add(bind_norm.scale(options.depth_bias));
+                const pos_biased = pos_bind.add(bind_norm.scale(skinned_local_bias));
 
                 const skin_interp = blendSkinWeights(
                     bary,
@@ -505,16 +511,17 @@ pub fn createDecal(
 
     if (target_mesh.skeleton != null and target_mesh.cpu_skin.len == target_mesh.cpu_positions.len) {
         decal_mesh.skeleton = target_mesh.skeleton;
-        decal_mesh.base_matrix = target_mesh.base_matrix;
-        decal_mesh.position = target_mesh.position;
-        decal_mesh.rotation = target_mesh.rotation;
-        decal_mesh.scaling = target_mesh.scaling;
-        decal_mesh.parent = target_mesh.parent;
+        decal_mesh.parent = @constCast(target_mesh);
+        decal_mesh.position = Vec3.zero;
+        decal_mesh.rotation = Vec3.zero;
+        decal_mesh.scaling = Vec3.one;
+        decal_mesh.base_matrix = Mat4.identity;
     } else if (options.parent_to_target) {
         decal_mesh.parent = @constCast(target_mesh);
         decal_mesh.position = Vec3.zero;
         decal_mesh.rotation = Vec3.zero;
         decal_mesh.scaling = Vec3.one;
+        decal_mesh.base_matrix = Mat4.identity;
     }
     return decal_mesh;
 }
