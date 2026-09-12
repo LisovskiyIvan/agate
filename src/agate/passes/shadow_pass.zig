@@ -225,7 +225,7 @@ pub const ShadowPass = struct {
         // 1. Pre-bin shadow-casting meshes into the 6 pipeline buckets once.
         var counts: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
         for (meshes) |mesh| {
-            if (!mesh.cast_shadows) continue;
+            if (!mesh.cast_shadows or mesh.is_lod_child) continue;
             counts[@intFromEnum(bucketFor(mesh))] += 1;
         }
 
@@ -245,7 +245,7 @@ pub const ShadowPass = struct {
         }
 
         for (meshes) |mesh| {
-            if (!mesh.cast_shadows) continue;
+            if (!mesh.cast_shadows or mesh.is_lod_child) continue;
             const b = @intFromEnum(bucketFor(mesh));
             self.binned_meshes.items[cursors[b]] = mesh;
             cursors[b] += 1;

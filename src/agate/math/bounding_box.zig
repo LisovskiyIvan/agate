@@ -15,6 +15,13 @@ pub const BoundingBox = struct {
         return .{ .min = min_v, .max = max_v };
     }
 
+    pub fn isValid(self: BoundingBox) bool {
+        const dx = self.max.x - self.min.x;
+        const dy = self.max.y - self.min.y;
+        const dz = self.max.z - self.min.z;
+        return dx >= 0.0 and dy >= 0.0 and dz >= 0.0 and (dx > 0.0 or dy > 0.0 or dz > 0.0);
+    }
+
     pub fn center(self: BoundingBox) Vec3 {
         return Vec3.new(
             (self.min.x + self.max.x) * 0.5,

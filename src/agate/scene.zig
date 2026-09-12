@@ -528,7 +528,7 @@ pub const Scene = struct {
         var best_mesh: ?*Mesh = null;
 
         for (self.meshes.items) |mesh| {
-            if (!mesh.is_visible) continue;
+            if (!mesh.is_visible or mesh.is_lod_child) continue;
 
             if (mesh.instances.items.len > 0) {
                 continue;
@@ -762,6 +762,7 @@ pub const Scene = struct {
 
         // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
         for (self.meshes.items) |mesh| {
+            if (mesh.is_lod_child) continue;
             if (mesh.instances.items.len > 0) {
                 self.instance_matrices.clearRetainingCapacity();
                 const total_insts = mesh.instances.items.len;
@@ -914,10 +915,33 @@ pub const Scene = struct {
                 self.stats.total_meshes += 1;
                 if (!mesh.is_visible) continue;
 
-                const model = self.worldMatrixCached(mesh);
-                const world_aabb = mesh.cached_aabb;
+                var render_mesh = mesh;
+                if (mesh.lod_levels.items.len > 0) {
+                    const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
+                    const active_lod = mesh.getLOD(dist);
+                    if (active_lod) |lod| {
+                        render_mesh = lod;
+                        if (lod != mesh) {
+                            lod.position = mesh.position;
+                            lod.rotation = mesh.rotation;
+                            lod.scaling = mesh.scaling;
+                            lod.parent = mesh.parent;
+                            lod.base_matrix = mesh.base_matrix;
+                            if (lod.material == null) {
+                                lod.material = mesh.material;
+                            }
+                        }
+                    } else {
+                        // Beyond max distance, culled
+                        self.stats.culled_meshes += 1;
+                        continue;
+                    }
+                }
 
-                if (self.enable_frustum_culling and mesh.culling_strategy == .frustum) {
+                const model = self.worldMatrixCached(render_mesh);
+                const world_aabb = render_mesh.cached_aabb;
+
+                if (self.enable_frustum_culling and render_mesh.culling_strategy == .frustum) {
                     if (!frustum.intersectsAABB(world_aabb)) {
                         self.stats.culled_meshes += 1;
                         continue;
@@ -926,23 +950,23 @@ pub const Scene = struct {
 
                 self.stats.rendered_meshes += 1;
 
-                const is_pbr = if (mesh.material) |m| (m == .pbr) else false;
-                const tex_id: u32 = if (mesh.material) |m| switch (m) {
+                const is_pbr = if (render_mesh.material) |m| (m == .pbr) else false;
+                const tex_id: u32 = if (render_mesh.material) |m| switch (m) {
                     .pbr => |p| if (p.albedo_texture) |t| t.view.id else self.default_white_texture.view.id,
                     .standard => |s| if (s.diffuse_texture) |t| t.view.id else self.default_white_texture.view.id,
                 } else self.default_white_texture.view.id;
 
                 const d_sq = world_aabb.center().sub(eye).lengthSq();
-                const transparent = materialIsTransparent(mesh.material);
+                const transparent = materialIsTransparent(render_mesh.material);
                 const target_queue = if (transparent) &self.transparent_queue else &self.render_queue;
                 target_queue.append(self.allocator, .{
-                    .mesh = mesh,
+                    .mesh = render_mesh,
                     .model = model,
                     .distance_sq = d_sq,
                     .is_pbr = is_pbr,
                     .texture_id = tex_id,
                     .transparent = transparent,
-                    .double_sided = scene_render_queue.materialIsDoubleSided(mesh.material),
+                    .double_sided = scene_render_queue.materialIsDoubleSided(render_mesh.material),
                 }) catch continue;
             }
         }

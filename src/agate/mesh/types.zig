@@ -21,6 +21,11 @@ pub const CullingStrategy = enum {
     always_render,
 };
 
+pub const LODLevel = struct {
+    distance: f32,
+    mesh: ?*Mesh,
+};
+
 /// Maximum morph targets (blend shapes) per mesh.
 /// glTF files with more targets load only the first MAX_MORPH_TARGETS;
 /// extras are dropped at import (documented loader behavior).

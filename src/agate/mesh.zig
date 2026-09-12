@@ -8,6 +8,7 @@ pub const MorphTarget = types.MorphTarget;
 pub const InstancedMesh = types.InstancedMesh;
 pub const BoneAttachment = types.BoneAttachment;
 pub const GeometryData = types.GeometryData;
+pub const LODLevel = types.LODLevel;
 
 pub const tangents = @import("mesh/tangents.zig");
 pub const computeTangents = tangents.computeTangents;
@@ -62,6 +63,11 @@ pub const buildExtrudeData = builders.buildExtrudeData;
 
 pub const builder = @import("mesh/builder.zig");
 pub const MeshBuilder = builder.MeshBuilder;
+
+pub const decal = @import("mesh/decal.zig");
+pub const DecalOptions = decal.DecalOptions;
+pub const buildDecalData = decal.buildDecalData;
+pub const createDecal = decal.createDecal;
 
 test {
     _ = @import("mesh/tests.zig");

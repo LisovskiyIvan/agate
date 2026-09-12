@@ -15,6 +15,7 @@ const MorphTarget = types.MorphTarget;
 const InstancedMesh = types.InstancedMesh;
 const BoneAttachment = types.BoneAttachment;
 const GeometryData = types.GeometryData;
+const LODLevel = types.LODLevel;
 
 const Material = @import("../material.zig").Material;
 const StandardMaterial = @import("../material.zig").StandardMaterial;
@@ -76,6 +77,10 @@ pub const Mesh = struct {
     instance_hash: u64 = 0,
     instance_uploaded_count: usize = 0,
 
+    // Level of Detail (LOD)
+    lod_levels: std.ArrayListUnmanaged(LODLevel) = .empty,
+    is_lod_child: bool = false,
+
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
         inst.* = .{
@@ -113,6 +118,50 @@ pub const Mesh = struct {
     /// Detaches this mesh from its bone socket.
     pub fn detachFromBone(self: *Mesh) void {
         self.attach_bone = null;
+    }
+
+    /// Adds an LOD level. Levels can be added in any order; they will be kept
+    /// sorted by distance ascending. Setting lod_mesh to null means culling
+    /// the mesh when distance >= distance.
+    pub fn addLODLevel(self: *Mesh, allocator: std.mem.Allocator, distance: f32, lod_mesh: ?*Mesh) !void {
+        if (lod_mesh) |lm| {
+            lm.is_lod_child = true;
+        }
+        var insert_idx: usize = self.lod_levels.items.len;
+        for (self.lod_levels.items, 0..) |lvl, i| {
+            if (distance < lvl.distance) {
+                insert_idx = i;
+                break;
+            }
+        }
+        try self.lod_levels.insert(allocator, insert_idx, .{
+            .distance = distance,
+            .mesh = lod_mesh,
+        });
+    }
+
+    /// Selects the appropriate active LOD mesh for a given distance from camera.
+    /// Returns self if distance is below the first LOD threshold,
+    /// or the LOD mesh for the matched distance bracket,
+    /// or null if the matched bracket specifies a culled mesh (null).
+    pub fn getLOD(self: *const Mesh, distance: f32) ?*Mesh {
+        if (self.lod_levels.items.len == 0) return @constCast(self);
+        var active: ?*Mesh = @constCast(self);
+        for (self.lod_levels.items) |lvl| {
+            if (distance >= lvl.distance) {
+                active = lvl.mesh;
+            } else {
+                break;
+            }
+        }
+        return active;
+    }
+
+    /// Selects the active LOD mesh based on camera distance to this mesh's center.
+    pub fn getLODForCamera(self: *const Mesh, camera_pos: Vec3) ?*Mesh {
+        const center = if (self.cached_aabb.isValid()) self.cached_aabb.center() else self.position;
+        const dist = center.distance(camera_pos);
+        return self.getLOD(dist);
     }
 
     pub fn getWorldMatrix(self: Mesh) Mat4 {
@@ -294,8 +343,12 @@ pub const Mesh = struct {
     }
 
     pub fn deinit(self: *Mesh, allocator: std.mem.Allocator) void {
-        sg.destroyBuffer(self.vertex_buffer);
-        sg.destroyBuffer(self.index_buffer);
+        if (self.vertex_buffer.id != 0) {
+            sg.destroyBuffer(self.vertex_buffer);
+        }
+        if (self.index_buffer.id != 0) {
+            sg.destroyBuffer(self.index_buffer);
+        }
         if (self.instance_buffer.id != 0) {
             sg.destroyBuffer(self.instance_buffer);
         }
@@ -303,6 +356,7 @@ pub const Mesh = struct {
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
+        self.lod_levels.deinit(allocator);
         for (self.morph_targets) |*mt| {
             if (mt.position_deltas.len > 0) allocator.free(mt.position_deltas);
             if (mt.normal_deltas.len > 0) allocator.free(mt.normal_deltas);

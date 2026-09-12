@@ -43,7 +43,8 @@
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
 | События анимаций, ретаргетинг | — | ❌ |
 | Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines | 🟡 |
-| Polygon/Decals/CSG/LOD | — | ❌ |
+| LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
+| Polygon / CSG / Упрощение мешей | — | ❌ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
 | Draco/meshopt/KTX2, экспорт | — | ❌ |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
@@ -223,6 +224,15 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 Проверки: 310+ тестов, `zig build test` (agate) и `zig build` (sandbox) проходят за 1-2 сек без ошибок и предупреждений.
 
+### Волна 8: LOD (Level of Detail) и система декалей (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| Система LOD | `mesh/types.zig`, `mesh/mesh.zig`, `scene.zig`, `passes/shadow_pass.zig` | Сортированные дистанционные уровни детальности (`LODLevel`), автоматический выбор меша по расстоянию до камеры, поддержка дистанционного куллинга (`mesh: null`), исключение `is_lod_child` из теневых пассов и рейкаста, синхронизация трансформов и материалов | ✅ |
+| Система декалей | `mesh/decal.zig`, `mesh/builder.zig`, `mesh.zig`, `root.zig` | Проектор ориентированного куба (OBB) на целевой меш произвольной формы, алгоритм отсечения многоугольников Sutherland-Hodgman по 6 плоскостям, depth bias против z-fighting, backface culling, вычисление UV, касательных (tangents) и нормалей | ✅ |
+
+Проверки: 315 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений.
+
 
 ---
 
@@ -355,7 +365,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, MSAA, LUT-текстур, glow/highlight; MSAA выключен (sample_count=1) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
-| Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 15 примитивов + terrain (вкл. Plane/Tube/Extrude/Lines) | Polygon/N-gon, Decals, CSG, LOD, упрощения |
+| Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 15 примитивов + terrain + LOD + Decals | Polygon/N-gon, CSG, упрощения |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры, скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры | Draco/meshopt/KTX2, glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider | Инпутов, скроллов, dropdown, гридов/layout, 3D-виджетов, загрузки шрифтов, фокуса/состояния |
@@ -384,11 +394,11 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 **Постобработка и эффекты**
 * Depth of Field, motion blur, TAA, MSAA/SSAA, LUT/color curves, bloom с мип-пирамидой, SSR/SSAO более высокого качества.
-* Glow layer, highlight layer, outline renderer, decals, lens flares, snapshot-рендер.
+* Glow layer, highlight layer, outline renderer, lens flares, snapshot-рендер.
 
 **Геометрия**
-* Polygon/N-gon-билдеры, толстые GreasedLine-линии, decals, trail.
-* CSG/CSG2, LOD, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг отсутствует, instancing только для Standard).
+* Polygon/N-gon-билдеры, толстые GreasedLine-линии, trail.
+* CSG/CSG2, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг отсутствует, instancing только для Standard).
 * Blend shapes с GPU-скиннингом (сейчас CPU-блендинг морфов), морфы >8 таргетов.
 
 **Анимация**

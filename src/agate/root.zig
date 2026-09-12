@@ -52,6 +52,7 @@ pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;
 pub const InstancedMesh = mesh.InstancedMesh;
 pub const BoneAttachment = mesh.BoneAttachment;
+pub const LODLevel = mesh.LODLevel;
 pub const CullingStrategy = mesh.CullingStrategy;
 pub const Vertex = mesh.Vertex;
 pub const MeshBuilder = mesh.MeshBuilder;
@@ -71,6 +72,9 @@ pub const PlaneOptions = mesh.PlaneOptions;
 pub const TubeOptions = mesh.TubeOptions;
 pub const LinesOptions = mesh.LinesOptions;
 pub const ExtrudeOptions = mesh.ExtrudeOptions;
+pub const DecalOptions = mesh.DecalOptions;
+pub const buildDecalData = mesh.buildDecalData;
+pub const createDecal = mesh.createDecal;
 pub const MorphTarget = mesh.MorphTarget;
 pub const MAX_MORPH_TARGETS = mesh.MAX_MORPH_TARGETS;
 

@@ -28,6 +28,8 @@ const buildPlaneData = mesh_mod.buildPlaneData;
 const storeQuad = mesh_mod.storeQuad;
 const pickOrthogonal = mesh_mod.pickOrthogonal;
 const resolveFrameSeed = mesh_mod.resolveFrameSeed;
+const buildDecalData = mesh_mod.buildDecalData;
+const DecalOptions = mesh_mod.DecalOptions;
 
 test "Mesh attachToBone world matrix computation" {
     const ally = std.testing.allocator;
@@ -778,3 +780,214 @@ test "MorphTarget blend is u16/u32 index-type independent" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), mesh32.morph_staging[0].position[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), mesh32.morph_staging[0].position[2], 1e-6);
 }
+
+test "Mesh LOD levels selection, sorting and culling" {
+    const ally = std.testing.allocator;
+    var base_mesh = Mesh{
+        .name = "base_high",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 1000,
+        .position = Vec3.zero,
+    };
+    defer base_mesh.deinit(ally);
+
+    var lod_med = Mesh{
+        .name = "lod_medium",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 500,
+    };
+    defer lod_med.deinit(ally);
+
+    var lod_low = Mesh{
+        .name = "lod_low",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 100,
+    };
+    defer lod_low.deinit(ally);
+
+    // Add in arbitrary order to test automatic sorting by distance
+    try base_mesh.addLODLevel(ally, 50.0, &lod_low);
+    try base_mesh.addLODLevel(ally, 20.0, &lod_med);
+    try base_mesh.addLODLevel(ally, 100.0, null); // Cull beyond 100m
+
+    // Verify automatic distance sorting
+    try std.testing.expectEqual(@as(usize, 3), base_mesh.lod_levels.items.len);
+    try std.testing.expectEqual(@as(f32, 20.0), base_mesh.lod_levels.items[0].distance);
+    try std.testing.expectEqual(&lod_med, base_mesh.lod_levels.items[0].mesh.?);
+    try std.testing.expectEqual(@as(f32, 50.0), base_mesh.lod_levels.items[1].distance);
+    try std.testing.expectEqual(&lod_low, base_mesh.lod_levels.items[1].mesh.?);
+    try std.testing.expectEqual(@as(f32, 100.0), base_mesh.lod_levels.items[2].distance);
+    try std.testing.expect(base_mesh.lod_levels.items[2].mesh == null);
+
+    // Verify is_lod_child flag was set on children
+    try std.testing.expect(!base_mesh.is_lod_child);
+    try std.testing.expect(lod_med.is_lod_child);
+    try std.testing.expect(lod_low.is_lod_child);
+
+    // Test LOD selection by distance
+    try std.testing.expectEqual(&base_mesh, base_mesh.getLOD(0.0).?);
+    try std.testing.expectEqual(&base_mesh, base_mesh.getLOD(19.9).?);
+    try std.testing.expectEqual(&lod_med, base_mesh.getLOD(20.0).?);
+    try std.testing.expectEqual(&lod_med, base_mesh.getLOD(49.9).?);
+    try std.testing.expectEqual(&lod_low, base_mesh.getLOD(50.0).?);
+    try std.testing.expectEqual(&lod_low, base_mesh.getLOD(99.9).?);
+    try std.testing.expect(base_mesh.getLOD(100.0) == null);
+    try std.testing.expect(base_mesh.getLOD(200.0) == null);
+
+    // Test LOD for camera position
+    try std.testing.expectEqual(&base_mesh, base_mesh.getLODForCamera(Vec3.new(0, 10, 0)).?);
+    try std.testing.expectEqual(&lod_med, base_mesh.getLODForCamera(Vec3.new(0, 30, 0)).?);
+    try std.testing.expectEqual(&lod_low, base_mesh.getLODForCamera(Vec3.new(0, 70, 0)).?);
+    try std.testing.expect(base_mesh.getLODForCamera(Vec3.new(0, 150, 0)) == null);
+}
+
+test "Mesh decal projection onto planar mesh" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{ .width = 10.0, .height = 10.0 });
+    defer plane_data.deinit(ally);
+
+    var target_mesh: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+    };
+    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    defer target_mesh.deinit(ally);
+
+    var decal_data = try buildDecalData(ally, &target_mesh, .{
+        .position = Vec3.new(0.0, 0.0, 0.0),
+        .normal = Vec3.new(0.0, 0.0, 1.0),
+        .size = Vec3.new(2.0, 2.0, 2.0),
+        .depth_bias = 0.005,
+    });
+    defer decal_data.deinit(ally);
+
+    try std.testing.expect(decal_data.vertices.len > 0);
+    try std.testing.expect(decal_data.indices.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), decal_data.indices.len % 3);
+
+    // Verify UV coordinates in [0, 1] range
+    for (decal_data.vertices) |v| {
+        try std.testing.expect(v.uv[0] >= 0.0 and v.uv[0] <= 1.0);
+        try std.testing.expect(v.uv[1] >= 0.0 and v.uv[1] <= 1.0);
+        // Normal should align with plane normal (+Z)
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), v.normal[0], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), v.normal[1], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.normal[2], 1e-4);
+        // Depth bias applied along normal (+Z by 0.005)
+        try std.testing.expectApproxEqAbs(@as(f32, 0.005), v.position[2], 1e-4);
+    }
+
+    // Bounds should be clipped within the projector size ([-1, 1] in X and Y)
+    try std.testing.expect(decal_data.bounds.min.x >= -1.001);
+    try std.testing.expect(decal_data.bounds.max.x <= 1.001);
+    try std.testing.expect(decal_data.bounds.min.y >= -1.001);
+    try std.testing.expect(decal_data.bounds.max.y <= 1.001);
+}
+
+test "Mesh decal backface culling and pass-through" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
+    defer plane_data.deinit(ally);
+
+    var target_mesh: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+    };
+    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    defer target_mesh.deinit(ally);
+
+    // Projector facing backwards relative to surface normal
+    var culled_data = try buildDecalData(ally, &target_mesh, .{
+        .position = Vec3.zero,
+        .normal = Vec3.new(0.0, 0.0, -1.0),
+        .size = Vec3.new(2.0, 2.0, 2.0),
+        .cull_backfaces = true,
+    });
+    defer culled_data.deinit(ally);
+
+    try std.testing.expectEqual(@as(usize, 0), culled_data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 0), culled_data.indices.len);
+
+    // With cull_backfaces = false, backfacing triangles are preserved
+    var unculled_data = try buildDecalData(ally, &target_mesh, .{
+        .position = Vec3.zero,
+        .normal = Vec3.new(0.0, 0.0, -1.0),
+        .size = Vec3.new(2.0, 2.0, 2.0),
+        .cull_backfaces = false,
+    });
+    defer unculled_data.deinit(ally);
+
+    try std.testing.expect(unculled_data.vertices.len > 0);
+    try std.testing.expect(unculled_data.indices.len > 0);
+}
+
+test "Mesh decal off-target returns empty geometry" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{ .width = 2.0, .height = 2.0 });
+    defer plane_data.deinit(ally);
+
+    var target_mesh: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+    };
+    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    defer target_mesh.deinit(ally);
+
+    // Completely outside the bounds of the target plane (plane is at Z=0, [-1, 1]^2)
+    var decal_data = try buildDecalData(ally, &target_mesh, .{
+        .position = Vec3.new(20.0, 20.0, 0.0),
+        .normal = Vec3.new(0.0, 0.0, 1.0),
+        .size = Vec3.new(1.0, 1.0, 1.0),
+    });
+    defer decal_data.deinit(ally);
+
+    try std.testing.expectEqual(@as(usize, 0), decal_data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 0), decal_data.indices.len);
+}
+
+test "Mesh decal rotation angle and transformation" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
+    defer plane_data.deinit(ally);
+
+    var target_mesh: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+        // Target mesh with translation and scale
+        .position = Vec3.new(5.0, 0.0, 0.0),
+        .scaling = Vec3.new(2.0, 2.0, 1.0),
+    };
+    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    defer target_mesh.deinit(ally);
+
+    var decal_data = try buildDecalData(ally, &target_mesh, .{
+        .position = Vec3.new(5.0, 0.0, 0.0),
+        .normal = Vec3.new(0.0, 0.0, 1.0),
+        .size = Vec3.new(1.0, 1.0, 1.0),
+        .angle = std.math.pi / 4.0, // 45 degree rotation
+    });
+    defer decal_data.deinit(ally);
+
+    try std.testing.expect(decal_data.vertices.len > 0);
+    try std.testing.expect(decal_data.indices.len > 0);
+
+    for (decal_data.vertices) |v| {
+        try std.testing.expect(v.uv[0] >= 0.0 and v.uv[0] <= 1.0);
+        try std.testing.expect(v.uv[1] >= 0.0 and v.uv[1] <= 1.0);
+        // Tangent should be normalized
+        const tan_len = @sqrt(v.tangent[0] * v.tangent[0] + v.tangent[1] * v.tangent[1] + v.tangent[2] * v.tangent[2]);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), tan_len, 1e-4);
+    }
+}
+
