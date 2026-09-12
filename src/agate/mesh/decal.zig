@@ -274,11 +274,12 @@ pub fn createDecal(
     target_mesh: *const Mesh,
     options: DecalOptions,
 ) !*Mesh {
-    const data = try buildDecalData(scene.allocator, target_mesh, options);
+    var data = try buildDecalData(scene.allocator, target_mesh, options);
     if (data.vertices.len == 0) {
         data.deinit(scene.allocator);
         return error.DecalNoIntersection;
     }
+    defer data.deinit(scene.allocator);
     const decal_mesh = try mesh_mod.uploadGeometry(scene, name, data);
     decal_mesh.culling_strategy = .frustum;
     return decal_mesh;
