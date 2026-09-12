@@ -67,6 +67,8 @@ const trail_mod = @import("mesh/trail.zig");
 pub const TrailMesh = trail_mod.TrailMesh;
 pub const TrailOptions = trail_mod.TrailOptions;
 pub const DecalProjector = decal_mod.DecalProjector;
+const csg_mod = @import("mesh/csg.zig");
+pub const CSG = csg_mod.CSG;
 const ai_mod = @import("ai.zig");
 pub const NavMesh = ai_mod.NavMesh;
 pub const NavNode = ai_mod.NavNode;
@@ -513,6 +515,10 @@ pub const Scene = struct {
         for (self.trail_meshes.items) |tm| {
             tm.update(dt, cam_pos);
         }
+    }
+
+    pub fn createCSGMesh(self: *Scene, name: []const u8, csg_solid: *const csg_mod.CSG) !*Mesh {
+        return csg_solid.toMesh(self, name);
     }
 
     pub fn createNavMeshFromTriangles(
@@ -1774,6 +1780,8 @@ test "frameUniforms packs shared lighting state verbatim" {
         .spot_dir_inner = [_][4]f32{.{ 0, -1, 0, 0.9 }} ** 2,
         .spot_color_outer = [_][4]f32{.{ 1, 1, 1, 0.7 }} ** 2,
         .spot_intensity = [_][4]f32{.{ 3, 0, 0, 0 }} ** 2,
+        .spot_view_proj = [_]Mat4{ Mat4.identity, Mat4.identity },
+        .spot_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
     };
 
     const f = scene.frameUniforms(&mesh_obj, ctx);

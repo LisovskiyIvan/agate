@@ -44,7 +44,8 @@
 | События анимаций, ретаргетинг | — | ❌ |
 | Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines, Polygon, TrailMesh | ✅ |
 | LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
-| CSG / Упрощение мешей | — | ❌ |
+| CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
+| Упрощение мешей (Mesh simplification) | — | ❌ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
 | Draco/meshopt/KTX2, экспорт | — | ❌ |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
@@ -274,6 +275,17 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 Проверки: 334+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >360 FPS в runtime.
 
+### Волна 13: CSG (Constructive Solid Geometry) булевы операции (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| BSP-дерево и полигональное разбиение | `mesh/csg.zig`, `mesh.zig`, `root.zig` | Ядро BSP-дерева (`CSGNode`, `CSGPlane`, `CSGPolygon`, `CSGVertex`): разбиение выпуклых полигонов произвольной плоскостью (`splitPolygon`), классификация вершин (FRONT, BACK, COPLANAR, SPANNING) с эпсилон-допуском $10^{-5}$, рекурсивная инверсия твердотельного объема (`invert`), фильтрация и отсечение геометрии (`clipPolygons`, `clipTo`, `build`) | ✅ |
+| Булевы операции над твердыми телами | `mesh/csg.zig`, `root.zig` | Симметричные алгоритмы булевой геометрии на базе BSP: объединение (`unionWith`), вычитание (`subtract`), пересечение (`intersect`), поддержка цепочек операций и защита от непересекающихся/вырожденных тел | ✅ |
+| Конвертация геометрии и мешей | `mesh/csg.zig`, `mesh/builder.zig`, `scene.zig`, `root.zig` | Конструкторы `CSG.fromBox`, `CSG.fromSphere`, `CSG.fromCylinder`, `CSG.fromGeometryData`, `CSG.fromMesh`, обратная триангуляция выпуклых $N$-гонов веером (`toGeometryData`), пересчет касательных (tangents) и AABB, создание и загрузка GPU-меша (`Scene.createCSGMesh`) | ✅ |
+| Sandbox-витрина и тесты | `sandbox_showcase.zig`, `sandbox_ui.zig`, `mesh/csg_tests.zig` | Культовая CAD-скульптура в галерее на обсидиановом пьедестале: скругленный куб (Box ∩ Sphere) со сквозными перфорациями по всем 3 осям (- 3×Cylinder), вращение в реальном времени, PBR-материал «розовое золото», 7 unit-тестов булевых операций и BSP-плоскостей | ✅ |
+
+Проверки: 341+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >360 FPS в runtime.
+
 ---
 
 ## ✅ Что сделано
@@ -405,7 +417,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, MSAA, LUT-текстур, glow/highlight; MSAA выключен (sample_count=1) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
-| Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 15 примитивов + terrain + LOD + Decals | Polygon/N-gon, CSG, упрощения |
+| Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры, скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры | Draco/meshopt/KTX2, glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider | Инпутов, скроллов, dropdown, гридов/layout, 3D-виджетов, загрузки шрифтов, фокуса/состояния |

@@ -212,7 +212,7 @@ test "ndcExpandForViewport converts px width to NDC without div-by-zero" {
     try std.testing.expectApproxEqAbs(2.0 * 2.0 / 800.0, e[0], 1e-6);
     try std.testing.expectApproxEqAbs(2.0 * 2.0 / 600.0, e[1], 1e-6);
     // Degenerate viewports never produce Inf/NaN.
-    for ([2]f32{ 0.0, -10.0, std.math.nan(f32), std.math.inf(f32) }) |bad| {
+    for ([_]f32{ 0.0, -10.0, std.math.nan(f32), std.math.inf(f32) }) |bad| {
         const g = ndcExpandForViewport(2.0, bad, bad);
         try std.testing.expect(std.math.isFinite(g[0]));
         try std.testing.expect(std.math.isFinite(g[1]));

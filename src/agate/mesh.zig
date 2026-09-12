@@ -85,6 +85,14 @@ pub const TrailOptions = trail.TrailOptions;
 pub const TrailMesh = trail.TrailMesh;
 pub const TrailNode = trail.TrailNode;
 
+pub const csg = @import("mesh/csg.zig");
+pub const CSG = csg.CSG;
+pub const CSGVertex = csg.CSGVertex;
+pub const CSGPlane = csg.CSGPlane;
+pub const CSGPolygon = csg.CSGPolygon;
+pub const CSGNode = csg.CSGNode;
+
 test {
     _ = @import("mesh/tests.zig");
+    _ = @import("mesh/csg_tests.zig");
 }

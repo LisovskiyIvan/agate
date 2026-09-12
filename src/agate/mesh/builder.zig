@@ -6,11 +6,17 @@ const uploadGeometry = @import("mesh.zig").uploadGeometry;
 const builders = @import("builders.zig");
 const decal = @import("decal.zig");
 const trail = @import("trail.zig");
+const csg = @import("csg.zig");
 pub const DecalOptions = decal.DecalOptions;
 pub const buildDecalData = decal.buildDecalData;
 pub const TrailOptions = trail.TrailOptions;
 pub const TrailMesh = trail.TrailMesh;
 pub const TrailNode = trail.TrailNode;
+pub const CSG = csg.CSG;
+pub const CSGVertex = csg.CSGVertex;
+pub const CSGPlane = csg.CSGPlane;
+pub const CSGPolygon = csg.CSGPolygon;
+pub const CSGNode = csg.CSGNode;
 pub const BoxOptions = builders.BoxOptions;
 pub const SphereOptions = builders.SphereOptions;
 pub const GroundOptions = builders.GroundOptions;
@@ -144,5 +150,9 @@ pub const MeshBuilder = struct {
 
     pub fn createDecal(scene: *Scene, name: []const u8, target_mesh: *const Mesh, options: DecalOptions) !*Mesh {
         return decal.createDecal(scene, name, target_mesh, options);
+    }
+
+    pub fn createCSG(scene: *Scene, name: []const u8, csg_solid: *const CSG) !*Mesh {
+        return csg_solid.toMesh(scene, name);
     }
 };

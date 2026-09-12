@@ -373,7 +373,7 @@ test "PhysicsWorld height field terrain" {
     try std.testing.expect(ball_mesh.position.y > 0.7 and ball_mesh.position.y < 1.4);
 
     // Invalid dimensions are rejected.
-    try std.testing.expectError(error.InvalidHeightFieldDimensions, pw.createHeightField(&terrain_mesh, &heights, 5, 6));
+    try std.testing.expectError(error.InvalidHeightFieldDimensions, pw.createHeightField(&terrain_mesh, &heights, 5, 6, .{}));
 }
 
 test "PhysicsWorld raycast hits hulls and height fields" {

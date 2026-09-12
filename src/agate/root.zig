@@ -91,6 +91,11 @@ pub const barycentric = mesh.barycentric;
 pub const blendSkinWeights = mesh.blendSkinWeights;
 pub const MorphTarget = mesh.MorphTarget;
 pub const MAX_MORPH_TARGETS = mesh.MAX_MORPH_TARGETS;
+pub const CSG = mesh.CSG;
+pub const CSGVertex = mesh.CSGVertex;
+pub const CSGPlane = mesh.CSGPlane;
+pub const CSGPolygon = mesh.CSGPolygon;
+pub const CSGNode = mesh.CSGNode;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
@@ -261,4 +266,5 @@ pub const sokol = @import("sokol");
 
 test {
     _ = @import("ai.zig");
+    _ = @import("mesh/csg_tests.zig");
 }
