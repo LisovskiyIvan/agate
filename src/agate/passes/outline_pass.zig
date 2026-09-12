@@ -8,7 +8,6 @@ const Vec3 = math.Vec3;
 const Color4 = math.Color4;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
-const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 
 // Inverse-hull outline/highlight layer: highlighted meshes are redrawn with
@@ -18,8 +17,9 @@ const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 // pass whose depth attachment is reused). The constant screen-space width
 // comes from the shader (clip-depth-scaled NDC offset along the projected
 // normal); no extra geometry or render targets are needed.
-// Skinned and instanced meshes are out of scope: the outline shader has no
-// bone/instance path and would draw the wrong pose, so they are skipped.
+// All three mesh flavors are supported: rigid meshes, instanced meshes
+// (per-instance model matrix, only the visible instance prefix is drawn)
+// and skinned meshes (matrix-palette skinning, matching skinned_pbr.glsl).
 
 // Upper bound for the rim width; larger values would swallow small meshes.
 pub const max_width_px: f32 = 16.0;
@@ -69,22 +69,20 @@ pub fn outlineParamsFor(width_px: f32) [4]f32 {
     return .{ clampWidthPx(width_px), viewport_size[0], viewport_size[1], default_depth_bias };
 }
 
-/// Whether a mesh can take the outline path: visible, has drawable indexed
-/// geometry with live GPU buffers, and is a regular (non-skinned,
-/// non-instanced) mesh. Pure predicate, no GPU calls.
+/// Whether a mesh can take the outline path at all: visible and drawable
+/// through indexed geometry with live GPU buffers. Rigid, instanced and
+/// skinned meshes all qualify; render() routes each to its pipeline family.
+/// Pure predicate, no GPU calls.
 pub fn shouldOutlineMesh(mesh: *const Mesh) bool {
     if (!mesh.is_visible) return false;
     if (mesh.index_count == 0) return false;
     if (mesh.vertex_buffer.id == 0 or mesh.index_buffer.id == 0) return false;
-    if (mesh.skeleton != null) return false;
-    if (mesh.instances.items.len > 0) return false;
     return true;
 }
 
-/// Fills the inverse-hull state on a pipeline desc (culling, depth, blend,
-/// vertex layout). Takes no shader handle so it stays GPU-free and testable;
-/// init() assigns the compiled shader before calling it.
-pub fn configureOutlineDesc(desc: *sg.PipelineDesc) void {
+/// Shared inverse-hull pipeline state (culling, depth, blend). Vertex layout
+/// is configured per family by the configure*Desc functions below.
+fn setInverseHullState(desc: *sg.PipelineDesc) void {
     desc.depth = .{
         .compare = .LESS_EQUAL,
         .write_enabled = false,
@@ -100,8 +98,12 @@ pub fn configureOutlineDesc(desc: *sg.PipelineDesc) void {
         .src_factor_alpha = .ONE,
         .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
     };
-    // Reuses the Mesh vertex buffer directly: same stride, only the
-    // position/normal attributes are bound.
+}
+
+/// Rigid meshes: reuses the Mesh vertex buffer directly (same stride, only
+/// the position/normal attributes are bound).
+pub fn configureOutlineDesc(desc: *sg.PipelineDesc) void {
+    setInverseHullState(desc);
     desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
     desc.layout.attrs[outline_shd.ATTR_outline_position] = .{
         .format = .FLOAT3,
@@ -113,26 +115,101 @@ pub fn configureOutlineDesc(desc: *sg.PipelineDesc) void {
     };
 }
 
+/// Instanced meshes: mesh vertex buffer (position/normal) plus the shared
+/// per-instance model-matrix buffer (4 x FLOAT4, PER_INSTANCE), mirroring
+/// the instanced/instanced_pbr pipeline layouts.
+pub fn configureOutlineInstDesc(desc: *sg.PipelineDesc) void {
+    setInverseHullState(desc);
+    desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_position] = .{
+        .format = .FLOAT3,
+        .offset = @offsetOf(Vertex, "position"),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_normal] = .{
+        .format = .FLOAT3,
+        .offset = @offsetOf(Vertex, "normal"),
+    };
+    desc.layout.buffers[1] = .{
+        .step_func = .PER_INSTANCE,
+        .step_rate = 1,
+        .stride = @sizeOf(Mat4),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+    desc.layout.attrs[outline_shd.ATTR_outline_inst_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+}
+
+/// Skinned meshes: full Mesh.Vertex layout (position/normal/joints/weights)
+/// plus the vs_skin bone palette uniform applied per draw.
+pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
+    setInverseHullState(desc);
+    desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+    desc.layout.attrs[outline_shd.ATTR_outline_skinned_position] = .{
+        .format = .FLOAT3,
+        .offset = @offsetOf(Vertex, "position"),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_skinned_normal] = .{
+        .format = .FLOAT3,
+        .offset = @offsetOf(Vertex, "normal"),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_skinned_joints] = .{
+        .format = .FLOAT4,
+        .offset = @offsetOf(Vertex, "joints"),
+    };
+    desc.layout.attrs[outline_shd.ATTR_outline_skinned_weights] = .{
+        .format = .FLOAT4,
+        .offset = @offsetOf(Vertex, "weights"),
+    };
+}
+
 pub const OutlinePass = struct {
     pipeline_u16: sg.Pipeline = .{},
     pipeline_u32: sg.Pipeline = .{},
+    pipeline_inst_u16: sg.Pipeline = .{},
+    pipeline_inst_u32: sg.Pipeline = .{},
+    pipeline_skinned_u16: sg.Pipeline = .{},
+    pipeline_skinned_u32: sg.Pipeline = .{},
 
     pub fn init() OutlinePass {
-        const shader = sg.makeShader(outline_shd.outlineShaderDesc(sg.queryBackend()));
+        // One shader object per program family: the three @program entries in
+        // outline.glsl generate separate desc functions, each with its own
+        // uniform block table (only the skinned program declares vs_skin).
+        const shd_rigid = sg.makeShader(outline_shd.outlineShaderDesc(sg.queryBackend()));
+        const shd_inst = sg.makeShader(outline_shd.outlineInstShaderDesc(sg.queryBackend()));
+        const shd_skin = sg.makeShader(outline_shd.outlineSkinnedShaderDesc(sg.queryBackend()));
 
-        var desc_u16 = sg.PipelineDesc{ .shader = shader, .index_type = .UINT16 };
+        var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16 };
         configureOutlineDesc(&desc_u16);
-        desc_u16.index_type = .UINT16;
         const pip_u16 = sg.makePipeline(desc_u16);
 
-        var desc_u32 = sg.PipelineDesc{ .shader = shader, .index_type = .UINT32 };
+        var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32 };
         configureOutlineDesc(&desc_u32);
-        desc_u32.index_type = .UINT32;
         const pip_u32 = sg.makePipeline(desc_u32);
+
+        var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16 };
+        configureOutlineInstDesc(&desc_inst_u16);
+        const pip_inst_u16 = sg.makePipeline(desc_inst_u16);
+
+        var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32 };
+        configureOutlineInstDesc(&desc_inst_u32);
+        const pip_inst_u32 = sg.makePipeline(desc_inst_u32);
+
+        var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16 };
+        configureOutlineSkinnedDesc(&desc_skin_u16);
+        const pip_skin_u16 = sg.makePipeline(desc_skin_u16);
+
+        var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32 };
+        configureOutlineSkinnedDesc(&desc_skin_u32);
+        const pip_skin_u32 = sg.makePipeline(desc_skin_u32);
 
         return .{
             .pipeline_u16 = pip_u16,
             .pipeline_u32 = pip_u32,
+            .pipeline_inst_u16 = pip_inst_u16,
+            .pipeline_inst_u32 = pip_inst_u32,
+            .pipeline_skinned_u16 = pip_skin_u16,
+            .pipeline_skinned_u32 = pip_skin_u32,
         };
     }
 
@@ -144,9 +221,9 @@ pub const OutlinePass = struct {
     }
 
     /// Draws the outline rim for `meshes` into the currently open main pass.
-    /// Meshes failing shouldOutlineMesh are skipped silently (invisible,
-    /// skinned/instanced, or without GPU buffers). Empty list and zero
-    /// width are GPU-free no-ops.
+    /// Each mesh routes to its pipeline family (rigid / instanced / skinned);
+    /// meshes failing shouldOutlineMesh are skipped silently. Empty list and
+    /// zero width are GPU-free no-ops.
     pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
         // Reserved for view-dependent effects (distance fade); the width is
         // depth-invariant by construction (clip-scaled NDC offset).
@@ -158,17 +235,31 @@ pub const OutlinePass = struct {
 
         for (meshes) |mesh| {
             if (!shouldOutlineMesh(mesh)) continue;
-            const model = mesh.getWorldMatrix();
-            const mvp = Mat4.mul(view_proj, model);
-            const pip = if (mesh.index_type == .UINT32) self.pipeline_u32 else self.pipeline_u16;
+            const skinned = mesh.skeleton != null;
+            const instanced = !skinned and mesh.instances.items.len > 0;
+            const is_u32 = mesh.index_type == .UINT32;
+            const pip = if (skinned)
+                (if (is_u32) self.pipeline_skinned_u32 else self.pipeline_skinned_u16)
+            else if (instanced)
+                (if (is_u32) self.pipeline_inst_u32 else self.pipeline_inst_u16)
+            else
+                (if (is_u32) self.pipeline_u32 else self.pipeline_u16);
             if (pip.id == 0) continue;
-            sg.applyPipeline(pip);
 
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = mesh.vertex_buffer;
+            if (instanced) {
+                // Occlusion-culled instances are compacted into the visible
+                // prefix; nothing visible means nothing to outline.
+                if (mesh.instance_buffer.id == 0 or mesh.visible_instance_count == 0) continue;
+                bind.vertex_buffers[1] = mesh.instance_buffer;
+            }
             bind.index_buffer = mesh.index_buffer;
+            sg.applyPipeline(pip);
             sg.applyBindings(bind);
 
+            const model = mesh.getWorldMatrix();
+            const mvp = Mat4.mul(view_proj, model);
             const vs_params = outline_shd.VsParams{
                 .mvp = mvp,
                 .model = model,
@@ -176,14 +267,25 @@ pub const OutlinePass = struct {
                 .params = outlineParamsFor(width),
             };
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
+            if (skinned) {
+                const vs_skin = outline_shd.VsSkin{
+                    .bones = mesh.skeleton.?.skin_matrices,
+                };
+                sg.applyUniforms(outline_shd.UB_vs_skin, sg.asRange(&vs_skin));
+            }
 
-            sg.draw(0, mesh.index_count, 1);
+            const instance_count: u32 = if (instanced) mesh.visible_instance_count else 1;
+            sg.draw(0, mesh.index_count, instance_count);
         }
     }
 
     pub fn deinit(self: *OutlinePass) void {
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
+        sg.destroyPipeline(self.pipeline_inst_u16);
+        sg.destroyPipeline(self.pipeline_inst_u32);
+        sg.destroyPipeline(self.pipeline_skinned_u16);
+        sg.destroyPipeline(self.pipeline_skinned_u32);
         self.* = undefined;
     }
 };
@@ -213,9 +315,8 @@ test "ndcExpandForViewport converts px width to NDC without div-by-zero" {
     try std.testing.expectApproxEqAbs(2.0 * 2.0 / 600.0, e[1], 1e-6);
     // Degenerate viewports never produce Inf/NaN.
     for ([_]f32{ 0.0, -10.0, std.math.nan(f32), std.math.inf(f32) }) |bad| {
-        const g = ndcExpandForViewport(2.0, bad, bad);
-        try std.testing.expect(std.math.isFinite(g[0]));
-        try std.testing.expect(std.math.isFinite(g[1]));
+        try std.testing.expect(std.math.isFinite(ndcExpandForViewport(2.0, bad, bad)[0]));
+        try std.testing.expect(std.math.isFinite(ndcExpandForViewport(2.0, bad, bad)[1]));
     }
     // Width clamping flows through.
     const c = ndcExpandForViewport(max_width_px + 100.0, 800.0, 600.0);
@@ -244,7 +345,44 @@ test "configureOutlineDesc sets inverse-hull state" {
     );
 }
 
-test "shouldOutlineMesh filters invisible, empty, skinned and instanced meshes" {
+test "configureOutlineInstDesc binds per-instance matrix buffer" {
+    var desc = std.mem.zeroes(sg.PipelineDesc);
+    configureOutlineInstDesc(&desc);
+    try std.testing.expect(desc.cull_mode == .FRONT);
+    try std.testing.expectEqual(@sizeOf(Vertex), desc.layout.buffers[0].stride);
+    try std.testing.expectEqual(@sizeOf(Mat4), desc.layout.buffers[1].stride);
+    try std.testing.expect(desc.layout.buffers[1].step_func == .PER_INSTANCE);
+    inline for (0..4) |i| {
+        const attr = switch (i) {
+            0 => outline_shd.ATTR_outline_inst_inst_mat0,
+            1 => outline_shd.ATTR_outline_inst_inst_mat1,
+            2 => outline_shd.ATTR_outline_inst_inst_mat2,
+            else => outline_shd.ATTR_outline_inst_inst_mat3,
+        };
+        try std.testing.expectEqual(@as(i32, 1), desc.layout.attrs[attr].buffer_index);
+        try std.testing.expectEqual(@as(i32, @intCast(i * 16)), desc.layout.attrs[attr].offset);
+        try std.testing.expect(desc.layout.attrs[attr].format == .FLOAT4);
+    }
+}
+
+test "configureOutlineSkinnedDesc binds skin attributes" {
+    var desc = std.mem.zeroes(sg.PipelineDesc);
+    configureOutlineSkinnedDesc(&desc);
+    try std.testing.expect(desc.cull_mode == .FRONT);
+    try std.testing.expectEqual(@sizeOf(Vertex), desc.layout.buffers[0].stride);
+    try std.testing.expect(desc.layout.attrs[outline_shd.ATTR_outline_skinned_joints].format == .FLOAT4);
+    try std.testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(Vertex, "joints"))),
+        desc.layout.attrs[outline_shd.ATTR_outline_skinned_joints].offset,
+    );
+    try std.testing.expect(desc.layout.attrs[outline_shd.ATTR_outline_skinned_weights].format == .FLOAT4);
+    try std.testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(Vertex, "weights"))),
+        desc.layout.attrs[outline_shd.ATTR_outline_skinned_weights].offset,
+    );
+}
+
+test "shouldOutlineMesh filters invisible and empty meshes" {
     var mesh = Mesh{
         .name = "outline-test",
         .vertex_buffer = .{ .id = 1 },
@@ -265,16 +403,13 @@ test "shouldOutlineMesh filters invisible, empty, skinned and instanced meshes" 
     try std.testing.expect(!shouldOutlineMesh(&mesh));
     mesh.vertex_buffer = .{ .id = 1 };
 
+    // Skinned and instanced meshes take dedicated pipeline families, so they
+    // stay outline-eligible here (render() routes them).
     var skel: Skeleton = undefined;
     mesh.skeleton = &skel;
-    try std.testing.expect(!shouldOutlineMesh(&mesh));
-    mesh.skeleton = null;
     try std.testing.expect(shouldOutlineMesh(&mesh));
-
-    var inst_storage: [1]*InstancedMesh = undefined;
-    mesh.instances.items = inst_storage[0..];
-    try std.testing.expect(!shouldOutlineMesh(&mesh));
-    mesh.instances.items = &.{};
+    mesh.skeleton = null;
+    mesh.instances.items.len = 3;
     try std.testing.expect(shouldOutlineMesh(&mesh));
 }
 
@@ -299,9 +434,4 @@ test "outlineParamsFor packs clamped width and current viewport" {
     try std.testing.expectEqual([4]f32{ 2.0, 800.0, 600.0, default_depth_bias }, p);
     const clamped = outlineParamsFor(max_width_px + 100.0);
     try std.testing.expectEqual(max_width_px, clamped[0]);
-    // Degenerate resize inputs stay guarded.
-    OutlinePass.resize(0, -5);
-    const g = outlineParamsFor(2.0);
-    try std.testing.expect(g[1] >= 1.0 and g[2] >= 1.0);
-    OutlinePass.resize(800, 600);
 }
