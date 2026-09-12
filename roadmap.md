@@ -56,11 +56,11 @@
 | mp3/ogg, стриминг, шины, эффекты | — | ❌ |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике | ✅ |
 | Сериализация сцены (бинарный AGSC: TRS/материалы/свет/камера/post FX), экспорт | ✅ |
-| Навигация/crowd/pathfinding | — | ❌ |
+| Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 310 unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 334+ unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -262,6 +262,17 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 Проверки: 326 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >350 FPS в runtime.
 
+### Волна 12: AI-навигация (NavMesh, Funnel String-Pulling, A* Pathfinding, NavAgent) (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| NavMesh и генераторы | `ai/navmesh.zig`, `ai.zig`, `root.zig` | 3D навигационная полигональная сетка (`NavMesh`, `NavNode`): дуальный граф связности смежных треугольников через ребра (`neighbors`), фильтрация крутых уклонов (`max_slope_deg`), ориентированное определение принадлежности 2D/3D точек (`containsPointXZ`), автоматический построитель прямоугольных сеток с препятствиями (`buildGrid`) с защитой от касания границ (`obstacle_boxes`), проекция и клампинг высоты (`clampToMesh`) | ✅ |
+| Funnel Algorithm (String-Pulling) | `ai/funnel.zig`, `ai.zig`, `root.zig` | Алгоритм натяжения струны сквозь порталы коридора треугольников: определение левых и правых порталов ребер, 2D ориентированная площадь (`triArea2D`), схлопывание коридора в минимальную гладкую ломаную траекторию без зигзагов | ✅ |
+| A* Pathfinding | `ai/pathfinding.zig`, `ai.zig`, `root.zig` | Эвристический поиск пути по дуальному графу центроидов узлов на `std.PriorityQueue`: нахождение стартового и целевого узлов, расчет коридора смежных треугольников, извлечение общих порталов и вызов Funnel алгоритма для получения 3D polyline пути | ✅ |
+| NavAgent и интеграция со сценой | `ai/agent.zig`, `scene.zig`, `root.zig` | Автономный навигационный агент (`NavAgent`): следование по вейпоинтам с настраиваемой скоростью (`speed`), дистанцией прибытия (`stopping_distance`), плавным угловым подруливанием (`rotation_speed`, `yaw`), привязкой к высоте меша (`snap_to_mesh`), методами `setDestination`, `teleport`, автоматическое обновление агентов в `Scene.updateNavAgents(dt)` и очистка в `Scene.deinit` | ✅ |
+| Sandbox-витрина и тесты | `sandbox_showcase.zig`, `sandbox_scene.zig`, `sandbox_ui.zig`, `main.zig`, `ai/tests.zig` | Навигационная арена во внутреннем дворе замка с тремя гранитными обелисками-препятствиями, автономный парящий дрон-компаньон со шлейфом и подсветкой, режимы патрулирования и преследования игрока по клавише `[[]`, HUD-статус в demo-панели и шпаргалке управления, 8 unit-тестов (смежность, препятствия, обход углов A*, Funnel, телепорт) | ✅ |
+
+Проверки: 334+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >360 FPS в runtime.
 
 ---
 
@@ -455,7 +466,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 * Realtime ray tracing/Gaussian splatting (в Babylon 9 тоже отдельные подсистемы).
 
 **Прочее**
-* Навигация (navmesh/Recast), crowd simulation, pathfinding.
+* Crowd simulation (RVO2/ORCA локальное избегание столкновений толпы).
 * Сеть/multiplayer, репликация, WebSocket/WebRTC.
 * Behaviors/Actions/Observables как API-слой, теги объектов, smart filters, flow graph.
 * Локализация.

@@ -248,4 +248,17 @@ pub const writeStlAlloc = export_stl.writeStlAlloc;
 pub const writeStlAsciiAlloc = export_stl.writeStlAsciiAlloc;
 pub const writeStlBinaryAlloc = export_stl.writeStlBinaryAlloc;
 
+pub const ai = @import("ai.zig");
+pub const NavNode = ai.NavNode;
+pub const NavMesh = ai.NavMesh;
+pub const Portal = ai.Portal;
+pub const triArea2D = ai.triArea2D;
+pub const stringPull = ai.stringPull;
+pub const Pathfinding = ai.Pathfinding;
+pub const NavAgent = ai.NavAgent;
+
 pub const sokol = @import("sokol");
+
+test {
+    _ = @import("ai.zig");
+}

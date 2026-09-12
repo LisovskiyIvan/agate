@@ -67,6 +67,10 @@ const trail_mod = @import("mesh/trail.zig");
 pub const TrailMesh = trail_mod.TrailMesh;
 pub const TrailOptions = trail_mod.TrailOptions;
 pub const DecalProjector = decal_mod.DecalProjector;
+const ai_mod = @import("ai.zig");
+pub const NavMesh = ai_mod.NavMesh;
+pub const NavNode = ai_mod.NavNode;
+pub const NavAgent = ai_mod.NavAgent;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
 const Material = @import("material.zig").Material;
@@ -206,6 +210,10 @@ pub const Scene = struct {
 
     // Dynamic Trail Meshes
     trail_meshes: std.ArrayListUnmanaged(*trail_mod.TrailMesh) = .empty,
+
+    // Navigation & AI
+    nav_meshes: std.ArrayListUnmanaged(*ai_mod.NavMesh) = .empty,
+    nav_agents: std.ArrayListUnmanaged(*ai_mod.NavAgent) = .empty,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     // Transparent meshes (material alpha_mode == .blend), sorted strictly
@@ -504,6 +512,51 @@ pub const Scene = struct {
         const cam_pos = if (self.active_camera) |cam| cam.getPosition() else Vec3.zero;
         for (self.trail_meshes.items) |tm| {
             tm.update(dt, cam_pos);
+        }
+    }
+
+    pub fn createNavMeshFromTriangles(
+        self: *Scene,
+        positions: []const [3]f32,
+        indices: []const u32,
+        max_slope_rad: f32,
+    ) !*ai_mod.NavMesh {
+        const ptr = try self.allocator.create(ai_mod.NavMesh);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = try ai_mod.NavMesh.buildFromTriangles(self.allocator, positions, indices, max_slope_rad);
+        try self.nav_meshes.append(self.allocator, ptr);
+        return ptr;
+    }
+
+    pub fn createNavMeshGrid(
+        self: *Scene,
+        min_x: f32,
+        max_x: f32,
+        min_z: f32,
+        max_z: f32,
+        elevation_y: f32,
+        subdiv_x: usize,
+        subdiv_z: usize,
+        obstacles: []const BoundingBox,
+    ) !*ai_mod.NavMesh {
+        const ptr = try self.allocator.create(ai_mod.NavMesh);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = try ai_mod.NavMesh.buildGrid(self.allocator, min_x, max_x, min_z, max_z, elevation_y, subdiv_x, subdiv_z, obstacles);
+        try self.nav_meshes.append(self.allocator, ptr);
+        return ptr;
+    }
+
+    pub fn createNavAgent(self: *Scene, nav_mesh: *const ai_mod.NavMesh, start_pos: Vec3) !*ai_mod.NavAgent {
+        const ptr = try self.allocator.create(ai_mod.NavAgent);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = ai_mod.NavAgent.init(self.allocator, nav_mesh, start_pos);
+        try self.nav_agents.append(self.allocator, ptr);
+        return ptr;
+    }
+
+    pub fn updateNavAgents(self: *Scene, dt: f32) void {
+        for (self.nav_agents.items) |ag| {
+            ag.update(dt);
         }
     }
 
@@ -1415,6 +1468,18 @@ pub const Scene = struct {
             self.allocator.destroy(tm);
         }
         self.trail_meshes.deinit(self.allocator);
+
+        for (self.nav_agents.items) |agent| {
+            agent.deinit();
+            self.allocator.destroy(agent);
+        }
+        self.nav_agents.deinit(self.allocator);
+
+        for (self.nav_meshes.items) |nm| {
+            nm.deinit();
+            self.allocator.destroy(nm);
+        }
+        self.nav_meshes.deinit(self.allocator);
 
         self.default_white_texture.deinit();
         self.default_normal_texture.deinit();
