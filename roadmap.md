@@ -26,7 +26,7 @@
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
 | Рендер | Forward, 8 пайплайнов, opaque, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
-| Инстансинг | InstancedMesh + GPU-пайплайн | ✅ |
+| Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, объединяющая union Camera | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) | ✅ |
@@ -240,7 +240,16 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Шейдерная фильтрация PCF | `shaders/{standard,pbr,instanced,skinned_pbr}.glsl` | Вычисление перспективных координат в атласе, 4-tap PCF фильтрация с защитой от выхода за границы тайлов, нормальный сдвиг поверхности (normal bias) против теневых артефактов (shadow acne) | ✅ |
 | Интеграция и интерактивное демо | `scene.zig`, `scene/draw.zig`, `sandbox_scene.zig`, `sandbox_ui.zig` | Динамический качающийся прожектор над сценой с персонажами (Fox и CesiumMan), отбрасывание честных теней от анимированных скелетных моделей на пол, UI-кнопка переключения `SpotShd: ON/OFF` | ✅ |
 
-Проверки: 316 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений.
+### Волна 10: PBR-инстансинг (Cook-Torrance Instanced PBR) (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| Шейдер `instanced_pbr.glsl` | `shaders/instanced_pbr.glsl`, `build.zig` | Полный Cook-Torrance PBR для инстансированных мешей: поинстансные матрицы (`ATTR_inst_mat0..3`), TBN-базис нормалей, GGX NDF, Smith geometry, Fresnel-Schlick, 4-каскадный CSM (PCSS/PCF), SpotLight тени (4-tap PCF), IBL-отражения кубмапы неба, альфа-тест cutout | ✅ |
+| Пайплайны PBR-инстансинга | `scene/pipelines.zig` | Семейство `instanced_pbr`, Buffer 0 (`Vertex` 80 байт: pos, norm, tan, col, uv), Buffer 1 (`Mat4` 64 байт: `step_func = .PER_INSTANCE`), 4 базовых пайплайна (u16/u32 opaque/blend) + 4 double-sided cull-off твина | ✅ |
+| Интеграция в Scene & Draw | `scene.zig`, `scene/draw.zig` | Автоматический выбор PBR-инстанс пайплайнов при `mesh.material == .pbr`, биндинг текстур albedo/normal/metallic-roughness/emissive/occlusion/env cubemap/shadow maps, передача параметров в UB_vs_params и UB_fs_params | ✅ |
+| Sandbox-витрина | `sandbox_showcase.zig`, `sandbox_ui.zig` | Интерактивная витрина «Instanced PBR Grid» (64 медных/золотых сферы 8×8 с плавной синусоидальной волной над темным пьедесталом, честные CSM-тени и IBL-блики в 1 draw call), плавающий HUD-бейдж и отображение в debug-панели | ✅ |
+
+Проверки: 320 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений, 340+ FPS в runtime.
 
 
 ---
@@ -407,7 +416,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 **Геометрия**
 * Polygon/N-gon-билдеры, толстые GreasedLine-линии, trail.
-* CSG/CSG2, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг отсутствует, instancing только для Standard).
+* CSG/CSG2, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют).
 * Blend shapes с GPU-скиннингом (сейчас CPU-блендинг морфов), морфы >8 таргетов.
 
 **Анимация**

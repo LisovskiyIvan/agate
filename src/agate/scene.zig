@@ -7,6 +7,7 @@ const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const skinned_pbr_shd = @import("skinned_pbr_shader");
 const inst_shd = @import("instanced_shader");
+const inst_pbr_shd = @import("instanced_pbr_shader");
 const passes = @import("passes/mod.zig");
 const postprocess = @import("postprocess.zig");
 pub const PostProcessConfig = postprocess.PostProcessConfig;
@@ -159,6 +160,8 @@ pub const Scene = struct {
     pipeline_skinned_pbr_u32: sg.Pipeline = .{},
     pipeline_instanced_u16: sg.Pipeline = .{},
     pipeline_instanced_u32: sg.Pipeline = .{},
+    pipeline_instanced_pbr_u16: sg.Pipeline = .{},
+    pipeline_instanced_pbr_u32: sg.Pipeline = .{},
 
     // Transparent twin pipelines: same shaders/layouts as above, but with
     // alpha blending (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), depth test on and
@@ -171,6 +174,8 @@ pub const Scene = struct {
     pipeline_skinned_pbr_blend_u32: sg.Pipeline = .{},
     pipeline_instanced_blend_u16: sg.Pipeline = .{},
     pipeline_instanced_blend_u32: sg.Pipeline = .{},
+    pipeline_instanced_pbr_blend_u16: sg.Pipeline = .{},
+    pipeline_instanced_pbr_blend_u32: sg.Pipeline = .{},
 
     // Double-sided (cull-off) twins for every family; selected per item when
     // the material sets double_sided. Created in initPipelines, freed in deinit.
@@ -258,6 +263,7 @@ pub const Scene = struct {
             .standard = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
             .pbr = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
             .instanced = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+            .instanced_pbr = sg.makeShader(inst_pbr_shd.instancedPbrShaderDesc(sg.queryBackend())),
             .skinned_pbr = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
         };
         const specs = [_]struct {
@@ -291,6 +297,14 @@ pub const Scene = struct {
                 .opaque_u32 = &self.pipeline_instanced_u32,
                 .blend_u16 = &self.pipeline_instanced_blend_u16,
                 .blend_u32 = &self.pipeline_instanced_blend_u32,
+            },
+            .{
+                .shader = family_shaders.instanced_pbr,
+                .family = .instanced_pbr,
+                .opaque_u16 = &self.pipeline_instanced_pbr_u16,
+                .opaque_u32 = &self.pipeline_instanced_pbr_u32,
+                .blend_u16 = &self.pipeline_instanced_pbr_blend_u16,
+                .blend_u32 = &self.pipeline_instanced_pbr_blend_u32,
             },
             .{
                 .shader = family_shaders.skinned_pbr,
@@ -328,6 +342,8 @@ pub const Scene = struct {
             .{ .pipe = self.pipeline_skinned_pbr_u32, .msg = "pipeline_skinned_pbr_u32 failed to create!" },
             .{ .pipe = self.pipeline_instanced_u16, .msg = "pipeline_instanced_u16 failed to create!" },
             .{ .pipe = self.pipeline_instanced_u32, .msg = "pipeline_instanced_u32 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_pbr_u16, .msg = "pipeline_instanced_pbr_u16 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_pbr_u32, .msg = "pipeline_instanced_pbr_u32 failed to create!" },
             .{ .pipe = self.pipeline_blend_u16, .msg = "pipeline_blend_u16 failed to create!" },
             .{ .pipe = self.pipeline_blend_u32, .msg = "pipeline_blend_u32 failed to create!" },
             .{ .pipe = self.pipeline_pbr_blend_u16, .msg = "pipeline_pbr_blend_u16 failed to create!" },
@@ -336,6 +352,8 @@ pub const Scene = struct {
             .{ .pipe = self.pipeline_skinned_pbr_blend_u32, .msg = "pipeline_skinned_pbr_blend_u32 failed to create!" },
             .{ .pipe = self.pipeline_instanced_blend_u16, .msg = "pipeline_instanced_blend_u16 failed to create!" },
             .{ .pipe = self.pipeline_instanced_blend_u32, .msg = "pipeline_instanced_blend_u32 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_pbr_blend_u16, .msg = "pipeline_instanced_pbr_blend_u16 failed to create!" },
+            .{ .pipe = self.pipeline_instanced_pbr_blend_u32, .msg = "pipeline_instanced_pbr_blend_u32 failed to create!" },
         }) |entry| {
             if (entry.pipe.id == 0) @panic(entry.msg);
         }
@@ -1396,6 +1414,10 @@ pub const Scene = struct {
         sg.destroyPipeline(self.pipeline_skinned_pbr_blend_u32);
         sg.destroyPipeline(self.pipeline_instanced_blend_u16);
         sg.destroyPipeline(self.pipeline_instanced_blend_u32);
+        sg.destroyPipeline(self.pipeline_instanced_pbr_u16);
+        sg.destroyPipeline(self.pipeline_instanced_pbr_u32);
+        sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u16);
+        sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u32);
 
         for (self.animation_groups.items) |ag| {
             ag.deinit();
