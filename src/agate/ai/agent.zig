@@ -12,13 +12,13 @@ pub const NavAgent = struct {
     target_pos: ?Vec3 = null,
     waypoints: []Vec3 = &.{},
     current_waypoint_idx: usize = 0,
-    speed: f32 = 3.5,
-    acceleration: f32 = 8.0,
-    rotation_speed: f32 = 8.0,
-    stopping_distance: f32 = 0.2,
-    waypoint_radius: f32 = 0.8,
-    slowdown_distance: f32 = 1.5,
-    elevation_speed: f32 = 14.0,
+    speed: f32 = 2.0,
+    acceleration: f32 = 4.0,
+    rotation_speed: f32 = 5.0,
+    stopping_distance: f32 = 0.25,
+    waypoint_radius: f32 = 0.6,
+    slowdown_distance: f32 = 1.2,
+    elevation_speed: f32 = 10.0,
     yaw: f32 = 0.0,
     arrived: bool = true,
     snap_to_mesh: bool = true,
@@ -88,7 +88,7 @@ pub const NavAgent = struct {
             return;
         }
 
-        // Advance waypoints: check if within radius or passed waypoint plane
+        // Advance waypoints when within arrival radius
         while (self.current_waypoint_idx < self.waypoints.len) {
             const wp = self.waypoints[self.current_waypoint_idx];
             const dx = wp.x - self.position.x;
@@ -96,31 +96,11 @@ pub const NavAgent = struct {
             const dist_xz_sq = dx * dx + dz * dz;
 
             const is_last = (self.current_waypoint_idx + 1 >= self.waypoints.len);
-            if (is_last) {
-                if (dist_xz_sq <= self.stopping_distance * self.stopping_distance) {
-                    self.current_waypoint_idx += 1;
-                } else {
-                    break;
-                }
+            const radius = if (is_last) self.stopping_distance else @max(self.waypoint_radius, self.stopping_distance);
+            if (dist_xz_sq <= radius * radius) {
+                self.current_waypoint_idx += 1;
             } else {
-                const radius = @max(self.waypoint_radius, self.stopping_distance);
-                var advance = (dist_xz_sq <= radius * radius);
-                if (!advance) {
-                    // Check if agent passed the waypoint plane towards the next waypoint
-                    const next_wp = self.waypoints[self.current_waypoint_idx + 1];
-                    const seg_x = next_wp.x - wp.x;
-                    const seg_z = next_wp.z - wp.z;
-                    const past_x = self.position.x - wp.x;
-                    const past_z = self.position.z - wp.z;
-                    if (past_x * seg_x + past_z * seg_z > 0.0) {
-                        advance = true;
-                    }
-                }
-                if (advance) {
-                    self.current_waypoint_idx += 1;
-                } else {
-                    break;
-                }
+                break;
             }
         }
 
