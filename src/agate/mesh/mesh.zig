@@ -46,6 +46,7 @@ pub const Mesh = struct {
     cast_shadows: bool = true,
     receive_shadows: bool = true,
     culling_strategy: CullingStrategy = .frustum,
+    is_occluder: bool = false,
     local_bounding_box: BoundingBox = BoundingBox.zero,
 
     // Optional CPU-side geometry retained for physics collider creation

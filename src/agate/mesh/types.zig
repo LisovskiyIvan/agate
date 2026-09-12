@@ -23,6 +23,7 @@ pub const SkinJointWeight = extern struct {
 
 pub const CullingStrategy = enum {
     frustum,
+    occlusion,
     always_render,
 };
 

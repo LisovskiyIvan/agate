@@ -262,9 +262,15 @@ pub const stringPull = ai.stringPull;
 pub const Pathfinding = ai.Pathfinding;
 pub const NavAgent = ai.NavAgent;
 
+pub const visibility = @import("visibility/mod.zig");
+pub const HiZBuffer = visibility.HiZBuffer;
+pub const SoftwareRasterizer = visibility.SoftwareRasterizer;
+pub const OcclusionCuller = visibility.OcclusionCuller;
+
 pub const sokol = @import("sokol");
 
 test {
     _ = @import("ai.zig");
     _ = @import("mesh/csg_tests.zig");
+    _ = @import("visibility/mod.zig");
 }

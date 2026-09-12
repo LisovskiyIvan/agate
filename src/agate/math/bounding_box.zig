@@ -38,6 +38,19 @@ pub const BoundingBox = struct {
         );
     }
 
+    pub fn corners(self: BoundingBox) [8]Vec3 {
+        return .{
+            Vec3.new(self.min.x, self.min.y, self.min.z),
+            Vec3.new(self.max.x, self.min.y, self.min.z),
+            Vec3.new(self.max.x, self.max.y, self.min.z),
+            Vec3.new(self.min.x, self.max.y, self.min.z),
+            Vec3.new(self.min.x, self.min.y, self.max.z),
+            Vec3.new(self.max.x, self.min.y, self.max.z),
+            Vec3.new(self.max.x, self.max.y, self.max.z),
+            Vec3.new(self.min.x, self.max.y, self.max.z),
+        };
+    }
+
     /// Transforms an AABB by a 4x4 matrix and computes the tightest new AABB.
     pub fn transform(self: BoundingBox, m: Mat4) BoundingBox {
         const c = self.center();

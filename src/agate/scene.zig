@@ -79,11 +79,15 @@ const Material = @import("material.zig").Material;
 const Texture = @import("texture.zig").Texture;
 const CubeTexture = @import("texture.zig").CubeTexture;
 const SkyboxConfig = @import("texture.zig").SkyboxConfig;
+const visibility = @import("visibility/mod.zig");
 
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
     rendered_meshes: u32 = 0,
     culled_meshes: u32 = 0,
+    occluded_meshes: u32 = 0,
+    occluders_count: u32 = 0,
+    occluder_triangles: u32 = 0,
     draw_calls: u32 = 0,
     triangles: u32 = 0,
     pipeline_switches: u32 = 0,
@@ -109,6 +113,8 @@ pub const Scene = struct {
     default_cube_texture: CubeTexture,
 
     enable_frustum_culling: bool = true,
+    enable_occlusion_culling: bool = true,
+    occlusion_culler: visibility.OcclusionCuller = visibility.OcclusionCuller.init(),
     stats: SceneStats = .{},
     // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
     frame_id: u64 = 0,
@@ -907,6 +913,25 @@ pub const Scene = struct {
         const cascades = self.computeCascadesWithSun(camera, aspect, sun_dir);
         self.cascade_matrices = cascades;
 
+        // Phase -1: Occlusion Culling setup & occluder rasterization
+        if (self.enable_occlusion_culling) {
+            self.occlusion_culler.beginFrame(view_proj);
+            for (self.meshes.items) |m| {
+                if (!m.is_lod_child and m.is_visible and m.is_occluder) {
+                    const m_world = self.worldMatrixCached(m);
+                    self.occlusion_culler.rasterizeOccluderMesh(
+                        m.cpu_positions,
+                        m.cpu_indices,
+                        m.local_bounding_box,
+                        m_world,
+                    );
+                }
+            }
+            self.occlusion_culler.endOccluders();
+            self.stats.occluders_count = self.occlusion_culler.occluder_count;
+            self.stats.occluder_triangles = self.occlusion_culler.triangles_rasterized;
+        }
+
         // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
         for (self.meshes.items) |mesh| {
             if (mesh.is_lod_child) continue;
@@ -960,30 +985,50 @@ pub const Scene = struct {
 
                         const vis = frustum.intersectsAABB4(c_x, c_y, c_z, ex_x, ex_y, ex_z);
 
-                        if (inst0.is_visible and (inst0.culling_strategy != .frustum or vis[0])) {
-                            self.stats.rendered_meshes += 1;
-                            self.instance_matrices.append(self.allocator, m0) catch {};
+                        if (inst0.is_visible and (inst0.culling_strategy == .always_render or vis[0])) {
+                            if (self.enable_occlusion_culling and !mesh.is_occluder and inst0.culling_strategy != .always_render and self.occlusion_culler.isOccluded(b0)) {
+                                self.stats.occluded_meshes += 1;
+                                self.stats.culled_meshes += 1;
+                            } else {
+                                self.stats.rendered_meshes += 1;
+                                self.instance_matrices.append(self.allocator, m0) catch {};
+                            }
                         } else {
                             self.stats.culled_meshes += 1;
                         }
 
-                        if (inst1.is_visible and (inst1.culling_strategy != .frustum or vis[1])) {
-                            self.stats.rendered_meshes += 1;
-                            self.instance_matrices.append(self.allocator, m1) catch {};
+                        if (inst1.is_visible and (inst1.culling_strategy == .always_render or vis[1])) {
+                            if (self.enable_occlusion_culling and !mesh.is_occluder and inst1.culling_strategy != .always_render and self.occlusion_culler.isOccluded(b1)) {
+                                self.stats.occluded_meshes += 1;
+                                self.stats.culled_meshes += 1;
+                            } else {
+                                self.stats.rendered_meshes += 1;
+                                self.instance_matrices.append(self.allocator, m1) catch {};
+                            }
                         } else {
                             self.stats.culled_meshes += 1;
                         }
 
-                        if (inst2.is_visible and (inst2.culling_strategy != .frustum or vis[2])) {
-                            self.stats.rendered_meshes += 1;
-                            self.instance_matrices.append(self.allocator, m2) catch {};
+                        if (inst2.is_visible and (inst2.culling_strategy == .always_render or vis[2])) {
+                            if (self.enable_occlusion_culling and !mesh.is_occluder and inst2.culling_strategy != .always_render and self.occlusion_culler.isOccluded(b2)) {
+                                self.stats.occluded_meshes += 1;
+                                self.stats.culled_meshes += 1;
+                            } else {
+                                self.stats.rendered_meshes += 1;
+                                self.instance_matrices.append(self.allocator, m2) catch {};
+                            }
                         } else {
                             self.stats.culled_meshes += 1;
                         }
 
-                        if (inst3.is_visible and (inst3.culling_strategy != .frustum or vis[3])) {
-                            self.stats.rendered_meshes += 1;
-                            self.instance_matrices.append(self.allocator, m3) catch {};
+                        if (inst3.is_visible and (inst3.culling_strategy == .always_render or vis[3])) {
+                            if (self.enable_occlusion_culling and !mesh.is_occluder and inst3.culling_strategy != .always_render and self.occlusion_culler.isOccluded(b3)) {
+                                self.stats.occluded_meshes += 1;
+                                self.stats.culled_meshes += 1;
+                            } else {
+                                self.stats.rendered_meshes += 1;
+                                self.instance_matrices.append(self.allocator, m3) catch {};
+                            }
                         } else {
                             self.stats.culled_meshes += 1;
                         }
@@ -1014,9 +1059,16 @@ pub const Scene = struct {
                     if (!inst.is_visible) continue;
                     inst.updateCachedTransforms();
                     const m = inst.cached_world_matrix;
-                    if (self.enable_frustum_culling and inst.culling_strategy == .frustum) {
-                        const world_aabb = inst.cached_bounding_box;
+                    const world_aabb = inst.cached_bounding_box;
+                    if (self.enable_frustum_culling and inst.culling_strategy != .always_render) {
                         if (!frustum.intersectsAABB(world_aabb)) {
+                            self.stats.culled_meshes += 1;
+                            continue;
+                        }
+                    }
+                    if (self.enable_occlusion_culling and !mesh.is_occluder and inst.culling_strategy != .always_render) {
+                        if (self.occlusion_culler.isOccluded(world_aabb)) {
+                            self.stats.occluded_meshes += 1;
                             self.stats.culled_meshes += 1;
                             continue;
                         }
@@ -1088,8 +1140,16 @@ pub const Scene = struct {
                 const model = self.worldMatrixCached(render_mesh);
                 const world_aabb = render_mesh.cached_aabb;
 
-                if (self.enable_frustum_culling and render_mesh.culling_strategy == .frustum) {
+                if (self.enable_frustum_culling and render_mesh.culling_strategy != .always_render) {
                     if (!frustum.intersectsAABB(world_aabb)) {
+                        self.stats.culled_meshes += 1;
+                        continue;
+                    }
+                }
+
+                if (self.enable_occlusion_culling and !render_mesh.is_occluder and render_mesh.culling_strategy != .always_render) {
+                    if (self.occlusion_culler.isOccluded(world_aabb)) {
+                        self.stats.occluded_meshes += 1;
                         self.stats.culled_meshes += 1;
                         continue;
                     }

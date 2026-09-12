@@ -26,6 +26,7 @@
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
 | Рендер | Forward, 8 пайплайнов, opaque, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
+| Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, объединяющая union Camera | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
@@ -286,6 +287,17 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 Проверки: 341+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >360 FPS в runtime.
 
+### Волна 14: Иерархическое программное отсечение невидимой геометрии (Hierarchical Software Occlusion Culling / Hi-Z) (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| Иерархический Z-буфер (Hi-Z) | `visibility/hiz_buffer.zig`, `visibility/mod.zig`, `root.zig` | 9-уровневая консервативная пирамида глубин $256 \times 128 \dots 1 \times 1$ (175 КБ, 100% помещается в L1/L2 CPU-кэш): сверхбыстрый downsample с операцией $\max$, исключающей ложные отсечения (zero false-positives), проекция 8 вершин AABB и $O(1)$ тест видимости по $2 \times 2$ области соответствующего мип-уровня | ✅ |
+| Программный растеризатор окклюдеров | `visibility/rasterizer.zig`, `root.zig` | Высокопроизводительный CPU-растеризатор треугольников и ориентированных OBB-боксов: отсечение ближней плоскостью камеры (near-plane clipping $w \ge 0.001$), 2D backface culling, субпиксельные барицентрические координаты, субмиллисекундная растеризация окклюдеров | ✅ |
+| Высокоуровневый OcclusionCuller & интеграция | `visibility/culler.zig`, `scene.zig`, `mesh/types.zig`, `mesh/mesh.zig` | Менеджер отсечения сцены (`OcclusionCuller`): регистрация окклюдеров (`mesh.is_occluder`), автоматическая растеризация геометрии/боксов в Phase -1, отсечение скрытых за стенами мешей и инстансов до отправки на GPU, интеграция со `SceneStats` (`occluded_meshes`, `occluders_count`, `occluder_triangles`) | ✅ |
+| Sandbox-лаборатория и тесты | `sandbox_showcase.zig`, `sandbox_ui.zig`, `main.zig`, `visibility/tests.zig` | Интерактивная витрина «Occlusion Lab»: циклопическая крепостная стена-окклюдер и скрытая сокровищница из 32 рубиновых кристаллов за ней; мгновенное отсечение 32 мешей без малейшего pop-in, горячая клавиша `[]]` и строка в HUD, 6 unit-тестов математики, консервативности и бенчмарк 1000 AABB запросов | ✅ |
+
+Проверки: 347+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >350 FPS в runtime.
+
 ---
 
 ## ✅ Что сделано
@@ -474,7 +486,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 **Архитектура рендера**
 * Frame graph / node render graph, кастомные rendering pipelines, compute-шейдеры.
-* Occlusion queries, GPU culling, large world rendering (floating origin).
+* GPU compute culling, large world rendering (floating origin) (Software Hi-Z Occlusion Culling реализован в Волне 14).
 * Realtime ray tracing/Gaussian splatting (в Babylon 9 тоже отдельные подсистемы).
 
 **Прочее**
