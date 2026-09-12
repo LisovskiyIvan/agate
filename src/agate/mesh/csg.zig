@@ -130,8 +130,10 @@ pub const CSGPlane = struct {
                 try back.append(allocator, try polygon.clone(allocator));
             },
             SPANNING => {
-                var f_verts: std.ArrayList(CSGVertex) = .empty;
-                var b_verts: std.ArrayList(CSGVertex) = .empty;
+                var f_buf: [16]CSGVertex = undefined;
+                var b_buf: [16]CSGVertex = undefined;
+                var f_count: usize = 0;
+                var b_count: usize = 0;
 
                 const n = polygon.vertices.len;
                 for (0..n) |i| {
@@ -142,10 +144,16 @@ pub const CSGPlane = struct {
                     const vj = polygon.vertices[j];
 
                     if (ti != BACK) {
-                        try f_verts.append(allocator, vi);
+                        if (f_count < f_buf.len) {
+                            f_buf[f_count] = vi;
+                            f_count += 1;
+                        }
                     }
                     if (ti != FRONT) {
-                        try b_verts.append(allocator, vi);
+                        if (b_count < b_buf.len) {
+                            b_buf[b_count] = vi;
+                            b_count += 1;
+                        }
                     }
 
                     if ((ti | tj) == SPANNING) {
@@ -155,16 +163,22 @@ pub const CSGPlane = struct {
                         else
                             0.5;
                         const v = vi.interpolate(vj, t);
-                        try f_verts.append(allocator, v);
-                        try b_verts.append(allocator, v);
+                        if (f_count < f_buf.len) {
+                            f_buf[f_count] = v;
+                            f_count += 1;
+                        }
+                        if (b_count < b_buf.len) {
+                            b_buf[b_count] = v;
+                            b_count += 1;
+                        }
                     }
                 }
 
-                if (f_verts.items.len >= 3) {
-                    try front.append(allocator, try CSGPolygon.initWithPlane(allocator, f_verts.items, polygon.plane));
+                if (f_count >= 3) {
+                    try front.append(allocator, try CSGPolygon.initWithPlane(allocator, f_buf[0..f_count], polygon.plane));
                 }
-                if (b_verts.items.len >= 3) {
-                    try back.append(allocator, try CSGPolygon.initWithPlane(allocator, b_verts.items, polygon.plane));
+                if (b_count >= 3) {
+                    try back.append(allocator, try CSGPolygon.initWithPlane(allocator, b_buf[0..b_count], polygon.plane));
                 }
             },
             else => unreachable,
@@ -266,7 +280,9 @@ pub const CSGNode = struct {
 
         const p = self.plane.?;
         var front_list: std.ArrayList(CSGPolygon) = .empty;
+        try front_list.ensureTotalCapacity(allocator, list.len);
         var back_list: std.ArrayList(CSGPolygon) = .empty;
+        try back_list.ensureTotalCapacity(allocator, list.len);
 
         for (list) |poly| {
             try p.splitPolygon(allocator, poly, &front_list, &back_list, &front_list, &back_list);
@@ -317,12 +333,14 @@ pub const CSGNode = struct {
         if (list.len == 0) return;
 
         if (self.plane == null) {
-            self.plane = list[0].plane;
+            self.plane = list[list.len / 2].plane;
         }
 
         const p = self.plane.?;
         var front_list: std.ArrayList(CSGPolygon) = .empty;
+        try front_list.ensureTotalCapacity(allocator, list.len / 2 + 2);
         var back_list: std.ArrayList(CSGPolygon) = .empty;
+        try back_list.ensureTotalCapacity(allocator, list.len / 2 + 2);
 
         for (list) |poly| {
             try p.splitPolygon(allocator, poly, &self.polygons, &self.polygons, &front_list, &back_list);
@@ -384,10 +402,39 @@ pub const CSG = struct {
         return copy;
     }
 
+    /// Computes the axis-aligned bounding box enclosing this CSG solid.
+    pub fn computeBounds(self: *const CSG) BoundingBox {
+        var min_p = Vec3.new(std.math.inf(f32), std.math.inf(f32), std.math.inf(f32));
+        var max_p = Vec3.new(-std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32));
+        if (self.polygons.items.len == 0) return BoundingBox.zero;
+        for (self.polygons.items) |poly| {
+            for (poly.vertices) |v| {
+                min_p.x = @min(min_p.x, v.pos.x);
+                min_p.y = @min(min_p.y, v.pos.y);
+                min_p.z = @min(min_p.z, v.pos.z);
+                max_p.x = @max(max_p.x, v.pos.x);
+                max_p.y = @max(max_p.y, v.pos.y);
+                max_p.z = @max(max_p.z, v.pos.z);
+            }
+        }
+        return BoundingBox.init(min_p, max_p);
+    }
+
     /// Computes the union of two solids (A ∪ B).
     pub fn unionWith(self: *const CSG, other: *const CSG) !CSG {
         if (self.polygons.items.len == 0) return other.clone();
         if (other.polygons.items.len == 0) return self.clone();
+
+        const box_a = self.computeBounds();
+        const box_b = other.computeBounds();
+        if (!box_a.intersects(box_b)) {
+            // Disjoint solids: simply concatenate without clipping
+            var result = CSG.init(self.allocator);
+            try result.polygons.ensureTotalCapacity(self.allocator, self.polygons.items.len + other.polygons.items.len);
+            for (self.polygons.items) |p| try result.polygons.append(self.allocator, try p.clone(self.allocator));
+            for (other.polygons.items) |p| try result.polygons.append(self.allocator, try p.clone(self.allocator));
+            return result;
+        }
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -422,6 +469,13 @@ pub const CSG = struct {
         if (self.polygons.items.len == 0) return CSG.init(self.allocator);
         if (other.polygons.items.len == 0) return self.clone();
 
+        const box_a = self.computeBounds();
+        const box_b = other.computeBounds();
+        if (!box_a.intersects(box_b)) {
+            // Disjoint solids: subtracting B leaves A completely unaffected
+            return self.clone();
+        }
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const tmp = arena.allocator();
@@ -455,6 +509,13 @@ pub const CSG = struct {
     /// Computes the intersection of two solids (A ∩ B).
     pub fn intersect(self: *const CSG, other: *const CSG) !CSG {
         if (self.polygons.items.len == 0 or other.polygons.items.len == 0) {
+            return CSG.init(self.allocator);
+        }
+
+        const box_a = self.computeBounds();
+        const box_b = other.computeBounds();
+        if (!box_a.intersects(box_b)) {
+            // Disjoint solids: intersection is empty
             return CSG.init(self.allocator);
         }
 

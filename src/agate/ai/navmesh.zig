@@ -31,6 +31,15 @@ pub const NavNode = struct {
 
     /// Tests if a 2D horizontal point (XZ) lies inside this triangle using 2D cross products.
     pub fn containsPointXZ(self: NavNode, pt: Vec3) bool {
+        // Fast 2D AABB early-out rejection (4 simple comparisons)
+        const min_x = @min(self.vertices[0].x, @min(self.vertices[1].x, self.vertices[2].x));
+        const max_x = @max(self.vertices[0].x, @max(self.vertices[1].x, self.vertices[2].x));
+        if (pt.x < min_x - 1e-4 or pt.x > max_x + 1e-4) return false;
+
+        const min_z = @min(self.vertices[0].z, @min(self.vertices[1].z, self.vertices[2].z));
+        const max_z = @max(self.vertices[0].z, @max(self.vertices[1].z, self.vertices[2].z));
+        if (pt.z < min_z - 1e-4 or pt.z > max_z + 1e-4) return false;
+
         const p = Vec2.new(pt.x, pt.z);
         const a = Vec2.new(self.vertices[0].x, self.vertices[0].z);
         const b = Vec2.new(self.vertices[1].x, self.vertices[1].z);
