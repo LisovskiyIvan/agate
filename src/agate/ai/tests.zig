@@ -296,3 +296,47 @@ test "NavAgent: teleport and stop" {
     try testing.expectEqual(@as(f32, 4.0), agent.position.x);
     try testing.expectEqual(@as(f32, 4.0), agent.position.z);
 }
+
+test "NavAgent: smooth acceleration, cornering, and arrival" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const positions = [_][3]f32{
+        .{ 0.0, 0.0, 0.0 },
+        .{ 20.0, 0.0, 0.0 },
+        .{ 20.0, 0.0, 20.0 },
+        .{ 0.0, 0.0, 20.0 },
+    };
+    const indices = [_]u32{
+        0, 1, 2,
+        0, 2, 3,
+    };
+
+    var nav = try NavMesh.buildFromTriangles(allocator, &positions, &indices, std.math.pi * 0.4);
+    defer nav.deinit();
+
+    var agent = NavAgent.init(allocator, &nav, Vec3.new(2.0, 0.0, 2.0));
+    defer agent.deinit();
+
+    agent.speed = 4.0;
+    agent.acceleration = 6.0;
+    agent.waypoint_radius = 0.8;
+    agent.slowdown_distance = 1.5;
+
+    _ = try agent.setDestination(Vec3.new(10.0, 0.0, 2.0));
+
+    // After a very small step (1 frame at 60 FPS), velocity should ramp up smoothly, not jump instantly to 4.0
+    agent.update(0.016);
+    const initial_speed = agent.velocity.length();
+    try testing.expect(initial_speed > 0.0);
+    try testing.expect(initial_speed < 1.0);
+
+    // Step forward until arrival
+    var steps: usize = 0;
+    while (!agent.arrived and steps < 400) : (steps += 1) {
+        agent.update(0.016);
+    }
+    try testing.expect(agent.arrived);
+    try testing.expect(agent.position.sub(Vec3.new(10.0, 0.0, 2.0)).length() < 0.25);
+}
+
