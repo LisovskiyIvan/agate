@@ -92,6 +92,10 @@ pub const Vec3 = extern struct {
         return .{ .x = v[0], .y = v[1], .z = v[2] };
     }
 
+    pub inline fn eql(a: Vec3, b: Vec3) bool {
+        return a.x == b.x and a.y == b.y and a.z == b.z;
+    }
+
     pub inline fn toArray(v: Vec3) [3]f32 {
         return .{ v.x, v.y, v.z };
     }

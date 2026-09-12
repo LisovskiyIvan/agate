@@ -36,6 +36,13 @@ pub const SSAOPass = struct {
     width: i32 = 0,
     height: i32 = 0,
 
+    cached_proj: Mat4 = Mat4.identity,
+    cached_inv_proj: Mat4 = Mat4.identity,
+    last_aspect: f32 = 0.0,
+    last_fov: f32 = 0.0,
+    last_near: f32 = 0.0,
+    last_far: f32 = 0.0,
+
     pub fn init() SSAOPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -245,8 +252,22 @@ pub const SSAOPass = struct {
 
         self.resize(cur_w, cur_h);
 
-        const proj = camera.getProjectionMatrix(aspect);
-        const inv_proj = proj.invert() orelse return;
+        const fov = camera.getFovDeg();
+        const near_z = camera.getNear();
+        const far_z = camera.getFar();
+        if (aspect != self.last_aspect or fov != self.last_fov or near_z != self.last_near or far_z != self.last_far) {
+            const proj = camera.getProjectionMatrix(aspect);
+            const inv = proj.invert() orelse return;
+            self.cached_proj = proj;
+            self.cached_inv_proj = inv;
+            self.last_aspect = aspect;
+            self.last_fov = fov;
+            self.last_near = near_z;
+            self.last_far = far_z;
+        }
+
+        const proj = self.cached_proj;
+        const inv_proj = self.cached_inv_proj;
 
         // ---------------------------------------------
         // PASS 1: Generate SSAO into ssao_raw_image

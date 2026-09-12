@@ -144,6 +144,7 @@ pub const RigidBody = struct {
     use_gravity: bool = true,
     is_grounded: bool = false,
     enabled: bool = true,
+    was_awake: bool = true,
 
     // Collision filtering & events.
     filter: CollisionFilter = .{},

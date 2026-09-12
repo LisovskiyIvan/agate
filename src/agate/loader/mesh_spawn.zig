@@ -311,9 +311,18 @@ pub fn parsePrimitive(
         }
     }
 
-    const vbuf = sg.makeBuffer(.{
-        .data = sg.asRange(vertices),
-    });
+    // Morph targets rewrite the vertex buffer every frame they change. Sokol
+    // buffers created with initial data and no dynamic flag are immutable, so
+    // morph meshes get an empty updatable buffer; the first frame's
+    // applyMorphs() (before render) fills it with base + default weights.
+    const has_morph = prim.targets_count > 0;
+    const vbuf = if (has_morph)
+        sg.makeBuffer(.{
+            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .size = vertices.len * @sizeOf(Vertex),
+        })
+    else
+        sg.makeBuffer(.{ .data = sg.asRange(vertices) });
 
     var local_box = BoundingBox.zero;
     if (pos_accessor) |pos_acc| {
@@ -391,19 +400,9 @@ pub fn parsePrimitive(
 
     try mesh_obj.retainMorphBase(scene.allocator, vertices);
 
-    // Blend once when defaults are nonzero so the GPU buffer matches the
-    // morphed state; all-zero weights already equal base (no upload).
-    var any_morph_weight = false;
-    for (mesh_obj.morph_weights) |wgt| {
-        if (wgt != 0.0) {
-            any_morph_weight = true;
-            break;
-        }
-    }
-    if (any_morph_weight) {
-        mesh_obj.morph_dirty = true;
-        mesh_obj.applyMorphs();
-    }
+    // The GPU buffer is empty for morph meshes until the first applyMorphs();
+    // mark dirty so frame 1 uploads base + default weights before render.
+    if (mesh_obj.hasMorphTargets()) mesh_obj.morph_dirty = true;
 
     if (prim.material) |pm| {
         for (0..gltf.materials_count) |mat_i| {

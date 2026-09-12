@@ -19,12 +19,17 @@ pub const ShadowPass = struct {
     attachment_view: sg.View,
     texture_view: sg.View,
     sampler: sg.Sampler,
+    /// Nonfiltering sampler for raw depth reads (PCSS blocker search); the
+    /// comparison sampler above is only valid for depth2d shadow lookups.
+    depth_sampler: sg.Sampler,
     pipeline_u16: sg.Pipeline,
     pipeline_u32: sg.Pipeline,
     inst_pipeline_u16: sg.Pipeline,
     inst_pipeline_u32: sg.Pipeline,
     skinned_pipeline_u16: sg.Pipeline,
     skinned_pipeline_u32: sg.Pipeline,
+    allocator: std.mem.Allocator,
+    binned_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
 
     // Pipeline buckets in fixed order; the grouping key is defined once per
     // render so each cascade issues at most one applyPipeline per bucket.
@@ -50,7 +55,7 @@ pub const ShadowPass = struct {
         };
     }
 
-    pub fn init() ShadowPass {
+    pub fn init(allocator: std.mem.Allocator) ShadowPass {
         // SHADOW_ATLAS_SIZE atlas holding 4x (SHADOW_ATLAS_SIZE/2) cascades (2x2).
         // Was 4096/2048: same look for near geometry, 4x fewer depth texels rasterized per frame.
         const depth_img = sg.makeImage(.{
@@ -74,6 +79,12 @@ pub const ShadowPass = struct {
             .wrap_u = .CLAMP_TO_EDGE,
             .wrap_v = .CLAMP_TO_EDGE,
             .compare = .LESS_EQUAL,
+        });
+        const raw_depth_smp = sg.makeSampler(.{
+            .min_filter = .NEAREST,
+            .mag_filter = .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
         });
 
         // 1. Shadow Depth pipelines (regular meshes)
@@ -172,10 +183,13 @@ pub const ShadowPass = struct {
         const skinned_pip_u32 = sg.makePipeline(shadow_skinned_desc);
 
         return .{
+            .allocator = allocator,
+            .binned_meshes = .empty,
             .image = depth_img,
             .attachment_view = att_view,
             .texture_view = tex_view,
             .sampler = smp,
+            .depth_sampler = raw_depth_smp,
             .pipeline_u16 = pip_u16,
             .pipeline_u32 = pip_u32,
             .inst_pipeline_u16 = inst_pip_u16,
@@ -208,6 +222,35 @@ pub const ShadowPass = struct {
         // Kept across cascades: identical re-applies are skipped.
         var last_pipeline_id: u32 = 0;
 
+        // 1. Pre-bin shadow-casting meshes into the 6 pipeline buckets once.
+        var counts: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
+        for (meshes) |mesh| {
+            if (!mesh.cast_shadows) continue;
+            counts[@intFromEnum(bucketFor(mesh))] += 1;
+        }
+
+        var offsets: [6]usize = undefined;
+        var cursors: [6]usize = undefined;
+        var total: usize = 0;
+        for (0..6) |b| {
+            offsets[b] = total;
+            cursors[b] = total;
+            total += counts[b];
+        }
+
+        if (total > self.binned_meshes.items.len) {
+            self.binned_meshes.resize(self.allocator, total) catch return 0;
+        } else {
+            self.binned_meshes.shrinkRetainingCapacity(total);
+        }
+
+        for (meshes) |mesh| {
+            if (!mesh.cast_shadows) continue;
+            const b = @intFromEnum(bucketFor(mesh));
+            self.binned_meshes.items[cursors[b]] = mesh;
+            cursors[b] += 1;
+        }
+
         for (0..4) |c_idx| {
             const light_view_proj = cascades[c_idx];
             const vx: i32 = if (c_idx % 2 == 1) CASCADE_RES else 0;
@@ -221,13 +264,15 @@ pub const ShadowPass = struct {
             // Grouped by pipeline: intra-cascade draw order changes, but the
             // depth-only output is order-independent (no color, no blending).
             for (bucket_order) |bucket| {
+                const b_idx = @intFromEnum(bucket);
+                const count = counts[b_idx];
+                if (count == 0) continue;
+
                 const pip_id = self.pipelineFor(bucket);
                 if (pip_id == 0) continue;
 
-                for (meshes) |mesh| {
-                    if (bucketFor(mesh) != bucket) continue;
-                    if (!mesh.cast_shadows) continue;
-
+                const bucket_meshes = self.binned_meshes.items[offsets[b_idx] .. offsets[b_idx] + count];
+                for (bucket_meshes) |mesh| {
                     if (mesh.instances.items.len > 0) {
                         if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
 
@@ -296,6 +341,7 @@ pub const ShadowPass = struct {
     }
 
     pub fn deinit(self: *ShadowPass) void {
+        self.binned_meshes.deinit(self.allocator);
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.inst_pipeline_u16);
@@ -305,6 +351,7 @@ pub const ShadowPass = struct {
         sg.destroyView(self.attachment_view);
         sg.destroyView(self.texture_view);
         sg.destroySampler(self.sampler);
+        sg.destroySampler(self.depth_sampler);
         sg.destroyImage(self.image);
     }
 };

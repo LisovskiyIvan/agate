@@ -744,7 +744,25 @@ pub const UICanvas = struct {
         if (self.vertices.items.len == 0 or self.indices.items.len == 0) return;
         if (screen_w <= 0.0 or screen_h <= 0.0) return;
 
-        sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items));
+        const vert_count = @min(self.vertices.items.len, std.math.maxInt(u16));
+        if (vert_count > self.capacity_vertices) {
+            if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
+            self.capacity_vertices = @max(self.capacity_vertices * 2, vert_count);
+            self.vertex_buffer = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.capacity_vertices * @sizeOf(UIVertex),
+            });
+        }
+        if (self.indices.items.len > self.capacity_indices) {
+            if (self.index_buffer.id != 0) sg.destroyBuffer(self.index_buffer);
+            self.capacity_indices = @max(self.capacity_indices * 2, self.indices.items.len);
+            self.index_buffer = sg.makeBuffer(.{
+                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .size = self.capacity_indices * @sizeOf(u16),
+            });
+        }
+
+        sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items[0..vert_count]));
         sg.updateBuffer(self.index_buffer, sg.asRange(self.indices.items));
 
         if (self.pipeline.id == 0) return;

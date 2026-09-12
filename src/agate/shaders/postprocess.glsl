@@ -36,6 +36,11 @@ layout(binding = 0) uniform fs_params {
     vec4 fog_color; // xyz: fog_color, w: fog_sun_scattering
     vec4 ssr_params; // x: ssr_enabled (1/0), y: ssr_intensity, z: ssr_thickness, w: ssr_max_distance
     vec4 params5; // x: sharpen_amount (0=off), y: grain_intensity (0=off), z: temperature [-1,1], w: tint [-1,1]
+    vec4 dof_params; // x: dof_enabled (1/0), y: focus_distance, z: focus_range, w: max_blur_px
+    vec4 bloom_pyramid; // x: pyramid_enabled (1/0), y: mips, z/w: unused
+    vec4 grade_shadows; // xyz: shadows lift [-1,1], w: unused
+    vec4 grade_midtones; // xyz: midtones lift [-1,1], w: unused
+    vec4 grade_highlights; // xyz: highlights lift [-1,1], w: unused
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
 };
@@ -44,6 +49,7 @@ layout(binding = 0) uniform texture2D scene_tex;
 layout(binding = 1) uniform texture2D ssao_tex;
 @image_sample_type depth_tex unfilterable_float
 layout(binding = 2) uniform texture2D depth_tex;
+layout(binding = 3) uniform texture2D bloom_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -437,6 +443,52 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     return clamp(colorCenter + (edgeColor - centerFast), 0.0, 1.0);
 }
 
+float dofLinearize(float d) {
+    float near = camera_params.x;
+    float far = camera_params.y;
+    return (near * far) / max(far - d * (far - near), 0.0001);
+}
+
+// Depth of Field: gather blur with a golden-angle spiral over the tonemapped
+// color. Pixels inside the focal plane return early with zero extra taps.
+// Sky (cleared depth) is treated as far plane distance.
+vec3 applyDoF(vec3 color, vec2 uv) {
+    if (dof_params.x < 0.5) return color;
+    float raw = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    float lin = (raw >= 0.9999) ? camera_params.y : dofLinearize(raw);
+    float fr = max(dof_params.z, 0.0001);
+    float coc = clamp(abs(lin - dof_params.y) / fr, 0.0, 1.0) * max(dof_params.w, 0.0);
+    // In focus: no extra samples.
+    if (coc < 0.5) return color;
+
+    const int DOF_TAPS = 14;
+    const float GOLDEN_ANGLE = 2.3999632;
+    vec2 texel = resolution.zw;
+    vec3 acc = color;
+    float wsum = 1.0;
+    for (int i = 0; i < DOF_TAPS; i++) {
+        float fi = float(i);
+        float ang = fi * GOLDEN_ANGLE;
+        float rr = (fi + 0.5) / float(DOF_TAPS) * coc;
+        vec2 off = vec2(cos(ang), sin(ang)) * rr * texel;
+        // Fast LDR path reuses the FXAA neighbor approximation (skips
+        // SSR/fog re-evaluation on taps).
+        acc += sampleSceneFastLDR(uv + off);
+        wsum += 1.0;
+    }
+    return acc / wsum;
+}
+
+// Parametric zone grade: per-channel lifts weighted by luminance zones.
+// Mirrors applyGrade in postprocess.zig (same luma weights and ramps).
+vec3 applyColorCurves(vec3 c) {
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float w_s = clamp(1.0 - l * 2.0, 0.0, 1.0);
+    float w_h = clamp((l - 0.5) * 2.0, 0.0, 1.0);
+    float w_m = clamp(1.0 - abs(l - 0.5) * 2.0, 0.0, 1.0);
+    return c + grade_shadows.xyz * w_s + grade_midtones.xyz * w_m + grade_highlights.xyz * w_h;
+}
+
 void main() {
     vec2 uv = v_uv;
 
@@ -454,6 +506,9 @@ void main() {
     } else {
         color = sampleSceneLDR(uv);
     }
+
+    // Depth of Field (gather blur on the tonemapped image)
+    color = applyDoF(color, uv);
 
     // White Balance (post-tonemap channel gains, 0 = neutral)
     float wb_temp = params5.z;
@@ -482,8 +537,19 @@ void main() {
         color = clamp(color + (color - blur) * sharpen_amt, n_min, n_max);
     }
 
-    // Bloom glow pass (multi-tap bright pass blur)
-    if (params3.z > 0.5 && params1.z > 0.001) {
+    // Bloom glow pass: high-quality pyramid composite when BloomPass fed
+    // bloom_tex, otherwise the legacy single-shader multi-tap fallback.
+    if (bloom_pyramid.x > 0.5 && params1.z > 0.001) {
+        vec3 glow = texture(sampler2D(bloom_tex, smp), uv).rgb;
+        vec3 bloom_scaled = glow * params1.z * params1.x;
+        float tonemap_mode = params3.x;
+        if (tonemap_mode > 1.5) {
+            bloom_scaled = Reinhard(bloom_scaled);
+        } else if (tonemap_mode > 0.5) {
+            bloom_scaled = ACESFilm(bloom_scaled);
+        }
+        color += bloom_scaled;
+    } else if (params3.z > 0.5 && params1.z > 0.001) {
         float thresh = params1.y;
         vec2 texel = resolution.zw * params1.w;
         vec3 bloom = vec3(0.0);
@@ -526,6 +592,9 @@ void main() {
         float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
         color = mix(vec3(luma), color, saturation);
     }
+
+    // Parametric color curves (shadows/midtones/highlights lifts)
+    color = applyColorCurves(color);
 
     // Vignette
     if (params3.w > 0.5 && params2.x > 0.001) {

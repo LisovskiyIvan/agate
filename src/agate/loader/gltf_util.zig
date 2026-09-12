@@ -131,11 +131,26 @@ pub fn readSampler(allocator: std.mem.Allocator, samp: *c.cgltf_animation_sample
     const per_key: usize = if (is_cubic) stride * 3 else stride;
     const outputs = try allocator.alloc(f32, key_count * per_key);
     errdefer allocator.free(outputs);
+    // Morph weights are the one glTF track where a SCALAR output accessor
+    // holds `stride` elements per keyframe (one per morph target), so a
+    // single read per key with element_size = stride would walk the
+    // interleaved per-target sequence and alias targets. Read scalar
+    // elements individually in that case; vec2/vec3/vec4 tracks keep the
+    // fast per-key read path.
+    const scalar_multi = out_acc.*.type == c.cgltf_type_scalar and stride > 1;
     for (0..key_count) |ki| {
-        if (is_cubic) {
+        if (is_cubic and scalar_multi) {
+            for (0..3 * stride) |j| {
+                _ = c.cgltf_accessor_read_float(out_acc, ki * 3 * stride + j, outputs[ki * per_key + j ..][0..1].ptr, 1);
+            }
+        } else if (is_cubic) {
             for (0..3) |j| {
                 const dst = outputs[ki * per_key + j * stride .. ki * per_key + (j + 1) * stride];
                 _ = c.cgltf_accessor_read_float(out_acc, ki * 3 + j, dst.ptr, @intCast(stride));
+            }
+        } else if (scalar_multi) {
+            for (0..stride) |j| {
+                _ = c.cgltf_accessor_read_float(out_acc, ki * stride + j, outputs[ki * stride + j ..][0..1].ptr, 1);
             }
         } else {
             _ = c.cgltf_accessor_read_float(out_acc, ki, outputs[ki * stride .. ki * stride + stride].ptr, @intCast(stride));
@@ -148,4 +163,47 @@ pub fn readSampler(allocator: std.mem.Allocator, samp: *c.cgltf_animation_sample
         else => .linear,
     };
     return .{ .timestamps = timestamps, .outputs = outputs, .interpolation = interp };
+}
+
+test "readSampler reads interleaved morph weights per target" {
+    const allocator = std.testing.allocator;
+    var times = [_]f32{ 0.0, 1.0, 2.0, 3.0 };
+    var weights = [_]f32{ 0.0, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25 };
+
+    var time_buf = std.mem.zeroes(c.cgltf_buffer);
+    time_buf.data = @ptrCast(&times);
+    time_buf.size = @sizeOf(@TypeOf(times));
+    var time_view = std.mem.zeroes(c.cgltf_buffer_view);
+    time_view.buffer = &time_buf;
+    time_view.size = time_buf.size;
+    var in_acc = std.mem.zeroes(c.cgltf_accessor);
+    in_acc.buffer_view = &time_view;
+    in_acc.type = c.cgltf_type_scalar;
+    in_acc.component_type = c.cgltf_component_type_r_32f;
+    in_acc.count = times.len;
+
+    var weight_buf = std.mem.zeroes(c.cgltf_buffer);
+    weight_buf.data = @ptrCast(&weights);
+    weight_buf.size = @sizeOf(@TypeOf(weights));
+    var weight_view = std.mem.zeroes(c.cgltf_buffer_view);
+    weight_view.buffer = &weight_buf;
+    weight_view.size = weight_buf.size;
+    var out_acc = std.mem.zeroes(c.cgltf_accessor);
+    out_acc.buffer_view = &weight_view;
+    out_acc.type = c.cgltf_type_scalar;
+    out_acc.component_type = c.cgltf_component_type_r_32f;
+    out_acc.count = weights.len;
+
+    var samp = std.mem.zeroes(c.cgltf_animation_sampler);
+    samp.input = &in_acc;
+    samp.output = &out_acc;
+    samp.interpolation = c.cgltf_interpolation_type_linear;
+
+    // stride = morph target count: one SCALAR element per target per key.
+    const data = (try readSampler(allocator, &samp, 2)).?;
+    defer allocator.free(data.timestamps);
+    defer allocator.free(data.outputs);
+    try std.testing.expectEqual(@as(usize, 4), data.timestamps.len);
+    try std.testing.expectEqualSlices(f32, &times, data.timestamps);
+    try std.testing.expectEqualSlices(f32, &weights, data.outputs);
 }

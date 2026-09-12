@@ -76,10 +76,14 @@ layout(binding = 2) uniform texture2D metallic_roughness_tex;
 layout(binding = 3) uniform texture2D emissive_tex;
 layout(binding = 4) uniform texture2D occlusion_tex;
 layout(binding = 5) uniform texture2D shadow_tex;
+@image_sample_type shadow_depth_tex unfilterable_float
+layout(binding = 7) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
 layout(binding = 6) uniform textureCube env_tex;
 layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
 layout(binding = 2) uniform sampler env_smp;
+@sampler_type depth_smp nonfiltering
+layout(binding = 3) uniform sampler depth_smp;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -118,10 +122,51 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
     vec2(0.5, 0.5)
 );
 
+// PCSS (percentage-closer soft shadows) for the 4-cascade sun atlas.
+// Blocker search reads raw depths from shadow_depth_tex (same atlas view as
+// shadow_tex, regular sampler): PCSS_BLOCKER_SAMPLES Poisson taps inside
+// pcss_blocker_radius, average blocker depth -> penumbra ->
+// (d_receiver - d_blocker) / d_blocker * light_size, clamped to
+// [min_penumbra, max_penumbra]; the legacy Poisson PCF then runs with the
+// penumbra as its disk radius. Params ride free uniform lanes (fs_params
+// layout unchanged):
+//   cascade_debug.y = pcss_enabled (0.0/1.0)
+//   cascade_debug.z = pcss_light_size
+//   cascade_debug.w = pcss_blocker_radius (atlas-UV search radius)
+//   light_counts.z  = pcss_min_penumbra (atlas-UV clamp)
+//   light_counts.w  = pcss_max_penumbra (atlas-UV clamp)
+// Disabled (y <= 0.5): legacy fixed-radius 16x/8x Poisson PCF, bit-identical.
+// Counts mirror scene/shadow_pcss.zig (blocker_sample_count).
+#define PCSS_BLOCKER_SAMPLES 12
+
 float hash01(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
+}
+
+// PCSS blocker search: average depth of taps closer to the light than the
+// receiver, or -1.0 when nothing blocks (caller early-outs to fully lit).
+float pcssBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius) {
+    float blocker_sum = 0.0;
+    int blocker_count = 0;
+    for (int i = 0; i < PCSS_BLOCKER_SAMPLES; i++) {
+        vec2 tap_uv = atlas_uv + rot * POISSON_DISK[i] * search_radius;
+        float tap_depth = texture(sampler2D(depth_tex, depth_smp), tap_uv).r;
+        if (tap_depth < receiver_depth) {
+            blocker_sum += tap_depth;
+            blocker_count += 1;
+        }
+    }
+    if (blocker_count == 0) return -1.0;
+    return blocker_sum / float(blocker_count);
+}
+
+// PCSS variable penumbra, atlas-UV radius for the PCF disk. Mirrors
+// penumbraRadius in scene/shadow_pcss.zig.
+float pcssPenumbraRadius(float receiver_depth, float blocker_avg, float light_size, float min_penumbra, float max_penumbra) {
+    float penumbra = (receiver_depth - blocker_avg) / max(blocker_avg, 0.0001) * light_size;
+    return clamp(penumbra, min_penumbra, max_penumbra);
 }
 
 float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
@@ -162,6 +207,15 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     // where extra taps cost without visible quality.
     int taps = 16;
     if (cascade_idx > 0) taps = 8;
+
+    // PCSS: blocker search sets a receiver-dependent filter radius. Params
+    // ride free lanes (cascade_debug.yzw / light_counts.zw); disabled keeps
+    // the legacy fixed-radius path below bit-identical.
+    if (cascade_debug.y > 0.5) {
+        float blocker_avg = pcssBlockerAverage(shadow_depth_tex, depth_smp, atlas_uv, depth, rot, cascade_debug.w);
+        if (blocker_avg < 0.0) return 1.0;
+        filter_radius = pcssPenumbraRadius(depth, blocker_avg, cascade_debug.z, light_counts.z, light_counts.w);
+    }
 
     float lit = 0.0;
     for (int i = 0; i < 16; i++) {

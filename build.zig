@@ -37,6 +37,9 @@ pub fn build(b: *Build) !void {
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
         .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },
         .{ .name = "debug_shader", .input = "src/agate/shaders/debug.glsl", .output = "debug_shader.zig" },
+        .{ .name = "bloom_down_shader", .input = "src/agate/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig" },
+        .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig" },
+        .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});

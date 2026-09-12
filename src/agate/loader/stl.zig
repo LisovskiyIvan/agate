@@ -16,6 +16,8 @@ const Scene = @import("../scene.zig").Scene;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
 const computeTangents = @import("../mesh.zig").computeTangents;
+const GeometryData = @import("../mesh.zig").GeometryData;
+const uploadGeometry = @import("../mesh.zig").uploadGeometry;
 
 /// Flat triangle soup with per-vertex normals, deduplicated on import.
 /// All slices are owned (allocator passed to parse) and freed by deinit.
@@ -244,49 +246,21 @@ pub fn appendToScene(scene: *Scene, allocator: std.mem.Allocator, name: []const 
         max_p.z = @max(max_p.z, vert.position[2]);
     }
 
-    const use32 = n > std.math.maxInt(u16) or data.indices.len > std.math.maxInt(u16);
-    var ibuf: sg.Buffer = .{};
-    if (use32) {
-        const idx = try scene.allocator.alloc(u32, data.indices.len);
-        defer scene.allocator.free(idx);
-        @memcpy(idx, data.indices);
-        computeTangents(vertices, idx, null);
-        ibuf = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true },
-            .data = sg.asRange(idx),
-        });
-    } else {
-        const idx = try scene.allocator.alloc(u16, data.indices.len);
-        defer scene.allocator.free(idx);
-        for (data.indices, 0..) |src, i| idx[i] = @intCast(src);
-        computeTangents(vertices, null, idx);
-        ibuf = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true },
-            .data = sg.asRange(idx),
-        });
-    }
-
-    const vbuf = sg.makeBuffer(.{
-        .data = sg.asRange(vertices),
-    });
+    computeTangents(vertices, data.indices, null);
 
     const owned_name = try scene.allocator.dupe(u8, name);
     errdefer scene.allocator.free(owned_name);
-    const mesh_obj = try scene.allocator.create(Mesh);
-    errdefer scene.allocator.destroy(mesh_obj);
-    mesh_obj.* = .{
-        .name = owned_name,
-        .owns_name = true,
-        .vertex_buffer = vbuf,
-        .index_buffer = ibuf,
-        .index_count = @intCast(data.indices.len),
-        .index_type = if (use32) .UINT32 else .UINT16,
-        .local_bounding_box = BoundingBox.init(min_p, max_p),
+
+    const geom = GeometryData{
+        .vertices = vertices,
+        .indices = @constCast(data.indices),
+        .bounds = BoundingBox.init(min_p, max_p),
     };
-    try mesh_obj.retainCpuGeometryU32(scene.allocator, vertices, data.indices);
+
+    const mesh_obj = try uploadGeometry(scene, owned_name, geom);
+    mesh_obj.owns_name = true;
     try mesh_obj.retainMorphBase(scene.allocator, vertices);
 
-    try scene.meshes.append(scene.allocator, mesh_obj);
     const out = try allocator.alloc(*Mesh, 1);
     out[0] = mesh_obj;
     return out;

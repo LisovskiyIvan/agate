@@ -48,6 +48,7 @@ const scene_cascades = @import("scene/cascades.zig");
 const scene_uniforms = @import("scene/uniforms.zig");
 const scene_projection = @import("scene/projection.zig");
 const scene_draw = @import("scene/draw.zig");
+const scene_light_selection = @import("scene/light_selection.zig");
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
 const DirectionalLight = lights.DirectionalLight;
@@ -112,10 +113,18 @@ pub const Scene = struct {
     particle_pass: passes.ParticlePass,
     postprocess_pass: passes.PostProcessPass,
     ssao_pass: passes.SSAOPass,
+    bloom_pass: passes.BloomPass,
+    outline_pass: passes.OutlinePass,
     // Lazily created on first use; renders physics debug wireframes in 3D.
     debug_pass: ?passes.DebugPass = null,
     show_physics_debug: bool = false,
     debug_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty,
+
+    // Inverse-hull outline (highlight layer) settings.
+    outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    outline_enabled: bool = false,
+    outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
+    outline_width_px: f32 = 2.0,
 
     // Shadow Mapping settings (Cascaded Shadow Maps with 16-sample Poisson PCF)
     enable_shadows: bool = true,
@@ -124,6 +133,11 @@ pub const Scene = struct {
     shadow_intensity: f32 = 0.75,
     shadow_softness: f32 = 1.5,
     shadow_debug_cascades: bool = false,
+    // PCSS (percentage-closer soft shadows) for the CSM sun. Disabled keeps
+    // the legacy 16x Poisson PCF path bit-identical.
+    pcss_enabled: bool = false,
+    pcss_light_size: f32 = 0.02,
+    pcss_blocker_radius: f32 = 0.01,
     cascade_splits: [4]f32 = .{ 10.0, 26.0, 65.0, 150.0 },
     cascade_matrices: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
 
@@ -180,6 +194,8 @@ pub const Scene = struct {
     // Transparent meshes (material alpha_mode == .blend), sorted strictly
     // back-to-front and drawn after every opaque mesh and instanced mesh.
     transparent_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
+    opaque_instanced_queue: std.ArrayListUnmanaged(*Mesh) = .empty,
+    transparent_instanced_queue: std.ArrayListUnmanaged(*Mesh) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
 
     pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
@@ -188,11 +204,13 @@ pub const Scene = struct {
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
             .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
-            .shadow_pass = passes.ShadowPass.init(),
+            .shadow_pass = passes.ShadowPass.init(allocator),
             .skybox_pass = passes.SkyboxPass.init(),
             .particle_pass = passes.ParticlePass.init(),
             .postprocess_pass = passes.PostProcessPass.init(),
             .ssao_pass = passes.SSAOPass.init(),
+            .bloom_pass = passes.BloomPass.init(),
+            .outline_pass = passes.OutlinePass.init(),
             .light = HemisphericLight.init("hemi", .{
                 .direction = math.Vec3.new(0.5, 1.0, 0.3),
                 .diffuse = Color3.white,
@@ -320,6 +338,8 @@ pub const Scene = struct {
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
         self.postprocess_pass.resize(width, height);
         self.ssao_pass.resize(width, height);
+        self.bloom_pass.resize(width, height);
+        passes.OutlinePass.resize(width, height);
     }
 
     pub fn setPostProcess(self: *Scene, config: PostProcessConfig) void {
@@ -363,6 +383,7 @@ pub const Scene = struct {
     // previous light so at most one directional light is owned at a time.
     pub fn createDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         if (self.directional_light) |old| {
+            if (old.owns_name) self.allocator.free(old.name);
             self.allocator.destroy(old);
             self.directional_light = null;
         }
@@ -693,6 +714,9 @@ pub const Scene = struct {
             .normal_bias = self.shadow_normal_bias,
             .softness = self.shadow_softness,
             .debug_cascades = self.shadow_debug_cascades,
+            .pcss_enabled = self.pcss_enabled,
+            .pcss_light_size = self.pcss_light_size,
+            .pcss_blocker_radius = self.pcss_blocker_radius,
             .splits = self.cascade_splits,
         }, ctx);
     }
@@ -729,6 +753,8 @@ pub const Scene = struct {
         self.frame_id +%= 1;
         self.render_queue.clearRetainingCapacity();
         self.transparent_queue.clearRetainingCapacity();
+        self.opaque_instanced_queue.clearRetainingCapacity();
+        self.transparent_instanced_queue.clearRetainingCapacity();
 
         // 1. Directional Light Cascaded Shadow View-Projections
         const cascades = self.computeCascadesWithSun(camera, aspect, sun_dir);
@@ -750,15 +776,20 @@ pub const Scene = struct {
 
                     self.stats.total_meshes += 4;
 
-                    const m0 = inst0.getWorldMatrix();
-                    const m1 = inst1.getWorldMatrix();
-                    const m2 = inst2.getWorldMatrix();
-                    const m3 = inst3.getWorldMatrix();
+                    inst0.updateCachedTransforms();
+                    inst1.updateCachedTransforms();
+                    inst2.updateCachedTransforms();
+                    inst3.updateCachedTransforms();
 
-                    const b0 = mesh.local_bounding_box.transform(m0);
-                    const b1 = mesh.local_bounding_box.transform(m1);
-                    const b2 = mesh.local_bounding_box.transform(m2);
-                    const b3 = mesh.local_bounding_box.transform(m3);
+                    const m0 = inst0.cached_world_matrix;
+                    const m1 = inst1.cached_world_matrix;
+                    const m2 = inst2.cached_world_matrix;
+                    const m3 = inst3.cached_world_matrix;
+
+                    const b0 = inst0.cached_bounding_box;
+                    const b1 = inst1.cached_bounding_box;
+                    const b2 = inst2.cached_bounding_box;
+                    const b3 = inst3.cached_bounding_box;
 
                     if (self.enable_frustum_culling) {
                         const c0 = b0.center();
@@ -833,9 +864,10 @@ pub const Scene = struct {
                     const inst = mesh.instances.items[inst_idx];
                     self.stats.total_meshes += 1;
                     if (!inst.is_visible) continue;
-                    const m = inst.getWorldMatrix();
+                    inst.updateCachedTransforms();
+                    const m = inst.cached_world_matrix;
                     if (self.enable_frustum_culling and inst.culling_strategy == .frustum) {
-                        const world_aabb = mesh.local_bounding_box.transform(m);
+                        const world_aabb = inst.cached_bounding_box;
                         if (!frustum.intersectsAABB(world_aabb)) {
                             self.stats.culled_meshes += 1;
                             continue;
@@ -848,6 +880,12 @@ pub const Scene = struct {
                 const visible_count = self.instance_matrices.items.len;
                 mesh.visible_instance_count = @intCast(visible_count);
                 if (visible_count > 0) {
+                    if (materialIsTransparent(mesh.material)) {
+                        self.transparent_instanced_queue.append(self.allocator, mesh) catch {};
+                    } else {
+                        self.opaque_instanced_queue.append(self.allocator, mesh) catch {};
+                    }
+
                     if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < visible_count) {
                         if (mesh.instance_buffer.id != 0) {
                             sg.destroyBuffer(mesh.instance_buffer);
@@ -860,11 +898,11 @@ pub const Scene = struct {
                         mesh.instance_buffer_capacity = new_cap;
                         // Fresh buffer: must upload, then record hash.
                         sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items[0..visible_count]));
-                        mesh.instance_hash = std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
+                        mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
                         mesh.instance_uploaded_count = visible_count;
                     } else {
                         // Static instance sets skip the driver upload entirely.
-                        const h = std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
+                        const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.instance_matrices.items[0..visible_count]));
                         if (visible_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
                             sg.updateBuffer(mesh.instance_buffer, sg.asRange(self.instance_matrices.items[0..visible_count]));
                             mesh.instance_hash = h;
@@ -941,6 +979,7 @@ pub const Scene = struct {
 
         if (self.post_process.enabled) {
             self.postprocess_pass.resize(cur_w, cur_h);
+            self.bloom_pass.resize(cur_w, cur_h);
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
@@ -956,6 +995,9 @@ pub const Scene = struct {
                 .swapchain = sglue.swapchain(),
             });
         }
+
+        // Viewport for pixel-width outline expansion (static, shared).
+        passes.OutlinePass.resize(cur_w, cur_h);
 
         // State sorting: opaque items group by shader type and textures,
         // Front-to-Back Early-Z. Transparent items sort strictly
@@ -975,28 +1017,26 @@ pub const Scene = struct {
         var spot_color_outer = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
         var spot_intensity = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
 
-        var num_point: usize = 0;
-        for (self.point_lights.items) |pl| {
-            if (!pl.is_enabled) continue;
-            if (num_point >= 4) break;
-            point_pos_range[num_point] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
-            point_color_int[num_point] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
-            num_point += 1;
+        // Pick the most relevant lights for the camera before packing; the
+        // shader uniform arrays only hold 4 point + 2 spot slots.
+        var point_buf: [4]*PointLight = undefined;
+        const num_point = scene_light_selection.selectPoint(self.point_lights.items, eye, &point_buf);
+        for (point_buf[0..num_point], 0..) |pl, i| {
+            point_pos_range[i] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
+            point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
         }
         light_counts[0] = @floatFromInt(num_point);
 
-        var num_spot: usize = 0;
-        for (self.spot_lights.items) |sl| {
-            if (!sl.is_enabled) continue;
-            if (num_spot >= 2) break;
+        var spot_buf: [2]*SpotLight = undefined;
+        const num_spot = scene_light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
+        for (spot_buf[0..num_spot], 0..) |sl, i| {
             const dir = sl.direction.normalize();
             const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
             const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
-            spot_pos_range[num_spot] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
-            spot_dir_inner[num_spot] = .{ dir.x, dir.y, dir.z, cos_inner };
-            spot_color_outer[num_spot] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-            spot_intensity[num_spot] = .{ sl.intensity, 0.0, 0.0, 0.0 };
-            num_spot += 1;
+            spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
+            spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
+            spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
+            spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
         }
         light_counts[1] = @floatFromInt(num_spot);
 
@@ -1026,8 +1066,7 @@ pub const Scene = struct {
         }
 
         // Opaque instanced meshes.
-        for (self.meshes.items) |mesh| {
-            if (materialIsTransparent(mesh.material)) continue;
+        for (self.opaque_instanced_queue.items) |mesh| {
             self.drawInstancedMesh(mesh, frame_ctx, &current_pipeline_id);
         }
 
@@ -1038,9 +1077,15 @@ pub const Scene = struct {
 
         // Transparent instanced meshes last, drawn as-is (no per-instance
         // sorting; documented limitation).
-        for (self.meshes.items) |mesh| {
-            if (!materialIsTransparent(mesh.material)) continue;
+        for (self.transparent_instanced_queue.items) |mesh| {
             self.drawInstancedMesh(mesh, frame_ctx, &current_pipeline_id);
+        }
+
+        // Inverse-hull outline for highlighted meshes: inside the main pass,
+        // depth-tested, no depth write, drawn after all surface geometry.
+        if (self.outline_enabled and self.outline_meshes.items.len > 0) {
+            self.outline_pass.render(view_proj, eye, self.outline_meshes.items, self.outline_color, self.outline_width_px);
+            self.stats.draw_calls += @intCast(self.outline_meshes.items.len);
         }
 
         // Physics debug lines (3D pass, depth-tested, no depth write).
@@ -1105,6 +1150,25 @@ pub const Scene = struct {
             self.stats.draw_calls += 2;
             self.stats.triangles += 4;
         }
+
+        // ==============================================
+        // PASS 2.75: BLOOM MIP PYRAMID (optional)
+        // ==============================================
+        // Multi-pass glow; when disabled the composite shader keeps its legacy
+        // in-shader bloom and this binds the resolved scene view placeholder.
+        var bloom_view = self.postprocess_pass.offscreen_resolve_tex_view;
+        if (self.post_process.enabled and self.post_process.bloom_enabled and self.post_process.bloom_pyramid) {
+            bloom_view = self.bloom_pass.render(
+                self.postprocess_pass.offscreen_resolve_tex_view,
+                self.post_process.bloom_threshold,
+                self.post_process.bloom_pyramid_mips,
+                cur_w,
+                cur_h,
+            );
+            const mips = postprocess.clampBloomMips(self.post_process.bloom_pyramid_mips);
+            self.stats.draw_calls += 2 * @as(u32, mips) - 1;
+        }
+        self.postprocess_pass.setBloomTexture(bloom_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
@@ -1184,22 +1248,27 @@ pub const Scene = struct {
         self.pbr_materials.deinit(self.allocator);
 
         for (self.point_lights.items) |pl| {
+            if (pl.owns_name) self.allocator.free(pl.name);
             self.allocator.destroy(pl);
         }
         self.point_lights.deinit(self.allocator);
 
         for (self.spot_lights.items) |sl| {
+            if (sl.owns_name) self.allocator.free(sl.name);
             self.allocator.destroy(sl);
         }
         self.spot_lights.deinit(self.allocator);
 
         if (self.directional_light) |dl| {
+            if (dl.owns_name) self.allocator.free(dl.name);
             self.allocator.destroy(dl);
             self.directional_light = null;
         }
 
         self.render_queue.deinit(self.allocator);
         self.transparent_queue.deinit(self.allocator);
+        self.opaque_instanced_queue.deinit(self.allocator);
+        self.transparent_instanced_queue.deinit(self.allocator);
         self.instance_matrices.deinit(self.allocator);
         self.debug_lines.deinit(self.allocator);
 
@@ -1243,7 +1312,10 @@ pub const Scene = struct {
         self.particle_pass.deinit();
         self.postprocess_pass.deinit();
         self.ssao_pass.deinit();
+        self.bloom_pass.deinit();
+        self.outline_pass.deinit();
         if (self.debug_pass) |*dp| dp.deinit();
+        self.outline_meshes.deinit(self.allocator);
         self.ds_pipelines.deinit();
 
         for (self.particle_systems.items) |ps| {
@@ -1499,8 +1571,8 @@ test "frameUniforms packs shared lighting state verbatim" {
     try std.testing.expectEqual([4]f32{ 0.0012, 0.75, 0.02, 1.5 }, f.shadow_params);
     try std.testing.expectEqual([4]f32{ 10.0, 26.0, 65.0, 150.0 }, f.shadow_splits);
     try std.testing.expectEqual(cascades, f.cascade_view_proj);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, f.cascade_debug);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, f.light_counts);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.02, 0.01 }, f.cascade_debug);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0005, 0.01 }, f.light_counts);
     try std.testing.expectEqual(ctx.point_pos_range, f.point_pos_range);
     try std.testing.expectEqual(ctx.spot_intensity, f.spot_intensity);
 

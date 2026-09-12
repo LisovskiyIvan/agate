@@ -3,6 +3,7 @@ const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Color3 = math.Color3;
 const Material = @import("../material.zig").Material;
+const pcss = @import("shadow_pcss.zig");
 
 // Per-frame constants shared by the regular and instanced draw helpers.
 pub const FrameContext = struct {
@@ -45,7 +46,9 @@ pub const FrameUniforms = struct {
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
 // one struct makes the free function pure (no Scene import / no cycle)
-// while the values stay bit-identical to the legacy per-shader literals.
+// while the values stay bit-identical to the legacy per-shader literals
+// (the PCSS lanes below extend previously constant-zero lanes; every legacy
+// lane keeps its exact legacy value).
 pub const ShadowState = struct {
     ground_color: Color3,
     enable_shadows: bool,
@@ -56,10 +59,21 @@ pub const ShadowState = struct {
     softness: f32,
     debug_cascades: bool,
     splits: [4]f32,
+    // PCSS (percentage-closer soft shadows) inputs. Only `pcss_enabled`
+    // gates the shader branch; the rest ride free uniform lanes (see
+    // buildFrameUniforms) and are ignored while disabled.
+    pcss_enabled: bool = false,
+    pcss_light_size: f32 = pcss.default_light_size,
+    pcss_blocker_radius: f32 = pcss.default_blocker_radius,
+    pcss_min_penumbra: f32 = pcss.default_min_penumbra,
+    pcss_max_penumbra: f32 = pcss.default_max_penumbra,
 };
 
-// Packs the shared fragment uniforms once per draw. Values are
-// bit-identical to the legacy per-shader literals.
+// Packs the shared fragment uniforms once per draw. Legacy lanes are
+// bit-identical to the legacy per-shader literals. PCSS rides free lanes
+// with no fs_params layout change (no draw-path churn):
+//   cascade_debug.yzw = (pcss_enabled, pcss_light_size, pcss_blocker_radius)
+//   light_counts.zw   = (pcss_min_penumbra, pcss_max_penumbra)
 pub fn buildFrameUniforms(shadow: ShadowState, ctx: FrameContext) FrameUniforms {
     return .{
         .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
@@ -74,8 +88,18 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: FrameContext) FrameUniforms 
         },
         .shadow_splits = shadow.splits,
         .cascade_view_proj = ctx.cascades,
-        .cascade_debug = .{ if (shadow.debug_cascades) 1.0 else 0.0, 0.0, 0.0, 0.0 },
-        .light_counts = ctx.light_counts,
+        .cascade_debug = .{
+            if (shadow.debug_cascades) 1.0 else 0.0,
+            if (shadow.pcss_enabled) 1.0 else 0.0,
+            shadow.pcss_light_size,
+            shadow.pcss_blocker_radius,
+        },
+        .light_counts = .{
+            ctx.light_counts[0],
+            ctx.light_counts[1],
+            shadow.pcss_min_penumbra,
+            shadow.pcss_max_penumbra,
+        },
         .point_pos_range = ctx.point_pos_range,
         .point_color_int = ctx.point_color_int,
         .spot_pos_range = ctx.spot_pos_range,

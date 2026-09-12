@@ -23,6 +23,11 @@ pub const PostProcessPass = struct {
     postprocess_pipeline: sg.Pipeline = .{},
     postprocess_quad_vb: sg.Buffer = .{},
     postprocess_quad_ib: sg.Buffer = .{},
+    // Optional BloomPass result (pyramid glow, half resolution). Set via
+    // setBloomTexture(); empty by default, in which case the shader falls
+    // back to the legacy single-shader bloom and this binds the scene view
+    // as a harmless placeholder.
+    bloom_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -187,6 +192,12 @@ pub const PostProcessPass = struct {
         post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
         post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
         post_bind.views[post_shd.VIEW_depth_tex] = self.offscreen_depth_tex_view;
+        // Pyramid glow when the parent fed a BloomPass result; otherwise a
+        // valid placeholder the shader never samples (pyramid flag off).
+        post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)
+            self.bloom_tex_view
+        else
+            self.offscreen_resolve_tex_view;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
         post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
         sg.applyBindings(post_bind);
@@ -270,11 +281,48 @@ pub const PostProcessPass = struct {
                 config.temperature,
                 config.tint,
             },
+            .dof_params = .{
+                if (config.dof_enabled) 1.0 else 0.0,
+                config.dof_focus_distance,
+                config.dof_focus_range,
+                config.dof_max_blur,
+            },
+            .bloom_pyramid = .{
+                if (config.bloom_pyramid and self.bloom_tex_view.id != 0) 1.0 else 0.0,
+                @floatFromInt(config.bloom_pyramid_mips),
+                0.0,
+                0.0,
+            },
+            .grade_shadows = .{
+                config.grade_shadows[0],
+                config.grade_shadows[1],
+                config.grade_shadows[2],
+                0.0,
+            },
+            .grade_midtones = .{
+                config.grade_midtones[0],
+                config.grade_midtones[1],
+                config.grade_midtones[2],
+                0.0,
+            },
+            .grade_highlights = .{
+                config.grade_highlights[0],
+                config.grade_highlights[1],
+                config.grade_highlights[2],
+                0.0,
+            },
             .view_proj = view_proj,
             .inv_view_proj = inv_view_proj,
         };
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
+    }
+
+    // Feed the BloomPass pyramid result into the composite. Call every frame
+    // before render() once the parent owns a BloomPass; pass .{} to detach
+    // and return to the legacy single-shader bloom path.
+    pub fn setBloomTexture(self: *PostProcessPass, view: sg.View) void {
+        self.bloom_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

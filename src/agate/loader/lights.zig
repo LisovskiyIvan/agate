@@ -185,7 +185,7 @@ pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) 
                 }
                 // Engine direction points TOWARD the sun: negate the beam.
                 const to_sun = forwardFromWorld(world).scale(-1.0);
-                _ = scene.createDirectionalLight(owned_name, .{
+                const dl = scene.createDirectionalLight(owned_name, .{
                     .direction = to_sun,
                     .diffuse = lightColor(light),
                     .intensity = lightIntensity(light),
@@ -193,10 +193,11 @@ pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) 
                     scene.allocator.free(owned_name);
                     return err;
                 };
+                dl.owns_name = true;
                 have_directional = true;
             },
             c.cgltf_light_type_point => {
-                _ = scene.createPointLight(owned_name, .{
+                const pl = scene.createPointLight(owned_name, .{
                     .position = world.getTranslation(),
                     .color = lightColor(light),
                     .intensity = lightIntensity(light),
@@ -205,10 +206,11 @@ pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) 
                     scene.allocator.free(owned_name);
                     return err;
                 };
+                pl.owns_name = true;
             },
             c.cgltf_light_type_spot => {
                 const cone = spotConeDeg(light);
-                _ = scene.createSpotLight(owned_name, .{
+                const sl = scene.createSpotLight(owned_name, .{
                     .position = world.getTranslation(),
                     .direction = forwardFromWorld(world),
                     .color = lightColor(light),
@@ -220,6 +222,7 @@ pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) 
                     scene.allocator.free(owned_name);
                     return err;
                 };
+                sl.owns_name = true;
             },
             else => {
                 // Invalid/unknown type: nothing to map; drop the duped name.

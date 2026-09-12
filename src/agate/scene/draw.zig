@@ -63,7 +63,9 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
         bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
 
         bind.views[pbr_shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
+        bind.views[pbr_shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
+        bind.samplers[pbr_shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
         sg.applyBindings(bind);
 
@@ -122,7 +124,9 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
         bind.samplers[shd.SMP_smp] = tex.sampler;
 
         bind.views[shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
+        bind.views[shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
         bind.samplers[shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
+        bind.samplers[shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
         sg.applyBindings(bind);
 
@@ -196,7 +200,9 @@ pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, curre
     bind.samplers[inst_shd.SMP_smp] = tex.sampler;
 
     bind.views[inst_shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
+    bind.views[inst_shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
     bind.samplers[inst_shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
+    bind.samplers[inst_shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
     sg.applyBindings(bind);
 

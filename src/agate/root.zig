@@ -137,6 +137,8 @@ pub const TextInputState = ui.TextInputState;
 
 pub const passes = @import("passes/mod.zig");
 pub const DebugPass = passes.DebugPass;
+pub const BloomPass = passes.BloomPass;
+pub const OutlinePass = passes.OutlinePass;
 
 pub const animation = struct {
     pub const skeleton = @import("animation/skeleton.zig");
@@ -212,5 +214,20 @@ pub const appendObjToScene = obj_loader.appendToScene;
 pub const appendStlToScene = stl_loader.appendToScene;
 pub const loadGltfLights = loader_lights.loadLights;
 pub const loadGltfCameras = loader_lights.loadCameras;
+
+pub const ply_loader = @import("loader/ply.zig");
+pub const PlyData = ply_loader.PlyData;
+pub const parsePly = ply_loader.parse;
+pub const appendPlyToScene = ply_loader.appendToScene;
+
+pub const export_obj = @import("export/obj.zig");
+pub const export_stl = @import("export/stl.zig");
+pub const ObjExportOptions = export_obj.ObjExportOptions;
+pub const StlExportOptions = export_stl.StlExportOptions;
+pub const writeObjAlloc = export_obj.writeObjAlloc;
+pub const writeMtlAlloc = export_obj.writeMtlAlloc;
+pub const writeStlAlloc = export_stl.writeStlAlloc;
+pub const writeStlAsciiAlloc = export_stl.writeStlAsciiAlloc;
+pub const writeStlBinaryAlloc = export_stl.writeStlBinaryAlloc;
 
 pub const sokol = @import("sokol");
