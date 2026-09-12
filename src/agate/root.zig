@@ -162,6 +162,7 @@ pub const passes = @import("passes/mod.zig");
 pub const DebugPass = passes.DebugPass;
 pub const BloomPass = passes.BloomPass;
 pub const OutlinePass = passes.OutlinePass;
+pub const outline_pass = passes.outline_pass; // file-level: shouldOutlineMesh etc.
 
 pub const animation = struct {
     pub const skeleton = @import("animation/skeleton.zig");

@@ -6,4 +6,5 @@ pub const PostProcessPass = @import("postprocess_pass.zig").PostProcessPass;
 pub const BloomPass = @import("bloom_pass.zig").BloomPass;
 pub const OutlinePass = @import("outline_pass.zig").OutlinePass;
 pub const SSAOPass = @import("ssao_pass.zig").SSAOPass;
+pub const outline_pass = @import("outline_pass.zig");
 pub const DebugPass = @import("debug_pass.zig").DebugPass;
