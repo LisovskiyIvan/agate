@@ -16,6 +16,7 @@ const InstancedMesh = types.InstancedMesh;
 const BoneAttachment = types.BoneAttachment;
 const GeometryData = types.GeometryData;
 const LODLevel = types.LODLevel;
+const SkinJointWeight = types.SkinJointWeight;
 
 const Material = @import("../material.zig").Material;
 const StandardMaterial = @import("../material.zig").StandardMaterial;
@@ -48,9 +49,10 @@ pub const Mesh = struct {
     local_bounding_box: BoundingBox = BoundingBox.zero,
 
     // Optional CPU-side geometry retained for physics collider creation
-    // (convex hull / triangle mesh shapes). Owned by the scene allocator.
+    // (convex hull / triangle mesh shapes) and decal projection. Owned by the scene allocator.
     cpu_positions: []Vec3 = &.{},
     cpu_indices: []u32 = &.{},
+    cpu_skin: []SkinJointWeight = &.{},
 
     // Morph targets (blend shapes), CPU-blended with dirty tracking.
     // morph_targets/morph_weights/morph_base/morph_staging are owned by the
@@ -228,6 +230,20 @@ pub const Mesh = struct {
         self.cpu_indices = index_copy;
     }
 
+    /// Retains CPU skin joints and weights for skinned decal projection.
+    pub fn retainCpuSkin(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex) !void {
+        const skin = try allocator.alloc(SkinJointWeight, vertices.len);
+        errdefer allocator.free(skin);
+        for (vertices, 0..) |v, i| {
+            skin[i] = .{
+                .joints = v.joints,
+                .weights = v.weights,
+            };
+        }
+        if (self.cpu_skin.len > 0) allocator.free(self.cpu_skin);
+        self.cpu_skin = skin;
+    }
+
     pub fn hasMorphTargets(self: *const Mesh) bool {
         return self.morph_targets.len > 0;
     }
@@ -374,6 +390,9 @@ pub const Mesh = struct {
         }
         if (self.cpu_indices.len > 0) {
             allocator.free(self.cpu_indices);
+        }
+        if (self.cpu_skin.len > 0) {
+            allocator.free(self.cpu_skin);
         }
         if (self.owns_name and self.name.len > 0) {
             allocator.free(self.name);

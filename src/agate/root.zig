@@ -75,6 +75,13 @@ pub const ExtrudeOptions = mesh.ExtrudeOptions;
 pub const DecalOptions = mesh.DecalOptions;
 pub const buildDecalData = mesh.buildDecalData;
 pub const createDecal = mesh.createDecal;
+pub const DecalProjector = mesh.DecalProjector;
+pub const DecalManager = mesh.DecalManager;
+pub const DecalSpawnOptions = mesh.DecalSpawnOptions;
+pub const DecalInstance = mesh.DecalInstance;
+pub const SkinJointWeight = mesh.SkinJointWeight;
+pub const barycentric = mesh.barycentric;
+pub const blendSkinWeights = mesh.blendSkinWeights;
 pub const MorphTarget = mesh.MorphTarget;
 pub const MAX_MORPH_TARGETS = mesh.MAX_MORPH_TARGETS;
 

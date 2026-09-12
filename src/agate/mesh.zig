@@ -9,6 +9,7 @@ pub const InstancedMesh = types.InstancedMesh;
 pub const BoneAttachment = types.BoneAttachment;
 pub const GeometryData = types.GeometryData;
 pub const LODLevel = types.LODLevel;
+pub const SkinJointWeight = types.SkinJointWeight;
 
 pub const tangents = @import("mesh/tangents.zig");
 pub const computeTangents = tangents.computeTangents;
@@ -68,6 +69,12 @@ pub const decal = @import("mesh/decal.zig");
 pub const DecalOptions = decal.DecalOptions;
 pub const buildDecalData = decal.buildDecalData;
 pub const createDecal = decal.createDecal;
+pub const DecalProjector = decal.DecalProjector;
+pub const DecalSpawnOptions = decal.DecalSpawnOptions;
+pub const DecalInstance = decal.DecalInstance;
+pub const DecalManager = decal.DecalManager;
+pub const barycentric = decal.barycentric;
+pub const blendSkinWeights = decal.blendSkinWeights;
 
 test {
     _ = @import("mesh/tests.zig");

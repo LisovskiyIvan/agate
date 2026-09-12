@@ -16,6 +16,12 @@ pub const Vertex = extern struct {
     weights: [4]f32 = .{ 1.0, 0.0, 0.0, 0.0 },
 };
 
+pub const SkinJointWeight = extern struct {
+    joints: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
+    weights: [4]f32 = .{ 1.0, 0.0, 0.0, 0.0 },
+};
+
+
 pub const CullingStrategy = enum {
     frustum,
     always_render,

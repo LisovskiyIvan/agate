@@ -15,6 +15,10 @@ pub const Color3 = extern struct {
         return .{ .r = r, .g = g, .b = b };
     }
 
+    pub fn scale(self: Color3, s: f32) Color3 {
+        return .{ .r = self.r * s, .g = self.g * s, .b = self.b * s };
+    }
+
     pub fn toColor4(self: Color3, a: f32) Color4 {
         return Color4.new(self.r, self.g, self.b, a);
     }

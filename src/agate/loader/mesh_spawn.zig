@@ -11,6 +11,7 @@ const BoundingBox = math.BoundingBox;
 const Scene = @import("../scene.zig").Scene;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
+const SkinJointWeight = @import("../mesh.zig").types.SkinJointWeight;
 const MorphTarget = @import("../mesh.zig").MorphTarget;
 const MAX_MORPH_TARGETS = @import("../mesh.zig").MAX_MORPH_TARGETS;
 const computeTangents = @import("../mesh.zig").computeTangents;
@@ -428,6 +429,17 @@ pub fn parsePrimitive(
     }
     mesh_obj.cpu_positions = cpu_positions;
     mesh_obj.cpu_indices = cpu_indices;
+
+    if (skeleton != null or joints_accessor != null) {
+        const cpu_skin = try scene.allocator.alloc(SkinJointWeight, vert_count);
+        for (vertices, 0..) |v, i| {
+            cpu_skin[i] = .{
+                .joints = v.joints,
+                .weights = v.weights,
+            };
+        }
+        mesh_obj.cpu_skin = cpu_skin;
+    }
 
     return mesh_obj;
 }

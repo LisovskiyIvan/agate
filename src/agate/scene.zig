@@ -60,6 +60,9 @@ const SpotLightOptions = lights.SpotLightOptions;
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
 const InstancedMesh = @import("mesh.zig").InstancedMesh;
+const decal_mod = @import("mesh/decal.zig");
+pub const DecalManager = decal_mod.DecalManager;
+pub const DecalProjector = decal_mod.DecalProjector;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
 const Material = @import("material.zig").Material;
@@ -189,6 +192,9 @@ pub const Scene = struct {
 
     // 2D & 3D UI Canvas
     ui_canvas: ?UICanvas = null,
+
+    // Dynamic Decal Manager
+    decal_manager: ?decal_mod.DecalManager = null,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     // Transparent meshes (material alpha_mode == .blend), sorted strictly
@@ -405,6 +411,51 @@ pub const Scene = struct {
         mat.* = PBRMaterial.init(name);
         try self.pbr_materials.append(self.allocator, mat);
         return mat;
+    }
+
+    pub fn destroyPBRMaterial(self: *Scene, mat: *PBRMaterial) void {
+        for (self.pbr_materials.items, 0..) |m, i| {
+            if (m == mat) {
+                _ = self.pbr_materials.swapRemove(i);
+                break;
+            }
+        }
+        self.allocator.destroy(mat);
+    }
+
+    pub fn removeMesh(self: *Scene, mesh: *Mesh) bool {
+        for (self.meshes.items, 0..) |m, i| {
+            if (m == mesh) {
+                _ = self.meshes.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn destroyMesh(self: *Scene, mesh: *Mesh) void {
+        _ = self.removeMesh(mesh);
+        for (self.outline_meshes.items, 0..) |m, i| {
+            if (m == mesh) {
+                _ = self.outline_meshes.swapRemove(i);
+                break;
+            }
+        }
+        mesh.deinit(self.allocator);
+        self.allocator.destroy(mesh);
+    }
+
+    pub fn getOrCreateDecalManager(self: *Scene, max_decals: usize) *decal_mod.DecalManager {
+        if (self.decal_manager == null) {
+            self.decal_manager = decal_mod.DecalManager.init(self, max_decals);
+        }
+        return &self.decal_manager.?;
+    }
+
+    pub fn updateDecals(self: *Scene, dt: f32) void {
+        if (self.decal_manager) |*dm| {
+            dm.update(dt);
+        }
     }
 
     pub fn createParticleSystem(self: *Scene, name: []const u8, capacity: usize) !*particles.ParticleSystem {
@@ -1242,6 +1293,11 @@ pub const Scene = struct {
     }
 
     pub fn deinit(self: *Scene) void {
+        if (self.decal_manager) |*dm| {
+            dm.deinit();
+            self.decal_manager = null;
+        }
+
         for (self.meshes.items) |m| {
             m.deinit(self.allocator);
             self.allocator.destroy(m);

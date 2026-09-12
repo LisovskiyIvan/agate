@@ -30,6 +30,14 @@ const pickOrthogonal = mesh_mod.pickOrthogonal;
 const resolveFrameSeed = mesh_mod.resolveFrameSeed;
 const buildDecalData = mesh_mod.buildDecalData;
 const DecalOptions = mesh_mod.DecalOptions;
+const barycentric = mesh_mod.barycentric;
+const blendSkinWeights = mesh_mod.blendSkinWeights;
+const DecalProjector = mesh_mod.DecalProjector;
+const DecalManager = mesh_mod.DecalManager;
+const DecalSpawnOptions = mesh_mod.DecalSpawnOptions;
+const SkinJointWeight = mesh_mod.SkinJointWeight;
+const Scene = @import("../scene.zig").Scene;
+const PBRMaterial = @import("../material.zig").PBRMaterial;
 
 test "Mesh attachToBone world matrix computation" {
     const ally = std.testing.allocator;
@@ -1012,5 +1020,201 @@ test "Mesh decal depth bias anti-z-fighting properties" {
 
     try std.testing.expect(dummy_mesh.is_decal);
     try std.testing.expect(!dummy_mesh.cast_shadows);
+}
+
+test "Mesh decal barycentric coordinates" {
+    const a = Vec3.new(0.0, 0.0, 0.0);
+    const b = Vec3.new(1.0, 0.0, 0.0);
+    const c = Vec3.new(0.0, 1.0, 0.0);
+
+    // At vertex A
+    const bary_a = barycentric(a, a, b, c);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bary_a[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_a[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_a[2], 1e-4);
+
+    // At vertex B
+    const bary_b = barycentric(b, a, b, c);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_b[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bary_b[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_b[2], 1e-4);
+
+    // Midpoint of AB
+    const mid_ab = Vec3.new(0.5, 0.0, 0.0);
+    const bary_ab = barycentric(mid_ab, a, b, c);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bary_ab[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bary_ab[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_ab[2], 1e-4);
+
+    // Triangle centroid
+    const centroid = Vec3.new(1.0 / 3.0, 1.0 / 3.0, 0.0);
+    const bary_c = barycentric(centroid, a, b, c);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[2], 1e-4);
+}
+
+test "Mesh decal blend skin weights" {
+    // Identical joints
+    const s0 = SkinJointWeight{ .joints = .{ 2, 5, 0, 0 }, .weights = .{ 0.8, 0.2, 0, 0 } };
+    const s1 = SkinJointWeight{ .joints = .{ 2, 5, 0, 0 }, .weights = .{ 0.4, 0.6, 0, 0 } };
+    const s2 = SkinJointWeight{ .joints = .{ 2, 5, 0, 0 }, .weights = .{ 0.6, 0.4, 0, 0 } };
+
+    const blended = blendSkinWeights(.{ 0.5, 0.5, 0.0 }, s0, s1, s2);
+    try std.testing.expectEqual(s0.joints, blended.joints);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), blended.weights[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), blended.weights[1], 1e-4);
+
+    // Different joints
+    const d0 = SkinJointWeight{ .joints = .{ 1, 0, 0, 0 }, .weights = .{ 1.0, 0, 0, 0 } };
+    const d1 = SkinJointWeight{ .joints = .{ 3, 0, 0, 0 }, .weights = .{ 1.0, 0, 0, 0 } };
+    const d2 = SkinJointWeight{ .joints = .{ 4, 0, 0, 0 }, .weights = .{ 1.0, 0, 0, 0 } };
+
+    const blend_diff = blendSkinWeights(.{ 0.5, 0.5, 0.0 }, d0, d1, d2);
+    const sum_w = blend_diff.weights[0] + blend_diff.weights[1] + blend_diff.weights[2] + blend_diff.weights[3];
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum_w, 1e-4);
+    // Should have joints 1 and 3 with ~0.5 weight each
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blend_diff.weights[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blend_diff.weights[1], 1e-4);
+}
+
+test "Mesh decal projector multi-mesh projection" {
+    const ally = std.testing.allocator;
+
+    // Mesh 1: Floor at y = 0
+    var floor_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
+    defer floor_data.deinit(ally);
+    var floor_mesh = Mesh{
+        .name = "floor",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .rotation = Vec3.new(90.0, 0.0, 0.0), // Rotate plane flat onto XZ
+    };
+    defer floor_mesh.deinit(ally);
+    try floor_mesh.retainCpuGeometryU32(ally, floor_data.vertices, floor_data.indices);
+
+    // Mesh 2: Wall at z = 2
+    var wall_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
+    defer wall_data.deinit(ally);
+    var wall_mesh = Mesh{
+        .name = "wall",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 2.0, 2.0),
+    };
+    defer wall_mesh.deinit(ally);
+    try wall_mesh.retainCpuGeometryU32(ally, wall_data.vertices, wall_data.indices);
+
+    const projector = DecalProjector{
+        .position = Vec3.new(0.0, 0.2, 1.8),
+        .normal = Vec3.new(0.0, -0.5, 0.866).normalize(),
+        .size = Vec3.new(1.5, 1.5, 1.5),
+        .cull_backfaces = false,
+    };
+
+    const meshes = [_]*const Mesh{ &floor_mesh, &wall_mesh };
+    var multi_data = try projector.buildMultiMeshDecalData(ally, &meshes);
+    defer multi_data.deinit(ally);
+
+    try std.testing.expect(multi_data.vertices.len > 0);
+    try std.testing.expect(multi_data.indices.len > 0);
+    try std.testing.expect(multi_data.indices.len % 3 == 0);
+}
+
+test "Mesh decal skinned mesh projection" {
+    const ally = std.testing.allocator;
+
+    var plane_data = try buildPlaneData(ally, .{ .width = 2.0, .height = 2.0 });
+    defer plane_data.deinit(ally);
+
+    // Mock skeleton with 2 bones
+    var skel = try Skeleton.init(ally, 2);
+    defer skel.deinit();
+    skel.update();
+
+    var skinned_mesh = Mesh{
+        .name = "skinned_char",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .skeleton = skel,
+    };
+    defer skinned_mesh.deinit(ally);
+    try skinned_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+
+    // Assign bone 1 with 100% influence to all vertices
+    const skin_weights = try ally.alloc(SkinJointWeight, plane_data.vertices.len);
+    defer ally.free(skin_weights);
+    for (skin_weights) |*s| {
+        s.* = .{ .joints = .{ 1.0, 0.0, 0.0, 0.0 }, .weights = .{ 1.0, 0.0, 0.0, 0.0 } };
+    }
+    skinned_mesh.cpu_skin = try ally.dupe(SkinJointWeight, skin_weights);
+
+    const opts = DecalOptions{
+        .position = Vec3.new(0.0, 0.0, 0.0),
+        .normal = Vec3.new(0.0, 0.0, 1.0),
+        .size = Vec3.new(1.0, 1.0, 1.0),
+    };
+
+    var decal_data = try buildDecalData(ally, &skinned_mesh, opts);
+    defer decal_data.deinit(ally);
+
+    try std.testing.expect(decal_data.vertices.len > 0);
+    // Skinned decal vertices must preserve the skin joints and weights!
+    for (decal_data.vertices) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.joints[0], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.weights[0], 1e-4);
+    }
+}
+
+test "Mesh decal manager lifecycle and fade" {
+    const ally = std.testing.allocator;
+
+    var mock_scene: Scene = undefined;
+    mock_scene.allocator = ally;
+    mock_scene.meshes = .empty;
+    mock_scene.pbr_materials = .empty;
+    mock_scene.outline_meshes = .empty;
+
+    var mgr = DecalManager.init(&mock_scene, 2);
+    defer mgr.deinit();
+
+    // Create dummy mesh and dummy material to simulate active decals
+    const m1 = try ally.create(Mesh);
+    m1.* = Mesh{ .name = "d1", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    try mock_scene.meshes.append(ally, m1);
+
+    const mat1 = try ally.create(PBRMaterial);
+    mat1.* = PBRMaterial.init("m1");
+    try mock_scene.pbr_materials.append(ally, mat1);
+
+    try mgr.instances.append(ally, .{
+        .mesh = m1,
+        .material = mat1,
+        .base_color = math.Color3.white,
+        .lifetime = 2.0,
+        .fade_duration = 1.0,
+        .elapsed = 0.0,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), mgr.instances.items.len);
+
+    // Advance time before lifetime
+    mgr.update(1.0);
+    try std.testing.expectEqual(@as(usize, 1), mgr.instances.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mat1.albedo_color.r, 1e-4);
+
+    // Advance time into fade duration (elapsed = 2.5, lifetime = 2.0, fade = 1.0 -> factor = 0.5)
+    mgr.update(1.5);
+    try std.testing.expectEqual(@as(usize, 1), mgr.instances.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mat1.albedo_color.r, 1e-2);
+
+    // Advance time past expiration (elapsed = 3.5 > 3.0)
+    mgr.update(1.0);
+    try std.testing.expectEqual(@as(usize, 0), mgr.instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mock_scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mock_scene.pbr_materials.items.len);
 }
 
