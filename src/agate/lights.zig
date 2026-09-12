@@ -1,6 +1,7 @@
 const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
+const Mat4 = math.Mat4;
 const Color3 = math.Color3;
 
 pub const HemisphericLightOptions = struct {
@@ -89,6 +90,10 @@ pub const SpotLightOptions = struct {
     range: f32 = 15.0,
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
+    cast_shadows: bool = false,
+    shadow_bias: f32 = 0.002,
+    shadow_normal_bias: f32 = 0.005,
+    shadow_near: f32 = 0.1,
 };
 
 pub const SpotLight = struct {
@@ -103,6 +108,10 @@ pub const SpotLight = struct {
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
     is_enabled: bool = true,
+    cast_shadows: bool = false,
+    shadow_bias: f32 = 0.002,
+    shadow_normal_bias: f32 = 0.005,
+    shadow_near: f32 = 0.1,
 
     pub fn init(name: []const u8, options: SpotLightOptions) SpotLight {
         return .{
@@ -114,7 +123,25 @@ pub const SpotLight = struct {
             .range = options.range,
             .inner_angle_deg = options.inner_angle_deg,
             .outer_angle_deg = options.outer_angle_deg,
+            .cast_shadows = options.cast_shadows,
+            .shadow_bias = options.shadow_bias,
+            .shadow_normal_bias = options.shadow_normal_bias,
+            .shadow_near = options.shadow_near,
         };
+    }
+
+    /// Computes the light view-projection matrix for shadow map rendering.
+    pub fn getShadowViewProj(self: SpotLight) Mat4 {
+        const eye = self.position;
+        const dir = if (self.direction.lengthSq() > 1e-6) self.direction.normalize() else Vec3.new(0, -1, 0);
+        const target = eye.add(dir);
+        const up = if (@abs(dir.y) > 0.99) Vec3.new(0, 0, 1) else Vec3.up;
+        const view = Mat4.lookAt(eye, target, up);
+        const fov_deg = std.math.clamp(self.outer_angle_deg * 2.0, 1.0, 175.0);
+        const near = @max(self.shadow_near, 0.05);
+        const far = @max(self.range, near + 0.1);
+        const proj = Mat4.perspective(fov_deg, 1.0, near, far);
+        return Mat4.mul(proj, view);
     }
 };
 
@@ -183,4 +210,33 @@ test "resolveSunDirection with zero-length direction is safe" {
     try std.testing.expect(std.math.isFinite(dir.y));
     try std.testing.expect(std.math.isFinite(dir.z));
     try std.testing.expectApproxEqAbs(dir.y, 1.0, 1e-6);
+}
+
+test "SpotLight.getShadowViewProj transforms points in front of spotlight" {
+    const spot = SpotLight.init("spot", .{
+        .position = Vec3.new(0, 10, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 20.0,
+        .inner_angle_deg = 20.0,
+        .outer_angle_deg = 45.0,
+        .cast_shadows = true,
+    });
+    const vp = spot.getShadowViewProj();
+    // A point at (0, 0, 0) is 10 units directly in front of the spotlight along -Y.
+    const p_world = Vec3.new(0, 0, 0);
+    const p_clip_x = vp.m[0] * p_world.x + vp.m[4] * p_world.y + vp.m[8] * p_world.z + vp.m[12];
+    const p_clip_y = vp.m[1] * p_world.x + vp.m[5] * p_world.y + vp.m[9] * p_world.z + vp.m[13];
+    const p_clip_z = vp.m[2] * p_world.x + vp.m[6] * p_world.y + vp.m[10] * p_world.z + vp.m[14];
+    const p_clip_w = vp.m[3] * p_world.x + vp.m[7] * p_world.y + vp.m[11] * p_world.z + vp.m[15];
+
+    try std.testing.expect(p_clip_w > 0.0);
+    const ndc_x = p_clip_x / p_clip_w;
+    const ndc_y = p_clip_y / p_clip_w;
+    const ndc_z = p_clip_z / p_clip_w;
+
+    // Center of cone maps to (0, 0) in XY NDC
+    try std.testing.expectApproxEqAbs(ndc_x, 0.0, 1e-4);
+    try std.testing.expectApproxEqAbs(ndc_y, 0.0, 1e-4);
+    // Depth is within [0, 1]
+    try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
 }

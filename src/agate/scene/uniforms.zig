@@ -20,6 +20,8 @@ pub const FrameContext = struct {
     spot_dir_inner: [2][4]f32,
     spot_color_outer: [2][4]f32,
     spot_intensity: [2][4]f32,
+    spot_view_proj: [2]Mat4,
+    spot_shadow_params: [2][4]f32,
 };
 
 // Fragment uniforms shared by the standard, PBR and instanced shaders:
@@ -42,6 +44,8 @@ pub const FrameUniforms = struct {
     spot_dir_inner: [2][4]f32,
     spot_color_outer: [2][4]f32,
     spot_intensity: [2][4]f32,
+    spot_view_proj: [2]Mat4,
+    spot_shadow_params: [2][4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -106,6 +110,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: FrameContext) FrameUniforms 
         .spot_dir_inner = ctx.spot_dir_inner,
         .spot_color_outer = ctx.spot_color_outer,
         .spot_intensity = ctx.spot_intensity,
+        .spot_view_proj = ctx.spot_view_proj,
+        .spot_shadow_params = ctx.spot_shadow_params,
     };
 }
 

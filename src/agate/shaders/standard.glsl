@@ -52,6 +52,8 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_dir_inner[2];
     vec4 spot_color_outer[2];
     vec4 spot_intensity[2];
+    mat4 spot_view_proj[2];
+    vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
     // APPENDED LAST: existing offsets above must not shift for old bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
 };
@@ -60,6 +62,7 @@ layout(binding = 0) uniform texture2D diffuse_tex;
 layout(binding = 1) uniform texture2D shadow_tex;
 @image_sample_type shadow_depth_tex unfilterable_float
 layout(binding = 2) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
+layout(binding = 3) uniform texture2D spot_shadow_tex;
 layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
 @sampler_type depth_smp nonfiltering
@@ -230,6 +233,40 @@ float calculateShadow(vec3 world_pos, vec3 N, vec3 L, out vec3 debug_color) {
     return (1.0 - lit) * shadow_params.y;
 }
 
+float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
+    if (spot_shadow_params[spot_idx].x < 0.5) return 0.0;
+    if (shadow_params.y <= 0.001) return 0.0;
+
+    float cos_theta = max(dot(N, L), 0.0);
+    float depth_bias = max(spot_shadow_params[spot_idx].y * (1.0 - cos_theta), spot_shadow_params[spot_idx].y * 0.2);
+    vec3 normal_offset = N * (spot_shadow_params[spot_idx].z * (1.0 - cos_theta));
+
+    vec4 lpos = spot_view_proj[spot_idx] * vec4(world_pos + normal_offset, 1.0);
+    #if !SOKOL_GLSL
+        lpos.y = -lpos.y;
+    #endif
+
+    vec3 proj = lpos.xyz / lpos.w;
+    if (proj.z > 1.0 || proj.z < 0.0) return 0.0;
+
+    vec2 local_uv = (proj.xy + 1.0) * 0.5;
+    if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) return 0.0;
+
+    vec2 clamped_uv = clamp(local_uv, 0.002, 0.998);
+    vec2 atlas_uv = vec2(clamped_uv.x * 0.5 + float(spot_idx) * 0.5, clamped_uv.y);
+    float depth = proj.z - depth_bias;
+
+    vec2 texel = vec2(1.0 / 1024.0, 1.0 / 512.0);
+    float lit = 0.0;
+    lit += texture(sampler2DShadow(spot_shadow_tex, shadow_smp), vec3(atlas_uv + vec2(-texel.x, -texel.y), depth));
+    lit += texture(sampler2DShadow(spot_shadow_tex, shadow_smp), vec3(atlas_uv + vec2( texel.x, -texel.y), depth));
+    lit += texture(sampler2DShadow(spot_shadow_tex, shadow_smp), vec3(atlas_uv + vec2(-texel.x,  texel.y), depth));
+    lit += texture(sampler2DShadow(spot_shadow_tex, shadow_smp), vec3(atlas_uv + vec2( texel.x,  texel.y), depth));
+    lit *= 0.25;
+
+    return (1.0 - lit) * shadow_params.y;
+}
+
 void main() {
     vec3 N = normalize(v_normal);
 
@@ -297,7 +334,8 @@ void main() {
             float cone_att = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 0.0001), 0.0, 1.0);
             cone_att *= cone_att;
 
-            diffuse += s_col * (s_NdotL * s_int * dist_att * cone_att);
+            float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
+            diffuse += s_col * (s_NdotL * s_int * dist_att * cone_att * (1.0 - spot_shadow));
         }
     }
 

@@ -13,6 +13,14 @@ const Vertex = mesh_mod.Vertex;
 // sokol-shdc --defines only supports valueless macros, so the value cannot be
 // injected from the build and lives in these two places by convention.
 pub const SHADOW_ATLAS_SIZE: u32 = 2048;
+pub const SPOT_SHADOW_MAP_WIDTH: u32 = 1024;
+pub const SPOT_SHADOW_MAP_HEIGHT: u32 = 512;
+pub const SPOT_SHADOW_RES: i32 = 512;
+
+pub const SpotShadowRenderInfo = struct {
+    spot_index: usize,
+    view_proj: Mat4,
+};
 
 pub const ShadowPass = struct {
     image: sg.Image,
@@ -22,6 +30,10 @@ pub const ShadowPass = struct {
     /// Nonfiltering sampler for raw depth reads (PCSS blocker search); the
     /// comparison sampler above is only valid for depth2d shadow lookups.
     depth_sampler: sg.Sampler,
+    spot_image: sg.Image,
+    spot_attachment_view: sg.View,
+    spot_texture_view: sg.View,
+    spot_needs_clear: bool = true,
     pipeline_u16: sg.Pipeline,
     pipeline_u32: sg.Pipeline,
     inst_pipeline_u16: sg.Pipeline,
@@ -182,6 +194,20 @@ pub const ShadowPass = struct {
         shadow_skinned_desc.index_type = .UINT32;
         const skinned_pip_u32 = sg.makePipeline(shadow_skinned_desc);
 
+        const spot_depth_img = sg.makeImage(.{
+            .usage = .{ .depth_stencil_attachment = true },
+            .pixel_format = .DEPTH,
+            .width = SPOT_SHADOW_MAP_WIDTH,
+            .height = SPOT_SHADOW_MAP_HEIGHT,
+            .sample_count = 1,
+        });
+        const spot_att_view = sg.makeView(.{
+            .depth_stencil_attachment = .{ .image = spot_depth_img },
+        });
+        const spot_tex_view = sg.makeView(.{
+            .texture = .{ .image = spot_depth_img },
+        });
+
         return .{
             .allocator = allocator,
             .binned_meshes = .empty,
@@ -190,6 +216,10 @@ pub const ShadowPass = struct {
             .texture_view = tex_view,
             .sampler = smp,
             .depth_sampler = raw_depth_smp,
+            .spot_image = spot_depth_img,
+            .spot_attachment_view = spot_att_view,
+            .spot_texture_view = spot_tex_view,
+            .spot_needs_clear = true,
             .pipeline_u16 = pip_u16,
             .pipeline_u32 = pip_u32,
             .inst_pipeline_u16 = inst_pip_u16,
@@ -199,11 +229,98 @@ pub const ShadowPass = struct {
         };
     }
 
+    fn renderBuckets(
+        self: *ShadowPass,
+        light_view_proj: Mat4,
+        frustum: math.Frustum,
+        counts: [6]usize,
+        offsets: [6]usize,
+        frame_id: u64,
+        cascade_idx: ?usize,
+        last_pipeline_id: *u32,
+        draw_calls: *u32,
+    ) void {
+        for (bucket_order) |bucket| {
+            const b_idx = @intFromEnum(bucket);
+            const count = counts[b_idx];
+            if (count == 0) continue;
+
+            const pip_id = self.pipelineFor(bucket);
+            if (pip_id == 0) continue;
+
+            const bucket_meshes = self.binned_meshes.items[offsets[b_idx] .. offsets[b_idx] + count];
+            for (bucket_meshes) |mesh| {
+                if (mesh.instances.items.len > 0) {
+                    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+
+                    if (pip_id != last_pipeline_id.*) {
+                        sg.applyPipeline(.{ .id = pip_id });
+                        last_pipeline_id.* = pip_id;
+                    }
+
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.vertex_buffers[1] = mesh.instance_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const inst_vs = shadow_shd.VsInstParams{
+                        .light_view_proj = light_view_proj,
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
+                    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                    draw_calls.* += 1;
+                } else {
+                    if (!mesh.is_visible) continue;
+                    // Scene.render() already cached world matrix + AABB this frame;
+                    // fall back to direct computation if it didn't (stale or external call).
+                    const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
+                    if (!frustum.intersectsAABB(aabb_w)) continue;
+
+                    // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
+                    if (cascade_idx) |c_idx| {
+                        const ext = aabb_w.extents();
+                        const max_dim = @max(ext.x, @max(ext.y, ext.z));
+                        if (c_idx == 2 and max_dim < 0.35) continue;
+                        if (c_idx == 3 and max_dim < 0.75) continue;
+                    }
+
+                    if (pip_id != last_pipeline_id.*) {
+                        sg.applyPipeline(.{ .id = pip_id });
+                        last_pipeline_id.* = pip_id;
+                    }
+
+                    var bind = sg.Bindings{};
+                    bind.vertex_buffers[0] = mesh.vertex_buffer;
+                    bind.index_buffer = mesh.index_buffer;
+                    sg.applyBindings(bind);
+
+                    const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
+                    const shadow_vs = shadow_shd.VsParams{
+                        .mvp = Mat4.mul(light_view_proj, model),
+                    };
+                    sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
+
+                    if (mesh.skeleton) |skel| {
+                        const vs_skin = shadow_shd.VsSkin{
+                            .bones = skel.skin_matrices,
+                        };
+                        sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
+                    }
+
+                    sg.draw(0, mesh.index_count, 1);
+                    draw_calls.* += 1;
+                }
+            }
+        }
+    }
+
     pub fn render(
         self: *ShadowPass,
         meshes: []const *Mesh,
         frame_id: u64,
         cascades: [4]Mat4,
+        spot_shadows: []const SpotShadowRenderInfo,
     ) u32 {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
@@ -260,83 +377,38 @@ pub const ShadowPass = struct {
             sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
             const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
-
-            // Grouped by pipeline: intra-cascade draw order changes, but the
-            // depth-only output is order-independent (no color, no blending).
-            for (bucket_order) |bucket| {
-                const b_idx = @intFromEnum(bucket);
-                const count = counts[b_idx];
-                if (count == 0) continue;
-
-                const pip_id = self.pipelineFor(bucket);
-                if (pip_id == 0) continue;
-
-                const bucket_meshes = self.binned_meshes.items[offsets[b_idx] .. offsets[b_idx] + count];
-                for (bucket_meshes) |mesh| {
-                    if (mesh.instances.items.len > 0) {
-                        if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
-
-                        if (pip_id != last_pipeline_id) {
-                            sg.applyPipeline(.{ .id = pip_id });
-                            last_pipeline_id = pip_id;
-                        }
-
-                        var bind = sg.Bindings{};
-                        bind.vertex_buffers[0] = mesh.vertex_buffer;
-                        bind.vertex_buffers[1] = mesh.instance_buffer;
-                        bind.index_buffer = mesh.index_buffer;
-                        sg.applyBindings(bind);
-
-                        const inst_vs = shadow_shd.VsInstParams{
-                            .light_view_proj = light_view_proj,
-                        };
-                        sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
-                        sg.draw(0, mesh.index_count, mesh.visible_instance_count);
-                        draw_calls += 1;
-                    } else {
-                        if (!mesh.is_visible) continue;
-                        // Scene.render() already cached world matrix + AABB this frame;
-                        // fall back to direct computation if it didn't (stale or external call).
-                        const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
-                        if (!c_frustum.intersectsAABB(aabb_w)) continue;
-
-                        // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
-                        const ext = aabb_w.extents();
-                        const max_dim = @max(ext.x, @max(ext.y, ext.z));
-                        if (c_idx == 2 and max_dim < 0.35) continue;
-                        if (c_idx == 3 and max_dim < 0.75) continue;
-
-                        if (pip_id != last_pipeline_id) {
-                            sg.applyPipeline(.{ .id = pip_id });
-                            last_pipeline_id = pip_id;
-                        }
-
-                        var bind = sg.Bindings{};
-                        bind.vertex_buffers[0] = mesh.vertex_buffer;
-                        bind.index_buffer = mesh.index_buffer;
-                        sg.applyBindings(bind);
-
-                        const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
-                        const shadow_vs = shadow_shd.VsParams{
-                            .mvp = Mat4.mul(light_view_proj, model),
-                        };
-                        sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
-
-                        if (mesh.skeleton) |skel| {
-                            const vs_skin = shadow_shd.VsSkin{
-                                .bones = skel.skin_matrices,
-                            };
-                            sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
-                        }
-
-                        sg.draw(0, mesh.index_count, 1);
-                        draw_calls += 1;
-                    }
-                }
-            }
+            self.renderBuckets(light_view_proj, c_frustum, counts, offsets, frame_id, c_idx, &last_pipeline_id, &draw_calls);
         }
 
         sg.endPass();
+
+        // 2. Spot light shadow pass
+        if (spot_shadows.len > 0 or self.spot_needs_clear) {
+            var spot_action = sg.PassAction{};
+            spot_action.depth = .{
+                .load_action = .CLEAR,
+                .clear_value = 1.0,
+                .store_action = .STORE,
+            };
+            var spot_pass = sg.Pass{
+                .action = spot_action,
+            };
+            spot_pass.attachments.depth_stencil = self.spot_attachment_view;
+            sg.beginPass(spot_pass);
+
+            for (spot_shadows) |spot_info| {
+                const vx: i32 = if (spot_info.spot_index == 0) 0 else SPOT_SHADOW_RES;
+                sg.applyViewport(vx, 0, SPOT_SHADOW_RES, SPOT_SHADOW_RES, false);
+                sg.applyScissorRect(vx, 0, SPOT_SHADOW_RES, SPOT_SHADOW_RES, false);
+
+                const spot_frustum = math.Frustum.fromViewProjection(spot_info.view_proj);
+                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, frame_id, null, &last_pipeline_id, &draw_calls);
+            }
+
+            sg.endPass();
+            self.spot_needs_clear = false;
+        }
+
         return draw_calls;
     }
 
@@ -350,8 +422,11 @@ pub const ShadowPass = struct {
         sg.destroyPipeline(self.skinned_pipeline_u32);
         sg.destroyView(self.attachment_view);
         sg.destroyView(self.texture_view);
+        sg.destroyView(self.spot_attachment_view);
+        sg.destroyView(self.spot_texture_view);
         sg.destroySampler(self.sampler);
         sg.destroySampler(self.depth_sampler);
         sg.destroyImage(self.image);
+        sg.destroyImage(self.spot_image);
     }
 };

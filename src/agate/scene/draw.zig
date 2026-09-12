@@ -64,6 +64,7 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
 
         bind.views[pbr_shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
+        bind.views[pbr_shd.VIEW_spot_shadow_tex] = scene.shadow_pass.spot_texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
@@ -110,6 +111,8 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
             .spot_dir_inner = f.spot_dir_inner,
             .spot_color_outer = f.spot_color_outer,
             .spot_intensity = f.spot_intensity,
+            .spot_view_proj = f.spot_view_proj,
+            .spot_shadow_params = f.spot_shadow_params,
         };
         if (mesh.skeleton != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -125,6 +128,7 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
 
         bind.views[shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
         bind.views[shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
+        bind.views[shd.VIEW_spot_shadow_tex] = scene.shadow_pass.spot_texture_view;
         bind.samplers[shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
         bind.samplers[shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
@@ -155,6 +159,8 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
             .spot_dir_inner = f.spot_dir_inner,
             .spot_color_outer = f.spot_color_outer,
             .spot_intensity = f.spot_intensity,
+            .spot_view_proj = f.spot_view_proj,
+            .spot_shadow_params = f.spot_shadow_params,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -201,6 +207,7 @@ pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, curre
 
     bind.views[inst_shd.VIEW_shadow_tex] = scene.shadow_pass.texture_view;
     bind.views[inst_shd.VIEW_shadow_depth_tex] = scene.shadow_pass.texture_view;
+    bind.views[inst_shd.VIEW_spot_shadow_tex] = scene.shadow_pass.spot_texture_view;
     bind.samplers[inst_shd.SMP_shadow_smp] = scene.shadow_pass.sampler;
     bind.samplers[inst_shd.SMP_depth_smp] = scene.shadow_pass.depth_sampler;
 
@@ -230,6 +237,8 @@ pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, curre
         .spot_dir_inner = f.spot_dir_inner,
         .spot_color_outer = f.spot_color_outer,
         .spot_intensity = f.spot_intensity,
+        .spot_view_proj = f.spot_view_proj,
+        .spot_shadow_params = f.spot_shadow_params,
     };
     sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
 

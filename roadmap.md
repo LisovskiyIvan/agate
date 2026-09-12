@@ -29,7 +29,7 @@
 | Инстансинг | InstancedMesh + GPU-пайплайн | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, объединяющая union Camera | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
-| Тени | 4-каскадный CSM для солнца, 16× Poisson PCF | 🟡 |
+| Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) | ✅ |
 | Материал Standard | Diffuse-цвет/текстура | ✅ |
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL | 🟡 |
 | OpenPBR, clearcoat, sheen, transmission | — | ❌ |
@@ -231,7 +231,16 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Система LOD | `mesh/types.zig`, `mesh/mesh.zig`, `scene.zig`, `passes/shadow_pass.zig` | Сортированные дистанционные уровни детальности (`LODLevel`), автоматический выбор меша по расстоянию до камеры, поддержка дистанционного куллинга (`mesh: null`), исключение `is_lod_child` из теневых пассов и рейкаста, синхронизация трансформов и материалов | ✅ |
 | Система декалей | `mesh/decal.zig`, `mesh/builder.zig`, `mesh.zig`, `root.zig` | Проектор ориентированного куба (OBB) на целевой меш произвольной формы, алгоритм отсечения многоугольников Sutherland-Hodgman по 6 плоскостям, depth bias против z-fighting, backface culling, вычисление UV, касательных (tangents) и нормалей | ✅ |
 
-Проверки: 315 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений.
+### Волна 9: Перспективные тени прожекторов (SpotLight Shadows) (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| Математика и проекции SpotLight | `lights.zig` | Перспективная матрица отсечения (`fov = 2 * outer_angle_deg`, `aspect = 1.0`, `near/far = range`), lookAt-матрица вида, настраиваемые `shadow_bias` и `shadow_normal_bias` | ✅ |
+| Атлас теней прожекторов | `passes/shadow_pass.zig` | Depth-атлас 1024×512 (2 тайла 512×512 для Spot 0 и Spot 1), рендеринг геометрии через переиспользуемые бакеты пайплайнов (Standard, Instanced, Skinned), пропуск при отсутствии источников | ✅ |
+| Шейдерная фильтрация PCF | `shaders/{standard,pbr,instanced,skinned_pbr}.glsl` | Вычисление перспективных координат в атласе, 4-tap PCF фильтрация с защитой от выхода за границы тайлов, нормальный сдвиг поверхности (normal bias) против теневых артефактов (shadow acne) | ✅ |
+| Интеграция и интерактивное демо | `scene.zig`, `scene/draw.zig`, `sandbox_scene.zig`, `sandbox_ui.zig` | Динамический качающийся прожектор над сценой с персонажами (Fox и CesiumMan), отбрасывание честных теней от анимированных скелетных моделей на пол, UI-кнопка переключения `SpotShd: ON/OFF` | ✅ |
+
+Проверки: 316 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений.
 
 
 ---

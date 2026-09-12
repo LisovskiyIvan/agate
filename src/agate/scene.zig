@@ -1023,11 +1023,64 @@ pub const Scene = struct {
             }
         }
 
+        // Pack Point & Spot Lights. Directions are normalized once here so the
+        // fragment shaders can use them raw (no per-pixel normalize()).
+        // The directional light overrides the legacy hemispheric sun here;
+        // ambient stays hemispheric ground_color below.
+        var light_counts = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
+        var point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
+        var spot_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_dir_inner = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_color_outer = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_intensity = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+        var spot_view_proj = [_]Mat4{Mat4.identity} ** 2;
+        var spot_shadow_params = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
+
+        // Pick the most relevant lights for the camera before packing; the
+        // shader uniform arrays only hold 4 point + 2 spot slots.
+        var point_buf: [4]*PointLight = undefined;
+        const num_point = scene_light_selection.selectPoint(self.point_lights.items, eye, &point_buf);
+        for (point_buf[0..num_point], 0..) |pl, i| {
+            point_pos_range[i] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
+            point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
+        }
+        light_counts[0] = @floatFromInt(num_point);
+
+        var spot_buf: [2]*SpotLight = undefined;
+        const num_spot = scene_light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
+        var spot_shadows_buf: [2]passes.SpotShadowRenderInfo = undefined;
+        var num_spot_shadows: usize = 0;
+
+        for (spot_buf[0..num_spot], 0..) |sl, i| {
+            const dir = sl.direction.normalize();
+            const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
+            const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
+            spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
+            spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
+            spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
+            spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
+
+            if (sl.cast_shadows and self.enable_shadows and sl.is_enabled) {
+                const svp = sl.getShadowViewProj();
+                spot_view_proj[i] = svp;
+                spot_shadow_params[i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
+                spot_shadows_buf[num_spot_shadows] = .{
+                    .spot_index = i,
+                    .view_proj = svp,
+                };
+                num_spot_shadows += 1;
+            } else {
+                spot_shadow_params[i] = .{ 0.0, 0.0, 0.0, 0.0 };
+            }
+        }
+        light_counts[1] = @floatFromInt(num_spot);
+
         // ==============================================
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (self.enable_shadows) {
-            const shadow_draws = self.shadow_pass.render(self.meshes.items, self.frame_id, cascades);
+            const shadow_draws = self.shadow_pass.render(self.meshes.items, self.frame_id, cascades, spot_shadows_buf[0..num_spot_shadows]);
             self.stats.draw_calls += shadow_draws;
         }
 
@@ -1081,41 +1134,6 @@ pub const Scene = struct {
         std.mem.sort(RenderMeshItem, self.render_queue.items, {}, sortRenderItems);
         std.mem.sort(RenderMeshItem, self.transparent_queue.items, {}, sortTransparentBackToFront);
 
-        // Pack Point & Spot Lights. Directions are normalized once here so the
-        // fragment shaders can use them raw (no per-pixel normalize()).
-        // The directional light overrides the legacy hemispheric sun here;
-        // ambient stays hemispheric ground_color below.
-        var light_counts = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
-        var point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
-        var point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4;
-        var spot_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
-        var spot_dir_inner = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
-        var spot_color_outer = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
-        var spot_intensity = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2;
-
-        // Pick the most relevant lights for the camera before packing; the
-        // shader uniform arrays only hold 4 point + 2 spot slots.
-        var point_buf: [4]*PointLight = undefined;
-        const num_point = scene_light_selection.selectPoint(self.point_lights.items, eye, &point_buf);
-        for (point_buf[0..num_point], 0..) |pl, i| {
-            point_pos_range[i] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
-            point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
-        }
-        light_counts[0] = @floatFromInt(num_point);
-
-        var spot_buf: [2]*SpotLight = undefined;
-        const num_spot = scene_light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
-        for (spot_buf[0..num_spot], 0..) |sl, i| {
-            const dir = sl.direction.normalize();
-            const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
-            const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
-            spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
-            spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
-            spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-            spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
-        }
-        light_counts[1] = @floatFromInt(num_spot);
-
         const frame_ctx = FrameContext{
             .view_proj = view_proj,
             .eye = eye,
@@ -1130,6 +1148,8 @@ pub const Scene = struct {
             .spot_dir_inner = spot_dir_inner,
             .spot_color_outer = spot_color_outer,
             .spot_intensity = spot_intensity,
+            .spot_view_proj = spot_view_proj,
+            .spot_shadow_params = spot_shadow_params,
         };
 
         var current_pipeline_id: u32 = 0;
