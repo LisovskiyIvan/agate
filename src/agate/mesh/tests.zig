@@ -1218,3 +1218,144 @@ test "Mesh decal manager lifecycle and fade" {
     try std.testing.expectEqual(@as(usize, 0), mock_scene.pbr_materials.items.len);
 }
 
+test "buildPolygonData: flat 2D triangle, quad, and concave polygon" {
+    const ally = std.testing.allocator;
+
+    // 1. Triangle
+    const tri_shape = [_]Vec2{
+        Vec2.new(0.0, 0.0),
+        Vec2.new(2.0, 0.0),
+        Vec2.new(1.0, 2.0),
+    };
+    var tri_data = try mesh_mod.buildPolygonData(ally, .{
+        .shape = &tri_shape,
+        .depth = 0.0,
+        .plane = .xz,
+    });
+    defer tri_data.deinit(ally);
+    try std.testing.expectEqual(@as(usize, 3), tri_data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 3), tri_data.indices.len);
+
+    // 2. Convex quad
+    const quad_shape = [_]Vec2{
+        Vec2.new(0.0, 0.0),
+        Vec2.new(4.0, 0.0),
+        Vec2.new(4.0, 4.0),
+        Vec2.new(0.0, 4.0),
+    };
+    var quad_data = try mesh_mod.buildPolygonData(ally, .{
+        .shape = &quad_shape,
+        .depth = 0.0,
+        .plane = .xz,
+    });
+    defer quad_data.deinit(ally);
+    try std.testing.expectEqual(@as(usize, 4), quad_data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 6), quad_data.indices.len);
+
+    // 3. Concave L-shape
+    const l_shape = [_]Vec2{
+        Vec2.new(0.0, 0.0),
+        Vec2.new(4.0, 0.0),
+        Vec2.new(4.0, 2.0),
+        Vec2.new(2.0, 2.0),
+        Vec2.new(2.0, 4.0),
+        Vec2.new(0.0, 4.0),
+    };
+    var l_data = try mesh_mod.buildPolygonData(ally, .{
+        .shape = &l_shape,
+        .depth = 0.0,
+        .plane = .xz,
+    });
+    defer l_data.deinit(ally);
+    try std.testing.expectEqual(@as(usize, 6), l_data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 12), l_data.indices.len); // (6 - 2) * 3 = 12
+}
+
+test "buildPolygonData: polygon with hole" {
+    const ally = std.testing.allocator;
+
+    // Outer square: [0, 10] x [0, 10]
+    const outer = [_]Vec2{
+        Vec2.new(0.0, 0.0),
+        Vec2.new(10.0, 0.0),
+        Vec2.new(10.0, 10.0),
+        Vec2.new(0.0, 10.0),
+    };
+    // Inner hole: [3, 7] x [3, 7]
+    const hole = [_]Vec2{
+        Vec2.new(3.0, 3.0),
+        Vec2.new(7.0, 3.0),
+        Vec2.new(7.0, 7.0),
+        Vec2.new(3.0, 7.0),
+    };
+    const holes = [_][]const Vec2{&hole};
+
+    var data = try mesh_mod.buildPolygonData(ally, .{
+        .shape = &outer,
+        .holes = &holes,
+        .depth = 0.0,
+        .plane = .xz,
+    });
+    defer data.deinit(ally);
+
+    // Merged contour has 4 (outer) + 4 (hole) + 2 (bridge) = 10 vertices
+    try std.testing.expectEqual(@as(usize, 10), data.vertices.len);
+    // (10 - 2) * 3 = 24 indices (8 triangles)
+    try std.testing.expectEqual(@as(usize, 24), data.indices.len);
+}
+
+test "buildPolygonData: extruded 3D polygon with depth" {
+    const ally = std.testing.allocator;
+
+    const quad = [_]Vec2{
+        Vec2.new(0.0, 0.0),
+        Vec2.new(5.0, 0.0),
+        Vec2.new(5.0, 5.0),
+        Vec2.new(0.0, 5.0),
+    };
+
+    var data = try mesh_mod.buildPolygonData(ally, .{
+        .shape = &quad,
+        .depth = 3.0,
+        .plane = .xz,
+    });
+    defer data.deinit(ally);
+
+    // 2 caps * 4 vertices = 8; 4 side walls * 4 vertices = 16. Total = 24 vertices.
+    try std.testing.expectEqual(@as(usize, 24), data.vertices.len);
+    // 2 caps * 6 indices = 12; 4 side walls * 6 indices = 24. Total = 36 indices.
+    try std.testing.expectEqual(@as(usize, 36), data.indices.len);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.bounds.min.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), data.bounds.max.y, 1e-4);
+}
+
+test "TrailMesh: node recording, aging, and ribbon generation" {
+    const ally = std.testing.allocator;
+
+    const TrailMesh = mesh_mod.TrailMesh;
+    const TrailNode = mesh_mod.TrailNode;
+
+    var nodes: std.ArrayListUnmanaged(TrailNode) = .empty;
+    defer nodes.deinit(ally);
+
+    try nodes.append(ally, .{ .position = Vec3.new(0, 0, 0), .age = 0.0 });
+    try nodes.append(ally, .{ .position = Vec3.new(1, 0, 0), .age = 0.5 });
+    try nodes.append(ally, .{ .position = Vec3.new(2, 0, 0), .age = 1.0 });
+
+    try std.testing.expectEqual(@as(usize, 3), nodes.items.len);
+
+    // Simulate aging by dt = 0.6 with lifetime = 1.2
+    for (nodes.items) |*n| n.age += 0.6;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), nodes.items[0].age, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), nodes.items[1].age, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.6), nodes.items[2].age, 1e-4);
+
+    // Prune expired (> 1.2)
+    while (nodes.items.len > 0 and nodes.items[nodes.items.len - 1].age > 1.2) {
+        _ = nodes.pop();
+    }
+    try std.testing.expectEqual(@as(usize, 2), nodes.items.len);
+
+    _ = TrailMesh;
+}

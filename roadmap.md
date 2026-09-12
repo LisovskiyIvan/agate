@@ -42,9 +42,9 @@
 | GPU-симуляция, sub-emitters, flow maps | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
 | События анимаций, ретаргетинг | — | ❌ |
-| Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines | 🟡 |
+| Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines, Polygon, TrailMesh | ✅ |
 | LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
-| Polygon / CSG / Упрощение мешей | — | ❌ |
+| CSG / Упрощение мешей | — | ❌ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
 | Draco/meshopt/KTX2, экспорт | — | ❌ |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
@@ -250,6 +250,17 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Sandbox-витрина | `sandbox_showcase.zig`, `sandbox_ui.zig` | Интерактивная витрина «Instanced PBR Grid» (64 медных/золотых сферы 8×8 с плавной синусоидальной волной над темным пьедесталом, честные CSM-тени и IBL-блики в 1 draw call), плавающий HUD-бейдж и отображение в debug-панели | ✅ |
 
 Проверки: 320 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без ошибок и предупреждений, 340+ FPS в runtime.
+
+### Волна 11: Polygon Builder с отверстиями и динамические шлейфы TrailMesh (12.09.2026)
+
+| Фича | Файлы | Описание | Статус |
+|---|---|---|---|
+| Polygon Builder с Ear-Clipping | `mesh/builders.zig`, `mesh/builder.zig`, `mesh.zig`, `root.zig` | Генератор 2D и 3D экструдированных полигонов (`PolygonOptions`, `PolygonPlane`, `PolygonSideOrientation`): автоматическая нормализация обхода (CCW контур, CW отверстия), лучевой разрез и сшивка произвольного числа отверстий (Hole Bridging), устойчивая ear-clipping триангуляция, генерация боковых граней призмы с расчетными тангентами и нормалями | ✅ |
+| Динамический TrailMesh | `mesh/trail.zig`, `mesh/builder.zig`, `mesh.zig`, `root.zig` | Шлейфы движения за объектами (`TrailMesh`, `TrailOptions`): кольцевой буфер узлов с фильтрацией минимальной дистанции и старением/затуханием, billboard-ориентация квад-стрипа лицом к камере, сужение ширины (taper), интерполяция цвета вершины по времени жизни, динамическое GPU-обновление вершинного и индексного буферов (`sg.updateBuffer`) | ✅ |
+| Интеграция со сценой | `scene.zig`, `root.zig` | Регистрация и управление шлейфами сцены (`Scene.createTrailMesh`, `Scene.updateTrails(dt)`), автоматическое освобождение GPU-ресурсов в `Scene.deinit`, экспорт фасадов в `root.zig` | ✅ |
+| Sandbox-витрина и тесты | `sandbox_showcase.zig`, `sandbox_scene.zig`, `sandbox_ui.zig`, `mesh/tests.zig` | Золотая 3D 8-конечная звезда с квадратным отверстием на подиуме, спаренные шлейфы за спорткаром (`car_trail_left`, `car_trail_right`) и огненный шлейф за летающей сферой света (`orb_trail`), 6 новых unit-тестов для выпуклых/вогнутых полигонов, отверстий, экструзии и старения шлейфов | ✅ |
+
+Проверки: 326 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >350 FPS в runtime.
 
 
 ---

@@ -21,7 +21,6 @@ pub const SkinJointWeight = extern struct {
     weights: [4]f32 = .{ 1.0, 0.0, 0.0, 0.0 },
 };
 
-
 pub const CullingStrategy = enum {
     frustum,
     always_render,

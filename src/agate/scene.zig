@@ -63,6 +63,9 @@ const Vertex = @import("mesh.zig").Vertex;
 const InstancedMesh = @import("mesh.zig").InstancedMesh;
 const decal_mod = @import("mesh/decal.zig");
 pub const DecalManager = decal_mod.DecalManager;
+const trail_mod = @import("mesh/trail.zig");
+pub const TrailMesh = trail_mod.TrailMesh;
+pub const TrailOptions = trail_mod.TrailOptions;
 pub const DecalProjector = decal_mod.DecalProjector;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
@@ -200,6 +203,9 @@ pub const Scene = struct {
 
     // Dynamic Decal Manager
     decal_manager: ?decal_mod.DecalManager = null,
+
+    // Dynamic Trail Meshes
+    trail_meshes: std.ArrayListUnmanaged(*trail_mod.TrailMesh) = .empty,
 
     render_queue: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     // Transparent meshes (material alpha_mode == .blend), sorted strictly
@@ -485,6 +491,19 @@ pub const Scene = struct {
     pub fn updateParticles(self: *Scene, dt: f32) void {
         for (self.particle_systems.items) |ps| {
             ps.update(dt);
+        }
+    }
+
+    pub fn createTrailMesh(self: *Scene, name: []const u8, options: trail_mod.TrailOptions) !*trail_mod.TrailMesh {
+        const tm = try trail_mod.TrailMesh.init(self, name, options);
+        try self.trail_meshes.append(self.allocator, tm);
+        return tm;
+    }
+
+    pub fn updateTrails(self: *Scene, dt: f32) void {
+        const cam_pos = if (self.active_camera) |cam| cam.getPosition() else Vec3.zero;
+        for (self.trail_meshes.items) |tm| {
+            tm.update(dt, cam_pos);
         }
     }
 
@@ -1390,6 +1409,12 @@ pub const Scene = struct {
         self.transparent_instanced_queue.deinit(self.allocator);
         self.instance_matrices.deinit(self.allocator);
         self.debug_lines.deinit(self.allocator);
+
+        for (self.trail_meshes.items) |tm| {
+            tm.deinit();
+            self.allocator.destroy(tm);
+        }
+        self.trail_meshes.deinit(self.allocator);
 
         self.default_white_texture.deinit();
         self.default_normal_texture.deinit();

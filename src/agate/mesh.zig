@@ -36,6 +36,9 @@ pub const PlaneOptions = builders.PlaneOptions;
 pub const TubeOptions = builders.TubeOptions;
 pub const LinesOptions = builders.LinesOptions;
 pub const ExtrudeOptions = builders.ExtrudeOptions;
+pub const PolygonSideOrientation = builders.PolygonSideOrientation;
+pub const PolygonPlane = builders.PolygonPlane;
+pub const PolygonOptions = builders.PolygonOptions;
 
 pub const TrigEntry = builders.TrigEntry;
 pub const trigEntry = builders.trigEntry;
@@ -61,6 +64,7 @@ pub const buildLatheData = builders.buildLatheData;
 pub const buildTubeData = builders.buildTubeData;
 pub const buildLinesData = builders.buildLinesData;
 pub const buildExtrudeData = builders.buildExtrudeData;
+pub const buildPolygonData = builders.buildPolygonData;
 
 pub const builder = @import("mesh/builder.zig");
 pub const MeshBuilder = builder.MeshBuilder;
@@ -75,6 +79,11 @@ pub const DecalInstance = decal.DecalInstance;
 pub const DecalManager = decal.DecalManager;
 pub const barycentric = decal.barycentric;
 pub const blendSkinWeights = decal.blendSkinWeights;
+
+pub const trail = @import("mesh/trail.zig");
+pub const TrailOptions = trail.TrailOptions;
+pub const TrailMesh = trail.TrailMesh;
+pub const TrailNode = trail.TrailNode;
 
 test {
     _ = @import("mesh/tests.zig");

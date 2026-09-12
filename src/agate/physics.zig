@@ -62,7 +62,6 @@ const rope_mod = @import("physics/rope.zig");
 pub const Rope = rope_mod.Rope;
 pub const RopeOptions = rope_mod.RopeOptions;
 
-
 pub const PhysicsWorld = struct {
     allocator: std.mem.Allocator,
     gravity: Vec3 = Vec3.new(0.0, -9.81, 0.0),
