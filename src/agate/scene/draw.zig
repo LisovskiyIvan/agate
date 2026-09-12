@@ -167,6 +167,7 @@ pub fn drawRegularItem(scene: anytype, item: anytype, ctx: FrameContext, current
     }
 
     sg.draw(0, mesh.index_count, 1);
+    scene.stats.main_draw_calls += 1;
     scene.stats.draw_calls += 1;
     scene.stats.triangles += mesh.index_count / 3;
 }
@@ -312,6 +313,7 @@ pub fn drawInstancedMesh(scene: anytype, mesh: anytype, ctx: FrameContext, curre
     }
 
     sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+    scene.stats.main_draw_calls += 1;
     scene.stats.draw_calls += 1;
     scene.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
 }

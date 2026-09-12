@@ -89,6 +89,9 @@ pub const SceneStats = struct {
     occluders_count: u32 = 0,
     occluder_triangles: u32 = 0,
     draw_calls: u32 = 0,
+    shadow_draw_calls: u32 = 0,
+    main_draw_calls: u32 = 0,
+    post_draw_calls: u32 = 0,
     triangles: u32 = 0,
     pipeline_switches: u32 = 0,
 };
@@ -1237,6 +1240,7 @@ pub const Scene = struct {
         // ==============================================
         if (self.enable_shadows) {
             const shadow_draws = self.shadow_pass.render(self.meshes.items, self.frame_id, cascades, spot_shadows_buf[0..num_spot_shadows]);
+            self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;
         }
 
@@ -1337,7 +1341,9 @@ pub const Scene = struct {
         // depth-tested, no depth write, drawn after all surface geometry.
         if (self.outline_enabled and self.outline_meshes.items.len > 0) {
             self.outline_pass.render(view_proj, eye, self.outline_meshes.items, self.outline_color, self.outline_width_px);
-            self.stats.draw_calls += @intCast(self.outline_meshes.items.len);
+            const outline_count: u32 = @intCast(self.outline_meshes.items.len);
+            self.stats.main_draw_calls += outline_count;
+            self.stats.draw_calls += outline_count;
         }
 
         // Physics debug lines (3D pass, depth-tested, no depth write).
@@ -1351,6 +1357,7 @@ pub const Scene = struct {
                     }
                     if (self.debug_pass) |*dp| {
                         dp.render(view_proj, self.debug_lines.items);
+                        self.stats.main_draw_calls += 1;
                         self.stats.draw_calls += 1;
                     }
                 }
@@ -1360,6 +1367,7 @@ pub const Scene = struct {
         // Skybox Pass
         if (self.skybox_enabled) {
             self.skybox_pass.render(camera, aspect, self.skybox_texture orelse self.default_cube_texture, self.skybox_exposure);
+            self.stats.main_draw_calls += 1;
             self.stats.draw_calls += 1;
             self.stats.triangles += 12;
         }
@@ -1369,6 +1377,7 @@ pub const Scene = struct {
             self.particle_pass.render(self.particle_systems.items, camera, aspect);
             for (self.particle_systems.items) |ps| {
                 if (ps.active_count > 0) {
+                    self.stats.main_draw_calls += 1;
                     self.stats.draw_calls += 1;
                     self.stats.triangles += 2 * @as(u32, @intCast(ps.active_count));
                 }
@@ -1378,6 +1387,7 @@ pub const Scene = struct {
         if (!self.post_process.enabled) {
             if (self.ui_canvas) |*ui_c| {
                 ui_c.render(sapp.widthf(), sapp.heightf());
+                self.stats.post_draw_calls += 1;
                 self.stats.draw_calls += 1;
             }
         }
@@ -1399,6 +1409,7 @@ pub const Scene = struct {
                 cur_h,
             );
             ssao_view = self.ssao_pass.ssao_blur_tex_view;
+            self.stats.post_draw_calls += 2;
             self.stats.draw_calls += 2;
             self.stats.triangles += 4;
         }
@@ -1418,7 +1429,9 @@ pub const Scene = struct {
                 cur_h,
             );
             const mips = postprocess.clampBloomMips(self.post_process.bloom_pyramid_mips);
-            self.stats.draw_calls += 2 * @as(u32, mips) - 1;
+            const bloom_draws = 2 * @as(u32, mips) - 1;
+            self.stats.post_draw_calls += bloom_draws;
+            self.stats.draw_calls += bloom_draws;
         }
         self.postprocess_pass.setBloomTexture(bloom_view);
 
@@ -1453,12 +1466,14 @@ pub const Scene = struct {
                 camera.getNear(),
                 camera.getFar(),
             );
+            self.stats.post_draw_calls += 1;
             self.stats.draw_calls += 1;
             self.stats.triangles += 2;
 
             // Render 2D UI overlay on top of post-processed swapchain
             if (self.ui_canvas) |*ui_c| {
                 ui_c.render(@floatFromInt(cur_w), @floatFromInt(cur_h));
+                self.stats.post_draw_calls += 1;
                 self.stats.draw_calls += 1;
             }
 
