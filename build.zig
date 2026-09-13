@@ -344,6 +344,18 @@ pub fn build(b: *Build) !void {
     b.step("run", "Run the window").dependOn(&run.step);
     const lib_tests = b.addTest(.{
         .root_module = mod_agate,
+        // Vendored runner (tools/test_runner.zig): stock 0.16.0 fails to
+        // compile ANY fuzz-mode build (`*builtin.StackTrace` vs
+        // `*std.debug.StackTrace` in the -ffuzz-only branch). Same runner
+        // serves both modes: plain `zig build test` runs every fuzz target's
+        // corpus once (smoke pass), while
+        //
+        //     zig build test --fuzz[=limit]
+        //
+        // switches the build into coverage-guided deep fuzzing (-ffuzz) —
+        // e.g. `--fuzz=10K` caps iterations; without a limit it runs until
+        // interrupted. Findings are summarized in a "FUZZING REPORT".
+        .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .server },
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run library tests");
