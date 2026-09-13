@@ -77,6 +77,10 @@ pub const PBRMaterial = struct {
     albedo_texture: ?Texture = null,
 
     normal_texture: ?Texture = null,
+    /// Tangent-space normal map xy scale (glTF normalTexture.scale). 1.0
+    /// keeps the map as authored; 0.0 flattens it to the geometric normal.
+    /// Scaled in the PBR fragment shaders (uniform normal_scale).
+    normal_scale: f32 = 1.0,
     metallic_roughness_texture: ?Texture = null,
     emissive_texture: ?Texture = null,
     emissive_color: Color3 = Color3.black,

@@ -20,7 +20,7 @@ layout(binding = 1) uniform vs_skin {
 // Disabled draws bind a 1x1 zero texture with morph_params.x = 0 and zero
 // weights. Slots stay unique across both stages (sokol requires a shared
 // slot pool): UB 3 (vs_params 0, vs_skin 1, fs_params 2), texture 9
-// (fs uses 0..8), sampler 4 (fs uses 0..3).
+// (fs uses 0..8), sampler 5 (fs uses 0..3 plus data_smp at 5).
 layout(binding = 3) uniform vs_morph {
     vec4 morph_weights0; // target weights 0..3
     vec4 morph_weights1; // target weights 4..7
@@ -146,6 +146,7 @@ layout(binding = 2) uniform fs_params {
     vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
     // APPENDED LAST: existing offsets above must not shift for old bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
+    float normal_scale; // normal map xy scale (glTF normalTexture.scale)
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -158,7 +159,11 @@ layout(binding = 5) uniform texture2D shadow_tex;
 layout(binding = 7) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
 layout(binding = 6) uniform textureCube env_tex;
 layout(binding = 8) uniform texture2D spot_shadow_tex;
-layout(binding = 0) uniform sampler smp;
+layout(binding = 0) uniform sampler smp; // color slot: albedo (its own sampler)
+// Data slots (normal / metallic-roughness / occlusion / emissive) sample
+// through data_smp so their textures keep their OWN filter/wrap settings
+// instead of inheriting the albedo sampler.
+layout(binding = 5) uniform sampler data_smp;
 layout(binding = 1) uniform sampler shadow_smp;
 layout(binding = 2) uniform sampler env_smp;
 @sampler_type depth_smp nonfiltering
@@ -418,12 +423,14 @@ void main() {
     if (albedo_rgba.a < alpha_cutoff) discard;
     vec3 albedo = albedo_rgba.rgb;
 
-    vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, smp), v_uv);
+    vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, data_smp), v_uv);
     float metallic = clamp(pbr_factors.x * mr_sample.b, 0.0, 1.0);
     float roughness = clamp(pbr_factors.y * mr_sample.g, 0.04, 1.0);
 
-    // Normal mapping with TBN matrix
-    vec3 map_n = texture(sampler2D(normal_tex, smp), v_uv).xyz * 2.0 - 1.0;
+    // Normal mapping with TBN matrix; xy scaled by normal_scale (z stays
+    // unsigned so the TBN projection keeps the hemisphere).
+    vec3 map_n = texture(sampler2D(normal_tex, data_smp), v_uv).xyz * 2.0 - 1.0;
+    map_n.xy *= normal_scale;
     mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
     vec3 N = normalize(TBN * map_n);
 
@@ -530,7 +537,7 @@ void main() {
     }
 
     // Ambient Occlusion
-    float ao_sample = texture(sampler2D(occlusion_tex, smp), v_uv).r;
+    float ao_sample = texture(sampler2D(occlusion_tex, data_smp), v_uv).r;
     float ao = 1.0 + pbr_factors.z * (ao_sample - 1.0);
 
     // Image-Based Lighting (IBL)
@@ -555,7 +562,7 @@ void main() {
 
     vec3 ambient = ambient_color.rgb * ambient_color.a * albedo * ao;
 
-    vec4 emissive_sample = texture(sampler2D(emissive_tex, smp), v_uv);
+    vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), v_uv);
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;

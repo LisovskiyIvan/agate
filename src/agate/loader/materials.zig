@@ -1,4 +1,6 @@
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 
 const c = @import("../c.zig").c;
 const math = @import("math");
@@ -15,13 +17,16 @@ const DecodeJob = struct {
     bytes: ?[]const u8 = null,
     /// External URI path, owned by the job.
     path: ?[]const u8 = null,
+    /// sRGB -> linear conversion before mip generation (color-slot images).
+    srgb: bool = false,
     out: ?Texture.RawTexture = null,
 
     fn run(self: *DecodeJob) void {
+        const opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = self.srgb };
         if (self.bytes) |b| {
-            self.out = Texture.decodeMemory(self.allocator, b, true) catch null;
+            self.out = Texture.decodeMemory(self.allocator, b, opts) catch null;
         } else if (self.path) |p| {
-            self.out = Texture.decodeFile(self.allocator, p, true) catch null;
+            self.out = Texture.decodeFile(self.allocator, p, opts) catch null;
         }
     }
 };
@@ -39,6 +44,37 @@ const DecodeQueue = struct {
     }
 };
 
+/// Marks images referenced by COLOR texture slots (base color / emissive) so
+/// the parallel decoder runs sRGB -> linear before mip generation. Data slots
+/// (normal / metallic-roughness / occlusion) stay linear.
+pub fn colorSlotImageFlags(allocator: std.mem.Allocator, gltf: *c.cgltf_data) ![]bool {
+    const flags = try allocator.alloc(bool, gltf.images_count);
+    @memset(flags, false);
+    for (0..gltf.materials_count) |i| {
+        const mat = &gltf.materials[i];
+        if (mat.has_pbr_metallic_roughness != 0) {
+            markColorSlotImage(gltf, mat.pbr_metallic_roughness.base_color_texture, flags);
+        }
+        markColorSlotImage(gltf, mat.emissive_texture, flags);
+    }
+    return flags;
+}
+
+fn markColorSlotImage(gltf: *c.cgltf_data, view: c.cgltf_texture_view, flags: []bool) void {
+    const tex = view.texture orelse return;
+    const img = tex.*.image orelse return;
+    if (imageIndexFor(gltf, img)) |idx| {
+        if (idx < flags.len) flags[idx] = true;
+    }
+}
+
+fn imageIndexFor(gltf: *c.cgltf_data, img: [*c]const c.cgltf_image) ?usize {
+    for (0..gltf.images_count) |im_i| {
+        if (&gltf.images[im_i] == img) return im_i;
+    }
+    return null;
+}
+
 /// Decodes every GLB/GLTF image on worker threads. This never fails the
 /// load: images that could not be decoded stay null and loadTextureFromView
 /// falls back to the synchronous path.
@@ -48,10 +84,15 @@ pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Te
     const jobs = scene.allocator.alloc(DecodeJob, gltf.images_count) catch return;
     defer scene.allocator.free(jobs);
 
+    // Per-image color-slot scan drives load-time sRGB -> linear.
+    const srgb_flags: ?[]bool = colorSlotImageFlags(scene.allocator, gltf) catch null;
+    defer if (srgb_flags) |flags| scene.allocator.free(flags);
+
     var job_count: usize = 0;
     for (0..gltf.images_count) |i| {
         const img = &gltf.images[i];
         var job = DecodeJob{ .allocator = scene.allocator, .image_index = i };
+        if (srgb_flags) |flags| job.srgb = flags[i];
 
         if (img.buffer_view) |bv| {
             if (bv.*.buffer != null and bv.*.buffer.*.data != null) {
@@ -102,6 +143,43 @@ pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Te
     }
 }
 
+/// Maps a glTF sampler descriptor's raw enum values onto Texture.Options.
+/// wrap_s/wrap_t (33071 clamp, 33648 mirrored, 10497 repeat), mag_filter and
+/// min_filter (9728 nearest, 9729 linear; mipmapped variants 9984..9987 also
+/// split their mip half into Options.mip_filter). Unknown values keep the
+/// engine defaults (glTF spec allows omitting sampler fields).
+pub fn applyGltfSampler(wrap_s: c_int, wrap_t: c_int, mag_filter: c_int, min_filter: c_int, opts: *Texture.Options) void {
+    switch (wrap_s) {
+        33071 => opts.wrap_u = .CLAMP_TO_EDGE,
+        33648 => opts.wrap_u = .MIRRORED_REPEAT,
+        10497 => opts.wrap_u = .REPEAT,
+        else => {},
+    }
+    switch (wrap_t) {
+        33071 => opts.wrap_v = .CLAMP_TO_EDGE,
+        33648 => opts.wrap_v = .MIRRORED_REPEAT,
+        10497 => opts.wrap_v = .REPEAT,
+        else => {},
+    }
+    switch (mag_filter) {
+        9728 => opts.mag_filter = .NEAREST,
+        9729 => opts.mag_filter = .LINEAR,
+        else => {},
+    }
+    switch (min_filter) {
+        // min half
+        9728, 9984, 9986 => opts.min_filter = .NEAREST,
+        9729, 9985, 9987 => opts.min_filter = .LINEAR,
+        else => {},
+    }
+    switch (min_filter) {
+        // mip half: *_MIPMAP_NEAREST variants select nearest mips
+        9984, 9985 => opts.mip_filter = .NEAREST,
+        9986, 9987 => opts.mip_filter = .LINEAR,
+        else => {},
+    }
+}
+
 pub fn loadTextureFromView(
     scene: *Scene,
     gltf: *c.cgltf_data,
@@ -109,6 +187,7 @@ pub fn loadTextureFromView(
     decoded: []?Texture.RawTexture,
     view: [*c]const c.cgltf_texture_view,
     base_dir: ?[]const u8,
+    srgb_to_linear: bool,
 ) ?Texture {
     if (view == null) return null;
     if (view.*.texture == null) return null;
@@ -116,13 +195,7 @@ pub fn loadTextureFromView(
     if (tex.*.image == null) return null;
     const img = tex.*.image.?;
 
-    var img_idx: ?usize = null;
-    for (0..gltf.images_count) |im_i| {
-        if (&gltf.images[im_i] == img) {
-            img_idx = im_i;
-            break;
-        }
-    }
+    const img_idx = imageIndexFor(gltf, img);
 
     if (img_idx) |idx| {
         if (image_cache[idx]) |cached| {
@@ -132,29 +205,9 @@ pub fn loadTextureFromView(
 
     var tex_options: Texture.Options = .{};
     if (tex.*.sampler) |smp| {
-        switch (smp.*.wrap_s) {
-            33071 => tex_options.wrap_u = .CLAMP_TO_EDGE,
-            33648 => tex_options.wrap_u = .MIRRORED_REPEAT,
-            10497 => tex_options.wrap_u = .REPEAT,
-            else => {},
-        }
-        switch (smp.*.wrap_t) {
-            33071 => tex_options.wrap_v = .CLAMP_TO_EDGE,
-            33648 => tex_options.wrap_v = .MIRRORED_REPEAT,
-            10497 => tex_options.wrap_v = .REPEAT,
-            else => {},
-        }
-        switch (smp.*.mag_filter) {
-            9728 => tex_options.mag_filter = .NEAREST,
-            9729 => tex_options.mag_filter = .LINEAR,
-            else => {},
-        }
-        switch (smp.*.min_filter) {
-            9728, 9984, 9986 => tex_options.min_filter = .NEAREST,
-            9729, 9985, 9987 => tex_options.min_filter = .LINEAR,
-            else => {},
-        }
+        applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &tex_options);
     }
+    tex_options.srgb_to_linear = srgb_to_linear;
 
     // Pre-decoded on worker threads: only the GPU upload runs here.
     if (img_idx) |idx| {
@@ -236,15 +289,21 @@ pub fn loadMaterials(
             pbr_mat.metallic = pbr.metallic_factor;
             pbr_mat.roughness = pbr.roughness_factor;
 
-            pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir);
-            pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir);
+            // Color slots load sRGB -> linear (glTF: textures are sRGB,
+            // factors linear); data slots stay linear.
+            pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true);
+            pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false);
         }
 
-        pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir);
-        pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir);
+        pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false);
+        if (src_mat.normal_texture.texture != null) {
+            // cgltf defaults texture-view scale to 1.0 (cgltf.h parse).
+            pbr_mat.normal_scale = src_mat.normal_texture.scale;
+        }
+        pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false);
         pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
 
-        pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir);
+        pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true);
         if (pbr_mat.emissive_texture != null and
             src_mat.emissive_factor[0] == 0.0 and
             src_mat.emissive_factor[1] == 0.0 and
@@ -343,4 +402,127 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     try std.testing.expect(out[2].?.pbr.alpha_mode == .blend);
     try std.testing.expectEqual(@as(f32, 0.5), out[2].?.pbr.alpha_cutoff);
     try std.testing.expect(!out[2].?.pbr.double_sided);
+}
+
+test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {
+    // glTF 2.0 spec enums: 10497 REPEAT, 33071 CLAMP_TO_EDGE, 33648
+    // MIRRORED_REPEAT; 9728 NEAREST, 9729 LINEAR; 9984 NEAREST_MIPMAP_NEAREST,
+    // 9985 LINEAR_MIPMAP_NEAREST, 9986 NEAREST_MIPMAP_LINEAR,
+    // 9987 LINEAR_MIPMAP_LINEAR.
+
+    // Spec defaults (sampler omitted): wrap REPEAT/REPEAT, mag LINEAR,
+    // min LINEAR_MIPMAP_LINEAR -> min LINEAR + mip LINEAR.
+    var opts: Texture.Options = .{};
+    applyGltfSampler(10497, 10497, 9729, 9987, &opts);
+    try std.testing.expectEqual(sg.Wrap.REPEAT, opts.wrap_u);
+    try std.testing.expectEqual(sg.Wrap.REPEAT, opts.wrap_v);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.mag_filter);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.min_filter);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.mip_filter);
+
+    // Clamp + mirrored wrap, nearest mag.
+    opts = .{};
+    applyGltfSampler(33071, 33648, 9728, 9728, &opts);
+    try std.testing.expectEqual(sg.Wrap.CLAMP_TO_EDGE, opts.wrap_u);
+    try std.testing.expectEqual(sg.Wrap.MIRRORED_REPEAT, opts.wrap_v);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.mag_filter);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.min_filter);
+    // Mip half of a bare NEAREST (no explicit mip mode) keeps the engine
+    // default: glTF leaves mip selection to min_filter only when mipmapped
+    // variants are used.
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.mip_filter);
+
+    // The mip half: *_MIPMAP_NEAREST variants select NEAREST mips for both
+    // min halves; *_MIPMAP_LINEAR variants select LINEAR mips.
+    opts = .{};
+    applyGltfSampler(10497, 10497, 9728, 9984, &opts);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.min_filter);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.mip_filter);
+
+    opts = .{};
+    applyGltfSampler(10497, 10497, 9729, 9985, &opts);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.min_filter);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.mip_filter);
+
+    opts = .{};
+    applyGltfSampler(10497, 10497, 9728, 9986, &opts);
+    try std.testing.expectEqual(sg.Filter.NEAREST, opts.min_filter);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.mip_filter);
+
+    // Unknown values (spec: fields are optional) keep engine defaults.
+    opts = .{};
+    applyGltfSampler(0, 0, 0, 0, &opts);
+    try std.testing.expectEqual(sg.Wrap.REPEAT, opts.wrap_u);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.mag_filter);
+    try std.testing.expectEqual(sg.Filter.LINEAR, opts.min_filter);
+}
+
+test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var images: [1]c.cgltf_image = .{std.mem.zeroes(c.cgltf_image)};
+    var textures: [1]c.cgltf_texture = .{std.mem.zeroes(c.cgltf_texture)};
+    textures[0].image = &images[0];
+
+    var src: [2]c.cgltf_material = .{
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+    };
+    // [0]: no normal texture -> scale must stay the engine default 1.0.
+    // [1]: normal texture present with scale 0.5 -> mapped 1:1.
+    src[1].normal_texture.texture = &textures[0];
+    src[1].normal_texture.scale = 0.5;
+
+    var data: c.cgltf_data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [2]?Material = .{ null, null };
+    // image_cache/decoded are indexed by image (one image here); entries
+    // stay null: the texture has neither buffer view nor URI, so the load
+    // cleanly returns null without touching the GPU.
+    var tex_cache: [1]?Texture = .{null};
+    var raw_cache: [1]?Texture.RawTexture = .{null};
+    try loadMaterials(&scene, &data, null, &out, &tex_cache, &raw_cache);
+
+    try std.testing.expectEqual(@as(f32, 1.0), out[0].?.pbr.normal_scale);
+    try std.testing.expectEqual(@as(f32, 0.5), out[1].?.pbr.normal_scale);
+}
+
+test "colorSlotImageFlags marks albedo/emissive images, not data slots" {
+    const alloc = std.testing.allocator;
+
+    var images: [3]c.cgltf_image = .{
+        std.mem.zeroes(c.cgltf_image),
+        std.mem.zeroes(c.cgltf_image),
+        std.mem.zeroes(c.cgltf_image),
+    };
+    var textures: [3]c.cgltf_texture = .{
+        std.mem.zeroes(c.cgltf_texture),
+        std.mem.zeroes(c.cgltf_texture),
+        std.mem.zeroes(c.cgltf_texture),
+    };
+    textures[0].image = &images[0]; // albedo slot -> color
+    textures[1].image = &images[1]; // normal slot -> data
+    textures[2].image = &images[2]; // emissive slot -> color
+
+    var src: [1]c.cgltf_material = .{std.mem.zeroes(c.cgltf_material)};
+    src[0].has_pbr_metallic_roughness = 1;
+    src[0].pbr_metallic_roughness.base_color_texture.texture = &textures[0];
+    src[0].normal_texture.texture = &textures[1];
+    src[0].emissive_texture.texture = &textures[2];
+
+    var data: c.cgltf_data = std.mem.zeroes(c.cgltf_data);
+    data.images = &images[0];
+    data.images_count = images.len;
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    const flags = try colorSlotImageFlags(alloc, &data);
+    defer alloc.free(flags);
+
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true }, flags);
 }

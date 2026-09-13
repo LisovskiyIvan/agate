@@ -102,9 +102,18 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
         bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
         bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
         bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+        // Data slots sample with their own sampler class: the first present
+        // data texture wins (normal maps care most about wrap/filter);
+        // falls back to the albedo sampler when only a color map exists.
+        const data_sampler_tex = if (pbr_mat) |p|
+            (p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex)
+        else
+            albedo_tex;
+        bind.samplers[pbr_shd.SMP_data_smp] = data_sampler_tex.sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map: a material-level
-        // environment texture (e.g. an HDR probe) overrides the skybox.
+        // environment texture (e.g. an HDR probe) overrides the skybox,
+        // which in turn falls back to default_cube.
         const cube = (if (pbr_mat) |p| p.environment_texture else null) orelse env.sky_texture orelse env.default_cube.*;
         bind.views[pbr_shd.VIEW_env_tex] = cube.view;
         bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
@@ -153,6 +162,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
             .emissive_factor = emissive_col,
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -282,6 +292,9 @@ fn drawShaderMaterialItem(
             bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
             bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
             bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+            // Hook materials have no per-slot data textures; the flat normal
+            // default's sampler keeps the data_smp contract satisfied.
+            bind.samplers[pbr_shd.SMP_data_smp] = env.default_normal.sampler;
             const cube = env.sky_texture orelse env.default_cube.*;
             bind.views[pbr_shd.VIEW_env_tex] = cube.view;
             bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
@@ -307,6 +320,7 @@ fn drawShaderMaterialItem(
                 .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
                 .emissive_factor = .{ 0, 0, 0, 1 },
                 .alpha_cutoff = alpha_cutoff,
+                .normal_scale = 1.0,
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -472,6 +486,13 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext
         bind.views[inst_pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
         bind.views[inst_pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
         bind.samplers[inst_pbr_shd.SMP_smp] = albedo_tex.sampler;
+        // Data-slot sampler: first present data texture wins, mirroring the
+        // regular draw path.
+        const data_sampler_tex = if (pbr_mat) |p|
+            (p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex)
+        else
+            albedo_tex;
+        bind.samplers[inst_pbr_shd.SMP_data_smp] = data_sampler_tex.sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map
         const cube = (if (pbr_mat) |p| p.environment_texture else null) orelse env.sky_texture orelse env.default_cube.*;
@@ -521,6 +542,7 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {

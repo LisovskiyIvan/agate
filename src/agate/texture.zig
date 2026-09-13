@@ -55,6 +55,36 @@ fn boxDownsampleU8(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u3
     }
 }
 
+/// Comptime sRGB -> linear LUT for one u8 channel (IEC 61966-2-1). Round to
+/// nearest: linear byte = trunc(linear_f32 * 255 + 0.5).
+const srgb_to_linear_lut: [256]u8 = blk: {
+    @setEvalBranchQuota(200000);
+    var table: [256]u8 = undefined;
+    for (0..256) |i| {
+        const srgb: f32 = @as(f32, @floatFromInt(i)) / 255.0;
+        const lin = if (srgb <= 0.04045)
+            srgb / 12.92
+        else
+            std.math.pow(f32, (srgb + 0.055) / 1.055, 2.4);
+        table[i] = @intFromFloat(std.math.clamp(lin * 255.0 + 0.5, 0.0, 255.0));
+    }
+    break :blk table;
+};
+
+/// Exact per-byte sRGB -> linear conversion used for LDR color textures.
+pub fn srgbToLinearU8(value: u8) u8 {
+    return srgb_to_linear_lut[value];
+}
+
+/// In-place sRGB -> linear on RGB lanes of an RGBA8 buffer; alpha lanes are
+/// never touched. Runs BEFORE mip generation so the box filter averages in
+/// linear space.
+fn convertSrgbToLinearInPlace(pixels: []u8) void {
+    for (pixels, 0..) |*byte, i| {
+        if (i % 4 != 3) byte.* = srgb_to_linear_lut[byte.*];
+    }
+}
+
 /// Radial particle-dot falloff shared by createDefaultParticleDot32 and
 /// createParticleDot. Takes already-computed center/radius so both callers
 /// keep their exact historic parameters and output is unchanged.
@@ -82,12 +112,49 @@ pub const Texture = struct {
     pub const Options = struct {
         min_filter: sg.Filter = .LINEAR,
         mag_filter: sg.Filter = .LINEAR,
+        /// Mip selection filter used when the texture has a mip chain. Has no
+        /// effect on single-level textures. glTF's mipmapped min_filter
+        /// variants map their mip half here (loader/materials.zig).
+        mip_filter: sg.Filter = .LINEAR,
         wrap_u: sg.Wrap = .REPEAT,
         wrap_v: sg.Wrap = .REPEAT,
+        /// Max anisotropy 1..16 (sokol sg_sampler_desc.max_anisotropy). sokol
+        /// requires LINEAR min/mag/mip filters for anisotropy > 1 and fails
+        /// sampler validation otherwise, so non-LINEAR combinations clamp
+        /// back to 1 here. sokol has no lod bias; lod range defaults to
+        /// 0..FLT_MAX (not exposed).
+        max_anisotropy: u32 = 1,
         /// Signed distance fields must not be box-downsampled: the mip chain
         /// dilutes thin strokes and the shader edge drifts. Disable for fonts.
         mipmaps: bool = true,
+        /// Convert sRGB to linear at load time, BEFORE mip generation (the
+        /// box filter then averages in linear space). Turn ON for LDR color
+        /// textures that feed lighting math (glTF albedo/emissive), keep OFF
+        /// for data textures (normal / metallic-roughness / occlusion: they
+        /// are authored linear) and for GPU-bound views where the raw bytes
+        /// matter (fonts, LUTs, sprites drawn without lighting).
+        srgb_to_linear: bool = false,
     };
+
+    /// Shared sampler creation for LDR 2D textures: applies min/mag/wrap,
+    /// the mip filter (only meaningful with a chain), and the anisotropy
+    /// guard described on Options.max_anisotropy.
+    fn makeSamplerFor(options: Options, num_mip_levels: u32) sg.Sampler {
+        const mip_filter: sg.Filter = if (num_mip_levels > 1) options.mip_filter else .NEAREST;
+        var aniso = options.max_anisotropy;
+        if (aniso > 16) aniso = 16;
+        if (aniso > 1 and (options.min_filter != .LINEAR or options.mag_filter != .LINEAR or mip_filter != .LINEAR)) {
+            aniso = 1;
+        }
+        return sg.makeSampler(.{
+            .min_filter = options.min_filter,
+            .mag_filter = options.mag_filter,
+            .mipmap_filter = mip_filter,
+            .wrap_u = options.wrap_u,
+            .wrap_v = options.wrap_v,
+            .max_anisotropy = aniso,
+        });
+    }
 
     pub fn initRaw(width: u32, height: u32, rgba_pixels: []const u8, options: Options) Texture {
         var img_desc = sg.ImageDesc{
@@ -102,12 +169,7 @@ pub const Texture = struct {
             .texture = .{ .image = img },
         });
 
-        const smp = sg.makeSampler(.{
-            .min_filter = options.min_filter,
-            .mag_filter = options.mag_filter,
-            .wrap_u = options.wrap_u,
-            .wrap_v = options.wrap_v,
-        });
+        const smp = makeSamplerFor(options, 1);
 
         return .{
             .image = img,
@@ -210,13 +272,7 @@ pub const Texture = struct {
         const view = sg.makeView(.{
             .texture = .{ .image = img },
         });
-        const smp = sg.makeSampler(.{
-            .min_filter = options.min_filter,
-            .mag_filter = options.mag_filter,
-            .mipmap_filter = if (raw.num_levels > 1) .LINEAR else .NEAREST,
-            .wrap_u = options.wrap_u,
-            .wrap_v = options.wrap_v,
-        });
+        const smp = makeSamplerFor(options, raw.num_levels);
 
         return .{
             .image = img,
@@ -227,9 +283,16 @@ pub const Texture = struct {
         };
     }
 
+    /// Decode-time switches for the CPU paths (GPU-free, thread-safe).
+    /// srgb_to_linear converts RGB lanes before the mip chain is built.
+    pub const DecodeOptions = struct {
+        gen_mipmaps: bool = true,
+        srgb_to_linear: bool = false,
+    };
+
     /// Decodes an in-memory image (PNG/JPEG/...) to RGBA without touching the
     /// GPU. Thread-safe; pair with `fromRaw`.
-    pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, gen_mipmaps: bool) !RawTexture {
+    pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
         var w: c_int = 0;
         var h: c_int = 0;
         var channels_in_file: c_int = 0;
@@ -250,7 +313,9 @@ pub const Texture = struct {
         const width: u32 = @intCast(w);
         const height: u32 = @intCast(h);
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], gen_mipmaps);
+        // Convert before buildRaw so the box filter averages in linear space.
+        if (opts.srgb_to_linear) convertSrgbToLinearInPlace(data[0..size_bytes]);
+        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
 
         const t2 = sokol.time.now();
         std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
@@ -262,7 +327,7 @@ pub const Texture = struct {
     }
 
     /// File variant of `decodeMemory`. Thread-safe; pair with `fromRaw`.
-    pub fn decodeFile(allocator: std.mem.Allocator, file_path: []const u8, gen_mipmaps: bool) !RawTexture {
+    pub fn decodeFile(allocator: std.mem.Allocator, file_path: []const u8, opts: DecodeOptions) !RawTexture {
         const path_z = try allocator.dupeZ(u8, file_path);
         defer allocator.free(path_z);
 
@@ -279,7 +344,8 @@ pub const Texture = struct {
         const width: u32 = @intCast(w);
         const height: u32 = @intCast(h);
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], gen_mipmaps);
+        if (opts.srgb_to_linear) convertSrgbToLinearInPlace(data[0..size_bytes]);
+        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
 
         const t2 = sokol.time.now();
         std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
@@ -409,13 +475,19 @@ pub const Texture = struct {
     }
 
     pub fn fromMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
-        var raw = try decodeMemory(allocator, bytes, options.mipmaps);
+        var raw = try decodeMemory(allocator, bytes, .{
+            .gen_mipmaps = options.mipmaps,
+            .srgb_to_linear = options.srgb_to_linear,
+        });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
     }
 
     pub fn fromFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
-        var raw = try decodeFile(allocator, file_path, options.mipmaps);
+        var raw = try decodeFile(allocator, file_path, .{
+            .gen_mipmaps = options.mipmaps,
+            .srgb_to_linear = options.srgb_to_linear,
+        });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
     }
@@ -1029,7 +1101,8 @@ pub const CubeTexture = struct {
 
     /// GPU-free half-float cube faces converted from an HDR panorama.
     /// Owns six size*size*4 half-float bit patterns; free with deinit.
-    /// Single mip level only: HDR cubes upload without mipmaps.
+    /// Single mip level: `initRawFacesHdr` builds the f16 chain from this
+    /// level-0 data via `buildRawFacesHdr`.
     pub const RawHdrCube = struct {
         size: u32 = 0,
         faces: [6]?[]u16 = @splat(null),
@@ -1084,33 +1157,119 @@ pub const CubeTexture = struct {
         return raw;
     }
 
-    /// Uploads six half-float RGBA faces as a single-level RGBA16F cube.
-    /// Main thread only. Each face must hold size*size*4 half patterns.
-    /// Linear min/mag, clamp on all axes, no mipmaps, no gamma correction.
-    pub fn initRawFacesHdr(allocator: std.mem.Allocator, size: u32, faces: [6][]const u16) !CubeTexture {
+    /// One RGBA8-style box-filter mip step over RGBA16F (half-float) texels.
+    /// Averages in f32 (decode via halfBitsToFloat, encode via
+    /// floatToHalfBits); dims floor at 1, source coords clamp at edges —
+    /// same contract as `boxDownsampleU8`.
+    fn boxDownsampleF16(src: []const u16, src_w: u32, src_h: u32, dst: []u16, dst_w: u32, dst_h: u32) void {
+        var y: u32 = 0;
+        while (y < dst_h) : (y += 1) {
+            const sy0 = @min(y * 2, src_h - 1);
+            const sy1 = @min(y * 2 + 1, src_h - 1);
+            var x: u32 = 0;
+            while (x < dst_w) : (x += 1) {
+                const sx0 = @min(x * 2, src_w - 1);
+                const sx1 = @min(x * 2 + 1, src_w - 1);
+                const q00 = (sy0 * src_w + sx0) * 4;
+                const q10 = (sy0 * src_w + sx1) * 4;
+                const q01 = (sy1 * src_w + sx0) * 4;
+                const q11 = (sy1 * src_w + sx1) * 4;
+                const o = (y * dst_w + x) * 4;
+                inline for (0..4) |ch| {
+                    const sum = Texture.halfBitsToFloat(src[q00 + ch]) +
+                        Texture.halfBitsToFloat(src[q10 + ch]) +
+                        Texture.halfBitsToFloat(src[q01 + ch]) +
+                        Texture.halfBitsToFloat(src[q11 + ch]);
+                    dst[o + ch] = Texture.floatToHalfBits(sum * 0.25);
+                }
+            }
+        }
+    }
+
+    /// GPU-free f16 mip chain for a cube (six faces concatenated per level,
+    /// face layout identical to the LDR path). Level 0 is a deep copy of
+    /// `faces`; each following level halves the face size via
+    /// `boxDownsampleF16`. Same chain length as the 2D path. Used by
+    /// `initRawFacesHdr` and tests.
+    pub const RawHdrCubeMips = struct {
+        size: u32 = 0,
+        num_levels: u32 = 0,
+        /// levels[m] holds 6 * size_m * size_m * 4 half-float patterns.
+        levels: [16]?[]u16 = @splat(null),
+
+        pub fn deinit(self: *RawHdrCubeMips, allocator: std.mem.Allocator) void {
+            for (self.levels[0..self.num_levels]) |level| {
+                if (level) |buf| allocator.free(buf);
+            }
+            self.* = .{};
+        }
+    };
+
+    pub fn buildRawFacesHdr(allocator: std.mem.Allocator, size: u32, faces: [6][]const u16) !RawHdrCubeMips {
         if (size == 0) return error.InvalidDimensions;
-        const face_pixels = std.math.mul(usize, std.math.mul(usize, size, size) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+        const face_texels = std.math.mul(usize, std.math.mul(usize, size, size) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
         for (faces) |face| {
-            if (face.len != face_pixels) return error.InvalidFaceBufferSize;
+            if (face.len != face_texels) return error.InvalidFaceBufferSize;
         }
 
-        // Concatenate the 6 faces: sokol expects one contiguous cube upload.
-        const mip0 = try allocator.alloc(u16, std.math.mul(usize, 6, face_pixels) catch return error.ImageTooLarge);
-        defer allocator.free(mip0);
+        var chain = RawHdrCubeMips{ .size = size, .num_levels = 1 };
+        errdefer chain.deinit(allocator);
+
+        const mip0 = try allocator.alloc(u16, std.math.mul(usize, 6, face_texels) catch return error.ImageTooLarge);
         for (faces, 0..) |face, i| {
-            @memcpy(mip0[i * face_pixels .. (i + 1) * face_pixels], face);
+            @memcpy(mip0[i * face_texels .. (i + 1) * face_texels], face);
         }
+        chain.levels[0] = mip0;
+
+        var prev_size = size;
+        const levels = Texture.mipLevelCount(size, size);
+        for (1..levels) |m| {
+            const cur_size: u32 = @max(1, prev_size / 2);
+            const prev_texels: usize = @as(usize, prev_size) * prev_size * 4;
+            const cur_texels: usize = @as(usize, cur_size) * cur_size * 4;
+            const cur = try allocator.alloc(u16, std.math.mul(usize, 6, cur_texels) catch return error.ImageTooLarge);
+            chain.levels[m] = cur;
+            chain.num_levels = @intCast(m + 1);
+
+            const prev = chain.levels[m - 1].?;
+            for (0..6) |face| {
+                boxDownsampleF16(
+                    prev[face * prev_texels .. (face + 1) * prev_texels],
+                    prev_size,
+                    prev_size,
+                    cur[face * cur_texels .. (face + 1) * cur_texels],
+                    cur_size,
+                    cur_size,
+                );
+            }
+            prev_size = cur_size;
+        }
+        return chain;
+    }
+
+    /// Uploads six half-float RGBA faces as an RGBA16F cube WITH a full
+    /// CPU-generated mip chain (the PBR IBL path samples
+    /// `textureLod(lod <= 7)`, which needs the levels). Main thread only.
+    /// Each face must hold size*size*4 half patterns.
+    /// Linear min/mag/mip, clamp on all axes, no gamma correction.
+    pub fn initRawFacesHdr(allocator: std.mem.Allocator, size: u32, faces: [6][]const u16) !CubeTexture {
+        var chain = try buildRawFacesHdr(allocator, size, faces);
+        defer chain.deinit(allocator);
 
         var img_desc = sg.ImageDesc{
             .type = .CUBE,
             .width = @intCast(size),
             .height = @intCast(size),
             .num_slices = 6,
-            .num_mipmaps = 1,
+            .num_mipmaps = @intCast(chain.num_levels),
             .pixel_format = .RGBA16F,
             .sample_count = 1,
         };
-        img_desc.data.mip_levels[0] = sg.asRange(mip0);
+        for (0..chain.num_levels) |m| {
+            if (chain.levels[m]) |level| {
+                img_desc.data.mip_levels[m] = sg.asRange(level);
+            }
+        }
 
         const img = sg.makeImage(img_desc);
         const view = sg.makeView(.{
@@ -1119,7 +1278,7 @@ pub const CubeTexture = struct {
         const smp = sg.makeSampler(.{
             .min_filter = .LINEAR,
             .mag_filter = .LINEAR,
-            .mipmap_filter = .NEAREST,
+            .mipmap_filter = if (chain.num_levels > 1) .LINEAR else .NEAREST,
             .wrap_u = .CLAMP_TO_EDGE,
             .wrap_v = .CLAMP_TO_EDGE,
             .wrap_w = .CLAMP_TO_EDGE,
@@ -1130,7 +1289,7 @@ pub const CubeTexture = struct {
             .view = view,
             .sampler = smp,
             .size = size,
-            .num_mipmaps = 1,
+            .num_mipmaps = chain.num_levels,
             .format = .RGBA16F,
             .is_hdr = true,
         };
@@ -1178,14 +1337,14 @@ test "decodeMemory returns RGBA levels and owns its mip chain" {
     // CPU-only and needs its one-time setup (normally done at app startup).
     sokol.time.setup();
 
-    var single = try Texture.decodeMemory(allocator, png, false);
+    var single = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false });
     defer single.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 512), single.width);
     try std.testing.expectEqual(@as(u32, 512), single.height);
     try std.testing.expectEqual(@as(u32, 1), single.num_levels);
     try std.testing.expectEqual(@as(usize, 512 * 512 * 4), single.levels[0].?.len);
 
-    var mipped = try Texture.decodeMemory(allocator, png, true);
+    var mipped = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = true });
     defer mipped.deinit(allocator);
     try std.testing.expectEqual(Texture.mipLevelCount(512, 512), mipped.num_levels);
     try std.testing.expectEqual(@as(usize, 4), mipped.levels[mipped.num_levels - 1].?.len);
@@ -1380,5 +1539,320 @@ test "createCheckerboard overflow returns error instead of panicking" {
     try std.testing.expectError(
         error.ImageTooLarge,
         Texture.createCheckerboard(allocator, 100000, 100000, 8, c1, c2),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Golden tests: sRGB conversion
+// ---------------------------------------------------------------------------
+
+test "srgbToLinearU8 hits exact golden values and the endpoints" {
+    // Computed with the IEC 61966-2-1 formula, rounded to nearest.
+    try std.testing.expectEqual(@as(u8, 0), srgbToLinearU8(0));
+    try std.testing.expectEqual(@as(u8, 255), srgbToLinearU8(255));
+    try std.testing.expectEqual(@as(u8, 55), srgbToLinearU8(128));
+    try std.testing.expectEqual(@as(u8, 13), srgbToLinearU8(64));
+    try std.testing.expectEqual(@as(u8, 2), srgbToLinearU8(25));
+    try std.testing.expectEqual(@as(u8, 147), srgbToLinearU8(200));
+    // Monotonic non-decreasing over the whole table.
+    var v: usize = 1;
+    while (v < 256) : (v += 1) {
+        try std.testing.expect(srgbToLinearU8(@intCast(v)) >= srgbToLinearU8(@intCast(v - 1)));
+    }
+}
+
+test "convertSrgbToLinearInPlace converts RGB lanes and preserves alpha" {
+    var pixels = [_]u8{ 200, 128, 0, 42, 255, 0, 25, 7 };
+    convertSrgbToLinearInPlace(&pixels);
+    try std.testing.expectEqual(@as(u8, srgbToLinearU8(200)), pixels[0]);
+    try std.testing.expectEqual(@as(u8, srgbToLinearU8(128)), pixels[1]);
+    try std.testing.expectEqual(@as(u8, 0), pixels[2]);
+    try std.testing.expectEqual(@as(u8, 42), pixels[3]); // alpha untouched
+    try std.testing.expectEqual(@as(u8, 255), pixels[4]);
+    try std.testing.expectEqual(@as(u8, 0), pixels[5]);
+    try std.testing.expectEqual(@as(u8, srgbToLinearU8(25)), pixels[6]);
+    try std.testing.expectEqual(@as(u8, 7), pixels[7]); // alpha untouched
+}
+
+// ---------------------------------------------------------------------------
+// Minimal PNG fixture synthesis (no external dependencies): PNG container +
+// zlib stream with STORED deflate blocks + Adler-32. stb_image decodes these
+// like any real PNG.
+// ---------------------------------------------------------------------------
+
+const TestPng = struct {
+    fn crc32(tag: *const [4]u8, data: []const u8) u32 {
+        var h = std.hash.crc.Crc32.init();
+        h.update(tag);
+        h.update(data);
+        return h.final();
+    }
+
+    fn appendChunk(out: *std.Io.Writer, tag: *const [4]u8, data: []const u8) !void {
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
+        try out.writeAll(&len_buf);
+        try out.writeAll(tag);
+        try out.writeAll(data);
+        var crc_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc_buf, crc32(tag, data), .big);
+        try out.writeAll(&crc_buf);
+    }
+
+    /// Wraps `raw` in a zlib stream that only uses stored (uncompressed)
+    /// deflate blocks: header 0x78 0x01, blocks of up to 65535 bytes
+    /// (BFINAL flag, LEN, NLEN), Adler-32 checksum.
+    fn zlibStore(writer: *std.Io.Writer, raw: []const u8) !void {
+        try writer.writeAll(&.{ 0x78, 0x01 });
+        var rest = raw;
+        while (true) {
+            const final = rest.len <= 65535;
+            const chunk_len: u16 = @intCast(@min(rest.len, 65535));
+            try writer.writeByte(if (final) 0x01 else 0x00);
+            var len_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &len_buf, chunk_len, .little);
+            try writer.writeAll(&len_buf);
+            std.mem.writeInt(u16, &len_buf, ~chunk_len, .little);
+            try writer.writeAll(&len_buf);
+            try writer.writeAll(rest[0..chunk_len]);
+            rest = rest[chunk_len..];
+            if (final) break;
+        }
+        var sum_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &sum_buf, std.hash.Adler32.hash(raw), .big);
+        try writer.writeAll(&sum_buf);
+    }
+
+    /// Builds a minimal PNG: signature, IHDR, optional PLTE, IDAT, IEND.
+    /// `scanlines` must already contain one filter byte (0 = None) per row.
+    fn build(
+        allocator: std.mem.Allocator,
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        color_type: u8,
+        plte: ?[]const u8,
+        scanlines: []const u8,
+    ) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll(&[_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' });
+
+        var ihdr: [13]u8 = undefined;
+        std.mem.writeInt(u32, ihdr[0..4], width, .big);
+        std.mem.writeInt(u32, ihdr[4..8], height, .big);
+        ihdr[8] = bit_depth;
+        ihdr[9] = color_type;
+        ihdr[10] = 0; // compression: deflate
+        ihdr[11] = 0; // filter: adaptive filtering
+        ihdr[12] = 0; // interlace: none
+        try appendChunk(w, "IHDR", &ihdr);
+
+        if (plte) |entries| try appendChunk(w, "PLTE", entries);
+
+        var idat: std.Io.Writer.Allocating = .init(allocator);
+        defer idat.deinit();
+        try zlibStore(&idat.writer, scanlines);
+        try appendChunk(w, "IDAT", idat.written());
+
+        try appendChunk(w, "IEND", "");
+        return out.toOwnedSlice();
+    }
+};
+
+test "decodeMemory handles synthesized 8-bit grayscale PNG (gray replicated to RGB)" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    // 1x2 grayscale, values 0x00 and 0x80, filter byte 0 per row.
+    const scanlines = [_]u8{ 0, 0x00, 0, 0x80 };
+    const png = try TestPng.build(allocator, 1, 2, 8, 0, null, &scanlines);
+    defer allocator.free(png);
+
+    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false });
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), raw.width);
+    try std.testing.expectEqual(@as(u32, 2), raw.height);
+    const px = raw.levels[0].?;
+    // stb replicates the single gray channel into RGB; alpha becomes 255.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, px[0..4].*);
+    try std.testing.expectEqual([4]u8{ 128, 128, 128, 255 }, px[4..8].*);
+}
+
+test "decodeMemory keeps the HIGH byte of 16-bit PNG channels" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    // 1x1 RGB 16-bit: R=0x1234, G=0xABCD, B=0x0001. stb's LDR output keeps
+    // the top byte of each channel (stbi__convert_16_to_8: orig >> 8).
+    var scanlines: [7]u8 = undefined;
+    scanlines[0] = 0; // filter
+    std.mem.writeInt(u16, scanlines[1..3], 0x1234, .big);
+    std.mem.writeInt(u16, scanlines[3..5], 0xABCD, .big);
+    std.mem.writeInt(u16, scanlines[5..7], 0x0001, .big);
+    const png = try TestPng.build(allocator, 1, 1, 16, 2, null, &scanlines);
+    defer allocator.free(png);
+
+    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false });
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual([4]u8{ 0x12, 0xAB, 0x00, 255 }, raw.levels[0].?[0..4].*);
+}
+
+test "decodeMemory keeps the HIGH byte of 16-bit grayscale PNG" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    // 1x1 gray 16-bit value 0xABCD -> high byte 0xAB replicated to RGB.
+    var scanlines: [3]u8 = undefined;
+    scanlines[0] = 0;
+    std.mem.writeInt(u16, scanlines[1..3], 0xABCD, .big);
+    const png = try TestPng.build(allocator, 1, 1, 16, 0, null, &scanlines);
+    defer allocator.free(png);
+
+    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false });
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual([4]u8{ 0xAB, 0xAB, 0xAB, 255 }, raw.levels[0].?[0..4].*);
+}
+
+test "decodeMemory decodes synthesized palette PNG through PLTE" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    // 2x1 indexed (color type 3), palette {red, blue}; indices 0 and 1.
+    const scanlines = [_]u8{ 0, 0, 1 };
+    const plte = [_]u8{ 255, 0, 0, 0, 0, 255 };
+    const png = try TestPng.build(allocator, 2, 1, 8, 3, &plte, &scanlines);
+    defer allocator.free(png);
+
+    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false });
+    defer raw.deinit(allocator);
+
+    const px = raw.levels[0].?;
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, px[0..4].*);
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, px[4..8].*);
+}
+
+test "decodeMemory srgb_to_linear converts decoded pixels before upload" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    // 1x1 RGBA PNG with sRGB value 200 in R and a distinctive alpha 42.
+    const scanlines = [_]u8{ 0, 200, 128, 25, 42 };
+    const png = try TestPng.build(allocator, 1, 1, 8, 6, null, &scanlines);
+    defer allocator.free(png);
+
+    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false, .srgb_to_linear = true });
+    defer raw.deinit(allocator);
+
+    const px = raw.levels[0].?;
+    try std.testing.expectEqual(@as(u8, 147), px[0]); // 200 -> 147 golden
+    try std.testing.expectEqual(srgbToLinearU8(128), px[1]);
+    try std.testing.expectEqual(srgbToLinearU8(25), px[2]);
+    try std.testing.expectEqual(@as(u8, 42), px[3]); // alpha never converted
+}
+
+// ---------------------------------------------------------------------------
+// Golden test: the 2D mip chain (levels, dimensions, averaged colors)
+// ---------------------------------------------------------------------------
+
+test "buildRaw mip chain has correct levels, sizes and box-filter colors" {
+    const allocator = std.testing.allocator;
+
+    // 4x4: top half pure red, bottom half pure blue, alpha 255 everywhere.
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const o = (y * 4 + x) * 4;
+            const red = y < 2;
+            pixels[o + 0] = if (red) 255 else 0;
+            pixels[o + 1] = 0;
+            pixels[o + 2] = if (red) 0 else 255;
+            pixels[o + 3] = 255;
+        }
+    }
+
+    var raw = try Texture.buildRaw(allocator, 4, 4, &pixels, true);
+    defer raw.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), raw.num_levels);
+    try std.testing.expectEqual(@as(u32, 4), raw.width);
+    try std.testing.expectEqual(@as(u32, 4), raw.height);
+
+    // Level 1 (2x2): top row red, bottom row blue, untouched by the filter.
+    const l1 = raw.levels[1].?;
+    try std.testing.expectEqual(@as(usize, 2 * 2 * 4), l1.len);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, l1[0..4].*);
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, l1[8..12].*);
+
+    // Level 2 (1x1): equal red/blue mix rounds to 128 via (sum+2)>>2.
+    const l2 = raw.levels[2].?;
+    try std.testing.expectEqual(@as(usize, 4), l2.len);
+    try std.testing.expectEqual([4]u8{ 128, 0, 128, 255 }, l2[0..4].*);
+}
+
+test "buildRaw without mipmaps uploads exactly one level" {
+    const allocator = std.testing.allocator;
+    var pixels: [2 * 2 * 4]u8 = @splat(200);
+    var raw = try Texture.buildRaw(allocator, 2, 2, &pixels, false);
+    defer raw.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 1), raw.num_levels);
+    try std.testing.expectEqual(@as(u32, 200), raw.levels[0].?[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Golden test: HDR cube f16 mip chain (feeds textureLod in the IBL path)
+// ---------------------------------------------------------------------------
+
+test "buildRawFacesHdr builds the f16 mip chain with averaged values" {
+    const allocator = std.testing.allocator;
+
+    // One 2x2 face with R={1, 3, 5, 7}, G=B=0, A=1: level 1 must average
+    // R to 4.0 exactly (f16-representable).
+    var face: [2 * 2 * 4]u16 = undefined;
+    const r_values = [_]f32{ 1, 3, 5, 7 };
+    for (r_values, 0..) |rv, i| {
+        face[i * 4 + 0] = Texture.floatToHalfBits(rv);
+        face[i * 4 + 1] = 0;
+        face[i * 4 + 2] = 0;
+        face[i * 4 + 3] = Texture.floatToHalfBits(1.0);
+    }
+    var faces: [6][]const u16 = undefined;
+    for (&faces) |*f| f.* = &face;
+
+    var chain = try CubeTexture.buildRawFacesHdr(allocator, 2, faces);
+    defer chain.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), chain.num_levels);
+    try std.testing.expectEqual(@as(u32, 2), chain.size);
+
+    const l1 = chain.levels[1].?;
+    try std.testing.expectEqual(@as(usize, 6 * 1 * 1 * 4), l1.len);
+    // Face 0 averaged R = 4.0; every face inherits the same average.
+    for (0..6) |f| {
+        const o = f * 4;
+        try std.testing.expectEqual(@as(f32, 4.0), Texture.halfBitsToFloat(l1[o + 0]));
+        try std.testing.expectEqual(@as(f32, 0.0), Texture.halfBitsToFloat(l1[o + 1]));
+        try std.testing.expectEqual(@as(f32, 1.0), Texture.halfBitsToFloat(l1[o + 3]));
+    }
+}
+
+test "buildRawFacesHdr validates size and face buffers" {
+    const allocator = std.testing.allocator;
+    const face: [2 * 2 * 4]u16 = @splat(0);
+    var faces: [6][]const u16 = @splat(&face);
+
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.buildRawFacesHdr(allocator, 0, faces),
+    );
+    faces[5] = face[0..2];
+    try std.testing.expectError(
+        error.InvalidFaceBufferSize,
+        CubeTexture.buildRawFacesHdr(allocator, 2, faces),
     );
 }
