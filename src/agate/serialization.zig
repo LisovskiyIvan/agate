@@ -1312,40 +1312,11 @@ fn dupeStr(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return allocator.dupe(u8, s);
 }
 
-/// Minimal CPU-only Scene for capture/restore tests. The default textures and
-/// render subsystems are GPU-backed and never dereferenced by capture()/restore();
-/// std.mem.zeroes cannot build a Scene in Zig 0.16 (non-nullable pointer
-/// fields), so those fields stay undefined.
-fn testScene(alloc: std.mem.Allocator) Scene {
-    return .{
-        .allocator = alloc,
-        .default_white_texture = undefined,
-        .default_normal_texture = undefined,
-        .default_cube_texture = undefined,
-        .lights = .{},
-        .shadows = .{ .pass = undefined },
-        .sky = .{ .pass = undefined },
-        .postfx = .{
-            .postprocess_pass = undefined,
-            .ssao_pass = undefined,
-            .bloom_pass = undefined,
-            .outline_pass = undefined,
-        },
-        .forward = .{},
-        .particles = .{ .pass = undefined },
-    };
-}
-
-/// Buffer-free Mesh for capture/restore tests: serialization only touches
-/// name, transform, visibility and material fields.
-fn testMesh(name: []const u8) Mesh {
-    return .{
-        .name = name,
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
-}
+// CPU-only Scene/Mesh fixtures live in testing.zig (shared with
+// loader/materials.zig); the GPU-backed fields left `undefined` there are
+// never dereferenced by capture()/restore().
+const testScene = @import("testing.zig").testScene;
+const testMesh = @import("testing.zig").testMesh;
 
 fn makeFullState(allocator: std.mem.Allocator) !SceneState {
     var s = SceneState{};

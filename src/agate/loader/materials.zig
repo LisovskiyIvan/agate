@@ -334,29 +334,9 @@ pub fn loadMaterials(
     }
 }
 
-/// Minimal CPU-only Scene for loadMaterials tests: the material path only
-/// uses the allocator (createPBRMaterial) and never the GPU-backed default
-/// textures or render passes, which std.mem.zeroes cannot initialize anyway
-/// (non-nullable pointer fields).
-fn testScene(alloc: std.mem.Allocator) Scene {
-    return .{
-        .allocator = alloc,
-        .default_white_texture = undefined,
-        .default_normal_texture = undefined,
-        .default_cube_texture = undefined,
-        .lights = .{},
-        .shadows = .{ .pass = undefined },
-        .sky = .{ .pass = undefined },
-        .postfx = .{
-            .postprocess_pass = undefined,
-            .ssao_pass = undefined,
-            .bloom_pass = undefined,
-            .outline_pass = undefined,
-        },
-        .forward = .{},
-        .particles = .{ .pass = undefined },
-    };
-}
+// The loadMaterials tests only exercise the allocator-backed path, so they
+// share the CPU-only Scene fixture from testing.zig (see testScene there).
+const testScene = @import("../testing.zig").testScene;
 
 test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
