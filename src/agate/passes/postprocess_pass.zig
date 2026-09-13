@@ -4,7 +4,7 @@ const sg = sokol.gfx;
 const sglue = sokol.glue;
 const post_shd = @import("postprocess_shader");
 const postprocess = @import("../postprocess.zig");
-const PostProcessConfig = postprocess.PostProcessConfig;
+const PostProcessOptions = postprocess.PostProcessOptions;
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
@@ -186,7 +186,7 @@ pub const PostProcessPass = struct {
 
     pub fn render(
         self: *PostProcessPass,
-        config: PostProcessConfig,
+        config: PostProcessOptions,
         ssao_tex: sg.View,
         ssao_enabled: bool,
         ssao_debug: bool,

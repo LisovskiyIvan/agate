@@ -613,8 +613,11 @@ pub const Texture = struct {
     }
 };
 
+/// Deprecated alias: renamed to SkyboxOptions.
+pub const SkyboxConfig = SkyboxOptions;
+
 /// Gradient + sun parameters for `CubeTexture.createProceduralSkybox`.
-pub const SkyboxConfig = struct {
+pub const SkyboxOptions = struct {
     top_color: [4]u8 = .{ 35, 75, 155, 255 }, // Deep blue zenith
     horizon_color: [4]u8 = .{ 175, 195, 220, 255 }, // Atmospheric horizon
     bottom_color: [4]u8 = .{ 45, 42, 40, 255 }, // Ground nadir
@@ -773,7 +776,7 @@ pub const CubeTexture = struct {
         };
     }
 
-    pub fn createProceduralSkybox(allocator: std.mem.Allocator, config: SkyboxConfig) !CubeTexture {
+    pub fn createProceduralSkybox(allocator: std.mem.Allocator, config: SkyboxOptions) !CubeTexture {
         const size = config.size;
         const face_bytes = size * size * 4;
 

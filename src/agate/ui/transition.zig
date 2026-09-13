@@ -14,7 +14,7 @@ const types = @import("types.zig");
 const UIStyle = types.UIStyle;
 const UIGradient = types.UIGradient;
 const UIShadow = types.UIShadow;
-const TransitionConfig = types.TransitionConfig;
+const TransitionOptions = types.TransitionOptions;
 
 /// Fixed size of the per-canvas transition table. UI screens animate a
 /// couple dozen widgets at once; past the cap the stalest entry is recycled.

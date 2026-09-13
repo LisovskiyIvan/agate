@@ -71,7 +71,9 @@ pub const shader_material = @import("shader_material.zig");
 pub const texture = @import("texture.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
-pub const SkyboxConfig = texture.SkyboxConfig;
+pub const SkyboxOptions = texture.SkyboxOptions;
+/// Deprecated: use SkyboxOptions.
+pub const SkyboxConfig = SkyboxOptions;
 
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;
@@ -132,11 +134,15 @@ pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
 
 pub const postprocess = @import("postprocess.zig");
-pub const PostProcessConfig = postprocess.PostProcessConfig;
+pub const PostProcessOptions = postprocess.PostProcessOptions;
+/// Deprecated: use PostProcessOptions.
+pub const PostProcessConfig = PostProcessOptions;
 pub const TonemappingType = postprocess.TonemappingType;
 
 pub const ssao = @import("ssao.zig");
-pub const SSAOConfig = ssao.SSAOConfig;
+pub const SSAOOptions = ssao.SSAOOptions;
+/// Deprecated: use SSAOOptions.
+pub const SSAOConfig = SSAOOptions;
 
 pub const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
@@ -206,7 +212,9 @@ pub const LayoutGridOptions = ui.LayoutGridOptions;
 pub const LayoutAlign = ui.LayoutAlign;
 pub const LayoutAlignCross = ui.LayoutAlignCross;
 // Style system phase 2: CSS theming + style transitions.
-pub const TransitionConfig = ui.TransitionConfig;
+pub const TransitionOptions = ui.TransitionOptions;
+/// Deprecated: use TransitionOptions.
+pub const TransitionConfig = TransitionOptions;
 pub const UIStyleTransition = ui.UIStyleTransition;
 pub const max_style_transitions = ui.max_style_transitions;
 pub const lerpStyle = ui.lerpStyle;

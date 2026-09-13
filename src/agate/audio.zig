@@ -100,7 +100,7 @@ pub const AudioEngine = struct {
 
     /// One-shot procedural voice trigger: kind + spatial position + the
     /// envelope/filter sweep the synthesizer applies. `play` is the only entry.
-    pub const PlayParams = struct {
+    pub const PlayOptions = struct {
         kind: VoiceKind = .thump,
         position: ?Vec3 = null, // null = non-positional
         volume: f32 = 0.5,
@@ -207,7 +207,10 @@ pub const AudioEngine = struct {
         return .{ .vol = vol, .pan = pan };
     }
 
-    pub fn play(self: *AudioEngine, params: PlayParams) void {
+    /// Deprecated alias: renamed to PlayOptions.
+    pub const PlayParams = PlayOptions;
+
+    pub fn play(self: *AudioEngine, params: PlayOptions) void {
         const sp = spatializeWith(self.listener_pos, self.listener_right, params.position, params.volume);
         if (sp.vol <= 0.001) return;
         const duration = @max(params.duration, 0.01);

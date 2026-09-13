@@ -59,7 +59,7 @@ pub const Environment = struct {
 // resolve to the cull-off twins via pipelines.forRegularItem).
 // Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
 // in-shader discard. Updates stats.
-pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: FrameContext, current_pipeline_id: *u32) void {
+pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const FrameContext, current_pipeline_id: *u32) void {
     const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
@@ -243,7 +243,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: FrameContext
 fn drawShaderMaterialItem(
     env: Environment,
     item: RenderMeshItem,
-    ctx: FrameContext,
+    ctx: *const FrameContext,
     current_pipeline_id: *u32,
     sm: *const ShaderMaterial,
     mvp: Mat4,
@@ -396,7 +396,7 @@ fn drawShaderMaterialItem(
 
 // Packs the shared fragment uniforms for one mesh: the scene-level state is
 // copied and the per-mesh receive_shadows flag patched in.
-fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: FrameContext) uniforms.FrameUniforms {
+fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) uniforms.FrameUniforms {
     var state = env.shadow_uniforms;
     state.mesh_receive_shadows = mesh.receive_shadows;
     return uniforms.buildFrameUniforms(state, ctx);
@@ -436,7 +436,7 @@ fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMo
 // binds morph resources, so a morph mesh placed in an instanced queue
 // renders its base pose. CPU mode (the default) is unaffected: instanced
 // meshes share the already-blended dynamic vertex buffer.
-pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: FrameContext, current_pipeline_id: *u32) void {
+pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
     if (mesh.instances.items.len == 0) return;
     if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
 

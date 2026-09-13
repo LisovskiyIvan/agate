@@ -37,10 +37,13 @@ pub const LutBinding = struct {
     size: u32 = 0,
 };
 
+/// Deprecated alias: renamed to PostProcessOptions.
+pub const PostProcessConfig = PostProcessOptions;
+
 /// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
 /// toggles and their parameters). A flat config read/written by tooling;
 /// applied per frame by `Scene.postfx` (PostFXStack.renderChain).
-pub const PostProcessConfig = struct {
+pub const PostProcessOptions = struct {
     enabled: bool = false,
     exposure: f32 = 1.0,
     tonemapping: TonemappingType = .aces,
@@ -118,7 +121,7 @@ pub const PostProcessConfig = struct {
 
     // Return a copy with out-of-range values pulled into valid ranges.
     // Never fails; safe to apply on load or before uploading uniforms.
-    pub fn clamped(self: PostProcessConfig) PostProcessConfig {
+    pub fn clamped(self: PostProcessOptions) PostProcessOptions {
         var out = self;
         out.exposure = @max(self.exposure, 0.0);
         out.bloom_threshold = @max(self.bloom_threshold, 0.0);
@@ -253,7 +256,7 @@ pub fn applyLutStrip(
 // flag — packs all zeros, which is exactly the pre-LUT uniform state, so
 // the no-LUT path stays unchanged. Kept beside the Zig LUT math so tests
 // pin what postprocess_pass uploads.
-pub fn lutParams(cfg: PostProcessConfig) [4]f32 {
+pub fn lutParams(cfg: PostProcessOptions) [4]f32 {
     const lut = cfg.lut orelse return .{ 0.0, 0.0, 0.0, 0.0 };
     if (!cfg.lut_enabled or lut.view.id == 0 or !validLutSize(lut.size)) {
         return .{ 0.0, 0.0, 0.0, 0.0 };
@@ -353,7 +356,7 @@ pub fn applyGrade(color: [3]f32, shadows: [3]f32, midtones: [3]f32, highlights: 
 }
 
 test "postprocess defaults" {
-    const cfg = PostProcessConfig{};
+    const cfg = PostProcessOptions{};
     try std.testing.expect(!cfg.enabled);
     try std.testing.expect(!cfg.bloom_pyramid);
     try std.testing.expectEqual(@as(u32, 5), cfg.bloom_pyramid_mips);
@@ -377,14 +380,14 @@ test "bloom mips clamp" {
     try std.testing.expectEqual(@as(u32, 7), clampBloomMips(7));
     try std.testing.expectEqual(@as(u32, 7), clampBloomMips(42));
 
-    var cfg = PostProcessConfig{ .bloom_pyramid_mips = 99 };
+    var cfg = PostProcessOptions{ .bloom_pyramid_mips = 99 };
     try std.testing.expectEqual(@as(u32, 7), cfg.clamped().bloom_pyramid_mips);
     cfg.bloom_pyramid_mips = 1;
     try std.testing.expectEqual(@as(u32, 3), cfg.clamped().bloom_pyramid_mips);
 }
 
 test "config clamped sanitizes new fields" {
-    var cfg = PostProcessConfig{
+    var cfg = PostProcessOptions{
         .exposure = -2.0,
         .dof_focus_distance = -4.0,
         .dof_focus_range = -1.0,
@@ -596,14 +599,14 @@ test "lut intensity mix" {
 
 test "lut params packing and default path" {
     // Defaults: no LUT, disabled — the pre-LUT composite path.
-    const def = PostProcessConfig{};
+    const def = PostProcessOptions{};
     try std.testing.expect(def.lut == null);
     try std.testing.expect(!def.lut_enabled);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def.clamped()));
 
     // A live binding enables the uniform triplet.
-    const live = PostProcessConfig{
+    const live = PostProcessOptions{
         .lut = .{ .view = .{ .id = 7 }, .size = 32 },
         .lut_enabled = true,
         .lut_intensity = 1.0,
@@ -618,13 +621,13 @@ test "lut params packing and default path" {
     try std.testing.expectEqual(@as(f32, 0.0), hot.clamped().lut_intensity);
 
     // clamped() drops bindings that can never sample.
-    const dead = PostProcessConfig{ .lut = .{ .view = .{}, .size = 32 }, .lut_enabled = true };
+    const dead = PostProcessOptions{ .lut = .{ .view = .{}, .size = 32 }, .lut_enabled = true };
     try std.testing.expect(dead.clamped().lut == null);
     // Any N inside [2, 64] stays (33 is legal, the strip math is generic);
     // only out-of-range sizes are dropped.
-    const keep = PostProcessConfig{ .lut = .{ .view = .{ .id = 5 }, .size = 33 }, .lut_enabled = true };
+    const keep = PostProcessOptions{ .lut = .{ .view = .{ .id = 5 }, .size = 33 }, .lut_enabled = true };
     try std.testing.expect(keep.clamped().lut != null);
-    const bogus = PostProcessConfig{ .lut = .{ .view = .{ .id = 3 }, .size = 100 }, .lut_enabled = true };
+    const bogus = PostProcessOptions{ .lut = .{ .view = .{ .id = 3 }, .size = 100 }, .lut_enabled = true };
     try std.testing.expect(bogus.clamped().lut == null);
 
     // Present but disabled still packs zeros.

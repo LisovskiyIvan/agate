@@ -13,9 +13,9 @@ const Mesh = @import("../mesh.zig").Mesh;
 const Camera = @import("../camera.zig").Camera;
 const passes = @import("../passes/mod.zig");
 const postprocess = @import("../postprocess.zig");
-const PostProcessConfig = postprocess.PostProcessConfig;
+const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao_mod = @import("../ssao.zig");
-const SSAOConfig = ssao_mod.SSAOConfig;
+const SSAOOptions = ssao_mod.SSAOOptions;
 const ui = @import("../ui.zig");
 const UICanvas = ui.UICanvas;
 const stats_mod = @import("stats.zig");
@@ -103,8 +103,8 @@ pub const PostFXStack = struct {
     // Per-frame inputs for the post chain. Configs travel with the params
     // because they stay public Scene fields (tooling reads/writes them).
     pub const ChainParams = struct {
-        post: PostProcessConfig,
-        ssao: SSAOConfig,
+        post: PostProcessOptions,
+        ssao: SSAOOptions,
         camera: Camera,
         aspect: f32,
         view_proj: Mat4,

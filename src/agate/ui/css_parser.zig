@@ -27,7 +27,7 @@
 //!   names as in `animation/easing.zig` (`ease-out-quad` normalization of
 //!   dashes allowed).
 //! - `transition_duration` / `transition_easing` set the enclosing style
-//!   set's `TransitionConfig` (one config per set, whichever block set it
+//!   set's `TransitionOptions` (one config per set, whichever block set it
 //!   last wins).
 //!
 //! Error model: malformed input never aborts the parse. Problems are
@@ -47,7 +47,7 @@ const UIStyleOverride = types.UIStyleOverride;
 const UIStyleSet = types.UIStyleSet;
 const UIState = types.UIState;
 const UIStyleKind = types.UIStyleKind;
-const TransitionConfig = types.TransitionConfig;
+const TransitionOptions = types.TransitionOptions;
 const UITheme = theme_mod.UITheme;
 
 /// Hard cap on theme file size; protects against pathological inputs.
@@ -257,7 +257,7 @@ const Block = struct {
     target: Target,
     state: UIState = .normal,
     override: UIStyleOverride = .{},
-    transition: ?TransitionConfig = null,
+    transition: ?TransitionOptions = null,
 };
 
 const Parser = struct {
@@ -629,7 +629,7 @@ const Parser = struct {
                     bad(self, line, col, value);
                     return;
                 };
-                if (block.transition == null) block.transition = TransitionConfig{};
+                if (block.transition == null) block.transition = TransitionOptions{};
                 block.transition.?.duration_ms = @max(ms, 0.0);
             },
             .transition_easing => {
@@ -637,7 +637,7 @@ const Parser = struct {
                     bad(self, line, col, value);
                     return;
                 };
-                if (block.transition == null) block.transition = TransitionConfig{};
+                if (block.transition == null) block.transition = TransitionOptions{};
                 block.transition.?.easing = e;
             },
         }

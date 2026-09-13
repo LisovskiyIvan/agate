@@ -1,7 +1,7 @@
 const std = @import("std");
 const Camera = @import("../camera.zig").Camera;
 const CubeTexture = @import("../texture.zig").CubeTexture;
-const SkyboxConfig = @import("../texture.zig").SkyboxConfig;
+const SkyboxOptions = @import("../texture.zig").SkyboxOptions;
 const passes = @import("../passes/mod.zig");
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
@@ -36,7 +36,7 @@ pub const SkyboxLayer = struct {
         self.enabled = true;
     }
 
-    pub fn createDefault(self: *SkyboxLayer, allocator: std.mem.Allocator, config: SkyboxConfig) !void {
+    pub fn createDefault(self: *SkyboxLayer, allocator: std.mem.Allocator, config: SkyboxOptions) !void {
         const cube = try CubeTexture.createProceduralSkybox(allocator, config);
         self.setSkybox(cube);
     }

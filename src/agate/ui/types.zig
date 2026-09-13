@@ -48,7 +48,7 @@ pub const UIShadow = struct {
 /// Style transition (animation) configuration. `duration_ms == 0` means
 /// "instant": styles snap and nothing is stored per widget. The easing
 /// reuses the shared animation curves so files can name them directly.
-pub const TransitionConfig = struct {
+pub const TransitionOptions = struct {
     duration_ms: f32 = 0.0,
     easing: easing.EasingType = .ease_out_quad,
 };
@@ -135,7 +135,7 @@ pub const UIStyleSet = struct {
     active: ?UIStyleOverride = null,
     focus: ?UIStyleOverride = null,
     disabled: ?UIStyleOverride = null,
-    transition: TransitionConfig = .{},
+    transition: TransitionOptions = .{},
 
     pub fn resolve(self: UIStyleSet, base: UIStyle, state: UIState) UIStyle {
         var s = self.normal.apply(base);
@@ -166,7 +166,7 @@ pub const UIStyledOptions = struct {
     style: ?UIStyleOverride = null,
     state: UIState = .normal,
     anim_key: ?[]const u8 = null,
-    transition: ?TransitionConfig = null,
+    transition: ?TransitionOptions = null,
 };
 
 /// Style lookup request for `UICanvas.resolveStyle`.

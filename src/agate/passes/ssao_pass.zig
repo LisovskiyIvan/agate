@@ -6,7 +6,7 @@ const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
 const ssao_shd = @import("ssao_shader");
 const blur_shd = @import("ssao_blur_shader");
-const SSAOConfig = @import("../ssao.zig").SSAOConfig;
+const SSAOOptions = @import("../ssao.zig").SSAOOptions;
 const Camera = @import("../camera.zig").Camera;
 
 pub const SSAOPass = struct {
@@ -241,7 +241,7 @@ pub const SSAOPass = struct {
         camera: Camera,
         aspect: f32,
         depth_tex_view: sg.View,
-        config: SSAOConfig,
+        config: SSAOOptions,
         cur_w: i32,
         cur_h: i32,
     ) void {

@@ -148,7 +148,7 @@ test "frameUniforms packs shared lighting state verbatim" {
 
     var state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
     state.mesh_receive_shadows = mesh_obj.receive_shadows;
-    const f = uniforms.buildFrameUniforms(state, ctx);
+    const f = uniforms.buildFrameUniforms(state, &ctx);
     try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 4.0 }, f.eye_pos);
     try std.testing.expectEqual([4]f32{ 0.5, 1.0, 0.3, 2048.0 }, f.light_dir);
     try std.testing.expectEqual([4]f32{ 1.0, 0.9, 0.8, 2.0 }, f.light_color);
@@ -165,13 +165,13 @@ test "frameUniforms packs shared lighting state verbatim" {
     // but keep normal bias and softness, exactly like the legacy literals.
     shadows.enabled = false;
     const off_state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
-    const off = uniforms.buildFrameUniforms(off_state, ctx);
+    const off = uniforms.buildFrameUniforms(off_state, &ctx);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.02, 1.5 }, off.shadow_params);
     shadows.enabled = true;
     mesh_obj.receive_shadows = false;
     var skipped_state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
     skipped_state.mesh_receive_shadows = mesh_obj.receive_shadows;
-    const skipped = uniforms.buildFrameUniforms(skipped_state, ctx);
+    const skipped = uniforms.buildFrameUniforms(skipped_state, &ctx);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.02, 1.5 }, skipped.shadow_params);
 }
 

@@ -809,7 +809,7 @@ pub const UICanvas = struct {
 
     /// `resolveStyle` plus the transition layer: with `opts.anim_key` set,
     /// the widget animates from its previously drawn style toward the newly
-    /// resolved target over the cascade-resolved TransitionConfig. State
+    /// resolved target over the cascade-resolved TransitionOptions. State
     /// changes (hover/active/focus/disabled) trigger transitions implicitly —
     /// they simply change the resolved target. Without `anim_key` this is
     /// exactly resolveStyle (stateless, no per-widget storage).
@@ -823,7 +823,7 @@ pub const UICanvas = struct {
     /// Transition config from the cascade (per-call override already won in
     /// resolveAnimatedStyle): a class wins when it defines a duration,
     /// otherwise the theme kind's set provides it.
-    fn cascadeTransition(self: *UICanvas, kind: UIStyleKind, class: ?[]const u8) TransitionConfig {
+    fn cascadeTransition(self: *UICanvas, kind: UIStyleKind, class: ?[]const u8) TransitionOptions {
         if (class) |name| {
             if (self.styleClass(name)) |cs| {
                 if (cs.transition.duration_ms > 0.0) return cs.transition;
@@ -834,7 +834,7 @@ pub const UICanvas = struct {
 
     /// Advances (or starts) the retained transition `key` toward `target`
     /// and returns the style to draw this frame.
-    fn animateStyle(self: *UICanvas, key: u64, target: UIStyle, cfg: TransitionConfig) UIStyle {
+    fn animateStyle(self: *UICanvas, key: u64, target: UIStyle, cfg: TransitionOptions) UIStyle {
         const now = self.style_time_ms;
         if (cfg.duration_ms <= 0.0) {
             // Instant config: snap and release any retained transition.
@@ -1162,7 +1162,9 @@ pub const UIShadow = ui_types.UIShadow;
 pub const UIStyle = ui_types.UIStyle;
 pub const UIStyleOverride = ui_types.UIStyleOverride;
 pub const UIStyleSet = ui_types.UIStyleSet;
-pub const TransitionConfig = ui_types.TransitionConfig;
+pub const TransitionOptions = ui_types.TransitionOptions;
+/// Deprecated: use TransitionOptions.
+pub const TransitionConfig = TransitionOptions;
 pub const UIStyleKind = ui_types.UIStyleKind;
 pub const UIStyledOptions = ui_types.UIStyledOptions;
 pub const UIStyleRequest = ui_types.UIStyleRequest;

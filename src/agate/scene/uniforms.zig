@@ -78,7 +78,7 @@ pub const ShadowState = struct {
 // with no fs_params layout change (no draw-path churn):
 //   cascade_debug.yzw = (pcss_enabled, pcss_light_size, pcss_blocker_radius)
 //   light_counts.zw   = (pcss_min_penumbra, pcss_max_penumbra)
-pub fn buildFrameUniforms(shadow: ShadowState, ctx: FrameContext) FrameUniforms {
+pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUniforms {
     return .{
         .eye_pos = .{ ctx.eye.x, ctx.eye.y, ctx.eye.z, 4.0 },
         .light_dir = .{ ctx.sun_dir.x, ctx.sun_dir.y, ctx.sun_dir.z, 2048.0 },

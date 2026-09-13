@@ -41,7 +41,7 @@
 //!   any version != 2 reports UnsupportedVersion.)
 //!   render: skybox_enabled u8, skybox_exposure f32, shadows_enabled u8,
 //!     shadow_softness f32, ibl_intensity f32,
-//!   postprocess (PostProcessConfig field order): enabled u8, exposure f32,
+//!   postprocess (PostProcessOptions field order): enabled u8, exposure f32,
 //!     tonemapping u32, bloom_enabled u8, bloom_threshold f32,
 //!     bloom_intensity f32, bloom_radius f32, vignette_enabled u8,
 //!     vignette_intensity f32, vignette_radius f32, saturation f32,
@@ -66,7 +66,7 @@ const Vec3 = math.Vec3;
 const Color3 = math.Color3;
 const SceneModule = @import("scene.zig");
 const Scene = SceneModule.Scene;
-const PostProcessConfig = @import("postprocess.zig").PostProcessConfig;
+const PostProcessOptions = @import("postprocess.zig").PostProcessOptions;
 const TonemappingType = @import("postprocess.zig").TonemappingType;
 const CameraModule = @import("camera.zig");
 const Camera = CameraModule.Camera;
@@ -289,7 +289,7 @@ pub const SceneState = struct {
     spot_lights: []SpotEntry = &.{},
     camera: CameraEntry = .none,
     render: RenderEntry = .{},
-    postprocess: PostProcessConfig = .{},
+    postprocess: PostProcessOptions = .{},
 
     pub fn deinit(self: *SceneState, allocator: std.mem.Allocator) void {
         for (self.meshes) |*m| m.deinit(allocator);
@@ -826,7 +826,7 @@ const Reader = struct {
     }
 };
 
-fn writePostProcess(w: *Writer, pp: *const PostProcessConfig) !void {
+fn writePostProcess(w: *Writer, pp: *const PostProcessOptions) !void {
     try w.bool8(pp.enabled);
     try w.f32le(pp.exposure);
     try w.u32le(@intFromEnum(pp.tonemapping));
@@ -859,8 +859,8 @@ fn writePostProcess(w: *Writer, pp: *const PostProcessConfig) !void {
     try w.f32le(pp.tint);
 }
 
-fn readPostProcess(r: *Reader) DecodeError!PostProcessConfig {
-    var pp = PostProcessConfig{};
+fn readPostProcess(r: *Reader) DecodeError!PostProcessOptions {
+    var pp = PostProcessOptions{};
     pp.enabled = try r.readBool();
     pp.exposure = try r.readF32();
     pp.tonemapping = switch (try r.readU32()) {

@@ -3,9 +3,9 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const postprocess = @import("postprocess.zig");
-const PostProcessConfig = postprocess.PostProcessConfig;
+const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao = @import("ssao.zig");
-const SSAOConfig = ssao.SSAOConfig;
+const SSAOOptions = ssao.SSAOOptions;
 const particles = @import("particles.zig");
 const ParticleSystem = particles.ParticleSystem;
 
@@ -53,7 +53,7 @@ const PBRMaterial = @import("material.zig").PBRMaterial;
 const ShaderMaterial = @import("material.zig").ShaderMaterial;
 const Texture = @import("texture.zig").Texture;
 const CubeTexture = @import("texture.zig").CubeTexture;
-const SkyboxConfig = @import("texture.zig").SkyboxConfig;
+const SkyboxOptions = @import("texture.zig").SkyboxOptions;
 const visibility = @import("visibility/mod.zig");
 
 // Scene subsystems. Each owns its state (and GPU resources) plus the logic
@@ -139,8 +139,8 @@ pub const Scene = struct {
     // Public post-processing configs. Flat on purpose: sandbox tooling reads
     // and writes these two directly ~100 times; the stack that consumes them
     // lives in `postfx`.
-    post_process: PostProcessConfig = .{},
-    ssao: SSAOConfig = .{},
+    post_process: PostProcessOptions = .{},
+    ssao: SSAOOptions = .{},
 
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
@@ -187,11 +187,11 @@ pub const Scene = struct {
         self.postfx.resizeAll(width, height);
     }
 
-    pub fn setPostProcess(self: *Scene, config: PostProcessConfig) void {
+    pub fn setPostProcess(self: *Scene, config: PostProcessOptions) void {
         self.post_process = config;
     }
 
-    pub fn setSSAO(self: *Scene, config: SSAOConfig) void {
+    pub fn setSSAO(self: *Scene, config: SSAOOptions) void {
         self.ssao = config;
     }
 
@@ -201,7 +201,7 @@ pub const Scene = struct {
         self.sky.setSkybox(cube);
     }
 
-    pub fn createDefaultSkybox(self: *Scene, config: SkyboxConfig) !void {
+    pub fn createDefaultSkybox(self: *Scene, config: SkyboxOptions) !void {
         try self.sky.createDefault(self.allocator, config);
     }
 
@@ -547,23 +547,23 @@ pub const Scene = struct {
         // items live in queues.transparent and are drawn below, after every
         // opaque mesh including instanced ones.
         for (self.queues.items.items) |item| {
-            scene_draw.drawRegularItem(env, item, frame_ctx, &current_pipeline_id);
+            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
         }
 
         // Opaque instanced meshes.
         for (self.queues.opaque_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, frame_ctx, &current_pipeline_id);
+            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
         }
 
         // Transparent regular meshes (strict back-to-front, blended).
         for (self.queues.transparent.items) |item| {
-            scene_draw.drawRegularItem(env, item, frame_ctx, &current_pipeline_id);
+            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
         }
 
         // Transparent instanced meshes last, drawn as-is (no per-instance
         // sorting; documented limitation).
         for (self.queues.transparent_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, frame_ctx, &current_pipeline_id);
+            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
         }
 
         // Inverse-hull outline for highlighted meshes: inside the main pass,
