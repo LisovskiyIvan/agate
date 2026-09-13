@@ -25,6 +25,7 @@ test {
     _ = @import("loader/ply.zig");
     _ = @import("loader/stl.zig");
     _ = @import("material.zig");
+    _ = @import("shader_material.zig"); // pulls shader_material/merge.zig golden tests
     _ = @import("mesh.zig"); // pulls mesh/tests.zig and mesh/csg_tests.zig
     _ = @import("particles.zig");
     _ = @import("passes/debug_pass.zig");

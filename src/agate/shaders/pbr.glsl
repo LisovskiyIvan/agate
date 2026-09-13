@@ -33,6 +33,12 @@ in vec4 tangent;
 in vec4 color0;
 in vec2 texcoord0;
 
+// Shader material hook 'decls' (vertex stage): the same generated
+// sm_user_params uniform block as the fs-side hook, for snippets that use
+// params inside @hook(vertex). Empty otherwise. See shader_material/merge.zig.
+// @hook(decls)
+// @endhook
+
 out vec3 v_world_pos;
 out vec3 v_normal;
 out vec3 v_tangent;
@@ -82,6 +88,13 @@ void main() {
     vec3 morphed_nrm = normal;
     vec3 morphed_tan = tangent.xyz;
     applyMorphDeltas(morphed_pos, morphed_nrm, morphed_tan, gl_VertexIndex);
+
+    // Shader material hook 'vertex': user snippets may modify morphed_pos /
+    // morphed_nrm (world-space transforms below pick the changes up).
+    // Empty unless a shader material overrides it — see
+    // src/agate/shader_material/merge.zig.
+    // @hook(vertex)
+    // @endhook
 
     vec4 world_pos = model * vec4(morphed_pos, 1.0);
     v_world_pos = world_pos.xyz;
@@ -156,6 +169,15 @@ in vec4 v_color;
 in vec2 v_uv;
 
 out vec4 frag_color;
+
+// Shader material hook 'decls': the generated sm_user_params uniform block
+// (8x vec4, UB binding 3) for snippets that declare // @param entries lands
+// here (file scope). Empty otherwise. See shader_material/merge.zig.
+// NOTE: the UB slot pool is shared across stages but separate from the
+// texture/sampler pools: slots 0/1/2 are vs_params/fs_params/vs_morph,
+// so UB binding 3 is free (textures use 0..8, samplers 0..3).
+// @hook(decls)
+// @endhook
 
 const float PI = 3.14159265359;
 
@@ -400,6 +422,13 @@ vec2 envBRDFApprox(float roughness, float NoV) {
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), v_uv);
     vec4 albedo_rgba = v_color * base_color_factor * albedo_tex_val;
+
+    // Shader material hook 'albedo': user snippets may modify albedo_rgba
+    // (rgb and alpha; the alpha cutoff below sees the modified value).
+    // In scope: albedo_rgba, v_uv, v_world_pos, v_color, base_color_factor.
+    // @hook(albedo)
+    // @endhook
+
     // Alpha test (cutout): cutout materials discard sub-cutoff fragments
     // before any lighting work. Opaque/blend materials upload 0.0, so this
     // never fires for them (alpha is always >= 0.0).
@@ -551,7 +580,18 @@ void main() {
     vec4 emissive_sample = texture(sampler2D(emissive_tex, smp), v_uv);
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
+    // Shader material hook 'emissive': user snippets may modify `emissive`
+    // (custom glow patterns). In scope: emissive, v_uv, v_world_pos, albedo.
+    // @hook(emissive)
+    // @endhook
+
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;
+
+    // Shader material hook 'post_lighting': user snippets may modify
+    // final_color (rim light, color grading). In scope: final_color,
+    // ambient, ibl, Lo, emissive, albedo, v_world_pos, N, eye_pos.
+    // @hook(post_lighting)
+    // @endhook
 
     frag_color = vec4(final_color, albedo_rgba.a);
 }

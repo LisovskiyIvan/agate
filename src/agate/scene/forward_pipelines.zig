@@ -10,6 +10,115 @@ const inst_pbr_shd = @import("instanced_pbr_shader");
 const scene_pipelines = @import("pipelines.zig");
 const render_queue = @import("render_queue.zig");
 const RenderMeshItem = render_queue.RenderMeshItem;
+const shader_material = @import("../shader_material.zig");
+
+/// GPU pipeline set for one registered shader material: 8 pipelines shaped
+/// exactly like the built-in families (opaque/blend x u16/u32 plus their
+/// cull-off twins). Created lazily by ShaderMaterialCache on first use.
+pub const ShaderMaterialSet = struct {
+    key: u64 = 0,
+    shader: sg.Shader = .{},
+    opaque_u16: sg.Pipeline = .{},
+    opaque_u32: sg.Pipeline = .{},
+    blend_u16: sg.Pipeline = .{},
+    blend_u32: sg.Pipeline = .{},
+    ds_opaque_u16: sg.Pipeline = .{},
+    ds_opaque_u32: sg.Pipeline = .{},
+    ds_blend_u16: sg.Pipeline = .{},
+    ds_blend_u32: sg.Pipeline = .{},
+
+    /// Same contract as pipelineForRegularItem: cull-off twin when
+    /// requested and available, blend twin when transparent, regular
+    /// pipeline otherwise.
+    pub fn pipelineFor(self: *const ShaderMaterialSet, transparent: bool, is_u32: bool, double_sided: bool) u32 {
+        if (double_sided) {
+            const id = switch (transparent) {
+                true => if (is_u32) self.ds_blend_u32.id else self.ds_blend_u16.id,
+                false => if (is_u32) self.ds_opaque_u32.id else self.ds_opaque_u16.id,
+            };
+            if (id != 0) return id;
+        }
+        return switch (transparent) {
+            true => if (is_u32) self.blend_u32.id else self.blend_u16.id,
+            false => if (is_u32) self.opaque_u32.id else self.opaque_u16.id,
+        };
+    }
+};
+
+/// Lazy pipeline cache for registered shader materials. Entries are created
+/// on first use keyed by the registration key (Wyhash of the shader name,
+/// see shader_material.keyForName); lookups are O(slots) linear scans, the
+/// same determinism contract as the built-in pipeline table. Slots hold 8
+/// pipelines + 1 shader each; a full cache makes further materials skip
+/// drawing (overflow_count tracks it for diagnostics).
+pub const ShaderMaterialCache = struct {
+    pub const max_entries = 32;
+
+    slots: [max_entries]ShaderMaterialSet = @splat(.{}),
+    overflow_count: u32 = 0,
+
+    pub fn lookup(self: *const ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
+        for (&self.slots) |*slot| {
+            if (slot.key == key and slot.opaque_u16.id != 0) return slot;
+        }
+        return null;
+    }
+
+    /// GPU calls on cache miss. Null when the key is unregistered, the cache
+    /// is full, or pipeline creation failed (the draw path skips the mesh —
+    /// a material bug must not take the frame down; core pipeline failures
+    /// in ForwardPipelines.init still panic loudly).
+    pub fn getOrCreate(self: *ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
+        if (self.lookup(key)) |set| return set;
+        const entry = shader_material.entryForKey(key) orelse return null;
+        for (&self.slots) |*slot| {
+            if (slot.key == 0 and slot.opaque_u16.id == 0 and slot.shader.id == 0) {
+                const shader = entry.make_shader(sg.queryBackend());
+                if (shader.id == 0) return null;
+                slot.shader = shader;
+                var desc = sg.PipelineDesc{
+                    .shader = shader,
+                    .index_type = .UINT16,
+                    .depth = .{
+                        .compare = .LESS_EQUAL,
+                        .write_enabled = true,
+                    },
+                    .cull_mode = .BACK,
+                    .face_winding = .CCW,
+                };
+                scene_pipelines.pipelineLayoutFor(switch (entry.base) {
+                    .standard => .standard,
+                    .pbr => .pbr,
+                }, &desc);
+                scene_pipelines.makePipelinePair(desc, &slot.opaque_u16, &slot.opaque_u32, &slot.blend_u16, &slot.blend_u32);
+                scene_pipelines.makeCullOffPair(desc, &slot.ds_opaque_u16, &slot.ds_opaque_u32, &slot.ds_blend_u16, &slot.ds_blend_u32);
+                slot.key = key;
+                if (slot.opaque_u16.id == 0) return null; // creation failed
+                return slot;
+            }
+        }
+        self.overflow_count += 1;
+        return null;
+    }
+
+    pub fn deinit(self: *ShaderMaterialCache) void {
+        for (&self.slots) |*slot| {
+            inline for (.{
+                &slot.opaque_u16,    &slot.opaque_u32,
+                &slot.blend_u16,     &slot.blend_u32,
+                &slot.ds_opaque_u16, &slot.ds_opaque_u32,
+                &slot.ds_blend_u16,  &slot.ds_blend_u32,
+            }) |pipe| {
+                if (pipe.*.id != 0) sg.destroyPipeline(pipe.*);
+                pipe.* = .{};
+            }
+            if (slot.shader.id != 0) sg.destroyShader(slot.shader);
+            slot.shader = .{};
+            slot.key = 0;
+        }
+        self.overflow_count = 0;
+    }
+};
 
 /// All forward-rendering GPU pipelines in one place: the opaque u16/u32
 /// pairs and their transparent blend twins for the 5 shader families, plus
@@ -45,6 +154,10 @@ pub const ForwardPipelines = struct {
     // Double-sided (cull-off) twins for every family; selected per item when
     // the material sets double_sided. Created in init, freed in deinit.
     ds_pipelines: scene_pipelines.DoubleSidedPipelines = .{},
+
+    // Lazy pipeline cache for registered shader materials (built-in families
+    // above are eager; shader materials pay pipeline creation on first use).
+    shader_materials: ShaderMaterialCache = .{},
 
     // GPU-morph bind target for draws without morphs: binding/uniform state
     // persists across draws in sokol, so every forward draw must bind a
@@ -206,6 +319,7 @@ pub const ForwardPipelines = struct {
         sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u16);
         sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u32);
         self.ds_pipelines.deinit();
+        self.shader_materials.deinit();
     }
 
     // Selects the forward pipeline for a regular (non-instanced) queue item.
@@ -272,4 +386,44 @@ test "pipeline selection follows transparency flag" {
     mesh_obj.index_type = .UINT16;
     try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 31);
     try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 33);
+}
+
+test "ShaderMaterialSet.pipelineFor mirrors the built-in selection contract" {
+    const set = ShaderMaterialSet{
+        .key = 42,
+        .opaque_u16 = .{ .id = 101 },
+        .opaque_u32 = .{ .id = 102 },
+        .blend_u16 = .{ .id = 103 },
+        .blend_u32 = .{ .id = 104 },
+        .ds_opaque_u16 = .{ .id = 111 },
+        .ds_opaque_u32 = .{ .id = 112 },
+        .ds_blend_u16 = .{ .id = 113 },
+        .ds_blend_u32 = .{ .id = 114 },
+    };
+    try std.testing.expectEqual(@as(u32, 101), set.pipelineFor(false, false, false));
+    try std.testing.expectEqual(@as(u32, 102), set.pipelineFor(false, true, false));
+    try std.testing.expectEqual(@as(u32, 103), set.pipelineFor(true, false, false));
+    try std.testing.expectEqual(@as(u32, 104), set.pipelineFor(true, true, false));
+    // Double-sided resolves to the cull-off twins.
+    try std.testing.expectEqual(@as(u32, 111), set.pipelineFor(false, false, true));
+    try std.testing.expectEqual(@as(u32, 114), set.pipelineFor(true, true, true));
+
+    // Missing cull-off twin (id 0) falls back to the regular pipeline.
+    var partial = ShaderMaterialSet{
+        .opaque_u16 = .{ .id = 201 },
+        .blend_u32 = .{ .id = 204 },
+    };
+    try std.testing.expectEqual(@as(u32, 201), partial.pipelineFor(false, false, true));
+    try std.testing.expectEqual(@as(u32, 204), partial.pipelineFor(true, true, true));
+    _ = &partial;
+}
+
+test "ShaderMaterialCache lookup is key-based and miss-safe without GPU" {
+    var cache = ShaderMaterialCache{};
+    // No GPU resources were created: every lookup misses.
+    try std.testing.expect(cache.lookup(0) == null);
+    try std.testing.expect(cache.lookup(shader_material.keyForName("ramp_wave")) == null);
+    // entryForKey resolves the registration even though the cache is cold.
+    try std.testing.expect(shader_material.entryForKey(shader_material.keyForName("ramp_wave")) != null);
+    try std.testing.expect(shader_material.entryForKey(shader_material.keyForName("nope")) == null);
 }

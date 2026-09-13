@@ -358,6 +358,18 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .alpha_cutoff = p.alpha_cutoff,
                 .double_sided = p.double_sided,
             } },
+            // Documented limitation: shader materials serialize as plain
+            // standard materials carrying the tint/alpha state. The custom
+            // shader registration is not part of the snapshot format; after
+            // a roundtrip the mesh renders with the built-in shader (reassign
+            // the .shader_material variant after restore if needed).
+            .shader_material => |sm| .{ .standard = .{
+                .diffuse = .{ sm.tint_color.r, sm.tint_color.g, sm.tint_color.b },
+                .alpha = sm.alpha,
+                .alpha_mode = alphaModeToU8(sm.alpha_mode),
+                .alpha_cutoff = sm.alpha_cutoff,
+                .double_sided = sm.double_sided,
+            } },
         } else .{ .standard = .{} };
         try meshes.append(allocator, .{
             .name = name,
