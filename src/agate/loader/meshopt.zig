@@ -134,7 +134,13 @@ test "meshopt: decode is a no-op for uncompressed glTF" {
 }
 
 test "meshopt: plain fixture geometry matches golden values" {
-    const data = try parseGlbFromMemory(plain_glb);
+    // The accessor reads cast into the buffer at 2/4-byte boundaries, so the
+    // bytes must be aligned: @embedFile data has no alignment guarantee (this
+    // test used to abort on an UBSan misaligned-load depending on where the
+    // binary's rodata landed). Heap copies are max-aligned.
+    const plain = try std.testing.allocator.dupe(u8, plain_glb);
+    defer std.testing.allocator.free(plain);
+    const data = try parseGlbFromMemory(plain);
     defer c.cgltf_free(data);
 
     const prim = &data.meshes[0].primitives[0];

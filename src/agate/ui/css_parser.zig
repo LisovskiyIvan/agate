@@ -404,6 +404,10 @@ const Parser = struct {
         const raw = sel.slice;
         if (raw.len == 0) {
             self.addDiagAt(sel.start_line, sel.start_col, .syntax, "empty selector", false);
+            // Consume the '{' the scan stopped at: returning null without
+            // advancing would spin the outer parse loop on it forever
+            // (found by the css_parser fuzz target on a stray '{' input).
+            self.advance();
             return null;
         }
 
