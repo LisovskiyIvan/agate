@@ -2,6 +2,8 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const part_shd = @import("particle_shader");
+const part_compute_shd = @import("particle_compute_shader");
+const compute = @import("../compute.zig");
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
@@ -18,6 +20,15 @@ pub const ParticlePass = struct {
     // integrated state (see particles.GpuParticleSlot).
     pipeline_gpu_additive: sg.Pipeline,
     pipeline_gpu_alphablend: sg.Pipeline,
+    // Compute-simulation variants (shader programs particle_compute_sim /
+    // particle_compute in shaders/particle_compute.glsl): a compute pipeline
+    // integrates the state storage buffer, the render pipelines below draw
+    // billboards reading that buffer per instance. All four are .{} when the
+    // backend lacks compute (see compute.zig); systems then fall back.
+    compute_sim_pipeline: sg.Pipeline = .{},
+    pipeline_compute_additive: sg.Pipeline = .{},
+    pipeline_compute_alphablend: sg.Pipeline = .{},
+    compute_supported: bool = false,
     quad_vb: sg.Buffer,
     quad_ib: sg.Buffer,
     sampler: sg.Sampler,
@@ -91,6 +102,34 @@ pub const ParticlePass = struct {
         return sg.makePipeline(desc);
     }
 
+    /// Render pipeline for the compute path: the quad stays vertex buffer 0,
+    /// per-instance state comes from the storage-buffer view (no instance
+    /// vertex attributes). Blend/depth setup matches makePipeline verbatim.
+    fn makeComputeRenderPipeline(shader: sg.Shader, blend: sg.BlendState) sg.Pipeline {
+        var desc = sg.PipelineDesc{
+            .shader = shader,
+            .index_type = .UINT16,
+            .depth = .{
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        desc.layout.attrs[part_compute_shd.ATTR_particle_compute_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        desc.layout.attrs[part_compute_shd.ATTR_particle_compute_texcoord0] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 2 * @sizeOf(f32),
+        };
+        desc.colors[0].blend = blend;
+        return sg.makePipeline(desc);
+    }
+
     pub fn init() ParticlePass {
         const particle_quad_vertices = [_]f32{
             // x,     y,     u,   v
@@ -137,6 +176,22 @@ pub const ParticlePass = struct {
             .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
         };
 
+        // Compute support is a backend property (Metal / D3D11 / GL 4.3+ /
+        // WebGPU; see compute.zig). When missing, the compute pipelines stay
+        // invalid and `.compute` systems sticky-fall back on their next
+        // update (ParticleSystem.update gates on compute.supported()).
+        const compute_ok = compute.supported();
+        var compute_sim_pipeline: sg.Pipeline = .{};
+        var pipeline_compute_additive: sg.Pipeline = .{};
+        var pipeline_compute_alphablend: sg.Pipeline = .{};
+        if (compute_ok) {
+            const shader_sim = sg.makeShader(part_compute_shd.particleComputeSimShaderDesc(sg.queryBackend()));
+            compute_sim_pipeline = compute.makePipeline(shader_sim, "particle-compute-sim");
+            const shader_render = sg.makeShader(part_compute_shd.particleComputeShaderDesc(sg.queryBackend()));
+            pipeline_compute_additive = makeComputeRenderPipeline(shader_render, blend_additive);
+            pipeline_compute_alphablend = makeComputeRenderPipeline(shader_render, blend_alpha);
+        }
+
         return .{
             .pipeline_additive = makePipeline(
                 shader_cpu,
@@ -162,11 +217,71 @@ pub const ParticlePass = struct {
                 @sizeOf(particles.GpuParticleSlot),
                 true,
             ),
+            .compute_sim_pipeline = compute_sim_pipeline,
+            .pipeline_compute_additive = pipeline_compute_additive,
+            .pipeline_compute_alphablend = pipeline_compute_alphablend,
+            .compute_supported = compute_ok,
             .quad_vb = vb,
             .quad_ib = ib,
             .sampler = smp,
             .default_texture = Texture.createDefaultParticleDot32(),
         };
+    }
+
+    /// Runs the per-frame compute simulation for every `.compute` system in
+    /// one shared compute pass. Called from ParticleLayer.update — i.e.
+    /// outside any render pass and before the frame's render passes, so the
+    /// render stage reads freshly integrated state.
+    pub fn runComputeSimulations(self: *ParticlePass, systems: []const *ParticleSystem, dt: f32) void {
+        if (!self.compute_supported or self.compute_sim_pipeline.id == 0) return;
+        var any = false;
+        for (systems) |ps| {
+            if (ps.simulation_mode == .compute and ps.compute_state_buffer.id != 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+
+        sg.beginPass(.{ .compute = true, .label = "particle-compute-sim" });
+        sg.applyPipeline(self.compute_sim_pipeline);
+        for (systems) |ps| {
+            if (ps.simulation_mode != .compute) continue;
+            const params = ps.computeFrameParams(dt) orelse continue;
+            if (params.num_slots == 0) continue;
+
+            var bind = sg.Bindings{};
+            bind.views[part_compute_shd.VIEW_cs_slots] = ps.compute_slot_view;
+            bind.views[part_compute_shd.VIEW_cs_state] = ps.compute_state_view;
+            sg.applyBindings(bind);
+
+            const cs_params = part_compute_shd.CsParams{
+                .sim = .{
+                    params.dt,
+                    params.drag,
+                    @floatFromInt(params.spawn_start),
+                    @floatFromInt(params.spawn_count),
+                },
+                .misc = .{
+                    @floatFromInt(params.num_slots),
+                    if (params.init_all) 1.0 else 0.0,
+                    0.0,
+                    0.0,
+                },
+                .gravity = .{ params.gravity.x, params.gravity.y, params.gravity.z, 0.0 },
+            };
+            sg.applyUniforms(part_compute_shd.UB_cs_params, sg.asRange(&cs_params));
+
+            sg.dispatch(
+                @intCast(compute.groupCount(params.num_slots, compute.default_workgroup_size)),
+                1,
+                1,
+            );
+
+            // The init_all window is exactly one dispatch after creation.
+            ps.compute_init_pending = false;
+        }
+        sg.endPass();
     }
 
     pub fn render(
@@ -183,6 +298,11 @@ pub const ParticlePass = struct {
         var current_pipeline: sg.Pipeline = .{};
 
         for (systems) |ps| {
+            // Compute-simulated systems draw from the state storage buffer.
+            if (ps.simulation_mode == .compute) {
+                self.renderComputeSystem(ps, view_proj, cam_right, cam_up, &current_pipeline);
+                continue;
+            }
             const gpu = ps.simulation_mode == .gpu;
             const instance_buf = if (gpu) ps.gpu_slot_buffer else ps.instance_buffer;
             if (ps.active_count == 0 or instance_buf.id == 0) continue;
@@ -237,11 +357,62 @@ pub const ParticlePass = struct {
         }
     }
 
+    /// Draws one `.compute` system: billboards fed by the live-state storage
+    /// buffer (no instance vertex attributes; storage view instead).
+    fn renderComputeSystem(
+        self: *ParticlePass,
+        ps: *ParticleSystem,
+        view_proj: Mat4,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        current_pipeline: *sg.Pipeline,
+    ) void {
+        if (ps.active_count == 0 or ps.compute_state_view.id == 0) return;
+        const pip = switch (ps.blend_mode) {
+            .additive => self.pipeline_compute_additive,
+            .alpha_blend => self.pipeline_compute_alphablend,
+        };
+        if (pip.id == 0) return;
+        if (current_pipeline.id != pip.id) {
+            current_pipeline.* = pip;
+            sg.applyPipeline(pip);
+        }
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = self.quad_vb;
+        bind.index_buffer = self.quad_ib;
+        const tex_view = if (ps.texture) |*t| t.view else self.default_texture.view;
+        bind.views[part_compute_shd.VIEW_particle_tex] = tex_view;
+        bind.views[part_compute_shd.VIEW_vs_state] = ps.compute_state_view;
+        bind.samplers[part_compute_shd.SMP_smp] = self.sampler;
+        sg.applyBindings(bind);
+
+        const vs_params = part_compute_shd.VsParams{
+            .view_proj = view_proj,
+            .camera_right = .{ cam_right.x, cam_right.y, cam_right.z, 0.0 },
+            .camera_up = .{ cam_up.x, cam_up.y, cam_up.z, 0.0 },
+            .sprite = .{
+                @floatFromInt(if (ps.spritesheet_columns == 0) 1 else ps.spritesheet_columns),
+                @floatFromInt(if (ps.spritesheet_rows == 0) 1 else ps.spritesheet_rows),
+                ps.spritesheet_loops,
+                0.0,
+            },
+        };
+        sg.applyUniforms(part_compute_shd.UB_vs_params, sg.asRange(&vs_params));
+
+        // active_count is the written-slot high-water mark (dead slots cull
+        // in the vertex stage), same contract as the analytic path.
+        sg.draw(0, 6, @intCast(ps.active_count));
+    }
+
     pub fn deinit(self: *ParticlePass) void {
         sg.destroyPipeline(self.pipeline_additive);
         sg.destroyPipeline(self.pipeline_alphablend);
         sg.destroyPipeline(self.pipeline_gpu_additive);
         sg.destroyPipeline(self.pipeline_gpu_alphablend);
+        if (self.compute_sim_pipeline.id != 0) sg.destroyPipeline(self.compute_sim_pipeline);
+        if (self.pipeline_compute_additive.id != 0) sg.destroyPipeline(self.pipeline_compute_additive);
+        if (self.pipeline_compute_alphablend.id != 0) sg.destroyPipeline(self.pipeline_compute_alphablend);
         sg.destroyBuffer(self.quad_vb);
         sg.destroyBuffer(self.quad_ib);
         sg.destroySampler(self.sampler);

@@ -23,6 +23,22 @@ pub fn build(b: *Build) !void {
         name: []const u8,
         input: []const u8,
         output: []const u8,
+        /// Необязательный пер-модульный набор слэнгов. Дефолт (null) — общий
+        /// набор glsl410/metal_macos/hlsl5. Compute-шейдеры не выражаются в
+        /// GLSL 410, поэтому им нужен свой вызов shdc с glsl430 (доступность
+        /// на рантайме всё равно гейтится sg.queryFeatures().compute, см.
+        /// src/agate/compute.zig).
+        slang: ?sokol.shdc.Slang = null,
+    };
+    const default_slang = sokol.shdc.Slang{
+        .glsl410 = true, // Linux (GL)
+        .metal_macos = true, // macOS (Metal)
+        .hlsl5 = true, // Windows (D3D11)
+    };
+    const compute_slang = sokol.shdc.Slang{
+        .glsl430 = true, // Linux (GL): compute требует GL 4.3+
+        .metal_macos = true, // macOS (Metal)
+        .hlsl5 = true, // Windows (D3D11)
     };
     const shader_specs = [_]ShaderSpec{
         .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig" },
@@ -34,6 +50,7 @@ pub fn build(b: *Build) !void {
         .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
+        .{ .name = "particle_compute_shader", .input = "src/agate/shaders/particle_compute.glsl", .output = "particle_compute_shader.zig", .slang = compute_slang },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
         .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },
@@ -50,11 +67,7 @@ pub fn build(b: *Build) !void {
             .shdc_dep = dep_shdc,
             .input = spec.input,
             .output = spec.output,
-            .slang = .{
-                .glsl410 = true, // Linux (GL)
-                .metal_macos = true, // macOS (Metal)
-                .hlsl5 = true, // Windows (D3D11)
-            },
+            .slang = spec.slang orelse default_slang,
         });
         shader_mod.addImport("math", mod_math);
         shader_modules[i] = shader_mod;

@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const math = @import("math");
+const compute = @import("compute.zig");
 const Vec3 = math.Vec3;
 const Vec4 = math.Vec4;
 const Color4 = math.Color4;
@@ -17,42 +18,59 @@ pub const ParticleBlendMode = enum {
 /// Simulation driver of a ParticleSystem. Default `.cpu` keeps every existing
 /// system bit-for-bit identical; `.gpu` moves the integration into the vertex
 /// shader (stateless: each particle is a fixed slot holding only spawn data,
-/// position/fade/size are evaluated analytically from the age of the slot).
+/// position/fade/size are evaluated analytically from the age of the slot);
+/// `.compute` runs a stateful integration in a compute pass over a storage
+/// buffer (see shaders/particle_compute.glsl).
 ///
-/// Honest feature matrix — the GPU path can only express what a closed-form
-/// function of age `t = (now - spawn_time) / lifetime` produces:
+/// Honest feature matrix — the GPU paths can only express what their state
+/// model supports (`.gpu`: closed-form function of age; `.compute`: per-frame
+/// integrated live state):
 ///
-/// | Feature                              | .cpu      | .gpu                    |
-/// |--------------------------------------|-----------|-------------------------|
-/// | gravity                              | yes       | yes                     |
-/// | exponential drag (`drag`)            | no (1)    | yes                     |
-/// | lifetime / burst / emit_rate         | yes       | yes                     |
-/// | color & size start->end lerp         | yes       | yes                     |
-/// | spritesheet grid + loops             | yes       | yes                     |
-/// | rotation + angular velocity          | yes       | yes                     |
-/// | additive / alpha blend               | yes       | yes                     |
-/// | world-space emitter                  | yes       | yes                     |
-/// | local_space (moving emitter frame)   | yes       | fallback -> .cpu + warn |
-/// | collisions, noise, arbitrary forces  | (2)       | fallback -> .cpu + warn |
+/// | Feature                              | .cpu      | .gpu                    | .compute              |
+/// |--------------------------------------|-----------|-------------------------|-----------------------|
+/// | gravity                              | yes       | yes                     | yes                   |
+/// | exponential drag (`drag`)            | no (1)    | yes                     | yes (2)               |
+/// | lifetime / burst / emit_rate         | yes       | yes                     | yes                   |
+/// | color & size start->end lerp         | yes       | yes                     | yes                   |
+/// | spritesheet grid + loops             | yes       | yes                     | yes                   |
+/// | rotation + angular velocity          | yes       | yes                     | yes                   |
+/// | additive / alpha blend               | yes       | yes                     | yes                   |
+/// | world-space emitter                  | yes       | yes                     | yes                   |
+/// | local_space (moving emitter frame)   | yes       | fallback -> .cpu + warn | fallback -> .cpu + warn (3) |
+/// | collisions, noise, arbitrary forces  | (4)       | fallback -> .cpu + warn | future (5)            |
+/// | backend compute unavailable          | n/a       | n/a                     | fallback -> .gpu/.cpu + warn (6) |
 ///
 /// (1) `drag` is GPU-only by design: the CPU path integrates semi-implicit
-///     Euler per frame while the GPU path uses the exact exponential closed
-///     form; implementing drag on only one side keeps the two integration
-///     schemes from being silently mixed in one system.
-/// (2) Not implemented on either path today; features that need per-particle
-///     historical state (moving-emitter local space, collisions, force fields)
-///     must stay CPU-only because a stateless slot has no memory of previous
-///     frames. Requesting them in `.gpu` mode is not a panic: the system
-///     sticky-switches to `.cpu` with a warn log on the next update.
+///     Euler per frame while the GPU paths use the exact exponential form;
+///     implementing drag on only one side keeps the two integration schemes
+///     from being silently mixed in one system.
+/// (2) The compute path solves the drag ODE exactly per step:
+///     v' = v*e + g*(1-e)/k with e = exp(-k*dt) — the same family as the
+///     analytic closed form, stable for large k.
+/// (3) local_space needs the per-frame emitter transform; expressible in
+///     principle for `.compute`, but not wired yet — falls back like `.gpu`.
+/// (4) Not implemented on any path today; features that need per-particle
+///     historical state beyond the live record (collisions, force fields)
+///     must stay CPU-only until the state layout grows. Requesting them in a
+///     GPU mode is not a panic: the system sticky-switches to `.cpu` with a
+///     warn log on the next update.
+/// (5) The stateful storage buffer is the intended home for collisions and
+///     force fields; not implemented yet.
+/// (6) Compute needs Metal (Apple), D3D11/GL4.3+ (Windows/Linux) or WebGPU;
+///     unavailable on macOS-GL/iOS-GLES/WebGL2 (see compute.zig). The
+///     fallback prefers `.gpu`, then `.cpu`.
 ///
 /// Integration semantics differ by construction: `.cpu` advances with the
 /// frame dt (semi-implicit Euler), `.gpu` evaluates the exact closed form
 /// p(t) = p0 + v0*s + g*(t - s)/k with s = (1 - e^(-k*t)) / k (k = drag, and
-/// s = t, (t - s)/k = t^2/2 when k = 0). Both agree in the dt -> 0 limit; the
-/// analytic form is pinned by golden values in `analyticPosition` tests.
+/// s = t, (t - s)/k = t^2/2 when k = 0), `.compute` integrates per frame with
+/// the exact-per-step exponential drag above. All three agree in the dt -> 0
+/// limit; the analytic form is pinned by golden values in `analyticPosition`
+/// tests.
 pub const SimulationMode = enum {
     cpu,
     gpu,
+    compute,
 };
 
 /// One GPU particle slot: fixed-size spawn record consumed by the vertex
@@ -80,6 +98,25 @@ pub const GpuParticleSlot = extern struct {
 pub const SlotAge = struct {
     t: f32,
     alive: bool,
+};
+
+/// One compute-path particle record: the live state integrated by the compute
+/// shader (`@cs cs_simulate` in shaders/particle_compute.glsl, struct
+/// `pstate`, std430). 6 x vec4 = 96 bytes. The storage buffer of these
+/// records (`compute_state_buffer`) is written by the compute pass only;
+/// CPU-side spawn data flows through the shared GpuParticleSlot ring.
+pub const ComputeParticleState = extern struct {
+    /// xyz = current world position, w = age in seconds; -1.0 marks a
+    /// dead/unborn slot (the render stage culls on negative age).
+    pos_age: [4]f32,
+    /// xyz = current velocity, w = rotation (radians).
+    vel_rot: [4]f32,
+    /// x = lifetime (>= 0.0001), y = angular velocity (rad/s), zw unused.
+    life_misc: [4]f32,
+    color_start: [4]f32,
+    color_end: [4]f32,
+    /// x = size start, y = size end, zw unused.
+    size: [4]f32,
 };
 
 /// Normalized age of a particle slot. Mirrors the shader expression
@@ -260,6 +297,22 @@ pub const ParticleSystem = struct {
     gpu_dirty_end: usize = 0,
     gpu_dirty_wrapped: bool = false,
 
+    // --- Compute simulation path (simulation_mode == .compute) ---
+    /// Live per-slot state, integrated by the compute shader. Written by the
+    /// GPU only (the CPU never uploads it); provisioned lazily in update().
+    compute_state_buffer: sg.Buffer = .{},
+    /// Storage-buffer views for the compute pass: spawn ring (read-only) and
+    /// live state (read/write). Recreated never; destroyed in deinit.
+    compute_slot_view: sg.View = .{},
+    compute_state_view: sg.View = .{},
+    /// True for exactly the first frame after buffer creation, when the
+    /// backing storage is uninitialized: the compute shader then stamps all
+    /// non-spawned slots as dead instead of integrating garbage.
+    compute_init_pending: bool = false,
+    /// Spawn records written this frame (drives the compute shader's spawn
+    /// window); reset at the start of each compute update.
+    spawns_this_frame: usize = 0,
+
     // Emitter shape & origin
     emitter_position: Vec3 = Vec3.zero,
     emitter_box_min: Vec3 = Vec3.zero,
@@ -344,6 +397,18 @@ pub const ParticleSystem = struct {
             sg.destroyBuffer(self.gpu_slot_buffer);
             self.gpu_slot_buffer = .{};
         }
+        if (self.compute_state_buffer.id != 0) {
+            sg.destroyBuffer(self.compute_state_buffer);
+            self.compute_state_buffer = .{};
+        }
+        if (self.compute_slot_view.id != 0) {
+            sg.destroyView(self.compute_slot_view);
+            self.compute_slot_view = .{};
+        }
+        if (self.compute_state_view.id != 0) {
+            sg.destroyView(self.compute_state_view);
+            self.compute_state_view = .{};
+        }
         if (self.gpu_slots.len > 0) {
             self.allocator.free(self.gpu_slots);
             self.gpu_slots = &.{};
@@ -425,7 +490,9 @@ pub const ParticleSystem = struct {
     }
 
     pub fn emitOne(self: *ParticleSystem) void {
-        if (self.simulation_mode == .gpu) {
+        // `.gpu` and `.compute` share the spawn-slot ring; only their
+        // integration stage differs.
+        if (self.simulation_mode == .gpu or self.simulation_mode == .compute) {
             self.emitGpuSlot();
             return;
         }
@@ -481,9 +548,19 @@ pub const ParticleSystem = struct {
         if (self.gpu_write_cursor < c) self.gpu_dirty_wrapped = true;
         if (self.gpu_high_water < cap) self.gpu_high_water += 1;
         self.gpu_dirty_end = self.gpu_write_cursor;
+        // Feed the compute path's per-frame spawn window.
+        self.spawns_this_frame += 1;
         // Upper bound only (see gpu_high_water): scene stats and the render
         // skip-check key off active_count, so it must track the draw count.
         self.active_count = self.gpu_high_water;
+    }
+
+    /// Start index of this frame's spawn window in the ring: the cursor wound
+    /// back by the number of spawns written this frame. Pure; exercised by
+    /// tests without an sg context.
+    fn computeSpawnStart(self: *const ParticleSystem) usize {
+        const cap = if (self.capacity == 0) 1 else self.capacity;
+        return (self.gpu_write_cursor + cap - self.spawns_this_frame % cap) % cap;
     }
 
     pub fn burst(self: *ParticleSystem, count: usize) void {
@@ -595,6 +672,60 @@ pub const ParticleSystem = struct {
         self.simulation_mode = .cpu;
     }
 
+    /// Sticky target when compute is unavailable: prefer the stateless vertex
+    /// path (`.gpu`), degrade to `.cpu` when its feature set refuses too.
+    /// Pure so the fallback matrix stays testable without an sg context.
+    fn computeFallbackTarget(self: *const ParticleSystem) SimulationMode {
+        return if (self.gpuFeaturesSupported()) .gpu else .cpu;
+    }
+
+    fn fallbackFromCompute(self: *ParticleSystem, reason: []const u8) void {
+        const target = self.computeFallbackTarget();
+        std.log.warn(
+            "particles: system '{s}': compute simulation unavailable ({s}); sticky fallback to {s}",
+            .{ self.name, reason, @tagName(target) },
+        );
+        self.simulation_mode = target;
+    }
+
+    /// Compute-path frame bookkeeping: advances the epoch clock and appends
+    /// spawn slots to the ring (shared with the `.gpu` path). The actual
+    /// integration happens in the compute pass that ParticlePass runs for all
+    /// `.compute` systems after their update (shaders/particle_compute.glsl).
+    pub fn updateCompute(self: *ParticleSystem, dt: f32) void {
+        self.spawns_this_frame = 0;
+        // Reuses the `.gpu` emission machinery verbatim; its sticky fallbacks
+        // (local_space, allocation failure) degrade to `.cpu`, which matches
+        // the documented matrix for the compute path.
+        self.updateGpu(dt);
+    }
+
+    /// Per-frame compute-shader parameters, split out so ParticlePass can
+    /// drive the dispatch. Returns null when this system has nothing to do
+    /// this frame (no buffers provisioned yet).
+    pub const ComputeFrameParams = struct {
+        dt: f32,
+        drag: f32,
+        gravity: Vec3,
+        spawn_start: usize,
+        spawn_count: usize,
+        init_all: bool,
+        num_slots: usize,
+    };
+
+    pub fn computeFrameParams(self: *const ParticleSystem, dt: f32) ?ComputeFrameParams {
+        if (self.compute_state_buffer.id == 0) return null;
+        return .{
+            .dt = dt,
+            .drag = self.drag,
+            .gravity = self.gravity,
+            .spawn_start = self.computeSpawnStart(),
+            .spawn_count = self.spawns_this_frame,
+            .init_all = self.compute_init_pending,
+            .num_slots = self.capacity,
+        };
+    }
+
     /// GPU-path frame step: advances the epoch clock and appends spawn slots
     /// to the ring — O(emitted), never O(particles). The simulation itself
     /// happens in the vertex shader (shaders/particle.glsl, program
@@ -646,6 +777,13 @@ pub const ParticleSystem = struct {
     }
 
     pub fn update(self: *ParticleSystem, dt: f32) void {
+        if (self.simulation_mode == .compute) {
+            // Runtime gate first: compute needs Metal/D3D11/GL4.3+/WebGPU
+            // (see compute.zig). Sticky fallback to `.gpu`, then `.cpu`.
+            if (!compute.supported()) {
+                self.fallbackFromCompute("backend lacks compute support");
+            }
+        }
         if (self.simulation_mode == .gpu) {
             // Lazily create the GPU instance buffer on first update (the
             // sg context is required, which tests never have).
@@ -662,6 +800,40 @@ pub const ParticleSystem = struct {
             }
             // Sticky fallback happened mid-update: updateGpu already ran the
             // CPU step for this frame, only its instance upload is missing.
+            if (self.active_count > 0) {
+                sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+            }
+            return;
+        }
+        if (self.simulation_mode == .compute) {
+            // Lazily create the spawn ring buffer (shares the `.gpu` ring
+            // layout; the compute pass reads it as a storage buffer), the
+            // live-state storage buffer and their views. The state buffer
+            // starts uninitialized: the first compute dispatch runs in
+            // init_all mode to stamp every slot dead (see
+            // compute_init_pending).
+            if (self.gpu_slot_buffer.id == 0) {
+                self.gpu_slot_buffer = sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .storage_buffer = true, .dynamic_update = true },
+                    .size = self.capacity * @sizeOf(GpuParticleSlot),
+                });
+                self.compute_slot_view = compute.makeStorageView(self.gpu_slot_buffer, "particle-slot-view");
+            }
+            if (self.compute_state_buffer.id == 0) {
+                self.compute_state_buffer = sg.makeBuffer(.{
+                    .usage = .{ .storage_buffer = true },
+                    .size = self.capacity * @sizeOf(ComputeParticleState),
+                });
+                self.compute_state_view = compute.makeStorageView(self.compute_state_buffer, "particle-state-view");
+                self.compute_init_pending = true;
+            }
+            self.updateCompute(dt);
+            if (self.simulation_mode == .compute) {
+                self.flushGpuUpload();
+                return;
+            }
+            // Sticky fallback mid-update (local_space / allocation failure
+            // inside updateGpu): the CPU step already ran, upload instances.
             if (self.active_count > 0) {
                 sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
             }
@@ -1091,4 +1263,114 @@ test "gpu with local_space falls back to cpu (sticky, no panic)" {
     // Sticky: subsequent updates stay on the CPU path.
     ps.updateGpu(0.016);
     try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
+}
+
+// --- Compute-path tests: pure bookkeeping only (the dispatch itself runs in
+// ParticlePass under a live sg context; the shader formulas are mirrored and
+// pinned here so the CPU/GSL contract stays honest) ---
+
+test "compute mode defaults off and state layout matches the shader" {
+    var ps = try makeTestSystem(std.testing.allocator, 4);
+    defer freeTestSystem(&ps);
+    try std.testing.expectEqual(false, ps.compute_init_pending);
+    try std.testing.expectEqual(@as(usize, 0), ps.spawns_this_frame);
+    // Six FLOAT4s (see struct pstate in shaders/particle_compute.glsl):
+    // pos_age, vel_rot, life_misc, col0, col1, size.
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(ComputeParticleState));
+    // The compute wrapper's default workgroup must match the shader's
+    // `layout(local_size_x = 64) in;`.
+    try std.testing.expectEqual(@as(usize, 64), compute.default_workgroup_size);
+}
+
+test "compute fallback prefers gpu and honors local_space" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    // Without local_space the sticky chain steps down to the stateless path.
+    try std.testing.expectEqual(SimulationMode.gpu, ps.computeFallbackTarget());
+    // With local_space, `.gpu` is not expressible either: straight to CPU.
+    ps.local_space = true;
+    try std.testing.expectEqual(SimulationMode.cpu, ps.computeFallbackTarget());
+}
+
+test "compute spawn window tracks the ring cursor across wraps" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.gpu_slots = try a.alloc(GpuParticleSlot, 4);
+    ps.simulation_mode = .compute;
+    ps.updateCompute(0.0); // provision bookkeeping path: clock, no emission
+    try std.testing.expectEqual(@as(f32, 0.0), ps.clock_seconds);
+    try std.testing.expectEqual(@as(usize, 0), ps.spawns_this_frame);
+
+    // Emit one per frame; the window start is the slot the last write hit
+    // ((cursor - count) mod cap) and stays in sync with the ring cursor.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        ps.clock_seconds = @floatFromInt(i);
+        ps.updateCompute(0.0); // resets the per-frame spawn counter
+        ps.emitOne();
+        try std.testing.expectEqual(@as(usize, 1), ps.spawns_this_frame);
+        const last_written = (ps.gpu_write_cursor + 4 - 1) % 4;
+        try std.testing.expectEqual(last_written, ps.computeSpawnStart());
+    }
+    // Ring wrapped: slot 2 holds emission 6, window start == cursor == 2.
+    try std.testing.expectEqual(@as(usize, 2), ps.gpu_write_cursor);
+
+    // A spawn count of exactly one lap covers the whole ring from the cursor.
+    ps.spawns_this_frame = 4;
+    try std.testing.expectEqual(ps.gpu_write_cursor, ps.computeSpawnStart());
+    // More spawns than capacity: the start anchor wraps modulo the cap
+    // (cursor - 5 mod 4 = 1) while the window still covers every slot.
+    ps.spawns_this_frame = 5;
+    try std.testing.expectEqual(@as(usize, 1), ps.computeSpawnStart());
+    // Zero spawns anchor at the cursor with an empty window.
+    ps.spawns_this_frame = 0;
+    try std.testing.expectEqual(ps.gpu_write_cursor, ps.computeSpawnStart());
+}
+
+test "compute drag integration matches the analytic closed form" {
+    // The compute shader integrates the drag ODE exactly per step (the same
+    // closed form as the analytic .gpu path applied over dt):
+    //   p' = p + v*s + g*s2, v' = v*e + g*s
+    //   e = exp(-k*dt), s = (1-e)/k, s2 = (dt - s)/k
+    // so the iterated scheme pins to analyticPosition tightly. Drag off
+    // degenerates to semi-implicit Euler and only converges as dt -> 0.
+    const p0 = Vec3.new(0.0, 10.0, 0.0);
+    const v0 = Vec3.new(1.0, 0.0, 0.0);
+    const g = Vec3.new(0.0, -9.8, 0.0);
+    const k: f32 = 2.0;
+    const total: f32 = 1.0;
+    const steps: usize = 1000;
+    const dt = total / @as(f32, @floatFromInt(steps));
+
+    var pos = p0;
+    var vel = v0;
+    var i: usize = 0;
+    while (i < steps) : (i += 1) {
+        const e = @exp(-k * dt);
+        const s = (1.0 - e) / k;
+        const s2 = (dt - s) / k;
+        pos = pos.add(vel.scale(s)).add(g.scale(s2));
+        vel = vel.scale(e).add(g.scale(s));
+    }
+    const exact = analyticPosition(p0, v0, g, k, total);
+    // Tolerance 1e-3: the scheme is exact in real arithmetic, but f32
+    // rounding accumulates over 1000 exp/div steps.
+    try std.testing.expectApproxEqAbs(exact.x, pos.x, 1.0e-3);
+    try std.testing.expectApproxEqAbs(exact.y, pos.y, 1.0e-3);
+    try std.testing.expectApproxEqAbs(exact.z, pos.z, 1.0e-3);
+
+    // k = 0 degenerates to plain semi-implicit Euler: v += g*dt; p += v'*dt.
+    // Error vs the closed form is O(dt): 0.5*g*dt*t ~ 5e-4 at dt = 1e-4.
+    var vel_free = v0;
+    var pos_free = p0;
+    const fine_dt = total / 10000.0;
+    i = 0;
+    while (i < 10000) : (i += 1) {
+        vel_free = vel_free.add(g.scale(fine_dt));
+        pos_free = pos_free.add(vel_free.scale(fine_dt));
+    }
+    const exact_free = analyticPosition(p0, v0, g, 0.0, total);
+    try std.testing.expectApproxEqAbs(exact_free.y, pos_free.y, 1.0e-3);
 }
