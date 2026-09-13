@@ -97,8 +97,9 @@ loader/*) + скрипт-скан всех module-level `pub` деклараци
   ColliderType, UICanvas, UIVertex, DecalManager, TrailMesh, TrailOptions,
   DecalProjector, CSG, NavMesh, NavNode, NavAgent}` — брать из `agate.*`
 - `agate.Scene.{computeCascades, materialIsTransparent, frameUniforms,
-  getPhysicsWorld, resizeOffscreen(оставлен), FrameContext, FrameUniforms}` —
-  удалены первые пять и оба алиаса типов
+  getPhysicsWorld, FrameContext, FrameUniforms}` — мёртвые шимы/алиасы
+  удалены; `resizeOffscreen` оставлен (единственный путь ресайза SSAO),
+  задокументирован
 - `agate.mesh.{TrigEntry, trigEntry, buildTrigTable, storeQuadFlipped,
   buildBoxData, buildGroundData, buildTerrainData, buildSphereData,
   buildCylinderData, buildCapsuleData, orthogonal_dot_threshold}` —
@@ -124,10 +125,28 @@ loader/*) + скрипт-скан всех module-level `pub` деклараци
 `scene/draw.zig` `drawRegularItem`/`drawInstancedMesh` принимают
 `*const FrameContext` вместо копии.
 
-## 5. Итог
+## 5. Проверки (финал)
 
-- находок всего: 20 (remove: 9 групп / ~70 удалённых строк поверхности,
-  rename: 5, fix: 3, doc: 3)
-- ломающих для текущего sandbox: 0 (все удалённые имена имеют 0 вхождений;
-  переименования сохранены алиасами)
-- оптимизация: убрана копия ~830-байтного `FrameContext` на каждый draw
+- `zig build test --summary all` -> 26/26 steps, **451/451 passed**, exit 0
+- `zig build` -> 0 (демо-бинарь собирается)
+- `zig build fmt` -> 0
+- runtime-смоук `agate --frames N` в этой среде невыполним (нет оконной
+  сессии); прогнать `sandbox --bench` после мержа.
+
+## 6. Коммиты
+
+| Хэш | Содержимое |
+|---|---|
+| `5d84046` | docs(audit): этот отчёт |
+| `ee1f20a` | refactor: удаление мёртвой поверхности API + доки (−118/+82 строк, 14 файлов) |
+| `cbd04ab` | refactor(api): *Options-переименования с deprecated-алиасами + `*const FrameContext` (18 файлов) |
+
+## 7. Итог
+
+- находок всего: 20 (remove: 9 групп, rename: 5, fix: 3, doc: 3)
+- ломающих для текущего sandbox: 0 — все удалённые имена имеют 0 вхождений в
+  sandbox/src, переименования сохранены deprecated-алиасами (и в корне, и в
+  определяющих модулях)
+- оптимизация: `*const FrameContext` вместо копии ~830 байт на каждый draw
+  (drawRegularItem / drawInstancedMesh / drawShaderMaterialItem /
+  buildFrameUniforms); измерить `sandbox --bench` после мержа
