@@ -118,6 +118,10 @@ pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
 pub const ParticleInstanceData = particles.ParticleInstanceData;
+pub const SimulationMode = particles.SimulationMode;
+
+/// Compute-pass support (see compute.zig for the backend matrix).
+pub const compute = @import("compute.zig");
 
 pub const Ray = math.Ray;
 pub const RayHit = math.RayHit;
