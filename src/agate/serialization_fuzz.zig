@@ -62,3 +62,72 @@ test "fuzz: deserializeAlloc survives arbitrary bytes" {
 
     try std.testing.fuzz({}, testOne, .{ .corpus = corpus.items });
 }
+
+// ---------------------------------------------------------------------------
+// Allocation-failure, two contracts:
+// 1. capture/serialize/deserialize are strict: every allocation fails in
+//    turn, the call must return OOM and free everything it already took.
+// 2. restore is best-effort BY DESIGN (names degrade via `catch null`,
+//    ownership transfers into the scene), so it cannot pass the strict
+//    checker (OOM is swallowed, transferred memory outlives the call).
+//    For it we only assert crash-safety: a spread of fail indices runs the
+//    full pipeline through an arena (which also cleans up whatever restore
+//    managed to allocate).
+// ---------------------------------------------------------------------------
+
+fn snapshotAllocDense(alloc: std.mem.Allocator) !void {
+    var scene = fzg.testScene(alloc);
+    var mesh = fzg.testMesh("alloc-fail");
+    mesh.position = (fzg.vec3)(1, 2, 3);
+    try scene.meshes.append(alloc, &mesh);
+    defer scene.meshes.deinit(alloc);
+
+    var state = try serialization.capture(alloc, &scene);
+    defer state.deinit(alloc);
+
+    const bytes = try serialization.serializeAlloc(alloc, &state);
+    defer alloc.free(bytes);
+
+    var parsed = try serialization.deserializeAlloc(alloc, bytes);
+    defer parsed.deinit(alloc);
+}
+
+test "alloc-failure: capture/serialize/deserialize free everything on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, snapshotAllocDense, .{});
+}
+
+fn snapshotAllocCount() usize {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    snapshotAllocDense(failing.allocator()) catch {};
+    return failing.alloc_index;
+}
+
+test "restore survives allocation failures without crashing" {
+    const total = snapshotAllocCount();
+    for ([_]usize{ 0, total / 3, 2 * total / 3, total -| 1 }) |fail_index| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        const scoped = failing.allocator();
+
+        var scene = fzg.testScene(scoped);
+        var mesh = fzg.testMesh("alloc-fail");
+        scene.meshes.append(scoped, &mesh) catch continue;
+
+        var state = serialization.capture(scoped, &scene) catch continue;
+        const bytes = serialization.serializeAlloc(scoped, &state) catch {
+            state.deinit(scoped);
+            continue;
+        };
+        var parsed = serialization.deserializeAlloc(scoped, bytes) catch {
+            state.deinit(scoped);
+            continue;
+        };
+        serialization.restore(&scene, &parsed);
+
+        parsed.deinit(scoped);
+        state.deinit(scoped);
+    }
+}

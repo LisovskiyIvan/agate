@@ -485,9 +485,17 @@ pub fn buildDecalData(
         max_p.z = @max(max_p.z, v.position[2]);
     }
 
+    // Take ownership stepwise with errdefers: if the second toOwnedSlice
+    // fails, the first slice must be released (found by the allocation-failure
+    // test in mesh/tests.zig — the bare struct literal leaked the vertices).
+    const vertices = try out_vertices.toOwnedSlice(allocator);
+    errdefer allocator.free(vertices);
+    const indices = try out_indices.toOwnedSlice(allocator);
+    errdefer allocator.free(indices);
+
     return GeometryData{
-        .vertices = try out_vertices.toOwnedSlice(allocator),
-        .indices = try out_indices.toOwnedSlice(allocator),
+        .vertices = vertices,
+        .indices = indices,
         .bounds = BoundingBox.init(min_p, max_p),
     };
 }

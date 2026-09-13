@@ -51,6 +51,10 @@ pub fn testMesh(name: []const u8) Mesh {
     };
 }
 
+/// Engine vector constructor, re-exported so test files can build Vec3 values
+/// without importing the math module themselves.
+pub const vec3 = @import("math").Vec3.new;
+
 // ---------------------------------------------------------------------------
 // Comptime fuzz corpus builders: each turns a valid seed into the standard
 // malformed family (truncate at a power-of-two-ish spread + single-byte flips

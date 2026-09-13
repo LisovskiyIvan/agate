@@ -80,3 +80,17 @@ fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz: ply.parse survives arbitrary bytes" {
     try std.testing.fuzz({}, testOne, .{ .corpus = corpus });
 }
+
+// ---------------------------------------------------------------------------
+// Allocation-failure: the header table, vertex/face builders and the output
+// lists must survive any single allocation failing.
+// ---------------------------------------------------------------------------
+
+fn parseSeedPly(alloc: std.mem.Allocator) !void {
+    var data = try ply.parse(alloc, ascii_seed);
+    data.deinit(alloc);
+}
+
+test "alloc-failure: ply.parse frees everything on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseSeedPly, .{});
+}

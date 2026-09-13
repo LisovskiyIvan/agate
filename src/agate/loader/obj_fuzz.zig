@@ -59,3 +59,17 @@ fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz: obj.parse survives arbitrary bytes" {
     try std.testing.fuzz({}, testOne, .{ .corpus = corpus });
 }
+
+// ---------------------------------------------------------------------------
+// Allocation-failure: parse() juggles four output lists, a staging face list
+// and a dedup map; every allocation failing in turn must leave nothing behind.
+// ---------------------------------------------------------------------------
+
+fn parseSeedObj(alloc: std.mem.Allocator) !void {
+    var data = try obj.parse(alloc, seed);
+    data.deinit(alloc);
+}
+
+test "alloc-failure: obj.parse frees everything on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseSeedObj, .{});
+}

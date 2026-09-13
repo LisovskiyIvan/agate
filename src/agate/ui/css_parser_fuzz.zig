@@ -81,3 +81,20 @@ test "fuzz: css value parsers survive arbitrary bytes" {
         "9999999999999999999999px",
     } });
 }
+
+// ---------------------------------------------------------------------------
+// Allocation-failure: parseCss allocates class names, diagnostics and theme
+// tables through the caller's allocator. Parsed through an arena backed by
+// the failing allocator, so partial results die with the arena and the
+// FailingAllocator verifies nothing leaks.
+// ---------------------------------------------------------------------------
+
+fn parseSeedCss(alloc: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = try css.parseCss(arena.allocator(), seed);
+}
+
+test "alloc-failure: parseCss under OOM produces diagnostics, not crashes" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseSeedCss, .{});
+}

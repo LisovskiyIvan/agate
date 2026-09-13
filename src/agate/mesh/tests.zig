@@ -1006,6 +1006,37 @@ test "Mesh decal rotation angle and transformation" {
     }
 }
 
+// Allocation-failure: decal projection clips every intersecting triangle
+// through growable vertex/index lists; any single allocation may fail and
+// must leave nothing behind. (createDecal/trail upload via sokol and stay
+// GPU-only; buildDecalData is the CPU alloc-dense half of that path.)
+fn decalProjectionUnderOom(ally: std.mem.Allocator, target_mesh: *const Mesh) !void {
+    var decal_data = try buildDecalData(ally, target_mesh, .{
+        .position = Vec3.new(0.0, 0.0, 0.0),
+        .normal = Vec3.new(0.0, 0.0, 1.0),
+        .size = Vec3.new(2.0, 2.0, 2.0),
+        .depth_bias = 0.005,
+    });
+    decal_data.deinit(ally);
+}
+
+test "Mesh decal projection frees everything under allocation failure" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{ .width = 10.0, .height = 10.0 });
+    defer plane_data.deinit(ally);
+
+    var target_mesh: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+    };
+    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    defer target_mesh.deinit(ally);
+
+    try std.testing.checkAllAllocationFailures(ally, decalProjectionUnderOom, .{&target_mesh});
+}
+
 test "Mesh decal depth bias anti-z-fighting properties" {
     const ally = std.testing.allocator;
     const opts = DecalOptions{
