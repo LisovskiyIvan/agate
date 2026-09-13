@@ -4,6 +4,16 @@
 Метод: код-трассировка (texture.zig → draw.zig → *.glsl), sokol_gfx.h / stb_image.h /
 cgltf.h (vendored), базлайн `zig build test` — зелёный (exit 0) до изменений.
 
+## Итог (финализировано)
+
+- Фиксы + тесты: `d09991e` feat(textures): real mip/sRGB/filter/slot behavior per the audit.
+- Верификация: `zig build test --summary all` → **465/465 passed, 0 failed, exit 0**
+  (базлайн 451 + 14 новых golden-тестов); `zig build` → exit 0 (pbr/instanced_pbr/
+  skinned_pbr перекомпилированы sokol-shdc для glsl410/metal_macos/hlsl5);
+  `zig build fmt` → exit 0; рабочее дерево чистое.
+- Примечание: строка `failed command: .../test` в выводе build-раннера —
+  pre-existing артефакт (воспроизводится на базовом `f7f7d11`, 451/451, exit 0).
+
 ## Сводная таблица
 
 | # | Позиция | Было | Статус | Доказательство |
