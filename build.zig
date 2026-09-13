@@ -143,6 +143,10 @@ fn excludedFromTestRegistry(path: []const u8) bool {
     return false;
 }
 
+/// Clang flags disabling every sanitizer-coverage feature zig enables for C
+/// sources in fuzz mode. See the c_impl.c flag block for the rationale.
+const no_sancov = "-fno-sanitize-coverage=trace-pc-guard,inline-8bit-counters,pc-table,indirect-calls,trace-cmp,trace-div,trace-gep,inline-bool-flag";
+
 pub fn build(b: *Build) !void {
     syncTestRegistry(b);
 
@@ -248,10 +252,22 @@ pub fn build(b: *Build) !void {
         // JPEG decode runs scalar on Apple Silicon (measured ~2x slower).
         .flags = blk: {
             const neon = target.result.cpu.arch == .aarch64;
+            // -fno-sanitize-coverage: in fuzz mode (`zig build test --fuzz`)
+            // zig adds clang sancov instrumentation to this graph's C sources;
+            // its fuzzer runtime cannot account for the extra counters and
+            // panics at init ("pc counters length and pcs length do not
+            // match"). C decoders still execute under the fuzzer, they just
+            // contribute no coverage feedback. User cflags land after zig's.
             if (optimize == .Debug) {
-                break :blk if (neon) &.{ "-std=c99", "-O2", "-DSTBI_NEON" } else &.{ "-std=c99", "-O2" };
+                break :blk if (neon)
+                    &.{ "-std=c99", "-O2", "-DSTBI_NEON", no_sancov }
+                else
+                    &.{ "-std=c99", "-O2", no_sancov };
             }
-            break :blk if (neon) &.{ "-std=c99", "-DSTBI_NEON" } else &.{"-std=c99"};
+            break :blk if (neon)
+                &.{ "-std=c99", "-DSTBI_NEON", no_sancov }
+            else
+                &.{ "-std=c99", no_sancov };
         },
     });
     // Box3D v0.1.0, vendored C17 sources (MIT). Public headers under
@@ -309,7 +325,7 @@ pub fn build(b: *Build) !void {
             "src/agate/c/box3d/src/wheel_joint.c",
             "src/agate/c/box3d/src/world_snapshot.c",
         },
-        .flags = &.{"-std=c17"},
+        .flags = &.{ "-std=c17", no_sancov },
     });
     // meshoptimizer v1.2 (MIT), decoder-only subset vendored under
     // src/agate/c/meshopt. Compiled as C++: the decoder sources are
@@ -321,7 +337,7 @@ pub fn build(b: *Build) !void {
             "src/agate/c/meshopt/vertexcodec.cpp",
             "src/agate/c/meshopt/vertexfilter.cpp",
         },
-        .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" },
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", no_sancov },
     });
     mod_agate.link_libc = true;
     mod_agate.linkSystemLibrary("m", .{});
