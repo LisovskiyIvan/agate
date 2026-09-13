@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const decode = @import("decode.zig");
 
 /// Decoded WAV clip: interleaved stereo f32 at the clip's own sample rate.
 /// Read-only after load, so the mixer thread can safely read it while a
@@ -16,6 +17,43 @@ pub const AudioClip = struct {
     pub fn deinit(self: *AudioClip, allocator: std.mem.Allocator) void {
         allocator.free(self.samples);
         self.* = .{};
+    }
+
+    /// Decodes a whole MP3 file from memory via the vendored dr_mp3 decoder
+    /// (src/agate/c/dr_mp3.h). Output follows the WAV rules: interleaved
+    /// stereo f32 (mono duplicated) at the clip's own rate; playback
+    /// resamples via `AudioEngine.playClip`. MP3 is frame-based, so a
+    /// truncated stream yields the frames it contains; a stream with no
+    /// decodable frames is error.InvalidMp3.
+    pub fn fromMp3Memory(allocator: std.mem.Allocator, bytes: []const u8) decode.DecodeError!AudioClip {
+        const d = try decode.decodeMp3Memory(allocator, bytes);
+        return .{ .samples = d.samples, .sample_rate = d.sample_rate, .frames = d.frames };
+    }
+
+    /// Streaming MP3 file decode: dr_mp3 reads the file incrementally, so
+    /// peak memory is the f32 output (the compressed file is never fully
+    /// buffered). Filesystem errors surface before decoding; content errors
+    /// match `fromMp3Memory`.
+    pub fn fromMp3File(allocator: std.mem.Allocator, path: []const u8) !AudioClip {
+        const d = try decode.decodeMp3File(allocator, path);
+        return .{ .samples = d.samples, .sample_rate = d.sample_rate, .frames = d.frames };
+    }
+
+    /// Decodes an Ogg Vorbis stream from memory via the vendored stb_vorbis
+    /// decoder (src/agate/c/stb_vorbis.c). Output follows the WAV rules; a
+    /// valid stream with more than 2 channels is error.UnsupportedOggFormat
+    /// (mirroring UnsupportedWavFormat), anything malformed is
+    /// error.InvalidOgg.
+    pub fn fromOggMemory(allocator: std.mem.Allocator, bytes: []const u8) decode.DecodeError!AudioClip {
+        const d = try decode.decodeOggMemory(allocator, bytes);
+        return .{ .samples = d.samples, .sample_rate = d.sample_rate, .frames = d.frames };
+    }
+
+    /// Streaming Ogg Vorbis file decode; same semantics as `fromOggMemory`
+    /// with incremental input reads.
+    pub fn fromOggFile(allocator: std.mem.Allocator, path: []const u8) !AudioClip {
+        const d = try decode.decodeOggFile(allocator, path);
+        return .{ .samples = d.samples, .sample_rate = d.sample_rate, .frames = d.frames };
     }
 
     /// Streaming file decode: parses the RIFF header and chunk table with

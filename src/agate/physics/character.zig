@@ -3,6 +3,8 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const c = @import("../c.zig").c;
 const convert = @import("convert.zig");
+const world_mod = @import("world.zig");
+const PhysicsWorld = world_mod.PhysicsWorld;
 const toB3Pos = convert.toB3Pos;
 const toB3Vec = convert.toB3Vec;
 const fromB3Vec = convert.fromB3Vec;
@@ -37,7 +39,7 @@ pub const CharacterController = struct {
     /// Advances the controller. `wish_dir` is the desired horizontal move
     /// direction (y is ignored, longer than 1 is normalized). `jump_pressed`
     /// is an edge trigger consumed while grounded.
-    pub fn move(self: *CharacterController, world: anytype, wish_dir: Vec3, jump_pressed: bool, dt: f32) void {
+    pub fn move(self: *CharacterController, world: *PhysicsWorld, wish_dir: Vec3, jump_pressed: bool, dt: f32) void {
         if (dt <= 0.0) return;
         world.syncWorldParams();
         const h = @min(dt, 1.0 / 30.0);

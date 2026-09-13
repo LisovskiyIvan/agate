@@ -1,4 +1,6 @@
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 
 pub const TonemappingType = enum(u32) {
     none = 0,
@@ -17,6 +19,23 @@ pub const BLOOM_MAX_MIPS: usize = 7;
 // postprocess.glsl applyDoF so CPU tests mirror the shader exactly.
 pub const DOF_GOLDEN_ANGLE: f32 = 2.3999632;
 pub const DOF_TAPS: u32 = 14;
+
+// LUT color grading (2D strip): an N^3 color cube packed as an N*N wide,
+// N tall RGBA8 image. N is the cube edge; 32 (1024x32) and 64 (4096x64)
+// are the sizes the engine validates. The cap keeps the blue-derived
+// layer math comfortably exact in f32 and stops absurd uploads.
+pub const LUT_SIZE_MIN: u32 = 2;
+pub const LUT_SIZE_MAX: u32 = 64;
+
+/// GPU binding for a LUT strip texture: a texture view into an N*N x N
+/// RGBA8 image plus the cube edge N. Handles only — decode/upload stays
+/// with the parent via the public texture.zig API (Texture.fromFile with
+/// mipmaps=false, CLAMP_TO_EDGE wraps, then validate the strip with
+/// lutStripLayout before building this).
+pub const LutBinding = struct {
+    view: sg.View = .{},
+    size: u32 = 0,
+};
 
 pub const PostProcessConfig = struct {
     enabled: bool = false,
@@ -57,6 +76,13 @@ pub const PostProcessConfig = struct {
     grade_shadows: [3]f32 = .{ 0.0, 0.0, 0.0 },
     grade_midtones: [3]f32 = .{ 0.0, 0.0, 0.0 },
     grade_highlights: [3]f32 = .{ 0.0, 0.0, 0.0 },
+
+    // Texture LUT color grading, sampled after the parametric curves.
+    // With lut == null (the default) the shader skips the LUT branch
+    // entirely and the composite path stays bit-identical to pre-LUT.
+    lut: ?LutBinding = null,
+    lut_enabled: bool = false,
+    lut_intensity: f32 = 1.0,
 
     // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
     fxaa_enabled: bool = true,
@@ -102,6 +128,13 @@ pub const PostProcessConfig = struct {
         out.grade_shadows = clampGrade(self.grade_shadows);
         out.grade_midtones = clampGrade(self.grade_midtones);
         out.grade_highlights = clampGrade(self.grade_highlights);
+        out.lut_intensity = std.math.clamp(self.lut_intensity, 0.0, 1.0);
+        // A binding without a live view or supported size can never be
+        // sampled; drop it so the pass keeps its no-LUT path instead of
+        // binding a dead handle.
+        if (out.lut) |lut| {
+            if (lut.view.id == 0 or !validLutSize(lut.size)) out.lut = null;
+        }
         return out;
     }
 };
@@ -117,6 +150,116 @@ pub fn clampGrade(v: [3]f32) [3]f32 {
         std.math.clamp(v[0], -1.0, 1.0),
         std.math.clamp(v[1], -1.0, 1.0),
         std.math.clamp(v[2], -1.0, 1.0),
+    };
+}
+
+// True when `size` is a supported LUT cube edge (strip is N*N x N).
+pub fn validLutSize(size: u32) bool {
+    return size >= LUT_SIZE_MIN and size <= LUT_SIZE_MAX;
+}
+
+// Validated 2D strip geometry for one LUT.
+pub const LutStripLayout = struct {
+    /// Cube edge N (also the strip height).
+    size: u32,
+    /// Strip pixel width, always size * size.
+    width: u32,
+    /// Strip pixel height, always size.
+    height: u32,
+};
+
+// Validate decoded LUT strip dimensions: the image must be N texels tall
+// and N*N wide (one N x N slice per blue step), with N in the supported
+// range. Any other aspect cannot address the cube, so it is a hard error
+// at load time rather than a silent broken grade.
+pub fn lutStripLayout(width: u32, height: u32) !LutStripLayout {
+    if (height < LUT_SIZE_MIN or height > LUT_SIZE_MAX or width != height * height) {
+        return error.InvalidLutStrip;
+    }
+    return .{ .size = height, .width = width, .height = height };
+}
+
+// One manual-trilinear LUT strip lookup: two layer uvs plus the blend
+// weight between them.
+pub const LutStripSample = struct {
+    /// Strip uv inside layer floor(t) (blue axis).
+    uv0: [2]f32,
+    /// Strip uv inside the next layer up (same layer when b == 1).
+    uv1: [2]f32,
+    /// Linear blend weight from uv0's color toward uv1's color.
+    blend: f32,
+};
+
+// Strip uv math for one color lookup. Mirrors applyLut in
+// postprocess.glsl so CPU tests pin the exact shader formula.
+//
+// Derivation (N = cube edge, strip is N*N wide by N tall, v = 0 is the
+// first row as decoded/uploaded):
+//   1. Blue addresses the cube's third axis scaled to layer centers:
+//      t = b*(N-1), so b in {0,1} lands exactly on the first/last layer.
+//   2. t splits into integer layer k = floor(t) and fraction f = t - k;
+//      sampling layers k and k+1 and mixing by f is the manual
+//      trilinear third axis (hardware bilinear only covers r/g inside
+//      one layer).
+//   3. Red/green address texel centers inside one N x N slice with the
+//      same center inset, (c*(N-1)+0.5)/N: c=0/1 hit the slice edge
+//      centers, and the half-texel inset keeps hardware bilinear inside
+//      the layer (no bleed across neighboring slices in the strip).
+//   4. Layer k starts at column k*N of the strip, so
+//      uv.x = (k + u_slice)/N and uv.y = v_slice.
+pub fn lutStripUv(r: f32, g: f32, b: f32, size: u32) LutStripSample {
+    const n: f32 = @floatFromInt(size);
+    const t = std.math.clamp(b, 0.0, 1.0) * (n - 1.0);
+    const k = @floor(t);
+    const f = t - k;
+    const u_slice = (std.math.clamp(r, 0.0, 1.0) * (n - 1.0) + 0.5) / n;
+    const v_slice = (std.math.clamp(g, 0.0, 1.0) * (n - 1.0) + 0.5) / n;
+    const k1 = @min(k + 1.0, n - 1.0);
+    return .{
+        .uv0 = .{ (k + u_slice) / n, v_slice },
+        .uv1 = .{ (k1 + u_slice) / n, v_slice },
+        .blend = f,
+    };
+}
+
+// Final LUT blend. Mirrors applyLut in postprocess.glsl: mix the two
+// sampled layers by the trilinear weight, then blend the graded color
+// back toward the curve-graded input by `intensity` in [0, 1].
+pub fn applyLutStrip(
+    color: [3]f32,
+    layer0: [3]f32,
+    layer1: [3]f32,
+    sample: LutStripSample,
+    intensity: f32,
+) [3]f32 {
+    const graded = [3]f32{
+        layer0[0] + (layer1[0] - layer0[0]) * sample.blend,
+        layer0[1] + (layer1[1] - layer0[1]) * sample.blend,
+        layer0[2] + (layer1[2] - layer0[2]) * sample.blend,
+    };
+    const i = std.math.clamp(intensity, 0.0, 1.0);
+    return .{
+        color[0] + (graded[0] - color[0]) * i,
+        color[1] + (graded[1] - color[1]) * i,
+        color[2] + (graded[2] - color[2]) * i,
+    };
+}
+
+// Pack the shader lut_params vec4: (enabled 1/0, intensity, size N, 0).
+// Anything that cannot sample — no binding, dead view, bad size, disabled
+// flag — packs all zeros, which is exactly the pre-LUT uniform state, so
+// the no-LUT path stays unchanged. Kept beside the Zig LUT math so tests
+// pin what postprocess_pass uploads.
+pub fn lutParams(cfg: PostProcessConfig) [4]f32 {
+    const lut = cfg.lut orelse return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.lut_enabled or lut.view.id == 0 or !validLutSize(lut.size)) {
+        return .{ 0.0, 0.0, 0.0, 0.0 };
+    }
+    return .{
+        1.0,
+        std.math.clamp(cfg.lut_intensity, 0.0, 1.0),
+        @floatFromInt(lut.size),
+        0.0,
     };
 }
 
@@ -348,4 +491,141 @@ test "color grade identity and shadows" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.3), hl[1], 1e-6);
     const hl_dark = applyGrade(zero, zero, zero, .{ 0.0, 0.3, 0.0 });
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), hl_dark[1], 1e-6);
+}
+
+test "lut strip layout validation" {
+    // The two engine-validated strips decode cleanly.
+    const lut32 = try lutStripLayout(1024, 32);
+    try std.testing.expectEqual(@as(u32, 32), lut32.size);
+    try std.testing.expectEqual(@as(u32, 1024), lut32.width);
+    const lut64 = try lutStripLayout(4096, 64);
+    try std.testing.expectEqual(@as(u32, 64), lut64.size);
+    const lut16 = try lutStripLayout(256, 16);
+    try std.testing.expectEqual(@as(u32, 16), lut16.size);
+
+    // Broken aspects cannot address the cube: swapped dims, non-square
+    // slice, degenerate sizes, or an oversized edge.
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(1024, 64));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(512, 32));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(33, 33));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(32, 32));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(0, 0));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(1, 1));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(16384, 128));
+    try std.testing.expectError(error.InvalidLutStrip, lutStripLayout(4, 0));
+
+    try std.testing.expect(validLutSize(2));
+    try std.testing.expect(validLutSize(64));
+    try std.testing.expect(!validLutSize(1));
+    try std.testing.expect(!validLutSize(0));
+    try std.testing.expect(!validLutSize(128));
+}
+
+test "lut strip uv golden values" {
+    // Black at N=32: layer 0, half-texel inset in both slice axes. v is
+    // the slice-space row coordinate (already normalized); only u gains
+    // the layer offset and the extra 1/N strip scaling.
+    const s000 = lutStripUv(0.0, 0.0, 0.0, 32);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.015625 / 32.0), s000.uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.015625), s000.uv0[1], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.015625 / 32.0), s000.uv1[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s000.blend, 1e-7);
+
+    // White at N=32: last layer (31), no second layer needed.
+    const s111 = lutStripUv(1.0, 1.0, 1.0, 32);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.984375 / 32.0), s111.uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.5 / 32.0), s111.uv0[1], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s111.blend, 1e-7);
+
+    // Mid-blue at N=32 sits halfway between layers 15 and 16.
+    const smid = lutStripUv(0.0, 0.0, 0.5, 32);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.015625 / 32.0), smid.uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.015625 / 32.0), smid.uv1[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), smid.blend, 1e-7);
+    // Green only moves v, never the layer.
+    try std.testing.expectApproxEqAbs(smid.uv0[0], lutStripUv(0.0, 1.0, 0.5, 32).uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.5 / 32.0), lutStripUv(0.0, 1.0, 0.5, 32).uv0[1], 1e-7);
+
+    // N=64 spot check at mid-gray.
+    const s64 = lutStripUv(0.5, 0.5, 0.5, 64);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.5 / 64.0), s64.uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.5 / 64.0), s64.uv1[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s64.uv0[1], 1e-7);
+
+    // Out-of-range blue clamps to the layer range instead of wrapping.
+    const sclamp = lutStripUv(0.0, 0.0, 2.0, 32);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.015625 / 32.0), sclamp.uv0[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), sclamp.blend, 1e-7);
+}
+
+test "lut intensity mix" {
+    const sample = LutStripSample{
+        .uv0 = .{ 0.0, 0.0 },
+        .uv1 = .{ 0.0, 0.0 },
+        .blend = 0.5,
+    };
+    const base = [3]f32{ 0.2, 0.4, 0.6 };
+    const l0 = [3]f32{ 0.0, 0.0, 0.0 };
+    const l1 = [3]f32{ 1.0, 1.0, 1.0 };
+
+    // Intensity 0 keeps the curve-graded color untouched.
+    const off = applyLutStrip(base, l0, l1, sample, 0.0);
+    try std.testing.expectApproxEqAbs(base[0], off[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base[1], off[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base[2], off[2], 1e-6);
+
+    // Full trilinear between the two sampled layers.
+    const full = applyLutStrip(base, l0, l1, sample, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), full[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), full[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), full[2], 1e-6);
+
+    // Quarter blend sits a quarter of the way to the graded color.
+    const quarter = applyLutStrip(base, l0, l1, sample, 0.25);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2 + (0.5 - 0.2) * 0.25), quarter[0], 1e-6);
+
+    // Out-of-range intensity clamps, never overshoots.
+    const over = applyLutStrip(base, l0, l1, sample, 4.0);
+    try std.testing.expectApproxEqAbs(full[0], over[0], 1e-6);
+    const under = applyLutStrip(base, l0, l1, sample, -1.0);
+    try std.testing.expectApproxEqAbs(base[0], under[0], 1e-6);
+}
+
+test "lut params packing and default path" {
+    // Defaults: no LUT, disabled — the pre-LUT composite path.
+    const def = PostProcessConfig{};
+    try std.testing.expect(def.lut == null);
+    try std.testing.expect(!def.lut_enabled);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def.clamped()));
+
+    // A live binding enables the uniform triplet.
+    const live = PostProcessConfig{
+        .lut = .{ .view = .{ .id = 7 }, .size = 32 },
+        .lut_enabled = true,
+        .lut_intensity = 1.0,
+    };
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 32.0, 0.0 }, lutParams(live));
+
+    // Intensity packs clamped.
+    var hot = live;
+    hot.lut_intensity = 3.0;
+    try std.testing.expectEqual(@as(f32, 1.0), hot.clamped().lut_intensity);
+    hot.lut_intensity = -0.5;
+    try std.testing.expectEqual(@as(f32, 0.0), hot.clamped().lut_intensity);
+
+    // clamped() drops bindings that can never sample.
+    const dead = PostProcessConfig{ .lut = .{ .view = .{}, .size = 32 }, .lut_enabled = true };
+    try std.testing.expect(dead.clamped().lut == null);
+    // Any N inside [2, 64] stays (33 is legal, the strip math is generic);
+    // only out-of-range sizes are dropped.
+    const keep = PostProcessConfig{ .lut = .{ .view = .{ .id = 5 }, .size = 33 }, .lut_enabled = true };
+    try std.testing.expect(keep.clamped().lut != null);
+    const bogus = PostProcessConfig{ .lut = .{ .view = .{ .id = 3 }, .size = 100 }, .lut_enabled = true };
+    try std.testing.expect(bogus.clamped().lut == null);
+
+    // Present but disabled still packs zeros.
+    var idle = live;
+    idle.lut_enabled = false;
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(idle));
 }

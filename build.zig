@@ -146,6 +146,18 @@ pub fn build(b: *Build) !void {
         },
         .flags = &.{"-std=c17"},
     });
+    // meshoptimizer v1.2 (MIT), decoder-only subset vendored under
+    // src/agate/c/meshopt. Compiled as C++: the decoder sources are
+    // runtime-free C++ (no exceptions/RTTI/stdlib), so no libc++ link is
+    // needed and the module's existing libc link stays intact.
+    mod_agate.addCSourceFiles(.{
+        .files = &.{
+            "src/agate/c/meshopt/indexcodec.cpp",
+            "src/agate/c/meshopt/vertexcodec.cpp",
+            "src/agate/c/meshopt/vertexfilter.cpp",
+        },
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" },
+    });
     mod_agate.link_libc = true;
     mod_agate.linkSystemLibrary("m", .{});
 

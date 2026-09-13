@@ -207,9 +207,9 @@ fn parseHeader(allocator: std.mem.Allocator, bytes: []const u8) !Header {
         if (pos >= bytes.len) return error.TruncatedPly;
         var eol = pos;
         while (eol < bytes.len and bytes[eol] != '\n') : (eol += 1) {}
-        if (eol >= bytes.len) return error.TruncatedPly;
+        const terminated = eol < bytes.len;
         var line = bytes[pos..eol];
-        pos = eol + 1;
+        pos = if (terminated) eol + 1 else eol;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         line = trimH(line);
         if (first) {
@@ -218,13 +218,21 @@ fn parseHeader(allocator: std.mem.Allocator, bytes: []const u8) !Header {
             continue;
         }
         if (line.len == 0) continue;
-        const kw = firstToken(line);
-        if (std.mem.eql(u8, kw, "comment") or std.mem.eql(u8, kw, "obj_info")) continue;
-        if (std.mem.eql(u8, kw, "end_header")) {
-            if (!std.mem.eql(u8, line, "end_header")) return error.InvalidPly;
-            h.data_off = pos;
+        // Binary payload may start directly after "end_header" with no
+        // newline, so the keyword must be detected by prefix: tokenizing the
+        // line would fold payload bytes into the keyword token. The exact
+        // match takes the normal path; otherwise the header ends where the
+        // keyword ends (line is trimmed, so its start is eol - line.len).
+        if (std.mem.startsWith(u8, line, "end_header")) {
+            if (std.mem.eql(u8, line, "end_header")) {
+                h.data_off = pos;
+                break;
+            }
+            h.data_off = eol - line.len + "end_header".len;
             break;
         }
+        const kw = firstToken(line);
+        if (std.mem.eql(u8, kw, "comment") or std.mem.eql(u8, kw, "obj_info")) continue;
         var toks: [8][]const u8 = undefined;
         const n = headerTokens(line, &toks);
         if (std.mem.eql(u8, kw, "format")) {

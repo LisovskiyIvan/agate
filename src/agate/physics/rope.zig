@@ -5,6 +5,8 @@ const c = @import("../c.zig").c;
 const body_mod = @import("body.zig");
 const RigidBody = body_mod.RigidBody;
 const types = @import("types.zig");
+const world_mod = @import("world.zig");
+const PhysicsWorld = world_mod.PhysicsWorld;
 const ColliderType = types.ColliderType;
 const JointId = types.JointId;
 const DistanceJointOptions = types.DistanceJointOptions;
@@ -60,7 +62,7 @@ pub const Rope = struct {
     start_rest: f32 = 0.001,
     end_rest: f32 = 0.001,
 
-    pub fn deinit(self: *Rope, world: anytype) void {
+    pub fn deinit(self: *Rope, world: *PhysicsWorld) void {
         // Links may already be severed (detachAt) or invalidated by body
         // removal; destroying an invalid joint fails a Box3D assert.
         if (self.start_joint) |j| {
@@ -82,7 +84,7 @@ pub const Rope = struct {
 
     /// Severs the link between bodies[index] and bodies[index + 1].
     /// Out-of-range or already-severed links are ignored.
-    pub fn detachAt(self: *Rope, world: anytype, index: usize) void {
+    pub fn detachAt(self: *Rope, world: *PhysicsWorld, index: usize) void {
         if (index >= self.joints.items.len) return;
         const j = self.joints.items[index];
         if (!c.b3Joint_IsValid(j)) return;
@@ -90,7 +92,7 @@ pub const Rope = struct {
     }
 
     /// Recreates every missing link/pin joint (after detachAt or reset).
-    pub fn repair(self: *Rope, world: anytype) void {
+    pub fn repair(self: *Rope, world: *PhysicsWorld) void {
         if (self.bodies.items.len == 0) return;
         if (self.pin_start) |pin| {
             if (self.start_joint == null or !c.b3Joint_IsValid(self.start_joint.?)) {
@@ -132,7 +134,7 @@ pub const Rope = struct {
 
     /// Lays the segments back on the creation line, zeroes velocities and
     /// repairs severed joints.
-    pub fn reset(self: *Rope, world: anytype) void {
+    pub fn reset(self: *Rope, world: *PhysicsWorld) void {
         const n = self.bodies.items.len;
         if (n == 0) return;
         for (self.bodies.items, 0..) |b, i| {

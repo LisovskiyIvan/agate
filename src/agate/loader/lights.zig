@@ -160,7 +160,7 @@ fn cameraObjectName(cam: *const c.cgltf_camera) ?[]const u8 {
 /// imported, further directional lights are skipped (their duped names freed).
 pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) !void {
     if (gltf.nodes_count == 0) return;
-    var have_directional = scene.directional_light != null;
+    var have_directional = scene.lights.directional != null;
     for (0..gltf.nodes_count) |node_idx| {
         const node: *const c.cgltf_node = @ptrCast(&gltf.nodes[node_idx]);
         const light_ptr = node.light orelse continue;

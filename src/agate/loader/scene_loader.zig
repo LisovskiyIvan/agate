@@ -13,13 +13,28 @@ const skins_mod = @import("skins.zig");
 const mesh_spawn_mod = @import("mesh_spawn.zig");
 const animations_mod = @import("animations.zig");
 const lights_mod = @import("lights.zig");
+const MorphMode = @import("../mesh.zig").MorphMode;
 const math = @import("math");
 const Mat4 = math.Mat4;
 
 pub const SceneLoader = struct {
+    pub const LoadOptions = struct {
+        /// Morph blending mode for meshes spawned from this file.
+        /// .cpu (default) keeps the historical behavior: applyMorphs()
+        /// rewrites a dynamic vertex buffer. .gpu keeps a static base-pose
+        /// vertex buffer and the vertex shader blends from an RGBA32F delta
+        /// texture (forward standard/pbr/skinned paths only; fails loudly
+        /// when RGBA32F is unavailable).
+        morph_mode: MorphMode = .cpu,
+    };
+
     pub const appendGltf = appendGlb;
 
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
+        return appendGlbOptions(scene, file_path, .{});
+    }
+
+    pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh {
         const path_z = try scene.allocator.dupeZ(u8, file_path);
         defer scene.allocator.free(path_z);
 
@@ -36,6 +51,14 @@ pub const SceneLoader = struct {
         const load_buf_res = c.cgltf_load_buffers(&options, data, path_z.ptr);
         if (load_buf_res != c.cgltf_result_success) {
             return error.GltfLoadBuffersFailed;
+        }
+
+        // EXT_meshopt_compression: decode compressed buffer views in place.
+        // No-op (and bit-identical behaviour) for files without the extension;
+        // see loader/meshopt.zig for the supported modes and limitations.
+        const decode_res = c.agate_cgltf_decode_meshopt(&options, data);
+        if (decode_res != c.cgltf_result_success) {
+            return error.GltfMeshoptDecodeFailed;
         }
 
         const gltf = data.?;
@@ -87,7 +110,7 @@ pub const SceneLoader = struct {
         @memset(node_mesh_start, 0);
         @memset(node_mesh_count, 0);
 
-        try mesh_spawn_mod.spawnMeshes(scene, gltf, materials, skeletons, &spawned_meshes, node_mesh_start, node_mesh_count);
+        try mesh_spawn_mod.spawnMeshes(scene, gltf, materials, skeletons, &spawned_meshes, node_mesh_start, node_mesh_count, load_options.morph_mode);
 
         // 4. Parse animations (skeleton tracks + plain node tracks).
         // Group names come from gltf animation.name so UI code can enumerate

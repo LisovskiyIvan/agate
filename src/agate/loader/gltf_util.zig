@@ -181,6 +181,9 @@ test "readSampler reads interleaved morph weights per target" {
     in_acc.type = c.cgltf_type_scalar;
     in_acc.component_type = c.cgltf_component_type_r_32f;
     in_acc.count = times.len;
+    // cgltf fills accessor.stride at parse time; without it every index
+    // reads element 0.
+    in_acc.stride = @sizeOf(f32);
 
     var weight_buf = std.mem.zeroes(c.cgltf_buffer);
     weight_buf.data = @ptrCast(&weights);
@@ -193,6 +196,7 @@ test "readSampler reads interleaved morph weights per target" {
     out_acc.type = c.cgltf_type_scalar;
     out_acc.component_type = c.cgltf_component_type_r_32f;
     out_acc.count = weights.len;
+    out_acc.stride = @sizeOf(f32);
 
     var samp = std.mem.zeroes(c.cgltf_animation_sampler);
     samp.input = &in_acc;

@@ -373,14 +373,14 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
     state.meshes = try meshes.toOwnedSlice(allocator);
 
     state.hemi = .{
-        .name = try allocator.dupe(u8, scene.light.name),
-        .direction = .{ scene.light.direction.x, scene.light.direction.y, scene.light.direction.z },
-        .diffuse = .{ scene.light.diffuse.r, scene.light.diffuse.g, scene.light.diffuse.b },
-        .ground = .{ scene.light.ground_color.r, scene.light.ground_color.g, scene.light.ground_color.b },
-        .intensity = scene.light.intensity,
+        .name = try allocator.dupe(u8, scene.lights.hemi.name),
+        .direction = .{ scene.lights.hemi.direction.x, scene.lights.hemi.direction.y, scene.lights.hemi.direction.z },
+        .diffuse = .{ scene.lights.hemi.diffuse.r, scene.lights.hemi.diffuse.g, scene.lights.hemi.diffuse.b },
+        .ground = .{ scene.lights.hemi.ground_color.r, scene.lights.hemi.ground_color.g, scene.lights.hemi.ground_color.b },
+        .intensity = scene.lights.hemi.intensity,
     };
 
-    if (scene.directional_light) |dl| {
+    if (scene.lights.directional) |dl| {
         state.directional = .{
             .name = try allocator.dupe(u8, dl.name),
             .direction = .{ dl.direction.x, dl.direction.y, dl.direction.z },
@@ -394,7 +394,7 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
         for (points.items) |*p| p.deinit(allocator);
         points.deinit(allocator);
     }
-    for (scene.point_lights.items) |pl| {
+    for (scene.lights.point_lights.items) |pl| {
         const name = try allocator.dupe(u8, pl.name);
         errdefer allocator.free(name);
         try points.append(allocator, .{
@@ -412,7 +412,7 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
         for (spots.items) |*s| s.deinit(allocator);
         spots.deinit(allocator);
     }
-    for (scene.spot_lights.items) |sl| {
+    for (scene.lights.spot_lights.items) |sl| {
         const name = try allocator.dupe(u8, sl.name);
         errdefer allocator.free(name);
         try spots.append(allocator, .{
@@ -488,11 +488,11 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
     }
 
     state.render = .{
-        .skybox_enabled = scene.skybox_enabled,
-        .skybox_exposure = scene.skybox_exposure,
-        .shadows_enabled = scene.enable_shadows,
-        .shadow_softness = scene.shadow_softness,
-        .ibl_intensity = scene.ibl_intensity,
+        .skybox_enabled = scene.sky.enabled,
+        .skybox_exposure = scene.sky.exposure,
+        .shadows_enabled = scene.shadows.enabled,
+        .shadow_softness = scene.shadows.softness,
+        .ibl_intensity = scene.sky.ibl_intensity,
     };
     state.postprocess = scene.post_process;
 
@@ -578,7 +578,7 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
 
     {
         const owned: ?[]u8 = scene.allocator.dupe(u8, state.hemi.name) catch null;
-        scene.light = HemisphericLight.init(owned orelse state.hemi.name, .{
+        scene.lights.hemi = HemisphericLight.init(owned orelse state.hemi.name, .{
             .direction = Vec3.new(state.hemi.direction[0], state.hemi.direction[1], state.hemi.direction[2]),
             .diffuse = Color3.new(state.hemi.diffuse[0], state.hemi.diffuse[1], state.hemi.diffuse[2]),
             .ground_color = Color3.new(state.hemi.ground[0], state.hemi.ground[1], state.hemi.ground[2]),
@@ -596,13 +596,13 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
         }) catch {
             if (owned) |o| scene.allocator.free(o);
         };
-    } else if (scene.directional_light) |old| {
+    } else if (scene.lights.directional) |old| {
         scene.allocator.destroy(old);
-        scene.directional_light = null;
+        scene.lights.directional = null;
     }
 
-    for (scene.point_lights.items) |pl| scene.allocator.destroy(pl);
-    scene.point_lights.clearRetainingCapacity();
+    for (scene.lights.point_lights.items) |pl| scene.allocator.destroy(pl);
+    scene.lights.point_lights.clearRetainingCapacity();
     for (state.point_lights) |*p| {
         const owned: ?[]u8 = scene.allocator.dupe(u8, p.name) catch null;
         _ = scene.createPointLight(owned orelse p.name, .{
@@ -615,8 +615,8 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
         };
     }
 
-    for (scene.spot_lights.items) |sl| scene.allocator.destroy(sl);
-    scene.spot_lights.clearRetainingCapacity();
+    for (scene.lights.spot_lights.items) |sl| scene.allocator.destroy(sl);
+    scene.lights.spot_lights.clearRetainingCapacity();
     for (state.spot_lights) |*s| {
         const owned: ?[]u8 = scene.allocator.dupe(u8, s.name) catch null;
         _ = scene.createSpotLight(owned orelse s.name, .{
@@ -704,11 +704,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
         },
     }
 
-    scene.skybox_enabled = state.render.skybox_enabled;
-    scene.skybox_exposure = state.render.skybox_exposure;
-    scene.enable_shadows = state.render.shadows_enabled;
-    scene.shadow_softness = state.render.shadow_softness;
-    scene.ibl_intensity = state.render.ibl_intensity;
+    scene.sky.enabled = state.render.skybox_enabled;
+    scene.sky.exposure = state.render.skybox_exposure;
+    scene.shadows.enabled = state.render.shadows_enabled;
+    scene.shadows.softness = state.render.shadow_softness;
+    scene.sky.ibl_intensity = state.render.ibl_intensity;
     scene.post_process = state.postprocess;
 }
 
@@ -1300,6 +1300,41 @@ fn dupeStr(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return allocator.dupe(u8, s);
 }
 
+/// Minimal CPU-only Scene for capture/restore tests. The default textures and
+/// render subsystems are GPU-backed and never dereferenced by capture()/restore();
+/// std.mem.zeroes cannot build a Scene in Zig 0.16 (non-nullable pointer
+/// fields), so those fields stay undefined.
+fn testScene(alloc: std.mem.Allocator) Scene {
+    return .{
+        .allocator = alloc,
+        .default_white_texture = undefined,
+        .default_normal_texture = undefined,
+        .default_cube_texture = undefined,
+        .lights = .{},
+        .shadows = .{ .pass = undefined },
+        .sky = .{ .pass = undefined },
+        .postfx = .{
+            .postprocess_pass = undefined,
+            .ssao_pass = undefined,
+            .bloom_pass = undefined,
+            .outline_pass = undefined,
+        },
+        .forward = .{},
+        .particles = .{ .pass = undefined },
+    };
+}
+
+/// Buffer-free Mesh for capture/restore tests: serialization only touches
+/// name, transform, visibility and material fields.
+fn testMesh(name: []const u8) Mesh {
+    return .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+}
+
 fn makeFullState(allocator: std.mem.Allocator) !SceneState {
     var s = SceneState{};
     errdefer s.deinit(allocator);
@@ -1671,11 +1706,9 @@ test "serialization rejects huge counts and strings" {
 
 test "capture maps null material to standard default" {
     const alloc = std.testing.allocator;
-    var scene: Scene = std.mem.zeroes(Scene);
-    scene.allocator = alloc;
+    var scene = testScene(alloc);
 
-    var mesh = std.mem.zeroes(Mesh);
-    mesh.name = "plain";
+    var mesh = testMesh("plain");
     mesh.position = Vec3.new(1.0, 2.0, 3.0);
     // material stays null.
     try scene.meshes.append(alloc, &mesh);
@@ -1699,12 +1732,10 @@ test "restore applies by name and ignores missing" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var scene: Scene = std.mem.zeroes(Scene);
-    scene.allocator = alloc;
+    var scene = testScene(alloc);
 
     var std_mat = StandardMaterial.init("shared");
-    var mesh = std.mem.zeroes(Mesh);
-    mesh.name = "box";
+    var mesh = testMesh("box");
     mesh.material = .{ .standard = &std_mat };
     try scene.meshes.append(alloc, &mesh);
 
@@ -1763,14 +1794,14 @@ test "restore applies by name and ignores missing" {
     try std.testing.expectEqual(@as(f32, 0.5), std_mat.alpha);
     try std.testing.expect(std_mat.alpha_mode == .blend);
     // Missing mesh ignored: no crash, light recreated, camera applied.
-    try std.testing.expectEqual(@as(usize, 1), scene.point_lights.items.len);
-    try std.testing.expectEqualStrings("lamp", scene.point_lights.items[0].name);
-    try std.testing.expectEqual(@as(f32, 2.0), scene.point_lights.items[0].intensity);
-    try std.testing.expectEqual(@as(f32, 0.3), scene.light.intensity);
+    try std.testing.expectEqual(@as(usize, 1), scene.lights.point_lights.items.len);
+    try std.testing.expectEqualStrings("lamp", scene.lights.point_lights.items[0].name);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.lights.point_lights.items[0].intensity);
+    try std.testing.expectEqual(@as(f32, 0.3), scene.lights.hemi.intensity);
     try std.testing.expect(scene.active_camera != null);
     try std.testing.expect(scene.active_camera.? == .free);
     try std.testing.expectEqual(@as(f32, 70.0), scene.active_camera.?.free.fov_deg);
-    try std.testing.expect(!scene.enable_shadows);
+    try std.testing.expect(!scene.shadows.enabled);
     // Camera union import is exercised (keeps the Camera symbol referenced).
     const _cam: ?Camera = scene.active_camera;
     try std.testing.expect(_cam != null);
@@ -1911,8 +1942,7 @@ test "capture and restore target and fly cameras" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var scene: Scene = std.mem.zeroes(Scene);
-    scene.allocator = alloc;
+    var scene = testScene(alloc);
     scene.active_camera = .{ .target = TargetCamera.init("watcher", .{
         .position = Vec3.new(0.0, 0.0, 5.0),
         .target = Vec3.zero,
@@ -1953,15 +1983,13 @@ test "capture and restore cutout material fields" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var scene: Scene = std.mem.zeroes(Scene);
-    scene.allocator = alloc;
+    var scene = testScene(alloc);
 
     var std_mat = StandardMaterial.init("cut");
     std_mat.alpha_mode = .cutout;
     std_mat.alpha_cutoff = 0.2;
     std_mat.double_sided = true;
-    var mesh = std.mem.zeroes(Mesh);
-    mesh.name = "fence";
+    var mesh = testMesh("fence");
     mesh.material = .{ .standard = &std_mat };
     try scene.meshes.append(alloc, &mesh);
 

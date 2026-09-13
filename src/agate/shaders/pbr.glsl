@@ -9,6 +9,24 @@ layout(binding = 0) uniform vs_params {
     mat4 model;
 };
 
+// GPU morph targets (opt-in, Mesh.morph_mode == .gpu): per-vertex deltas
+// packed in an RGBA32F strip texture, texel index
+//   vertex_index * 24 + target * 3 + slot   (slot: 0 pos, 1 normal, 2 tangent)
+// texel.xyz carries the delta. Disabled draws bind a 1x1 zero texture with
+// morph_params.x = 0 and zero weights. Slots stay unique across both
+// stages (sokol requires a shared slot pool): UB 2 (fs_params is 1),
+// texture 9 (fs uses 0..8), sampler 4 (fs uses 0..3).
+layout(binding = 2) uniform vs_morph {
+    vec4 morph_weights0; // target weights 0..3
+    vec4 morph_weights1; // target weights 4..7
+    vec4 morph_params; // x: enabled (0/1), y: tex width, z: tex height, w: unused
+};
+
+@image_sample_type morph_tex unfilterable_float
+layout(binding = 9) uniform texture2D morph_tex;
+@sampler_type morph_smp nonfiltering
+layout(binding = 4) uniform sampler morph_smp;
+
 in vec3 position;
 in vec3 normal;
 in vec4 tangent;
@@ -22,13 +40,55 @@ out vec3 v_bitangent;
 out vec4 v_color;
 out vec2 v_uv;
 
-void main() {
-    vec4 world_pos = model * vec4(position, 1.0);
-    v_world_pos = world_pos.xyz;
-    gl_Position = mvp * vec4(position, 1.0);
+// One RGBA32F texel (xyz) at strip position idx; exact texel centers with
+// NEAREST filtering, so no filtering support is needed for float textures.
+vec3 morphTexel(float idx) {
+    float u = (mod(idx, morph_params.y) + 0.5) / morph_params.y;
+    float v = (floor(idx / morph_params.y) + 0.5) / morph_params.z;
+    return texture(sampler2D(morph_tex, morph_smp), vec2(u, v)).xyz;
+}
 
-    vec3 N = normalize(mat3(model) * normal);
-    vec3 T = normalize(mat3(model) * tangent.xyz);
+// Target weight lookup with constant vec4 lanes: SPIRV-Cross cannot
+// flatten dynamic component indexing (morph_weights0[t]) for legacy
+// targets (HLSL5), so the lane is selected via constant branches.
+float morphWeight(int t) {
+    if (t == 0) return morph_weights0.x;
+    if (t == 1) return morph_weights0.y;
+    if (t == 2) return morph_weights0.z;
+    if (t == 3) return morph_weights0.w;
+    if (t == 4) return morph_weights1.x;
+    if (t == 5) return morph_weights1.y;
+    if (t == 6) return morph_weights1.z;
+    return morph_weights1.w;
+}
+
+// Mirrors morph_gpu.blendDeltas (mesh/morph_gpu.zig): per-vertex
+// base + sum(weight * delta) accumulation in the same order.
+void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id) {
+    if (morph_params.x < 0.5) return;
+    float base = float(vertex_id) * 24.0;
+    for (int t = 0; t < 8; t++) {
+        float w = morphWeight(t);
+        if (w == 0.0) continue;
+        float idx = base + float(t) * 3.0;
+        pos += w * morphTexel(idx);
+        nrm += w * morphTexel(idx + 1.0);
+        tan_xyz += w * morphTexel(idx + 2.0);
+    }
+}
+
+void main() {
+    vec3 morphed_pos = position;
+    vec3 morphed_nrm = normal;
+    vec3 morphed_tan = tangent.xyz;
+    applyMorphDeltas(morphed_pos, morphed_nrm, morphed_tan, gl_VertexIndex);
+
+    vec4 world_pos = model * vec4(morphed_pos, 1.0);
+    v_world_pos = world_pos.xyz;
+    gl_Position = mvp * vec4(morphed_pos, 1.0);
+
+    vec3 N = normalize(mat3(model) * morphed_nrm);
+    vec3 T = normalize(mat3(model) * morphed_tan);
     // Gram-Schmidt orthogonalization
     T = normalize(T - dot(T, N) * N);
     vec3 B = cross(N, T) * tangent.w;

@@ -177,7 +177,11 @@ pub fn buildTrigTable(allocator: std.mem.Allocator, tessellation: u32) ![]TrigEn
 
 // Standard grid quad (a, b, c) + (a, c, d) with
 // a = row * stride + col, b = a + 1, c = (row + 1) * stride + col + 1,
-// d = (row + 1) * stride + col. Accepts both []u16 and []u32 slices.
+// d = (row + 1) * stride + col.
+// Deliberately generic in the index buffer: it is genuinely called with both
+// `[]u32` (GeometryData builders below) and `[]u16` (narrow-index mesh paths
+// and mesh/tests.zig, which pins the u16 narrowing behavior). `@intCast`
+// narrows the u32 corner ids into the slice's element type.
 pub inline fn storeQuad(indices: anytype, ii: usize, a: u32, b: u32, c: u32, d: u32) void {
     indices[ii + 0] = @intCast(a);
     indices[ii + 1] = @intCast(b);
@@ -188,7 +192,7 @@ pub inline fn storeQuad(indices: anytype, ii: usize, a: u32, b: u32, c: u32, d: 
 }
 
 // Flipped grid quad (a, c, b) + (a, d, c): the Ground/Terrain winding for the
-// +Y normal. Same slice polymorphism as storeQuad.
+// +Y normal. Same deliberate []u16/[]u32 slice genericity as storeQuad.
 pub inline fn storeQuadFlipped(indices: anytype, ii: usize, a: u32, b: u32, c: u32, d: u32) void {
     indices[ii + 0] = @intCast(a);
     indices[ii + 1] = @intCast(c);
@@ -198,6 +202,8 @@ pub inline fn storeQuadFlipped(indices: anytype, ii: usize, a: u32, b: u32, c: u
     indices[ii + 5] = @intCast(c);
 }
 
+// Computes the four corner ids of grid cell (row, col) and forwards to
+// storeQuad (same []u16/[]u32 slice genericity).
 pub inline fn appendGridQuad(indices: anytype, ii: usize, stride: usize, row: usize, col: usize) void {
     const s: u32 = @intCast(stride);
     const r: u32 = @intCast(row);
@@ -205,6 +211,7 @@ pub inline fn appendGridQuad(indices: anytype, ii: usize, stride: usize, row: us
     storeQuad(indices, ii, r * s + c, r * s + c + 1, (r + 1) * s + c + 1, (r + 1) * s + c);
 }
 
+// Flipped variant of appendGridQuad (Ground/Terrain winding).
 pub inline fn appendGridQuadFlipped(indices: anytype, ii: usize, stride: usize, row: usize, col: usize) void {
     const s: u32 = @intCast(stride);
     const r: u32 = @intCast(row);

@@ -12,6 +12,7 @@ const Vertex = types.Vertex;
 const CullingStrategy = types.CullingStrategy;
 const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 const MorphTarget = types.MorphTarget;
+const MorphMode = types.MorphMode;
 const InstancedMesh = types.InstancedMesh;
 const BoneAttachment = types.BoneAttachment;
 const GeometryData = types.GeometryData;
@@ -66,6 +67,17 @@ pub const Mesh = struct {
     /// Without a GPU buffer (unit tests, id == 0) this is the output.
     morph_staging: []Vertex = &.{},
     morph_dirty: bool = false,
+    /// Where deltas are blended: .cpu rewrites the vertex buffer from
+    /// morph_staging (default, historical behavior); .gpu keeps a static
+    /// base-pose vertex buffer and the vertex shader blends from the delta
+    /// texture below (see mesh/morph_gpu.zig).
+    morph_mode: MorphMode = .cpu,
+    /// GPU-mode resources: RGBA32F delta strip (image + texture view),
+    /// created by morph_gpu.uploadMorphDeltas. Destroyed in deinit.
+    morph_delta_image: sg.Image = .{},
+    morph_delta_view: sg.View = .{},
+    morph_tex_width: u32 = 0,
+    morph_tex_height: u32 = 0,
 
     // Instancing support
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
@@ -290,7 +302,11 @@ pub const Mesh = struct {
     /// Normals are NOT renormalized: keeps the blend exact and cheap;
     /// shaders consume them as-is. No-op when dirty == false.
     /// Uploads via sg.updateBuffer only when the vertex buffer exists (id != 0).
+    /// GPU mode returns immediately: deltas blend in the vertex shader from
+    /// the delta texture, the vertex buffer keeps the static base pose, and
+    /// per-frame CPU cost is only the weights the draw path reads.
     pub fn applyMorphs(self: *Mesh) void {
+        if (self.morph_mode == .gpu) return;
         if (!self.morph_dirty) return;
         self.morph_dirty = false;
         if (self.morph_base.len == 0 or self.morph_staging.len == 0) return;
@@ -386,6 +402,12 @@ pub const Mesh = struct {
         if (self.morph_weights.len > 0) allocator.free(self.morph_weights);
         if (self.morph_base.len > 0) allocator.free(self.morph_base);
         if (self.morph_staging.len > 0) allocator.free(self.morph_staging);
+        if (self.morph_delta_view.id != 0) {
+            sg.destroyView(self.morph_delta_view);
+        }
+        if (self.morph_delta_image.id != 0) {
+            sg.destroyImage(self.morph_delta_image);
+        }
         if (self.cpu_positions.len > 0) {
             allocator.free(self.cpu_positions);
         }

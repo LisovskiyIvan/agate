@@ -35,10 +35,16 @@ pub const LODLevel = struct {
 /// Maximum morph targets (blend shapes) per mesh.
 /// glTF files with more targets load only the first MAX_MORPH_TARGETS;
 /// extras are dropped at import (documented loader behavior).
-/// Blending is CPU-side with dirty tracking; GPU morphing is future work
-/// (no shader/pipeline changes — applyMorphs rewrites the vertex buffer
-/// from the CPU staging copy).
+/// CPU mode blends with dirty tracking and rewrites the dynamic vertex
+/// buffer; GPU mode blends in the vertex shader from the packed delta
+/// texture (see mesh/morph_gpu.zig). The 8-target cap holds for both.
 pub const MAX_MORPH_TARGETS: usize = 8;
+
+/// Where morph deltas are blended. .cpu is the default and the historical
+/// behavior (applyMorphs rewrites the vertex buffer); .gpu keeps a static
+/// base-pose vertex buffer and lets standard/pbr/skinned_pbr shaders blend
+/// deltas from an RGBA32F delta texture (opt-in, forward draw paths only).
+pub const MorphMode = enum { cpu, gpu };
 
 /// One glTF morph target: per-vertex deltas added to the base attributes,
 /// scaled by the matching entry of Mesh.morph_weights.

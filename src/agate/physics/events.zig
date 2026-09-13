@@ -1,22 +1,24 @@
 //! Sensor/contact event collection as free functions.
 //! Extracted from `PhysicsWorld` methods in `physics.zig`; behavior unchanged.
-//! Each function takes `world: anytype` (concretely `*PhysicsWorld`) so this
-//! module never imports `physics.zig` (no import cycle).
+//! Functions take a concrete `*PhysicsWorld` (the type lives in the neutral
+//! `world.zig`, so importing it here breaks no import cycle).
 const c = @import("../c.zig").c;
 const convert = @import("convert.zig");
 const queries = @import("queries.zig");
+const world_mod = @import("world.zig");
+const PhysicsWorld = world_mod.PhysicsWorld;
 const fromB3Pos = convert.fromB3Pos;
 const fromB3Vec = convert.fromB3Vec;
 
 /// Events are collected inside step() and cleared at the start of each
 /// call, so they describe the most recent frame only.
-pub fn clearEvents(world: anytype) void {
+pub fn clearEvents(world: *PhysicsWorld) void {
     world.sensor_events.clearRetainingCapacity();
     world.contact_events.clearRetainingCapacity();
     world.contact_hit_events.clearRetainingCapacity();
 }
 
-pub fn drainEvents(world: anytype) void {
+pub fn drainEvents(world: *PhysicsWorld) void {
     const sensor = c.b3World_GetSensorEvents(world.world_id);
     var i: i32 = 0;
     while (i < sensor.beginCount) : (i += 1) {

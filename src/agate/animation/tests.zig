@@ -839,8 +839,12 @@ test "Animation events fire across a loop wraparound" {
     });
 
     ag.play(true);
-    ag.update(1.0); // t = 1.0, crosses nothing
-    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+    // Window (0, 1] crosses "wrapped"@0.25: prev_time starts at from=0, so
+    // only the t == 0 event stays below the open lower bound on this pass.
+    ag.update(1.0);
+    const f0 = ag.drainFiredEvents();
+    try std.testing.expectEqual(@as(usize, 1), f0.len);
+    try std.testing.expectEqualStrings("wrapped", f0[0]);
 
     ag.update(1.0); // t = 2.0, window (1, 2] fires "end"
     const f1 = ag.drainFiredEvents();

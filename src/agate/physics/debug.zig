@@ -1,13 +1,15 @@
 //! Debug wireframe entry points as free functions.
 //! Extracted from `PhysicsWorld` methods in `physics.zig`; behavior unchanged.
-//! Each function takes `world: anytype` (concretely `*PhysicsWorld`) so this
-//! module never imports `physics.zig` (no import cycle). The geometry
+//! Functions take a concrete `*PhysicsWorld` (the type lives in the neutral
+//! `world.zig`, so importing it here breaks no import cycle). The geometry
 //! helpers live in `debug_geo.zig`.
 const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const types = @import("types.zig");
 const debug_geo = @import("debug_geo.zig");
+const world_mod = @import("world.zig");
+const PhysicsWorld = world_mod.PhysicsWorld;
 const DebugLine = types.DebugLine;
 const min_debug_circle_segments = debug_geo.min_debug_circle_segments;
 const debug_unit_stack_max = debug_geo.debug_unit_stack_max;
@@ -26,7 +28,7 @@ const primaryDebugLineCount = debug_geo.primaryDebugLineCount;
 const childDebugLineCount = debug_geo.childDebugLineCount;
 
 /// Clamped ring segment count used by the debug wireframe helpers.
-pub fn debugCircleSegments(world: anytype) usize {
+pub fn debugCircleSegments(world: *const PhysicsWorld) usize {
     return @max(min_debug_circle_segments, world.debug_circle_segments);
 }
 
@@ -46,7 +48,7 @@ pub fn debugCircleSegments(world: anytype) usize {
 /// hull/mesh/heightfield 12 (AABB box). Capacity for the exact count is
 /// reserved once up front, so steady-state appends never reallocate;
 /// circle trig is computed once per call into a shared unit table.
-pub fn appendDebugLines(world: anytype, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DebugLine)) !void {
+pub fn appendDebugLines(world: *const PhysicsWorld, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DebugLine)) !void {
     // Reserve once; every helper below uses appendAssumeCapacity.
     try out.ensureUnusedCapacity(allocator, debugLineCount(world));
     const segs = debugCircleSegments(world);
@@ -96,7 +98,7 @@ pub fn appendDebugLines(world: anytype, allocator: std.mem.Allocator, out: *std.
 }
 
 /// Exact line count `appendDebugLines` would add (no allocation).
-pub fn debugLineCount(world: anytype) usize {
+pub fn debugLineCount(world: *const PhysicsWorld) usize {
     const segs = debugCircleSegments(world);
     var n: usize = 0;
     for (world.bodies.items) |body| {

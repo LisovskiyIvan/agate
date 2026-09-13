@@ -232,10 +232,8 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !ObjData {
     }
 
     if (out_idx.items.len == 0) {
-        out_pos.deinit(allocator);
-        out_nrm.deinit(allocator);
-        out_uv.deinit(allocator);
-        out_idx.deinit(allocator);
+        // The errdefers release the out_* lists on these error returns; do not
+        // deinit them here as well (double free).
         if (!saw_content) return error.NoGeometry;
         return error.InvalidFormat;
     }

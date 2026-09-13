@@ -28,3 +28,16 @@ pub const TriangleHit = ray.TriangleHit;
 pub inline fn lerp(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
 }
+
+// math is its own build module (name "math" in build.zig), so the engine's
+// tests.zig cannot import these files by path; they are aggregated here and
+// reach the suite when tests.zig imports the module inside a test block.
+test {
+    _ = @import("math/vec.zig");
+    _ = @import("math/color.zig");
+    _ = @import("math/mat4.zig");
+    _ = @import("math/quat.zig");
+    _ = @import("math/bounding_box.zig");
+    _ = @import("math/frustum.zig");
+    _ = @import("math/ray.zig");
+}

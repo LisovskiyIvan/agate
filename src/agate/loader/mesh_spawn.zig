@@ -17,6 +17,8 @@ const MAX_MORPH_TARGETS = @import("../mesh.zig").MAX_MORPH_TARGETS;
 const computeTangents = @import("../mesh.zig").computeTangents;
 const Material = @import("../material.zig").Material;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
+const MorphMode = @import("../mesh.zig").MorphMode;
+const morph_gpu = @import("../mesh.zig").morph_gpu;
 
 pub fn spawnMeshes(
     scene: *Scene,
@@ -26,6 +28,7 @@ pub fn spawnMeshes(
     spawned_meshes: *std.ArrayList(*Mesh),
     node_mesh_start: []usize,
     node_mesh_count: []usize,
+    morph_mode: MorphMode,
 ) !void {
     if (gltf.nodes_count > 0) {
         for (0..gltf.nodes_count) |node_idx| {
@@ -56,7 +59,7 @@ pub fn spawnMeshes(
 
             for (0..src_mesh.*.primitives_count) |prim_idx| {
                 const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.*.primitives[prim_idx]);
-                if (try parsePrimitive(scene, gltf, prim, src_mesh, node, mesh_name, base_matrix, materials, node_skeleton)) |mesh_obj| {
+                if (try parsePrimitive(scene, gltf, prim, src_mesh, node, mesh_name, base_matrix, materials, node_skeleton, morph_mode)) |mesh_obj| {
                     try scene.meshes.append(scene.allocator, mesh_obj);
                     try spawned_meshes.append(scene.allocator, mesh_obj);
                 }
@@ -77,7 +80,7 @@ pub fn spawnMeshes(
 
             for (0..src_mesh.primitives_count) |prim_idx| {
                 const prim: *const c.cgltf_primitive = @ptrCast(&src_mesh.primitives[prim_idx]);
-                if (try parsePrimitive(scene, gltf, prim, src_mesh, null, mesh_name, Mat4.identity, materials, null)) |mesh_obj| {
+                if (try parsePrimitive(scene, gltf, prim, src_mesh, null, mesh_name, Mat4.identity, materials, null, morph_mode)) |mesh_obj| {
                     try scene.meshes.append(scene.allocator, mesh_obj);
                     try spawned_meshes.append(scene.allocator, mesh_obj);
                 }
@@ -155,6 +158,7 @@ pub fn parsePrimitive(
     base_matrix: Mat4,
     materials: []const ?Material,
     skeleton: ?*Skeleton,
+    morph_mode: MorphMode,
 ) !?*Mesh {
     if (prim.type != c.cgltf_primitive_type_triangles) return null;
 
@@ -312,18 +316,22 @@ pub fn parsePrimitive(
         }
     }
 
-    // Morph targets rewrite the vertex buffer every frame they change. Sokol
-    // buffers created with initial data and no dynamic flag are immutable, so
-    // morph meshes get an empty updatable buffer; the first frame's
-    // applyMorphs() (before render) fills it with base + default weights.
+    // Morph targets blend either on CPU or GPU:
+    // - CPU mode (default): buffers created with initial data and no dynamic
+    //   flag are immutable in sokol, so morph meshes get an empty updatable
+    //   buffer; the first frame's applyMorphs() (before render) fills it
+    //   with base + default weights.
+    // - GPU mode: the vertex buffer stays the static base pose; deltas live
+    //   in the RGBA32F delta texture and the vertex shader blends them, so
+    //   the buffer is created filled with base data.
     const has_morph = prim.targets_count > 0;
-    const vbuf = if (has_morph)
+    const vbuf = if (!has_morph or morph_mode == .gpu)
+        sg.makeBuffer(.{ .data = sg.asRange(vertices) })
+    else
         sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = vertices.len * @sizeOf(Vertex),
-        })
-    else
-        sg.makeBuffer(.{ .data = sg.asRange(vertices) });
+        });
 
     var local_box = BoundingBox.zero;
     if (pos_accessor) |pos_acc| {
@@ -399,11 +407,25 @@ pub fn parsePrimitive(
         mesh_obj.morph_weights = weights;
     }
 
+    mesh_obj.morph_mode = morph_mode;
+
     try mesh_obj.retainMorphBase(scene.allocator, vertices);
 
-    // The GPU buffer is empty for morph meshes until the first applyMorphs();
-    // mark dirty so frame 1 uploads base + default weights before render.
-    if (mesh_obj.hasMorphTargets()) mesh_obj.morph_dirty = true;
+    if (mesh_obj.hasMorphTargets()) {
+        if (morph_mode == .gpu) {
+            // Pack target deltas into the RGBA32F delta texture. The vertex
+            // buffer is already the static base pose; applyMorphs() no-ops
+            // in this mode, so no first-frame upload is needed. Fails loudly
+            // when RGBA32F is unavailable (no silent CPU fallback: the
+            // buffer is already immutable).
+            try morph_gpu.uploadMorphDeltas(mesh_obj, scene.allocator);
+        } else {
+            // The GPU buffer is empty for CPU-morph meshes until the first
+            // applyMorphs(); mark dirty so frame 1 uploads base + default
+            // weights before render.
+            mesh_obj.morph_dirty = true;
+        }
+    }
 
     if (prim.material) |pm| {
         for (0..gltf.materials_count) |mat_i| {

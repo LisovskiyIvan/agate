@@ -41,6 +41,7 @@ layout(binding = 0) uniform fs_params {
     vec4 grade_shadows; // xyz: shadows lift [-1,1], w: unused
     vec4 grade_midtones; // xyz: midtones lift [-1,1], w: unused
     vec4 grade_highlights; // xyz: highlights lift [-1,1], w: unused
+    vec4 lut_params; // x: lut_enabled (1/0), y: lut_intensity [0,1], z: lut size N, w: unused
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
 };
@@ -50,10 +51,12 @@ layout(binding = 1) uniform texture2D ssao_tex;
 @image_sample_type depth_tex unfilterable_float
 layout(binding = 2) uniform texture2D depth_tex;
 layout(binding = 3) uniform texture2D bloom_tex;
+layout(binding = 4) uniform texture2D lut_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
 layout(binding = 1) uniform sampler depth_smp;
+layout(binding = 2) uniform sampler lut_smp;
 
 in vec2 v_uv;
 out vec4 frag_color;
@@ -489,6 +492,31 @@ vec3 applyColorCurves(vec3 c) {
     return c + grade_shadows.xyz * w_s + grade_midtones.xyz * w_m + grade_highlights.xyz * w_h;
 }
 
+// Texture LUT color grade on a 2D strip (N*N wide, N tall; N = cube edge
+// in lut_params.z). Mirrors lutStripUv/applyLutStrip in postprocess.zig,
+// which document the full uv derivation. Blue picks the layer with a
+// half-texel-inset t = b*(N-1); hardware bilinear interpolates r/g inside
+// one layer, and the manual mix of layers floor(t) and floor(t)+1 by the
+// fraction f adds the third (trilinear) axis. The graded color then blends
+// back toward the curve-graded input by lut_intensity, so intensity 0 is
+// an exact no-op. All zeros in lut_params (no LUT bound) short-circuit to
+// the unchanged pre-LUT path.
+vec3 applyLut(vec3 color) {
+    if (lut_params.x < 0.5) return color;
+    float n = lut_params.z;
+    float t = clamp(color.b, 0.0, 1.0) * (n - 1.0);
+    float k = floor(t);
+    float f = t - k;
+    float u_slice = (clamp(color.r, 0.0, 1.0) * (n - 1.0) + 0.5) / n;
+    float v_slice = (clamp(color.g, 0.0, 1.0) * (n - 1.0) + 0.5) / n;
+    float k1 = min(k + 1.0, n - 1.0);
+    vec2 uv0 = vec2((k + u_slice) / n, v_slice);
+    vec2 uv1 = vec2((k1 + u_slice) / n, v_slice);
+    vec3 c0 = texture(sampler2D(lut_tex, lut_smp), uv0).rgb;
+    vec3 c1 = texture(sampler2D(lut_tex, lut_smp), uv1).rgb;
+    return mix(color, mix(c0, c1, f), clamp(lut_params.y, 0.0, 1.0));
+}
+
 void main() {
     vec2 uv = v_uv;
 
@@ -595,6 +623,10 @@ void main() {
 
     // Parametric color curves (shadows/midtones/highlights lifts)
     color = applyColorCurves(color);
+
+    // Texture LUT grade, sampled after the curves so the LUT authors the
+    // final look on top of the parametric grade.
+    color = applyLut(color);
 
     // Vignette
     if (params3.w > 0.5 && params2.x > 0.001) {

@@ -588,15 +588,17 @@ pub fn pipelineForInstancedMesh(scene: anytype, is_pbr: bool, transparent: bool,
 // Scene-side double-sided set, if the scene embeds one as `ds_pipelines`
 // (see DoubleSidedPipelines). Missing field (legacy Scene) means no
 // double-sided pipelines: selection falls back to regular ids. Accepts
-// both Scene values and pointers.
-fn sceneDoubleSided(scene: anytype) ?*const DoubleSidedPipelines {
+// both Scene values and pointers; the set is returned BY VALUE because
+// `&scene.ds_pipelines` would dangle for by-value args (the field would
+// live in this function's stack frame).
+fn sceneDoubleSided(scene: anytype) ?DoubleSidedPipelines {
     const S = @TypeOf(scene);
     const T = switch (@typeInfo(S)) {
         .pointer => |p| p.child,
         else => S,
     };
     if (@typeInfo(T) == .@"struct" and @hasField(T, "ds_pipelines")) {
-        return &scene.ds_pipelines;
+        return scene.ds_pipelines;
     }
     return null;
 }

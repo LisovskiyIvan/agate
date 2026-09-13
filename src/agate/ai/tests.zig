@@ -339,4 +339,3 @@ test "NavAgent: smooth acceleration, cornering, and arrival" {
     try testing.expect(agent.arrived);
     try testing.expect(agent.position.sub(Vec3.new(10.0, 0.0, 2.0)).length() < 0.25);
 }
-

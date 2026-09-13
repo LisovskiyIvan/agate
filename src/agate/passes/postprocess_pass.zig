@@ -3,7 +3,8 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sglue = sokol.glue;
 const post_shd = @import("postprocess_shader");
-const PostProcessConfig = @import("../postprocess.zig").PostProcessConfig;
+const postprocess = @import("../postprocess.zig");
+const PostProcessConfig = postprocess.PostProcessConfig;
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
@@ -20,6 +21,10 @@ pub const PostProcessPass = struct {
     offscreen_resolve_tex_view: sg.View = .{},
     postprocess_sampler: sg.Sampler = .{},
     depth_sampler: sg.Sampler = .{},
+    // Dedicated LUT sampler: bilinear inside the strip with LOD pinned to
+    // the base level, so a mipped LUT upload can never smear cube slices
+    // through box-filtered mips.
+    lut_sampler: sg.Sampler = .{},
     postprocess_pipeline: sg.Pipeline = .{},
     postprocess_quad_vb: sg.Buffer = .{},
     postprocess_quad_ib: sg.Buffer = .{},
@@ -68,6 +73,17 @@ pub const PostProcessPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
+        const lut_smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            // Sample only the base level: LUT strips must not pick up
+            // (corrupting) mips even when uploaded with a mip chain.
+            .min_lod = 0.0,
+            .max_lod = 0.0,
+        });
+
         var pp_desc = sg.PipelineDesc{
             .shader = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend())),
             .index_type = .UINT16,
@@ -91,6 +107,7 @@ pub const PostProcessPass = struct {
         return .{
             .postprocess_sampler = smp,
             .depth_sampler = depth_smp,
+            .lut_sampler = lut_smp,
             .postprocess_pipeline = pip,
             .postprocess_quad_vb = vb,
             .postprocess_quad_ib = ib,
@@ -198,8 +215,17 @@ pub const PostProcessPass = struct {
             self.bloom_tex_view
         else
             self.offscreen_resolve_tex_view;
+        // LUT when the config carries a live binding; otherwise the resolved
+        // scene view as a valid placeholder the shader never samples
+        // (lut_params.x = 0 gates the LUT branch off).
+        const lut_view: sg.View = if (config.lut) |l| l.view else .{};
+        post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
+            lut_view
+        else
+            self.offscreen_resolve_tex_view;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
         post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
+        post_bind.samplers[post_shd.SMP_lut_smp] = self.lut_sampler;
         sg.applyBindings(post_bind);
 
         const pp_params = post_shd.FsParams{
@@ -311,6 +337,9 @@ pub const PostProcessPass = struct {
                 config.grade_highlights[2],
                 0.0,
             },
+            // (enabled 1/0, intensity, size N, 0); zeros when no LUT, which
+            // keeps the composite identical to the pre-LUT path.
+            .lut_params = postprocess.lutParams(config),
             .view_proj = view_proj,
             .inv_view_proj = inv_view_proj,
         };
@@ -345,6 +374,7 @@ pub const PostProcessPass = struct {
         }
         sg.destroySampler(self.postprocess_sampler);
         sg.destroySampler(self.depth_sampler);
+        sg.destroySampler(self.lut_sampler);
         sg.destroyPipeline(self.postprocess_pipeline);
         sg.destroyBuffer(self.postprocess_quad_vb);
         sg.destroyBuffer(self.postprocess_quad_ib);

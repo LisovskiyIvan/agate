@@ -1,13 +1,15 @@
 //! Joint creation, tuning and destruction as free functions.
 //! Extracted from `PhysicsWorld` methods in `physics.zig`; behavior unchanged.
-//! Each function takes `world: anytype` (concretely `*PhysicsWorld`) so this
-//! module never imports `physics.zig` (no import cycle).
+//! Functions take a concrete `*PhysicsWorld` (the type lives in the neutral
+//! `world.zig`, so importing it here breaks no import cycle).
 const math = @import("math");
 const Vec3 = math.Vec3;
 const c = @import("../c.zig").c;
 const convert = @import("convert.zig");
 const types = @import("types.zig");
 const body_mod = @import("body.zig");
+const world_mod = @import("world.zig");
+const PhysicsWorld = world_mod.PhysicsWorld;
 const RigidBody = body_mod.RigidBody;
 const JointId = types.JointId;
 const DistanceJointOptions = types.DistanceJointOptions;
@@ -24,7 +26,7 @@ const toB3Quat = convert.toB3Quat;
 const rad2deg = convert.rad2deg;
 
 pub fn createDistanceJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -63,7 +65,7 @@ pub fn createDistanceJoint(
 }
 
 pub fn createDistanceJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor_a: Vec3,
@@ -81,7 +83,7 @@ pub fn createDistanceJointWorld(
 }
 
 pub fn createSphericalJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -111,7 +113,7 @@ pub fn createSphericalJoint(
 }
 
 pub fn createSphericalJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -131,7 +133,7 @@ pub fn createSphericalJointWorld(
 /// z-axis of the joint frame, which is the world z-axis when both bodies
 /// are unrotated at creation time.
 pub fn createRevoluteJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -163,7 +165,7 @@ pub fn createRevoluteJoint(
 
 /// Creates a hinge joint from a shared world-space pivot point.
 pub fn createRevoluteJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -182,7 +184,7 @@ pub fn createRevoluteJointWorld(
 /// Enables/disables a hinge motor and sets its target speed (rad/s) and
 /// torque budget. Wakes the bodies so the change applies immediately.
 pub fn setRevoluteMotor(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     enabled: bool,
     motor_speed_rad: f32,
@@ -197,7 +199,7 @@ pub fn setRevoluteMotor(
 
 /// Enables and sets the hinge angular limits (radians, [-0.99*pi .. 0.99*pi]).
 pub fn setRevoluteLimits(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     lower_angle_rad: f32,
     upper_angle_rad: f32,
@@ -209,13 +211,13 @@ pub fn setRevoluteLimits(
 }
 
 /// Current hinge angle (radians), relative to the reference angle at creation.
-pub fn revoluteAngleRad(world: anytype, joint_id: JointId) f32 {
+pub fn revoluteAngleRad(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3RevoluteJoint_GetAngle(joint_id);
 }
 
 /// Current hinge angle in degrees.
-pub fn revoluteAngleDeg(world: anytype, joint_id: JointId) f32 {
+pub fn revoluteAngleDeg(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3RevoluteJoint_GetAngle(joint_id) * rad2deg;
 }
@@ -225,7 +227,7 @@ pub fn revoluteAngleDeg(world: anytype, joint_id: JointId) f32 {
 /// x-axis of frame A. Suspension travel is measured from the creation
 /// pose, so build the vehicle at rest ride height.
 pub fn createWheelJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -265,7 +267,7 @@ pub fn createWheelJoint(
 
 /// Creates a wheel joint from a shared world-space anchor point.
 pub fn createWheelJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -285,7 +287,7 @@ pub fn createWheelJointWorld(
 /// torque budget. Negative speed drives forward when the wheel axle is
 /// +Z and forward is +X. Wakes the bodies so it applies immediately.
 pub fn setWheelSpin(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     enabled: bool,
     spin_speed_rad: f32,
@@ -300,7 +302,7 @@ pub fn setWheelSpin(
 
 /// Enables/disables steering and sets the target angle (radians).
 pub fn setWheelSteering(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     enabled: bool,
     target_angle_rad: f32,
@@ -314,13 +316,13 @@ pub fn setWheelSteering(
 }
 
 /// Current wheel spin speed (rad/s), relative between wheel and chassis.
-pub fn wheelSpinSpeed(world: anytype, joint_id: JointId) f32 {
+pub fn wheelSpinSpeed(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3WheelJoint_GetSpinSpeed(joint_id);
 }
 
 /// Current steering angle (radians).
-pub fn wheelSteeringAngle(world: anytype, joint_id: JointId) f32 {
+pub fn wheelSteeringAngle(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3WheelJoint_GetSteeringAngle(joint_id);
 }
@@ -329,7 +331,7 @@ pub fn wheelSteeringAngle(world: anytype, joint_id: JointId) f32 {
 /// x-axis with rotation locked. Build it in the rest pose: limits and the
 /// reported translation are relative to creation.
 pub fn createPrismaticJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -361,7 +363,7 @@ pub fn createPrismaticJoint(
 
 /// Creates a slider joint from a shared world-space anchor point.
 pub fn createPrismaticJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -380,7 +382,7 @@ pub fn createPrismaticJointWorld(
 /// Enables/disables the slider motor and sets target speed (m/s along
 /// frame A x-axis) and force budget. Wakes the bodies.
 pub fn setPrismaticMotor(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     enabled: bool,
     motor_speed: f32,
@@ -395,7 +397,7 @@ pub fn setPrismaticMotor(
 
 /// Enables and sets the slider travel limits (meters, from rest pose).
 pub fn setPrismaticLimits(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     lower_translation: f32,
     upper_translation: f32,
@@ -407,13 +409,13 @@ pub fn setPrismaticLimits(
 }
 
 /// Current slider translation (meters) relative to the creation pose.
-pub fn prismaticTranslation(world: anytype, joint_id: JointId) f32 {
+pub fn prismaticTranslation(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3PrismaticJoint_GetTranslation(joint_id);
 }
 
 /// Current slider speed (m/s).
-pub fn prismaticSpeed(world: anytype, joint_id: JointId) f32 {
+pub fn prismaticSpeed(world: *PhysicsWorld, joint_id: JointId) f32 {
     _ = world;
     return c.b3PrismaticJoint_GetSpeed(joint_id);
 }
@@ -422,7 +424,7 @@ pub fn prismaticSpeed(world: anytype, joint_id: JointId) f32 {
 /// optional pose spring. With no spring/force configured the joint is
 /// inert until per-frame velocity targets are set.
 pub fn createMotorJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -455,7 +457,7 @@ pub fn createMotorJoint(
 
 /// Creates a motor joint from a shared world-space anchor point.
 pub fn createMotorJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -472,28 +474,28 @@ pub fn createMotorJointWorld(
 }
 
 /// Sets the motor linear velocity target (m/s). Wakes the bodies.
-pub fn setMotorLinearVelocity(world: anytype, joint_id: JointId, velocity: Vec3) void {
+pub fn setMotorLinearVelocity(world: *PhysicsWorld, joint_id: JointId, velocity: Vec3) void {
     _ = world;
     c.b3MotorJoint_SetLinearVelocity(joint_id, toB3Vec(velocity));
     c.b3Joint_WakeBodies(joint_id);
 }
 
 /// Sets the motor angular velocity target (rad/s). Wakes the bodies.
-pub fn setMotorAngularVelocity(world: anytype, joint_id: JointId, velocity_rad: Vec3) void {
+pub fn setMotorAngularVelocity(world: *PhysicsWorld, joint_id: JointId, velocity_rad: Vec3) void {
     _ = world;
     c.b3MotorJoint_SetAngularVelocity(joint_id, toB3Vec(velocity_rad));
     c.b3Joint_WakeBodies(joint_id);
 }
 
 /// Sets the linear motor force budget (N). Wakes the bodies.
-pub fn setMotorMaxVelocityForce(world: anytype, joint_id: JointId, max_force: f32) void {
+pub fn setMotorMaxVelocityForce(world: *PhysicsWorld, joint_id: JointId, max_force: f32) void {
     _ = world;
     c.b3MotorJoint_SetMaxVelocityForce(joint_id, max_force);
     c.b3Joint_WakeBodies(joint_id);
 }
 
 /// Sets the angular motor torque budget (N*m). Wakes the bodies.
-pub fn setMotorMaxVelocityTorque(world: anytype, joint_id: JointId, max_torque: f32) void {
+pub fn setMotorMaxVelocityTorque(world: *PhysicsWorld, joint_id: JointId, max_torque: f32) void {
     _ = world;
     c.b3MotorJoint_SetMaxVelocityTorque(joint_id, max_torque);
     c.b3Joint_WakeBodies(joint_id);
@@ -501,7 +503,7 @@ pub fn setMotorMaxVelocityTorque(world: anytype, joint_id: JointId, max_torque: 
 
 /// Creates a weld joint holding the creation relative pose of two bodies.
 pub fn createWeldJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -528,7 +530,7 @@ pub fn createWeldJoint(
 
 /// Creates a weld joint from a shared world-space anchor point.
 pub fn createWeldJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -546,13 +548,13 @@ pub fn createWeldJointWorld(
 
 /// Current joint constraint force (N). Poll it to implement breakable
 /// joints: destroy the joint once the load exceeds a threshold.
-pub fn jointConstraintForce(world: anytype, joint_id: JointId) Vec3 {
+pub fn jointConstraintForce(world: *PhysicsWorld, joint_id: JointId) Vec3 {
     _ = world;
     return fromB3Vec(c.b3Joint_GetConstraintForce(joint_id));
 }
 
 /// Current joint constraint torque (N*m).
-pub fn jointConstraintTorque(world: anytype, joint_id: JointId) Vec3 {
+pub fn jointConstraintTorque(world: *PhysicsWorld, joint_id: JointId) Vec3 {
     _ = world;
     return fromB3Vec(c.b3Joint_GetConstraintTorque(joint_id));
 }
@@ -561,7 +563,7 @@ pub fn jointConstraintTorque(world: anytype, joint_id: JointId) Vec3 {
 /// parallel to the z-axis of body A. Anchor points only define the
 /// joint frames, not a position constraint.
 pub fn createParallelJoint(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     local_anchor_a: Vec3,
@@ -587,7 +589,7 @@ pub fn createParallelJoint(
 
 /// Creates a parallel joint from a shared world-space anchor point.
 pub fn createParallelJointWorld(
-    world: anytype,
+    world: *PhysicsWorld,
     body_a: *RigidBody,
     body_b: *RigidBody,
     world_anchor: Vec3,
@@ -605,7 +607,7 @@ pub fn createParallelJointWorld(
 
 /// Retunes the parallel spring at runtime. Wakes the bodies.
 pub fn setParallelSpring(
-    world: anytype,
+    world: *PhysicsWorld,
     joint_id: JointId,
     hertz: f32,
     damping_ratio: f32,
@@ -624,7 +626,7 @@ pub fn isJointValid(joint_id: JointId) bool {
     return c.b3Joint_IsValid(joint_id);
 }
 
-pub fn destroyJoint(world: anytype, joint_id: JointId) void {
+pub fn destroyJoint(world: *PhysicsWorld, joint_id: JointId) void {
     c.b3DestroyJoint(joint_id, true);
     for (world.joints.items, 0..) |j, idx| {
         if (j.index1 == joint_id.index1 and j.generation == joint_id.generation) {

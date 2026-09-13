@@ -4,8 +4,10 @@
 //! Meshes without CPU geometry (empty `cpu_positions`) are skipped: glTF
 //! imports and geometry builders retain it, GPU-only meshes do not.
 //!
-//! Normals: flat per-triangle face normals (one `vn` per triangle, faces use
-//! the `v//vn` form). The STL exporter uses the same convention.
+//! Normals: flat per-triangle face normals; byte-identical normals share one
+//! `vn` line so coplanar faces keep the importer from splitting shared
+//! corners (faces use the `v//vn` form). The STL exporter uses the same
+//! convention.
 //! UVs are dropped (no `vt`); the OBJ importer defaults them to zero, so a
 //! round-trip stays lossless on positions and triangle counts.
 //! Materials: with `emit_materials`, meshes carrying a Standard or PBR
@@ -74,6 +76,13 @@ fn faceNormal(a: Vec3, b: Vec3, c: Vec3) Vec3 {
     const n = b.sub(a).cross(c.sub(a));
     if (n.lengthSq() < 1e-12) return Vec3.up;
     return n.normalize();
+}
+
+/// Quantizes a normal component for vn dedup (1e-5, as in the STL importer).
+/// NaN maps to 0 so degenerate input cannot trap @intFromFloat.
+fn quantNormal(x: f32) i32 {
+    if (std.math.isNan(x)) return 0;
+    return @intFromFloat(@round(x * 100000.0));
 }
 
 fn materialName(mesh: *const Mesh) ?[]const u8 {
@@ -161,27 +170,44 @@ pub fn writeObjAlloc(
             }
         }
 
+        // vn dedup: identical normals share one line. The OBJ importer keys
+        // vertices on (position, uv, normal), so repeating the same normal
+        // per face would split corners shared by coplanar faces and inflate
+        // the round-trip vertex count.
+        var n_cache: std.AutoHashMapUnmanaged([3]i32, usize) = .empty;
+        defer n_cache.deinit(allocator);
+        var face_ni: std.ArrayListUnmanaged(usize) = .empty;
+        defer face_ni.deinit(allocator);
+
         for (tris.items) |tri| {
             const n = faceNormal(
                 exportPosition(mesh, world, tri[0]),
                 exportPosition(mesh, world, tri[1]),
                 exportPosition(mesh, world, tri[2]),
             );
-            const n_line = try std.fmt.allocPrint(allocator, "vn {d} {d} {d}\n", .{ n.x, n.y, n.z });
-            defer allocator.free(n_line);
-            try buf.appendSlice(allocator, n_line);
+            const key = [3]i32{ quantNormal(n.x), quantNormal(n.y), quantNormal(n.z) };
+            const gop = try n_cache.getOrPut(allocator, key);
+            if (!gop.found_existing) {
+                // Key is already inserted here, so count()-1 is its index.
+                gop.value_ptr.* = n_cache.count() - 1;
+                const n_line = try std.fmt.allocPrint(allocator, "vn {d} {d} {d}\n", .{ n.x, n.y, n.z });
+                defer allocator.free(n_line);
+                try buf.appendSlice(allocator, n_line);
+            }
+            try face_ni.append(allocator, gop.value_ptr.*);
         }
 
         var ni: usize = 0;
         for (tris.items) |tri| {
             ni += 1;
+            const nidx = base_n + face_ni.items[ni - 1] + 1;
             const f_line = try std.fmt.allocPrint(
                 allocator,
                 "f {d}//{d} {d}//{d} {d}//{d}\n",
                 .{
-                    tri[0] + base_v + 1, base_n + ni,
-                    tri[1] + base_v + 1, base_n + ni,
-                    tri[2] + base_v + 1, base_n + ni,
+                    tri[0] + base_v + 1, nidx,
+                    tri[1] + base_v + 1, nidx,
+                    tri[2] + base_v + 1, nidx,
                 },
             );
             defer allocator.free(f_line);
@@ -189,7 +215,7 @@ pub fn writeObjAlloc(
         }
 
         base_v += mesh.cpu_positions.len;
-        base_n += tris.items.len;
+        base_n += n_cache.count();
     }
 
     return buf.toOwnedSlice(allocator);

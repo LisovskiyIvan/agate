@@ -551,6 +551,152 @@ test "AudioClip decodes 32-bit mono and stereo WAV" {
     }
 }
 
+// --- MP3 / OGG clip tests ---
+//
+// Fixture provenance: `tone_440_880.mp3` / `tone_440_880.ogg` (src/agate/audio/
+// fixtures/) are 0.06 s stereo sine tones (left 440 Hz, right 880 Hz, amp 0.5,
+// 44100 Hz, 2646 source samples). Both are committed so the decode results
+// below are fully deterministic.
+//   mp3: ffmpeg -f lavfi -i "aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*880*t):s=44100:d=0.06" -c:a libmp3lame -b:a 96k tone_440_880.mp3
+//   ogg: libvorbis 1.3.7 (vorbis_encode_init_vbr, quality 0) via a one-shot
+//        generator over the same samples; ffmpeg's bundled vorbis encoder is
+//        experimental and produced silence, and homebrew ffmpeg has no
+//        libvorbis, hence the direct libvorbis encode.
+// Reference decode (vendored decoders, C probe): mp3 = 2646 frames @44100 Hz
+// stereo (dr_mp3 honors the LAME gapless tag), ogg = 2646 frames per channel
+// @44100 Hz stereo, per-channel RMS ~0.35.
+
+fn clipRms(clip: *const AudioClip) f64 {
+    if (clip.samples.len == 0) return 0.0;
+    var sum: f64 = 0.0;
+    for (clip.samples) |s| sum += @as(f64, s) * s;
+    return @sqrt(sum / @as(f64, @floatFromInt(clip.samples.len)));
+}
+
+fn expectStereoTone(clip: *const AudioClip, want_frames: usize) !void {
+    try std.testing.expectEqual(@as(f32, 44100.0), clip.sample_rate);
+    try std.testing.expectEqual(want_frames, clip.frames);
+    try std.testing.expectEqual(want_frames * 2, clip.samples.len);
+    // Audible tone on both channels, channels distinct (440 vs 880 Hz).
+    try std.testing.expect(clipRms(clip) > 0.2);
+    var differ: usize = 0;
+    for (0..want_frames) |i| {
+        if (@abs(clip.samples[i * 2] - clip.samples[i * 2 + 1]) > 0.01) differ += 1;
+    }
+    try std.testing.expect(differ > want_frames / 4);
+}
+
+test "AudioClip decodes MP3 from memory with expected duration, channels and RMS" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("fixtures/tone_440_880.mp3");
+    var clip = try AudioClip.fromMp3Memory(alloc, bytes);
+    defer clip.deinit(alloc);
+    try expectStereoTone(&clip, 2646);
+}
+
+test "AudioClip decodes OGG Vorbis from memory with expected duration, channels and RMS" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("fixtures/tone_440_880.ogg");
+    var clip = try AudioClip.fromOggMemory(alloc, bytes);
+    defer clip.deinit(alloc);
+    try expectStereoTone(&clip, 2646);
+}
+
+test "AudioClip MP3 and OGG file decodes match the memory decodes exactly" {
+    const alloc = std.testing.allocator;
+    const tio = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const mp3_bytes = @embedFile("fixtures/tone_440_880.mp3");
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+    var mp3_mem = try AudioClip.fromMp3Memory(alloc, mp3_bytes);
+    defer mp3_mem.deinit(alloc);
+    var ogg_mem = try AudioClip.fromOggMemory(alloc, ogg_bytes);
+    defer ogg_mem.deinit(alloc);
+
+    if (cwd.writeFile(tio, .{ .sub_path = "agate_mp3_fixture_test.mp3", .data = mp3_bytes })) {
+        defer cwd.deleteFile(tio, "agate_mp3_fixture_test.mp3") catch {};
+        var mp3_file = try AudioClip.fromMp3File(alloc, "agate_mp3_fixture_test.mp3");
+        defer mp3_file.deinit(alloc);
+        try std.testing.expectEqual(mp3_mem.frames, mp3_file.frames);
+        try std.testing.expectEqual(mp3_mem.sample_rate, mp3_file.sample_rate);
+        try std.testing.expectEqualSlices(f32, mp3_mem.samples, mp3_file.samples);
+    } else |_| {}
+
+    if (cwd.writeFile(tio, .{ .sub_path = "agate_ogg_fixture_test.ogg", .data = ogg_bytes })) {
+        defer cwd.deleteFile(tio, "agate_ogg_fixture_test.ogg") catch {};
+        var ogg_file = try AudioClip.fromOggFile(alloc, "agate_ogg_fixture_test.ogg");
+        defer ogg_file.deinit(alloc);
+        try std.testing.expectEqual(ogg_mem.frames, ogg_file.frames);
+        try std.testing.expectEqual(ogg_mem.sample_rate, ogg_file.sample_rate);
+        try std.testing.expectEqualSlices(f32, ogg_mem.samples, ogg_file.samples);
+    } else |_| {}
+}
+
+test "AudioClip plays a decoded MP3 clip through the mixer" {
+    const alloc = std.testing.allocator;
+    var clip = try AudioClip.fromMp3Memory(alloc, @embedFile("fixtures/tone_440_880.mp3"));
+    defer clip.deinit(alloc);
+
+    var eng = AudioEngine{};
+    eng.playClip(&clip, .{});
+    // Clip is ~0.06 s; render 0.15 s and expect energy only in the head.
+    var buf: [13230]f32 = [_]f32{0.0} ** 13230;
+    eng.renderFrames(&buf);
+    try std.testing.expect(channelEnergy(&buf, 0) + channelEnergy(&buf, 1) > 10.0);
+    try std.testing.expect(peakAbs(&buf, 5513, 6615) < 1e-6);
+}
+
+test "AudioClip rejects garbage MP3 and OGG data with clean errors" {
+    const alloc = std.testing.allocator;
+    // Empty input.
+    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, ""));
+    try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, ""));
+    // No MP3 frame sync (no 0xFF byte) / no Ogg page magic: deterministic failures.
+    const garbage = "This is definitely not an MP3 file";
+    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, garbage));
+    try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, garbage));
+    // All-zero buffer: no sync, no pages.
+    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, &[_]u8{0} ** 512));
+    // MP3 bytes carry no "OggS" magic, so the vorbis open must fail cleanly.
+    try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, @embedFile("fixtures/tone_440_880.mp3")));
+}
+
+test "AudioClip truncated MP3 and OGG data fail cleanly or decode fewer frames" {
+    const alloc = std.testing.allocator;
+    const mp3_bytes = @embedFile("fixtures/tone_440_880.mp3");
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var full_mp3 = try AudioClip.fromMp3Memory(alloc, mp3_bytes);
+    defer full_mp3.deinit(alloc);
+    var full_ogg = try AudioClip.fromOggMemory(alloc, ogg_bytes);
+    defer full_ogg.deinit(alloc);
+
+    // MP3 cut to 10 bytes cannot hold a whole frame (>= ~100 bytes at this
+    // bitrate): dr_mp3 finds no valid frame header, so this is a clean error.
+    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, mp3_bytes[0..10]));
+
+    // Ogg pages carry CRCs: a half-truncated stream fails at open time.
+    try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, ogg_bytes[0 .. ogg_bytes.len / 2]));
+
+    // MP3 truncated mid-payload may legitimately decode the frames it holds;
+    // whatever happens, it must never crash or exceed the full decode.
+    if (AudioClip.fromMp3Memory(alloc, mp3_bytes[0 .. mp3_bytes.len / 2])) |half_in| {
+        var half = half_in;
+        defer half.deinit(alloc);
+        try std.testing.expect(half.frames > 0 and half.frames < full_mp3.frames);
+        try std.testing.expectEqual(@as(f32, 44100.0), half.sample_rate);
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidMp3, err);
+    }
+}
+
+test "AudioClip fromMp3File and fromOggFile surface missing files" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.FileNotFound, AudioClip.fromMp3File(alloc, "agate_missing_file.mp3"));
+    try std.testing.expectError(error.FileNotFound, AudioClip.fromOggFile(alloc, "agate_missing_file.ogg"));
+}
+
 test "AudioClip fromWavFile streams PCM in chunks" {
     const alloc = std.testing.allocator;
     const tio = std.testing.io;

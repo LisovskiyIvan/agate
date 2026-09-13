@@ -492,7 +492,36 @@ pub const Texture = struct {
         const width: u32 = @intCast(w);
         const height: u32 = @intCast(h);
         const channel_count = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
+        // stb_image's flat Radiance path ignores stbi__getn's result and
+        // zero-fills truncated pixel data, so short payloads are rejected
+        // here: after the resolution line a flat file needs exactly
+        // width*height RGBE pixels. RLE payloads are variable-length, but
+        // stb errors on bad RLE runs, so they need no extra check.
+        if (width < 8 or width >= 32768) {
+            if (radiancePayload(bytes)) |payload| {
+                if (payload.len < channel_count) return error.ImageDecodeFailed;
+            }
+        }
         return buildRawHdr(allocator, width, height, data[0..channel_count]);
+    }
+
+    /// Returns the pixel-data slice after the Radiance resolution line
+    /// ("-Y h +X w"), or null when the header has no such line. The
+    /// resolution line is the first line after the header's empty separator
+    /// line; scanning beyond it could hit binary payload bytes.
+    fn radiancePayload(bytes: []const u8) ?[]const u8 {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const nl = std.mem.indexOfScalarPos(u8, bytes, pos, '\n') orelse return null;
+            if (nl == pos) {
+                pos = nl + 1;
+                break;
+            }
+            pos = nl + 1;
+        } else return null;
+        const nl = std.mem.indexOfScalarPos(u8, bytes, pos, '\n') orelse return null;
+        if (!std.mem.startsWith(u8, bytes[pos..nl], "-Y ")) return null;
+        return bytes[nl + 1 ..];
     }
 
     /// File variant of `decodeHDRMemory`. Thread-safe; pair with `fromRawHdr`.
@@ -1140,6 +1169,10 @@ test "downsampleLevel handles odd dimensions and averages correctly" {
 test "decodeMemory returns RGBA levels and owns its mip chain" {
     const png = @embedFile("assets/font_sdf.png");
     const allocator = std.testing.allocator;
+
+    // decodeMemory logs decode timings through sokol.time; sokol_time is
+    // CPU-only and needs its one-time setup (normally done at app startup).
+    sokol.time.setup();
 
     var single = try Texture.decodeMemory(allocator, png, false);
     defer single.deinit(allocator);

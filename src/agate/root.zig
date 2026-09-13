@@ -91,6 +91,7 @@ pub const barycentric = mesh.barycentric;
 pub const blendSkinWeights = mesh.blendSkinWeights;
 pub const MorphTarget = mesh.MorphTarget;
 pub const MAX_MORPH_TARGETS = mesh.MAX_MORPH_TARGETS;
+pub const MorphMode = mesh.MorphMode;
 pub const CSG = mesh.CSG;
 pub const CSGVertex = mesh.CSGVertex;
 pub const CSGPlane = mesh.CSGPlane;
@@ -157,6 +158,36 @@ pub const GlyphUV = ui.GlyphUV;
 pub const getGlyphUV = ui.getGlyphUV;
 pub const ScrollState = ui.ScrollState;
 pub const TextInputState = ui.TextInputState;
+pub const UIState = ui.UIState;
+pub const UIStyle = ui.UIStyle;
+pub const UIStyleOverride = ui.UIStyleOverride;
+pub const UIStyleSet = ui.UIStyleSet;
+pub const UIStyleClass = ui.UIStyleClass;
+pub const UIStyleKind = ui.UIStyleKind;
+pub const UIStyleRequest = ui.UIStyleRequest;
+pub const UIStyledOptions = ui.UIStyledOptions;
+pub const UIBoxStyle = ui.UIBoxStyle;
+pub const UITheme = ui.UITheme;
+pub const UIGradient = ui.UIGradient;
+pub const UIShadow = ui.UIShadow;
+pub const LayoutStack = ui.LayoutStack;
+pub const LayoutGridSpec = ui.LayoutGridSpec;
+pub const LayoutFlowOptions = ui.LayoutFlowOptions;
+pub const LayoutGridOptions = ui.LayoutGridOptions;
+pub const LayoutAlign = ui.LayoutAlign;
+pub const LayoutAlignCross = ui.LayoutAlignCross;
+// Style system phase 2: CSS theming + style transitions.
+pub const TransitionConfig = ui.TransitionConfig;
+pub const UIStyleTransition = ui.UIStyleTransition;
+pub const max_style_transitions = ui.max_style_transitions;
+pub const lerpStyle = ui.lerpStyle;
+pub const styleEql = ui.styleEql;
+pub const CssTheme = ui.CssTheme;
+pub const CssClass = ui.CssClass;
+pub const CssDiag = ui.CssDiag;
+pub const CssDiagKind = ui.CssDiagKind;
+pub const parseCss = ui.parseCss;
+pub const loadThemeFile = ui.loadThemeFile;
 
 pub const passes = @import("passes/mod.zig");
 pub const DebugPass = passes.DebugPass;
@@ -271,7 +302,5 @@ pub const OcclusionCuller = visibility.OcclusionCuller;
 pub const sokol = @import("sokol");
 
 test {
-    _ = @import("ai.zig");
-    _ = @import("mesh/csg_tests.zig");
-    _ = @import("visibility/mod.zig");
+    _ = @import("tests.zig");
 }

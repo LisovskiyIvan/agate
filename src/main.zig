@@ -15,6 +15,10 @@ export fn init() callconv(.c) void {
     sg.setup(.{
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
+        // Scene subsystems (forward + DS twins + shadow/skybox/particles +
+        // postfx) create well over the 128-pipeline sokol default.
+        .pipeline_pool_size = 256,
+        .shader_pool_size = 64,
     });
 
     const allocator = gpa.allocator();

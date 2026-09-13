@@ -289,14 +289,16 @@ test "PhysicsWorld static mesh collider" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    // A 10x10 flat quad (2 triangles) at y = 0.
+    // A 10x10 flat quad (2 triangles) at y = 0. CCW seen from +Y: Box3D
+    // treats the opposite winding as back faces and ignores them, so the
+    // ball would fall straight through.
     var positions = [_]Vec3{
         Vec3.new(-5.0, 0.0, -5.0),
         Vec3.new(5.0, 0.0, -5.0),
         Vec3.new(5.0, 0.0, 5.0),
         Vec3.new(-5.0, 0.0, 5.0),
     };
-    var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    var indices = [_]u32{ 0, 2, 1, 0, 3, 2 };
 
     var floor_mesh = Mesh{
         .name = "tri_floor",
@@ -409,8 +411,10 @@ test "PhysicsWorld raycast hits hulls and height fields" {
     const miss = pw.raycast(Vec3.new(2.0, 6.0, 2.0), Vec3.new(0.0, 1.0, 0.0), 20.0);
     try std.testing.expect(!miss.hit);
 
-    // Ray above the ball still hits the height field below it.
-    const floor_hit = pw.raycast(Vec3.new(4.5, 6.0, 4.5), Vec3.new(0.0, -1.0, 0.0), 20.0);
+    // Ray above the ball still hits the height field below it. The field
+    // spans [0, count-1] per axis (Box3D corner-origin layout), so the ray
+    // must target a point inside that footprint.
+    const floor_hit = pw.raycast(Vec3.new(3.5, 6.0, 3.5), Vec3.new(0.0, -1.0, 0.0), 20.0);
     try std.testing.expect(floor_hit.hit);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), floor_hit.point.y, 0.1);
 
@@ -907,12 +911,18 @@ test "Rope deinit releases lists after a severed link" {
     try std.testing.expectEqual(@as(usize, 0), rope.joints.items.len);
 }
 
-fn makeWheelTestRig(pw: *PhysicsWorld) !struct {
+fn makeWheelTestRig(
+    pw: *PhysicsWorld,
+    chassis_mesh: *Mesh,
+    wheel_meshes: *[4]Mesh,
+) !struct {
     chassis: *RigidBody,
     wheels: [4]*RigidBody,
     joints: [4]JointId,
 } {
-    var chassis_mesh = Mesh{
+    // Mesh storage is caller-owned: bodies keep `mesh` pointers alive across
+    // steps, so they must not point into this function's stack frame.
+    chassis_mesh.* = .{
         .name = "wheel_chassis",
         .vertex_buffer = .{},
         .index_buffer = .{},
@@ -920,7 +930,7 @@ fn makeWheelTestRig(pw: *PhysicsWorld) !struct {
         .position = Vec3.new(0.0, 0.5, 0.0),
         .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5)),
     };
-    const chassis = try pw.createBody(&chassis_mesh, .box, 4.0);
+    const chassis = try pw.createBody(chassis_mesh, .box, 4.0);
 
     // Suspension acts along frame A x-axis: rotate it onto world -Y.
     const frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0));
@@ -933,7 +943,6 @@ fn makeWheelTestRig(pw: *PhysicsWorld) !struct {
         Vec3.new(-0.7, 0.0, -0.4),
         Vec3.new(0.7, 0.0, -0.4),
     };
-    var wheel_meshes: [4]Mesh = undefined;
     for (0..4) |i| {
         wheel_meshes[i] = .{
             .name = "wheel_test",
@@ -958,7 +967,9 @@ test "PhysicsWorld wheel suspension holds the chassis" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    const rig = try makeWheelTestRig(&pw);
+    var chassis_mesh: Mesh = undefined;
+    var wheel_meshes: [4]Mesh = undefined;
+    const rig = try makeWheelTestRig(&pw, &chassis_mesh, &wheel_meshes);
     _ = rig.wheels;
 
     var i: usize = 0;

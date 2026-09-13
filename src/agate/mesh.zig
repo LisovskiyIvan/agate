@@ -5,6 +5,7 @@ pub const Vertex = types.Vertex;
 pub const CullingStrategy = types.CullingStrategy;
 pub const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 pub const MorphTarget = types.MorphTarget;
+pub const MorphMode = types.MorphMode;
 pub const InstancedMesh = types.InstancedMesh;
 pub const BoneAttachment = types.BoneAttachment;
 pub const GeometryData = types.GeometryData;
@@ -19,6 +20,10 @@ pub const orthogonal_dot_threshold = tangents.orthogonal_dot_threshold;
 pub const mesh_impl = @import("mesh/mesh.zig");
 pub const Mesh = mesh_impl.Mesh;
 pub const uploadGeometry = mesh_impl.uploadGeometry;
+
+/// GPU morph blending: delta-texture packing plus the pure Zig mirror of
+/// the vertex-shader blend (opt-in via Mesh.morph_mode == .gpu).
+pub const morph_gpu = @import("mesh/morph_gpu.zig");
 
 pub const builders = @import("mesh/builders.zig");
 pub const BoxOptions = builders.BoxOptions;

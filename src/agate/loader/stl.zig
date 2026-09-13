@@ -169,6 +169,11 @@ fn parseAscii(allocator: std.mem.Allocator, bytes: []const u8) !StlData {
     var nv: usize = 0;
     var in_facet = false;
     var saw_any = false;
+    // ASCII STL must open with "solid"; reaching this path without it means
+    // the bytes are not STL text (e.g. a corrupt binary failed the size check).
+    const first = t.next() orelse return error.NoGeometry;
+    if (!std.mem.eql(u8, first, "solid")) return error.InvalidFormat;
+    saw_any = true;
     while (t.next()) |tok| {
         if (std.mem.eql(u8, tok, "solid")) {
             saw_any = true;

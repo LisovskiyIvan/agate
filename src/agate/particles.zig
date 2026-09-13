@@ -14,6 +14,112 @@ pub const ParticleBlendMode = enum {
     alpha_blend,
 };
 
+/// Simulation driver of a ParticleSystem. Default `.cpu` keeps every existing
+/// system bit-for-bit identical; `.gpu` moves the integration into the vertex
+/// shader (stateless: each particle is a fixed slot holding only spawn data,
+/// position/fade/size are evaluated analytically from the age of the slot).
+///
+/// Honest feature matrix — the GPU path can only express what a closed-form
+/// function of age `t = (now - spawn_time) / lifetime` produces:
+///
+/// | Feature                              | .cpu      | .gpu                    |
+/// |--------------------------------------|-----------|-------------------------|
+/// | gravity                              | yes       | yes                     |
+/// | exponential drag (`drag`)            | no (1)    | yes                     |
+/// | lifetime / burst / emit_rate         | yes       | yes                     |
+/// | color & size start->end lerp         | yes       | yes                     |
+/// | spritesheet grid + loops             | yes       | yes                     |
+/// | rotation + angular velocity          | yes       | yes                     |
+/// | additive / alpha blend               | yes       | yes                     |
+/// | world-space emitter                  | yes       | yes                     |
+/// | local_space (moving emitter frame)   | yes       | fallback -> .cpu + warn |
+/// | collisions, noise, arbitrary forces  | (2)       | fallback -> .cpu + warn |
+///
+/// (1) `drag` is GPU-only by design: the CPU path integrates semi-implicit
+///     Euler per frame while the GPU path uses the exact exponential closed
+///     form; implementing drag on only one side keeps the two integration
+///     schemes from being silently mixed in one system.
+/// (2) Not implemented on either path today; features that need per-particle
+///     historical state (moving-emitter local space, collisions, force fields)
+///     must stay CPU-only because a stateless slot has no memory of previous
+///     frames. Requesting them in `.gpu` mode is not a panic: the system
+///     sticky-switches to `.cpu` with a warn log on the next update.
+///
+/// Integration semantics differ by construction: `.cpu` advances with the
+/// frame dt (semi-implicit Euler), `.gpu` evaluates the exact closed form
+/// p(t) = p0 + v0*s + g*(t - s)/k with s = (1 - e^(-k*t)) / k (k = drag, and
+/// s = t, (t - s)/k = t^2/2 when k = 0). Both agree in the dt -> 0 limit; the
+/// analytic form is pinned by golden values in `analyticPosition` tests.
+pub const SimulationMode = enum {
+    cpu,
+    gpu,
+};
+
+/// One GPU particle slot: fixed-size spawn record consumed by the vertex
+/// shader (program `particle_gpu` in shaders/particle.glsl). Layout mirrors
+/// the five FLOAT4 instance attributes declared there; 5 * 16 = 80 bytes.
+pub const GpuParticleSlot = extern struct {
+    /// xyz = spawn position (world space), w = spawn time in seconds since
+    /// the system's epoch clock (`clock_seconds`). Epoch-relative times keep
+    /// float32 magnitudes small: f32 has a 24-bit mantissa, so the spawn-time
+    /// resolution degrades to ~0.00024 s after one hour of session time;
+    /// reset() re-anchors the clock for long-lived systems.
+    spawn_pos_time: [4]f32,
+    /// xyz = initial velocity, w = lifetime in seconds (>= 0.0001).
+    velocity_lifetime: [4]f32,
+    color_start: [4]f32,
+    color_end: [4]f32,
+    /// x = size start, y = size end, z = rotation start (radians),
+    /// w = angular velocity (radians/second).
+    size_rotation: [4]f32,
+};
+
+/// Age of a slot relative to the render clock. `alive` is false for unborn
+/// (spawn in the future) and dead (t >= 1) slots; the shader collapses those
+/// into a degenerate off-screen triangle.
+pub const SlotAge = struct {
+    t: f32,
+    alive: bool,
+};
+
+/// Normalized age of a particle slot. Mirrors the shader expression
+/// `t = (time - spawn_time) / max(lifetime, 1.0e-4)` so CPU tests pin the
+/// exact branching the GLSL performs (unborn -> t=0/dead, dead -> t clamped 1).
+pub fn slotAge(now: f32, spawn_time: f32, lifetime: f32) SlotAge {
+    const life: f32 = if (lifetime > 0.0001) lifetime else 0.0001;
+    const age = now - spawn_time;
+    if (age < 0.0) return .{ .t = 0.0, .alive = false };
+    const t = age / life;
+    if (t >= 1.0) return .{ .t = 1.0, .alive = false };
+    return .{ .t = t, .alive = true };
+}
+
+/// Integration spans shared by the Zig and GLSL analytic trajectories:
+/// position = spawn + velocity * s + gravity * s2. With drag k > 0 the
+/// velocity ODE dv/dt = g - k*v has the closed form v(t) = v0*e^(-kt) +
+/// (g/k)*(1 - e^(-kt)); integrating gives s = (1 - e^(-kt)) / k and
+/// s2 = (t - s) / k. For k = 0 these degenerate to s = t, s2 = t^2 / 2, i.e.
+/// the classic p = p0 + v0*t + 0.5*g*t^2. The k threshold (1e-6) avoids the
+/// catastrophic cancellation of (1 - e^(-kt))/k for near-zero drag.
+pub const DragSpans = struct { s: f32, s2: f32 };
+
+pub fn analyticDragSpans(drag: f32, time: f32) DragSpans {
+    if (drag > 1.0e-6) {
+        const s = (1.0 - @exp(-drag * time)) / drag;
+        return .{ .s = s, .s2 = (time - s) / drag };
+    }
+    return .{ .s = time, .s2 = 0.5 * time * time };
+}
+
+/// Analytic particle position after `time` seconds. GLSL duplicate lives in
+/// shaders/particle.glsl (program particle_gpu); both use exp(), so expect
+/// ~1e-6 relative deviation between backends (libm expf vs GPU intrinsic) —
+/// the golden tests below pin the Zig side to 1e-4 absolute tolerance.
+pub fn analyticPosition(spawn: Vec3, velocity: Vec3, gravity: Vec3, drag: f32, time: f32) Vec3 {
+    const spans = analyticDragSpans(drag, time);
+    return spawn.add(velocity.scale(spans.s)).add(gravity.scale(spans.s2));
+}
+
 pub const Particle = struct {
     position: Vec3,
     velocity: Vec3,
@@ -124,6 +230,36 @@ pub const ParticleSystem = struct {
     texture: ?Texture = null,
     blend_mode: ParticleBlendMode = .additive,
 
+    // --- GPU simulation path (simulation_mode == .gpu) ---
+    /// See `SimulationMode` for the exact feature matrix. Default .cpu keeps
+    /// existing systems bit-for-bit identical.
+    simulation_mode: SimulationMode = .cpu,
+    /// Exponential drag coefficient (1/s), GPU-path only (see matrix note (1)).
+    drag: f32 = 0.0,
+    /// Epoch clock for the GPU path: seconds accumulated by updateGpu. Slot
+    /// spawn times are offsets from this epoch so float32 magnitudes stay small.
+    clock_seconds: f32 = 0.0,
+    /// CPU mirror of the GPU slot ring; provisioned lazily on first GPU update
+    /// (and from tests) so CPU-only systems pay no extra memory.
+    gpu_slots: []GpuParticleSlot = &.{},
+    /// Instance buffer holding `gpu_slots` (per-instance spawn records).
+    gpu_slot_buffer: sg.Buffer = .{},
+    /// Ring cursor: next slot to overwrite. Emission is strictly sequential,
+    /// which keeps the CPU cursor and the upload ranges trivially in sync.
+    gpu_write_cursor: usize = 0,
+    /// High-water mark of written slots = GPU draw instance count. Slots below
+    /// it may be dead; the shader culls them, so `active_count` (aliased to
+    /// this in .gpu mode) is an upper bound — the exact live count lives on
+    /// the GPU only.
+    gpu_high_water: usize = 0,
+    // Dirty bookkeeping for the once-per-frame sg.updateBuffer: emission writes
+    // a contiguous cursor run per frame unless it wraps the ring, in which case
+    // the whole [0, high_water) prefix is re-uploaded.
+    gpu_dirty: bool = false,
+    gpu_dirty_start: usize = 0,
+    gpu_dirty_end: usize = 0,
+    gpu_dirty_wrapped: bool = false,
+
     // Emitter shape & origin
     emitter_position: Vec3 = Vec3.zero,
     emitter_box_min: Vec3 = Vec3.zero,
@@ -204,6 +340,14 @@ pub const ParticleSystem = struct {
             sg.destroyBuffer(self.instance_buffer);
             self.instance_buffer = .{};
         }
+        if (self.gpu_slot_buffer.id != 0) {
+            sg.destroyBuffer(self.gpu_slot_buffer);
+            self.gpu_slot_buffer = .{};
+        }
+        if (self.gpu_slots.len > 0) {
+            self.allocator.free(self.gpu_slots);
+            self.gpu_slots = &.{};
+        }
         if (self.texture) |*t| {
             t.deinit();
             self.texture = null;
@@ -223,16 +367,35 @@ pub const ParticleSystem = struct {
     pub fn reset(self: *ParticleSystem) void {
         self.active_count = 0;
         self.emit_accumulator = 0.0;
+        // GPU ring: re-anchor the epoch and drop all slots. Old slot records
+        // (if the buffer is not cleared) carry spawn times far ahead of the
+        // new epoch, so they cull as unborn (t < 0) in the shader.
+        self.clock_seconds = 0.0;
+        self.gpu_write_cursor = 0;
+        self.gpu_high_water = 0;
+        self.gpu_dirty = false;
+        self.gpu_dirty_wrapped = false;
     }
 
     inline fn randomRange(rnd: std.Random, min_val: f32, max_val: f32) f32 {
         return min_val + rnd.float(f32) * (max_val - min_val);
     }
 
-    pub fn emitOne(self: *ParticleSystem) void {
-        if (self.active_count >= self.capacity) return;
-        const rnd = self.prng.random();
+    /// One sampled particle spawn, shared verbatim by both simulation paths so
+    /// identical seeds produce identical particles regardless of mode. The PRNG
+    /// call order (box xyz, direction xyz, speed, lifetime, rotation, angular
+    /// velocity) is part of the CPU behaviour contract — do not reorder.
+    const SpawnSample = struct {
+        position: Vec3,
+        velocity: Vec3,
+        lifetime: f32,
+        /// Degrees, normalized to [0, 360).
+        rotation_deg: f32,
+        /// Degrees/second.
+        angular_velocity: f32,
+    };
 
+    fn sampleSpawn(self: *ParticleSystem, rnd: std.Random) SpawnSample {
         // In local_space mode this offset is stored verbatim (emitter-local);
         // the emitter world matrix is applied only at instance-fill time.
         const spawn_pos = Vec3.new(
@@ -252,24 +415,83 @@ pub const ParticleSystem = struct {
 
         const lifetime = randomRange(rnd, self.lifetime_min, self.lifetime_max);
 
-        self.particles[self.active_count] = .{
+        return .{
             .position = spawn_pos,
             .velocity = vel,
+            .lifetime = if (lifetime > 0.0001) lifetime else 0.0001,
+            .rotation_deg = normalizeAngleDeg(randomRange(rnd, self.rotation_min, self.rotation_max)),
+            .angular_velocity = randomRange(rnd, self.angular_velocity_min, self.angular_velocity_max),
+        };
+    }
+
+    pub fn emitOne(self: *ParticleSystem) void {
+        if (self.simulation_mode == .gpu) {
+            self.emitGpuSlot();
+            return;
+        }
+        if (self.active_count >= self.capacity) return;
+        const sample = self.sampleSpawn(self.prng.random());
+
+        self.particles[self.active_count] = .{
+            .position = sample.position,
+            .velocity = sample.velocity,
             .size = self.size_start,
             .size_end = self.size_end,
             .color = self.color_start,
             .color_end = self.color_end,
             .age = 0.0,
-            .lifetime = if (lifetime > 0.0001) lifetime else 0.0001,
-            .rotation = normalizeAngleDeg(randomRange(rnd, self.rotation_min, self.rotation_max)),
-            .angular_velocity = randomRange(rnd, self.angular_velocity_min, self.angular_velocity_max),
+            .lifetime = sample.lifetime,
+            .rotation = sample.rotation_deg,
+            .angular_velocity = sample.angular_velocity,
         };
         self.active_count += 1;
     }
 
+    /// Writes the next ring slot for the GPU path. The ring overwrites the
+    /// oldest slot instead of dropping the spawn (the CPU path drops when
+    /// full) — with no live-count tracking on the CPU this is the only
+    /// policy a stateless ring can afford, and it keeps steady emission
+    /// allocation-free. Bookkeeping here feeds the per-frame upload ranges.
+    fn emitGpuSlot(self: *ParticleSystem) void {
+        // Slots are provisioned by updateGpu; emissions before the first
+        // update (no ring yet) drop instead of allocating on the hot path.
+        if (self.gpu_slots.len < self.capacity) return;
+        const sample = self.sampleSpawn(self.prng.random());
+
+        const cap = self.capacity;
+        const c = self.gpu_write_cursor;
+        if (!self.gpu_dirty) {
+            self.gpu_dirty = true;
+            self.gpu_dirty_start = c;
+            self.gpu_dirty_wrapped = false;
+        }
+        self.gpu_slots[c] = .{
+            .spawn_pos_time = .{ sample.position.x, sample.position.y, sample.position.z, self.clock_seconds },
+            .velocity_lifetime = .{ sample.velocity.x, sample.velocity.y, sample.velocity.z, sample.lifetime },
+            .color_start = self.color_start.toArray(),
+            .color_end = self.color_end.toArray(),
+            .size_rotation = .{
+                self.size_start,
+                self.size_end,
+                rotationToRadians(sample.rotation_deg),
+                rotationToRadians(sample.angular_velocity),
+            },
+        };
+        self.gpu_write_cursor = (c + 1) % cap;
+        if (self.gpu_write_cursor < c) self.gpu_dirty_wrapped = true;
+        if (self.gpu_high_water < cap) self.gpu_high_water += 1;
+        self.gpu_dirty_end = self.gpu_write_cursor;
+        // Upper bound only (see gpu_high_water): scene stats and the render
+        // skip-check key off active_count, so it must track the draw count.
+        self.active_count = self.gpu_high_water;
+    }
+
     pub fn burst(self: *ParticleSystem, count: usize) void {
         var n: usize = 0;
-        while (n < count and self.active_count < self.capacity) : (n += 1) {
+        while (n < count) : (n += 1) {
+            // CPU keeps the old drop-when-full guard; the GPU ring always
+            // accepts (oldest slot is recycled).
+            if (self.simulation_mode == .cpu and self.active_count >= self.capacity) break;
             self.emitOne();
         }
     }
@@ -349,7 +571,102 @@ pub const ParticleSystem = struct {
         }
     }
 
+    /// True when the current configuration can run on the stateless GPU path.
+    /// Features that need per-particle history (moving-emitter local space,
+    /// collisions, force fields — see `SimulationMode`) are CPU-only.
+    fn gpuFeaturesSupported(self: *const ParticleSystem) bool {
+        return !self.local_space;
+    }
+
+    /// Lazily provisions the slot ring; a failed allocation triggers the same
+    /// sticky CPU fallback as an unsupported feature (no panic, warn only).
+    fn provisionGpuSlots(self: *ParticleSystem) bool {
+        if (self.gpu_slots.len == self.capacity) return true;
+        const slots = self.allocator.alloc(GpuParticleSlot, self.capacity) catch return false;
+        self.gpu_slots = slots;
+        return true;
+    }
+
+    fn fallbackToCpu(self: *ParticleSystem, reason: []const u8) void {
+        std.log.warn(
+            "particles: system '{s}': GPU simulation unavailable ({s}); sticky fallback to CPU",
+            .{ self.name, reason },
+        );
+        self.simulation_mode = .cpu;
+    }
+
+    /// GPU-path frame step: advances the epoch clock and appends spawn slots
+    /// to the ring — O(emitted), never O(particles). The simulation itself
+    /// happens in the vertex shader (shaders/particle.glsl, program
+    /// particle_gpu). Falls back to the CPU path when the feature set or slot
+    /// provisioning does not support GPU simulation.
+    pub fn updateGpu(self: *ParticleSystem, dt: f32) void {
+        if (!self.gpuFeaturesSupported()) {
+            self.fallbackToCpu("features require historical state (local_space)");
+            self.updateCpu(dt);
+            return;
+        }
+        if (!self.provisionGpuSlots()) {
+            self.fallbackToCpu("slot allocation failed");
+            self.updateCpu(dt);
+            return;
+        }
+        self.clock_seconds += dt;
+        if (self.is_emitting and self.emit_rate > 0.0) {
+            self.emit_accumulator += dt * self.emit_rate;
+            // No capacity guard: the ring recycles the oldest slot, so a full
+            // system never blocks the accumulator (CPU drops instead).
+            while (self.emit_accumulator >= 1.0) {
+                self.emitGpuSlot();
+                self.emit_accumulator -= 1.0;
+            }
+        }
+    }
+
+    /// Dirty slot range to upload this frame, or null when nothing changed.
+    /// Pure so tests can exercise the bookkeeping without a GPU context.
+    fn gpuUploadRange(self: *const ParticleSystem) ?[]GpuParticleSlot {
+        if (!self.gpu_dirty) return null;
+        // A frame that wrapped the ring wrote two disjoint segments; a single
+        // sg.updateBuffer can only cover one range from offset 0, so such
+        // frames re-upload the whole [0, high_water) prefix. Beyond that
+        // prefix nothing changed since the previous upload.
+        if (self.gpu_dirty_wrapped) return self.gpu_slots[0..self.gpu_high_water];
+        if (self.gpu_dirty_end <= self.gpu_dirty_start) return null;
+        return self.gpu_slots[self.gpu_dirty_start..self.gpu_dirty_end];
+    }
+
+    fn flushGpuUpload(self: *ParticleSystem) void {
+        if (self.gpu_slot_buffer.id == 0) return;
+        if (self.gpuUploadRange()) |range| {
+            sg.updateBuffer(self.gpu_slot_buffer, sg.asRange(range));
+        }
+        self.gpu_dirty = false;
+        self.gpu_dirty_wrapped = false;
+    }
+
     pub fn update(self: *ParticleSystem, dt: f32) void {
+        if (self.simulation_mode == .gpu) {
+            // Lazily create the GPU instance buffer on first update (the
+            // sg context is required, which tests never have).
+            if (self.gpu_slot_buffer.id == 0) {
+                self.gpu_slot_buffer = sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                    .size = self.capacity * @sizeOf(GpuParticleSlot),
+                });
+            }
+            self.updateGpu(dt);
+            if (self.simulation_mode == .gpu) {
+                self.flushGpuUpload();
+                return;
+            }
+            // Sticky fallback happened mid-update: updateGpu already ran the
+            // CPU step for this frame, only its instance upload is missing.
+            if (self.active_count > 0) {
+                sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+            }
+            return;
+        }
         self.updateCpu(dt);
 
         if (self.active_count > 0) {
@@ -377,6 +694,7 @@ fn makeTestSystem(allocator: std.mem.Allocator, capacity: usize) !ParticleSystem
 }
 
 fn freeTestSystem(ps: *ParticleSystem) void {
+    if (ps.gpu_slots.len > 0) ps.allocator.free(ps.gpu_slots);
     ps.allocator.free(ps.particles);
     ps.allocator.free(ps.instances);
 }
@@ -515,7 +833,8 @@ test "defaults keep world positions bit-identical" {
 test "local_space spawn stays relative, instances follow emitter" {
     var ps = try makeTestSystem(std.testing.allocator, 4);
     defer freeTestSystem(&ps);
-    var emitter: Mesh = std.mem.zeroes(Mesh);
+    // Buffer-free emitter mesh: local-space update only reads the transform.
+    var emitter = Mesh{ .name = "emitter", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
     emitter.position = Vec3.new(5.0, 0.0, 0.0);
     emitter.rotation = Vec3.zero;
     emitter.scaling = Vec3.one;
@@ -547,4 +866,229 @@ test "local_space spawn stays relative, instances follow emitter" {
     ps.updateCpu(0.0);
     try std.testing.expectEqual(Vec3.new(1.0, 2.0, 3.0), ps.particles[0].position);
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), ps.instances[0].pos_size[0], 1e-5);
+}
+
+// --- GPU-path tests: analytic math, ring bookkeeping and fallback (sg-free;
+// the GLSL side of the formulas is exercised by sokol-shdc at build time) ---
+
+test "gpu mode defaults off and slot layout matches shader attrs" {
+    var ps = try makeTestSystem(std.testing.allocator, 4);
+    defer freeTestSystem(&ps);
+    try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.drag);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.clock_seconds);
+    // Five FLOAT4 vertex attributes (see particle_gpu program in
+    // shaders/particle.glsl): spawn_pos_time, velocity_lifetime, color_start,
+    // color_end, size_rotation.
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(GpuParticleSlot));
+}
+
+test "slot age gates the alive window" {
+    // Unborn (spawn in the future): also culls stale slots after a reset.
+    const unborn = slotAge(1.0, 2.0, 1.5);
+    try std.testing.expectEqual(false, unborn.alive);
+    try std.testing.expectEqual(@as(f32, 0.0), unborn.t);
+    // Mid-life.
+    const mid = slotAge(2.75, 2.0, 1.5);
+    try std.testing.expectEqual(true, mid.alive);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mid.t, 1e-6);
+    // Death at exactly t == 1.
+    const dead = slotAge(3.5, 2.0, 1.5);
+    try std.testing.expectEqual(false, dead.alive);
+    try std.testing.expectEqual(@as(f32, 1.0), dead.t);
+    // Degenerate lifetimes clamp so the shader division stays finite; a
+    // zeroed slot (never written) is dead at any clock >= 1e-4 and unborn
+    // exactly at the epoch.
+    try std.testing.expectEqual(false, slotAge(0.5, 0.0, 0.0).alive);
+    try std.testing.expectEqual(true, slotAge(0.0, 0.0, 0.0).alive);
+}
+
+test "analytic trajectory matches golden values" {
+    const p0 = Vec3.new(1.0, 2.0, 3.0);
+    const v0 = Vec3.new(1.0, 0.0, -1.0);
+    const g = Vec3.new(0.0, -9.8, 0.0);
+
+    // No drag: p = p0 + v0*t + 0.5*g*t^2 at t = 0.5 ->
+    // (1.5, 2 - 1.225, 2.5).
+    const free = analyticPosition(p0, v0, g, 0.0, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), free.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.775), free.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), free.z, 1e-6);
+
+    // Zero elapsed time returns the spawn point exactly.
+    try std.testing.expectEqual(p0, analyticPosition(p0, v0, g, 3.0, 0.0));
+
+    // Drag k = 2 at t = 0.5: s = (1 - e^-1)/2 = 0.3160602794,
+    // s2 = (0.5 - s)/2 = 0.0919698603:
+    //   x = 1 + s         = 1.3160602794
+    //   y = 2 - 9.8 * s2  = 1.0986953694
+    //   z = 3 - s         = 2.6839397206
+    // Tolerance 1e-4 covers the float32 rounding of the hand-computed
+    // doubles; the GLSL duplicate may deviate by ~1e-6 relative on top
+    // (documented on analyticPosition).
+    const dragged = analyticPosition(p0, v0, g, 2.0, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.3160603), dragged.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0986954), dragged.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.6839397), dragged.z, 1e-4);
+
+    // Drag below the cancellation threshold (1e-6) degrades to the free
+    // trajectory without catastrophic cancellation.
+    const tiny = analyticPosition(p0, v0, g, 1.0e-7, 0.5);
+    try std.testing.expectApproxEqAbs(free.x, tiny.x, 1e-5);
+    try std.testing.expectApproxEqAbs(free.y, tiny.y, 1e-5);
+    try std.testing.expectApproxEqAbs(free.z, tiny.z, 1e-5);
+}
+
+test "gpu spawn sampling matches cpu with the same seed" {
+    const a = std.testing.allocator;
+    var cpu = try makeTestSystem(a, 4);
+    defer freeTestSystem(&cpu);
+    var gpu = try makeTestSystem(a, 4);
+    defer freeTestSystem(&gpu);
+    gpu.gpu_slots = try a.alloc(GpuParticleSlot, 4);
+    gpu.simulation_mode = .gpu;
+    cpu.emitOne();
+    gpu.emitOne(); // ring write at slot 0, clock 0
+
+    const p = cpu.particles[0];
+    const s = gpu.gpu_slots[0];
+    // Same seed + shared sampler => identical spawn attributes.
+    try std.testing.expectEqual(p.position.x, s.spawn_pos_time[0]);
+    try std.testing.expectEqual(p.position.y, s.spawn_pos_time[1]);
+    try std.testing.expectEqual(p.position.z, s.spawn_pos_time[2]);
+    try std.testing.expectEqual(@as(f32, 0.0), s.spawn_pos_time[3]);
+    try std.testing.expectEqual(p.velocity.x, s.velocity_lifetime[0]);
+    try std.testing.expectEqual(p.velocity.y, s.velocity_lifetime[1]);
+    try std.testing.expectEqual(p.velocity.z, s.velocity_lifetime[2]);
+    try std.testing.expectEqual(p.lifetime, s.velocity_lifetime[3]);
+    try std.testing.expectEqual(cpu.color_start.toArray(), s.color_start);
+    try std.testing.expectEqual(cpu.color_end.toArray(), s.color_end);
+    try std.testing.expectEqual(p.size, s.size_rotation[0]);
+    try std.testing.expectEqual(p.size_end, s.size_rotation[1]);
+    // Rotation is stored normalized-degrees on CPU, radians on GPU.
+    try std.testing.expectApproxEqAbs(rotationToRadians(p.rotation), s.size_rotation[2], 1e-6);
+    try std.testing.expectApproxEqAbs(rotationToRadians(p.angular_velocity), s.size_rotation[3], 1e-6);
+    try std.testing.expectEqual(@as(usize, 1), gpu.active_count);
+    try std.testing.expectEqual(@as(usize, 1), gpu.gpu_high_water);
+}
+
+test "gpu ring wraps and recycles oldest slots" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.gpu_slots = try a.alloc(GpuParticleSlot, 4);
+    ps.simulation_mode = .gpu;
+    // Stamp each emission with a distinct epoch time: the spawn time tags
+    // which emission a slot holds.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        ps.clock_seconds = @floatFromInt(i);
+        ps.emitOne();
+    }
+    try std.testing.expectEqual(@as(usize, 2), ps.gpu_write_cursor);
+    try std.testing.expectEqual(@as(usize, 4), ps.gpu_high_water);
+    try std.testing.expectEqual(@as(usize, 4), ps.active_count);
+    // Emissions 5 and 6 recycled slots 0 and 1.
+    try std.testing.expectEqual(@as(f32, 4.0), ps.gpu_slots[0].spawn_pos_time[3]);
+    try std.testing.expectEqual(@as(f32, 5.0), ps.gpu_slots[1].spawn_pos_time[3]);
+    try std.testing.expectEqual(@as(f32, 2.0), ps.gpu_slots[2].spawn_pos_time[3]);
+    try std.testing.expectEqual(@as(f32, 3.0), ps.gpu_slots[3].spawn_pos_time[3]);
+    // The frame that crossed the ring end re-uploads the whole prefix.
+    try std.testing.expectEqual(true, ps.gpu_dirty);
+    try std.testing.expectEqual(true, ps.gpu_dirty_wrapped);
+    try std.testing.expectEqual(@as(usize, 4), ps.gpuUploadRange().?.len);
+
+    // Simulate the flush (the sg.updateBuffer part has no GPU in tests).
+    ps.gpu_dirty = false;
+    ps.gpu_dirty_wrapped = false;
+    ps.clock_seconds = 6.0;
+    ps.emitOne(); // slot 2
+    try std.testing.expectEqual(false, ps.gpu_dirty_wrapped);
+    const range = ps.gpuUploadRange().?;
+    try std.testing.expectEqual(@as(usize, 1), range.len);
+    try std.testing.expectEqual(@as(f32, 6.0), range[0].spawn_pos_time[3]);
+    try std.testing.expectEqual(@as(usize, 2), ps.gpu_dirty_start);
+    try std.testing.expectEqual(@as(usize, 3), ps.gpu_dirty_end);
+
+    // Reset re-anchors the epoch and empties the ring.
+    ps.reset();
+    try std.testing.expectEqual(@as(usize, 0), ps.gpu_write_cursor);
+    try std.testing.expectEqual(@as(usize, 0), ps.gpu_high_water);
+    try std.testing.expectEqual(@as(usize, 0), ps.active_count);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.clock_seconds);
+    try std.testing.expectEqual(false, ps.gpu_dirty);
+}
+
+test "gpu burst overflows the ring instead of dropping" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.gpu_slots = try a.alloc(GpuParticleSlot, 4);
+    ps.simulation_mode = .gpu;
+    ps.burst(6);
+    // All six emissions landed (ring recycled the two oldest slots), while a
+    // CPU burst caps at capacity.
+    try std.testing.expectEqual(@as(usize, 2), ps.gpu_write_cursor);
+    try std.testing.expectEqual(@as(usize, 4), ps.active_count);
+    try std.testing.expectEqual(true, ps.gpu_dirty_wrapped);
+
+    var cpu = try makeTestSystem(a, 4);
+    defer freeTestSystem(&cpu);
+    cpu.burst(6);
+    try std.testing.expectEqual(@as(usize, 4), cpu.active_count);
+}
+
+test "gpu update does no per-particle cpu work" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.simulation_mode = .gpu;
+    ps.is_emitting = true;
+    ps.emit_rate = 60.0;
+    ps.lifetime_min = 1.0;
+    ps.lifetime_max = 1.0;
+    // Sentinel in the CPU storage: the GPU frame step must never touch it.
+    const sentinel = Particle{
+        .position = Vec3.new(7.0, 8.0, 9.0),
+        .velocity = Vec3.new(1.0, 2.0, 3.0),
+        .size = 1.0,
+        .size_end = 0.0,
+        .color = Color4.new(1.0, 1.0, 1.0, 1.0),
+        .color_end = Color4.new(0.0, 0.0, 0.0, 0.0),
+        .age = 0.5,
+        .lifetime = 2.0,
+        .rotation = 45.0,
+        .angular_velocity = 10.0,
+    };
+    ps.particles[0] = sentinel;
+    ps.updateGpu(1.0);
+    try std.testing.expectEqual(sentinel.age, ps.particles[0].age);
+    try std.testing.expectEqual(sentinel.position, ps.particles[0].position);
+    // A full second at 60 p/s filled the 4-slot ring; the epoch clock advanced
+    // exactly once and the accumulator drained to zero.
+    try std.testing.expectEqual(@as(usize, 4), ps.gpu_high_water);
+    try std.testing.expectEqual(@as(usize, 4), ps.active_count);
+    try std.testing.expectEqual(@as(usize, 0), ps.gpu_write_cursor);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), ps.clock_seconds, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ps.emit_accumulator, 1e-5);
+}
+
+test "gpu with local_space falls back to cpu (sticky, no panic)" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.simulation_mode = .gpu;
+    ps.local_space = true; // moving-emitter local frame needs historical state
+    ps.is_emitting = true;
+    ps.emit_rate = 100.0;
+    ps.lifetime_min = 10.0;
+    ps.lifetime_max = 10.0;
+    ps.updateGpu(0.016);
+    try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
+    // The CPU path served this very frame; the GPU ring never engaged.
+    try std.testing.expect(ps.active_count > 0);
+    try std.testing.expectEqual(@as(usize, 0), ps.gpu_high_water);
+    // Sticky: subsequent updates stay on the CPU path.
+    ps.updateGpu(0.016);
+    try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
 }
