@@ -35,7 +35,7 @@
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL | 🟡 |
 | OpenPBR, clearcoat, sheen, transmission | — | ❌ |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
-| HDR/EXR/DDS/KTX/Basis, сжатие, видеотекстуры | — | ❌ |
+| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 несжатый LDR (мипы, cube, sRGB), HDR Radiance | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO | 🟡 |
 | DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | — | ❌ |
@@ -48,7 +48,7 @@
 | CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
 | Упрощение мешей (Mesh simplification) | — | ❌ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
-| Draco/meshopt/KTX2, экспорт | — | ❌ |
+| Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (несжатые LDR-форматы) в glTF-загрузке | 🟡 |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
@@ -338,7 +338,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 ### Материалы и IBL
 
 * `StandardMaterial`: diffuse color + текстура.
-* `PBRMaterial` (metallic-roughness, Cook-Torrance): albedo, normal, metallic-roughness, emissive, occlusion (сила), alpha, цветовые факторы, environment intensity.
+* `PBRMaterial` (metallic-roughness, Cook-Torrance): albedo, normal, metallic-roughness, emissive, occlusion (сила), alpha, цветовые факторы, environment intensity, per-slot UV-трансформы (KHR_texture_transform), выбор каналов AO/roughness/metallic (ручные материалы).
 * IBL от skybox-кубмапы, exposure, выбор текстуры отражений.
 * Дефолтные 1×1 текстуры (white/black/flat normal/cube) — PBR работает без ассетов.
 
@@ -425,12 +425,12 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS | Теней от point/spot, ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL | Расширенных слоёв PBR, OpenPBR, unlit-режима |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), back-to-front очередь | Сортировки прозрачных инстансов; back-face освещение по геометрическим нормалям |
-| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео, anisotropy) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter | EXR/сжатых форматов, видеотекстур, анизотропии, render-target/reflection probe текстур |
+| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 несжатый LDR (мипы/cube/sRGB) | EXR, DDS, KTX2-суперкомпрессии и блочных форматов (нужен транскодер), HDR-16F в KTX2, видеотекстур, render-target/reflection probe текстур |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, MSAA, LUT-текстур, glow/highlight; MSAA выключен (sample_count=1) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
-| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры, скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры | Draco/meshopt/KTX2, glTF-экспорта |
+| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco/meshopt, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider | Инпутов, скроллов, dropdown, гридов/layout, 3D-виджетов, загрузки шрифтов, фокуса/состояния |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, позиционирование | mp3/ogg, стриминга, шин/эффектов, doppler/окклюзии |
@@ -453,7 +453,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 **Материалы и текстуры**
 * OpenPBR, clearcoat, sheen, anisotropic, transmission, subsurface.
 * NodeMaterial/ShaderMaterial (кастомные шейдеры без пересборки движка), библиотека материалов.
-* EXR/DDS/KTX/Basis, сжатые форматы, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды.
+* EXR/DDS, KTX2-суперкомпрессия (BasisLZ/Zstd; нужен basis_universal), BC/ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды.
 * Сортировка прозрачных инстансов; back-face освещение по геометрическим нормалям.
 
 **Постобработка и эффекты**
@@ -482,7 +482,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 **Ассеты и данные**
 * Экспорт glTF, AssetManager с прогрессом и кэшем.
-* Draco/meshopt/KTX2, 3D Tiles.
+* Draco/meshopt, KTX2-транскодинг (Basis), 3D Tiles.
 
 **Архитектура рендера**
 * Frame graph / node render graph, кастомные rendering pipelines, compute-шейдеры.

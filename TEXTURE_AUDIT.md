@@ -55,3 +55,46 @@ cgltf.h (vendored), базлайн `zig build test` — зелёный (exit 0) 
 - **KHR_texture_transform**: uv-матрица в шейдерах (5 штук × 3 слэнга) + расширение vertex-контракта.
 - **lod_min/lod_max в Options**: не было запросов, sokol-дефолты (0..FLT_MAX) корректны; экспонирование тривиально при необходимости.
 - **Анизотропия для HDR-cube/дефолтных текстур**: применена только там, где есть Options.
+
+---
+
+# Волна wave/ktx2 (2026-09-12): KTX2-контейнер, KHR_texture_transform, каналы
+
+Ворктри: `agate-wt-ktx2`, база `8506814` (финал wave/textures).
+Коммиты: `260c2c7` feat(ktx2), `0ed47e0` feat(material) (transform + каналы).
+
+## Сводная таблица
+
+| # | Позиция | Было | Стало | Доказательство |
+|---|---------|------|-------|----------------|
+| K1 | KTX2: контейнер + несжатые LDR-форматы | НЕТ | ДЕЛАЕТ | `src/agate/ktx2.zig`: sniff/decode2D/decodeCube; vkFormat 9/15 (R8), 16/22 (R8G8), 37/43 (R8G8B8A8), 44/50 (B8G8R8A8), 51/57 (A8B8G8R8_PACK32, тот же LE-байтовый порядок) — UNORM и SRGB; только supercompressionScheme 0 (NONE); заголовок 80Б + LevelIndex (24Б/уровень, от крупного к мелкому); жёсткая валидация `byteLength == uncompressedByteLength == w*h*texelBlockSize*faceCount`, границ файла, levelCount<=16, typeSize==1 |
+| K2 | KTX2 mip-цепочки | НЕТ | ДЕЛАЕТ | цепочки из файла грузятся как авторские (генерация поверх авторской молча теряла бы данные); single-level файл с `gen_mipmaps` → движковая box-цепочка (`Texture.buildRaw`, теперь pub) |
+| K3 | KTX2 cube faces | НЕТ | ДЕЛАЕТ | faceCount 6, порядок граней KTX2 (+X,-X,+Y,-Y,+Z,-Z) совпадает с движковым; GPU-free `decodeCube` -> `CubeTexture.RawCubeMips` -> `CubeTexture.initRawFacesMips` (полная авторская цепочка, в отличие от `initRawFaces`, который регенерирует) |
+| K4 | KTX2 в glTF-пайплайне | НЕТ | ДЕЛАЕТ (2D) | `Texture.decodeMemory`/`decodeFile` снифят 12-байтовую магию KTX2 -> .ktx2-изображения (embedded buffer view или URI) грузятся прозрачно; `decodeFile` читает файл в память; cube-KTX2 в 2D-пути — error.UnsupportedFaceCount (не молча) |
+| K5 | KHR_texture_transform (uv offset/rotate/scale) | игнорировался | ДЕЛАЕТ (texcoord0) | `material.UvTransform` (R(rot)*diag(scale)+offset, packing matrixRows/offsetPacked); 5 полей в PBRMaterial (albedo/normal/MR/emissive/occlusion) + diffuse в StandardMaterial; `uv_matrix`/`uv_offset` appended-last в fs_params всех 5 forward-шейдеров (pbr, skinned_pbr, instanced_pbr, standard, instanced), `uvApply()` на каждой выборке; identity-юниформы = no-op, картинка без расширения не меняется; loader/materials.zig читает cgltf `has_transform/offset/rotation/scale` |
+| K6 | Канальное чтение (AO/MR) | жёстко R/G/B | API ДЕЛАЕТ | `material.Channel {r,g,b,a}` + `occlusion_channel`/`roughness_channel`/`metallic_channel` (дефолты = glTF-конвенции); юниформ `channel_selectors` (append-last); шейдерный `channelSelect` через константные ветки (SPIRV-Cross не умеет динамический индекс компонент — тот же приём, что morphWeight); glTF выбора канала не даёт — это API для ручных материалов |
+| K7 | DDS | НЕТ | НЕ В СКОУПЕ (зафиксировано) | см. «Честно НЕ сделано» этой волны |
+
+## Ключевые решения
+
+1. **Нормализация в RGBA8 на CPU.** Поддержанные vkFormat-ы раскладываются в RGBA8-байты движка (BGRA свизлится, R8 реплицируется в RGB как grayscale-PNG, RG8 -> RG01+A=255) — KTX2 переиспользует существующий upload-путь (`Texture.RawTexture`/`fromRaw`) без новых пиксельных форматов. Расширение на 16F/упакованные форматы потребовало бы mipped-f16 2D-uploader'а — отдельная работа.
+2. **DFD/KVD не интерпретируются** — числовой vkFormat один-в-один задаёт раскладку текселей для поддержанного подмножества; блоки пропускаются по смещениям. Чтение DFD (colorModel/primaries) имеет смысл только вместе с широким форматным покрытием.
+3. **sRGB-политика.** У собственного API ktx2 `DecodeOptions.srgb_to_linear: ?bool = null` = auto (конвертируются ровно _SRGB-форматы по тегу формата). Сниф-маршрут из `Texture.decodeMemory` передаёт булев флаг слота как есть (glTF: color-слоты true, data-слоты false) — поведение консистентно с PNG-путём волны wave/textures, data-слоты никогда не конвертируются «сюрпризом».
+4. **Transform: юниформ-матрицы per-slot** (вариант (а), 2x vec4 на слот = 160Б на PBR-draw) — против (б) CPU-предеформации UV (невозможна для shared-атрибутов меша) и (в) vertex-паковки (доп. varyings на 5 слотов дороже в FS-интерполяции и всё равно требует FS-ветки для cutout-альфы). 160Б на фоне существующего fs_params (4 cascade mat4 + массивы света) — шум. Лимитация: glTF `texCoord > 0` фолбэчится на texcoord0 (второго UV-сета в движке нет), задокументировано в UvTransform и лоадере.
+5. **Каналы: юниформ-маски, не comptime-ветки.** Компиляция вариантов шейдера per-channel комбинацию умножила бы пайплайны; юниформ + 3 константные ветки дешевле порога и переносимо (GL410/Metal/HLSL5).
+
+## Честно НЕ сделано (и почему)
+
+- **BasisLZ / Zstandard / Zlib суперкомпрессия и BC/ETC/ASTC в KTX2**: нужен транскодер (basis_universal / KTX-Software); zig-pkg read-only, добавление новой C-зависимости — отдельная веха (future work). Файлы с scheme != 0 и блочными форматами отбрасываются с точными ошибками (`UnsupportedSupercompression` / `UnsupportedVkFormat`), мусорного декода нет.
+- **HDR KTX2 (R16G16B16A16_SFLOAT и другие 16/32-битные форматы)**: движковый HDR-2D путь одноуровневый (`initRawHdr`, num_mipmaps=1); честной загрузки авторских 16F-цепочек нет. Cube-IBL env-map в KTX2 — естественный первый клиент, когда появится.
+- **3D-текстуры (pixelDepth>1) и массивы (layerCount>0)**: движок их не грузит вовсе; KTX2-ридер отклоняет их явно.
+- **DDS — вне скоупа сознательно (зафиксировано)**: отдельный контейнер с собственным реестром FourCC/DXGI-форматов; без транскодера (см. Basis) DDS дал бы лишь второй несжатый контейнер рядом с KTX2. Кандидат в бэклог вместе с KTX2-транскодингом, не этой волной.
+- **KHR_texture_transform: texCoord > 0 (второй UV-сет)**: требует v_uv2 varying + расширение vertex-контракта в 5 шейдерах x 3 слэнга; roadmap.
+- **Каналы для color-слотов (albedo/emissive)**: цветовые слоты по смыслу RGBA; выбор одиночной полосы сценария не имеет — API ограничен data-слотами.
+
+## Верификация
+
+- `zig build test --summary all` -> **481/481 passed, 0 failed** (базлайн 465 + 16 новых: 10 ktx2, 2 material, 2 loader, 2 draw-контракт).
+- `zig build` -> exit 0; все 5 forward-шейдеров перекомпилированы sokol-shdc под glsl410/metal_macos/hlsl5 с новыми юниформ-блоками.
+- `zig build fmt` -> exit 0.
+- KTX2-фикстуры синтезируются в тестах in-memory (билдер TestKtx2: заголовок + LevelIndex + dummy-DFD + данные с mipPadding по spec); внешних .ktx2 файлов нет. Прочие проверки: swizzle BGRA, расширение R8/RG8, auto/force/forbid sRGB, отклонение всех неподдерживаемых форм контейнера (BasisLZ/Zstd/Zlib, BC3, RGBA16F, 3D, массивы, faceCount 3, 16-битный typeSize, 17 уровней, усечённые данные).
