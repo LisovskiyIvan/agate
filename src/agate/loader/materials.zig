@@ -8,6 +8,7 @@ const Color3 = math.Color3;
 
 const Scene = @import("../scene.zig").Scene;
 const Material = @import("../material.zig").Material;
+const UvTransform = @import("../material.zig").UvTransform;
 const Texture = @import("../texture.zig").Texture;
 
 const DecodeJob = struct {
@@ -180,6 +181,22 @@ pub fn applyGltfSampler(wrap_s: c_int, wrap_t: c_int, mag_filter: c_int, min_fil
     }
 }
 
+/// Extracts the KHR_texture_transform UV map from a glTF texture view
+/// (identity when the extension is absent). Documented limitation: views
+/// with `texCoord` > 0 reference a second UV set the engine does not load
+/// (single v_uv varying); the transform still applies to texcoord0.
+/// `anytype` accepts both normal and C (allowzero) pointers to
+/// cgltf_texture_view (cgltf's own structs carry C-pointer parents).
+pub fn uvTransformFromView(view: anytype) UvTransform {
+    if (view.has_transform == 0) return UvTransform.identity;
+    const t = view.transform;
+    return .{
+        .offset = .{ t.offset[0], t.offset[1] },
+        .rotation = t.rotation,
+        .scale = .{ t.scale[0], t.scale[1] },
+    };
+}
+
 pub fn loadTextureFromView(
     scene: *Scene,
     gltf: *c.cgltf_data,
@@ -292,7 +309,9 @@ pub fn loadMaterials(
             // Color slots load sRGB -> linear (glTF: textures are sRGB,
             // factors linear); data slots stay linear.
             pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true);
+            pbr_mat.albedo_uv_transform = uvTransformFromView(&pbr.base_color_texture);
             pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false);
+            pbr_mat.metallic_roughness_uv_transform = uvTransformFromView(&pbr.metallic_roughness_texture);
         }
 
         pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false);
@@ -300,10 +319,13 @@ pub fn loadMaterials(
             // cgltf defaults texture-view scale to 1.0 (cgltf.h parse).
             pbr_mat.normal_scale = src_mat.normal_texture.scale;
         }
+        pbr_mat.normal_uv_transform = uvTransformFromView(&src_mat.normal_texture);
         pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false);
         pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
+        pbr_mat.occlusion_uv_transform = uvTransformFromView(&src_mat.occlusion_texture);
 
         pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true);
+        pbr_mat.emissive_uv_transform = uvTransformFromView(&src_mat.emissive_texture);
         if (pbr_mat.emissive_texture != null and
             src_mat.emissive_factor[0] == 0.0 and
             src_mat.emissive_factor[1] == 0.0 and
@@ -525,4 +547,58 @@ test "colorSlotImageFlags marks albedo/emissive images, not data slots" {
     defer alloc.free(flags);
 
     try std.testing.expectEqualSlices(bool, &.{ true, false, true }, flags);
+}
+
+test "uvTransformFromView reads KHR_texture_transform, identity when absent" {
+    var view: c.cgltf_texture_view = std.mem.zeroes(c.cgltf_texture_view);
+    // No extension: identity.
+    try std.testing.expect(uvTransformFromView(&view).isIdentity());
+
+    // has_transform with offset/rotation/scale maps 1:1.
+    view.has_transform = 1;
+    view.transform.offset = .{ 0.25, -0.5 };
+    view.transform.rotation = 1.5;
+    view.transform.scale = .{ 2, 4 };
+    const t = uvTransformFromView(&view);
+    try testingExpected(t);
+}
+
+fn testingExpected(t: UvTransform) !void {
+    try std.testing.expectEqual(@as(f32, 0.25), t.offset[0]);
+    try std.testing.expectEqual(@as(f32, -0.5), t.offset[1]);
+    try std.testing.expectEqual(@as(f32, 1.5), t.rotation);
+    try std.testing.expectEqual(@as(f32, 2), t.scale[0]);
+    try std.testing.expectEqual(@as(f32, 4), t.scale[1]);
+    try std.testing.expect(!t.isIdentity());
+}
+
+test "loadMaterials maps texture transforms into the PBR slots (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var src: [1]c.cgltf_material = .{std.mem.zeroes(c.cgltf_material)};
+    src[0].has_pbr_metallic_roughness = 1;
+    // Albedo slot carries a transform; the other slots stay default.
+    src[0].pbr_metallic_roughness.base_color_texture.has_transform = 1;
+    src[0].pbr_metallic_roughness.base_color_texture.transform.rotation = 0.5;
+    src[0].pbr_metallic_roughness.base_color_texture.transform.scale = .{ 3, 3 };
+
+    var data: c.cgltf_data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [1]?Material = .{null};
+    try loadMaterials(&scene, &data, null, &out, &.{}, &.{});
+
+    const mat = out[0].?.pbr;
+    try std.testing.expectEqual(@as(f32, 0.5), mat.albedo_uv_transform.rotation);
+    try std.testing.expectEqual(@as(f32, 3), mat.albedo_uv_transform.scale[0]);
+    try std.testing.expect(mat.normal_uv_transform.isIdentity());
+    try std.testing.expect(mat.metallic_roughness_uv_transform.isIdentity());
+    try std.testing.expect(mat.occlusion_uv_transform.isIdentity());
+    try std.testing.expect(mat.emissive_uv_transform.isIdentity());
+    // Channels stay at the glTF conventions: the format defines no override.
+    try std.testing.expectEqual(@import("../material.zig").Channel.r, mat.occlusion_channel);
 }

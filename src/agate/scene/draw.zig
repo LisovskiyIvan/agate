@@ -1,3 +1,4 @@
+const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const shd = @import("shader");
@@ -11,7 +12,9 @@ const Mat4 = math.Mat4;
 
 const Texture = @import("../texture.zig").Texture;
 const CubeTexture = @import("../texture.zig").CubeTexture;
-const StandardMaterial = @import("../material.zig").StandardMaterial;
+const material_mod = @import("../material.zig");
+const StandardMaterial = material_mod.StandardMaterial;
+const PBRMaterial = material_mod.PBRMaterial;
 const passes = @import("../passes/mod.zig");
 
 const render_queue = @import("render_queue.zig");
@@ -163,6 +166,9 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             .emissive_factor = emissive_col,
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
             .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
+            .uv_matrix = pbrUvMatrices(pbr_mat),
+            .uv_offset = pbrUvOffsets(pbr_mat),
+            .channel_selectors = pbrChannelSelectors(pbr_mat),
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -215,6 +221,8 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             .ambient_color = f.ambient_color,
             .diffuse_color = std_mat.getDiffuseColor4(),
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .uv_matrix = std_mat.diffuse_uv_transform.matrixRows(),
+            .uv_offset = std_mat.diffuse_uv_transform.offsetPacked(),
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -321,6 +329,11 @@ fn drawShaderMaterialItem(
                 .emissive_factor = .{ 0, 0, 0, 1 },
                 .alpha_cutoff = alpha_cutoff,
                 .normal_scale = 1.0,
+                // Hook materials carry no per-slot maps: identity UVs and
+                // the glTF channel conventions.
+                .uv_matrix = identityUvMatrices(),
+                .uv_offset = identityUvOffsets(),
+                .channel_selectors = pbrChannelSelectors(null),
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -361,6 +374,9 @@ fn drawShaderMaterialItem(
                 .ambient_color = f.ambient_color,
                 .diffuse_color = sm.getTintColor4(),
                 .alpha_cutoff = alpha_cutoff,
+                // Hook materials have no UV transform: identity.
+                .uv_matrix = material_mod.UvTransform.identity.matrixRows(),
+                .uv_offset = material_mod.UvTransform.identity.offsetPacked(),
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -438,6 +454,65 @@ fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMo
         .morph_weights1 = u.weights1,
         .morph_params = u.params,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Per-slot UV transforms (KHR_texture_transform) and channel selection
+// packing (wave/ktx2). Identity/default inputs produce no-op uniforms, so
+// materials without these features upload exactly the same values the
+// shaders' defaults would sample with.
+// ---------------------------------------------------------------------------
+
+const uv_identity_matrix: [4]f32 = .{ 1, 0, 0, 1 };
+const uv_identity_offset: [4]f32 = .{ 0, 0, 0, 0 };
+
+fn identityUvMatrices() [5][4]f32 {
+    return @splat(uv_identity_matrix);
+}
+
+fn identityUvOffsets() [5][4]f32 {
+    return @splat(uv_identity_offset);
+}
+
+/// PBR slot order (must match the pbr.glsl texture bindings):
+/// 0 albedo, 1 normal, 2 metallic-roughness, 3 emissive, 4 occlusion.
+/// Null material = all identity.
+fn pbrUvMatrices(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
+    var rows: [5][4]f32 = identityUvMatrices();
+    if (pbr_mat) |p| {
+        rows[0] = p.albedo_uv_transform.matrixRows();
+        rows[1] = p.normal_uv_transform.matrixRows();
+        rows[2] = p.metallic_roughness_uv_transform.matrixRows();
+        rows[3] = p.emissive_uv_transform.matrixRows();
+        rows[4] = p.occlusion_uv_transform.matrixRows();
+    }
+    return rows;
+}
+
+fn pbrUvOffsets(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
+    var offs: [5][4]f32 = identityUvOffsets();
+    if (pbr_mat) |p| {
+        offs[0] = p.albedo_uv_transform.offsetPacked();
+        offs[1] = p.normal_uv_transform.offsetPacked();
+        offs[2] = p.metallic_roughness_uv_transform.offsetPacked();
+        offs[3] = p.emissive_uv_transform.offsetPacked();
+        offs[4] = p.occlusion_uv_transform.offsetPacked();
+    }
+    return offs;
+}
+
+/// Lane indices for occlusion/roughness/metallic; null material = glTF
+/// conventions (R, G, B).
+fn pbrChannelSelectors(pbr_mat: ?*const PBRMaterial) [4]f32 {
+    if (pbr_mat) |p| {
+        return .{
+            p.occlusion_channel.selector(),
+            p.roughness_channel.selector(),
+            p.metallic_channel.selector(),
+            0,
+        };
+    }
+    return .{ 0, 1, 2, 0 };
 }
 
 // Draws one instanced mesh with the currently visible instance buffer.
@@ -543,6 +618,9 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext
             .spot_shadow_params = f.spot_shadow_params,
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
             .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
+            .uv_matrix = pbrUvMatrices(pbr_mat),
+            .uv_offset = pbrUvOffsets(pbr_mat),
+            .channel_selectors = pbrChannelSelectors(pbr_mat),
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {
@@ -580,6 +658,8 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext
             .ambient_color = f.ambient_color,
             .diffuse_color = std_mat.getDiffuseColor4(),
             .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .uv_matrix = std_mat.diffuse_uv_transform.matrixRows(),
+            .uv_offset = std_mat.diffuse_uv_transform.offsetPacked(),
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -601,4 +681,49 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
     env.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the shader-facing contract of the wave/ktx2 uniforms. The generated
+// modules are build artifacts of sokol-shdc, so these comptime checks fail
+// at test time (GPU-free) if the .glsl templates and the packing helpers
+// ever drift apart.
+// ---------------------------------------------------------------------------
+
+test "forward shader FsParams carry the appended uv/channel uniforms" {
+    // PBR family: 5 slots + channel selectors, appended after normal_scale.
+    comptime {
+        for ([_]type{ pbr_shd.FsParams, skinned_pbr_shd.FsParams, inst_pbr_shd.FsParams }) |P| {
+            if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
+            if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
+            if (!@hasField(P, "channel_selectors")) @compileError("FsParams missing channel_selectors");
+        }
+    }
+    // Standard family: one diffuse slot.
+    comptime {
+        for ([_]type{ shd.FsParams, inst_shd.FsParams }) |P| {
+            if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
+            if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
+        }
+    }
+}
+
+test "pbr uniform packing defaults are identity and glTF conventions" {
+    const mats = pbrUvMatrices(null);
+    const offs = pbrUvOffsets(null);
+    for (0..5) |slot| {
+        try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &mats[slot]);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &offs[slot]);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0 }, &pbrChannelSelectors(null));
+
+    var mat = PBRMaterial.init("m");
+    mat.albedo_uv_transform = .{ .offset = .{ 0.5, 0 }, .scale = .{ 2, 2 } };
+    mat.occlusion_channel = .a;
+    const packed_mats = pbrUvMatrices(&mat);
+    const packed_offs = pbrUvOffsets(&mat);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 0, 0, 2 }, &packed_mats[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0 }, &packed_offs[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &packed_mats[1]); // normal untouched
+    try std.testing.expectEqualSlices(f32, &.{ 3, 1, 2, 0 }, &pbrChannelSelectors(&mat));
 }

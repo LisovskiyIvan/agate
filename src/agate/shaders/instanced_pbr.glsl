@@ -78,6 +78,12 @@ layout(binding = 1) uniform fs_params {
     // APPENDED LAST: existing offsets above must not shift for old bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
     float normal_scale; // normal map xy scale (glTF normalTexture.scale)
+    // APPENDED LAST (wave/ktx2): per-slot KHR_texture_transform UV maps and
+    // manual channel selection. Slot order follows the texture bindings:
+    // 0 albedo, 1 normal, 2 metallic-roughness, 3 emissive, 4 occlusion.
+    vec4 uv_matrix[5]; // per slot: rotation*scale rows [m00, m01, m10, m11]
+    vec4 uv_offset[5]; // per slot: xy offset, zw unused
+    vec4 channel_selectors; // x occlusion, y roughness, z metallic (lane index), w unused
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -349,8 +355,25 @@ vec2 envBRDFApprox(float roughness, float NoV) {
     return AB;
 }
 
+// KHR_texture_transform: uv' = matrix * uv + offset. Identity uniforms make
+// this a no-op, so materials without the extension sample unchanged.
+vec2 uvApply(vec4 m, vec4 o, vec2 uv) {
+    return vec2(m.x * uv.x + m.y * uv.y + o.x, m.z * uv.x + m.w * uv.y + o.y);
+}
+
+// Manual channel selection (no glTF counterpart; see Channel in
+// material.zig): picks one RGBA lane by uniform index through constant
+// branches — SPIRV-Cross cannot flatten dynamic component indexing for
+// legacy targets (HLSL5), same constraint as morphWeight.
+float channelSelect(vec4 s, float lane) {
+    if (lane < 0.5) return s.r;
+    if (lane < 1.5) return s.g;
+    if (lane < 2.5) return s.b;
+    return s.a;
+}
+
 void main() {
-    vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), v_uv);
+    vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
     vec4 albedo_rgba = v_color * base_color_factor * albedo_tex_val;
     // Alpha test (cutout): cutout materials discard sub-cutoff fragments
     // before any lighting work. Opaque/blend materials upload 0.0, so this
@@ -358,13 +381,13 @@ void main() {
     if (albedo_rgba.a < alpha_cutoff) discard;
     vec3 albedo = albedo_rgba.rgb;
 
-    vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, data_smp), v_uv);
-    float metallic = clamp(pbr_factors.x * mr_sample.b, 0.0, 1.0);
-    float roughness = clamp(pbr_factors.y * mr_sample.g, 0.04, 1.0);
+    vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, data_smp), uvApply(uv_matrix[2], uv_offset[2], v_uv));
+    float metallic = clamp(pbr_factors.x * channelSelect(mr_sample, channel_selectors.z), 0.0, 1.0);
+    float roughness = clamp(pbr_factors.y * channelSelect(mr_sample, channel_selectors.y), 0.04, 1.0);
 
     // Normal mapping with TBN matrix; xy scaled by normal_scale (z stays
     // unsigned so the TBN projection keeps the hemisphere).
-    vec3 map_n = texture(sampler2D(normal_tex, data_smp), v_uv).xyz * 2.0 - 1.0;
+    vec3 map_n = texture(sampler2D(normal_tex, data_smp), uvApply(uv_matrix[1], uv_offset[1], v_uv)).xyz * 2.0 - 1.0;
     map_n.xy *= normal_scale;
     mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
     vec3 N = normalize(TBN * map_n);
@@ -475,7 +498,7 @@ void main() {
     }
 
     // Ambient Occlusion
-    float ao_sample = texture(sampler2D(occlusion_tex, data_smp), v_uv).r;
+    float ao_sample = channelSelect(texture(sampler2D(occlusion_tex, data_smp), uvApply(uv_matrix[4], uv_offset[4], v_uv)), channel_selectors.x);
     float ao = 1.0 + pbr_factors.z * (ao_sample - 1.0);
 
     // Image-Based Lighting (IBL): two cube fetches + BRDF fit skipped when off.
@@ -502,7 +525,7 @@ void main() {
     vec3 ambient = ambient_color.rgb * ambient_color.a * albedo * ao;
 
     // Emissive
-    vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), v_uv);
+    vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;

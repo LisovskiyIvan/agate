@@ -63,6 +63,9 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
     // APPENDED LAST: existing offsets above must not shift for old bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
+    // APPENDED LAST (wave/ktx2): diffuse-slot KHR_texture_transform UV map.
+    vec4 uv_matrix; // rotation*scale rows [m00, m01, m10, m11]
+    vec4 uv_offset; // xy offset, zw unused
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -114,6 +117,12 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // pcss_blocker_radius, average blocker depth -> penumbra ->
 // (d_receiver - d_blocker) / d_blocker * light_size, clamped to
 // [min_penumbra, max_penumbra]; the legacy Poisson PCF then runs with the
+// KHR_texture_transform: uv' = matrix * uv + offset (identity uniforms are
+// a no-op; see material.zig UvTransform for the packing).
+vec2 uvApply(vec4 m, vec4 o, vec2 uv) {
+    return vec2(m.x * uv.x + m.y * uv.y + o.x, m.z * uv.x + m.w * uv.y + o.y);
+}
+
 // penumbra as its disk radius. Params ride free uniform lanes (fs_params
 // layout unchanged):
 //   cascade_debug.y = pcss_enabled (0.0/1.0)
@@ -280,7 +289,9 @@ void main() {
     // Alpha test (cutout): cutout materials discard sub-cutoff fragments
     // before any lighting work. Opaque/blend materials upload 0.0, so this
     // never fires for them (alpha is always >= 0.0).
-    vec4 tex_val = texture(sampler2D(diffuse_tex, smp), v_uv);
+    // KHR_texture_transform: uv' = matrix * uv + offset. Identity uniforms
+    // make this a no-op, so materials without the extension sample unchanged.
+    vec4 tex_val = texture(sampler2D(diffuse_tex, smp), uvApply(uv_matrix, uv_offset, v_uv));
     vec4 base = v_color * diffuse_color * tex_val;
     if (base.a < alpha_cutoff) discard;
 

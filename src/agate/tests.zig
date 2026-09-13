@@ -37,6 +37,7 @@ test {
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");
     _ = @import("scene/content.zig");
+    _ = @import("scene/draw.zig"); // GPU-free uniform-packing contract tests
     _ = @import("scene/light_selection.zig");
     _ = @import("scene/light_rig.zig");
     _ = @import("scene/pipelines.zig");

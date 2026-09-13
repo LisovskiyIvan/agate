@@ -23,6 +23,72 @@ pub const AlphaMode = enum {
     blend,
 };
 
+/// Selects one RGBA lane of a sampled texture. Data slots (occlusion /
+/// roughness / metallic) only: glTF fixes the KHR_materials_occlusion_roughness-
+/// metallic conventions (AO=R, roughness=G, metallic=B) and provides no
+/// channel override, so this is an API for MANUAL materials — e.g. an ORM
+/// map in a different layout, or packing three scalar maps into one RGBA
+/// texture. The defaults reproduce the glTF behavior exactly.
+pub const Channel = enum(u2) {
+    r = 0,
+    g = 1,
+    b = 2,
+    a = 3,
+
+    /// Index uploaded to the shaders' channel_selectors uniform. The GLSL
+    /// side picks the lane via constant branches (SPIRV-Cross cannot
+    /// flatten dynamic component indexing, same constraint as morphWeight).
+    pub fn selector(self: Channel) f32 {
+        return @floatFromInt(@intFromEnum(self));
+    }
+};
+
+/// Per-slot texture UV transform (KHR_texture_transform subset):
+///   uv' = R(rotation) * (scale .* uv) + offset
+/// with counter-clockwise `rotation` in radians around the UV origin, per
+/// the extension spec. Applied in the fragment shaders from two vec4
+/// uniforms per slot ([m00, m01, m10, m11] rows + offset) so every slot can
+/// carry its own transform without touching the vertex contract.
+///
+/// Documented limitation: glTF `texCoord` > 0 (a second UV set) is NOT
+/// supported — the transform applies to texcoord0 regardless. Multi-UV
+/// support would need a v_uv2 varying across the five forward shaders
+/// (roadmap).
+pub const UvTransform = struct {
+    offset: [2]f32 = .{ 0, 0 },
+    rotation: f32 = 0,
+    scale: [2]f32 = .{ 1, 1 },
+
+    pub const identity: UvTransform = .{};
+
+    pub fn isIdentity(self: UvTransform) bool {
+        return self.offset[0] == 0 and self.offset[1] == 0 and
+            self.rotation == 0 and
+            self.scale[0] == 1 and self.scale[1] == 1;
+    }
+
+    /// The 2x2 rotation*scale matrix rows packed for the shaders' uv_matrix
+    /// uniform: [m00, m01, m10, m11], i.e.
+    ///   u' = m00*u + m01*v + offset.x
+    ///   v' = m10*u + m11*v + offset.y
+    pub fn matrixRows(self: UvTransform) [4]f32 {
+        const cos_r = @cos(self.rotation);
+        const sin_r = @sin(self.rotation);
+        // M = R(rotation) * diag(scale.x, scale.y): the scale applies to the
+        // raw uv components BEFORE the rotation (extension spec:
+        // uv' = offset + R * (scale .* uv)).
+        return .{
+            cos_r * self.scale[0], -sin_r * self.scale[1],
+            sin_r * self.scale[0], cos_r * self.scale[1],
+        };
+    }
+
+    /// The offset packed for the shaders' uv_offset uniform ([x, y, 0, 0]).
+    pub fn offsetPacked(self: UvTransform) [4]f32 {
+        return .{ self.offset[0], self.offset[1], 0, 0 };
+    }
+};
+
 pub const StandardMaterial = struct {
     name: []const u8 = "StandardMaterial",
     diffuse_color: Color3 = Color3.white,
@@ -36,6 +102,10 @@ pub const StandardMaterial = struct {
     /// pipeline twin). Both opaque and blend twins exist.
     double_sided: bool = false,
     diffuse_texture: ?Texture = null,
+    /// KHR_texture_transform-style UV map for the diffuse slot (identity =
+    /// unchanged sampling). glTF never produces StandardMaterials, so this
+    /// is a manual-material API only.
+    diffuse_uv_transform: UvTransform = .{},
 
     pub fn init(name: []const u8) StandardMaterial {
         return .{
@@ -86,6 +156,22 @@ pub const PBRMaterial = struct {
     emissive_color: Color3 = Color3.black,
     occlusion_texture: ?Texture = null,
     occlusion_strength: f32 = 1.0,
+
+    // KHR_texture_transform per-slot UV maps (identity = unchanged
+    // sampling). glTF texture views with `has_transform` load into these.
+    albedo_uv_transform: UvTransform = .{},
+    normal_uv_transform: UvTransform = .{},
+    metallic_roughness_uv_transform: UvTransform = .{},
+    emissive_uv_transform: UvTransform = .{},
+    occlusion_uv_transform: UvTransform = .{},
+
+    // Manual channel selection (see Channel): glTF fixes AO=R, roughness=G,
+    // metallic=B and the defaults reproduce that; re-point the lanes for
+    // hand-authored ORM-style maps. Uploaded in the channel_selectors
+    // uniform and applied with constant branches in the PBR shaders.
+    occlusion_channel: Channel = .r,
+    roughness_channel: Channel = .g,
+    metallic_channel: Channel = .b,
 
     environment_texture: ?CubeTexture = null,
     environment_intensity: f32 = 1.0,
@@ -432,4 +518,55 @@ test "ShaderMaterial.setUniform packs through the registration table" {
 
     // Typo guard: unknown names are hard errors.
     try std.testing.expectError(error.UnknownParam, sm.setUniform("u_nope", .{ .scalar = 1 }));
+}
+
+test "UvTransform packs the KHR_texture_transform matrix rows" {
+    const ident = UvTransform.identity;
+    try std.testing.expect(ident.isIdentity());
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &ident.matrixRows());
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &ident.offsetPacked());
+
+    // Scale only: 2x on u, 3x on v.
+    const scaled = UvTransform{ .scale = .{ 2, 3 } };
+    try std.testing.expect(!scaled.isIdentity());
+    try std.testing.expectEqualSlices(f32, &.{ 2, 0, 0, 3 }, &scaled.matrixRows());
+
+    // 90 degrees CCW rotation with unit scale: (u,v) -> (-v, u).
+    const quarter = std.math.pi / 2.0;
+    const rotated = UvTransform{ .rotation = quarter };
+    try std.testing.expectApproxEqAbs(@as(f32, 0), rotated.matrixRows()[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), rotated.matrixRows()[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), rotated.matrixRows()[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), rotated.matrixRows()[3], 1e-6);
+
+    // Spec formula spot-check: u' = cos*sx*u - sin*sy*v + ox,
+    // v' = sin*sx*u + cos*sy*v + oy for rotation 45deg, scale (2, 4).
+    const t = UvTransform{ .offset = .{ 0.25, -0.5 }, .rotation = quarter / 2.0, .scale = .{ 2, 4 } };
+    const m = t.matrixRows();
+    const cos_h: f32 = @cos(quarter / 2.0);
+    const sin_h: f32 = @sin(quarter / 2.0);
+    const u: f32 = 0.75;
+    const v: f32 = 1.5;
+    const u_prime = m[0] * u + m[1] * v + t.offset[0];
+    const v_prime = m[2] * u + m[3] * v + t.offset[1];
+    try std.testing.expectApproxEqAbs(cos_h * 2 * u - sin_h * 4 * v + 0.25, u_prime, 1e-5);
+    try std.testing.expectApproxEqAbs(sin_h * 2 * u + cos_h * 4 * v - 0.5, v_prime, 1e-5);
+}
+
+test "PBRMaterial slot defaults reproduce the glTF conventions" {
+    const mat = PBRMaterial.init("m");
+    // Channels: glTF fixed conventions (AO=R, roughness=G, metallic=B).
+    try std.testing.expectEqual(Channel.r, mat.occlusion_channel);
+    try std.testing.expectEqual(Channel.g, mat.roughness_channel);
+    try std.testing.expectEqual(Channel.b, mat.metallic_channel);
+    try std.testing.expectEqual(@as(f32, 0), mat.occlusion_channel.selector());
+    try std.testing.expectEqual(@as(f32, 1), mat.roughness_channel.selector());
+    try std.testing.expectEqual(@as(f32, 2), mat.metallic_channel.selector());
+    try std.testing.expectEqual(@as(f32, 3), Channel.a.selector());
+    // Transforms: identity, so existing materials sample unchanged.
+    try std.testing.expect(mat.albedo_uv_transform.isIdentity());
+    try std.testing.expect(mat.normal_uv_transform.isIdentity());
+    try std.testing.expect(mat.metallic_roughness_uv_transform.isIdentity());
+    try std.testing.expect(mat.emissive_uv_transform.isIdentity());
+    try std.testing.expect(mat.occlusion_uv_transform.isIdentity());
 }
