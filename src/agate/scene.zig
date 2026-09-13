@@ -57,6 +57,7 @@ pub const NavNode = ai_mod.NavNode;
 pub const NavAgent = ai_mod.NavAgent;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
+const ShaderMaterial = @import("material.zig").ShaderMaterial;
 const Texture = @import("texture.zig").Texture;
 const CubeTexture = @import("texture.zig").CubeTexture;
 const SkyboxConfig = @import("texture.zig").SkyboxConfig;
@@ -97,6 +98,7 @@ pub const Scene = struct {
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
     materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
+    shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
     active_camera: ?Camera = null,
@@ -239,6 +241,22 @@ pub const Scene = struct {
         const mat = try self.allocator.create(PBRMaterial);
         mat.* = PBRMaterial.init(name);
         try self.pbr_materials.append(self.allocator, mat);
+        return mat;
+    }
+
+    // Creates a custom-shader material bound to a registered shader (by
+    // name — build.zig `user_shader_materials` or registerRuntime). Returns
+    // null when the shader name is not registered.
+    pub fn createShaderMaterial(self: *Scene, name: []const u8, shader_name: []const u8) ?*ShaderMaterial {
+        const mat = self.allocator.create(ShaderMaterial) catch return null;
+        mat.* = ShaderMaterial.initForShader(shader_name, name) orelse {
+            self.allocator.destroy(mat);
+            return null;
+        };
+        self.shader_materials.append(self.allocator, mat) catch {
+            self.allocator.destroy(mat);
+            return null;
+        };
         return mat;
     }
 
@@ -623,6 +641,7 @@ pub const Scene = struct {
         scene_content.deinitMeshes(self.allocator, &self.meshes);
         scene_content.deinitMaterials(self.allocator, &self.materials);
         scene_content.deinitPbrMaterials(self.allocator, &self.pbr_materials);
+        scene_content.deinitShaderMaterials(self.allocator, &self.shader_materials);
 
         self.lights.deinit(self.allocator);
 

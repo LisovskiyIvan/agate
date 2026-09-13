@@ -21,6 +21,8 @@ const morph_gpu = @import("../mesh/morph_gpu.zig");
 const uniforms = @import("uniforms.zig");
 const forward_pipelines = @import("forward_pipelines.zig");
 const ForwardPipelines = forward_pipelines.ForwardPipelines;
+const shader_material = @import("../shader_material.zig");
+const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 
@@ -31,7 +33,9 @@ pub const FrameContext = uniforms.FrameContext;
 /// values are read-only snapshots except stats and the per-mesh
 /// receive_shadows patch on shadow_uniforms.
 pub const Environment = struct {
-    pipelines: *const ForwardPipelines,
+    // Mutable: shader-material pipelines are created lazily on first use
+    // (ShaderMaterialCache.getOrCreate); everything else is read-only.
+    pipelines: *ForwardPipelines,
     stats: *SceneStats,
     // Fallbacks for meshes/materials without their own textures.
     default_material: *const StandardMaterial,
@@ -59,6 +63,15 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: FrameContext
     const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
+
+    // Shader materials take their own path: pipeline from the lazy
+    // ShaderMaterialCache, bindings/uniforms per the registration's base
+    // template contract (identical layouts — see drawShaderMaterialItem).
+    if (mesh.material) |mat| {
+        if (mat == .shader_material) {
+            return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, mat.shader_material, mvp);
+        }
+    }
 
     const pip_id = env.pipelines.forRegularItem(item);
 
@@ -215,6 +228,172 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: FrameContext
     env.stats.triangles += mesh.index_count / 3;
 }
 
+// Draws one regular queue item whose material is a .shader_material.
+//
+// The pipeline comes from the lazy ShaderMaterialCache (keyed by the
+// registration key); bindings and uniforms reuse the engine module structs
+// (shd.* / pbr_shd.*) because hook materials are compiled from the unmodified
+// engine templates — the uniform/texture contract is layout-identical, only
+// the UB slot handles are read from the registration entry.
+//
+// Documented limitations: skinned meshes skip drawing (hook materials are
+// compiled from the non-skinned templates); runtime-registered sources with
+// engine_template == false get only vertex/index binds, the material texture
+// at view slot 0 and (optionally) the user uniform block.
+fn drawShaderMaterialItem(
+    env: Environment,
+    item: RenderMeshItem,
+    ctx: FrameContext,
+    current_pipeline_id: *u32,
+    sm: *const ShaderMaterial,
+    mvp: Mat4,
+) void {
+    const mesh = item.mesh;
+    if (mesh.skeleton != null) return; // see limitation note above
+
+    const entry = shader_material.entry(sm.entry_index) orelse return;
+    const set = env.pipelines.shader_materials.getOrCreate(entry.key) orelse return;
+
+    const is_u32 = mesh.index_type == .UINT32;
+    const pip_id = set.pipelineFor(item.transparent, is_u32, sm.double_sided);
+    if (pip_id == 0) return;
+    if (pip_id != current_pipeline_id.*) {
+        sg.applyPipeline(.{ .id = pip_id });
+        current_pipeline_id.* = pip_id;
+        env.stats.pipeline_switches += 1;
+    }
+
+    var bind = sg.Bindings{};
+    bind.vertex_buffers[0] = mesh.vertex_buffer;
+    bind.index_buffer = mesh.index_buffer;
+
+    const f = frameUniformsFor(env, mesh, ctx);
+    const alpha_cutoff = uniforms.alphaCutoffFor(mesh.material);
+
+    if (entry.engine_template) {
+        const morph_bind = morphBindFor(env, mesh);
+        if (entry.base == .pbr) {
+            // PBR-base hook material: full PBR lighting with engine defaults
+            // for the maps the material does not override.
+            const albedo_tex = sm.texture orelse env.default_white.*;
+            bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
+            bind.views[pbr_shd.VIEW_normal_tex] = env.default_normal.view;
+            bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
+            bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
+            bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
+            bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+            const cube = env.sky_texture orelse env.default_cube.*;
+            bind.views[pbr_shd.VIEW_env_tex] = cube.view;
+            bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
+            bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
+            bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
+            bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+            bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
+            bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+            bind.views[pbr_shd.VIEW_morph_tex] = morph_bind.view;
+            bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+            sg.applyBindings(bind);
+
+            const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
+            sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
+            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_bind.uniforms)));
+
+            const fs_params = pbr_shd.FsParams{
+                .eye_pos = f.eye_pos,
+                .light_dir = f.light_dir,
+                .light_color = f.light_color,
+                .ambient_color = f.ambient_color,
+                .base_color_factor = sm.getTintColor4(),
+                .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
+                .emissive_factor = .{ 0, 0, 0, 1 },
+                .alpha_cutoff = alpha_cutoff,
+                .shadow_params = f.shadow_params,
+                .shadow_splits = f.shadow_splits,
+                .cascade_view_proj = f.cascade_view_proj,
+                .cascade_debug = f.cascade_debug,
+                .light_counts = f.light_counts,
+                .point_pos_range = f.point_pos_range,
+                .point_color_int = f.point_color_int,
+                .spot_pos_range = f.spot_pos_range,
+                .spot_dir_inner = f.spot_dir_inner,
+                .spot_color_outer = f.spot_color_outer,
+                .spot_intensity = f.spot_intensity,
+                .spot_view_proj = f.spot_view_proj,
+                .spot_shadow_params = f.spot_shadow_params,
+            };
+            sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
+        } else {
+            // Standard-base hook material.
+            const tex = sm.texture orelse env.default_white.*;
+            bind.views[shd.VIEW_diffuse_tex] = tex.view;
+            bind.samplers[shd.SMP_smp] = tex.sampler;
+            bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
+            bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
+            bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+            bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
+            bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+            bind.views[shd.VIEW_morph_tex] = morph_bind.view;
+            bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+            sg.applyBindings(bind);
+
+            const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
+            sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
+            sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_bind.uniforms)));
+
+            const fs_params = shd.FsParams{
+                .eye_pos = f.eye_pos,
+                .light_dir = f.light_dir,
+                .light_color = f.light_color,
+                .ambient_color = f.ambient_color,
+                .diffuse_color = sm.getTintColor4(),
+                .alpha_cutoff = alpha_cutoff,
+                .shadow_params = f.shadow_params,
+                .shadow_splits = f.shadow_splits,
+                .cascade_view_proj = f.cascade_view_proj,
+                .cascade_debug = f.cascade_debug,
+                .light_counts = f.light_counts,
+                .point_pos_range = f.point_pos_range,
+                .point_color_int = f.point_color_int,
+                .spot_pos_range = f.spot_pos_range,
+                .spot_dir_inner = f.spot_dir_inner,
+                .spot_color_outer = f.spot_color_outer,
+                .spot_intensity = f.spot_intensity,
+                .spot_view_proj = f.spot_view_proj,
+                .spot_shadow_params = f.spot_shadow_params,
+            };
+            sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
+        }
+    } else {
+        // Runtime-registered custom source: vertex/index binds plus the
+        // material texture at view slot 0 (sokol tolerates binding slots the
+        // shader does not declare; shaders that declare nothing get white).
+        // Contract: UB 0 carries {mat4 mvp, mat4 model} like every forward
+        // shader (runtime sources must declare it, see registerRuntime docs).
+        const tex = sm.texture orelse env.default_white.*;
+        bind.views[0] = tex.view;
+        bind.samplers[0] = tex.sampler;
+        sg.applyBindings(bind);
+
+        const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
+        sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
+    }
+
+    // User uniform block (declarative param table -> packed 128 bytes);
+    // materials with vertex-stage params carry the same payload on the
+    // fs-stage and vs-stage blocks.
+    if (entry.user_ub) |ub| {
+        sg.applyUniforms(ub, sg.asRange(&sm.uniforms));
+    }
+    if (entry.vs_user_ub) |ub| {
+        sg.applyUniforms(ub, sg.asRange(&sm.uniforms));
+    }
+
+    sg.draw(0, mesh.index_count, 1);
+    env.stats.main_draw_calls += 1;
+    env.stats.draw_calls += 1;
+    env.stats.triangles += mesh.index_count / 3;
+}
+
 // Packs the shared fragment uniforms for one mesh: the scene-level state is
 // copied and the per-mesh receive_shadows flag patched in.
 fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: FrameContext) uniforms.FrameUniforms {
@@ -345,9 +524,13 @@ pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: FrameContext, curre
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {
+        // Documented limitation: instanced shader-material meshes render with
+        // the default standard material in this version (the hook materials
+        // are compiled from the non-instanced templates).
         const std_mat = if (mesh.material) |m| switch (m) {
             .standard => |s| s,
             .pbr => env.default_material,
+            .shader_material => env.default_material,
         } else env.default_material;
         const tex = if (std_mat.diffuse_texture) |t| t else env.default_white.*;
 

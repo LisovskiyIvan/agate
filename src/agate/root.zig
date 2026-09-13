@@ -42,6 +42,12 @@ pub const StandardMaterial = material.StandardMaterial;
 pub const PBRMaterial = material.PBRMaterial;
 pub const Material = material.Material;
 pub const AlphaMode = material.AlphaMode;
+pub const ShaderMaterial = material.ShaderMaterial;
+
+// Custom shader materials: build-time hook materials (build.zig
+// `user_shader_materials`) and runtime-registered sources. See
+// shader_material.zig docs for the registration/uniform model.
+pub const shader_material = @import("shader_material.zig");
 
 pub const texture = @import("texture.zig");
 pub const Texture = texture.Texture;

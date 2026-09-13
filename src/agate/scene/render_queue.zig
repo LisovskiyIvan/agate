@@ -421,6 +421,9 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
             const tex_id: u32 = if (render_mesh.material) |m| switch (m) {
                 .pbr => |p| if (p.albedo_texture) |t| t.view.id else ctx.default_white_id,
                 .standard => |s| if (s.diffuse_texture) |t| t.view.id else ctx.default_white_id,
+                // Shader materials sort with the standard group by their
+                // primary texture (draw pipeline selection happens later).
+                .shader_material => |sm| if (sm.texture) |t| t.view.id else ctx.default_white_id,
             } else ctx.default_white_id;
 
             const d_sq = world_aabb.center().sub(eye).lengthSq();

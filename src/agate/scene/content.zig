@@ -3,6 +3,7 @@ const std = @import("std");
 const Mesh = @import("../mesh.zig").Mesh;
 const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
+const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const AnimationGroup = @import("../animation/animation.zig").AnimationGroup;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 
@@ -23,6 +24,18 @@ pub fn deinitMeshes(allocator: std.mem.Allocator, meshes: *std.ArrayListUnmanage
 pub fn deinitMaterials(allocator: std.mem.Allocator, materials: *std.ArrayListUnmanaged(*StandardMaterial)) void {
     for (materials.items) |mat| {
         if (mat.diffuse_texture) |*t| {
+            t.deinit();
+        }
+        allocator.destroy(mat);
+    }
+    materials.deinit(allocator);
+}
+
+/// Destroys shader materials (texture ownership mirrors deinitMaterials) and
+/// the list.
+pub fn deinitShaderMaterials(allocator: std.mem.Allocator, materials: *std.ArrayListUnmanaged(*ShaderMaterial)) void {
+    for (materials.items) |mat| {
+        if (mat.texture) |*t| {
             t.deinit();
         }
         allocator.destroy(mat);

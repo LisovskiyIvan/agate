@@ -104,6 +104,7 @@ pub fn cutoutInfoFor(mesh: *const Mesh) ?CutoutInfo {
     const tex = switch (mesh.material.?) {
         .standard => |s| s.diffuse_texture,
         .pbr => |p| p.albedo_texture,
+        .shader_material => |sm| sm.texture,
     } orelse return null;
     return .{ .texture = tex, .cutoff = cutoff };
 }

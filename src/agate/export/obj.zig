@@ -90,6 +90,7 @@ fn materialName(mesh: *const Mesh) ?[]const u8 {
     return switch (mat) {
         .standard => |s| s.name,
         .pbr => |p| p.name,
+        .shader_material => |sm| sm.name,
     };
 }
 
@@ -245,6 +246,7 @@ pub fn writeMtlAlloc(
         const raw_name = switch (mat) {
             .standard => |s| s.name,
             .pbr => |p| p.name,
+            .shader_material => |sm| sm.name,
         };
         const clean = try sanitizeNameAlloc(allocator, raw_name);
         errdefer allocator.free(clean);
@@ -263,10 +265,12 @@ pub fn writeMtlAlloc(
         const kd: [3]f32 = switch (mat) {
             .standard => |s| .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b },
             .pbr => |p| .{ p.albedo_color.r, p.albedo_color.g, p.albedo_color.b },
+            .shader_material => |sm| .{ sm.tint_color.r, sm.tint_color.g, sm.tint_color.b },
         };
         const alpha: f32 = switch (mat) {
             .standard => |s| s.alpha,
             .pbr => |p| p.alpha,
+            .shader_material => |sm| sm.alpha,
         };
         const block = try std.fmt.allocPrint(
             allocator,
