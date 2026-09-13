@@ -167,7 +167,8 @@ pub fn blendSkinWeights(
 }
 
 /// Evaluates the posed world position of a vertex on a skinned mesh.
-pub fn getSkinnedWorldPosition(
+// World-space skinned position helper; internal to decal projection.
+fn getSkinnedWorldPosition(
     world_mat: Mat4,
     skel: *const Skeleton,
     pos: Vec3,

@@ -3,6 +3,7 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const Vertex = @import("types.zig").Vertex;
 
+/// Dot product above which two axes count as parallel in pickOrthogonal.
 pub const orthogonal_dot_threshold: f32 = 0.9;
 
 /// Fallback axis when a normal is degenerate: up when the normal is near ±X,

@@ -1,3 +1,22 @@
+//! agate: a Babylon.js-style 3D engine in Zig on top of sokol.
+//!
+//! This file is the library facade: everything public is reachable from here
+//! (`@import("agate")`), while module paths (`agate.mesh.Mesh`,
+//! `agate.scene.Scene`, ...) stay importable for finer-grained access.
+//!
+//! Naming conventions used across the API:
+//! - Value constructors: `Type.new(...)` (math) and `Type.init(name, options)`
+//!   (plain structs: materials, cameras, lights).
+//! - Scene/GPU-owning entities: `create*` (MeshBuilder.createBox,
+//!   scene.createParticleSystem); sokol-object wrappers use `make*` to mirror
+//!   sg.makePipeline (`compute.makePipeline`).
+//! - Pure data assembly without GPU side effects: `build*Data` returning
+//!   `GeometryData`.
+//! - Option structs: `*Options` for user-tweakable knobs (all fields
+//!   defaulted); `*Desc` for registration descriptors with required fields
+//!   (shader_material.RuntimeDesc, mirroring sg.*Desc); `*Params` for
+//!   computed per-frame data packs (particles.ComputeFrameParams).
+
 pub const math = @import("math");
 pub const Vec2 = math.Vec2;
 pub const Vec3 = math.Vec3;

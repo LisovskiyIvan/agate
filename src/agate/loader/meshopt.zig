@@ -1,5 +1,5 @@
 //! EXT_meshopt_compression (glTF/GLB buffer views compressed with
-//! meshoptimizer). Support is transparent: SceneLoader.appendGlb/appendGltf
+//! meshoptimizer). Support is transparent: SceneLoader.appendGlb
 //! accept such files without new parameters. cgltf parses the extension
 //! metadata, and after cgltf_load_buffers the C glue
 //! agate_cgltf_decode_meshopt (c_impl.c, vendored decoder in c/meshopt)

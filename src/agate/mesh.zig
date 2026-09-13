@@ -15,7 +15,6 @@ pub const SkinJointWeight = types.SkinJointWeight;
 pub const tangents = @import("mesh/tangents.zig");
 pub const computeTangents = tangents.computeTangents;
 pub const pickOrthogonal = tangents.pickOrthogonal;
-pub const orthogonal_dot_threshold = tangents.orthogonal_dot_threshold;
 
 pub const mesh_impl = @import("mesh/mesh.zig");
 pub const Mesh = mesh_impl.Mesh;
@@ -45,21 +44,15 @@ pub const PolygonSideOrientation = builders.PolygonSideOrientation;
 pub const PolygonPlane = builders.PolygonPlane;
 pub const PolygonOptions = builders.PolygonOptions;
 
-pub const TrigEntry = builders.TrigEntry;
-pub const trigEntry = builders.trigEntry;
-pub const buildTrigTable = builders.buildTrigTable;
+// Quad/seed helpers shared by the builders and used by mesh tests.
 pub const storeQuad = builders.storeQuad;
-pub const storeQuadFlipped = builders.storeQuadFlipped;
 pub const appendGridQuad = builders.appendGridQuad;
 pub const appendGridQuadFlipped = builders.appendGridQuadFlipped;
 pub const resolveFrameSeed = builders.resolveFrameSeed;
 
-pub const buildBoxData = builders.buildBoxData;
-pub const buildGroundData = builders.buildGroundData;
-pub const buildTerrainData = builders.buildTerrainData;
-pub const buildSphereData = builders.buildSphereData;
-pub const buildCylinderData = builders.buildCylinderData;
-pub const buildCapsuleData = builders.buildCapsuleData;
+// Pure data builders: assemble a GeometryData without touching the GPU.
+// (Box/Ground/Terrain/Sphere/Cylinder/Capsule variants are internal to
+// mesh/builders.zig; MeshBuilder wraps them in create* factories.)
 pub const buildPlaneData = builders.buildPlaneData;
 pub const buildTorusData = builders.buildTorusData;
 pub const buildTorusKnotData = builders.buildTorusKnotData;

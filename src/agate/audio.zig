@@ -98,6 +98,8 @@ pub const AudioEngine = struct {
         self.started = false;
     }
 
+    /// One-shot procedural voice trigger: kind + spatial position + the
+    /// envelope/filter sweep the synthesizer applies. `play` is the only entry.
     pub const PlayParams = struct {
         kind: VoiceKind = .thump,
         position: ?Vec3 = null, // null = non-positional

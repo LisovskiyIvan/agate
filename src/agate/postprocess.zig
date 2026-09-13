@@ -37,6 +37,9 @@ pub const LutBinding = struct {
     size: u32 = 0,
 };
 
+/// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
+/// toggles and their parameters). A flat config read/written by tooling;
+/// applied per frame by `Scene.postfx` (PostFXStack.renderChain).
 pub const PostProcessConfig = struct {
     enabled: bool = false,
     exposure: f32 = 1.0,

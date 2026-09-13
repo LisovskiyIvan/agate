@@ -1125,32 +1125,6 @@ pub const UICanvas = struct {
     }
 };
 
-// Top-level aliases for the stateless UI helpers above, so calling code can
-// use them without spelling `UICanvas.` Both paths share one implementation.
-pub fn dropdownItemHeight(font_size: f32) f32 {
-    return UICanvas.dropdownItemHeight(font_size);
-}
-
-pub fn dropdownItemRect(rect: [4]f32, item_h: f32, index: usize) [4]f32 {
-    return UICanvas.dropdownItemRect(rect, item_h, index);
-}
-
-pub fn dropdownHit(rect: [4]f32, item_h: f32, count: usize, mx: f32, my: f32) ?usize {
-    return UICanvas.dropdownHit(rect, item_h, count, mx, my);
-}
-
-pub fn scrollClamp(state: *ScrollState, delta: f32) void {
-    UICanvas.scrollClamp(state, delta);
-}
-
-pub fn scrollOffsetForItem(offset: f32, item_y: f32, item_h: f32, view_h: f32, content_h: f32) f32 {
-    return UICanvas.scrollOffsetForItem(offset, item_y, item_h, view_h, content_h);
-}
-
-pub fn scrollbarThumbRect(track: [4]f32, content_h: f32, view_h: f32, offset: f32) [4]f32 {
-    return UICanvas.scrollbarThumbRect(track, content_h, view_h, offset);
-}
-
 // CSS-subset theme parsing (see ui/css_parser.zig). `UITheme.parseCss` is
 // the same parser as a method on the theme type; install a parsed theme on
 // a canvas with UICanvas.applyCssTheme.
@@ -1195,7 +1169,6 @@ pub const UIStyleRequest = ui_types.UIStyleRequest;
 pub const UIStyleClass = ui_types.UIStyleClass;
 pub const UIBoxStyle = ui_types.UIBoxStyle;
 pub const max_style_classes = ui_types.max_style_classes;
-pub const animKeyHash = ui_types.animKeyHash;
 pub const UITheme = ui_theme_mod.UITheme;
 pub const UIStyleTransition = ui_transition.UIStyleTransition;
 pub const max_style_transitions = ui_transition.max_style_transitions;

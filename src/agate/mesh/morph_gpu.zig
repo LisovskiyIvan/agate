@@ -201,7 +201,7 @@ pub fn uploadMorphDeltas(mesh: *Mesh, allocator: std.mem.Allocator) !void {
 
 /// Destroys the mesh's delta image and view (GPU calls). Mesh.deinit
 /// performs the same teardown inline to avoid importing this module back.
-pub fn destroyDeltaResources(mesh: *Mesh) void {
+fn destroyDeltaResources(mesh: *Mesh) void {
     if (mesh.morph_delta_view.id != 0) sg.destroyView(mesh.morph_delta_view);
     if (mesh.morph_delta_image.id != 0) sg.destroyImage(mesh.morph_delta_image);
     mesh.morph_delta_image = .{};

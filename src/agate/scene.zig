@@ -3,14 +3,11 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const postprocess = @import("postprocess.zig");
-pub const PostProcessConfig = postprocess.PostProcessConfig;
-pub const TonemappingType = postprocess.TonemappingType;
+const PostProcessConfig = postprocess.PostProcessConfig;
 const ssao = @import("ssao.zig");
-pub const SSAOConfig = ssao.SSAOConfig;
+const SSAOConfig = ssao.SSAOConfig;
 const particles = @import("particles.zig");
-pub const ParticleSystem = particles.ParticleSystem;
-pub const ParticleBlendMode = particles.ParticleBlendMode;
-pub const Particle = particles.Particle;
+const ParticleSystem = particles.ParticleSystem;
 
 const math = @import("math");
 const Vec3 = math.Vec3;
@@ -21,14 +18,13 @@ const BoundingBox = math.BoundingBox;
 const Ray = math.Ray;
 
 const physics = @import("physics.zig");
-pub const PhysicsWorld = physics.PhysicsWorld;
-pub const RigidBody = physics.RigidBody;
-pub const PickingInfo = physics.PickingInfo;
-pub const ColliderType = physics.ColliderType;
+const PhysicsWorld = physics.PhysicsWorld;
+const RigidBody = physics.RigidBody;
+const PickingInfo = physics.PickingInfo;
+const ColliderType = physics.ColliderType;
 
 const ui = @import("ui.zig");
-pub const UICanvas = ui.UICanvas;
-pub const UIVertex = ui.UIVertex;
+const UICanvas = ui.UICanvas;
 
 const AnimationGroup = @import("animation/animation.zig").AnimationGroup;
 const Skeleton = @import("animation/skeleton.zig").Skeleton;
@@ -44,17 +40,14 @@ const SpotLight = lights.SpotLight;
 const SpotLightOptions = lights.SpotLightOptions;
 const Mesh = @import("mesh.zig").Mesh;
 const decal_mod = @import("mesh/decal.zig");
-pub const DecalManager = decal_mod.DecalManager;
+const DecalManager = decal_mod.DecalManager;
 const trail_mod = @import("mesh/trail.zig");
-pub const TrailMesh = trail_mod.TrailMesh;
-pub const TrailOptions = trail_mod.TrailOptions;
-pub const DecalProjector = decal_mod.DecalProjector;
+const TrailMesh = trail_mod.TrailMesh;
+const TrailOptions = trail_mod.TrailOptions;
 const csg_mod = @import("mesh/csg.zig");
-pub const CSG = csg_mod.CSG;
 const ai_mod = @import("ai.zig");
-pub const NavMesh = ai_mod.NavMesh;
-pub const NavNode = ai_mod.NavNode;
-pub const NavAgent = ai_mod.NavAgent;
+const NavMesh = ai_mod.NavMesh;
+const NavAgent = ai_mod.NavAgent;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const PBRMaterial = @import("material.zig").PBRMaterial;
 const ShaderMaterial = @import("material.zig").ShaderMaterial;
@@ -85,6 +78,7 @@ const scene_content = @import("scene/content.zig");
 const scene_animation = @import("scene/animation_runtime.zig");
 const scene_picking = @import("scene/picking.zig");
 const scene_uniforms = @import("scene/uniforms.zig");
+const FrameContext = scene_uniforms.FrameContext;
 const scene_draw = @import("scene/draw.zig");
 
 /// The scene: content registries (flat, iterated directly by loaders,
@@ -155,10 +149,7 @@ pub const Scene = struct {
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
 
-    // Frame uniform types shared with the draw path (aliases kept so
-    // `Scene.FrameContext` keeps resolving for tests and tooling).
-    pub const FrameContext = scene_uniforms.FrameContext;
-    pub const FrameUniforms = scene_uniforms.FrameUniforms;
+    // Frame uniform types shared with the draw path (see scene/uniforms.zig).
 
     pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
         self.* = Scene{
@@ -188,6 +179,10 @@ pub const Scene = struct {
 
     // ---- Offscreen targets & post-processing config. ----
 
+    /// Window-resize hook: resizes every viewport-sized offscreen target
+    /// (postprocess, bloom, SSAO, outline). The per-frame post chain resizes
+    /// postprocess/bloom lazily, but SSAO has no other resize path — call
+    /// this when the window size changes and post-processing/SSAO is in use.
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
         self.postfx.resizeAll(width, height);
     }
@@ -364,10 +359,7 @@ pub const Scene = struct {
         return self.physics.enable(self.allocator, gravity);
     }
 
-    pub fn getPhysicsWorld(self: *Scene) ?*PhysicsWorld {
-        return self.physics.getWorld();
-    }
-
+    /// Finds the rigid body previously created for `mesh`, if any.
     pub fn getRigidBody(self: *Scene, mesh: *const Mesh) ?*RigidBody {
         if (self.physics.getWorld()) |pw| {
             return pw.findBody(mesh);
@@ -435,24 +427,6 @@ pub const Scene = struct {
         if (self.active_camera) |*cam| {
             cam.handleEvent(ev);
         }
-    }
-
-    // ---- Shadow / uniform plumbing kept for API compatibility. ----
-
-    pub fn computeCascades(self: *Scene, camera: Camera, aspect: f32) [4]Mat4 {
-        return self.shadows.computeCascades(camera, aspect, self.lights.sunDirection());
-    }
-
-    // A mesh is transparent when its material opts into .blend alpha mode.
-    // Meshes without a material render opaque (legacy behavior).
-    pub fn materialIsTransparent(mat: ?@import("material.zig").Material) bool {
-        return scene_render_queue.materialIsTransparent(mat);
-    }
-
-    pub fn frameUniforms(self: *Scene, mesh: *const Mesh, ctx: FrameContext) FrameUniforms {
-        var state = self.shadows.uniformState(self.lights.hemi.ground_color);
-        state.mesh_receive_shadows = mesh.receive_shadows;
-        return scene_uniforms.buildFrameUniforms(state, ctx);
     }
 
     // ---- Rendering. ----

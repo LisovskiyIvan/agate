@@ -613,6 +613,7 @@ pub const Texture = struct {
     }
 };
 
+/// Gradient + sun parameters for `CubeTexture.createProceduralSkybox`.
 pub const SkyboxConfig = struct {
     top_color: [4]u8 = .{ 35, 75, 155, 255 }, // Deep blue zenith
     horizon_color: [4]u8 = .{ 175, 195, 220, 255 }, // Atmospheric horizon

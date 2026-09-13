@@ -28,8 +28,9 @@ pub const SceneLoader = struct {
         morph_mode: MorphMode = .cpu,
     };
 
-    pub const appendGltf = appendGlb;
-
+    /// Parses a glTF scene and spawns its content into `scene`. Both
+    /// `.glb` (binary) and `.gltf` (JSON + external .bin) files work.
+    /// Returns the spawned meshes in node order.
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
         return appendGlbOptions(scene, file_path, .{});
     }
