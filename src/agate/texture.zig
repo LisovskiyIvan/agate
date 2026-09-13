@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const c = @import("c.zig").c;
+const ktx2 = @import("ktx2.zig");
 
 /// Shared RGBA8 box-filter downsample of one mip level. Dims floor at 1,
 /// source coords clamp at edges (handles NPOT). Fast path for the exact
@@ -226,7 +227,9 @@ pub const Texture = struct {
     };
 
     /// Copies `rgba_pixels` and optionally builds the box-filtered mip chain.
-    fn buildRaw(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
+    /// Public so the KTX2 reader (ktx2.zig) can reuse the generator for
+    /// single-level files; the decode paths above use it internally.
+    pub fn buildRaw(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
         var raw = RawTexture{ .width = width, .height = height, .num_levels = 1 };
         errdefer raw.deinit(allocator);
 
@@ -290,9 +293,22 @@ pub const Texture = struct {
         srgb_to_linear: bool = false,
     };
 
-    /// Decodes an in-memory image (PNG/JPEG/...) to RGBA without touching the
-    /// GPU. Thread-safe; pair with `fromRaw`.
+    /// Decodes an in-memory image (PNG/JPEG/KTX2/...) to RGBA without
+    /// touching the GPU. Thread-safe; pair with `fromRaw`. KTX2 payloads
+    /// (magic sniff) route to the ktx2 reader: only its uncompressed LDR
+    /// subset decodes here — cube KTX2 files are rejected with
+    /// error.UnsupportedFaceCount (use ktx2.decodeCube instead).
     pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
+        if (ktx2.sniff(bytes)) {
+            return ktx2.decode2D(allocator, bytes, .{
+                .gen_mipmaps = opts.gen_mipmaps,
+                // The caller's per-slot color/data decision is authoritative;
+                // ktx2's format-tag auto detection applies only to its own
+                // direct API (DecodeOptions.srgb_to_linear = null).
+                .srgb_to_linear = opts.srgb_to_linear,
+            });
+        }
+
         var w: c_int = 0;
         var h: c_int = 0;
         var channels_in_file: c_int = 0;
@@ -327,33 +343,23 @@ pub const Texture = struct {
     }
 
     /// File variant of `decodeMemory`. Thread-safe; pair with `fromRaw`.
+    /// The file is read into memory first so KTX2 files (magic sniff) take
+    /// the same reader as in-memory payloads; everything else decodes via
+    /// stb from the buffered bytes.
     pub fn decodeFile(allocator: std.mem.Allocator, file_path: []const u8, opts: DecodeOptions) !RawTexture {
-        const path_z = try allocator.dupeZ(u8, file_path);
-        defer allocator.free(path_z);
+        // Zig 0.16 removed std.fs.cwd(); read through the global
+        // single-threaded Io (same pattern as CubeTexture.fromEquirectangularFile).
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
 
-        var w: c_int = 0;
-        var h: c_int = 0;
-        var channels_in_file: c_int = 0;
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
 
-        const t0 = sokol.time.now();
-        const data = c.stbi_load(path_z.ptr, &w, &h, &channels_in_file, 4);
-        const t1 = sokol.time.now();
-        if (data == null) return error.ImageDecodeFailed;
-        defer c.stbi_image_free(data);
-
-        const width: u32 = @intCast(w);
-        const height: u32 = @intCast(h);
-        const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        if (opts.srgb_to_linear) convertSrgbToLinearInPlace(data[0..size_bytes]);
-        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
-
-        const t2 = sokol.time.now();
-        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
-            width,                                  height,
-            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
-            sokol.time.ms(sokol.time.diff(t2, t0)),
-        });
-        return raw;
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return decodeMemory(allocator, bytes, opts);
     }
 
     pub fn createWhite1x1() Texture {
@@ -1310,6 +1316,65 @@ pub const CubeTexture = struct {
         var faces: [6][]const u16 = undefined;
         for (0..6) |i| faces[i] = raw.faces[i].?;
         return initRawFacesHdr(allocator, size, faces);
+    }
+
+    /// GPU-free pre-built LDR cube levels (six faces concatenated per level,
+    /// face order +X,-X,+Y,-Y,+Z,-Z, level 0 largest). Produced by
+    /// ktx2.decodeCube; uploaded with `initRawFacesMips`. Free with deinit.
+    pub const RawCubeMips = struct {
+        size: u32 = 0,
+        num_levels: u32 = 0,
+        /// levels[m] holds 6 * size_m * size_m * 4 RGBA8 bytes.
+        levels: [16]?[]u8 = @splat(null),
+
+        pub fn deinit(self: *RawCubeMips, allocator: std.mem.Allocator) void {
+            for (self.levels[0..self.num_levels]) |level| {
+                if (level) |buf| allocator.free(buf);
+            }
+            self.* = .{};
+        }
+    };
+
+    /// Uploads pre-built LDR cube levels as an RGBA8 cube WITH a full mip
+    /// chain as authored (unlike `initRawFaces`, which generates the chain
+    /// from level 0). Main thread only. Sampler: linear min/mag/mip, clamp
+    /// on all axes — the env/skybox convention of every cube path.
+    pub fn initRawFacesMips(raw: *const RawCubeMips) CubeTexture {
+        var img_desc = sg.ImageDesc{
+            .type = .CUBE,
+            .width = @intCast(raw.size),
+            .height = @intCast(raw.size),
+            .num_slices = 6,
+            .num_mipmaps = @intCast(raw.num_levels),
+            .pixel_format = .RGBA8,
+            .sample_count = 1,
+        };
+        for (0..raw.num_levels) |m| {
+            if (raw.levels[m]) |level| {
+                img_desc.data.mip_levels[m] = sg.asRange(level);
+            }
+        }
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = if (raw.num_levels > 1) .LINEAR else .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .wrap_w = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .size = raw.size,
+            .num_mipmaps = raw.num_levels,
+        };
     }
 };
 

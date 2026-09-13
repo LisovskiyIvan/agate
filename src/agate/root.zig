@@ -69,6 +69,9 @@ pub const ShaderMaterial = material.ShaderMaterial;
 pub const shader_material = @import("shader_material.zig");
 
 pub const texture = @import("texture.zig");
+/// KTX2 container reader (uncompressed LDR subset); Texture.decodeMemory/
+/// decodeFile route KTX2 payloads here automatically by magic sniff.
+pub const ktx2 = @import("ktx2.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;
