@@ -11,6 +11,36 @@ var scene: z.Scene = undefined;
 var box: *z.Mesh = undefined;
 var camera: z.ArcRotateCamera = undefined;
 
+// CLI: --frames N quits after N rendered frames (0 = run until closed);
+// --particles <cpu|gpu|compute> adds a demo particle system with that
+// simulation mode (default: none). --frames is useful for headless smokes:
+// `agate --frames 120` must complete without sokol validation errors.
+var frame_limit: u32 = 0;
+var frame_count: u32 = 0;
+var particle_mode: ?z.SimulationMode = null;
+var particles: *z.ParticleSystem = undefined;
+
+fn parseArgs(args: std.process.Args) void {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // program name
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--frames")) {
+            if (it.next()) |n| {
+                frame_limit = std.fmt.parseInt(u32, n, 10) catch 0;
+            }
+        } else if (std.mem.eql(u8, arg, "--particles")) {
+            const mode = it.next() orelse break;
+            if (std.mem.eql(u8, mode, "cpu")) {
+                particle_mode = .cpu;
+            } else if (std.mem.eql(u8, mode, "gpu")) {
+                particle_mode = .gpu;
+            } else if (std.mem.eql(u8, mode, "compute")) {
+                particle_mode = .compute;
+            }
+        }
+    }
+}
+
 export fn init() callconv(.c) void {
     sg.setup(.{
         .environment = sglue.environment(),
@@ -47,6 +77,22 @@ export fn init() callconv(.c) void {
     }) catch |err| {
         std.debug.panic("Failed to create box: {}", .{err});
     };
+
+    if (particle_mode) |mode| {
+        particles = scene.createParticleSystem("demo", 256) catch |err| {
+            std.debug.panic("Failed to create particle system: {}", .{err});
+        };
+        particles.simulation_mode = mode;
+        particles.emit_rate = 120.0;
+        particles.is_emitting = true;
+        particles.gravity = z.Vec3.new(0.0, -1.5, 0.0);
+        particles.drag = 0.8;
+        particles.emitter_box_max = z.Vec3.new(0.2, 0.2, 0.2);
+        particles.direction_max = z.Vec3.new(0.5, 2.0, 0.5);
+        particles.speed_max = 3.0;
+        particles.size_start = 0.1;
+        particles.size_end = 0.02;
+    }
 }
 
 export fn frame() callconv(.c) void {
@@ -56,7 +102,16 @@ export fn frame() callconv(.c) void {
     box.rotation.x += 0.8 * dt;
     box.rotation.y += 1.6 * dt;
 
+    if (particle_mode != null) {
+        scene.updateParticles(@floatCast(sapp.frameDuration()));
+    }
+
     scene.render();
+
+    if (frame_limit != 0) {
+        frame_count += 1;
+        if (frame_count >= frame_limit) sapp.quit();
+    }
 }
 
 export fn cleanup() callconv(.c) void {
@@ -91,7 +146,8 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     }
 }
 
-pub fn main() void {
+pub fn main(minimal: std.process.Init.Minimal) void {
+    parseArgs(minimal.args);
     sapp.run(.{
         .init_cb = init,
         .frame_cb = frame,
