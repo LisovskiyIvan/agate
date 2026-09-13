@@ -33,6 +33,12 @@ in vec3 normal;
 in vec4 color0;
 in vec2 texcoord0;
 
+// Shader material hook 'decls' (vertex stage): the same generated
+// sm_user_params uniform block as the fs-side hook, for snippets that use
+// params inside @hook(vertex). Empty otherwise. See shader_material/merge.zig.
+// @hook(decls)
+// @endhook
+
 out vec3 v_world_pos;
 out vec3 v_normal;
 out vec4 v_color;
@@ -78,6 +84,13 @@ void main() {
     vec3 morphed_pos = position;
     vec3 morphed_nrm = normal;
     applyMorphDeltas(morphed_pos, morphed_nrm, gl_VertexIndex);
+
+    // Shader material hook 'vertex': user snippets may modify morphed_pos /
+    // morphed_nrm (world-space transforms below pick the changes up).
+    // Empty unless a shader material overrides it — see
+    // src/agate/shader_material/merge.zig.
+    // @hook(vertex)
+    // @endhook
 
     vec4 world_pos = model * vec4(morphed_pos, 1.0);
     v_world_pos = world_pos.xyz;
@@ -133,6 +146,12 @@ in vec4 v_color;
 in vec2 v_uv;
 
 out vec4 frag_color;
+
+// Shader material hook 'decls': the generated sm_user_params uniform block
+// (8x vec4, UB binding 3) for snippets that declare // @param entries lands
+// here (file scope). Empty otherwise. See shader_material/merge.zig.
+// @hook(decls)
+// @endhook
 
 const vec2 POISSON_DISK[16] = vec2[](
     vec2(-0.94201624, -0.39906216),
@@ -334,6 +353,13 @@ void main() {
     // never fires for them (alpha is always >= 0.0).
     vec4 tex_val = texture(sampler2D(diffuse_tex, smp), v_uv);
     vec4 base = v_color * diffuse_color * tex_val;
+
+    // Shader material hook 'albedo': user snippets may modify `base` (rgb
+    // and alpha; the alpha cutoff below sees the modified value). In scope:
+    // base, v_uv, v_world_pos, N, v_color, diffuse_color, eye_pos.
+    // @hook(albedo)
+    // @endhook
+
     if (base.a < alpha_cutoff) discard;
 
     // Primary directional light
@@ -401,6 +427,13 @@ void main() {
     vec3 ambient = ambient_color.rgb * ambient_color.a;
 
     vec3 final_rgb = base.rgb * (ambient + diffuse) + debug_tint;
+
+    // Shader material hook 'post_lighting': user snippets may modify
+    // final_rgb (rim light, color grading, custom emissive glow). In scope:
+    // final_rgb, base, ambient, diffuse, v_world_pos, N, eye_pos.
+    // @hook(post_lighting)
+    // @endhook
+
     frag_color = vec4(final_rgb, base.a);
 }
 @end
