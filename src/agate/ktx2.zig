@@ -697,3 +697,25 @@ test "formatFromVk covers exactly the supported subset" {
     try testing.expect(Format.rgba8_unorm.isSrgb() == false);
     try testing.expect(Format.r8_srgb.isSrgb() == true);
 }
+
+test "Texture.decodeMemory routes KTX2 payloads by magic sniff" {
+    const allocator = testing.allocator;
+    const level0 = [_]u8{ 200, 0, 0, 255 };
+    const ktx = try (TestKtx2{
+        .vk_format = 43, // R8G8B8A8_SRGB
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&level0},
+    }).build(allocator);
+    defer allocator.free(ktx);
+
+    // The sniffed route forwards the caller's per-slot sRGB decision
+    // (color slot -> true), unlike ktx2.decode2D's format-tag auto mode.
+    var routed = try Texture.decodeMemory(allocator, ktx, .{ .srgb_to_linear = true });
+    defer routed.deinit(allocator);
+    try testing.expectEqual(@as(u8, texture.srgbToLinearU8(200)), routed.levels[0].?[0]);
+
+    var raw = try Texture.decodeMemory(allocator, ktx, .{ .srgb_to_linear = false });
+    defer raw.deinit(allocator);
+    try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, raw.levels[0].?[0..4].*);
+}
