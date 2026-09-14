@@ -130,13 +130,31 @@ pub fn blendDescFor(base: sg.PipelineDesc) sg.PipelineDesc {
 }
 
 /// World matrix computed at most once per render() call (tagged with the
-/// frame id on the mesh). Parent chains resolve through the same cache, so
-/// hierarchies stay O(depth) total.
+/// frame id on the mesh). Semantics mirror Mesh.getWorldMatrix exactly —
+/// including bone attachment, which replaces the parent chain when the
+/// host skeleton is live — so every pass sees the same transform. Parent
+/// and host chains resolve through the same cache, so hierarchies stay
+/// O(depth) total.
 pub fn worldMatrixCached(frame_id: u64, mesh: *Mesh) Mat4 {
     if (mesh.cached_frame == frame_id) return mesh.cached_matrix;
     const trs = Mat4.fromRotationTranslationScale(mesh.position, mesh.rotation, mesh.scaling);
     const local = Mat4.mul(trs, mesh.base_matrix);
-    const world = if (mesh.parent) |p| Mat4.mul(worldMatrixCached(frame_id, p), local) else local;
+    var world: Mat4 = undefined;
+    if (mesh.attach_bone) |att| {
+        if (att.host_mesh.skeleton) |skel| {
+            const host_mat = worldMatrixCached(frame_id, att.host_mesh);
+            const bone_mat = skel.getBoneWorldMatrix(att.bone_index, host_mat);
+            world = Mat4.mul(Mat4.mul(bone_mat, att.offset_matrix), local);
+        } else if (mesh.parent) |p| {
+            world = Mat4.mul(worldMatrixCached(frame_id, p), local);
+        } else {
+            world = local;
+        }
+    } else if (mesh.parent) |p| {
+        world = Mat4.mul(worldMatrixCached(frame_id, p), local);
+    } else {
+        world = local;
+    }
     mesh.cached_matrix = world;
     mesh.cached_aabb = mesh.local_bounding_box.transform(world);
     mesh.cached_frame = frame_id;
@@ -576,6 +594,7 @@ test "worldMatrixCached caches per frame and resolves parents" {
     parent.base_matrix = Mat4.identity;
     parent.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
     parent.parent = null;
+    parent.attach_bone = null;
     parent.cached_frame = 0;
     child.position = Vec3.new(0.0, 1.0, 0.0);
     child.rotation = Vec3.zero;
@@ -583,6 +602,7 @@ test "worldMatrixCached caches per frame and resolves parents" {
     child.base_matrix = Mat4.identity;
     child.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
     child.parent = &parent;
+    child.attach_bone = null;
     child.cached_frame = 0;
 
     const world = worldMatrixCached(7, &child);
@@ -624,6 +644,7 @@ test "shared LOD mesh preserves entity transforms without mutation" {
     shared_lod.lod_levels = .empty;
     shared_lod.instances = .empty;
     shared_lod.skeleton = null;
+    shared_lod.attach_bone = null;
     shared_lod.index_type = .UINT16;
 
     var mesh1: Mesh = shared_lod;
@@ -828,4 +849,59 @@ test "parallel cull produces serial-identical queues" {
         try std.testing.expectEqual(a.texture_id, b.texture_id);
         try std.testing.expectEqual(a.transparent, b.transparent);
     }
+}
+
+test "worldMatrixCached honors bone attachment like getWorldMatrix" {
+    const ally = std.testing.allocator;
+    const Skeleton = @import("../animation/skeleton.zig").Skeleton;
+
+    // Host: identity TRS with a one-bone skeleton whose bone sits at (2,0,0).
+    var host: Mesh = undefined;
+    host.position = Vec3.zero;
+    host.rotation = Vec3.zero;
+    host.scaling = Vec3.new(1.0, 1.0, 1.0);
+    host.base_matrix = Mat4.identity;
+    host.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    host.parent = null;
+    host.cached_frame = 0;
+    host.attach_bone = null;
+    host.skeleton = null;
+
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].model_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    skel.bones[0].model_matrix.m[12] = 2.0; // bone at x=2
+    host.skeleton = skel;
+
+    // Attached mesh: offset (0,1,0) on the bone, local TRS at (0,0,3).
+    var attached: Mesh = undefined;
+    attached.position = Vec3.new(0.0, 0.0, 3.0);
+    attached.rotation = Vec3.zero;
+    attached.scaling = Vec3.new(1.0, 1.0, 1.0);
+    attached.base_matrix = Mat4.identity;
+    attached.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    attached.parent = null;
+    attached.cached_frame = 0;
+    attached.skeleton = null;
+    attached.attach_bone = .{ .host_mesh = &host, .bone_index = 0, .offset_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0)) };
+    attached.attach_bone.?.offset_matrix.m[13] = 1.0;
+
+    const cached = worldMatrixCached(5, &attached);
+    const direct = attached.getWorldMatrix();
+    // The cache must agree with the uncached bone-aware path everywhere:
+    // bone (x=2) + offset (y=1) + local (z=3).
+    try std.testing.expectEqual(direct, cached);
+    try std.testing.expectEqual(@as(f32, 2.0), cached.m[12]);
+    try std.testing.expectEqual(@as(f32, 1.0), cached.m[13]);
+    try std.testing.expectEqual(@as(f32, 3.0), cached.m[14]);
+    try std.testing.expectEqual(@as(u64, 5), attached.cached_frame);
+
+    // Dead-skeleton host: falls through to the plain parent-less matrix.
+    // Per getWorldMatrix semantics the offset applies only on the bone
+    // path, so the fallback is the bare local TRS (z=3).
+    host.skeleton = null;
+    const fallback = worldMatrixCached(6, &attached);
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[12]);
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[13]);
+    try std.testing.expectEqual(@as(f32, 3.0), fallback.m[14]);
 }

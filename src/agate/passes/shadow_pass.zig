@@ -6,6 +6,7 @@ const math = @import("math");
 const Mat4 = math.Mat4;
 const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
+const scene_render_queue = @import("../scene/render_queue.zig");
 const Vertex = mesh_mod.Vertex;
 
 // Resolution of the shadow atlas texture (square). Must match the
@@ -281,9 +282,10 @@ pub const ShadowPass = struct {
                     draw_calls.* += 1;
                 } else {
                     if (!mesh.is_visible) continue;
-                    // Scene.render() already cached world matrix + AABB this frame;
-                    // fall back to direct computation if it didn't (stale or external call).
-                    const aabb_w = if (mesh.cached_frame == frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
+                    // Cached world transforms, filled here on first touch
+                    // and reused by the main pass's queue build (same frame
+                    // id). Bone attachment semantics match Mesh.getWorldMatrix.
+                    const aabb_w = scene_render_queue.worldAABBCached(frame_id, mesh);
                     if (!frustum.intersectsAABB(aabb_w)) continue;
 
                     // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
@@ -304,7 +306,7 @@ pub const ShadowPass = struct {
                     bind.index_buffer = mesh.index_buffer;
                     sg.applyBindings(bind);
 
-                    const model = if (mesh.cached_frame == frame_id) mesh.cached_matrix else mesh.getWorldMatrix();
+                    const model = scene_render_queue.worldMatrixCached(frame_id, mesh);
                     const shadow_vs = shadow_shd.VsParams{
                         .mvp = Mat4.mul(light_view_proj, model),
                     };

@@ -124,6 +124,54 @@ Remaining slices, in order:
    engine systems (Scene is not thread-safe by construction) is expected
    to surface races — fix them at the audit level, not with locks.
 
+#### Frame-payload audit (done 2026-09)
+
+Full sweep of every CPU read in `Scene.render()` (core path + all passes).
+Key findings, condensed:
+
+Render-side hidden mutations today (must stay render-owned or move):
+- `LightRig.packFrame(..., dt)` runs light-selection **hysteresis fades
+  inside render** (light_selection.zig update) — simulation living in the
+  render pass; move to the publish step.
+- `worldMatrixCached` writes `mesh.cached_matrix/cached_aabb/cached_frame`;
+  `submitInstancedMesh` writes InstancedMesh caches + instance buffers;
+  `ShadowPass.binned_meshes`/`spot_needs_clear`; `Scene.stats` reset+counters;
+  `frame_id` bump; lazy GPU resources (`ensureForwardMsaa`,
+  `ShaderMaterialCache.getOrCreate`, sky/postfx MSAA twins); `WarnOnce`.
+- `UploadQueue.drain` patches material texture slots at render top (stage 2).
+- Update side issues sg calls today: `particles.update` (instance buffer
+  upload), `TrailMesh.update` (index buffer upload) — must move under the
+  render side on a split.
+- `DecalManager.update` destroys meshes/materials in `scene.meshes` —
+  container-level hazard.
+
+True shared-mutable (update writes AND render reads/writes same field):
+mesh/instance caches; `morph_weights` (draw-time read); skeleton
+`skin_matrices` (draw-time upload); material scalars+slots; light
+hysteresis; container arrays frozen only by single-thread discipline.
+
+Payload split decision (summary): COPY per frame — per-camera derived
+{view_proj, eye, viewport, mask, clear}, sun pack, `FramePack`, shadow
+config+cascades, post/ssao/msaa/sky config, per-item draw records (model,
+flags, material scalars ~120B, texture handles), skin palette (4KB/skeleton),
+morph weights, stats double-buffer. ALTERNATE (render-owned): queues,
+matrix/instance caches, occlusion culler + HiZ, hysteresis, frame_id, lazy
+GPU caches. GPU_ONLY: all sg handles. RO_AFTER_LOAD: topology, base_matrix,
+parents, LODs, cpu geometry.
+
+Two semantics bugs the audit surfaced, FIXED:
+1. `worldMatrixCached` ignored `attach_bone` while `Mesh.getWorldMatrix`
+   honored it — bone-attached meshes rendered at different positions in
+   main vs shadow passes. The cached path now mirrors getWorldMatrix
+   exactly (bone branch replaces the parent chain when the host skeleton
+   is live; dead skeleton falls through to parent).
+2. `frame_id` was bumped before the shadow pass, whose cache checks
+   therefore always missed and recomputed every world matrix twice per
+   frame. Shadow fallbacks now use `worldMatrixCached`/`worldAABBCached`:
+   shadow warms the cache, the main pass queue build hits it, and bone
+   semantics are identical across passes. Nothing in engine or sandbox
+   sets attach_bone yet, so the fix is inert today — it closes the trap.
+
 ## What other engines do (reference)
 
 - **Unreal**: Game → Render → RHI threads, one frame latency between each;
