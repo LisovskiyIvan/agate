@@ -55,8 +55,6 @@ pub const Error = error{
     HookNotTerminated,
     /// Snippet overrides a hook the template does not define.
     UnknownHook,
-    /// Template defines the same hook name twice.
-    DuplicateHook,
     /// More params than the 32-float user block can hold.
     ParamSpaceOverflow,
     /// Malformed `// @param` declaration.
@@ -353,7 +351,7 @@ fn laneDot(lane: u8) []const u8 {
 
 /// Merges a user snippet into an engine shader template.
 /// With no overriding hooks the output is byte-identical to the template.
-pub fn merge(allocator: std.mem.Allocator, opts: Options) (Error || std.mem.Allocator.Error)!Result {
+pub fn merge(allocator: std.mem.Allocator, opts: Options) Error!Result {
     const template_lines = try splitLines(allocator, opts.template);
     defer allocator.free(template_lines);
     const template_hooks = try parseTemplateHooks(allocator, template_lines);

@@ -5,8 +5,8 @@
 //! regular pass started with `sg_begin_pass(&(.{ .compute = true }))`, a
 //! regular pipeline created with `sg_pipeline_desc.compute = true`, and is
 //! driven with the same apply/bind/dispatch calls as rendering. This module
-//! wraps that contract in one place so engine code does not hand-roll pass
-//! descriptors, plus documents the platform matrix.
+//! wraps pipeline creation, storage-buffer view setup, and dispatch group
+//! math in one place, plus documents the platform matrix.
 //!
 //! Backend support matrix (from the sokol_gfx.h "ON COMPUTE PASSES" section,
 //! mirrored by `sg_query_features().compute` at runtime — the runtime query is

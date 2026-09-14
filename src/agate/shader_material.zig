@@ -165,7 +165,7 @@ pub const RuntimeDesc = struct {
 /// thread contract, like the rest of the engine's GPU state).
 pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName }!u32 {
     if (runtime_len >= max_runtime_entries) return error.RegistryFull;
-    if (findInRuntime(desc.name) != null) return error.DuplicateName;
+    if (indexForName(desc.name) != null) return error.DuplicateName;
     const index: u32 = @intCast(static_len + runtime_len);
     runtime_table[runtime_len] = .{
         .name = desc.name,
@@ -337,7 +337,7 @@ test "runtime registration appends entries with deterministic keys" {
     try std.testing.expectEqual(keyForName("test_runtime_mat"), e.key);
     try std.testing.expect(!e.engine_template);
     try std.testing.expectEqual(@as(u32, 3), e.user_ub.?);
-    try std.testing.expect(entry(idx) == entry(idx));
+    try std.testing.expectEqual(e, entry(idx).?);
     // Name path finds runtime entries too.
     try std.testing.expectEqual(idx, indexForName("test_runtime_mat").?);
 

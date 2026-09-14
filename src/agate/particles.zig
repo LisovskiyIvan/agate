@@ -432,6 +432,7 @@ pub const ParticleSystem = struct {
     pub fn reset(self: *ParticleSystem) void {
         self.active_count = 0;
         self.emit_accumulator = 0.0;
+        self.spawns_this_frame = 0;
         // GPU ring: re-anchor the epoch and drop all slots. Old slot records
         // (if the buffer is not cleared) carry spawn times far ahead of the
         // new epoch, so they cull as unborn (t < 0) in the shader.
@@ -440,6 +441,12 @@ pub const ParticleSystem = struct {
         self.gpu_high_water = 0;
         self.gpu_dirty = false;
         self.gpu_dirty_wrapped = false;
+        // Compute mode: the state buffer integrates age per frame, so
+        // re-anchoring the clock is not enough. Schedule an init_all dispatch
+        // to stamp every slot dead (pos_age.w = -1).
+        if (self.compute_state_buffer.id != 0) {
+            self.compute_init_pending = true;
+        }
     }
 
     inline fn randomRange(rnd: std.Random, min_val: f32, max_val: f32) f32 {
@@ -522,7 +529,7 @@ pub const ParticleSystem = struct {
     fn emitGpuSlot(self: *ParticleSystem) void {
         // Slots are provisioned by updateGpu; emissions before the first
         // update (no ring yet) drop instead of allocating on the hot path.
-        if (self.gpu_slots.len < self.capacity) return;
+        if (self.capacity == 0 or self.gpu_slots.len < self.capacity) return;
         const sample = self.sampleSpawn(self.prng.random());
 
         const cap = self.capacity;
@@ -714,7 +721,9 @@ pub const ParticleSystem = struct {
     };
 
     pub fn computeFrameParams(self: *const ParticleSystem, dt: f32) ?ComputeFrameParams {
-        if (self.compute_state_buffer.id == 0) return null;
+        if (self.compute_state_buffer.id == 0 or
+            self.compute_state_view.id == 0 or
+            self.compute_slot_view.id == 0) return null;
         return .{
             .dt = dt,
             .drag = self.drag,
