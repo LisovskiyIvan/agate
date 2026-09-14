@@ -297,13 +297,10 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
 
             const mat = render_mesh.material orelse mesh.material;
             const is_pbr = if (mat) |m| (m == .pbr) else false;
-            const tex_id: u32 = if (mat) |m| switch (m) {
-                .pbr => |p| if (p.albedo_texture) |t| t.view.id else ctx.default_white_id,
-                .standard => |s| if (s.diffuse_texture) |t| t.view.id else ctx.default_white_id,
-                // Shader materials sort with the standard group by their
-                // primary texture (draw pipeline selection happens later).
-                .shader_material => |sm| if (sm.texture) |t| t.view.id else ctx.default_white_id,
-            } else ctx.default_white_id;
+            const tex_id: u32 = if (mat) |m|
+                if (m.primaryTexture()) |t| t.view.id else ctx.default_white_id
+            else
+                ctx.default_white_id;
 
             const d_sq = world_aabb.center().sub(eye).lengthSq();
             const is_decal = render_mesh.is_decal or mesh.is_decal;
@@ -604,4 +601,3 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
     try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
     try std.testing.expectEqual(&mesh2, queues.items.items[0].mesh);
 }
-

@@ -292,25 +292,19 @@ pub const Material = union(enum) {
 
     pub fn isTransparent(self: Material) bool {
         return switch (self) {
-            .standard => |s| s.isTransparent(),
-            .pbr => |p| p.isTransparent(),
-            .shader_material => |sm| sm.isTransparent(),
+            inline else => |m| m.isTransparent(),
         };
     }
 
     pub fn isCutout(self: Material) bool {
         return switch (self) {
-            .standard => |s| s.isCutout(),
-            .pbr => |p| p.isCutout(),
-            .shader_material => |sm| sm.isCutout(),
+            inline else => |m| m.isCutout(),
         };
     }
 
     pub fn isDoubleSided(self: Material) bool {
         return switch (self) {
-            .standard => |s| s.double_sided,
-            .pbr => |p| p.double_sided,
-            .shader_material => |sm| sm.double_sided,
+            inline else => |m| m.double_sided,
         };
     }
 
@@ -319,9 +313,42 @@ pub const Material = union(enum) {
     /// See scene/uniforms.zig alphaCutoffFor.
     pub fn alphaCutoff(self: Material) f32 {
         return switch (self) {
-            .standard => |s| s.alpha_cutoff,
-            .pbr => |p| p.alpha_cutoff,
-            .shader_material => |sm| sm.alpha_cutoff,
+            inline else => |m| m.alpha_cutoff,
+        };
+    }
+
+    /// Display/registration name. Every variant must carry `name` — the
+    /// `inline else` enforces the convention at compile time when a new
+    /// variant is added.
+    pub fn name(self: Material) []const u8 {
+        return switch (self) {
+            inline else => |m| m.name,
+        };
+    }
+
+    /// The single scalar alpha. Same compile-time convention as `name`.
+    pub fn alpha(self: Material) f32 {
+        return switch (self) {
+            inline else => |m| m.alpha,
+        };
+    }
+
+    /// Alpha blending mode. Same compile-time convention as `name`.
+    pub fn alphaMode(self: Material) AlphaMode {
+        return switch (self) {
+            inline else => |m| m.alpha_mode,
+        };
+    }
+
+    /// Semantic base color of the workflow: diffuse_color (standard /
+    /// specular-glossiness), albedo_color (metallic-roughness), tint_color
+    /// (shader material multiply). The storage names stay glTF-faithful per
+    /// workflow; the mapping lives here so call sites never hand-switch.
+    pub fn baseColor3(self: Material) Color3 {
+        return switch (self) {
+            .standard => |s| s.diffuse_color,
+            .pbr => |p| p.albedo_color,
+            .shader_material => |sm| sm.tint_color,
         };
     }
 

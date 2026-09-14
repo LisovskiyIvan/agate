@@ -340,36 +340,35 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
     for (scene.meshes.items) |mesh| {
         const name = try allocator.dupe(u8, mesh.name);
         errdefer allocator.free(name);
-        const material: MaterialEntry = if (mesh.material) |mat| switch (mat) {
-            .standard => |s| .{ .standard = .{
-                .diffuse = .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b },
-                .alpha = s.alpha,
-                .alpha_mode = alphaModeToU8(s.alpha_mode),
-                .alpha_cutoff = s.alpha_cutoff,
-                .double_sided = s.double_sided,
-            } },
-            .pbr => |p| .{ .pbr = .{
-                .albedo = .{ p.albedo_color.r, p.albedo_color.g, p.albedo_color.b },
-                .metallic = p.metallic,
-                .roughness = p.roughness,
-                .emissive = .{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b },
-                .alpha = p.alpha,
-                .alpha_mode = alphaModeToU8(p.alpha_mode),
-                .alpha_cutoff = p.alpha_cutoff,
-                .double_sided = p.double_sided,
-            } },
-            // Documented limitation: shader materials serialize as plain
-            // standard materials carrying the tint/alpha state. The custom
-            // shader registration is not part of the snapshot format; after
-            // a roundtrip the mesh renders with the built-in shader (reassign
+        const material: MaterialEntry = if (mesh.material) |mat| blk: {
+            // PBR keeps its own entry shape (metallic / roughness / emissive).
+            if (mat == .pbr) {
+                const p = mat.pbr;
+                break :blk .{ .pbr = .{
+                    .albedo = .{ p.albedo_color.r, p.albedo_color.g, p.albedo_color.b },
+                    .metallic = p.metallic,
+                    .roughness = p.roughness,
+                    .emissive = .{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b },
+                    .alpha = p.alpha,
+                    .alpha_mode = alphaModeToU8(p.alpha_mode),
+                    .alpha_cutoff = p.alpha_cutoff,
+                    .double_sided = p.double_sided,
+                } };
+            }
+            // Standard-shaped entries for every other variant. Documented
+            // limitation: shader materials serialize as plain standard
+            // materials carrying the tint/alpha state. The custom shader
+            // registration is not part of the snapshot format; after a
+            // roundtrip the mesh renders with the built-in shader (reassign
             // the .shader_material variant after restore if needed).
-            .shader_material => |sm| .{ .standard = .{
-                .diffuse = .{ sm.tint_color.r, sm.tint_color.g, sm.tint_color.b },
-                .alpha = sm.alpha,
-                .alpha_mode = alphaModeToU8(sm.alpha_mode),
-                .alpha_cutoff = sm.alpha_cutoff,
-                .double_sided = sm.double_sided,
-            } },
+            const base = mat.baseColor3();
+            break :blk .{ .standard = .{
+                .diffuse = .{ base.r, base.g, base.b },
+                .alpha = mat.alpha(),
+                .alpha_mode = alphaModeToU8(mat.alphaMode()),
+                .alpha_cutoff = mat.alphaCutoff(),
+                .double_sided = mat.isDoubleSided(),
+            } };
         } else .{ .standard = .{} };
         try meshes.append(allocator, .{
             .name = name,

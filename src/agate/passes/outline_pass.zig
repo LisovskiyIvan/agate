@@ -101,11 +101,7 @@ pub const CutoutInfo = struct {
 pub fn cutoutInfoFor(mesh: *const Mesh) ?CutoutInfo {
     const cutoff = uniforms.alphaCutoffFor(mesh.material);
     if (cutoff <= 0.0) return null;
-    const tex = switch (mesh.material.?) {
-        .standard => |s| s.diffuse_texture,
-        .pbr => |p| p.albedo_texture,
-        .shader_material => |sm| sm.texture,
-    } orelse return null;
+    const tex = mesh.material.?.primaryTexture() orelse return null;
     return .{ .texture = tex, .cutoff = cutoff };
 }
 
