@@ -39,20 +39,12 @@ pub const UIStyleTransition = struct {
 /// Exact field-by-field equality of two resolved styles. Targets come from
 /// the same deterministic cascade every frame, so identical inputs produce
 /// bit-identical styles and exact comparison is the right "did anything
-/// change" test.
+/// change" test. std.meta.eql recurses value structs/optionals field-wise
+/// and compares numerics with == — UIStyle is all value types, so adding a
+/// field automatically extends the comparison instead of silently opting
+/// out of transition invalidation.
 pub fn styleEql(a: UIStyle, b: UIStyle) bool {
-    if (!colorEql(a.background, b.background)) return false;
-    if (!gradientEql(a.gradient, b.gradient)) return false;
-    if (!colorEql(a.border_color, b.border_color)) return false;
-    if (a.border_width != b.border_width) return false;
-    if (a.corner_radius != b.corner_radius) return false;
-    if (a.padding != b.padding) return false;
-    if (a.margin != b.margin) return false;
-    if (!shadowEql(a.shadow, b.shadow)) return false;
-    if (!colorEql(a.text_color, b.text_color)) return false;
-    if (!accentEql(a.accent, b.accent)) return false;
-    if (a.opacity != b.opacity) return false;
-    return true;
+    return std.meta.eql(a, b);
 }
 
 /// Interpolates every numeric/color component of a style. Optional fields
@@ -91,29 +83,6 @@ pub fn sample(entry: *const UIStyleTransition, now_ms: f64) UIStyle {
 
 fn lerpF32(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
-}
-
-fn colorEql(a: Color4, b: Color4) bool {
-    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
-}
-
-fn gradientEql(a: ?UIGradient, b: ?UIGradient) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return colorEql(a.?.top, b.?.top) and colorEql(a.?.bottom, b.?.bottom);
-}
-
-fn shadowEql(a: ?UIShadow, b: ?UIShadow) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return colorEql(a.?.color, b.?.color) and a.?.offset_x == b.?.offset_x and
-        a.?.offset_y == b.?.offset_y and a.?.blur == b.?.blur;
-}
-
-fn accentEql(a: ?Color4, b: ?Color4) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return colorEql(a.?, b.?);
 }
 
 fn lerpGradient(a: ?UIGradient, b: ?UIGradient, bg_a: Color4, bg_b: Color4, t: f32) ?UIGradient {

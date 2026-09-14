@@ -826,77 +826,75 @@ const Reader = struct {
     }
 };
 
+/// Comptime field codec for plain options structs. The explicit
+/// `persisted` name list IS the on-disk contract: list order == byte
+/// order, and fields absent from the list stay session-local instead of
+/// silently changing the format. Field types dispatch at comptime:
+/// bool -> bool8, f32 -> f32le, u32 -> u32le, [3]f32 -> vec3,
+/// enum -> u32le(@intFromEnum). The enum mapping is derived from the
+/// enum declaration itself, so a name<->int mismatch between the writer
+/// and the reader is impossible by construction.
+fn writeField(w: *Writer, value: anytype) !void {
+    const T = @TypeOf(value);
+    if (T == bool) return w.bool8(value);
+    if (T == f32) return w.f32le(value);
+    if (T == u32) return w.u32le(value);
+    if (T == [3]f32) return w.vec3(value);
+    if (@typeInfo(T) == .@"enum") return w.u32le(@intFromEnum(value));
+    @compileError("serialization: unsupported options field type " ++ @typeName(T));
+}
+
+fn readFieldAs(comptime T: type, r: *Reader) DecodeError!T {
+    if (T == bool) return r.readBool();
+    if (T == f32) return r.readF32();
+    if (T == u32) return r.readU32();
+    if (T == [3]f32) return r.readVec3();
+    if (@typeInfo(T) == .@"enum") {
+        const raw = try r.readU32();
+        inline for (@typeInfo(T).@"enum".fields) |f| {
+            if (f.value == raw) return @enumFromInt(f.value);
+        }
+        return error.Truncated;
+    }
+    @compileError("serialization: unsupported options field type " ++ @typeName(T));
+}
+
+fn writeOptions(w: *Writer, options: anytype, comptime persisted: []const []const u8) !void {
+    inline for (persisted) |name| {
+        try writeField(w, @field(options, name));
+    }
+}
+
+fn readOptions(comptime T: type, r: *Reader, comptime persisted: []const []const u8) DecodeError!T {
+    var out: T = .{};
+    inline for (persisted) |name| {
+        @field(out, name) = try readFieldAs(@TypeOf(@field(out, name)), r);
+    }
+    return out;
+}
+
+/// PostProcessOptions fields persisted in save states, in byte order.
+/// Anything not listed here (transient knobs like bloom_pyramid, dof_*,
+/// grade_*) is rebuilt from defaults on load.
+const postprocess_persisted = [_][]const u8{
+    "enabled",              "exposure",           "tonemapping",
+    "bloom_enabled",        "bloom_threshold",    "bloom_intensity",
+    "bloom_radius",         "vignette_enabled",   "vignette_intensity",
+    "vignette_radius",      "saturation",         "contrast",
+    "chromatic_aberration", "fxaa_enabled",       "fog_enabled",
+    "fog_density",          "fog_height_falloff", "fog_start_distance",
+    "fog_color",            "fog_sun_scattering", "ssr_enabled",
+    "ssr_intensity",        "ssr_max_distance",   "ssr_thickness",
+    "sharpen_enabled",      "sharpen_amount",     "grain_enabled",
+    "grain_intensity",      "temperature",        "tint",
+};
+
 fn writePostProcess(w: *Writer, pp: *const PostProcessOptions) !void {
-    try w.bool8(pp.enabled);
-    try w.f32le(pp.exposure);
-    try w.u32le(@intFromEnum(pp.tonemapping));
-    try w.bool8(pp.bloom_enabled);
-    try w.f32le(pp.bloom_threshold);
-    try w.f32le(pp.bloom_intensity);
-    try w.f32le(pp.bloom_radius);
-    try w.bool8(pp.vignette_enabled);
-    try w.f32le(pp.vignette_intensity);
-    try w.f32le(pp.vignette_radius);
-    try w.f32le(pp.saturation);
-    try w.f32le(pp.contrast);
-    try w.f32le(pp.chromatic_aberration);
-    try w.bool8(pp.fxaa_enabled);
-    try w.bool8(pp.fog_enabled);
-    try w.f32le(pp.fog_density);
-    try w.f32le(pp.fog_height_falloff);
-    try w.f32le(pp.fog_start_distance);
-    try w.vec3(pp.fog_color);
-    try w.f32le(pp.fog_sun_scattering);
-    try w.bool8(pp.ssr_enabled);
-    try w.f32le(pp.ssr_intensity);
-    try w.f32le(pp.ssr_max_distance);
-    try w.f32le(pp.ssr_thickness);
-    try w.bool8(pp.sharpen_enabled);
-    try w.f32le(pp.sharpen_amount);
-    try w.bool8(pp.grain_enabled);
-    try w.f32le(pp.grain_intensity);
-    try w.f32le(pp.temperature);
-    try w.f32le(pp.tint);
+    try writeOptions(w, pp.*, &postprocess_persisted);
 }
 
 fn readPostProcess(r: *Reader) DecodeError!PostProcessOptions {
-    var pp = PostProcessOptions{};
-    pp.enabled = try r.readBool();
-    pp.exposure = try r.readF32();
-    pp.tonemapping = switch (try r.readU32()) {
-        0 => .none,
-        1 => .aces,
-        2 => .reinhard,
-        else => return error.Truncated,
-    };
-    pp.bloom_enabled = try r.readBool();
-    pp.bloom_threshold = try r.readF32();
-    pp.bloom_intensity = try r.readF32();
-    pp.bloom_radius = try r.readF32();
-    pp.vignette_enabled = try r.readBool();
-    pp.vignette_intensity = try r.readF32();
-    pp.vignette_radius = try r.readF32();
-    pp.saturation = try r.readF32();
-    pp.contrast = try r.readF32();
-    pp.chromatic_aberration = try r.readF32();
-    pp.fxaa_enabled = try r.readBool();
-    pp.fog_enabled = try r.readBool();
-    pp.fog_density = try r.readF32();
-    pp.fog_height_falloff = try r.readF32();
-    pp.fog_start_distance = try r.readF32();
-    pp.fog_color = try r.readVec3();
-    pp.fog_sun_scattering = try r.readF32();
-    pp.ssr_enabled = try r.readBool();
-    pp.ssr_intensity = try r.readF32();
-    pp.ssr_max_distance = try r.readF32();
-    pp.ssr_thickness = try r.readF32();
-    pp.sharpen_enabled = try r.readBool();
-    pp.sharpen_amount = try r.readF32();
-    pp.grain_enabled = try r.readBool();
-    pp.grain_intensity = try r.readF32();
-    pp.temperature = try r.readF32();
-    pp.tint = try r.readF32();
-    return pp;
+    return readOptions(PostProcessOptions, r, &postprocess_persisted);
 }
 
 /// Serializes a snapshot into a freshly allocated byte buffer (little-endian

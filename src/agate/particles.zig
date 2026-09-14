@@ -93,6 +93,13 @@ pub const GpuParticleSlot = extern struct {
     size_rotation: [4]f32,
 };
 
+comptime {
+    // Vertex-shader ABI (particle_gpu program, five FLOAT4 attributes).
+    // Compile-time guarantee instead of a runtime test that only some
+    // build configurations ever run.
+    if (@sizeOf(GpuParticleSlot) != 5 * 16) @compileError("GpuParticleSlot layout drifted from particle.glsl");
+}
+
 /// Age of a slot relative to the render clock. `alive` is false for unborn
 /// (spawn in the future) and dead (t >= 1) slots; the shader collapses those
 /// into a degenerate off-screen triangle.
