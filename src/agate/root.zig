@@ -150,6 +150,7 @@ pub const TonemappingType = postprocess.TonemappingType;
 pub const ssao = @import("ssao.zig");
 pub const SSAOOptions = ssao.SSAOOptions;
 
+pub const jobs = @import("jobs.zig");
 pub const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;

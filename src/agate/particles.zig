@@ -8,6 +8,7 @@ const Color4 = math.Color4;
 const Mat4 = math.Mat4;
 const Texture = @import("texture.zig").Texture;
 const Mesh = @import("mesh.zig").Mesh;
+const jobs = @import("jobs.zig");
 
 pub const ParticleBlendMode = enum {
     additive,
@@ -249,6 +250,14 @@ pub const ParticleSystem = struct {
     allocator: std.mem.Allocator,
     particles: []Particle,
     instances: []ParticleInstanceData,
+    /// Scratch survival flags for the parallel CPU integration (phase A
+    /// writes them, the serial compaction phase consumes them). Allocated
+    /// alongside `particles`; OOM surfaces from init, never at update time.
+    alive_scratch: []u8 = &.{},
+    /// Optional per-system override of the worker pool used by the CPU
+    /// integration. Null falls back to `jobs.global`, then to serial
+    /// execution — a scheduling detail, never a behavior change.
+    thread_pool: ?*jobs.Pool = null,
     capacity: usize,
     active_count: usize = 0,
 
@@ -343,6 +352,9 @@ pub const ParticleSystem = struct {
         const instances = try allocator.alloc(ParticleInstanceData, capacity);
         errdefer allocator.free(instances);
 
+        const alive_scratch = try allocator.alloc(u8, capacity);
+        errdefer allocator.free(alive_scratch);
+
         const buf = sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = capacity * @sizeOf(ParticleInstanceData),
@@ -353,6 +365,7 @@ pub const ParticleSystem = struct {
             .allocator = allocator,
             .particles = particles,
             .instances = instances,
+            .alive_scratch = alive_scratch,
             .capacity = capacity,
             .active_count = 0,
             .instance_buffer = buf,
@@ -380,6 +393,7 @@ pub const ParticleSystem = struct {
         }
         self.allocator.free(self.particles);
         self.allocator.free(self.instances);
+        if (self.alive_scratch.len > 0) self.allocator.free(self.alive_scratch);
     }
 
     pub fn start(self: *ParticleSystem) void {
@@ -534,8 +548,15 @@ pub const ParticleSystem = struct {
         return mesh.getWorldMatrix();
     }
 
-    /// GPU-free simulation step: emission, physics, rotation integration and
-    /// instance-data fill. `update` calls this and then uploads to the GPU.
+    /// CPU simulation step, structured as three phases so the heavy work is
+    /// data-parallel while the results stay bit-identical to the legacy
+    /// fused loop for any worker count:
+    ///   A (parallel)  — age + integrate every live slot exactly once,
+    ///                   recording survival in `alive_scratch`;
+    ///   B (serial)    — legacy swap-compaction of dead slots;
+    ///   C (parallel)  — fill render instance data for the compacted range.
+    /// Each slot is touched only through its own index in A and C, so no
+    /// locks are needed; emission (PRNG-driven) stays serial up front.
     pub fn updateCpu(self: *ParticleSystem, dt: f32) void {
         if (self.is_emitting and self.emit_rate > 0.0) {
             self.emit_accumulator += dt * self.emit_rate;
@@ -548,55 +569,38 @@ pub const ParticleSystem = struct {
         const emitter_matrix = self.resolveEmitterMatrix();
         const emitter_scale = if (emitter_matrix) |m| worldScaleFactor(m) else 1.0;
         const grav_dt = self.gravity.scale(dt);
+
+        const pool = self.thread_pool orelse jobs.global;
+
+        // Phase A: integrate. Each worker owns its index range exclusively.
+        var ictx = IntegrateCtx{ .ps = self, .grav_dt = grav_dt, .dt = dt };
+        jobs.parallelFor(pool, IntegrateCtx, &ictx, integrateRange, self.active_count);
+
+        // Phase B: compact. Same swap-with-last recycling as the legacy
+        // loop (dead slot at i replaced by the last integrated slot).
+        const alive = self.alive_scratch;
         var i: usize = 0;
         while (i < self.active_count) {
-            var p = &self.particles[i];
-            p.age += dt;
-            if (p.age >= p.lifetime) {
-                // Swap with last active particle
+            if (alive[i] == 0) {
                 self.active_count -= 1;
                 if (i < self.active_count) {
                     self.particles[i] = self.particles[self.active_count];
+                    alive[i] = alive[self.active_count];
                     continue;
                 } else {
                     break;
                 }
             }
-
-            // Physics update (hoisted gravity delta + scaled velocity).
-            // In local_space mode gravity/velocity integrate in emitter-local
-            // units; the world transform applies below at instance-fill time.
-            p.velocity = p.velocity.add(grav_dt);
-            p.position = p.position.add(p.velocity.scale(dt));
-            p.rotation = normalizeAngleDeg(p.rotation + p.angular_velocity * dt);
-
-            const t = p.age / p.lifetime;
-            const current_size = p.size + (p.size_end - p.size) * t;
-            const current_color = Color4.lerp(p.color, p.color_end, t);
-            const frame = spritesheetFrameForAge(
-                p.age,
-                p.lifetime,
-                self.spritesheet_columns,
-                self.spritesheet_rows,
-                self.spritesheet_loops,
-            );
-            const uv = spritesheetUvRect(frame, self.spritesheet_columns, self.spritesheet_rows);
-
-            var render_pos = p.position;
-            var render_size = current_size;
-            if (emitter_matrix) |m| {
-                render_pos = localToWorld(m, p.position);
-                render_size = current_size * emitter_scale;
-            }
-
-            self.instances[i] = .{
-                .pos_size = .{ render_pos.x, render_pos.y, render_pos.z, render_size },
-                .color = current_color.toArray(),
-                .uv_offset_scale = uv,
-                .rotation_misc = .{ rotationToRadians(p.rotation), 0.0, 0.0, 0.0 },
-            };
             i += 1;
         }
+
+        // Phase C: render-data fill over the compacted range.
+        var fctx = FillCtx{
+            .ps = self,
+            .emitter_matrix = emitter_matrix,
+            .emitter_scale = emitter_scale,
+        };
+        jobs.parallelFor(pool, FillCtx, &fctx, fillRange, self.active_count);
     }
 
     /// Lazily provisions the slot ring. `false` means allocation failure;
@@ -674,6 +678,116 @@ pub const ParticleSystem = struct {
     }
 };
 
+/// Phase-A payload: per-slot integration. A slot touches only `particles[i]`
+/// and `alive_scratch[i]`, so workers own disjoint ranges without locks.
+const IntegrateCtx = struct {
+    ps: *ParticleSystem,
+    grav_dt: Vec3,
+    dt: f32,
+};
+
+fn integrateRange(ctx: *IntegrateCtx, start: usize, end: usize) void {
+    const ps = ctx.ps;
+    for (start..end) |i| {
+        const p = &ps.particles[i];
+        p.age += ctx.dt;
+        if (p.age >= p.lifetime) {
+            ps.alive_scratch[i] = 0;
+            continue;
+        }
+        ps.alive_scratch[i] = 1;
+        // Physics update (hoisted gravity delta + scaled velocity).
+        // In local_space mode gravity/velocity integrate in emitter-local
+        // units; the world transform applies at instance-fill time.
+        p.velocity = p.velocity.add(ctx.grav_dt);
+        p.position = p.position.add(p.velocity.scale(ctx.dt));
+        p.rotation = normalizeAngleDeg(p.rotation + p.angular_velocity * ctx.dt);
+    }
+}
+
+/// Phase-C payload: render instance fill. Reads `particles[i]` (already
+/// compacted), writes `instances[i]` — again index-exclusive.
+const FillCtx = struct {
+    ps: *ParticleSystem,
+    emitter_matrix: ?Mat4,
+    emitter_scale: f32,
+};
+
+fn fillRange(ctx: *FillCtx, start: usize, end: usize) void {
+    const ps = ctx.ps;
+    for (start..end) |i| {
+        const p = &ps.particles[i];
+        const t = p.age / p.lifetime;
+        const current_size = p.size + (p.size_end - p.size) * t;
+        const current_color = Color4.lerp(p.color, p.color_end, t);
+        const frame = spritesheetFrameForAge(
+            p.age,
+            p.lifetime,
+            ps.spritesheet_columns,
+            ps.spritesheet_rows,
+            ps.spritesheet_loops,
+        );
+        const uv = spritesheetUvRect(frame, ps.spritesheet_columns, ps.spritesheet_rows);
+
+        var render_pos = p.position;
+        var render_size = current_size;
+        if (ctx.emitter_matrix) |m| {
+            render_pos = localToWorld(m, p.position);
+            render_size = current_size * ctx.emitter_scale;
+        }
+
+        ps.instances[i] = .{
+            .pos_size = .{ render_pos.x, render_pos.y, render_pos.z, render_size },
+            .color = current_color.toArray(),
+            .uv_offset_scale = uv,
+            .rotation_misc = .{ rotationToRadians(p.rotation), 0.0, 0.0, 0.0 },
+        };
+    }
+}
+
+test "two-phase CPU update is worker-count invariant" {
+    const a = std.testing.allocator;
+    const pool = try jobs.Pool.init(a, 2);
+    defer pool.deinit();
+
+    // Identical seed + config; the only difference is the execution path:
+    // `serial` runs inline (no pool), `parallel` fork-joins once the live
+    // count crosses jobs.Pool.min_len_for_workers.
+    var serial = try makeTestSystem(a, 16_384);
+    defer freeTestSystem(&serial);
+    var parallel = try makeTestSystem(a, 16_384);
+    defer freeTestSystem(&parallel);
+    parallel.thread_pool = pool;
+
+    for ([2]*ParticleSystem{ &serial, &parallel }) |ps| {
+        ps.gravity = Vec3.new(0.0, -3.0, 0.0);
+        ps.emit_rate = 8000.0;
+        ps.is_emitting = true;
+    }
+
+    var frame: usize = 0;
+    while (frame < 40) : (frame += 1) {
+        serial.updateCpu(1.0 / 60.0);
+        parallel.updateCpu(1.0 / 60.0);
+        try std.testing.expectEqual(serial.active_count, parallel.active_count);
+        const live = serial.active_count;
+        try std.testing.expect(std.mem.eql(
+            u8,
+            std.mem.sliceAsBytes(serial.particles[0..live]),
+            std.mem.sliceAsBytes(parallel.particles[0..live]),
+        ));
+        try std.testing.expect(std.mem.eql(
+            u8,
+            std.mem.sliceAsBytes(serial.instances[0..live]),
+            std.mem.sliceAsBytes(parallel.instances[0..live]),
+        ));
+    }
+    // Past the pool threshold with real deaths: proves phase A/B/C actually
+    // forked (not just the inline fallback both systems would share on a
+    // small range).
+    try std.testing.expect(serial.active_count > jobs.Pool.min_len_for_workers);
+}
+
 // --- GPU-free test helpers & tests (no sg.* calls below this line) ---
 
 fn makeTestSystem(allocator: std.mem.Allocator, capacity: usize) !ParticleSystem {
@@ -681,11 +795,14 @@ fn makeTestSystem(allocator: std.mem.Allocator, capacity: usize) !ParticleSystem
     errdefer allocator.free(parts);
     const insts = try allocator.alloc(ParticleInstanceData, capacity);
     errdefer allocator.free(insts);
+    const scratch = try allocator.alloc(u8, capacity);
+    errdefer allocator.free(scratch);
     return ParticleSystem{
         .name = "test",
         .allocator = allocator,
         .particles = parts,
         .instances = insts,
+        .alive_scratch = scratch,
         .capacity = capacity,
         .instance_buffer = .{},
         .prng = std.Random.DefaultPrng.init(42),
@@ -696,6 +813,7 @@ fn freeTestSystem(ps: *ParticleSystem) void {
     if (ps.gpu_slots.len > 0) ps.allocator.free(ps.gpu_slots);
     ps.allocator.free(ps.particles);
     ps.allocator.free(ps.instances);
+    if (ps.alive_scratch.len > 0) ps.allocator.free(ps.alive_scratch);
 }
 
 test "spritesheet frames across ages and loops" {

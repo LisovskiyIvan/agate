@@ -59,6 +59,9 @@ export fn init() callconv(.c) void {
         .shader_pool_size = 128,
     });
 
+    // Worker pool for data-parallel systems (particles CPU integration).
+    // Null on failure: everything degrades to serial execution by design.
+    z.jobs.global = z.jobs.Pool.init(gpa.allocator(), z.jobs.Pool.recommendedWorkerCount()) catch null;
     const allocator = gpa.allocator();
     scene = z.Scene.init(allocator);
 
@@ -136,6 +139,10 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
+    if (z.jobs.global) |pool| {
+        pool.deinit();
+        z.jobs.global = null;
+    }
     scene.deinit();
     _ = gpa.deinit();
     sg.shutdown();
