@@ -38,18 +38,41 @@ pub const PendingTexture = struct {
     /// Set by the worker before publishing `.failed`; read after observing
     /// that state. The state store is the release barrier.
     err: ?anyerror = null,
+    /// Owned source: `path` = file on disk; `memory` = owned copy of an
+    /// embedded payload (glTF buffer views die with the cgltf data, so the
+    /// bytes are copied at request time and freed right after decode).
     path: []u8 = &.{},
+    memory: ?[]u8 = null,
     options: Texture.Options = .{},
     decode_opts: Texture.DecodeOptions = .{},
-    /// When set, `drain` patches the uploaded texture pointer into here so
-    /// materials pick it up without re-wiring (in-place update propagates:
-    /// draws read the material every frame).
-    target: ?*Texture = null,
+    /// Material slots to patch on upload (e.g. `&pbr.albedo_texture`).
+    /// Several materials may share one image. Registration happens on the
+    /// posting thread before the next `drain`; both run on the sg thread,
+    /// so no lock is needed here.
+    targets: std.ArrayListUnmanaged(*?Texture) = .empty,
     allocator: std.mem.Allocator = undefined,
     raw: Texture.RawTexture = .{},
     texture: ?Texture = null,
 
+    pub fn addTarget(self: *PendingTexture, slot: *?Texture) void {
+        self.targets.append(self.allocator, slot) catch {};
+    }
+
     fn decode(self: *PendingTexture) void {
+        if (self.memory) |bytes| {
+            defer {
+                self.allocator.free(bytes);
+                self.memory = null;
+            }
+            if (Texture.decodeMemory(self.allocator, bytes, self.decode_opts)) |raw| {
+                self.raw = raw;
+                self.state.store(.ready, .release);
+            } else |e| {
+                self.err = e;
+                self.state.store(.failed, .release);
+            }
+            return;
+        }
         const raw = Texture.decodeFile(self.allocator, self.path, self.decode_opts) catch |e| {
             self.err = e;
             self.state.store(.failed, .release);
@@ -67,6 +90,12 @@ pub const PendingTexture = struct {
         const t = self.texture.?;
         self.texture = null;
         return t;
+    }
+
+    fn deinitResources(self: *PendingTexture) void {
+        if (self.path.len > 0) self.allocator.free(self.path);
+        if (self.memory) |m| self.allocator.free(m);
+        self.targets.deinit(self.allocator);
     }
 };
 
@@ -105,20 +134,20 @@ pub const UploadQueue = struct {
                 .ready => p.raw.deinit(self.allocator),
                 else => {},
             }
-            if (p.path.len > 0) self.allocator.free(p.path);
+            p.deinitResources();
             self.allocator.destroy(p);
         }
         self.pending.deinit(self.allocator);
     }
 
     /// Starts an async load of an image file. The returned slot stays valid
-    /// until `release` (or queue `deinit`).
+    /// until `release` (or queue `deinit`); register targets via
+    /// `PendingTexture.addTarget` before the next `drain`.
     pub fn requestFile(
         self: *UploadQueue,
         path: []const u8,
         options: Texture.Options,
         decode_opts: Texture.DecodeOptions,
-        target: ?*Texture,
     ) !*PendingTexture {
         const p = try self.allocator.create(PendingTexture);
         errdefer self.allocator.destroy(p);
@@ -126,10 +155,37 @@ pub const UploadQueue = struct {
             .path = try self.allocator.dupe(u8, path),
             .options = options,
             .decode_opts = decode_opts,
-            .target = target,
             .allocator = self.allocator,
         };
         errdefer self.allocator.free(p.path);
+
+        lockSpin(&self.mutex);
+        self.pending.append(self.allocator, p) catch |e| {
+            self.mutex.unlock();
+            return e;
+        };
+        self.mutex.unlock();
+
+        self.runner.post(p, decodeTask);
+        return p;
+    }
+
+    /// Starts an async decode of an owned embedded payload. `bytes`
+    /// ownership transfers to the queue (freed right after decode).
+    pub fn requestMemory(
+        self: *UploadQueue,
+        bytes: []u8,
+        options: Texture.Options,
+        decode_opts: Texture.DecodeOptions,
+    ) !*PendingTexture {
+        const p = try self.allocator.create(PendingTexture);
+        errdefer self.allocator.destroy(p);
+        p.* = .{
+            .memory = bytes,
+            .options = options,
+            .decode_opts = decode_opts,
+            .allocator = self.allocator,
+        };
 
         lockSpin(&self.mutex);
         self.pending.append(self.allocator, p) catch |e| {
@@ -157,7 +213,9 @@ pub const UploadQueue = struct {
             if (p.state.load(.acquire) != .ready) continue;
             p.texture = Texture.fromRaw(&p.raw, p.options);
             p.raw.deinit(p.allocator);
-            if (p.target) |slot| slot.* = p.texture.?;
+            for (p.targets.items) |slot| slot.* = p.texture.?;
+            p.targets.deinit(p.allocator);
+            p.targets = .empty;
             p.state.store(.uploaded, .release);
             uploaded += 1;
         }
@@ -178,7 +236,7 @@ pub const UploadQueue = struct {
             }
         }
         self.mutex.unlock();
-        if (p.path.len > 0) self.allocator.free(p.path);
+        p.deinitResources();
         self.allocator.destroy(p);
     }
 };
@@ -205,7 +263,7 @@ test "requestFile reports missing files through the worker" {
     var queue = try UploadQueue.init(a, 1);
     defer queue.deinit();
 
-    const p = try queue.requestFile("/definitely/missing/image.png", .{}, .{}, null);
+    const p = try queue.requestFile("/definitely/missing/image.png", .{}, .{});
     try testing.expect(waitForState(p, &.{.failed}));
     try testing.expect(p.err != null);
 
@@ -242,7 +300,7 @@ test "real PNG decodes to ready off-thread; drain reports nothing without sg" {
     }
     try testing.expect(path.len > 0);
 
-    const p = try queue.requestFile(path, .{}, .{ .gen_mipmaps = true }, null);
+    const p = try queue.requestFile(path, .{}, .{ .gen_mipmaps = true });
     try testing.expect(waitForState(p, &.{ .ready, .failed }));
     try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
     try testing.expect(p.raw.width > 0);
@@ -267,7 +325,7 @@ test "shutdown with in-flight decodes frees without use-after-free" {
     for (0..16) |i| {
         var buf: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "/missing/{d}.png", .{i});
-        _ = try queue.requestFile(path, .{}, .{}, null);
+        _ = try queue.requestFile(path, .{}, .{});
     }
     queue.deinit();
 }
@@ -279,7 +337,7 @@ test "many parallel loads all report terminal states" {
 
     var slots: [8]*PendingTexture = undefined;
     for (&slots) |*slot| {
-        slot.* = try queue.requestFile("/definitely/missing/image.png", .{}, .{}, null);
+        slot.* = try queue.requestFile("/definitely/missing/image.png", .{}, .{});
     }
     for (slots) |p| {
         try testing.expect(waitForState(p, &.{.failed}));

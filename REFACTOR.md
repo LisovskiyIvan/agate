@@ -51,28 +51,27 @@ job owns a disjoint index range.
   ticks a single manager. Parallel-safe in shape; not routed through the
   pool yet — real scenes hold single-digit entities.
 
-### [~] Stage 2 — async assets & uploads (queue landed, loader integration next)
+### [x] Stage 2 — async assets & uploads (loader integration landed)
 
 - [x] `jobs.TaskRunner` — fire-and-forget tasks on dedicated threads;
   deliberately separate from `Pool.forkJoin` (forkJoin spins its callers,
   so long tasks must never share its workers). Shutdown drains: join
   guarantees every posted task finished writing.
-- [x] `assets.UploadQueue` — decode off-thread (`Texture.decodeFile`, the
-  documented GPU-free path), `drain()` on the sg-context thread uploads
-  via `Texture.fromRaw` and patches an optional live `target: *Texture`
-  slot (a material's texture field) so draws pick the real texture up
-  automatically. Slots: `PendingTexture` with atomic state machine
-  (decoding → ready → uploaded/taken | failed), `take`/`release`
-  ownership. Tested including real-PNG decode and shutdown-with-in-flight.
-- [~] Loader integration: `decodeImagesInParallel` (pre-existing) already
-  parallelizes glTF image decode. Measured sandbox boot (Debug build):
-  DamagedHelmet 169 ms total, **117 ms decode**, spawn 6 ms, sg upload ≈ 0;
-  LightsPunctualLamp decode 122 ms. Decode is bounded by the largest
-  single embedded image (stb/ktx2 decode is monolithic — no intra-image
-  parallelism), so the remaining lever is moving it off the critical
-  path: async glTF material fill-in via `UploadQueue` targets (materials
-  read textures every frame, in-place patch propagates; not-yet-ready
-  slots render with the existing default-white fallback). Next slice.
+- [x] Loader integration: `LoadOptions.async_textures` (opt-in; sandbox
+  demos use it). Sync mode unchanged — fork-join predecode, single hitch.
+  Async mode skips the predecode; materials start with null texture slots
+  (the engine's existing default-white fallback renders) and
+  `AsyncTexCtx` registers each slot as an `UploadQueue` patch target —
+  one background decode per image+srgb pair, embedded bytes copied at
+  request time (cgltf data dies at appendGlb return). `Scene` owns the
+  queue: drained at the top of `render()` so patched textures draw the
+  same frame; deinit'd FIRST in `Scene.deinit` so in-flight decodes join
+  before any targeted material is freed. Emissive white-override now
+  keys on "texture requested" so async loads keep the factor-hack
+  semantics. Measured (Debug): DamagedHelmet critical-path 169 → 10 ms,
+  Fox 41 → 11 ms; sandbox frame loop verified uploading +7 textures in
+  one drain. NOTE: this path is only fully covered by app smoke — tests
+  have no GL context and cannot reach the uploaded state.
 - [ ] Serialization save off-thread: needs a scene-quiesce or snapshot
   story first (state holds pointers; plain capture-then-marshal is unsafe
   while the main thread mutates).

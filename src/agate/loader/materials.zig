@@ -10,6 +10,7 @@ const Scene = @import("../scene.zig").Scene;
 const Material = @import("../material.zig").Material;
 const UvTransform = @import("../material.zig").UvTransform;
 const Texture = @import("../texture.zig").Texture;
+const assets = @import("../assets.zig");
 
 const DecodeJob = struct {
     allocator: std.mem.Allocator,
@@ -197,6 +198,103 @@ pub fn uvTransformFromView(view: anytype) UvTransform {
     };
 }
 
+/// Stage 2: schedules background decodes for images the sync path could
+/// not serve, registering material slots as patch targets. One decode per
+/// image+srgb pair (`seen`), even when several materials share it.
+/// Embedded buffer-view bytes are copied at registration time — the cgltf
+/// data dies when appendGlb returns, long before the worker decodes.
+pub const AsyncTexCtx = struct {
+    scene: *Scene,
+    gltf: *c.cgltf_data,
+    base_dir: ?[]const u8,
+    queue: *assets.UploadQueue,
+    /// image_index * 2 + srgb -> in-flight request
+    seen: std.AutoHashMapUnmanaged(usize, *assets.PendingTexture) = .empty,
+
+    pub fn init(scene: *Scene, gltf: *c.cgltf_data, base_dir: ?[]const u8, queue: *assets.UploadQueue) AsyncTexCtx {
+        return .{ .scene = scene, .gltf = gltf, .base_dir = base_dir, .queue = queue };
+    }
+
+    pub fn deinit(self: *AsyncTexCtx) void {
+        self.seen.deinit(self.scene.allocator);
+    }
+
+    /// Never fails the load: allocation or extraction problems leave the
+    /// slot null (default-white), matching the sync path's failure mode.
+    pub fn register(self: *AsyncTexCtx, view: [*c]const c.cgltf_texture_view, srgb: bool, slot: *?Texture) void {
+        if (view == null) return;
+        if (view.*.texture == null) return;
+        const tex = view.*.texture.?;
+        if (tex.*.image == null) return;
+        const img_idx = imageIndexFor(self.gltf, tex.*.image.?) orelse return;
+        const key = img_idx * 2 + (if (srgb) @as(usize, 1) else @as(usize, 0));
+
+        if (self.seen.get(key)) |existing| {
+            existing.addTarget(slot);
+            return;
+        }
+
+        var tex_options: Texture.Options = .{};
+        if (tex.*.sampler) |smp| {
+            applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &tex_options);
+        }
+        tex_options.srgb_to_linear = srgb;
+        const decode_opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = srgb };
+
+        const img = &self.gltf.images[img_idx];
+        var pending: ?*assets.PendingTexture = null;
+        if (img.buffer_view) |bv| {
+            if (bv.*.buffer != null and bv.*.buffer.*.data != null) {
+                const raw_buf: [*]const u8 = @ptrCast(bv.*.buffer.*.data);
+                const bytes = self.scene.allocator.dupe(u8, (raw_buf + bv.*.offset)[0..bv.*.size]) catch return;
+                pending = self.queue.requestMemory(bytes, tex_options, decode_opts) catch {
+                    self.scene.allocator.free(bytes);
+                    return;
+                };
+            }
+        } else if (img.uri) |uri_c| {
+            const uri = std.mem.span(uri_c);
+            const path = if (self.base_dir) |dir|
+                std.fs.path.join(self.scene.allocator, &.{ dir, uri }) catch return
+            else
+                self.scene.allocator.dupe(u8, uri) catch return;
+            pending = self.queue.requestFile(path, tex_options, decode_opts) catch {
+                self.scene.allocator.free(path);
+                return;
+            };
+        } else return;
+
+        pending.?.addTarget(slot);
+        self.seen.put(self.scene.allocator, key, pending.?) catch {};
+    }
+};
+
+/// Sync load with an async fallback: on success the texture lands in
+/// `slot`; otherwise a background decode is scheduled for it (async mode)
+/// or the slot stays null (sync mode). Returns true when the slot has a
+/// texture now or will get one later.
+pub fn loadTextureSlot(
+    scene: *Scene,
+    gltf: *c.cgltf_data,
+    image_cache: []?Texture,
+    decoded: []?Texture.RawTexture,
+    view: [*c]const c.cgltf_texture_view,
+    base_dir: ?[]const u8,
+    srgb_to_linear: bool,
+    slot: *?Texture,
+    actx: ?*AsyncTexCtx,
+) bool {
+    if (loadTextureFromView(scene, gltf, image_cache, decoded, view, base_dir, srgb_to_linear, actx == null)) |t| {
+        slot.* = t;
+        return true;
+    }
+    if (actx) |a| {
+        a.register(view, srgb_to_linear, slot);
+        return true;
+    }
+    return false;
+}
+
 pub fn loadTextureFromView(
     scene: *Scene,
     gltf: *c.cgltf_data,
@@ -205,6 +303,7 @@ pub fn loadTextureFromView(
     view: [*c]const c.cgltf_texture_view,
     base_dir: ?[]const u8,
     srgb_to_linear: bool,
+    allow_sync_fallback: bool,
 ) ?Texture {
     if (view == null) return null;
     if (view.*.texture == null) return null;
@@ -247,6 +346,8 @@ pub fn loadTextureFromView(
             }
         }
     }
+
+    if (!allow_sync_fallback) return null;
 
     // 1. Embedded buffer view (typical in GLB or embedded GLTF)
     if (img.*.buffer_view) |bv| {
@@ -296,6 +397,7 @@ pub fn loadMaterials(
     materials: []?Material,
     image_cache: []?Texture,
     decoded: []?Texture.RawTexture,
+    actx: ?*AsyncTexCtx,
 ) !void {
     for (0..gltf.materials_count) |i| {
         const src_mat = &gltf.materials[i];
@@ -319,25 +421,25 @@ pub fn loadMaterials(
 
             // Color slots load sRGB -> linear (glTF: textures are sRGB,
             // factors linear); data slots stay linear.
-            pbr_mat.albedo_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true);
+            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true, &pbr_mat.albedo_texture, actx);
             pbr_mat.albedo_uv_transform = uvTransformFromView(&pbr.base_color_texture);
-            pbr_mat.metallic_roughness_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false);
+            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false, &pbr_mat.metallic_roughness_texture, actx);
             pbr_mat.metallic_roughness_uv_transform = uvTransformFromView(&pbr.metallic_roughness_texture);
         }
 
-        pbr_mat.normal_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false);
+        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false, &pbr_mat.normal_texture, actx);
         if (src_mat.normal_texture.texture != null) {
             // cgltf defaults texture-view scale to 1.0 (cgltf.h parse).
             pbr_mat.normal_scale = src_mat.normal_texture.scale;
         }
         pbr_mat.normal_uv_transform = uvTransformFromView(&src_mat.normal_texture);
-        pbr_mat.occlusion_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false);
+        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false, &pbr_mat.occlusion_texture, actx);
         pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
         pbr_mat.occlusion_uv_transform = uvTransformFromView(&src_mat.occlusion_texture);
 
-        pbr_mat.emissive_texture = loadTextureFromView(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true);
+        const emissive_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true, &pbr_mat.emissive_texture, actx);
         pbr_mat.emissive_uv_transform = uvTransformFromView(&src_mat.emissive_texture);
-        if (pbr_mat.emissive_texture != null and
+        if ((pbr_mat.emissive_texture != null or emissive_textured) and
             src_mat.emissive_factor[0] == 0.0 and
             src_mat.emissive_factor[1] == 0.0 and
             src_mat.emissive_factor[2] == 0.0)
@@ -401,7 +503,7 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     var out: [3]?Material = .{ null, null, null };
     const empty_tex: []?Texture = &.{};
     const empty_raw: []?Texture.RawTexture = &.{};
-    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_raw);
+    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_raw, null);
 
     try std.testing.expect(out[0].? == .pbr);
     try std.testing.expect(out[0].?.pbr.alpha_mode == .@"opaque");
@@ -499,7 +601,7 @@ test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
     // cleanly returns null without touching the GPU.
     var tex_cache: [2]?Texture = .{ null, null };
     var raw_cache: [1]?Texture.RawTexture = .{null};
-    try loadMaterials(&scene, &data, null, &out, &tex_cache, &raw_cache);
+    try loadMaterials(&scene, &data, null, &out, &tex_cache, &raw_cache, null);
 
     try std.testing.expectEqual(@as(f32, 1.0), out[0].?.pbr.normal_scale);
     try std.testing.expectEqual(@as(f32, 0.5), out[1].?.pbr.normal_scale);
@@ -581,7 +683,7 @@ test "loadMaterials maps texture transforms into the PBR slots (GPU-free)" {
     data.materials_count = src.len;
 
     var out: [1]?Material = .{null};
-    try loadMaterials(&scene, &data, null, &out, &.{}, &.{});
+    try loadMaterials(&scene, &data, null, &out, &.{}, &.{}, null);
 
     const mat = out[0].?.pbr;
     try std.testing.expectEqual(@as(f32, 0.5), mat.albedo_uv_transform.rotation);
@@ -623,7 +725,7 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
     };
 
     // Requesting as linear (srgb_to_linear = false) MUST NOT consume or alias with the sRGB decoded texture
-    const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false);
+    const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true);
     // Since it's linear and decoded was sRGB (and no buffer_view/uri exists), linear_tex stays null:
     try std.testing.expect(linear_tex == null);
     try std.testing.expect(decoded[0] != null); // Was NOT consumed!
@@ -647,12 +749,11 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
     image_cache[1] = mock_srgb;
 
     // Separate lookups must return their own distinct slot!
-    const query_linear = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false);
+    const query_linear = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true);
     try std.testing.expect(query_linear != null);
     try std.testing.expectEqual(@as(u32, 101), query_linear.?.image.id);
 
-    const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true);
+    const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true, true);
     try std.testing.expect(query_srgb != null);
     try std.testing.expectEqual(@as(u32, 102), query_srgb.?.image.id);
 }
-

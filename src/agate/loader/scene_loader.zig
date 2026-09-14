@@ -26,6 +26,13 @@ pub const SceneLoader = struct {
         /// texture (forward standard/pbr/skinned paths only; fails loudly
         /// when RGBA32F is unavailable).
         morph_mode: MorphMode = .cpu,
+        /// Stage 2: decode images on the UploadQueue workers instead of
+        /// blocking this call. Materials start with null texture slots
+        /// (default-white fallback renders) and the real textures patch in
+        /// via scene.render()'s drain. Requires scene.uploads (present in
+        /// every Scene.init scene); silently falls back to synchronous
+        /// decoding when the queue is unavailable.
+        async_textures: bool = false,
     };
 
     /// Parses a glTF scene and spawns its content into `scene`. Both
@@ -87,8 +94,6 @@ pub const SceneLoader = struct {
         defer scene.allocator.free(image_cache);
         @memset(image_cache, null);
 
-        // Decode every image up front on worker threads; the sg.Image is built
-        // later in loadTextureFromView because sokol_gfx is not thread-safe.
         const decoded = try scene.allocator.alloc(?Texture.RawTexture, gltf.images_count);
         @memset(decoded, null);
         defer {
@@ -97,8 +102,22 @@ pub const SceneLoader = struct {
             }
             scene.allocator.free(decoded);
         }
-        materials_mod.decodeImagesInParallel(scene, gltf, decoded, base_dir);
-        try materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded);
+
+        // Stage 2: in async mode the pre-decode pass is skipped entirely —
+        // images decode on the scene's UploadQueue after this call returns,
+        // and loadMaterials registers material slots as patch targets.
+        // Sync mode keeps the fork-join predecode (single hitch, no pop-in).
+        const async_textures = load_options.async_textures and scene.uploads != null;
+        var actx: ?materials_mod.AsyncTexCtx = if (async_textures)
+            materials_mod.AsyncTexCtx.init(scene, gltf, base_dir, &scene.uploads.?)
+        else
+            null;
+        defer if (actx) |*a| a.deinit();
+
+        if (!async_textures) {
+            materials_mod.decodeImagesInParallel(scene, gltf, decoded, base_dir);
+        }
+        try materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded, if (actx) |*a| a else null);
 
         // 2. Parse skeletons/skins
         const skeletons = try scene.allocator.alloc(?*Skeleton, gltf.skins_count);
@@ -164,4 +183,3 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(!isExtensionSupported("KHR_materials_volume"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
 }
-

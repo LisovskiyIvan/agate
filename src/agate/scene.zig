@@ -68,6 +68,7 @@ const scene_stats = @import("scene/stats.zig");
 pub const SceneStats = scene_stats.SceneStats;
 const scene_render_queue = @import("scene/render_queue.zig");
 const jobs = @import("jobs.zig");
+const assets_mod = @import("assets.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
@@ -152,6 +153,10 @@ pub const Scene = struct {
     forward: scene_forward.ForwardPipelines,
     // Particle systems + billboard pass.
     particles: scene_particles.ParticleLayer,
+    /// Async texture decode/upload pipeline. Drained at the top of
+    /// render(); deinit'd FIRST in deinit so in-flight decodes finish
+    /// before any material they target is freed. Null = synchronous loads.
+    uploads: ?assets_mod.UploadQueue = null,
     // Dynamic decals.
     decals: scene_decals.DecalLayer = .{},
     // Trail meshes.
@@ -214,6 +219,9 @@ pub const Scene = struct {
             .forward = scene_forward.ForwardPipelines.init(),
             .particles = scene_particles.ParticleLayer.init(),
         };
+        // Async texture decode/uploads (stage 2): failures degrade to a
+        // null queue and all loads take the synchronous path.
+        self.uploads = assets_mod.UploadQueue.init(allocator, 2) catch null;
     }
 
     pub fn init(allocator: std.mem.Allocator) Scene {
@@ -801,6 +809,9 @@ pub const Scene = struct {
     }
 
     pub fn render(self: *Scene) void {
+        // Stage 2: upload finished background decodes before drawing, so
+        // patched materials pick the textures up this same frame.
+        if (self.uploads) |*q| _ = q.drain();
         const camera = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else return);
         const aspect = sapp.widthf() / sapp.heightf();
         // Sun resolved once per frame; reused by cascades, mesh uniforms, postprocess.
@@ -959,6 +970,12 @@ pub const Scene = struct {
     }
 
     pub fn deinit(self: *Scene) void {
+        // In-flight decodes target material fields; join them before any
+        // mesh/material teardown can free those fields.
+        if (self.uploads) |*q| {
+            q.deinit();
+            self.uploads = null;
+        }
         for (self.cameras.items) |entry| {
             if (entry.owns_name) {
                 self.allocator.free(entry.name);
