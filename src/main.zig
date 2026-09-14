@@ -12,7 +12,7 @@ var box: *z.Mesh = undefined;
 var camera: z.ArcRotateCamera = undefined;
 
 // CLI: --frames N quits after N rendered frames (0 = run until closed);
-// --particles <cpu|gpu|compute> adds a demo particle system with that
+// --particles <cpu|gpu> adds a demo particle system with that
 // simulation mode (default: none). --msaa N requests MSAA for the offscreen
 // main target (valid: 1/2/4, clamped per scene/msaa.zig; enabling it turns
 // the post chain on, because MSAA applies only to the offscreen path, and
@@ -41,8 +41,6 @@ fn parseArgs(args: std.process.Args) void {
                 particle_mode = .cpu;
             } else if (std.mem.eql(u8, mode, "gpu")) {
                 particle_mode = .gpu;
-            } else if (std.mem.eql(u8, mode, "compute")) {
-                particle_mode = .compute;
             }
         } else if (std.mem.eql(u8, arg, "--msaa")) {
             const n = it.next() orelse break;
@@ -121,7 +119,12 @@ export fn frame() callconv(.c) void {
     box.rotation.y += 1.6 * dt;
 
     if (particle_mode != null) {
-        scene.updateParticles(@floatCast(sapp.frameDuration()));
+        scene.updateParticles(@floatCast(sapp.frameDuration())) catch |err| {
+            std.debug.panic("particle simulation failed: {s} (mode: {s})", .{
+                @errorName(err),
+                @tagName(particles.simulation_mode),
+            });
+        };
     }
 
     scene.render();

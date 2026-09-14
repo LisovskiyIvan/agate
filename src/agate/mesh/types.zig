@@ -44,6 +44,8 @@ pub const MAX_MORPH_TARGETS: usize = 8;
 /// behavior (applyMorphs rewrites the vertex buffer); .gpu keeps a static
 /// base-pose vertex buffer and lets standard/pbr/skinned_pbr shaders blend
 /// deltas from an RGBA32F delta texture (opt-in, forward draw paths only).
+/// Drawing a .gpu mesh without an uploaded delta texture panics
+/// (morph_gpu.vsUniforms) — the engine never silently renders base pose.
 pub const MorphMode = enum { cpu, gpu };
 
 /// One glTF morph target: per-vertex deltas added to the base attributes,

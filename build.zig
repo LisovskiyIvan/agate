@@ -182,11 +182,6 @@ pub fn build(b: *Build) !void {
         .metal_macos = true, // macOS (Metal)
         .hlsl5 = true, // Windows (D3D11)
     };
-    const compute_slang = sokol.shdc.Slang{
-        .glsl430 = true, // Linux (GL): compute требует GL 4.3+
-        .metal_macos = true, // macOS (Metal)
-        .hlsl5 = true, // Windows (D3D11)
-    };
     const shader_specs = [_]ShaderSpec{
         .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig" },
         .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig" },
@@ -197,7 +192,6 @@ pub fn build(b: *Build) !void {
         .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
-        .{ .name = "particle_compute_shader", .input = "src/agate/shaders/particle_compute.glsl", .output = "particle_compute_shader.zig", .slang = compute_slang },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
         .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },

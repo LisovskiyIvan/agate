@@ -144,8 +144,10 @@ pub fn packWeights(weights: []const f32) PackedWeights {
 }
 
 /// Per-draw vs_morph uniform values for one mesh. Active only when the
-/// mesh is in GPU mode with an uploaded delta texture; everything else
-/// binds the disabled default (zero weights on a 1x1 zero texture).
+/// mesh is in GPU mode; everything else binds the disabled default (zero
+/// weights on a 1x1 zero texture). A `.gpu` mesh without an uploaded delta
+/// texture is a wiring bug and panics here — drawing the base pose silently
+/// would hide it.
 pub const VsUniforms = struct {
     weights0: [4]f32,
     weights1: [4]f32,
@@ -154,12 +156,18 @@ pub const VsUniforms = struct {
 };
 
 pub fn vsUniforms(mesh: *const Mesh) VsUniforms {
-    if (mesh.morph_mode != .gpu or mesh.morph_delta_view.id == 0) {
+    if (mesh.morph_mode != .gpu) {
         return .{
             .weights0 = .{ 0, 0, 0, 0 },
             .weights1 = .{ 0, 0, 0, 0 },
             .params = .{ 0, 1, 1, 0 },
         };
+    }
+    if (mesh.morph_delta_view.id == 0) {
+        std.debug.panic(
+            "mesh '{s}': morph_mode == .gpu requires morph_gpu.uploadMorphDeltas() before drawing (no silent base-pose fallback)",
+            .{mesh.name},
+        );
     }
     const pw = packWeights(mesh.morph_weights);
     return .{

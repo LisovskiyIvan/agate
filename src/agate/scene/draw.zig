@@ -440,7 +440,7 @@ fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, 
 // the pipeline-owned 1x1 zero texture with the enable flag off, keeping
 // the shader's fetch loop a no-op.
 fn morphBindFor(env: Environment, mesh: *const Mesh) struct { view: sg.View, uniforms: morph_gpu.VsUniforms } {
-    const gpu = mesh.morph_mode == .gpu and mesh.morph_delta_view.id != 0;
+    const gpu = mesh.morph_mode == .gpu; // missing delta texture panics in vsUniforms
     return .{
         .view = if (gpu) mesh.morph_delta_view else env.pipelines.default_morph_view,
         .uniforms = morph_gpu.vsUniforms(mesh),

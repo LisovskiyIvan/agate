@@ -1369,6 +1369,25 @@ test "buildPolygonData: extruded 3D polygon with depth" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.bounds.min.y, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), data.bounds.max.y, 1e-4);
+
+    // Verify all triangle geometric face normals align with vertex normals (dot product > 0)
+    var ti: usize = 0;
+    while (ti < data.indices.len) : (ti += 3) {
+        const idx0 = data.indices[ti + 0];
+        const idx1 = data.indices[ti + 1];
+        const idx2 = data.indices[ti + 2];
+        const p0 = data.vertices[idx0].position;
+        const p1 = data.vertices[idx1].position;
+        const p2 = data.vertices[idx2].position;
+        const v0 = Vec3.new(p0[0], p0[1], p0[2]);
+        const v1 = Vec3.new(p1[0], p1[1], p1[2]);
+        const v2 = Vec3.new(p2[0], p2[1], p2[2]);
+        const geom_n = Vec3.cross(v1.sub(v0), v2.sub(v0));
+        const n0 = data.vertices[idx0].normal;
+        const vert_n = Vec3.new(n0[0], n0[1], n0[2]);
+        const dot = geom_n.dot(vert_n);
+        try std.testing.expect(dot > 0.0);
+    }
 }
 
 test "TrailMesh: node recording, aging, and ribbon generation" {
@@ -1566,12 +1585,8 @@ test "MorphGpu applyMorphs is a no-op in gpu mode" {
     try std.testing.expectEqual(mesh.morph_base[0], mesh.morph_staging[0]);
     try std.testing.expectEqual(mesh.morph_base[1], mesh.morph_staging[1]);
 
-    // Delta texture absent (id 0, unit-test mesh): uniforms stay disabled
-    // so the draw binds the default zero texture with zero weights.
-    const u = morph_gpu.vsUniforms(&mesh);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.weights0);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.weights1);
-    try std.testing.expectEqual(@as(f32, 0), u.params[0]);
+    // Delta texture absent (id 0, unit-test mesh): vsUniforms would panic —
+    // the explicit contract; see "MorphGpu vsUniforms enable and packing".
 
     // With a delta texture present the weights ride the uniform lanes.
     mesh.morph_delta_view = .{ .id = 1 };

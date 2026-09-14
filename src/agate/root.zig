@@ -15,7 +15,7 @@
 //! - Option structs: `*Options` for user-tweakable knobs (all fields
 //!   defaulted); `*Desc` for registration descriptors with required fields
 //!   (shader_material.RuntimeDesc, mirroring sg.*Desc); `*Params` for
-//!   computed per-frame data packs (particles.ComputeFrameParams).
+//!   computed per-frame data packs (vat.VatSampleParams).
 
 pub const math = @import("math");
 pub const Vec2 = math.Vec2;

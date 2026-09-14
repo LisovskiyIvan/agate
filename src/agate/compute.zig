@@ -25,11 +25,11 @@
 //! | Web WebGL2                      | no      | no              |
 //! | Vulkan (sokol backend still WIP)| no      | no              |
 //!
-//! The engine compiles compute shaders for slang glsl430 (desktop GL),
-//! metal_macos and hlsl5 — glsl410 cannot express compute, so compute shader
-//! modules must use their own sokol-shdc invocation (see build.zig). On any
-//! backend where `supported()` returns false, consumers (particles.zig
-//! `.compute` mode) must fall back to a render-only simulation path.
+//! Compute shaders cannot share the default glsl410 slang (410 has no
+//! compute): modules must use their own sokol-shdc invocation with a
+//! compute-capable slang set (glsl430 / metal_macos / hlsl5). On any
+//! backend where `supported()` returns false, a compute pipeline cannot be
+//! created — surface that as an explicit error to your users.
 const std = @import("std");
 const builtin = @import("builtin");
 const sokol = @import("sokol");
@@ -39,8 +39,9 @@ const sg = sokol.gfx;
 /// shaders. Keep in sync with `layout(local_size_x = ...) in;` in the GLSL.
 pub const default_workgroup_size: usize = 64;
 
-/// Runtime capability query. Safe to call before sg.setup() / after
-/// sg.shutdown(): sokol then reports a zeroed feature set, i.e. false.
+/// Runtime capability query. Requires a live sg context: sokol asserts
+/// `_sg.valid` in debug builds when queried before setup (this engine only
+/// calls it from frame-loop code that runs after sg.setup()).
 pub fn supported() bool {
     return sg.queryFeatures().compute;
 }
@@ -73,8 +74,8 @@ pub fn groupCount(items: usize, local_size: usize) usize {
 }
 
 /// Creates a compute pipeline from a compute-stage-only shader.
-/// The shader must come from an shdc `@cs` program (see
-/// shaders/particle_compute.glsl).
+/// The shader must come from an shdc `@cs` program (a compute-stage-only
+/// shader module compiled for compute-capable slangs).
 pub fn makePipeline(shader: sg.Shader, label: [:0]const u8) sg.Pipeline {
     return sg.makePipeline(.{
         .compute = true,

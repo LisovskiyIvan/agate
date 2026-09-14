@@ -345,8 +345,10 @@ pub const Scene = struct {
         return self.particles.create(self.allocator, name, capacity);
     }
 
-    pub fn updateParticles(self: *Scene, dt: f32) void {
-        self.particles.update(dt);
+    /// Explicit particle stepping: GPU simulation modes either run or return
+    /// an error (particles.UpdateError) — never a silent CPU downgrade.
+    pub fn updateParticles(self: *Scene, dt: f32) particles.UpdateError!void {
+        try self.particles.update(dt);
     }
 
     pub fn createTrailMesh(self: *Scene, name: []const u8, options: TrailOptions) !*TrailMesh {

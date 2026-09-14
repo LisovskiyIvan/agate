@@ -42,15 +42,10 @@ pub const ParticleLayer = struct {
         return ps;
     }
 
-    pub fn update(self: *ParticleLayer, dt: f32) void {
+    pub fn update(self: *ParticleLayer, dt: f32) particles.UpdateError!void {
         for (self.systems.items) |ps| {
-            ps.update(dt);
+            try ps.update(dt);
         }
-        // Compute-simulated systems integrate in one shared compute pass
-        // after their bookkeeping (spawn-ring uploads) and before the frame's
-        // render passes. No-op when the backend lacks compute or no system
-        // uses `.compute` mode.
-        self.pass.runComputeSimulations(self.systems.items, dt);
     }
 
     /// Renders all particle systems inside the main pass. `samples` is the
