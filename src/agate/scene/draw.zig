@@ -66,13 +66,14 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
     const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
+    const mat = item.material orelse mesh.material;
 
     // Shader materials take their own path: pipeline from the lazy
     // ShaderMaterialCache, bindings/uniforms per the registration's base
     // template contract (identical layouts — see drawShaderMaterialItem).
-    if (mesh.material) |mat| {
-        if (mat == .shader_material) {
-            return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, mat.shader_material, mvp);
+    if (mat) |m| {
+        if (m == .shader_material) {
+            return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, m.shader_material, mvp);
         }
     }
 
@@ -92,7 +93,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
     const morph_bind = morphBindFor(env, mesh);
 
     if (item.is_pbr) {
-        const pbr_mat = if (mesh.material) |m| m.pbr else null;
+        const pbr_mat = if (mat) |m| m.pbr else null;
         const albedo_tex = if (pbr_mat) |p| (p.albedo_texture orelse env.default_white.*) else env.default_white.*;
         const normal_tex = if (pbr_mat) |p| (p.normal_texture orelse env.default_normal.*) else env.default_normal.*;
         const mr_tex = if (pbr_mat) |p| (p.metallic_roughness_texture orelse env.default_white.*) else env.default_white.*;
@@ -164,7 +165,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             .base_color_factor = mat_albedo,
             .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
             .emissive_factor = emissive_col,
-            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .alpha_cutoff = uniforms.alphaCutoffFor(mat),
             .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
             .uv_matrix = pbrUvMatrices(pbr_mat),
             .uv_offset = pbrUvOffsets(pbr_mat),
@@ -189,7 +190,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
         }
     } else {
-        const std_mat = if (mesh.material) |m| m.standard else env.default_material;
+        const std_mat = if (mat) |m| m.standard else env.default_material;
         const tex = if (std_mat.diffuse_texture) |t| t else env.default_white.*;
 
         bind.views[shd.VIEW_diffuse_tex] = tex.view;
@@ -220,7 +221,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
             .diffuse_color = std_mat.getDiffuseColor4(),
-            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
+            .alpha_cutoff = uniforms.alphaCutoffFor(mat),
             .uv_matrix = std_mat.diffuse_uv_transform.matrixRows(),
             .uv_offset = std_mat.diffuse_uv_transform.offsetPacked(),
             .shadow_params = f.shadow_params,
@@ -286,7 +287,7 @@ fn drawShaderMaterialItem(
     bind.index_buffer = mesh.index_buffer;
 
     const f = frameUniformsFor(env, mesh, ctx);
-    const alpha_cutoff = uniforms.alphaCutoffFor(mesh.material);
+    const alpha_cutoff = uniforms.alphaCutoffFor(item.material orelse mesh.material);
 
     if (entry.engine_template) {
         const morph_bind = morphBindFor(env, mesh);

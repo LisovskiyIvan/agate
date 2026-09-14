@@ -645,10 +645,10 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
     }
 
     switch (state.camera) {
-        .none => scene.active_camera = null,
+        .none => scene.setActiveCamera(null, null),
         .arc_rotate => |*c| {
             const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.active_camera = .{ .arc_rotate = .{
+            scene.setActiveCamera(.{ .arc_rotate = .{
                 .name = owned orelse c.name,
                 .alpha = c.alpha,
                 .beta = c.beta,
@@ -657,11 +657,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .fov_deg = c.fov_deg,
                 .near = c.near,
                 .far = c.far,
-            } };
+            } }, owned);
         },
         .free => |*c| {
             const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.active_camera = .{ .free = .{
+            scene.setActiveCamera(.{ .free = .{
                 .name = owned orelse c.name,
                 .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
                 .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
@@ -670,11 +670,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .far = c.far,
                 .speed = c.speed,
                 .angular_sensitivity = c.angular_sensitivity,
-            } };
+            } }, owned);
         },
         .follow => |*c| {
             const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.active_camera = .{ .follow = .{
+            scene.setActiveCamera(.{ .follow = .{
                 .name = owned orelse c.name,
                 .target_mesh = null,
                 .target_position = Vec3.new(c.target_position[0], c.target_position[1], c.target_position[2]),
@@ -686,11 +686,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .near = c.near,
                 .far = c.far,
                 .lerp_speed = c.lerp_speed,
-            } };
+            } }, owned);
         },
         .target => |*c| {
             const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.active_camera = .{ .target = TargetCamera.init(owned orelse c.name, .{
+            scene.setActiveCamera(.{ .target = TargetCamera.init(owned orelse c.name, .{
                 .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
                 .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
                 .up = Vec3.new(c.up[0], c.up[1], c.up[2]),
@@ -698,11 +698,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .near = c.near,
                 .far = c.far,
                 .smoothing = c.smoothing,
-            }) };
+            }) }, owned);
         },
         .fly => |*c| {
             const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.active_camera = .{ .fly = FlyCamera.init(owned orelse c.name, .{
+            scene.setActiveCamera(.{ .fly = FlyCamera.init(owned orelse c.name, .{
                 .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
                 .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
                 .fov_deg = c.fov_deg,
@@ -712,7 +712,7 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .boost_multiplier = c.boost_multiplier,
                 .angular_sensitivity = c.angular_sensitivity,
                 .roll_speed_deg = c.roll_speed_deg,
-            }) };
+            }) }, owned);
         },
     }
 

@@ -12,7 +12,13 @@ pub inline fn pickOrthogonal(n: Vec3) Vec3 {
     return if (@abs(n.x) > orthogonal_dot_threshold) Vec3.up else Vec3.right;
 }
 
-inline fn accumulateTriangleTangent(vertices: []Vertex, idx0: usize, idx1: usize, idx2: usize) void {
+inline fn accumulateTriangleTangent(
+    vertices: []Vertex,
+    bitangents: ?[]Vec3,
+    idx0: usize,
+    idx1: usize,
+    idx2: usize,
+) void {
     if (idx0 >= vertices.len or idx1 >= vertices.len or idx2 >= vertices.len) return;
 
     const v0 = vertices[idx0];
@@ -35,6 +41,11 @@ inline fn accumulateTriangleTangent(vertices: []Vertex, idx0: usize, idx1: usize
             (edge1.y * delta_v2 - edge2.y * delta_v1) * r,
             (edge1.z * delta_v2 - edge2.z * delta_v1) * r,
         );
+        const bitangent = Vec3.new(
+            (edge2.x * delta_u1 - edge1.x * delta_u2) * r,
+            (edge2.y * delta_u1 - edge1.y * delta_u2) * r,
+            (edge2.z * delta_u1 - edge1.z * delta_u2) * r,
+        );
 
         vertices[idx0].tangent[0] += tangent.x;
         vertices[idx0].tangent[1] += tangent.y;
@@ -47,6 +58,12 @@ inline fn accumulateTriangleTangent(vertices: []Vertex, idx0: usize, idx1: usize
         vertices[idx2].tangent[0] += tangent.x;
         vertices[idx2].tangent[1] += tangent.y;
         vertices[idx2].tangent[2] += tangent.z;
+
+        if (bitangents) |bts| {
+            bts[idx0] = bts[idx0].add(bitangent);
+            bts[idx1] = bts[idx1].add(bitangent);
+            bts[idx2] = bts[idx2].add(bitangent);
+        }
     }
 }
 
@@ -55,26 +72,39 @@ pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]
         v.tangent = .{ 0, 0, 0, 1 };
     }
 
+    var stack_bitangents: [512]Vec3 = undefined;
+    const bitangents: ?[]Vec3 = if (vertices.len <= stack_bitangents.len)
+        stack_bitangents[0..vertices.len]
+    else
+        std.heap.page_allocator.alloc(Vec3, vertices.len) catch null;
+    defer if (vertices.len > stack_bitangents.len) {
+        if (bitangents) |b| std.heap.page_allocator.free(b);
+    };
+
+    if (bitangents) |bts| {
+        @memset(bts, Vec3.zero);
+    }
+
     // One loop per index source so the per-triangle source selection branches
     // disappear; accumulation order (and hence shared-vertex sums) is unchanged.
     if (indices) |idx| {
         var tri_i: usize = 0;
         while (tri_i + 2 < idx.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, idx[tri_i], idx[tri_i + 1], idx[tri_i + 2]);
+            accumulateTriangleTangent(vertices, bitangents, idx[tri_i], idx[tri_i + 1], idx[tri_i + 2]);
         }
     } else if (indices16) |idx16| {
         var tri_i: usize = 0;
         while (tri_i + 2 < idx16.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, idx16[tri_i], idx16[tri_i + 1], idx16[tri_i + 2]);
+            accumulateTriangleTangent(vertices, bitangents, idx16[tri_i], idx16[tri_i + 1], idx16[tri_i + 2]);
         }
     } else {
         var tri_i: usize = 0;
         while (tri_i + 2 < vertices.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, tri_i, tri_i + 1, tri_i + 2);
+            accumulateTriangleTangent(vertices, bitangents, tri_i, tri_i + 1, tri_i + 2);
         }
     }
 
-    for (vertices) |*v| {
+    for (vertices, 0..) |*v, i| {
         const n = Vec3.new(v.normal[0], v.normal[1], v.normal[2]);
         var t = Vec3.new(v.tangent[0], v.tangent[1], v.tangent[2]);
 
@@ -88,9 +118,54 @@ pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]
             v.tangent[0] = t_norm.x;
             v.tangent[1] = t_norm.y;
             v.tangent[2] = t_norm.z;
-            v.tangent[3] = 1.0;
+
+            // Handedness calculation:
+            // Shaders calculate: B = cross(N, T) * tangent.w
+            // If cross(N, T) is anti-parallel to accumulated bitangent B, handedness must be -1.0.
+            if (bitangents) |bts| {
+                const b = bts[i];
+                if (b.lengthSq() > 1e-6) {
+                    const handedness: f32 = if (n.cross(t_norm).dot(b) < 0.0) -1.0 else 1.0;
+                    v.tangent[3] = handedness;
+                } else {
+                    v.tangent[3] = 1.0;
+                }
+            } else {
+                v.tangent[3] = 1.0;
+            }
         } else {
             v.tangent = .{ 1.0, 0.0, 0.0, 1.0 };
         }
     }
 }
+
+test "computeTangents right-handed vs mirrored UV handedness" {
+    // Triangle 1: Standard right-handed UV coordinates
+    // Pos: (0,0,0), (1,0,0), (0,1,0)
+    // UV:  (0,0),   (1,0),   (0,1)
+    // Normal: (0,0,1) -> T should be (1,0,0), B should be (0,1,0), cross(N, T) = (0,1,0) -> handedness = +1.0
+    var rh_verts = [_]Vertex{
+        .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 1, 0, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 0, 1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 1 }, .color = .{ 1, 1, 1, 1 } },
+    };
+    computeTangents(&rh_verts, null, null);
+    try std.testing.expectEqual(@as(f32, 1.0), rh_verts[0].tangent[3]);
+    try std.testing.expectEqual(@as(f32, 1.0), rh_verts[1].tangent[3]);
+    try std.testing.expectEqual(@as(f32, 1.0), rh_verts[2].tangent[3]);
+
+    // Triangle 2: Mirrored left-handed UV coordinates (flipped U)
+    // Pos: (0,0,0), (1,0,0), (0,1,0)
+    // UV:  (1,0),   (0,0),   (1,1)
+    // Handedness must be -1.0!
+    var lh_verts = [_]Vertex{
+        .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 1, 0, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 0, 1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 1 }, .color = .{ 1, 1, 1, 1 } },
+    };
+    computeTangents(&lh_verts, null, null);
+    try std.testing.expectEqual(@as(f32, -1.0), lh_verts[0].tangent[3]);
+    try std.testing.expectEqual(@as(f32, -1.0), lh_verts[1].tangent[3]);
+    try std.testing.expectEqual(@as(f32, -1.0), lh_verts[2].tangent[3]);
+}
+

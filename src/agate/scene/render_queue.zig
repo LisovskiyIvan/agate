@@ -19,6 +19,7 @@ pub const RenderMeshItem = struct {
     distance_sq: f32,
     is_pbr: bool,
     texture_id: u32,
+    material: ?Material = null,
     // True when the mesh material uses .blend alpha mode. Set at queue
     // build time; defaults to false so opaque behavior is unchanged.
     transparent: bool = false,
@@ -380,16 +381,6 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                 const active_lod = mesh.getLOD(dist);
                 if (active_lod) |lod| {
                     render_mesh = lod;
-                    if (lod != mesh) {
-                        lod.position = mesh.position;
-                        lod.rotation = mesh.rotation;
-                        lod.scaling = mesh.scaling;
-                        lod.parent = mesh.parent;
-                        lod.base_matrix = mesh.base_matrix;
-                        if (lod.material == null) {
-                            lod.material = mesh.material;
-                        }
-                    }
                 } else {
                     // Beyond max distance, culled
                     ctx.stats.culled_meshes += 1;
@@ -397,8 +388,11 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                 }
             }
 
-            const model = worldMatrixCached(ctx.frame_id, render_mesh);
-            const world_aabb = render_mesh.cached_aabb;
+            const model = worldMatrixCached(ctx.frame_id, mesh);
+            const world_aabb = if (render_mesh != mesh and render_mesh.local_bounding_box.isValid())
+                render_mesh.local_bounding_box.transform(model)
+            else
+                mesh.cached_aabb;
 
             if (ctx.cull_frustum and render_mesh.culling_strategy != .always_render) {
                 if (!frustum.intersectsAABB(world_aabb)) {
@@ -417,8 +411,9 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
 
             ctx.stats.rendered_meshes += 1;
 
-            const is_pbr = if (render_mesh.material) |m| (m == .pbr) else false;
-            const tex_id: u32 = if (render_mesh.material) |m| switch (m) {
+            const mat = render_mesh.material orelse mesh.material;
+            const is_pbr = if (mat) |m| (m == .pbr) else false;
+            const tex_id: u32 = if (mat) |m| switch (m) {
                 .pbr => |p| if (p.albedo_texture) |t| t.view.id else ctx.default_white_id,
                 .standard => |s| if (s.diffuse_texture) |t| t.view.id else ctx.default_white_id,
                 // Shader materials sort with the standard group by their
@@ -427,17 +422,19 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
             } else ctx.default_white_id;
 
             const d_sq = world_aabb.center().sub(eye).lengthSq();
-            const transparent = materialIsTransparent(render_mesh.material) or render_mesh.is_decal;
+            const is_decal = render_mesh.is_decal or mesh.is_decal;
+            const transparent = materialIsTransparent(mat) or is_decal;
             const target_queue = if (transparent) &ctx.queues.transparent else &ctx.queues.items;
             target_queue.append(ctx.allocator, .{
                 .mesh = render_mesh,
+                .material = mat,
                 .model = model,
                 .distance_sq = d_sq,
                 .is_pbr = is_pbr,
                 .texture_id = tex_id,
                 .transparent = transparent,
-                .double_sided = materialIsDoubleSided(render_mesh.material) or render_mesh.is_decal,
-                .is_decal = render_mesh.is_decal,
+                .double_sided = materialIsDoubleSided(mat) or is_decal,
+                .is_decal = is_decal,
             }) catch continue;
         }
     }
@@ -589,3 +586,74 @@ test "worldMatrixCached caches per frame and resolves parents" {
     const aabb = worldAABBCached(7, &child);
     try std.testing.expect(aabb.isValid());
 }
+
+test "shared LOD mesh preserves entity transforms without mutation" {
+    const ally = std.testing.allocator;
+
+    var shared_lod: Mesh = undefined;
+    shared_lod.position = Vec3.zero;
+    shared_lod.rotation = Vec3.zero;
+    shared_lod.scaling = Vec3.new(1.0, 1.0, 1.0);
+    shared_lod.base_matrix = Mat4.identity;
+    shared_lod.local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+    shared_lod.cached_aabb = shared_lod.local_bounding_box;
+    shared_lod.cached_matrix = Mat4.identity;
+    shared_lod.cached_frame = 0;
+    shared_lod.parent = null;
+    shared_lod.material = null;
+    shared_lod.is_visible = true;
+    shared_lod.is_decal = false;
+    shared_lod.is_occluder = false;
+    shared_lod.culling_strategy = .always_render;
+    shared_lod.lod_levels = .empty;
+    shared_lod.instances = .empty;
+    shared_lod.skeleton = null;
+    shared_lod.index_type = .UINT16;
+
+    var mesh1: Mesh = shared_lod;
+    mesh1.position = Vec3.new(10.0, 0.0, 0.0);
+    mesh1.cached_frame = 0;
+    try mesh1.lod_levels.append(ally, .{ .distance = 0.0, .mesh = &shared_lod });
+    defer mesh1.lod_levels.deinit(ally);
+
+    var mesh2: Mesh = shared_lod;
+    mesh2.position = Vec3.new(20.0, 0.0, 0.0);
+    mesh2.cached_frame = 0;
+    try mesh2.lod_levels.append(ally, .{ .distance = 0.0, .mesh = &shared_lod });
+    defer mesh2.lod_levels.deinit(ally);
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+
+    const meshes = [_]*Mesh{ &mesh1, &mesh2 };
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 42,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    // The shared child LOD mesh MUST NOT be mutated!
+    try std.testing.expectEqual(@as(f32, 0.0), shared_lod.position.x);
+    try std.testing.expectEqual(@as(usize, 2), queues.items.items.len);
+
+    // Both items render with the shared LOD mesh geometry
+    try std.testing.expectEqual(&shared_lod, queues.items.items[0].mesh);
+    try std.testing.expectEqual(&shared_lod, queues.items.items[1].mesh);
+
+    // But each entity keeps its own distinct world matrix!
+    const m0_x = queues.items.items[0].model.m[12];
+    const m1_x = queues.items.items[1].model.m[12];
+    try std.testing.expect((m0_x == 10.0 and m1_x == 20.0) or (m0_x == 20.0 and m1_x == 10.0));
+}
+

@@ -48,6 +48,19 @@ pub const SceneLoader = struct {
         }
         defer c.cgltf_free(data);
 
+        // Check required extensions against supported set per glTF 2.0 specification:
+        // Client implementations must not parse/render assets requiring unsupported extensions.
+        if (data.?.extensions_required_count > 0 and data.?.extensions_required != null) {
+            for (0..data.?.extensions_required_count) |ext_i| {
+                const ext_ptr = data.?.extensions_required[ext_i];
+                if (ext_ptr == null) continue;
+                const ext_name = std.mem.span(ext_ptr);
+                if (!isExtensionSupported(ext_name)) {
+                    return error.UnsupportedGltfExtension;
+                }
+            }
+        }
+
         // Load binary buffers (in GLB they are inside the buffer itself, in GLTF from .bin on disk)
         const load_buf_res = c.cgltf_load_buffers(&options, data, path_z.ptr);
         if (load_buf_res != c.cgltf_result_success) {
@@ -70,7 +83,7 @@ pub const SceneLoader = struct {
         defer scene.allocator.free(materials);
         @memset(materials, null);
 
-        const image_cache = try scene.allocator.alloc(?Texture, gltf.images_count);
+        const image_cache = try scene.allocator.alloc(?Texture, gltf.images_count * 2);
         defer scene.allocator.free(image_cache);
         @memset(image_cache, null);
 
@@ -126,3 +139,29 @@ pub const SceneLoader = struct {
         return spawned_meshes.toOwnedSlice(scene.allocator);
     }
 };
+
+pub fn isExtensionSupported(name: []const u8) bool {
+    const supported = [_][]const u8{
+        "EXT_meshopt_compression",
+        "KHR_lights_punctual",
+        "KHR_texture_transform",
+        "KHR_materials_unlit",
+    };
+    for (supported) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
+test "isExtensionSupported accepts engine extensions and rejects unsupported" {
+    try std.testing.expect(isExtensionSupported("EXT_meshopt_compression"));
+    try std.testing.expect(isExtensionSupported("KHR_lights_punctual"));
+    try std.testing.expect(isExtensionSupported("KHR_texture_transform"));
+    try std.testing.expect(isExtensionSupported("KHR_materials_unlit"));
+
+    // Unsupported extensions that must be rejected when required:
+    try std.testing.expect(!isExtensionSupported("KHR_draco_mesh_compression"));
+    try std.testing.expect(!isExtensionSupported("KHR_materials_volume"));
+    try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
+}
+

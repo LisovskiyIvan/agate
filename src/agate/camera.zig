@@ -731,6 +731,16 @@ pub const Camera = union(enum) {
     target: TargetCamera,
     fly: FlyCamera,
 
+    pub fn getName(self: Camera) []const u8 {
+        return switch (self) {
+            .arc_rotate => |c| c.name,
+            .free => |c| c.name,
+            .follow => |c| c.name,
+            .target => |c| c.name,
+            .fly => |c| c.name,
+        };
+    }
+
     pub fn getPosition(self: Camera) Vec3 {
         return switch (self) {
             .arc_rotate => |c| c.getPosition(),

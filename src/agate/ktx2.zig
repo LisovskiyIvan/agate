@@ -308,13 +308,16 @@ fn decodeLevels2D(
     if (levels.len == 1 and gen_mipmaps) {
         const level0 = try convertLevel(allocator, format, levels[0], srgb);
         defer allocator.free(level0);
-        return texture.Texture.buildRaw(allocator, header.pixel_width, header.pixel_height, level0, true);
+        var raw = try texture.Texture.buildRaw(allocator, header.pixel_width, header.pixel_height, level0, true);
+        raw.is_srgb = srgb;
+        return raw;
     }
 
     var raw = Texture.RawTexture{
         .width = header.pixel_width,
         .height = header.pixel_height,
         .num_levels = @intCast(levels.len),
+        .is_srgb = srgb,
     };
     errdefer raw.deinit(allocator);
     for (levels, 0..) |level, m| {

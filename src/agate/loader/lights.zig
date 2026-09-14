@@ -285,7 +285,7 @@ pub fn loadCameras(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4)
         // The scene has a single active_camera slot: the first import wins
         // and owns its name; later names are freed with the dropped values.
         if (scene.active_camera == null) {
-            scene.active_camera = .{ .free = free_cam };
+            scene.setActiveCamera(.{ .free = free_cam }, owned_name);
         } else {
             scene.allocator.free(owned_name);
         }

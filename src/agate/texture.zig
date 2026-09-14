@@ -216,6 +216,7 @@ pub const Texture = struct {
         width: u32 = 0,
         height: u32 = 0,
         num_levels: u32 = 0,
+        is_srgb: bool = false,
         levels: [16]?[]u8 = @splat(null),
 
         pub fn deinit(self: *RawTexture, allocator: std.mem.Allocator) void {
@@ -329,7 +330,9 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         // Convert before buildRaw so the box filter averages in linear space.
         if (opts.srgb_to_linear) convertSrgbToLinearInPlace(data[0..size_bytes]);
-        return try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
+        var raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
+        raw.is_srgb = opts.srgb_to_linear;
+        return raw;
     }
 
     /// File variant of `decodeMemory`. Thread-safe; pair with `fromRaw`.

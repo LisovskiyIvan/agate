@@ -98,6 +98,7 @@ pub const Scene = struct {
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
     active_camera: ?Camera = null,
+    active_camera_owned_name: ?[]const u8 = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
@@ -400,6 +401,14 @@ pub const Scene = struct {
         self.physics.step(dt);
     }
 
+    pub fn setActiveCamera(self: *Scene, cam: ?Camera, owned_name: ?[]const u8) void {
+        if (self.active_camera_owned_name) |old| {
+            self.allocator.free(old);
+        }
+        self.active_camera = cam;
+        self.active_camera_owned_name = owned_name;
+    }
+
     pub fn updateCamera(self: *Scene, dt: f32) void {
         if (self.active_camera) |*cam| {
             cam.update(dt);
@@ -672,6 +681,12 @@ pub const Scene = struct {
     }
 
     pub fn deinit(self: *Scene) void {
+        if (self.active_camera_owned_name) |n| {
+            self.allocator.free(n);
+            self.active_camera_owned_name = null;
+        }
+        self.active_camera = null;
+
         self.decals.deinit();
 
         scene_content.deinitMeshes(self.allocator, &self.meshes);

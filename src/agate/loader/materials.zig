@@ -213,9 +213,15 @@ pub fn loadTextureFromView(
     const img = tex.*.image.?;
 
     const img_idx = imageIndexFor(gltf, img);
+    const cache_idx: ?usize = if (img_idx) |idx| blk: {
+        const slot = idx * 2 + (if (srgb_to_linear) @as(usize, 1) else @as(usize, 0));
+        if (slot < image_cache.len) break :blk slot;
+        if (idx < image_cache.len) break :blk idx;
+        break :blk null;
+    } else null;
 
-    if (img_idx) |idx| {
-        if (image_cache[idx]) |cached| {
+    if (cache_idx) |c_idx| {
+        if (image_cache[c_idx]) |cached| {
             return cached;
         }
     }
@@ -228,12 +234,17 @@ pub fn loadTextureFromView(
 
     // Pre-decoded on worker threads: only the GPU upload runs here.
     if (img_idx) |idx| {
-        if (decoded[idx]) |*raw| {
-            const loaded = Texture.fromRaw(raw, tex_options);
-            raw.deinit(scene.allocator);
-            decoded[idx] = null;
-            image_cache[idx] = loaded;
-            return loaded;
+        if (idx < decoded.len and decoded[idx] != null) {
+            if (decoded[idx].?.is_srgb == srgb_to_linear) {
+                var raw = decoded[idx].?;
+                decoded[idx] = null;
+                const loaded = Texture.fromRaw(&raw, tex_options);
+                raw.deinit(scene.allocator);
+                if (cache_idx) |c_idx| {
+                    image_cache[c_idx] = loaded;
+                }
+                return loaded;
+            }
         }
     }
 
@@ -243,8 +254,8 @@ pub fn loadTextureFromView(
             const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
             const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
             if (Texture.fromMemory(scene.allocator, img_data, tex_options)) |loaded| {
-                if (img_idx) |idx| {
-                    image_cache[idx] = loaded;
+                if (cache_idx) |c_idx| {
+                    image_cache[c_idx] = loaded;
                 }
                 return loaded;
             } else |_| {}
@@ -259,16 +270,16 @@ pub fn loadTextureFromView(
             if (full_path) |fp| {
                 defer scene.allocator.free(fp);
                 if (Texture.fromFile(scene.allocator, fp, tex_options)) |loaded| {
-                    if (img_idx) |idx| {
-                        image_cache[idx] = loaded;
+                    if (cache_idx) |c_idx| {
+                        image_cache[c_idx] = loaded;
                     }
                     return loaded;
                 } else |_| {}
             }
         } else {
             if (Texture.fromFile(scene.allocator, uri, tex_options)) |loaded| {
-                if (img_idx) |idx| {
-                    image_cache[idx] = loaded;
+                if (cache_idx) |c_idx| {
+                    image_cache[c_idx] = loaded;
                 }
                 return loaded;
             } else |_| {}
@@ -486,7 +497,7 @@ test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
     // image_cache/decoded are indexed by image (one image here); entries
     // stay null: the texture has neither buffer view nor URI, so the load
     // cleanly returns null without touching the GPU.
-    var tex_cache: [1]?Texture = .{null};
+    var tex_cache: [2]?Texture = .{ null, null };
     var raw_cache: [1]?Texture.RawTexture = .{null};
     try loadMaterials(&scene, &data, null, &out, &tex_cache, &raw_cache);
 
@@ -582,3 +593,66 @@ test "loadMaterials maps texture transforms into the PBR slots (GPU-free)" {
     // Channels stay at the glTF conventions: the format defines no override.
     try std.testing.expectEqual(@import("../material.zig").Channel.r, mat.occlusion_channel);
 }
+
+test "loadTextureFromView caches linear and sRGB variants separately without aliasing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var img = std.mem.zeroes(c.cgltf_image);
+    var tex = std.mem.zeroes(c.cgltf_texture);
+    tex.image = &img;
+    var view = std.mem.zeroes(c.cgltf_texture_view);
+    view.texture = &tex;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.images = &img;
+    data.images_count = 1;
+
+    // Cache has 2 slots for image 0: slot 0 (linear) and slot 1 (sRGB)
+    var image_cache: [2]?Texture = .{ null, null };
+    var decoded: [1]?Texture.RawTexture = .{null};
+
+    // Pre-populate predecoded buffer with an sRGB decoded raw texture
+    decoded[0] = Texture.RawTexture{
+        .width = 1,
+        .height = 1,
+        .num_levels = 1,
+        .is_srgb = true,
+    };
+
+    // Requesting as linear (srgb_to_linear = false) MUST NOT consume or alias with the sRGB decoded texture
+    const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false);
+    // Since it's linear and decoded was sRGB (and no buffer_view/uri exists), linear_tex stays null:
+    try std.testing.expect(linear_tex == null);
+    try std.testing.expect(decoded[0] != null); // Was NOT consumed!
+
+    // Mock GPU textures into the cache slots to verify cache query separation:
+    const mock_linear = Texture{
+        .image = .{ .id = 101 },
+        .view = .{ .id = 201 },
+        .sampler = .{ .id = 301 },
+        .width = 1,
+        .height = 1,
+    };
+    const mock_srgb = Texture{
+        .image = .{ .id = 102 },
+        .view = .{ .id = 202 },
+        .sampler = .{ .id = 302 },
+        .width = 1,
+        .height = 1,
+    };
+    image_cache[0] = mock_linear;
+    image_cache[1] = mock_srgb;
+
+    // Separate lookups must return their own distinct slot!
+    const query_linear = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false);
+    try std.testing.expect(query_linear != null);
+    try std.testing.expectEqual(@as(u32, 101), query_linear.?.image.id);
+
+    const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true);
+    try std.testing.expect(query_srgb != null);
+    try std.testing.expectEqual(@as(u32, 102), query_srgb.?.image.id);
+}
+

@@ -302,6 +302,7 @@ pub fn buildDecalData(
 
     const target_mat = @constCast(target_mesh).getWorldMatrix();
     const inv_target_mat = if (options.parent_to_target) (target_mat.invert() orelse Mat4.identity) else Mat4.identity;
+    const local_u = if (options.parent_to_target) inv_target_mat.transformDirection(u_axis).normalize() else u_axis;
 
     const col0 = Vec3.new(target_mat.m[0], target_mat.m[1], target_mat.m[2]);
     const col1 = Vec3.new(target_mat.m[4], target_mat.m[5], target_mat.m[6]);
@@ -439,7 +440,7 @@ pub fn buildDecalData(
                     .normal = .{ local_n.x, local_n.y, local_n.z },
                     .color = .{ 1.0, 1.0, 1.0, 1.0 },
                     .uv = .{ uv_x, uv_y },
-                    .tangent = .{ u_axis.x, u_axis.y, u_axis.z, 1.0 },
+                    .tangent = .{ local_u.x, local_u.y, local_u.z, 1.0 },
                     .joints = .{ 0.0, 0.0, 0.0, 0.0 },
                     .weights = .{ 1.0, 0.0, 0.0, 0.0 },
                 });
@@ -464,6 +465,10 @@ pub fn buildDecalData(
             try out_indices.append(allocator, base_idx + j);
             try out_indices.append(allocator, base_idx + j + 1);
         }
+    }
+
+    if (out_vertices.items.len > 0 and out_indices.items.len > 0) {
+        tangents.computeTangents(out_vertices.items, out_indices.items, null);
     }
 
     if (out_vertices.items.len == 0) {
