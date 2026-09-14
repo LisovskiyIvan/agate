@@ -36,6 +36,7 @@ pub const PostProcessPass = struct {
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
+    postprocess_shader: sg.Shader = .{},
     pub fn init() PostProcessPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -83,8 +84,9 @@ pub const PostProcessPass = struct {
             .max_lod = 0.0,
         });
 
+        const shd = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend()));
         var pp_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend())),
+            .shader = shd,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .ALWAYS,
@@ -110,6 +112,7 @@ pub const PostProcessPass = struct {
             .postprocess_pipeline = pip,
             .postprocess_quad_vb = vb,
             .postprocess_quad_ib = ib,
+            .postprocess_shader = shd,
         };
     }
 
@@ -400,6 +403,8 @@ pub const PostProcessPass = struct {
         sg.destroySampler(self.depth_sampler);
         sg.destroySampler(self.lut_sampler);
         sg.destroyPipeline(self.postprocess_pipeline);
+        if (self.postprocess_shader.id != 0) sg.destroyShader(self.postprocess_shader);
+        self.postprocess_shader = .{};
         sg.destroyBuffer(self.postprocess_quad_vb);
         sg.destroyBuffer(self.postprocess_quad_ib);
     }

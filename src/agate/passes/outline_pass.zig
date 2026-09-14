@@ -239,6 +239,11 @@ pub const OutlinePass = struct {
     pipeline_skinned_u16: sg.Pipeline = .{},
     pipeline_skinned_u32: sg.Pipeline = .{},
 
+    shader_rigid: sg.Shader = .{},
+    shader_inst: sg.Shader = .{},
+    shader_skin: sg.Shader = .{},
+    shader_cutout: sg.Shader = .{},
+
     /// Sample count the pipelines were built for. Draw calls into the main
     /// pass must use the variant matching the target (scene/msaa.zig).
     sample_count: i32 = 1,
@@ -300,6 +305,10 @@ pub const OutlinePass = struct {
             .pipeline_cutout_u32 = pip_cut_u32,
             .pipeline_skinned_u16 = pip_skin_u16,
             .pipeline_skinned_u32 = pip_skin_u32,
+            .shader_rigid = shd_rigid,
+            .shader_inst = shd_inst,
+            .shader_skin = shd_skin,
+            .shader_cutout = shd_cutout,
             .sample_count = sample_count,
         };
     }
@@ -401,6 +410,10 @@ pub const OutlinePass = struct {
         sg.destroyPipeline(self.pipeline_cutout_u32);
         sg.destroyPipeline(self.pipeline_skinned_u16);
         sg.destroyPipeline(self.pipeline_skinned_u32);
+        if (self.shader_rigid.id != 0) sg.destroyShader(self.shader_rigid);
+        if (self.shader_inst.id != 0) sg.destroyShader(self.shader_inst);
+        if (self.shader_skin.id != 0) sg.destroyShader(self.shader_skin);
+        if (self.shader_cutout.id != 0) sg.destroyShader(self.shader_cutout);
         self.* = undefined;
     }
 };

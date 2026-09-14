@@ -20,7 +20,6 @@ pub const ParticleLayer = struct {
     // changes. Compute simulation always runs through the 1x pass: compute
     // pipelines have no attachments and are sample-count independent.
     pass_msaa: ?passes.ParticlePass = null,
-    pass_msaa_samples: i32 = 0,
 
     pub fn init() ParticleLayer {
         return .{ .pass = passes.ParticlePass.init() };
@@ -72,10 +71,9 @@ pub const ParticleLayer = struct {
     /// Pass variant matching the target sample count.
     fn passFor(self: *ParticleLayer, samples: i32) *passes.ParticlePass {
         if (samples <= 1) return &self.pass;
-        if (self.pass_msaa == null or self.pass_msaa_samples != samples) {
+        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples) {
             if (self.pass_msaa) |*p| p.deinit();
             self.pass_msaa = passes.ParticlePass.initSampled(samples);
-            self.pass_msaa_samples = samples;
         }
         return &self.pass_msaa.?;
     }

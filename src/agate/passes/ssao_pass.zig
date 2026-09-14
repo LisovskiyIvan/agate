@@ -27,6 +27,8 @@ pub const SSAOPass = struct {
 
     ssao_pipeline: sg.Pipeline = .{},
     ssao_blur_pipeline: sg.Pipeline = .{},
+    ssao_shader: sg.Shader = .{},
+    blur_shader: sg.Shader = .{},
 
     quad_vb: sg.Buffer = .{},
     quad_ib: sg.Buffer = .{},
@@ -133,8 +135,9 @@ pub const SSAOPass = struct {
         });
 
         // 3. SSAO pipeline
+        const ssao_shd_handle = sg.makeShader(ssao_shd.ssaoShaderDesc(sg.queryBackend()));
         var ssao_pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(ssao_shd.ssaoShaderDesc(sg.queryBackend())),
+            .shader = ssao_shd_handle,
             .index_type = .UINT16,
             .depth = .{
                 .pixel_format = .NONE,
@@ -151,8 +154,9 @@ pub const SSAOPass = struct {
         const ssao_pip = sg.makePipeline(ssao_pip_desc);
 
         // 4. SSAO Blur pipeline
+        const blur_shd_handle = sg.makeShader(blur_shd.ssaoBlurShaderDesc(sg.queryBackend()));
         var blur_pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(blur_shd.ssaoBlurShaderDesc(sg.queryBackend())),
+            .shader = blur_shd_handle,
             .index_type = .UINT16,
             .depth = .{
                 .pixel_format = .NONE,
@@ -176,6 +180,8 @@ pub const SSAOPass = struct {
             .blur_sampler = blur_smp,
             .ssao_pipeline = ssao_pip,
             .ssao_blur_pipeline = blur_pip,
+            .ssao_shader = ssao_shd_handle,
+            .blur_shader = blur_shd_handle,
             .quad_vb = vb,
             .quad_ib = ib,
             .kernel_samples = kernel,
@@ -370,6 +376,10 @@ pub const SSAOPass = struct {
         sg.destroySampler(self.blur_sampler);
         sg.destroyPipeline(self.ssao_pipeline);
         sg.destroyPipeline(self.ssao_blur_pipeline);
+        if (self.ssao_shader.id != 0) sg.destroyShader(self.ssao_shader);
+        if (self.blur_shader.id != 0) sg.destroyShader(self.blur_shader);
+        self.ssao_shader = .{};
+        self.blur_shader = .{};
         sg.destroyBuffer(self.quad_vb);
         sg.destroyBuffer(self.quad_ib);
     }

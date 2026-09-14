@@ -37,6 +37,8 @@ pub const BloomPass = struct {
     sampler: sg.Sampler = .{},
     down_pipeline: sg.Pipeline = .{},
     up_pipeline: sg.Pipeline = .{},
+    down_shader: sg.Shader = .{},
+    up_shader: sg.Shader = .{},
     quad_vb: sg.Buffer = .{},
     quad_ib: sg.Buffer = .{},
 
@@ -72,8 +74,9 @@ pub const BloomPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
+        const down_shd_handle = sg.makeShader(down_shd.bloomDownShaderDesc(sg.queryBackend()));
         var down_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(down_shd.bloomDownShaderDesc(sg.queryBackend())),
+            .shader = down_shd_handle,
             .index_type = .UINT16,
             .depth = .{
                 .pixel_format = .NONE,
@@ -89,8 +92,9 @@ pub const BloomPass = struct {
         down_desc.layout.attrs[down_shd.ATTR_bloom_down_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
         const down_pip = sg.makePipeline(down_desc);
 
+        const up_shd_handle = sg.makeShader(up_shd.bloomUpShaderDesc(sg.queryBackend()));
         var up_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(up_shd.bloomUpShaderDesc(sg.queryBackend())),
+            .shader = up_shd_handle,
             .index_type = .UINT16,
             .depth = .{
                 .pixel_format = .NONE,
@@ -110,6 +114,8 @@ pub const BloomPass = struct {
             .sampler = smp,
             .down_pipeline = down_pip,
             .up_pipeline = up_pip,
+            .down_shader = down_shd_handle,
+            .up_shader = up_shd_handle,
             .quad_vb = vb,
             .quad_ib = ib,
         };
@@ -286,6 +292,10 @@ pub const BloomPass = struct {
         sg.destroySampler(self.sampler);
         sg.destroyPipeline(self.down_pipeline);
         sg.destroyPipeline(self.up_pipeline);
+        if (self.down_shader.id != 0) sg.destroyShader(self.down_shader);
+        if (self.up_shader.id != 0) sg.destroyShader(self.up_shader);
+        self.down_shader = .{};
+        self.up_shader = .{};
         sg.destroyBuffer(self.quad_vb);
         sg.destroyBuffer(self.quad_ib);
     }

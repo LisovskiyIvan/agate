@@ -465,7 +465,11 @@ pub const Scene = struct {
     fn ensureForwardMsaa(self: *Scene, samples: i32) *scene_forward.ForwardPipelines {
         if (self.forward_msaa == null or self.forward_msaa.?.sample_count != samples) {
             if (self.forward_msaa) |*fw| fw.deinit();
-            self.forward_msaa = scene_forward.ForwardPipelines.initSampled(samples);
+            if (self.forward.family_shaders) |fs| {
+                self.forward_msaa = scene_forward.ForwardPipelines.initSampledWithShaders(samples, fs);
+            } else {
+                self.forward_msaa = scene_forward.ForwardPipelines.initSampled(samples);
+            }
         }
         return &self.forward_msaa.?;
     }

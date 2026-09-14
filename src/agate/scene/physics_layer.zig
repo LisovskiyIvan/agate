@@ -22,7 +22,6 @@ pub const PhysicsIntegration = struct {
     // MSAA twin (pipeline sample count must match the main target); lazily
     // created on the first MSAA frame, recreated on count changes.
     debug_pass_msaa: ?passes.DebugPass = null,
-    debug_pass_msaa_samples: i32 = 0,
 
     pub fn deinit(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
         if (self.world) |*pw| {
@@ -83,10 +82,9 @@ pub const PhysicsIntegration = struct {
             }
             return if (self.debug_pass) |*dp| dp else null;
         }
-        if (self.debug_pass_msaa == null or self.debug_pass_msaa_samples != samples) {
+        if (self.debug_pass_msaa == null or self.debug_pass_msaa.?.sample_count != samples) {
             if (self.debug_pass_msaa) |*dp| dp.deinit();
             self.debug_pass_msaa = passes.DebugPass.initSampled(allocator, samples) catch null;
-            self.debug_pass_msaa_samples = samples;
         }
         return if (self.debug_pass_msaa) |*dp| dp else null;
     }

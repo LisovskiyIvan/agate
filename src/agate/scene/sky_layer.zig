@@ -23,7 +23,6 @@ pub const SkyboxLayer = struct {
     // MSAA twin pass (pipeline sample count must match the main target).
     // Lazily created on the first MSAA frame, recreated on count changes.
     pass_msaa: ?passes.SkyboxPass = null,
-    pass_msaa_samples: i32 = 0,
 
     pub fn init() SkyboxLayer {
         return .{ .pass = passes.SkyboxPass.init() };
@@ -63,10 +62,9 @@ pub const SkyboxLayer = struct {
     /// Pass variant matching the target sample count.
     fn passFor(self: *SkyboxLayer, samples: i32) *passes.SkyboxPass {
         if (samples <= 1) return &self.pass;
-        if (self.pass_msaa == null or self.pass_msaa_samples != samples) {
+        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples) {
             if (self.pass_msaa) |*p| p.deinit();
             self.pass_msaa = passes.SkyboxPass.initSampled(samples);
-            self.pass_msaa_samples = samples;
         }
         return &self.pass_msaa.?;
     }

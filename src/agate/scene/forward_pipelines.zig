@@ -185,6 +185,9 @@ pub const ForwardPipelines = struct {
     /// (1 = legacy set; > 1 via initSampled for the MSAA twin in Scene).
     sample_count: i32 = 1,
 
+    family_shaders: ?scene_pipelines.DoubleSidedSourceShaders = null,
+    owns_shaders: bool = false,
+
     /// Builds the default 1x pipeline set (GPU calls). Panics if a base
     /// pipeline fails to create — same loud failure as the legacy
     /// Scene.initPipelines.
@@ -198,8 +201,25 @@ pub const ForwardPipelines = struct {
     /// keeps one set per active target shape and never mixes them within a
     /// frame. Panics if a base pipeline fails to create.
     pub fn initSampled(sample_count: i32) ForwardPipelines {
+        const family_shaders = scene_pipelines.DoubleSidedSourceShaders{
+            .standard = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
+            .pbr = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
+            .instanced = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
+            .instanced_pbr = sg.makeShader(inst_pbr_shd.instancedPbrShaderDesc(sg.queryBackend())),
+            .skinned_pbr = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
+        };
+        var self = initSampledWithShaders(sample_count, family_shaders);
+        self.owns_shaders = true;
+        return self;
+    }
+
+    /// Variant of initSampled that borrows pre-compiled family shaders (e.g. from
+    /// the 1x ForwardPipelines in Scene) instead of compiling new ones.
+    pub fn initSampledWithShaders(sample_count: i32, family_shaders: scene_pipelines.DoubleSidedSourceShaders) ForwardPipelines {
         var self: ForwardPipelines = .{};
         self.sample_count = sample_count;
+        self.family_shaders = family_shaders;
+        self.owns_shaders = false;
 
         const zero_texel = [_]f32{ 0, 0, 0, 0 };
         var img_desc = sg.ImageDesc{
@@ -217,15 +237,6 @@ pub const ForwardPipelines = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
-        // One shader handle per family, shared by the opaque/blend pairs and
-        // the double-sided twins.
-        const family_shaders = scene_pipelines.DoubleSidedSourceShaders{
-            .standard = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
-            .pbr = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
-            .instanced = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
-            .instanced_pbr = sg.makeShader(inst_pbr_shd.instancedPbrShaderDesc(sg.queryBackend())),
-            .skinned_pbr = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
-        };
         const specs = [_]struct {
             shader: sg.Shader,
             family: scene_pipelines.PipelineFamily,
@@ -342,6 +353,17 @@ pub const ForwardPipelines = struct {
         sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u32);
         self.ds_pipelines.deinit();
         self.shader_materials.deinit();
+        if (self.owns_shaders) {
+            if (self.family_shaders) |fs| {
+                if (fs.standard.id != 0) sg.destroyShader(fs.standard);
+                if (fs.pbr.id != 0) sg.destroyShader(fs.pbr);
+                if (fs.instanced.id != 0) sg.destroyShader(fs.instanced);
+                if (fs.instanced_pbr.id != 0) sg.destroyShader(fs.instanced_pbr);
+                if (fs.skinned_pbr.id != 0) sg.destroyShader(fs.skinned_pbr);
+            }
+        }
+        self.family_shaders = null;
+        self.owns_shaders = false;
     }
 
     // Selects the forward pipeline for a regular (non-instanced) queue item.

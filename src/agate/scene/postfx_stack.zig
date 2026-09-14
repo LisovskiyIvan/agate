@@ -38,7 +38,6 @@ pub const PostFXStack = struct {
     // target's sample count). Lazily created on the first MSAA frame,
     // recreated if the count changes; null keeps the 1x-only memory shape.
     outline_msaa: ?passes.OutlinePass = null,
-    outline_msaa_samples: i32 = 0,
 
     // Effective main-target sample count of the current/last frame. Kept so
     // resizeAll (window resize path outside render()) can keep the target
@@ -132,10 +131,9 @@ pub const PostFXStack = struct {
     /// device-specific clamp narrows a requested 8x to 4x).
     fn outlinePassFor(self: *PostFXStack, samples: i32) *passes.OutlinePass {
         if (samples <= 1) return &self.outline_pass;
-        if (self.outline_msaa == null or self.outline_msaa_samples != samples) {
+        if (self.outline_msaa == null or self.outline_msaa.?.sample_count != samples) {
             if (self.outline_msaa) |*op| op.deinit();
             self.outline_msaa = passes.OutlinePass.initSampled(samples);
-            self.outline_msaa_samples = samples;
         }
         return &self.outline_msaa.?;
     }
@@ -153,14 +151,11 @@ pub const PostFXStack = struct {
         sun_color: Color3,
         // Placeholder SSAO view when SSAO is off (shared 1x1 white).
         default_white_view: sg.View,
-        // Effective main-target sample count for this frame (scene/msaa.zig).
-        // > 1 suppresses the depth-consuming effects (SSAO/SSR/DoF): sokol
-        // has no depth resolve, so the MSAA depth attachment cannot feed
-        // them. Warned once per stack, not per frame.
+        stats: *SceneStats,
+        // Main-target sample count; see scene/msaa.zig for the clamp policy.
         main_samples: i32 = 1,
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         ui: ?*UICanvas = null,
-        stats: *SceneStats,
     };
 
     /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 3 (fullscreen
@@ -175,7 +170,7 @@ pub const PostFXStack = struct {
         var post = params.post;
         var ssao = params.ssao;
         if (msaa_active) {
-            if (ssao.enabled or ssao.debug_mode or post.ssr_enabled or post.dof_enabled) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled)) {
                 _ = self.warn_depth_effects.warn(
                     "msaa: SSAO/SSR/DoF disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},

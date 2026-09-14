@@ -28,6 +28,12 @@ pub const ParticlePass = struct {
     compute_sim_pipeline: sg.Pipeline = .{},
     pipeline_compute_additive: sg.Pipeline = .{},
     pipeline_compute_alphablend: sg.Pipeline = .{},
+
+    shader_cpu: sg.Shader = .{},
+    shader_gpu: sg.Shader = .{},
+    shader_sim: sg.Shader = .{},
+    shader_render: sg.Shader = .{},
+
     /// Main-target sample count the render pipelines were built for
     /// (scene/msaa.zig). Compute-sim pipeline is sample-count independent.
     sample_count: i32 = 1,
@@ -199,10 +205,12 @@ pub const ParticlePass = struct {
         var compute_sim_pipeline: sg.Pipeline = .{};
         var pipeline_compute_additive: sg.Pipeline = .{};
         var pipeline_compute_alphablend: sg.Pipeline = .{};
+        var shader_sim: sg.Shader = .{};
+        var shader_render: sg.Shader = .{};
         if (compute_ok) {
-            const shader_sim = sg.makeShader(part_compute_shd.particleComputeSimShaderDesc(sg.queryBackend()));
+            shader_sim = sg.makeShader(part_compute_shd.particleComputeSimShaderDesc(sg.queryBackend()));
             compute_sim_pipeline = compute.makePipeline(shader_sim, "particle-compute-sim");
-            const shader_render = sg.makeShader(part_compute_shd.particleComputeShaderDesc(sg.queryBackend()));
+            shader_render = sg.makeShader(part_compute_shd.particleComputeShaderDesc(sg.queryBackend()));
             pipeline_compute_additive = makeComputeRenderPipeline(shader_render, blend_additive, sample_count);
             pipeline_compute_alphablend = makeComputeRenderPipeline(shader_render, blend_alpha, sample_count);
         }
@@ -239,6 +247,10 @@ pub const ParticlePass = struct {
             .compute_sim_pipeline = compute_sim_pipeline,
             .pipeline_compute_additive = pipeline_compute_additive,
             .pipeline_compute_alphablend = pipeline_compute_alphablend,
+            .shader_cpu = shader_cpu,
+            .shader_gpu = shader_gpu,
+            .shader_sim = shader_sim,
+            .shader_render = shader_render,
             .compute_supported = compute_ok,
             .quad_vb = vb,
             .quad_ib = ib,
@@ -433,6 +445,14 @@ pub const ParticlePass = struct {
         if (self.compute_sim_pipeline.id != 0) sg.destroyPipeline(self.compute_sim_pipeline);
         if (self.pipeline_compute_additive.id != 0) sg.destroyPipeline(self.pipeline_compute_additive);
         if (self.pipeline_compute_alphablend.id != 0) sg.destroyPipeline(self.pipeline_compute_alphablend);
+        if (self.shader_cpu.id != 0) sg.destroyShader(self.shader_cpu);
+        if (self.shader_gpu.id != 0) sg.destroyShader(self.shader_gpu);
+        if (self.shader_sim.id != 0) sg.destroyShader(self.shader_sim);
+        if (self.shader_render.id != 0) sg.destroyShader(self.shader_render);
+        self.shader_cpu = .{};
+        self.shader_gpu = .{};
+        self.shader_sim = .{};
+        self.shader_render = .{};
         sg.destroyBuffer(self.quad_vb);
         sg.destroyBuffer(self.quad_ib);
         sg.destroySampler(self.sampler);

@@ -40,6 +40,9 @@ pub const ShadowPass = struct {
     inst_pipeline_u32: sg.Pipeline,
     skinned_pipeline_u16: sg.Pipeline,
     skinned_pipeline_u32: sg.Pipeline,
+    shadow_shader: sg.Shader = .{},
+    inst_shader: sg.Shader = .{},
+    skinned_shader: sg.Shader = .{},
     allocator: std.mem.Allocator,
     binned_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
 
@@ -100,8 +103,9 @@ pub const ShadowPass = struct {
         });
 
         // 1. Shadow Depth pipelines (regular meshes)
+        const shadow_shd_handle = sg.makeShader(shadow_shd.shadowShaderDesc(sg.queryBackend()));
         var shadow_pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(shadow_shd.shadowShaderDesc(sg.queryBackend())),
+            .shader = shadow_shd_handle,
             .index_type = .UINT16,
             .sample_count = 1,
             .depth = .{
@@ -126,8 +130,9 @@ pub const ShadowPass = struct {
         const pip_u32 = sg.makePipeline(shadow_pip_desc);
 
         // 2. Shadow Depth pipelines (instanced meshes)
+        const inst_shd_handle = sg.makeShader(shadow_shd.shadowInstancedShaderDesc(sg.queryBackend()));
         var shadow_inst_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(shadow_shd.shadowInstancedShaderDesc(sg.queryBackend())),
+            .shader = inst_shd_handle,
             .index_type = .UINT16,
             .sample_count = 1,
             .depth = .{
@@ -162,8 +167,9 @@ pub const ShadowPass = struct {
         const inst_pip_u32 = sg.makePipeline(shadow_inst_desc);
 
         // 3. Skinned Shadow pipelines
+        const skinned_shd_handle = sg.makeShader(shadow_shd.shadowSkinnedShaderDesc(sg.queryBackend()));
         var shadow_skinned_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(shadow_shd.shadowSkinnedShaderDesc(sg.queryBackend())),
+            .shader = skinned_shd_handle,
             .index_type = .UINT16,
             .sample_count = 1,
             .depth = .{
@@ -226,6 +232,9 @@ pub const ShadowPass = struct {
             .inst_pipeline_u32 = inst_pip_u32,
             .skinned_pipeline_u16 = skinned_pip_u16,
             .skinned_pipeline_u32 = skinned_pip_u32,
+            .shadow_shader = shadow_shd_handle,
+            .inst_shader = inst_shd_handle,
+            .skinned_shader = skinned_shd_handle,
         };
     }
 
@@ -420,6 +429,12 @@ pub const ShadowPass = struct {
         sg.destroyPipeline(self.inst_pipeline_u32);
         sg.destroyPipeline(self.skinned_pipeline_u16);
         sg.destroyPipeline(self.skinned_pipeline_u32);
+        if (self.shadow_shader.id != 0) sg.destroyShader(self.shadow_shader);
+        if (self.inst_shader.id != 0) sg.destroyShader(self.inst_shader);
+        if (self.skinned_shader.id != 0) sg.destroyShader(self.skinned_shader);
+        self.shadow_shader = .{};
+        self.inst_shader = .{};
+        self.skinned_shader = .{};
         sg.destroyView(self.attachment_view);
         sg.destroyView(self.texture_view);
         sg.destroyView(self.spot_attachment_view);

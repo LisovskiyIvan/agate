@@ -82,6 +82,7 @@ pub const DebugPass = struct {
     capacity_lines: usize = 0,
     /// Main-target sample count the pipeline was built for (scene/msaa.zig).
     sample_count: i32 = 1,
+    shader: sg.Shader = .{},
 
     pub fn init(allocator: std.mem.Allocator) !DebugPass {
         return initSampled(allocator, 1);
@@ -99,8 +100,9 @@ pub const DebugPass = struct {
             .size = verticesForLineCount(initial_capacity_lines) * @sizeOf(Vertex),
         });
 
+        const shd = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
         var pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend())),
+            .shader = shd,
             .index_type = .NONE,
             .primitive_type = .LINES,
             .depth = .{
@@ -128,6 +130,7 @@ pub const DebugPass = struct {
             .staging = staging,
             .capacity_lines = initial_capacity_lines,
             .sample_count = sample_count,
+            .shader = shd,
         };
     }
 
@@ -183,6 +186,7 @@ pub const DebugPass = struct {
 
     pub fn deinit(self: *DebugPass) void {
         sg.destroyPipeline(self.pipeline);
+        if (self.shader.id != 0) sg.destroyShader(self.shader);
         sg.destroyBuffer(self.vertex_buffer);
         self.staging.deinit(self.allocator);
         self.* = undefined;

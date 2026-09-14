@@ -14,6 +14,7 @@ pub const SkyboxPass = struct {
     sampler: sg.Sampler,
     /// Main-target sample count the pipeline was built for (scene/msaa.zig).
     sample_count: i32 = 1,
+    shader: sg.Shader = .{},
 
     pub fn init() SkyboxPass {
         return initSampled(1);
@@ -65,8 +66,9 @@ pub const SkyboxPass = struct {
             .wrap_w = .CLAMP_TO_EDGE,
         });
 
+        const shd = sg.makeShader(skybox_shd.skyboxShaderDesc(sg.queryBackend()));
         var pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(skybox_shd.skyboxShaderDesc(sg.queryBackend())),
+            .shader = shd,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .LESS_EQUAL, // Skybox rendered at maximum depth (depth = 1.0) behind scene geometry
@@ -89,6 +91,7 @@ pub const SkyboxPass = struct {
             .mesh_ib = ib,
             .sampler = smp,
             .sample_count = sample_count,
+            .shader = shd,
         };
     }
 
@@ -127,6 +130,8 @@ pub const SkyboxPass = struct {
 
     pub fn deinit(self: *SkyboxPass) void {
         sg.destroyPipeline(self.pipeline);
+        if (self.shader.id != 0) sg.destroyShader(self.shader);
+        self.shader = .{};
         sg.destroyBuffer(self.mesh_vb);
         sg.destroyBuffer(self.mesh_ib);
         sg.destroySampler(self.sampler);
