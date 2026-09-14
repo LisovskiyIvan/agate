@@ -241,6 +241,116 @@ pub fn parallelFor(
     pool.?.forkJoin(C, ctx, run, len);
 }
 
+/// Fire-and-forget background tasks on dedicated threads — the asset
+/// loading half of the threading story (decode while frames render).
+/// Deliberately independent of `Pool.forkJoin`: forkJoin spins its callers
+/// until participants finish, so a long task (texture decode, compression)
+/// must never share its threads.
+///
+/// `post` enqueues under the parking-lot mutex and wakes one idle worker
+/// (broadcast — cheap at asset-scale rates). Tasks run to completion on
+/// shutdown: `deinit` drains the queue before joining, so a posted task is
+/// either done or running when deinit returns.
+pub const TaskRunner = struct {
+    const Task = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) void,
+    };
+
+    allocator: std.mem.Allocator,
+    lot: ParkingLot = .{},
+    threads: []std.Thread,
+    queue: std.ArrayListUnmanaged(Task) = .empty,
+    /// Guarded by `lot`.
+    quit: bool = false,
+
+    /// Heap-allocates so worker threads hold a stable pointer. Zero (or
+    /// single-threaded builds) runs every posted task inline on the poster.
+    pub fn init(allocator: std.mem.Allocator, thread_count: usize) !*TaskRunner {
+        const self = try allocator.create(TaskRunner);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .threads = &.{},
+        };
+        const effective: usize = if (builtin.single_threaded) 0 else thread_count;
+        if (effective == 0) return self;
+
+        self.threads = try allocator.alloc(std.Thread, effective);
+        errdefer allocator.free(self.threads);
+        var spawned: usize = 0;
+        errdefer for (self.threads[0..spawned]) |t| t.join();
+        for (0..effective) |i| {
+            self.threads[i] = try std.Thread.spawn(.{}, workerMain, .{self});
+            spawned += 1;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *TaskRunner) void {
+        if (self.threads.len > 0) {
+            self.lot.lock();
+            self.quit = true;
+            self.lot.unlock();
+            self.lot.broadcast();
+            for (self.threads) |t| t.join();
+        }
+        self.queue.deinit(self.allocator);
+        const a = self.allocator;
+        if (self.threads.len > 0) a.free(self.threads);
+        _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
+        _ = std.c.pthread_cond_destroy(&self.lot.cond);
+        a.destroy(self);
+    }
+
+    /// Number of tasks not yet picked up. Tasks currently running are not
+    /// counted; poll the task's own completion state for that.
+    pub fn queuedCount(self: *TaskRunner) usize {
+        self.lot.lock();
+        defer self.lot.unlock();
+        return self.queue.items.len;
+    }
+
+    /// Enqueues a task. `ctx` must outlive the run — tasks own their
+    /// context and free it in `run`, or the poster observes completion via
+    /// its own state and frees afterwards. On queue-allocation failure the
+    /// task runs inline on the posting thread: scheduling fallback, never
+    /// a dropped job.
+    pub fn post(self: *TaskRunner, ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void) void {
+        self.lot.lock();
+        if (self.threads.len == 0) {
+            self.lot.unlock();
+            run(ctx);
+            return;
+        }
+        self.queue.append(self.allocator, .{ .ctx = ctx, .run = run }) catch {
+            self.lot.unlock();
+            run(ctx);
+            return;
+        };
+        self.lot.unlock();
+        self.lot.broadcast();
+    }
+
+    fn workerMain(self: *TaskRunner) void {
+        while (true) {
+            self.lot.lock();
+            while (self.queue.items.len == 0) {
+                if (self.quit) {
+                    self.lot.unlock();
+                    return;
+                }
+                self.lot.sleep();
+            }
+            // FIFO: asset requests decode roughly in request order, which
+            // keeps later frames' textures arriving after earlier ones.
+            const task = self.queue.orderedRemove(0);
+            self.lot.unlock();
+            task.run(task.ctx);
+        }
+    }
+};
+
 // --- tests ---
 
 const CountCtx = struct {
@@ -358,4 +468,52 @@ test "init/deinit cycles leak nothing and restart cleanly" {
         pool.forkJoin(CountCtx, &ctx, countRange, len);
         try std.testing.expectEqual(@as(usize, len), ctx.total.load(.acquire));
     }
+}
+
+const Counters = struct {
+    hits: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    freed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn bumpTask(ctx: *anyopaque) void {
+    const counters: *Counters = @ptrCast(@alignCast(ctx));
+    _ = counters.hits.fetchAdd(1, .acq_rel);
+}
+
+test "TaskRunner runs every posted task exactly once" {
+    const a = std.testing.allocator;
+    const runner = try TaskRunner.init(a, 2);
+    defer runner.deinit();
+
+    var counters = Counters{};
+    for (0..100) |_| runner.post(&counters, bumpTask);
+    // Tasks may still be in flight; deinit joins them. Poll cheaply before
+    // that to prove progress happens without any further posting.
+    var waited: usize = 0;
+    while (counters.hits.load(.acquire) < 100 and waited < 10_000_000) : (waited += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(@as(u32, 100), counters.hits.load(.acquire));
+}
+
+test "TaskRunner deinit drains queued tasks" {
+    const a = std.testing.allocator;
+    const runner = try TaskRunner.init(a, 2);
+    var counters = Counters{};
+    // Posted but never waited for: shutdown must run them all before join.
+    for (0..50) |_| runner.post(&counters, bumpTask);
+    runner.deinit();
+    // Join-on-shutdown implies a fully drained queue; hits would be short
+    // otherwise.
+    try std.testing.expectEqual(@as(u32, 50), counters.hits.load(.acquire));
+}
+
+test "zero-thread TaskRunner runs tasks inline on the poster" {
+    const a = std.testing.allocator;
+    const runner = try TaskRunner.init(a, 0);
+    defer runner.deinit();
+    var counters = Counters{};
+    runner.post(&counters, bumpTask);
+    // Inline: complete before post returns.
+    try std.testing.expectEqual(@as(u32, 1), counters.hits.load(.acquire));
 }
