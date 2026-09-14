@@ -1960,18 +1960,35 @@ pub fn buildPolygonData(allocator: std.mem.Allocator, options: PolygonOptions) !
         }
 
         var ii: usize = 0;
-        for (cap_tris[0..tri_count]) |tri| {
-            indices[ii + 0] = tri[0];
-            indices[ii + 1] = tri[1];
-            indices[ii + 2] = tri[2];
-            ii += 3;
-        }
-        if (double_sided) {
+        if (is_xz) {
             for (cap_tris[0..tri_count]) |tri| {
                 indices[ii + 0] = tri[0];
                 indices[ii + 1] = tri[2];
                 indices[ii + 2] = tri[1];
                 ii += 3;
+            }
+            if (double_sided) {
+                for (cap_tris[0..tri_count]) |tri| {
+                    indices[ii + 0] = tri[0];
+                    indices[ii + 1] = tri[1];
+                    indices[ii + 2] = tri[2];
+                    ii += 3;
+                }
+            }
+        } else {
+            for (cap_tris[0..tri_count]) |tri| {
+                indices[ii + 0] = tri[0];
+                indices[ii + 1] = tri[1];
+                indices[ii + 2] = tri[2];
+                ii += 3;
+            }
+            if (double_sided) {
+                for (cap_tris[0..tri_count]) |tri| {
+                    indices[ii + 0] = tri[0];
+                    indices[ii + 1] = tri[2];
+                    indices[ii + 2] = tri[1];
+                    ii += 3;
+                }
             }
         }
 
@@ -2052,20 +2069,38 @@ pub fn buildPolygonData(allocator: std.mem.Allocator, options: PolygonOptions) !
             vi += 1;
         }
 
-        // Top cap indices (CCW)
-        for (cap_tris[0..tri_count]) |tri| {
-            indices[ii + 0] = top_base + tri[0];
-            indices[ii + 1] = top_base + tri[1];
-            indices[ii + 2] = top_base + tri[2];
-            ii += 3;
-        }
+        if (is_xz) {
+            // Top cap indices (facing +Y)
+            for (cap_tris[0..tri_count]) |tri| {
+                indices[ii + 0] = top_base + tri[0];
+                indices[ii + 1] = top_base + tri[2];
+                indices[ii + 2] = top_base + tri[1];
+                ii += 3;
+            }
 
-        // Bottom cap indices (reversed winding)
-        for (cap_tris[0..tri_count]) |tri| {
-            indices[ii + 0] = bot_base + tri[0];
-            indices[ii + 1] = bot_base + tri[2];
-            indices[ii + 2] = bot_base + tri[1];
-            ii += 3;
+            // Bottom cap indices (facing -Y)
+            for (cap_tris[0..tri_count]) |tri| {
+                indices[ii + 0] = bot_base + tri[0];
+                indices[ii + 1] = bot_base + tri[1];
+                indices[ii + 2] = bot_base + tri[2];
+                ii += 3;
+            }
+        } else {
+            // Top cap indices (facing +Z, CCW)
+            for (cap_tris[0..tri_count]) |tri| {
+                indices[ii + 0] = top_base + tri[0];
+                indices[ii + 1] = top_base + tri[1];
+                indices[ii + 2] = top_base + tri[2];
+                ii += 3;
+            }
+
+            // Bottom cap indices (facing -Z, reversed winding)
+            for (cap_tris[0..tri_count]) |tri| {
+                indices[ii + 0] = bot_base + tri[0];
+                indices[ii + 1] = bot_base + tri[2];
+                indices[ii + 2] = bot_base + tri[1];
+                ii += 3;
+            }
         }
 
         // Side walls helper
@@ -2162,13 +2197,23 @@ pub fn buildPolygonData(allocator: std.mem.Allocator, options: PolygonOptions) !
                     }
                     cur_vi.* += 4;
 
-                    inds[cur_ii.* + 0] = base_v + 0;
-                    inds[cur_ii.* + 1] = base_v + 1;
-                    inds[cur_ii.* + 2] = base_v + 2;
+                    if (xz_mode) {
+                        inds[cur_ii.* + 0] = base_v + 0;
+                        inds[cur_ii.* + 1] = base_v + 2;
+                        inds[cur_ii.* + 2] = base_v + 1;
 
-                    inds[cur_ii.* + 3] = base_v + 1;
-                    inds[cur_ii.* + 4] = base_v + 3;
-                    inds[cur_ii.* + 5] = base_v + 2;
+                        inds[cur_ii.* + 3] = base_v + 1;
+                        inds[cur_ii.* + 4] = base_v + 2;
+                        inds[cur_ii.* + 5] = base_v + 3;
+                    } else {
+                        inds[cur_ii.* + 0] = base_v + 0;
+                        inds[cur_ii.* + 1] = base_v + 1;
+                        inds[cur_ii.* + 2] = base_v + 2;
+
+                        inds[cur_ii.* + 3] = base_v + 1;
+                        inds[cur_ii.* + 4] = base_v + 3;
+                        inds[cur_ii.* + 5] = base_v + 2;
+                    }
                     cur_ii.* += 6;
                 }
             }

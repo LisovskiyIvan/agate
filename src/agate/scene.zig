@@ -640,19 +640,10 @@ pub const Scene = struct {
 
     fn ensureClearResources(self: *Scene, samples: i32) void {
         if (self.clear_vb.id == 0) {
-            const clear_verts = [_]debug_pass.Vertex{
-                .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-                .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-                .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-                .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-                .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-                .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
-            };
             self.clear_vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = 6 * @sizeOf(debug_pass.Vertex),
+                .size = 16 * 6 * @sizeOf(debug_pass.Vertex),
             });
-            sg.updateBuffer(self.clear_vb, sg.asRange(&clear_verts));
         }
         if (self.clear_shader.id == 0) {
             self.clear_shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
@@ -680,13 +671,19 @@ pub const Scene = struct {
                 .offset = @offsetOf(debug_pass.Vertex, "color"),
             };
             target_pip.* = sg.makePipeline(pip_desc);
+            if (sg.queryPipelineState(target_pip.*) != .VALID) {
+                std.debug.print("[CLEAR PIPELINE FAILED]: shader_state={}, pip_state={}\n", .{
+                    sg.queryShaderState(self.clear_shader),
+                    sg.queryPipelineState(target_pip.*),
+                });
+            }
         }
     }
 
     fn clearCurrentViewport(self: *Scene, color: Color4, samples: i32) void {
         self.ensureClearResources(samples);
         const pip = if (samples > 1) self.clear_pipeline_msaa else self.clear_pipeline;
-        if (pip.id == 0 or self.clear_vb.id == 0) return;
+        if (pip.id == 0 or self.clear_vb.id == 0 or sg.queryPipelineState(pip) != .VALID) return;
 
         const clear_verts = [_]debug_pass.Vertex{
             .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
@@ -696,11 +693,13 @@ pub const Scene = struct {
             .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
             .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
         };
-        sg.updateBuffer(self.clear_vb, sg.asRange(&clear_verts));
+        const offset = sg.appendBuffer(self.clear_vb, sg.asRange(&clear_verts));
+        if (offset < 0) return;
 
         sg.applyPipeline(pip);
         var bind = sg.Bindings{};
         bind.vertex_buffers[0] = self.clear_vb;
+        bind.vertex_buffer_offsets[0] = offset;
         sg.applyBindings(bind);
 
         const vs_params = debug_shd.VsParams{
@@ -887,13 +886,22 @@ pub const Scene = struct {
         };
 
         if (self.enable_multi_camera and self.cameras.items.len > 0) {
+            const active_idx = self.active_camera_index orelse 0;
+            const primary_cam = self.cameras.items[active_idx].camera;
+            const primary_vp = self.cameras.items[active_idx].viewport;
+            const primary_mask = self.cameras.items[active_idx].culling_mask;
+            const primary_rect = primary_vp.toPixelRect(cur_w, cur_h);
+            sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
+            sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
+            self.renderSceneView(primary_cam, primary_mask, primary_rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+
             for (self.cameras.items, 0..) |entry, i| {
-                if (!entry.enabled) continue;
+                if (i == active_idx or !entry.enabled) continue;
                 const rect = entry.viewport.toPixelRect(cur_w, cur_h);
                 sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
                 sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-                if (i > 0 and entry.clear_viewport) {
+                if (entry.clear_viewport) {
                     const clr = entry.clear_color orelse self.clear_color;
                     self.clearCurrentViewport(clr, samples);
                 }

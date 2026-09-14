@@ -183,7 +183,7 @@ pub const VatData = struct {
             .pixel_format = .RGBA32F,
             .usage = .{ .immutable = true },
         };
-        pos_img_desc.data.subimage[0][0] = sg.asRange(self.positions);
+        pos_img_desc.data.mip_levels[0] = sg.asRange(self.positions);
         self.position_image = sg.makeImage(pos_img_desc);
         if (self.position_image.id == 0) return error.GpuImageCreationFailed;
 
@@ -198,7 +198,7 @@ pub const VatData = struct {
                 .pixel_format = .RGBA32F,
                 .usage = .{ .immutable = true },
             };
-            norm_img_desc.data.subimage[0][0] = sg.asRange(norms);
+            norm_img_desc.data.mip_levels[0] = sg.asRange(norms);
             self.normal_image = sg.makeImage(norm_img_desc);
             if (self.normal_image.id != 0) {
                 self.normal_view = sg.makeView(.{

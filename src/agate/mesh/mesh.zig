@@ -92,6 +92,7 @@ pub const Mesh = struct {
     // Instance buffer upload dedup: skip sg.updateBuffer when data unchanged.
     instance_hash: u64 = 0,
     instance_uploaded_count: usize = 0,
+    instance_uploaded_frame: u64 = std.math.maxInt(u64),
 
     // Level of Detail (LOD)
     lod_levels: std.ArrayListUnmanaged(LODLevel) = .empty,

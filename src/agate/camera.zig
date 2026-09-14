@@ -169,6 +169,22 @@ pub const ArcRotateCamera = struct {
     pub fn getFovDeg(self: ArcRotateCamera) f32 {
         return self.fov_deg;
     }
+
+    pub fn getViewport(self: ArcRotateCamera) Viewport {
+        return self.viewport;
+    }
+
+    pub fn setViewport(self: *ArcRotateCamera, vp: Viewport) void {
+        self.viewport = vp;
+    }
+
+    pub fn getCullingMask(self: ArcRotateCamera) u32 {
+        return self.culling_mask;
+    }
+
+    pub fn setCullingMask(self: *ArcRotateCamera, mask: u32) void {
+        self.culling_mask = mask;
+    }
 };
 
 // Rotation convention (degrees): x = pitch (positive looks up),
@@ -319,6 +335,22 @@ pub const FreeCamera = struct {
     pub fn getFovDeg(self: FreeCamera) f32 {
         return self.fov_deg;
     }
+
+    pub fn getViewport(self: FreeCamera) Viewport {
+        return self.viewport;
+    }
+
+    pub fn setViewport(self: *FreeCamera, vp: Viewport) void {
+        self.viewport = vp;
+    }
+
+    pub fn getCullingMask(self: FreeCamera) u32 {
+        return self.culling_mask;
+    }
+
+    pub fn setCullingMask(self: *FreeCamera, mask: u32) void {
+        self.culling_mask = mask;
+    }
 };
 
 pub const FollowCameraOptions = struct {
@@ -429,6 +461,22 @@ pub const FollowCamera = struct {
 
     pub fn getFovDeg(self: FollowCamera) f32 {
         return self.fov_deg;
+    }
+
+    pub fn getViewport(self: FollowCamera) Viewport {
+        return self.viewport;
+    }
+
+    pub fn setViewport(self: *FollowCamera, vp: Viewport) void {
+        self.viewport = vp;
+    }
+
+    pub fn getCullingMask(self: FollowCamera) u32 {
+        return self.culling_mask;
+    }
+
+    pub fn setCullingMask(self: *FollowCamera, mask: u32) void {
+        self.culling_mask = mask;
     }
 };
 
@@ -588,6 +636,22 @@ pub const TargetCamera = struct {
 
     pub fn getFovDeg(self: TargetCamera) f32 {
         return self.fov_deg;
+    }
+
+    pub fn getViewport(self: TargetCamera) Viewport {
+        return self.viewport;
+    }
+
+    pub fn setViewport(self: *TargetCamera, vp: Viewport) void {
+        self.viewport = vp;
+    }
+
+    pub fn getCullingMask(self: TargetCamera) u32 {
+        return self.culling_mask;
+    }
+
+    pub fn setCullingMask(self: *TargetCamera, mask: u32) void {
+        self.culling_mask = mask;
     }
 };
 
@@ -782,6 +846,22 @@ pub const FlyCamera = struct {
 
     pub fn getFovDeg(self: FlyCamera) f32 {
         return self.fov_deg;
+    }
+
+    pub fn getViewport(self: FlyCamera) Viewport {
+        return self.viewport;
+    }
+
+    pub fn setViewport(self: *FlyCamera, vp: Viewport) void {
+        self.viewport = vp;
+    }
+
+    pub fn getCullingMask(self: FlyCamera) u32 {
+        return self.culling_mask;
+    }
+
+    pub fn setCullingMask(self: *FlyCamera, mask: u32) void {
+        self.culling_mask = mask;
     }
 };
 

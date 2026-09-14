@@ -404,6 +404,7 @@ pub const ShadowPass = struct {
             };
             spot_pass.attachments.depth_stencil = self.spot_attachment_view;
             sg.beginPass(spot_pass);
+            var spot_last_pipeline_id: u32 = 0;
 
             for (spot_shadows) |spot_info| {
                 const vx: i32 = if (spot_info.spot_index == 0) 0 else SPOT_SHADOW_RES;
@@ -411,7 +412,7 @@ pub const ShadowPass = struct {
                 sg.applyScissorRect(vx, 0, SPOT_SHADOW_RES, SPOT_SHADOW_RES, false);
 
                 const spot_frustum = math.Frustum.fromViewProjection(spot_info.view_proj);
-                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, frame_id, null, &last_pipeline_id, &draw_calls);
+                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, frame_id, null, &spot_last_pipeline_id, &draw_calls);
             }
 
             sg.endPass();

@@ -80,6 +80,21 @@ pub const BoundingBox = struct {
             (self.min.z <= other.max.z and self.max.z >= other.min.z);
     }
 
+    pub fn merge(self: BoundingBox, other: BoundingBox) BoundingBox {
+        return .{
+            .min = Vec3.new(
+                @min(self.min.x, other.min.x),
+                @min(self.min.y, other.min.y),
+                @min(self.min.z, other.min.z),
+            ),
+            .max = Vec3.new(
+                @max(self.max.x, other.max.x),
+                @max(self.max.y, other.max.y),
+                @max(self.max.z, other.max.z),
+            ),
+        };
+    }
+
     pub fn containsPoint(self: BoundingBox, pt: Vec3) bool {
         return (pt.x >= self.min.x and pt.x <= self.max.x) and
             (pt.y >= self.min.y and pt.y <= self.max.y) and

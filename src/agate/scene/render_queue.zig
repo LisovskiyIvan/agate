@@ -199,180 +199,62 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
         if (mesh.is_lod_child) continue;
         if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
         if (mesh.instances.items.len > 0) {
-            ctx.queues.instance_matrices.clearRetainingCapacity();
-            const total_insts = mesh.instances.items.len;
-            var inst_idx: usize = 0;
-
-            // SIMD 4-wide batching
-            while (inst_idx + 4 <= total_insts) : (inst_idx += 4) {
-                const inst0 = mesh.instances.items[inst_idx + 0];
-                const inst1 = mesh.instances.items[inst_idx + 1];
-                const inst2 = mesh.instances.items[inst_idx + 2];
-                const inst3 = mesh.instances.items[inst_idx + 3];
-
-                ctx.stats.total_meshes += 4;
-
-                inst0.updateCachedTransforms();
-                inst1.updateCachedTransforms();
-                inst2.updateCachedTransforms();
-                inst3.updateCachedTransforms();
-
-                const m0 = inst0.cached_world_matrix;
-                const m1 = inst1.cached_world_matrix;
-                const m2 = inst2.cached_world_matrix;
-                const m3 = inst3.cached_world_matrix;
-
-                const b0 = inst0.cached_bounding_box;
-                const b1 = inst1.cached_bounding_box;
-                const b2 = inst2.cached_bounding_box;
-                const b3 = inst3.cached_bounding_box;
-
-                if (ctx.cull_frustum) {
-                    const c0 = b0.center();
-                    const c1 = b1.center();
-                    const c2 = b2.center();
-                    const c3 = b3.center();
-
-                    const e0 = b0.extents();
-                    const e1 = b1.extents();
-                    const e2 = b2.extents();
-                    const e3 = b3.extents();
-
-                    const c_x: @Vector(4, f32) = .{ c0.x, c1.x, c2.x, c3.x };
-                    const c_y: @Vector(4, f32) = .{ c0.y, c1.y, c2.y, c3.y };
-                    const c_z: @Vector(4, f32) = .{ c0.z, c1.z, c2.z, c3.z };
-
-                    const ex_x: @Vector(4, f32) = .{ e0.x, e1.x, e2.x, e3.x };
-                    const ex_y: @Vector(4, f32) = .{ e0.y, e1.y, e2.y, e3.y };
-                    const ex_z: @Vector(4, f32) = .{ e0.z, e1.z, e2.z, e3.z };
-
-                    const vis = frustum.intersectsAABB4(c_x, c_y, c_z, ex_x, ex_y, ex_z);
-
-                    if (inst0.is_visible and ((inst0.layer_mask & ctx.culling_mask) != 0) and (inst0.culling_strategy == .always_render or vis[0])) {
-                        if (ctx.cull_occlusion and !mesh.is_occluder and inst0.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b0)) {
-                            ctx.stats.occluded_meshes += 1;
-                            ctx.stats.culled_meshes += 1;
-                        } else {
-                            ctx.stats.rendered_meshes += 1;
-                            ctx.queues.instance_matrices.append(ctx.allocator, m0) catch {};
-                        }
+            if (mesh.instance_uploaded_frame != ctx.frame_id) {
+                mesh.instance_uploaded_frame = ctx.frame_id;
+                ctx.queues.instance_matrices.clearRetainingCapacity();
+                var combined_aabb = math.BoundingBox.zero;
+                for (mesh.instances.items) |inst| {
+                    if (!inst.is_visible) continue;
+                    inst.updateCachedTransforms();
+                    ctx.queues.instance_matrices.append(ctx.allocator, inst.cached_world_matrix) catch continue;
+                    if (combined_aabb.isValid()) {
+                        combined_aabb = combined_aabb.merge(inst.cached_bounding_box);
                     } else {
-                        ctx.stats.culled_meshes += 1;
+                        combined_aabb = inst.cached_bounding_box;
                     }
-
-                    if (inst1.is_visible and ((inst1.layer_mask & ctx.culling_mask) != 0) and (inst1.culling_strategy == .always_render or vis[1])) {
-                        if (ctx.cull_occlusion and !mesh.is_occluder and inst1.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b1)) {
-                            ctx.stats.occluded_meshes += 1;
-                            ctx.stats.culled_meshes += 1;
-                        } else {
-                            ctx.stats.rendered_meshes += 1;
-                            ctx.queues.instance_matrices.append(ctx.allocator, m1) catch {};
+                }
+                mesh.cached_aabb = combined_aabb;
+                const active_count = ctx.queues.instance_matrices.items.len;
+                mesh.visible_instance_count = @intCast(active_count);
+                if (active_count > 0) {
+                    if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < active_count) {
+                        if (mesh.instance_buffer.id != 0) {
+                            sg.destroyBuffer(mesh.instance_buffer);
                         }
+                        const new_cap = @max(active_count, mesh.instance_buffer_capacity * 2);
+                        mesh.instance_buffer = sg.makeBuffer(.{
+                            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                            .size = new_cap * @sizeOf(Mat4),
+                        });
+                        mesh.instance_buffer_capacity = new_cap;
+                        sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
+                        mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                        mesh.instance_uploaded_count = active_count;
                     } else {
-                        ctx.stats.culled_meshes += 1;
-                    }
-
-                    if (inst2.is_visible and ((inst2.layer_mask & ctx.culling_mask) != 0) and (inst2.culling_strategy == .always_render or vis[2])) {
-                        if (ctx.cull_occlusion and !mesh.is_occluder and inst2.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b2)) {
-                            ctx.stats.occluded_meshes += 1;
-                            ctx.stats.culled_meshes += 1;
-                        } else {
-                            ctx.stats.rendered_meshes += 1;
-                            ctx.queues.instance_matrices.append(ctx.allocator, m2) catch {};
+                        const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                        if (active_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
+                            sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
+                            mesh.instance_hash = h;
+                            mesh.instance_uploaded_count = active_count;
                         }
-                    } else {
-                        ctx.stats.culled_meshes += 1;
-                    }
-
-                    if (inst3.is_visible and ((inst3.layer_mask & ctx.culling_mask) != 0) and (inst3.culling_strategy == .always_render or vis[3])) {
-                        if (ctx.cull_occlusion and !mesh.is_occluder and inst3.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b3)) {
-                            ctx.stats.occluded_meshes += 1;
-                            ctx.stats.culled_meshes += 1;
-                        } else {
-                            ctx.stats.rendered_meshes += 1;
-                            ctx.queues.instance_matrices.append(ctx.allocator, m3) catch {};
-                        }
-                    } else {
-                        ctx.stats.culled_meshes += 1;
-                    }
-                } else {
-                    if (inst0.is_visible and ((inst0.layer_mask & ctx.culling_mask) != 0)) {
-                        ctx.stats.rendered_meshes += 1;
-                        ctx.queues.instance_matrices.append(ctx.allocator, m0) catch {};
-                    }
-                    if (inst1.is_visible and ((inst1.layer_mask & ctx.culling_mask) != 0)) {
-                        ctx.stats.rendered_meshes += 1;
-                        ctx.queues.instance_matrices.append(ctx.allocator, m1) catch {};
-                    }
-                    if (inst2.is_visible and ((inst2.layer_mask & ctx.culling_mask) != 0)) {
-                        ctx.stats.rendered_meshes += 1;
-                        ctx.queues.instance_matrices.append(ctx.allocator, m2) catch {};
-                    }
-                    if (inst3.is_visible and ((inst3.layer_mask & ctx.culling_mask) != 0)) {
-                        ctx.stats.rendered_meshes += 1;
-                        ctx.queues.instance_matrices.append(ctx.allocator, m3) catch {};
                     }
                 }
             }
 
-            // Remainder instances
-            while (inst_idx < total_insts) : (inst_idx += 1) {
-                const inst = mesh.instances.items[inst_idx];
-                ctx.stats.total_meshes += 1;
-                if (!inst.is_visible or ((inst.layer_mask & ctx.culling_mask) == 0)) continue;
-                inst.updateCachedTransforms();
-                const m = inst.cached_world_matrix;
-                const world_aabb = inst.cached_bounding_box;
-                if (ctx.cull_frustum and inst.culling_strategy != .always_render) {
-                    if (!frustum.intersectsAABB(world_aabb)) {
-                        ctx.stats.culled_meshes += 1;
-                        continue;
-                    }
+            if (mesh.visible_instance_count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
+                if (ctx.cull_frustum and mesh.cached_aabb.isValid() and !frustum.intersectsAABB(mesh.cached_aabb)) {
+                    ctx.stats.culled_meshes += @intCast(mesh.instances.items.len);
+                    continue;
                 }
-                if (ctx.cull_occlusion and !mesh.is_occluder and inst.culling_strategy != .always_render) {
-                    if (ctx.occlusion_culler.isOccluded(world_aabb)) {
-                        ctx.stats.occluded_meshes += 1;
-                        ctx.stats.culled_meshes += 1;
-                        continue;
-                    }
-                }
-                ctx.stats.rendered_meshes += 1;
-                ctx.queues.instance_matrices.append(ctx.allocator, m) catch continue;
-            }
-
-            const visible_count = ctx.queues.instance_matrices.items.len;
-            mesh.visible_instance_count = @intCast(visible_count);
-            if (visible_count > 0) {
+                ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
+                ctx.stats.rendered_meshes += mesh.visible_instance_count;
                 if (materialIsTransparent(mesh.material)) {
                     ctx.queues.transparent_instanced.append(ctx.allocator, mesh) catch {};
                 } else {
                     ctx.queues.opaque_instanced.append(ctx.allocator, mesh) catch {};
                 }
-
-                if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < visible_count) {
-                    if (mesh.instance_buffer.id != 0) {
-                        sg.destroyBuffer(mesh.instance_buffer);
-                    }
-                    const new_cap = @max(visible_count, mesh.instance_buffer_capacity * 2);
-                    mesh.instance_buffer = sg.makeBuffer(.{
-                        .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                        .size = new_cap * @sizeOf(Mat4),
-                    });
-                    mesh.instance_buffer_capacity = new_cap;
-                    // Fresh buffer: must upload, then record hash.
-                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..visible_count]));
-                    mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..visible_count]));
-                    mesh.instance_uploaded_count = visible_count;
-                } else {
-                    // Static instance sets skip the driver upload entirely.
-                    const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..visible_count]));
-                    if (visible_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
-                        sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..visible_count]));
-                        mesh.instance_hash = h;
-                        mesh.instance_uploaded_count = visible_count;
-                    }
-                }
             }
+            continue;
         } else {
             ctx.stats.total_meshes += 1;
             if (!mesh.is_visible) continue;
