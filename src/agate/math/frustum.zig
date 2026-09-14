@@ -82,21 +82,20 @@ pub const Frustum = struct {
         return f;
     }
 
-    /// Tests if an Axis-Aligned Bounding Box intersects or is inside the frustum.
+    /// Tests if an Axis-Aligned Bounding Box intersects or is inside the frustum using SIMD.
     /// Returns true if visible, false if entirely culled.
     pub fn intersectsAABB(self: Frustum, aabb: BoundingBox) bool {
         const c = aabb.center();
         const e = aabb.extents();
+        const c_v: @Vector(4, f32) = .{ c.x, c.y, c.z, 1.0 };
+        const e_v: @Vector(4, f32) = .{ e.x, e.y, e.z, 0.0 };
 
-        for (self.planes) |p| {
-            // Distance of center to plane
-            const dist = p.normal.dot(c) + p.d;
-            // Maximum projection of extents along plane normal
-            const radius = @abs(p.normal.x) * e.x +
-                @abs(p.normal.y) * e.y +
-                @abs(p.normal.z) * e.z;
+        inline for (self.planes) |p| {
+            const p_v: @Vector(4, f32) = .{ p.normal.x, p.normal.y, p.normal.z, p.d };
+            const abs_n: @Vector(4, f32) = .{ @abs(p.normal.x), @abs(p.normal.y), @abs(p.normal.z), 0.0 };
+            const dist = @reduce(.Add, p_v * c_v);
+            const radius = @reduce(.Add, abs_n * e_v);
 
-            // If the box is completely on the negative side of any plane, it's outside!
             if (dist < -radius) {
                 return false;
             }

@@ -258,38 +258,55 @@ pub const Mat4 = extern struct {
         return r;
     }
 
-    /// Transforms a 3D point (w = 1.0) and applies perspective division
+    /// Transforms a 3D point (w = 1.0) and applies perspective division using SIMD
     pub fn transformPoint(self: Mat4, p: Vec3) Vec3 {
-        const x = self.m[0] * p.x + self.m[4] * p.y + self.m[8] * p.z + self.m[12];
-        const y = self.m[1] * p.x + self.m[5] * p.y + self.m[9] * p.z + self.m[13];
-        const z = self.m[2] * p.x + self.m[6] * p.y + self.m[10] * p.z + self.m[14];
-        const w = self.m[3] * p.x + self.m[7] * p.y + self.m[11] * p.z + self.m[15];
+        const col0: @Vector(4, f32) = self.m[0..4].*;
+        const col1: @Vector(4, f32) = self.m[4..8].*;
+        const col2: @Vector(4, f32) = self.m[8..12].*;
+        const col3: @Vector(4, f32) = self.m[12..16].*;
+        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(p.x)) +
+            col1 * @as(@Vector(4, f32), @splat(p.y)) +
+            col2 * @as(@Vector(4, f32), @splat(p.z)) +
+            col3;
+
+        const w = v[3];
         if (w != 0.0 and w != 1.0) {
             const inv_w = 1.0 / w;
-            return Vec3.new(x * inv_w, y * inv_w, z * inv_w);
+            return Vec3.new(v[0] * inv_w, v[1] * inv_w, v[2] * inv_w);
         }
-        return Vec3.new(x, y, z);
+        return Vec3.new(v[0], v[1], v[2]);
     }
 
-    /// Transforms a 3D direction vector (w = 0.0) without translation
+    /// Transforms a 3D direction vector (w = 0.0) without translation using SIMD
     pub fn transformDirection(self: Mat4, d: Vec3) Vec3 {
-        const x = self.m[0] * d.x + self.m[4] * d.y + self.m[8] * d.z;
-        const y = self.m[1] * d.x + self.m[5] * d.y + self.m[9] * d.z;
-        const z = self.m[2] * d.x + self.m[6] * d.y + self.m[10] * d.z;
-        return Vec3.new(x, y, z).normalize();
+        const col0: @Vector(4, f32) = self.m[0..4].*;
+        const col1: @Vector(4, f32) = self.m[4..8].*;
+        const col2: @Vector(4, f32) = self.m[8..12].*;
+        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(d.x)) +
+            col1 * @as(@Vector(4, f32), @splat(d.y)) +
+            col2 * @as(@Vector(4, f32), @splat(d.z));
+
+        return Vec3.new(v[0], v[1], v[2]).normalize();
     }
 
     /// Projects a 3D world space point into 2D screen pixel space (top-left is (0,0)).
     /// Returns null if the point is behind the camera.
     pub fn projectPoint(self: Mat4, p: Vec3, screen_w: f32, screen_h: f32) ?Vec2 {
-        const x = self.m[0] * p.x + self.m[4] * p.y + self.m[8] * p.z + self.m[12];
-        const y = self.m[1] * p.x + self.m[5] * p.y + self.m[9] * p.z + self.m[13];
-        const w = self.m[3] * p.x + self.m[7] * p.y + self.m[11] * p.z + self.m[15];
+        const col0: @Vector(4, f32) = self.m[0..4].*;
+        const col1: @Vector(4, f32) = self.m[4..8].*;
+        const col2: @Vector(4, f32) = self.m[8..12].*;
+        const col3: @Vector(4, f32) = self.m[12..16].*;
+        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(p.x)) +
+            col1 * @as(@Vector(4, f32), @splat(p.y)) +
+            col2 * @as(@Vector(4, f32), @splat(p.z)) +
+            col3;
+
+        const w = v[3];
         if (w <= 0.001) return null;
 
         const inv_w = 1.0 / w;
-        const ndc_x = x * inv_w;
-        const ndc_y = y * inv_w;
+        const ndc_x = v[0] * inv_w;
+        const ndc_y = v[1] * inv_w;
 
         const sx = (ndc_x * 0.5 + 0.5) * screen_w;
         const sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
