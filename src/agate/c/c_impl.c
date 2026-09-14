@@ -45,6 +45,11 @@ cgltf_result agate_cgltf_decode_meshopt(const cgltf_options* options, cgltf_data
 			return cgltf_result_data_too_short;
 		}
 
+		if (mc->stride != 0 && mc->count > ((cgltf_size)-1) / mc->stride)
+		{
+			return cgltf_result_invalid_gltf;
+		}
+
 		const unsigned char* source = (const unsigned char*)mc->buffer->data + mc->offset;
 		void* decoded = mem_alloc(options->memory.user_data, mc->count * mc->stride);
 		if (!decoded)

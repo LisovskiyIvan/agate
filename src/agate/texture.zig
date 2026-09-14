@@ -313,7 +313,6 @@ pub const Texture = struct {
         var h: c_int = 0;
         var channels_in_file: c_int = 0;
 
-        const t0 = sokol.time.now();
         const data = c.stbi_load_from_memory(
             bytes.ptr,
             @intCast(bytes.len),
@@ -322,7 +321,6 @@ pub const Texture = struct {
             &channels_in_file,
             4,
         );
-        const t1 = sokol.time.now();
         if (data == null) return error.ImageDecodeFailed;
         defer c.stbi_image_free(data);
 
@@ -331,15 +329,7 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         // Convert before buildRaw so the box filter averages in linear space.
         if (opts.srgb_to_linear) convertSrgbToLinearInPlace(data[0..size_bytes]);
-        const raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
-
-        const t2 = sokol.time.now();
-        std.debug.print("  [TEX {d}x{d}] stbi: {d:0.1} ms | mipgen: {d:0.1} ms | total: {d:0.1} ms\n", .{
-            width,                                  height,
-            sokol.time.ms(sokol.time.diff(t1, t0)), sokol.time.ms(sokol.time.diff(t2, t1)),
-            sokol.time.ms(sokol.time.diff(t2, t0)),
-        });
-        return raw;
+        return try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
     }
 
     /// File variant of `decodeMemory`. Thread-safe; pair with `fromRaw`.
@@ -856,11 +846,11 @@ pub const CubeTexture = struct {
         const face_bytes = size * size * 4;
 
         var face_slices: [6][]u8 = undefined;
+        var allocated_faces: usize = 0;
+        defer for (face_slices[0..allocated_faces]) |s| allocator.free(s);
         for (0..6) |i| {
             face_slices[i] = try allocator.alloc(u8, face_bytes);
-        }
-        defer {
-            for (0..6) |i| allocator.free(face_slices[i]);
+            allocated_faces += 1;
         }
 
         // Normalize sun direction
@@ -1013,11 +1003,11 @@ pub const CubeTexture = struct {
         const face_bytes = face_size * face_size * 4;
 
         var face_slices: [6][]u8 = undefined;
+        var allocated_faces: usize = 0;
+        defer for (face_slices[0..allocated_faces]) |s| allocator.free(s);
         for (0..6) |i| {
             face_slices[i] = try allocator.alloc(u8, face_bytes);
-        }
-        defer {
-            for (0..6) |i| allocator.free(face_slices[i]);
+            allocated_faces += 1;
         }
 
         for (0..6) |face| {

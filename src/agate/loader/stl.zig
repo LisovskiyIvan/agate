@@ -41,18 +41,27 @@ pub const max_facets: usize = 10_000_000;
 const quant_scale: f32 = 100000.0;
 
 const VertKey = struct {
-    p: [3]i32,
+    p: [3]i64,
     n: [3]i32,
 };
 
-fn quantize(x: f32) i32 {
-    return @intFromFloat(@round(x * quant_scale));
+fn quantizePos(x: f32) i64 {
+    if (std.math.isNan(x) or std.math.isInf(x)) return 0;
+    const scaled = @as(f64, x) * quant_scale;
+    const clamped = std.math.clamp(scaled, -9e15, 9e15);
+    return @intFromFloat(@round(clamped));
+}
+
+fn quantizeNrm(x: f32) i32 {
+    if (std.math.isNan(x) or std.math.isInf(x)) return 0;
+    const scaled = std.math.clamp(x, -1.0, 1.0) * quant_scale;
+    return @intFromFloat(@round(scaled));
 }
 
 fn keyFor(pos: [3]f32, nrm: [3]f32) VertKey {
     return .{
-        .p = .{ quantize(pos[0]), quantize(pos[1]), quantize(pos[2]) },
-        .n = .{ quantize(nrm[0]), quantize(nrm[1]), quantize(nrm[2]) },
+        .p = .{ quantizePos(pos[0]), quantizePos(pos[1]), quantizePos(pos[2]) },
+        .n = .{ quantizeNrm(nrm[0]), quantizeNrm(nrm[1]), quantizeNrm(nrm[2]) },
     };
 }
 
@@ -74,9 +83,25 @@ const Builder = struct {
         self.map.deinit();
     }
 
-    fn addFacet(self: *Builder, allocator: std.mem.Allocator, n: [3]f32, v: [3][3]f32) !void {
+    fn addFacet(self: *Builder, allocator: std.mem.Allocator, n_in: [3]f32, v: [3][3]f32) !void {
         if (self.tri_count >= max_facets) return error.TooLarge;
         self.tri_count += 1;
+        var n = n_in;
+        if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] < 1e-12) {
+            const e1 = [3]f32{ v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2] };
+            const e2 = [3]f32{ v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2] };
+            const c = [3]f32{
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            };
+            const len = @sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+            if (len > 1e-6) {
+                n = .{ c[0] / len, c[1] / len, c[2] / len };
+            } else {
+                n = .{ 0.0, 1.0, 0.0 };
+            }
+        }
         for (v) |p| {
             const k = keyFor(p, n);
             const entry = try self.map.getOrPut(k);
@@ -346,6 +371,47 @@ test "stl empty is NoGeometry" {
     try std.testing.expectError(error.NoGeometry, parse(alloc, ""));
 }
 
+test "stl large coordinates do not panic" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\solid test
+        \\  facet normal 0 0 1
+        \\    outer loop
+        \\      vertex 50000.0 0 0
+        \\      vertex 50001.0 0 0
+        \\      vertex 50000.0 1.0 0
+        \\    endloop
+        \\  endfacet
+        \\endsolid test
+    ;
+    var data = try parse(alloc, text);
+    defer data.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), data.vertex_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 50000.0), data.positions[0], 1e-3);
+}
+
+test "stl zero facet normal is computed from geometry" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\solid test
+        \\  facet normal 0 0 0
+        \\    outer loop
+        \\      vertex 0 0 0
+        \\      vertex 1 0 0
+        \\      vertex 0 1 0
+        \\    endloop
+        \\  endfacet
+        \\endsolid test
+    ;
+    var data = try parse(alloc, text);
+    defer data.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), data.vertex_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.normals[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.normals[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.normals[2], 1e-5);
+}
+
 test "stl appendToScene links (type check)" {
     _ = appendToScene;
 }
+

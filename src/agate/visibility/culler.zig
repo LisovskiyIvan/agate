@@ -44,20 +44,14 @@ pub const OcclusionCuller = struct {
         local_aabb: BoundingBox,
         world_mat: Mat4,
     ) void {
-        self.occluder_count += 1;
+        _ = local_aabb;
         if (positions.len >= 3 and indices.len >= 3) {
+            self.occluder_count += 1;
             self.triangles_rasterized += SoftwareRasterizer.rasterizeTriangles(
                 &self.hiz,
                 self.view_proj,
                 positions,
                 indices,
-                world_mat,
-            );
-        } else if (local_aabb.isValid()) {
-            self.triangles_rasterized += SoftwareRasterizer.rasterizeBox(
-                &self.hiz,
-                self.view_proj,
-                local_aabb,
                 world_mat,
             );
         }

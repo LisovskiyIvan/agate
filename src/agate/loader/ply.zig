@@ -709,11 +709,6 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !PlyData {
     }
 
     if (out_idx.items.len == 0) {
-        out_pos.deinit(allocator);
-        out_nrm.deinit(allocator);
-        out_uv.deinit(allocator);
-        out_col.deinit(allocator);
-        out_idx.deinit(allocator);
         return error.InvalidPly;
     }
 
@@ -1175,6 +1170,26 @@ test "ply float colors clamp to 0..1" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), data.colors[2], 1e-6);
 }
 
+test "ply zero faces returns InvalidPly without double free" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 3
+        \\property float x
+        \\property float y
+        \\property float z
+        \\element face 0
+        \\property list uchar int vertex_indices
+        \\end_header
+        \\0 0 0
+        \\1 0 0
+        \\0 1 0
+    ;
+    try std.testing.expectError(error.InvalidPly, parse(alloc, text));
+}
+
 test "ply appendToScene links (type check)" {
     _ = appendToScene;
 }
+

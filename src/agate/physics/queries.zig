@@ -212,9 +212,9 @@ const SphereCastCtx = struct {
     last: ?*RigidBody = null,
 };
 
-/// `b3CastResultFcn`: keeps the closest accepted hit, scanning all shapes
-/// (returns 1.0 to continue). Untracked shapes and `!enabled` bodies are
-/// ignored (return -1.0).
+/// `b3CastResultFcn`: keeps the closest accepted hit, clipping the cast to
+/// the best fraction found so far to enable BVH tree pruning.
+/// Untracked shapes and `!enabled` bodies are ignored (return -1.0).
 fn sphereCastCollectFcn(
     shape_id: c.b3ShapeId,
     point: c.b3Pos,
@@ -239,8 +239,9 @@ fn sphereCastCollectFcn(
         ctx.body = body;
         ctx.point = fromB3Pos(point);
         ctx.normal = fromB3Vec(normal);
+        return fraction;
     }
-    return 1.0;
+    return ctx.best_fraction;
 }
 
 /// Sweeps a sphere (`origin`, `radius`) along `translation` and returns

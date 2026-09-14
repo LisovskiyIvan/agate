@@ -438,20 +438,10 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
         try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
         const cpu_positions = mesh.cpu_positions;
         const cpu_indices = mesh.cpu_indices;
-        // Narrow the u32 source buffer in place instead of allocating a temp
-        // indices16 array.
-        const wide = data.indices;
-        const narrow_ptr: [*]u16 = @ptrCast(wide.ptr);
-        const indices16 = narrow_ptr[0..wide.len];
-        var k: usize = 0;
-        const narrow_tail = wide.len & ~@as(usize, 7);
-        while (k < narrow_tail) : (k += 8) {
-            const v: @Vector(8, u32) = wide[k..][0..8].*;
-            const n: @Vector(8, u16) = @truncate(v);
-            (narrow_ptr + k)[0..8].* = n;
-        }
-        while (k < wide.len) : (k += 1) {
-            indices16[k] = @intCast(wide[k]);
+        const indices16 = try scene.allocator.alloc(u16, data.indices.len);
+        defer scene.allocator.free(indices16);
+        for (data.indices, 0..) |idx, k| {
+            indices16[k] = @intCast(idx);
         }
         const ibuf = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true },
