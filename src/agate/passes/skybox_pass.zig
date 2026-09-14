@@ -12,8 +12,17 @@ pub const SkyboxPass = struct {
     mesh_vb: sg.Buffer,
     mesh_ib: sg.Buffer,
     sampler: sg.Sampler,
+    /// Main-target sample count the pipeline was built for (scene/msaa.zig).
+    sample_count: i32 = 1,
 
     pub fn init() SkyboxPass {
+        return initSampled(1);
+    }
+
+    /// Same pass at a different main-target sample count: sokol requires
+    /// pipeline.sample_count to match the attachments of the pass it draws
+    /// into, so MSAA main targets need their own pipeline variant.
+    pub fn initSampled(sample_count: i32) SkyboxPass {
         const skybox_positions = [_][3]f32{
             .{ -1.0, -1.0, -1.0 }, // 0
             .{ 1.0, -1.0, -1.0 }, // 1
@@ -64,6 +73,7 @@ pub const SkyboxPass = struct {
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
+            .sample_count = sample_count,
         };
         pip_desc.layout.buffers[0] = .{ .stride = 3 * @sizeOf(f32) };
         pip_desc.layout.attrs[skybox_shd.ATTR_skybox_position] = .{
@@ -78,6 +88,7 @@ pub const SkyboxPass = struct {
             .mesh_vb = vb,
             .mesh_ib = ib,
             .sampler = smp,
+            .sample_count = sample_count,
         };
     }
 

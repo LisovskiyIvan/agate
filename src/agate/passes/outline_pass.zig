@@ -239,7 +239,17 @@ pub const OutlinePass = struct {
     pipeline_skinned_u16: sg.Pipeline = .{},
     pipeline_skinned_u32: sg.Pipeline = .{},
 
+    /// Sample count the pipelines were built for. Draw calls into the main
+    /// pass must use the variant matching the target (scene/msaa.zig).
+    sample_count: i32 = 1,
+
     pub fn init() OutlinePass {
+        return initSampled(1);
+    }
+
+    /// Same pass at a different main-target sample count (sokol requires
+    /// pipeline.sample_count to equal the attachment's on every draw).
+    pub fn initSampled(sample_count: i32) OutlinePass {
         // One shader object per program family: the @program entries in
         // outline.glsl generate separate desc functions, each with its own
         // uniform block table (only the skinned program declares vs_skin,
@@ -249,35 +259,35 @@ pub const OutlinePass = struct {
         const shd_skin = sg.makeShader(outline_shd.outlineSkinnedShaderDesc(sg.queryBackend()));
         const shd_cutout = sg.makeShader(outline_shd.outlineCutoutShaderDesc(sg.queryBackend()));
 
-        var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16 };
+        var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16, .sample_count = sample_count };
         configureOutlineDesc(&desc_u16);
         const pip_u16 = sg.makePipeline(desc_u16);
 
-        var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32 };
+        var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32, .sample_count = sample_count };
         configureOutlineDesc(&desc_u32);
         const pip_u32 = sg.makePipeline(desc_u32);
 
-        var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16 };
+        var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16, .sample_count = sample_count };
         configureOutlineInstDesc(&desc_inst_u16);
         const pip_inst_u16 = sg.makePipeline(desc_inst_u16);
 
-        var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32 };
+        var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32, .sample_count = sample_count };
         configureOutlineInstDesc(&desc_inst_u32);
         const pip_inst_u32 = sg.makePipeline(desc_inst_u32);
 
-        var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16 };
+        var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16, .sample_count = sample_count };
         configureOutlineSkinnedDesc(&desc_skin_u16);
         const pip_skin_u16 = sg.makePipeline(desc_skin_u16);
 
-        var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32 };
+        var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32, .sample_count = sample_count };
         configureOutlineSkinnedDesc(&desc_skin_u32);
         const pip_skin_u32 = sg.makePipeline(desc_skin_u32);
 
-        var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16 };
+        var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16, .sample_count = sample_count };
         configureOutlineCutoutDesc(&desc_cut_u16);
         const pip_cut_u16 = sg.makePipeline(desc_cut_u16);
 
-        var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32 };
+        var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32, .sample_count = sample_count };
         configureOutlineCutoutDesc(&desc_cut_u32);
         const pip_cut_u32 = sg.makePipeline(desc_cut_u32);
 
@@ -290,6 +300,7 @@ pub const OutlinePass = struct {
             .pipeline_cutout_u32 = pip_cut_u32,
             .pipeline_skinned_u16 = pip_skin_u16,
             .pipeline_skinned_u32 = pip_skin_u32,
+            .sample_count = sample_count,
         };
     }
 

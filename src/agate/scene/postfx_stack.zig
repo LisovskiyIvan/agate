@@ -16,6 +16,7 @@ const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao_mod = @import("../ssao.zig");
 const SSAOOptions = ssao_mod.SSAOOptions;
+const msaa = @import("msaa.zig");
 const ui = @import("../ui.zig");
 const UICanvas = ui.UICanvas;
 const stats_mod = @import("stats.zig");
@@ -32,6 +33,20 @@ pub const PostFXStack = struct {
     ssao_pass: passes.SSAOPass,
     bloom_pass: passes.BloomPass,
     outline_pass: passes.OutlinePass,
+
+    // MSAA twin of the outline pass (its pipelines must match the main
+    // target's sample count). Lazily created on the first MSAA frame,
+    // recreated if the count changes; null keeps the 1x-only memory shape.
+    outline_msaa: ?passes.OutlinePass = null,
+    outline_msaa_samples: i32 = 0,
+
+    // Effective main-target sample count of the current/last frame. Kept so
+    // resizeAll (window resize path outside render()) can keep the target
+    // shape stable between frames.
+    main_samples: i32 = 1,
+
+    // One-shot policy warnings (see scene/msaa.zig for the reasoning).
+    warn_depth_effects: msaa.WarnOnce = .{},
 
     // Inverse-hull outline (highlight layer) settings.
     outline_enabled: bool = false,
@@ -52,33 +67,43 @@ pub const PostFXStack = struct {
         self.ssao_pass.deinit();
         self.bloom_pass.deinit();
         self.outline_pass.deinit();
+        if (self.outline_msaa) |*op| op.deinit();
+        self.outline_msaa = null;
     }
 
     /// Resizes every viewport-sized offscreen target (window resize path).
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
-        self.postprocess_pass.resize(width, height);
+        self.postprocess_pass.resize(width, height, self.main_samples);
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
-    /// Begins PASS 2 (the main scene pass) either into the offscreen
-    /// MSAA target (post-processing on) or straight into the swapchain.
-    /// Then refreshes the outline pass viewport, exactly in legacy order.
-    pub fn beginMainPass(self: *PostFXStack, main_pass_action: sg.PassAction, post_enabled: bool, width: i32, height: i32) void {
+    /// Begins PASS 2 (the main scene pass) either into the offscreen target
+    /// (post-processing on) or straight into the swapchain. `samples` is the
+    /// effective main-target sample count from scene/msaa.zig (1 = legacy
+    /// shape). With samples > 1 the pass carries a resolve attachment: sokol
+    /// resolves MSAA color into it at end of pass, so the MSAA color content
+    /// itself is DONTCARE-stored, as is the MSAA depth (write-only for the
+    /// post chain by design).
+    pub fn beginMainPass(self: *PostFXStack, main_pass_action: sg.PassAction, post_enabled: bool, samples: i32, width: i32, height: i32) void {
         if (post_enabled) {
-            self.postprocess_pass.resize(width, height);
+            self.main_samples = samples;
+            self.postprocess_pass.resize(width, height, samples);
             self.bloom_pass.resize(width, height);
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
             offscreen_pass.attachments.colors[0] = self.postprocess_pass.offscreen_color_att_view;
             offscreen_pass.attachments.depth_stencil = self.postprocess_pass.offscreen_depth_att_view;
-            if (self.postprocess_pass.sample_count > 1) {
+            if (samples > 1) {
                 offscreen_pass.attachments.resolves[0] = self.postprocess_pass.offscreen_resolve_att_view;
+                offscreen_pass.action.colors[0].store_action = .DONTCARE;
+                offscreen_pass.action.depth.store_action = .DONTCARE;
             }
             sg.beginPass(offscreen_pass);
         } else {
+            self.main_samples = 1;
             sg.beginPass(.{
                 .action = main_pass_action,
                 .swapchain = sglue.swapchain(),
@@ -90,14 +115,29 @@ pub const PostFXStack = struct {
     }
 
     /// Inverse-hull outline for highlighted meshes: inside the main pass,
-    /// depth-tested, no depth write, drawn after all surface geometry.
-    pub fn renderOutline(self: *PostFXStack, view_proj: Mat4, eye: Vec3, outline_meshes: []const *Mesh, stats: *SceneStats) void {
+    /// depth-tested, no depth write, drawn after all surface geometry. The
+    /// pass variant must match the main target's sample count.
+    pub fn renderOutline(self: *PostFXStack, view_proj: Mat4, eye: Vec3, outline_meshes: []const *Mesh, samples: i32, stats: *SceneStats) void {
         if (self.outline_enabled and outline_meshes.len > 0) {
-            self.outline_pass.render(view_proj, eye, outline_meshes, self.outline_color, self.outline_width_px);
+            const pass = self.outlinePassFor(samples);
+            pass.render(view_proj, eye, outline_meshes, self.outline_color, self.outline_width_px);
             const outline_count: u32 = @intCast(outline_meshes.len);
             stats.main_draw_calls += outline_count;
             stats.draw_calls += outline_count;
         }
+    }
+
+    /// Outline pipeline set matching the target sample count; the MSAA twin
+    /// is created lazily (and recreated on count changes, e.g. when a
+    /// device-specific clamp narrows a requested 8x to 4x).
+    fn outlinePassFor(self: *PostFXStack, samples: i32) *passes.OutlinePass {
+        if (samples <= 1) return &self.outline_pass;
+        if (self.outline_msaa == null or self.outline_msaa_samples != samples) {
+            if (self.outline_msaa) |*op| op.deinit();
+            self.outline_msaa = passes.OutlinePass.initSampled(samples);
+            self.outline_msaa_samples = samples;
+        }
+        return &self.outline_msaa.?;
     }
 
     // Per-frame inputs for the post chain. Configs travel with the params
@@ -113,6 +153,11 @@ pub const PostFXStack = struct {
         sun_color: Color3,
         // Placeholder SSAO view when SSAO is off (shared 1x1 white).
         default_white_view: sg.View,
+        // Effective main-target sample count for this frame (scene/msaa.zig).
+        // > 1 suppresses the depth-consuming effects (SSAO/SSR/DoF): sokol
+        // has no depth resolve, so the MSAA depth attachment cannot feed
+        // them. Warned once per stack, not per frame.
+        main_samples: i32 = 1,
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         ui: ?*UICanvas = null,
         stats: *SceneStats,
@@ -123,17 +168,36 @@ pub const PostFXStack = struct {
     /// itself only runs when post-processing is enabled — SSAO/bloom then
     /// just refresh their inputs (legacy behavior kept verbatim).
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
+        // Depth-consuming effects are incompatible with the MSAA main
+        // target (no depth resolve in sokol — see scene/msaa.zig); degrade
+        // them for the frame on a local copy of the configs.
+        const msaa_active = params.main_samples > 1;
+        var post = params.post;
+        var ssao = params.ssao;
+        if (msaa_active) {
+            if (ssao.enabled or ssao.debug_mode or post.ssr_enabled or post.dof_enabled) {
+                _ = self.warn_depth_effects.warn(
+                    "msaa: SSAO/SSR/DoF disabled this session: MSAA x{} main target has no depth resolve",
+                    .{params.main_samples},
+                );
+            }
+            ssao.enabled = false;
+            ssao.debug_mode = false;
+            post.ssr_enabled = false;
+            post.dof_enabled = false;
+        }
+
         // ==============================================
         // PASS 2.5: SCREEN-SPACE AMBIENT OCCLUSION (SSAO)
         // ==============================================
         var ssao_view = params.default_white_view;
-        const ssao_active = params.ssao.enabled or params.ssao.debug_mode;
+        const ssao_active = ssao.enabled or ssao.debug_mode;
         if (params.post.enabled and ssao_active) {
             self.ssao_pass.render(
                 params.camera,
                 params.aspect,
-                self.postprocess_pass.offscreen_depth_tex_view,
-                params.ssao,
+                self.postprocess_pass.depthSampleView(),
+                ssao,
                 cur_w,
                 cur_h,
             );
@@ -149,15 +213,15 @@ pub const PostFXStack = struct {
         // Multi-pass glow; when disabled the composite shader keeps its legacy
         // in-shader bloom and this binds the resolved scene view placeholder.
         var bloom_view = self.postprocess_pass.offscreen_resolve_tex_view;
-        if (params.post.enabled and params.post.bloom_enabled and params.post.bloom_pyramid) {
+        if (params.post.enabled and post.bloom_enabled and post.bloom_pyramid) {
             bloom_view = self.bloom_pass.render(
                 self.postprocess_pass.offscreen_resolve_tex_view,
-                params.post.bloom_threshold,
-                params.post.bloom_pyramid_mips,
+                post.bloom_threshold,
+                post.bloom_pyramid_mips,
                 cur_w,
                 cur_h,
             );
-            const mips = postprocess.clampBloomMips(params.post.bloom_pyramid_mips);
+            const mips = postprocess.clampBloomMips(post.bloom_pyramid_mips);
             const bloom_draws = 2 * @as(u32, mips) - 1;
             params.stats.post_draw_calls += bloom_draws;
             params.stats.draw_calls += bloom_draws;
@@ -180,11 +244,11 @@ pub const PostFXStack = struct {
             const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
 
             self.postprocess_pass.render(
-                params.post,
+                post,
                 ssao_view,
-                params.ssao.enabled,
-                params.ssao.debug_mode,
-                params.ssao.intensity,
+                ssao.enabled,
+                ssao.debug_mode,
+                ssao.intensity,
                 cur_w,
                 cur_h,
                 params.view_proj,

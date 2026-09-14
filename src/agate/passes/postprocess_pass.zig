@@ -36,7 +36,6 @@ pub const PostProcessPass = struct {
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
-
     pub fn init() PostProcessPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -114,36 +113,45 @@ pub const PostProcessPass = struct {
         };
     }
 
-    pub fn resize(self: *PostProcessPass, width: i32, height: i32) void {
-        if (width <= 0 or height <= 0) return;
-        if (self.width == width and self.height == height) return;
+    /// Destroys the render-target images/views (not samplers/pipelines).
+    /// MSAA shape (sample_count > 1): MSAA color + MSAA depth attachments,
+    /// a 1x resolve image the color resolves into at end of pass, and NO
+    /// depth texture view (sokol has no depth resolve; an MSAA depth image
+    /// is not samplable as a plain texture). 1x shape: plain color+depth,
+    /// "resolve" views alias the color image.
+    fn destroyTargets(self: *PostProcessPass) void {
+        if (self.offscreen_color_image.id != 0) sg.destroyImage(self.offscreen_color_image);
+        if (self.offscreen_color_att_view.id != 0) sg.destroyView(self.offscreen_color_att_view);
+        if (self.offscreen_resolve_image.id != 0) sg.destroyImage(self.offscreen_resolve_image);
+        if (self.offscreen_resolve_att_view.id != 0) sg.destroyView(self.offscreen_resolve_att_view);
+        if (self.offscreen_resolve_tex_view.id != 0) sg.destroyView(self.offscreen_resolve_tex_view);
+        if (self.offscreen_depth_image.id != 0) sg.destroyImage(self.offscreen_depth_image);
+        if (self.offscreen_depth_att_view.id != 0) sg.destroyView(self.offscreen_depth_att_view);
+        if (self.offscreen_depth_tex_view.id != 0) sg.destroyView(self.offscreen_depth_tex_view);
+        self.offscreen_color_image = .{};
+        self.offscreen_color_att_view = .{};
+        self.offscreen_resolve_image = .{};
+        self.offscreen_resolve_att_view = .{};
+        self.offscreen_resolve_tex_view = .{};
+        self.offscreen_depth_image = .{};
+        self.offscreen_depth_att_view = .{};
+        self.offscreen_depth_tex_view = .{};
+    }
 
-        if (self.offscreen_color_image.id != 0) {
-            sg.destroyImage(self.offscreen_color_image);
-            sg.destroyView(self.offscreen_color_att_view);
-            if (self.offscreen_resolve_image.id != 0) {
-                sg.destroyImage(self.offscreen_resolve_image);
-                sg.destroyView(self.offscreen_resolve_att_view);
-                sg.destroyView(self.offscreen_resolve_tex_view);
-            } else {
-                sg.destroyView(self.offscreen_resolve_tex_view);
-            }
-            sg.destroyImage(self.offscreen_depth_image);
-            sg.destroyView(self.offscreen_depth_att_view);
-            if (self.offscreen_depth_tex_view.id != 0) {
-                sg.destroyView(self.offscreen_depth_tex_view);
-                self.offscreen_depth_tex_view = .{};
-            }
-            self.offscreen_resolve_image = .{};
-            self.offscreen_resolve_att_view = .{};
-            self.offscreen_resolve_tex_view = .{};
-        }
+    pub fn resize(self: *PostProcessPass, width: i32, height: i32, sample_count: i32) void {
+        if (width <= 0 or height <= 0) return;
+        const samples: i32 = if (sample_count < 1) 1 else sample_count;
+        if (self.width == width and self.height == height and self.sample_count == samples) return;
+
+        self.destroyTargets();
 
         const sw = sglue.swapchain();
         const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
         const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
-        const samples: i32 = 1; // Offscreen targets must be sample_count=1 to allow depth sampling as a texture view
 
+        // Color: attachment at the full sample count; when resolving, a
+        // separate 1x resolve image (usage.resolve_attachment) receives the
+        // MSAA resolve at end of pass and carries the texture view.
         const col_img = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
             .width = width,
@@ -154,12 +162,35 @@ pub const PostProcessPass = struct {
         const col_att = sg.makeView(.{
             .color_attachment = .{ .image = col_img },
         });
+        self.offscreen_color_image = col_img;
+        self.offscreen_color_att_view = col_att;
 
-        const col_tex = sg.makeView(.{
-            .texture = .{ .image = col_img },
-        });
-        self.offscreen_resolve_tex_view = col_tex;
+        if (samples > 1) {
+            const res_img = sg.makeImage(.{
+                .usage = .{ .resolve_attachment = true },
+                .width = width,
+                .height = height,
+                .pixel_format = color_fmt,
+                .sample_count = 1,
+            });
+            self.offscreen_resolve_image = res_img;
+            self.offscreen_resolve_att_view = sg.makeView(.{
+                .resolve_attachment = .{ .image = res_img },
+            });
+            self.offscreen_resolve_tex_view = sg.makeView(.{
+                .texture = .{ .image = res_img },
+            });
+        } else {
+            // Legacy 1x shape: postfx samples the color image directly.
+            self.offscreen_resolve_tex_view = sg.makeView(.{
+                .texture = .{ .image = col_img },
+            });
+        }
 
+        // Depth: same sample count as color (sokol validation requires the
+        // match). Only the 1x depth gets a texture view; MSAA depth is
+        // write-only for the post chain (scene/msaa.zig suppresses the
+        // depth-consuming effects instead).
         const depth_img = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
             .width = width,
@@ -167,21 +198,30 @@ pub const PostProcessPass = struct {
             .pixel_format = depth_fmt,
             .sample_count = samples,
         });
-        const depth_att = sg.makeView(.{
+        self.offscreen_depth_image = depth_img;
+        self.offscreen_depth_att_view = sg.makeView(.{
             .depth_stencil_attachment = .{ .image = depth_img },
         });
-        const depth_tex = sg.makeView(.{
-            .texture = .{ .image = depth_img },
-        });
+        if (samples == 1) {
+            self.offscreen_depth_tex_view = sg.makeView(.{
+                .texture = .{ .image = depth_img },
+            });
+        }
 
         self.width = width;
         self.height = height;
         self.sample_count = samples;
-        self.offscreen_color_image = col_img;
-        self.offscreen_color_att_view = col_att;
-        self.offscreen_depth_image = depth_img;
-        self.offscreen_depth_att_view = depth_att;
-        self.offscreen_depth_tex_view = depth_tex;
+    }
+
+    /// Valid texture view for slots that semantically want scene depth.
+    /// 1x target: the depth texture itself. MSAA target: no depth texture
+    /// exists, so the resolved color view serves as a valid placeholder —
+    /// the depth-consuming shader branches (SSR/DoF) are flag-gated off
+    /// while MSAA is active (scene/postfx_stack.zig), the binding only has
+    /// to exist for sokol's apply-bindings validation.
+    pub fn depthSampleView(self: *const PostProcessPass) sg.View {
+        if (self.offscreen_depth_tex_view.id != 0) return self.offscreen_depth_tex_view;
+        return self.offscreen_resolve_tex_view;
     }
 
     pub fn render(
@@ -208,7 +248,7 @@ pub const PostProcessPass = struct {
         post_bind.index_buffer = self.postprocess_quad_ib;
         post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
         post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
-        post_bind.views[post_shd.VIEW_depth_tex] = self.offscreen_depth_tex_view;
+        post_bind.views[post_shd.VIEW_depth_tex] = self.depthSampleView();
         // Pyramid glow when the parent fed a BloomPass result; otherwise a
         // valid placeholder the shader never samples (pyramid flag off).
         post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)
@@ -355,23 +395,7 @@ pub const PostProcessPass = struct {
     }
 
     pub fn deinit(self: *PostProcessPass) void {
-        if (self.offscreen_color_image.id != 0) {
-            sg.destroyImage(self.offscreen_color_image);
-            sg.destroyView(self.offscreen_color_att_view);
-            if (self.offscreen_resolve_image.id != 0) {
-                sg.destroyImage(self.offscreen_resolve_image);
-                sg.destroyView(self.offscreen_resolve_att_view);
-                sg.destroyView(self.offscreen_resolve_tex_view);
-            } else {
-                sg.destroyView(self.offscreen_resolve_tex_view);
-            }
-            sg.destroyImage(self.offscreen_depth_image);
-            sg.destroyView(self.offscreen_depth_att_view);
-            if (self.offscreen_depth_tex_view.id != 0) {
-                sg.destroyView(self.offscreen_depth_tex_view);
-                self.offscreen_depth_tex_view = .{};
-            }
-        }
+        self.destroyTargets();
         sg.destroySampler(self.postprocess_sampler);
         sg.destroySampler(self.depth_sampler);
         sg.destroySampler(self.lut_sampler);

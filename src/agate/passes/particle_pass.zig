@@ -28,6 +28,9 @@ pub const ParticlePass = struct {
     compute_sim_pipeline: sg.Pipeline = .{},
     pipeline_compute_additive: sg.Pipeline = .{},
     pipeline_compute_alphablend: sg.Pipeline = .{},
+    /// Main-target sample count the render pipelines were built for
+    /// (scene/msaa.zig). Compute-sim pipeline is sample-count independent.
+    sample_count: i32 = 1,
     compute_supported: bool = false,
     quad_vb: sg.Buffer,
     quad_ib: sg.Buffer,
@@ -37,8 +40,10 @@ pub const ParticlePass = struct {
     /// Builds one pipeline variant per blend mode. `stride`/`attrs` differ
     /// between the CPU path (integrated instance data) and the GPU path
     /// (spawn-slot data); quad geometry, depth and blend setup are shared,
-    /// matching the historical pipeline configs bit-for-bit.
-    fn makePipeline(shader: sg.Shader, blend: sg.BlendState, slot_stride: usize, gpu: bool) sg.Pipeline {
+    /// matching the historical pipeline configs bit-for-bit. `sample_count`
+    /// must match the main render target (compute pipelines are exempt:
+    /// they run in attachment-less compute passes).
+    fn makePipeline(shader: sg.Shader, blend: sg.BlendState, slot_stride: usize, gpu: bool, sample_count: i32) sg.Pipeline {
         var desc = sg.PipelineDesc{
             .shader = shader,
             .index_type = .UINT16,
@@ -47,6 +52,7 @@ pub const ParticlePass = struct {
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
+            .sample_count = sample_count,
         };
         // Buffer 0: Unit quad
         desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
@@ -105,7 +111,7 @@ pub const ParticlePass = struct {
     /// Render pipeline for the compute path: the quad stays vertex buffer 0,
     /// per-instance state comes from the storage-buffer view (no instance
     /// vertex attributes). Blend/depth setup matches makePipeline verbatim.
-    fn makeComputeRenderPipeline(shader: sg.Shader, blend: sg.BlendState) sg.Pipeline {
+    fn makeComputeRenderPipeline(shader: sg.Shader, blend: sg.BlendState, sample_count: i32) sg.Pipeline {
         var desc = sg.PipelineDesc{
             .shader = shader,
             .index_type = .UINT16,
@@ -114,6 +120,7 @@ pub const ParticlePass = struct {
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
+            .sample_count = sample_count,
         };
         desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
         desc.layout.attrs[part_compute_shd.ATTR_particle_compute_position] = .{
@@ -131,6 +138,14 @@ pub const ParticlePass = struct {
     }
 
     pub fn init() ParticlePass {
+        return initSampled(1);
+    }
+
+    /// Same pass at a different main-target sample count: sokol requires
+    /// pipeline.sample_count to match the attachments of the pass it draws
+    /// into. The compute-simulation pipeline is unaffected (compute passes
+    /// have no attachments) and keeps the default sample count.
+    pub fn initSampled(sample_count: i32) ParticlePass {
         const particle_quad_vertices = [_]f32{
             // x,     y,     u,   v
             -0.5, -0.5, 0.0, 0.0,
@@ -188,8 +203,8 @@ pub const ParticlePass = struct {
             const shader_sim = sg.makeShader(part_compute_shd.particleComputeSimShaderDesc(sg.queryBackend()));
             compute_sim_pipeline = compute.makePipeline(shader_sim, "particle-compute-sim");
             const shader_render = sg.makeShader(part_compute_shd.particleComputeShaderDesc(sg.queryBackend()));
-            pipeline_compute_additive = makeComputeRenderPipeline(shader_render, blend_additive);
-            pipeline_compute_alphablend = makeComputeRenderPipeline(shader_render, blend_alpha);
+            pipeline_compute_additive = makeComputeRenderPipeline(shader_render, blend_additive, sample_count);
+            pipeline_compute_alphablend = makeComputeRenderPipeline(shader_render, blend_alpha, sample_count);
         }
 
         return .{
@@ -198,24 +213,28 @@ pub const ParticlePass = struct {
                 blend_additive,
                 @sizeOf(particles.ParticleInstanceData),
                 false,
+                sample_count,
             ),
             .pipeline_alphablend = makePipeline(
                 shader_cpu,
                 blend_alpha,
                 @sizeOf(particles.ParticleInstanceData),
                 false,
+                sample_count,
             ),
             .pipeline_gpu_additive = makePipeline(
                 shader_gpu,
                 blend_additive,
                 @sizeOf(particles.GpuParticleSlot),
                 true,
+                sample_count,
             ),
             .pipeline_gpu_alphablend = makePipeline(
                 shader_gpu,
                 blend_alpha,
                 @sizeOf(particles.GpuParticleSlot),
                 true,
+                sample_count,
             ),
             .compute_sim_pipeline = compute_sim_pipeline,
             .pipeline_compute_additive = pipeline_compute_additive,
@@ -225,6 +244,7 @@ pub const ParticlePass = struct {
             .quad_ib = ib,
             .sampler = smp,
             .default_texture = Texture.createDefaultParticleDot32(),
+            .sample_count = sample_count,
         };
     }
 

@@ -14,6 +14,28 @@ const render_queue = @import("render_queue.zig");
 // transparent blend twins. Only initPipelines uses this table.
 pub const PipelineFamily = enum { standard, pbr, instanced, skinned_pbr, instanced_pbr };
 
+// Single funnel for the base descriptor of every main-target pipeline
+// (built-in families, double-sided twins, shader-material sets): the base
+// depth/cull state plus the target sample count. Sokol validation rejects
+// sg_apply_pipeline when pipeline.sample_count differs from any attachment
+// image of the current pass (color AND depth), so every pipeline that can
+// draw into the main target must be built through here with the same count
+// as the target (scene/msaa.zig decides that count; the 1x set and the
+// sampled twin sets in Scene must never be mixed within a frame).
+pub fn forwardBaseDesc(shader: sg.Shader, sample_count: i32) sg.PipelineDesc {
+    return .{
+        .shader = shader,
+        .index_type = .UINT16,
+        .depth = .{
+            .compare = .LESS_EQUAL,
+            .write_enabled = true,
+        },
+        .cull_mode = .BACK,
+        .face_winding = .CCW,
+        .sample_count = sample_count,
+    };
+}
+
 // Fills the vertex layout for a family exactly as the legacy hand-written
 // descs did (same buffers, attr slots, formats, offsets). Any shader-side
 // layout risk lives here: attr changes must mirror the matching *.glsl.
@@ -158,8 +180,10 @@ pub const DoubleSidedPipelines = struct {
 
     // Builds all 20 cull-off twins from the family shaders (GPU calls).
     // Base descs mirror Scene.initPipelines (depth LESS_EQUAL/write on,
-    // BACK cull, CCW winding); makeCullOffPair forces cull off.
-    pub fn initFromShaders(self: *DoubleSidedPipelines, shaders: DoubleSidedSourceShaders) void {
+    // BACK cull, CCW winding) plus the main-target sample count (sokol
+    // requires pipelines to match the attachment sample count they draw
+    // into); makeCullOffPair forces cull off.
+    pub fn initFromShaders(self: *DoubleSidedPipelines, shaders: DoubleSidedSourceShaders, sample_count: i32) void {
         const specs = [_]struct {
             shader: sg.Shader,
             family: PipelineFamily,
@@ -211,16 +235,7 @@ pub const DoubleSidedPipelines = struct {
         };
 
         for (specs) |spec| {
-            var desc = sg.PipelineDesc{
-                .shader = spec.shader,
-                .index_type = .UINT16,
-                .depth = .{
-                    .compare = .LESS_EQUAL,
-                    .write_enabled = true,
-                },
-                .cull_mode = .BACK,
-                .face_winding = .CCW,
-            };
+            var desc = forwardBaseDesc(spec.shader, sample_count);
             pipelineLayoutFor(spec.family, &desc);
             makeCullOffPair(desc, spec.opaque_u16, spec.opaque_u32, spec.blend_u16, spec.blend_u32);
         }

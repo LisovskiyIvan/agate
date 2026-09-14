@@ -80,8 +80,17 @@ pub const DebugPass = struct {
     vertex_buffer: sg.Buffer = .{},
     staging: std.ArrayListUnmanaged(Vertex) = .empty,
     capacity_lines: usize = 0,
+    /// Main-target sample count the pipeline was built for (scene/msaa.zig).
+    sample_count: i32 = 1,
 
     pub fn init(allocator: std.mem.Allocator) !DebugPass {
+        return initSampled(allocator, 1);
+    }
+
+    /// Same pass at a different main-target sample count: sokol requires
+    /// pipeline.sample_count to match the attachments of the pass it draws
+    /// into.
+    pub fn initSampled(allocator: std.mem.Allocator, sample_count: i32) !DebugPass {
         var staging: std.ArrayListUnmanaged(Vertex) = .empty;
         try staging.ensureTotalCapacity(allocator, verticesForLineCount(initial_capacity_lines));
 
@@ -99,6 +108,7 @@ pub const DebugPass = struct {
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
+            .sample_count = sample_count,
         };
         pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
         pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
@@ -117,6 +127,7 @@ pub const DebugPass = struct {
             .vertex_buffer = vb,
             .staging = staging,
             .capacity_lines = initial_capacity_lines,
+            .sample_count = sample_count,
         };
     }
 

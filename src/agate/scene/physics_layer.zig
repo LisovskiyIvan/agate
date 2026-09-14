@@ -19,6 +19,10 @@ pub const PhysicsIntegration = struct {
     debug_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty,
     // Lazily created on first use; renders physics debug wireframes in 3D.
     debug_pass: ?passes.DebugPass = null,
+    // MSAA twin (pipeline sample count must match the main target); lazily
+    // created on the first MSAA frame, recreated on count changes.
+    debug_pass_msaa: ?passes.DebugPass = null,
+    debug_pass_msaa_samples: i32 = 0,
 
     pub fn deinit(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
         if (self.world) |*pw| {
@@ -28,6 +32,8 @@ pub const PhysicsIntegration = struct {
         self.debug_lines.deinit(allocator);
         if (self.debug_pass) |*dp| dp.deinit();
         self.debug_pass = null;
+        if (self.debug_pass_msaa) |*dp| dp.deinit();
+        self.debug_pass_msaa = null;
     }
 
     /// Creates the world on first call (gravity optional) and returns it.
@@ -54,20 +60,34 @@ pub const PhysicsIntegration = struct {
 
     /// Renders the physics debug wireframe (main pass, depth-tested, no
     /// depth write). No-op unless show_debug is set and a world exists; the
-    /// GPU pass is created on first visible frame.
-    pub fn renderDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator, view_proj: Mat4, stats: *SceneStats) void {
+    /// GPU pass is created on first visible frame. `samples` is the
+    /// effective main-target sample count (scene/msaa.zig).
+    pub fn renderDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator, view_proj: Mat4, samples: i32, stats: *SceneStats) void {
         if (!self.show_debug) return;
         const pw = &(self.world orelse return);
         self.debug_lines.clearRetainingCapacity();
         pw.appendDebugLines(allocator, &self.debug_lines) catch {};
         if (self.debug_lines.items.len == 0) return;
-        if (self.debug_pass == null) {
-            self.debug_pass = passes.DebugPass.init(allocator) catch null;
+
+        const pass = self.debugPassFor(allocator, samples) orelse return;
+        pass.render(view_proj, self.debug_lines.items);
+        stats.main_draw_calls += 1;
+        stats.draw_calls += 1;
+    }
+
+    /// Debug pass variant matching the target sample count.
+    fn debugPassFor(self: *PhysicsIntegration, allocator: std.mem.Allocator, samples: i32) ?*passes.DebugPass {
+        if (samples <= 1) {
+            if (self.debug_pass == null) {
+                self.debug_pass = passes.DebugPass.init(allocator) catch null;
+            }
+            return if (self.debug_pass) |*dp| dp else null;
         }
-        if (self.debug_pass) |*dp| {
-            dp.render(view_proj, self.debug_lines.items);
-            stats.main_draw_calls += 1;
-            stats.draw_calls += 1;
+        if (self.debug_pass_msaa == null or self.debug_pass_msaa_samples != samples) {
+            if (self.debug_pass_msaa) |*dp| dp.deinit();
+            self.debug_pass_msaa = passes.DebugPass.initSampled(allocator, samples) catch null;
+            self.debug_pass_msaa_samples = samples;
         }
+        return if (self.debug_pass_msaa) |*dp| dp else null;
     }
 };
