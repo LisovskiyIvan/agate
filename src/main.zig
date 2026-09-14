@@ -114,8 +114,30 @@ export fn init() callconv(.c) void {
     }
 }
 
+/// Stage 3 seam: input events are produced in the sapp callback and
+/// consumed by the frame/update side. Today both run on the same thread —
+/// the ring only establishes the handoff so the update side can move to
+/// its own thread without touching this code again.
+const AppEvent = union(enum) {
+    key_down: sapp.Keycode,
+    mouse_down,
+};
+var input_ring: z.jobs.SpscRing(AppEvent, 64) = .{};
+
 export fn frame() callconv(.c) void {
     const dt: f32 = @floatCast(sapp.frameDuration() * 60.0);
+
+    // Drain input first: the update below must see this frame's events.
+    while (input_ring.pop()) |ev| {
+        switch (ev) {
+            .mouse_down => cycleClearColor(),
+            .key_down => |key| switch (key) {
+                .SPACE => cycleClearColor(),
+                .ESCAPE => sapp.quit(),
+                else => {},
+            },
+        }
+    }
 
     // Вращаем куб
     box.rotation.x += 0.8 * dt;
@@ -156,18 +178,16 @@ const bg_colors = [_]z.Color4{
     z.Color4.new(0.14, 0.18, 0.28, 1.0),
 };
 
+fn cycleClearColor() void {
+    color_toggle += 1;
+    scene.clear_color = bg_colors[color_toggle % bg_colors.len];
+}
+
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     switch (ev.*.type) {
-        .MOUSE_DOWN => {
-            color_toggle += 1;
-            scene.clear_color = bg_colors[color_toggle % bg_colors.len];
-        },
+        .MOUSE_DOWN => _ = input_ring.push(.mouse_down),
         .KEY_DOWN => switch (ev.*.key_code) {
-            .SPACE => {
-                color_toggle += 1;
-                scene.clear_color = bg_colors[color_toggle % bg_colors.len];
-            },
-            .ESCAPE => sapp.quit(),
+            .SPACE, .ESCAPE => _ = input_ring.push(.{ .key_down = ev.*.key_code }),
             else => {},
         },
         else => {},

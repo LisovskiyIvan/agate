@@ -76,22 +76,53 @@ job owns a disjoint index range.
   story first (state holds pointers; plain capture-then-marshal is unsafe
   while the main thread mutates).
 
-### [ ] Stage 3 — game/render thread split ("non-blocking render")
+### [~] Stage 3 — simulation/render decoupling (groundwork landed)
 
-Render thread owns the graphics context: `sg.setup` happens there and **all**
-`sg.*` calls (create/update/destroy/commit) move to it. Main thread:
-input + `Scene.update` → capture per-frame uniform/draw snapshots
-(`scene/uniforms.zig` structs are already close to what needs capturing) →
-SPSC handoff. Render thread consumes the latest complete frame.
+Sokol reality check (design driver): the swapchain is acquired through
+`sglue`/`sapp_swapchain`, which is only valid inside the sapp frame
+callback, so the render side must stay inside `sapp_run`. The achievable
+split is therefore NOT "render on a separate thread" but:
 
-Costs to accept explicitly: +1 frame input→pixel latency; state snapshot
-discipline (double-buffer whatever update mutates); strict
-create/destroy-on-render-thread ownership. Benefits: update spikes
-(serialization, streaming, 100k+ particles) never starve submission.
+- **sapp thread (window + render)**: frame callback drains input, renders
+  the latest published state, commits. Never blocked by simulation spikes.
+- **game thread**: `Scene.update*` at its own cadence, publishing a frame
+  payload through `Handoff` (latest-wins; drops allowed, never queues).
+- **Input** crosses threads through `jobs.SpscRing` (events arrive on the
+  sapp thread; the update side drains them).
 
-Not available in sokol: parallel command recording (Vulkan/DX12 secondary
-command buffers). "Multithreaded render" here always means "render on its
-own thread", never "render recorded by many threads".
+Costs to accept explicitly: +1 frame input→pixel latency; the frame payload
+must own everything render reads (or render keeps reading engine state with
+ownership alternating through the handoff — requires identifying every
+mutable field render touches: mesh transforms, materials, particles, UI).
+That audit is the real work of this stage; the primitives below are its
+mechanical half.
+
+Landed groundwork:
+
+- [x] `jobs.SpscRing(T, N)` — lock-free SPSC ring, drop-newest when full,
+  monotonic indices, power-of-two capacity; same-thread safe so apps can
+  adopt it before any thread crosses. Engine `main.zig` input already
+  flows through it (drained at the top of `frame()`).
+- [x] `handoff.Handoff(T, slots)` — lock-free latest-wins N-slot mailbox:
+  `claim` CASes a free slot, `publish` stamps a global sequence,
+  `takeLatest` copies the newest payload and releases stale slots. Fixed
+  during testing: the sequence MUST come from a global counter — per-slot
+  seqs let stale frames resurface; and multi-publisher is unsupported by
+  design (counter assignment happens before the meta store, so "newest"
+  would be ill-defined). Verified with a threaded publisher/consumer
+  stress test (untorn checksums, strict delivery order, drops allowed).
+
+Remaining slices, in order:
+
+1. Frame payload audit: enumerate every field `render()` reads (mesh
+   transforms, material fields, particle instances, sky/postfx params) and
+   decide copy-vs-alternate-ownership per group.
+2. Game thread: move `Scene.update*` + input consumption onto a worker;
+   sapp frame callback only drains handoff + renders. Same-thread mode
+   first (update inline, publish skipped) to prove no behavior drift.
+3. Only then split the threads, gated behind a flag; serialization of
+   engine systems (Scene is not thread-safe by construction) is expected
+   to surface races — fix them at the audit level, not with locks.
 
 ## What other engines do (reference)
 

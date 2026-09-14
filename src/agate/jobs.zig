@@ -517,3 +517,108 @@ test "zero-thread TaskRunner runs tasks inline on the poster" {
     // Inline: complete before post returns.
     try std.testing.expectEqual(@as(u32, 1), counters.hits.load(.acquire));
 }
+
+/// Lock-free single-producer / single-consumer ring buffer. The producer
+/// owns `head`, the consumer owns `tail`; both indices are monotonic and
+/// slot selection is `index % capacity`, so no ABA is possible.
+///
+/// `push` returns false when the ring is full (drop-newest policy — the
+/// caller decides what a lost item means). `pop` returns null when empty.
+/// Works same-thread too (plain reads then), which lets apps adopt the
+/// queue before any thread actually crosses it. Stage 3 seam: sapp input
+/// events are produced on the window thread and consumed by the update
+/// side, whichever thread that ends up on.
+pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
+    comptime std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0); // power of two
+    return struct {
+        const Self = @This();
+        head: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        tail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        buf: [capacity]T = undefined,
+
+        pub fn push(self: *Self, value: T) bool {
+            const h = self.head.load(.monotonic);
+            const t = self.tail.load(.acquire);
+            if (h - t >= capacity) return false;
+            self.buf[h % capacity] = value;
+            self.head.store(h + 1, .release);
+            return true;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            const t = self.tail.load(.monotonic);
+            const h = self.head.load(.acquire);
+            if (t >= h) return null;
+            const v = self.buf[t % capacity];
+            self.tail.store(t + 1, .release);
+            return v;
+        }
+
+        /// Items available for the consumer.
+        pub fn len(self: *Self) usize {
+            return @intCast(self.head.load(.monotonic) - self.tail.load(.monotonic));
+        }
+    };
+}
+
+// --- SpscRing tests ---
+
+test "SpscRing preserves order and capacity" {
+    var ring = SpscRing(usize, 8){};
+    for (0..8) |i| try testing_expect(ring.push(i));
+    // Full: push rejected (drop-newest).
+    try testing_expect(!ring.push(100));
+    try testing_expectEqual(usize, 8, ring.len());
+    for (0..8) |i| {
+        try testing_expectEqual(usize, i, ring.pop().?);
+    }
+    try testing_expect(ring.pop() == null);
+}
+
+test "SpscRing wraps cleanly across many fills" {
+    var ring = SpscRing(u32, 4){};
+    var produced: u32 = 0;
+    var consumed: u32 = 0;
+    // Interleave pushes/pops far beyond one lap of the buffer.
+    while (consumed < 1000) {
+        var pushes: u32 = 0;
+        while (pushes < 3) : (pushes += 1) {
+            if (ring.push(produced)) produced += 1;
+        }
+        while (ring.pop()) |v| {
+            try testing_expectEqual(u32, consumed, v);
+            consumed += 1;
+        }
+    }
+}
+
+test "SpscRing crosses threads in order" {
+    var ring = SpscRing(u64, 64){};
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(r: *SpscRing(u64, 64)) void {
+            var i: u64 = 1;
+            while (i <= 10_000) : (i += 1) {
+                while (!r.push(i)) std.atomic.spinLoopHint();
+            }
+        }
+    }.run, .{&ring});
+    defer thread.join();
+
+    var expected: u64 = 1;
+    while (expected <= 10_000) {
+        if (ring.pop()) |v| {
+            try testing_expectEqual(u64, expected, v);
+            expected += 1;
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+}
+
+fn testing_expect(ok: bool) !void {
+    if (!ok) return error.TestUnexpectedResult;
+}
+
+fn testing_expectEqual(comptime T: type, expected: T, actual: T) !void {
+    if (expected != actual) return error.TestExpectedEqual;
+}

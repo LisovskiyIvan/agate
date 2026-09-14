@@ -31,6 +31,7 @@ test {
     _ = @import("compute.zig");
     _ = @import("export/obj.zig");
     _ = @import("export/stl.zig");
+    _ = @import("handoff.zig");
     _ = @import("jobs.zig");
     _ = @import("ktx2.zig");
     _ = @import("lights.zig");
