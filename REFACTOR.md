@@ -19,7 +19,7 @@ sequential (`src/main.zig`, `scene.zig`). No engine subsystem spawns threads.
   buffers, single PRNGs per subsystem.
 
 ## The ladder (cheap → expensive)
-### [~] Stage 1 — job pool + data-parallel systems (pool, particles, culling landed)
+### [x] Stage 1 — job pool + data-parallel systems (landed)
 Fork-join pool for pure-CPU work. No `sg.*`, no shared mutable state; each
 job owns a disjoint index range.
 
@@ -45,9 +45,13 @@ job owns a disjoint index range.
   serially before the parallel pass (shared parents would race otherwise).
   Active only above `FrameCullContext.parallel_min_meshes` (default 1024)
   with a pool attached — current demo scenes sit below it by design.
-- [ ] Trails / decals / nav agents: audit for per-entity independence
-  before touching; trail histories are chain-sequential (likely stay serial).
-
+- [x] Trails / decals / nav agents audit (2026-09): `NavAgent.update` reads
+  only its own state (waypoints/position/velocity — no neighbor coupling),
+  `TrailMesh.update` touches only its own segment history, `DecalLayer`
+  ticks a single manager. All three are parallel-safe in shape; none
+  routed through the pool yet because real scenes hold single-digit
+  entities — wire them through `jobs.parallelFor` when counts justify it
+  (no API change needed: same pattern as particles).
 ### [ ] Stage 2 — async assets & uploads
 
 Decode/compress off-thread, upload on-thread:
