@@ -67,6 +67,7 @@ pub const InstancedMesh = struct {
     cast_shadows: bool = true,
     receive_shadows: bool = true,
     culling_strategy: CullingStrategy = .frustum,
+    layer_mask: u32 = 0xFFFFFFFF,
     source_mesh: *Mesh,
 
     cached_world_matrix: Mat4 = Mat4.identity,

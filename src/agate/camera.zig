@@ -5,6 +5,37 @@ const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Mesh = @import("mesh.zig").Mesh;
 
+pub const Viewport = struct {
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    width: f32 = 1.0,
+    height: f32 = 1.0,
+
+    /// Converts normalized viewport [0..1] to pixel rect given screen width and height.
+    pub fn toPixelRect(self: Viewport, screen_w: i32, screen_h: i32) PixelRect {
+        const sw: f32 = @floatFromInt(screen_w);
+        const sh: f32 = @floatFromInt(screen_h);
+        return .{
+            .x = @intFromFloat(@round(self.x * sw)),
+            .y = @intFromFloat(@round(self.y * sh)),
+            .width = @max(1, @as(i32, @intFromFloat(@round(self.width * sw)))),
+            .height = @max(1, @as(i32, @intFromFloat(@round(self.height * sh)))),
+        };
+    }
+
+    pub const PixelRect = struct {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+
+        pub fn aspect(self: PixelRect) f32 {
+            const h: f32 = @floatFromInt(self.height);
+            return if (h > 0.0) @as(f32, @floatFromInt(self.width)) / h else 1.0;
+        }
+    };
+};
+
 pub const ArcRotateCameraOptions = struct {
     alpha: f32 = 0.0,
     beta: f32 = std.math.pi / 3.0,
@@ -13,6 +44,8 @@ pub const ArcRotateCameraOptions = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 };
 
 pub const ArcRotateCamera = struct {
@@ -25,6 +58,8 @@ pub const ArcRotateCamera = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 
     // Управление мышью / трекпадом
     angular_sensitivity: f32 = 0.006,
@@ -48,6 +83,8 @@ pub const ArcRotateCamera = struct {
             .fov_deg = options.fov_deg,
             .near = options.near,
             .far = options.far,
+            .culling_mask = options.culling_mask,
+            .viewport = options.viewport,
         };
     }
 
@@ -144,6 +181,8 @@ pub const FreeCameraOptions = struct {
     far: f32 = 100.0,
     speed: f32 = 6.0,
     angular_sensitivity: f32 = 0.25,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 };
 
 pub const FreeCamera = struct {
@@ -155,6 +194,8 @@ pub const FreeCamera = struct {
     far: f32 = 100.0,
     speed: f32 = 6.0,
     angular_sensitivity: f32 = 0.25, // Degrees per pixel
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 
     move_forward: bool = false,
     move_back: bool = false,
@@ -177,6 +218,8 @@ pub const FreeCamera = struct {
             .far = options.far,
             .speed = options.speed,
             .angular_sensitivity = options.angular_sensitivity,
+            .culling_mask = options.culling_mask,
+            .viewport = options.viewport,
         };
     }
 
@@ -287,6 +330,8 @@ pub const FollowCameraOptions = struct {
     near: f32 = 0.1,
     far: f32 = 100.0,
     lerp_speed: f32 = 8.0,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 };
 
 pub const FollowCamera = struct {
@@ -301,6 +346,8 @@ pub const FollowCamera = struct {
     near: f32 = 0.1,
     far: f32 = 100.0,
     lerp_speed: f32 = 8.0, // 0 = instant snap
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 
     pub fn init(name: []const u8, options: FollowCameraOptions) FollowCamera {
         var self = FollowCamera{
@@ -313,6 +360,8 @@ pub const FollowCamera = struct {
             .near = options.near,
             .far = options.far,
             .lerp_speed = options.lerp_speed,
+            .culling_mask = options.culling_mask,
+            .viewport = options.viewport,
         };
         self.position = self.desiredPosition();
         return self;
@@ -391,6 +440,8 @@ pub const TargetCameraOptions = struct {
     near: f32 = 0.1,
     far: f32 = 100.0,
     smoothing: f32 = 8.0, // Lerp speed 1/s towards the goals; 0 = instant snap
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 };
 
 // Observer camera: fixed lookAt(position, target, up), no mouse input.
@@ -408,6 +459,8 @@ pub const TargetCamera = struct {
     near: f32 = 0.1,
     far: f32 = 100.0,
     smoothing: f32 = 8.0,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 
     pub fn init(name: []const u8, options: TargetCameraOptions) TargetCamera {
         return .{
@@ -419,6 +472,8 @@ pub const TargetCamera = struct {
             .near = options.near,
             .far = options.far,
             .smoothing = options.smoothing,
+            .culling_mask = options.culling_mask,
+            .viewport = options.viewport,
         };
     }
 
@@ -551,6 +606,8 @@ pub const FlyCameraOptions = struct {
     boost_multiplier: f32 = 4.0,
     angular_sensitivity: f32 = 0.25,
     roll_speed_deg: f32 = 90.0, // Degrees per second while Q/E held
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 };
 
 pub const FlyCamera = struct {
@@ -564,6 +621,8 @@ pub const FlyCamera = struct {
     boost_multiplier: f32 = 4.0,
     angular_sensitivity: f32 = 0.25, // Degrees per pixel
     roll_speed_deg: f32 = 90.0,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
 
     move_forward: bool = false,
     move_back: bool = false,
@@ -591,6 +650,8 @@ pub const FlyCamera = struct {
             .boost_multiplier = options.boost_multiplier,
             .angular_sensitivity = options.angular_sensitivity,
             .roll_speed_deg = options.roll_speed_deg,
+            .culling_mask = options.culling_mask,
+            .viewport = options.viewport,
         };
     }
 
@@ -840,6 +901,30 @@ pub const Camera = union(enum) {
             .fly => |c| c.getFovDeg(),
         };
     }
+
+    pub fn getCullingMask(self: Camera) u32 {
+        return switch (self) {
+            inline else => |c| c.culling_mask,
+        };
+    }
+
+    pub fn setCullingMask(self: *Camera, mask: u32) void {
+        switch (self.*) {
+            inline else => |*c| c.culling_mask = mask,
+        }
+    }
+
+    pub fn getViewport(self: Camera) Viewport {
+        return switch (self) {
+            inline else => |c| c.viewport,
+        };
+    }
+
+    pub fn setViewport(self: *Camera, vp: Viewport) void {
+        switch (self.*) {
+            inline else => |*c| c.viewport = vp,
+        }
+    }
 };
 
 test "FreeCamera faces -Z at zero yaw and pitch" {
@@ -1068,4 +1153,25 @@ test "Camera union dispatches target and fly views and lens params" {
     try std.testing.expectApproxEqAbs(@as(f32, 70.0), fly.getFovDeg(), 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), fly.getNear(), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 300.0), fly.getFar(), 1e-5);
+}
+
+test "Viewport toPixelRect and aspect" {
+    const vp = Viewport{ .x = 0.5, .y = 0.25, .width = 0.5, .height = 0.75 };
+    const rect = vp.toPixelRect(1920, 1080);
+    try std.testing.expectEqual(@as(i32, 960), rect.x);
+    try std.testing.expectEqual(@as(i32, 270), rect.y);
+    try std.testing.expectEqual(@as(i32, 960), rect.width);
+    try std.testing.expectEqual(@as(i32, 810), rect.height);
+    try std.testing.expectApproxEqAbs(@as(f32, 960.0 / 810.0), rect.aspect(), 1e-5);
+}
+
+test "Camera mask and viewport dispatch" {
+    var cam: Camera = .{ .free = FreeCamera.init("free", .{}) };
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), cam.getCullingMask());
+    cam.setCullingMask(0x00000004);
+    try std.testing.expectEqual(@as(u32, 0x00000004), cam.getCullingMask());
+
+    cam.setViewport(.{ .x = 0.1, .y = 0.2, .width = 0.3, .height = 0.4 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), cam.getViewport().x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), cam.getViewport().width, 1e-5);
 }

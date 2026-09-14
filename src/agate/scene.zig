@@ -30,7 +30,11 @@ const UICanvas = ui.UICanvas;
 const AnimationGroup = @import("animation/animation.zig").AnimationGroup;
 const Skeleton = @import("animation/skeleton.zig").Skeleton;
 
-const Camera = @import("camera.zig").Camera;
+const camera_mod = @import("camera.zig");
+const Camera = camera_mod.Camera;
+const Viewport = camera_mod.Viewport;
+const debug_shd = @import("debug_shader");
+const debug_pass = @import("passes/debug_pass.zig");
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
 const DirectionalLight = lights.DirectionalLight;
@@ -83,6 +87,17 @@ const FrameContext = scene_uniforms.FrameContext;
 const scene_draw = @import("scene/draw.zig");
 const scene_msaa = @import("scene/msaa.zig");
 
+pub const CameraEntry = struct {
+    name: []const u8,
+    camera: Camera,
+    owns_name: bool = false,
+    enabled: bool = true,
+    culling_mask: u32 = 0xFFFFFFFF,
+    viewport: Viewport = .{},
+    clear_viewport: bool = true,
+    clear_color: ?Color4 = null,
+};
+
 /// The scene: content registries (flat, iterated directly by loaders,
 /// tooling and serialization), a handful of cross-cutting config flags, and
 /// one field per render subsystem. New features should add state to the
@@ -97,6 +112,16 @@ pub const Scene = struct {
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
+
+    // ---- Camera management ----
+    cameras: std.ArrayListUnmanaged(CameraEntry) = .empty,
+    active_camera_index: ?usize = null,
+    enable_multi_camera: bool = false,
+    clear_pipeline: sg.Pipeline = .{},
+    clear_pipeline_msaa: sg.Pipeline = .{},
+    clear_shader: sg.Shader = .{},
+    clear_vb: sg.Buffer = .{},
+
     active_camera: ?Camera = null,
     active_camera_owned_name: ?[]const u8 = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
@@ -401,17 +426,140 @@ pub const Scene = struct {
         self.physics.step(dt);
     }
 
+    // ---- Camera management ----
+
+    pub fn addCamera(self: *Scene, entry: CameraEntry) !usize {
+        var e = entry;
+        if (e.culling_mask == 0xFFFFFFFF and e.camera.getCullingMask() != 0xFFFFFFFF) {
+            e.culling_mask = e.camera.getCullingMask();
+        }
+        const cam_vp = e.camera.getViewport();
+        if (e.viewport.x == 0.0 and e.viewport.y == 0.0 and e.viewport.width == 1.0 and e.viewport.height == 1.0 and
+            (cam_vp.x != 0.0 or cam_vp.y != 0.0 or cam_vp.width != 1.0 or cam_vp.height != 1.0))
+        {
+            e.viewport = cam_vp;
+        }
+        const idx = self.cameras.items.len;
+        try self.cameras.append(self.allocator, e);
+        if (self.active_camera_index == null) {
+            self.active_camera_index = idx;
+            self.active_camera = e.camera;
+        }
+        return idx;
+    }
+
+    pub fn removeCamera(self: *Scene, index: usize) void {
+        if (index >= self.cameras.items.len) return;
+        const entry = self.cameras.orderedRemove(index);
+        if (entry.owns_name) {
+            self.allocator.free(entry.name);
+        }
+        if (self.cameras.items.len == 0) {
+            self.active_camera_index = null;
+            self.active_camera = null;
+        } else {
+            const cur_idx = self.active_camera_index orelse 0;
+            if (cur_idx >= self.cameras.items.len) {
+                self.switchCamera(self.cameras.items.len - 1);
+            } else {
+                self.switchCamera(cur_idx);
+            }
+        }
+    }
+
+    pub fn getCamera(self: *Scene, index: usize) ?*CameraEntry {
+        if (index < self.cameras.items.len) return &self.cameras.items[index];
+        return null;
+    }
+
+    pub fn getCameraByName(self: *Scene, name: []const u8) ?*CameraEntry {
+        for (self.cameras.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
+    pub fn switchCamera(self: *Scene, index: usize) void {
+        if (index >= self.cameras.items.len) return;
+        if (self.active_camera_index) |curr_idx| {
+            if (curr_idx < self.cameras.items.len and self.active_camera != null) {
+                self.cameras.items[curr_idx].camera = self.active_camera.?;
+            }
+        }
+        self.active_camera_index = index;
+        self.active_camera = self.cameras.items[index].camera;
+    }
+
+    pub fn switchCameraByName(self: *Scene, name: []const u8) bool {
+        for (self.cameras.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                self.switchCamera(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn nextCamera(self: *Scene) void {
+        if (self.cameras.items.len == 0) return;
+        const current = self.active_camera_index orelse 0;
+        const next_idx = (current + 1) % self.cameras.items.len;
+        self.switchCamera(next_idx);
+    }
+
+    pub fn prevCamera(self: *Scene) void {
+        if (self.cameras.items.len == 0) return;
+        const current = self.active_camera_index orelse 0;
+        const prev_idx = if (current == 0) self.cameras.items.len - 1 else current - 1;
+        self.switchCamera(prev_idx);
+    }
+
+    pub fn getActiveCameraIndex(self: Scene) ?usize {
+        return self.active_camera_index;
+    }
+
+    pub fn getActiveCameraName(self: Scene) ?[]const u8 {
+        if (self.active_camera_index) |idx| {
+            if (idx < self.cameras.items.len) return self.cameras.items[idx].name;
+        }
+        if (self.active_camera) |cam| return cam.getName();
+        return null;
+    }
+
+    pub fn getCameraCount(self: Scene) usize {
+        return self.cameras.items.len;
+    }
+
     pub fn setActiveCamera(self: *Scene, cam: ?Camera, owned_name: ?[]const u8) void {
         if (self.active_camera_owned_name) |old| {
             self.allocator.free(old);
         }
         self.active_camera = cam;
         self.active_camera_owned_name = owned_name;
+        if (self.active_camera_index) |idx| {
+            if (idx < self.cameras.items.len and cam != null) {
+                self.cameras.items[idx].camera = cam.?;
+            }
+        }
     }
 
     pub fn updateCamera(self: *Scene, dt: f32) void {
-        if (self.active_camera) |*cam| {
+        if (self.enable_multi_camera) {
+            for (self.cameras.items, 0..) |*entry, i| {
+                if (entry.enabled) {
+                    entry.camera.update(dt);
+                    if (self.active_camera_index == i) {
+                        self.active_camera = entry.camera;
+                    }
+                }
+            }
+        } else if (self.active_camera) |*cam| {
             cam.update(dt);
+            if (self.active_camera_index) |idx| {
+                if (idx < self.cameras.items.len) {
+                    self.cameras.items[idx].camera = cam.*;
+                }
+            }
         }
     }
 
@@ -453,6 +601,11 @@ pub const Scene = struct {
     pub fn handleEvent(self: *Scene, ev: [*c]const sapp.Event) void {
         if (self.active_camera) |*cam| {
             cam.handleEvent(ev);
+            if (self.active_camera_index) |idx| {
+                if (idx < self.cameras.items.len) {
+                    self.cameras.items[idx].camera = cam.*;
+                }
+            }
         }
     }
 
@@ -483,8 +636,169 @@ pub const Scene = struct {
         return &self.forward_msaa.?;
     }
 
+    fn ensureClearResources(self: *Scene, samples: i32) void {
+        if (self.clear_vb.id == 0) {
+            const clear_verts = [_]debug_pass.Vertex{
+                .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+                .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+                .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+                .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+                .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+                .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ 1.0, 1.0, 1.0, 1.0 } },
+            };
+            self.clear_vb = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = 6 * @sizeOf(debug_pass.Vertex),
+            });
+            sg.updateBuffer(self.clear_vb, sg.asRange(&clear_verts));
+        }
+        if (self.clear_shader.id == 0) {
+            self.clear_shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
+        }
+        const target_pip = if (samples > 1) &self.clear_pipeline_msaa else &self.clear_pipeline;
+        if (target_pip.id == 0) {
+            var pip_desc = sg.PipelineDesc{
+                .shader = self.clear_shader,
+                .index_type = .NONE,
+                .primitive_type = .TRIANGLES,
+                .depth = .{
+                    .compare = .ALWAYS,
+                    .write_enabled = true,
+                },
+                .cull_mode = .NONE,
+                .sample_count = samples,
+            };
+            pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(debug_pass.Vertex) };
+            pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
+                .format = .FLOAT3,
+                .offset = @offsetOf(debug_pass.Vertex, "position"),
+            };
+            pip_desc.layout.attrs[debug_shd.ATTR_debug_color0] = .{
+                .format = .FLOAT4,
+                .offset = @offsetOf(debug_pass.Vertex, "color"),
+            };
+            target_pip.* = sg.makePipeline(pip_desc);
+        }
+    }
+
+    fn clearCurrentViewport(self: *Scene, color: Color4, samples: i32) void {
+        self.ensureClearResources(samples);
+        const pip = if (samples > 1) self.clear_pipeline_msaa else self.clear_pipeline;
+        if (pip.id == 0 or self.clear_vb.id == 0) return;
+
+        const clear_verts = [_]debug_pass.Vertex{
+            .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+            .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+            .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+            .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+            .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+            .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
+        };
+        sg.updateBuffer(self.clear_vb, sg.asRange(&clear_verts));
+
+        sg.applyPipeline(pip);
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = self.clear_vb;
+        sg.applyBindings(bind);
+
+        const vs_params = debug_shd.VsParams{
+            .mvp = Mat4.identity,
+        };
+        sg.applyUniforms(debug_shd.UB_vs_params, sg.asRange(&vs_params));
+        sg.draw(0, 6, 1);
+    }
+
+    fn renderSceneView(
+        self: *Scene,
+        cam: Camera,
+        culling_mask: u32,
+        aspect: f32,
+        samples: i32,
+        sun_dir: Vec3,
+        sun_color: Color3,
+        sun_intensity: f32,
+        cascades: [4]Mat4,
+        light_pack: scene_lights.LightRig.FramePack,
+        env: scene_draw.Environment,
+    ) void {
+        const view_proj = cam.getViewProjection(aspect);
+        const eye = cam.getPosition();
+
+        self.queues.reset();
+
+        scene_render_queue.buildFrameQueues(.{
+            .allocator = self.allocator,
+            .meshes = self.meshes.items,
+            .frame_id = self.frame_id,
+            .view_proj = view_proj,
+            .eye = eye,
+            .cull_frustum = self.enable_frustum_culling,
+            .cull_occlusion = self.enable_occlusion_culling,
+            .culling_mask = culling_mask,
+            .occlusion_culler = &self.occlusion_culler,
+            .stats = &self.stats,
+            .queues = &self.queues,
+            .default_white_id = self.default_white_texture.view.id,
+        });
+
+        std.mem.sort(RenderMeshItem, self.queues.items.items, {}, scene_render_queue.sortRenderItems);
+        std.mem.sort(RenderMeshItem, self.queues.transparent.items, {}, scene_render_queue.sortTransparentBackToFront);
+
+        const frame_ctx = FrameContext{
+            .view_proj = view_proj,
+            .eye = eye,
+            .sun_dir = sun_dir,
+            .sun_color = sun_color,
+            .sun_intensity = sun_intensity,
+            .cascades = cascades,
+            .light_counts = light_pack.counts,
+            .point_pos_range = light_pack.point_pos_range,
+            .point_color_int = light_pack.point_color_int,
+            .spot_pos_range = light_pack.spot_pos_range,
+            .spot_dir_inner = light_pack.spot_dir_inner,
+            .spot_color_outer = light_pack.spot_color_outer,
+            .spot_intensity = light_pack.spot_intensity,
+            .spot_view_proj = light_pack.spot_view_proj,
+            .spot_shadow_params = light_pack.spot_shadow_params,
+        };
+
+        var current_pipeline_id: u32 = 0;
+
+        // Opaque regular meshes first (front-to-back, early-Z).
+        for (self.queues.items.items) |item| {
+            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
+        }
+
+        // Opaque instanced meshes.
+        for (self.queues.opaque_instanced.items) |mesh| {
+            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
+        }
+
+        // Transparent regular meshes (strict back-to-front, blended).
+        for (self.queues.transparent.items) |item| {
+            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
+        }
+
+        // Transparent instanced meshes.
+        for (self.queues.transparent_instanced.items) |mesh| {
+            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
+        }
+
+        // Inverse-hull outline for highlighted meshes
+        self.postfx.renderOutline(view_proj, eye, self.outline_meshes.items, samples, &self.stats);
+
+        // Physics debug lines
+        self.physics.renderDebug(self.allocator, view_proj, samples, &self.stats);
+
+        // Skybox Pass
+        self.sky.render(cam, aspect, self.default_cube_texture, samples, &self.stats);
+
+        // Particle Pass
+        self.particles.render(cam, aspect, samples, &self.stats);
+    }
+
     pub fn render(self: *Scene) void {
-        const camera = self.active_camera orelse return;
+        const camera = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else return);
         const aspect = sapp.widthf() / sapp.heightf();
         // Sun resolved once per frame; reused by cascades, mesh uniforms, postprocess.
         const sun_dir = self.lights.sunDirection();
@@ -511,26 +825,9 @@ pub const Scene = struct {
 
         self.stats = .{};
         self.frame_id +%= 1;
-        self.queues.reset();
 
         // 1. Directional Light Cascaded Shadow View-Projections
         const cascades = self.shadows.computeCascades(camera, aspect, sun_dir);
-
-        // Phase -1/0: occluder rasterization, frustum/occlusion culling,
-        // LOD picking, instance buffers and queue fill.
-        scene_render_queue.buildFrameQueues(.{
-            .allocator = self.allocator,
-            .meshes = self.meshes.items,
-            .frame_id = self.frame_id,
-            .view_proj = view_proj,
-            .eye = eye,
-            .cull_frustum = self.enable_frustum_culling,
-            .cull_occlusion = self.enable_occlusion_culling,
-            .occlusion_culler = &self.occlusion_culler,
-            .stats = &self.stats,
-            .queues = &self.queues,
-            .default_white_id = self.default_white_texture.view.id,
-        });
 
         // Pack Point & Spot Lights (top-k selection + uniform arrays +
         // spot shadow infos for the depth pass). dt drives the slot
@@ -572,30 +869,6 @@ pub const Scene = struct {
         // Offscreen target when post-processing is on, swapchain otherwise.
         self.postfx.beginMainPass(main_pass_action, self.post_process.enabled, samples, cur_w, cur_h);
 
-        // State sorting: opaque items group by shader type and textures,
-        // Front-to-Back Early-Z. Transparent items sort strictly
-        // back-to-front in their own queue and draw after all opaque work.
-        std.mem.sort(RenderMeshItem, self.queues.items.items, {}, scene_render_queue.sortRenderItems);
-        std.mem.sort(RenderMeshItem, self.queues.transparent.items, {}, scene_render_queue.sortTransparentBackToFront);
-
-        const frame_ctx = FrameContext{
-            .view_proj = view_proj,
-            .eye = eye,
-            .sun_dir = sun_dir,
-            .sun_color = sun_color,
-            .sun_intensity = sun_intensity,
-            .cascades = cascades,
-            .light_counts = light_pack.counts,
-            .point_pos_range = light_pack.point_pos_range,
-            .point_color_int = light_pack.point_color_int,
-            .spot_pos_range = light_pack.spot_pos_range,
-            .spot_dir_inner = light_pack.spot_dir_inner,
-            .spot_color_outer = light_pack.spot_color_outer,
-            .spot_intensity = light_pack.spot_intensity,
-            .spot_view_proj = light_pack.spot_view_proj,
-            .spot_shadow_params = light_pack.spot_shadow_params,
-        };
-
         const env = scene_draw.Environment{
             // Pipeline set must match the main target's sample count: the
             // 1x set for the legacy/swapchain path, the MSAA twin otherwise.
@@ -611,43 +884,36 @@ pub const Scene = struct {
             .shadow_uniforms = self.shadows.uniformState(self.lights.hemi.ground_color),
         };
 
-        var current_pipeline_id: u32 = 0;
+        if (self.enable_multi_camera and self.cameras.items.len > 0) {
+            for (self.cameras.items, 0..) |entry, i| {
+                if (!entry.enabled) continue;
+                const rect = entry.viewport.toPixelRect(cur_w, cur_h);
+                sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
+                sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-        // Opaque regular meshes first (front-to-back, early-Z). Transparent
-        // items live in queues.transparent and are drawn below, after every
-        // opaque mesh including instanced ones.
-        for (self.queues.items.items) |item| {
-            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
+                if (i > 0 and entry.clear_viewport) {
+                    const clr = entry.clear_color orelse self.clear_color;
+                    self.clearCurrentViewport(clr, samples);
+                }
+
+                self.renderSceneView(entry.camera, entry.culling_mask, rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+            }
+            // Restore full viewport
+            sg.applyViewport(0, 0, cur_w, cur_h, true);
+            sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+        } else {
+            const vp = camera.getViewport();
+            const rect = vp.toPixelRect(cur_w, cur_h);
+            sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
+            sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
+
+            self.renderSceneView(camera, camera.getCullingMask(), rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+
+            if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
+                sg.applyViewport(0, 0, cur_w, cur_h, true);
+                sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+            }
         }
-
-        // Opaque instanced meshes.
-        for (self.queues.opaque_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
-        }
-
-        // Transparent regular meshes (strict back-to-front, blended).
-        for (self.queues.transparent.items) |item| {
-            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
-        }
-
-        // Transparent instanced meshes last, drawn as-is (no per-instance
-        // sorting; documented limitation).
-        for (self.queues.transparent_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
-        }
-
-        // Inverse-hull outline for highlighted meshes: inside the main pass,
-        // depth-tested, no depth write, drawn after all surface geometry.
-        self.postfx.renderOutline(view_proj, eye, self.outline_meshes.items, samples, &self.stats);
-
-        // Physics debug lines (3D pass, depth-tested, no depth write).
-        self.physics.renderDebug(self.allocator, view_proj, samples, &self.stats);
-
-        // Skybox Pass
-        self.sky.render(camera, aspect, self.default_cube_texture, samples, &self.stats);
-
-        // Particle Pass
-        self.particles.render(camera, aspect, samples, &self.stats);
 
         if (!self.post_process.enabled) {
             if (self.ui_canvas) |*ui_c| {
@@ -681,6 +947,17 @@ pub const Scene = struct {
     }
 
     pub fn deinit(self: *Scene) void {
+        for (self.cameras.items) |entry| {
+            if (entry.owns_name) {
+                self.allocator.free(entry.name);
+            }
+        }
+        self.cameras.deinit(self.allocator);
+        if (self.clear_vb.id != 0) sg.destroyBuffer(self.clear_vb);
+        if (self.clear_pipeline.id != 0) sg.destroyPipeline(self.clear_pipeline);
+        if (self.clear_pipeline_msaa.id != 0) sg.destroyPipeline(self.clear_pipeline_msaa);
+        if (self.clear_shader.id != 0) sg.destroyShader(self.clear_shader);
+
         if (self.active_camera_owned_name) |n| {
             self.allocator.free(n);
             self.active_camera_owned_name = null;
@@ -726,3 +1003,55 @@ pub const Scene = struct {
         }
     }
 };
+
+test "Scene camera switching and cycling" {
+    const ally = std.testing.allocator;
+    var scene: Scene = undefined;
+    scene.allocator = ally;
+    scene.cameras = .empty;
+    scene.active_camera_index = null;
+    scene.active_camera = null;
+    scene.active_camera_owned_name = null;
+    scene.enable_multi_camera = true;
+
+    defer {
+        for (scene.cameras.items) |entry| {
+            if (entry.owns_name) ally.free(entry.name);
+        }
+        scene.cameras.deinit(ally);
+    }
+
+    const cam1 = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    const cam2 = Camera{ .arc_rotate = camera_mod.ArcRotateCamera.init("Cam2", .{}) };
+    const cam3 = Camera{ .fly = camera_mod.FlyCamera.init("Cam3", .{}) };
+
+    const idx0 = try scene.addCamera(.{ .name = "Cam1", .camera = cam1 });
+    try std.testing.expectEqual(@as(usize, 0), idx0);
+    try std.testing.expectEqual(@as(usize, 0), scene.getActiveCameraIndex().?);
+    try std.testing.expectEqualStrings("Cam1", scene.getActiveCameraName().?);
+
+    _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
+    _ = try scene.addCamera(.{ .name = "Cam3", .camera = cam3 });
+    try std.testing.expectEqual(@as(usize, 3), scene.getCameraCount());
+
+    // Cycle next: 0 -> 1 -> 2 -> 0
+    scene.nextCamera();
+    try std.testing.expectEqual(@as(usize, 1), scene.getActiveCameraIndex().?);
+    try std.testing.expectEqualStrings("Cam2", scene.getActiveCameraName().?);
+
+    scene.nextCamera();
+    try std.testing.expectEqual(@as(usize, 2), scene.getActiveCameraIndex().?);
+    try std.testing.expectEqualStrings("Cam3", scene.getActiveCameraName().?);
+
+    scene.nextCamera();
+    try std.testing.expectEqual(@as(usize, 0), scene.getActiveCameraIndex().?);
+
+    // Cycle prev: 0 -> 2 -> 1
+    scene.prevCamera();
+    try std.testing.expectEqual(@as(usize, 2), scene.getActiveCameraIndex().?);
+
+    // Switch by name
+    try std.testing.expect(scene.switchCameraByName("Cam2"));
+    try std.testing.expectEqual(@as(usize, 1), scene.getActiveCameraIndex().?);
+    try std.testing.expect(!scene.switchCameraByName("NonExistent"));
+}

@@ -31,6 +31,7 @@ pub const FrustumPlane = math.FrustumPlane;
 pub const lerp = math.lerp;
 
 pub const camera = @import("camera.zig");
+pub const Viewport = camera.Viewport;
 pub const ArcRotateCameraOptions = camera.ArcRotateCameraOptions;
 pub const ArcRotateCamera = camera.ArcRotateCamera;
 pub const Camera = camera.Camera;
@@ -42,6 +43,7 @@ pub const TargetCamera = camera.TargetCamera;
 pub const TargetCameraOptions = camera.TargetCameraOptions;
 pub const FlyCamera = camera.FlyCamera;
 pub const FlyCameraOptions = camera.FlyCameraOptions;
+pub const CameraEntry = @import("scene.zig").CameraEntry;
 
 pub const lights = @import("lights.zig");
 pub const HemisphericLightOptions = lights.HemisphericLightOptions;

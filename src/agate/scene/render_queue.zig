@@ -159,6 +159,7 @@ pub const FrameCullContext = struct {
     eye: Vec3,
     cull_frustum: bool,
     cull_occlusion: bool,
+    culling_mask: u32 = 0xFFFFFFFF,
     occlusion_culler: *visibility.OcclusionCuller,
     stats: *SceneStats,
     queues: *RenderQueues,
@@ -178,7 +179,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
     if (ctx.cull_occlusion) {
         ctx.occlusion_culler.beginFrame(ctx.view_proj);
         for (ctx.meshes) |m| {
-            if (!m.is_lod_child and m.is_visible and m.is_occluder) {
+            if (!m.is_lod_child and m.is_visible and m.is_occluder and ((m.layer_mask & ctx.culling_mask) != 0)) {
                 const m_world = worldMatrixCached(ctx.frame_id, m);
                 ctx.occlusion_culler.rasterizeOccluderMesh(
                     m.cpu_positions,
@@ -196,6 +197,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
     // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
     for (ctx.meshes) |mesh| {
         if (mesh.is_lod_child) continue;
+        if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
         if (mesh.instances.items.len > 0) {
             ctx.queues.instance_matrices.clearRetainingCapacity();
             const total_insts = mesh.instances.items.len;
@@ -246,7 +248,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
 
                     const vis = frustum.intersectsAABB4(c_x, c_y, c_z, ex_x, ex_y, ex_z);
 
-                    if (inst0.is_visible and (inst0.culling_strategy == .always_render or vis[0])) {
+                    if (inst0.is_visible and ((inst0.layer_mask & ctx.culling_mask) != 0) and (inst0.culling_strategy == .always_render or vis[0])) {
                         if (ctx.cull_occlusion and !mesh.is_occluder and inst0.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b0)) {
                             ctx.stats.occluded_meshes += 1;
                             ctx.stats.culled_meshes += 1;
@@ -258,7 +260,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                         ctx.stats.culled_meshes += 1;
                     }
 
-                    if (inst1.is_visible and (inst1.culling_strategy == .always_render or vis[1])) {
+                    if (inst1.is_visible and ((inst1.layer_mask & ctx.culling_mask) != 0) and (inst1.culling_strategy == .always_render or vis[1])) {
                         if (ctx.cull_occlusion and !mesh.is_occluder and inst1.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b1)) {
                             ctx.stats.occluded_meshes += 1;
                             ctx.stats.culled_meshes += 1;
@@ -270,7 +272,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                         ctx.stats.culled_meshes += 1;
                     }
 
-                    if (inst2.is_visible and (inst2.culling_strategy == .always_render or vis[2])) {
+                    if (inst2.is_visible and ((inst2.layer_mask & ctx.culling_mask) != 0) and (inst2.culling_strategy == .always_render or vis[2])) {
                         if (ctx.cull_occlusion and !mesh.is_occluder and inst2.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b2)) {
                             ctx.stats.occluded_meshes += 1;
                             ctx.stats.culled_meshes += 1;
@@ -282,7 +284,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                         ctx.stats.culled_meshes += 1;
                     }
 
-                    if (inst3.is_visible and (inst3.culling_strategy == .always_render or vis[3])) {
+                    if (inst3.is_visible and ((inst3.layer_mask & ctx.culling_mask) != 0) and (inst3.culling_strategy == .always_render or vis[3])) {
                         if (ctx.cull_occlusion and !mesh.is_occluder and inst3.culling_strategy != .always_render and ctx.occlusion_culler.isOccluded(b3)) {
                             ctx.stats.occluded_meshes += 1;
                             ctx.stats.culled_meshes += 1;
@@ -294,19 +296,19 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
                         ctx.stats.culled_meshes += 1;
                     }
                 } else {
-                    if (inst0.is_visible) {
+                    if (inst0.is_visible and ((inst0.layer_mask & ctx.culling_mask) != 0)) {
                         ctx.stats.rendered_meshes += 1;
                         ctx.queues.instance_matrices.append(ctx.allocator, m0) catch {};
                     }
-                    if (inst1.is_visible) {
+                    if (inst1.is_visible and ((inst1.layer_mask & ctx.culling_mask) != 0)) {
                         ctx.stats.rendered_meshes += 1;
                         ctx.queues.instance_matrices.append(ctx.allocator, m1) catch {};
                     }
-                    if (inst2.is_visible) {
+                    if (inst2.is_visible and ((inst2.layer_mask & ctx.culling_mask) != 0)) {
                         ctx.stats.rendered_meshes += 1;
                         ctx.queues.instance_matrices.append(ctx.allocator, m2) catch {};
                     }
-                    if (inst3.is_visible) {
+                    if (inst3.is_visible and ((inst3.layer_mask & ctx.culling_mask) != 0)) {
                         ctx.stats.rendered_meshes += 1;
                         ctx.queues.instance_matrices.append(ctx.allocator, m3) catch {};
                     }
@@ -317,7 +319,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
             while (inst_idx < total_insts) : (inst_idx += 1) {
                 const inst = mesh.instances.items[inst_idx];
                 ctx.stats.total_meshes += 1;
-                if (!inst.is_visible) continue;
+                if (!inst.is_visible or ((inst.layer_mask & ctx.culling_mask) == 0)) continue;
                 inst.updateCachedTransforms();
                 const m = inst.cached_world_matrix;
                 const world_aabb = inst.cached_bounding_box;
@@ -655,5 +657,69 @@ test "shared LOD mesh preserves entity transforms without mutation" {
     const m0_x = queues.items.items[0].model.m[12];
     const m1_x = queues.items.items[1].model.m[12];
     try std.testing.expect((m0_x == 10.0 and m1_x == 20.0) or (m0_x == 20.0 and m1_x == 10.0));
+}
+
+test "culling_mask filters out meshes with disjoint layer_mask" {
+    const ally = std.testing.allocator;
+
+    var mesh1 = Mesh{
+        .name = "layer1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .layer_mask = 0b01,
+    };
+    var mesh2 = Mesh{
+        .name = "layer2",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .layer_mask = 0b10,
+    };
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+
+    const meshes = [_]*Mesh{ &mesh1, &mesh2 };
+
+    // Cull with mask 0b01: only mesh1 should be queued
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .culling_mask = 0b01,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
+    try std.testing.expectEqual(&mesh1, queues.items.items[0].mesh);
+
+    // Cull with mask 0b10: only mesh2 should be queued
+    queues.reset();
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 2,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .culling_mask = 0b10,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
+    try std.testing.expectEqual(&mesh2, queues.items.items[0].mesh);
 }
 
