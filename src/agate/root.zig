@@ -127,6 +127,13 @@ pub const CSGVertex = mesh.CSGVertex;
 pub const CSGPlane = mesh.CSGPlane;
 pub const CSGPolygon = mesh.CSGPolygon;
 pub const CSGNode = mesh.CSGNode;
+pub const vat = mesh.vat;
+pub const VatData = mesh.VatData;
+pub const VatBaker = mesh.VatBaker;
+pub const VatPlayer = mesh.VatPlayer;
+pub const VatConfig = mesh.VatConfig;
+pub const VatLayout = mesh.VatLayout;
+pub const VatSampleParams = mesh.VatSampleParams;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;

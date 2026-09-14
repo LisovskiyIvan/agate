@@ -60,6 +60,7 @@ test {
     _ = @import("mesh/tests.zig");
     _ = @import("mesh/trail.zig");
     _ = @import("mesh/types.zig");
+    _ = @import("mesh/vat.zig");
     _ = @import("particles.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");

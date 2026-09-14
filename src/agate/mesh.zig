@@ -24,6 +24,15 @@ pub const uploadGeometry = mesh_impl.uploadGeometry;
 /// the vertex-shader blend (opt-in via Mesh.morph_mode == .gpu).
 pub const morph_gpu = @import("mesh/morph_gpu.zig");
 
+/// Vertex Animation Textures (VAT) baking and playback subsystem
+pub const vat = @import("mesh/vat.zig");
+pub const VatData = vat.VatData;
+pub const VatBaker = vat.VatBaker;
+pub const VatPlayer = vat.VatPlayer;
+pub const VatConfig = vat.VatConfig;
+pub const VatLayout = vat.VatLayout;
+pub const VatSampleParams = vat.VatSampleParams;
+
 pub const builders = @import("mesh/builders.zig");
 pub const BoxOptions = builders.BoxOptions;
 pub const SphereOptions = builders.SphereOptions;
