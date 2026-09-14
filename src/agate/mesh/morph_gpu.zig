@@ -131,13 +131,17 @@ pub const PackedWeights = struct {
 
 /// Splits the up-to-8 weights into the two vec4 lanes of the vs_morph
 /// uniform block (targets 0..3 -> w0, 4..7 -> w1). Missing entries stay 0.
+/// The 8-target cap is a hard invariant (mesh loader clamps to
+/// MAX_MORPH_TARGETS); a longer slice is a caller bug -> panic.
 pub fn packWeights(weights: []const f32) PackedWeights {
+    std.debug.assert(weights.len <= MAX_MORPH_TARGETS);
     var pw: PackedWeights = .{ .w0 = .{ 0, 0, 0, 0 }, .w1 = .{ 0, 0, 0, 0 } };
     for (weights, 0..) |w, i| {
         switch (i) {
             0...3 => pw.w0[i] = w,
             4...7 => pw.w1[i - 4] = w,
-            else => {},
+            // Assert above proves i < 8; ReleaseFast drops the branch.
+            else => unreachable,
         }
     }
     return pw;

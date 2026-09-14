@@ -767,22 +767,22 @@ pub const Scene = struct {
 
         // Opaque regular meshes first (front-to-back, early-Z).
         for (self.queues.items.items) |item| {
-            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id);
         }
 
         // Opaque instanced meshes.
         for (self.queues.opaque_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawInstancedMesh(&env, mesh, &frame_ctx, &current_pipeline_id);
         }
 
         // Transparent regular meshes (strict back-to-front, blended).
         for (self.queues.transparent.items) |item| {
-            scene_draw.drawRegularItem(env, item, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id);
         }
 
         // Transparent instanced meshes.
         for (self.queues.transparent_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(env, mesh, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawInstancedMesh(&env, mesh, &frame_ctx, &current_pipeline_id);
         }
 
         // Inverse-hull outline for highlighted meshes

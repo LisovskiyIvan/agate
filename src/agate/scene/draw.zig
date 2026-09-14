@@ -62,7 +62,7 @@ pub const Environment = struct {
 // resolve to the cull-off twins via pipelines.forRegularItem).
 // Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
 // in-shader discard. Updates stats.
-pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *const FrameContext, current_pipeline_id: *u32) void {
     const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
@@ -260,7 +260,7 @@ pub fn drawRegularItem(env: Environment, item: RenderMeshItem, ctx: *const Frame
 // engine_template == false get only vertex/index binds, the material texture
 // at view slot 0 and (optionally) the user uniform block.
 fn drawShaderMaterialItem(
-    env: Environment,
+    env: *const Environment,
     item: RenderMeshItem,
     ctx: *const FrameContext,
     current_pipeline_id: *u32,
@@ -427,7 +427,7 @@ fn drawShaderMaterialItem(
 
 // Packs the shared fragment uniforms for one mesh: the scene-level state is
 // copied and the per-mesh receive_shadows flag patched in.
-fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) uniforms.FrameUniforms {
+fn frameUniformsFor(env: *const Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) uniforms.FrameUniforms {
     var state = env.shadow_uniforms;
     state.mesh_receive_shadows = mesh.receive_shadows;
     return uniforms.buildFrameUniforms(state, ctx);
@@ -439,7 +439,7 @@ fn frameUniformsFor(env: Environment, mesh: *const @import("../mesh.zig").Mesh, 
 // mesh's delta texture and weights. CPU-morph and non-morph meshes bind
 // the pipeline-owned 1x1 zero texture with the enable flag off, keeping
 // the shader's fetch loop a no-op.
-fn morphBindFor(env: Environment, mesh: *const Mesh) struct { view: sg.View, uniforms: morph_gpu.VsUniforms } {
+fn morphBindFor(env: *const Environment, mesh: *const Mesh) struct { view: sg.View, uniforms: morph_gpu.VsUniforms } {
     const gpu = mesh.morph_mode == .gpu; // missing delta texture panics in vsUniforms
     return .{
         .view = if (gpu) mesh.morph_delta_view else env.pipelines.default_morph_view,
@@ -526,7 +526,7 @@ fn pbrChannelSelectors(pbr_mat: ?*const PBRMaterial) [4]f32 {
 // binds morph resources, so a morph mesh placed in an instanced queue
 // renders its base pose. CPU mode (the default) is unaffected: instanced
 // meshes share the already-blended dynamic vertex buffer.
-pub fn drawInstancedMesh(env: Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
     if (mesh.instances.items.len == 0) return;
     if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
 
