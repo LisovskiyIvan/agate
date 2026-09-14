@@ -151,7 +151,9 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
         vec3 scene_pos = reconstructWorldPos(march_uv, scene_d);
 
-        float depth_diff = ray_pos.z - scene_pos.z;
+        float ray_cam_dist = length(ray_pos - camera_pos.xyz);
+        float scene_cam_dist = length(scene_pos - camera_pos.xyz);
+        float depth_diff = ray_cam_dist - scene_cam_dist;
         float dist_to_surface = length(ray_pos - scene_pos);
 
         if (depth_diff >= 0.0 && dist_to_surface < thickness) {
@@ -183,7 +185,7 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
     vec3 ray_dir = (dist > 0.0001) ? (to_pixel / dist) : vec3(0.0, 0.0, 1.0);
 
     // Directional Sun Inscattering (atmospheric Mie glow)
-    float sun_dot = max(0.0, dot(ray_dir, -sun_dir.xyz));
+    float sun_dot = max(0.0, dot(ray_dir, sun_dir.xyz));
     float sun_inscatter = pow(sun_dot, 8.0) * fog_color.w;
     vec3 current_fog_color = mix(fog_color.rgb, sun_color.rgb * 1.5, sun_inscatter);
 
@@ -307,6 +309,14 @@ vec3 sampleSceneFastLDR(vec2 uv) {
     return clamp(color, 0.0, 1.0);
 }
 
+// Fast luma approximation for FXAA edge detection and tangent walking:
+// skips re-running tonemapping polynomials on every neighbor tap.
+float sampleLumaFast(vec2 uv) {
+    vec3 c = texture(sampler2D(scene_tex, smp), uv).rgb;
+    float luma_hdr = dot(c, vec3(0.299, 0.587, 0.114)) * params1.x;
+    return luma_hdr / (luma_hdr + 1.0);
+}
+
 // FXAA 3.11 Quality Anti-Aliasing
 #define FXAA_EDGE_THRESHOLD_MIN 0.0312
 #define FXAA_EDGE_THRESHOLD     0.125
@@ -317,11 +327,11 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     vec3 colorCenter = sampleSceneLDR(uv);
     float lumaCenter = rgbToLuma(colorCenter);
 
-    // 4 cross neighbors (fast sampling: avoids re-evaluating SSR / Fog on neighbors)
-    float lumaDown  = rgbToLuma(sampleSceneFastLDR(uv + vec2(0.0, -rcpFrame.y)));
-    float lumaUp    = rgbToLuma(sampleSceneFastLDR(uv + vec2(0.0,  rcpFrame.y)));
-    float lumaLeft  = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x, 0.0)));
-    float lumaRight = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x, 0.0)));
+    // 4 cross neighbors (fast scalar luminance)
+    float lumaDown  = sampleLumaFast(uv + vec2(0.0, -rcpFrame.y));
+    float lumaUp    = sampleLumaFast(uv + vec2(0.0,  rcpFrame.y));
+    float lumaLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, 0.0));
+    float lumaRight = sampleLumaFast(uv + vec2( rcpFrame.x, 0.0));
 
     float lumaMin = min(lumaCenter, min(min(lumaDown, lumaUp), min(lumaLeft, lumaRight)));
     float lumaMax = max(lumaCenter, max(max(lumaDown, lumaUp), max(lumaLeft, lumaRight)));
@@ -333,10 +343,10 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     }
 
     // 4 corner neighbors
-    float lumaDownLeft  = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x, -rcpFrame.y)));
-    float lumaUpRight   = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x,  rcpFrame.y)));
-    float lumaUpLeft    = rgbToLuma(sampleSceneFastLDR(uv + vec2(-rcpFrame.x,  rcpFrame.y)));
-    float lumaDownRight = rgbToLuma(sampleSceneFastLDR(uv + vec2( rcpFrame.x, -rcpFrame.y)));
+    float lumaDownLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, -rcpFrame.y));
+    float lumaUpRight   = sampleLumaFast(uv + vec2( rcpFrame.x,  rcpFrame.y));
+    float lumaUpLeft    = sampleLumaFast(uv + vec2(-rcpFrame.x,  rcpFrame.y));
+    float lumaDownRight = sampleLumaFast(uv + vec2( rcpFrame.x, -rcpFrame.y));
 
     // Edge orientation detection (horizontal vs vertical)
     float lumaDownUp = lumaDown + lumaUp;
@@ -387,8 +397,8 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     vec2 uv1 = currentUv - offset;
     vec2 uv2 = currentUv + offset;
 
-    float lumaEnd1 = rgbToLuma(sampleSceneFastLDR(uv1)) - lumaLocalAverage;
-    float lumaEnd2 = rgbToLuma(sampleSceneFastLDR(uv2)) - lumaLocalAverage;
+    float lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
+    float lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
 
     bool reached1 = abs(lumaEnd1) >= gradientScaled;
     bool reached2 = abs(lumaEnd2) >= gradientScaled;
@@ -398,11 +408,11 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
 
     for (int i = 2; i < FXAA_SEARCH_STEPS; i++) {
         if (!reached1) {
-            lumaEnd1 = rgbToLuma(sampleSceneFastLDR(uv1)) - lumaLocalAverage;
+            lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
             reached1 = abs(lumaEnd1) >= gradientScaled;
         }
         if (!reached2) {
-            lumaEnd2 = rgbToLuma(sampleSceneFastLDR(uv2)) - lumaLocalAverage;
+            lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
             reached2 = abs(lumaEnd2) >= gradientScaled;
         }
         if (reached1 && reached2) break;
@@ -441,9 +451,7 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
         finalUv.x += finalOffset * stepLength;
     }
 
-    vec3 edgeColor = sampleSceneFastLDR(finalUv);
-    vec3 centerFast = sampleSceneFastLDR(uv);
-    return clamp(colorCenter + (edgeColor - centerFast), 0.0, 1.0);
+    return sampleSceneLDR(finalUv);
 }
 
 float dofLinearize(float d) {
@@ -569,13 +577,7 @@ void main() {
     // bloom_tex, otherwise the legacy single-shader multi-tap fallback.
     if (bloom_pyramid.x > 0.5 && params1.z > 0.001) {
         vec3 glow = texture(sampler2D(bloom_tex, smp), uv).rgb;
-        vec3 bloom_scaled = glow * params1.z * params1.x;
-        float tonemap_mode = params3.x;
-        if (tonemap_mode > 1.5) {
-            bloom_scaled = Reinhard(bloom_scaled);
-        } else if (tonemap_mode > 0.5) {
-            bloom_scaled = ACESFilm(bloom_scaled);
-        }
+        vec3 bloom_scaled = glow * params1.z;
         color += bloom_scaled;
     } else if (params3.z > 0.5 && params1.z > 0.001) {
         float thresh = params1.y;
@@ -598,13 +600,7 @@ void main() {
         bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0, -1.0) * texel2).rgb, thresh) * 0.1000;
         bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0,  1.0) * texel2).rgb, thresh) * 0.1000;
 
-        vec3 bloom_scaled = bloom * params1.z * params1.x;
-        float tonemap_mode = params3.x;
-        if (tonemap_mode > 1.5) {
-            bloom_scaled = Reinhard(bloom_scaled);
-        } else if (tonemap_mode > 0.5) {
-            bloom_scaled = ACESFilm(bloom_scaled);
-        }
+        vec3 bloom_scaled = bloom * params1.z;
         color += bloom_scaled;
     }
 

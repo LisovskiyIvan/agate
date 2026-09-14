@@ -50,14 +50,12 @@ pub fn averageBlocker(sum: f32, count: u32) ?f32 {
 }
 
 // Variable penumbra from the average blocker depth:
-// (d_receiver - d_blocker) / d_blocker * light_size, clamped to
+// (d_receiver - d_blocker) * light_size, clamped to
 // [min_penumbra, max_penumbra]. Mirrors pcssPenumbraRadius in the shaders.
-// A zero/negative blocker average is guarded to min_blocker_depth, which
-// pushes the raw value far above any sane max (near-light blocker means the
-// widest penumbra). A receiver at or behind the blocker floor yields min.
+// For parallel rays (orthographic directional sun), penumbra scales linearly
+// with the distance between blocker and receiver without perspective division.
 pub fn penumbraRadius(receiver_depth: f32, blocker_avg: f32, light_size: f32, min_penumbra: f32, max_penumbra: f32) f32 {
-    const guarded = @max(blocker_avg, min_blocker_depth);
-    const raw = (receiver_depth - guarded) / guarded * light_size;
+    const raw = (receiver_depth - blocker_avg) * light_size;
     return @min(@max(raw, min_penumbra), max_penumbra);
 }
 
@@ -70,23 +68,22 @@ pub fn resolveLit(blocker_avg: ?f32, pcf_lit: f32) f32 {
 
 test "penumbraRadius matches the analytic formula" {
     const std = @import("std");
-    // (0.6 - 0.5) / 0.5 * 0.02 = 0.004, inside wide clamps: raw value passes through.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.004), penumbraRadius(0.6, 0.5, 0.02, 0.0, 1.0), 1e-6);
-    // (0.9 - 0.3) / 0.3 * 0.05 = 0.1.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), penumbraRadius(0.9, 0.3, 0.05, 0.0, 1.0), 1e-6);
+    // (0.6 - 0.5) * 0.02 = 0.002, inside wide clamps: raw value passes through.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.002), penumbraRadius(0.6, 0.5, 0.02, 0.0, 1.0), 1e-6);
+    // (0.9 - 0.3) * 0.05 = 0.03.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), penumbraRadius(0.9, 0.3, 0.05, 0.0, 1.0), 1e-6);
 }
 
 test "penumbraRadius clamps below min and above max" {
     const std = @import("std");
-    // Near-contact: (0.5001 - 0.5) / 0.5 * 0.02 = 4e-6 -> min.
+    // Near-contact: (0.5001 - 0.5) * 0.02 = 2e-6 -> min.
     try std.testing.expectEqual(@as(f32, 0.0005), penumbraRadius(0.5001, 0.5, 0.02, 0.0005, 0.01));
-    // Far blocker: (0.9 - 0.1) / 0.1 * 0.02 = 0.16 -> max.
+    // Far blocker: (0.9 - 0.1) * 0.02 = 0.016 -> max.
     try std.testing.expectEqual(@as(f32, 0.01), penumbraRadius(0.9, 0.1, 0.02, 0.0005, 0.01));
 }
 
 test "penumbraRadius guards zero and negative blocker depth" {
     const std = @import("std");
-    // Guarded divider keeps the math finite and saturates at max.
     try std.testing.expectEqual(@as(f32, 0.01), penumbraRadius(0.5, 0.0, 0.02, 0.0005, 0.01));
     try std.testing.expectEqual(@as(f32, 0.01), penumbraRadius(0.5, -0.3, 0.02, 0.0005, 0.01));
 }

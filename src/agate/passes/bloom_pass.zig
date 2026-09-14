@@ -45,6 +45,11 @@ pub const BloomPass = struct {
     base_width: i32 = 0,
     base_height: i32 = 0,
 
+    pub fn bloomPixelFormat() sg.PixelFormat {
+        if (sg.queryPixelformat(.RGBA16F).render) return .RGBA16F;
+        return .RGBA8;
+    }
+
     pub fn init() BloomPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -74,6 +79,8 @@ pub const BloomPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
+        const bloom_fmt = bloomPixelFormat();
+
         const down_shd_handle = sg.makeShader(down_shd.bloomDownShaderDesc(sg.queryBackend()));
         var down_desc = sg.PipelineDesc{
             .shader = down_shd_handle,
@@ -86,7 +93,7 @@ pub const BloomPass = struct {
             .cull_mode = .NONE,
             .sample_count = 1,
         };
-        down_desc.colors[0].pixel_format = .RGBA8;
+        down_desc.colors[0].pixel_format = bloom_fmt;
         down_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
         down_desc.layout.attrs[down_shd.ATTR_bloom_down_position] = .{ .format = .FLOAT2, .offset = 0 };
         down_desc.layout.attrs[down_shd.ATTR_bloom_down_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
@@ -104,7 +111,7 @@ pub const BloomPass = struct {
             .cull_mode = .NONE,
             .sample_count = 1,
         };
-        up_desc.colors[0].pixel_format = .RGBA8;
+        up_desc.colors[0].pixel_format = bloom_fmt;
         up_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
         up_desc.layout.attrs[up_shd.ATTR_bloom_up_position] = .{ .format = .FLOAT2, .offset = 0 };
         up_desc.layout.attrs[up_shd.ATTR_bloom_up_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
@@ -127,6 +134,8 @@ pub const BloomPass = struct {
 
         self.destroyTargets();
 
+        const bloom_fmt = bloomPixelFormat();
+
         // Down chain: level 0 is half resolution, each level halves again.
         // Up chain mirrors down sizes so every upsample lands 1:1.
         for (0..pp.BLOOM_MAX_MIPS) |i| {
@@ -135,7 +144,7 @@ pub const BloomPass = struct {
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
-                .pixel_format = .RGBA8,
+                .pixel_format = bloom_fmt,
                 .sample_count = 1,
             });
             self.down_images[i] = down_img;
@@ -150,7 +159,7 @@ pub const BloomPass = struct {
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
-                .pixel_format = .RGBA8,
+                .pixel_format = bloom_fmt,
                 .sample_count = 1,
             });
             self.up_images[i] = up_img;

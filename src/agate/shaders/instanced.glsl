@@ -142,11 +142,11 @@ float hash01(vec2 p) {
 
 // PCSS blocker search: average depth of taps closer to the light than the
 // receiver, or -1.0 when nothing blocks (caller early-outs to fully lit).
-float pcssBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius) {
+float pcssBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius, vec2 quad_min, vec2 quad_max) {
     float blocker_sum = 0.0;
     int blocker_count = 0;
     for (int i = 0; i < PCSS_BLOCKER_SAMPLES; i++) {
-        vec2 tap_uv = atlas_uv + rot * POISSON_DISK[i] * search_radius;
+        vec2 tap_uv = clamp(atlas_uv + rot * POISSON_DISK[i] * search_radius, quad_min, quad_max);
         float tap_depth = texture(sampler2D(depth_tex, depth_smp), tap_uv).r;
         if (tap_depth < receiver_depth) {
             blocker_sum += tap_depth;
@@ -158,9 +158,9 @@ float pcssBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, 
 }
 
 // PCSS variable penumbra, atlas-UV radius for the PCF disk. Mirrors
-// penumbraRadius in scene/shadow_pcss.zig.
+// penumbraRadius in scene/shadow_pcss.zig (parallel rays: linear scaling without perspective division).
 float pcssPenumbraRadius(float receiver_depth, float blocker_avg, float light_size, float min_penumbra, float max_penumbra) {
-    float penumbra = (receiver_depth - blocker_avg) / max(blocker_avg, 0.0001) * light_size;
+    float penumbra = (receiver_depth - blocker_avg) * light_size;
     return clamp(penumbra, min_penumbra, max_penumbra);
 }
 
@@ -184,6 +184,9 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     vec2 atlas_uv = clamped_local_uv * 0.5 + CASCADE_OFFSETS[cascade_idx];
     float depth = proj.z - depth_bias;
 
+    vec2 quad_min = CASCADE_OFFSETS[cascade_idx] + vec2(0.003);
+    vec2 quad_max = CASCADE_OFFSETS[cascade_idx] + vec2(0.497);
+
     float h = hash01(gl_FragCoord.xy);
     mat2 rot = mat2(1.0, 0.0, 0.0, 1.0);
     if (h > 0.75) {
@@ -203,7 +206,7 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     // ride free lanes (cascade_debug.yzw / light_counts.zw); disabled keeps
     // the legacy fixed-radius path below bit-identical.
     if (cascade_debug.y > 0.5) {
-        float blocker_avg = pcssBlockerAverage(shadow_depth_tex, depth_smp, atlas_uv, depth, rot, cascade_debug.w);
+        float blocker_avg = pcssBlockerAverage(shadow_depth_tex, depth_smp, atlas_uv, depth, rot, cascade_debug.w, quad_min, quad_max);
         if (blocker_avg < 0.0) return 1.0;
         filter_radius = pcssPenumbraRadius(depth, blocker_avg, cascade_debug.z, light_counts.z, light_counts.w);
     }
@@ -212,7 +215,8 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     for (int i = 0; i < 16; i++) {
         if (i >= taps) break;
         vec2 offset = rot * POISSON_DISK[i] * filter_radius;
-        lit += texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(atlas_uv + offset, depth));
+        vec2 sample_uv = clamp(atlas_uv + offset, quad_min, quad_max);
+        lit += texture(sampler2DShadow(shadow_tex, shadow_smp), vec3(sample_uv, depth));
     }
     return lit / float(taps);
 }

@@ -117,8 +117,8 @@ pub fn effectiveSampleCount(requested: i32, in: Inputs) i32 {
 
 /// True when any depth-texture-consuming post effect would run this frame.
 /// While the main target is MSAA these are suppressed (see module docs).
-pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool) bool {
-    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled);
+pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool) bool {
+    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled);
 }
 
 /// True when a resolve attachment must exist for the main color target.
@@ -178,15 +178,16 @@ test "effectiveSampleCount gates on post path and format support" {
     try testing.expectEqual(@as(i32, 8), effectiveSampleCount(8, base));
 }
 
-test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF)" {
+test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog)" {
     // SSAO defaults on in this engine: that alone counts as active.
-    try testing.expect(depthEffectsActive(true, true, false, false, false));
-    try testing.expect(depthEffectsActive(true, false, true, false, false)); // debug
-    try testing.expect(depthEffectsActive(true, false, false, true, false)); // SSR
-    try testing.expect(depthEffectsActive(true, false, false, false, true)); // DoF
-    try testing.expect(!depthEffectsActive(true, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, true, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, false, true, false, false, false)); // debug
+    try testing.expect(depthEffectsActive(true, false, false, true, false, false)); // SSR
+    try testing.expect(depthEffectsActive(true, false, false, false, true, false)); // DoF
+    try testing.expect(depthEffectsActive(true, false, false, false, false, true)); // Fog
+    try testing.expect(!depthEffectsActive(true, false, false, false, false, false));
     // Without the post chain nothing runs at all.
-    try testing.expect(!depthEffectsActive(false, true, true, true, true));
+    try testing.expect(!depthEffectsActive(false, true, true, true, true, true));
 }
 
 test "needsResolveAttachment follows the sokol resolve contract" {

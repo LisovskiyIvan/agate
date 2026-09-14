@@ -170,9 +170,9 @@ pub const PostFXStack = struct {
         var post = params.post;
         var ssao = params.ssao;
         if (msaa_active) {
-            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled)) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled)) {
                 _ = self.warn_depth_effects.warn(
-                    "msaa: SSAO/SSR/DoF disabled this session: MSAA x{} main target has no depth resolve",
+                    "msaa: SSAO/SSR/DoF/Fog disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},
                 );
             }
@@ -180,6 +180,8 @@ pub const PostFXStack = struct {
             ssao.debug_mode = false;
             post.ssr_enabled = false;
             post.dof_enabled = false;
+            post.fog_enabled = false;
+            post.fxaa_enabled = false;
         }
 
         // ==============================================

@@ -174,10 +174,10 @@ pub const LightRig = struct {
                 self.fade_time,
                 &point_packed,
             );
-            for (point_packed[0..num_point]) |p| {
+            for (point_packed[0..num_point], 0..) |p, i| {
                 const pl = p.light;
-                pack.point_pos_range[p.slot] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
-                pack.point_color_int[p.slot] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity * p.factor };
+                pack.point_pos_range[i] = .{ pl.position.x, pl.position.y, pl.position.z, pl.range };
+                pack.point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity * p.factor };
             }
             pack.counts[0] = @floatFromInt(num_point);
 
@@ -190,30 +190,30 @@ pub const LightRig = struct {
                 self.fade_time,
                 &spot_packed,
             );
-            for (spot_packed[0..num_spot]) |p| {
+            for (spot_packed[0..num_spot], 0..) |p, i| {
                 const sl = p.light;
                 const dir = sl.direction.normalize();
                 const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
                 const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
                 const fade_intensity = sl.intensity * p.factor;
-                pack.spot_pos_range[p.slot] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
-                pack.spot_dir_inner[p.slot] = .{ dir.x, dir.y, dir.z, cos_inner };
-                pack.spot_color_outer[p.slot] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-                pack.spot_intensity[p.slot] = .{ fade_intensity, 0.0, 0.0, 0.0 };
+                pack.spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
+                pack.spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
+                pack.spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
+                pack.spot_intensity[i] = .{ fade_intensity, 0.0, 0.0, 0.0 };
 
                 // A fading-out shadow caster keeps its shadow: dropping the
                 // shadow earlier than the light itself would pop twice.
                 if (sl.cast_shadows and shadows_enabled and sl.is_enabled) {
                     const svp = sl.getShadowViewProj();
-                    pack.spot_view_proj[p.slot] = svp;
-                    pack.spot_shadow_params[p.slot] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
+                    pack.spot_view_proj[i] = svp;
+                    pack.spot_shadow_params[i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
                     pack.spot_shadows[pack.num_spot_shadows] = .{
-                        .spot_index = p.slot,
+                        .spot_index = i,
                         .view_proj = svp,
                     };
                     pack.num_spot_shadows += 1;
                 } else {
-                    pack.spot_shadow_params[p.slot] = .{ 0.0, 0.0, 0.0, 0.0 };
+                    pack.spot_shadow_params[i] = .{ 0.0, 0.0, 0.0, 0.0 };
                 }
             }
             pack.counts[1] = @floatFromInt(num_spot);

@@ -98,9 +98,20 @@ void main() {
                 // form as the analytic .gpu path, applied over dt):
                 //   p' = p + v*s + g*s2,  v' = v*e + g*s
                 //   e = exp(-k*dt), s = (1 - e)/k, s2 = (dt - s)/k
-                float e = exp(-k * dt);
-                float s = (1.0 - e) / k;
-                float s2 = (dt - s) / k;
+                float x = k * dt;
+                float e;
+                float s;
+                float s2;
+                if (x < 1.0e-3) {
+                    // Taylor expansion avoids catastrophic cancellation in float32
+                    s = dt * (1.0 - 0.5 * x);
+                    s2 = 0.5 * dt * dt * (1.0 - x * (1.0 / 3.0));
+                    e = 1.0 - x;
+                } else {
+                    e = exp(-x);
+                    s = (1.0 - e) / k;
+                    s2 = (dt - s) / k;
+                }
                 p.pos_age.xyz += p.vel_rot.xyz * s + gravity.xyz * s2;
                 p.vel_rot.xyz = p.vel_rot.xyz * e + gravity.xyz * s;
             } else {

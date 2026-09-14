@@ -250,6 +250,12 @@ fn parseSnippet(allocator: std.mem.Allocator, snippet: []const u8, opts: Options
     };
 }
 
+pub const reserved_param_names = [_][]const u8{
+    "time", "roughness", "metallic", "albedo", "normal", "position",
+    "color", "gl_Position", "gl_FragColor", "gl_FragCoord",
+    "v_world_pos", "v_normal", "v_uv", "v_color", "v_tangent", "v_bitangent",
+};
+
 // Parses `// @param <name> <float|vec4> [= d0 d1 d2 d3]` at the given
 // f32 allocation cursor. Returns null for comment headers that are not
 // actual declarations (caller maps that to BadParamDecl where required).
@@ -262,6 +268,9 @@ fn parseParamDecl(line: []const u8, cursor: u8) Error!?Param {
     // name
     const sp1 = std.mem.indexOfAny(u8, rest, " \t") orelse return Error.BadParamDecl;
     const name = rest[0..sp1];
+    for (reserved_param_names) |res| {
+        if (std.mem.eql(u8, name, res)) return Error.BadParamDecl;
+    }
     rest = std.mem.trimStart(u8, rest[sp1..], " \t");
     // type
     const sp2 = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
@@ -600,3 +609,10 @@ test "real engine templates merge byte-identical and accept an albedo hook" {
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "applyMorphDeltas(morphed_pos, morphed_nrm, gl_VertexIndex);") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "frag_color = vec4(final_rgb, base.a);") != null);
 }
+
+test "reserved param names are rejected" {
+    const tmpl = "// @hook(decls)\n// @endhook\n";
+    const snippet = "// @param roughness float = 0.5\n";
+    try std.testing.expectError(error.BadParamDecl, merge(std.testing.allocator, .{ .template = tmpl, .snippet = snippet }));
+}
+
