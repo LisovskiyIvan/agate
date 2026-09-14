@@ -95,6 +95,7 @@ test {
     _ = @import("scene/forward_pipelines.zig");
     _ = @import("scene/light_rig.zig");
     _ = @import("scene/light_selection.zig");
+    _ = @import("scene/msaa.zig");
     _ = @import("scene/nav_layer.zig");
     _ = @import("scene/particle_layer.zig");
     _ = @import("scene/physics_layer.zig");

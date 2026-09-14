@@ -13,12 +13,19 @@ var camera: z.ArcRotateCamera = undefined;
 
 // CLI: --frames N quits after N rendered frames (0 = run until closed);
 // --particles <cpu|gpu|compute> adds a demo particle system with that
-// simulation mode (default: none). --frames is useful for headless smokes:
-// `agate --frames 120` must complete without sokol validation errors.
+// simulation mode (default: none). --msaa N requests MSAA for the offscreen
+// main target (valid: 1/2/4, clamped per scene/msaa.zig; enabling it turns
+// the post chain on, because MSAA applies only to the offscreen path, and
+// suppresses SSAO/SSR/DoF, which need a depth texture sokol cannot resolve
+// from an MSAA target). --frames is useful for headless smokes:
+// `agate --frames 120 --msaa 4` must complete without sokol validation
+// errors (the classic MSAA failure is a pipeline/attachment sample-count
+// mismatch).
 var frame_limit: u32 = 0;
 var frame_count: u32 = 0;
 var particle_mode: ?z.SimulationMode = null;
 var particles: *z.ParticleSystem = undefined;
+var msaa_samples: i32 = 1;
 
 fn parseArgs(args: std.process.Args) void {
     var it = std.process.Args.Iterator.init(args);
@@ -37,6 +44,9 @@ fn parseArgs(args: std.process.Args) void {
             } else if (std.mem.eql(u8, mode, "compute")) {
                 particle_mode = .compute;
             }
+        } else if (std.mem.eql(u8, arg, "--msaa")) {
+            const n = it.next() orelse break;
+            msaa_samples = std.fmt.parseInt(i32, n, 10) catch 1;
         }
     }
 }
@@ -53,6 +63,14 @@ export fn init() callconv(.c) void {
 
     const allocator = gpa.allocator();
     scene = z.Scene.init(allocator);
+
+    // MSAA applies to the offscreen main target, so the post chain must own
+    // PASS 2. Depth-consuming effects (SSAO/SSR/DoF) are suppressed by the
+    // engine (warned once) while MSAA is active.
+    if (msaa_samples > 1) {
+        scene.msaa_sample_count = msaa_samples;
+        scene.post_process.enabled = true;
+    }
 
     // Babylon.js style: настройка орбитальной камеры
     camera = z.ArcRotateCamera.init("MainCamera", .{
