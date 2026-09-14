@@ -10,6 +10,7 @@ const BoundingBox = math.BoundingBox;
 const Mesh = @import("../mesh.zig").Mesh;
 const Material = @import("../material.zig").Material;
 const visibility = @import("../visibility/mod.zig");
+const jobs = @import("../jobs.zig");
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 
@@ -153,6 +154,16 @@ pub fn worldAABBCached(frame_id: u64, mesh: *Mesh) BoundingBox {
 /// free of scene.zig imports.
 pub const FrameCullContext = struct {
     allocator: std.mem.Allocator,
+    /// Optional worker pool for the parallel cull pass. Null (or a scene
+    /// smaller than `parallel_min_meshes`) keeps the legacy single-threaded
+    /// loop — a scheduling detail, never a behavior change: both paths
+    /// produce identical queues in identical order.
+    thread_pool: ?*jobs.Pool = null,
+    /// Scene size at which the parallel cull pays for waking the workers.
+    parallel_min_meshes: usize = 1024,
+
+    /// View id of the shared 1x1 white fallback (texture-less meshes).
+    default_white_id: u32,
     meshes: []const *Mesh,
     frame_id: u64,
     view_proj: Mat4,
@@ -163,19 +174,25 @@ pub const FrameCullContext = struct {
     occlusion_culler: *visibility.OcclusionCuller,
     stats: *SceneStats,
     queues: *RenderQueues,
-    // View id of the shared 1x1 white fallback (texture-less meshes).
-    default_white_id: u32,
 };
 
 /// Phase -1 (occluder rasterization) and Phase 0 (frustum/occlusion
 /// culling, LOD picking, instance-buffer management, queue fill) of the
-/// render frame. Moved verbatim from the legacy Scene.render; results land
-/// in ctx.queues and the stats counters.
+/// render frame. Results land in ctx.queues and the stats counters.
+///
+/// Instance-bearing meshes stay serial in every path: they interleave with
+/// sg buffer creation/update, which is single-context. Plain meshes cull
+/// data-parallel when a pool is attached and the scene clears
+/// `parallel_min_meshes`; the parallel pass produces the same records in
+/// the same order as the serial loop (chunks partition the mesh list in
+/// order and merge back in chunk order), so the choice between them is a
+/// scheduling detail, never a behavior change.
 pub fn buildFrameQueues(ctx: FrameCullContext) void {
     const frustum = Frustum.fromViewProjection(ctx.view_proj);
     const eye = ctx.eye;
 
-    // Phase -1: Occlusion Culling setup & occluder rasterization
+    // Phase -1: Occlusion Culling setup & occluder rasterization (serial:
+    // the Hi-Z rasterizer is stateful).
     if (ctx.cull_occlusion) {
         ctx.occlusion_culler.beginFrame(ctx.view_proj);
         for (ctx.meshes) |m| {
@@ -194,130 +211,248 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
         ctx.stats.occluder_triangles = ctx.occlusion_culler.triangles_rasterized;
     }
 
-    // Phase 0: Pre-filter meshes and populate instance buffers using SIMD 4-wide batching
+    // Phase 0: cull + queue fill.
+    const pool = ctx.thread_pool;
+    if (pool != null and pool.?.workerCount() > 0 and ctx.meshes.len >= ctx.parallel_min_meshes) {
+        buildFrameQueuesParallel(ctx, frustum, eye, pool.?) catch {};
+        return;
+    }
+
     for (ctx.meshes) |mesh| {
         if (mesh.is_lod_child) continue;
         if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
         if (mesh.instances.items.len > 0) {
-            if (mesh.instance_uploaded_frame != ctx.frame_id) {
-                mesh.instance_uploaded_frame = ctx.frame_id;
-                ctx.queues.instance_matrices.clearRetainingCapacity();
-                var combined_aabb = math.BoundingBox.zero;
-                for (mesh.instances.items) |inst| {
-                    if (!inst.is_visible) continue;
-                    inst.updateCachedTransforms();
-                    ctx.queues.instance_matrices.append(ctx.allocator, inst.cached_world_matrix) catch continue;
-                    if (combined_aabb.isValid()) {
-                        combined_aabb = combined_aabb.merge(inst.cached_bounding_box);
-                    } else {
-                        combined_aabb = inst.cached_bounding_box;
-                    }
-                }
-                mesh.cached_aabb = combined_aabb;
-                const active_count = ctx.queues.instance_matrices.items.len;
-                mesh.visible_instance_count = @intCast(active_count);
-                if (active_count > 0) {
-                    if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < active_count) {
-                        if (mesh.instance_buffer.id != 0) {
-                            sg.destroyBuffer(mesh.instance_buffer);
-                        }
-                        const new_cap = @max(active_count, mesh.instance_buffer_capacity * 2);
-                        mesh.instance_buffer = sg.makeBuffer(.{
-                            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                            .size = new_cap * @sizeOf(Mat4),
-                        });
-                        mesh.instance_buffer_capacity = new_cap;
-                        sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
-                        mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
-                        mesh.instance_uploaded_count = active_count;
-                    } else {
-                        const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
-                        if (active_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
-                            sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
-                            mesh.instance_hash = h;
-                            mesh.instance_uploaded_count = active_count;
-                        }
-                    }
-                }
-            }
-
-            if (mesh.visible_instance_count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
-                if (ctx.cull_frustum and mesh.cached_aabb.isValid() and !frustum.intersectsAABB(mesh.cached_aabb)) {
-                    ctx.stats.culled_meshes += @intCast(mesh.instances.items.len);
-                    continue;
-                }
-                ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
-                ctx.stats.rendered_meshes += mesh.visible_instance_count;
-                if (materialIsTransparent(mesh.material)) {
-                    ctx.queues.transparent_instanced.append(ctx.allocator, mesh) catch {};
-                } else {
-                    ctx.queues.opaque_instanced.append(ctx.allocator, mesh) catch {};
-                }
-            }
+            submitInstancedMesh(ctx, frustum, mesh);
             continue;
-        } else {
-            ctx.stats.total_meshes += 1;
-            if (!mesh.is_visible) continue;
-
-            var render_mesh = mesh;
-            if (mesh.lod_levels.items.len > 0) {
-                const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
-                const active_lod = mesh.getLOD(dist);
-                if (active_lod) |lod| {
-                    render_mesh = lod;
-                } else {
-                    // Beyond max distance, culled
-                    ctx.stats.culled_meshes += 1;
-                    continue;
-                }
-            }
-
-            const model = worldMatrixCached(ctx.frame_id, mesh);
-            const world_aabb = if (render_mesh != mesh and render_mesh.local_bounding_box.isValid())
-                render_mesh.local_bounding_box.transform(model)
-            else
-                mesh.cached_aabb;
-
-            if (ctx.cull_frustum and render_mesh.culling_strategy != .always_render) {
-                if (!frustum.intersectsAABB(world_aabb)) {
-                    ctx.stats.culled_meshes += 1;
-                    continue;
-                }
-            }
-
-            if (ctx.cull_occlusion and !render_mesh.is_occluder and render_mesh.culling_strategy != .always_render) {
-                if (ctx.occlusion_culler.isOccluded(world_aabb)) {
-                    ctx.stats.occluded_meshes += 1;
-                    ctx.stats.culled_meshes += 1;
-                    continue;
-                }
-            }
-
-            ctx.stats.rendered_meshes += 1;
-
-            const mat = render_mesh.material orelse mesh.material;
-            const is_pbr = if (mat) |m| (m == .pbr) else false;
-            const tex_id: u32 = if (mat) |m|
-                if (m.primaryTexture()) |t| t.view.id else ctx.default_white_id
-            else
-                ctx.default_white_id;
-
-            const d_sq = world_aabb.center().sub(eye).lengthSq();
-            const is_decal = render_mesh.is_decal or mesh.is_decal;
-            const transparent = materialIsTransparent(mat) or is_decal;
-            const target_queue = if (transparent) &ctx.queues.transparent else &ctx.queues.items;
-            target_queue.append(ctx.allocator, .{
-                .mesh = render_mesh,
-                .material = mat,
-                .model = model,
-                .distance_sq = d_sq,
-                .is_pbr = is_pbr,
-                .texture_id = tex_id,
-                .transparent = transparent,
-                .double_sided = materialIsDoubleSided(mat) or is_decal,
-                .is_decal = is_decal,
-            }) catch continue;
         }
+        if (cullNonInstancedMesh(ctx, frustum, eye, mesh, ctx.stats)) |item| {
+            appendRenderItem(ctx, item);
+        }
+    }
+}
+
+/// Routes a finished record into the draw queue it belongs to.
+fn appendRenderItem(ctx: FrameCullContext, item: RenderMeshItem) void {
+    if (item.transparent) {
+        ctx.queues.transparent.append(ctx.allocator, item) catch {};
+    } else {
+        ctx.queues.items.append(ctx.allocator, item) catch {};
+    }
+}
+
+/// Instance-bearing mesh handling, verbatim from the legacy loop: per-frame
+/// instance-matrix staging, sg buffer (re)creation/upload, frustum test on
+/// the combined AABB, instanced queue fill. Serial-only by design.
+fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh) void {
+    if (mesh.instance_uploaded_frame != ctx.frame_id) {
+        mesh.instance_uploaded_frame = ctx.frame_id;
+        ctx.queues.instance_matrices.clearRetainingCapacity();
+        var combined_aabb = math.BoundingBox.zero;
+        for (mesh.instances.items) |inst| {
+            if (!inst.is_visible) continue;
+            inst.updateCachedTransforms();
+            ctx.queues.instance_matrices.append(ctx.allocator, inst.cached_world_matrix) catch return;
+            if (combined_aabb.isValid()) {
+                combined_aabb = combined_aabb.merge(inst.cached_bounding_box);
+            } else {
+                combined_aabb = inst.cached_bounding_box;
+            }
+        }
+        mesh.cached_aabb = combined_aabb;
+        const active_count = ctx.queues.instance_matrices.items.len;
+        mesh.visible_instance_count = @intCast(active_count);
+        if (active_count > 0) {
+            if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < active_count) {
+                if (mesh.instance_buffer.id != 0) {
+                    sg.destroyBuffer(mesh.instance_buffer);
+                }
+                const new_cap = @max(active_count, mesh.instance_buffer_capacity * 2);
+                mesh.instance_buffer = sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                    .size = new_cap * @sizeOf(Mat4),
+                });
+                mesh.instance_buffer_capacity = new_cap;
+                sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
+                mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                mesh.instance_uploaded_count = active_count;
+            } else {
+                const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                if (active_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
+                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
+                    mesh.instance_hash = h;
+                    mesh.instance_uploaded_count = active_count;
+                }
+            }
+        }
+    }
+
+    if (mesh.visible_instance_count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
+        if (ctx.cull_frustum and mesh.cached_aabb.isValid() and !frustum.intersectsAABB(mesh.cached_aabb)) {
+            ctx.stats.culled_meshes += @intCast(mesh.instances.items.len);
+            return;
+        }
+        ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
+        ctx.stats.rendered_meshes += mesh.visible_instance_count;
+        if (materialIsTransparent(mesh.material)) {
+            ctx.queues.transparent_instanced.append(ctx.allocator, mesh) catch {};
+        } else {
+            ctx.queues.opaque_instanced.append(ctx.allocator, mesh) catch {};
+        }
+    }
+}
+
+/// Plain-mesh cull: LOD pick, world AABB, frustum + occlusion tests, record
+/// build. Pure with respect to the mesh (world matrix must already be warm
+/// in the parallel path — see buildFrameQueuesParallel). Stats go to the
+/// caller-supplied counter block so parallel chunks can merge locally.
+fn cullNonInstancedMesh(
+    ctx: FrameCullContext,
+    frustum: Frustum,
+    eye: Vec3,
+    mesh: *Mesh,
+    stats: *SceneStats,
+) ?RenderMeshItem {
+    stats.total_meshes += 1;
+    if (!mesh.is_visible) return null;
+
+    var render_mesh = mesh;
+    if (mesh.lod_levels.items.len > 0) {
+        const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
+        const active_lod = mesh.getLOD(dist);
+        if (active_lod) |lod| {
+            render_mesh = lod;
+        } else {
+            // Beyond max distance, culled
+            stats.culled_meshes += 1;
+            return null;
+        }
+    }
+
+    const model = worldMatrixCached(ctx.frame_id, mesh);
+    const world_aabb = if (render_mesh != mesh and render_mesh.local_bounding_box.isValid())
+        render_mesh.local_bounding_box.transform(model)
+    else
+        mesh.cached_aabb;
+
+    if (ctx.cull_frustum and render_mesh.culling_strategy != .always_render) {
+        if (!frustum.intersectsAABB(world_aabb)) {
+            stats.culled_meshes += 1;
+            return null;
+        }
+    }
+
+    if (ctx.cull_occlusion and !render_mesh.is_occluder and render_mesh.culling_strategy != .always_render) {
+        if (ctx.occlusion_culler.isOccluded(world_aabb)) {
+            stats.occluded_meshes += 1;
+            stats.culled_meshes += 1;
+            return null;
+        }
+    }
+
+    stats.rendered_meshes += 1;
+
+    const mat = render_mesh.material orelse mesh.material;
+    const is_pbr = if (mat) |m| (m == .pbr) else false;
+    const tex_id: u32 = if (mat) |m|
+        if (m.primaryTexture()) |t| t.view.id else ctx.default_white_id
+    else
+        ctx.default_white_id;
+
+    const d_sq = world_aabb.center().sub(eye).lengthSq();
+    const is_decal = render_mesh.is_decal or mesh.is_decal;
+    const transparent = materialIsTransparent(mat) or is_decal;
+    return .{
+        .mesh = render_mesh,
+        .material = mat,
+        .model = model,
+        .distance_sq = d_sq,
+        .is_pbr = is_pbr,
+        .texture_id = tex_id,
+        .transparent = transparent,
+        .double_sided = materialIsDoubleSided(mat) or is_decal,
+        .is_decal = is_decal,
+    };
+}
+
+/// Parallel cull pass state. Chunks partition `ctx.meshes` into fixed
+/// ranges; each chunk collects its records and stats independently (no
+/// locks) and the caller merges them in chunk order, reproducing the serial
+/// loop's queue order and stat totals exactly.
+const ParallelCull = struct {
+    ctx: FrameCullContext,
+    frustum: Frustum,
+    eye: Vec3,
+    /// Meshes per chunk (ceil split; the last chunk may be short).
+    span: usize,
+    records: []std.ArrayListUnmanaged(RenderMeshItem),
+    chunk_stats: []SceneStats,
+
+    fn cullChunkRange(pass: *ParallelCull, start: usize, end: usize) void {
+        for (start..end) |chunk_id| {
+            const lo = chunk_id * pass.span;
+            const hi = @min(lo + pass.span, pass.ctx.meshes.len);
+            var local = SceneStats{};
+            for (pass.ctx.meshes[lo..hi]) |mesh| {
+                if (mesh.is_lod_child) continue;
+                if ((mesh.layer_mask & pass.ctx.culling_mask) == 0) continue;
+                if (cullNonInstancedMesh(pass.ctx, pass.frustum, pass.eye, mesh, &local)) |item| {
+                    pass.records[chunk_id].append(pass.ctx.allocator, item) catch {};
+                }
+            }
+            pass.chunk_stats[chunk_id] = local;
+        }
+    }
+};
+
+fn buildFrameQueuesParallel(
+    ctx: FrameCullContext,
+    frustum: Frustum,
+    eye: Vec3,
+    pool: *jobs.Pool,
+) !void {
+    // World matrices cache per mesh with parent-chain recursion; lazy fill
+    // from two workers could race on a shared parent's cache. Warm the
+    // cache in mesh order first — pure TRS work, O(meshes), and a no-op
+    // for meshes already tagged with this frame id (e.g. second camera of
+    // a PIP render).
+    for (ctx.meshes) |m| _ = worldMatrixCached(ctx.frame_id, m);
+
+    const chunk_count = (pool.workerCount() + 1) * 4;
+    const span = (ctx.meshes.len + chunk_count - 1) / chunk_count;
+
+    const records = try ctx.allocator.alloc(std.ArrayListUnmanaged(RenderMeshItem), chunk_count);
+    defer ctx.allocator.free(records);
+    for (records) |*r| r.* = .empty;
+    const chunk_stats = try ctx.allocator.alloc(SceneStats, chunk_count);
+    defer ctx.allocator.free(chunk_stats);
+    @memset(chunk_stats, .{});
+
+    var pass = ParallelCull{
+        .ctx = ctx,
+        .frustum = frustum,
+        .eye = eye,
+        .span = span,
+        .records = records,
+        .chunk_stats = chunk_stats,
+    };
+    pool.forkJoin(ParallelCull, &pass, ParallelCull.cullChunkRange, chunk_count);
+
+    // Deterministic merge: chunk order == mesh order, so the queues land
+    // exactly as the serial loop would have filled them.
+    for (records, chunk_stats) |*list, local| {
+        ctx.stats.total_meshes += local.total_meshes;
+        ctx.stats.rendered_meshes += local.rendered_meshes;
+        ctx.stats.culled_meshes += local.culled_meshes;
+        ctx.stats.occluded_meshes += local.occluded_meshes;
+        for (list.items) |item| appendRenderItem(ctx, item);
+        list.deinit(ctx.allocator);
+    }
+
+    // Instance-bearing meshes: serial submission (sg buffer management).
+    for (ctx.meshes) |mesh| {
+        if (mesh.is_lod_child or mesh.instances.items.len == 0) continue;
+        if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
+        submitInstancedMesh(ctx, frustum, mesh);
     }
 }
 
@@ -600,4 +735,97 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
     });
     try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
     try std.testing.expectEqual(&mesh2, queues.items.items[0].mesh);
+}
+
+test "parallel cull produces serial-identical queues" {
+    const ally = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    // Deterministic synthetic scene: mixed layer masks, visibility, and
+    // placement so both culling decisions and sort keys vary.
+    const count = 3000;
+    const meshes = try ally.alloc(Mesh, count);
+    defer ally.free(meshes);
+    const ptrs = try ally.alloc(*Mesh, count);
+    defer ally.free(ptrs);
+    for (0..count) |i| {
+        meshes[i] = .{
+            .name = "m",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 3,
+            .layer_mask = if (i % 7 == 0) 0b10 else 0b01,
+        };
+        if (i % 5 == 0) {
+            // Near the origin: survives the identity-projection frustum.
+            meshes[i].position = Vec3.new(rand.float(f32) * 0.2, rand.float(f32) * 0.2, rand.float(f32) * 0.2);
+        } else {
+            meshes[i].position = Vec3.new(rand.float(f32) * 100 - 50, rand.float(f32) * 100 - 50, rand.float(f32) * 100 - 50);
+        }
+        meshes[i].is_visible = i % 11 != 0;
+        ptrs[i] = &meshes[i];
+    }
+
+    var culler = visibility.OcclusionCuller.init();
+    var stats_a = SceneStats{};
+    var queues_a = RenderQueues{};
+    defer queues_a.deinit(ally);
+    var stats_b = SceneStats{};
+    var queues_b = RenderQueues{};
+    defer queues_b.deinit(ally);
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    // Serial pass (no pool attached).
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = true,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_a,
+        .queues = &queues_a,
+        .default_white_id = 1,
+    });
+
+    // Parallel pass (forced past the mesh threshold, 2 workers).
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 2,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = true,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_b,
+        .queues = &queues_b,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+
+    // Identical stats…
+    try std.testing.expectEqual(stats_a.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_a.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(stats_a.culled_meshes, stats_b.culled_meshes);
+    try std.testing.expectEqual(stats_a.occluded_meshes, stats_b.occluded_meshes);
+    // …identical queue lengths…
+    try std.testing.expectEqual(queues_a.items.items.len, queues_b.items.items.len);
+    try std.testing.expect(stats_a.rendered_meshes > 0);
+    try std.testing.expect(stats_a.culled_meshes > 0);
+    // …and identical records in identical order (chunk merge order ==
+    // serial mesh order, and the same world matrices feed both passes).
+    for (queues_a.items.items, queues_b.items.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.texture_id, b.texture_id);
+        try std.testing.expectEqual(a.transparent, b.transparent);
+    }
 }

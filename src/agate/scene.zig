@@ -67,6 +67,7 @@ const visibility = @import("visibility/mod.zig");
 const scene_stats = @import("scene/stats.zig");
 pub const SceneStats = scene_stats.SceneStats;
 const scene_render_queue = @import("scene/render_queue.zig");
+const jobs = @import("jobs.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
@@ -740,6 +741,7 @@ pub const Scene = struct {
             .stats = &self.stats,
             .queues = &self.queues,
             .default_white_id = self.default_white_texture.view.id,
+            .thread_pool = jobs.global,
         });
 
         std.mem.sort(RenderMeshItem, self.queues.items.items, {}, scene_render_queue.sortRenderItems);

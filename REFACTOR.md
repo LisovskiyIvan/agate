@@ -19,26 +19,32 @@ sequential (`src/main.zig`, `scene.zig`). No engine subsystem spawns threads.
   buffers, single PRNGs per subsystem.
 
 ## The ladder (cheap → expensive)
-
-### [~] Stage 1 — job pool + data-parallel systems (pool + particles landed)
+### [~] Stage 1 — job pool + data-parallel systems (pool, particles, culling landed)
 Fork-join pool for pure-CPU work. No `sg.*`, no shared mutable state; each
 job owns a disjoint index range.
 
 - `src/agate/jobs.zig` — `Pool` (N workers + calling thread forage a chunked
   atomic cursor), `parallelFor(?*Pool, ctx, fn, len)` with serial fallback
-  (null pool / `min_len_for_workers`). Process-global handle `jobs.global`
-  for engine code; explicit pools for tests.
+  (null pool / `min_len_for_workers`); workers park on a pthread condvar.
+  Process-global handle `jobs.global` for engine code; explicit pools for
+  tests. Landmark: Zig 0.16 `std.Thread` ships no public condvar, so the
+  pool wraps `std.c` directly (the engine links libc for sokol anyway).
 - [x] CPU particle integration (`particles.zig updateCpu`) split into
   **integrate (parallel) → swap-compaction (serial, legacy-exact) →
   instance fill (parallel)**. Per-slot work is order-independent, so results
   are bit-identical for any worker count (pinned by a determinism test).
-- [ ] Frustum culling (`render_queue.buildFrameQueues`): currently NOT
-  parallelizable as written — `sg.makeBuffer/updateBuffer` and shared
-  scratch (`instance_matrices`) sit inside the per-mesh loop. Required
-  restructure: pure per-mesh cull test producing a record
-  (mesh, model, d_sq, queue class) into per-thread chunks; serial pass then
-  appends, sorts, and performs the sg buffer uploads. Next candidate after
-  particles.
+  Pool is injected per system (`thread_pool`), falling back to
+  `jobs.global`, then to inline execution.
+- [x] Frustum culling (`render_queue.buildFrameQueues`): split into
+  `cullNonInstancedMesh` (pure per-mesh test producing a record) +
+  `submitInstancedMesh` (serial; owns all sg buffer work) + a chunked
+  parallel pass. Chunks partition the mesh list in fixed order and merge
+  back in chunk order, so queues and stats are identical to the serial
+  loop — pinned by a 3000-mesh equivalence test. Instance-bearing meshes
+  keep the serial path (sg calls inside); world-matrix caches are warmed
+  serially before the parallel pass (shared parents would race otherwise).
+  Active only above `FrameCullContext.parallel_min_meshes` (default 1024)
+  with a pool attached — current demo scenes sit below it by design.
 - [ ] Trails / decals / nav agents: audit for per-entity independence
   before touching; trail histories are chain-sequential (likely stay serial).
 
