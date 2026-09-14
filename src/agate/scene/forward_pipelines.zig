@@ -12,6 +12,21 @@ const render_queue = @import("render_queue.zig");
 const RenderMeshItem = render_queue.RenderMeshItem;
 const shader_material = @import("../shader_material.zig");
 
+/// Base descriptor funnel for every main-target pipeline (defined in
+/// pipelines.zig; re-exported here because this file is the pipeline front
+/// door). See the definition for the sample-count contract.
+pub const forwardBaseDesc = scene_pipelines.forwardBaseDesc;
+
+/// Cache-slot key mixing a shader-material registration key with the target
+/// sample count, so 1x and MSAA pipeline sets for the same shader coexist in
+/// one cache without colliding.
+pub fn shaderMaterialSlotKey(key: u64, sample_count: i32) u64 {
+    var h = std.hash.Wyhash.init(0x6d73_6161_2020_2020); // "msaa    "
+    h.update(std.mem.asBytes(&key));
+    h.update(std.mem.asBytes(&sample_count));
+    return h.final();
+}
+
 /// GPU pipeline set for one registered shader material: 8 pipelines shaped
 /// exactly like the built-in families (opaque/blend x u16/u32 plus their
 /// cull-off twins). Created lazily by ShaderMaterialCache on first use.
@@ -56,10 +71,15 @@ pub const ShaderMaterialCache = struct {
 
     slots: [max_entries]ShaderMaterialSet = @splat(.{}),
     overflow_count: u32 = 0,
+    /// Main-target sample count the cached pipelines are built for; mixed
+    /// into the slot key so 1x and MSAA variants coexist (see
+    /// shaderMaterialSlotKey).
+    sample_count: i32 = 1,
 
     pub fn lookup(self: *const ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
+        const slot_key = shaderMaterialSlotKey(key, self.sample_count);
         for (&self.slots) |*slot| {
-            if (slot.key == key and slot.opaque_u16.id != 0) return slot;
+            if (slot.key == slot_key and slot.opaque_u16.id != 0) return slot;
         }
         return null;
     }
@@ -71,28 +91,20 @@ pub const ShaderMaterialCache = struct {
     pub fn getOrCreate(self: *ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
         if (self.lookup(key)) |set| return set;
         const entry = shader_material.entryForKey(key) orelse return null;
+        const slot_key = shaderMaterialSlotKey(key, self.sample_count);
         for (&self.slots) |*slot| {
             if (slot.key == 0 and slot.opaque_u16.id == 0 and slot.shader.id == 0) {
                 const shader = entry.make_shader(sg.queryBackend());
                 if (shader.id == 0) return null;
                 slot.shader = shader;
-                var desc = sg.PipelineDesc{
-                    .shader = shader,
-                    .index_type = .UINT16,
-                    .depth = .{
-                        .compare = .LESS_EQUAL,
-                        .write_enabled = true,
-                    },
-                    .cull_mode = .BACK,
-                    .face_winding = .CCW,
-                };
+                var desc = forwardBaseDesc(shader, self.sample_count);
                 scene_pipelines.pipelineLayoutFor(switch (entry.base) {
                     .standard => .standard,
                     .pbr => .pbr,
                 }, &desc);
                 scene_pipelines.makePipelinePair(desc, &slot.opaque_u16, &slot.opaque_u32, &slot.blend_u16, &slot.blend_u32);
                 scene_pipelines.makeCullOffPair(desc, &slot.ds_opaque_u16, &slot.ds_opaque_u32, &slot.ds_blend_u16, &slot.ds_blend_u32);
-                slot.key = key;
+                slot.key = slot_key;
                 if (slot.opaque_u16.id == 0) return null; // creation failed
                 return slot;
             }
@@ -169,10 +181,25 @@ pub const ForwardPipelines = struct {
     default_morph_view: sg.View = .{},
     morph_sampler: sg.Sampler = .{},
 
-    /// Builds every pipeline (GPU calls). Panics if a base pipeline fails
-    /// to create — same loud failure as the legacy Scene.initPipelines.
+    /// Main-target sample count every pipeline in this set was built with
+    /// (1 = legacy set; > 1 via initSampled for the MSAA twin in Scene).
+    sample_count: i32 = 1,
+
+    /// Builds the default 1x pipeline set (GPU calls). Panics if a base
+    /// pipeline fails to create — same loud failure as the legacy
+    /// Scene.initPipelines.
     pub fn init() ForwardPipelines {
+        return initSampled(1);
+    }
+
+    /// Builds every pipeline for a specific main-target sample count (GPU
+    /// calls). Sokol requires pipeline.sample_count to equal the sample
+    /// count of every attachment of the pass it is applied in, so Scene
+    /// keeps one set per active target shape and never mixes them within a
+    /// frame. Panics if a base pipeline fails to create.
+    pub fn initSampled(sample_count: i32) ForwardPipelines {
         var self: ForwardPipelines = .{};
+        self.sample_count = sample_count;
 
         const zero_texel = [_]f32{ 0, 0, 0, 0 };
         var img_desc = sg.ImageDesc{
@@ -250,21 +277,16 @@ pub const ForwardPipelines = struct {
         };
 
         for (specs) |spec| {
-            var desc = sg.PipelineDesc{
-                .shader = spec.shader,
-                .index_type = .UINT16,
-                .depth = .{
-                    .compare = .LESS_EQUAL,
-                    .write_enabled = true,
-                },
-                .cull_mode = .BACK,
-                .face_winding = .CCW,
-            };
+            var desc = forwardBaseDesc(spec.shader, sample_count);
             scene_pipelines.pipelineLayoutFor(spec.family, &desc);
             scene_pipelines.makePipelinePair(desc, spec.opaque_u16, spec.opaque_u32, spec.blend_u16, spec.blend_u32);
         }
 
-        self.ds_pipelines.initFromShaders(family_shaders);
+        self.ds_pipelines.initFromShaders(family_shaders, sample_count);
+
+        // The sample-aware shader-material cache: lazily filled pipelines
+        // built for the same target shape as the eager sets above.
+        self.shader_materials.sample_count = sample_count;
 
         inline for (.{
             .{ .pipe = self.pipeline_u16, .msg = "pipeline_u16 failed to create!" },
@@ -426,4 +448,61 @@ test "ShaderMaterialCache lookup is key-based and miss-safe without GPU" {
     // entryForKey resolves the registration even though the cache is cold.
     try std.testing.expect(shader_material.entryForKey(shader_material.keyForName("ramp_wave")) != null);
     try std.testing.expect(shader_material.entryForKey(shader_material.keyForName("nope")) == null);
+}
+
+// --- MSAA pipeline-table consistency (GPU-free contracts). Visual AA
+// quality cannot be unit-tested; that verification is the agate smoke run
+// (`agate --frames 120 --msaa 4` must complete without sokol validation
+// errors, the loudest failure mode being a pipeline/attachment sample-count
+// mismatch).
+
+/// Number of sg.Pipeline-typed fields of a struct, via comptime reflection.
+fn countPipelineFields(comptime T: type) usize {
+    var n: usize = 0;
+    for (@typeInfo(T).@"struct".fields) |f| {
+        if (f.type == sg.Pipeline) n += 1;
+    }
+    return n;
+}
+
+test "pipeline tables cover every pipeline field (sample-count twins stay in sync)" {
+    // 5 families x opaque/blend x u16/u32. If a new pipeline field is added
+    // to ForwardPipelines, initSampled's panic list and deinit must grow
+    // with it — the count change fails this test and forces the review.
+    const n_forward = comptime countPipelineFields(ForwardPipelines);
+    try std.testing.expectEqual(@as(usize, 20), n_forward);
+    // 5 families x opaque/blend x u16/u32 (cull-off twins).
+    const n_ds = comptime countPipelineFields(scene_pipelines.DoubleSidedPipelines);
+    try std.testing.expectEqual(@as(usize, 20), n_ds);
+    // opaque/blend x u16/u32 x regular/ds per registered shader material.
+    const n_shader_mat = comptime countPipelineFields(ShaderMaterialSet);
+    try std.testing.expectEqual(@as(usize, 8), n_shader_mat);
+}
+
+test "forwardBaseDesc funnels the sample count into the pipeline descriptor" {
+    const desc = forwardBaseDesc(.{}, 4);
+    try std.testing.expectEqual(@as(i32, 4), desc.sample_count);
+    try std.testing.expectEqual(sg.IndexType.UINT16, desc.index_type);
+    try std.testing.expect(desc.depth.compare == .LESS_EQUAL);
+    try std.testing.expect(desc.depth.write_enabled);
+    try std.testing.expect(desc.cull_mode == .BACK);
+    // Default stays the legacy 1x shape.
+    try std.testing.expectEqual(@as(i32, 1), forwardBaseDesc(.{}, 1).sample_count);
+}
+
+test "shaderMaterialSlotKey separates sample-count variants and is stable" {
+    const key = shader_material.keyForName("ramp_wave");
+    const k1 = shaderMaterialSlotKey(key, 1);
+    const k4 = shaderMaterialSlotKey(key, 4);
+    try std.testing.expect(k1 != k4);
+    try std.testing.expectEqual(k1, shaderMaterialSlotKey(key, 1));
+    try std.testing.expectEqual(k4, shaderMaterialSlotKey(key, 4));
+    // Different registration keys stay distinct within one sample count.
+    try std.testing.expect(k1 != shaderMaterialSlotKey(key + 1, 1));
+}
+
+test "sampled ForwardPipelines default field keeps the legacy shape" {
+    const fw = ForwardPipelines{};
+    try std.testing.expectEqual(@as(i32, 1), fw.sample_count);
+    try std.testing.expectEqual(@as(i32, 1), fw.shader_materials.sample_count);
 }

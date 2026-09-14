@@ -2,6 +2,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
+const sglue = sokol.glue;
 const postprocess = @import("postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao = @import("ssao.zig");
@@ -80,6 +81,7 @@ const scene_picking = @import("scene/picking.zig");
 const scene_uniforms = @import("scene/uniforms.zig");
 const FrameContext = scene_uniforms.FrameContext;
 const scene_draw = @import("scene/draw.zig");
+const scene_msaa = @import("scene/msaa.zig");
 
 /// The scene: content registries (flat, iterated directly by loaders,
 /// tooling and serialization), a handful of cross-cutting config flags, and
@@ -141,6 +143,22 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+
+    // Requested MSAA sample count for the offscreen main render target
+    // (PASS 2). 1 = off (default). Effective count = scene/msaa.zig policy:
+    // clamped per backend, applied only when the post chain owns the main
+    // pass, 1x on the swapchain path. While active it suppresses the
+    // depth-consuming post effects (SSAO/SSR/DoF) — sokol has no depth
+    // resolve, so an MSAA depth attachment cannot feed them (warned once).
+    // Set before the first render(); changing it later recreates the MSAA
+    // pipeline/target twins on the next MSAA frame.
+    msaa_sample_count: i32 = 1,
+
+    // Forward pipeline twin built for the effective MSAA sample count
+    // (sokol requires pipeline.sample_count to match every main-target
+    // attachment). Null until the first MSAA frame.
+    forward_msaa: ?scene_forward.ForwardPipelines = null,
+    warn_msaa_format: scene_msaa.WarnOnce = .{},
 
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
@@ -431,6 +449,27 @@ pub const Scene = struct {
 
     // ---- Rendering. ----
 
+    /// True when the swapchain color AND depth formats both support MSAA at
+    /// runtime (the main target mirrors them; see postprocess_pass.resize).
+    /// sg.queryPixelformat is the sokol-provided backend gate.
+    fn mainTargetFormatsMsaaCapable() bool {
+        const sw = sglue.swapchain();
+        const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
+        const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
+        return sg.queryPixelformat(color_fmt).msaa and sg.queryPixelformat(depth_fmt).msaa;
+    }
+
+    /// Forward pipeline set matching the MSAA main-target shape; created
+    /// lazily (and recreated on count changes) on the first MSAA frame. The
+    /// returned pointer aliases Scene state.
+    fn ensureForwardMsaa(self: *Scene, samples: i32) *scene_forward.ForwardPipelines {
+        if (self.forward_msaa == null or self.forward_msaa.?.sample_count != samples) {
+            if (self.forward_msaa) |*fw| fw.deinit();
+            self.forward_msaa = scene_forward.ForwardPipelines.initSampled(samples);
+        }
+        return &self.forward_msaa.?;
+    }
+
     pub fn render(self: *Scene) void {
         const camera = self.active_camera orelse return;
         const aspect = sapp.widthf() / sapp.heightf();
@@ -440,6 +479,22 @@ pub const Scene = struct {
         const sun_intensity = self.lights.sunIntensity();
         const view_proj = camera.getViewProjection(aspect);
         const eye = camera.getPosition();
+
+        // Effective main-target MSAA sample count for this frame
+        // (scene/msaa.zig holds the policy and the backend matrix).
+        const samples = scene_msaa.effectiveSampleCount(self.msaa_sample_count, .{
+            .post_enabled = self.post_process.enabled,
+            .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
+            .backend = sg.queryBackend(),
+        });
+        if (self.post_process.enabled and self.msaa_sample_count > 1 and samples == 1) {
+            // Only the runtime format gate can nullify a > 1 request here
+            // (clamping lands on a valid count, post-off forces 1 upstream).
+            _ = self.warn_msaa_format.warn(
+                "msaa: x{} requested but the main target formats cannot MSAA on this backend; running 1x",
+                .{self.msaa_sample_count},
+            );
+        }
 
         self.stats = .{};
         self.frame_id +%= 1;
@@ -502,7 +557,7 @@ pub const Scene = struct {
         };
 
         // Offscreen target when post-processing is on, swapchain otherwise.
-        self.postfx.beginMainPass(main_pass_action, self.post_process.enabled, cur_w, cur_h);
+        self.postfx.beginMainPass(main_pass_action, self.post_process.enabled, samples, cur_w, cur_h);
 
         // State sorting: opaque items group by shader type and textures,
         // Front-to-Back Early-Z. Transparent items sort strictly
@@ -529,7 +584,9 @@ pub const Scene = struct {
         };
 
         const env = scene_draw.Environment{
-            .pipelines = &self.forward,
+            // Pipeline set must match the main target's sample count: the
+            // 1x set for the legacy/swapchain path, the MSAA twin otherwise.
+            .pipelines = if (samples > 1) self.ensureForwardMsaa(samples) else &self.forward,
             .stats = &self.stats,
             .default_material = &self.default_material,
             .default_white = &self.default_white_texture,
@@ -568,16 +625,16 @@ pub const Scene = struct {
 
         // Inverse-hull outline for highlighted meshes: inside the main pass,
         // depth-tested, no depth write, drawn after all surface geometry.
-        self.postfx.renderOutline(view_proj, eye, self.outline_meshes.items, &self.stats);
+        self.postfx.renderOutline(view_proj, eye, self.outline_meshes.items, samples, &self.stats);
 
         // Physics debug lines (3D pass, depth-tested, no depth write).
-        self.physics.renderDebug(self.allocator, view_proj, &self.stats);
+        self.physics.renderDebug(self.allocator, view_proj, samples, &self.stats);
 
         // Skybox Pass
-        self.sky.render(camera, aspect, self.default_cube_texture, &self.stats);
+        self.sky.render(camera, aspect, self.default_cube_texture, samples, &self.stats);
 
         // Particle Pass
-        self.particles.render(camera, aspect, &self.stats);
+        self.particles.render(camera, aspect, samples, &self.stats);
 
         if (!self.post_process.enabled) {
             if (self.ui_canvas) |*ui_c| {
@@ -602,6 +659,7 @@ pub const Scene = struct {
             .sun_dir = sun_dir,
             .sun_color = sun_color,
             .default_white_view = self.default_white_texture.view,
+            .main_samples = samples,
             .ui = if (self.ui_canvas) |*u| u else null,
             .stats = &self.stats,
         }, cur_w, cur_h);
@@ -632,6 +690,8 @@ pub const Scene = struct {
         self.sky.deinit();
 
         self.forward.deinit();
+        if (self.forward_msaa) |*fw| fw.deinit();
+        self.forward_msaa = null;
 
         scene_content.deinitAnimations(self.allocator, &self.animation_groups, &self.skeletons);
 
