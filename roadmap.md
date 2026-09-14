@@ -377,7 +377,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 * Дистанционный + высотный fog с подмешиванием цвета солнца (sun scattering).
 * SSR: 16 шагов screen-space марша, fresnel, edge fade, настраиваемая интенсивность/толщина/дистанция.
 * SSAO: depth-based выборки + bilateral blur, debug-режим, интенсивность/power/radius.
-* У каждого эффекта есть вкл/выкл и параметры в `PostProcessConfig` / `SSAOConfig`.
+* У каждого эффекта есть вкл/выкл и параметры в `PostProcessOptions` / `SSAOOptions`.
 
 ### Физика (Box3D v0.1.0)
 

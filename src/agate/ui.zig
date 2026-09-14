@@ -1163,8 +1163,6 @@ pub const UIStyle = ui_types.UIStyle;
 pub const UIStyleOverride = ui_types.UIStyleOverride;
 pub const UIStyleSet = ui_types.UIStyleSet;
 pub const TransitionOptions = ui_types.TransitionOptions;
-/// Deprecated: use TransitionOptions.
-pub const TransitionConfig = TransitionOptions;
 pub const UIStyleKind = ui_types.UIStyleKind;
 pub const UIStyledOptions = ui_types.UIStyledOptions;
 pub const UIStyleRequest = ui_types.UIStyleRequest;

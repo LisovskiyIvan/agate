@@ -691,9 +691,6 @@ pub const Texture = struct {
     }
 };
 
-/// Deprecated alias: renamed to SkyboxOptions.
-pub const SkyboxConfig = SkyboxOptions;
-
 /// Gradient + sun parameters for `CubeTexture.createProceduralSkybox`.
 pub const SkyboxOptions = struct {
     top_color: [4]u8 = .{ 35, 75, 155, 255 }, // Deep blue zenith

@@ -207,9 +207,6 @@ pub const AudioEngine = struct {
         return .{ .vol = vol, .pan = pan };
     }
 
-    /// Deprecated alias: renamed to PlayOptions.
-    pub const PlayParams = PlayOptions;
-
     pub fn play(self: *AudioEngine, params: PlayOptions) void {
         const sp = spatializeWith(self.listener_pos, self.listener_right, params.position, params.volume);
         if (sp.vol <= 0.001) return;

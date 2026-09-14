@@ -37,9 +37,6 @@ pub const LutBinding = struct {
     size: u32 = 0,
 };
 
-/// Deprecated alias: renamed to PostProcessOptions.
-pub const PostProcessConfig = PostProcessOptions;
-
 /// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
 /// toggles and their parameters). A flat config read/written by tooling;
 /// applied per frame by `Scene.postfx` (PostFXStack.renderChain).
