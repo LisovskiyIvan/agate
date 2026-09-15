@@ -1,222 +1,166 @@
-# Threading refactor: single-threaded → multi-threaded
+# Threading refactor: status & roadmap
 
-Status legend: [x] done, [~] in progress, [ ] planned.
+Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 
-## Current state
+## Status at a glance
 
-The whole frame runs in the `sapp` frame callback on the main thread:
-input events → `Scene.update*()` → `Scene.render()` → `sg.commit()`, strictly
-sequential (`src/main.zig`, `scene.zig`). No engine subsystem spawns threads.
+| Stage | Scope | Status |
+|---|---|---|
+| 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
+| 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
+| 3. Simulation/render decoupling | threads, phase ownership | [~] engine demo threaded; payload + sandbox remain |
 
-## Hard constraints
+## What exists (as built)
 
-- **sokol_gfx is not thread-safe.** Every `sg.*` call must come from one
-  thread (the GL/Metal context owner). `SOKOL_THREAD_SAFETY=1` exists but is
-  a single global mutex: it serializes, it does not parallelize.
-- **`sapp` callbacks are main-thread.** Windowing, input, swapchain stay there.
-- Implicit main-thread assumptions: generation-tagged caches
-  (`Mesh.cached_*`, `frame_id` in `render_queue.zig`), per-frame scratch
-  buffers, single PRNGs per subsystem.
+### Primitives
 
-## The ladder (cheap → expensive)
-### [x] Stage 1 — job pool + data-parallel systems (landed)
-Fork-join pool for pure-CPU work. No `sg.*`, no shared mutable state; each
-job owns a disjoint index range.
+- `jobs.Pool` — fork-join data-parallel work: calling thread + N workers
+  forage chunks off an atomic cursor. Workers park on a pthread condvar
+  (Zig 0.16 std.Thread ships no public condvar; `std.c` is wrapped
+  directly — the engine links libc for sokol anyway). Single-producer
+  (`forkJoin`), deterministic output order independent of scheduling.
+- `jobs.SpscRing(T, N)` — lock-free single-producer/single-consumer ring,
+  drop-newest when full, monotonic indices, power-of-two capacity.
+- `jobs.TaskRunner` — fire-and-forget tasks on dedicated threads,
+  FIFO, join-on-shutdown drains the queue; allocation failure runs the
+  task inline rather than dropping it.
+- `jobs.Mutex` — blocking pthread mutex for coarse phase ownership.
+- `handoff.Handoff(T, slots)` — lock-free latest-wins mailbox:
+  `claim`/`publish`/`takeLatest`, global publish sequence, stale frames
+  never resurface, drops allowed. Single-publisher by contract.
+- `assets.UploadQueue` + `PendingTexture` — decode off-thread
+  (`Texture.decodeFile/decodeMemory` are documented GPU-free and
+  thread-safe), upload on the sg-context thread, optional live
+  `target: *?Texture` slot patching (materials pick textures up with no
+  re-wiring).
 
-- `src/agate/jobs.zig` — `Pool` (N workers + calling thread forage a chunked
-  atomic cursor), `parallelFor(?*Pool, ctx, fn, len)` with serial fallback
-  (null pool / `min_len_for_workers`); workers park on a pthread condvar.
-  Process-global handle `jobs.global` for engine code; explicit pools for
-  tests. Landmark: Zig 0.16 `std.Thread` ships no public condvar, so the
-  pool wraps `std.c` directly (the engine links libc for sokol anyway).
-- [x] CPU particle integration (`particles.zig updateCpu`) split into
-  **integrate (parallel) → swap-compaction (serial, legacy-exact) →
-  instance fill (parallel)**. Per-slot work is order-independent, so results
-  are bit-identical for any worker count (pinned by a determinism test).
-  Pool is injected per system (`thread_pool`), falling back to
-  `jobs.global`, then to inline execution.
-- [x] Frustum culling (`render_queue.buildFrameQueues`): split into
-  `cullNonInstancedMesh` (pure per-mesh test producing a record) +
-  `submitInstancedMesh` (serial; owns all sg buffer work) + a chunked
-  parallel pass. Chunks partition the mesh list in fixed order and merge
-  back in chunk order, so queues and stats are identical to the serial
-  loop — pinned by a 3000-mesh equivalence test. Instance-bearing meshes
-  keep the serial path (sg calls inside); world-matrix caches are warmed
-  serially before the parallel pass (shared parents would race otherwise).
-  Active only above `FrameCullContext.parallel_min_meshes` (default 1024)
-  with a pool attached — current demo scenes sit below it by design.
-- [x] Trails / decals / nav agents audit (2026-09): `NavAgent.update` reads
-  only its own state (waypoints/position/velocity — no neighbor coupling),
-  `TrailMesh.update` touches only its own segment history, `DecalLayer`
-  ticks a single manager. Parallel-safe in shape; not routed through the
-  pool yet — real scenes hold single-digit entities.
+### Stage 1 — data-parallel systems [x]
 
-### [x] Stage 2 — async assets & uploads (loader integration landed)
+- `Scene.update(dt)` — single game-side entry point, canonical order:
+  camera -> lights -> physics -> animations -> particles -> nav agents ->
+  trails -> decals. Trails and nav agents folded in after verifying they
+  receive the same clamped real-seconds dt through the umbrella that the
+  app used to pass them.
+- CPU particle integration is three-phase: integrate (parallel) ->
+  legacy swap-compaction (serial) -> instance fill (parallel).
+  Bit-identical output for any worker count (pinned by a 16k-particle
+  byte-equality test).
+- Frustum culling: `cullNonInstancedMesh` (pure per-mesh test) +
+  chunked parallel pass; chunks partition the mesh list in fixed order
+  and merge in chunk order, so queues and stats match the serial loop
+  exactly (3000-mesh equivalence test). Active above
+  `FrameCullContext.parallel_min_meshes` (default 1024). Instance-bearing
+  meshes stay serial (they own sg buffer uploads).
+- Update-side `sg.*` calls eliminated: particles and trails stage CPU
+  data and set dirty flags; `Scene.flushPendingGpuUploads()` (render
+  start) performs the uploads. The update phase is free of sg.* calls.
 
-- [x] `jobs.TaskRunner` — fire-and-forget tasks on dedicated threads;
-  deliberately separate from `Pool.forkJoin` (forkJoin spins its callers,
-  so long tasks must never share its workers). Shutdown drains: join
-  guarantees every posted task finished writing.
-- [x] Loader integration: `LoadOptions.async_textures` (opt-in; sandbox
-  demos use it). Sync mode unchanged — fork-join predecode, single hitch.
-  Async mode skips the predecode; materials start with null texture slots
-  (the engine's existing default-white fallback renders) and
-  `AsyncTexCtx` registers each slot as an `UploadQueue` patch target —
-  one background decode per image+srgb pair, embedded bytes copied at
-  request time (cgltf data dies at appendGlb return). `Scene` owns the
-  queue: drained at the top of `render()` so patched textures draw the
-  same frame; deinit'd FIRST in `Scene.deinit` so in-flight decodes join
-  before any targeted material is freed. Emissive white-override now
-  keys on "texture requested" so async loads keep the factor-hack
-  semantics. Measured (Debug): DamagedHelmet critical-path 169 → 10 ms,
-  Fox 41 → 11 ms; sandbox frame loop verified uploading +7 textures in
-  one drain. NOTE: this path is only fully covered by app smoke — tests
-  have no GL context and cannot reach the uploaded state.
-- [ ] Serialization save off-thread: needs a scene-quiesce or snapshot
-  story first (state holds pointers; plain capture-then-marshal is unsafe
-  while the main thread mutates).
+### Stage 2 — async assets [x]
 
-### [~] Stage 3 — simulation/render decoupling (groundwork landed)
+- `Scene.updateLights(dt)` packs point/spot lights (including the
+  incumbency-hysteresis fade simulation) during the update phase and
+  publishes through `Scene.light_handoff`
+  (`handoff.Handoff(FramePack, 2)`); render takes the newest pack.
+  First state group fully thread-ready (pinned by a fade-in test).
+- `LoadOptions.async_textures` — glTF images decode on the UploadQueue
+  instead of blocking `appendGlb`; materials start with null slots
+  (default-white fallback) and patch in via `AsyncTexCtx` targets.
+  Measured (Debug): DamagedHelmet critical path 169 -> 10 ms, Fox
+  41 -> 11 ms; one drain observed patching 7 textures.
+- Sync mode (default elsewhere) is unchanged.
+- Serialization save off-thread: [ ] blocked on a scene quiesce/snapshot
+  story (state holds pointers; capture-then-marshal races the main
+  thread).
 
-Sokol reality check (design driver): the swapchain is acquired through
-`sglue`/`sapp_swapchain`, which is only valid inside the sapp frame
-callback, so the render side must stay inside `sapp_run`. The achievable
-split is therefore NOT "render on a separate thread" but:
+### Stage 3 — simulation/render decoupling [~]
 
-- **sapp thread (window + render)**: frame callback drains input, renders
-  the latest published state, commits. Never blocked by simulation spikes.
-- **game thread**: `Scene.update*` at its own cadence, publishing a frame
-  payload through `Handoff` (latest-wins; drops allowed, never queues).
-- **Input** crosses threads through `jobs.SpscRing` (events arrive on the
-  sapp thread; the update side drains them).
+Shipped (engine demo, threaded by default; `--no-threads` falls back to
+inline simulation):
 
-Costs to accept explicitly: +1 frame input→pixel latency; the frame payload
-must own everything render reads (or render keeps reading engine state with
-ownership alternating through the handoff — requires identifying every
-mutable field render touches: mesh transforms, materials, particles, UI).
-That audit is the real work of this stage; the primitives below are its
-mechanical half.
+- Game thread loop: `simulate(dt)` = input drain (SpscRing) + demo state
+  + `Scene.update(dt)`, paced ~1 kHz on its own sokol-time clock.
+- sapp thread: windowing + `Scene.render()` of the newest state.
+- Phase ownership: `jobs.Mutex` held for the whole update phase and the
+  whole render phase — the two never overlap. ESC on the game thread sets
+  a quit flag the sapp thread observes (sapp stays single-threaded).
+- Update phase is free of `sg.*`; all GPU pushes happen at render start
+  (`flushPendingGpuUploads`) or during draws.
+- Thread-safety verified by: two-thread lost-update mutex test
+  (20000/20000), 1500-frame threaded smoke, handoff threaded stress test,
+  SpscRing cross-thread order test.
 
-Landed groundwork:
+Known limitations of the shipped split:
 
-- [x] `jobs.SpscRing(T, N)` — lock-free SPSC ring, drop-newest when full,
-  monotonic indices, power-of-two capacity; same-thread safe so apps can
-  adopt it before any thread crosses. Engine `main.zig` input already
-  flows through it (drained at the top of `frame()`).
-- [x] `handoff.Handoff(T, slots)` — lock-free latest-wins N-slot mailbox:
-  `claim` CASes a free slot, `publish` stamps a global sequence,
-  `takeLatest` copies the newest payload and releases stale slots. Fixed
-  during testing: the sequence MUST come from a global counter — per-slot
-  seqs let stale frames resurface; and multi-publisher is unsupported by
-  design (counter assignment happens before the meta store, so "newest"
-  would be ill-defined). Verified with a threaded publisher/consumer
-  stress test (untorn checksums, strict delivery order, drops allowed).
+- **Coarse payload.** Phase ownership means an update spike delays render
+  for its duration. Strictly non-blocking render needs the full per-item
+  payload (below).
+- **Sandbox is single-threaded by design.** Its UI mutates scene state
+  from sapp callbacks; it needs a mutation queue (sapp thread posts
+  mutations, game thread applies) before it can join the split.
 
-Remaining slices, in order:
+## What remains (TODO, in priority order)
 
-1. [x] Frame payload audit (see above).
-2. [x] Update-phase consolidation: `Scene.update(dt)` is the single
-   game-side entry point — camera, lights (`updateLights`, hysteresis
-   fades included), physics, animations, particles, **nav agents**,
-   **trails**, decals in canonical order. Engine and sandbox frame loops
-   both drive it. Nav agents and trails were folded in after verifying
-   they receive the same clamped real-seconds dt the umbrella passes
-   (the sandbox had been feeding them exactly that value), and their
-   updates are self-only CPU work. The light pack travels through
-   `Scene.light_handoff` (`handoff.Handoff(FramePack, 2)`): update
-   publishes, render take-latest — the first state group is already
-   thread-ready; when the split lands, lights cross the boundary with
-   zero code change. The consumed copy (`light_pack`) stands between
-   publishes, which covers the PIP multi-render-per-update pattern
-   (pinned by test). Deferred to split day: trail and particle updates
-   end with sg.updateBuffer uploads — those move to a render-side flush
-   (pattern already exists in particles.flushGpuUpload).
-3. [x] Game thread landed (engine demo, on by default; `--no-threads`
-   falls back to inline simulation): a dedicated thread runs
-   `simulate(dt)` — input drain, demo state, `Scene.update` — paced at
-   ~1 kHz with its own sokol-time clock; the sapp frame callback renders
-   the newest state under coarse phase ownership (`jobs.Mutex` held for
-   the duration of each phase, so update and render never overlap). ESC
-   on the game thread sets a quit flag the sapp thread observes (sapp
-   stays single-threaded). Update-side sg uploads were relocated first:
-   particles and trails stage CPU data and set dirty flags; render
-   flushes them at frame start (`Scene.flushPendingGpuUploads`) — the
-   update phase is now free of sg.* calls, verified by tests (flush
-   skips cleanly with no sg context). Known limitation: the payload is
-   still coarse (phase ownership, not per-field copies) — update spikes
-   delay render for their duration; the full per-item record payload
-   from the audit remains the path to strictly non-blocking render.
-   Sandbox stays same-thread: its UI mutates scene state from sapp
-   callbacks and needs a mutation queue before it can join.
+1. [ ] **Full per-item frame payload.** Convert the remaining
+   read-during-render state into published records so render never
+   touches live game state:
+   - per drawn item: model Mat4 (already copied at queue build), plus a
+     compact material draw record (~120 B: factors, uv transforms,
+     cutoff, texture handles),
+   - skeleton skin palettes (4 KB/skeleton, double-buffered),
+   - morph weights (32 B/mesh),
+   - per-camera derived {view_proj, eye, viewport, mask, clear} snapshot,
+   - shadow config + cascades, post/ssao/msaa/sky config snapshot.
+   After this, render holds zero references to game-mutable state and the
+   phase mutex shrinks to the handoff points (strictly non-blocking
+   render).
+2. [ ] **Sandbox joins the split.** Mutation queue for UI-driven scene
+   changes (sapp thread posts, game thread applies), then flip
+   `threaded = true`.
+3. [ ] **Serialization save off-thread.** Needs quiesce or snapshot
+   semantics; the UploadQueue/TaskRunner machinery already exists.
+4. [ ] **Granularity refinements** (optional, as scenes grow):
+   lower `parallel_min_meshes` (1024) or make it adaptive; parallel
+   shadow-pass binning; parallel instanced-path transform staging.
+5. [ ] **GPU-side follow-ups** (optional): async compute is available on
+   Metal/D3D12/WebGPU but sokol does not expose queues — revisit only if
+   a compute-heavy workload demands it.
 
-#### Frame-payload audit (done 2026-09)
+## Hard constraints (unchanged)
 
-Full sweep of every CPU read in `Scene.render()` (core path + all passes).
-Key findings, condensed:
+- **sokol_gfx is not thread-safe.** Every `sg.*` call happens on the
+  context thread (today: main/sapp thread). `SOKOL_THREAD_SAFETY` is a
+  mutex, not parallelism.
+- **sapp callbacks are main-thread.** Input is produced there and crosses
+  into the game side via `jobs.SpscRing`.
+- The swapchain is acquired through `sglue` inside the frame callback, so
+  render stays inside `sapp_run`; decoupling moves simulation off, not
+  rendering.
 
-Render-side hidden mutations today (must stay render-owned or move):
-- `LightRig.packFrame(..., dt)` runs light-selection **hysteresis fades
-  inside render** (light_selection.zig update) — simulation living in the
-  render pass; move to the publish step.
-- `worldMatrixCached` writes `mesh.cached_matrix/cached_aabb/cached_frame`;
-  `submitInstancedMesh` writes InstancedMesh caches + instance buffers;
-  `ShadowPass.binned_meshes`/`spot_needs_clear`; `Scene.stats` reset+counters;
-  `frame_id` bump; lazy GPU resources (`ensureForwardMsaa`,
-  `ShaderMaterialCache.getOrCreate`, sky/postfx MSAA twins); `WarnOnce`.
-- `UploadQueue.drain` patches material texture slots at render top (stage 2).
-- Update side issues sg calls today: `particles.update` (instance buffer
-  upload), `TrailMesh.update` (index buffer upload) — must move under the
-  render side on a split.
-- `DecalManager.update` destroys meshes/materials in `scene.meshes` —
-  container-level hazard.
+## Rules for threaded code in agate
 
-True shared-mutable (update writes AND render reads/writes same field):
-mesh/instance caches; `morph_weights` (draw-time read); skeleton
-`skin_matrices` (draw-time upload); material scalars+slots; light
-hysteresis; container arrays frozen only by single-thread discipline.
-
-Payload split decision (summary): COPY per frame — per-camera derived
-{view_proj, eye, viewport, mask, clear}, sun pack, `FramePack`, shadow
-config+cascades, post/ssao/msaa/sky config, per-item draw records (model,
-flags, material scalars ~120B, texture handles), skin palette (4KB/skeleton),
-morph weights, stats double-buffer. ALTERNATE (render-owned): queues,
-matrix/instance caches, occlusion culler + HiZ, hysteresis, frame_id, lazy
-GPU caches. GPU_ONLY: all sg handles. RO_AFTER_LOAD: topology, base_matrix,
-parents, LODs, cpu geometry.
-
-Two semantics bugs the audit surfaced, FIXED:
-1. `worldMatrixCached` ignored `attach_bone` while `Mesh.getWorldMatrix`
-   honored it — bone-attached meshes rendered at different positions in
-   main vs shadow passes. The cached path now mirrors getWorldMatrix
-   exactly (bone branch replaces the parent chain when the host skeleton
-   is live; dead skeleton falls through to parent).
-2. `frame_id` was bumped before the shadow pass, whose cache checks
-   therefore always missed and recomputed every world matrix twice per
-   frame. Shadow fallbacks now use `worldMatrixCached`/`worldAABBCached`:
-   shadow warms the cache, the main pass queue build hits it, and bone
-   semantics are identical across passes. Nothing in engine or sandbox
-   sets attach_bone yet, so the fix is inert today — it closes the trap.
+1. `sg.*` only from the context-owning thread; updates stage + flag, the
+   render side flushes (`flushPendingGpuUploads` pattern).
+2. Jobs are CPU-only, own disjoint index ranges, never nest
+   `parallelFor`; no sg, no shared mutable state.
+3. Determinism: per-entity work must not depend on chunking — pinned by
+   tests (byte-equality, queue equivalence), not convention.
+4. No silent fallbacks: missing pool/queue degrades to *serial execution*
+   (a scheduling detail); allocation failures still surface as errors.
+5. New shared state must be classified at design time per the audit
+   taxonomy: COPY into payload / ALTERNATE-OWNED by one phase /
+   GPU_ONLY handle / READONLY_AFTER_LOAD. The audit (2026-09) is the
+   reference map; re-run it after touching render reads.
 
 ## What other engines do (reference)
 
-- **Unreal**: Game → Render → RHI threads, one frame latency between each;
-  task graph for systems. Stage 3 in its most explicit form.
-- **Unity**: main + render thread + work-stealing job system
-  (`IJobParallelFor` ≈ stage 1).
-- **id Tech (Doom Eternal)**: everything jobified; dedicated render thread
-  only submits.
-- **Naughty Dog (GDC 2015)**: fiber-based jobs, whole frame is one job DAG —
-  end-state inspiration, not a starting point.
-- **Frostbite**: frame graph + jobs; dropped the dedicated render thread in
-  favor of jobs (requires owning the whole submission model — we do not).
-- **Godot / bgfx**: thread-safe command queue consumed by the render thread —
-  closest to what stage 3 looks like under sokol.
-
-## Rules for any threaded code in agate
-
-1. `sg.*` only from the context-owning thread (today: main; stage 3: render).
-2. Jobs are CPU-only, own disjoint ranges, never nest `parallelFor`.
-3. Determinism: per-entity integration must not depend on chunking —
-   pinned by tests, not by convention.
-4. No silent fallbacks: a missing pool degrades to *serial execution*, which
-   is a scheduling detail, not a behavioral one. Allocation/OOM still errors.
+- **Unreal**: Game -> Render -> RHI threads, one frame latency between
+  each; task graph for systems. Stage 3's end state, most explicit form.
+- **Unity**: main + render thread + work-stealing job system (stage 1).
+- **id Tech (Doom Eternal)**: everything jobified; dedicated render
+  thread only submits.
+- **Naughty Dog (GDC 2015)**: fiber-based jobs, whole frame as one job
+  DAG — end-state inspiration, not a starting point.
+- **Frostbite**: frame graph + jobs; dropped the dedicated render thread
+  in favor of jobs (requires owning the whole submission model).
+- **Godot / bgfx**: thread-safe command queue consumed by the render
+  thread — closest to what a full-payload agate looks like.
