@@ -117,10 +117,13 @@ Remaining slices, in order:
 1. [x] Frame payload audit (see above).
 2. [x] Update-phase consolidation: `Scene.update(dt)` is the single
    game-side entry point — camera, lights (`updateLights`, hysteresis
-   fades included), physics, animations, particles, decals in canonical
-   order. Engine and sandbox frame loops both drive it. Trails and nav
-   agents stay app-driven deliberately: they require real-seconds dt
-   (the 60fps-normalized clamp breaks their SI tuning).
+   fades included), physics, animations, particles, **nav agents**,
+   decals in canonical order. Engine and sandbox frame loops both drive
+   it. Trails stay app-driven deliberately: they require real-seconds dt
+   (the 60fps-normalized clamp breaks their SI tuning). Nav agents were
+   folded in after verifying their update is self-only (waypoints,
+   velocity, position — SI units, seconds dt) and that the sandbox had
+   been feeding them the same clamped seconds the umbrella passes.
 3. [ ] Game thread: run the update umbrella on a worker publishing
    through `Handoff` (same-thread mode first — publish inline, consume
    immediately — to prove no drift), then the actual split behind a flag.
