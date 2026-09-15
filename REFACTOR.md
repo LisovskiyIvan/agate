@@ -118,18 +118,19 @@ Remaining slices, in order:
 2. [x] Update-phase consolidation: `Scene.update(dt)` is the single
    game-side entry point — camera, lights (`updateLights`, hysteresis
    fades included), physics, animations, particles, **nav agents**,
-   decals in canonical order. Engine and sandbox frame loops both drive
-   it. Trails stay app-driven deliberately: they require real-seconds dt
-   (the 60fps-normalized clamp breaks their SI tuning). Nav agents were
-   folded in after verifying their update is self-only (waypoints,
-   velocity, position — SI units, seconds dt) and that the sandbox had
-   been feeding them the same clamped seconds the umbrella passes.
-   The light pack travels through `Scene.light_handoff`
-   (`handoff.Handoff(FramePack, 2)`): update publishes, render
-   take-latest — the first state group is already thread-ready; when the
-   split lands, lights cross the boundary with zero code change. The
-   consumed copy (`light_pack`) stands between publishes, which covers
-   the PIP multi-render-per-update pattern (pinned by test).
+   **trails**, decals in canonical order. Engine and sandbox frame loops
+   both drive it. Nav agents and trails were folded in after verifying
+   they receive the same clamped real-seconds dt the umbrella passes
+   (the sandbox had been feeding them exactly that value), and their
+   updates are self-only CPU work. The light pack travels through
+   `Scene.light_handoff` (`handoff.Handoff(FramePack, 2)`): update
+   publishes, render take-latest — the first state group is already
+   thread-ready; when the split lands, lights cross the boundary with
+   zero code change. The consumed copy (`light_pack`) stands between
+   publishes, which covers the PIP multi-render-per-update pattern
+   (pinned by test). Deferred to split day: trail and particle updates
+   end with sg.updateBuffer uploads — those move to a render-side flush
+   (pattern already exists in particles.flushGpuUpload).
 3. [ ] Game thread: run the update umbrella on a worker publishing
    through `Handoff` (same-thread mode first — publish inline, consume
    immediately — to prove no drift), then the actual split behind a flag.
