@@ -10,6 +10,7 @@ const BoundingBox = math.BoundingBox;
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("types.zig").Vertex;
 const Scene = @import("../scene.zig").Scene;
+const gpu_thread = @import("../gpu_thread.zig");
 
 pub const TrailOptions = struct {
     /// Width of the ribbon at the head (most recent position).
@@ -53,6 +54,10 @@ pub const TrailMesh = struct {
     /// Stage 3: update() stages CPU data and sets this flag; the sg
     /// upload happens in flushGpuUploads on the render side.
     gpu_dirty: bool = false,
+    /// True when the vertex/index buffers could not be created at init time
+    /// (off-context `createTrailMesh`): flushGpuUploads creates them on the
+    /// render side once a context is available, then uploads staged data.
+    buffers_pending: bool = false,
     pending_vertex_count: usize = 0,
     pending_index_count: usize = 0,
     pending_min_pt: Vec3 = undefined,
@@ -70,12 +75,14 @@ pub const TrailMesh = struct {
         const indices = try allocator.alloc(u16, max_indices);
         errdefer allocator.free(indices);
 
-        // Dynamic vertex & index buffers
-        const vb = sg.makeBuffer(.{
+        // Dynamic vertex & index buffers. Off-context construction (runtime
+        // spawn on the game thread) defers creation to flushGpuUploads.
+        const deferred = !gpu_thread.isOnContextThread();
+        const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = max_verts * @sizeOf(Vertex),
         });
-        const ib = sg.makeBuffer(.{
+        const ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .index_buffer = true, .dynamic_update = true },
             .size = max_indices * @sizeOf(u16),
         });
@@ -102,6 +109,7 @@ pub const TrailMesh = struct {
             .vertices = vertices,
             .indices = indices,
             .is_active = options.auto_start,
+            .buffers_pending = deferred,
         };
         return self;
     }
@@ -280,6 +288,29 @@ pub const TrailMesh = struct {
     /// Uploads staged trail geometry. Runs on the sg-context thread
     /// (Scene.render start), never during the update phase.
     pub fn flushGpuUploads(self: *TrailMesh) void {
+        // Deferred construction (off-context spawn): create the buffers
+        // here, on the render side, then upload whatever was staged.
+        if (self.buffers_pending and sg.isvalid()) {
+            const vb = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.vertices.len * @sizeOf(Vertex),
+            });
+            const ib = sg.makeBuffer(.{
+                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .size = self.indices.len * @sizeOf(u16),
+            });
+            if (vb.id != 0 and ib.id != 0) {
+                self.mesh.vertex_buffer = vb;
+                self.mesh.index_buffer = ib;
+                self.buffers_pending = false;
+                if (self.pending_index_count > 0) self.gpu_dirty = true;
+            } else {
+                // Partial creation (pool exhaustion): destroy whatever was
+                // created so the retry next frame does not leak handles.
+                if (vb.id != 0) sg.destroyBuffer(vb);
+                if (ib.id != 0) sg.destroyBuffer(ib);
+            }
+        }
         if (!self.gpu_dirty) return;
         self.gpu_dirty = false;
         if (self.mesh.vertex_buffer.id != 0) {

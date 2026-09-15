@@ -71,6 +71,7 @@ const scene_render_queue = @import("scene/render_queue.zig");
 const jobs = @import("jobs.zig");
 const assets_mod = @import("assets.zig");
 const handoff_mod = @import("handoff.zig");
+const gpu_thread = @import("gpu_thread.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
@@ -114,6 +115,11 @@ pub const Scene = struct {
 
     // ---- Content registries (kept flat: external code iterates them). ----
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    /// Meshes removed off-context whose GPU teardown is deferred to the next
+    /// flushPendingGpuUploads on the context thread (see destroyMesh). Already
+    /// unlinked from `meshes`/`outline_meshes`, so deinitMeshes never sees
+    /// them twice.
+    pending_gpu_destroys: std.ArrayListUnmanaged(*Mesh) = .empty,
     materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
@@ -383,6 +389,20 @@ pub const Scene = struct {
                 _ = self.outline_meshes.swapRemove(i);
                 break;
             }
+        }
+        // Decal expiration calls this from Scene.update on the game thread,
+        // where sg.destroyBuffer is illegal: unlink now, destroy the GPU
+        // resources at the next render-start flush on the context thread.
+        if (!gpu_thread.isOnContextThread()) {
+            self.pending_gpu_destroys.append(self.allocator, mesh) catch {
+                // Queue-append OOM fallback: destroy synchronously despite
+                // the thread affinity rather than leak the mesh (Debug
+                // notes the affinity breach; correctness over strictness).
+                std.log.debug("scene: pending destroy queue OOM, destroying mesh inline", .{});
+                mesh.deinit(self.allocator);
+                self.allocator.destroy(mesh);
+            };
+            return;
         }
         mesh.deinit(self.allocator);
         self.allocator.destroy(mesh);
@@ -1026,13 +1046,26 @@ pub const Scene = struct {
     }
 
     /// Publishes a complete frame snapshot through the lock-free mailbox.
+    /// When the mailbox is saturated (consumer lagging, both slots
+    /// published), stale published slots are drained first so the NEWEST
+    /// snapshot wins — otherwise prepareFrame's takeLatest would resurface
+    /// an older published frame over the newer fallback.
     pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
         const snap = self.packFrameSnapshot(aspect, cur_w, cur_h);
         if (self.frame_handoff.claim()) |i| {
             self.frame_handoff.slot(i).* = snap;
             self.frame_handoff.publish(i);
         } else {
-            self.frame_snapshot = snap;
+            // Saturated: drop stale published frames (consumer is excluded
+            // by phase ownership here) and publish the newest; the direct
+            // fallback only remains for a claim that still fails.
+            self.frame_handoff.releasePublished();
+            if (self.frame_handoff.claim()) |i| {
+                self.frame_handoff.slot(i).* = snap;
+                self.frame_handoff.publish(i);
+            } else {
+                self.frame_snapshot = snap;
+            }
         }
     }
 
@@ -1054,7 +1087,12 @@ pub const Scene = struct {
         }
 
         self.render_outline_meshes.clearRetainingCapacity();
-        self.render_outline_meshes.appendSlice(self.allocator, self.outline_meshes.items) catch {};
+        // Skip meshes whose GPU buffers are still pending (deferred creation
+        // on an off-context thread): outline draws bind raw handles.
+        for (self.outline_meshes.items) |m| {
+            if (m.gpu_pending) continue;
+            self.render_outline_meshes.append(self.allocator, m) catch {};
+        }
 
         self.frame_prepared = true;
     }
@@ -1081,9 +1119,18 @@ pub const Scene = struct {
             self.light_handoff.slot(i).* = pack;
             self.light_handoff.publish(i);
         } else {
-            // Both slots still published (consumer lagging): fall back to
-            // the consumed copy as the carrier.
-            self.light_pack = pack;
+            // Same saturation shape as publishFrameSnapshot: drain stale
+            // published packs (consumer excluded by phase ownership) so the
+            // newest pack wins; direct fallback only on a still-failed claim.
+            self.light_handoff.releasePublished();
+            if (self.light_handoff.claim()) |i| {
+                self.light_handoff.slot(i).* = pack;
+                self.light_handoff.publish(i);
+            } else {
+                // Both slots still published (consumer lagging): fall back to
+                // the consumed copy as the carrier.
+                self.light_pack = pack;
+            }
         }
     }
 
@@ -1115,12 +1162,26 @@ pub const Scene = struct {
     /// every sg.* touch stays on the context thread; the update phase is
     /// free of sg.* calls.
     pub fn flushPendingGpuUploads(self: *Scene) void {
+        gpu_thread.assertOnContextThread();
+        // Deferred off-context destroys first: unlinking already happened in
+        // destroyMesh, this completes the GPU teardown (deinit + free).
+        for (self.pending_gpu_destroys.items) |m| {
+            m.deinit(self.allocator);
+            self.allocator.destroy(m);
+        }
+        self.pending_gpu_destroys.clearRetainingCapacity();
+        // Deferred off-context creations (uploadGeometry): finish the vertex/
+        // index buffers before queue building can reference them. Plain scan
+        // over meshes — the loop below already visits every mesh, so the
+        // pending check adds no traversal, just one branch per mesh.
+        for (self.meshes.items) |m| m.finishGpuUpload(self.allocator);
         for (self.particles.systems.items) |ps| ps.flushGpuUploads();
         for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
         for (self.meshes.items) |m| m.flushGpuUploads();
     }
 
     pub fn render(self: *Scene) void {
+        gpu_thread.assertOnContextThread();
         if (!self.frame_prepared) {
             self.prepareFrame();
         }
@@ -1302,6 +1363,15 @@ pub const Scene = struct {
 
         self.decals.deinit();
 
+        // Deferred off-context destroys that never reached a render-start
+        // flush (queued meshes are already unlinked from `meshes`, so this
+        // cannot double-free with deinitMeshes below).
+        for (self.pending_gpu_destroys.items) |m| {
+            m.deinit(self.allocator);
+            self.allocator.destroy(m);
+        }
+        self.pending_gpu_destroys.deinit(self.allocator);
+
         scene_content.deinitMeshes(self.allocator, &self.meshes);
         scene_content.deinitMaterials(self.allocator, &self.materials);
         scene_content.deinitPbrMaterials(self.allocator, &self.pbr_materials);
@@ -1449,4 +1519,51 @@ test "publishFrameSnapshot and prepareFrame snapshot handoff" {
     try std.testing.expect(scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(i32, 1920), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 1080), scene.frame_snapshot.screen_h);
+}
+
+test "saturated frame mailbox keeps the newest snapshot" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // Reproducer for the fallback-overwrite bug: three publishes without a
+    // consuming prepareFrame saturate the 2-slot mailbox. The third publish
+    // must drain the stale slots and land, so prepareFrame takes 300 — not
+    // an older published frame over the newer fallback. packFrameSnapshot
+    // sets screen_w before the no-camera early-out, so no camera is needed.
+    scene.publishFrameSnapshot(1.0, 100, 100);
+    scene.publishFrameSnapshot(1.0, 200, 200);
+    scene.publishFrameSnapshot(1.0, 300, 300);
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_h);
+}
+
+test "saturated light mailbox keeps the newest pack" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+
+    // Same saturation shape for lights: fill both slots with a sentinel,
+    // then update through the saturated mailbox. updateLights must drain the
+    // stale sentinels and publish the fresh pack, so takeLatest never
+    // resurfaces one.
+    var sentinel = std.mem.zeroes(scene_lights.LightRig.FramePack);
+    sentinel.counts[0] = 7.0;
+    for (0..2) |_| {
+        const i = scene.light_handoff.claim().?;
+        scene.light_handoff.slot(i).* = sentinel;
+        scene.light_handoff.publish(i);
+    }
+    try std.testing.expect(scene.light_handoff.claim() == null);
+
+    scene.updateLights(0.016);
+    var pack_out: scene_lights.LightRig.FramePack = undefined;
+    try std.testing.expect(scene.light_handoff.takeLatest(&pack_out));
+    // Fresh pack from the light-less rig: zero lights, not the sentinel.
+    try std.testing.expectEqual(@as(f32, 0.0), pack_out.counts[0]);
+    try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
 }

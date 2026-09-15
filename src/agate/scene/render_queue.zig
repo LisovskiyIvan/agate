@@ -30,6 +30,10 @@ pub const RenderMeshItem = struct {
     is_pbr: bool,
     texture_id: u32,
     material: ?Material = null,
+    /// Index of the source mesh in FrameCullContext.meshes. Feeds the
+    /// transparent order tie-break (see TransparentDrawEntry.seq) so serial
+    /// and parallel paths break exact-distance ties identically.
+    mesh_index: u32 = 0,
     /// Compact, GPU-ready material snapshot (~120-240 B): factors, uv transforms,
     /// cutoff, and texture views/samplers. Render passes consume this directly.
     draw_record: MaterialDrawRecord = .{},
@@ -61,8 +65,11 @@ pub const RenderMeshItem = struct {
 /// One transparent draw in the unified back-to-front pass. Regular items
 /// index `queues.transparent`, instanced groups index
 /// `queues.transparent_instanced`; both draw as a single batch at their
-/// sorted position (no per-instance sorting/OIT). `seq` is the insertion
-/// order and only breaks exact distance ties deterministically.
+/// sorted position (no per-instance sorting/OIT). `seq` is the source mesh
+/// index (RenderMeshItem.mesh_index) and only breaks exact distance ties
+/// deterministically. Mesh order is identical across serial and parallel
+/// paths, so the tie-break — and therefore the sorted order — matches
+/// exactly between them.
 pub const TransparentKind = enum { regular, instanced };
 pub const TransparentDrawEntry = struct {
     distance_sq: f32,
@@ -119,10 +126,10 @@ pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
 
 // Unified transparent order: globally back-to-front by exact group distance
 // so regular and instanced transparents interleave correctly. Strict weak
-// ordering (exact distance, then decal, then insertion sequence — never an
+// ordering (exact distance, then decal, then source mesh index — never an
 // epsilon band, which would be non-transitive: a≈b and b≈c need not imply
 // a≈c). Exact ties (e.g. coplanar surfaces) keep decals after non-decals,
-// then insertion order, for a deterministic result.
+// then mesh order, for a deterministic result identical across paths.
 pub fn sortTransparentDrawOrder(_: void, a: TransparentDrawEntry, b: TransparentDrawEntry) bool {
     if (a.distance_sq != b.distance_sq) {
         return a.distance_sq > b.distance_sq;
@@ -131,19 +138,6 @@ pub fn sortTransparentDrawOrder(_: void, a: TransparentDrawEntry, b: Transparent
         return !a.is_decal;
     }
     return a.seq < b.seq;
-}
-
-// Transparent items sort strictly back-to-front (by squared camera
-// distance) so alpha blending composites in the correct order.
-// When two coplanar surfaces are at the same distance, decals sort after
-// (drawn on top of) non-decals.
-pub fn sortTransparentBackToFront(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
-    if (@abs(a.distance_sq - b.distance_sq) < 1e-4) {
-        if (a.is_decal != b.is_decal) {
-            return !a.is_decal;
-        }
-    }
-    return a.distance_sq > b.distance_sq;
 }
 
 // A mesh is transparent when its material opts into .blend alpha mode.
@@ -303,18 +297,28 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
     else
         ctx.parallel_min_meshes;
     if (pool != null and pool.?.workerCount() > 0 and ctx.meshes.len >= min_meshes) {
-        buildFrameQueuesParallel(ctx, frustum, eye, pool.?) catch {};
-        return;
+        const parallel_ran = blk: {
+            buildFrameQueuesParallel(ctx, frustum, eye, pool.?) catch break :blk false;
+            break :blk true;
+        };
+        if (parallel_ran) return;
+        // Parallel setup OOM: it fails before any queue/stats write (only
+        // benign world-matrix cache warming precedes the fallible allocs),
+        // so fall through to the serial loop and still draw the frame.
     }
 
-    for (ctx.meshes) |mesh| {
+    for (ctx.meshes, 0..) |mesh, mesh_index| {
         if (mesh.is_lod_child) continue;
         if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
+        // Deferred-creation meshes (off-context uploadGeometry) have no GPU
+        // buffers until finishGpuUpload runs; drawing them would bind
+        // invalid handles, so they stay out of the queues until finished.
+        if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len > 0) {
-            submitInstancedMesh(ctx, frustum, mesh);
+            submitInstancedMesh(ctx, frustum, mesh, mesh_index);
             continue;
         }
-        if (cullNonInstancedMesh(ctx, frustum, eye, mesh, ctx.stats)) |item| {
+        if (cullNonInstancedMesh(ctx, frustum, eye, mesh, ctx.stats, mesh_index)) |item| {
             appendRenderItem(ctx, item);
         }
     }
@@ -323,7 +327,7 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
 /// Routes a finished record into the draw queue it belongs to. Transparent
 /// regulars also append a unified order entry (index into
 /// queues.transparent); instanced transparents append theirs in
-/// submitInstancedMesh so both share one insertion sequence.
+/// submitInstancedMesh so both share one mesh-index sequence.
 fn appendRenderItem(ctx: FrameCullContext, item: RenderMeshItem) void {
     if (item.transparent) {
         // Reserve both slots up front: if either allocation fails the item
@@ -331,7 +335,7 @@ fn appendRenderItem(ctx: FrameCullContext, item: RenderMeshItem) void {
         ctx.queues.transparent.ensureUnusedCapacity(ctx.allocator, 1) catch return;
         ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch return;
         const idx: u32 = @intCast(ctx.queues.transparent.items.len);
-        const seq: u32 = @intCast(ctx.queues.transparent_order.items.len);
+        const seq: u32 = item.mesh_index;
         ctx.queues.transparent.appendAssumeCapacity(item);
         ctx.queues.transparent_order.appendAssumeCapacity(.{
             .distance_sq = item.distance_sq,
@@ -392,7 +396,10 @@ const ParallelInstanceStage = struct {
 /// when attached to a pool and exceeding parallel_min_instances), sg buffer
 /// (re)creation/upload on the context thread, frustum test on the combined AABB,
 /// instanced queue fill.
-fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh) void {
+fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mesh_index: usize) void {
+    // Deferred-creation meshes have no vertex/index buffers yet; staging
+    // instance data for them would produce a draw against invalid handles.
+    if (mesh.gpu_pending) return;
     if (mesh.instance_uploaded_frame != ctx.frame_id) {
         mesh.instance_uploaded_frame = ctx.frame_id;
         ctx.queues.instance_matrices.clearRetainingCapacity();
@@ -497,7 +504,7 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh) voi
             // the combined AABB is degenerate.
             const center = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center() else mesh.position;
             const idx: u32 = @intCast(ctx.queues.transparent_instanced.items.len);
-            const seq: u32 = @intCast(ctx.queues.transparent_order.items.len);
+            const seq: u32 = @intCast(mesh_index);
             ctx.queues.transparent_instanced.appendAssumeCapacity(mesh);
             ctx.queues.transparent_order.appendAssumeCapacity(.{
                 .distance_sq = center.sub(ctx.eye).lengthSq(),
@@ -522,6 +529,7 @@ fn cullNonInstancedMesh(
     eye: Vec3,
     mesh: *Mesh,
     stats: *SceneStats,
+    mesh_index: usize,
 ) ?RenderMeshItem {
     stats.total_meshes += 1;
     if (!mesh.is_visible) return null;
@@ -538,6 +546,10 @@ fn cullNonInstancedMesh(
             return null;
         }
     }
+
+    // The active LOD child may itself still be awaiting GPU buffers
+    // (deferred creation): never queue it for drawing with dead handles.
+    if (render_mesh.gpu_pending) return null;
 
     const model = worldMatrixCached(ctx.frame_id, mesh);
     const world_aabb = if (render_mesh != mesh and render_mesh.local_bounding_box.isValid())
@@ -613,6 +625,7 @@ fn cullNonInstancedMesh(
         .distance_sq = d_sq,
         .is_pbr = is_pbr,
         .texture_id = tex_id,
+        .mesh_index = @intCast(mesh_index),
         .transparent = transparent,
         .double_sided = materialIsDoubleSided(mat) or is_decal,
         .is_decal = is_decal,
@@ -639,12 +652,23 @@ const ParallelCull = struct {
     fn cullChunkRange(pass: *ParallelCull, start: usize, end: usize) void {
         for (start..end) |chunk_id| {
             const lo = chunk_id * pass.span;
+            // chunk_count can exceed meshes.len (span floors at 1), so tail
+            // chunks beyond the mesh list must be skipped: without this,
+            // `lo..hi` would have start > end and panic.
+            if (lo >= pass.ctx.meshes.len) continue;
             const hi = @min(lo + pass.span, pass.ctx.meshes.len);
             var local = SceneStats{};
-            for (pass.ctx.meshes[lo..hi]) |mesh| {
+            for (pass.ctx.meshes[lo..hi], lo..) |mesh, mesh_index| {
                 if (mesh.is_lod_child) continue;
                 if ((mesh.layer_mask & pass.ctx.culling_mask) == 0) continue;
-                if (cullNonInstancedMesh(pass.ctx, pass.frustum, pass.eye, mesh, &local)) |item| {
+                // Deferred-creation meshes have no buffers yet (same skip as
+                // the serial loop above).
+                if (mesh.gpu_pending) continue;
+                // Instance-bearing meshes are staged serially in the merge
+                // tail (sg buffer management); skip them here so they are
+                // never culled as plain meshes and double-queued.
+                if (mesh.instances.items.len > 0) continue;
+                if (cullNonInstancedMesh(pass.ctx, pass.frustum, pass.eye, mesh, &local, mesh_index)) |item| {
                     pass.records[chunk_id].appendAssumeCapacity(item);
                 }
             }
@@ -670,12 +694,16 @@ fn buildFrameQueuesParallel(
     const span = (ctx.meshes.len + chunk_count - 1) / chunk_count;
 
     const records = try ctx.allocator.alloc(std.ArrayListUnmanaged(RenderMeshItem), chunk_count);
-    defer ctx.allocator.free(records);
-    for (records) |*r| {
-        r.* = try std.ArrayListUnmanaged(RenderMeshItem).initCapacity(ctx.allocator, span);
-    }
+    // Zero every element and register cleanup BEFORE the first fallible
+    // initCapacity: a failure at element k then frees buffers 0..k (the
+    // rest are still .empty, so deinit is a no-op) instead of leaking them.
+    for (records) |*r| r.* = .empty;
     defer {
         for (records) |*r| r.deinit(ctx.allocator);
+        ctx.allocator.free(records);
+    }
+    for (records) |*r| {
+        r.* = try std.ArrayListUnmanaged(RenderMeshItem).initCapacity(ctx.allocator, span);
     }
     const chunk_stats = try ctx.allocator.alloc(SceneStats, chunk_count);
     defer ctx.allocator.free(chunk_stats);
@@ -709,10 +737,10 @@ fn buildFrameQueuesParallel(
     }
 
     // Instance-bearing meshes: serial submission (sg buffer management).
-    for (ctx.meshes) |mesh| {
+    for (ctx.meshes, 0..) |mesh, mesh_index| {
         if (mesh.is_lod_child or mesh.instances.items.len == 0) continue;
         if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;
-        submitInstancedMesh(ctx, frustum, mesh);
+        submitInstancedMesh(ctx, frustum, mesh, mesh_index);
     }
 }
 
@@ -770,19 +798,6 @@ test "transparent classification follows material alpha mode" {
     pbr_mat.alpha_mode = .blend;
     try std.testing.expect(materialIsTransparent(Material{ .standard = &std_mat }));
     try std.testing.expect(materialIsTransparent(Material{ .pbr = &pbr_mat }));
-}
-
-test "transparent queue sorts strictly back-to-front" {
-    var m: Mesh = undefined;
-    var items = [_]RenderMeshItem{
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = true },
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 0, .transparent = true },
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 4.0, .is_pbr = true, .texture_id = 1, .transparent = true },
-    };
-    std.mem.sort(RenderMeshItem, &items, {}, sortTransparentBackToFront);
-    try std.testing.expect(items[0].distance_sq == 9.0);
-    try std.testing.expect(items[1].distance_sq == 4.0);
-    try std.testing.expect(items[2].distance_sq == 1.0);
 }
 
 test "opaque sort unchanged: state groups, front-to-back" {
@@ -1205,7 +1220,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .stats = &stats_s,
         .queues = &queues_s,
     };
-    submitInstancedMesh(ctx_s, Frustum.fromViewProjection(Mat4.identity), &mesh_serial);
+    submitInstancedMesh(ctx_s, Frustum.fromViewProjection(Mat4.identity), &mesh_serial, 0);
 
     // Parallel staging
     const pool = try jobs.Pool.init(ally, 2);
@@ -1235,7 +1250,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .stats = &stats_p,
         .queues = &queues_p,
     };
-    submitInstancedMesh(ctx_p, Frustum.fromViewProjection(Mat4.identity), &mesh_parallel);
+    submitInstancedMesh(ctx_p, Frustum.fromViewProjection(Mat4.identity), &mesh_parallel, 0);
 
     // Verify bit-identical results
     try std.testing.expectEqual(mesh_serial.cached_aabb, mesh_parallel.cached_aabb);
@@ -1354,7 +1369,7 @@ test "transparent regular+instanced groups share one back-to-front order" {
     try std.testing.expectEqual(@as(u32, 0), ordered[1].index);
     try std.testing.expectEqual(&near_parent, queues.transparent_instanced.items[ordered[2].index]);
 
-    // Deterministic tie-break: exactly equal distances keep insertion order.
+    // Deterministic tie-break: exactly equal distances keep seq order.
     var ties = [_]TransparentDrawEntry{
         .{ .distance_sq = 4.0, .seq = 7, .kind = .regular, .index = 0, .is_decal = false },
         .{ .distance_sq = 4.0, .seq = 3, .kind = .instanced, .index = 0, .is_decal = false },
@@ -1375,4 +1390,462 @@ test "transparent regular+instanced groups share one back-to-front order" {
     try std.testing.expectEqual(@as(u32, 2), near[0].index);
     try std.testing.expectEqual(@as(u32, 1), near[1].index);
     try std.testing.expectEqual(@as(u32, 0), near[2].index);
+}
+
+test "parallel cull mixed scene matches serial on all queues" {
+    const ally = std.testing.allocator;
+    const material = @import("../material.zig");
+
+    var blend_mat = material.StandardMaterial.init("mixed_blend");
+    blend_mat.alpha_mode = .blend;
+    const blend: Material = .{ .standard = &blend_mat };
+    const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+
+    var opaque_a = Mesh{
+        .name = "opaque_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(1, 0, 0),
+        .local_bounding_box = unit_box,
+    };
+    var trans_a = Mesh{
+        .name = "trans_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = unit_box,
+        .material = blend,
+    };
+    var src_opaque = Mesh{
+        .name = "src_opaque",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var inst_op_0 = InstancedMesh{ .name = "op0", .source_mesh = &src_opaque, .position = Vec3.new(2, 0, 0) };
+    var inst_op_1 = InstancedMesh{ .name = "op1", .source_mesh = &src_opaque, .position = Vec3.new(3, 0, 0) };
+    var op_ptrs = [_]*InstancedMesh{ &inst_op_0, &inst_op_1 };
+    var inst_opaque = Mesh{
+        .name = "inst_opaque",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &op_ptrs, .capacity = 2 },
+    };
+    var tie_regular = Mesh{
+        .name = "tie_regular",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(7, 0, 0),
+        .local_bounding_box = unit_box,
+        .material = blend,
+    };
+    var src_tie = Mesh{
+        .name = "src_tie",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    // Same center as tie_regular (7,0,0), same non-decal flag: an exact
+    // distance tie between a regular and an instanced transparent.
+    var inst_tie = InstancedMesh{ .name = "tie_inst", .source_mesh = &src_tie, .position = Vec3.new(7, 0, 0) };
+    var tie_ptrs = [_]*InstancedMesh{&inst_tie};
+    var inst_trans_tie = Mesh{
+        .name = "inst_trans_tie",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = blend,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &tie_ptrs, .capacity = 1 },
+    };
+    var decal_a = Mesh{
+        .name = "decal_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(3, 0, 0),
+        .local_bounding_box = unit_box,
+        .is_decal = true,
+    };
+    var opaque_b = Mesh{
+        .name = "opaque_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(9, 0, 0),
+        .local_bounding_box = unit_box,
+    };
+    var src_far = Mesh{
+        .name = "src_far",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var inst_far = InstancedMesh{ .name = "far_inst", .source_mesh = &src_far, .position = Vec3.new(15, 0, 0) };
+    var far_ptrs = [_]*InstancedMesh{&inst_far};
+    var inst_trans_far = Mesh{
+        .name = "inst_trans_far",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = blend,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+    };
+
+    const meshes = [_]*Mesh{ &opaque_a, &trans_a, &inst_opaque, &tie_regular, &inst_trans_tie, &decal_a, &opaque_b, &inst_trans_far };
+
+    var culler = visibility.OcclusionCuller.init();
+    var stats_a = SceneStats{};
+    var queues_a = RenderQueues{};
+    defer queues_a.deinit(ally);
+    var stats_b = SceneStats{};
+    var queues_b = RenderQueues{};
+    defer queues_b.deinit(ally);
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 21,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_a,
+        .queues = &queues_a,
+        .default_white_id = 1,
+    });
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 22,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_b,
+        .queues = &queues_b,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+
+    // No double-queueing of instanced meshes: identical stat totals.
+    try std.testing.expectEqual(stats_a.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_a.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(stats_a.culled_meshes, stats_b.culled_meshes);
+    try std.testing.expectEqual(stats_a.occluded_meshes, stats_b.occluded_meshes);
+    try std.testing.expect(stats_a.rendered_meshes > 0);
+
+    // Opaque regulars: identical records in identical order.
+    try std.testing.expectEqual(queues_a.items.items.len, queues_b.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), queues_a.items.items.len);
+    for (queues_a.items.items, queues_b.items.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.texture_id, b.texture_id);
+        try std.testing.expectEqual(a.transparent, b.transparent);
+        try std.testing.expectEqual(a.is_decal, b.is_decal);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
+    }
+
+    // Transparent regulars (incl. the decal): identical records in order.
+    try std.testing.expectEqual(queues_a.transparent.items.len, queues_b.transparent.items.len);
+    try std.testing.expectEqual(@as(usize, 3), queues_a.transparent.items.len);
+    for (queues_a.transparent.items, queues_b.transparent.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.is_decal, b.is_decal);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
+    }
+
+    // Instanced groups: submitted once each, in mesh order, on both paths.
+    try std.testing.expectEqual(queues_a.opaque_instanced.items.len, queues_b.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queues_a.opaque_instanced.items.len);
+    try std.testing.expectEqual(queues_a.opaque_instanced.items[0], queues_b.opaque_instanced.items[0]);
+    try std.testing.expectEqual(&inst_opaque, queues_a.opaque_instanced.items[0]);
+    try std.testing.expectEqual(queues_a.transparent_instanced.items.len, queues_b.transparent_instanced.items.len);
+    try std.testing.expectEqual(@as(usize, 2), queues_a.transparent_instanced.items.len);
+    for (queues_a.transparent_instanced.items, queues_b.transparent_instanced.items) |a, b| {
+        try std.testing.expectEqual(a, b);
+    }
+    try std.testing.expectEqual(&inst_trans_tie, queues_a.transparent_instanced.items[0]);
+    try std.testing.expectEqual(&inst_trans_far, queues_a.transparent_instanced.items[1]);
+
+    // Staged instance matrices: identical contents.
+    try std.testing.expectEqual(queues_a.instance_matrices.items.len, queues_b.instance_matrices.items.len);
+    try std.testing.expect(queues_a.instance_matrices.items.len > 0);
+    for (queues_a.instance_matrices.items, queues_b.instance_matrices.items) |a, b| {
+        try std.testing.expectEqual(a, b);
+    }
+
+    // Unified transparent order: raw insertion differs (parallel merges all
+    // regulars before the instanced tail), so compare the sorted order —
+    // the contract both paths must honor.
+    try std.testing.expectEqual(queues_a.transparent_order.items.len, queues_b.transparent_order.items.len);
+    try std.testing.expectEqual(@as(usize, 5), queues_a.transparent_order.items.len);
+    std.mem.sort(TransparentDrawEntry, queues_a.transparent_order.items, {}, sortTransparentDrawOrder);
+    std.mem.sort(TransparentDrawEntry, queues_b.transparent_order.items, {}, sortTransparentDrawOrder);
+    for (queues_a.transparent_order.items, queues_b.transparent_order.items) |a, b| {
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.seq, b.seq);
+        try std.testing.expectEqual(a.kind, b.kind);
+        try std.testing.expectEqual(a.index, b.index);
+        try std.testing.expectEqual(a.is_decal, b.is_decal);
+        if (a.kind == .regular) {
+            try std.testing.expectEqual(
+                queues_a.transparent.items[a.index].mesh,
+                queues_b.transparent.items[b.index].mesh,
+            );
+        } else {
+            try std.testing.expectEqual(
+                queues_a.transparent_instanced.items[a.index],
+                queues_b.transparent_instanced.items[b.index],
+            );
+        }
+    }
+
+    // Exact-distance tie (regular mesh 3 + instanced group 4 at 7^2 = 49):
+    // the entries are bit-identical distances and mesh-index order wins on
+    // both paths.
+    const ordered = queues_a.transparent_order.items;
+    try std.testing.expect(ordered[1].distance_sq == ordered[2].distance_sq);
+    try std.testing.expectEqual(@as(f32, 49.0), ordered[1].distance_sq);
+    try std.testing.expectEqual(TransparentKind.regular, ordered[1].kind);
+    try std.testing.expectEqual(TransparentKind.instanced, ordered[2].kind);
+    try std.testing.expectEqual(@as(u32, 3), ordered[1].seq);
+    try std.testing.expectEqual(@as(u32, 4), ordered[2].seq);
+}
+
+test "parallel setup OOM fails cleanly without leaking" {
+    const ally = std.testing.allocator;
+
+    const count = 4;
+    const meshes = try ally.alloc(Mesh, count);
+    defer ally.free(meshes);
+    const ptrs = try ally.alloc(*Mesh, count);
+    defer ally.free(ptrs);
+    for (0..count) |i| {
+        meshes[i] = .{
+            .name = "m",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 3,
+        };
+        ptrs[i] = &meshes[i];
+    }
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    // (2 workers + 1) * 4 = 12 per-chunk buffers: fail_index 0 hits the
+    // records array itself, 1 the first chunk buffer, 7 a middle one.
+    for ([_]usize{ 0, 1, 7 }) |fail_index| {
+        var gpa = std.heap.DebugAllocator(.{}){};
+        var failing = std.testing.FailingAllocator.init(gpa.allocator(), .{ .fail_index = fail_index });
+        var queues = RenderQueues{};
+        var stats = SceneStats{};
+        var culler = visibility.OcclusionCuller.init();
+        const result = buildFrameQueuesParallel(.{
+            .allocator = failing.allocator(),
+            .meshes = ptrs,
+            .frame_id = 100 + fail_index,
+            .view_proj = Mat4.identity,
+            .eye = Vec3.zero,
+            .cull_frustum = false,
+            .cull_occlusion = false,
+            .occlusion_culler = &culler,
+            .stats = &stats,
+            .queues = &queues,
+            .default_white_id = 1,
+        }, Frustum.fromViewProjection(Mat4.identity), Vec3.zero, pool);
+        try std.testing.expectError(error.OutOfMemory, result);
+        // Setup failed before any queue/stats write: the frame is untouched.
+        try std.testing.expectEqual(@as(usize, 0), queues.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), queues.transparent.items.len);
+        try std.testing.expectEqual(@as(usize, 0), queues.transparent_order.items.len);
+        try std.testing.expectEqual(@as(u32, 0), stats.total_meshes);
+        try std.testing.expectEqual(@as(u32, 0), stats.rendered_meshes);
+        try std.testing.expectEqual(@as(u32, 0), stats.culled_meshes);
+        // The GPA deinit check is the leak proof: every buffer allocated
+        // before the failure was freed by the setup cleanup.
+        try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+    }
+}
+
+/// Test allocator that fails the first N allocations, then delegates to
+/// backing. Unlike FailingAllocator (which fails persistently at its index),
+/// a single failure lets the serial fallback that follows a parallel setup
+/// OOM allocate normally.
+const FailFirstN = struct {
+    backing: std.mem.Allocator,
+    failures_left: usize,
+
+    fn allocator(self: *FailFirstN) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailFirstN = @ptrCast(@alignCast(ctx));
+        if (self.failures_left > 0) {
+            self.failures_left -= 1;
+            return null;
+        }
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FailFirstN = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FailFirstN = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *FailFirstN = @ptrCast(@alignCast(ctx));
+        return self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+test "parallel setup OOM falls back to serial queues" {
+    const ally = std.testing.allocator;
+    const material = @import("../material.zig");
+
+    var blend_mat = material.StandardMaterial.init("fallback_blend");
+    blend_mat.alpha_mode = .blend;
+    const blend: Material = .{ .standard = &blend_mat };
+    const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+
+    var plain_a = Mesh{
+        .name = "plain_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(1, 0, 0),
+        .local_bounding_box = unit_box,
+    };
+    var plain_b = Mesh{
+        .name = "plain_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = unit_box,
+        .material = blend,
+    };
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var inst = InstancedMesh{ .name = "i", .source_mesh = &src, .position = Vec3.new(2, 0, 0) };
+    var inst_ptrs = [_]*InstancedMesh{&inst};
+    var inst_parent = Mesh{
+        .name = "inst_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &inst_ptrs, .capacity = 1 },
+    };
+    const meshes = [_]*Mesh{ &plain_a, &plain_b, &inst_parent };
+
+    var culler = visibility.OcclusionCuller.init();
+    var stats_a = SceneStats{};
+    var queues_a = RenderQueues{};
+    defer queues_a.deinit(ally);
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 31,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_a,
+        .queues = &queues_a,
+        .default_white_id = 1,
+    });
+
+    // One failed allocation — the parallel records array — then the serial
+    // fallback allocates normally through the same allocator.
+    var limited = FailFirstN{ .backing = ally, .failures_left = 1 };
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+    var stats_b = SceneStats{};
+    var queues_b = RenderQueues{};
+    defer queues_b.deinit(limited.allocator());
+    buildFrameQueues(.{
+        .allocator = limited.allocator(),
+        .meshes = &meshes,
+        .frame_id = 32,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_b,
+        .queues = &queues_b,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+
+    // The frame still drew: serial-identical queues, not empty ones.
+    try std.testing.expect(stats_b.rendered_meshes > 0);
+    try std.testing.expectEqual(stats_a.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_a.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(stats_a.culled_meshes, stats_b.culled_meshes);
+    try std.testing.expectEqual(queues_a.items.items.len, queues_b.items.items.len);
+    try std.testing.expectEqual(queues_a.transparent.items.len, queues_b.transparent.items.len);
+    try std.testing.expectEqual(queues_a.opaque_instanced.items.len, queues_b.opaque_instanced.items.len);
+    try std.testing.expectEqual(queues_a.transparent_instanced.items.len, queues_b.transparent_instanced.items.len);
+    try std.testing.expectEqual(queues_a.transparent_order.items.len, queues_b.transparent_order.items.len);
+    for (queues_a.items.items, queues_b.items.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+    }
+    for (queues_a.transparent.items, queues_b.transparent.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+    }
+    for (queues_a.opaque_instanced.items, queues_b.opaque_instanced.items) |a, b| {
+        try std.testing.expectEqual(a, b);
+    }
+    for (queues_a.transparent_order.items, queues_b.transparent_order.items) |a, b| {
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.seq, b.seq);
+        try std.testing.expectEqual(a.kind, b.kind);
+        try std.testing.expectEqual(a.index, b.index);
+    }
+    try std.testing.expectEqual(queues_a.instance_matrices.items.len, queues_b.instance_matrices.items.len);
+    for (queues_a.instance_matrices.items, queues_b.instance_matrices.items) |a, b| {
+        try std.testing.expectEqual(a, b);
+    }
 }

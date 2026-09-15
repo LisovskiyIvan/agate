@@ -75,6 +75,26 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
             self.meta[i].store(seq << 2 | STATE_PUBLISHED, .release);
         }
 
+        /// Drops every published slot WITHOUT copying. Publisher-side drain
+        /// for mailbox saturation: the publisher could not claim a free
+        /// slot, so it discards the stale published frames and retries the
+        /// claim to publish the newest payload. Only safe while the consumer
+        /// is excluded (the apps hold phase_mutex across update and render);
+        /// with a concurrent consumer a takeLatest could race the release and
+        /// either miss or re-deliver a frame. The type's single-consumer
+        /// contract otherwise stays.
+        pub fn releasePublished(self: *Self) void {
+            for (0..slot_count) |j| {
+                const m = self.meta[j].load(.monotonic);
+                if (m & 3 == STATE_PUBLISHED) {
+                    // Keep the seq (same as takeLatest): free slots are
+                    // reclaimed with the same seq, publish stamps a fresh
+                    // global one, so ordering stays monotonic.
+                    _ = self.meta[j].cmpxchgStrong(m, m & ~@as(u64, 3), .release, .monotonic);
+                }
+            }
+        }
+
         /// Copies the newest published payload into `out` and releases all
         /// published slots. Returns false when nothing new is available.
         pub fn takeLatest(self: *Self, out: *T) bool {
@@ -136,6 +156,26 @@ test "Handoff delivers the latest and drops stale frames" {
     try testing.expect(h.takeLatest(&out));
     try testing.expectEqual(@as(u64, 2), out.seq);
     // Both published slots released: nothing new afterwards.
+    try testing.expect(!h.takeLatest(&out));
+}
+
+test "Handoff publisher drains stale slots so the newest wins" {
+    var h = Handoff(Frame, 2){};
+    for (1..3) |seq| {
+        const i = h.claim().?;
+        fill(h.slot(i), seq);
+        h.publish(i);
+    }
+    // Saturated: claim fails. Drain stale published slots, then the newest
+    // payload claims and publishes.
+    try testing.expect(h.claim() == null);
+    h.releasePublished();
+    const i = h.claim().?;
+    fill(h.slot(i), 3);
+    h.publish(i);
+    var out: Frame = undefined;
+    try testing.expect(h.takeLatest(&out));
+    try testing.expectEqual(@as(u64, 3), out.seq);
     try testing.expect(!h.takeLatest(&out));
 }
 

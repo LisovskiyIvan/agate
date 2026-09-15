@@ -242,6 +242,15 @@ pub const Texture = struct {
     /// Public so the KTX2 reader (ktx2.zig) can reuse the generator for
     /// single-level files; the decode paths above use it internally.
     pub fn buildRaw(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
+        // Guard the public entry point: the mip chain treats the buffer as
+        // width*height*4, and downsampleLevel runs unsafely, so a short
+        // buffer would cause out-of-bounds reads. Checked arithmetic keeps
+        // huge dimensions from wrapping to a small expected size.
+        if (width == 0 or height == 0) return error.InvalidDimensions;
+        const pixel_count = std.math.mul(u32, width, height) catch return error.ImageTooLarge;
+        const expected_bytes = std.math.mul(u32, pixel_count, 4) catch return error.ImageTooLarge;
+        if (rgba_pixels.len != expected_bytes) return error.InvalidDimensions;
+
         var raw = RawTexture{ .width = width, .height = height, .num_levels = 1 };
         errdefer raw.deinit(allocator);
 
@@ -1876,6 +1885,42 @@ test "buildRaw without mipmaps uploads exactly one level" {
     defer raw.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 1), raw.num_levels);
     try std.testing.expectEqual(@as(u32, 200), raw.levels[0].?[0]);
+}
+
+test "buildRaw rejects short, oversized and empty pixel buffers" {
+    const allocator = std.testing.allocator;
+    var pixels: [2 * 2 * 4]u8 = @splat(128);
+    // Short by one byte (would over-read in the unsafely-downsampled chain).
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        Texture.buildRaw(allocator, 2, 2, pixels[0 .. pixels.len - 1], true),
+    );
+    // One byte too many.
+    var over: [2 * 2 * 4 + 1]u8 = @splat(128);
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        Texture.buildRaw(allocator, 2, 2, &over, false),
+    );
+    // Zero dimensions rejected even with an empty buffer.
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        Texture.buildRaw(allocator, 0, 2, &.{}, false),
+    );
+    // Huge dimensions fail on checked arithmetic before any allocation.
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        Texture.buildRaw(allocator, 100000, 100000, &.{}, false),
+    );
+}
+
+test "buildRaw accepts an exact-size tiny raw texture" {
+    const allocator = std.testing.allocator;
+    var pixels: [2 * 2 * 4]u8 = @splat(200);
+    var raw = try Texture.buildRaw(allocator, 2, 2, &pixels, true);
+    defer raw.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 2), raw.num_levels);
+    try std.testing.expectEqual(@as(usize, 2 * 2 * 4), raw.levels[0].?.len);
+    try std.testing.expectEqual(@as(usize, 1 * 1 * 4), raw.levels[1].?.len);
 }
 
 // ---------------------------------------------------------------------------

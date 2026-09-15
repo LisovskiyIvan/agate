@@ -9,6 +9,7 @@ const Mat4 = math.Mat4;
 const Texture = @import("texture.zig").Texture;
 const Mesh = @import("mesh.zig").Mesh;
 const jobs = @import("jobs.zig");
+const gpu_thread = @import("gpu_thread.zig");
 
 pub const ParticleBlendMode = enum {
     additive,
@@ -267,6 +268,10 @@ pub const ParticleSystem = struct {
     gpu_flush_pending: bool = false,
 
     instance_buffer: sg.Buffer,
+    /// True when `.instance_buffer` could not be created at construction
+    /// time (off-context `createParticleSystem`): flushGpuUploads creates it
+    /// on the render side once a context is available.
+    instance_buffer_pending: bool = false,
     texture: ?Texture = null,
     blend_mode: ParticleBlendMode = .additive,
 
@@ -284,6 +289,10 @@ pub const ParticleSystem = struct {
     gpu_slots: []GpuParticleSlot = &.{},
     /// Instance buffer holding `gpu_slots` (per-instance spawn records).
     gpu_slot_buffer: sg.Buffer = .{},
+    /// Staged by update() on first `.gpu` use; the buffer itself is created in
+    /// flushGpuUploads on the context thread, so the update phase stays free
+    /// of sg.* calls. Cleared once the buffer exists.
+    gpu_slot_buffer_pending: bool = false,
     /// Ring cursor: next slot to overwrite. Emission is strictly sequential,
     /// which keeps the CPU cursor and the upload ranges trivially in sync.
     gpu_write_cursor: usize = 0,
@@ -360,7 +369,11 @@ pub const ParticleSystem = struct {
         const alive_scratch = try allocator.alloc(u8, capacity);
         errdefer allocator.free(alive_scratch);
 
-        const buf = sg.makeBuffer(.{
+        // Off-context construction (runtime spawn on the game thread) must
+        // not touch sg.*: defer the instance buffer to flushGpuUploads,
+        // which runs on the render side.
+        const deferred = !gpu_thread.isOnContextThread();
+        const buf = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = capacity * @sizeOf(ParticleInstanceData),
         });
@@ -374,6 +387,7 @@ pub const ParticleSystem = struct {
             .capacity = capacity,
             .active_count = 0,
             .instance_buffer = buf,
+            .instance_buffer_pending = deferred,
             .prng = std.Random.DefaultPrng.init(1337),
         };
         return ps;
@@ -663,13 +677,10 @@ pub const ParticleSystem = struct {
     /// returns an error (`UpdateError`) — never a silent downgrade.
     pub fn update(self: *ParticleSystem, dt: f32) UpdateError!void {
         if (self.simulation_mode == .gpu) {
-            // Lazily create the GPU instance buffer on first update (the
-            // sg context is required, which tests never have).
+            // First use only stages the creation flag (sg.makeBuffer is a
+            // context-thread call); flushGpuUploads creates the buffer.
             if (self.gpu_slot_buffer.id == 0) {
-                self.gpu_slot_buffer = sg.makeBuffer(.{
-                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                    .size = self.capacity * @sizeOf(GpuParticleSlot),
-                });
+                self.gpu_slot_buffer_pending = true;
             }
             try self.updateGpu(dt);
             self.gpu_flush_pending = true;
@@ -686,11 +697,32 @@ pub const ParticleSystem = struct {
     /// (Scene.render start) — the update phase only stages CPU data and
     /// sets the dirty flags, so simulation stays free of sg.* calls.
     pub fn flushGpuUploads(self: *ParticleSystem) void {
+        // Deferred construction (off-context spawn): create the instance
+        // buffer here, on the render side, and upload any staged data.
+        if (self.instance_buffer_pending and sg.isvalid()) {
+            self.instance_buffer = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.capacity * @sizeOf(ParticleInstanceData),
+            });
+            if (self.instance_buffer.id != 0) {
+                self.instance_buffer_pending = false;
+                if (self.active_count > 0) self.instance_dirty = true;
+            }
+        }
         if (self.instance_dirty) {
             self.instance_dirty = false;
             if (self.active_count > 0 and self.instance_buffer.id != 0) {
                 sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
             }
+        }
+        // Deferred first-use creation (staged by update): without a valid sg
+        // context the flag stays set and a later flush retries.
+        if (self.gpu_slot_buffer_pending and self.gpu_slot_buffer.id == 0 and sg.isvalid()) {
+            self.gpu_slot_buffer = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.capacity * @sizeOf(GpuParticleSlot),
+            });
+            if (self.gpu_slot_buffer.id != 0) self.gpu_slot_buffer_pending = false;
         }
         if (self.gpu_flush_pending) {
             self.gpu_flush_pending = false;
@@ -1223,4 +1255,22 @@ test "gpu with local_space is an explicit error, not a downgrade" {
     try std.testing.expectEqual(SimulationMode.gpu, ps.simulation_mode);
     try std.testing.expectEqual(@as(usize, 0), ps.active_count);
     try std.testing.expectEqual(@as(usize, 0), ps.gpu_high_water);
+}
+
+test "gpu update stages buffer creation without an sg context" {
+    const a = std.testing.allocator;
+    var ps = try makeTestSystem(a, 4);
+    defer freeTestSystem(&ps);
+    ps.simulation_mode = .gpu;
+    ps.is_emitting = true;
+    try ps.update(0.016);
+    // No sg context in tests: no buffer was created, but the creation was
+    // staged (and the frame's upload flagged) instead of crashing.
+    try std.testing.expectEqual(true, ps.gpu_slot_buffer_pending);
+    try std.testing.expectEqual(@as(u32, 0), ps.gpu_slot_buffer.id);
+    try std.testing.expectEqual(true, ps.gpu_flush_pending);
+    // Flushing without a context is a safe no-op that keeps the staged flag.
+    ps.flushGpuUploads();
+    try std.testing.expectEqual(true, ps.gpu_slot_buffer_pending);
+    try std.testing.expectEqual(@as(u32, 0), ps.gpu_slot_buffer.id);
 }

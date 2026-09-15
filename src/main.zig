@@ -63,6 +63,10 @@ fn parseArgs(args: std.process.Args) void {
 }
 
 export fn init() callconv(.c) void {
+    // This callback runs on the sokol-app thread: the only thread allowed
+    // to touch sg.*. Engine paths use the marker to defer off-thread GPU
+    // work (mesh destroy/create, particle buffer creation) to render start.
+    z.gpu_thread.markContextThread();
     sg.setup(.{
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
@@ -149,6 +153,21 @@ const AppEvent = union(enum) {
     mouse_down,
 };
 var input_ring: z.jobs.SpscRing(AppEvent, 64) = .{};
+/// Push results are otherwise silent: count dropped events and rate-limit
+/// the log (every 64th drop) so a flooded ring stays visible without
+/// spamming. MOUSE_MOVE is intentionally never queued — simulate() consumes
+/// discrete presses only, and queuing per-move events would flood the 64
+/// slots with stale positions.
+var input_dropped: u64 = 0;
+
+fn pushInput(ev: AppEvent) void {
+    if (!input_ring.push(ev)) {
+        input_dropped += 1;
+        if (input_dropped % 64 == 1) {
+            std.debug.print("input ring full, dropped {} events\n", .{input_dropped});
+        }
+    }
+}
 
 /// One simulation step on the game side: input consumption + Scene.update
 /// + demo state. Callers own phase ownership (the mutex when threaded).
@@ -252,9 +271,9 @@ fn cycleClearColor() void {
 
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     switch (ev.*.type) {
-        .MOUSE_DOWN => _ = input_ring.push(.mouse_down),
+        .MOUSE_DOWN => pushInput(.mouse_down),
         .KEY_DOWN => switch (ev.*.key_code) {
-            .SPACE, .ESCAPE => _ = input_ring.push(.{ .key_down = ev.*.key_code }),
+            .SPACE, .ESCAPE => pushInput(.{ .key_down = ev.*.key_code }),
             else => {},
         },
         else => {},

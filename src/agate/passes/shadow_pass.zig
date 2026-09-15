@@ -261,6 +261,9 @@ pub const ShadowPass = struct {
 
             const bucket_meshes = self.binned_meshes.items[offsets[b_idx] .. offsets[b_idx] + count];
             for (bucket_meshes) |mesh| {
+                // Deferred-creation meshes (off-context uploadGeometry) have
+                // no buffers yet: drawing them would bind invalid handles.
+                if (mesh.gpu_pending) continue;
                 if (mesh.instances.items.len > 0) {
                     if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
 

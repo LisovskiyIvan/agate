@@ -308,7 +308,12 @@ fn decodeLevels2D(
     if (levels.len == 1 and gen_mipmaps) {
         const level0 = try convertLevel(allocator, format, levels[0], srgb);
         defer allocator.free(level0);
-        var raw = try texture.Texture.buildRaw(allocator, header.pixel_width, header.pixel_height, level0, true);
+        // buildRaw validates dimensions against the byte length; a mismatch
+        // here means the file's level data disagrees with its header.
+        var raw = texture.Texture.buildRaw(allocator, header.pixel_width, header.pixel_height, level0, true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidLevelData,
+        };
         raw.is_srgb = srgb;
         return raw;
     }

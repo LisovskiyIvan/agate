@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const jobs = @import("jobs.zig");
+const gpu_thread = @import("gpu_thread.zig");
 const Texture = @import("texture.zig").Texture;
 
 pub const TextureState = enum(u8) {
@@ -206,6 +207,7 @@ pub const UploadQueue = struct {
     /// Uploads every finished decode. Must run on the sg-context thread.
     /// Returns how many textures were uploaded this call.
     pub fn drain(self: *UploadQueue) usize {
+        gpu_thread.assertOnContextThread();
         var uploaded: usize = 0;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();

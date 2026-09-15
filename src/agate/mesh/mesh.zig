@@ -24,6 +24,7 @@ const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const Scene = @import("../scene.zig").Scene;
+const gpu_thread = @import("../gpu_thread.zig");
 
 pub const Mesh = struct {
     name: []const u8,
@@ -101,6 +102,16 @@ pub const Mesh = struct {
 
     // Decal
     is_decal: bool = false,
+
+    /// Deferred GPU upload: true while the vertex/index buffers still need
+    /// creating on the context thread (see uploadGeometry). `pending_vertices`
+    /// holds the owned vertex copy the finish step builds the buffers from;
+    /// indices come from the regular cpu_indices mirror. Set at creation when
+    /// the caller is off-context (or no sg context exists yet); cleared by
+    /// finishGpuUpload. Mesh.deinit frees the retained copies either way, so
+    /// a mesh that dies pending never leaks.
+    gpu_pending: bool = false,
+    pending_vertices: []Vertex = &.{},
 
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
@@ -390,6 +401,54 @@ pub const Mesh = struct {
         }
     }
 
+    /// Completes a deferred GPU upload: creates the vertex/index buffers from
+    /// the retained pending_vertices/cpu_indices and frees the temporary
+    /// vertex copy. Runs on the sg-context thread via
+    /// Scene.flushPendingGpuUploads at render start — never from the update
+    /// phase. No-op unless gpu_pending; when no sg context is valid yet the
+    /// mesh stays pending and the next flush retries (tests exercise meshes
+    /// in that state without ever touching sg.*).
+    pub fn finishGpuUpload(self: *Mesh, allocator: std.mem.Allocator) void {
+        if (!self.gpu_pending) return;
+        if (!sg.isvalid()) return;
+        const vbuf = sg.makeBuffer(.{
+            .data = sg.asRange(self.pending_vertices),
+        });
+        if (vbuf.id == 0) return;
+        if (self.index_type == .UINT16) {
+            const indices16 = allocator.alloc(u16, self.cpu_indices.len) catch return;
+            defer allocator.free(indices16);
+            for (self.cpu_indices, 0..) |idx, k| {
+                indices16[k] = @intCast(idx);
+            }
+            const ibuf = sg.makeBuffer(.{
+                .usage = .{ .index_buffer = true },
+                .data = sg.asRange(indices16),
+            });
+            if (ibuf.id == 0) {
+                sg.destroyBuffer(vbuf);
+                return;
+            }
+            self.index_buffer = ibuf;
+        } else {
+            const ibuf = sg.makeBuffer(.{
+                .usage = .{ .index_buffer = true },
+                .data = sg.asRange(self.cpu_indices),
+            });
+            if (ibuf.id == 0) {
+                sg.destroyBuffer(vbuf);
+                return;
+            }
+            self.index_buffer = ibuf;
+        }
+        self.vertex_buffer = vbuf;
+        self.gpu_pending = false;
+        if (self.pending_vertices.len > 0) {
+            allocator.free(self.pending_vertices);
+            self.pending_vertices = &.{};
+        }
+    }
+
     pub fn deinit(self: *Mesh, allocator: std.mem.Allocator) void {
         if (self.vertex_buffer.id != 0) {
             sg.destroyBuffer(self.vertex_buffer);
@@ -429,6 +488,10 @@ pub const Mesh = struct {
         if (self.cpu_skin.len > 0) {
             allocator.free(self.cpu_skin);
         }
+        if (self.pending_vertices.len > 0) {
+            allocator.free(self.pending_vertices);
+            self.pending_vertices = &.{};
+        }
         if (self.owns_name and self.name.len > 0) {
             allocator.free(self.name);
         }
@@ -437,7 +500,40 @@ pub const Mesh = struct {
 
 // Uploads CPU-side geometry to sokol buffers, narrowing indices to 16-bit
 // when the vertex count allows it (matching the existing builders).
+// Callers on a non-context thread (input-driven decal stamping, drag-box
+// creation on the game thread) must not touch sg.*: they take the deferred
+// path below (CPU-only + gpu_pending), and Scene.flushPendingGpuUploads
+// finishes the buffers on the context thread. prepareFrame() flushes before
+// queue building, so a pending mesh always has buffers before it can be
+// queued for drawing. The deferred path also covers "no valid sg context
+// yet", so context-less tests never crash inside makeBuffer.
 pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mesh {
+    if (!gpu_thread.isOnContextThread() or !sg.isvalid()) {
+        const mesh = try scene.allocator.create(Mesh);
+        errdefer scene.allocator.destroy(mesh);
+        mesh.* = .{
+            .name = name,
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = @intCast(data.indices.len),
+            .index_type = if (data.vertices.len <= std.math.maxInt(u16)) .UINT16 else .UINT32,
+            .local_bounding_box = data.bounds,
+            .gpu_pending = true,
+        };
+        errdefer {
+            if (mesh.pending_vertices.len > 0) scene.allocator.free(mesh.pending_vertices);
+            if (mesh.cpu_positions.len > 0) scene.allocator.free(mesh.cpu_positions);
+            if (mesh.cpu_indices.len > 0) scene.allocator.free(mesh.cpu_indices);
+        }
+        // Same CPU mirrors as the immediate path (physics colliders and
+        // decal projection read them); indices double as the finish-step
+        // source, vertices are kept in pending_vertices for buffer creation.
+        try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
+        mesh.pending_vertices = try scene.allocator.dupe(Vertex, data.vertices);
+        try scene.meshes.append(scene.allocator, mesh);
+        return mesh;
+    }
+
     const vbuf = sg.makeBuffer(.{
         .data = sg.asRange(data.vertices),
     });
@@ -484,6 +580,15 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
         try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
     }
 
-    try scene.meshes.append(scene.allocator, mesh);
+    scene.meshes.append(scene.allocator, mesh) catch |err| {
+        // Nothing has adopted the mesh yet: destroy the buffers and CPU
+        // mirrors instead of leaking them (mesh.owns_name stays false).
+        if (mesh.vertex_buffer.id != 0) sg.destroyBuffer(mesh.vertex_buffer);
+        if (mesh.index_buffer.id != 0) sg.destroyBuffer(mesh.index_buffer);
+        if (mesh.cpu_positions.len > 0) scene.allocator.free(mesh.cpu_positions);
+        if (mesh.cpu_indices.len > 0) scene.allocator.free(mesh.cpu_indices);
+        scene.allocator.destroy(mesh);
+        return err;
+    };
     return mesh;
 }

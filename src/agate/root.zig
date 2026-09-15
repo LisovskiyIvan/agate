@@ -151,6 +151,9 @@ pub const ssao = @import("ssao.zig");
 pub const SSAOOptions = ssao.SSAOOptions;
 
 pub const jobs = @import("jobs.zig");
+/// Graphics-context thread marker: apps call `markContextThread()` in their
+/// init callback so engine paths can detect off-context GPU touches.
+pub const gpu_thread = @import("gpu_thread.zig");
 pub const particles = @import("particles.zig");
 pub const ParticleSystem = particles.ParticleSystem;
 pub const ParticleBlendMode = particles.ParticleBlendMode;
