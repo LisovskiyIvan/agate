@@ -152,6 +152,7 @@ export fn frame() callconv(.c) void {
         };
     }
 
+    scene.updateLights(@floatCast(sapp.frameDuration()));
     scene.render();
 
     if (frame_limit != 0) {

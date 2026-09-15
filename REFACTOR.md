@@ -114,15 +114,19 @@ Landed groundwork:
 
 Remaining slices, in order:
 
-1. Frame payload audit: enumerate every field `render()` reads (mesh
-   transforms, material fields, particle instances, sky/postfx params) and
-   decide copy-vs-alternate-ownership per group.
-2. Game thread: move `Scene.update*` + input consumption onto a worker;
-   sapp frame callback only drains handoff + renders. Same-thread mode
-   first (update inline, publish skipped) to prove no behavior drift.
-3. Only then split the threads, gated behind a flag; serialization of
-   engine systems (Scene is not thread-safe by construction) is expected
-   to surface races — fix them at the audit level, not with locks.
+1. [x] Frame payload audit (see above).
+2. [~] Update-phase consolidation: `Scene.updateLights(dt)` landed — light
+   selection + hysteresis fades are now update-phase simulation; render
+   consumes the plain `light_pack` (audit finding #1 resolved). Engine and
+   sandbox call it in their frame update, right after camera update.
+   Next: fold the remaining per-frame update calls (physics, particles,
+   animations, decals, nav, trails) into one `Scene.update(dt)` umbrella
+   so the game side is a single entry point.
+3. [ ] Game thread: run the update umbrella on a worker publishing
+   through `Handoff` (same-thread mode first — publish inline, consume
+   immediately — to prove no drift), then the actual split behind a flag.
+   Serialization of engine systems is expected to surface races — fix
+   them at the audit level, not with locks.
 
 #### Frame-payload audit (done 2026-09)
 

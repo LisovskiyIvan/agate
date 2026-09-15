@@ -153,6 +153,12 @@ pub const Scene = struct {
     forward: scene_forward.ForwardPipelines,
     // Particle systems + billboard pass.
     particles: scene_particles.ParticleLayer,
+    /// Stage 3, slice 2: light selection + packing (including the
+    /// incumbency-hysteresis fade simulation) runs in `updateLights`
+    /// during the update phase; render() consumes this plain value and no
+    /// longer mutates light state. Handoff-safe plain data for the later
+    /// game/render thread split (audit finding #1).
+    light_pack: scene_lights.LightRig.FramePack = std.mem.zeroes(scene_lights.LightRig.FramePack),
     /// Async texture decode/upload pipeline. Drained at the top of
     /// render(); deinit'd FIRST in deinit so in-flight decodes finish
     /// before any material they target is freed. Null = synchronous loads.
@@ -808,6 +814,23 @@ pub const Scene = struct {
         self.particles.render(cam, aspect, samples, &self.stats);
     }
 
+    /// Stage 3, slice 2: update-phase light packing. Selects the top-k
+    /// point/spot lights for the camera (advancing the incumbency-
+    /// hysteresis fades with `dt`) and stores the uniform-ready pack.
+    /// Called once per frame BEFORE render(); render consumes
+    /// `self.light_pack` without touching light state.
+    pub fn updateLights(self: *Scene, dt: f32) void {
+        // Zero-eye fallback keeps the pack defined for camera-less scenes
+        // (render early-returns without a camera anyway).
+        const eye = if (self.active_camera) |cam|
+            cam.getPosition()
+        else if (self.cameras.items.len > 0)
+            self.cameras.items[0].camera.getPosition()
+        else
+            Vec3.zero;
+        self.light_pack = self.lights.packFrame(eye, self.shadows.enabled, dt);
+    }
+
     pub fn render(self: *Scene) void {
         // Stage 2: upload finished background decodes before drawing, so
         // patched materials pick the textures up this same frame.
@@ -843,11 +866,10 @@ pub const Scene = struct {
         // 1. Directional Light Cascaded Shadow View-Projections
         const cascades = self.shadows.computeCascades(camera, aspect, sun_dir);
 
-        // Pack Point & Spot Lights (top-k selection + uniform arrays +
-        // spot shadow infos for the depth pass). dt drives the slot
-        // hand-off fades (incumbency-hysteresis light selection).
-        const dt: f32 = @floatCast(sapp.frameDuration());
-        const light_pack = self.lights.packFrame(eye, self.shadows.enabled, dt);
+        // Point & Spot light arrays were packed during the update phase
+        // (updateLights) — including the hysteresis fade advance, which is
+        // update-phase simulation. Render only consumes the result.
+        const light_pack = self.light_pack;
 
         // ==============================================
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
@@ -1083,4 +1105,29 @@ test "Scene camera switching and cycling" {
     try std.testing.expect(scene.switchCameraByName("Cam2"));
     try std.testing.expectEqual(@as(usize, 1), scene.getActiveCameraIndex().?);
     try std.testing.expect(!scene.switchCameraByName("NonExistent"));
+}
+
+test "updateLights packs point lights into the frame payload" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+
+    _ = try scene.createPointLight("probe", .{
+        .position = Vec3.zero,
+        .intensity = 10.0,
+        .range = 10.0,
+    });
+
+    // One point light packed into slot 0 (the light sits at the pack eye,
+    // so its score is maximal). Hysteresis fades a newly seen light in
+    // over fade_time (0.25 s), so the first pack carries a partial factor.
+    // A newly seen light enters the enter-fade this frame and is packed
+    // from the next update on (fade-in over fade_time, 0.25 s).
+    try std.testing.expectEqual(@as(f32, 0.0), scene.light_pack.counts[0]);
+    var frame: usize = 0;
+    while (frame < 32) : (frame += 1) scene.updateLights(0.016);
+    // Fully faded in (0.512 s >= fade_time): the intensity lane carries
+    // the light's exact intensity, and the incumbent keeps its slot.
+    try std.testing.expectEqual(@as(f32, 1.0), scene.light_pack.counts[0]);
+    try std.testing.expectEqual(@as(f32, 10.0), scene.light_pack.point_color_int[0][3]);
 }
