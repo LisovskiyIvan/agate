@@ -923,3 +923,194 @@ test "stop and fade-out never fire events" {
     try std.testing.expect(!ag.is_playing);
     try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
 }
+
+test "Truncated LINEAR/STEP bone tracks are skipped, preserving pose" {
+    const allocator = std.testing.allocator;
+    const skel = try Skeleton.init(allocator, 1);
+    defer skel.deinit();
+    skel.bones[0].bind_position = Vec3.new(1.0, 2.0, 3.0);
+    skel.bones[0].bind_rotation = Quat.identity;
+    skel.bones[0].bind_scale = Vec3.one;
+    skel.bones[0].local_position = Vec3.new(1.0, 2.0, 3.0);
+    skel.bones[0].local_rotation = Quat.identity;
+    skel.bones[0].local_scale = Vec3.one;
+
+    // 2 keys but only 1 frame of outputs: truncated LINEAR translation.
+    const t_times = try allocator.alloc(f32, 2);
+    t_times[0] = 0.0;
+    t_times[1] = 1.0;
+    const t_out = try allocator.alloc(f32, 3);
+    t_out[0] = 99.0;
+    t_out[1] = 99.0;
+    t_out[2] = 99.0;
+    // 2 keys but only 1 frame of outputs: truncated STEP rotation.
+    const r_times = try allocator.alloc(f32, 2);
+    r_times[0] = 0.0;
+    r_times[1] = 1.0;
+    const r_out = try allocator.alloc(f32, 4);
+    r_out[0] = 0.0;
+    r_out[1] = 0.0;
+    r_out[2] = 0.0;
+    r_out[3] = 1.0;
+
+    const channels = try allocator.alloc(AnimationChannel, 2);
+    channels[0] = .{
+        .bone_index = 0,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = t_times, .outputs = t_out, .interpolation = .linear },
+    };
+    channels[1] = .{
+        .bone_index = 0,
+        .target_path = .rotation,
+        .sampler = .{ .timestamps = r_times, .outputs = r_out, .interpolation = .step },
+    };
+
+    const ag = try AnimationGroup.init(allocator, "bone_truncated", channels, 1.0);
+    defer ag.deinit();
+    ag.skeleton = skel;
+
+    // Direct sampling: invalid tracks leave nullable outputs null (all OOB
+    // branches: first/mid/last keyframe).
+    for ([_]f32{ 0.0, 0.5, 1.0 }) |t| {
+        var p: ?Vec3 = null;
+        var r: ?Quat = null;
+        var s: ?Vec3 = null;
+        ag.sampleBoneAtTime(0, t, &p, &r, &s);
+        try std.testing.expect(p == null);
+        try std.testing.expect(r == null);
+        try std.testing.expect(s == null);
+    }
+
+    // Direct apply: invalid tracks preserve the pose, never write 99s.
+    for ([_]f32{ 0.0, 0.5, 1.0 }) |t| {
+        ag.applyAtTime(t);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), skel.bones[0].local_position.x, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), skel.bones[0].local_position.y, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 3.0), skel.bones[0].local_position.z, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), skel.bones[0].local_rotation.w, 1e-6);
+    }
+
+    // Cubic fallback preserved: a truncated CUBICSPLINE bone track still
+    // reaches the sampler (zero usable frames -> Vec3.zero), not skipped.
+    const c_times = try allocator.alloc(f32, 2);
+    c_times[0] = 0.0;
+    c_times[1] = 1.0;
+    const c_out = try allocator.alloc(f32, 3);
+    c_out[0] = 42.0;
+    c_out[1] = 42.0;
+    c_out[2] = 42.0;
+    const c_ch = try allocator.alloc(AnimationChannel, 1);
+    c_ch[0] = .{
+        .bone_index = 0,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = c_times, .outputs = c_out, .interpolation = .cubic_spline },
+    };
+    const ag_cubic = try AnimationGroup.init(allocator, "bone_truncated_cubic", c_ch, 1.0);
+    defer ag_cubic.deinit();
+    ag_cubic.skeleton = skel;
+    var cp: ?Vec3 = null;
+    var cr: ?Quat = null;
+    var cs: ?Vec3 = null;
+    ag_cubic.sampleBoneAtTime(0, 0.5, &cp, &cr, &cs);
+    try std.testing.expect(cp != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), cp.?.x, 1e-6);
+    skel.bones[0].local_position = Vec3.new(1.0, 2.0, 3.0);
+    ag_cubic.applyAtTime(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), skel.bones[0].local_position.x, 1e-6);
+}
+
+test "Truncated bone tracks fall back to bind pose in skeleton blending" {
+    const allocator = std.testing.allocator;
+    const skel = try Skeleton.init(allocator, 1);
+    defer skel.deinit();
+    skel.bones[0].bind_position = Vec3.zero;
+    skel.bones[0].bind_rotation = Quat.identity;
+    skel.bones[0].bind_scale = Vec3.one;
+
+    // Bad clip: truncated LINEAR translation + truncated STEP rotation.
+    const bad_t = try allocator.alloc(f32, 2);
+    bad_t[0] = 0.0;
+    bad_t[1] = 1.0;
+    const bad_t_out = try allocator.alloc(f32, 3);
+    bad_t_out[0] = 99.0;
+    bad_t_out[1] = 99.0;
+    bad_t_out[2] = 99.0;
+    const bad_r = try allocator.alloc(f32, 2);
+    bad_r[0] = 0.0;
+    bad_r[1] = 1.0;
+    const bad_r_out = try allocator.alloc(f32, 4);
+    bad_r_out[0] = 0.0;
+    bad_r_out[1] = 0.0;
+    bad_r_out[2] = 0.0;
+    bad_r_out[3] = 1.0;
+    const bad_ch = try allocator.alloc(AnimationChannel, 2);
+    bad_ch[0] = .{
+        .bone_index = 0,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = bad_t, .outputs = bad_t_out, .interpolation = .linear },
+    };
+    bad_ch[1] = .{
+        .bone_index = 0,
+        .target_path = .rotation,
+        .sampler = .{ .timestamps = bad_r, .outputs = bad_r_out, .interpolation = .step },
+    };
+    const ag_bad = try AnimationGroup.init(allocator, "bad", bad_ch, 1.0);
+    defer ag_bad.deinit();
+    ag_bad.play(true);
+
+    // Good clip: valid translation (z=20) + valid 90deg Y rotation.
+    const q1 = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+    const good_t = try allocator.alloc(f32, 1);
+    good_t[0] = 0.0;
+    const good_t_out = try allocator.alloc(f32, 3);
+    good_t_out[0] = 0.0;
+    good_t_out[1] = 0.0;
+    good_t_out[2] = 20.0;
+    const good_r = try allocator.alloc(f32, 1);
+    good_r[0] = 0.0;
+    const good_r_out = try allocator.alloc(f32, 4);
+    good_r_out[0] = q1.x;
+    good_r_out[1] = q1.y;
+    good_r_out[2] = q1.z;
+    good_r_out[3] = q1.w;
+    const good_ch = try allocator.alloc(AnimationChannel, 2);
+    good_ch[0] = .{
+        .bone_index = 0,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = good_t, .outputs = good_t_out },
+    };
+    good_ch[1] = .{
+        .bone_index = 0,
+        .target_path = .rotation,
+        .sampler = .{ .timestamps = good_r, .outputs = good_r_out },
+    };
+    const ag_good = try AnimationGroup.init(allocator, "good", good_ch, 1.0);
+    defer ag_good.deinit();
+    ag_good.play(true);
+
+    // 50/50 blend: bad side falls back to bind, so translation is the
+    // midpoint bind<->good (z=10), rotation is ~45deg Y. A truncated track
+    // writing 99s would fail both checks.
+    ag_bad.setWeight(0.5);
+    ag_good.setWeight(0.5);
+    const base_groups = [_]*AnimationGroup{ ag_bad, ag_good };
+    evaluateSkeleton(skel, &base_groups, &.{});
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), skel.bones[0].local_position.z, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 45.0), skel.bones[0].local_rotation.toEulerDeg().y, 0.5);
+
+    // Bad clip alone takes the fast path (single full-weight clip ->
+    // applyAtTime), which preserves the current pose when channels yield
+    // null. Seed a sentinel so preserve vs. bind-reset is distinguishable.
+    skel.bones[0].local_position = Vec3.new(7.0, 8.0, 9.0);
+    skel.bones[0].local_rotation = q1;
+    ag_bad.setWeight(1.0);
+    const single = [_]*AnimationGroup{ag_bad};
+    evaluateSkeleton(skel, &single, &.{});
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), skel.bones[0].local_position.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), skel.bones[0].local_position.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), skel.bones[0].local_position.z, 1e-6);
+    try std.testing.expectApproxEqAbs(q1.x, skel.bones[0].local_rotation.x, 1e-6);
+    try std.testing.expectApproxEqAbs(q1.y, skel.bones[0].local_rotation.y, 1e-6);
+    try std.testing.expectApproxEqAbs(q1.z, skel.bones[0].local_rotation.z, 1e-6);
+    try std.testing.expectApproxEqAbs(q1.w, skel.bones[0].local_rotation.w, 1e-6);
+}

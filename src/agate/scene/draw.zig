@@ -15,6 +15,7 @@ const CubeTexture = @import("../texture.zig").CubeTexture;
 const material_mod = @import("../material.zig");
 const StandardMaterial = material_mod.StandardMaterial;
 const PBRMaterial = material_mod.PBRMaterial;
+const Material = material_mod.Material;
 const passes = @import("../passes/mod.zig");
 
 const render_queue = @import("render_queue.zig");
@@ -496,6 +497,17 @@ fn pbrChannelSelectors(pbr_mat: ?*const PBRMaterial) [4]f32 {
     return .{ 0, 1, 2, 0 };
 }
 
+// Pipeline flags for one instanced group. Mirrors the regular-decal rule
+// (see cullNonInstancedMesh): is_decal forces the transparent blend
+// pipeline and the cull-off twin, so an instanced decal with an opaque
+// material draws exactly like a regular decal. Pure (no GPU calls).
+pub fn instancedDrawFlags(material: ?Material, is_decal: bool) struct { transparent: bool, double_sided: bool } {
+    return .{
+        .transparent = render_queue.materialIsTransparent(material) or is_decal,
+        .double_sided = render_queue.materialIsDoubleSided(material) or is_decal,
+    };
+}
+
 // Draws one instanced mesh with the currently visible instance buffer.
 // Transparent instanced meshes use the blend twin pipeline and are drawn
 // as-is (no per-instance back-to-front sort); the caller draws them
@@ -511,11 +523,11 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
     if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
 
     const is_pbr = if (mesh.material) |m| (m == .pbr) else false;
-    const transparent = render_queue.materialIsTransparent(mesh.material);
+    const flags = instancedDrawFlags(mesh.material, mesh.is_decal);
     const is_u32 = mesh.index_type == .UINT32;
     // Double-sided instanced meshes use the cull-off twins when the set
     // provides them; otherwise the regular pipelines (legacy behavior).
-    const pip_id = env.pipelines.forInstancedMesh(is_pbr, transparent, is_u32, render_queue.materialIsDoubleSided(mesh.material));
+    const pip_id = env.pipelines.forInstancedMesh(is_pbr, flags.transparent, is_u32, flags.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
         sg.applyPipeline(.{ .id = pip_id });
@@ -707,4 +719,24 @@ test "pbr uniform packing defaults are identity and glTF conventions" {
     try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0 }, &packed_offs[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &packed_mats[1]); // normal untouched
     try std.testing.expectEqualSlices(f32, &.{ 3, 1, 2, 0 }, &pbrChannelSelectors(&mat));
+}
+
+test "instanced decal forces transparent + double-sided like regular decals" {
+    var opaque_mat = StandardMaterial.init("opaque");
+    const solid_mat: Material = .{ .standard = &opaque_mat };
+    // No material, no decal: opaque single-sided (legacy behavior).
+    const plain = instancedDrawFlags(null, false);
+    try std.testing.expect(!plain.transparent and !plain.double_sided);
+    // Opaque material, no decal: stays opaque single-sided.
+    const solid = instancedDrawFlags(solid_mat, false);
+    try std.testing.expect(!solid.transparent and !solid.double_sided);
+    // The regression: opaque material + is_decal must draw as transparent
+    // double-sided, matching cullNonInstancedMesh for regular decals.
+    const decal = instancedDrawFlags(solid_mat, true);
+    try std.testing.expect(decal.transparent and decal.double_sided);
+    // Blend material is transparent without the decal flag; double-sided
+    // still follows the material alone here.
+    opaque_mat.alpha_mode = .blend;
+    const blended = instancedDrawFlags(solid_mat, false);
+    try std.testing.expect(blended.transparent and !blended.double_sided);
 }

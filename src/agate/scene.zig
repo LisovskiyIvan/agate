@@ -212,9 +212,10 @@ pub const Scene = struct {
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
     render_outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
 
-    /// Mailbox for publishing frame snapshots from the simulation thread.
-    /// The render thread consumes the newest snapshot without holding coarse
-    /// locks during GPU draw calls, enabling strictly non-blocking rendering.
+    /// Mailbox for publishing frame-level camera/light/pass state from the
+    /// simulation thread. Meshes and materials are still live scene objects,
+    /// so threaded applications must keep coarse phase ownership through the
+    /// complete render until a full per-item render payload exists.
     frame_handoff: handoff_mod.Handoff(scene_snapshot.SceneFrameSnapshot, 2) = .{},
     /// Last consumed frame snapshot.
     frame_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
@@ -621,17 +622,78 @@ pub const Scene = struct {
         }
     }
 
+    /// Viewport-aware picking ray. In multi-camera mode the visually relevant
+    /// enabled camera under the cursor wins (draw overlay order: active first,
+    /// then the rest in index order, topmost covering entry). Falls back to a
+    /// forward ray from the origin when no camera covers the cursor (or no
+    /// camera exists); pick() maps the same case to PickingInfo{} (no hit).
+    /// Fullscreen viewports reduce to the legacy whole-window formula.
     pub fn createPickingRay(self: *Scene, screen_x: f32, screen_y: f32) Ray {
-        const cam = self.active_camera orelse return Ray.new(Vec3.zero, Vec3.forward);
-        return scene_picking.createPickingRay(cam, screen_x, screen_y);
+        const w = sapp.widthf();
+        const h = sapp.heightf();
+        if (w <= 0.0 or h <= 0.0) return Ray.new(Vec3.zero, Vec3.forward);
+        if (self.enable_multi_camera and self.cameras.items.len > 0) {
+            const idx = scene_picking.selectPickIndex(
+                self.cameras.items,
+                self.active_camera_index,
+                screen_x,
+                screen_y,
+                w,
+                h,
+            ) orelse return Ray.new(Vec3.zero, Vec3.forward);
+            const entry = self.cameras.items[idx];
+            return scene_picking.createPickingRayViewport(entry.camera, screen_x, screen_y, w, h, entry.viewport);
+        }
+        if (self.active_camera) |cam| {
+            const vp = if (self.active_camera_index) |ai| (if (ai < self.cameras.items.len)
+                self.cameras.items[ai].viewport
+            else
+                cam.getViewport()) else cam.getViewport();
+            if (!scene_picking.viewportContainsPoint(vp, screen_x, screen_y, w, h)) {
+                return Ray.new(cam.getPosition(), Vec3.forward);
+            }
+            return scene_picking.createPickingRayViewport(cam, screen_x, screen_y, w, h, vp);
+        }
+        return Ray.new(Vec3.zero, Vec3.forward);
     }
 
     pub fn pickWithRay(self: *Scene, r: Ray) PickingInfo {
         return scene_picking.pickWithRay(self.meshes.items, self.physics.getWorld(), r);
     }
 
+    /// Viewport-aware pick: resolves the camera like createPickingRay but
+    /// returns PickingInfo{} (no hit) when no enabled camera covers the
+    /// cursor, instead of casting a fallback ray into the scene.
     pub fn pick(self: *Scene, screen_x: f32, screen_y: f32) PickingInfo {
+        const w = sapp.widthf();
+        const h = sapp.heightf();
+        if (w <= 0.0 or h <= 0.0) return PickingInfo{};
+        if (self.enable_multi_camera and self.cameras.items.len > 0) {
+            const idx = scene_picking.selectPickIndex(
+                self.cameras.items,
+                self.active_camera_index,
+                screen_x,
+                screen_y,
+                w,
+                h,
+            ) orelse return PickingInfo{};
+            const entry = self.cameras.items[idx];
+            const r = scene_picking.createPickingRayViewport(entry.camera, screen_x, screen_y, w, h, entry.viewport);
+            return self.pickWithRay(r);
+        }
         const r = self.createPickingRay(screen_x, screen_y);
+        // Single-camera PIP: cursor outside the viewport is a clean miss.
+        if (self.active_camera) |cam| {
+            const vp = if (self.active_camera_index) |ai| (if (ai < self.cameras.items.len)
+                self.cameras.items[ai].viewport
+            else
+                cam.getViewport()) else cam.getViewport();
+            if (!scene_picking.viewportContainsPoint(vp, screen_x, screen_y, w, h)) {
+                return PickingInfo{};
+            }
+        } else {
+            return PickingInfo{};
+        }
         return self.pickWithRay(r);
     }
 
@@ -801,7 +863,14 @@ pub const Scene = struct {
         });
 
         std.mem.sort(RenderMeshItem, self.queues.items.items, {}, scene_render_queue.sortRenderItems);
-        std.mem.sort(RenderMeshItem, self.queues.transparent.items, {}, scene_render_queue.sortTransparentBackToFront);
+        // Unified transparent order: regular + instanced groups globally
+        // back-to-front by group distance (one entry per batch).
+        std.mem.sort(
+            scene_render_queue.TransparentDrawEntry,
+            self.queues.transparent_order.items,
+            {},
+            scene_render_queue.sortTransparentDrawOrder,
+        );
 
         const frame_ctx = FrameContext{
             .view_proj = view_proj,
@@ -833,14 +902,22 @@ pub const Scene = struct {
             scene_draw.drawInstancedMesh(&env, mesh, &frame_ctx, &current_pipeline_id);
         }
 
-        // Transparent regular meshes (strict back-to-front, blended).
-        for (self.queues.transparent.items) |item| {
-            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id);
-        }
-
-        // Transparent instanced meshes.
-        for (self.queues.transparent_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(&env, mesh, &frame_ctx, &current_pipeline_id);
+        // Transparent pass: regular items and instanced groups interleaved in
+        // one global back-to-front order (each instanced group draws as a
+        // single batch at its sorted position; no per-instance sorting).
+        for (self.queues.transparent_order.items) |entry| {
+            switch (entry.kind) {
+                .regular => {
+                    if (entry.index < self.queues.transparent.items.len) {
+                        scene_draw.drawRegularItem(&env, self.queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id);
+                    }
+                },
+                .instanced => {
+                    if (entry.index < self.queues.transparent_instanced.items.len) {
+                        scene_draw.drawInstancedMesh(&env, self.queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id);
+                    }
+                },
+            }
         }
 
         // Inverse-hull outline for highlighted meshes
@@ -959,9 +1036,9 @@ pub const Scene = struct {
         }
     }
 
-    /// Stage 3: prepares GPU uploads and acquires the frame snapshot.
-    /// In threaded mode, calling this under the brief handoff lock (<0.05 ms)
-    /// allows render() to execute all GPU passes completely unlocked.
+    /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.
+    /// Threaded callers hold phase ownership through this call and render():
+    /// render still reads live mesh/material state not carried by the snapshot.
     pub fn prepareFrame(self: *Scene) void {
         if (self.uploads) |*q| _ = q.drain();
         self.flushPendingGpuUploads();
@@ -1373,4 +1450,3 @@ test "publishFrameSnapshot and prepareFrame snapshot handoff" {
     try std.testing.expectEqual(@as(i32, 1920), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 1080), scene.frame_snapshot.screen_h);
 }
-

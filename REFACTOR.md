@@ -8,7 +8,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 |---|---|---|
 | 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
 | 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
-| 3. Simulation/render decoupling | threads, non-blocking render, full payload | [x] done |
+| 3. Simulation/render decoupling | threads, coarse phase ownership, partial payload | [~] safe; non-blocking pending |
 
 ## What exists (as built)
 
@@ -49,7 +49,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
   chunked parallel pass; chunks partition the mesh list in fixed order
   and merge in chunk order, so queues and stats match the serial loop
   exactly (3000-mesh equivalence test). Active above
-  `FrameCullContext.parallel_min_meshes` (default 1024). Instance-bearing
+  `FrameCullContext.parallel_min_meshes` (default 128). Instance-bearing
   meshes stay serial (they own sg buffer uploads).
 - Update-side `sg.*` calls eliminated: particles, trails, and mesh
   morphs stage CPU data and set dirty flags; `Scene.flushPendingGpuUploads()`
@@ -69,9 +69,8 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
   Measured (Debug): DamagedHelmet critical path 169 -> 10 ms, Fox
   41 -> 11 ms; one drain observed patching 7 textures.
 - Sync mode (default elsewhere) is unchanged.
-- Serialization save off-thread: [ ] blocked on a scene quiesce/snapshot
-  story (state holds pointers; capture-then-marshal races the main
-  thread).
+- Serialization save/load runs off-thread after an owned `SceneState` capture;
+  restore is applied explicitly on the game thread.
 
 ### Stage 3 — simulation/render decoupling [~]
 
@@ -105,18 +104,15 @@ Known limitations of the shipped split:
 
 ## What remains (TODO, in priority order)
 
-1. [x] **Full per-item frame payload / strictly non-blocking render.**
-   Converted all read-during-render state into published records and snapshots:
-   - per drawn item: model Mat4, compact `MaterialDrawRecord` (~120 B: factors,
-     uv transforms, cutoff, texture views and samplers), `receive_shadows`,
-   - skeleton skin palettes (`[2][MAX_BONES]Mat4` double-buffered with atomic
-     release/acquire slots),
-   - morph weights and texture view packaged into `RenderMeshItem`,
-   - `CameraSnapshot` and `SceneFrameSnapshot` capturing derived cameras,
-     sun direction/color/intensity, CSM cascades, light packs, skybox,
-     clear color, MSAA, outline, SSAO, and post-process options.
-   `Scene.prepareFrame()` consumes the snapshot under the brief handoff lock (<0.05 ms),
-   and `Scene.render()` executes all GPU passes completely outside `phase_mutex`.
+1. [ ] **Full per-item frame payload / strictly non-blocking render.**
+   Partial groundwork exists: `MaterialDrawRecord`, double-buffered skin
+   palettes, morph data in `RenderMeshItem`, plus `CameraSnapshot` and
+   `SceneFrameSnapshot` for camera/light/pass state. It is not a complete
+   render snapshot: queue construction, shadows, instancing and draw paths
+   still read live `Mesh`/`Material` state and write transform caches.
+   Therefore `phase_mutex` intentionally spans `prepareFrame() + render()`.
+   Unlock render only after every pass consumes immutable per-frame records
+   with explicit resource lifetime guarantees.
 2. [x] **Sandbox joins the split.** Raw sapp event ring buffer feeding
    game-thread UI event handling, state mutations directly on the game
    thread, `flushPendingGpuUploads` for morph targets, `threaded = true`
@@ -177,3 +173,171 @@ Known limitations of the shipped split:
   in favor of jobs (requires owning the whole submission model).
 - **Godot / bgfx**: thread-safe command queue consumed by the render
   thread — closest to what a full-payload agate looks like.
+
+## Аудит 2026-09-15: состояние, ошибки, куда двигаться
+
+Дата: 2026-09-15. Первичный метод: статический аудит кода; затем исправления,
+независимый review и проверки ниже. Пути относительно `agate/`, кроме `sandbox/`.
+Вывод: широта возможностей опережает надёжность их совместной работы.
+Следующий шаг — стабилизация потоковой модели, ресурсов и рендера, а не новые эффекты.
+
+### 1. Критично: simulation/render разделены на потоки, но данные не разделены — исправлено стабилизацией
+
+- `src/main.zig:205-212`, `sandbox/src/main.zig:359-364`: mutex защищает только
+  `prepareFrame()`, затем `scene.render()` работает без него.
+- Рендер читает живую сцену: `src/agate/scene.zig:780-800`
+  (`self.meshes.items`), `src/agate/scene/render_queue.zig:161-183`
+  (`worldMatrixCached`), игровой поток параллельно пишет TRS
+  (`src/main.zig:172-173`).
+- `SceneFrameSnapshot` содержит камеры/свет/настройки, но не независимый снимок
+  мешей и материалов: `src/agate/scene/snapshot.zig:41-85`.
+- Оба потока используют `jobs.global`, хотя `Pool.forkJoin()` single-producer:
+  `src/agate/jobs.zig:140`. Возможны потеря dispatch и зависание.
+- Действие: сначала вернуть mutex на весь `prepareFrame() + render()` в обоих
+  приложениях; убрать утверждение о завершённом независимом рендере; настоящий
+  concurrent render делать отдельной задачей с неизменяемыми render-records.
+- Статус: mutex снова охватывает полный render в `agate` и `sandbox`; общий
+  single-producer pool больше не вызывается двумя producer одновременно.
+- Проверка: CPU-частицы выше порога 4096 + сотни мешей в рендере; анимации,
+  изменение материалов, создание/удаление объектов. Smoke с кубом недостаточен.
+
+### 2. Высокий приоритет: ошибочный `free` при загрузке кубмапы — исправлено
+
+- `CubeTexture.fromFiles()`: `src/agate/texture.zig:944-974`.
+- `face_data` стартует как `undefined`; при неквадратной грани или несовпадении
+  размеров освобождается `0..i+1`, хотя `face_data[i]` присваивается позже.
+- Дополнительно: отказ `dupeZ()` на следующей грани оставляет ранее загруженные
+  изображения без очистки.
+- Действие: счётчик успешно загруженных граней + единый `defer`; регистрировать
+  `data` до последующих проверок.
+- Статус: введены `loaded` + единый sized-defer; текущая грань освобождается
+  явно при ошибке валидации. Заодно закрыто переполнение RGBA8 size arithmetic.
+- Проверка: первая неквадратная грань; несовпадение размеров на 2-й и 6-й;
+  отсутствующий файл после успешных загрузок; отказ аллокатора. Одного
+  `std.testing.allocator` недостаточно: освобождение идёт через `stbi_image_free`.
+
+### 3. Высокий приоритет: частичный отказ `spawn` может повесить инициализацию — исправлено
+
+- `Pool.init()`: `src/agate/jobs.zig:106-110`.
+- `TaskRunner.init()`: `src/agate/jobs.zig:298-302`.
+- При отказе позднего `spawn` `errdefer` делает `join()` без `quit`/`broadcast`,
+  worker ждёт работу, инициализатор ждёт worker.
+- Действие: на частичном отказе выполнить `quit → broadcast → join` только
+  созданных потоков, затем освободить ресурсы.
+- Статус: оба init-пути сигналят shutdown, join-ят созданный prefix и уничтожают
+  pthread mutex/cond на всех error-path после инициализации `self`.
+- Проверка: управляемый отказ второго/третьего `spawn`; должен вернуться error,
+  а не зависнуть.
+
+### 4. Анимация: усечённые bone-треки без bounds-check — исправлено
+
+- LINEAR/STEP-пути: `src/agate/animation/sampler.zig:138-163`,
+  `src/agate/animation/sampler.zig:173-220`.
+- Node-пути guard есть через `samplerHasFrames()`, bone-пути вызывают сэмплер
+  напрямую: `src/agate/animation/group.zig:516-537`.
+- Действие: применить существующую проверку к bone LINEAR/STEP; поведение cubic
+  не менять.
+- Статус: malformed LINEAR/STEP пропускаются с сохранением позы; безопасный
+  прежний fallback CUBICSPLINE сохранён и закреплён тестами.
+- Проверка: bone-аналог `NodeChannel invalid targets and samplers never crash`
+  (`src/agate/animation/tests.zig:389`), включая `applyAtTime` и блендинг скелета.
+
+### 5. Прозрачность сортируется не в общем порядке — исправлено
+
+- `src/agate/scene.zig:803-844`: сначала все прозрачные regular, затем все
+  прозрачные instanced без сортировки по расстоянию
+  (`src/agate/scene/render_queue.zig:438-439`).
+- Действие: общая прозрачная очередь либо слияние двух очередей по distance-key.
+- Статус: введён единый retained order для regular/instanced batches со строгой
+  back-to-front сортировкой; instanced decals согласованы с blend/cull-off draw.
+- Проверка: regular/instanced на 15/10/5 м, порядок `15 → 10 → 5`.
+- Не путать с OIT и per-instance сортировкой внутри draw call — отдельные лимиты.
+
+### 6. Picking не соответствует viewport камеры — исправлено
+
+- `createPickingRay()` всегда использует размер окна:
+  `src/agate/scene/picking.zig:17-27`; рендер строит проекцию по viewport:
+  `src/agate/scene.zig:893-905`.
+- Действие: общий расчёт viewport для рендера/picking/projection; выбор камеры
+  под курсором для PIP.
+- Статус: ray использует тот же округлённый pixel rect/aspect, а PIP выбирает
+  верхнюю включённую камеру под курсором. Instanced picking остаётся backlog.
+- Проверка: центр/углы смещённого viewport, клик вне него, перекрывающиеся камеры.
+- Отсутствие picking инстансов задокументировано в `picking.zig:36` — недостающая
+  возможность, а не скрытый баг.
+
+### 7. Пакет не самодостаточен для внешнего подключения — исправлено в manifest/build graph
+
+- `.paths` включает только build-файлы и `src`: `build.zig.zon:40-47`.
+- Сборка требует `examples/shader_materials/ramp_wave.glsl` (`build.zig:42-44`)
+  и `tools/test_runner.zig` (`build.zig:368`).
+- `sandbox/build.zig.zon:7-9` использует `.path = "../agate"` и маскирует проблему.
+- Действие: включить нужные файлы в `.paths`; проверить упакованный пакет
+  отдельным потребителем. Обычной сборке убрать скрытую перезапись
+  `src/agate/tests.zig` (`build.zig:115-123`): вынести регенерацию в явный шаг.
+- Статус: `.paths` включает test runner и каталог shader snippets; обычный build
+  не пишет source tree; `zig build update-tests` — единственный явный regen,
+  `zig build test` проверяет stale registry. `run` теперь передаёт `b.args`.
+
+### Проверено и отведено как ложные срабатывания
+
+- `UploadQueue.requestMemory`: утечки нет, владение переходит только при успехе,
+  caller освобождает при ошибке (`src/agate/assets.zig:175-199`,
+  `src/agate/loader/materials.zig:249-253`). Осталась только неоднозначность
+  комментария о владении.
+- `applyTorqueImpulse`: Box3D сам будит тело в `b3Body_SetAngularVelocity`
+  (`src/agate/c/box3d/src/body.c:1178-1211`). Осталось недокументированное
+  упрощение mass вместо inertia tensor.
+
+### Чего не хватает
+
+1. Матрица интеграционных сцен: threaded/serial, regular/instanced/skinned/morph,
+   opaque/cutout/blend/double-sided, одна камера/PIP, post/MSAA,
+   загрузка/изменение/удаление ресурсов.
+2. README, CI и проверка реально fetched/archive-пакета; в `roadmap.md` есть устаревшие статусы
+   (например, DoF/MSAA помечены отсутствующими при наличии кода).
+3. Контракты владения и отложенное освобождение ресурсов до дальнейшего
+   распараллеливания.
+4. Сохранение игры: устойчивые ID, связи объектов, игровое состояние, версия
+   формата. Текущий serializer намеренно хранит только состояние существующей
+   сцены (`src/agate/serialization.zig:55-61`).
+5. Метрики: CPU simulation/render submission отдельно, ожидание mutex/jobs,
+   p95/p99, upload bytes/frame, память текстур/геометрии.
+6. Asset pipeline раньше новых эффектов: mip-цепочки, сжатые текстуры, кэш импорта.
+
+### Порядок работ
+
+1. [x] Стабилизация: потоки, `spawn`, кубмапы, bounds-check анимаций.
+2. [~] Воспроизводимость: package paths и test-registry готовы; README/CI и
+   archive-consumer check остаются.
+3. [~] Согласованность рендера: прозрачная очередь и viewport-aware picking
+   готовы; visual-regression сцены остаются.
+4. Одна небольшая законченная игра как проверка движка.
+5. Оптимизация только по профилю.
+
+### Выполненные проверки
+
+```sh
+# В agate/: успешно
+zig build update-tests                 # повторный запуск идемпотентен
+zig build test                         # 563/563
+zig build test -Doptimize=ReleaseSafe # 563/563
+zig build
+zig build -Doptimize=ReleaseSafe
+zig build run -- --frames 30
+zig build run -- --frames 30 --no-threads
+zig build run -- --frames 30 --msaa 4
+
+# В sandbox/: успешно
+zig build
+zig build run -- --frames 120
+zig build run -- --test-pip
+zig build run -- --test-save
+zig build bench -Doptimize=ReleaseFast
+```
+
+Изменённые Zig-файлы проходят `zig fmt --check`. Общий `zig build fmt` пока
+падает на семи неизменённых ранее неформатированных файлах; они не затрагивались.
+Sandbox dependency-build не изменяет `src/agate/tests.zig`. Отдельный
+`zig fetch .` дважды завис без вывода, поэтому fetched/archive package и ручная
+визуальная проверка прозрачности остаются незакрытыми проверками.

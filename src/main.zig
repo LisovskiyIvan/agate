@@ -203,13 +203,13 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Handoff point (<0.05 ms): flush GPU uploads and consume the published snapshot.
+        // Stabilization: hold phase_mutex across prepareFrame AND render.
+        // render() reads live meshes/materials and uses the shared
+        // single-producer jobs.global pool, so it must not overlap gameLoop.
         phase_mutex.lock();
         scene.prepareFrame();
-        phase_mutex.unlock();
-
-        // Strictly non-blocking render: GPU passes execute without holding phase_mutex.
         scene.render();
+        phase_mutex.unlock();
     } else {
         simulate(@floatCast(sapp.frameDuration()));
         scene.render();

@@ -98,6 +98,17 @@ fn particleDotAlpha(x: u32, y: u32, center: f32, radius: f32) u8 {
     return @intFromFloat(std.math.clamp(alpha_f * 255.0, 0.0, 255.0));
 }
 
+/// Checked RGBA8 face size (size*size*4). The old u32 `size * size * 4`
+/// wrapped to a small value for large sizes, causing undersized allocations
+/// and OOB writes. Uses the file's ImageTooLarge/InvalidDimensions
+/// conventions; returns usize for direct use as an alloc length.
+fn checkedFaceBytes(size: u32) !usize {
+    if (size == 0) return error.InvalidDimensions;
+    const pixels = std.math.mul(u32, size, size) catch return error.ImageTooLarge;
+    const bytes = std.math.mul(u32, pixels, 4) catch return error.ImageTooLarge;
+    return @as(usize, bytes);
+}
+
 pub const Texture = struct {
     image: sg.Image,
     view: sg.View,
@@ -444,8 +455,8 @@ pub const Texture = struct {
     }
 
     pub fn createParticleDot(allocator: std.mem.Allocator, size: u32) !Texture {
-        const pixel_count = size * size;
-        const buffer = try allocator.alloc(u8, pixel_count * 4);
+        const byte_count = try checkedFaceBytes(size);
+        const buffer = try allocator.alloc(u8, byte_count);
         defer allocator.free(buffer);
 
         const center: f32 = @as(f32, @floatFromInt(size)) * 0.5 - 0.5;
@@ -457,7 +468,7 @@ pub const Texture = struct {
             while (x < size) : (x += 1) {
                 const alpha = particleDotAlpha(x, y, center, radius);
 
-                const idx = (y * size + x) * 4;
+                const idx: usize = (@as(usize, y) * @as(usize, size) + @as(usize, x)) * 4;
                 buffer[idx + 0] = 255;
                 buffer[idx + 1] = 255;
                 buffer[idx + 2] = 255;
@@ -755,13 +766,13 @@ pub const CubeTexture = struct {
     }
 
     pub fn initRawFaces(allocator: std.mem.Allocator, size: u32, faces: [6][]const u8, generate_mips: bool) !CubeTexture {
-        const face_bytes = size * size * 4;
+        const face_bytes = try checkedFaceBytes(size);
         for (faces) |face| {
             if (face.len != face_bytes) return error.InvalidFaceBufferSize;
         }
 
         // Concatenate 6 faces for mip 0
-        const mip0_total_bytes = 6 * face_bytes;
+        const mip0_total_bytes = std.math.mul(usize, face_bytes, 6) catch return error.ImageTooLarge;
         const mip0_buffer = try allocator.alloc(u8, mip0_total_bytes);
         defer allocator.free(mip0_buffer);
 
@@ -803,12 +814,13 @@ pub const CubeTexture = struct {
             // @max(1, ...) keeps NPOT chains alive (e.g. 3 -> 1) instead of
             // hitting a zero-sized level; POT chains are unchanged.
             const cur_size: u32 = @max(1, prev_size / 2);
-            const cur_total_bytes = 6 * cur_size * cur_size * 4;
+            const cur_face_checked = try checkedFaceBytes(cur_size);
+            const cur_total_bytes = std.math.mul(usize, cur_face_checked, 6) catch return error.ImageTooLarge;
             const cur_buf = try allocator.alloc(u8, cur_total_bytes);
             mip_buffers[m] = cur_buf;
 
             const prev_face_bytes: usize = @as(usize, prev_size) * @as(usize, prev_size) * 4;
-            const cur_face_bytes: usize = @as(usize, cur_size) * @as(usize, cur_size) * 4;
+            const cur_face_bytes: usize = cur_face_checked;
             for (0..6) |face| {
                 const src_face = prev_buf[face * prev_face_bytes .. (face + 1) * prev_face_bytes];
                 const dst_face = cur_buf[face * cur_face_bytes .. (face + 1) * cur_face_bytes];
@@ -846,7 +858,7 @@ pub const CubeTexture = struct {
 
     pub fn createProceduralSkybox(allocator: std.mem.Allocator, config: SkyboxOptions) !CubeTexture {
         const size = config.size;
-        const face_bytes = size * size * 4;
+        const face_bytes = try checkedFaceBytes(size);
 
         var face_slices: [6][]u8 = undefined;
         var allocated_faces: usize = 0;
@@ -919,7 +931,7 @@ pub const CubeTexture = struct {
                         }
                     }
 
-                    const out_idx = (py * size + px) * 4;
+                    const out_idx: usize = (@as(usize, py) * @as(usize, size) + @as(usize, px)) * 4;
                     inline for (0..3) |c_idx| {
                         const byte_val = std.math.clamp(color[c_idx] * 255.0, 0.0, 255.0);
                         buf[out_idx + c_idx] = @intFromFloat(byte_val);
@@ -943,6 +955,12 @@ pub const CubeTexture = struct {
 
     pub fn fromFiles(allocator: std.mem.Allocator, face_paths: [6][]const u8) !CubeTexture {
         var face_data: [6][*c]u8 = undefined;
+        // Single ownership scheme: `loaded` counts fully validated faces.
+        // The defer frees exactly those on every exit — error returns after
+        // a `try` (e.g. dupeZ OOM) or decode failure, and the success path
+        // after initRawFaces has copied the pixels for GPU upload.
+        var loaded: usize = 0;
+        defer for (face_data[0..loaded]) |d| c.stbi_image_free(d);
         var size: u32 = 0;
 
         for (face_paths, 0..) |path, i| {
@@ -954,27 +972,27 @@ pub const CubeTexture = struct {
             var comp: c_int = 0;
             const data = c.stbi_load(path_z.ptr, &w, &h, &comp, 4);
             if (data == null) {
-                // Free previously loaded
-                for (0..i) |prev| c.stbi_image_free(face_data[prev]);
                 return error.ImageDecodeFailed;
             }
+            if (w <= 0 or h <= 0) {
+                c.stbi_image_free(data);
+                return error.InvalidDimensions;
+            }
             if (w != h) {
-                for (0..i + 1) |prev| c.stbi_image_free(face_data[prev]);
+                c.stbi_image_free(data);
                 return error.CubeFaceMustBeSquare;
             }
             if (i == 0) {
                 size = @intCast(w);
             } else if (@as(u32, @intCast(w)) != size) {
-                for (0..i + 1) |prev| c.stbi_image_free(face_data[prev]);
+                c.stbi_image_free(data);
                 return error.CubeFacesMustHaveEqualSize;
             }
             face_data[i] = data;
-        }
-        defer {
-            for (0..6) |i| c.stbi_image_free(face_data[i]);
+            loaded += 1;
         }
 
-        const face_bytes = size * size * 4;
+        const face_bytes = try checkedFaceBytes(size);
         var const_faces: [6][]const u8 = undefined;
         for (0..6) |i| {
             const_faces[i] = face_data[i][0..face_bytes];
@@ -1000,10 +1018,11 @@ pub const CubeTexture = struct {
         );
         if (p_data == null) return error.ImageDecodeFailed;
         defer c.stbi_image_free(p_data);
+        if (pw <= 0 or ph <= 0) return error.InvalidDimensions;
 
         const pano_w: u32 = @intCast(pw);
         const pano_h: u32 = @intCast(ph);
-        const face_bytes = face_size * face_size * 4;
+        const face_bytes = try checkedFaceBytes(face_size);
 
         var face_slices: [6][]u8 = undefined;
         var allocated_faces: usize = 0;
@@ -1021,8 +1040,8 @@ pub const CubeTexture = struct {
                 while (px < face_size) : (px += 1) {
                     const d = cubeTexelDirection(face, px, py, face_size);
                     const t = panoramaTexel(d, pano_w, pano_h);
-                    const p_idx = (t.y * pano_w + t.x) * 4;
-                    const out_idx = (py * face_size + px) * 4;
+                    const p_idx: usize = (@as(usize, t.y) * @as(usize, pano_w) + @as(usize, t.x)) * 4;
+                    const out_idx: usize = (@as(usize, py) * @as(usize, face_size) + @as(usize, px)) * 4;
 
                     @memcpy(buf[out_idx .. out_idx + 4], p_data[p_idx .. p_idx + 4]);
                 }
@@ -1142,8 +1161,8 @@ pub const CubeTexture = struct {
                 while (px < size) : (px += 1) {
                     const d = cubeTexelDirection(face, px, py, size);
                     const t = panoramaTexel(d, width, height);
-                    const p_idx = (t.y * width + t.x) * 4;
-                    const out_idx = (py * size + px) * 4;
+                    const p_idx: usize = (@as(usize, t.y) * @as(usize, width) + @as(usize, t.x)) * 4;
+                    const out_idx: usize = (@as(usize, py) * @as(usize, size) + @as(usize, px)) * 4;
                     for (0..4) |ch| {
                         out[out_idx + ch] = Texture.floatToHalfBits(rgba[p_idx + ch]);
                     }
@@ -1909,5 +1928,80 @@ test "buildRawFacesHdr validates size and face buffers" {
     try std.testing.expectError(
         error.InvalidFaceBufferSize,
         CubeTexture.buildRawFacesHdr(allocator, 2, faces),
+    );
+}
+
+test "checkedFaceBytes rejects empty and overflowing sizes" {
+    try std.testing.expectError(error.InvalidDimensions, checkedFaceBytes(0));
+    // 100000^2 overflows u32: old `size * size * 4` wrapped to a small
+    // alloc size; now ImageTooLarge before any allocation or GPU upload.
+    try std.testing.expectError(error.ImageTooLarge, checkedFaceBytes(100000));
+    try std.testing.expectEqual(@as(usize, 2 * 2 * 4), try checkedFaceBytes(2));
+}
+
+test "createParticleDot validates size without GPU upload" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        Texture.createParticleDot(allocator, 0),
+    );
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        Texture.createParticleDot(allocator, 100000),
+    );
+}
+
+test "initRawFaces validates dimensions without GPU upload" {
+    const allocator = std.testing.allocator;
+    const empty_faces: [6][]const u8 = @splat(&.{});
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.initRawFaces(allocator, 0, empty_faces, false),
+    );
+    // Huge size fails on checked arithmetic before face-length checks.
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        CubeTexture.initRawFaces(allocator, 100000, empty_faces, false),
+    );
+    // Small size with short faces fails on length validation (no GPU).
+    var one_pixel: [4]u8 = .{ 1, 2, 3, 255 };
+    const bad_faces: [6][]const u8 = .{
+        one_pixel[0..2], &one_pixel, &one_pixel, &one_pixel, &one_pixel, &one_pixel,
+    };
+    try std.testing.expectError(
+        error.InvalidFaceBufferSize,
+        CubeTexture.initRawFaces(allocator, 1, bad_faces, false),
+    );
+}
+
+test "createProceduralSkybox rejects empty size" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        CubeTexture.createProceduralSkybox(allocator, .{ .size = 0 }),
+    );
+}
+
+test "fromFiles reports missing faces without freeing uninitialized memory" {
+    const allocator = std.testing.allocator;
+    // First face missing: loaded == 0, the sized defer frees nothing.
+    // C stbi allocations are not tracked by std.testing.allocator; this
+    // only asserts the error contract, not leak accounting.
+    const missing: [6][]const u8 = @splat("definitely/missing/face.png");
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        CubeTexture.fromFiles(allocator, missing),
+    );
+}
+
+test "fromEquirectangular rejects huge faces before allocation" {
+    const allocator = std.testing.allocator;
+    // 1x1 RGBA PNG through the in-file fixture builder (no GPU involved).
+    const scanlines = [_]u8{ 0, 10, 20, 30, 255 };
+    const png = try TestPng.build(allocator, 1, 1, 8, 6, null, &scanlines);
+    defer allocator.free(png);
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        CubeTexture.fromEquirectangular(allocator, png, 100000),
     );
 }

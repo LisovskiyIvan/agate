@@ -41,8 +41,11 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        // Referenced by build.zig outside src/: vendored test runner (only
+        // needed for `zig build test`) and the user shader snippet dir backing
+        // the growing `user_shader_materials` table. Narrow paths to avoid
+        // shipping unrelated artifacts (e.g. tools/generate_font_sdf.py).
+        "tools/test_runner.zig",
+        "examples/shader_materials",
     },
 }

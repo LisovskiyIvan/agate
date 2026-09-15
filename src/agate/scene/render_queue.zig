@@ -58,6 +58,20 @@ pub const RenderMeshItem = struct {
     morph_view: sg.View = .{},
 };
 
+/// One transparent draw in the unified back-to-front pass. Regular items
+/// index `queues.transparent`, instanced groups index
+/// `queues.transparent_instanced`; both draw as a single batch at their
+/// sorted position (no per-instance sorting/OIT). `seq` is the insertion
+/// order and only breaks exact distance ties deterministically.
+pub const TransparentKind = enum { regular, instanced };
+pub const TransparentDrawEntry = struct {
+    distance_sq: f32,
+    seq: u32,
+    kind: TransparentKind,
+    index: u32,
+    is_decal: bool,
+};
+
 /// The four draw queues plus the per-frame instance-matrix staging buffer.
 /// Cleared and refilled by buildFrameQueues each render(); ownership stays
 /// with Scene via a single field.
@@ -69,6 +83,10 @@ pub const RenderQueues = struct {
     opaque_instanced: std.ArrayListUnmanaged(*Mesh) = .empty,
     transparent_instanced: std.ArrayListUnmanaged(*Mesh) = .empty,
     instance_matrices: std.ArrayListUnmanaged(Mat4) = .empty,
+    // Unified transparent draw order across regular + instanced groups,
+    // sorted by sortTransparentDrawOrder in renderSceneView. Retained
+    // across frames (clearRetainingCapacity in reset: no per-frame churn).
+    transparent_order: std.ArrayListUnmanaged(TransparentDrawEntry) = .empty,
 
     pub fn reset(self: *RenderQueues) void {
         self.items.clearRetainingCapacity();
@@ -76,6 +94,7 @@ pub const RenderQueues = struct {
         self.opaque_instanced.clearRetainingCapacity();
         self.transparent_instanced.clearRetainingCapacity();
         self.instance_matrices.clearRetainingCapacity();
+        self.transparent_order.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderQueues, allocator: std.mem.Allocator) void {
@@ -84,6 +103,7 @@ pub const RenderQueues = struct {
         self.opaque_instanced.deinit(allocator);
         self.transparent_instanced.deinit(allocator);
         self.instance_matrices.deinit(allocator);
+        self.transparent_order.deinit(allocator);
     }
 };
 
@@ -95,6 +115,22 @@ pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
         return a.texture_id < b.texture_id;
     }
     return a.distance_sq < b.distance_sq;
+}
+
+// Unified transparent order: globally back-to-front by exact group distance
+// so regular and instanced transparents interleave correctly. Strict weak
+// ordering (exact distance, then decal, then insertion sequence — never an
+// epsilon band, which would be non-transitive: a≈b and b≈c need not imply
+// a≈c). Exact ties (e.g. coplanar surfaces) keep decals after non-decals,
+// then insertion order, for a deterministic result.
+pub fn sortTransparentDrawOrder(_: void, a: TransparentDrawEntry, b: TransparentDrawEntry) bool {
+    if (a.distance_sq != b.distance_sq) {
+        return a.distance_sq > b.distance_sq;
+    }
+    if (a.is_decal != b.is_decal) {
+        return !a.is_decal;
+    }
+    return a.seq < b.seq;
 }
 
 // Transparent items sort strictly back-to-front (by squared camera
@@ -284,10 +320,26 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
     }
 }
 
-/// Routes a finished record into the draw queue it belongs to.
+/// Routes a finished record into the draw queue it belongs to. Transparent
+/// regulars also append a unified order entry (index into
+/// queues.transparent); instanced transparents append theirs in
+/// submitInstancedMesh so both share one insertion sequence.
 fn appendRenderItem(ctx: FrameCullContext, item: RenderMeshItem) void {
     if (item.transparent) {
-        ctx.queues.transparent.append(ctx.allocator, item) catch {};
+        // Reserve both slots up front: if either allocation fails the item
+        // is dropped entirely, never an undrawn orphan in one array.
+        ctx.queues.transparent.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        const idx: u32 = @intCast(ctx.queues.transparent.items.len);
+        const seq: u32 = @intCast(ctx.queues.transparent_order.items.len);
+        ctx.queues.transparent.appendAssumeCapacity(item);
+        ctx.queues.transparent_order.appendAssumeCapacity(.{
+            .distance_sq = item.distance_sq,
+            .seq = seq,
+            .kind = .regular,
+            .index = idx,
+            .is_decal = item.is_decal,
+        });
     } else {
         ctx.queues.items.append(ctx.allocator, item) catch {};
     }
@@ -435,8 +487,25 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh) voi
         }
         ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
         ctx.stats.rendered_meshes += mesh.visible_instance_count;
-        if (materialIsTransparent(mesh.material)) {
-            ctx.queues.transparent_instanced.append(ctx.allocator, mesh) catch {};
+        if (materialIsTransparent(mesh.material) or mesh.is_decal) {
+            // Reserve both slots up front (see appendRenderItem): the group
+            // and its order entry are appended atomically under OOM.
+            ctx.queues.transparent_instanced.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+            ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+            // Group distance key: combined AABB center (batch draws as one;
+            // no per-instance sorting). Falls back to the mesh position when
+            // the combined AABB is degenerate.
+            const center = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center() else mesh.position;
+            const idx: u32 = @intCast(ctx.queues.transparent_instanced.items.len);
+            const seq: u32 = @intCast(ctx.queues.transparent_order.items.len);
+            ctx.queues.transparent_instanced.appendAssumeCapacity(mesh);
+            ctx.queues.transparent_order.appendAssumeCapacity(.{
+                .distance_sq = center.sub(ctx.eye).lengthSq(),
+                .seq = seq,
+                .kind = .instanced,
+                .index = idx,
+                .is_decal = mesh.is_decal,
+            });
         } else {
             ctx.queues.opaque_instanced.append(ctx.allocator, mesh) catch {};
         }
@@ -1177,3 +1246,133 @@ test "parallel instanced staging produces serial-identical instance matrices" {
     }
 }
 
+test "transparent regular+instanced groups share one back-to-front order" {
+    const ally = std.testing.allocator;
+    const material = @import("../material.zig");
+
+    var blend_mat = material.StandardMaterial.init("blend");
+    blend_mat.alpha_mode = .blend;
+    const blend: Material = .{ .standard = &blend_mat };
+    const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+
+    var regular = Mesh{
+        .name = "regular",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 10),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+        .material = blend,
+    };
+
+    var src_far = Mesh{
+        .name = "src_far",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var src_near = Mesh{
+        .name = "src_near",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var inst_far = InstancedMesh{
+        .name = "far_inst",
+        .source_mesh = &src_far,
+        .position = Vec3.new(0, 0, 15),
+    };
+    var inst_near = InstancedMesh{
+        .name = "near_inst",
+        .source_mesh = &src_near,
+        .position = Vec3.new(0, 0, 5),
+    };
+    var far_ptrs = [_]*InstancedMesh{&inst_far};
+    var near_ptrs = [_]*InstancedMesh{&inst_near};
+    var far_parent = Mesh{
+        .name = "far_group",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = blend,
+        .culling_strategy = .always_render,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+    };
+    var near_parent = Mesh{
+        .name = "near_group",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = blend,
+        .culling_strategy = .always_render,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1 },
+    };
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    const meshes = [_]*Mesh{ &regular, &far_parent, &near_parent };
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 11,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    // One regular transparent plus two instanced transparent groups share a
+    // single order list; per-instance batching is preserved (one entry per
+    // group, not per instance).
+    try std.testing.expectEqual(@as(usize, 1), queues.transparent.items.len);
+    try std.testing.expectEqual(@as(usize, 2), queues.transparent_instanced.items.len);
+    try std.testing.expectEqual(@as(usize, 3), queues.transparent_order.items.len);
+    try std.testing.expectEqual(@as(u32, 3), stats.rendered_meshes);
+    // Material snapshot survives the queue: regular item kept its material.
+    try std.testing.expect(queues.transparent.items[0].material != null);
+    try std.testing.expect(queues.transparent.items[0].transparent);
+
+    std.mem.sort(TransparentDrawEntry, queues.transparent_order.items, {}, sortTransparentDrawOrder);
+    const ordered = queues.transparent_order.items;
+    // Global back-to-front: far group (15^2=225), regular (10^2=100), near (5^2=25).
+    try std.testing.expectApproxEqAbs(@as(f32, 225.0), ordered[0].distance_sq, 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0), ordered[1].distance_sq, 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), ordered[2].distance_sq, 1e-2);
+    try std.testing.expectEqual(TransparentKind.instanced, ordered[0].kind);
+    try std.testing.expectEqual(TransparentKind.regular, ordered[1].kind);
+    try std.testing.expectEqual(TransparentKind.instanced, ordered[2].kind);
+    try std.testing.expectEqual(&far_parent, queues.transparent_instanced.items[ordered[0].index]);
+    try std.testing.expectEqual(@as(u32, 0), ordered[1].index);
+    try std.testing.expectEqual(&near_parent, queues.transparent_instanced.items[ordered[2].index]);
+
+    // Deterministic tie-break: exactly equal distances keep insertion order.
+    var ties = [_]TransparentDrawEntry{
+        .{ .distance_sq = 4.0, .seq = 7, .kind = .regular, .index = 0, .is_decal = false },
+        .{ .distance_sq = 4.0, .seq = 3, .kind = .instanced, .index = 0, .is_decal = false },
+    };
+    std.mem.sort(TransparentDrawEntry, &ties, {}, sortTransparentDrawOrder);
+    try std.testing.expectEqual(@as(u32, 3), ties[0].seq);
+    try std.testing.expectEqual(@as(u32, 7), ties[1].seq);
+
+    // Strict weak ordering: near-equal but distinct distances sort by exact
+    // distance, never by tie-break. An epsilon band would be non-transitive
+    // here (first≈second and second≈third within 1e-4, yet first≉third).
+    var near = [_]TransparentDrawEntry{
+        .{ .distance_sq = 1.0, .seq = 0, .kind = .regular, .index = 0, .is_decal = false },
+        .{ .distance_sq = 1.0 + 5e-5, .seq = 1, .kind = .regular, .index = 1, .is_decal = false },
+        .{ .distance_sq = 1.0 + 1e-4, .seq = 2, .kind = .regular, .index = 2, .is_decal = false },
+    };
+    std.mem.sort(TransparentDrawEntry, &near, {}, sortTransparentDrawOrder);
+    try std.testing.expectEqual(@as(u32, 2), near[0].index);
+    try std.testing.expectEqual(@as(u32, 1), near[1].index);
+    try std.testing.expectEqual(@as(u32, 0), near[2].index);
+}

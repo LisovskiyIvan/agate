@@ -35,9 +35,9 @@ pub const CameraSnapshot = struct {
     enabled: bool = true,
 };
 
-/// Complete per-frame snapshot payload published via handoff from the simulation side.
-/// The render thread consumes the newest snapshot without holding coarse phase locks
-/// during GPU draw calls, enabling strictly non-blocking concurrent simulation and rendering.
+/// Frame-level camera/light/pass state published by the simulation side.
+/// This deliberately does not contain per-mesh render records yet; threaded
+/// applications retain coarse phase ownership while render reads live scene data.
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,

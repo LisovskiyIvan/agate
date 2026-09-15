@@ -94,6 +94,10 @@ pub const Pool = struct {
             .workers = &.{},
             .mailbox = &.{},
         };
+        errdefer {
+            _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
+            _ = std.c.pthread_cond_destroy(&self.lot.cond);
+        }
         const effective: usize = if (builtin.single_threaded) 0 else worker_count;
         if (effective == 0) return self;
 
@@ -104,7 +108,13 @@ pub const Pool = struct {
         for (self.mailbox) |*m| m.* = std.atomic.Value(?*Job).init(null);
 
         var spawned: usize = 0;
-        errdefer for (self.workers[0..spawned]) |t| t.join();
+        errdefer {
+            self.lot.lock();
+            self.quit = true;
+            self.lot.unlock();
+            self.lot.broadcast();
+            for (self.workers[0..spawned]) |t| t.join();
+        }
         for (0..effective) |i| {
             self.workers[i] = try std.Thread.spawn(.{}, workerMain, .{ self, i });
             spawned += 1;
@@ -290,13 +300,23 @@ pub const TaskRunner = struct {
             .allocator = allocator,
             .threads = &.{},
         };
+        errdefer {
+            _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
+            _ = std.c.pthread_cond_destroy(&self.lot.cond);
+        }
         const effective: usize = if (builtin.single_threaded) 0 else thread_count;
         if (effective == 0) return self;
 
         self.threads = try allocator.alloc(std.Thread, effective);
         errdefer allocator.free(self.threads);
         var spawned: usize = 0;
-        errdefer for (self.threads[0..spawned]) |t| t.join();
+        errdefer {
+            self.lot.lock();
+            self.quit = true;
+            self.lot.unlock();
+            self.lot.broadcast();
+            for (self.threads[0..spawned]) |t| t.join();
+        }
         for (0..effective) |i| {
             self.threads[i] = try std.Thread.spawn(.{}, workerMain, .{self});
             spawned += 1;

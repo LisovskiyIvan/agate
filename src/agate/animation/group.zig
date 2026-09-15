@@ -516,6 +516,9 @@ pub const AnimationGroup = struct {
     pub fn sampleBoneAtTime(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
         for (self.channels) |ch| {
             if (ch.bone_index == bone_idx) {
+                // Skip malformed/truncated LINEAR/STEP tracks: preserve pose, outputs stay null.
+                // CUBICSPLINE keeps its sampler fallback (usable frame/zero), so it is not guarded.
+                if (ch.sampler.interpolation != .cubic_spline and !samplerHasFrames(ch.sampler, ch.target_path, 0)) continue;
                 switch (ch.target_path) {
                     .translation => out_pos.* = ch.sampler.sampleVec3(time),
                     .rotation => out_rot.* = ch.sampler.sampleQuat(time),
@@ -530,6 +533,9 @@ pub const AnimationGroup = struct {
         if (self.skeleton) |skel| {
             for (self.channels) |ch| {
                 if (ch.bone_index >= skel.bones.len) continue;
+                // Skip malformed/truncated LINEAR/STEP tracks: preserve current pose.
+                // CUBICSPLINE keeps its sampler fallback (usable frame/zero), so it is not guarded.
+                if (ch.sampler.interpolation != .cubic_spline and !samplerHasFrames(ch.sampler, ch.target_path, 0)) continue;
                 const bone = &skel.bones[ch.bone_index];
                 switch (ch.target_path) {
                     .translation => bone.local_position = ch.sampler.sampleVec3(time),
