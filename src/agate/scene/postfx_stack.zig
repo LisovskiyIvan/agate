@@ -117,9 +117,23 @@ pub const PostFXStack = struct {
     /// depth-tested, no depth write, drawn after all surface geometry. The
     /// pass variant must match the main target's sample count.
     pub fn renderOutline(self: *PostFXStack, view_proj: Mat4, eye: Vec3, outline_meshes: []const *Mesh, samples: i32, stats: *SceneStats) void {
-        if (self.outline_enabled and outline_meshes.len > 0) {
+        self.renderOutlineExplicit(view_proj, eye, outline_meshes, samples, stats, self.outline_enabled, self.outline_color, self.outline_width_px);
+    }
+
+    pub fn renderOutlineExplicit(
+        self: *PostFXStack,
+        view_proj: Mat4,
+        eye: Vec3,
+        outline_meshes: []const *Mesh,
+        samples: i32,
+        stats: *SceneStats,
+        enabled: bool,
+        color: Color4,
+        width_px: f32,
+    ) void {
+        if (enabled and outline_meshes.len > 0) {
             const pass = self.outlinePassFor(samples);
-            pass.render(view_proj, eye, outline_meshes, self.outline_color, self.outline_width_px);
+            pass.render(view_proj, eye, outline_meshes, color, width_px);
             const outline_count: u32 = @intCast(outline_meshes.len);
             stats.main_draw_calls += outline_count;
             stats.draw_calls += outline_count;

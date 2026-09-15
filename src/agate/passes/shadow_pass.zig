@@ -19,8 +19,8 @@ pub const SPOT_SHADOW_MAP_HEIGHT: u32 = 512;
 pub const SPOT_SHADOW_RES: i32 = 512;
 
 pub const SpotShadowRenderInfo = struct {
-    spot_index: usize,
-    view_proj: Mat4,
+    spot_index: usize = 0,
+    view_proj: Mat4 = Mat4.identity,
 };
 
 pub const ShadowPass = struct {
@@ -314,7 +314,7 @@ pub const ShadowPass = struct {
 
                     if (mesh.skeleton) |skel| {
                         const vs_skin = shadow_shd.VsSkin{
-                            .bones = skel.skin_matrices,
+                            .bones = skel.getRenderSkinMatrices().*,
                         };
                         sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
                     }

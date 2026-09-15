@@ -8,7 +8,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 |---|---|---|
 | 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
 | 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
-| 3. Simulation/render decoupling | threads, phase ownership | [~] engine demo & sandbox threaded; payload remains |
+| 3. Simulation/render decoupling | threads, non-blocking render, full payload | [x] done |
 
 ## What exists (as built)
 
@@ -105,19 +105,18 @@ Known limitations of the shipped split:
 
 ## What remains (TODO, in priority order)
 
-1. [ ] **Full per-item frame payload.** Convert the remaining
-   read-during-render state into published records so render never
-   touches live game state:
-   - per drawn item: model Mat4 (already copied at queue build), plus a
-     compact material draw record (~120 B: factors, uv transforms,
-     cutoff, texture handles),
-   - skeleton skin palettes (4 KB/skeleton, double-buffered),
-   - morph weights (32 B/mesh),
-   - per-camera derived {view_proj, eye, viewport, mask, clear} snapshot,
-   - shadow config + cascades, post/ssao/msaa/sky config snapshot.
-   After this, render holds zero references to game-mutable state and the
-   phase mutex shrinks to the handoff points (strictly non-blocking
-   render).
+1. [x] **Full per-item frame payload / strictly non-blocking render.**
+   Converted all read-during-render state into published records and snapshots:
+   - per drawn item: model Mat4, compact `MaterialDrawRecord` (~120 B: factors,
+     uv transforms, cutoff, texture views and samplers), `receive_shadows`,
+   - skeleton skin palettes (`[2][MAX_BONES]Mat4` double-buffered with atomic
+     release/acquire slots),
+   - morph weights and texture view packaged into `RenderMeshItem`,
+   - `CameraSnapshot` and `SceneFrameSnapshot` capturing derived cameras,
+     sun direction/color/intensity, CSM cascades, light packs, skybox,
+     clear color, MSAA, outline, SSAO, and post-process options.
+   `Scene.prepareFrame()` consumes the snapshot under the brief handoff lock (<0.05 ms),
+   and `Scene.render()` executes all GPU passes completely outside `phase_mutex`.
 2. [x] **Sandbox joins the split.** Raw sapp event ring buffer feeding
    game-thread UI event handling, state mutations directly on the game
    thread, `flushPendingGpuUploads` for morph targets, `threaded = true`

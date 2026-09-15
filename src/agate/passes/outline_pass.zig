@@ -377,7 +377,7 @@ pub const OutlinePass = struct {
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
             if (skinned) {
                 const vs_skin = outline_shd.VsSkin{
-                    .bones = mesh.skeleton.?.skin_matrices,
+                    .bones = mesh.skeleton.?.getRenderSkinMatrices().*,
                 };
                 sg.applyUniforms(outline_shd.UB_vs_skin, sg.asRange(&vs_skin));
             }

@@ -112,6 +112,7 @@ test {
     _ = @import("scene/shadow_pcss.zig");
     _ = @import("scene/shadow_system.zig");
     _ = @import("scene/sky_layer.zig");
+    _ = @import("scene/snapshot.zig");
     _ = @import("scene/stats.zig");
     _ = @import("scene/trail_layer.zig");
     _ = @import("scene/uniforms.zig");

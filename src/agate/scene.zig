@@ -89,6 +89,9 @@ const scene_uniforms = @import("scene/uniforms.zig");
 const FrameContext = scene_uniforms.FrameContext;
 const scene_draw = @import("scene/draw.zig");
 const scene_msaa = @import("scene/msaa.zig");
+pub const scene_snapshot = @import("scene/snapshot.zig");
+pub const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
+pub const CameraSnapshot = scene_snapshot.CameraSnapshot;
 
 pub const CameraEntry = struct {
     name: []const u8,
@@ -206,6 +209,16 @@ pub const Scene = struct {
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    render_outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+
+    /// Mailbox for publishing frame snapshots from the simulation thread.
+    /// The render thread consumes the newest snapshot without holding coarse
+    /// locks during GPU draw calls, enabling strictly non-blocking rendering.
+    frame_handoff: handoff_mod.Handoff(scene_snapshot.SceneFrameSnapshot, 2) = .{},
+    /// Last consumed frame snapshot.
+    frame_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
+    /// Flag indicating whether prepareFrame() has already run for this frame.
+    frame_prepared: bool = false,
 
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
@@ -637,9 +650,9 @@ pub const Scene = struct {
     /// runtime (the main target mirrors them; see postprocess_pass.resize).
     /// sg.queryPixelformat is the sokol-provided backend gate.
     fn mainTargetFormatsMsaaCapable() bool {
-        const sw = sglue.swapchain();
-        const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
-        const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
+        const env_def = sg.queryDesc().environment.defaults;
+        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+        const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
         return sg.queryPixelformat(color_fmt).msaa and sg.queryPixelformat(depth_fmt).msaa;
     }
 
@@ -731,19 +744,13 @@ pub const Scene = struct {
 
     fn renderSceneView(
         self: *Scene,
-        cam: Camera,
-        culling_mask: u32,
-        aspect: f32,
+        cam_snap: scene_snapshot.CameraSnapshot,
         samples: i32,
-        sun_dir: Vec3,
-        sun_color: Color3,
-        sun_intensity: f32,
-        cascades: [4]Mat4,
-        light_pack: scene_lights.LightRig.FramePack,
+        snap: *const scene_snapshot.SceneFrameSnapshot,
         env: scene_draw.Environment,
     ) void {
-        const view_proj = cam.getViewProjection(aspect);
-        const eye = cam.getPosition();
+        const view_proj = cam_snap.view_proj;
+        const eye = cam_snap.eye;
 
         self.queues.reset();
 
@@ -755,11 +762,18 @@ pub const Scene = struct {
             .eye = eye,
             .cull_frustum = self.enable_frustum_culling,
             .cull_occlusion = self.enable_occlusion_culling,
-            .culling_mask = culling_mask,
+            .culling_mask = cam_snap.culling_mask,
             .occlusion_culler = &self.occlusion_culler,
             .stats = &self.stats,
             .queues = &self.queues,
             .default_white_id = self.default_white_texture.view.id,
+            .default_material = &self.default_material,
+            .default_white = &self.default_white_texture,
+            .default_normal = &self.default_normal_texture,
+            .default_cube = &self.default_cube_texture,
+            .sky_texture = env.sky_texture,
+            .ibl_intensity = env.ibl_intensity,
+            .default_morph_view = self.forward.default_morph_view,
             .thread_pool = jobs.global,
         });
 
@@ -769,19 +783,19 @@ pub const Scene = struct {
         const frame_ctx = FrameContext{
             .view_proj = view_proj,
             .eye = eye,
-            .sun_dir = sun_dir,
-            .sun_color = sun_color,
-            .sun_intensity = sun_intensity,
-            .cascades = cascades,
-            .light_counts = light_pack.counts,
-            .point_pos_range = light_pack.point_pos_range,
-            .point_color_int = light_pack.point_color_int,
-            .spot_pos_range = light_pack.spot_pos_range,
-            .spot_dir_inner = light_pack.spot_dir_inner,
-            .spot_color_outer = light_pack.spot_color_outer,
-            .spot_intensity = light_pack.spot_intensity,
-            .spot_view_proj = light_pack.spot_view_proj,
-            .spot_shadow_params = light_pack.spot_shadow_params,
+            .sun_dir = snap.sun_dir,
+            .sun_color = snap.sun_color,
+            .sun_intensity = snap.sun_intensity,
+            .cascades = snap.cascades,
+            .light_counts = snap.light_pack.counts,
+            .point_pos_range = snap.light_pack.point_pos_range,
+            .point_color_int = snap.light_pack.point_color_int,
+            .spot_pos_range = snap.light_pack.spot_pos_range,
+            .spot_dir_inner = snap.light_pack.spot_dir_inner,
+            .spot_color_outer = snap.light_pack.spot_color_outer,
+            .spot_intensity = snap.light_pack.spot_intensity,
+            .spot_view_proj = snap.light_pack.spot_view_proj,
+            .spot_shadow_params = snap.light_pack.spot_shadow_params,
         };
 
         var current_pipeline_id: u32 = 0;
@@ -807,16 +821,142 @@ pub const Scene = struct {
         }
 
         // Inverse-hull outline for highlighted meshes
-        self.postfx.renderOutline(view_proj, eye, self.outline_meshes.items, samples, &self.stats);
+        self.postfx.renderOutlineExplicit(
+            view_proj,
+            eye,
+            self.render_outline_meshes.items,
+            samples,
+            &self.stats,
+            snap.outline_enabled,
+            snap.outline_color,
+            snap.outline_width_px,
+        );
 
         // Physics debug lines
         self.physics.renderDebug(self.allocator, view_proj, samples, &self.stats);
 
         // Skybox Pass
-        self.sky.render(cam, aspect, self.default_cube_texture, samples, &self.stats);
+        self.sky.render(cam_snap.camera, cam_snap.aspect, self.default_cube_texture, samples, &self.stats);
 
         // Particle Pass
-        self.particles.render(cam, aspect, samples, &self.stats);
+        self.particles.render(cam_snap.camera, cam_snap.aspect, samples, &self.stats);
+    }
+
+    /// Packs the current camera, light, shadow, and environment state into an immutable
+    /// frame snapshot that can be published to the render thread.
+    pub fn packFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) scene_snapshot.SceneFrameSnapshot {
+        const w = if (cur_w > 0) cur_w else sapp.width();
+        const h = if (cur_h > 0) cur_h else sapp.height();
+        const eff_aspect = if (aspect > 0.0) aspect else (if (h > 0) @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(h)) else 1.0);
+
+        var snap = scene_snapshot.SceneFrameSnapshot{
+            .frame_id = self.frame_id,
+            .aspect = eff_aspect,
+            .screen_w = w,
+            .screen_h = h,
+        };
+
+        const primary_cam_opt = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else null);
+        if (primary_cam_opt == null) {
+            snap.has_camera = false;
+            return snap;
+        }
+        snap.has_camera = true;
+
+        snap.enable_multi_camera = self.enable_multi_camera;
+        snap.active_camera_idx = self.active_camera_index orelse 0;
+        snap.camera_count = @min(self.cameras.items.len, scene_snapshot.MAX_CAMERAS);
+
+        for (0..snap.camera_count) |i| {
+            const entry = self.cameras.items[i];
+            const cam_rect = entry.viewport.toPixelRect(w, h);
+            const cam_aspect = cam_rect.aspect();
+            snap.cameras[i] = scene_snapshot.CameraSnapshot{
+                .camera = entry.camera,
+                .view_proj = entry.camera.getViewProjection(cam_aspect),
+                .eye = entry.camera.getPosition(),
+                .viewport = entry.viewport,
+                .culling_mask = entry.culling_mask,
+                .clear_viewport = entry.clear_viewport,
+                .clear_color = entry.clear_color,
+                .aspect = cam_aspect,
+                .enabled = entry.enabled,
+            };
+        }
+
+        if (snap.enable_multi_camera and snap.camera_count > 0 and snap.active_camera_idx < snap.camera_count) {
+            snap.primary_cam = snap.cameras[snap.active_camera_idx];
+        } else {
+            const vp = primary_cam_opt.?.getViewport();
+            const rect = vp.toPixelRect(w, h);
+            const cam_aspect = rect.aspect();
+            snap.primary_cam = scene_snapshot.CameraSnapshot{
+                .camera = primary_cam_opt.?,
+                .view_proj = primary_cam_opt.?.getViewProjection(cam_aspect),
+                .eye = primary_cam_opt.?.getPosition(),
+                .viewport = vp,
+                .culling_mask = primary_cam_opt.?.getCullingMask(),
+                .aspect = cam_aspect,
+            };
+        }
+
+        snap.sun_dir = self.lights.sunDirection();
+        snap.sun_color = self.lights.sunColor();
+        snap.sun_intensity = self.lights.sunIntensity();
+        snap.cascades = self.shadows.computeCascades(snap.primary_cam.camera, snap.primary_cam.aspect, snap.sun_dir);
+
+        var lp = self.light_pack;
+        _ = self.light_handoff.takeLatest(&lp);
+        self.light_pack = lp;
+        snap.light_pack = lp;
+
+        snap.shadows_enabled = self.shadows.enabled;
+        snap.shadow_uniforms = self.shadows.uniformState(self.lights.hemi.ground_color);
+        snap.sky_texture = self.sky.texture;
+        snap.ibl_intensity = self.sky.ibl_intensity;
+        snap.clear_color = self.clear_color;
+        snap.msaa_sample_count = self.msaa_sample_count;
+        snap.post_process = self.post_process;
+        snap.ssao = self.ssao;
+        snap.outline_enabled = self.postfx.outline_enabled;
+        snap.outline_color = self.postfx.outline_color;
+        snap.outline_width_px = self.postfx.outline_width_px;
+
+        return snap;
+    }
+
+    /// Publishes a complete frame snapshot through the lock-free mailbox.
+    pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
+        const snap = self.packFrameSnapshot(aspect, cur_w, cur_h);
+        if (self.frame_handoff.claim()) |i| {
+            self.frame_handoff.slot(i).* = snap;
+            self.frame_handoff.publish(i);
+        } else {
+            self.frame_snapshot = snap;
+        }
+    }
+
+    /// Stage 3: prepares GPU uploads and acquires the frame snapshot.
+    /// In threaded mode, calling this under the brief handoff lock (<0.05 ms)
+    /// allows render() to execute all GPU passes completely unlocked.
+    pub fn prepareFrame(self: *Scene) void {
+        if (self.uploads) |*q| _ = q.drain();
+        self.flushPendingGpuUploads();
+
+        var snap = self.frame_snapshot;
+        if (self.frame_handoff.takeLatest(&snap)) {
+            self.frame_snapshot = snap;
+        } else {
+            const cur_w = sapp.width();
+            const cur_h = sapp.height();
+            const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
+            self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+        }
+
+        self.render_outline_meshes.clearRetainingCapacity();
+        self.render_outline_meshes.appendSlice(self.allocator, self.outline_meshes.items) catch {};
+
+        self.frame_prepared = true;
     }
 
     /// Stage 3, slice 2: update-phase light packing. Selects the top-k
@@ -850,8 +990,8 @@ pub const Scene = struct {
     /// Stage 3, slice 2: the game-side update entry point. Everything the
     /// simulation advances per frame, in one call, in the canonical order
     /// (camera -> lights -> physics -> animations -> particles -> decals);
-    /// render() then consumes the published frame values (light_pack) and
-    /// engine state without simulating anything itself.
+    /// render() then consumes the published frame values (light_pack, frame_snapshot)
+    /// without simulating anything itself.
     ///
     /// Deliberately NOT included: `updateTrails` and `updateNavAgents` —
     /// both require real-seconds dt (the 60fps-normalized dt breaks their
@@ -863,6 +1003,11 @@ pub const Scene = struct {
         self.updateAnimations(dt);
         try self.updateParticles(dt);
         self.updateDecals(dt);
+
+        const cur_w = sapp.width();
+        const cur_h = sapp.height();
+        const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
+        self.publishFrameSnapshot(aspect, cur_w, cur_h);
     }
 
     /// Stage 3: uploads the GPU buffers that the update phase staged
@@ -876,33 +1021,30 @@ pub const Scene = struct {
     }
 
     pub fn render(self: *Scene) void {
-        // Stage 2: upload finished background decodes before drawing, so
-        // patched materials pick the textures up this same frame.
-        if (self.uploads) |*q| _ = q.drain();
-        // Stage 3: push update-staged CPU data into the GPU buffers.
-        self.flushPendingGpuUploads();
-        const camera = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else return);
-        const aspect = sapp.widthf() / sapp.heightf();
-        // Sun resolved once per frame; reused by cascades, mesh uniforms, postprocess.
-        const sun_dir = self.lights.sunDirection();
-        const sun_color = self.lights.sunColor();
-        const sun_intensity = self.lights.sunIntensity();
-        const view_proj = camera.getViewProjection(aspect);
-        const eye = camera.getPosition();
+        if (!self.frame_prepared) {
+            self.prepareFrame();
+        }
+        self.frame_prepared = false;
+
+        const snap = &self.frame_snapshot;
+        if (!snap.has_camera) return;
+
+        const cur_w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
+        const cur_h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
 
         // Effective main-target MSAA sample count for this frame
         // (scene/msaa.zig holds the policy and the backend matrix).
-        const samples = scene_msaa.effectiveSampleCount(self.msaa_sample_count, .{
-            .post_enabled = self.post_process.enabled,
+        const samples = scene_msaa.effectiveSampleCount(snap.msaa_sample_count, .{
+            .post_enabled = snap.post_process.enabled,
             .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
             .backend = sg.queryBackend(),
         });
-        if (self.post_process.enabled and self.msaa_sample_count > 1 and samples == 1) {
+        if (snap.post_process.enabled and snap.msaa_sample_count > 1 and samples == 1) {
             // Only the runtime format gate can nullify a > 1 request here
             // (clamping lands on a valid count, post-off forces 1 upstream).
             _ = self.warn_msaa_format.warn(
                 "msaa: x{} requested but the main target formats cannot MSAA on this backend; running 1x",
-                .{self.msaa_sample_count},
+                .{snap.msaa_sample_count},
             );
         }
 
@@ -910,21 +1052,13 @@ pub const Scene = struct {
         self.frame_id +%= 1;
 
         // 1. Directional Light Cascaded Shadow View-Projections
-        const cascades = self.shadows.computeCascades(camera, aspect, sun_dir);
-
-        // Point & Spot light arrays were packed during the update phase
-        // (updateLights) — including the hysteresis fade advance, which is
-        // update-phase simulation. Render only consumes the newest
-        // published pack; without a fresh one, the last consumed pack
-        // stands (several render calls may share one update, e.g. PIP).
-        var light_pack = self.light_pack;
-        _ = self.light_handoff.takeLatest(&light_pack);
-        self.light_pack = light_pack;
+        const cascades = snap.cascades;
+        const light_pack = snap.light_pack;
 
         // ==============================================
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
-        if (self.shadows.enabled) {
+        if (snap.shadows_enabled) {
             const shadow_draws = self.shadows.pass.render(self.meshes.items, self.frame_id, cascades, light_pack.spot_shadows[0..light_pack.num_spot_shadows]);
             self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;
@@ -933,17 +1067,14 @@ pub const Scene = struct {
         // ==============================================
         // PASS 2: MAIN SCENE RENDER PASS
         // ==============================================
-        const cur_w = sapp.width();
-        const cur_h = sapp.height();
-
         var main_pass_action = sg.PassAction{};
         main_pass_action.colors[0] = .{
             .load_action = .CLEAR,
             .clear_value = .{
-                .r = self.clear_color.r,
-                .g = self.clear_color.g,
-                .b = self.clear_color.b,
-                .a = self.clear_color.a,
+                .r = snap.clear_color.r,
+                .g = snap.clear_color.g,
+                .b = snap.clear_color.b,
+                .a = snap.clear_color.a,
             },
         };
         main_pass_action.depth = .{
@@ -953,7 +1084,7 @@ pub const Scene = struct {
         };
 
         // Offscreen target when post-processing is on, swapchain otherwise.
-        self.postfx.beginMainPass(main_pass_action, self.post_process.enabled, samples, cur_w, cur_h);
+        self.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
 
         const env = scene_draw.Environment{
             // Pipeline set must match the main target's sample count: the
@@ -964,45 +1095,43 @@ pub const Scene = struct {
             .default_white = &self.default_white_texture,
             .default_normal = &self.default_normal_texture,
             .default_cube = &self.default_cube_texture,
-            .sky_texture = self.sky.texture,
-            .ibl_intensity = self.sky.ibl_intensity,
+            .sky_texture = snap.sky_texture orelse self.sky.texture,
+            .ibl_intensity = snap.ibl_intensity,
             .shadow_pass = &self.shadows.pass,
-            .shadow_uniforms = self.shadows.uniformState(self.lights.hemi.ground_color),
+            .shadow_uniforms = snap.shadow_uniforms,
         };
 
-        if (self.enable_multi_camera and self.cameras.items.len > 0) {
-            const active_idx = self.active_camera_index orelse 0;
-            const primary_cam = self.cameras.items[active_idx].camera;
-            const primary_vp = self.cameras.items[active_idx].viewport;
-            const primary_mask = self.cameras.items[active_idx].culling_mask;
-            const primary_rect = primary_vp.toPixelRect(cur_w, cur_h);
+        if (snap.enable_multi_camera and snap.camera_count > 0) {
+            const active_idx = snap.active_camera_idx;
+            const primary_snap = if (active_idx < snap.camera_count) snap.cameras[active_idx] else snap.primary_cam;
+            const primary_rect = primary_snap.viewport.toPixelRect(cur_w, cur_h);
             sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
             sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
-            self.renderSceneView(primary_cam, primary_mask, primary_rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+            self.renderSceneView(primary_snap, samples, snap, env);
 
-            for (self.cameras.items, 0..) |entry, i| {
+            for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
                 if (i == active_idx or !entry.enabled) continue;
                 const rect = entry.viewport.toPixelRect(cur_w, cur_h);
                 sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
                 sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
                 if (entry.clear_viewport) {
-                    const clr = entry.clear_color orelse self.clear_color;
+                    const clr = entry.clear_color orelse snap.clear_color;
                     self.clearCurrentViewport(clr, samples);
                 }
 
-                self.renderSceneView(entry.camera, entry.culling_mask, rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+                self.renderSceneView(entry, samples, snap, env);
             }
             // Restore full viewport
             sg.applyViewport(0, 0, cur_w, cur_h, true);
             sg.applyScissorRect(0, 0, cur_w, cur_h, true);
         } else {
-            const vp = camera.getViewport();
+            const vp = snap.primary_cam.viewport;
             const rect = vp.toPixelRect(cur_w, cur_h);
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-            self.renderSceneView(camera, camera.getCullingMask(), rect.aspect(), samples, sun_dir, sun_color, sun_intensity, cascades, light_pack, env);
+            self.renderSceneView(snap.primary_cam, samples, snap, env);
 
             if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
                 sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -1010,7 +1139,7 @@ pub const Scene = struct {
             }
         }
 
-        if (!self.post_process.enabled) {
+        if (!snap.post_process.enabled) {
             if (self.ui_canvas) |*ui_c| {
                 ui_c.render(sapp.widthf(), sapp.heightf());
                 self.stats.post_draw_calls += 1;
@@ -1024,14 +1153,14 @@ pub const Scene = struct {
         // PASS 2.5 (SSAO) + 2.75 (bloom) + 3 (composite & UI overlay)
         // ==============================================
         self.postfx.renderChain(.{
-            .post = self.post_process,
-            .ssao = self.ssao,
-            .camera = camera,
-            .aspect = aspect,
-            .view_proj = view_proj,
-            .eye = eye,
-            .sun_dir = sun_dir,
-            .sun_color = sun_color,
+            .post = snap.post_process,
+            .ssao = snap.ssao,
+            .camera = snap.primary_cam.camera,
+            .aspect = snap.primary_cam.aspect,
+            .view_proj = snap.primary_cam.view_proj,
+            .eye = snap.primary_cam.eye,
+            .sun_dir = snap.sun_dir,
+            .sun_color = snap.sun_color,
             .default_white_view = self.default_white_texture.view,
             .main_samples = samples,
             .ui = if (self.ui_canvas) |*u| u else null,
@@ -1093,6 +1222,7 @@ pub const Scene = struct {
         scene_content.deinitAnimations(self.allocator, &self.animation_groups, &self.skeletons);
 
         self.outline_meshes.deinit(self.allocator);
+        self.render_outline_meshes.deinit(self.allocator);
         self.postfx.deinit();
 
         self.particles.deinit(self.allocator);
@@ -1195,3 +1325,23 @@ test "updateLights packs point lights into the frame payload" {
     // stands on the render side) — the PIP multi-render pattern.
     try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
 }
+
+test "publishFrameSnapshot and prepareFrame snapshot handoff" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    try std.testing.expect(!scene.frame_prepared);
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expect(scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(i32, 1920), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 1080), scene.frame_snapshot.screen_h);
+}
+

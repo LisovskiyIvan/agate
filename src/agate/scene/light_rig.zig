@@ -126,17 +126,17 @@ pub const LightRig = struct {
     /// `shadows_enabled` gates spot shadow info generation exactly like the
     /// legacy inline render() code.
     pub const FramePack = struct {
-        counts: [4]f32,
-        point_pos_range: [4][4]f32,
-        point_color_int: [4][4]f32,
-        spot_pos_range: [2][4]f32,
-        spot_dir_inner: [2][4]f32,
-        spot_color_outer: [2][4]f32,
-        spot_intensity: [2][4]f32,
-        spot_view_proj: [2]Mat4,
-        spot_shadow_params: [2][4]f32,
-        spot_shadows: [2]passes.SpotShadowRenderInfo,
-        num_spot_shadows: usize,
+        counts: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
+        point_pos_range: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+        point_color_int: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+        spot_pos_range: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        spot_dir_inner: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        spot_color_outer: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        spot_intensity: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        spot_view_proj: [2]Mat4 = [_]Mat4{Mat4.identity} ** 2,
+        spot_shadow_params: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        spot_shadows: [2]passes.SpotShadowRenderInfo = [_]passes.SpotShadowRenderInfo{.{}} ** 2,
+        num_spot_shadows: usize = 0,
     };
 
     /// Packs point & spot lights for the camera. Directions are normalized

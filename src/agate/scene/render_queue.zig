@@ -8,7 +8,15 @@ const Frustum = math.Frustum;
 const Vec3 = math.Vec3;
 const BoundingBox = math.BoundingBox;
 const Mesh = @import("../mesh.zig").Mesh;
-const Material = @import("../material.zig").Material;
+const material_mod = @import("../material.zig");
+const Material = material_mod.Material;
+const MaterialDrawRecord = material_mod.MaterialDrawRecord;
+const StandardMaterial = material_mod.StandardMaterial;
+const Texture = @import("../texture.zig").Texture;
+const CubeTexture = @import("../texture.zig").CubeTexture;
+const skeleton_mod = @import("../animation/skeleton.zig");
+const MAX_BONES = skeleton_mod.MAX_BONES;
+const morph_gpu = @import("../mesh/morph_gpu.zig");
 const visibility = @import("../visibility/mod.zig");
 const jobs = @import("../jobs.zig");
 const stats_mod = @import("stats.zig");
@@ -21,6 +29,9 @@ pub const RenderMeshItem = struct {
     is_pbr: bool,
     texture_id: u32,
     material: ?Material = null,
+    /// Compact, GPU-ready material snapshot (~120-240 B): factors, uv transforms,
+    /// cutoff, and texture views/samplers. Render passes consume this directly.
+    draw_record: MaterialDrawRecord = .{},
     // True when the mesh material uses .blend alpha mode. Set at queue
     // build time; defaults to false so opaque behavior is unchanged.
     transparent: bool = false,
@@ -33,6 +44,17 @@ pub const RenderMeshItem = struct {
     // queue so they render after all opaque geometry with depth writes disabled,
     // eliminating depth-buffer z-fighting against the underlying surface.
     is_decal: bool = false,
+    receive_shadows: bool = true,
+    /// Pointer to the published double-buffered skin matrices slot for this mesh's skeleton
+    skin_matrices: ?*const [MAX_BONES]Mat4 = null,
+    /// Per-mesh morph uniforms (weights and delta dimensions)
+    morph_uniforms: morph_gpu.VsUniforms = .{
+        .weights0 = .{ 0, 0, 0, 0 },
+        .weights1 = .{ 0, 0, 0, 0 },
+        .params = .{ 0, 1, 1, 0 },
+    },
+    /// Delta strip texture view for GPU-mode morphs
+    morph_view: sg.View = .{},
 };
 
 /// The four draw queues plus the per-frame instance-matrix staging buffer.
@@ -182,6 +204,13 @@ pub const FrameCullContext = struct {
 
     /// View id of the shared 1x1 white fallback (texture-less meshes).
     default_white_id: u32,
+    default_material: ?*const StandardMaterial = null,
+    default_white: ?*const Texture = null,
+    default_normal: ?*const Texture = null,
+    default_cube: ?*const CubeTexture = null,
+    sky_texture: ?CubeTexture = null,
+    ibl_intensity: f32 = 1.0,
+    default_morph_view: sg.View = .{},
     meshes: []const *Mesh,
     frame_id: u64,
     view_proj: Mat4,
@@ -376,12 +405,46 @@ fn cullNonInstancedMesh(
     else
         ctx.default_white_id;
 
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{}, .sampler = .{}, .size = 1 };
+    const dummy_std = StandardMaterial.init("default");
+
+    const white_tex = ctx.default_white orelse &dummy_tex;
+    const norm_tex = ctx.default_normal orelse &dummy_tex;
+    const cube_tex = ctx.default_cube orelse &dummy_cube;
+    const def_mat = ctx.default_material orelse &dummy_std;
+
+    const draw_rec = material_mod.buildDrawRecord(
+        mat,
+        def_mat,
+        white_tex,
+        norm_tex,
+        cube_tex,
+        ctx.sky_texture,
+        ctx.ibl_intensity,
+    );
+
+    const skin_mat = if (render_mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null;
+    const morph_u = if (render_mesh.morph_mode == .gpu)
+        morph_gpu.vsUniforms(render_mesh)
+    else
+        morph_gpu.VsUniforms{
+            .weights0 = .{ 0, 0, 0, 0 },
+            .weights1 = .{ 0, 0, 0, 0 },
+            .params = .{ 0, 1, 1, 0 },
+        };
+    const morph_v = if (render_mesh.morph_mode == .gpu)
+        render_mesh.morph_delta_view
+    else
+        ctx.default_morph_view;
+
     const d_sq = world_aabb.center().sub(eye).lengthSq();
     const is_decal = render_mesh.is_decal or mesh.is_decal;
     const transparent = materialIsTransparent(mat) or is_decal;
     return .{
         .mesh = render_mesh,
         .material = mat,
+        .draw_record = draw_rec,
         .model = model,
         .distance_sq = d_sq,
         .is_pbr = is_pbr,
@@ -389,6 +452,10 @@ fn cullNonInstancedMesh(
         .transparent = transparent,
         .double_sided = materialIsDoubleSided(mat) or is_decal,
         .is_decal = is_decal,
+        .receive_shadows = render_mesh.receive_shadows,
+        .skin_matrices = skin_mat,
+        .morph_uniforms = morph_u,
+        .morph_view = morph_v,
     };
 }
 

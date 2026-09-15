@@ -203,11 +203,13 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Render consumes the newest state under phase ownership; a long
-        // update on the game thread delays this frame but cannot race it.
+        // Handoff point (<0.05 ms): flush GPU uploads and consume the published snapshot.
         phase_mutex.lock();
-        scene.render();
+        scene.prepareFrame();
         phase_mutex.unlock();
+
+        // Strictly non-blocking render: GPU passes execute without holding phase_mutex.
+        scene.render();
     } else {
         simulate(@floatCast(sapp.frameDuration()));
         scene.render();

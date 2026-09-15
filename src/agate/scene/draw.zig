@@ -66,15 +66,13 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
     const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
-    const mat = item.material orelse mesh.material;
+    const rec = item.draw_record;
 
     // Shader materials take their own path: pipeline from the lazy
     // ShaderMaterialCache, bindings/uniforms per the registration's base
     // template contract (identical layouts — see drawShaderMaterialItem).
-    if (mat) |m| {
-        if (m == .shader_material) {
-            return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, m.shader_material, mvp);
-        }
+    if (rec.shader_material) |sm| {
+        return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, sm, mvp);
     }
 
     const pip_id = env.pipelines.forRegularItem(item);
@@ -90,37 +88,23 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
     bind.vertex_buffers[0] = mesh.vertex_buffer;
     bind.index_buffer = mesh.index_buffer;
 
-    const morph_bind = morphBindFor(env, mesh);
+    const morph_view = item.morph_view;
+    const morph_uniforms = item.morph_uniforms;
 
     if (item.is_pbr) {
-        const pbr_mat = if (mat) |m| m.pbr else null;
-        const albedo_tex = if (pbr_mat) |p| (p.albedo_texture orelse env.default_white.*) else env.default_white.*;
-        const normal_tex = if (pbr_mat) |p| (p.normal_texture orelse env.default_normal.*) else env.default_normal.*;
-        const mr_tex = if (pbr_mat) |p| (p.metallic_roughness_texture orelse env.default_white.*) else env.default_white.*;
-        const emissive_tex = if (pbr_mat) |p| (p.emissive_texture orelse env.default_white.*) else env.default_white.*;
-        const occlusion_tex = if (pbr_mat) |p| (p.occlusion_texture orelse env.default_white.*) else env.default_white.*;
+        bind.views[pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
+        bind.views[pbr_shd.VIEW_normal_tex] = rec.normal_view;
+        bind.views[pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
+        bind.views[pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
+        bind.views[pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+        bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
+        bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
 
-        bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
-        bind.views[pbr_shd.VIEW_normal_tex] = normal_tex.view;
-        bind.views[pbr_shd.VIEW_metallic_roughness_tex] = mr_tex.view;
-        bind.views[pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
-        bind.views[pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
-        bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
-        // Data slots sample with their own sampler class: the first present
-        // data texture wins (normal maps care most about wrap/filter);
-        // falls back to the albedo sampler when only a color map exists.
-        const data_sampler_tex = if (pbr_mat) |p|
-            (p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex)
-        else
-            albedo_tex;
-        bind.samplers[pbr_shd.SMP_data_smp] = data_sampler_tex.sampler;
-
-        // Environment IBL Cubemap & Shadow Depth Map: a material-level
-        // environment texture (e.g. an HDR probe) overrides the skybox,
-        // which in turn falls back to default_cube.
-        const cube = (if (pbr_mat) |p| p.environment_texture else null) orelse env.sky_texture orelse env.default_cube.*;
-        bind.views[pbr_shd.VIEW_env_tex] = cube.view;
-        bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
+        // Environment IBL Cubemap & Shadow Depth Map
+        const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube.*).view;
+        const cube_sampler = rec.env_sampler orelse (env.sky_texture orelse env.default_cube.*).sampler;
+        bind.views[pbr_shd.VIEW_env_tex] = cube_view;
+        bind.samplers[pbr_shd.SMP_env_smp] = cube_sampler;
 
         bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
@@ -128,7 +112,7 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
-        bind.views[pbr_shd.VIEW_morph_tex] = morph_bind.view;
+        bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
         bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
 
         sg.applyBindings(bind);
@@ -139,37 +123,31 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         };
         sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
-        if (mesh.skeleton) |skel| {
+        const skel_bones = item.skin_matrices orelse (if (mesh.skeleton) |sk| sk.getRenderSkinMatrices() else null);
+        if (skel_bones) |bones| {
             const vs_skin = skinned_pbr_shd.VsSkin{
-                .bones = skel.skin_matrices,
+                .bones = bones.*,
             };
             sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
-            sg.applyUniforms(skinned_pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(skinned_pbr_shd, morph_bind.uniforms)));
+            sg.applyUniforms(skinned_pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(skinned_pbr_shd, morph_uniforms)));
         } else {
-            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_bind.uniforms)));
+            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
         }
 
-        const mat_albedo = if (pbr_mat) |p| p.getAlbedoColor4() else [4]f32{ 1, 1, 1, 1 };
-        const metallic = if (pbr_mat) |p| p.metallic else 0.0;
-        const roughness = if (pbr_mat) |p| p.roughness else 0.5;
-        const env_intensity = if (pbr_mat) |p| env.ibl_intensity * p.environment_intensity else env.ibl_intensity;
-        const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
-        const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
-
-        const f = frameUniformsFor(env, mesh, ctx);
+        const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
         const fs_params = pbr_shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
-            .base_color_factor = mat_albedo,
-            .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
-            .emissive_factor = emissive_col,
-            .alpha_cutoff = uniforms.alphaCutoffFor(mat),
-            .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
-            .uv_matrix = pbrUvMatrices(pbr_mat),
-            .uv_offset = pbrUvOffsets(pbr_mat),
-            .channel_selectors = pbrChannelSelectors(pbr_mat),
+            .base_color_factor = rec.base_color,
+            .pbr_factors = rec.pbr_factors,
+            .emissive_factor = rec.emissive_color,
+            .alpha_cutoff = rec.alpha_cutoff,
+            .normal_scale = rec.normal_scale,
+            .uv_matrix = rec.uv_matrices,
+            .uv_offset = rec.uv_offsets,
+            .channel_selectors = rec.channel_selectors,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -184,17 +162,14 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
         };
-        if (mesh.skeleton != null) {
+        if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
         } else {
             sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
         }
     } else {
-        const std_mat = if (mat) |m| m.standard else env.default_material;
-        const tex = if (std_mat.diffuse_texture) |t| t else env.default_white.*;
-
-        bind.views[shd.VIEW_diffuse_tex] = tex.view;
-        bind.samplers[shd.SMP_smp] = tex.sampler;
+        bind.views[shd.VIEW_diffuse_tex] = rec.albedo_view;
+        bind.samplers[shd.SMP_smp] = rec.albedo_sampler;
 
         bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
@@ -202,7 +177,7 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
-        bind.views[shd.VIEW_morph_tex] = morph_bind.view;
+        bind.views[shd.VIEW_morph_tex] = morph_view;
         bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
 
         sg.applyBindings(bind);
@@ -212,18 +187,18 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
             .model = model,
         };
         sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
-        sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_bind.uniforms)));
+        sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_uniforms)));
 
-        const f = frameUniformsFor(env, mesh, ctx);
+        const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
         const fs_params = shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
-            .diffuse_color = std_mat.getDiffuseColor4(),
-            .alpha_cutoff = uniforms.alphaCutoffFor(mat),
-            .uv_matrix = std_mat.diffuse_uv_transform.matrixRows(),
-            .uv_offset = std_mat.diffuse_uv_transform.offsetPacked(),
+            .diffuse_color = rec.base_color,
+            .alpha_cutoff = rec.alpha_cutoff,
+            .uv_matrix = rec.standard_uv_matrix,
+            .uv_offset = rec.standard_uv_offset,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -286,11 +261,12 @@ fn drawShaderMaterialItem(
     bind.vertex_buffers[0] = mesh.vertex_buffer;
     bind.index_buffer = mesh.index_buffer;
 
-    const f = frameUniformsFor(env, mesh, ctx);
-    const alpha_cutoff = uniforms.alphaCutoffFor(item.material orelse mesh.material);
+    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
+    const alpha_cutoff = item.draw_record.alpha_cutoff;
 
     if (entry.engine_template) {
-        const morph_bind = morphBindFor(env, mesh);
+        const morph_view = item.morph_view;
+        const morph_uniforms = item.morph_uniforms;
         if (entry.base == .pbr) {
             // PBR-base hook material: full PBR lighting with engine defaults
             // for the maps the material does not override.
@@ -312,13 +288,13 @@ fn drawShaderMaterialItem(
             bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
             bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
             bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-            bind.views[pbr_shd.VIEW_morph_tex] = morph_bind.view;
+            bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
             bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
             sg.applyBindings(bind);
 
             const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
             sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
-            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_bind.uniforms)));
+            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
 
             const fs_params = pbr_shd.FsParams{
                 .eye_pos = f.eye_pos,
@@ -360,13 +336,13 @@ fn drawShaderMaterialItem(
             bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
             bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
             bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-            bind.views[shd.VIEW_morph_tex] = morph_bind.view;
+            bind.views[shd.VIEW_morph_tex] = morph_view;
             bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
             sg.applyBindings(bind);
 
             const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
             sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
-            sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_bind.uniforms)));
+            sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_uniforms)));
 
             const fs_params = shd.FsParams{
                 .eye_pos = f.eye_pos,
@@ -425,12 +401,16 @@ fn drawShaderMaterialItem(
     env.stats.triangles += mesh.index_count / 3;
 }
 
+fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) uniforms.FrameUniforms {
+    var state = shadow_uniforms;
+    state.mesh_receive_shadows = mesh_receive_shadows;
+    return uniforms.buildFrameUniforms(state, ctx);
+}
+
 // Packs the shared fragment uniforms for one mesh: the scene-level state is
 // copied and the per-mesh receive_shadows flag patched in.
 fn frameUniformsFor(env: *const Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) uniforms.FrameUniforms {
-    var state = env.shadow_uniforms;
-    state.mesh_receive_shadows = mesh.receive_shadows;
-    return uniforms.buildFrameUniforms(state, ctx);
+    return frameUniformsForState(env.shadow_uniforms, mesh.receive_shadows, ctx);
 }
 
 // GPU-morph bind resources for one regular draw. Every draw must bind the

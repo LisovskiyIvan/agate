@@ -32,6 +32,11 @@ pub const Skeleton = struct {
     name: []const u8 = "",
     bones: []Bone,
     root_transform: Mat4 = Mat4.identity,
+    /// Double-buffered skin matrices: writers fill (1 - render_slot),
+    /// then publish by updating render_slot with release semantics.
+    skin_slots: [2][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** MAX_BONES} ** 2,
+    render_slot: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Simulation-thread view of the latest computed skin matrices (preserves backward compatibility)
     skin_matrices: [MAX_BONES]Mat4 = [_]Mat4{Mat4.identity} ** MAX_BONES,
 
     pub fn init(allocator: std.mem.Allocator, bone_count: usize) !*Skeleton {
@@ -67,6 +72,8 @@ pub const Skeleton = struct {
             b.local_scale = b.bind_scale;
         }
         self.update();
+        self.skin_slots[0] = self.skin_matrices;
+        self.skin_slots[1] = self.skin_matrices;
     }
 
     pub fn update(self: *Skeleton) void {
@@ -75,9 +82,20 @@ pub const Skeleton = struct {
         for (0..count) |i| {
             self.computeBoneMatrix(i, &computed);
         }
+        const write_slot: u8 = 1 - (self.render_slot.load(.monotonic) & 1);
         for (0..count) |i| {
-            self.skin_matrices[i] = self.bones[i].model_matrix.mul(self.bones[i].inverse_bind_matrix);
+            const m = self.bones[i].model_matrix.mul(self.bones[i].inverse_bind_matrix);
+            self.skin_slots[write_slot][i] = m;
+            self.skin_matrices[i] = m;
         }
+        self.render_slot.store(write_slot, .release);
+    }
+
+    /// Read-side: returns a pointer to the currently published skin matrices slot.
+    /// Thread-safe against concurrent simulation updates (which write to the alternate slot).
+    pub fn getRenderSkinMatrices(self: *const Skeleton) *const [MAX_BONES]Mat4 {
+        const slot = self.render_slot.load(.acquire) & 1;
+        return &self.skin_slots[slot];
     }
 
     fn computeBoneMatrix(self: *Skeleton, index: usize, computed: []bool) void {
@@ -166,3 +184,26 @@ test "Skeleton bone socket and world transform queries" {
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), bone_pos.y, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 30.0), bone_pos.z, 1e-4);
 }
+
+test "Skeleton double-buffered skin matrices are published safely" {
+    const ally = std.testing.allocator;
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+
+    // Initial state: slot 0
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    const read1 = skel.getRenderSkinMatrices();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), read1[0].m[12], 1e-4);
+
+    // Second update: writes into slot 1, publishes slot 1
+    skel.bones[0].local_position = Vec3.new(5, 0, 0);
+    skel.update();
+
+    const read2 = skel.getRenderSkinMatrices();
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), read2[0].m[12], 1e-4);
+    // read1 was in slot 0, so slot 1 is a different address in skin_slots
+    try std.testing.expect(read1 != read2);
+}
+

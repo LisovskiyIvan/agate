@@ -148,9 +148,9 @@ pub const PostProcessPass = struct {
 
         self.destroyTargets();
 
-        const sw = sglue.swapchain();
-        const color_fmt: sg.PixelFormat = if (sw.color_format != .DEFAULT and sw.color_format != .NONE) sw.color_format else .BGRA8;
-        const depth_fmt: sg.PixelFormat = if (sw.depth_format != .DEFAULT and sw.depth_format != .NONE) sw.depth_format else .DEPTH_STENCIL;
+        const env_def = sg.queryDesc().environment.defaults;
+        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+        const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
 
         // Color: attachment at the full sample count; when resolving, a
         // separate 1x resolve image (usage.resolve_attachment) receives the
