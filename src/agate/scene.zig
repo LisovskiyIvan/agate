@@ -69,6 +69,7 @@ pub const SceneStats = scene_stats.SceneStats;
 const scene_render_queue = @import("scene/render_queue.zig");
 const jobs = @import("jobs.zig");
 const assets_mod = @import("assets.zig");
+const handoff_mod = @import("handoff.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
@@ -155,9 +156,13 @@ pub const Scene = struct {
     particles: scene_particles.ParticleLayer,
     /// Stage 3, slice 2: light selection + packing (including the
     /// incumbency-hysteresis fade simulation) runs in `updateLights`
-    /// during the update phase; render() consumes this plain value and no
-    /// longer mutates light state. Handoff-safe plain data for the later
-    /// game/render thread split (audit finding #1).
+    /// during the update phase and publishes through this mailbox; render
+    /// takes the newest pack at frame start. Plain data end to end, so
+    /// the group is already thread-ready for the game/render split.
+    light_handoff: handoff_mod.Handoff(scene_lights.LightRig.FramePack, 2) = .{},
+    /// Last consumed pack — the fallback render uses when no new light
+    /// pack was published since the previous frame (e.g. PIP: several
+    /// render calls per one update).
     light_pack: scene_lights.LightRig.FramePack = std.mem.zeroes(scene_lights.LightRig.FramePack),
     /// Async texture decode/upload pipeline. Drained at the top of
     /// render(); deinit'd FIRST in deinit so in-flight decodes finish
@@ -828,7 +833,18 @@ pub const Scene = struct {
             self.cameras.items[0].camera.getPosition()
         else
             Vec3.zero;
-        self.light_pack = self.lights.packFrame(eye, self.shadows.enabled, dt);
+        const pack = self.lights.packFrame(eye, self.shadows.enabled, dt);
+        // Publish through the mailbox. Same-thread today (publish is
+        // visible to this frame's render takeLatest); after the split the
+        // same call sequence crosses the thread boundary unchanged.
+        if (self.light_handoff.claim()) |i| {
+            self.light_handoff.slot(i).* = pack;
+            self.light_handoff.publish(i);
+        } else {
+            // Both slots still published (consumer lagging): fall back to
+            // the consumed copy as the carrier.
+            self.light_pack = pack;
+        }
     }
 
     /// Stage 3, slice 2: the game-side update entry point. Everything the
@@ -886,8 +902,12 @@ pub const Scene = struct {
 
         // Point & Spot light arrays were packed during the update phase
         // (updateLights) — including the hysteresis fade advance, which is
-        // update-phase simulation. Render only consumes the result.
-        const light_pack = self.light_pack;
+        // update-phase simulation. Render only consumes the newest
+        // published pack; without a fresh one, the last consumed pack
+        // stands (several render calls may share one update, e.g. PIP).
+        var light_pack = self.light_pack;
+        _ = self.light_handoff.takeLatest(&light_pack);
+        self.light_pack = light_pack;
 
         // ==============================================
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
@@ -1139,13 +1159,27 @@ test "updateLights packs point lights into the frame payload" {
     // One point light packed into slot 0 (the light sits at the pack eye,
     // so its score is maximal). Hysteresis fades a newly seen light in
     // over fade_time (0.25 s), so the first pack carries a partial factor.
-    // A newly seen light enters the enter-fade this frame and is packed
-    // from the next update on (fade-in over fade_time, 0.25 s).
-    try std.testing.expectEqual(@as(f32, 0.0), scene.light_pack.counts[0]);
+    // The pack travels through the mailbox: render-side consumption goes
+    // via takeLatest, exactly what the render pass does.
+    scene.updateLights(0.016);
+    var pack_out: scene_lights.LightRig.FramePack = undefined;
+    try std.testing.expect(scene.light_handoff.takeLatest(&pack_out));
+    // First sight: packed with a partial enter-fade factor (intensity
+    // lane = intensity * factor < full intensity).
+    try std.testing.expectEqual(@as(f32, 1.0), pack_out.counts[0]);
+    try std.testing.expect(pack_out.point_color_int[0][3] < 10.0);
     var frame: usize = 0;
-    while (frame < 32) : (frame += 1) scene.updateLights(0.016);
+    while (frame < 32) : (frame += 1) {
+        scene.updateLights(0.016);
+        // Consume per frame like render does: a fresh pack lands each
+        // update, so the mailbox never lags.
+        _ = scene.light_handoff.takeLatest(&pack_out);
+    }
     // Fully faded in (0.512 s >= fade_time): the intensity lane carries
     // the light's exact intensity, and the incumbent keeps its slot.
-    try std.testing.expectEqual(@as(f32, 1.0), scene.light_pack.counts[0]);
-    try std.testing.expectEqual(@as(f32, 10.0), scene.light_pack.point_color_int[0][3]);
+    try std.testing.expectEqual(@as(f32, 1.0), pack_out.counts[0]);
+    try std.testing.expectEqual(@as(f32, 10.0), pack_out.point_color_int[0][3]);
+    // A second take without a new publish consumes nothing (last pack
+    // stands on the render side) — the PIP multi-render pattern.
+    try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
 }
