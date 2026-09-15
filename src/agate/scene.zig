@@ -120,6 +120,14 @@ pub const Scene = struct {
     /// unlinked from `meshes`/`outline_meshes`, so deinitMeshes never sees
     /// them twice.
     pending_gpu_destroys: std.ArrayListUnmanaged(*Mesh) = .empty,
+    /// Allocation-free spillover for destroyMesh queue-append OOM
+    /// off-context: append cannot allocate here, so the mesh pointer parks
+    /// in a fixed slot instead. Drained alongside `pending_gpu_destroys`
+    /// in flushPendingGpuUploads and deinit, both on the context thread.
+    /// If this is also full the mesh is leaked (err-logged) rather than
+    /// touching sg.* off-context.
+    pending_gpu_destroys_overflow: [8]?*Mesh = [_]?*Mesh{null} ** 8,
+    pending_gpu_destroys_overflow_len: usize = 0,
     materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
@@ -390,22 +398,108 @@ pub const Scene = struct {
                 break;
             }
         }
+        // Referent cleanup: neutralize every cross-mesh reference to `mesh`
+        // before its storage is freed. Runs before the sync/deferred branch
+        // below so both paths are covered. Never cascade-destroys: orphaned
+        // meshes stay alive under their own transform.
+        // Physics: drop the rigid body bound to this mesh, if any.
+        if (self.physics.getWorld()) |pw| {
+            if (pw.findBody(mesh)) |body| pw.removeBody(body);
+        }
+        // Hierarchy: orphan children and detach bone attachments hosted by
+        // the destroyed mesh (this also covers decal meshes parented to a
+        // destroyed target via createDecal).
+        for (self.meshes.items) |child| {
+            if (child.parent == mesh) child.parent = null;
+            if (child.attach_bone) |ab| {
+                if (ab.host_mesh == mesh) child.detachFromBone();
+            }
+        }
+        // LOD: order-preserving removal keeps the distance-sorted band
+        // order; the parent renders its own geometry for the freed band
+        // instead of holding a dangling pointer.
+        for (self.meshes.items) |other| {
+            var i: usize = 0;
+            while (i < other.lod_levels.items.len) {
+                if (other.lod_levels.items[i].mesh == mesh) {
+                    _ = other.lod_levels.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Animation groups: morph targets bind slices INTO the mesh (weights
+        // slice + the dirty flag), unlike node transforms whose pointers are
+        // scene-owned. Tombstone matching targets instead of removing them so
+        // NodeChannel.target indices stay valid (applyNodesAtTime skips empty
+        // weight slices) and free the group-owned rest snapshot.
+        for (self.animation_groups.items) |ag| {
+            for (ag.morph_targets) |*mt| {
+                const binds_mesh = mt.dirty == &mesh.morph_dirty or
+                    (mt.weights.len > 0 and mt.weights.ptr == mesh.morph_weights.ptr);
+                if (!binds_mesh) continue;
+                // rest_weights belongs to the group's allocator, not the
+                // scene's; today they are the same instance.
+                if (mt.rest_weights.len > 0) ag.allocator.free(mt.rest_weights);
+                mt.weights = &.{};
+                mt.rest_weights = &.{};
+                mt.dirty = null;
+            }
+        }
+        // Decals: drop manager instances of this mesh and free their
+        // material so neither dangles nor leaks. Safe against DecalManager
+        // iteration: update/destroyOldest/clear remove the instance BEFORE
+        // calling destroyMesh, so this scan only mutates the list on
+        // user-initiated destroys where no manager iteration is in flight.
+        if (self.decals.manager) |*dm| {
+            var i: usize = 0;
+            while (i < dm.instances.items.len) {
+                if (dm.instances.items[i].mesh == mesh) {
+                    const removed = dm.instances.orderedRemove(i);
+                    self.destroyPBRMaterial(removed.material);
+                } else {
+                    i += 1;
+                }
+            }
+        }
         // Decal expiration calls this from Scene.update on the game thread,
         // where sg.destroyBuffer is illegal: unlink now, destroy the GPU
         // resources at the next render-start flush on the context thread.
         if (!gpu_thread.isOnContextThread()) {
             self.pending_gpu_destroys.append(self.allocator, mesh) catch {
-                // Queue-append OOM fallback: destroy synchronously despite
-                // the thread affinity rather than leak the mesh (Debug
-                // notes the affinity breach; correctness over strictness).
-                std.log.debug("scene: pending destroy queue OOM, destroying mesh inline", .{});
-                mesh.deinit(self.allocator);
-                self.allocator.destroy(mesh);
+                // Queue-append OOM: park the pointer in the allocation-free
+                // overflow instead of touching sg.* off-context.
+                if (self.pending_gpu_destroys_overflow_len < self.pending_gpu_destroys_overflow.len) {
+                    self.pending_gpu_destroys_overflow[self.pending_gpu_destroys_overflow_len] = mesh;
+                    self.pending_gpu_destroys_overflow_len += 1;
+                } else {
+                    // Both queues exhausted under pathological OOM: leak the
+                    // mesh (err-logged) rather than breach thread affinity.
+                    std.log.err("scene: destroy queues exhausted, leaking mesh '{s}'", .{mesh.name});
+                }
             };
             return;
         }
         mesh.deinit(self.allocator);
         self.allocator.destroy(mesh);
+    }
+
+    /// Completes deferred off-context destroys (main queue + OOM overflow)
+    /// on the context thread. Called at render start and from deinit.
+    fn drainPendingGpuDestroys(self: *Scene) void {
+        for (self.pending_gpu_destroys.items) |m| {
+            m.deinit(self.allocator);
+            self.allocator.destroy(m);
+        }
+        self.pending_gpu_destroys.clearRetainingCapacity();
+        for (self.pending_gpu_destroys_overflow[0..self.pending_gpu_destroys_overflow_len]) |slot| {
+            if (slot) |m| {
+                m.deinit(self.allocator);
+                self.allocator.destroy(m);
+            }
+        }
+        @memset(&self.pending_gpu_destroys_overflow, null);
+        self.pending_gpu_destroys_overflow_len = 0;
     }
 
     // ---- Decals / particles / trails / CSG / nav. ----
@@ -1165,11 +1259,7 @@ pub const Scene = struct {
         gpu_thread.assertOnContextThread();
         // Deferred off-context destroys first: unlinking already happened in
         // destroyMesh, this completes the GPU teardown (deinit + free).
-        for (self.pending_gpu_destroys.items) |m| {
-            m.deinit(self.allocator);
-            self.allocator.destroy(m);
-        }
-        self.pending_gpu_destroys.clearRetainingCapacity();
+        self.drainPendingGpuDestroys();
         // Deferred off-context creations (uploadGeometry): finish the vertex/
         // index buffers before queue building can reference them. Plain scan
         // over meshes — the loop below already visits every mesh, so the
@@ -1366,10 +1456,7 @@ pub const Scene = struct {
         // Deferred off-context destroys that never reached a render-start
         // flush (queued meshes are already unlinked from `meshes`, so this
         // cannot double-free with deinitMeshes below).
-        for (self.pending_gpu_destroys.items) |m| {
-            m.deinit(self.allocator);
-            self.allocator.destroy(m);
-        }
+        self.drainPendingGpuDestroys();
         self.pending_gpu_destroys.deinit(self.allocator);
 
         scene_content.deinitMeshes(self.allocator, &self.meshes);
@@ -1566,4 +1653,148 @@ test "saturated light mailbox keeps the newest pack" {
     // Fresh pack from the light-less rig: zero lights, not the sentinel.
     try std.testing.expectEqual(@as(f32, 0.0), pack_out.counts[0]);
     try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
+}
+
+test "destroyMesh removes the physics body" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.physics.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("testing.zig").testMesh("body_mesh");
+    try scene.meshes.append(alloc, m);
+
+    _ = try scene.createRigidBody(m, .box, 1.0);
+    try std.testing.expect(scene.getRigidBody(m) != null);
+
+    scene.destroyMesh(m);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.getWorld().?.bodies.items.len);
+}
+
+test "destroyMesh orphans children and detaches bone links" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const parent = try alloc.create(Mesh);
+    parent.* = @import("testing.zig").testMesh("parent");
+    try scene.meshes.append(alloc, parent);
+    const child = try alloc.create(Mesh);
+    child.* = @import("testing.zig").testMesh("child");
+    child.parent = parent;
+    try scene.meshes.append(alloc, child);
+    const attached = try alloc.create(Mesh);
+    attached.* = @import("testing.zig").testMesh("attached");
+    attached.attachToBone(parent, 2);
+    try scene.meshes.append(alloc, attached);
+
+    scene.destroyMesh(parent);
+    try std.testing.expect(child.parent == null);
+    try std.testing.expect(attached.attach_bone == null);
+    // No cascade: the orphans stay alive under their own transform.
+    try std.testing.expectEqual(@as(usize, 2), scene.meshes.items.len);
+
+    scene.destroyMesh(child);
+    scene.destroyMesh(attached);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "destroyMesh removes LOD entries preserving order" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const parent = try alloc.create(Mesh);
+    parent.* = @import("testing.zig").testMesh("lod_parent");
+    try scene.meshes.append(alloc, parent);
+    const c1 = try alloc.create(Mesh);
+    c1.* = @import("testing.zig").testMesh("lod_c1");
+    try scene.meshes.append(alloc, c1);
+    const c2 = try alloc.create(Mesh);
+    c2.* = @import("testing.zig").testMesh("lod_c2");
+    try scene.meshes.append(alloc, c2);
+    const c3 = try alloc.create(Mesh);
+    c3.* = @import("testing.zig").testMesh("lod_c3");
+    try scene.meshes.append(alloc, c3);
+
+    try parent.addLODLevel(alloc, 10.0, c1);
+    try parent.addLODLevel(alloc, 20.0, c2);
+    try parent.addLODLevel(alloc, 30.0, c3);
+
+    scene.destroyMesh(c2);
+    try std.testing.expectEqual(@as(usize, 2), parent.lod_levels.items.len);
+    try std.testing.expectEqual(@as(f32, 10.0), parent.lod_levels.items[0].distance);
+    try std.testing.expect(parent.lod_levels.items[0].mesh.? == c1);
+    try std.testing.expectEqual(@as(f32, 30.0), parent.lod_levels.items[1].distance);
+    try std.testing.expect(parent.lod_levels.items[1].mesh.? == c3);
+
+    scene.destroyMesh(c1);
+    scene.destroyMesh(c3);
+    scene.destroyMesh(parent);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "destroyMesh drops decal instances and frees material" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.decals.deinit();
+    defer scene.meshes.deinit(alloc);
+    defer scene.pbr_materials.deinit(alloc);
+    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    // Manual instance (no projection/GPU): the manager only stores the
+    // mesh/material pair, so removal + material teardown is fully
+    // exercisable without projecting any decal geometry.
+    const dm = scene.getOrCreateDecalManager(8);
+    const dm_mesh = try alloc.create(Mesh);
+    dm_mesh.* = @import("testing.zig").testMesh("decal_mesh");
+    try scene.meshes.append(alloc, dm_mesh);
+    const mat = try scene.createPBRMaterial("decal_mat");
+    try dm.instances.append(alloc, .{
+        .mesh = dm_mesh,
+        .material = mat,
+        .base_color = Color3.white,
+        .lifetime = 0.0,
+        .fade_duration = 1.0,
+    });
+
+    scene.destroyMesh(dm_mesh);
+    try std.testing.expectEqual(@as(usize, 0), dm.instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.pbr_materials.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "pending destroy overflow drains on flush" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.pending_gpu_destroys.deinit(alloc);
+
+    // Drive the allocation-free spillover directly: the off-context OOM
+    // enqueue itself needs fault injection, but the drain path (flush and
+    // deinit share drainPendingGpuDestroys) is covered here with a
+    // buffer-free mesh, so no sg.* call is involved.
+    const m = try alloc.create(Mesh);
+    m.* = @import("testing.zig").testMesh("overflow_mesh");
+    scene.pending_gpu_destroys_overflow[0] = m;
+    scene.pending_gpu_destroys_overflow_len = 1;
+
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys_overflow_len);
+    try std.testing.expect(scene.pending_gpu_destroys_overflow[0] == null);
+    try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys.items.len);
 }

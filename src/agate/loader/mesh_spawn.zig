@@ -19,6 +19,7 @@ const Material = @import("../material.zig").Material;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const MorphMode = @import("../mesh.zig").MorphMode;
 const morph_gpu = @import("../mesh.zig").morph_gpu;
+const gpu_thread = @import("../gpu_thread.zig");
 
 pub fn spawnMeshes(
     scene: *Scene,
@@ -30,6 +31,12 @@ pub fn spawnMeshes(
     node_mesh_count: []usize,
     morph_mode: MorphMode,
 ) !void {
+    // Texture/material loading for a GLB still touches sg.* inline
+    // (Texture.fromRaw/fromMemory/fromFile in loader/materials.zig), so the
+    // whole spawn stays a context-thread operation until textures grow a
+    // deferred path: fail loudly here in Debug/ReleaseSafe instead of
+    // touching sokol from a game thread.
+    gpu_thread.assertOnContextThread();
     if (gltf.nodes_count > 0) {
         for (0..gltf.nodes_count) |node_idx| {
             const node = &gltf.nodes[node_idx];
@@ -162,6 +169,11 @@ pub fn parsePrimitive(
 ) !?*Mesh {
     if (prim.type != c.cgltf_primitive_type_triangles) return null;
 
+    // Off-context (game-thread) loads must not touch sg.*: buffer and delta
+    // texture creation below is skipped and the mesh is finished by
+    // Mesh.finishGpuUpload on the context thread instead.
+    const off_context = !gpu_thread.isOnContextThread();
+
     var pos_accessor: ?*c.cgltf_accessor = null;
     var norm_accessor: ?*c.cgltf_accessor = null;
     var col_accessor: ?*c.cgltf_accessor = null;
@@ -261,7 +273,7 @@ pub fn parsePrimitive(
                 computeTangents(vertices, indices, null);
             }
 
-            ibuf = sg.makeBuffer(.{
+            ibuf = if (off_context) .{} else sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(indices),
             });
@@ -278,7 +290,7 @@ pub fn parsePrimitive(
                 computeTangents(vertices, null, indices);
             }
 
-            ibuf = sg.makeBuffer(.{
+            ibuf = if (off_context) .{} else sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(indices),
             });
@@ -295,7 +307,7 @@ pub fn parsePrimitive(
             if (tan_accessor == null) {
                 computeTangents(vertices, indices, null);
             }
-            ibuf = sg.makeBuffer(.{
+            ibuf = if (off_context) .{} else sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(indices),
             });
@@ -309,7 +321,7 @@ pub fn parsePrimitive(
             if (tan_accessor == null) {
                 computeTangents(vertices, null, indices);
             }
-            ibuf = sg.makeBuffer(.{
+            ibuf = if (off_context) .{} else sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(indices),
             });
@@ -325,7 +337,12 @@ pub fn parsePrimitive(
     //   in the RGBA32F delta texture and the vertex shader blends them, so
     //   the buffer is created filled with base data.
     const has_morph = prim.targets_count > 0;
-    const vbuf = if (!has_morph or morph_mode == .gpu)
+    // Explicit result type: the deferred branch is an empty handle, and
+    // without the annotation Zig cannot unify `.{}` with `sg.Buffer` here
+    // (visible only when a consumer actually instantiates spawnMeshes).
+    const vbuf: sg.Buffer = if (off_context)
+        .{}
+    else if (!has_morph or morph_mode == .gpu)
         sg.makeBuffer(.{ .data = sg.asRange(vertices) })
     else
         sg.makeBuffer(.{
@@ -367,7 +384,38 @@ pub fn parsePrimitive(
         .skeleton = skeleton,
         .base_matrix = base_matrix,
         .local_bounding_box = local_box,
+        .gpu_pending = off_context,
+        .pending_dynamic_update = off_context and has_morph and morph_mode == .cpu,
     };
+
+    // Adopt the mesh's owned allocations before any fallible step below.
+    // Buffers are id-guarded (empty on the deferred path); the morph-target
+    // list has its own errdefer that clears the field first, so this outer
+    // cleanup can mirror Mesh.deinit for everything else without double-free.
+    errdefer {
+        if (mesh_obj.vertex_buffer.id != 0) sg.destroyBuffer(mesh_obj.vertex_buffer);
+        if (mesh_obj.index_buffer.id != 0) sg.destroyBuffer(mesh_obj.index_buffer);
+        if (mesh_obj.morph_delta_view.id != 0) sg.destroyView(mesh_obj.morph_delta_view);
+        if (mesh_obj.morph_delta_image.id != 0) sg.destroyImage(mesh_obj.morph_delta_image);
+        for (mesh_obj.morph_targets) |*mt| freeMorphTarget(scene.allocator, mt);
+        if (mesh_obj.morph_targets.len > 0) scene.allocator.free(mesh_obj.morph_targets);
+        if (mesh_obj.morph_weights.len > 0) scene.allocator.free(mesh_obj.morph_weights);
+        if (mesh_obj.morph_base.len > 0) scene.allocator.free(mesh_obj.morph_base);
+        if (mesh_obj.morph_staging.len > 0) scene.allocator.free(mesh_obj.morph_staging);
+        if (mesh_obj.cpu_positions.len > 0) scene.allocator.free(mesh_obj.cpu_positions);
+        if (mesh_obj.cpu_indices.len > 0) scene.allocator.free(mesh_obj.cpu_indices);
+        if (mesh_obj.cpu_skin.len > 0) scene.allocator.free(mesh_obj.cpu_skin);
+        if (mesh_obj.pending_vertices.len > 0) scene.allocator.free(mesh_obj.pending_vertices);
+        if (mesh_obj.owns_name and mesh_obj.name.len > 0) scene.allocator.free(mesh_obj.name);
+        scene.allocator.destroy(mesh_obj);
+    }
+
+    if (off_context) {
+        // No sg.* above: retain the vertices so Mesh.finishGpuUpload can
+        // create the buffers on the context thread. cpu_positions/cpu_indices
+        // below stay the finish-step index source, exactly as on-context.
+        mesh_obj.pending_vertices = try scene.allocator.dupe(Vertex, vertices);
+    }
 
     // Morph targets (blend shapes): per-vertex POSITION/NORMAL/TANGENT
     // deltas. Only the first MAX_MORPH_TARGETS are kept; extras are dropped
@@ -381,6 +429,9 @@ pub fn parsePrimitive(
         errdefer {
             for (list[0..done]) |*mt| freeMorphTarget(scene.allocator, mt);
             scene.allocator.free(list);
+            // The outer mesh errdefer also scans morph_targets: clear the
+            // field so a failure here can never double-free the list.
+            mesh_obj.morph_targets = &.{};
         }
         for (0..want) |ti| {
             const target_ptr: *const c.cgltf_morph_target = @ptrCast(&prim.targets[ti]);
@@ -418,7 +469,13 @@ pub fn parsePrimitive(
             // in this mode, so no first-frame upload is needed. Fails loudly
             // when RGBA32F is unavailable (no silent CPU fallback: the
             // buffer is already immutable).
-            try morph_gpu.uploadMorphDeltas(mesh_obj, scene.allocator);
+            if (off_context) {
+                // No sg.* off-context: Mesh.finishGpuUpload uploads the
+                // delta texture on the context thread and retries on failure.
+                mesh_obj.morph_upload_pending = true;
+            } else {
+                try morph_gpu.uploadMorphDeltas(mesh_obj, scene.allocator);
+            }
         } else {
             // The GPU buffer is empty for CPU-morph meshes until the first
             // applyMorphs(); mark dirty so frame 1 uploads base + default

@@ -25,6 +25,7 @@ const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const Scene = @import("../scene.zig").Scene;
 const gpu_thread = @import("../gpu_thread.zig");
+const morph_gpu = @import("morph_gpu.zig");
 
 pub const Mesh = struct {
     name: []const u8,
@@ -112,6 +113,20 @@ pub const Mesh = struct {
     /// a mesh that dies pending never leaks.
     gpu_pending: bool = false,
     pending_vertices: []Vertex = &.{},
+    /// Set by the glTF loader for off-context CPU-morph meshes: finishGpuUpload
+    /// then creates the same EMPTY dynamic vertex buffer the immediate loader
+    /// path builds (first frame's applyMorphs fills it) instead of a static
+    /// buffer. One-shot: cleared together with gpu_pending on success.
+    pending_dynamic_update: bool = false,
+    /// Set by the glTF loader for off-context GPU-morph meshes instead of
+    /// calling morph_gpu.uploadMorphDeltas inline (an sg.* call). finishGpuUpload
+    /// performs the upload on the context thread and clears this only on
+    /// success, so a failure/OOM retries on the next flush.
+    morph_upload_pending: bool = false,
+    /// One-shot guard: logs the first morph-delta upload failure so a
+    /// permanent condition (e.g. missing RGBA32F support) is visible without
+    /// spamming every flush; the retry itself continues.
+    morph_upload_failure_logged: bool = false,
 
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
@@ -411,9 +426,18 @@ pub const Mesh = struct {
     pub fn finishGpuUpload(self: *Mesh, allocator: std.mem.Allocator) void {
         if (!self.gpu_pending) return;
         if (!sg.isvalid()) return;
-        const vbuf = sg.makeBuffer(.{
-            .data = sg.asRange(self.pending_vertices),
-        });
+        // CPU-morph glTF meshes created off-context need the same empty
+        // dynamic vertex buffer the immediate loader path builds (the first
+        // frame's applyMorphs fills it); everything else uploads static.
+        const vbuf = if (self.pending_dynamic_update)
+            sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.pending_vertices.len * @sizeOf(Vertex),
+            })
+        else
+            sg.makeBuffer(.{
+                .data = sg.asRange(self.pending_vertices),
+            });
         if (vbuf.id == 0) return;
         if (self.index_type == .UINT16) {
             const indices16 = allocator.alloc(u16, self.cpu_indices.len) catch return;
@@ -441,12 +465,48 @@ pub const Mesh = struct {
             }
             self.index_buffer = ibuf;
         }
+        // Deferred GPU-morph delta texture: upload on the context thread now
+        // that the base buffers exist. On failure (OOM) or pool exhaustion
+        // (dead view handle) tear the fresh buffers back down and keep every
+        // pending flag, so the next flush retries the whole finish
+        // atomically and the mesh stays skipped by the queue meanwhile.
+        if (self.morph_upload_pending) {
+            morph_gpu.uploadMorphDeltas(self, allocator) catch {
+                self.logMorphUploadFailure();
+                sg.destroyBuffer(vbuf);
+                sg.destroyBuffer(self.index_buffer);
+                self.index_buffer = .{};
+                return;
+            };
+            if (self.morph_delta_view.id == 0) {
+                self.logMorphUploadFailure();
+                sg.destroyBuffer(vbuf);
+                sg.destroyBuffer(self.index_buffer);
+                self.index_buffer = .{};
+                return;
+            }
+            self.morph_upload_pending = false;
+        }
         self.vertex_buffer = vbuf;
         self.gpu_pending = false;
+        // CPU-morph deferred creation can land after this frame's applyMorphs
+        // already ran (or before it ever will): upload the retained base pose
+        // so frame 1 cannot draw an all-zero dynamic buffer. Staging equals
+        // the base pose until applyMorphs blends the first time.
+        if (self.pending_dynamic_update) self.morph_upload_needed = true;
+        self.pending_dynamic_update = false;
         if (self.pending_vertices.len > 0) {
             allocator.free(self.pending_vertices);
             self.pending_vertices = &.{};
         }
+    }
+
+    /// Logs the first morph-delta failure only (permanent conditions such as
+    /// missing RGBA32F would otherwise log on every flush).
+    fn logMorphUploadFailure(self: *Mesh) void {
+        if (self.morph_upload_failure_logged) return;
+        self.morph_upload_failure_logged = true;
+        std.log.err("mesh '{s}': morph delta texture unavailable, retrying on each flush", .{self.name});
     }
 
     pub fn deinit(self: *Mesh, allocator: std.mem.Allocator) void {
@@ -507,6 +567,11 @@ pub const Mesh = struct {
 // queue building, so a pending mesh always has buffers before it can be
 // queued for drawing. The deferred path also covers "no valid sg context
 // yet", so context-less tests never crash inside makeBuffer.
+//
+// The immediate path fails with error.GpuBufferAllocationFailed when the
+// sokol buffer pool is exhausted (sg.makeBuffer returns id == 0) instead of
+// publishing a mesh with dead handles; nothing is appended and no GPU/CPU
+// state leaks.
 pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mesh {
     if (!gpu_thread.isOnContextThread() or !sg.isvalid()) {
         const mesh = try scene.allocator.create(Mesh);
@@ -534,18 +599,38 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
         return mesh;
     }
 
+    // Immediate path: default-initialize the Mesh first so the single
+    // errdefer below cleans whatever exists on any failure (pool-exhausted
+    // buffers, CPU mirror OOM, scene append OOM). owns_name stays false:
+    // the name slice is caller-owned until scene.meshes adopts the mesh.
+    const index_type: sg.IndexType = if (data.vertices.len <= std.math.maxInt(u16)) .UINT16 else .UINT32;
+    const mesh = try scene.allocator.create(Mesh);
+    mesh.* = .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(data.indices.len),
+        .index_type = index_type,
+        .local_bounding_box = data.bounds,
+    };
+    errdefer {
+        if (mesh.vertex_buffer.id != 0) sg.destroyBuffer(mesh.vertex_buffer);
+        if (mesh.index_buffer.id != 0) sg.destroyBuffer(mesh.index_buffer);
+        if (mesh.cpu_positions.len > 0) scene.allocator.free(mesh.cpu_positions);
+        if (mesh.cpu_indices.len > 0) scene.allocator.free(mesh.cpu_indices);
+        if (mesh.pending_vertices.len > 0) scene.allocator.free(mesh.pending_vertices);
+        scene.allocator.destroy(mesh);
+    }
+
     const vbuf = sg.makeBuffer(.{
         .data = sg.asRange(data.vertices),
     });
+    if (vbuf.id == 0) return error.GpuBufferAllocationFailed;
+    mesh.vertex_buffer = vbuf;
 
-    const mesh = try scene.allocator.create(Mesh);
-    errdefer scene.allocator.destroy(mesh);
-
-    if (data.vertices.len <= std.math.maxInt(u16)) {
+    if (index_type == .UINT16) {
         // CPU copy first: it needs the original u32 indices.
         try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
-        const cpu_positions = mesh.cpu_positions;
-        const cpu_indices = mesh.cpu_indices;
         const indices16 = try scene.allocator.alloc(u16, data.indices.len);
         defer scene.allocator.free(indices16);
         for (data.indices, 0..) |idx, k| {
@@ -555,40 +640,96 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(indices16),
         });
-        mesh.* = .{
-            .name = name,
-            .vertex_buffer = vbuf,
-            .index_buffer = ibuf,
-            .index_count = @intCast(data.indices.len),
-            .local_bounding_box = data.bounds,
-            .cpu_positions = cpu_positions,
-            .cpu_indices = cpu_indices,
-        };
+        if (ibuf.id == 0) return error.GpuBufferAllocationFailed;
+        mesh.index_buffer = ibuf;
     } else {
         const ibuf = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(data.indices),
         });
-        mesh.* = .{
-            .name = name,
-            .vertex_buffer = vbuf,
-            .index_buffer = ibuf,
-            .index_count = @intCast(data.indices.len),
-            .index_type = .UINT32,
-            .local_bounding_box = data.bounds,
-        };
+        if (ibuf.id == 0) return error.GpuBufferAllocationFailed;
+        mesh.index_buffer = ibuf;
         try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
     }
 
-    scene.meshes.append(scene.allocator, mesh) catch |err| {
-        // Nothing has adopted the mesh yet: destroy the buffers and CPU
-        // mirrors instead of leaking them (mesh.owns_name stays false).
-        if (mesh.vertex_buffer.id != 0) sg.destroyBuffer(mesh.vertex_buffer);
-        if (mesh.index_buffer.id != 0) sg.destroyBuffer(mesh.index_buffer);
-        if (mesh.cpu_positions.len > 0) scene.allocator.free(mesh.cpu_positions);
-        if (mesh.cpu_indices.len > 0) scene.allocator.free(mesh.cpu_indices);
-        scene.allocator.destroy(mesh);
-        return err;
-    };
+    try scene.meshes.append(scene.allocator, mesh);
     return mesh;
+}
+
+test "finishGpuUpload with pending_dynamic_update stays pending without sg context" {
+    const ally = std.testing.allocator;
+    var m: Mesh = .{
+        .name = "pending_dynamic",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    m.gpu_pending = true;
+    m.pending_dynamic_update = true;
+    m.pending_vertices = try ally.dupe(Vertex, &[_]Vertex{
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+    });
+    m.cpu_indices = try ally.dupe(u32, &[_]u32{ 0, 1, 2 });
+    defer m.deinit(ally);
+    // No sg context in tests: must stay pending without touching sg.* and
+    // keep the retained vertex copy for the later context-thread finish.
+    m.finishGpuUpload(ally);
+    try std.testing.expect(m.gpu_pending);
+    try std.testing.expect(m.pending_dynamic_update);
+    try std.testing.expectEqual(@as(usize, 3), m.pending_vertices.len);
+    try std.testing.expectEqual(@as(u32, 0), m.vertex_buffer.id);
+}
+
+test "finishGpuUpload with morph_upload_pending survives without sg context" {
+    const ally = std.testing.allocator;
+    var m: Mesh = .{
+        .name = "pending_morph",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    m.gpu_pending = true;
+    m.morph_upload_pending = true;
+    m.pending_vertices = try ally.dupe(Vertex, &[_]Vertex{
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+    });
+    m.cpu_indices = try ally.dupe(u32, &[_]u32{ 0, 1, 2 });
+    defer m.deinit(ally);
+    // No sg context: the delta-texture upload must not run; the flag stays
+    // set so the context-thread flush retries it.
+    m.finishGpuUpload(ally);
+    try std.testing.expect(m.gpu_pending);
+    try std.testing.expect(m.morph_upload_pending);
+    try std.testing.expectEqual(@as(usize, 3), m.pending_vertices.len);
+}
+
+test "uploadGeometry defers without sg context and finish preserves pending" {
+    const testScene = @import("../testing.zig").testScene;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+    var verts = [_]Vertex{
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+        std.mem.zeroes(Vertex),
+    };
+    var idx = [_]u32{ 0, 1, 2 };
+    const m = try uploadGeometry(&scene, "deferred", .{
+        .vertices = &verts,
+        .indices = &idx,
+        .bounds = BoundingBox.zero,
+    });
+    try std.testing.expect(m.gpu_pending);
+    try std.testing.expectEqual(@as(usize, 3), m.pending_vertices.len);
+    try std.testing.expectEqual(@as(usize, 3), m.cpu_positions.len);
+    try std.testing.expectEqual(@as(usize, 3), m.cpu_indices.len);
+    // Still no sg context: the finish attempt must keep everything pending.
+    m.finishGpuUpload(alloc);
+    try std.testing.expect(m.gpu_pending);
+    try std.testing.expectEqual(@as(usize, 3), m.pending_vertices.len);
 }

@@ -203,6 +203,15 @@ pub fn uploadMorphDeltas(mesh: *Mesh, allocator: std.mem.Allocator) !void {
     img_desc.data.mip_levels[0] = sg.asRange(pixels);
     const img = sg.makeImage(img_desc);
     const view = sg.makeView(.{ .texture = .{ .image = img } });
+    if (img.id == 0 or view.id == 0) {
+        // Pool exhaustion or missing RGBA32F support: never publish dead
+        // handles (vsUniforms panics on an invalid view) and destroy any
+        // partial handle here instead of leaking it. The caller decides
+        // between a hard load error (on-context) and a deferred retry.
+        if (view.id != 0) sg.destroyView(view);
+        if (img.id != 0) sg.destroyImage(img);
+        return error.MorphDeltaTextureUnavailable;
+    }
 
     destroyDeltaResources(mesh);
     mesh.morph_delta_image = img;
@@ -211,8 +220,8 @@ pub fn uploadMorphDeltas(mesh: *Mesh, allocator: std.mem.Allocator) !void {
     mesh.morph_tex_height = size.height;
 }
 
-/// Destroys the mesh's delta image and view (GPU calls). Mesh.deinit
-/// performs the same teardown inline to avoid importing this module back.
+/// Destroys the mesh's delta image and view (GPU calls). Both Mesh.deinit
+/// and finishGpuUpload tear the resources down inline for the retry path.
 fn destroyDeltaResources(mesh: *Mesh) void {
     if (mesh.morph_delta_view.id != 0) sg.destroyView(mesh.morph_delta_view);
     if (mesh.morph_delta_image.id != 0) sg.destroyImage(mesh.morph_delta_image);
