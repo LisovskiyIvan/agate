@@ -10,6 +10,7 @@ const RayHit = math.RayHit;
 const Camera = @import("../camera.zig").Camera;
 const Viewport = @import("../camera.zig").Viewport;
 const Mesh = @import("../mesh.zig").Mesh;
+const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const physics = @import("../physics.zig");
 const PickingInfo = physics.PickingInfo;
 const PhysicsWorld = physics.PhysicsWorld;
@@ -109,75 +110,135 @@ fn conservativeSphereHit(r: Ray, model: Mat4, local_radius: f32) ?RayHit {
     return r.intersectsSphereNormal(model.getTranslation(), local_radius * @sqrt(sx2 + sy2 + sz2));
 }
 
-/// Closest hit across visible, non-instanced, non-decal meshes. A sphere
-/// collider on the mesh's rigid body replaces the AABB test (tighter fit).
+/// Exact local-space sphere test shared by the plain-mesh and instance
+/// paths: maps the world ray into the mesh's local space with the inverse
+/// world matrix and intersects the local sphere (centered at the local
+/// origin, radius = collider radius). The map is affine and the world
+/// direction is unit length, so the ray parameter t equals the world-space
+/// distance — no local re-normalization, which would corrupt the parameter
+/// under non-uniform scale. Follows parent chains, bone attachment,
+/// rotation and scale exactly. Singular transforms (|det| < 1e-8) and
+/// numerically collapsed local directions use the conservative fallback.
+fn sphereHit(r: Ray, model: Mat4, radius: f32) ?RayHit {
+    const im = model.invert() orelse
+        return conservativeSphereHit(r, model, radius);
+    const o = r.origin;
+    const d = r.direction;
+    const lo = im.transformPoint(o);
+    const ld = Vec3.new(
+        im.m[0] * d.x + im.m[4] * d.y + im.m[8] * d.z,
+        im.m[1] * d.x + im.m[5] * d.y + im.m[9] * d.z,
+        im.m[2] * d.x + im.m[6] * d.y + im.m[10] * d.z,
+    );
+    const a = ld.lengthSq();
+    if (a <= 1e-12) return conservativeSphereHit(r, model, radius);
+    const b = lo.dot(ld);
+    const cc = lo.lengthSq() - radius * radius;
+    const disc = b * b - a * cc;
+    if (disc < 0.0) return null;
+    const sq = @sqrt(disc);
+    var t = (-b - sq) / a;
+    if (t < 0.0) t = (-b + sq) / a;
+    if (t < 0.0) return null;
+    // Local surface normal -> world via the inverse-transpose of the
+    // linear part.
+    const n_loc = lo.add(ld.scale(t)).normalize();
+    const n_world = Vec3.new(
+        im.m[0] * n_loc.x + im.m[1] * n_loc.y + im.m[2] * n_loc.z,
+        im.m[4] * n_loc.x + im.m[5] * n_loc.y + im.m[6] * n_loc.z,
+        im.m[8] * n_loc.x + im.m[9] * n_loc.y + im.m[10] * n_loc.z,
+    ).normalize();
+    return RayHit{
+        .distance = t,
+        .point = r.getPoint(t),
+        .normal = n_world,
+    };
+}
+
+/// Closest hit across visible, non-decal meshes, including every visible
+/// instance of instance-bearing meshes. A sphere collider on the source
+/// mesh's rigid body replaces the AABB test (tighter fit) for plain meshes
+/// and instances alike.
+///
+/// Instance picking uses the drawn model matrix: each candidate is refreshed
+/// with the same CPU-only `updateCachedTransforms()` the render path calls,
+/// and the ray tests `cached_bounding_box` / the source-local sphere in that
+/// exact space. The cached matrix is `TRS(instance) * source.base_matrix` —
+/// the source mesh's own TRS and parent chain never reach the instanced draw,
+/// so they must not move picks either. Resolution is AABB-level, matching the
+/// mesh-level AABB path (no triangle tests exist in picking). The nearest hit
+/// across meshes AND instances wins via the shared `closest_dist`;
+/// `picked_instance` reports the raw `instances.items` index (invisible slots
+/// included) and stays null for plain meshes.
+///
+/// Threading: instance picking refreshes per-instance transform caches in
+/// place, so callers must hold phase ownership (the same `phase_mutex` the
+/// render and simulation phases serialize on) — calling Scene.pick from an
+/// unrelated thread would race the render-side instance staging.
 pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) PickingInfo {
     var closest_dist: f32 = std.math.inf(f32);
     var best_hit: ?RayHit = null;
     var best_mesh: ?*Mesh = null;
+    var best_instance: ?usize = null;
 
     for (meshes) |mesh| {
-        if (!mesh.is_visible or mesh.is_lod_child or mesh.is_decal) continue;
+        if (mesh.is_lod_child or mesh.is_decal) continue;
+        // Deferred-creation meshes have no buffers yet and are skipped by
+        // every render path; picking must not see them before they draw.
+        if (mesh.gpu_pending) continue;
 
         if (mesh.instances.items.len > 0) {
+            // Instanced draws are gated per instance, not by the source
+            // template's own is_visible flag: a hidden source with visible
+            // instances still renders, so it must still be pickable.
+            var sphere_radius: ?f32 = null;
+            if (world) |pw| {
+                if (pw.findBody(mesh)) |body| {
+                    if (body.collider == .sphere) sphere_radius = body.sphere_radius;
+                }
+            }
+            for (mesh.instances.items, 0..) |inst, idx| {
+                if (!inst.is_visible) continue;
+                // Same CPU-only refresh the render path performs; the cached
+                // matrix is exactly the model matrix the instanced draw
+                // uploads, so picks land where instances draw.
+                inst.updateCachedTransforms();
+                if (sphere_radius) |radius| {
+                    if (sphereHit(r, inst.cached_world_matrix, radius)) |hit| {
+                        if (hit.distance < closest_dist) {
+                            closest_dist = hit.distance;
+                            best_hit = hit;
+                            best_mesh = mesh;
+                            best_instance = idx;
+                        }
+                    }
+                    continue;
+                }
+                if (r.intersectsAABBNormal(inst.cached_bounding_box)) |hit| {
+                    if (hit.distance < closest_dist) {
+                        closest_dist = hit.distance;
+                        best_hit = hit;
+                        best_mesh = mesh;
+                        best_instance = idx;
+                    }
+                }
+            }
             continue;
         }
+
+        if (!mesh.is_visible) continue;
 
         const model = mesh.getWorldMatrix();
         const world_aabb = mesh.local_bounding_box.transform(model);
 
         if (if (world) |pw| pw.findBody(mesh) else null) |body| {
             if (body.collider == .sphere) {
-                // Exact test: map the world ray into the mesh's local space
-                // with the inverse world matrix and intersect the local
-                // sphere (centered at the local origin, radius = collider
-                // radius). The map is affine and the world direction is unit
-                // length, so the ray parameter t equals the world-space
-                // distance — no local re-normalization, which would corrupt
-                // the parameter under non-uniform scale. This follows
-                // parent chains, bone attachment, rotation and scale exactly.
-                // Singular transforms (|det| < 1e-8) and numerically
-                // collapsed local directions use the conservative fallback.
-                const sphere_hit: ?RayHit = blk: {
-                    const im = model.invert() orelse
-                        break :blk conservativeSphereHit(r, model, body.sphere_radius);
-                    const o = r.origin;
-                    const d = r.direction;
-                    const lo = im.transformPoint(o);
-                    const ld = Vec3.new(
-                        im.m[0] * d.x + im.m[4] * d.y + im.m[8] * d.z,
-                        im.m[1] * d.x + im.m[5] * d.y + im.m[9] * d.z,
-                        im.m[2] * d.x + im.m[6] * d.y + im.m[10] * d.z,
-                    );
-                    const a = ld.lengthSq();
-                    if (a <= 1e-12) break :blk conservativeSphereHit(r, model, body.sphere_radius);
-                    const b = lo.dot(ld);
-                    const cc = lo.lengthSq() - body.sphere_radius * body.sphere_radius;
-                    const disc = b * b - a * cc;
-                    if (disc < 0.0) break :blk null;
-                    const sq = @sqrt(disc);
-                    var t = (-b - sq) / a;
-                    if (t < 0.0) t = (-b + sq) / a;
-                    if (t < 0.0) break :blk null;
-                    // Local surface normal -> world via the inverse-transpose
-                    // of the linear part.
-                    const n_loc = lo.add(ld.scale(t)).normalize();
-                    const n_world = Vec3.new(
-                        im.m[0] * n_loc.x + im.m[1] * n_loc.y + im.m[2] * n_loc.z,
-                        im.m[4] * n_loc.x + im.m[5] * n_loc.y + im.m[6] * n_loc.z,
-                        im.m[8] * n_loc.x + im.m[9] * n_loc.y + im.m[10] * n_loc.z,
-                    ).normalize();
-                    break :blk RayHit{
-                        .distance = t,
-                        .point = r.getPoint(t),
-                        .normal = n_world,
-                    };
-                };
-                if (sphere_hit) |hit| {
+                if (sphereHit(r, model, body.sphere_radius)) |hit| {
                     if (hit.distance < closest_dist) {
                         closest_dist = hit.distance;
                         best_hit = hit;
                         best_mesh = mesh;
+                        best_instance = null;
                     }
                 }
                 continue;
@@ -189,6 +250,7 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
                 closest_dist = hit.distance;
                 best_hit = hit;
                 best_mesh = mesh;
+                best_instance = null;
             }
         }
     }
@@ -200,6 +262,7 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
             .picked_point = hit.point,
             .picked_normal = hit.normal,
             .picked_mesh = best_mesh,
+            .picked_instance = best_instance,
         };
     }
 
@@ -387,6 +450,33 @@ test "sphere picking composes rotation with non-uniform parent scale" {
     try std.testing.expect(!pickWithRay(&list, &pw, Ray.new(center.add(Vec3.new(0, 2, -5)), Vec3.new(0, 0, 1))).hit);
 }
 
+test "sphere picking normal uses the inverse-transpose under rotation" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    // Rz(90°): a ray offset in x hits off-center, so the normal has both x
+    // and z components. The world normal must be the local normal mapped by
+    // the inverse-transpose of the linear part — (0.5, 0, -0.866) here.
+    // Mapping by the matrix itself (a common mix-up: rows vs columns of the
+    // column-major inverse) would flip the x sign to -0.5.
+    var mesh = Mesh{
+        .name = "rot",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .rotation = Vec3.new(0, 0, 90),
+    };
+    const body = try pw.createBody(&mesh, .sphere, 0.0);
+    body.sphere_radius = 1.0;
+    var list = [_]*Mesh{&mesh};
+
+    const hit_info = pickWithRay(&list, &pw, Ray.new(Vec3.new(0.5, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(hit_info.hit);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), hit_info.picked_normal.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), hit_info.picked_normal.y, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.86603), hit_info.picked_normal.z, 1e-3);
+}
+
 test "picking ray with degenerate framebuffer returns a defined forward ray" {
     const FreeCamera = @import("../camera.zig").FreeCamera;
     const cam: Camera = .{ .free = FreeCamera.init("test", .{ .position = Vec3.new(0, 0, 5) }) };
@@ -404,4 +494,171 @@ test "picking ray with degenerate framebuffer returns a defined forward ray" {
     // Degenerate containment stays a defined false, never a crash.
     try std.testing.expect(!viewportContainsPoint(.{}, 100.0, 100.0, 0.0, 600.0));
     try std.testing.expect(!viewportContainsPoint(.{}, 100.0, 100.0, 800.0, 0.0));
+}
+
+test "instance picking hits an offset instance and reports its index" {
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    var list = [_]*Mesh{&src};
+
+    const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(5, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(hit_info.hit);
+    try std.testing.expectEqual(&src, hit_info.picked_mesh.?);
+    try std.testing.expectEqual(@as(?usize, 0), hit_info.picked_instance);
+
+    // The source origin holds no instance, so a ray through it misses even
+    // though the source mesh itself is under the cursor.
+    try std.testing.expect(!pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1))).hit);
+}
+
+test "instance picking reports the nearer of two instances" {
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &src, .position = Vec3.new(0, 0, 5) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 2 };
+    var list = [_]*Mesh{&src};
+
+    const from_front = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(from_front.hit);
+    try std.testing.expectEqual(@as(?usize, 0), from_front.picked_instance);
+
+    const from_back = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, 10), Vec3.new(0, 0, -1)));
+    try std.testing.expect(from_back.hit);
+    try std.testing.expectEqual(@as(?usize, 1), from_back.picked_instance);
+}
+
+test "instance picking skips invisible instances" {
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0), .is_visible = false };
+    var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &src, .position = Vec3.new(0, 0, 5) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 2 };
+    var list = [_]*Mesh{&src};
+
+    // The nearer instance is invisible, so the farther visible one wins.
+    const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(hit_info.hit);
+    try std.testing.expectEqual(@as(?usize, 1), hit_info.picked_instance);
+
+    // All instances invisible behaves like a miss.
+    inst1.is_visible = false;
+    try std.testing.expect(!pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1))).hit);
+}
+
+test "instance picking matches the drawn instance matrix" {
+    // The instanced draw path uses TRS(instance) * source.base_matrix as the
+    // model matrix; the source mesh's own TRS and parent chain never reach
+    // the draw. Picking must mirror that: a parent on the source does NOT
+    // move instances, and picks land where instances actually render.
+    var parent = Mesh{
+        .name = "parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(10, 0, 0),
+    };
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .parent = &parent,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    var list = [_]*Mesh{&src};
+
+    // Instance at its own local origin draws (and picks) at (0,0,0)...
+    const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(hit_info.hit);
+    try std.testing.expectEqual(@as(?usize, 0), hit_info.picked_instance);
+    // ...not at the source parent's position (the draw ignores it).
+    try std.testing.expect(!pickWithRay(&list, null, Ray.new(Vec3.new(10, 0, -5), Vec3.new(0, 0, 1))).hit);
+}
+
+test "instance picking sees instances of a hidden source" {
+    // The instanced draw ignores the source template's own is_visible flag
+    // (only per-instance visibility gates it), so a hidden source with a
+    // visible instance must still be pickable — exactly where it draws.
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .is_visible = false,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(3, 0, 0) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    var list = [_]*Mesh{&src};
+
+    const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(3, 0, -5), Vec3.new(0, 0, 1)));
+    try std.testing.expect(hit_info.hit);
+    try std.testing.expectEqual(@as(?usize, 0), hit_info.picked_instance);
+}
+
+test "plain mesh picking still reports a null instance index" {
+    var src = Mesh{
+        .name = "src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    var plain = Mesh{
+        .name = "plain",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0, 0, -4),
+        .local_bounding_box = math.BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var list = [_]*Mesh{ &src, &plain };
+
+    // Plain box spans z in [-5,-3], instance box spans [-1,1]: from z=-10 the
+    // plain mesh is nearer and must win with a null instance index.
+    const plain_wins = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -10), Vec3.new(0, 0, 1)));
+    try std.testing.expect(plain_wins.hit);
+    try std.testing.expectEqual(&plain, plain_wins.picked_mesh.?);
+    try std.testing.expectEqual(@as(?usize, null), plain_wins.picked_instance);
+
+    // From z=-2 going +z the plain box [-5,-3] is behind the origin, so the
+    // instance wins and its index is reported.
+    const inst_wins = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -2), Vec3.new(0, 0, 1)));
+    try std.testing.expect(inst_wins.hit);
+    try std.testing.expectEqual(&src, inst_wins.picked_mesh.?);
+    try std.testing.expectEqual(@as(?usize, 0), inst_wins.picked_instance);
+
+    // A lone plain mesh hit also reports null.
+    var lone = [_]*Mesh{&plain};
+    const lone_hit = pickWithRay(&lone, null, Ray.new(Vec3.new(0, 0, -10), Vec3.new(0, 0, 1)));
+    try std.testing.expect(lone_hit.hit);
+    try std.testing.expectEqual(@as(?usize, null), lone_hit.picked_instance);
 }

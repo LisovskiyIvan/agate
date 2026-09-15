@@ -17,13 +17,20 @@ var camera: z.ArcRotateCamera = undefined;
 // main target (valid: 1/2/4, clamped per scene/msaa.zig; enabling it turns
 // the post chain on, because MSAA applies only to the offscreen path, and
 // suppresses SSAO/SSR/DoF, which need a depth texture sokol cannot resolve
-// from an MSAA target). --frames is useful for headless smokes:
+// from an MSAA target). --stats prints a compact one-line frame-metrics
+// summary (phase timings, draws, texture-upload tally) every 120 frames.
+// --frames is useful for headless smokes:
 // `agate --frames 120 --msaa 4` must complete without sokol validation
 // errors (the classic MSAA failure is a pipeline/attachment sample-count
 // mismatch).
 var frame_limit: u32 = 0;
 var frame_count: u32 = 0;
 var particle_mode: ?z.SimulationMode = null;
+/// --stats gate: frame-metrics summary every `stats_interval` frames.
+/// Off by default so normal runs see no stdout change.
+var show_stats: bool = false;
+const stats_interval: u32 = 120;
+var stats_tick: u32 = 0;
 /// Stage 3: real thread split. The game thread owns simulation
 /// (Scene.update + input consumption), the sapp thread owns windowing +
 /// render. Coarse phase ownership: one mutex, held by whichever side is
@@ -58,8 +65,38 @@ fn parseArgs(args: std.process.Args) void {
         } else if (std.mem.eql(u8, arg, "--msaa")) {
             const n = it.next() orelse break;
             msaa_samples = std.fmt.parseInt(i32, n, 10) catch 1;
+        } else if (std.mem.eql(u8, arg, "--stats")) {
+            show_stats = true;
         }
     }
+}
+
+/// Milliseconds elapsed since a `sokol.time.now()` tick. Cheap, no
+/// allocation; used for the SceneStats phase timings.
+fn msSince(t0: u64) f32 {
+    return @floatCast(sokol.time.ms(sokol.time.now() -% t0));
+}
+
+/// Compact one-line frame metrics, printed every `stats_interval` frames
+/// when `--stats` is passed. update/prepare are measured here around
+/// Scene.update/prepareFrame; shadow/main/post are timed inside
+/// Scene.render. Under threading this runs inside phase ownership (called
+/// before phase_mutex.unlock), so the game thread cannot race the read.
+fn printFrameStats() void {
+    stats_tick += 1;
+    if (stats_tick % stats_interval != 0) return;
+    const s = scene.stats;
+    std.debug.print("stats: update={d:.2}ms prepare={d:.2}ms shadow={d:.2}ms main={d:.2}ms post={d:.2}ms draws={d} tris={d} up_tex={d} up_bytes={d}\n", .{
+        s.update_ms,
+        s.prepare_ms,
+        s.shadow_ms,
+        s.main_ms,
+        s.post_ms,
+        s.draw_calls,
+        s.triangles,
+        s.uploaded_textures_frame,
+        s.uploaded_bytes_frame,
+    });
 }
 
 export fn init() callconv(.c) void {
@@ -191,12 +228,14 @@ fn simulate(dt_sec: f32) void {
     box.rotation.x += 0.8 * dt_norm;
     box.rotation.y += 1.6 * dt_norm;
 
+    const t_update = sokol.time.now();
     scene.update(dt_sec) catch |err| {
         std.debug.panic("scene update failed: {s} (particle mode: {s})", .{
             @errorName(err),
             if (particle_mode) |m| @tagName(m) else "off",
         });
     };
+    scene.stats.update_ms = msSince(t_update);
 }
 
 fn gameLoop() void {
@@ -226,12 +265,26 @@ export fn frame() callconv(.c) void {
         // render() reads live meshes/materials and uses the shared
         // single-producer jobs.global pool, so it must not overlap gameLoop.
         phase_mutex.lock();
+        const t_prepare = sokol.time.now();
         scene.prepareFrame();
+        const prepare_ms = msSince(t_prepare);
         scene.render();
+        // Assigned after render: render's per-frame stats reset preserves
+        // update_ms/prepare_ms, so either order would survive, but writing
+        // the finished measurement here keeps measure-then-publish local.
+        scene.stats.prepare_ms = prepare_ms;
+        if (show_stats) printFrameStats();
         phase_mutex.unlock();
     } else {
         simulate(@floatCast(sapp.frameDuration()));
+        // Explicit prepare (render would do it internally): same total work,
+        // but the prepare phase gets its own timing attribution.
+        const t_prepare = sokol.time.now();
+        scene.prepareFrame();
+        const prepare_ms = msSince(t_prepare);
         scene.render();
+        scene.stats.prepare_ms = prepare_ms;
+        if (show_stats) printFrameStats();
     }
 
     if (frame_limit != 0) {

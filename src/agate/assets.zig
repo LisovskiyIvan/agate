@@ -2,21 +2,46 @@
 //!
 //! Decode runs off-thread on a `jobs.TaskRunner` (`Texture.decodeFile` is
 //! documented GPU-free and thread-safe); the `sg.*` upload happens later on
-//! the thread that calls `drain` — usually main — via `Texture.fromRaw`.
+//! the thread that calls `drain`/`drainBudget` — usually main — via
+//! `Texture.fromRaw`.
 //!
 //! Ownership model:
 //!   - `requestFile` allocates a `PendingTexture` and posts the decode.
-//!   - `drain` uploads every finished decode (optional `target` slot gets
+//!   - `drainBudget` uploads at most `max` finished decodes per call
+//!     (`drain` is the unbounded wrapper); an optional `target` slot gets
 //!     the live texture pointer patched in — e.g. `&pbr.albedo_texture.?`,
 //!     so draws pick the real texture up on the next frame with no further
-//!     wiring).
+//!     wiring. Leftover `.ready` slots ride to later frames.
 //!   - `take` moves the GPU texture out once uploaded.
 //!   - `release` frees a finished slot (after `take`, or when failed).
+//!
+//! Locking/ownership contract (what `drainCounted` relies on):
+//!   - The queue is serialized by external phase ownership, not by thread
+//!     identity: in the threaded apps the game and render phases never
+//!     overlap (`phase_mutex`), so `requestFile`/`requestMemory` +
+//!     `PendingTexture.addTarget` (posted from either side — the off-context
+//!     GLB loader does it from the game thread) and
+//!     `drainCounted`/`release`/`deinit` never run concurrently. Posting and
+//!     draining from two threads at once is out of contract for every op
+//!     except the worker's decode.
+//!   - The spinlock therefore only ever contends with list ops from the
+//!     current phase plus the worker's atomic state stores.
+//!   - The worker touches a slot only while it is `.decoding` and publishes
+//!     `.ready`/`.failed` via the state release store; after that it never
+//!     touches the slot again. So once a slot is collected as `.ready`, the
+//!     unlocked upload phase (fromRaw, raw deinit, target patching, state
+//!     store) races with nothing and needs no re-lock.
+//!   - Slots are freed only by `release` (contract: `.failed`/`.taken` only)
+//!     and `deinit` (runner joined first), both serialized by the same phase
+//!     ownership, so a collected pointer stays alive through the unlocked
+//!     phase.
 //!
 //! State publication is ordered by the atomic `state` release/acquire pair:
 //! the worker writes results before publishing, consumers read after.
 
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 const jobs = @import("jobs.zig");
 const gpu_thread = @import("gpu_thread.zig");
 const Texture = @import("texture.zig").Texture;
@@ -204,24 +229,88 @@ pub const UploadQueue = struct {
         p.decode();
     }
 
-    /// Uploads every finished decode. Must run on the sg-context thread.
-    /// Returns how many textures were uploaded this call.
-    pub fn drain(self: *UploadQueue) usize {
-        gpu_thread.assertOnContextThread();
-        var uploaded: usize = 0;
+    /// Per-call upload tally: how many textures reached the GPU and how
+    /// many decoded bytes were handed to sg (sum of mip level bytes).
+    pub const DrainResult = struct {
+        count: usize = 0,
+        bytes: u64 = 0,
+    };
+
+    /// Ready-slot batch capacity per lock acquisition. Normal frames drain
+    /// at most `Scene.upload_budget_per_frame`; asset-scale unbounded drains
+    /// loop over chunks, so the spinlock is never held across GPU work and
+    /// the batch itself is a stack array (no per-frame allocation).
+    const drain_chunk: usize = 64;
+
+    /// Collects up to `out.len` `.ready` slots into `out`. The spinlock is
+    /// held only for this scan; GPU work and slot patching happen after
+    /// release (see module contract).
+    fn collectReady(self: *UploadQueue, out: []*PendingTexture) usize {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        var n: usize = 0;
         for (self.pending.items) |p| {
+            if (n == out.len) break;
             if (p.state.load(.acquire) != .ready) continue;
-            p.texture = Texture.fromRaw(&p.raw, p.options);
-            p.raw.deinit(p.allocator);
-            for (p.targets.items) |slot| slot.* = p.texture.?;
-            p.targets.deinit(p.allocator);
-            p.targets = .empty;
-            p.state.store(.uploaded, .release);
-            uploaded += 1;
+            out[n] = p;
+            n += 1;
         }
-        return uploaded;
+        return n;
+    }
+
+    /// Uploads at most `max` finished decodes (null = every finished decode),
+    /// in chunks so the spinlock is never held across GPU work. Must run
+    /// under phase ownership (sg-context phase; see module contract).
+    /// Returns per-call count + bytes. Without an sg context (unit tests,
+    /// tools) this is a safe no-op that leaves `.ready` slots intact for a
+    /// later real drain.
+    pub fn drainCounted(self: *UploadQueue, max: ?usize) DrainResult {
+        gpu_thread.assertOnContextThread();
+        if (!sg.isvalid()) return .{};
+        var res: DrainResult = .{};
+        var buf: [drain_chunk]*PendingTexture = undefined;
+        while (max == null or res.count < max.?) {
+            const want = if (max) |m| @min(m - res.count, drain_chunk) else drain_chunk;
+            if (want == 0) break;
+            const n = self.collectReady(buf[0..want]);
+            if (n == 0) break;
+            for (buf[0..n]) |p| {
+                // Defensive only: per the module contract no other thread can
+                // advance a collected `.ready` slot (worker never leaves it;
+                // release/deinit are serialized by phase ownership).
+                if (p.state.load(.acquire) != .ready) continue;
+                var bytes: u64 = 0;
+                for (p.raw.levels[0..p.raw.num_levels]) |level| {
+                    if (level) |level_buf| bytes += level_buf.len;
+                }
+                p.texture = Texture.fromRaw(&p.raw, p.options);
+                p.raw.deinit(p.allocator);
+                for (p.targets.items) |slot| slot.* = p.texture.?;
+                p.targets.deinit(p.allocator);
+                p.targets = .empty;
+                p.state.store(.uploaded, .release);
+                res.count += 1;
+                res.bytes += bytes;
+            }
+            // Fewer ready slots than requested: the queue is exhausted for
+            // this call (a defensive skip above does not change that).
+            if (n < want) break;
+        }
+        return res;
+    }
+
+    /// Uploads at most `max` finished decodes. Must run on the sg-context
+    /// thread. Returns how many textures were uploaded this call; leftover
+    /// `.ready` slots upload on subsequent calls.
+    pub fn drainBudget(self: *UploadQueue, max: usize) usize {
+        return self.drainCounted(max).count;
+    }
+
+    /// Uploads every finished decode. Must run on the sg-context thread.
+    /// Returns how many textures were uploaded this call. Unbounded wrapper
+    /// around `drainCounted` (kept for compatibility/tests).
+    pub fn drain(self: *UploadQueue) usize {
+        return self.drainCounted(null).count;
     }
 
     /// Frees a finished slot. Valid once the state is `.failed` or `.taken`
@@ -346,4 +435,114 @@ test "many parallel loads all report terminal states" {
     }
     for (slots) |p| queue.release(p);
     try testing.expectEqual(@as(usize, 0), queue.drain());
+}
+
+/// Repo-relative font bitmap probe (same locations as the PNG test above).
+fn findFontPng() ?[]const u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const candidates = [_][]const u8{
+        "src/agate/assets/font_sdf.png",
+        "agate/src/agate/assets/font_sdf.png",
+        "../agate/src/agate/assets/font_sdf.png",
+    };
+    for (candidates) |candidate| {
+        const f = std.Io.Dir.cwd().openFile(io, candidate, .{}) catch continue;
+        f.close(io);
+        return candidate;
+    }
+    return null;
+}
+
+test "drainBudget paces ready slots across calls without an sg context" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    var slots: [3]*PendingTexture = undefined;
+    for (&slots) |*slot| {
+        slot.* = try queue.requestFile(path.?, .{}, .{ .gen_mipmaps = true });
+    }
+    for (slots) |p| {
+        try testing.expect(waitForState(p, &.{.ready}));
+    }
+
+    // No sg context in tests: bounded and unbounded drains upload nothing
+    // and leave every .ready slot intact for a later real drain.
+    try testing.expectEqual(@as(usize, 0), queue.drainBudget(1));
+    try testing.expectEqual(@as(usize, 0), queue.drainBudget(2));
+    try testing.expectEqual(@as(usize, 0), queue.drain());
+    const no_result = queue.drainCounted(1);
+    try testing.expectEqual(@as(usize, 0), no_result.count);
+    try testing.expectEqual(@as(u64, 0), no_result.bytes);
+    for (slots) |p| {
+        try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
+    }
+
+    // Budget pacing at the selection level (the fromRaw upload itself needs
+    // a real sg context and is exercised by every app boot): collect at most
+    // `max` ready slots per call. Each simulated upload — raw freed plus
+    // `.uploaded` stored, exactly what drainCounted does after fromRaw —
+    // shrinks the next collection. 3 ready, budget 1 -> 1, then 1, then 1.
+    var batch: [3]*PendingTexture = undefined;
+
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..1]));
+    try testing.expect(batch[0] == slots[0]);
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..1]));
+    try testing.expect(batch[0] == slots[1]);
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+
+    // A budget larger than the remainder collects just the remainder.
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..2]));
+    try testing.expect(batch[0] == slots[2]);
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+
+    try testing.expectEqual(@as(usize, 0), queue.collectReady(batch[0..1]));
+    try testing.expectEqual(@as(usize, 0), queue.collectReady(batch[0..3]));
+}
+
+test "unbounded collect takes every ready slot and skips the rest" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    var slots: [3]*PendingTexture = undefined;
+    for (&slots) |*slot| {
+        slot.* = try queue.requestFile(path.?, .{}, .{ .gen_mipmaps = true });
+    }
+    const failed = try queue.requestFile("/definitely/missing/image.png", .{}, .{});
+    for (slots) |p| {
+        try testing.expect(waitForState(p, &.{.ready}));
+    }
+    try testing.expect(waitForState(failed, &.{.failed}));
+
+    var batch: [3]*PendingTexture = undefined;
+
+    // Zero budget collects nothing even with ready slots pending.
+    try testing.expectEqual(@as(usize, 0), queue.collectReady(batch[0..0]));
+
+    // A full-width collection takes every ready slot, never the failed one.
+    const n = queue.collectReady(batch[0..3]);
+    try testing.expectEqual(@as(usize, 3), n);
+    for (batch[0..n]) |p| {
+        try testing.expect(p != failed);
+        try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
+    }
+
+    // Mirror drainCounted's post-upload teardown so deinit frees cleanly.
+    for (batch[0..n]) |p| {
+        p.raw.deinit(a);
+        p.state.store(.uploaded, .release);
+    }
+    queue.release(failed);
 }

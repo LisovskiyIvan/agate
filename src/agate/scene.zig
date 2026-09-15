@@ -106,6 +106,12 @@ pub const CameraEntry = struct {
     clear_color: ?Color4 = null,
 };
 
+/// Milliseconds elapsed since a `sokol.time.now()` tick. Cheap, no
+/// allocation; used for the SceneStats phase timings.
+fn msSince(t0: u64) f32 {
+    return @floatCast(sokol.time.ms(sokol.time.now() -% t0));
+}
+
 /// The scene: content registries (flat, iterated directly by loaders,
 /// tooling and serialization), a handful of cross-cutting config flags, and
 /// one field per render subsystem. New features should add state to the
@@ -186,6 +192,15 @@ pub const Scene = struct {
     /// render(); deinit'd FIRST in deinit so in-flight decodes finish
     /// before any material they target is freed. Null = synchronous loads.
     uploads: ?assets_mod.UploadQueue = null,
+    /// Dedicated file-I/O runner for async save/load (saveStateFileAsync /
+    /// loadStateFileAsync). Decode work stays on `uploads.runner`, so long
+    /// disk I/O can never starve texture decodes. 1 thread: file ops are
+    /// serial by nature. Null = NoTaskRunner, same fallback as uploads.
+    io_runner: ?*jobs.TaskRunner = null,
+    /// Last prepareFrame texture-upload tally, published into
+    /// `stats.uploaded_*_frame` at render start (prepareFrame runs before
+    /// the per-frame stats reset, so the tally is staged here first).
+    frame_uploads: assets_mod.UploadQueue.DrainResult = .{},
     // Dynamic decals.
     decals: scene_decals.DecalLayer = .{},
     // Trail meshes.
@@ -262,6 +277,9 @@ pub const Scene = struct {
         // Async texture decode/uploads (stage 2): failures degrade to a
         // null queue and all loads take the synchronous path.
         self.uploads = assets_mod.UploadQueue.init(allocator, 2) catch null;
+        // Dedicated file-I/O runner (1 thread): async save/load must not
+        // share the decode runner, or long file I/O starves decodes.
+        self.io_runner = jobs.TaskRunner.init(allocator, 1) catch null;
     }
 
     pub fn init(allocator: std.mem.Allocator) Scene {
@@ -299,14 +317,14 @@ pub const Scene = struct {
             var s = snap;
             s.deinit(self.allocator);
         }
-        const runner = if (self.uploads) |*q| q.runner else return error.NoTaskRunner;
+        const runner = if (self.io_runner) |r| r else return error.NoTaskRunner;
         return serialization.saveFileAsync(self.allocator, runner, snap, path);
     }
 
     /// Loads a scene file off-thread; caller polls task.isDone() and calls
     /// restoreSceneState(scene, &task.result.?) on the game thread.
     pub fn loadStateFileAsync(self: *Scene, path: []const u8) !*serialization.AsyncLoadTask {
-        const runner = if (self.uploads) |*q| q.runner else return error.NoTaskRunner;
+        const runner = if (self.io_runner) |r| r else return error.NoTaskRunner;
         return serialization.loadFileAsync(self.allocator, runner, path);
     }
 
@@ -1166,8 +1184,15 @@ pub const Scene = struct {
     /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.
     /// Threaded callers hold phase ownership through this call and render():
     /// render still reads live mesh/material state not carried by the snapshot.
+    /// At most `upload_budget_per_frame` textures upload per call; leftover
+    /// `.ready` slots ride to subsequent frames instead of stalling one frame.
+    pub const upload_budget_per_frame: usize = 4;
     pub fn prepareFrame(self: *Scene) void {
-        if (self.uploads) |*q| _ = q.drain();
+        if (self.uploads) |*q| {
+            self.frame_uploads = q.drainCounted(upload_budget_per_frame);
+        } else {
+            self.frame_uploads = .{};
+        }
         self.flushPendingGpuUploads();
 
         var snap = self.frame_snapshot;
@@ -1299,7 +1324,17 @@ pub const Scene = struct {
             );
         }
 
+        // Preserve cross-phase values across the per-frame reset: update_ms /
+        // prepare_ms are measured by the app around Scene.update/prepareFrame
+        // (before this reset runs), and the texture-upload tally is staged by
+        // prepareFrame above.
+        const keep_update_ms = self.stats.update_ms;
+        const keep_prepare_ms = self.stats.prepare_ms;
         self.stats = .{};
+        self.stats.update_ms = keep_update_ms;
+        self.stats.prepare_ms = keep_prepare_ms;
+        self.stats.uploaded_textures_frame = std.math.cast(u32, self.frame_uploads.count) orelse std.math.maxInt(u32);
+        self.stats.uploaded_bytes_frame = self.frame_uploads.bytes;
         self.frame_id +%= 1;
 
         // 1. Directional Light Cascaded Shadow View-Projections
@@ -1310,6 +1345,7 @@ pub const Scene = struct {
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (snap.shadows_enabled) {
+            const t_shadow = sokol.time.now();
             const shadow_draws = self.shadows.pass.render(
                 self.meshes.items,
                 self.frame_id,
@@ -1319,6 +1355,7 @@ pub const Scene = struct {
             );
             self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;
+            self.stats.shadow_ms = msSince(t_shadow);
         }
 
         // ==============================================
@@ -1341,6 +1378,7 @@ pub const Scene = struct {
         };
 
         // Offscreen target when post-processing is on, swapchain otherwise.
+        const t_main = sokol.time.now();
         self.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
 
         const env = scene_draw.Environment{
@@ -1405,10 +1443,12 @@ pub const Scene = struct {
         }
 
         sg.endPass();
+        self.stats.main_ms = msSince(t_main);
 
         // ==============================================
         // PASS 2.5 (SSAO) + 2.75 (bloom) + 3 (composite & UI overlay)
         // ==============================================
+        const t_post = sokol.time.now();
         self.postfx.renderChain(.{
             .post = snap.post_process,
             .ssao = snap.ssao,
@@ -1425,6 +1465,7 @@ pub const Scene = struct {
         }, cur_w, cur_h);
 
         sg.commit();
+        self.stats.post_ms = msSince(t_post);
     }
 
     pub fn deinit(self: *Scene) void {
@@ -1433,6 +1474,13 @@ pub const Scene = struct {
         if (self.uploads) |*q| {
             q.deinit();
             self.uploads = null;
+        }
+        // Join file-I/O tasks next: save tasks own their SceneState snapshot
+        // and load tasks own their result, so both must finish before the
+        // allocator-backed state they touch is torn down below.
+        if (self.io_runner) |r| {
+            r.deinit();
+            self.io_runner = null;
         }
         for (self.cameras.items) |entry| {
             if (entry.owns_name) {
@@ -1800,4 +1848,30 @@ test "pending destroy overflow drains on flush" {
     try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys_overflow_len);
     try std.testing.expect(scene.pending_gpu_destroys_overflow[0] == null);
     try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys.items.len);
+}
+
+test "prepareFrame stages an empty upload tally without an upload queue" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // No uploads queue and no io runner on the fixture: prepareFrame takes
+    // the synchronous path and stages a zero tally for the stats publish.
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.frame_uploads.count);
+    try std.testing.expectEqual(@as(u64, 0), scene.frame_uploads.bytes);
+}
+
+test "async save/load report NoTaskRunner without an io runner" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // The fixture has no io_runner: capture succeeds, dispatch fails with
+    // NoTaskRunner (and frees the snapshot — testing.allocator verifies).
+    try std.testing.expectError(error.NoTaskRunner, scene.saveStateFileAsync("no_runner.agsc"));
+    try std.testing.expectError(error.NoTaskRunner, scene.loadStateFileAsync("no_runner.agsc"));
 }

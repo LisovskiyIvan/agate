@@ -12,6 +12,10 @@ pub const PickingInfo = struct {
     picked_point: Vec3 = Vec3.zero,
     picked_normal: Vec3 = Vec3.up,
     picked_mesh: ?*Mesh = null,
+    /// Index into `Mesh.instances.items` when the hit landed on an
+    /// instance of the picked mesh; null for plain (non-instanced) hits
+    /// and for misses. Defaulted so existing literals stay valid.
+    picked_instance: ?usize = null,
 };
 
 pub const ColliderType = enum {

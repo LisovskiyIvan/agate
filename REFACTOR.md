@@ -136,12 +136,17 @@ Known limitations of the shipped split:
 - **Coarse payload.** Phase ownership means an update spike delays render
   for its duration. Strictly non-blocking render needs the full per-item
   payload (below).
-- **Instanced picking and per-instance transparency sorting** remain
-  documented gaps: `pickWithRay` skips instance-bearing meshes, and a
-  transparent instanced group sorts as one batch (no OIT).
-- **Upload granularity.** `UploadQueue.drain` uploads every ready texture
-  in one call while holding its spinlock, and its `TaskRunner` multiplexes
-  texture decode with async save/load I/O — splitting these is future work.
+- **Per-instance transparency sorting (OIT)** remains a documented gap: a
+  transparent instanced group sorts as one batch. Instanced picking is
+  implemented: `pickWithRay` tests every visible instance in the drawn space
+  (`cached_world_matrix`, refreshed with the same call the render path uses)
+  and reports `PickingInfo.picked_instance`.
+- **Uploads and I/O are paced and split**: `UploadQueue.drainBudget` uploads
+  at most `Scene.upload_budget_per_frame` (4) textures per frame without ever
+  holding the spinlock across GPU work (stack-batched collection), and async
+  save/load runs on a dedicated `Scene.io_runner` instead of the texture
+  decode runner. `SceneStats` exposes phase timings and upload counters
+  (`--stats`).
 
 ## What remains (TODO, in priority order)
 
@@ -344,10 +349,11 @@ Known limitations of the shipped split:
 ### Чего не хватает
 
 1. [~] Матрица интеграционных сцен: unit-тестами закрыты serial/parallel
-   очереди и типы очередей; runtime-покрытие — `--test-pip` (PIP), `--msaa`,
-   `--particles`, `--test-decal` (создание/удаление), `--test-async-load`
-   (off-context GLB). Visual regression и нагрузочная смесь (сотни мешей +
-   >4096 частиц + мутации) отсутствуют.
+   очереди и типы очередей, instanced picking и OOM-пути; runtime-покрытие —
+   `--test-pip` (PIP), `--msaa`, `--particles`, `--test-decal`,
+   `--test-async-load` и `--test-stress` (200+ мешей, instanced-группа,
+   >4096 частиц, create/destroy-хворь на игровом потоке, 240 кадров).
+   Visual regression отсутствует.
 2. [~] README и CI по-прежнему отсутствуют; проверка fetched/archive-пакета
    не закрыта (`zig fetch` зависает в этой среде); устаревшие статусы
    `roadmap.md` выправлены 2026-09-15.
@@ -358,8 +364,11 @@ Known limitations of the shipped split:
 4. Сохранение игры: устойчивые ID, связи объектов, игровое состояние, версия
    формата. Текущий serializer намеренно хранит только состояние существующей
    сцены (`src/agate/serialization.zig:55-61`).
-5. Метрики: CPU simulation/render submission отдельно, ожидание mutex/jobs,
-   p95/p99, upload bytes/frame, память текстур/геометрии.
+5. [~] Метрики: `SceneStats` отдаёт `update_ms`/`prepare_ms`/`shadow_ms`/
+   `main_ms`/`post_ms` и `uploaded_textures_frame`/`uploaded_bytes_frame`
+   (текстуры; байты буферных аплоадов — следующая волна); agate печатает
+   строку по `--stats`. Осталось: ожидание mutex/jobs, p95/p99, память
+   текстур/геометрии.
 6. Asset pipeline раньше новых эффектов: mip-цепочки, сжатые текстуры, кэш импорта.
 
 ### Порядок работ
@@ -372,8 +381,9 @@ Known limitations of the shipped split:
 4. [~] Согласованность рендера: прозрачная очередь и viewport-aware picking
    готовы; visual-regression сцены остаются.
 5. [ ] Одна небольшая законченная игра как проверка движка.
-6. [ ] Оптимизация только по профилю (гранулярность UploadQueue, разделение
-   TaskRunner для decode и save/load I/O, instanced picking).
+6. [ ] Оптимизация только по профилю: полный per-item payload (см. #1 выше),
+   per-instance сортировка прозрачности (OIT), байтовые метрики буферных
+   аплоадов, память текстур/геометрии.
 
 ### Выполненные проверки
 
@@ -449,6 +459,22 @@ visual regression и нагрузочная матрица остаются не
 - `--test-async-load`: `gpu_pending=1 → 0`, `textured=1` — полный off-context
   путь подтверждён runtime-харнессом;
 - `zig build fmt` впервые зелёный (7 файлов отформатированы).
+
+### Волна 5 — оставшиеся пункты плана (текущая)
+- instanced picking: `pickWithRay` тестирует каждый видимый инстанс в
+  нарисованном пространстве (`cached_world_matrix`/`cached_bounding_box`
+  после `updateCachedTransforms`); скрытый источник с видимыми инстансами
+  пикается так же, как рисуется; `PickingInfo.picked_instance` — сырой
+  индекс; `gpu_pending`-меши не пикаются;
+- `UploadQueue`: стековый чанк вместо аллокации под спинлоком, бюджет
+  `upload_budget_per_frame`, счётчики текстуры/байт;
+- `Scene.io_runner`: отдельный `TaskRunner` для async save/load — декод
+  текстур больше не голодает на файловом I/O;
+- метрики фаз (`update/prepare/shadow/main/post`) и аплоадов в `SceneStats`,
+  `--stats` в agate;
+- sandbox `--test-stress`: 200+ мешей, instanced-группа 1×64, CPU-частицы
+  cap 5000, churn create/destroy + декали на игровом потоке, 240 кадров,
+  `errors=0`, без графических ассертов.
 
 ### Инварианты (закреплены ассертами и тестами)
 1. `sg.*` — только на графическом потоке; иначе отложить и завершить на
