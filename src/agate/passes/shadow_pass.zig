@@ -649,4 +649,3 @@ test "parallel shadow binning produces serial-identical results" {
         try std.testing.expectEqual(m_s, m_p);
     }
 }
-

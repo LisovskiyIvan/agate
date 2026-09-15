@@ -1192,4 +1192,3 @@ test "ply zero faces returns InvalidPly without double free" {
 test "ply appendToScene links (type check)" {
     _ = appendToScene;
 }
-

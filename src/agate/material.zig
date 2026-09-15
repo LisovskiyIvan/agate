@@ -759,4 +759,3 @@ test "MaterialDrawRecord builds correctly from PBRMaterial" {
     try std.testing.expectEqual(@as(f32, 0.2), rec.pbr_factors[1]);
     try std.testing.expectEqual(@as(f32, 0.4), rec.alpha_cutoff);
 }
-

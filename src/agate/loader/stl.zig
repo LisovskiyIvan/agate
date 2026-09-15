@@ -414,4 +414,3 @@ test "stl zero facet normal is computed from geometry" {
 test "stl appendToScene links (type check)" {
     _ = appendToScene;
 }
-

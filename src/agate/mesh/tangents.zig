@@ -168,4 +168,3 @@ test "computeTangents right-handed vs mirrored UV handedness" {
     try std.testing.expectEqual(@as(f32, -1.0), lh_verts[1].tangent[3]);
     try std.testing.expectEqual(@as(f32, -1.0), lh_verts[2].tangent[3]);
 }
-

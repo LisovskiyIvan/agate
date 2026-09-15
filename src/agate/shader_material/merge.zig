@@ -251,9 +251,9 @@ fn parseSnippet(allocator: std.mem.Allocator, snippet: []const u8, opts: Options
 }
 
 pub const reserved_param_names = [_][]const u8{
-    "time", "roughness", "metallic", "albedo", "normal", "position",
-    "color", "gl_Position", "gl_FragColor", "gl_FragCoord",
-    "v_world_pos", "v_normal", "v_uv", "v_color", "v_tangent", "v_bitangent",
+    "time",  "roughness",   "metallic",     "albedo",       "normal",      "position",
+    "color", "gl_Position", "gl_FragColor", "gl_FragCoord", "v_world_pos", "v_normal",
+    "v_uv",  "v_color",     "v_tangent",    "v_bitangent",
 };
 
 // Parses `// @param <name> <float|vec4> [= d0 d1 d2 d3]` at the given
@@ -615,4 +615,3 @@ test "reserved param names are rejected" {
     const snippet = "// @param roughness float = 0.5\n";
     try std.testing.expectError(error.BadParamDecl, merge(std.testing.allocator, .{ .template = tmpl, .snippet = snippet }));
 }
-

@@ -206,4 +206,3 @@ test "Skeleton double-buffered skin matrices are published safely" {
     // read1 was in slot 0, so slot 1 is a different address in skin_slots
     try std.testing.expect(read1 != read2);
 }
-
