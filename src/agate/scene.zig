@@ -1082,7 +1082,13 @@ pub const Scene = struct {
         // PASS 1: OFFSCREEN SHADOW DEPTH PASS
         // ==============================================
         if (snap.shadows_enabled) {
-            const shadow_draws = self.shadows.pass.render(self.meshes.items, self.frame_id, cascades, light_pack.spot_shadows[0..light_pack.num_spot_shadows]);
+            const shadow_draws = self.shadows.pass.render(
+                self.meshes.items,
+                self.frame_id,
+                cascades,
+                light_pack.spot_shadows[0..light_pack.num_spot_shadows],
+                jobs.global,
+            );
             self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;
         }

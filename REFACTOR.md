@@ -128,9 +128,12 @@ Known limitations of the shipped split:
    simulation or render loops. `Scene.loadStateFileAsync` reads and deserializes
    off-thread, ready for fast in-place `restore()`. Fully integrated into
    `sandbox` showcase with non-blocking UI status updates and automated testing.
-4. [ ] **Granularity refinements** (optional, as scenes grow):
-   lower `parallel_min_meshes` (1024) or make it adaptive; parallel
-   shadow-pass binning; parallel instanced-path transform staging.
+4. [x] **Granularity refinements.**
+   - Lowered default `parallel_min_meshes` from 1024 to 128 (and adaptive `(workers + 1) * 32` when set to 0),
+     with zero-allocation worker culling (`initCapacity(span)` on caller thread + `appendAssumeCapacity` in workers).
+   - Parallel shadow-pass bucket binning (`ShadowPass.binMeshes` with chunk counting, prefix sums, and lock-free parallel scatter).
+   - Parallel instanced-path transform staging in `submitInstancedMesh` (`ParallelInstanceStage` with parallel TRS updates, chunk AABB reductions, and parallel matrix scattering).
+   - All parallel paths verified bit-identical and deterministic with comprehensive unit tests and live sandbox runs.
 5. [ ] **GPU-side follow-ups** (optional): async compute is available on
    Metal/D3D12/WebGPU but sokol does not expose queues — revisit only if
    a compute-heavy workload demands it.
