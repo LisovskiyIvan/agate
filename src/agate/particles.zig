@@ -260,6 +260,11 @@ pub const ParticleSystem = struct {
     thread_pool: ?*jobs.Pool = null,
     capacity: usize,
     active_count: usize = 0,
+    /// Stage 3: update() stages CPU data and sets these flags; the sg
+    /// uploads happen in flushGpuUploads on the render side (sg is
+    /// single-context — the update phase must stay free of sg.* calls).
+    instance_dirty: bool = false,
+    gpu_flush_pending: bool = false,
 
     instance_buffer: sg.Buffer,
     texture: ?Texture = null,
@@ -667,13 +672,29 @@ pub const ParticleSystem = struct {
                 });
             }
             try self.updateGpu(dt);
-            self.flushGpuUpload();
+            self.gpu_flush_pending = true;
             return;
         }
         self.updateCpu(dt);
 
         if (self.active_count > 0) {
-            sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+            self.instance_dirty = true;
+        }
+    }
+
+    /// Uploads staged instance data. Runs on the sg-context thread
+    /// (Scene.render start) — the update phase only stages CPU data and
+    /// sets the dirty flags, so simulation stays free of sg.* calls.
+    pub fn flushGpuUploads(self: *ParticleSystem) void {
+        if (self.instance_dirty) {
+            self.instance_dirty = false;
+            if (self.active_count > 0 and self.instance_buffer.id != 0) {
+                sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+            }
+        }
+        if (self.gpu_flush_pending) {
+            self.gpu_flush_pending = false;
+            self.flushGpuUpload();
         }
     }
 };

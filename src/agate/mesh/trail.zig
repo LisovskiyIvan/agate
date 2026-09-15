@@ -50,6 +50,13 @@ pub const TrailMesh = struct {
     indices: []u16,
     is_active: bool = true,
     last_position: ?Vec3 = null,
+    /// Stage 3: update() stages CPU data and sets this flag; the sg
+    /// upload happens in flushGpuUploads on the render side.
+    gpu_dirty: bool = false,
+    pending_vertex_count: usize = 0,
+    pending_index_count: usize = 0,
+    pending_min_pt: Vec3 = undefined,
+    pending_max_pt: Vec3 = undefined,
 
     pub fn init(scene: *Scene, name: []const u8, options: TrailOptions) !*TrailMesh {
         const allocator = scene.allocator;
@@ -260,16 +267,29 @@ pub const TrailMesh = struct {
             ii += 6;
         }
 
-        // Upload to GPU
+        // Stage CPU data only; the sg buffer upload happens in
+        // `flushGpuUploads` on the render side (sg is single-context —
+        // the update phase must stay free of sg.* calls).
+        self.pending_vertex_count = vi;
+        self.pending_index_count = ii;
+        self.pending_min_pt = min_pt;
+        self.pending_max_pt = max_pt;
+        self.gpu_dirty = true;
+    }
+
+    /// Uploads staged trail geometry. Runs on the sg-context thread
+    /// (Scene.render start), never during the update phase.
+    pub fn flushGpuUploads(self: *TrailMesh) void {
+        if (!self.gpu_dirty) return;
+        self.gpu_dirty = false;
         if (self.mesh.vertex_buffer.id != 0) {
-            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices[0..vi]));
+            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices[0..self.pending_vertex_count]));
         }
         if (self.mesh.index_buffer.id != 0) {
-            sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices[0..ii]));
+            sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices[0..self.pending_index_count]));
         }
-
-        self.mesh.index_count = @intCast(ii);
-        self.mesh.local_bounding_box = BoundingBox.init(min_pt, max_pt);
+        self.mesh.index_count = @intCast(self.pending_index_count);
+        self.mesh.local_bounding_box = BoundingBox.init(self.pending_min_pt, self.pending_max_pt);
         self.mesh.cached_aabb = self.mesh.local_bounding_box;
     }
 

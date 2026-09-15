@@ -131,11 +131,23 @@ Remaining slices, in order:
    (pinned by test). Deferred to split day: trail and particle updates
    end with sg.updateBuffer uploads — those move to a render-side flush
    (pattern already exists in particles.flushGpuUpload).
-3. [ ] Game thread: run the update umbrella on a worker publishing
-   through `Handoff` (same-thread mode first — publish inline, consume
-   immediately — to prove no drift), then the actual split behind a flag.
-   Serialization of engine systems is expected to surface races — fix
-   them at the audit level, not with locks.
+3. [x] Game thread landed (engine demo, on by default; `--no-threads`
+   falls back to inline simulation): a dedicated thread runs
+   `simulate(dt)` — input drain, demo state, `Scene.update` — paced at
+   ~1 kHz with its own sokol-time clock; the sapp frame callback renders
+   the newest state under coarse phase ownership (`jobs.Mutex` held for
+   the duration of each phase, so update and render never overlap). ESC
+   on the game thread sets a quit flag the sapp thread observes (sapp
+   stays single-threaded). Update-side sg uploads were relocated first:
+   particles and trails stage CPU data and set dirty flags; render
+   flushes them at frame start (`Scene.flushPendingGpuUploads`) — the
+   update phase is now free of sg.* calls, verified by tests (flush
+   skips cleanly with no sg context). Known limitation: the payload is
+   still coarse (phase ownership, not per-field copies) — update spikes
+   delay render for their duration; the full per-item record payload
+   from the audit remains the path to strictly non-blocking render.
+   Sandbox stays same-thread: its UI mutates scene state from sapp
+   callbacks and needs a mutation queue before it can join.
 
 #### Frame-payload audit (done 2026-09)
 

@@ -24,6 +24,17 @@ var camera: z.ArcRotateCamera = undefined;
 var frame_limit: u32 = 0;
 var frame_count: u32 = 0;
 var particle_mode: ?z.SimulationMode = null;
+/// Stage 3: real thread split. The game thread owns simulation
+/// (Scene.update + input consumption), the sapp thread owns windowing +
+/// render. Coarse phase ownership: one mutex, held by whichever side is
+/// inside its phase, so update and render never overlap. sg.* calls only
+/// happen on the sapp thread (render + the deferred flushes at render
+/// start); the update phase is free of them.
+var threaded: bool = true;
+var phase_mutex: z.jobs.Mutex = .{};
+var game_running = std.atomic.Value(bool).init(false);
+var quit_requested = std.atomic.Value(bool).init(false);
+var game_thread: ?std.Thread = null;
 var particles: *z.ParticleSystem = undefined;
 var msaa_samples: i32 = 1;
 
@@ -35,6 +46,8 @@ fn parseArgs(args: std.process.Args) void {
             if (it.next()) |n| {
                 frame_limit = std.fmt.parseInt(u32, n, 10) catch 0;
             }
+        } else if (std.mem.eql(u8, arg, "--no-threads")) {
+            threaded = false;
         } else if (std.mem.eql(u8, arg, "--particles")) {
             const mode = it.next() orelse break;
             if (std.mem.eql(u8, mode, "cpu")) {
@@ -62,6 +75,7 @@ export fn init() callconv(.c) void {
     // Worker pool for data-parallel systems (particles CPU integration).
     // Null on failure: everything degrades to serial execution by design.
     z.jobs.global = z.jobs.Pool.init(gpa.allocator(), z.jobs.Pool.recommendedWorkerCount()) catch null;
+    sokol.time.setup();
     const allocator = gpa.allocator();
     scene = z.Scene.init(allocator);
 
@@ -112,47 +126,92 @@ export fn init() callconv(.c) void {
         particles.size_start = 0.1;
         particles.size_end = 0.02;
     }
+
+    // Stage 3: spawn the game thread — simulation moves there; the sapp
+    // thread keeps windowing + render. Spawn failure degrades to
+    // single-threaded (frame() runs simulate inline).
+    if (threaded) {
+        game_running.store(true, .release);
+        game_thread = std.Thread.spawn(.{}, gameLoop, .{}) catch |err| blk: {
+            game_running.store(false, .release);
+            std.debug.print("game thread spawn failed ({s}); running single-threaded\n", .{@errorName(err)});
+            break :blk null;
+        };
+        if (game_thread == null) threaded = false;
+    }
 }
 
 /// Stage 3 seam: input events are produced in the sapp callback and
-/// consumed by the frame/update side. Today both run on the same thread —
-/// the ring only establishes the handoff so the update side can move to
-/// its own thread without touching this code again.
+/// consumed by the game side (gameLoop when threaded). The ring crosses
+/// the thread boundary; same-thread it is a plain FIFO.
 const AppEvent = union(enum) {
     key_down: sapp.Keycode,
     mouse_down,
 };
 var input_ring: z.jobs.SpscRing(AppEvent, 64) = .{};
 
-export fn frame() callconv(.c) void {
-    const dt: f32 = @floatCast(sapp.frameDuration() * 60.0);
-
-    // Drain input first: the update below must see this frame's events.
+/// One simulation step on the game side: input consumption + Scene.update
+/// + demo state. Callers own phase ownership (the mutex when threaded).
+fn simulate(dt_sec: f32) void {
+    // Game-side input consumption: events were produced on the sapp
+    // thread (ring), applied here where the simulation state lives.
     while (input_ring.pop()) |ev| {
         switch (ev) {
             .mouse_down => cycleClearColor(),
             .key_down => |key| switch (key) {
                 .SPACE => cycleClearColor(),
-                .ESCAPE => sapp.quit(),
+                .ESCAPE => quit_requested.store(true, .release),
                 else => {},
             },
         }
     }
 
-    // Вращаем куб
-    box.rotation.x += 0.8 * dt;
-    box.rotation.y += 1.6 * dt;
+    // Вращаем куб (60fps-normalized speed, preserved from the demo's
+    // original frame-based pacing).
+    const dt_norm: f32 = dt_sec * 60.0;
+    box.rotation.x += 0.8 * dt_norm;
+    box.rotation.y += 1.6 * dt_norm;
 
-    // Stage 3, slice 2: the whole simulation advances through one entry
-    // point, so the game side can later move to its own thread unchanged.
-    scene.update(@floatCast(sapp.frameDuration())) catch |err| {
+    scene.update(dt_sec) catch |err| {
         std.debug.panic("scene update failed: {s} (particle mode: {s})", .{
             @errorName(err),
             if (particle_mode) |m| @tagName(m) else "off",
         });
     };
+}
 
-    scene.render();
+fn gameLoop() void {
+    var last = sokol.time.now();
+    while (game_running.load(.acquire)) {
+        const now = sokol.time.now();
+        const dt_sec: f32 = @floatCast(sokol.time.ms(now -% last) / 1000.0);
+        last = now;
+
+        phase_mutex.lock();
+        if (game_running.load(.acquire)) simulate(dt_sec);
+        phase_mutex.unlock();
+
+        // Pace the simulation thread (~1 kHz): leaves cores free and
+        // keeps dt magnitudes sane for the demo's float32 state.
+        const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&ts, &rem);
+    }
+}
+
+export fn frame() callconv(.c) void {
+    if (quit_requested.load(.acquire)) sapp.quit();
+
+    if (threaded) {
+        // Render consumes the newest state under phase ownership; a long
+        // update on the game thread delays this frame but cannot race it.
+        phase_mutex.lock();
+        scene.render();
+        phase_mutex.unlock();
+    } else {
+        simulate(@floatCast(sapp.frameDuration()));
+        scene.render();
+    }
 
     if (frame_limit != 0) {
         frame_count += 1;
@@ -161,6 +220,12 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
+    // Stage 3: stop the game thread before any state it touches dies.
+    if (game_thread) |t| {
+        game_running.store(false, .release);
+        t.join();
+        game_thread = null;
+    }
     if (z.jobs.global) |pool| {
         pool.deinit();
         z.jobs.global = null;

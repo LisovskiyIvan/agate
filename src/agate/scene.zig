@@ -865,10 +865,21 @@ pub const Scene = struct {
         self.updateDecals(dt);
     }
 
+    /// Stage 3: uploads the GPU buffers that the update phase staged
+    /// (particle instances, trail geometry). Called at render start so
+    /// every sg.* touch stays on the context thread; the update phase is
+    /// free of sg.* calls.
+    pub fn flushPendingGpuUploads(self: *Scene) void {
+        for (self.particles.systems.items) |ps| ps.flushGpuUploads();
+        for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
+    }
+
     pub fn render(self: *Scene) void {
         // Stage 2: upload finished background decodes before drawing, so
         // patched materials pick the textures up this same frame.
         if (self.uploads) |*q| _ = q.drain();
+        // Stage 3: push update-staged CPU data into the GPU buffers.
+        self.flushPendingGpuUploads();
         const camera = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else return);
         const aspect = sapp.widthf() / sapp.heightf();
         // Sun resolved once per frame; reused by cascades, mesh uniforms, postprocess.

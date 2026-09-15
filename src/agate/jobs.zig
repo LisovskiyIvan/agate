@@ -241,6 +241,23 @@ pub fn parallelFor(
     pool.?.forkJoin(C, ctx, run, len);
 }
 
+/// Blocking mutex (pthread) for coarse phase ownership: the threaded game
+/// loop holds it during Scene.update, the sapp thread during render, so
+/// the two phases never overlap. Small critical sections only — this is
+/// ownership, not a data-race bandage. Condition-variable parking lives
+/// in ParkingLot (TaskRunner); this type is the bare lock.
+pub const Mutex = struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    pub fn lock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+};
+
 /// Fire-and-forget background tasks on dedicated threads — the asset
 /// loading half of the threading story (decode while frames render).
 /// Deliberately independent of `Pool.forkJoin`: forkJoin spins its callers
@@ -621,4 +638,28 @@ fn testing_expect(ok: bool) !void {
 
 fn testing_expectEqual(comptime T: type, expected: T, actual: T) !void {
     if (expected != actual) return error.TestExpectedEqual;
+}
+
+test "Mutex serializes concurrent sections" {
+    var m = Mutex{};
+    var counter = std.atomic.Value(u32).init(0);
+    const W = struct {
+        fn run(mu: *Mutex, c: *std.atomic.Value(u32)) void {
+            var i: usize = 0;
+            while (i < 10_000) : (i += 1) {
+                mu.lock();
+                // Non-atomic read-modify-write inside the critical section:
+                // lost updates would show up as a short count.
+                const v = c.load(.monotonic);
+                std.atomic.spinLoopHint();
+                c.store(v + 1, .monotonic);
+                mu.unlock();
+            }
+        }
+    };
+    const t1 = try std.Thread.spawn(.{}, W.run, .{ &m, &counter });
+    const t2 = try std.Thread.spawn(.{}, W.run, .{ &m, &counter });
+    t1.join();
+    t2.join();
+    try std.testing.expectEqual(@as(u32, 20_000), counter.load(.acquire));
 }
