@@ -831,6 +831,24 @@ pub const Scene = struct {
         self.light_pack = self.lights.packFrame(eye, self.shadows.enabled, dt);
     }
 
+    /// Stage 3, slice 2: the game-side update entry point. Everything the
+    /// simulation advances per frame, in one call, in the canonical order
+    /// (camera -> lights -> physics -> animations -> particles -> decals);
+    /// render() then consumes the published frame values (light_pack) and
+    /// engine state without simulating anything itself.
+    ///
+    /// Deliberately NOT included: `updateTrails` and `updateNavAgents` —
+    /// both require real-seconds dt (the 60fps-normalized dt breaks their
+    /// SI tuning), so apps drive them explicitly with their own time base.
+    pub fn update(self: *Scene, dt: f32) particles.UpdateError!void {
+        self.updateCamera(dt);
+        self.updateLights(dt);
+        self.updatePhysics(dt);
+        self.updateAnimations(dt);
+        try self.updateParticles(dt);
+        self.updateDecals(dt);
+    }
+
     pub fn render(self: *Scene) void {
         // Stage 2: upload finished background decodes before drawing, so
         // patched materials pick the textures up this same frame.

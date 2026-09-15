@@ -115,13 +115,12 @@ Landed groundwork:
 Remaining slices, in order:
 
 1. [x] Frame payload audit (see above).
-2. [~] Update-phase consolidation: `Scene.updateLights(dt)` landed — light
-   selection + hysteresis fades are now update-phase simulation; render
-   consumes the plain `light_pack` (audit finding #1 resolved). Engine and
-   sandbox call it in their frame update, right after camera update.
-   Next: fold the remaining per-frame update calls (physics, particles,
-   animations, decals, nav, trails) into one `Scene.update(dt)` umbrella
-   so the game side is a single entry point.
+2. [x] Update-phase consolidation: `Scene.update(dt)` is the single
+   game-side entry point — camera, lights (`updateLights`, hysteresis
+   fades included), physics, animations, particles, decals in canonical
+   order. Engine and sandbox frame loops both drive it. Trails and nav
+   agents stay app-driven deliberately: they require real-seconds dt
+   (the 60fps-normalized clamp breaks their SI tuning).
 3. [ ] Game thread: run the update umbrella on a worker publishing
    through `Handoff` (same-thread mode first — publish inline, consume
    immediately — to prove no drift), then the actual split behind a flag.

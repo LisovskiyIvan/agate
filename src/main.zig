@@ -143,16 +143,15 @@ export fn frame() callconv(.c) void {
     box.rotation.x += 0.8 * dt;
     box.rotation.y += 1.6 * dt;
 
-    if (particle_mode != null) {
-        scene.updateParticles(@floatCast(sapp.frameDuration())) catch |err| {
-            std.debug.panic("particle simulation failed: {s} (mode: {s})", .{
-                @errorName(err),
-                @tagName(particles.simulation_mode),
-            });
-        };
-    }
+    // Stage 3, slice 2: the whole simulation advances through one entry
+    // point, so the game side can later move to its own thread unchanged.
+    scene.update(@floatCast(sapp.frameDuration())) catch |err| {
+        std.debug.panic("scene update failed: {s} (particle mode: {s})", .{
+            @errorName(err),
+            if (particle_mode) |m| @tagName(m) else "off",
+        });
+    };
 
-    scene.updateLights(@floatCast(sapp.frameDuration()));
     scene.render();
 
     if (frame_limit != 0) {
