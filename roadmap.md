@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026.
+> Дата: 10.09.2026 (обновлено 15.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -24,11 +24,12 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
+| Потоки и владение GPU | game/render threads, affinity-маркер, отложенные create/update/destroy, async-ассеты | ✅ |
 | Рендер | Forward, 8 пайплайнов, opaque, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
-| Камеры | ArcRotate + Free + Fly + Follow + Target, объединяющая union Camera | 🟡 |
+| Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) | ✅ |
 | Материал Standard | Diffuse-цвет/текстура | ✅ |
@@ -38,7 +39,7 @@
 | HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 несжатый LDR (мипы, cube, sRGB), HDR Radiance | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO | 🟡 |
-| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | — | ❌ |
+| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF и цветовые curves есть; MSAA — только offscreen main target | 🟡 |
 | Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот | 🟡 |
 | GPU-симуляция, sub-emitters, flow maps | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
@@ -62,7 +63,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 334+ unit-тестов, `zig build test`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 584 unit-теста, `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -298,6 +299,29 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 Проверки: 347+ unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят чисто без предупреждений, >350 FPS в runtime.
 
+### Волна 15: стабилизация потоков и владения ресурсами (15.09.2026)
+
+Четыре волны после аудита `REFACTOR.md` (детали и инварианты — там же).
+Коммиты agate: `c64e8be` (стабилизация), `8e27ab7` (потоковая модель),
+`38f9a9e` (жизненный цикл), `222722b` + `0e8d413` (off-context загрузки,
+форматирование); sandbox: `e977606`, `605045a`.
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Affinity-маркер графического потока | `gpu_thread.zig`, оба `main.zig` | `markContextThread` / `isOnContextThread` / `assertOnContextThread` (Debug+ReleaseSafe); приложения маркируют sapp-поток | ✅ |
+| Отложенное уничтожение | `scene.zig`, `mesh/mesh.zig` | `destroyMesh` вне контекста снимает меш и складывает в очередь (+фиксированный overflow на OOM), дренаж на render-start и в `deinit` | ✅ |
+| Отложенное создание | `mesh/mesh.zig`, `loader/mesh_spawn.zig`, `morph_gpu.zig` | `uploadGeometry` и glTF-примитивы строятся CPU-only (`gpu_pending`, `pending_dynamic_update`, `morph_upload_pending`), буферы собирает `finishGpuUpload` | ✅ |
+| Частицы и trail | `particles.zig`, `mesh/trail.zig` | буферы создаются на flush-стороне; частичное создание уничтожает недоделанный handle | ✅ |
+| Очистка referent'ов | `scene.zig` | тело физики, `parent`, `attach_bone`, LOD-записи, декаль-инстансы и morph-привязки анимаций разрываются до освобождения | ✅ |
+| Mailbox newest-wins | `handoff.zig`, `scene.zig` | `releasePublished` + перепубликация при насыщении: свежий кадр и light pack всегда побеждают | ✅ |
+| Очереди рендера | `scene/render_queue.zig` | parallel cull skip инстансов, OOM-fallback в serial, единый tie-break по индексу меша, guard tail-чанков | ✅ |
+| Picking | `scene/picking.zig` | sphere-тест в локальном пространстве через обратную матрицу (точно для parented/rotated/non-uniform) | ✅ |
+| Текстуры | `texture.zig`, `ktx2.zig`, `loader/materials.zig` | checked-размеры `buildRaw`, KTX2 error-маппинг, off-context assert и авто-async для GLB | ✅ |
+| Инструменты | `sandbox/main.zig` | `--test-decal`, `--test-async-load`, mouse-mailbox вместо флуда кольца | ✅ |
+
+Проверки волны: 584/584 (Debug + ReleaseSafe), `zig build fmt` зелёный,
+smoke-набор agate и sandbox (включая `--test-decal` и `--test-async-load`) чистый.
+
 ---
 
 ## ✅ Что сделано
@@ -308,7 +332,8 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
 * Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов (`SceneStats`).
-* 310 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, флаг `--bench`).
+* Многопоточность: game/render threads под coarse phase mutex, `jobs.Pool`/`TaskRunner`, lock-free `Handoff`/`SpscRing`, affinity-маркер `gpu_thread`, отложенные создание/обновление/уничтожение GPU-ресурсов вне графического потока.
+* 584 unit-теста в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
@@ -420,19 +445,19 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 
 | Возможность Babylon.js | В Agate есть | Чего не хватает |
 |---|---|---|
-| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera | Камера-ригов, мультикамеры и viewport'ов, touch/pinch, инерции |
+| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP) | Камера-ригов, touch/pinch, инерции |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + 1 directional (солнце) + 4 point + 2 spot (выбор лучших по камере) | Area-света, кластерного освещения, light probes, нескольких directional |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS | Теней от point/spot, ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL | Расширенных слоёв PBR, OpenPBR, unlit-режима |
-| Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), back-to-front очередь | Сортировки прозрачных инстансов; back-face освещение по геометрическим нормалям |
+| Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced | Per-instance сортировки внутри instanced-группы (OIT), back-face освещение по геометрическим нормалям |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 несжатый LDR (мипы/cube/sRGB) | EXR, DDS, KTX2-суперкомпрессии и блочных форматов (нужен транскодер), HDR-16F в KTX2, видеотекстур, render-target/reflection probe текстур |
-| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, MSAA, LUT-текстур, glow/highlight; MSAA выключен (sample_count=1) |
+| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, LUT-текстур, glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
-| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco/meshopt, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
+| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
-| UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider | Инпутов, скроллов, dropdown, гридов/layout, 3D-виджетов, загрузки шрифтов, фокуса/состояния |
+| UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider/dropdown/скролл/text input | Layout-контейнеров, 3D-виджетов, загрузки шрифтов, фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, позиционирование | mp3/ogg, стриминга, шин/эффектов, doppler/окклюзии |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
 | Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, debug-режимы SSAO/каскадов, `appendDebugLines` | Инспектора сцены, профилировщика, редактирования на лету |
@@ -457,13 +482,13 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 * Сортировка прозрачных инстансов; back-face освещение по геометрическим нормалям.
 
 **Постобработка и эффекты**
-* Depth of Field, motion blur, TAA, MSAA/SSAA, LUT/color curves, bloom с мип-пирамидой, SSR/SSAO более высокого качества.
-* Glow layer, highlight layer, outline renderer, lens flares, snapshot-рендер.
+* Motion blur, TAA, MSAA/SSAA (MSAA — только offscreen main target), LUT-текстура цветокоррекции.
+* Glow layer, highlight layer, lens flares, snapshot-рендер, SSR/SSAO более высокого качества.
 
 **Геометрия**
-* Polygon/N-gon-билдеры, толстые GreasedLine-линии, trail.
-* CSG/CSG2, mesh simplification, инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют).
-* Blend shapes с GPU-скиннингом (сейчас CPU-блендинг морфов), морфы >8 таргетов.
+* Толстые GreasedLine-линии, mesh simplification.
+* Инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют).
+* Морфы >8 таргетов (GPU-блендинг через delta-текстуру реализован).
 
 **Анимация**
 * Animation retargeting, ретаргетинг скелетов, редактор анимаций.
@@ -485,8 +510,8 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 * Draco/meshopt, KTX2-транскодинг (Basis), 3D Tiles.
 
 **Архитектура рендера**
-* Frame graph / node render graph, кастомные rendering pipelines, compute-шейдеры.
-* GPU compute culling, large world rendering (floating origin) (Software Hi-Z Occlusion Culling реализован в Волне 14).
+* Frame graph / node render graph, кастомные rendering pipelines.
+* GPU compute culling, large world rendering (floating origin) (Software Hi-Z Occlusion Culling реализован в Волне 14; compute-шейдеры есть через `compute.zig` с runtime-гейтом).
 * Realtime ray tracing/Gaussian splatting (в Babylon 9 тоже отдельные подсистемы).
 
 **Прочее**

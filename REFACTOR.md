@@ -6,6 +6,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 
 | Stage | Scope | Status |
 |---|---|---|
+| 0. Thread affinity & GPU ownership | marker, deferred create/update/destroy, off-context loads | [x] done |
 | 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
 | 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
 | 3. Simulation/render decoupling | threads, coarse phase ownership, partial payload | [~] safe; non-blocking pending |
@@ -27,7 +28,13 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 - `jobs.Mutex` — blocking pthread mutex for coarse phase ownership.
 - `handoff.Handoff(T, slots)` — lock-free latest-wins mailbox:
   `claim`/`publish`/`takeLatest`, global publish sequence, stale frames
-  never resurface, drops allowed. Single-publisher by contract.
+  never resurface, drops allowed. Single-publisher by contract; a
+  publisher-side `releasePublished()` drains saturated slots before
+  republishing so the newest state always wins.
+- `gpu_thread` — graphics-context thread marker: `markContextThread()`
+  (called from the apps' sokol init), `isOnContextThread()` for call
+  sites that must defer GPU work, `assertOnContextThread()` as the
+  Debug + ReleaseSafe tripwire.
 - `assets.UploadQueue` + `PendingTexture` — decode off-thread
   (`Texture.decodeFile/decodeMemory` are documented GPU-free and
   thread-safe), upload on the sg-context thread, optional live
@@ -95,12 +102,46 @@ back to inline simulation):
 - Thread-safety verified by: two-thread lost-update mutex test
   (20000/20000), 1500-frame threaded smoke, handoff threaded stress test,
   SpscRing cross-thread order test.
+- **Thread affinity marker.** Both apps call
+  `gpu_thread.markContextThread()` in their sokol init; engine paths that
+  may run on the game thread branch on `isOnContextThread()` and
+  `assertOnContextThread()` catches misplaced `sg.*` in Debug and
+  ReleaseSafe. Off-context sync texture creation is rejected loudly;
+  async decode/upload is the legal path.
+- **Deferred creation and destruction.** `Scene.destroyMesh` unlinks
+  immediately and queues off-context teardown (`pending_gpu_destroys` +
+  allocation-free `[8]` overflow, err-logged leak only under pathological
+  OOM), drained at render start and in `Scene.deinit`. `uploadGeometry`
+  and the glTF loader build CPU-only meshes off-context
+  (`gpu_pending` + `pending_vertices`), with `pending_dynamic_update`
+  (CPU-morph empty dynamic buffer) and `morph_upload_pending` (delta
+  texture) finished by `Mesh.finishGpuUpload`. Particle systems and
+  trail meshes defer instance/vertex/index buffer creation the same way.
+- **Off-context GLB loading.** `.async_textures` queues image decode on
+  `Scene.uploads`; an off-context load auto-degrades to async textures
+  when the queue exists (sync texture creation would assert). The
+  sandbox `--test-async-load` harness pins the full path
+  (`gpu_pending=1 -> 0`, material texture patched by the drain).
+- **Mailbox newest-wins.** Saturated frame/light handoffs drain stale
+  published slots before republishing (`Handoff.releasePublished`), so
+  the newest complete state always wins (100/200/300 regression test).
+- **Destroy referents.** `destroyMesh` neutralizes every cross-reference
+  before freeing: physics body, children's `parent`, bone attachments,
+  LOD entries, decal-manager instances (and their materials), animation
+  morph bindings (weights slice + dirty pointer tombstoned so channel
+  indices stay valid).
 
 Known limitations of the shipped split:
 
 - **Coarse payload.** Phase ownership means an update spike delays render
   for its duration. Strictly non-blocking render needs the full per-item
   payload (below).
+- **Instanced picking and per-instance transparency sorting** remain
+  documented gaps: `pickWithRay` skips instance-bearing meshes, and a
+  transparent instanced group sorts as one batch (no OIT).
+- **Upload granularity.** `UploadQueue.drain` uploads every ready texture
+  in one call while holding its spinlock, and its `TaskRunner` multiplexes
+  texture decode with async save/load I/O — splitting these is future work.
 
 ## What remains (TODO, in priority order)
 
@@ -147,15 +188,26 @@ Known limitations of the shipped split:
 
 ## Rules for threaded code in agate
 
-1. `sg.*` only from the context-owning thread; updates stage + flag, the
-   render side flushes (`flushPendingGpuUploads` pattern).
+1. `sg.*` only from the context-owning thread. Creation, upload and
+   destruction follow one shape: the game side stages CPU data or unlinks
+   objects and sets a flag (`gpu_pending`, `*_pending`,
+   `pending_gpu_destroys`), the render side finishes it
+   (`flushPendingGpuUploads` / `drainPendingGpuDestroys`). `gpu_thread`
+   asserts the thread in Debug + ReleaseSafe; off-context sync texture
+   creation is rejected loudly, async decode/upload is the legal path.
 2. Jobs are CPU-only, own disjoint index ranges, never nest
    `parallelFor`; no sg, no shared mutable state.
 3. Determinism: per-entity work must not depend on chunking — pinned by
-   tests (byte-equality, queue equivalence), not convention.
+   tests (byte-equality, queue equivalence), not convention. Parallel and
+   serial queue paths must produce identical `transparent_order`, so the
+   tie-break derives from the source mesh index, never insertion order.
 4. No silent fallbacks: missing pool/queue degrades to *serial execution*
-   (a scheduling detail); allocation failures still surface as errors.
-5. New shared state must be classified at design time per the audit
+   (a scheduling detail); allocation failures still surface as errors
+   (e.g. `GpuBufferAllocationFailed` instead of dead buffer handles).
+5. Deleting an object must neutralize its referents before the memory is
+   freed (physics body, hierarchy links, LOD entries, decals, animation
+   morph bindings); failing to do so is a bug, not a limitation.
+6. New shared state must be classified at design time per the audit
    taxonomy: COPY into payload / ALTERNATE-OWNED by one phase /
    GPU_ONLY handle / READONLY_AFTER_LOAD. The audit (2026-09) is the
    reference map; re-run it after touching render reads.
@@ -291,13 +343,18 @@ Known limitations of the shipped split:
 
 ### Чего не хватает
 
-1. Матрица интеграционных сцен: threaded/serial, regular/instanced/skinned/morph,
-   opaque/cutout/blend/double-sided, одна камера/PIP, post/MSAA,
-   загрузка/изменение/удаление ресурсов.
-2. README, CI и проверка реально fetched/archive-пакета; в `roadmap.md` есть устаревшие статусы
-   (например, DoF/MSAA помечены отсутствующими при наличии кода).
-3. Контракты владения и отложенное освобождение ресурсов до дальнейшего
-   распараллеливания.
+1. [~] Матрица интеграционных сцен: unit-тестами закрыты serial/parallel
+   очереди и типы очередей; runtime-покрытие — `--test-pip` (PIP), `--msaa`,
+   `--particles`, `--test-decal` (создание/удаление), `--test-async-load`
+   (off-context GLB). Visual regression и нагрузочная смесь (сотни мешей +
+   >4096 частиц + мутации) отсутствуют.
+2. [~] README и CI по-прежнему отсутствуют; проверка fetched/archive-пакета
+   не закрыта (`zig fetch` зависает в этой среде); устаревшие статусы
+   `roadmap.md` выправлены 2026-09-15.
+3. [x] Контракты владения и отложенное освобождение ресурсов: affinity-маркер,
+   отложенные create/update/destroy, чистка referent'ов при удалении и
+   OOM-политики без off-context `sg.*`. Осталось: полный per-item payload и
+   instanced picking.
 4. Сохранение игры: устойчивые ID, связи объектов, игровое состояние, версия
    формата. Текущий serializer намеренно хранит только состояние существующей
    сцены (`src/agate/serialization.zig:55-61`).
@@ -308,36 +365,96 @@ Known limitations of the shipped split:
 ### Порядок работ
 
 1. [x] Стабилизация: потоки, `spawn`, кубмапы, bounds-check анимаций.
-2. [~] Воспроизводимость: package paths и test-registry готовы; README/CI и
-   archive-consumer check остаются.
-3. [~] Согласованность рендера: прозрачная очередь и viewport-aware picking
+2. [x] Владение ресурсами: affinity-маркер, отложенные create/update/destroy,
+   чистка referent'ов, OOM-политики, off-context glTF-загрузки.
+3. [~] Воспроизводимость: package paths, test-registry и `zig build fmt`
+   готовы; README/CI и archive-consumer check остаются.
+4. [~] Согласованность рендера: прозрачная очередь и viewport-aware picking
    готовы; visual-regression сцены остаются.
-4. Одна небольшая законченная игра как проверка движка.
-5. Оптимизация только по профилю.
+5. [ ] Одна небольшая законченная игра как проверка движка.
+6. [ ] Оптимизация только по профилю (гранулярность UploadQueue, разделение
+   TaskRunner для decode и save/load I/O, instanced picking).
 
 ### Выполненные проверки
 
 ```sh
-# В agate/: успешно
+# В agate/: успешно (2026-09-15)
+zig build fmt                          # чисто (ранее падал на 7 файлах)
 zig build update-tests                 # повторный запуск идемпотентен
-zig build test                         # 563/563
-zig build test -Doptimize=ReleaseSafe # 563/563
+zig build test                         # 584/584
+zig build test -Doptimize=ReleaseSafe  # 584/584
 zig build
-zig build -Doptimize=ReleaseSafe
-zig build run -- --frames 30
-zig build run -- --frames 30 --no-threads
-zig build run -- --frames 30 --msaa 4
+zig build run -- --frames 30 [--no-threads | --msaa 4]
 
 # В sandbox/: успешно
 zig build
 zig build run -- --frames 120
-zig build run -- --test-pip
-zig build run -- --test-save
+zig build run -- --test-pip            # PIP: вкл/выкл мультикамеры
+zig build run -- --test-save           # async save/load состояния
+zig build run -- --test-decal          # создание декали из игрового потока
+zig build run -- --test-async-load     # off-context GLB + async-текстуры
 zig build bench -Doptimize=ReleaseFast
 ```
 
-Изменённые Zig-файлы проходят `zig fmt --check`. Общий `zig build fmt` пока
-падает на семи неизменённых ранее неформатированных файлах; они не затрагивались.
-Sandbox dependency-build не изменяет `src/agate/tests.zig`. Отдельный
-`zig fetch .` дважды завис без вывода, поэтому fetched/archive package и ручная
-визуальная проверка прозрачности остаются незакрытыми проверками.
+`zig build fmt` зелёный: семь ранее неформатированных файлов отформатированы
+2026-09-15. Sandbox dependency-build не изменяет `src/agate/tests.zig`.
+Отдельный `zig fetch .` зависает в этой среде, поэтому fetched/archive package,
+visual regression и нагрузочная матрица остаются незакрытыми проверками.
+
+## Стабилизационные волны (2026-09-15)
+
+Четыре волны после аудита. Коммиты: `c64e8be`, `8e27ab7`, `38f9a9e`, `222722b`
+(+ форматирование `0e8d413`) в agate и `e977606`, `605045a` в sandbox.
+Тестов стало 563 → 584.
+
+### Волна 1 — стабилизация (`c64e8be`)
+- mutex снова охватывает `prepareFrame() + render()` до появления полного
+  per-item payload; частичный отказ spawn завершает потоки корректно;
+- кубмапы: единый sized-defer, checked size arithmetic; bounds-check
+  LINEAR/STEP bone-треков;
+- общая back-to-front очередь прозрачности (regular + instanced, decals);
+- viewport-aware picking (ray, containment, PIP-камера);
+- `.paths` пакета, явный `zig build update-tests`, передача аргументов в run.
+
+### Волна 2 — потоковая модель (`8e27ab7`, sandbox `e977606`)
+- `gpu_thread` маркер и ассерты графического потока;
+- `Scene.destroyMesh` откладывает teardown; `uploadGeometry` строит CPU-only
+  меши (`gpu_pending`); частицы и trail откладывают буферы;
+- насыщенные mailbox'ы дренируют stale-слоты и перепубликуют (100/200/300);
+- parallel culling: skip инстансов, OOM-fallback в serial, единый tie-break
+  по индексу меша, guard на tail-чанки;
+- sphere picking через обратную матрицу (точный для родительских цепочек,
+  поворотов и неравномерного масштаба);
+- `buildRaw` проверяет размеры; KTX2 маппит новые ошибки;
+- sandbox: mouse-mailbox вместо флуда кольца, `--test-decal`.
+
+### Волна 3 — жизненный цикл ресурсов (`38f9a9e`)
+- `destroyMesh` нейтрализует referent'ы: тело физики, `parent`,
+  `attach_bone`, LOD-записи, декаль-инстансы и morph-привязки анимаций
+  (tombstone, чтобы индексы каналов остались валидными);
+- очередь разрушения при OOM не трогает `sg.*` вне контекста (фиксированный
+  overflow, err-logged leak только при полном исчерпании);
+- glTF `parsePrimitive` вне контекста: без `sg.*`, флаги
+  `pending_dynamic_update` / `morph_upload_pending`, полный `errdefer`;
+- `uploadGeometry`: единый errdefer, `GpuBufferAllocationFailed` вместо
+  мёртвых handles; morph delta валидация, лог первой ошибки, базовая поза
+  в кадре 1 для отложенных CPU-морфов.
+
+### Волна 4 — off-context загрузка (`222722b`)
+- синхронное создание текстур требует графический поток (assert в точках
+  `Texture.fromRaw/fromMemory/fromFile`); off-context GLB-загрузка
+  автоматически переходит на async-текстуры при наличии `scene.uploads`;
+- `spawnMeshes` больше не требует контекст; исправлена утечка имени при OOM;
+- `Scene.deinit` разрушает физику до мешей (тела держат raw `mesh`-указатели);
+- `--test-async-load`: `gpu_pending=1 → 0`, `textured=1` — полный off-context
+  путь подтверждён runtime-харнессом;
+- `zig build fmt` впервые зелёный (7 файлов отформатированы).
+
+### Инварианты (закреплены ассертами и тестами)
+1. `sg.*` — только на графическом потоке; иначе отложить и завершить на
+   render-стороне.
+2. Ошибка аллокатора не публикует невалидные GPU-handles и не течёт.
+3. Удаление объекта разрывает все ссылки на него до освобождения памяти.
+4. Mailbox всегда отдаёт самое новое состояние; устаревшие кадры отбрасываются.
+5. Тест-реестр — источник правды для `zig build test`; новый файл требует
+   `zig build update-tests`.
