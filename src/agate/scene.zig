@@ -872,6 +872,7 @@ pub const Scene = struct {
     pub fn flushPendingGpuUploads(self: *Scene) void {
         for (self.particles.systems.items) |ps| ps.flushGpuUploads();
         for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
+        for (self.meshes.items) |m| m.flushGpuUploads();
     }
 
     pub fn render(self: *Scene) void {

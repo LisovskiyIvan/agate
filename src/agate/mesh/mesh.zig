@@ -68,6 +68,7 @@ pub const Mesh = struct {
     /// Without a GPU buffer (unit tests, id == 0) this is the output.
     morph_staging: []Vertex = &.{},
     morph_dirty: bool = false,
+    morph_upload_needed: bool = false,
     /// Where deltas are blended: .cpu rewrites the vertex buffer from
     /// morph_staging (default, historical behavior); .gpu keeps a static
     /// base-pose vertex buffer and the vertex shader blends from the delta
@@ -375,7 +376,16 @@ pub const Mesh = struct {
             }
         }
 
-        if (self.vertex_buffer.id != 0) {
+        self.morph_upload_needed = true;
+    }
+
+    /// Pushes update-staged morph vertex data into the GPU vertex buffer.
+    /// Called at render start on the context thread (flushPendingGpuUploads pattern).
+    pub fn flushGpuUploads(self: *Mesh) void {
+        if (!self.morph_upload_needed) return;
+        self.morph_upload_needed = false;
+        const n = @min(self.morph_base.len, self.morph_staging.len);
+        if (n > 0 and self.vertex_buffer.id != 0) {
             sg.updateBuffer(self.vertex_buffer, sg.asRange(self.morph_staging[0..n]));
         }
     }

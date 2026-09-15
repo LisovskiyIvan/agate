@@ -8,7 +8,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 |---|---|---|
 | 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
 | 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
-| 3. Simulation/render decoupling | threads, phase ownership | [~] engine demo threaded; payload + sandbox remain |
+| 3. Simulation/render decoupling | threads, phase ownership | [~] engine demo & sandbox threaded; payload remains |
 
 ## What exists (as built)
 
@@ -51,9 +51,10 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
   exactly (3000-mesh equivalence test). Active above
   `FrameCullContext.parallel_min_meshes` (default 1024). Instance-bearing
   meshes stay serial (they own sg buffer uploads).
-- Update-side `sg.*` calls eliminated: particles and trails stage CPU
-  data and set dirty flags; `Scene.flushPendingGpuUploads()` (render
-  start) performs the uploads. The update phase is free of sg.* calls.
+- Update-side `sg.*` calls eliminated: particles, trails, and mesh
+  morphs stage CPU data and set dirty flags; `Scene.flushPendingGpuUploads()`
+  (render start) performs the uploads. The update phase is free of sg.*
+  calls.
 
 ### Stage 2 — async assets [x]
 
@@ -74,8 +75,8 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 
 ### Stage 3 — simulation/render decoupling [~]
 
-Shipped (engine demo, threaded by default; `--no-threads` falls back to
-inline simulation):
+Shipped (engine demo & sandbox, threaded by default; `--no-threads` falls
+back to inline simulation):
 
 - Game thread loop: `simulate(dt)` = input drain (SpscRing) + demo state
   + `Scene.update(dt)`, paced ~1 kHz on its own sokol-time clock.
@@ -83,6 +84,13 @@ inline simulation):
 - Phase ownership: `jobs.Mutex` held for the whole update phase and the
   whole render phase — the two never overlap. ESC on the game thread sets
   a quit flag the sapp thread observes (sapp stays single-threaded).
+- **Sandbox UI & threading**: raw `sapp.Event` input events cross into the
+  game thread via `jobs.SpscRing(sapp.Event, 512)`. Event consumption and
+  UI event dispatch (`sandbox_ui.handleEvent`) run on the game thread
+  under phase ownership. Because UI callbacks execute on the game thread,
+  they mutate `scene` and `sb_scene` state directly with zero mutation-queue
+  boilerplate. `sandbox_ui.renderUI` runs on the sapp thread under the
+  phase mutex, safely generating vertex data for `Scene.render()`.
 - Update phase is free of `sg.*`; all GPU pushes happen at render start
   (`flushPendingGpuUploads`) or during draws.
 - Thread-safety verified by: two-thread lost-update mutex test
@@ -94,9 +102,6 @@ Known limitations of the shipped split:
 - **Coarse payload.** Phase ownership means an update spike delays render
   for its duration. Strictly non-blocking render needs the full per-item
   payload (below).
-- **Sandbox is single-threaded by design.** Its UI mutates scene state
-  from sapp callbacks; it needs a mutation queue (sapp thread posts
-  mutations, game thread applies) before it can join the split.
 
 ## What remains (TODO, in priority order)
 
@@ -113,9 +118,10 @@ Known limitations of the shipped split:
    After this, render holds zero references to game-mutable state and the
    phase mutex shrinks to the handoff points (strictly non-blocking
    render).
-2. [ ] **Sandbox joins the split.** Mutation queue for UI-driven scene
-   changes (sapp thread posts, game thread applies), then flip
-   `threaded = true`.
+2. [x] **Sandbox joins the split.** Raw sapp event ring buffer feeding
+   game-thread UI event handling, state mutations directly on the game
+   thread, `flushPendingGpuUploads` for morph targets, `threaded = true`
+   by default.
 3. [ ] **Serialization save off-thread.** Needs quiesce or snapshot
    semantics; the UploadQueue/TaskRunner machinery already exists.
 4. [ ] **Granularity refinements** (optional, as scenes grow):
