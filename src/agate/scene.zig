@@ -60,6 +60,7 @@ const Texture = @import("texture.zig").Texture;
 const CubeTexture = @import("texture.zig").CubeTexture;
 const SkyboxOptions = @import("texture.zig").SkyboxOptions;
 const visibility = @import("visibility/mod.zig");
+const serialization = @import("serialization.zig");
 
 // Scene subsystems. Each owns its state (and GPU resources) plus the logic
 // that belongs to it; Scene is the owner/orchestrator facade. Subsystems
@@ -270,6 +271,28 @@ pub const Scene = struct {
 
     pub fn setSSAO(self: *Scene, config: SSAOOptions) void {
         self.ssao = config;
+    }
+
+    // ---- Serialization (off-thread save/load). ----
+
+    /// Stage 3, slice 3: captures scene state under snapshot semantics (<0.1 ms)
+    /// and dispatches serialization + file I/O to a background TaskRunner.
+    /// Neither the game thread nor the sapp render thread blocks on disk I/O.
+    pub fn saveStateFileAsync(self: *Scene, path: []const u8) !*serialization.AsyncSaveTask {
+        const snap = try serialization.capture(self.allocator, self);
+        errdefer {
+            var s = snap;
+            s.deinit(self.allocator);
+        }
+        const runner = if (self.uploads) |*q| q.runner else return error.NoTaskRunner;
+        return serialization.saveFileAsync(self.allocator, runner, snap, path);
+    }
+
+    /// Loads a scene file off-thread; caller polls task.isDone() and calls
+    /// restoreSceneState(scene, &task.result.?) on the game thread.
+    pub fn loadStateFileAsync(self: *Scene, path: []const u8) !*serialization.AsyncLoadTask {
+        const runner = if (self.uploads) |*q| q.runner else return error.NoTaskRunner;
+        return serialization.loadFileAsync(self.allocator, runner, path);
     }
 
     // ---- Skybox. ----

@@ -121,8 +121,13 @@ Known limitations of the shipped split:
    game-thread UI event handling, state mutations directly on the game
    thread, `flushPendingGpuUploads` for morph targets, `threaded = true`
    by default.
-3. [ ] **Serialization save off-thread.** Needs quiesce or snapshot
-   semantics; the UploadQueue/TaskRunner machinery already exists.
+3. [x] **Serialization save off-thread.** Implemented `AsyncSaveTask` and `AsyncLoadTask`
+   with snapshot semantics via `jobs.TaskRunner`. `Scene.saveStateFileAsync`
+   captures `SceneState` snapshot (<0.1 ms) on the game thread and dispatches
+   binary serialization and disk I/O to background worker threads without stalling
+   simulation or render loops. `Scene.loadStateFileAsync` reads and deserializes
+   off-thread, ready for fast in-place `restore()`. Fully integrated into
+   `sandbox` showcase with non-blocking UI status updates and automated testing.
 4. [ ] **Granularity refinements** (optional, as scenes grow):
    lower `parallel_min_meshes` (1024) or make it adaptive; parallel
    shadow-pass binning; parallel instanced-path transform staging.

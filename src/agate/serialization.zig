@@ -61,6 +61,7 @@
 //! on restore; geometry is referenced, never stored.
 
 const std = @import("std");
+const jobs = @import("jobs.zig");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Color3 = math.Color3;
@@ -528,11 +529,7 @@ fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) vo
                 if (mesh.material) |m| {
                     if (m == .standard) break :blk m.standard;
                 }
-                const owned: ?[]u8 = scene.allocator.dupe(u8, mesh.name) catch null;
-                const mat = scene.createStandardMaterial(owned orelse mesh.name) catch {
-                    if (owned) |o| scene.allocator.free(o);
-                    return;
-                };
+                const mat = scene.createStandardMaterial(mesh.name) catch return;
                 break :blk mat;
             };
             sm.diffuse_color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]);
@@ -547,11 +544,7 @@ fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) vo
                 if (mesh.material) |m| {
                     if (m == .pbr) break :blk m.pbr;
                 }
-                const owned: ?[]u8 = scene.allocator.dupe(u8, mesh.name) catch null;
-                const mat = scene.createPBRMaterial(owned orelse mesh.name) catch {
-                    if (owned) |o| scene.allocator.free(o);
-                    return;
-                };
+                const mat = scene.createPBRMaterial(mesh.name) catch return;
                 break :blk mat;
             };
             pm.albedo_color = Color3.new(p.albedo[0], p.albedo[1], p.albedo[2]);
@@ -587,50 +580,58 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
         restoreMeshMaterial(scene, mesh, &entry.material);
     }
 
-    {
-        const owned: ?[]u8 = scene.allocator.dupe(u8, state.hemi.name) catch null;
-        scene.lights.hemi = HemisphericLight.init(owned orelse state.hemi.name, .{
-            .direction = Vec3.new(state.hemi.direction[0], state.hemi.direction[1], state.hemi.direction[2]),
-            .diffuse = Color3.new(state.hemi.diffuse[0], state.hemi.diffuse[1], state.hemi.diffuse[2]),
-            .ground_color = Color3.new(state.hemi.ground[0], state.hemi.ground[1], state.hemi.ground[2]),
-            .intensity = state.hemi.intensity,
-        });
-    }
+    scene.lights.hemi = HemisphericLight.init(scene.lights.hemi.name, .{
+        .direction = Vec3.new(state.hemi.direction[0], state.hemi.direction[1], state.hemi.direction[2]),
+        .diffuse = Color3.new(state.hemi.diffuse[0], state.hemi.diffuse[1], state.hemi.diffuse[2]),
+        .ground_color = Color3.new(state.hemi.ground[0], state.hemi.ground[1], state.hemi.ground[2]),
+        .intensity = state.hemi.intensity,
+    });
 
     if (state.directional) |*d| {
         // createDirectionalLight destroys the previous sun internally.
         const owned: ?[]u8 = scene.allocator.dupe(u8, d.name) catch null;
-        _ = scene.createDirectionalLight(owned orelse d.name, .{
+        if (scene.createDirectionalLight(owned orelse d.name, .{
             .direction = Vec3.new(d.direction[0], d.direction[1], d.direction[2]),
             .diffuse = Color3.new(d.diffuse[0], d.diffuse[1], d.diffuse[2]),
             .intensity = d.intensity,
-        }) catch {
+        })) |dl| {
+            if (owned != null) dl.owns_name = true;
+        } else |_| {
             if (owned) |o| scene.allocator.free(o);
-        };
+        }
     } else if (scene.lights.directional) |old| {
+        if (old.owns_name) scene.allocator.free(old.name);
         scene.allocator.destroy(old);
         scene.lights.directional = null;
     }
 
-    for (scene.lights.point_lights.items) |pl| scene.allocator.destroy(pl);
+    for (scene.lights.point_lights.items) |pl| {
+        if (pl.owns_name) scene.allocator.free(pl.name);
+        scene.allocator.destroy(pl);
+    }
     scene.lights.point_lights.clearRetainingCapacity();
     for (state.point_lights) |*p| {
         const owned: ?[]u8 = scene.allocator.dupe(u8, p.name) catch null;
-        _ = scene.createPointLight(owned orelse p.name, .{
+        if (scene.createPointLight(owned orelse p.name, .{
             .position = Vec3.new(p.position[0], p.position[1], p.position[2]),
             .color = Color3.new(p.diffuse[0], p.diffuse[1], p.diffuse[2]),
             .intensity = p.intensity,
             .range = p.range,
-        }) catch {
+        })) |pl| {
+            if (owned != null) pl.owns_name = true;
+        } else |_| {
             if (owned) |o| scene.allocator.free(o);
-        };
+        }
     }
 
-    for (scene.lights.spot_lights.items) |sl| scene.allocator.destroy(sl);
+    for (scene.lights.spot_lights.items) |sl| {
+        if (sl.owns_name) scene.allocator.free(sl.name);
+        scene.allocator.destroy(sl);
+    }
     scene.lights.spot_lights.clearRetainingCapacity();
     for (state.spot_lights) |*s| {
         const owned: ?[]u8 = scene.allocator.dupe(u8, s.name) catch null;
-        _ = scene.createSpotLight(owned orelse s.name, .{
+        if (scene.createSpotLight(owned orelse s.name, .{
             .position = Vec3.new(s.position[0], s.position[1], s.position[2]),
             .direction = Vec3.new(s.direction[0], s.direction[1], s.direction[2]),
             .color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]),
@@ -638,9 +639,11 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
             .range = s.range,
             .inner_angle_deg = s.inner_deg,
             .outer_angle_deg = s.outer_deg,
-        }) catch {
+        })) |sl| {
+            if (owned != null) sl.owns_name = true;
+        } else |_| {
             if (owned) |o| scene.allocator.free(o);
-        };
+        }
     }
 
     switch (state.camera) {
@@ -1299,6 +1302,197 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !SceneState {
     const read = try file.readPositionalAll(io, bytes, 0);
     if (read < bytes.len) return error.Truncated;
     return deserializeAlloc(allocator, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Async off-thread file serialization (TaskRunner)
+// ---------------------------------------------------------------------------
+
+pub const AsyncSaveTask = struct {
+    pub const State = enum(u8) {
+        pending = 0,
+        serializing = 1,
+        writing = 2,
+        completed = 3,
+        failed = 4,
+    };
+
+    allocator: std.mem.Allocator,
+    path: []u8,
+    scene_state: SceneState,
+    state: std.atomic.Value(State) = std.atomic.Value(State).init(.pending),
+    bytes_written: usize = 0,
+    err_name: ?[:0]const u8 = null,
+
+    pub fn isDone(self: *const AsyncSaveTask) bool {
+        const s = self.state.load(.acquire);
+        return s == .completed or s == .failed;
+    }
+
+    pub fn isSuccess(self: *const AsyncSaveTask) bool {
+        return self.state.load(.acquire) == .completed;
+    }
+
+    pub fn deinit(self: *AsyncSaveTask) void {
+        self.scene_state.deinit(self.allocator);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
+fn runSaveTask(ctx: *anyopaque) void {
+    const task: *AsyncSaveTask = @ptrCast(@alignCast(ctx));
+    task.state.store(.serializing, .release);
+
+    const bytes = serializeAlloc(task.allocator, &task.scene_state) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+    defer task.allocator.free(bytes);
+
+    task.state.store(.writing, .release);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = task.path, .data = bytes }) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+
+    task.bytes_written = bytes.len;
+    task.state.store(.completed, .release);
+}
+
+/// Dispatches serializing and writing the scene state to path on a background
+/// task thread. Ownership of `scene_state` transfers into the returned task.
+/// The caller polls `task.isDone()` and must call `task.deinit()` when finished.
+pub fn saveFileAsync(allocator: std.mem.Allocator, runner: *jobs.TaskRunner, scene_state: SceneState, path: []const u8) !*AsyncSaveTask {
+    const task = try allocator.create(AsyncSaveTask);
+    errdefer allocator.destroy(task);
+
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+
+    task.* = .{
+        .allocator = allocator,
+        .path = owned_path,
+        .scene_state = scene_state,
+        .state = std.atomic.Value(AsyncSaveTask.State).init(.pending),
+        .bytes_written = 0,
+        .err_name = null,
+    };
+
+    runner.post(task, runSaveTask);
+    return task;
+}
+
+pub const AsyncLoadTask = struct {
+    pub const State = enum(u8) {
+        pending = 0,
+        reading = 1,
+        deserializing = 2,
+        completed = 3,
+        failed = 4,
+    };
+
+    allocator: std.mem.Allocator,
+    path: []u8,
+    state: std.atomic.Value(State) = std.atomic.Value(State).init(.pending),
+    result: ?SceneState = null,
+    err_name: ?[:0]const u8 = null,
+
+    pub fn isDone(self: *const AsyncLoadTask) bool {
+        const s = self.state.load(.acquire);
+        return s == .completed or s == .failed;
+    }
+
+    pub fn isSuccess(self: *const AsyncLoadTask) bool {
+        return self.state.load(.acquire) == .completed;
+    }
+
+    pub fn deinit(self: *AsyncLoadTask) void {
+        if (self.result) |*r| r.deinit(self.allocator);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
+fn runLoadTask(ctx: *anyopaque) void {
+    const task: *AsyncLoadTask = @ptrCast(@alignCast(ctx));
+    task.state.store(.reading, .release);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = std.Io.Dir.cwd().openFile(io, task.path, .{}) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+    defer file.close(io);
+
+    const len = file.length(io) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+    if (len > MAX_FILE_BYTES) {
+        task.err_name = @errorName(error.TooLarge);
+        task.state.store(.failed, .release);
+        return;
+    }
+    const n = std.math.cast(usize, len) orelse {
+        task.err_name = @errorName(error.TooLarge);
+        task.state.store(.failed, .release);
+        return;
+    };
+    const bytes = task.allocator.alloc(u8, n) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+    defer task.allocator.free(bytes);
+
+    const read = file.readPositionalAll(io, bytes, 0) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+    if (read < bytes.len) {
+        task.err_name = @errorName(error.Truncated);
+        task.state.store(.failed, .release);
+        return;
+    }
+
+    task.state.store(.deserializing, .release);
+    const scene_state = deserializeAlloc(task.allocator, bytes) catch |err| {
+        task.err_name = @errorName(err);
+        task.state.store(.failed, .release);
+        return;
+    };
+
+    task.result = scene_state;
+    task.state.store(.completed, .release);
+}
+
+/// Dispatches reading and deserializing a scene state file on a background
+/// task thread. The caller polls `task.isDone()`, uses `task.result` on success,
+/// and must call `task.deinit()` when finished.
+pub fn loadFileAsync(allocator: std.mem.Allocator, runner: *jobs.TaskRunner, path: []const u8) !*AsyncLoadTask {
+    const task = try allocator.create(AsyncLoadTask);
+    errdefer allocator.destroy(task);
+
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+
+    task.* = .{
+        .allocator = allocator,
+        .path = owned_path,
+        .state = std.atomic.Value(AsyncLoadTask.State).init(.pending),
+        .result = null,
+        .err_name = null,
+    };
+
+    runner.post(task, runLoadTask);
+    return task;
 }
 
 // ---------------------------------------------------------------------------
@@ -1986,4 +2180,56 @@ test "capture and restore cutout material fields" {
     try std.testing.expect(std_mat.alpha_mode == .cutout);
     try std.testing.expectEqual(@as(f32, 0.2), std_mat.alpha_cutoff);
     try std.testing.expect(std_mat.double_sided);
+}
+
+test "saveFileAsync and loadFileAsync round-trip with TaskRunner" {
+    const alloc = std.testing.allocator;
+    const runner = try jobs.TaskRunner.init(alloc, 2);
+    defer runner.deinit();
+
+    const original = try makeFullState(alloc);
+    const test_path = "test_async_scene.bin";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+
+    const save_task = try saveFileAsync(alloc, runner, original, test_path);
+    defer save_task.deinit();
+
+    // Poll until complete
+    var waited: usize = 0;
+    while (!save_task.isDone() and waited < 10_000_000) : (waited += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(save_task.isDone());
+    try std.testing.expect(save_task.isSuccess());
+    try std.testing.expect(save_task.bytes_written > 0);
+
+    const load_task = try loadFileAsync(alloc, runner, test_path);
+    defer load_task.deinit();
+
+    waited = 0;
+    while (!load_task.isDone() and waited < 10_000_000) : (waited += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(load_task.isDone());
+    try std.testing.expect(load_task.isSuccess());
+    try std.testing.expect(load_task.result != null);
+    try std.testing.expectEqual(@as(usize, 2), load_task.result.?.meshes.len);
+}
+
+test "loadFileAsync reports failure for non-existent file" {
+    const alloc = std.testing.allocator;
+    const runner = try jobs.TaskRunner.init(alloc, 1);
+    defer runner.deinit();
+
+    const load_task = try loadFileAsync(alloc, runner, "non_existent_file_12345.bin");
+    defer load_task.deinit();
+
+    var waited: usize = 0;
+    while (!load_task.isDone() and waited < 10_000_000) : (waited += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(load_task.isDone());
+    try std.testing.expect(!load_task.isSuccess());
+    try std.testing.expect(load_task.err_name != null);
 }

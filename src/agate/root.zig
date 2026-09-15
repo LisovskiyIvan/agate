@@ -299,6 +299,10 @@ pub const serializeSceneState = serialization.serializeAlloc;
 pub const deserializeSceneState = serialization.deserializeAlloc;
 pub const saveSceneStateFile = serialization.saveFile;
 pub const loadSceneStateFile = serialization.loadFile;
+pub const saveSceneStateFileAsync = serialization.saveFileAsync;
+pub const loadSceneStateFileAsync = serialization.loadFileAsync;
+pub const AsyncSaveTask = serialization.AsyncSaveTask;
+pub const AsyncLoadTask = serialization.AsyncLoadTask;
 
 pub const loader_lights = @import("loader/lights.zig");
 pub const obj_loader = @import("loader/obj.zig");
