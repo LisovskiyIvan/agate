@@ -1459,6 +1459,11 @@ pub const Scene = struct {
         self.drainPendingGpuDestroys();
         self.pending_gpu_destroys.deinit(self.allocator);
 
+        // Physics before meshes: bodies keep raw `mesh` pointers and bulk
+        // teardown does not remove them individually (per-mesh destroyMesh
+        // does). Destroying the world first closes that dangling window.
+        self.physics.deinit(self.allocator);
+
         scene_content.deinitMeshes(self.allocator, &self.meshes);
         scene_content.deinitMaterials(self.allocator, &self.materials);
         scene_content.deinitPbrMaterials(self.allocator, &self.pbr_materials);
@@ -1489,8 +1494,6 @@ pub const Scene = struct {
         self.postfx.deinit();
 
         self.particles.deinit(self.allocator);
-
-        self.physics.deinit(self.allocator);
 
         if (self.ui_canvas) |*u| {
             u.deinit();

@@ -16,6 +16,7 @@ const lights_mod = @import("lights.zig");
 const MorphMode = @import("../mesh.zig").MorphMode;
 const math = @import("math");
 const Mat4 = math.Mat4;
+const gpu_thread = @import("../gpu_thread.zig");
 
 pub const SceneLoader = struct {
     pub const LoadOptions = struct {
@@ -31,7 +32,9 @@ pub const SceneLoader = struct {
         /// (default-white fallback renders) and the real textures patch in
         /// via scene.render()'s drain. Requires scene.uploads (present in
         /// every Scene.init scene); silently falls back to synchronous
-        /// decoding when the queue is unavailable.
+        /// decoding when the queue is unavailable. A load running off the
+        /// graphics thread forces this mode when the queue exists: sync
+        /// texture creation touches sg.* inline and would fail loudly.
         async_textures: bool = false,
     };
 
@@ -107,7 +110,10 @@ pub const SceneLoader = struct {
         // images decode on the scene's UploadQueue after this call returns,
         // and loadMaterials registers material slots as patch targets.
         // Sync mode keeps the fork-join predecode (single hitch, no pop-in).
-        const async_textures = load_options.async_textures and scene.uploads != null;
+        // Off-context loads are forced into async mode when the queue exists:
+        // sync texture creation touches sg.* inline and would fail loudly.
+        const off_context = !gpu_thread.isOnContextThread();
+        const async_textures = (load_options.async_textures or off_context) and scene.uploads != null;
         var actx: ?materials_mod.AsyncTexCtx = if (async_textures)
             materials_mod.AsyncTexCtx.init(scene, gltf, base_dir, &scene.uploads.?)
         else

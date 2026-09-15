@@ -11,6 +11,7 @@ const Material = @import("../material.zig").Material;
 const UvTransform = @import("../material.zig").UvTransform;
 const Texture = @import("../texture.zig").Texture;
 const assets = @import("../assets.zig");
+const gpu_thread = @import("../gpu_thread.zig");
 
 const DecodeJob = struct {
     allocator: std.mem.Allocator,
@@ -335,6 +336,8 @@ pub fn loadTextureFromView(
     if (img_idx) |idx| {
         if (idx < decoded.len and decoded[idx] != null) {
             if (decoded[idx].?.is_srgb == srgb_to_linear) {
+                // GPU upload of a pre-decoded image (sg.makeImage).
+                gpu_thread.assertOnContextThread();
                 var raw = decoded[idx].?;
                 decoded[idx] = null;
                 const loaded = Texture.fromRaw(&raw, tex_options);
@@ -348,6 +351,13 @@ pub fn loadTextureFromView(
     }
 
     if (!allow_sync_fallback) return null;
+
+    // Everything below creates GPU objects (sg.makeImage through
+    // Texture.fromMemory/fromFile): synchronous texture loading must run on
+    // the graphics thread. Async texture mode returns null above and queues
+    // the decode + upload through the UploadQueue instead, which is what
+    // makes an off-context GLB load legal.
+    gpu_thread.assertOnContextThread();
 
     // 1. Embedded buffer view (typical in GLB or embedded GLTF)
     if (img.*.buffer_view) |bv| {

@@ -31,12 +31,12 @@ pub fn spawnMeshes(
     node_mesh_count: []usize,
     morph_mode: MorphMode,
 ) !void {
-    // Texture/material loading for a GLB still touches sg.* inline
-    // (Texture.fromRaw/fromMemory/fromFile in loader/materials.zig), so the
-    // whole spawn stays a context-thread operation until textures grow a
-    // deferred path: fail loudly here in Debug/ReleaseSafe instead of
-    // touching sokol from a game thread.
-    gpu_thread.assertOnContextThread();
+    // Off-context spawns are safe: mesh buffers are deferred (gpu_pending +
+    // pending_vertices, finished by Scene.flushPendingGpuUploads), and the
+    // texture paths assert the graphics thread only when they would create
+    // sg objects inline (sync texture mode). Async texture mode queues the
+    // decode/upload through Scene.uploads instead, so a GLB load with
+    // `.async_textures = true` is legal from the game thread.
     if (gltf.nodes_count > 0) {
         for (0..gltf.nodes_count) |node_idx| {
             const node = &gltf.nodes[node_idx];
@@ -372,8 +372,13 @@ pub fn parsePrimitive(
         }
     }
 
-    const owned_name = try scene.allocator.dupe(u8, mesh_name);
+    // Allocate the struct first: if the name dupe fails, destroying the bare
+    // struct cannot leak the name (the reverse order would).
     const mesh_obj = try scene.allocator.create(Mesh);
+    const owned_name = scene.allocator.dupe(u8, mesh_name) catch |err| {
+        scene.allocator.destroy(mesh_obj);
+        return err;
+    };
     mesh_obj.* = .{
         .name = owned_name,
         .owns_name = true,
