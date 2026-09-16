@@ -22,6 +22,7 @@ const physics_joints = @import("joints.zig");
 const physics_debug = @import("debug.zig");
 const physics_events = @import("events.zig");
 const rope_mod = @import("rope.zig");
+const audio = @import("../audio.zig");
 
 // Private aliases to the extracted helpers (behavior unchanged).
 const step_h = convert.step_h;
@@ -511,6 +512,23 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
     ) PhysicsRayHit {
         return physics_queries.raycastWithFilter(self, origin, direction, max_distance, filter);
+    }
+
+    /// Raycast adapter matching audio.RaycastFn for audio occlusion queries.
+    pub fn audioRaycastAdapter(origin: Vec3, direction: Vec3, max_distance: f32, user_data: ?*anyopaque) bool {
+        const self: *PhysicsWorld = @ptrCast(@alignCast(user_data orelse return false));
+        const hit = self.raycast(origin, direction, max_distance);
+        return hit.hit;
+    }
+
+    /// Evaluates audio occlusion between listener and emitter through physics colliders.
+    pub fn evaluateAudioOcclusion(
+        self: *PhysicsWorld,
+        listener_pos: Vec3,
+        emitter_pos: Vec3,
+        config: audio.AudioOcclusionConfig,
+    ) f32 {
+        return audio.evaluateRaycastOcclusion(listener_pos, emitter_pos, config, audioRaycastAdapter, self);
     }
 
     pub fn queryAABB(

@@ -310,6 +310,11 @@ pub const BusFilterConfig = audio.BusFilterConfig;
 pub const BusReverbConfig = audio.BusReverbConfig;
 pub const BiquadFilter = audio.BiquadFilter;
 pub const ReverbProcessor = audio.ReverbProcessor;
+pub const AudioOcclusionConfig = audio.AudioOcclusionConfig;
+pub const RaycastFn = audio.RaycastFn;
+pub const evaluateRaycastOcclusion = audio.evaluateRaycastOcclusion;
+pub const AudioOcclusionTracker = audio.AudioOcclusionTracker;
+pub const AudioEmitter = audio.AudioEmitter;
 
 pub const serialization = @import("serialization.zig");
 pub const SceneState = serialization.SceneState;

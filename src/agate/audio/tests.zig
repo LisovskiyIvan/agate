@@ -11,6 +11,9 @@ const AudioBus = audio.AudioBus;
 const BiquadFilterType = audio.BiquadFilterType;
 const BusFilterConfig = audio.BusFilterConfig;
 const BusReverbConfig = audio.BusReverbConfig;
+const Mesh = @import("../mesh.zig").Mesh;
+const physics = @import("../physics.zig");
+const PhysicsWorld = physics.PhysicsWorld;
 
 fn peakAbs(buf: []const f32, from_frame: usize, to_frame: usize) f32 {
     var peak: f32 = 0.0;
@@ -1256,4 +1259,178 @@ test "AudioEngine DAG hierarchy mixes child filtered audio into parent reverb" {
     var tail: [4410]f32 = [_]f32{0.0} ** 4410;
     eng.renderFrames(&tail);
     try std.testing.expect(peakAbs(&tail, 0, 2205) > 1e-4);
+}
+
+test "AudioEngine play procedural voice with occlusion attenuates energy and cutoff" {
+    var eng = AudioEngine{};
+    // 1. Play unoccluded tone
+    eng.play(.{
+        .kind = .blip,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 4000.0,
+        .freq_end = 4000.0,
+        .cutoff = 5000.0,
+        .occlusion = 0.0,
+    });
+    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&unocc_buf);
+    const unocc_energy = channelEnergy(&unocc_buf, 0);
+    try std.testing.expect(unocc_energy > 0.05);
+
+    // 2. Play fully occluded tone (occlusion = 1.0)
+    eng.play(.{
+        .kind = .blip,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 4000.0,
+        .freq_end = 4000.0,
+        .cutoff = 5000.0,
+        .occlusion = 1.0,
+        .occlusion_config = .{
+            .min_volume = 0.2,
+            .min_cutoff = 400.0,
+            .max_cutoff = 20000.0,
+        },
+    });
+    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&occ_buf);
+    const occ_energy = channelEnergy(&occ_buf, 0);
+
+    // Occluded sound has min_volume = 0.2 (energy ~ 0.04) plus cutoff dropped to 400 Hz
+    // so energy should be a tiny fraction of unoccluded
+    try std.testing.expect(occ_energy < unocc_energy * 0.1);
+}
+
+test "AudioEngine playClip with occlusion attenuates volume and lowpass filters WAV audio" {
+    const alloc = std.testing.allocator;
+    // Generate 3000 Hz sine wave (2205 frames = 0.05s at 44.1 kHz, 4410 stereo samples)
+    const pcm = try sineI16(alloc, 2205, 44100, 3000.0, 20000.0);
+    defer alloc.free(pcm);
+    const raw = try encodeI16(alloc, pcm);
+    defer alloc.free(raw);
+    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
+    defer alloc.free(wav);
+
+    var clip = try AudioClip.fromWavMemory(alloc, wav);
+    defer clip.deinit(alloc);
+
+    var eng = AudioEngine{};
+
+    // Play unoccluded clip
+    eng.playClip(&clip, .{
+        .volume = 0.8,
+        .occlusion = 0.0,
+    });
+    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&unocc_buf);
+    const unocc_energy = channelEnergy(&unocc_buf, 0);
+    try std.testing.expect(unocc_energy > 0.05);
+
+    // Play occluded clip with fresh engine (min_cutoff = 500 Hz, while audio is 3000 Hz)
+    var eng_occ = AudioEngine{};
+    eng_occ.playClip(&clip, .{
+        .volume = 0.8,
+        .occlusion = 1.0,
+        .occlusion_config = .{
+            .min_volume = 0.25,
+            .min_cutoff = 500.0,
+            .max_cutoff = 20000.0,
+        },
+    });
+    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng_occ.renderFrames(&occ_buf);
+    const occ_energy = channelEnergy(&occ_buf, 0);
+
+    // Volume scaled to 0.25 (-12 dB) and 3000 Hz filtered by 500 Hz one-pole filter => energy << unoccluded
+    try std.testing.expect(occ_energy < unocc_energy * 0.1);
+}
+
+test "AudioEngine bus occlusion sets lowpass cutoff and attenuates volume" {
+    var eng = AudioEngine{};
+    const b = eng.createNonSpatialBus("monitored_bus", 1.0) orelse return error.BusCreationFailed;
+
+    try std.testing.expectEqual(@as(f32, 0.0), eng.getBusOcclusion(b));
+
+    eng.setBusOcclusionConfig(b, .{
+        .min_volume = 0.2,
+        .min_cutoff = 400.0,
+        .max_cutoff = 20000.0,
+    });
+    eng.setBusOcclusion(b, 0.9);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), eng.getBusOcclusion(b), 1e-4);
+
+    // Play tone on occluded bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = b,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 2500.0,
+        .freq_end = 2500.0,
+    });
+    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&occ_buf);
+    const occ_energy = channelEnergy(&occ_buf, 0);
+
+    // Clear occlusion and play same tone
+    eng.clearBusOcclusion(b);
+    try std.testing.expectEqual(@as(f32, 0.0), eng.getBusOcclusion(b));
+
+    eng.play(.{
+        .kind = .blip,
+        .bus = b,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 2500.0,
+        .freq_end = 2500.0,
+    });
+    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&unocc_buf);
+    const unocc_energy = channelEnergy(&unocc_buf, 0);
+
+    try std.testing.expect(occ_energy < unocc_energy * 0.15);
+}
+
+test "AudioEngine bus occlusion smooth temporal update" {
+    var eng = AudioEngine{};
+    const b = eng.createNonSpatialBus("smooth_bus", 1.0) orelse return error.BusCreationFailed;
+    eng.setBusOcclusionConfig(b, .{ .smooth_time = 0.10 });
+
+    // Step 0.05s towards target 1.0: should interpolate smoothly without reaching 1.0 immediately
+    eng.updateBusOcclusion(b, 1.0, 0.05);
+    const step1 = eng.getBusOcclusion(b);
+    try std.testing.expect(step1 > 0.2 and step1 < 0.6);
+
+    // After several seconds: converges to 1.0
+    eng.updateBusOcclusion(b, 1.0, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), eng.getBusOcclusion(b), 1e-3);
+}
+
+test "PhysicsWorld audio occlusion raycast integration" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    // Create a wall mesh & body at x = 5.0
+    var m = Mesh{
+        .name = "wall",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(5.0, 0.0, 0.0),
+    };
+    m.local_bounding_box = math.BoundingBox.init(Vec3.new(-0.2, -5.0, -5.0), Vec3.new(0.2, 5.0, 5.0));
+    _ = try pw.createBody(&m, .box, 0.0); // static body
+
+    const listener = Vec3.new(0.0, 0.0, 0.0);
+    const emitter_behind = Vec3.new(10.0, 0.0, 0.0);
+    const emitter_clear = Vec3.new(2.0, 0.0, 0.0);
+
+    // Emitter behind wall is occluded (1.0)
+    const occ_behind = pw.evaluateAudioOcclusion(listener, emitter_behind, .{});
+    try std.testing.expectEqual(@as(f32, 1.0), occ_behind);
+
+    // Emitter in front of wall is clear (0.0)
+    const occ_clear = pw.evaluateAudioOcclusion(listener, emitter_clear, .{});
+    try std.testing.expectEqual(@as(f32, 0.0), occ_clear);
 }

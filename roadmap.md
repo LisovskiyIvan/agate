@@ -55,15 +55,15 @@
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
 | Layout-контейнеры, 3D GUI | — | ❌ |
-| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR) и стерео-реверберация Freeverb | ✅ |
-| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler, biquad low/high/band/notch, Freeverb reverb) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
+| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb и звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling) | ✅ |
+| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 621 unit-тест, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 629 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -388,6 +388,21 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 621/621 unit-тест, `zig build test` (agate) и `zig build` (sandbox) проходят без ошибок.
 
+### Волна 21: Акустическая окклюзия звука геометрией и физикой (16.09.2026)
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Конфигурация окклюзии | `audio/occlusion.zig`, `audio.zig`, `root.zig` | `AudioOcclusionConfig` с гибкими параметрами: `min_volume` (0.25), `min_cutoff` (500 Гц), `max_cutoff` (20000 Гц), `num_rays` (1..5), `spread_radius` (0.6 м), `smooth_time` (0.15 с) | ✅ |
+| Multi-tap Raycast & Дифракция | `audio/occlusion.zig` | Трассировка лучей окклюзии (1 прямой луч или 5-лучевой ортогональный дифракционный паттерн вокруг источника звука для реалистичного огибания углов и препятствий) | ✅ |
+| Временное сглаживание (Temporal Smoothing) | `audio/occlusion.zig` | `AudioOcclusionTracker`: экспоненциальное фильтрование окклюзии без щелчков (`1 - exp(-dt / smooth_time)`), мгновенное или плавное применение | ✅ |
+| AudioEmitter компонент | `audio/occlusion.zig`, `root.zig` | Высокоуровневая структура 3D-источника звука с позицией, скоростью, шиной, трекером окклюзии и методом `update(dt, listener_pos, raycast_fn, user_data)` | ✅ |
+| Окклюзия процедурных голосов и WAV-клипов | `audio.zig` | Поддержка `occlusion` и `occlusion_config` в `PlayOptions` и `ClipPlayOptions`; затухание громкости и срез частот (однополюсный IIR-фильтр низких частот в реальном времени для WAV-сэмплов) | ✅ |
+| Окклюзия на аудиошинах | `audio.zig` | Выделенные IIR biquad lowpass фильтры `bus_occlusion_filters` на каждой шине; `setBusOcclusion`, `updateBusOcclusion`, `updateBusOcclusionWithRaycast`; независимость от художественных EQ/фильтров | ✅ |
+| Адаптеры физики и сцены | `physics/world.zig`, `scene.zig` | `evaluateAudioOcclusion` и `audioRaycastAdapter` для быстрой проверки препятствий через физические коллайдеры `PhysicsWorld` и полигональные меши `Scene.pickWithRay` | ✅ |
+| Тесты и потокобезопасность | `audio/tests.zig`, `audio/occlusion.zig` | 8 новых модульных тестов, атомарные значения окклюзии (`@bitCast(f32)`), 0 аллокаций в аудиопотоке | ✅ |
+
+Проверки: 629/629 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят без ошибок.
+
 ---
 
 ## ✅ Что сделано
@@ -594,7 +609,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Grid/layout-контейнеры, привязки/анимации UI, 3D-GUI, загрузка TTF/OTF-шрифтов и Unicode (сейчас зашитый SDF-атлас, ASCII).
 
 **Аудио**
-* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска, звуковая окклюзия геометрией (динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры и Freeverb-реверберация уже реализованы).
+* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска (динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры, Freeverb-реверберация и звуковая окклюзия геометрией/физикой уже реализованы).
 
 **Ассеты и данные**
 * Экспорт glTF, AssetManager с прогрессом и кэшем.

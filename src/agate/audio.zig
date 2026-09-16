@@ -21,6 +21,13 @@ pub const BusReverbConfig = dsp.BusReverbConfig;
 pub const BiquadFilter = dsp.BiquadFilter;
 pub const ReverbProcessor = dsp.ReverbProcessor;
 
+const occlusion_mod = @import("audio/occlusion.zig");
+pub const AudioOcclusionConfig = occlusion_mod.AudioOcclusionConfig;
+pub const RaycastFn = occlusion_mod.RaycastFn;
+pub const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
+pub const AudioOcclusionTracker = occlusion_mod.AudioOcclusionTracker;
+pub const AudioEmitter = occlusion_mod.AudioEmitter;
+
 pub const BusId = enum(u8) {
     _,
 
@@ -74,6 +81,8 @@ pub const BusConfig = struct {
     doppler_factor: f32 = 1.0,
     filter: BusFilterConfig = .{},
     reverb: ?BusReverbConfig = null,
+    occlusion: f32 = 0.0,
+    occlusion_config: AudioOcclusionConfig = .{},
 };
 
 pub const AudioEngine = struct {
@@ -107,6 +116,7 @@ pub const AudioEngine = struct {
             sample_step: f64,
             loop: bool,
             seed: u32,
+            cutoff: f32 = 20000.0,
         },
     };
 
@@ -162,6 +172,11 @@ pub const AudioEngine = struct {
     reverbs: [max_reverbs]dsp.ReverbProcessor = [_]dsp.ReverbProcessor{dsp.ReverbProcessor.init(44100.0)} ** max_reverbs,
     bus_reverb_slot: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_bus_capacity,
     reverb_bus_owner: [max_reverbs]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_reverbs,
+
+    // Occlusion state & filters (geometry attenuation and muffling)
+    bus_occlusion: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 0.0)))} ** max_bus_capacity,
+    bus_occlusion_config: [max_bus_capacity]AudioOcclusionConfig = [_]AudioOcclusionConfig{AudioOcclusionConfig{}} ** max_bus_capacity,
+    bus_occlusion_filters: [max_bus_capacity]dsp.BiquadFilter = [_]dsp.BiquadFilter{dsp.BiquadFilter{}} ** max_bus_capacity,
 
     // Block-based scratch chunk buffers
     bus_chunks: [max_bus_capacity][chunk_samples]f32 = [_][chunk_samples]f32{[_]f32{0.0} ** chunk_samples} ** max_bus_capacity,
@@ -238,6 +253,8 @@ pub const AudioEngine = struct {
         cutoff_end: f32 = 500.0,
         pitch: f32 = 1.0,
         pitch_randomness: f32 = 0.0,
+        occlusion: f32 = 0.0,
+        occlusion_config: AudioOcclusionConfig = .{},
     };
 
     /// Pushes an audio trigger command to the lock-free SPSC queue.
@@ -290,6 +307,10 @@ pub const AudioEngine = struct {
                     .volume = c.volume,
                     .pan = c.pan,
                     .duration = c.duration,
+                    .cutoff = c.cutoff,
+                    .cutoff_end = c.cutoff,
+                    .lp = 0.0,
+                    .lp_r = 0.0,
                     .clip = c.clip,
                     .sample_pos = 0.0,
                     .sample_step = c.sample_step,
@@ -441,6 +462,16 @@ pub const AudioEngine = struct {
                 sp_doppler = 1.0 + (sp.doppler - 1.0) * dop_scale;
             }
         }
+
+        var eff_cutoff = params.cutoff;
+        var eff_cutoff_end = params.cutoff_end;
+        if (params.occlusion > 0.0) {
+            const occ = std.math.clamp(params.occlusion, 0.0, 1.0);
+            sp_vol *= std.math.lerp(1.0, params.occlusion_config.min_volume, occ);
+            const occ_cutoff = std.math.lerp(params.occlusion_config.max_cutoff, params.occlusion_config.min_cutoff, occ);
+            eff_cutoff = @min(eff_cutoff, occ_cutoff);
+            eff_cutoff_end = @min(eff_cutoff_end, occ_cutoff);
+        }
         if (sp_vol <= 0.001) return;
 
         self.next_seed +%= 1;
@@ -464,8 +495,8 @@ pub const AudioEngine = struct {
                 .duration = duration,
                 .freq = params.freq * pitch_factor,
                 .freq_end = params.freq_end * pitch_factor,
-                .cutoff = params.cutoff,
-                .cutoff_end = params.cutoff_end,
+                .cutoff = eff_cutoff,
+                .cutoff_end = eff_cutoff_end,
                 .seed = seed,
             },
         };
@@ -541,6 +572,8 @@ pub const AudioEngine = struct {
         loop: bool = false,
         rate: f32 = 1.0, // playback speed multiplier
         pitch_randomness: f32 = 0.0,
+        occlusion: f32 = 0.0,
+        occlusion_config: AudioOcclusionConfig = .{},
     };
 
     /// Plays a decoded WAV clip on a mixer voice. Reuses the same
@@ -601,6 +634,13 @@ pub const AudioEngine = struct {
                 sp_doppler = 1.0 + (sp.doppler - 1.0) * dop_scale;
             }
         }
+
+        var eff_cutoff: f32 = 20000.0;
+        if (options.occlusion > 0.0) {
+            const occ = std.math.clamp(options.occlusion, 0.0, 1.0);
+            sp_vol *= std.math.lerp(1.0, options.occlusion_config.min_volume, occ);
+            eff_cutoff = std.math.lerp(options.occlusion_config.max_cutoff, options.occlusion_config.min_cutoff, occ);
+        }
         if (sp_vol <= 0.001) return;
 
         self.next_seed +%= 1;
@@ -630,6 +670,7 @@ pub const AudioEngine = struct {
                 .sample_step = step,
                 .loop = options.loop,
                 .seed = seed,
+                .cutoff = eff_cutoff,
             },
         };
 
@@ -721,6 +762,8 @@ pub const AudioEngine = struct {
         if (config.reverb) |rev_cfg| {
             _ = self.setBusReverb(bus, rev_cfg);
         }
+        self.setBusOcclusionConfig(bus, config.occlusion_config);
+        self.setBusOcclusion(bus, config.occlusion);
     }
 
     pub fn destroyBus(self: *AudioEngine, bus: BusId) void {
@@ -731,6 +774,7 @@ pub const AudioEngine = struct {
         self.stopBus(bus);
         self.clearBusFilter(bus);
         self.clearBusReverb(bus);
+        self.clearBusOcclusion(bus);
         const my_parent = self.bus_parent[id].load(.acquire);
         for (0..cap) |i| {
             if (self.bus_active[i].load(.acquire) and self.bus_parent[i].load(.acquire) == id) {
@@ -1048,6 +1092,79 @@ pub const AudioEngine = struct {
         return self.setBusReverb(bus, .{ .room_size = 0.45, .damping = 0.5, .wet = 0.25, .dry = 0.85 });
     }
 
+    pub fn setBusOcclusion(self: *AudioEngine, bus: BusId, occlusion: f32) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        const val = std.math.clamp(occlusion, 0.0, 1.0);
+        self.bus_occlusion[id].store(@bitCast(val), .release);
+    }
+
+    pub fn getBusOcclusion(self: *const AudioEngine, bus: BusId) f32 {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return 0.0;
+        return @bitCast(self.bus_occlusion[id].load(.acquire));
+    }
+
+    pub fn setBusOcclusionConfig(self: *AudioEngine, bus: BusId, config: AudioOcclusionConfig) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_occlusion_config[id] = config;
+    }
+
+    pub fn getBusOcclusionConfig(self: *const AudioEngine, bus: BusId) AudioOcclusionConfig {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return .{};
+        return self.bus_occlusion_config[id];
+    }
+
+    pub fn clearBusOcclusion(self: *AudioEngine, bus: BusId) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_occlusion[id].store(@bitCast(@as(f32, 0.0)), .release);
+        self.bus_occlusion_filters[id].resetState();
+    }
+
+    pub fn updateBusOcclusion(self: *AudioEngine, bus: BusId, target_occlusion: f32, dt: f32) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        const target = std.math.clamp(target_occlusion, 0.0, 1.0);
+        const smooth_time = self.bus_occlusion_config[id].smooth_time;
+        const cur = self.getBusOcclusion(bus);
+        if (smooth_time <= 1e-4 or dt <= 1e-4) {
+            self.setBusOcclusion(bus, target);
+            return;
+        }
+        const alpha = 1.0 - @exp(-dt / @max(smooth_time, 0.001));
+        const new_val = cur + (target - cur) * std.math.clamp(alpha, 0.0, 1.0);
+        self.setBusOcclusion(bus, new_val);
+    }
+
+    pub fn evaluateOcclusion(
+        self: *const AudioEngine,
+        emitter_pos: Vec3,
+        config: AudioOcclusionConfig,
+        raycast_fn: RaycastFn,
+        user_data: ?*anyopaque,
+    ) f32 {
+        return evaluateRaycastOcclusion(self.listener_pos, emitter_pos, config, raycast_fn, user_data);
+    }
+
+    pub fn updateBusOcclusionWithRaycast(
+        self: *AudioEngine,
+        bus: BusId,
+        emitter_pos: Vec3,
+        dt: f32,
+        raycast_fn: RaycastFn,
+        user_data: ?*anyopaque,
+    ) f32 {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return 0.0;
+        const cfg = self.bus_occlusion_config[id];
+        const raw = self.evaluateOcclusion(emitter_pos, cfg, raycast_fn, user_data);
+        self.updateBusOcclusion(bus, raw, dt);
+        return self.getBusOcclusion(bus);
+    }
+
     pub fn stopAll(self: *AudioEngine) void {
         for (&self.voices) |*v| {
             v.active = false;
@@ -1279,11 +1396,19 @@ pub const AudioEngine = struct {
             for (active_buses[0..active_count]) |b| {
                 const r_slot = self.bus_reverb_slot[b].load(.acquire);
                 const has_rev = (r_slot < max_reverbs and self.reverbs[r_slot].active);
+                const occ: f32 = @bitCast(self.bus_occlusion[b].load(.acquire));
 
                 if (!bus_has_audio[b] and !has_rev) continue;
 
                 if (self.bus_filters[b].filter_type != .none) {
                     self.bus_filters[b].processBuffer(self.bus_chunks[b][0..cur_samples]);
+                }
+
+                if (occ > 0.001) {
+                    const o_cfg = self.bus_occlusion_config[b];
+                    const occ_cutoff = std.math.lerp(o_cfg.max_cutoff, o_cfg.min_cutoff, occ);
+                    self.bus_occlusion_filters[b].setParams(.lowpass, occ_cutoff, 0.7071, self.sample_rate);
+                    self.bus_occlusion_filters[b].processBuffer(self.bus_chunks[b][0..cur_samples]);
                 }
 
                 if (has_rev) {
@@ -1293,7 +1418,10 @@ pub const AudioEngine = struct {
                 if (self.bus_muted[b].load(.acquire)) {
                     @memset(self.bus_chunks[b][0..cur_samples], 0.0);
                 } else {
-                    const vol: f32 = @bitCast(self.bus_volumes[b].load(.acquire));
+                    var vol: f32 = @bitCast(self.bus_volumes[b].load(.acquire));
+                    if (occ > 0.001) {
+                        vol *= std.math.lerp(1.0, self.bus_occlusion_config[b].min_volume, occ);
+                    }
                     if (vol != 1.0) {
                         for (self.bus_chunks[b][0..cur_samples]) |*s| {
                             s.* *= vol;
@@ -1400,6 +1528,11 @@ pub const AudioEngine = struct {
         const n: f64 = @floatFromInt(a.frames);
         var pos = v.sample_pos;
         var t = v.t;
+        var lp_l = v.lp;
+        var lp_r = v.lp_r;
+        const filter_active = a.cutoff0 < 19000.0;
+        const omega: f32 = 2.0 * std.math.pi * dt;
+        const alpha: f32 = if (filter_active) 1.0 - @exp(-omega * @max(a.cutoff0, 40.0)) else 1.0;
         const total: usize = buffer.len / 2;
         var j: usize = 0;
         if (a.step_one) {
@@ -1413,13 +1546,25 @@ pub const AudioEngine = struct {
                     } else {
                         v.sample_pos = pos;
                         v.t = t;
+                        v.lp = lp_l;
+                        v.lp_r = lp_r;
                         v.active = false;
                         return;
                     }
                 }
                 const idx: usize = @intFromFloat(pos);
-                buffer[j * 2] += s[idx * 2] * a.gl;
-                buffer[j * 2 + 1] += s[idx * 2 + 1] * a.gr;
+                var smp_l = s[idx * 2];
+                var smp_r = s[idx * 2 + 1];
+                if (filter_active) {
+                    lp_l += alpha * (smp_l - lp_l);
+                    lp_r += alpha * (smp_r - lp_r);
+                    if (@abs(lp_l) < 1e-15) lp_l = 0.0;
+                    if (@abs(lp_r) < 1e-15) lp_r = 0.0;
+                    smp_l = lp_l;
+                    smp_r = lp_r;
+                }
+                buffer[j * 2] += smp_l * a.gl;
+                buffer[j * 2 + 1] += smp_r * a.gr;
                 pos += 1.0;
             }
         } else {
@@ -1433,6 +1578,8 @@ pub const AudioEngine = struct {
                     } else {
                         v.sample_pos = pos;
                         v.t = t;
+                        v.lp = lp_l;
+                        v.lp_r = lp_r;
                         v.active = false;
                         return;
                     }
@@ -1442,15 +1589,25 @@ pub const AudioEngine = struct {
                 const frac: f32 = @floatCast(pos - fl);
                 const x = @min(idx0, a.frames - 1);
                 const y = @min(x + 1, a.frames - 1);
-                const l = s[x * 2] + (s[y * 2] - s[x * 2]) * frac;
-                const r = s[x * 2 + 1] + (s[y * 2 + 1] - s[x * 2 + 1]) * frac;
-                buffer[j * 2] += l * a.gl;
-                buffer[j * 2 + 1] += r * a.gr;
+                var smp_l = s[x * 2] + (s[y * 2] - s[x * 2]) * frac;
+                var smp_r = s[x * 2 + 1] + (s[y * 2 + 1] - s[x * 2 + 1]) * frac;
+                if (filter_active) {
+                    lp_l += alpha * (smp_l - lp_l);
+                    lp_r += alpha * (smp_r - lp_r);
+                    if (@abs(lp_l) < 1e-15) lp_l = 0.0;
+                    if (@abs(lp_r) < 1e-15) lp_r = 0.0;
+                    smp_l = lp_l;
+                    smp_r = lp_r;
+                }
+                buffer[j * 2] += smp_l * a.gl;
+                buffer[j * 2 + 1] += smp_r * a.gr;
                 pos += a.step;
             }
         }
         v.sample_pos = pos;
         v.t = t;
+        v.lp = lp_l;
+        v.lp_r = lp_r;
     }
 
     fn streamCallback(buffer: [*c]f32, num_frames: i32, num_channels: i32, user_data: ?*anyopaque) callconv(.c) void {
@@ -1482,6 +1639,7 @@ pub const Voice = struct {
     cutoff_end: f32 = 500.0,
     seed: u32 = 1,
     lp: f32 = 0.0,
+    lp_r: f32 = 0.0,
     phase: f32 = 0.0,
     // Sample playback state. `clip` is read-only and must outlive the voice.
     clip: ?*const AudioClip = null,

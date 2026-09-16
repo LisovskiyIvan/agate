@@ -26,6 +26,7 @@ const ColliderType = physics.ColliderType;
 
 const ui = @import("ui.zig");
 const UICanvas = ui.UICanvas;
+const audio = @import("audio.zig");
 
 const AnimationGroup = @import("animation/animation.zig").AnimationGroup;
 const Skeleton = @import("animation/skeleton.zig").Skeleton;
@@ -801,6 +802,24 @@ pub const Scene = struct {
 
     pub fn pickWithRay(self: *Scene, r: Ray) PickingInfo {
         return scene_picking.pickWithRay(self.meshes.items, self.physics.getWorld(), r);
+    }
+
+    /// Raycast adapter matching audio.RaycastFn for audio occlusion queries.
+    pub fn audioRaycastAdapter(origin: Vec3, direction: Vec3, max_distance: f32, user_data: ?*anyopaque) bool {
+        const self: *Scene = @ptrCast(@alignCast(user_data orelse return false));
+        const r = Ray.new(origin, direction);
+        const info = self.pickWithRay(r);
+        return info.hit and info.distance <= max_distance;
+    }
+
+    /// Evaluates audio occlusion between listener and emitter through scene meshes and colliders.
+    pub fn evaluateAudioOcclusion(
+        self: *Scene,
+        listener_pos: Vec3,
+        emitter_pos: Vec3,
+        config: audio.AudioOcclusionConfig,
+    ) f32 {
+        return audio.evaluateRaycastOcclusion(listener_pos, emitter_pos, config, audioRaycastAdapter, self);
     }
 
     /// Viewport-aware pick: resolves the camera like createPickingRay but
