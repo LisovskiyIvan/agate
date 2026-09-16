@@ -465,6 +465,14 @@ void main() {
     // before any lighting work. Opaque/blend materials upload 0.0, so this
     // never fires for them (alpha is always >= 0.0).
     if (albedo_rgba.a < alpha_cutoff) discard;
+
+    // Unlit mode: bypass all lighting, shadows, and IBL
+    if (uv_offset[0].z > 0.5) {
+        vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
+        vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
+        frag_color = vec4(albedo_rgba.rgb + emissive, albedo_rgba.a);
+        return;
+    }
     vec3 albedo = albedo_rgba.rgb;
 
     vec4 mr_sample = texture(sampler2D(metallic_roughness_tex, data_smp), uvApply(uv_matrix[2], uv_offset[2], v_uv));

@@ -238,6 +238,7 @@ pub const PostProcessPass = struct {
         cur_h: i32,
         view_proj: Mat4,
         inv_view_proj: Mat4,
+        prev_view_proj: Mat4,
         camera_pos: Vec3,
         sun_dir: Vec3,
         sun_color: Color3,
@@ -385,6 +386,13 @@ pub const PostProcessPass = struct {
             .lut_params = postprocess.lutParams(config),
             .view_proj = view_proj,
             .inv_view_proj = inv_view_proj,
+            .prev_view_proj = prev_view_proj,
+            .motion_blur_params = .{
+                if (config.motion_blur_enabled) 1.0 else 0.0,
+                config.motion_blur_intensity,
+                config.motion_blur_max_blur_px,
+                0.0,
+            },
         };
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);

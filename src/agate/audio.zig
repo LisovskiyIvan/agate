@@ -14,6 +14,22 @@ const Vec3 = math.Vec3;
 const clip_mod = @import("audio/clip.zig");
 pub const AudioClip = clip_mod.AudioClip;
 
+pub const AudioBus = enum(u3) {
+    master = 0,
+    music = 1,
+    sfx = 2,
+    ambient = 3,
+    ui = 4,
+
+    pub const count = 5;
+};
+
+pub const AttenuationModel = enum {
+    linear,
+    inverse,
+    exponential,
+};
+
 pub const AudioEngine = struct {
     pub const max_voices = 24;
     pub const max_distance = 30.0;
@@ -22,6 +38,7 @@ pub const AudioEngine = struct {
     const Command = union(enum) {
         voice: struct {
             kind: VoiceKind,
+            bus: AudioBus,
             volume: f32,
             pan: f32,
             duration: f32,
@@ -33,6 +50,7 @@ pub const AudioEngine = struct {
         },
         clip: struct {
             clip: *const AudioClip,
+            bus: AudioBus,
             volume: f32,
             pan: f32,
             duration: f32,
@@ -69,9 +87,16 @@ pub const AudioEngine = struct {
 
     voices: [max_voices]Voice = [_]Voice{Voice{}} ** max_voices,
     master_volume: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
+    bus_volumes: [AudioBus.count]std.atomic.Value(u32) = [_]std.atomic.Value(u32){
+        std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0))),
+    } ** AudioBus.count,
+    bus_muted: [AudioBus.count]std.atomic.Value(bool) = [_]std.atomic.Value(bool){
+        std.atomic.Value(bool).init(false),
+    } ** AudioBus.count,
     muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listener_pos: Vec3 = Vec3.zero,
     listener_right: Vec3 = Vec3.new(1.0, 0.0, 0.0),
+    listener_vel: Vec3 = Vec3.zero,
     started: bool = false,
     sample_rate: f32 = 44100.0,
     next_seed: u32 = 0x12345678,
@@ -102,13 +127,21 @@ pub const AudioEngine = struct {
     /// envelope/filter sweep the synthesizer applies. `play` is the only entry.
     pub const PlayOptions = struct {
         kind: VoiceKind = .thump,
+        bus: AudioBus = .sfx,
         position: ?Vec3 = null, // null = non-positional
+        min_distance: f32 = 1.0,
+        max_distance: f32 = 30.0,
+        rolloff: f32 = 1.0,
+        attenuation_model: AttenuationModel = .linear,
+        velocity: ?Vec3 = null, // emitter velocity for Doppler
         volume: f32 = 0.5,
         duration: f32 = 0.2,
         freq: f32 = 110.0,
         freq_end: f32 = 55.0,
         cutoff: f32 = 5000.0,
         cutoff_end: f32 = 500.0,
+        pitch: f32 = 1.0,
+        pitch_randomness: f32 = 0.0,
     };
 
     /// Pushes an audio trigger command to the lock-free SPSC queue.
@@ -142,6 +175,7 @@ pub const AudioEngine = struct {
                 v.* = .{
                     .active = true,
                     .kind = p.kind,
+                    .bus = p.bus,
                     .volume = p.volume,
                     .pan = p.pan,
                     .duration = p.duration,
@@ -156,6 +190,7 @@ pub const AudioEngine = struct {
                 v.* = .{
                     .active = true,
                     .kind = .sample,
+                    .bus = c.bus,
                     .volume = c.volume,
                     .pan = c.pan,
                     .duration = c.duration,
@@ -187,41 +222,119 @@ pub const AudioEngine = struct {
         return best;
     }
 
+    pub const SpatializeResult = struct {
+        vol: f32,
+        pan: f32,
+        doppler: f32,
+    };
+
     /// Shared distance attenuation + pan for `play` and `playClip`.
     fn spatialize(self: *const AudioEngine, position: ?Vec3, volume: f32) struct { vol: f32, pan: f32 } {
-        return spatializeWith(self.listener_pos, self.listener_right, position, volume);
+        const res = spatializeWith(self.listener_pos, self.listener_right, self.listener_vel, position, volume, 1.0, max_distance, 1.0, .linear, null);
+        return .{ .vol = res.vol, .pan = res.pan };
     }
 
-    /// Lock-free attenuation/pan from a listener snapshot.
-    fn spatializeWith(lpos: Vec3, lright: Vec3, position: ?Vec3, volume: f32) struct { vol: f32, pan: f32 } {
+    /// Lock-free attenuation/pan/doppler from a listener snapshot.
+    pub fn spatializeWith(
+        lpos: Vec3,
+        lright: Vec3,
+        lvel: Vec3,
+        position: ?Vec3,
+        volume: f32,
+        min_dist: f32,
+        max_dist: f32,
+        rolloff: f32,
+        model: AttenuationModel,
+        velocity: ?Vec3,
+    ) SpatializeResult {
         var vol = volume;
         var pan: f32 = 0.0;
+        var doppler: f32 = 1.0;
         if (position) |p| {
             const to = p.sub(lpos);
             const dist = to.length();
-            vol *= @max(0.0, 1.0 - dist / max_distance);
+            const min_d = @max(0.001, min_dist);
+            const max_d = @max(min_d + 0.001, max_dist);
+            const r_off = @max(0.0, rolloff);
+
+            if (dist <= min_d) {
+                // inside inner full-volume radius
+            } else if (dist >= max_d) {
+                vol = 0.0;
+            } else {
+                const delta_d = dist - min_d;
+                const range_d = max_d - min_d;
+                switch (model) {
+                    .linear => {
+                        const factor = @max(0.0, 1.0 - delta_d / range_d);
+                        vol *= if (r_off != 1.0) std.math.pow(f32, factor, r_off) else factor;
+                    },
+                    .inverse => {
+                        const factor = min_d / (min_d + r_off * delta_d);
+                        vol *= factor;
+                    },
+                    .exponential => {
+                        const factor = std.math.exp(-r_off * delta_d / range_d);
+                        vol *= factor;
+                    },
+                }
+            }
+
             if (dist > 1e-4) {
-                pan = std.math.clamp(to.scale(1.0 / dist).dot(lright), -1.0, 1.0);
+                const dir = to.scale(1.0 / dist);
+                pan = std.math.clamp(dir.dot(lright), -1.0, 1.0);
+
+                if (velocity) |vel| {
+                    const SPEED_OF_SOUND: f32 = 343.0;
+                    const v_l = lvel.dot(dir);
+                    const v_e = vel.dot(dir);
+                    const num = SPEED_OF_SOUND + v_l;
+                    const den = SPEED_OF_SOUND + v_e;
+                    if (num > 1.0 and den > 1.0) {
+                        doppler = std.math.clamp(num / den, 0.25, 4.0);
+                    }
+                }
             }
         }
-        return .{ .vol = vol, .pan = pan };
+        return .{ .vol = vol, .pan = pan, .doppler = doppler };
     }
 
     pub fn play(self: *AudioEngine, params: PlayOptions) void {
-        const sp = spatializeWith(self.listener_pos, self.listener_right, params.position, params.volume);
+        const sp = spatializeWith(
+            self.listener_pos,
+            self.listener_right,
+            self.listener_vel,
+            params.position,
+            params.volume,
+            params.min_distance,
+            params.max_distance,
+            params.rolloff,
+            params.attenuation_model,
+            params.velocity,
+        );
         if (sp.vol <= 0.001) return;
-        const duration = @max(params.duration, 0.01);
 
         self.next_seed +%= 1;
         const seed = self.next_seed *% 2654435761 +% 97;
+
+        var pitch_factor = params.pitch * sp.doppler;
+        if (params.pitch_randomness > 0.0) {
+            const r = @as(f32, @floatFromInt(seed & 0xFFFF)) / 65535.0;
+            const rnd_offset = (r * 2.0 - 1.0) * params.pitch_randomness;
+            pitch_factor *= @max(0.1, 1.0 + rnd_offset);
+        }
+        pitch_factor = std.math.clamp(pitch_factor, 0.1, 10.0);
+
+        const duration = @max(params.duration / pitch_factor, 0.01);
         const cmd = Command{
             .voice = .{
                 .kind = params.kind,
+                .bus = params.bus,
                 .volume = sp.vol,
                 .pan = sp.pan,
                 .duration = duration,
-                .freq = params.freq,
-                .freq_end = params.freq_end,
+                .freq = params.freq * pitch_factor,
+                .freq_end = params.freq_end * pitch_factor,
                 .cutoff = params.cutoff,
                 .cutoff_end = params.cutoff_end,
                 .seed = seed,
@@ -239,6 +352,7 @@ pub const AudioEngine = struct {
         const s = std.math.clamp(speed, 0.0, 15.0);
         self.play(.{
             .kind = .thump,
+            .bus = .sfx,
             .position = position,
             .volume = 0.12 + 0.05 * s,
             .duration = 0.12 + 0.012 * s,
@@ -251,6 +365,7 @@ pub const AudioEngine = struct {
     pub fn playExplosion(self: *AudioEngine, position: Vec3, size: f32) void {
         self.play(.{
             .kind = .noise_burst,
+            .bus = .sfx,
             .position = position,
             .volume = 0.85,
             .duration = 0.5 + 0.3 * size,
@@ -263,6 +378,7 @@ pub const AudioEngine = struct {
     pub fn playBlip(self: *AudioEngine, freq: f32) void {
         self.play(.{
             .kind = .blip,
+            .bus = .ui,
             .volume = 0.25,
             .duration = 0.09,
             .freq = freq,
@@ -271,10 +387,17 @@ pub const AudioEngine = struct {
     }
 
     pub const ClipPlayOptions = struct {
+        bus: AudioBus = .sfx,
         position: ?Vec3 = null, // null = non-positional
+        min_distance: f32 = 1.0,
+        max_distance: f32 = 30.0,
+        rolloff: f32 = 1.0,
+        attenuation_model: AttenuationModel = .linear,
+        velocity: ?Vec3 = null,
         volume: f32 = 1.0,
         loop: bool = false,
         rate: f32 = 1.0, // playback speed multiplier
+        pitch_randomness: f32 = 0.0,
     };
 
     /// Plays a decoded WAV clip on a mixer voice. Reuses the same
@@ -289,19 +412,41 @@ pub const AudioEngine = struct {
 
         const engine_rate = self.sample_rate;
         if (engine_rate <= 0.0) return;
-        const sp = spatializeWith(self.listener_pos, self.listener_right, options.position, options.volume);
+        const sp = spatializeWith(
+            self.listener_pos,
+            self.listener_right,
+            self.listener_vel,
+            options.position,
+            options.volume,
+            options.min_distance,
+            options.max_distance,
+            options.rolloff,
+            options.attenuation_model,
+            options.velocity,
+        );
         if (sp.vol <= 0.001) return;
-        const rate_f64: f64 = @floatCast(options.rate);
+
+        self.next_seed +%= 1;
+        const seed = self.next_seed *% 2654435761 +% 97;
+
+        var eff_rate = options.rate * sp.doppler;
+        if (options.pitch_randomness > 0.0) {
+            const r = @as(f32, @floatFromInt(seed & 0xFFFF)) / 65535.0;
+            const rnd_offset = (r * 2.0 - 1.0) * options.pitch_randomness;
+            eff_rate *= @max(0.1, 1.0 + rnd_offset);
+        }
+        eff_rate = std.math.clamp(eff_rate, 0.05, 20.0);
+
+        const rate_f64: f64 = @floatCast(eff_rate);
         const step: f64 = @as(f64, @floatCast(clip.sample_rate / engine_rate)) * rate_f64;
         if (!std.math.isFinite(step) or step <= 0.0) return;
         const clip_dur: f64 = @as(f64, @floatFromInt(clip.frames)) / @as(f64, @floatCast(clip.sample_rate)) / rate_f64;
         const duration = @max(@as(f32, @floatCast(clip_dur)), 0.01);
 
-        self.next_seed +%= 1;
-        const seed = self.next_seed *% 2654435761 +% 97;
         const cmd = Command{
             .clip = .{
                 .clip = clip,
+                .bus = options.bus,
                 .volume = sp.vol,
                 .pan = sp.pan,
                 .duration = duration,
@@ -321,6 +466,61 @@ pub const AudioEngine = struct {
         const r = if (right.length() > 1e-4) right.normalize() else Vec3.new(1.0, 0.0, 0.0);
         self.listener_pos = pos;
         self.listener_right = r;
+    }
+
+    pub fn updateListenerWithVelocity(self: *AudioEngine, pos: Vec3, right: Vec3, vel: Vec3) void {
+        const r = if (right.length() > 1e-4) right.normalize() else Vec3.new(1.0, 0.0, 0.0);
+        self.listener_pos = pos;
+        self.listener_right = r;
+        self.listener_vel = vel;
+    }
+
+    pub fn setBusVolume(self: *AudioEngine, bus: AudioBus, vol: f32) void {
+        const v = std.math.clamp(vol, 0.0, 2.0);
+        self.bus_volumes[@intFromEnum(bus)].store(@bitCast(v), .release);
+    }
+
+    pub fn getBusVolume(self: *const AudioEngine, bus: AudioBus) f32 {
+        return @bitCast(self.bus_volumes[@intFromEnum(bus)].load(.acquire));
+    }
+
+    pub fn setBusMuted(self: *AudioEngine, bus: AudioBus, muted: bool) void {
+        self.bus_muted[@intFromEnum(bus)].store(muted, .release);
+    }
+
+    pub fn isBusMuted(self: *const AudioEngine, bus: AudioBus) bool {
+        return self.bus_muted[@intFromEnum(bus)].load(.acquire);
+    }
+
+    pub fn stopBus(self: *AudioEngine, bus: AudioBus) void {
+        for (&self.voices) |*v| {
+            if (v.bus == bus) {
+                v.active = false;
+            }
+        }
+    }
+
+    pub fn stopAll(self: *AudioEngine) void {
+        for (&self.voices) |*v| {
+            v.active = false;
+        }
+    }
+
+    pub const MusicPlayOptions = struct {
+        volume: f32 = 1.0,
+        loop: bool = true,
+        rate: f32 = 1.0,
+    };
+
+    pub fn playMusic(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void {
+        self.stopBus(.music);
+        self.playClip(clip, .{
+            .bus = .music,
+            .volume = options.volume,
+            .loop = options.loop,
+            .rate = options.rate,
+            .position = null,
+        });
     }
 
     pub fn setMuted(self: *AudioEngine, muted: bool) void {
@@ -365,8 +565,9 @@ pub const AudioEngine = struct {
         var count: usize = 0;
         for (&self.voices) |*v| {
             if (!v.active) continue;
+            const bus_vol: f32 = if (self.isBusMuted(v.bus)) 0.0 else self.getBusVolume(v.bus);
             const pan = std.math.clamp(v.pan, -1.0, 1.0);
-            const g = v.volume * master;
+            const g = v.volume * master * bus_vol;
             const dur = @max(v.duration, 1e-6);
             var a = ActiveVoice{
                 .v = v,
@@ -587,6 +788,7 @@ pub const VoiceKind = enum {
 pub const Voice = struct {
     active: bool = false,
     kind: VoiceKind = .thump,
+    bus: AudioBus = .sfx,
     t: f32 = 0.0,
     duration: f32 = 0.2,
     freq: f32 = 110.0,

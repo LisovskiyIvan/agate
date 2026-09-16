@@ -52,6 +52,10 @@ pub const PostFXStack = struct {
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
     outline_width_px: f32 = 2.0,
 
+    // Previous frame view_proj matrix for camera motion blur reprojection
+    prev_view_proj: Mat4 = Mat4.identity,
+    has_prev_view_proj: bool = false,
+
     pub fn init() PostFXStack {
         return .{
             .postprocess_pass = passes.PostProcessPass.init(),
@@ -273,6 +277,7 @@ pub const PostFXStack = struct {
             });
 
             const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
+            const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
 
             self.postprocess_pass.render(
                 post,
@@ -284,12 +289,15 @@ pub const PostFXStack = struct {
                 cur_h,
                 params.view_proj,
                 inv_view_proj,
+                prev_vp,
                 params.eye,
                 params.sun_dir,
                 params.sun_color,
                 params.camera.getNear(),
                 params.camera.getFar(),
             );
+            self.prev_view_proj = params.view_proj;
+            self.has_prev_view_proj = true;
             params.stats.post_draw_calls += 1;
             params.stats.draw_calls += 1;
             params.stats.triangles += 2;

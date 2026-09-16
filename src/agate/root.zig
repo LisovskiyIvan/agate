@@ -294,6 +294,8 @@ pub const AudioEngine = audio.AudioEngine;
 pub const AudioClip = audio.AudioClip;
 pub const VoiceKind = audio.VoiceKind;
 pub const Voice = audio.Voice;
+pub const AudioBus = audio.AudioBus;
+pub const AttenuationModel = audio.AttenuationModel;
 
 pub const serialization = @import("serialization.zig");
 pub const SceneState = serialization.SceneState;

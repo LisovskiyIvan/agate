@@ -116,6 +116,11 @@ pub const PostProcessOptions = struct {
     temperature: f32 = 0.0,
     tint: f32 = 0.0,
 
+    // Camera Motion Blur (screen velocity gather blur)
+    motion_blur_enabled: bool = false,
+    motion_blur_intensity: f32 = 0.5,
+    motion_blur_max_blur_px: f32 = 32.0,
+
     // Return a copy with out-of-range values pulled into valid ranges.
     // Never fails; safe to apply on load or before uploading uniforms.
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
@@ -128,6 +133,8 @@ pub const PostProcessOptions = struct {
         out.dof_focus_distance = @max(self.dof_focus_distance, 0.0);
         out.dof_focus_range = @max(self.dof_focus_range, 0.0);
         out.dof_max_blur = @max(self.dof_max_blur, 0.0);
+        out.motion_blur_intensity = std.math.clamp(self.motion_blur_intensity, 0.0, 3.0);
+        out.motion_blur_max_blur_px = std.math.clamp(self.motion_blur_max_blur_px, 1.0, 128.0);
         out.grade_shadows = clampGrade(self.grade_shadows);
         out.grade_midtones = clampGrade(self.grade_midtones);
         out.grade_highlights = clampGrade(self.grade_highlights);

@@ -771,3 +771,88 @@ test "AudioClip fromWavFile streams PCM in chunks" {
         try std.testing.expectEqualSlices(f32, mem.samples, fc.samples);
     }
 }
+
+test "AudioEngine audio buses volume, mute, and stop isolation" {
+    var eng = AudioEngine{};
+    try std.testing.expectEqual(@as(f32, 1.0), eng.getBusVolume(.sfx));
+    try std.testing.expectEqual(false, eng.isBusMuted(.sfx));
+
+    // Play on .sfx and check output
+    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    var buf_sfx: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_sfx);
+    const e_sfx = channelEnergy(&buf_sfx, 0);
+    try std.testing.expect(e_sfx > 0.01);
+
+    // Mute .sfx, play again -> should produce pure silence
+    eng.setBusMuted(.sfx, true);
+    try std.testing.expect(eng.isBusMuted(.sfx));
+    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    var buf_muted: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_muted);
+    try std.testing.expect(peakAbs(&buf_muted, 0, 2205) < 1e-6);
+
+    // .music is unmuted, so music should still play while .sfx is muted
+    eng.play(.{ .kind = .thump, .bus = .music, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    var buf_music: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_music);
+    try std.testing.expect(channelEnergy(&buf_music, 0) > 0.01);
+
+    // Unmute .sfx, reduce volume to 0.5 -> energy should be noticeably lower
+    eng.setBusMuted(.sfx, false);
+    eng.setBusVolume(.sfx, 0.2);
+    try std.testing.expectEqual(@as(f32, 0.2), eng.getBusVolume(.sfx));
+    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    var buf_half: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_half);
+    const e_half = channelEnergy(&buf_half, 0);
+    try std.testing.expect(e_half < e_sfx * 0.2);
+
+    // stopBus clears active voices on that bus
+    eng.play(.{ .kind = .blip, .bus = .music, .duration = 1.0, .freq = 440.0, .freq_end = 440.0 });
+    eng.renderFrames(&buf_half); // process command into active voice
+    var active_music: usize = 0;
+    for (&eng.voices) |*v| {
+        if (v.active and v.bus == .music) active_music += 1;
+    }
+    try std.testing.expect(active_music > 0);
+    eng.stopBus(.music);
+    active_music = 0;
+    for (&eng.voices) |*v| {
+        if (v.active and v.bus == .music) active_music += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), active_music);
+}
+
+test "AudioEngine attenuation models and Doppler shift calculation" {
+    const lpos = Vec3.zero;
+    const lright = Vec3.new(1.0, 0.0, 0.0);
+    const lvel = Vec3.zero;
+
+    // 1. Inside min_dist (0..2.0): full volume
+    const inside = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 1.0, 0.0), 1.0, 2.0, 20.0, 1.0, .linear, null);
+    try std.testing.expectEqual(@as(f32, 1.0), inside.vol);
+
+    // 2. Beyond max_dist: zero volume
+    const outside = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 25.0, 0.0), 1.0, 2.0, 20.0, 1.0, .linear, null);
+    try std.testing.expectEqual(@as(f32, 0.0), outside.vol);
+
+    // 3. Linear vs Inverse vs Exponential at midpoint (dist = 11.0, range = 18.0)
+    const mid_pos = Vec3.new(0.0, 11.0, 0.0);
+    const lin = AudioEngine.spatializeWith(lpos, lright, lvel, mid_pos, 1.0, 2.0, 20.0, 1.0, .linear, null);
+    const inv = AudioEngine.spatializeWith(lpos, lright, lvel, mid_pos, 1.0, 2.0, 20.0, 1.0, .inverse, null);
+    const exp = AudioEngine.spatializeWith(lpos, lright, lvel, mid_pos, 1.0, 2.0, 20.0, 1.0, .exponential, null);
+    try std.testing.expect(lin.vol > 0.4 and lin.vol < 0.6); // 1.0 - 9/18 = 0.5
+    try std.testing.expect(inv.vol > 0.15 and inv.vol < 0.25); // 2 / (2 + 9) = 2/11 ~= 0.18
+    try std.testing.expect(exp.vol > 0.55 and exp.vol < 0.65); // exp(-9/18) = exp(-0.5) ~= 0.606
+
+    // 4. Doppler effect: source approaching listener (velocity towards listener)
+    const approach_vel = Vec3.new(0.0, -34.3, 0.0); // emitter at (0, 10, 0) moving towards (0, 0, 0)
+    const dop_app = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 10.0, 0.0), 1.0, 1.0, 30.0, 1.0, .linear, approach_vel);
+    try std.testing.expect(dop_app.doppler > 1.08); // pitch shifted up!
+
+    // Source receding from listener (velocity away from listener)
+    const recede_vel = Vec3.new(0.0, 34.3, 0.0);
+    const dop_rec = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 10.0, 0.0), 1.0, 1.0, 30.0, 1.0, .linear, recede_vel);
+    try std.testing.expect(dop_rec.doppler < 0.95); // pitch shifted down!
+}

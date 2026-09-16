@@ -377,6 +377,12 @@ void main() {
 
     if (base.a < alpha_cutoff) discard;
 
+    // Unlit mode: bypass all lighting and shadows
+    if (uv_offset.z > 0.5) {
+        frag_color = base;
+        return;
+    }
+
     // Primary directional light
     vec3 L = light_dir.xyz;
     float NdotL = max(dot(N, L), 0.0);

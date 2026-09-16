@@ -101,6 +101,9 @@ pub const StandardMaterial = struct {
     /// When true the mesh renders with face culling disabled (a cull-off
     /// pipeline twin). Both opaque and blend twins exist.
     double_sided: bool = false,
+    /// When true, lighting calculations are bypassed: renders pure base color + emissive.
+    unlit: bool = false,
+    emissive_color: Color3 = Color3.black,
     diffuse_texture: ?Texture = null,
     /// KHR_texture_transform-style UV map for the diffuse slot (identity =
     /// unchanged sampling). glTF never produces StandardMaterials, so this
@@ -142,6 +145,9 @@ pub const PBRMaterial = struct {
     /// When true the mesh renders with face culling disabled (a cull-off
     /// pipeline twin). Both opaque and blend twins exist.
     double_sided: bool = false,
+    /// When true, lighting calculations (direct lights, shadows, SSAO, IBL)
+    /// are bypassed: renders pure albedo + emissive.
+    unlit: bool = false,
     metallic: f32 = 0.0,
     roughness: f32 = 0.5,
     albedo_texture: ?Texture = null,
@@ -306,6 +312,22 @@ pub const Material = union(enum) {
         return switch (self) {
             inline else => |m| m.double_sided,
         };
+    }
+
+    pub fn isUnlit(self: Material) bool {
+        return switch (self) {
+            .standard => |s| s.unlit,
+            .pbr => |p| p.unlit,
+            .shader_material => false,
+        };
+    }
+
+    pub fn setUnlit(self: *Material, unlit_val: bool) void {
+        switch (self.*) {
+            .standard => |s| s.unlit = unlit_val,
+            .pbr => |p| p.unlit = unlit_val,
+            .shader_material => {},
+        }
     }
 
     /// Raw per-material cutoff (defaults to 0.5). The draw path gates this:
@@ -691,6 +713,7 @@ pub fn buildDrawRecord(
                 rec.uv_matrices[4] = p.occlusion_uv_transform.matrixRows();
 
                 rec.uv_offsets[0] = p.albedo_uv_transform.offsetPacked();
+                if (p.unlit) rec.uv_offsets[0][2] = 1.0;
                 rec.uv_offsets[1] = p.normal_uv_transform.offsetPacked();
                 rec.uv_offsets[2] = p.metallic_roughness_uv_transform.offsetPacked();
                 rec.uv_offsets[3] = p.emissive_uv_transform.offsetPacked();
@@ -711,6 +734,7 @@ pub fn buildDrawRecord(
                 rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
                 rec.standard_uv_matrix = s.diffuse_uv_transform.matrixRows();
                 rec.standard_uv_offset = s.diffuse_uv_transform.offsetPacked();
+                if (s.unlit) rec.standard_uv_offset[2] = 1.0;
             },
             .shader_material => |sm| {
                 rec.shader_material = sm;
@@ -758,4 +782,27 @@ test "MaterialDrawRecord builds correctly from PBRMaterial" {
     try std.testing.expectEqual(@as(f32, 0.8), rec.pbr_factors[0]);
     try std.testing.expectEqual(@as(f32, 0.2), rec.pbr_factors[1]);
     try std.testing.expectEqual(@as(f32, 0.4), rec.alpha_cutoff);
+}
+
+test "Material unlit mode properly routes to DrawRecord" {
+    var pbr_mat = PBRMaterial.init("unlit_pbr");
+    pbr_mat.unlit = true;
+
+    var std_mat = StandardMaterial.init("unlit_std");
+    std_mat.unlit = true;
+
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    var mat_pbr = Material{ .pbr = &pbr_mat };
+    try std.testing.expect(mat_pbr.isUnlit());
+
+    var mat_std = Material{ .standard = &std_mat };
+    try std.testing.expect(mat_std.isUnlit());
+
+    const rec_pbr = buildDrawRecord(mat_pbr, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), rec_pbr.uv_offsets[0][2]);
+
+    const rec_std = buildDrawRecord(mat_std, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), rec_std.standard_uv_offset[2]);
 }

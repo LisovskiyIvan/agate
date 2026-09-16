@@ -44,6 +44,8 @@ layout(binding = 0) uniform fs_params {
     vec4 lut_params; // x: lut_enabled (1/0), y: lut_intensity [0,1], z: lut size N, w: unused
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
+    mat4 prev_view_proj; // previous frame view-projection matrix
+    vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: unused
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -213,7 +215,35 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
     return mix(scene_color, current_fog_color, fog_amount);
 }
 
-// Sample scene HDR color, apply chromatic aberration, SSAO, SSR, and Fog
+// Camera Motion Blur: gathers samples along screen velocity derived from depth reprojection
+vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
+    if (motion_blur_params.x < 0.5) return color;
+    if (depth >= 1.0) return color;
+
+    vec3 world_pos = reconstructWorldPos(uv, depth);
+    vec4 prev_clip = prev_view_proj * vec4(world_pos, 1.0);
+    if (prev_clip.w <= 0.0001) return color;
+    vec2 prev_ndc = prev_clip.xy / prev_clip.w;
+    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+
+    vec2 velocity = (uv - prev_uv) * motion_blur_params.y;
+    float max_blur = motion_blur_params.z * resolution.z;
+    float speed = length(velocity);
+    if (speed > max_blur) {
+        velocity = velocity * (max_blur / speed);
+    }
+    if (speed < 0.0002) return color;
+
+    vec3 acc = color;
+    for (int i = 1; i < 8; ++i) {
+        float t = float(i) / 7.0 - 0.5;
+        vec2 sample_uv = clamp(uv + velocity * t, vec2(0.001), vec2(0.999));
+        acc += texture(sampler2D(scene_tex, smp), sample_uv).rgb;
+    }
+    return acc * 0.125;
+}
+
+// Sample scene HDR color, apply chromatic aberration, SSAO, SSR, Fog, and Motion Blur
 vec3 sampleSceneRaw(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
@@ -237,7 +267,7 @@ vec3 sampleSceneRaw(vec2 uv) {
         color *= ao_factor;
     }
 
-    // Depth-dependent passes: SSR and Atmospheric Fog
+    // Depth-dependent passes: SSR, Atmospheric Fog, and Motion Blur
     float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
 
     // Screen-Space Reflections (SSR)
@@ -245,6 +275,9 @@ vec3 sampleSceneRaw(vec2 uv) {
 
     // Atmospheric Depth & Height Fog
     color = applyAtmosphericFog(color, uv, raw_depth);
+
+    // Camera Motion Blur
+    color = applyMotionBlur(color, uv, raw_depth);
 
     return color;
 }

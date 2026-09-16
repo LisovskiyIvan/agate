@@ -254,4 +254,3 @@ test "computeNormals generates correct triangle surface normals" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[2].normal[1], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts[2].normal[2], 1e-5);
 }
-

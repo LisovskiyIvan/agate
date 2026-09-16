@@ -475,6 +475,7 @@ pub fn loadMaterials(
             pbr_mat.alpha_mode = .@"opaque";
         }
         pbr_mat.double_sided = src_mat.double_sided != 0;
+        pbr_mat.unlit = src_mat.unlit != 0;
 
         materials[i] = .{ .pbr = pbr_mat };
     }
