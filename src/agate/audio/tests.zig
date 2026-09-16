@@ -776,52 +776,55 @@ test "AudioClip fromWavFile streams PCM in chunks" {
 
 test "AudioEngine audio buses volume, mute, and stop isolation" {
     var eng = AudioEngine{};
-    try std.testing.expectEqual(@as(f32, 1.0), eng.getBusVolume(.sfx));
-    try std.testing.expectEqual(false, eng.isBusMuted(.sfx));
+    const sfx = eng.createSpatialBus("sfx", .{}) orelse return error.BusCreationFailed;
+    const music = eng.createNonSpatialBus("music", 1.0) orelse return error.BusCreationFailed;
 
-    // Play on .sfx and check output
-    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    try std.testing.expectEqual(@as(f32, 1.0), eng.getBusVolume(sfx));
+    try std.testing.expectEqual(false, eng.isBusMuted(sfx));
+
+    // Play on sfx and check output
+    eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
     var buf_sfx: [4410]f32 = [_]f32{0.0} ** 4410;
     eng.renderFrames(&buf_sfx);
     const e_sfx = channelEnergy(&buf_sfx, 0);
     try std.testing.expect(e_sfx > 0.01);
 
-    // Mute .sfx, play again -> should produce pure silence
-    eng.setBusMuted(.sfx, true);
-    try std.testing.expect(eng.isBusMuted(.sfx));
-    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    // Mute sfx, play again -> should produce pure silence
+    eng.setBusMuted(sfx, true);
+    try std.testing.expect(eng.isBusMuted(sfx));
+    eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
     var buf_muted: [4410]f32 = [_]f32{0.0} ** 4410;
     eng.renderFrames(&buf_muted);
     try std.testing.expect(peakAbs(&buf_muted, 0, 2205) < 1e-6);
 
-    // .music is unmuted, so music should still play while .sfx is muted
-    eng.play(.{ .kind = .thump, .bus = .music, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    // music is unmuted, so music should still play while sfx is muted
+    eng.play(.{ .kind = .thump, .bus = music, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
     var buf_music: [4410]f32 = [_]f32{0.0} ** 4410;
     eng.renderFrames(&buf_music);
     try std.testing.expect(channelEnergy(&buf_music, 0) > 0.01);
 
-    // Unmute .sfx, reduce volume to 0.5 -> energy should be noticeably lower
-    eng.setBusMuted(.sfx, false);
-    eng.setBusVolume(.sfx, 0.2);
-    try std.testing.expectEqual(@as(f32, 0.2), eng.getBusVolume(.sfx));
-    eng.play(.{ .kind = .thump, .bus = .sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
+    // Unmute sfx, reduce volume to 0.2 -> energy should be noticeably lower
+    eng.setBusMuted(sfx, false);
+    eng.setBusVolume(sfx, 0.2);
+    try std.testing.expectEqual(@as(f32, 0.2), eng.getBusVolume(sfx));
+    eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
     var buf_half: [4410]f32 = [_]f32{0.0} ** 4410;
     eng.renderFrames(&buf_half);
     const e_half = channelEnergy(&buf_half, 0);
     try std.testing.expect(e_half < e_sfx * 0.2);
 
     // stopBus clears active voices on that bus
-    eng.play(.{ .kind = .blip, .bus = .music, .duration = 1.0, .freq = 440.0, .freq_end = 440.0 });
+    eng.play(.{ .kind = .blip, .bus = music, .duration = 1.0, .freq = 440.0, .freq_end = 440.0 });
     eng.renderFrames(&buf_half); // process command into active voice
     var active_music: usize = 0;
     for (&eng.voices) |*v| {
-        if (v.active and v.bus == .music) active_music += 1;
+        if (v.active and v.bus != null and v.bus.? == music) active_music += 1;
     }
     try std.testing.expect(active_music > 0);
-    eng.stopBus(.music);
+    eng.stopBus(music);
     active_music = 0;
     for (&eng.voices) |*v| {
-        if (v.active and v.bus == .music) active_music += 1;
+        if (v.active and v.bus != null and v.bus.? == music) active_music += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), active_music);
 }
@@ -862,7 +865,7 @@ test "AudioEngine attenuation models and Doppler shift calculation" {
 test "AudioEngine dynamic bus creation, lookup, and configuration" {
     var eng = AudioEngine{};
     const initial_count = eng.getBusCount();
-    try std.testing.expectEqual(@as(usize, 5), initial_count); // master, sfx, music, ambient, ui
+    try std.testing.expectEqual(@as(usize, 0), initial_count);
 
     // Create spatial and non-spatial buses
     const weapons_bus = eng.createSpatialBus("weapons", .{
@@ -874,7 +877,7 @@ test "AudioEngine dynamic bus creation, lookup, and configuration" {
 
     const voiceover_bus = eng.createNonSpatialBus("voiceover", 0.75) orelse return error.BusCreationFailed;
 
-    try std.testing.expectEqual(@as(usize, 7), eng.getBusCount());
+    try std.testing.expectEqual(@as(usize, 2), eng.getBusCount());
     try std.testing.expect(eng.isBusActive(weapons_bus));
     try std.testing.expect(eng.isBusActive(voiceover_bus));
 
@@ -904,7 +907,7 @@ test "AudioEngine dynamic bus creation, lookup, and configuration" {
     // Destroy voiceover bus
     eng.destroyBus(voiceover_bus);
     try std.testing.expect(!eng.isBusActive(voiceover_bus));
-    try std.testing.expectEqual(@as(usize, 6), eng.getBusCount());
+    try std.testing.expectEqual(@as(usize, 1), eng.getBusCount());
     try std.testing.expect(eng.findBus("voiceover") == null);
 }
 
@@ -993,16 +996,18 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
 
 test "AudioEngine bus hierarchy and effective volume/mute propagation" {
     var eng = AudioEngine{};
-    // Create parent bus
+    // Create root bus
+    const root = eng.createNonSpatialBus("root", 0.8) orelse return error.BusCreationFailed;
+    // Create parent bus routing into root
     const parent = eng.createNonSpatialBus("combat_mix", 0.5) orelse return error.BusCreationFailed;
+    eng.setBusParent(parent, root);
     // Create child bus routing into parent
     const child = eng.createNonSpatialBus("gunshots", 0.5) orelse return error.BusCreationFailed;
     eng.setBusParent(child, parent);
 
     try std.testing.expectEqual(parent, eng.getBusParent(child).?);
 
-    // Master volume is 0.8 by default.
-    // child local = 0.5, parent local = 0.5, master = 0.8.
+    // root local = 0.8, parent local = 0.5, child local = 0.5.
     // child effective = 0.5 * 0.5 * 0.8 = 0.20
     const eff_child = eng.getBusEffectiveVolume(child);
     try std.testing.expectApproxEqAbs(@as(f32, 0.20), eff_child, 1e-4);
@@ -1026,9 +1031,9 @@ test "AudioEngine bus hierarchy and effective volume/mute propagation" {
     eng.renderFrames(&buf);
     try std.testing.expect(channelEnergy(&buf, 0) > 0.001);
 
-    // Destroying parent re-parents child to master (0)
+    // Destroying parent re-parents child to parent's parent (root)
     eng.destroyBus(parent);
-    try std.testing.expectEqual(@as(BusId, .master), eng.getBusParent(child).?);
-    // Now child routes directly to master: 0.5 * 0.8 = 0.40
+    try std.testing.expectEqual(root, eng.getBusParent(child).?);
+    // Now child routes directly to root: 0.5 * 0.8 = 0.40
     try std.testing.expectApproxEqAbs(@as(f32, 0.40), eng.getBusEffectiveVolume(child), 1e-4);
 }

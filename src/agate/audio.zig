@@ -15,12 +15,9 @@ const clip_mod = @import("audio/clip.zig");
 pub const AudioClip = clip_mod.AudioClip;
 
 pub const BusId = enum(u8) {
-    master = 0,
-    sfx = 1,
-    music = 2,
-    ambient = 3,
-    ui = 4,
     _,
+
+    pub const invalid: BusId = @enumFromInt(0xFF);
 
     pub fn id(self: BusId) u8 {
         return @intFromEnum(self);
@@ -33,7 +30,7 @@ pub const BusId = enum(u8) {
 
 pub const AudioBus = BusId;
 pub const max_buses: usize = 32;
-pub const no_parent: BusId = @enumFromInt(0xFF);
+pub const invalid_bus: BusId = BusId.invalid;
 
 pub const AttenuationModel = enum(u8) {
     linear = 0,
@@ -53,79 +50,12 @@ pub const BusConfig = struct {
     spatial: bool = false,
     volume: f32 = 1.0,
     muted: bool = false,
-    parent: ?BusId = .master,
+    parent: ?BusId = null,
     attenuation_model: AttenuationModel = .inverse,
     min_distance: f32 = 1.0,
     max_distance: f32 = 30.0,
     rolloff: f32 = 1.0,
     doppler_factor: f32 = 1.0,
-};
-
-fn makeDefaultName(comptime s: []const u8) [32]u8 {
-    var buf = [_]u8{0} ** 32;
-    @memcpy(buf[0..s.len], s);
-    return buf;
-}
-
-const default_bus_names = blk: {
-    var arr = [_][32]u8{[_]u8{0} ** 32} ** max_buses;
-    arr[0] = makeDefaultName("master");
-    arr[1] = makeDefaultName("sfx");
-    arr[2] = makeDefaultName("music");
-    arr[3] = makeDefaultName("ambient");
-    arr[4] = makeDefaultName("ui");
-    break :blk arr;
-};
-
-const default_bus_name_lens = blk: {
-    var arr = [_]u8{0} ** max_buses;
-    arr[0] = 6;
-    arr[1] = 3;
-    arr[2] = 5;
-    arr[3] = 7;
-    arr[4] = 2;
-    break :blk arr;
-};
-
-const default_bus_active = blk: {
-    var arr = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_buses;
-    arr[0] = std.atomic.Value(bool).init(true);
-    arr[1] = std.atomic.Value(bool).init(true);
-    arr[2] = std.atomic.Value(bool).init(true);
-    arr[3] = std.atomic.Value(bool).init(true);
-    arr[4] = std.atomic.Value(bool).init(true);
-    break :blk arr;
-};
-
-const default_bus_spatial = blk: {
-    var arr = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_buses;
-    arr[0] = std.atomic.Value(bool).init(false); // master: 2D non-spatial
-    arr[1] = std.atomic.Value(bool).init(true); // sfx: 3D spatial
-    arr[2] = std.atomic.Value(bool).init(false); // music: 2D non-spatial
-    arr[3] = std.atomic.Value(bool).init(true); // ambient: 3D spatial
-    arr[4] = std.atomic.Value(bool).init(false); // ui: 2D non-spatial
-    break :blk arr;
-};
-
-const default_bus_parent = blk: {
-    var arr = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_buses;
-    arr[1] = std.atomic.Value(u8).init(0); // sfx -> master
-    arr[2] = std.atomic.Value(u8).init(0); // music -> master
-    arr[3] = std.atomic.Value(u8).init(0); // ambient -> master
-    arr[4] = std.atomic.Value(u8).init(0); // ui -> master
-    break :blk arr;
-};
-
-const default_bus_volumes = blk: {
-    var arr = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_buses;
-    arr[0] = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8)));
-    break :blk arr;
-};
-
-const default_bus_max_dist = blk: {
-    var arr = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 30.0)))} ** max_buses;
-    arr[3] = std.atomic.Value(u32).init(@bitCast(@as(f32, 35.0)));
-    break :blk arr;
 };
 
 pub const AudioEngine = struct {
@@ -136,7 +66,7 @@ pub const AudioEngine = struct {
     const Command = union(enum) {
         voice: struct {
             kind: VoiceKind,
-            bus: BusId,
+            bus: ?BusId = null,
             volume: f32,
             pan: f32,
             duration: f32,
@@ -148,7 +78,7 @@ pub const AudioEngine = struct {
         },
         clip: struct {
             clip: *const AudioClip,
-            bus: BusId,
+            bus: ?BusId = null,
             volume: f32,
             pan: f32,
             duration: f32,
@@ -186,29 +116,19 @@ pub const AudioEngine = struct {
     voices: [max_voices]Voice = [_]Voice{Voice{}} ** max_voices,
     master_volume: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
 
-    // Bus registry (up to max_buses = 32)
-    bus_names: [max_buses][32]u8 = default_bus_names,
-    bus_name_lens: [max_buses]u8 = default_bus_name_lens,
-    bus_active: [max_buses]std.atomic.Value(bool) = default_bus_active,
-    bus_spatial: [max_buses]std.atomic.Value(bool) = default_bus_spatial,
-    bus_volumes: [max_buses]std.atomic.Value(u32) = default_bus_volumes,
-    bus_muted: [max_buses]std.atomic.Value(bool) = [_]std.atomic.Value(bool){
-        std.atomic.Value(bool).init(false),
-    } ** max_buses,
-    bus_parent: [max_buses]std.atomic.Value(u8) = default_bus_parent,
-    bus_model: [max_buses]std.atomic.Value(u8) = [_]std.atomic.Value(u8){
-        std.atomic.Value(u8).init(@intFromEnum(AttenuationModel.inverse)),
-    } ** max_buses,
-    bus_min_dist: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){
-        std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0))),
-    } ** max_buses,
-    bus_max_dist: [max_buses]std.atomic.Value(u32) = default_bus_max_dist,
-    bus_rolloff: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){
-        std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0))),
-    } ** max_buses,
-    bus_doppler: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){
-        std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0))),
-    } ** max_buses,
+    // Bus registry (up to max_buses = 32, all created dynamically by user)
+    bus_names: [max_buses][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_buses,
+    bus_name_lens: [max_buses]u8 = [_]u8{0} ** max_buses,
+    bus_active: [max_buses]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_buses,
+    bus_spatial: [max_buses]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_buses,
+    bus_volumes: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_buses,
+    bus_muted: [max_buses]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_buses,
+    bus_parent: [max_buses]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_buses,
+    bus_model: [max_buses]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(AttenuationModel.inverse))} ** max_buses,
+    bus_min_dist: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_buses,
+    bus_max_dist: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 30.0)))} ** max_buses,
+    bus_rolloff: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_buses,
+    bus_doppler: [max_buses]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_buses,
     muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listener_pos: Vec3 = Vec3.zero,
     listener_right: Vec3 = Vec3.new(1.0, 0.0, 0.0),
@@ -243,7 +163,7 @@ pub const AudioEngine = struct {
     /// envelope/filter sweep the synthesizer applies. `play` is the only entry.
     pub const PlayOptions = struct {
         kind: VoiceKind = .thump,
-        bus: AudioBus = .sfx,
+        bus: ?BusId = null,
         pan: f32 = 0.0,
         position: ?Vec3 = null, // null = non-positional
         min_distance: ?f32 = null, // null = inherit from bus
@@ -418,18 +338,32 @@ pub const AudioEngine = struct {
     }
 
     pub fn play(self: *AudioEngine, params: PlayOptions) void {
-        const is_spatial = self.isBusSpatial(params.bus);
+        const is_spatial = if (params.bus) |b| self.isBusSpatial(b) else (params.position != null);
         var sp_vol: f32 = params.volume;
         var sp_pan: f32 = params.pan;
         var sp_doppler: f32 = 1.0;
 
         if (is_spatial and params.position != null) {
-            const bus_attn = self.getBusAttenuation(params.bus);
-            const min_dist = params.min_distance orelse bus_attn.min_distance;
-            const max_dist = params.max_distance orelse bus_attn.max_distance;
-            const rolloff = params.rolloff orelse bus_attn.rolloff;
-            const model = params.attenuation_model orelse bus_attn.model;
-            const dop_scale = params.doppler_factor orelse self.getBusDopplerFactor(params.bus);
+            var min_dist: f32 = 1.0;
+            var max_dist: f32 = 30.0;
+            var rolloff: f32 = 1.0;
+            var model: AttenuationModel = .inverse;
+            var dop_scale: f32 = 1.0;
+
+            if (params.bus) |b| {
+                const bus_attn = self.getBusAttenuation(b);
+                min_dist = params.min_distance orelse bus_attn.min_distance;
+                max_dist = params.max_distance orelse bus_attn.max_distance;
+                rolloff = params.rolloff orelse bus_attn.rolloff;
+                model = params.attenuation_model orelse bus_attn.model;
+                dop_scale = params.doppler_factor orelse self.getBusDopplerFactor(b);
+            } else {
+                min_dist = params.min_distance orelse 1.0;
+                max_dist = params.max_distance orelse 30.0;
+                rolloff = params.rolloff orelse 1.0;
+                model = params.attenuation_model orelse .inverse;
+                dop_scale = params.doppler_factor orelse 1.0;
+            }
 
             const sp = spatializeWith(
                 self.listener_pos,
@@ -486,10 +420,14 @@ pub const AudioEngine = struct {
 
     /// Impact thump, louder and deeper with speed (m/s).
     pub fn playImpact(self: *AudioEngine, position: Vec3, speed: f32) void {
+        self.playImpactOn(null, position, speed);
+    }
+
+    pub fn playImpactOn(self: *AudioEngine, bus: ?BusId, position: Vec3, speed: f32) void {
         const s = std.math.clamp(speed, 0.0, 15.0);
         self.play(.{
             .kind = .thump,
-            .bus = .sfx,
+            .bus = bus,
             .position = position,
             .volume = 0.12 + 0.05 * s,
             .duration = 0.12 + 0.012 * s,
@@ -500,9 +438,13 @@ pub const AudioEngine = struct {
 
     /// Explosion noise burst; size scales duration.
     pub fn playExplosion(self: *AudioEngine, position: Vec3, size: f32) void {
+        self.playExplosionOn(null, position, size);
+    }
+
+    pub fn playExplosionOn(self: *AudioEngine, bus: ?BusId, position: Vec3, size: f32) void {
         self.play(.{
             .kind = .noise_burst,
-            .bus = .sfx,
+            .bus = bus,
             .position = position,
             .volume = 0.85,
             .duration = 0.5 + 0.3 * size,
@@ -513,9 +455,13 @@ pub const AudioEngine = struct {
 
     /// Short non-positional blip (UI, jumps, snaps).
     pub fn playBlip(self: *AudioEngine, freq: f32) void {
+        self.playBlipOn(null, freq);
+    }
+
+    pub fn playBlipOn(self: *AudioEngine, bus: ?BusId, freq: f32) void {
         self.play(.{
             .kind = .blip,
-            .bus = .ui,
+            .bus = bus,
             .volume = 0.25,
             .duration = 0.09,
             .freq = freq,
@@ -524,7 +470,7 @@ pub const AudioEngine = struct {
     }
 
     pub const ClipPlayOptions = struct {
-        bus: AudioBus = .sfx,
+        bus: ?BusId = null,
         pan: f32 = 0.0,
         position: ?Vec3 = null, // null = non-positional
         min_distance: ?f32 = null, // null = inherit from bus
@@ -552,18 +498,32 @@ pub const AudioEngine = struct {
         const engine_rate = self.sample_rate;
         if (engine_rate <= 0.0) return;
 
-        const is_spatial = self.isBusSpatial(options.bus);
+        const is_spatial = if (options.bus) |b| self.isBusSpatial(b) else (options.position != null);
         var sp_vol: f32 = options.volume;
         var sp_pan: f32 = options.pan;
         var sp_doppler: f32 = 1.0;
 
         if (is_spatial and options.position != null) {
-            const bus_attn = self.getBusAttenuation(options.bus);
-            const min_dist = options.min_distance orelse bus_attn.min_distance;
-            const max_dist = options.max_distance orelse bus_attn.max_distance;
-            const rolloff = options.rolloff orelse bus_attn.rolloff;
-            const model = options.attenuation_model orelse bus_attn.model;
-            const dop_scale = options.doppler_factor orelse self.getBusDopplerFactor(options.bus);
+            var min_dist: f32 = 1.0;
+            var max_dist: f32 = 30.0;
+            var rolloff: f32 = 1.0;
+            var model: AttenuationModel = .inverse;
+            var dop_scale: f32 = 1.0;
+
+            if (options.bus) |b| {
+                const bus_attn = self.getBusAttenuation(b);
+                min_dist = options.min_distance orelse bus_attn.min_distance;
+                max_dist = options.max_distance orelse bus_attn.max_distance;
+                rolloff = options.rolloff orelse bus_attn.rolloff;
+                model = options.attenuation_model orelse bus_attn.model;
+                dop_scale = options.doppler_factor orelse self.getBusDopplerFactor(b);
+            } else {
+                min_dist = options.min_distance orelse 1.0;
+                max_dist = options.max_distance orelse 30.0;
+                rolloff = options.rolloff orelse 1.0;
+                model = options.attenuation_model orelse .inverse;
+                dop_scale = options.doppler_factor orelse 1.0;
+            }
 
             const sp = spatializeWith(
                 self.listener_pos,
@@ -636,7 +596,7 @@ pub const AudioEngine = struct {
 
     pub fn createBus(self: *AudioEngine, config: BusConfig) ?BusId {
         var slot: ?usize = null;
-        for (5..max_buses) |i| {
+        for (0..max_buses) |i| {
             if (!self.bus_active[i].load(.acquire)) {
                 slot = i;
                 break;
@@ -682,10 +642,8 @@ pub const AudioEngine = struct {
         self.bus_spatial[id].store(config.spatial, .release);
         self.bus_volumes[id].store(@bitCast(std.math.clamp(config.volume, 0.0, 2.0)), .release);
         self.bus_muted[id].store(config.muted, .release);
-        if (id != 0) {
-            const parent_id: u8 = if (config.parent) |p| @intFromEnum(p) else 0xFF;
-            self.bus_parent[id].store(parent_id, .release);
-        }
+        const parent_id: u8 = if (config.parent) |p| @intFromEnum(p) else 0xFF;
+        self.bus_parent[id].store(parent_id, .release);
         self.bus_model[id].store(@intFromEnum(config.attenuation_model), .release);
         self.bus_min_dist[id].store(@bitCast(@max(0.001, config.min_distance)), .release);
         self.bus_max_dist[id].store(@bitCast(@max(0.002, config.max_distance)), .release);
@@ -695,12 +653,13 @@ pub const AudioEngine = struct {
 
     pub fn destroyBus(self: *AudioEngine, bus: BusId) void {
         const id = @intFromEnum(bus);
-        if (id == 0 or id >= max_buses) return;
+        if (id >= max_buses) return;
         if (!self.bus_active[id].load(.acquire)) return;
         self.stopBus(bus);
+        const my_parent = self.bus_parent[id].load(.acquire);
         for (0..max_buses) |i| {
             if (self.bus_active[i].load(.acquire) and self.bus_parent[i].load(.acquire) == id) {
-                self.bus_parent[i].store(0, .release);
+                self.bus_parent[i].store(my_parent, .release);
             }
         }
         self.bus_active[id].store(false, .release);
@@ -719,12 +678,11 @@ pub const AudioEngine = struct {
         return null;
     }
 
-    pub fn findOrCreateBus(self: *AudioEngine, name: []const u8, config: BusConfig) BusId {
+    pub fn findOrCreateBus(self: *AudioEngine, name: []const u8, config: BusConfig) ?BusId {
         if (self.findBus(name)) |b| return b;
         var cfg = config;
         cfg.name = name;
-        if (self.createBus(cfg)) |b| return b;
-        return if (config.spatial) .sfx else .master;
+        return self.createBus(cfg);
     }
 
     pub fn isBusActive(self: *const AudioEngine, bus: BusId) bool {
@@ -775,7 +733,7 @@ pub const AudioEngine = struct {
 
     pub fn setBusParent(self: *AudioEngine, bus: BusId, parent: ?BusId) void {
         const id = @intFromEnum(bus);
-        if (id == 0 or id >= max_buses) return;
+        if (id >= max_buses) return;
         const p_val: u8 = if (parent) |p| @intFromEnum(p) else 0xFF;
         self.bus_parent[id].store(p_val, .release);
     }
@@ -820,27 +778,24 @@ pub const AudioEngine = struct {
         return @bitCast(self.bus_doppler[id].load(.acquire));
     }
 
-    pub fn setBusVolume(self: *AudioEngine, bus: AudioBus, vol: f32) void {
+    pub fn setBusVolume(self: *AudioEngine, bus: BusId, vol: f32) void {
         const id = @intFromEnum(bus);
         if (id >= max_buses) return;
         const v = std.math.clamp(vol, 0.0, 2.0);
         self.bus_volumes[id].store(@bitCast(v), .release);
-        if (id == 0) {
-            self.master_volume.store(@bitCast(v), .release);
-        }
     }
 
-    pub fn getBusVolume(self: *const AudioEngine, bus: AudioBus) f32 {
+    pub fn getBusVolume(self: *const AudioEngine, bus: BusId) f32 {
         const id = @intFromEnum(bus);
         if (id >= max_buses) return 0.0;
         return @bitCast(self.bus_volumes[id].load(.acquire));
     }
 
-    pub fn getBusEffectiveVolume(self: *const AudioEngine, bus: AudioBus) f32 {
+    pub fn getBusEffectiveVolume(self: *const AudioEngine, bus_opt: ?BusId) f32 {
+        const bus = bus_opt orelse return 1.0;
         const b_id = @intFromEnum(bus);
         if (b_id >= max_buses) return 0.0;
         if (!self.bus_active[b_id].load(.acquire)) return 0.0;
-        if (self.muted.load(.acquire)) return 0.0;
 
         var current = bus;
         var vol: f32 = 1.0;
@@ -860,37 +815,33 @@ pub const AudioEngine = struct {
         return vol;
     }
 
-    pub fn setBusMuted(self: *AudioEngine, bus: AudioBus, muted_val: bool) void {
+    pub fn setBusMuted(self: *AudioEngine, bus: BusId, muted_val: bool) void {
         const id = @intFromEnum(bus);
         if (id >= max_buses) return;
         self.bus_muted[id].store(muted_val, .release);
-        if (id == 0) {
-            self.muted.store(muted_val, .release);
-        }
     }
 
-    pub fn isBusMuted(self: *const AudioEngine, bus: AudioBus) bool {
+    pub fn isBusMuted(self: *const AudioEngine, bus: BusId) bool {
         const id = @intFromEnum(bus);
         if (id >= max_buses) return true;
         return self.bus_muted[id].load(.acquire);
     }
 
-    pub fn toggleBusMuted(self: *AudioEngine, bus: AudioBus) void {
+    pub fn toggleBusMuted(self: *AudioEngine, bus: BusId) void {
         const id = @intFromEnum(bus);
         if (id >= max_buses) return;
         var cur = self.bus_muted[id].load(.monotonic);
         while (self.bus_muted[id].cmpxchgWeak(cur, !cur, .acq_rel, .monotonic)) |next| {
             cur = next;
         }
-        if (id == 0) {
-            self.muted.store(!cur, .release);
-        }
     }
 
-    pub fn stopBus(self: *AudioEngine, bus: AudioBus) void {
+    pub fn stopBus(self: *AudioEngine, bus: BusId) void {
         for (&self.voices) |*v| {
-            if (v.bus == bus) {
-                v.active = false;
+            if (v.bus) |b| {
+                if (b == bus) {
+                    v.active = false;
+                }
             }
         }
     }
@@ -902,15 +853,18 @@ pub const AudioEngine = struct {
     }
 
     pub const MusicPlayOptions = struct {
+        bus: ?BusId = null,
         volume: f32 = 1.0,
         loop: bool = true,
         rate: f32 = 1.0,
     };
 
     pub fn playMusic(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void {
-        self.stopBus(.music);
+        if (options.bus) |b| {
+            self.stopBus(b);
+        }
         self.playClip(clip, .{
-            .bus = .music,
+            .bus = options.bus,
             .volume = options.volume,
             .loop = options.loop,
             .rate = options.rate,
@@ -920,25 +874,26 @@ pub const AudioEngine = struct {
 
     pub fn setMuted(self: *AudioEngine, muted_val: bool) void {
         self.muted.store(muted_val, .release);
-        self.bus_muted[0].store(muted_val, .release);
     }
 
     pub fn toggleMuted(self: *AudioEngine) void {
-        self.toggleBusMuted(.master);
+        var cur = self.muted.load(.monotonic);
+        while (self.muted.cmpxchgWeak(cur, !cur, .acq_rel, .monotonic)) |next| {
+            cur = next;
+        }
     }
 
     pub fn isMuted(self: *const AudioEngine) bool {
-        return self.muted.load(.acquire) or self.bus_muted[0].load(.acquire);
+        return self.muted.load(.acquire);
     }
 
     pub fn setMasterVolume(self: *AudioEngine, vol: f32) void {
         const v = std.math.clamp(vol, 0.0, 2.0);
         self.master_volume.store(@bitCast(v), .release);
-        self.bus_volumes[0].store(@bitCast(v), .release);
     }
 
     pub fn getMasterVolume(self: *const AudioEngine) f32 {
-        return @bitCast(self.bus_volumes[0].load(.acquire));
+        return @bitCast(self.master_volume.load(.acquire));
     }
 
     /// Mixes stereo-interleaved frames and advances voice state. Called by
@@ -949,6 +904,7 @@ pub const AudioEngine = struct {
         const total: usize = buffer.len / 2;
         if (total == 0) return;
         const dt: f32 = 1.0 / self.sample_rate;
+        const master: f32 = if (self.isMuted()) 0.0 else self.getMasterVolume();
 
         // Per-callback setup: collect the active voices once with all
         // constant-per-buffer data precomputed (pan gains, envelope and
@@ -961,7 +917,7 @@ pub const AudioEngine = struct {
             if (!v.active) continue;
             const bus_vol: f32 = self.getBusEffectiveVolume(v.bus);
             const pan = std.math.clamp(v.pan, -1.0, 1.0);
-            const g = v.volume * bus_vol;
+            const g = v.volume * master * bus_vol;
             const dur = @max(v.duration, 1e-6);
             var a = ActiveVoice{
                 .v = v,
@@ -1182,7 +1138,7 @@ pub const VoiceKind = enum {
 pub const Voice = struct {
     active: bool = false,
     kind: VoiceKind = .thump,
-    bus: AudioBus = .sfx,
+    bus: ?BusId = null,
     t: f32 = 0.0,
     duration: f32 = 0.2,
     freq: f32 = 110.0,

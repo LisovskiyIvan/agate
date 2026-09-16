@@ -296,6 +296,7 @@ pub const VoiceKind = audio.VoiceKind;
 pub const Voice = audio.Voice;
 pub const AudioBus = audio.AudioBus;
 pub const BusId = audio.BusId;
+pub const invalid_bus = audio.invalid_bus;
 pub const BusConfig = audio.BusConfig;
 pub const BusAttenuation = audio.BusAttenuation;
 pub const AttenuationModel = audio.AttenuationModel;
