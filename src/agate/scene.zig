@@ -1023,7 +1023,7 @@ pub const Scene = struct {
         const view_proj = cam_snap.view_proj;
         const eye = cam_snap.eye;
 
-        const frame_ctx = FrameContext{
+        var frame_ctx = FrameContext{
             .view_proj = view_proj,
             .eye = eye,
             .sun_dir = snap.sun_dir,
@@ -1040,6 +1040,17 @@ pub const Scene = struct {
             .spot_view_proj = snap.light_pack.spot_view_proj,
             .spot_shadow_params = snap.light_pack.spot_shadow_params,
         };
+
+        var shadow_state_with = env.shadow_uniforms;
+        shadow_state_with.mesh_receive_shadows = true;
+        const u_with = scene_uniforms.buildFrameUniforms(shadow_state_with, &frame_ctx);
+
+        var shadow_state_no = env.shadow_uniforms;
+        shadow_state_no.mesh_receive_shadows = false;
+        const u_no = scene_uniforms.buildFrameUniforms(shadow_state_no, &frame_ctx);
+
+        frame_ctx.uniforms_with_shadows = &u_with;
+        frame_ctx.uniforms_without_shadows = &u_no;
 
         var current_pipeline_id: u32 = 0;
 

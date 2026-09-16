@@ -168,6 +168,7 @@ pub const SceneLoader = struct {
 pub fn isExtensionSupported(name: []const u8) bool {
     const supported = [_][]const u8{
         "EXT_meshopt_compression",
+        "KHR_mesh_quantization",
         "KHR_lights_punctual",
         "KHR_texture_transform",
         "KHR_materials_unlit",
@@ -180,6 +181,7 @@ pub fn isExtensionSupported(name: []const u8) bool {
 
 test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(isExtensionSupported("EXT_meshopt_compression"));
+    try std.testing.expect(isExtensionSupported("KHR_mesh_quantization"));
     try std.testing.expect(isExtensionSupported("KHR_lights_punctual"));
     try std.testing.expect(isExtensionSupported("KHR_texture_transform"));
     try std.testing.expect(isExtensionSupported("KHR_materials_unlit"));

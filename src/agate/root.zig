@@ -86,6 +86,7 @@ pub const LODLevel = mesh.LODLevel;
 pub const CullingStrategy = mesh.CullingStrategy;
 pub const Vertex = mesh.Vertex;
 pub const MeshBuilder = mesh.MeshBuilder;
+pub const computeNormals = mesh.computeNormals;
 pub const computeTangents = mesh.computeTangents;
 pub const BoxOptions = mesh.BoxOptions;
 pub const SphereOptions = mesh.SphereOptions;

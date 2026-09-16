@@ -13,6 +13,7 @@ pub const LODLevel = types.LODLevel;
 pub const SkinJointWeight = types.SkinJointWeight;
 
 pub const tangents = @import("mesh/tangents.zig");
+pub const computeNormals = tangents.computeNormals;
 pub const computeTangents = tangents.computeTangents;
 pub const pickOrthogonal = tangents.pickOrthogonal;
 

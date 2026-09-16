@@ -22,6 +22,8 @@ pub const FrameContext = struct {
     spot_intensity: [2][4]f32,
     spot_view_proj: [2]Mat4,
     spot_shadow_params: [2][4]f32,
+    uniforms_with_shadows: ?*const FrameUniforms = null,
+    uniforms_without_shadows: ?*const FrameUniforms = null,
 };
 
 // Fragment uniforms shared by the standard, PBR and instanced shaders:

@@ -69,6 +69,7 @@ pub const ShadowPass = struct {
         visible_instance_count: u32 = 0,
         model: Mat4 = Mat4.identity,
         world_aabb: math.BoundingBox = math.BoundingBox.zero,
+        max_dim: f32 = 0.0,
         skin_matrices: ?*const [MAX_BONES]Mat4 = null,
         bucket: Bucket = .regular_u16,
         is_instanced: bool = false,
@@ -274,6 +275,9 @@ pub const ShadowPass = struct {
         last_pipeline_id: *u32,
         draw_calls: *u32,
     ) void {
+        var last_vb_id: u32 = 0;
+        var last_ib_id: u32 = 0;
+
         for (bucket_order) |bucket| {
             const b_idx = @intFromEnum(bucket);
             const count = counts[b_idx];
@@ -291,6 +295,8 @@ pub const ShadowPass = struct {
                     if (pip_id != last_pipeline_id.*) {
                         sg.applyPipeline(.{ .id = pip_id });
                         last_pipeline_id.* = pip_id;
+                        last_vb_id = 0;
+                        last_ib_id = 0;
                     }
 
                     var bind = sg.Bindings{};
@@ -298,6 +304,8 @@ pub const ShadowPass = struct {
                     bind.vertex_buffers[1] = item.instance_buffer;
                     bind.index_buffer = item.index_buffer;
                     sg.applyBindings(bind);
+                    last_vb_id = 0;
+                    last_ib_id = 0;
 
                     const inst_vs = shadow_shd.VsInstParams{
                         .light_view_proj = light_view_proj,
@@ -312,21 +320,26 @@ pub const ShadowPass = struct {
 
                     // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
                     if (cascade_idx) |c_idx| {
-                        const ext = aabb_w.extents();
-                        const max_dim = @max(ext.x, @max(ext.y, ext.z));
-                        if (c_idx == 2 and max_dim < 0.35) continue;
-                        if (c_idx == 3 and max_dim < 0.75) continue;
+                        if (c_idx == 1 and item.max_dim < 0.12) continue;
+                        if (c_idx == 2 and item.max_dim < 0.35) continue;
+                        if (c_idx == 3 and item.max_dim < 0.75) continue;
                     }
 
                     if (pip_id != last_pipeline_id.*) {
                         sg.applyPipeline(.{ .id = pip_id });
                         last_pipeline_id.* = pip_id;
+                        last_vb_id = 0;
+                        last_ib_id = 0;
                     }
 
-                    var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = item.vertex_buffer;
-                    bind.index_buffer = item.index_buffer;
-                    sg.applyBindings(bind);
+                    if (item.vertex_buffer.id != last_vb_id or item.index_buffer.id != last_ib_id) {
+                        var bind = sg.Bindings{};
+                        bind.vertex_buffers[0] = item.vertex_buffer;
+                        bind.index_buffer = item.index_buffer;
+                        sg.applyBindings(bind);
+                        last_vb_id = item.vertex_buffer.id;
+                        last_ib_id = item.index_buffer.id;
+                    }
 
                     const shadow_vs = shadow_shd.VsParams{
                         .mvp = Mat4.mul(light_view_proj, item.model),
@@ -362,6 +375,10 @@ pub const ShadowPass = struct {
         fn countChunkRange(pass: *ParallelShadowBinning, start: usize, end: usize) void {
             for (start..end) |chunk_id| {
                 const lo = chunk_id * pass.span;
+                if (lo >= pass.meshes.len) {
+                    pass.chunk_counts[chunk_id] = .{ 0, 0, 0, 0, 0, 0 };
+                    continue;
+                }
                 const hi = @min(lo + pass.span, pass.meshes.len);
                 var local: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
                 for (pass.meshes[lo..hi]) |mesh| {
@@ -375,6 +392,7 @@ pub const ShadowPass = struct {
         fn scatterChunkRange(pass: *ParallelShadowBinning, start: usize, end: usize) void {
             for (start..end) |chunk_id| {
                 const lo = chunk_id * pass.span;
+                if (lo >= pass.meshes.len) continue;
                 const hi = @min(lo + pass.span, pass.meshes.len);
                 var cursors = pass.chunk_offsets[chunk_id];
                 for (pass.meshes[lo..hi]) |mesh| {
@@ -497,6 +515,8 @@ pub const ShadowPass = struct {
             const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(frame_id, mesh) else mesh.cached_aabb;
             const model = if (!is_inst) scene_render_queue.worldMatrixCached(frame_id, mesh) else Mat4.identity;
             const skin_bones = if (mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null;
+            const ext = aabb_w.extents();
+            const max_dim = @max(ext.x, @max(ext.y, ext.z));
 
             self.binned_items.items[idx] = ShadowDrawItem{
                 .vertex_buffer = mesh.vertex_buffer,
@@ -506,6 +526,7 @@ pub const ShadowPass = struct {
                 .visible_instance_count = mesh.visible_instance_count,
                 .model = model,
                 .world_aabb = aabb_w,
+                .max_dim = max_dim,
                 .skin_matrices = skin_bones,
                 .bucket = bucketFor(mesh),
                 .is_instanced = is_inst,

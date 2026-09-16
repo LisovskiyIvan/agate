@@ -401,15 +401,23 @@ fn drawShaderMaterialItem(
     env.stats.triangles += item.index_count / 3;
 }
 
-fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) uniforms.FrameUniforms {
+threadlocal var fallback_uniforms: uniforms.FrameUniforms = undefined;
+
+fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) *const uniforms.FrameUniforms {
+    if (mesh_receive_shadows) {
+        if (ctx.uniforms_with_shadows) |u| return u;
+    } else {
+        if (ctx.uniforms_without_shadows) |u| return u;
+    }
     var state = shadow_uniforms;
     state.mesh_receive_shadows = mesh_receive_shadows;
-    return uniforms.buildFrameUniforms(state, ctx);
+    fallback_uniforms = uniforms.buildFrameUniforms(state, ctx);
+    return &fallback_uniforms;
 }
 
 // Packs the shared fragment uniforms for one mesh: the scene-level state is
 // copied and the per-mesh receive_shadows flag patched in.
-fn frameUniformsFor(env: *const Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) uniforms.FrameUniforms {
+fn frameUniformsFor(env: *const Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) *const uniforms.FrameUniforms {
     return frameUniformsForState(env.shadow_uniforms, mesh.receive_shadows, ctx);
 }
 

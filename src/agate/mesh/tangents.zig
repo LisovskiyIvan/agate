@@ -67,6 +67,70 @@ inline fn accumulateTriangleTangent(
     }
 }
 
+inline fn accumulateTriangleNormal(
+    vertices: []Vertex,
+    idx0: usize,
+    idx1: usize,
+    idx2: usize,
+) void {
+    if (idx0 >= vertices.len or idx1 >= vertices.len or idx2 >= vertices.len) return;
+
+    const p0 = Vec3.new(vertices[idx0].position[0], vertices[idx0].position[1], vertices[idx0].position[2]);
+    const p1 = Vec3.new(vertices[idx1].position[0], vertices[idx1].position[1], vertices[idx1].position[2]);
+    const p2 = Vec3.new(vertices[idx2].position[0], vertices[idx2].position[1], vertices[idx2].position[2]);
+
+    const edge1 = p1.sub(p0);
+    const edge2 = p2.sub(p0);
+    const fnorm = Vec3.cross(edge1, edge2);
+
+    vertices[idx0].normal[0] += fnorm.x;
+    vertices[idx0].normal[1] += fnorm.y;
+    vertices[idx0].normal[2] += fnorm.z;
+
+    vertices[idx1].normal[0] += fnorm.x;
+    vertices[idx1].normal[1] += fnorm.y;
+    vertices[idx1].normal[2] += fnorm.z;
+
+    vertices[idx2].normal[0] += fnorm.x;
+    vertices[idx2].normal[1] += fnorm.y;
+    vertices[idx2].normal[2] += fnorm.z;
+}
+
+/// Generates smooth area-weighted vertex normals for meshes lacking normal attributes.
+pub fn computeNormals(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]const u16) void {
+    for (vertices) |*v| {
+        v.normal = .{ 0, 0, 0 };
+    }
+
+    if (indices) |idx| {
+        var tri_i: usize = 0;
+        while (tri_i + 2 < idx.len) : (tri_i += 3) {
+            accumulateTriangleNormal(vertices, idx[tri_i], idx[tri_i + 1], idx[tri_i + 2]);
+        }
+    } else if (indices16) |idx16| {
+        var tri_i: usize = 0;
+        while (tri_i + 2 < idx16.len) : (tri_i += 3) {
+            accumulateTriangleNormal(vertices, idx16[tri_i], idx16[tri_i + 1], idx16[tri_i + 2]);
+        }
+    } else {
+        var tri_i: usize = 0;
+        while (tri_i + 2 < vertices.len) : (tri_i += 3) {
+            accumulateTriangleNormal(vertices, tri_i, tri_i + 1, tri_i + 2);
+        }
+    }
+
+    for (vertices) |*v| {
+        const n = Vec3.new(v.normal[0], v.normal[1], v.normal[2]);
+        const len = n.length();
+        if (len > 1e-6) {
+            const norm = n.scale(1.0 / len);
+            v.normal = .{ norm.x, norm.y, norm.z };
+        } else {
+            v.normal = .{ 0, 1, 0 };
+        }
+    }
+}
+
 pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]const u16) void {
     for (vertices) |*v| {
         v.tangent = .{ 0, 0, 0, 1 };
@@ -168,3 +232,26 @@ test "computeTangents right-handed vs mirrored UV handedness" {
     try std.testing.expectEqual(@as(f32, -1.0), lh_verts[1].tangent[3]);
     try std.testing.expectEqual(@as(f32, -1.0), lh_verts[2].tangent[3]);
 }
+
+test "computeNormals generates correct triangle surface normals" {
+    // Triangle in XY plane CCW: (0,0,0), (1,0,0), (0,1,0)
+    // Edge1 = (1,0,0), Edge2 = (0,1,0) -> Cross = (0,0,1)
+    var verts = [_]Vertex{
+        .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 0, 0 }, .uv = .{ 0, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 1, 0, 0 }, .normal = .{ 0, 0, 0 }, .uv = .{ 1, 0 }, .color = .{ 1, 1, 1, 1 } },
+        .{ .position = .{ 0, 1, 0 }, .normal = .{ 0, 0, 0 }, .uv = .{ 0, 1 }, .color = .{ 1, 1, 1, 1 } },
+    };
+    computeNormals(&verts, null, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[0].normal[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[0].normal[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts[0].normal[2], 1e-5);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[1].normal[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[1].normal[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts[1].normal[2], 1e-5);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[2].normal[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts[2].normal[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts[2].normal[2], 1e-5);
+}
+

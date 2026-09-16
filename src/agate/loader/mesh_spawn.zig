@@ -14,6 +14,7 @@ const Vertex = @import("../mesh.zig").Vertex;
 const SkinJointWeight = @import("../mesh.zig").types.SkinJointWeight;
 const MorphTarget = @import("../mesh.zig").MorphTarget;
 const MAX_MORPH_TARGETS = @import("../mesh.zig").MAX_MORPH_TARGETS;
+const computeNormals = @import("../mesh.zig").computeNormals;
 const computeTangents = @import("../mesh.zig").computeTangents;
 const Material = @import("../material.zig").Material;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
@@ -269,6 +270,9 @@ pub fn parsePrimitive(
                 indices[i] = @intCast(c.cgltf_accessor_read_index(ind_accessor, i));
             }
 
+            if (norm_accessor == null) {
+                computeNormals(vertices, indices, null);
+            }
             if (tan_accessor == null) {
                 computeTangents(vertices, indices, null);
             }
@@ -286,6 +290,9 @@ pub fn parsePrimitive(
                 indices[i] = @intCast(c.cgltf_accessor_read_index(ind_accessor, i));
             }
 
+            if (norm_accessor == null) {
+                computeNormals(vertices, null, indices);
+            }
             if (tan_accessor == null) {
                 computeTangents(vertices, null, indices);
             }
@@ -304,6 +311,9 @@ pub fn parsePrimitive(
             for (0..vert_count) |i| {
                 indices[i] = @intCast(i);
             }
+            if (norm_accessor == null) {
+                computeNormals(vertices, indices, null);
+            }
             if (tan_accessor == null) {
                 computeTangents(vertices, indices, null);
             }
@@ -317,6 +327,9 @@ pub fn parsePrimitive(
             defer scene.allocator.free(indices);
             for (0..vert_count) |i| {
                 indices[i] = @intCast(i);
+            }
+            if (norm_accessor == null) {
+                computeNormals(vertices, null, indices);
             }
             if (tan_accessor == null) {
                 computeTangents(vertices, null, indices);
