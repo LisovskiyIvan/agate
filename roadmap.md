@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 15.09.2026).
+> Дата: 10.09.2026 (обновлено 16.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -24,22 +24,22 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, отложенные create/update/destroy, async-ассеты | ✅ |
-| Рендер | Forward, 8 пайплайнов, opaque, сортировка по пайплайну/текстуре/дистанции | ✅ |
+| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты | ✅ |
+| Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) | ✅ |
-| Материал Standard | Diffuse-цвет/текстура | ✅ |
-| Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL | 🟡 |
+| Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
+| Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
 | OpenPBR, clearcoat, sheen, transmission | — | ❌ |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
 | HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 несжатый LDR (мипы, cube, sRGB), HDR Radiance | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
-| Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO | 🟡 |
-| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF и цветовые curves есть; MSAA — только offscreen main target | 🟡 |
+| Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur | 🟡 |
+| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur и цветовые curves есть; MSAA — только offscreen main target | 🟡 |
 | Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот | 🟡 |
 | GPU-симуляция, sub-emitters, flow maps | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
@@ -48,22 +48,22 @@
 | LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
 | CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
 | Упрощение мешей (Mesh simplification) | — | ❌ |
-| glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), внешние URI | 🟡 |
+| glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали | 🟡 |
 | Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (несжатые LDR-форматы) в glTF-загрузке | 🟡 |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
 | Layout-контейнеры, 3D GUI | — | ❌ |
-| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, панорама/затухание | 🟡 |
-| mp3/ogg, стриминг, шины, эффекты | — | ❌ |
-| Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике | ✅ |
-| Сериализация сцены (бинарный AGSC: TRS/материалы/свет/камера/post FX), экспорт | ✅ |
+| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler | ✅ |
+| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
+| Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
+| Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 584 unit-теста, `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 613 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -322,6 +322,59 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 Проверки волны: 584/584 (Debug + ReleaseSafe), `zig build fmt` зелёный,
 smoke-набор agate и sandbox (включая `--test-decal` и `--test-async-load`) чистый.
 
+### Волна 16: Инстанс-пикинг, профилировщик, OIT-сортировка и формат сцены v3 (15–16.09.2026)
+
+Коммиты: `b5cb6d7`, `4170bfc`.
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Точный инстанс-пикинг | `scene/picking.zig`, `scene.zig` | `pickWithRay` проверяет каждый видимый инстанс в пространстве отрисовки с корректным inverse-transpose нормалей и возвратом индекса `picked_instance` | ✅ |
+| Дозирование GPU-загрузок | `assets.zig`, `scene.zig` | `UploadQueue.drainCounted` с покадровым бюджетом (`upload_budget_per_frame = 4`), выделенный поток `io_runner` под сохранение/загрузку | ✅ |
+| Встроенный профилировщик | `profiler.zig`, `main.zig`, `root.zig` | Замер фаз (Update, Prepare, Shadow, Main, PostFX), эвристическая диагностика боттлнеков с рекомендациями, генерация HTML с интерактивным SVG-таймлайном, Markdown и Chrome Trace JSON (`chrome://tracing`) | ✅ |
+| Снимки памяти | `profiler.zig`, `mesh/mesh.zig` | `MemorySnapshot`: раздельный учёт памяти CPU-геометрии, общих аллокаций и видеопамяти VRAM (буферы и текстуры GPU) | ✅ |
+| OIT-сортировка прозрачности | `scene/render_queue.zig` | Поинстансная back-to-front сортировка прозрачных инстансов внутри `submitInstancedMesh` | ✅ |
+| Сериализация сцены v3 | `serialization.zig` | Бинарный формат v3: поддержка Entity ID, иерархии нод, кастомных игровых свойств с обратной совместимостью с v1 и v2 | ✅ |
+| Дедупликация текстур | `assets.zig` | Проверка существующих текстур в очереди (`findFile`, `getOrRequestFile`) для предотвращения повторного декодирования | ✅ |
+
+### Волна 17: Полностью неблокирующий рендер без разыменования мешей (16.09.2026)
+
+Коммит: `ea5ee2e`.
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Изоляция данных рендера | `scene/render_queue.zig`, `scene.zig` | Упаковка всех GPU-хэндлов, параметров материалов и матриц в `RenderMeshItem` и `RenderInstancedBatch` в `prepareFrame()` | ✅ |
+| Zero-dereference render | `scene/draw.zig`, `scene.zig` | Полное исключение чтения и разыменования указателей `*Mesh` во время `Scene.render()` | ✅ |
+| Lock-free shadow & outline | `passes/shadow_pass.zig`, `passes/outline_pass.zig` | Автономные `ShadowDrawItem` и `OutlineDrawItem` со своими предвычисленными бинами и матрицами | ✅ |
+| Сужение мьютекса фаз | `scene.zig`, `main.zig` | `phase_mutex` удерживается только во время `prepareFrame()`; `Scene.render()` исполняется параллельно и lock-free относительно игрового цикла | ✅ |
+
+### Волна 18: Квантование glTF, генерация нормалей, unlit-материалы и Camera Motion Blur (16.09.2026)
+
+Коммиты: `4d0aeb7`, `9624277`.
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| glTF KHR_mesh_quantization | `loader/mesh_spawn.zig`, `mesh.zig` | Декодирование нормализованных 8- и 16-битных целочисленных атрибутов (позиции, нормали, UV) | ✅ |
+| Автогенерация нормалей glTF | `mesh/tangents.zig`, `loader/scene_loader.zig` | `computeMissingNormals`: взвешенный по площади расчёт нормалей граней для мешей без атрибута нормалей | ✅ |
+| Оптимизация биннинга теней | `passes/shadow_pass.zig`, `scene/uniforms.zig` | Корректные границы бинов теней, предвычисление uniform-буферов | ✅ |
+| Unlit-режим материалов | `material.zig`, `loader/materials.zig`, шейдеры | Флаг `Material.unlit = true` отключает расчёт света и теней в Standard и Cook-Torrance PBR шейдерах для стилизованной графики и UI | ✅ |
+| Camera Motion Blur | `postprocess.zig`, `passes/postprocess_pass.zig`, `shaders/postprocess.glsl` | Полноэкранный эффект размытия движения камеры по delta VP-матрице с настраиваемым числом выборок (до 16) и интенсивностью | ✅ |
+
+### Волна 19: Пользовательская аудио-система: динамические DAG-шины, затухание и эффект Доплера (16.09.2026)
+
+Коммиты: `9624277`, `3aad9ff`, `bebad8f`, `691cf09`.
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Открытый реестр шин | `audio.zig`, `root.zig` | Открытый тип `BusId = enum(u8) { _, pub const invalid }` — движок не навязывает enum, пользователь сам создаёт мастер-, SFX-, музыку или любые другие шины | ✅ |
+| Прямой роутинг звуков | `audio.zig` | Воспроизведение без шины (`bus: ?BusId = null`) направляет голос или клип напрямую на мастер-выход | ✅ |
+| DAG-иерархия шин | `audio.zig` | Дерево шин: каскадное наследование эффективной громкости и mute с защитой от циклов (`getBusEffectiveVolume`), автоматический reparenting дочерних шин при уничтожении родителя | ✅ |
+| Безопасная емкость без аллокаций | `audio.zig`, `root.zig` | Фиксированный статический потолок до 128 шин с нулевыми аллокациями в аудиопотоке, настройка активной ёмкости при инициализации (`AudioConfig{ .max_buses = 32 }`) | ✅ |
+| 3D Spatial Audio & затухание | `audio.zig` | Модели `linear`, `inverse`, `exponential` с параметрами `min_distance`, `max_distance`, `rolloff`, переключение spatial/non-spatial на лету (`setBusSpatial`) | ✅ |
+| 3D Эффект Доплера | `audio.zig` | Расчёт изменения частоты по векторам скоростей слушателя и источников звука (`setListenerVelocity`, скорость голоса/клипа, `doppler_factor`) | ✅ |
+| Интеграция с синтезатором и сценой | `audio.zig`, `sandbox_scene.zig`, `sandbox_ui.zig` | Хелперы `playImpactOn`, `playExplosionOn`, `playBlipOn`, полное управление шинами в UI и сцене sandbox | ✅ |
+
+Проверки: 613/613 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят за ~1 сек, >200 FPS в runtime.
+
 ---
 
 ## ✅ Что сделано
@@ -331,17 +384,24 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Нативное приложение на sokol: macOS (Metal), Windows (D3D11), Linux (GL).
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
-* Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов (`SceneStats`).
-* Многопоточность: game/render threads под coarse phase mutex, `jobs.Pool`/`TaskRunner`, lock-free `Handoff`/`SpscRing`, affinity-маркер `gpu_thread`, отложенные создание/обновление/уничтожение GPU-ресурсов вне графического потока.
-* 584 unit-теста в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
+* Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов, тайминги фаз (`SceneStats`).
+* Многопоточность: game/render threads под узким phase mutex (`prepareFrame`), `jobs.Pool`/`TaskRunner`, lock-free `Handoff`/`SpscRing`, affinity-маркер `gpu_thread`, отложенные создание/обновление/уничтожение GPU-ресурсов вне графического потока.
+* Встроенный профилировщик (`profiler.zig`): точный замер фаз кадра (Update, Prepare, Shadow, Main, PostFX), автоматическая эвристическая диагностика боттлнеков с подсказками, экспорт в интерактивный HTML (SVG-таймлайн), Markdown и Chrome Trace Event JSON (`chrome://tracing`).
+* Мониторинг памяти (`MemorySnapshot`): раздельный учёт памяти геометрии на CPU, общих аллокаций рантайма и видеопамяти VRAM для GPU-буферов и текстур.
+* Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
+* Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
+* 613 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
 * Forward-рендер, шейдеры cross-compile через sokol-shdc (GLSL410/Metal/HLSL5).
-* 8 пайплайнов: Standard, PBR, Instanced, Skinned PBR — каждый под u16/u32 индексы.
-* Сортировка очереди: сначала непрозрачные Standard/PBR группами по текстуре, front-to-back для early-Z.
+* 8 пайплайнов: Standard, PBR, Instanced, Skinned PBR — каждый под u16/u32 индексы + double-sided твины.
+* Полностью неблокирующий рендеринг: zero-dereference рендер (`Scene.render` исполняется без захвата блокировок симуляции и не разыменовывает указатели `*Mesh`); все GPU-хэндлы, матрицы и дескрипторы материалов упаковываются в фазе `prepareFrame()` в изолированные структуры `RenderMeshItem`, `RenderInstancedBatch`, `ShadowDrawItem`, `OutlineDrawItem`.
+* Сортировка очереди: непрозрачные Standard/PBR группами по текстуре, front-to-back для early-Z; back-to-front для прозрачных мешей.
+* OIT-сортировка прозрачных инстансов: поинстансная сортировка back-to-front внутри батча `submitInstancedMesh` перед заливкой в GPU instance-буфер.
 * Frustum culling AABB, включая SIMD-батч по 4 инстанса (`Frustum.intersectsAABB4`).
-* GPU-инстансинг: динамический instance-буфер с дедупликацией загрузок по хэшу.
+* Occlusion culling: CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая консервативная пирамида глубин, O(1) AABB-тест, 0 GPU stall/pop-in.
+* GPU-инстансинг: динамический instance-буфер с дедупликацией загрузок по хэшу (Standard + Cook-Torrance PBR + CSM + Spot shadows).
 * Offscreen-буфер для постобработки с depth-текстурой; UI-оверлей поверх.
 * Документированные проходы: shadow → main → skybox → particles → SSAO → post-process → UI (`passes/`).
 
@@ -350,20 +410,23 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * `ArcRotateCamera` — орбита мышью, зум колесом, лимиты радиуса/угла.
 * `FreeCamera` — движение WASD/стрелками + Space/Ctrl, обзор ЛКМ-драгом, скорость/чувствительность, `update(dt)`.
 * `FollowCamera` — следование за мешем или точкой с радиусом, высотой, смещением угла и сглаживанием.
-* `Camera` — union-абстракция (arc_rotate/free/follow), `Scene.updateCamera(dt)`; проходы и пикинг работают с любым типом.
+* `Camera` — union-абстракция (arc_rotate/free/follow/target/fly), `Scene.updateCamera(dt)`; проходы и пикинг работают с любым типом.
+* Мультикамера / PIP (Picture-in-Picture) с раздельными viewport'ами.
 
 ### Свет и тени
 
 * `HemisphericLight` (небо + ground color) — всегда одна.
 * `DirectionalLight` — `Scene.createDirectionalLight`; управляет солнцем (направление, цвет, интенсивность, 4-каскадный CSM), hemi остаётся ambient.
-* До 4 `PointLight` с range/интенсивностью и до 2 `SpotLight` (inner/outer cone) — per-pixel затухание.
-* Тени: 4-каскадный CSM (атлас 2048², 4 × 1024²), 16-выборок Poisson PCF, depth bias + normal bias, мягкость, fade дальнего каскада, debug-режим каскадов.
+* До 4 `PointLight` с range/интенсивностью и до 2 `SpotLight` (inner/outer cone) — per-pixel затухание, выбор значимых источников в камере за 1 проход.
+* Тени: 4-каскадный CSM (атлас 2048², 4 × 1024²), 16-выборок Poisson PCF / переменная полутень PCSS, depth bias + normal bias, мягкость, fade дальнего каскада.
+* Перспективные тени SpotLight: depth-атлас 1024×512 (до 2 прожекторов), 4-tap PCF-фильтрация.
 * `mesh.cast_shadows` / `mesh.receive_shadows` на каждый меш; скелетные меши тоже отбрасывают тени (skinned shadow-пайплайн).
 
 ### Материалы и IBL
 
-* `StandardMaterial`: diffuse color + текстура.
-* `PBRMaterial` (metallic-roughness, Cook-Torrance): albedo, normal, metallic-roughness, emissive, occlusion (сила), alpha, цветовые факторы, environment intensity, per-slot UV-трансформы (KHR_texture_transform), выбор каналов AO/roughness/metallic (ручные материалы).
+* `StandardMaterial`: diffuse color + текстура, поддержка флага `unlit`.
+* `PBRMaterial` (metallic-roughness, Cook-Torrance): albedo, normal, metallic-roughness, emissive, occlusion (сила), alpha, цветовые факторы, environment intensity, per-slot UV-трансформы (KHR_texture_transform), выбор каналов AO/roughness/metallic.
+* Unlit-режим (`Material.unlit = true`): полный обход расчётов освещения и теней в PBR и Standard шейдерах для стилизованной геометрии, спецэффектов и элементов интерфейса.
 * IBL от skybox-кубмапы, exposure, выбор текстуры отражений.
 * Дефолтные 1×1 текстуры (white/black/flat normal/cube) — PBR работает без ассетов.
 
@@ -371,33 +434,43 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 * 2D-текстуры: декод PNG/JPEG/… через stb_image, RGBA8, настройки wrap/min/mag, полная CPU-цепочка мипмапов (box-filter), процедурные checkerboard и particle-dot.
 * CubeTexture: 6 граней, дефолтная 1×1, процедурный skybox-градиент, развёртка equirectangular-панорамы в куб, загрузка граней из файлов.
-* Асинхронный декод картинок glTF на worker-потоках с fallback на синхронный путь.
+* Асинхронный декод картинок glTF на worker-потоках с fallback на синхронный путь и дедупликацией в очереди загрузок.
 
 ### Геометрия
 
 * `Mesh` + `InstancedMesh`, дочерние меши, `BoneAttachment` (крепление к кости).
-* `MeshBuilder`: Box (с цветами граней), Sphere, Cylinder, Capsule, Ground (subdivisions), Terrain (heightmap), Torus, TorusKnot, Disc, Ribbon (набор путей), Lathe (профиль вращения).
-* Генерация касательных (`computeTangents`), u16/u32 индексы, локальный AABB, опциональное хранение CPU-геометрии для физики (hull/mesh-коллайдеры).
+* `MeshBuilder`: Box (с цветами граней), Sphere, Cylinder, Capsule, Ground (subdivisions), Terrain (heightmap), Torus, TorusKnot, Disc, Ribbon (набор путей), Lathe (профиль вращения), Plane, Tube, Extrude, Lines, Polygon (с отверстиями и ear-clipping), TrailMesh.
+* CSG (Constructive Solid Geometry): BSP-дерево, булевы операции (Union, Subtract, Intersect).
+* LOD: иерархические дистанционные уровни детальности мешей (`addLODLevel`, `getLODForCamera`) с автоматическим переключением.
+* Декали: проектор ориентированного куба (OBB) с отсечением по Sutherland-Hodgman, расчётом нормалей и tangents.
+* Автоматическая генерация нормалей (`computeMissingNormals`): расчёт взвешенных по площади нормалей граней при их отсутствии в файле модели.
+* Поддержка glTF `KHR_mesh_quantization`: декодирование 8/16-битных нормализованных целочисленных вершинных атрибутов.
+* Генерация касательных (`computeTangents`), u16/u32 индексы, локальный AABB, хранение CPU-геометрии для физики.
 * Вершинные цвета (color0) поддерживаются Standard/PBR шейдерами.
 
 ### Анимация
 
 * Скелеты до 64 костей (`MAX_BONES`), GPU-скиннинг через uniform matrix palette.
-* glTF-скины и каналы translation/rotation/scale; линейная и step-интерполяция.
+* glTF-скины и каналы translation/rotation/scale; линейная, step и Hermite cubic-spline интерполяция.
 * `AnimationGroup`: play/pause/stop, loop, `playRange`, скорость (в т.ч. отрицательная), вес.
 * Блендинг базовых клипов (1, 2 и N клипов), аддитивные слои, fadeTo/fadeIn/fadeOut/crossFadeTo.
+* События и таймлайн-маркеры анимаций с колбэками.
+* Морф-таргеты glTF (до 8 targets) с CPU/GPU-блендингом и синхронизацией каналов весов.
 * Крепления (sockets) мешей к костям, анимированные тени для скелетов.
 
 ### Частицы
 
 * `ParticleSystem`: CPU-симуляция, рендер GPU-инстансами.
-* Режимы additive / alpha-blend, текстура частицы (есть процедурный dot).
-* Эмиттер-бокс, emit rate, burst, гравитация, время жизни, интерполяция цвета и размера start→end.
+* Режимы additive / alpha-blend, текстура частицы (есть процедурный dot), спрайт-листы (spritesheets) и угловое вращение.
+* Локальное пространство эмиттера, эмиттер-бокс, emit rate, burst, гравитация, время жизни, интерполяция цвета и размера start→end.
 
 ### Постобработка
 
 * Tonemapping: ACES или Reinhard, exposure.
-* Bloom (bright pass + гало), виньетка, saturation/contrast, chromatic aberration, sharpen (unsharp mask), film grain, white balance (temperature/tint).
+* Bloom (bright pass + Karis downsample + tent upsample, мип-пирамида 3–7 мипов), виньетка, saturation/contrast, chromatic aberration, sharpen (unsharp mask), film grain, white balance (temperature/tint).
+* Camera Motion Blur: шейдерное размытие движения камеры по матрицам вида-проекции текущего и предыдущего кадров (`prev_view_proj`), настраиваемое число выборок (до 16) и интенсивность.
+* DoF (Depth of Field) по глубине (14 golden-angle taps CoC), параметрические цветовые curves (shadows/midtones/highlights).
+* Outline-слой (inverse hull, контур объектов с настраиваемой шириной и цветом).
 * FXAA 3.11.
 * Дистанционный + высотный fog с подмешиванием цвета солнца (sun scattering).
 * SSR: 16 шагов screen-space марша, fresnel, edge fade, настраиваемая интенсивность/толщина/дистанция.
@@ -406,38 +479,43 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 ### Физика (Box3D v0.1.0)
 
-* Тела: static/dynamic/kinematic, массы, restitution, friction, linear/angular damping, гравитация.
+* Тела: static/dynamic/kinematic, массы, restitution, friction, linear/angular damping, гравитация, спящий режим (`!is_awake`).
 * Коллайдеры: box, sphere, capsule, convex hull, triangle mesh (static), heightfield.
 * Compound-коллайдеры: дополнительные box/sphere/capsule/hull child shapes с фильтрами и событиями.
 * Суставы: distance, spherical, revolute (+limits/motor), wheel (+spin/steering), prismatic (+limits/motor), motor, weld, parallel.
-* Character controller (кинематический mover), rope (цепочка сегментов, резка/ремонт).
+* Character controller (кинематический mover), rope (цепочка сегментов, резка/ремонт), ragdoll и vehicle-хелперы.
 * Сенсоры и события: sensor events, contact events, contact hit events.
 * Raycast с фильтрами, `applyImpulse` / `applyTorqueImpulse` / `applyForce`, radial explosion (`applyExplosion`).
 * Пространственные запросы: `queryAABB` / `querySphere` / `queryPoint` (+ `*WithFilter`) и `spherecast`.
-* Debug-геометрия: `appendDebugLines` / `DebugLine` — каркасы коллайдеров (box/sphere/capsule/compound/AABB) для внешнего отладчика.
+* Debug-геометрия: `appendDebugLines` / `DebugLine` + 3D-пасс линий физических форм с depth-test.
 * Фиксированный шаг 1/60 c аккумулятором (Fix Your Timestep).
 
 ### UI
 
-* `UICanvas`: экранный immediate-mode рендер квадов.
-* Примитивы: rect, outline, panel, прогресс-бар, кнопка, бейдж, checkbox, slider, divider, arrow, line (`drawLine`), SDF-текст (обычный/жирный/с обводкой), `measureText`, hit-test.
-* SDF-шрифт зашит в движок (SDF-атлас), масштабируется без потери чёткости.
-* `Scene.projectPoint` — мировые точки в экранные (используется sandbox для 3D-подписей над объектами).
+* `UICanvas`: экранный immediate-mode рендер квадов с геометрическим динамическим перевыделением GPU-буферов.
+* Примитивы: rect, outline, panel, прогресс-бар, кнопка, бейдж, checkbox, slider, dropdown, скролл (`ScrollState`), поле ввода текста (`TextInputState`, UTF-8 редактирование), divider, arrow, line (`drawLine`), SDF-текст (обычный/жирный/с обводкой), `measureText`, hit-test.
+* SDF-шрифт зашит в движок (SDF-атлас), масштабируется без потери чёткости, CLI-флаг `--ui-scale N`.
+* `Scene.projectPoint` — мировые точки в экранные (используется для 3D-подписей над объектами).
 
 ### Аудио
 
-* Процедурный синтез на sokol.audio: thump, noise burst, blip — без аудиоассетов.
-* `AudioClip.fromWavMemory` / `fromWavFile` — WAV PCM 8/16/24/32-bit и float32, mono/stereo, ресемплинг; `AudioEngine.playClip` с loop/rate/позиционированием.
-* 24 голоса с вытеснением, мастер-громкость, mute.
-* Позиционирование: затухание по дистанции (30 м), панорама по вектору слушателя.
-* Потокобезопасный микс в audio-callback, ядро микса покрыто тестами.
+* Процедурный синтез на sokol.audio: thump, noise burst, blip — без внешних аудиоассетов.
+* `AudioClip.fromWavMemory` / `fromWavFile` — WAV PCM 8/16/24/32-bit и float32, mono/stereo, потоковый ресемплинг; `AudioEngine.playClip` с loop/rate/позиционированием.
+* Динамический открытый реестр шин (`BusId = enum(u8) { _, pub const invalid }`): пользователь сам объявляет любые шины (Master, SFX, Music, Ambient, UI, Weapons и др.).
+* Прямой роутинг по умолчанию: воспроизведение звуков без шины (`bus: ?BusId = null`) направляет поток напрямую на мастер-выход.
+* DAG-дерево шин (Parent-Child): каскадное наследование эффективной громкости и mute с защитой от циклов (`getBusEffectiveVolume`), авто-переподключение дочерних шин при удалении родителя.
+* Статическая память без аллокаций: потолок 128 шин (`max_bus_capacity`), конфигурируемый активный лимит при старте через `AudioConfig{ .max_buses = 32 }` — 100% real-time safety в потоке аудио.
+* 3D Spatial Audio & затухание: модели `linear`, `inverse`, `exponential` с параметрами `min_distance`, `max_distance`, `rolloff`. Динамическое переключение spatial/non-spatial на лету (`setBusSpatial`).
+* 3D Эффект Доплера: расчёт сдвига высоты тона по взаимным скоростям слушателя и источников (`setListenerVelocity`, скорость эмиттера, `doppler_factor`).
+* Хелперы синтезатора с привязкой к шинам: `playImpactOn(bus, pos, speed)`, `playExplosionOn(bus, pos, size)`, `playBlipOn(bus, freq)`.
+* 24 аппаратных голоса с вытеснением, lock-free SPSC кольцо команд, атомики громкости/mute.
 
 ### Пикинг и ввод
 
-* `Scene.pick` / `pickWithRay` — CPU-луч по AABB/сферам видимых мешей, с учётом sphere-коллайдеров.
-* `PhysicsWorld.raycast` — точный луч по физическим формам, включая heightfield/hull/mesh.
-* `ArcRotateCamera` — ЛКМ-орбита, колесо-зум, лимиты радиуса/угла; `FreeCamera` и `FollowCamera` — см. раздел «Камеры».
-* События окна/мыши/клавиатуры через sokol; sandbox показывает полноценное управление.
+* `Scene.pick` / `pickWithRay` — CPU-луч по AABB/сферам видимых мешей, точный луч по физическим телам (`PhysicsWorld.raycast`).
+* Точный инстанс-пикинг: проверка каждого видимого инстанса `InstancedMesh` в пространстве отрисовки с корректным inverse-transpose нормалей и возвратом индекса инстанса (`picked_instance`).
+* `ArcRotateCamera` — ЛКМ-орбита, колесо-зум, лимиты радиуса/угла; `FreeCamera`, `FollowCamera`, `FlyCamera`, `TargetCamera` — см. раздел «Камеры».
+* События окна/мыши/клавиатуры через sokol; sandbox демонстрирует комплексное управление с hotkeys и HUD.
 
 ---
 
@@ -447,20 +525,20 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 |---|---|---|
 | Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP) | Камера-ригов, touch/pinch, инерции |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + 1 directional (солнце) + 4 point + 2 spot (выбор лучших по камере) | Area-света, кластерного освещения, light probes, нескольких directional |
-| Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS | Теней от point/spot, ESM, каскадных настроек per-light |
-| PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL | Расширенных слоёв PBR, OpenPBR, unlit-режима |
-| Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced | Per-instance сортировки внутри instanced-группы (OIT), back-face освещение по геометрическим нормалям |
+| Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight | Теней от point-светов, ESM, каскадных настроек per-light |
+| PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим | Расширенных слоёв PBR, OpenPBR |
+| Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 несжатый LDR (мипы/cube/sRGB) | EXR, DDS, KTX2-суперкомпрессии и блочных форматов (нужен транскодер), HDR-16F в KTX2, видеотекстур, render-target/reflection probe текстур |
-| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | Motion blur, TAA, LUT-текстур, glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
+| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, camera motion blur, цветовые curves, outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | TAA, LUT-текстур, glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing | GPU-морфов, ретаргетинга, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
-| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
+| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider/dropdown/скролл/text input | Layout-контейнеров, 3D-виджетов, загрузки шрифтов, фокуса/состояния, редактора |
-| Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, позиционирование | mp3/ogg, стриминга, шин/эффектов, doppler/окклюзии |
+| Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler | mp3/ogg, потоковый стриминг музыки с диска, DSP-эффекты (reverb/lowpass/highpass) |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
-| Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, debug-режимы SSAO/каскадов, `appendDebugLines` | Инспектора сцены, профилировщика, редактирования на лету |
+| Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
 
 ---
 
@@ -472,17 +550,17 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 **Свет и тени**
 * Несколько directional-светов одновременно.
-* Тени от point/spot, PCSS/contact hardening, ESM, blur-exponential.
+* Тени от point-светов, PCSS/contact hardening для точечных источников, ESM, blur-exponential.
 * Area (rect) свет, light probes, динамический IBL, кластерное освещение (сотни источников), объёмный свет/атмосфера.
 
 **Материалы и текстуры**
 * OpenPBR, clearcoat, sheen, anisotropic, transmission, subsurface.
 * NodeMaterial/ShaderMaterial (кастомные шейдеры без пересборки движка), библиотека материалов.
 * EXR/DDS, KTX2-суперкомпрессия (BasisLZ/Zstd; нужен basis_universal), BC/ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды.
-* Сортировка прозрачных инстансов; back-face освещение по геометрическим нормалям.
+* Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
-* Motion blur, TAA, MSAA/SSAA (MSAA — только offscreen main target), LUT-текстура цветокоррекции.
+* TAA, MSAA/SSAA (MSAA — только offscreen main target), LUT-текстура цветокоррекции (Camera Motion Blur уже реализован).
 * Glow layer, highlight layer, lens flares, snapshot-рендер, SSR/SSAO более высокого качества.
 
 **Геометрия**
@@ -503,7 +581,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Grid/layout-контейнеры, привязки/анимации UI, 3D-GUI, загрузка TTF/OTF-шрифтов и Unicode (сейчас зашитый SDF-атлас, ASCII).
 
 **Аудио**
-* mp3/ogg (WAV уже поддержан), стриминг, музыкальные циклы, шины/эффекты, doppler, окклюзия.
+* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска, DSP-фильтры/эффекты (reverb, echo, lowpass/highpass), звуковая окклюзия геометрией (динамические шины, DAG-дерево, затухание и Doppler уже реализованы).
 
 **Ассеты и данные**
 * Экспорт glTF, AssetManager с прогрессом и кэшем.
