@@ -8,6 +8,9 @@ const VoiceKind = audio.VoiceKind;
 const Voice = audio.Voice;
 const BusId = audio.BusId;
 const AudioBus = audio.AudioBus;
+const BiquadFilterType = audio.BiquadFilterType;
+const BusFilterConfig = audio.BusFilterConfig;
+const BusReverbConfig = audio.BusReverbConfig;
 
 fn peakAbs(buf: []const f32, from_frame: usize, to_frame: usize) f32 {
     var peak: f32 = 0.0;
@@ -1079,4 +1082,178 @@ test "AudioEngine configurable bus capacity at initialization" {
     // 4. Clamping behavior
     var clamped_eng = AudioEngine.init(.{ .max_buses = 500 });
     try std.testing.expectEqual(@as(usize, 128), clamped_eng.getBusCapacity());
+}
+
+test "AudioEngine bus filter lowpass attenuates high frequency sounds" {
+    var eng = AudioEngine{};
+    const raw_bus = eng.createNonSpatialBus("raw", 1.0) orelse return error.BusCreationFailed;
+    const lp_bus = eng.createNonSpatialBus("lp", 1.0) orelse return error.BusCreationFailed;
+
+    // Apply lowpass filter at 300 Hz to lp_bus
+    eng.setBusFilter(lp_bus, .lowpass, 300.0, 0.7071);
+    const cfg = eng.getBusFilter(lp_bus);
+    try std.testing.expectEqual(BiquadFilterType.lowpass, cfg.filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0), cfg.cutoff, 0.1);
+
+    // Play high-frequency 3000 Hz tone on raw_bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = raw_bus,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 3000.0,
+        .freq_end = 3000.0,
+    });
+    var raw_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&raw_buf);
+    const raw_energy = channelEnergy(&raw_buf, 0);
+    try std.testing.expect(raw_energy > 0.1);
+
+    // Now play the same 3000 Hz tone on lp_bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = lp_bus,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 3000.0,
+        .freq_end = 3000.0,
+    });
+    var lp_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&lp_buf);
+    const lp_energy = channelEnergy(&lp_buf, 0);
+
+    // 3000 Hz is 10x cutoff (300 Hz), 2nd order Butterworth drops ~40 dB => energy should be < 10% of raw
+    try std.testing.expect(lp_energy < raw_energy * 0.1);
+
+    // Open filter cutoff to 5000 Hz
+    eng.setBusFilterCutoff(lp_bus, 5000.0);
+    eng.play(.{
+        .kind = .blip,
+        .bus = lp_bus,
+        .volume = 0.8,
+        .duration = 0.05,
+        .freq = 3000.0,
+        .freq_end = 3000.0,
+    });
+    var open_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&open_buf);
+    const open_energy = channelEnergy(&open_buf, 0);
+    try std.testing.expect(open_energy > lp_energy * 5.0);
+
+    // Clear filter
+    eng.clearBusFilter(lp_bus);
+    try std.testing.expectEqual(BiquadFilterType.none, eng.getBusFilter(lp_bus).filter_type);
+}
+
+test "AudioEngine bus reverb generates reverberation tail after voice completes" {
+    var eng = AudioEngine{};
+    const dry_bus = eng.createNonSpatialBus("dry", 1.0) orelse return error.BusCreationFailed;
+    const rev_bus = eng.createNonSpatialBus("reverb", 1.0) orelse return error.BusCreationFailed;
+
+    try std.testing.expect(!eng.isBusReverbEnabled(rev_bus));
+    try std.testing.expect(eng.setBusReverb(rev_bus, .{
+        .room_size = 0.8,
+        .damping = 0.2,
+        .wet = 0.6,
+        .dry = 0.8,
+    }));
+    try std.testing.expect(eng.isBusReverbEnabled(rev_bus));
+
+    // Play short 0.02s impulse on dry bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = dry_bus,
+        .volume = 0.8,
+        .duration = 0.02,
+        .freq = 440.0,
+        .freq_end = 440.0,
+    });
+    var initial_buf: [4410]f32 = [_]f32{0.0} ** 4410; // 0.05s -> voice finishes here
+    eng.renderFrames(&initial_buf);
+
+    // Next buffer (t in [0.05, 0.10]): dry bus should be completely silent
+    var dry_tail_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&dry_tail_buf);
+    try std.testing.expect(peakAbs(&dry_tail_buf, 0, 2205) < 1e-6);
+
+    // Now play short 0.02s impulse on reverb bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = rev_bus,
+        .volume = 0.8,
+        .duration = 0.02,
+        .freq = 440.0,
+        .freq_end = 440.0,
+    });
+    eng.renderFrames(&initial_buf); // voice finishes
+
+    // Next buffer: reverb tail should still be ringing out audibly!
+    var rev_tail_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&rev_tail_buf);
+    const rev_peak = peakAbs(&rev_tail_buf, 0, 2205);
+    try std.testing.expect(rev_peak > 1e-4);
+
+    // Clear reverb releases slot
+    eng.clearBusReverb(rev_bus);
+    try std.testing.expect(!eng.isBusReverbEnabled(rev_bus));
+}
+
+test "AudioEngine bus audio presets underwater, muffled, telephone, cave, room" {
+    var eng = AudioEngine{};
+    const b = eng.createNonSpatialBus("fx_bus", 1.0) orelse return error.BusCreationFailed;
+
+    eng.setBusUnderwater(b);
+    var filter_cfg = eng.getBusFilter(b);
+    try std.testing.expectEqual(BiquadFilterType.lowpass, filter_cfg.filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 600.0), filter_cfg.cutoff, 0.1);
+
+    eng.setBusMuffled(b);
+    filter_cfg = eng.getBusFilter(b);
+    try std.testing.expectEqual(BiquadFilterType.lowpass, filter_cfg.filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 1200.0), filter_cfg.cutoff, 0.1);
+
+    eng.setBusTelephone(b);
+    filter_cfg = eng.getBusFilter(b);
+    try std.testing.expectEqual(BiquadFilterType.bandpass, filter_cfg.filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 1800.0), filter_cfg.cutoff, 0.1);
+
+    try std.testing.expect(eng.setBusCaveReverb(b));
+    try std.testing.expect(eng.isBusReverbEnabled(b));
+    const cave_rev = eng.getBusReverb(b).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.85), cave_rev.room_size, 1e-3);
+
+    try std.testing.expect(eng.setBusRoomReverb(b));
+    const room_rev = eng.getBusReverb(b).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), room_rev.room_size, 1e-3);
+}
+
+test "AudioEngine DAG hierarchy mixes child filtered audio into parent reverb" {
+    var eng = AudioEngine{};
+    const parent = eng.createNonSpatialBus("parent_hall", 1.0) orelse return error.BusCreationFailed;
+    const child = eng.createNonSpatialBus("child_synth", 1.0) orelse return error.BusCreationFailed;
+    eng.setBusParent(child, parent);
+
+    // Parent has cave reverb
+    _ = eng.setBusCaveReverb(parent);
+    // Child has underwater lowpass filter
+    eng.setBusUnderwater(child);
+
+    // Play audio on child bus
+    eng.play(.{
+        .kind = .blip,
+        .bus = child,
+        .volume = 0.8,
+        .duration = 0.02,
+        .freq = 440.0,
+        .freq_end = 440.0,
+    });
+
+    var buf1: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf1);
+    try std.testing.expect(channelEnergy(&buf1, 0) > 0.01);
+
+    // Tail buffer after voice has ended: parent reverb should be ringing
+    var tail: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&tail);
+    try std.testing.expect(peakAbs(&tail, 0, 2205) > 1e-4);
 }

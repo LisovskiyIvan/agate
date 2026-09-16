@@ -14,6 +14,13 @@ const Vec3 = math.Vec3;
 const clip_mod = @import("audio/clip.zig");
 pub const AudioClip = clip_mod.AudioClip;
 
+const dsp = @import("audio/dsp.zig");
+pub const BiquadFilterType = dsp.BiquadFilterType;
+pub const BusFilterConfig = dsp.BusFilterConfig;
+pub const BusReverbConfig = dsp.BusReverbConfig;
+pub const BiquadFilter = dsp.BiquadFilter;
+pub const ReverbProcessor = dsp.ReverbProcessor;
+
 pub const BusId = enum(u8) {
     _,
 
@@ -65,6 +72,8 @@ pub const BusConfig = struct {
     max_distance: f32 = 30.0,
     rolloff: f32 = 1.0,
     doppler_factor: f32 = 1.0,
+    filter: BusFilterConfig = .{},
+    reverb: ?BusReverbConfig = null,
 };
 
 pub const AudioEngine = struct {
@@ -72,6 +81,9 @@ pub const AudioEngine = struct {
     pub const max_distance = 30.0;
     pub const max_commands = 64;
     pub const bus_limit = max_bus_capacity;
+    pub const max_reverbs: usize = 4;
+    pub const chunk_frames: usize = 64;
+    pub const chunk_samples: usize = chunk_frames * 2;
 
     const Command = union(enum) {
         voice: struct {
@@ -140,6 +152,20 @@ pub const AudioEngine = struct {
     bus_max_dist: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 30.0)))} ** max_bus_capacity,
     bus_rolloff: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
     bus_doppler: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
+
+    // DSP effects (filters and reverb units)
+    bus_filter_type: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(BiquadFilterType.none))} ** max_bus_capacity,
+    bus_filter_cutoff: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1000.0)))} ** max_bus_capacity,
+    bus_filter_q: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 0.7071)))} ** max_bus_capacity,
+    bus_filters: [max_bus_capacity]dsp.BiquadFilter = [_]dsp.BiquadFilter{dsp.BiquadFilter{}} ** max_bus_capacity,
+
+    reverbs: [max_reverbs]dsp.ReverbProcessor = [_]dsp.ReverbProcessor{dsp.ReverbProcessor.init(44100.0)} ** max_reverbs,
+    bus_reverb_slot: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_bus_capacity,
+    reverb_bus_owner: [max_reverbs]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_reverbs,
+
+    // Block-based scratch chunk buffers
+    bus_chunks: [max_bus_capacity][chunk_samples]f32 = [_][chunk_samples]f32{[_]f32{0.0} ** chunk_samples} ** max_bus_capacity,
+
     muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listener_pos: Vec3 = Vec3.zero,
     listener_right: Vec3 = Vec3.new(1.0, 0.0, 0.0),
@@ -180,6 +206,7 @@ pub const AudioEngine = struct {
         });
         if (saudio.isvalid()) {
             self.sample_rate = @floatFromInt(saudio.sampleRate());
+            for (&self.reverbs) |*r| r.setSampleRate(self.sample_rate);
             self.started = true;
         }
     }
@@ -647,7 +674,14 @@ pub const AudioEngine = struct {
         self.bus_rolloff[idx].store(@bitCast(@max(0.0, config.rolloff)), .release);
         self.bus_doppler[idx].store(@bitCast(std.math.clamp(config.doppler_factor, 0.0, 5.0)), .release);
         self.bus_active[idx].store(true, .release);
-        return @enumFromInt(@as(u8, @intCast(idx)));
+        const idx_bus = @as(BusId, @enumFromInt(@as(u8, @intCast(idx))));
+        if (config.filter.filter_type != .none) {
+            self.setBusFilter(idx_bus, config.filter.filter_type, config.filter.cutoff, config.filter.q);
+        }
+        if (config.reverb) |rev_cfg| {
+            _ = self.setBusReverb(idx_bus, rev_cfg);
+        }
+        return idx_bus;
     }
 
     pub fn createSpatialBus(self: *AudioEngine, name: []const u8, config: ?BusConfig) ?BusId {
@@ -681,6 +715,12 @@ pub const AudioEngine = struct {
         self.bus_max_dist[id].store(@bitCast(@max(0.002, config.max_distance)), .release);
         self.bus_rolloff[id].store(@bitCast(@max(0.0, config.rolloff)), .release);
         self.bus_doppler[id].store(@bitCast(std.math.clamp(config.doppler_factor, 0.0, 5.0)), .release);
+        if (config.filter.filter_type != .none) {
+            self.setBusFilter(bus, config.filter.filter_type, config.filter.cutoff, config.filter.q);
+        }
+        if (config.reverb) |rev_cfg| {
+            _ = self.setBusReverb(bus, rev_cfg);
+        }
     }
 
     pub fn destroyBus(self: *AudioEngine, bus: BusId) void {
@@ -689,6 +729,8 @@ pub const AudioEngine = struct {
         if (id >= cap) return;
         if (!self.bus_active[id].load(.acquire)) return;
         self.stopBus(bus);
+        self.clearBusFilter(bus);
+        self.clearBusReverb(bus);
         const my_parent = self.bus_parent[id].load(.acquire);
         for (0..cap) |i| {
             if (self.bus_active[i].load(.acquire) and self.bus_parent[i].load(.acquire) == id) {
@@ -887,6 +929,125 @@ pub const AudioEngine = struct {
         }
     }
 
+    // --- Bus DSP Effect Methods (Biquad Filter & Reverb) ---
+
+    pub fn setBusFilter(self: *AudioEngine, bus: BusId, filter_type: BiquadFilterType, cutoff: f32, q: f32) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_filter_type[id].store(@intFromEnum(filter_type), .release);
+        self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
+        self.bus_filter_q[id].store(@bitCast(q), .release);
+        self.bus_filters[id].setParams(filter_type, cutoff, q, self.sample_rate);
+    }
+
+    pub fn setBusFilterCutoff(self: *AudioEngine, bus: BusId, cutoff: f32) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
+        const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[id].load(.acquire));
+        const q: f32 = @bitCast(self.bus_filter_q[id].load(.acquire));
+        self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
+    }
+
+    pub fn setBusFilterQ(self: *AudioEngine, bus: BusId, q: f32) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_filter_q[id].store(@bitCast(q), .release);
+        const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[id].load(.acquire));
+        const cutoff: f32 = @bitCast(self.bus_filter_cutoff[id].load(.acquire));
+        self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
+    }
+
+    pub fn clearBusFilter(self: *AudioEngine, bus: BusId) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        self.bus_filter_type[id].store(@intFromEnum(BiquadFilterType.none), .release);
+        self.bus_filters[id].setParams(.none, 1000.0, 0.7071, self.sample_rate);
+        self.bus_filters[id].resetState();
+    }
+
+    pub fn getBusFilter(self: *const AudioEngine, bus: BusId) BusFilterConfig {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return .{};
+        return .{
+            .filter_type = @enumFromInt(self.bus_filter_type[id].load(.acquire)),
+            .cutoff = @bitCast(self.bus_filter_cutoff[id].load(.acquire)),
+            .q = @bitCast(self.bus_filter_q[id].load(.acquire)),
+        };
+    }
+
+    pub fn setBusReverb(self: *AudioEngine, bus: BusId, config: BusReverbConfig) bool {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return false;
+        if (!self.bus_active[id].load(.acquire)) return false;
+
+        const current_slot = self.bus_reverb_slot[id].load(.acquire);
+        if (current_slot < max_reverbs) {
+            self.reverbs[current_slot].setConfig(config);
+            self.reverbs[current_slot].active = true;
+            return true;
+        }
+
+        // Allocate free reverb unit from pool
+        for (0..max_reverbs) |slot| {
+            if (self.reverb_bus_owner[slot].load(.acquire) == 0xFF) {
+                self.reverb_bus_owner[slot].store(@intCast(id), .release);
+                self.bus_reverb_slot[id].store(@intCast(slot), .release);
+                self.reverbs[slot].setSampleRate(self.sample_rate);
+                self.reverbs[slot].setConfig(config);
+                self.reverbs[slot].active = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn clearBusReverb(self: *AudioEngine, bus: BusId) void {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return;
+        const slot = self.bus_reverb_slot[id].load(.acquire);
+        if (slot < max_reverbs) {
+            self.reverbs[slot].active = false;
+            self.reverbs[slot].clear();
+            self.reverb_bus_owner[slot].store(0xFF, .release);
+            self.bus_reverb_slot[id].store(0xFF, .release);
+        }
+    }
+
+    pub fn getBusReverb(self: *const AudioEngine, bus: BusId) ?BusReverbConfig {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return null;
+        const slot = self.bus_reverb_slot[id].load(.acquire);
+        if (slot >= max_reverbs) return null;
+        return self.reverbs[slot].config;
+    }
+
+    pub fn isBusReverbEnabled(self: *const AudioEngine, bus: BusId) bool {
+        const id = @intFromEnum(bus);
+        if (id >= self.getBusCapacity()) return false;
+        return self.bus_reverb_slot[id].load(.acquire) < max_reverbs;
+    }
+
+    pub fn setBusUnderwater(self: *AudioEngine, bus: BusId) void {
+        self.setBusFilter(bus, .lowpass, 600.0, 1.0);
+    }
+
+    pub fn setBusMuffled(self: *AudioEngine, bus: BusId) void {
+        self.setBusFilter(bus, .lowpass, 1200.0, 0.7071);
+    }
+
+    pub fn setBusTelephone(self: *AudioEngine, bus: BusId) void {
+        self.setBusFilter(bus, .bandpass, 1800.0, 1.5);
+    }
+
+    pub fn setBusCaveReverb(self: *AudioEngine, bus: BusId) bool {
+        return self.setBusReverb(bus, .{ .room_size = 0.85, .damping = 0.25, .wet = 0.5, .dry = 0.7 });
+    }
+
+    pub fn setBusRoomReverb(self: *AudioEngine, bus: BusId) bool {
+        return self.setBusReverb(bus, .{ .room_size = 0.45, .damping = 0.5, .wet = 0.25, .dry = 0.85 });
+    }
+
     pub fn stopAll(self: *AudioEngine) void {
         for (&self.voices) |*v| {
             v.active = false;
@@ -946,19 +1107,73 @@ pub const AudioEngine = struct {
         if (total == 0) return;
         const dt: f32 = 1.0 / self.sample_rate;
         const master: f32 = if (self.isMuted()) 0.0 else self.getMasterVolume();
+        const cap = self.getBusCapacity();
 
-        // Per-callback setup: collect the active voices once with all
-        // constant-per-buffer data precomputed (pan gains, envelope and
-        // filter slopes, clip step/loop), so the per-sample inner loops do
-        // no sqrt, no voice scan and no pan math. Sample voices that are
-        // already invalid are deactivated here, not per sample.
+        // 1. Update Biquad filter parameters if changed atomically
+        for (0..cap) |i| {
+            if (self.bus_active[i].load(.acquire)) {
+                const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[i].load(.acquire));
+                const f_cut: f32 = @bitCast(self.bus_filter_cutoff[i].load(.acquire));
+                const f_q: f32 = @bitCast(self.bus_filter_q[i].load(.acquire));
+                if (self.bus_filters[i].filter_type != f_type or
+                    self.bus_filters[i].cutoff != f_cut or
+                    self.bus_filters[i].q != f_q or
+                    self.bus_filters[i].last_sample_rate != self.sample_rate)
+                {
+                    self.bus_filters[i].setParams(f_type, f_cut, f_q, self.sample_rate);
+                }
+            }
+        }
+
+        // 2. Build topological evaluation order (leaves first, parents after children)
+        var active_buses: [max_bus_capacity]u8 = undefined;
+        var active_count: usize = 0;
+        var heights: [max_bus_capacity]u8 = [_]u8{0} ** max_bus_capacity;
+        var parents: [max_bus_capacity]u8 = undefined;
+
+        for (0..cap) |i| {
+            if (self.bus_active[i].load(.acquire)) {
+                active_buses[active_count] = @intCast(i);
+                active_count += 1;
+                parents[i] = self.bus_parent[i].load(.acquire);
+            }
+        }
+
+        if (active_count > 1) {
+            var pass: usize = 0;
+            while (pass < 8) : (pass += 1) {
+                var changed = false;
+                for (active_buses[0..active_count]) |b| {
+                    const p = parents[b];
+                    if (p < cap and p != b and self.bus_active[p].load(.acquire)) {
+                        if (heights[p] <= heights[b]) {
+                            heights[p] = heights[b] + 1;
+                            changed = true;
+                        }
+                    }
+                }
+                if (!changed) break;
+            }
+
+            var i: usize = 1;
+            while (i < active_count) : (i += 1) {
+                const key = active_buses[i];
+                const key_h = heights[key];
+                var j: usize = i;
+                while (j > 0 and heights[active_buses[j - 1]] > key_h) : (j -= 1) {
+                    active_buses[j] = active_buses[j - 1];
+                }
+                active_buses[j] = key;
+            }
+        }
+
+        // 3. Collect active voices
         var list: [max_voices]ActiveVoice = undefined;
-        var count: usize = 0;
+        var voice_count: usize = 0;
         for (&self.voices) |*v| {
             if (!v.active) continue;
-            const bus_vol: f32 = self.getBusEffectiveVolume(v.bus);
             const pan = std.math.clamp(v.pan, -1.0, 1.0);
-            const g = v.volume * master * bus_vol;
+            const g = v.volume;
             const dur = @max(v.duration, 1e-6);
             var a = ActiveVoice{
                 .v = v,
@@ -1005,36 +1220,113 @@ pub const AudioEngine = struct {
                 }
                 a.clip = clip.samples[0 .. clip.frames * 2];
                 a.frames = clip.frames;
-                // Exact 1:1 step from an integer position needs no
-                // interpolation, and the position stays integral all buffer.
                 a.step_one = v.sample_step == 1.0 and pos == @floor(pos);
-                list[count] = a;
+                list[voice_count] = a;
             } else {
-                list[count] = a;
+                list[voice_count] = a;
             }
-            count += 1;
+            voice_count += 1;
         }
-        if (count == 0) {
-            for (buffer) |*x| x.* = 0.0;
+
+        // Fast-path: if no voices and no active reverbs, silence buffer
+        var any_reverb = false;
+        for (&self.reverbs) |*r| {
+            if (r.active) {
+                any_reverb = true;
+                break;
+            }
+        }
+        if (voice_count == 0 and !any_reverb) {
+            @memset(buffer, 0.0);
             return;
         }
 
-        // Voices outer, samples inner: the kind dispatch happens once per
-        // voice per buffer and each inner loop only touches its own state.
-        for (buffer) |*x| x.* = 0.0;
-        for (list[0..count]) |a| {
-            switch (a.kind) {
-                .noise_burst => renderNoise(a, dt, buffer),
-                .thump => renderTone(true, a, dt, buffer),
-                .blip => renderTone(false, a, dt, buffer),
-                .sample => renderSample(a, dt, buffer),
+        // 4. Chunked block rendering (64 frames = 128 samples per block)
+        var offset: usize = 0;
+        var master_chunk: [chunk_samples]f32 = undefined;
+        var bus_has_audio: [max_bus_capacity]bool = undefined;
+
+        while (offset < buffer.len) {
+            const remaining = buffer.len - offset;
+            const cur_samples = @min(remaining, chunk_samples);
+
+            @memset(master_chunk[0..cur_samples], 0.0);
+            for (active_buses[0..active_count]) |b| {
+                @memset(self.bus_chunks[b][0..cur_samples], 0.0);
+                bus_has_audio[b] = false;
             }
-        }
-        // Soft clip into the output buffer.
-        var f: usize = 0;
-        while (f < buffer.len) : (f += 2) {
-            buffer[f] = buffer[f] / (1.0 + @abs(buffer[f]));
-            buffer[f + 1] = buffer[f + 1] / (1.0 + @abs(buffer[f + 1]));
+
+            for (list[0..voice_count]) |*a| {
+                if (!a.v.active) continue;
+                const target = if (a.v.bus) |b_id| blk: {
+                    const idx = @intFromEnum(b_id);
+                    if (idx < cap and self.bus_active[idx].load(.acquire)) {
+                        bus_has_audio[idx] = true;
+                        break :blk self.bus_chunks[idx][0..cur_samples];
+                    }
+                    break :blk master_chunk[0..cur_samples];
+                } else master_chunk[0..cur_samples];
+
+                switch (a.kind) {
+                    .noise_burst => renderNoise(a.*, dt, target),
+                    .thump => renderTone(true, a.*, dt, target),
+                    .blip => renderTone(false, a.*, dt, target),
+                    .sample => renderSample(a.*, dt, target),
+                }
+            }
+
+            // Process buses in leaf-to-root topological order
+            for (active_buses[0..active_count]) |b| {
+                const r_slot = self.bus_reverb_slot[b].load(.acquire);
+                const has_rev = (r_slot < max_reverbs and self.reverbs[r_slot].active);
+
+                if (!bus_has_audio[b] and !has_rev) continue;
+
+                if (self.bus_filters[b].filter_type != .none) {
+                    self.bus_filters[b].processBuffer(self.bus_chunks[b][0..cur_samples]);
+                }
+
+                if (has_rev) {
+                    self.reverbs[r_slot].processBuffer(self.bus_chunks[b][0..cur_samples]);
+                }
+
+                if (self.bus_muted[b].load(.acquire)) {
+                    @memset(self.bus_chunks[b][0..cur_samples], 0.0);
+                } else {
+                    const vol: f32 = @bitCast(self.bus_volumes[b].load(.acquire));
+                    if (vol != 1.0) {
+                        for (self.bus_chunks[b][0..cur_samples]) |*s| {
+                            s.* *= vol;
+                        }
+                    }
+                }
+
+                const p = parents[b];
+                if (p < cap and p != b and self.bus_active[p].load(.acquire)) {
+                    for (0..cur_samples) |k| {
+                        self.bus_chunks[p][k] += self.bus_chunks[b][k];
+                    }
+                    bus_has_audio[p] = true;
+                } else {
+                    for (0..cur_samples) |k| {
+                        master_chunk[k] += self.bus_chunks[b][k];
+                    }
+                }
+            }
+
+            if (master == 0.0) {
+                @memset(buffer[offset .. offset + cur_samples], 0.0);
+            } else {
+                var k: usize = 0;
+                while (k < cur_samples) : (k += 2) {
+                    const l = master_chunk[k] * master;
+                    const r = master_chunk[k + 1] * master;
+                    buffer[offset + k] = l / (1.0 + @abs(l));
+                    buffer[offset + k + 1] = r / (1.0 + @abs(r));
+                }
+            }
+
+            offset += cur_samples;
         }
     }
 

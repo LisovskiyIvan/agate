@@ -305,6 +305,11 @@ pub const invalid_bus = audio.invalid_bus;
 pub const BusConfig = audio.BusConfig;
 pub const BusAttenuation = audio.BusAttenuation;
 pub const AttenuationModel = audio.AttenuationModel;
+pub const BiquadFilterType = audio.BiquadFilterType;
+pub const BusFilterConfig = audio.BusFilterConfig;
+pub const BusReverbConfig = audio.BusReverbConfig;
+pub const BiquadFilter = audio.BiquadFilter;
+pub const ReverbProcessor = audio.ReverbProcessor;
 
 pub const serialization = @import("serialization.zig");
 pub const SceneState = serialization.SceneState;

@@ -55,15 +55,15 @@
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
 | Layout-контейнеры, 3D GUI | — | ❌ |
-| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler | ✅ |
-| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
+| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR) и стерео-реверберация Freeverb | ✅ |
+| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler, biquad low/high/band/notch, Freeverb reverb) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 613 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 621 unit-тест, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -375,6 +375,19 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 613/613 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят за ~1 сек, >200 FPS в runtime.
 
+### Волна 20: Audio DSP-эффекты и фильтры на шинах (Biquad IIR, Freeverb Reverb, DAG-микширование) (16.09.2026)
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Biquad IIR фильтры | `audio/dsp.zig`, `audio.zig`, `root.zig` | 2-й порядок Robert Bristow-Johnson (Cookbook) в форме Transposed Direct Form II: lowpass, highpass, bandpass, notch; защита от denormals, in-place обработка блоками | ✅ |
+| Freeverb стерео-ревербератор | `audio/dsp.zig`, `audio.zig`, `root.zig` | Алгоритмический стерео-ревербератор: пул из 8 параллельных гребенчатых (LBCF) и 4 последовательных аллпасс (APF) фильтров на канал, кольцевые буферы со степенями двойки (`& 2047`, `& 1023`), масштабирование задержек под частоту дискретизации | ✅ |
+| DAG-микширование блоками (chunks) | `audio.zig` | Обработка звука блоками по 64 фрейма (128 сэмплов = 512 байт на шину, L1 cache-friendly), топологическая сортировка шин в аудиопотоке (листья -> родители -> корни), каскадирование эффектов и громкости без аллокаций | ✅ |
+| Пресеты и управление на лету | `audio.zig` | Геймплейные пресеты (`setBusUnderwater`, `setBusMuffled`, `setBusTelephone`, `setBusCaveReverb`, `setBusRoomReverb`), атомарное изменение среза (`cutoff`) и резонанса (`q`) без щелчков | ✅ |
+| Интеграция с UI и сценой sandbox | `sandbox_scene.zig`, `sandbox_ui.zig`, `main.zig` | Хоткеи F9 (Underwater Lowpass), F10 (Cave Reverb) и интерактивные кнопки в HUD | ✅ |
+| Полная безопасность реального времени | `audio.zig`, `audio/dsp.zig` | 0 динамических аллокаций в аудиопотоке sokol-audio, lock-free атомарные параметры, автоматический tail-процессинг реверберации после завершения голосов | ✅ |
+
+Проверки: 621/621 unit-тест, `zig build test` (agate) и `zig build` (sandbox) проходят без ошибок.
+
 ---
 
 ## ✅ Что сделано
@@ -390,7 +403,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Мониторинг памяти (`MemorySnapshot`): раздельный учёт памяти геометрии на CPU, общих аллокаций рантайма и видеопамяти VRAM для GPU-буферов и текстур.
 * Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
 * Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
-* 613 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
+* 621 unit-тест в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
@@ -581,7 +594,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Grid/layout-контейнеры, привязки/анимации UI, 3D-GUI, загрузка TTF/OTF-шрифтов и Unicode (сейчас зашитый SDF-атлас, ASCII).
 
 **Аудио**
-* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска, DSP-фильтры/эффекты (reverb, echo, lowpass/highpass), звуковая окклюзия геометрией (динамические шины, DAG-дерево, затухание и Doppler уже реализованы).
+* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска, звуковая окклюзия геометрией (динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры и Freeverb-реверберация уже реализованы).
 
 **Ассеты и данные**
 * Экспорт glTF, AssetManager с прогрессом и кэшем.
