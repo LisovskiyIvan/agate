@@ -28,6 +28,7 @@ const gpu_thread = @import("../gpu_thread.zig");
 const morph_gpu = @import("morph_gpu.zig");
 
 pub const Mesh = struct {
+    id: u64 = 0,
     name: []const u8,
     owns_name: bool = false,
     position: Vec3 = Vec3.zero,
@@ -36,6 +37,7 @@ pub const Mesh = struct {
 
     vertex_buffer: sg.Buffer,
     index_buffer: sg.Buffer,
+    vertex_count: u32 = 0,
     index_count: u32,
     index_type: sg.IndexType = .UINT16,
     material: ?Material = null,
@@ -488,6 +490,9 @@ pub const Mesh = struct {
             self.morph_upload_pending = false;
         }
         self.vertex_buffer = vbuf;
+        if (self.vertex_count == 0 and self.pending_vertices.len > 0) {
+            self.vertex_count = @intCast(self.pending_vertices.len);
+        }
         self.gpu_pending = false;
         // CPU-morph deferred creation can land after this frame's applyMorphs
         // already ran (or before it ever will): upload the retained base pose
@@ -499,6 +504,46 @@ pub const Mesh = struct {
             allocator.free(self.pending_vertices);
             self.pending_vertices = &.{};
         }
+    }
+
+    /// Returns total estimated GPU memory in bytes for this mesh's vertex/index buffers
+    /// and morph delta textures.
+    pub fn getGpuMemoryBytes(self: *const Mesh) usize {
+        var total: usize = 0;
+        if (self.vertex_buffer.id != 0) {
+            total += @as(usize, self.vertex_count) * @sizeOf(Vertex);
+        }
+        if (self.index_buffer.id != 0) {
+            const idx_size: usize = if (self.index_type == .UINT16) 2 else 4;
+            total += @as(usize, self.index_count) * idx_size;
+        }
+        if (self.morph_delta_image.id != 0) {
+            total += @as(usize, self.morph_tex_width) * @as(usize, self.morph_tex_height) * 16;
+        }
+        if (self.instance_buffer.id != 0) {
+            total += self.instance_buffer_capacity * @sizeOf(Mat4);
+        }
+        return total;
+    }
+
+    /// Returns total CPU heap memory in bytes retained by this mesh.
+    pub fn getCpuMemoryBytes(self: *const Mesh) usize {
+        var total: usize = @sizeOf(Mesh);
+        if (self.owns_name) total += self.name.len;
+        total += self.cpu_positions.len * @sizeOf(Vec3);
+        total += self.cpu_indices.len * @sizeOf(u32);
+        total += self.cpu_skin.len * @sizeOf(SkinJointWeight);
+        total += self.pending_vertices.len * @sizeOf(Vertex);
+        total += self.morph_weights.len * @sizeOf(f32);
+        total += self.morph_base.len * @sizeOf(Vertex);
+        total += self.morph_staging.len * @sizeOf(Vertex);
+        total += self.morph_targets.len * @sizeOf(MorphTarget);
+        for (self.morph_targets) |mt| {
+            total += mt.position_deltas.len * @sizeOf([3]f32);
+            total += mt.normal_deltas.len * @sizeOf([3]f32);
+            total += mt.tangent_deltas.len * @sizeOf([3]f32);
+        }
+        return total;
     }
 
     /// Logs the first morph-delta failure only (permanent conditions such as
@@ -580,6 +625,7 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
             .name = name,
             .vertex_buffer = .{},
             .index_buffer = .{},
+            .vertex_count = @intCast(data.vertices.len),
             .index_count = @intCast(data.indices.len),
             .index_type = if (data.vertices.len <= std.math.maxInt(u16)) .UINT16 else .UINT32,
             .local_bounding_box = data.bounds,
@@ -609,6 +655,7 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
         .name = name,
         .vertex_buffer = .{},
         .index_buffer = .{},
+        .vertex_count = @intCast(data.vertices.len),
         .index_count = @intCast(data.indices.len),
         .index_type = index_type,
         .local_bounding_box = data.bounds,

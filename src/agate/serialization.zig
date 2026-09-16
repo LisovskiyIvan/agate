@@ -8,7 +8,9 @@
 //! bool as u8 0/1, string as u32 length + raw bytes, no padding):
 //!   magic[4] = "AGSC", version u32,
 //!   mesh_count u32, meshes[],
-//!     per mesh: name str, position[3]f32, rotation[3]f32 (euler deg),
+//!     per mesh (v3): id u64, name str, parent_name str,
+//!       (v2: name str),
+//!       position[3]f32, rotation[3]f32 (euler deg),
 //!       scaling[3]f32, flags u8 (bit0 visible, bit1 cast, bit2 receive),
 //!       material_kind u8 (0 standard, 1 pbr),
 //!       standard: diffuse[3]f32, alpha f32, alpha_mode u8 (0 opaque, 1 blend,
@@ -38,7 +40,7 @@
 //!       angular_sensitivity f32, roll_speed_deg f32,
 //!   (v2 layout: camera kinds appended as 4 target, 5 fly; material tails
 //!   extended with alpha_cutoff + double_sided. v1 bytes are NOT readable:
-//!   any version != 2 reports UnsupportedVersion.)
+//!   any version < 2 or > 3 reports UnsupportedVersion.)
 //!   render: skybox_enabled u8, skybox_exposure f32, shadows_enabled u8,
 //!     shadow_softness f32, ibl_intensity f32,
 //!   postprocess (PostProcessOptions field order): enabled u8, exposure f32,
@@ -51,14 +53,15 @@
 //!     ssr_intensity f32, ssr_max_distance f32, ssr_thickness f32,
 //!     sharpen_enabled u8, sharpen_amount f32, grain_enabled u8,
 //!     grain_intensity f32, temperature f32, tint f32.
+//!   (v3 tail: game_property_count u32, per property: key str, value str).
 //!
 //! NOT SERIALIZED (by design): geometry (vertices/indices), textures and
 //! cube maps (skybox/IBL contents), skeletons/animations, morph targets,
-//! physics bodies, particles, UI, instanced meshes, parent links, bone
+//! physics bodies, particles, UI, instanced meshes, bone
 //! attachments, follow-camera target link (target_position is kept),
 //! material sharing topology (values are per-mesh), SSAO config, shadow
-//! tuning beyond softness, pipeline/GPU handles. Meshes are matched by name
-//! on restore; geometry is referenced, never stored.
+//! tuning beyond softness, pipeline/GPU handles. Meshes are matched by id
+//! or name on restore; geometry is referenced, never stored.
 
 const std = @import("std");
 const jobs = @import("jobs.zig");
@@ -82,9 +85,10 @@ const AlphaMode = MaterialModule.AlphaMode;
 const Mesh = @import("mesh.zig").Mesh;
 
 pub const MAGIC: [4]u8 = .{ 'A', 'G', 'S', 'C' };
-/// v2: adds target/fly cameras (kinds 4/5) and material alpha cutout mode
-/// (alpha_mode 2) with alpha_cutoff + double_sided tails. v1 is rejected.
-pub const VERSION: u32 = 2;
+/// v3: adds mesh stable entity `id` (u64) and `parent_name` (string) for hierarchy
+/// persistence, plus custom game key-value properties table at file tail.
+/// Backwards-compatible: v2 files parse cleanly without parent/game-properties.
+pub const VERSION: u32 = 3;
 
 /// Hard caps for untrusted input. Counts above max_entries and strings above
 /// max_string_bytes report TooLarge instead of driving wild allocations.
@@ -128,7 +132,9 @@ pub const MaterialEntry = union(enum) {
 };
 
 pub const MeshEntry = struct {
+    id: u64 = 0,
     name: []const u8 = "",
+    parent_name: []const u8 = "",
     position: [3]f32 = .{ 0.0, 0.0, 0.0 },
     rotation: [3]f32 = .{ 0.0, 0.0, 0.0 },
     scaling: [3]f32 = .{ 1.0, 1.0, 1.0 },
@@ -139,6 +145,7 @@ pub const MeshEntry = struct {
 
     pub fn deinit(self: *MeshEntry, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
+        if (self.parent_name.len > 0) allocator.free(self.parent_name);
     }
 };
 
@@ -282,6 +289,16 @@ pub const RenderEntry = struct {
     ibl_intensity: f32 = 1.0,
 };
 
+pub const GameProperty = struct {
+    key: []const u8 = "",
+    value: []const u8 = "",
+
+    pub fn deinit(self: *GameProperty, allocator: std.mem.Allocator) void {
+        if (self.key.len > 0) allocator.free(self.key);
+        if (self.value.len > 0) allocator.free(self.value);
+    }
+};
+
 pub const SceneState = struct {
     meshes: []MeshEntry = &.{},
     hemi: HemiEntry = .{},
@@ -291,6 +308,35 @@ pub const SceneState = struct {
     camera: CameraEntry = .none,
     render: RenderEntry = .{},
     postprocess: PostProcessOptions = .{},
+    game_properties: []GameProperty = &.{},
+
+    pub fn getGameProperty(self: *const SceneState, key: []const u8) ?[]const u8 {
+        for (self.game_properties) |p| {
+            if (std.mem.eql(u8, p.key, key)) return p.value;
+        }
+        return null;
+    }
+
+    pub fn setGameProperty(self: *SceneState, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        for (self.game_properties) |*p| {
+            if (std.mem.eql(u8, p.key, key)) {
+                if (p.value.len > 0) allocator.free(p.value);
+                p.value = try allocator.dupe(u8, value);
+                return;
+            }
+        }
+        const old_len = self.game_properties.len;
+        const new_slice = try allocator.alloc(GameProperty, old_len + 1);
+        if (old_len > 0) {
+            @memcpy(new_slice[0..old_len], self.game_properties);
+            allocator.free(self.game_properties);
+        }
+        new_slice[old_len] = .{
+            .key = try allocator.dupe(u8, key),
+            .value = try allocator.dupe(u8, value),
+        };
+        self.game_properties = new_slice;
+    }
 
     pub fn deinit(self: *SceneState, allocator: std.mem.Allocator) void {
         for (self.meshes) |*m| m.deinit(allocator);
@@ -302,6 +348,8 @@ pub const SceneState = struct {
         for (self.spot_lights) |*s| s.deinit(allocator);
         if (self.spot_lights.len > 0) allocator.free(self.spot_lights);
         self.camera.deinit(allocator);
+        for (self.game_properties) |*gp| gp.deinit(allocator);
+        if (self.game_properties.len > 0) allocator.free(self.game_properties);
         self.* = .{};
     }
 };
@@ -341,6 +389,8 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
     for (scene.meshes.items) |mesh| {
         const name = try allocator.dupe(u8, mesh.name);
         errdefer allocator.free(name);
+        const parent_name = if (mesh.parent) |p| try allocator.dupe(u8, p.name) else "";
+        errdefer if (parent_name.len > 0) allocator.free(parent_name);
         const material: MaterialEntry = if (mesh.material) |mat| blk: {
             // PBR keeps its own entry shape (metallic / roughness / emissive).
             if (mat == .pbr) {
@@ -372,7 +422,9 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
             } };
         } else .{ .standard = .{} };
         try meshes.append(allocator, .{
+            .id = mesh.id,
             .name = name,
+            .parent_name = parent_name,
             .position = .{ mesh.position.x, mesh.position.y, mesh.position.z },
             .rotation = .{ mesh.rotation.x, mesh.rotation.y, mesh.rotation.z },
             .scaling = .{ mesh.scaling.x, mesh.scaling.y, mesh.scaling.z },
@@ -518,6 +570,15 @@ fn findMesh(scene: *Scene, name: []const u8) ?*Mesh {
     return null;
 }
 
+fn findMeshByIdOrName(scene: *Scene, id: u64, name: []const u8) ?*Mesh {
+    if (id != 0) {
+        for (scene.meshes.items) |m| {
+            if (m.id == id) return m;
+        }
+    }
+    return findMesh(scene, name);
+}
+
 /// Applies one snapshot material to a live mesh. Mutates the existing
 /// material in place when the kind matches (note: shared materials change
 /// for every mesh using them); otherwise allocates a fresh scene material
@@ -560,24 +621,32 @@ fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) vo
     }
 }
 
-/// Applies a snapshot to a live scene. Meshes match by name, unknown names
-/// are ignored. Point/spot lights are destroyed and recreated; the
-/// directional light is replaced via createDirectionalLight (or removed when
-/// the snapshot has none; note the scene API destroys the old sun before
-/// allocating, so OOM there loses the sun). Follow-camera target_mesh resets
-/// to null (target_position is kept). Never fails and never crashes on count
-/// mismatches; OOM during point/spot/material recreation silently keeps the
-/// previous object.
+/// Applies a snapshot to a live scene. Meshes match by id (if non-zero) or by name,
+/// unknown names are ignored. Parent-child hierarchy is reconstructed.
+/// Point/spot lights are destroyed and recreated; the directional light is
+/// replaced via createDirectionalLight. Follow-camera target_mesh resets to null
+/// (target_position is kept).
 pub fn restore(scene: *Scene, state: *const SceneState) void {
     for (state.meshes) |*entry| {
-        const mesh = findMesh(scene, entry.name) orelse continue;
+        const mesh = findMeshByIdOrName(scene, entry.id, entry.name) orelse continue;
         mesh.position = Vec3.new(entry.position[0], entry.position[1], entry.position[2]);
         mesh.rotation = Vec3.new(entry.rotation[0], entry.rotation[1], entry.rotation[2]);
         mesh.scaling = Vec3.new(entry.scaling[0], entry.scaling[1], entry.scaling[2]);
         mesh.is_visible = entry.is_visible;
         mesh.cast_shadows = entry.cast_shadows;
         mesh.receive_shadows = entry.receive_shadows;
+        if (entry.id != 0) mesh.id = entry.id;
         restoreMeshMaterial(scene, mesh, &entry.material);
+    }
+
+    // Second pass: restore parent links across meshes
+    for (state.meshes) |*entry| {
+        const mesh = findMeshByIdOrName(scene, entry.id, entry.name) orelse continue;
+        if (entry.parent_name.len == 0) {
+            mesh.parent = null;
+        } else if (findMesh(scene, entry.parent_name)) |parent_mesh| {
+            mesh.parent = parent_mesh;
+        }
     }
 
     scene.lights.hemi = HemisphericLight.init(scene.lights.hemi.name, .{
@@ -748,6 +817,12 @@ const Writer = struct {
         try self.bytes(&b);
     }
 
+    fn u64le(self: *Writer, v: u64) !void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, v, .little);
+        try self.bytes(&b);
+    }
+
     fn f32le(self: *Writer, v: f32) !void {
         var b: [4]u8 = undefined;
         std.mem.writeInt(u32, &b, @as(u32, @bitCast(v)), .little);
@@ -785,6 +860,11 @@ const Reader = struct {
     fn readU32(self: *Reader) DecodeError!u32 {
         const raw = try self.readRaw(4);
         return std.mem.readInt(u32, raw[0..4], .little);
+    }
+
+    fn readU64(self: *Reader) DecodeError!u64 {
+        const raw = try self.readRaw(8);
+        return std.mem.readInt(u64, raw[0..8], .little);
     }
 
     fn readF32(self: *Reader) DecodeError!f32 {
@@ -911,7 +991,9 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
 
     try w.u32le(std.math.cast(u32, state.meshes.len) orelse return error.TooLarge);
     for (state.meshes) |*m| {
+        try w.u64le(m.id);
         try w.str(m.name);
+        try w.str(m.parent_name);
         try w.vec3(m.position);
         try w.vec3(m.rotation);
         try w.vec3(m.scaling);
@@ -1051,10 +1133,16 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
 
     try writePostProcess(&w, &state.postprocess);
 
+    try w.u32le(std.math.cast(u32, state.game_properties.len) orelse return error.TooLarge);
+    for (state.game_properties) |gp| {
+        try w.str(gp.key);
+        try w.str(gp.value);
+    }
+
     return w.buf.toOwnedSlice(allocator);
 }
 
-fn readMeshes(allocator: std.mem.Allocator, r: *Reader) ![]MeshEntry {
+fn readMeshes(allocator: std.mem.Allocator, r: *Reader, version: u32) ![]MeshEntry {
     const count = try r.readCount();
     var list: std.ArrayListUnmanaged(MeshEntry) = .empty;
     errdefer {
@@ -1064,7 +1152,14 @@ fn readMeshes(allocator: std.mem.Allocator, r: *Reader) ![]MeshEntry {
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         var entry = MeshEntry{};
-        entry.name = try r.readString(allocator);
+        if (version >= 3) {
+            entry.id = try r.readU64();
+            entry.name = try r.readString(allocator);
+            errdefer entry.deinit(allocator);
+            entry.parent_name = try r.readString(allocator);
+        } else {
+            entry.name = try r.readString(allocator);
+        }
         errdefer entry.deinit(allocator);
         entry.position = try r.readVec3();
         entry.rotation = try r.readVec3();
@@ -1243,12 +1338,12 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
     var r = Reader{ .bytes = bytes, .pos = MAGIC.len };
 
     const version = try r.readU32();
-    if (version != VERSION) return error.UnsupportedVersion;
+    if (version != 2 and version != 3) return error.UnsupportedVersion;
 
     var state = SceneState{};
     errdefer state.deinit(allocator);
 
-    state.meshes = try readMeshes(allocator, &r);
+    state.meshes = try readMeshes(allocator, &r, version);
 
     state.hemi.name = try r.readString(allocator);
     state.hemi.direction = try r.readVec3();
@@ -1273,6 +1368,24 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
     state.render.ibl_intensity = try r.readF32();
 
     state.postprocess = try readPostProcess(&r);
+
+    if (version >= 3) {
+        const count = try r.readCount();
+        var props: std.ArrayListUnmanaged(GameProperty) = .empty;
+        errdefer {
+            for (props.items) |*p| p.deinit(allocator);
+            props.deinit(allocator);
+        }
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            var prop = GameProperty{};
+            prop.key = try r.readString(allocator);
+            errdefer prop.deinit(allocator);
+            prop.value = try r.readString(allocator);
+            try props.append(allocator, prop);
+        }
+        state.game_properties = try props.toOwnedSlice(allocator);
+    }
 
     return state;
 }
@@ -1519,7 +1632,9 @@ fn makeFullState(allocator: std.mem.Allocator) !SceneState {
         const meshes = try allocator.alloc(MeshEntry, 2);
         errdefer allocator.free(meshes);
         meshes[0] = .{
+            .id = 101,
             .name = try dupeStr(allocator, "box"),
+            .parent_name = try dupeStr(allocator, "sphere"),
             .position = .{ 1.0, 2.0, 3.0 },
             .rotation = .{ 10.0, 20.0, 30.0 },
             .scaling = .{ 1.0, 1.0, 1.0 },
@@ -1530,7 +1645,9 @@ fn makeFullState(allocator: std.mem.Allocator) !SceneState {
         };
         errdefer meshes[0].deinit(allocator);
         meshes[1] = .{
+            .id = 102,
             .name = try dupeStr(allocator, "sphere"),
+            .parent_name = "",
             .position = .{ -4.0, 0.5, 8.0 },
             .rotation = .{ 0.0, 90.0, 0.0 },
             .scaling = .{ 2.0, 2.0, 2.0 },
@@ -1626,13 +1743,18 @@ fn makeFullState(allocator: std.mem.Allocator) !SceneState {
     s.postprocess.temperature = 0.5;
     s.postprocess.tint = -0.25;
 
+    try s.setGameProperty(allocator, "quest_stage", "3");
+    try s.setGameProperty(allocator, "difficulty", "hard");
+
     return s;
 }
 
 fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
     try std.testing.expectEqual(a.meshes.len, b.meshes.len);
     for (a.meshes, b.meshes) |*am, *bm| {
+        try std.testing.expectEqual(am.id, bm.id);
         try std.testing.expectEqualStrings(am.name, bm.name);
+        try std.testing.expectEqualStrings(am.parent_name, bm.parent_name);
         try std.testing.expectEqual(am.position, bm.position);
         try std.testing.expectEqual(am.rotation, bm.rotation);
         try std.testing.expectEqual(am.scaling, bm.scaling);
@@ -1761,6 +1883,11 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
     try std.testing.expectEqual(a.render.shadow_softness, b.render.shadow_softness);
     try std.testing.expectEqual(a.render.ibl_intensity, b.render.ibl_intensity);
     try std.testing.expectEqual(a.postprocess, b.postprocess);
+    try std.testing.expectEqual(a.game_properties.len, b.game_properties.len);
+    for (a.game_properties, b.game_properties) |ap, bp| {
+        try std.testing.expectEqualStrings(ap.key, bp.key);
+        try std.testing.expectEqualStrings(ap.value, bp.value);
+    }
 }
 
 test "serialization round-trip full state" {
@@ -1862,6 +1989,8 @@ test "serialization rejects huge counts and strings" {
     try buf.appendSlice(alloc, &vb);
     std.mem.writeInt(u32, &vb, 1, .little);
     try buf.appendSlice(alloc, &vb);
+    var id_b: [8]u8 = [_]u8{0} ** 8;
+    try buf.appendSlice(alloc, &id_b);
     std.mem.writeInt(u32, &vb, 0x0FFFFFFF, .little);
     try buf.appendSlice(alloc, &vb);
     try std.testing.expectError(error.TooLarge, deserializeAlloc(alloc, buf.items));
@@ -1873,6 +2002,7 @@ test "serialization rejects huge counts and strings" {
     try buf.appendSlice(alloc, &vb);
     std.mem.writeInt(u32, &vb, 1, .little);
     try buf.appendSlice(alloc, &vb);
+    try buf.appendSlice(alloc, &id_b);
     std.mem.writeInt(u32, &vb, 64, .little);
     try buf.appendSlice(alloc, &vb);
     try std.testing.expectError(error.Truncated, deserializeAlloc(alloc, buf.items));
@@ -2232,4 +2362,148 @@ test "loadFileAsync reports failure for non-existent file" {
     try std.testing.expect(load_task.isDone());
     try std.testing.expect(!load_task.isSuccess());
     try std.testing.expect(load_task.err_name != null);
+}
+
+test "serialization backwards compatibility with version 2" {
+    const alloc = std.testing.allocator;
+    var w = Writer{ .alloc = alloc };
+    defer w.buf.deinit(alloc);
+
+    try w.bytes(MAGIC[0..]);
+    try w.u32le(2); // version 2
+
+    // 1 mesh
+    try w.u32le(1);
+    try w.str("legacy_cube");
+    try w.vec3(.{ 1.0, 2.0, 3.0 });
+    try w.vec3(.{ 0.0, 45.0, 0.0 });
+    try w.vec3(.{ 1.0, 1.0, 1.0 });
+    try w.byte(1 | 2 | 4); // visible, cast, receive
+    try w.byte(0); // standard material
+    try w.vec3(.{ 0.8, 0.8, 0.8 }); // diffuse
+    try w.f32le(1.0); // alpha
+    try w.byte(0); // opaque
+    try w.f32le(0.5); // cutoff
+    try w.bool8(false); // double sided
+
+    // hemi light
+    try w.str("hemi");
+    try w.vec3(.{ 0.0, 1.0, 0.0 });
+    try w.vec3(.{ 1.0, 1.0, 1.0 });
+    try w.vec3(.{ 0.2, 0.2, 0.2 });
+    try w.f32le(1.0);
+
+    // directional light
+    try w.byte(0);
+
+    // point lights
+    try w.u32le(0);
+
+    // spot lights
+    try w.u32le(0);
+
+    // camera kind: 0 none
+    try w.byte(0);
+
+    // render
+    try w.bool8(false); // skybox
+    try w.f32le(1.0);
+    try w.bool8(true); // shadows
+    try w.f32le(1.5);
+    try w.f32le(1.0); // ibl
+
+    // postprocess
+    const pp = PostProcessOptions{};
+    try writePostProcess(&w, &pp);
+
+    // Now deserialize with deserializeAlloc
+    var state = try deserializeAlloc(alloc, w.buf.items);
+    defer state.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), state.meshes.len);
+    try std.testing.expectEqualStrings("legacy_cube", state.meshes[0].name);
+    try std.testing.expectEqual(@as(u64, 0), state.meshes[0].id);
+    try std.testing.expectEqualStrings("", state.meshes[0].parent_name);
+    try std.testing.expectEqual(@as(usize, 0), state.game_properties.len);
+}
+
+test "capture and restore mesh hierarchy and entity id" {
+    const alloc = std.testing.allocator;
+    var scene = testScene(alloc);
+    defer {
+        for (scene.materials.items) |m| alloc.destroy(m);
+        scene.materials.deinit(alloc);
+    }
+
+    var mat_parent = StandardMaterial.init("mat_parent");
+    var parent = testMesh("root_node");
+    parent.id = 1001;
+    parent.material = .{ .standard = &mat_parent };
+    parent.position = Vec3.new(10.0, 0.0, 0.0);
+    try scene.meshes.append(alloc, &parent);
+
+    var mat_child = StandardMaterial.init("mat_child");
+    var child = testMesh("child_node");
+    child.id = 1002;
+    child.material = .{ .standard = &mat_child };
+    child.parent = &parent;
+    child.position = Vec3.new(2.0, 3.0, 4.0);
+    try scene.meshes.append(alloc, &child);
+    defer scene.meshes.deinit(alloc);
+
+    // Capture
+    var snap = try capture(alloc, &scene);
+    defer snap.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 1001), snap.meshes[0].id);
+    try std.testing.expectEqualStrings("", snap.meshes[0].parent_name);
+    try std.testing.expectEqual(@as(u64, 1002), snap.meshes[1].id);
+    try std.testing.expectEqualStrings("root_node", snap.meshes[1].parent_name);
+
+    // Roundtrip via binary
+    const bytes = try serializeAlloc(alloc, &snap);
+    defer alloc.free(bytes);
+
+    var loaded = try deserializeAlloc(alloc, bytes);
+    defer loaded.deinit(alloc);
+
+    // Reset scene hierarchy and IDs to ensure restore re-links them
+    child.parent = null;
+    parent.id = 0;
+    child.id = 0;
+
+    restore(&scene, &loaded);
+
+    try std.testing.expectEqual(@as(u64, 1001), parent.id);
+    try std.testing.expectEqual(@as(u64, 1002), child.id);
+    try std.testing.expect(child.parent == &parent);
+}
+
+test "game properties set and get roundtrip" {
+    const alloc = std.testing.allocator;
+    var state = SceneState{};
+    defer state.deinit(alloc);
+
+    try std.testing.expect(state.getGameProperty("level") == null);
+
+    try state.setGameProperty(alloc, "level", "dungeon_01");
+    try state.setGameProperty(alloc, "player_hp", "100");
+    try std.testing.expectEqualStrings("dungeon_01", state.getGameProperty("level").?);
+    try std.testing.expectEqualStrings("100", state.getGameProperty("player_hp").?);
+
+    // Mutate existing property in place
+    try state.setGameProperty(alloc, "player_hp", "85");
+    try std.testing.expectEqualStrings("85", state.getGameProperty("player_hp").?);
+    try std.testing.expectEqual(@as(usize, 2), state.game_properties.len);
+
+    // Roundtrip serialize/deserialize
+    const bytes = try serializeAlloc(alloc, &state);
+    defer alloc.free(bytes);
+
+    var loaded = try deserializeAlloc(alloc, bytes);
+    defer loaded.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.game_properties.len);
+    try std.testing.expectEqualStrings("dungeon_01", loaded.getGameProperty("level").?);
+    try std.testing.expectEqualStrings("85", loaded.getGameProperty("player_hp").?);
 }

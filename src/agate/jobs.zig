@@ -73,6 +73,7 @@ pub const Pool = struct {
     /// with an .acq_rel swap, so they always see a valid job or null.
     mailbox: []std.atomic.Value(?*Job),
     lot: ParkingLot = .{},
+    dispatch_mutex: Mutex = .{},
     /// Protected by `lot.mutex`; workers check it while holding the lock.
     quit: bool = false,
 
@@ -93,10 +94,12 @@ pub const Pool = struct {
             .allocator = allocator,
             .workers = &.{},
             .mailbox = &.{},
+            .dispatch_mutex = .{},
         };
         errdefer {
             _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
             _ = std.c.pthread_cond_destroy(&self.lot.cond);
+            _ = std.c.pthread_mutex_destroy(&self.dispatch_mutex.mutex);
         }
         const effective: usize = if (builtin.single_threaded) 0 else worker_count;
         if (effective == 0) return self;
@@ -137,6 +140,7 @@ pub const Pool = struct {
         if (self.mailbox.len > 0) a.free(self.mailbox);
         _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
         _ = std.c.pthread_cond_destroy(&self.lot.cond);
+        _ = std.c.pthread_mutex_destroy(&self.dispatch_mutex.mutex);
         a.destroy(self);
     }
 
@@ -147,7 +151,7 @@ pub const Pool = struct {
     /// Splits [0, len) into chunks and runs `run(ctx, start, end)` over all
     /// of them, cooperating with the workers. Blocks until every chunk is
     /// finished and every fired worker has stopped reading the job.
-    /// Single-producer: do not call concurrently from two threads.
+    /// Thread-safe: serializes multiple producers via dispatch_mutex.
     pub fn forkJoin(
         self: *Pool,
         comptime C: type,
@@ -159,6 +163,8 @@ pub const Pool = struct {
             if (len > 0) run(ctx, 0, len);
             return;
         }
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
         const TypeErased = struct {
             fn trampoline(raw: *anyopaque, start: usize, end: usize) void {
                 run(@as(*C, @ptrCast(@alignCast(raw))), start, end);
@@ -682,4 +688,51 @@ test "Mutex serializes concurrent sections" {
     t1.join();
     t2.join();
     try std.testing.expectEqual(@as(u32, 20_000), counter.load(.acquire));
+}
+
+test "Pool.forkJoin is multi-producer safe under concurrent callers" {
+    const a = std.testing.allocator;
+    const pool = try Pool.init(a, 2);
+    defer pool.deinit();
+
+    const Shared = struct {
+        p: *Pool,
+        total1: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        total2: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+        fn worker1(s: *@This()) void {
+            for (0..20) |_| {
+                const ItemCtx = struct {
+                    c: *std.atomic.Value(usize),
+                    fn run(ctx: *@This(), start: usize, end: usize) void {
+                        _ = ctx.c.fetchAdd(end - start, .monotonic);
+                    }
+                };
+                var ic = ItemCtx{ .c = &s.total1 };
+                s.p.forkJoin(ItemCtx, &ic, ItemCtx.run, 500);
+            }
+        }
+
+        fn worker2(s: *@This()) void {
+            for (0..20) |_| {
+                const ItemCtx = struct {
+                    c: *std.atomic.Value(usize),
+                    fn run(ctx: *@This(), start: usize, end: usize) void {
+                        _ = ctx.c.fetchAdd(end - start, .monotonic);
+                    }
+                };
+                var ic = ItemCtx{ .c = &s.total2 };
+                s.p.forkJoin(ItemCtx, &ic, ItemCtx.run, 500);
+            }
+        }
+    };
+
+    var shared = Shared{ .p = pool };
+    const t1 = try std.Thread.spawn(.{}, Shared.worker1, .{&shared});
+    const t2 = try std.Thread.spawn(.{}, Shared.worker2, .{&shared});
+    t1.join();
+    t2.join();
+
+    try std.testing.expectEqual(@as(usize, 20 * 500), shared.total1.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 20 * 500), shared.total2.load(.acquire));
 }

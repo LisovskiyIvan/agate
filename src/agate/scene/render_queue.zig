@@ -462,6 +462,31 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
         }
         const active_count = ctx.queues.instance_matrices.items.len;
         mesh.visible_instance_count = @intCast(active_count);
+
+        // Per-instance transparency sorting (OIT):
+        // When the instanced mesh is transparent or a decal, sort its instance
+        // matrices back-to-front relative to the camera eye. Farthest instances
+        // render first, blending nearer instances over them correctly.
+        if (active_count > 1 and (materialIsTransparent(mesh.material) or mesh.is_decal)) {
+            const SortCtx = struct {
+                eye: Vec3,
+                pub fn sortFn(c: @This(), a: Mat4, b: Mat4) bool {
+                    const pos_a = Vec3.new(a.m[12], a.m[13], a.m[14]);
+                    const pos_b = Vec3.new(b.m[12], b.m[13], b.m[14]);
+                    const dist_a = pos_a.sub(c.eye).lengthSq();
+                    const dist_b = pos_b.sub(c.eye).lengthSq();
+                    if (dist_a != dist_b) {
+                        return dist_a > dist_b; // back-to-front: farthest first
+                    }
+                    for (0..16) |i| {
+                        if (a.m[i] != b.m[i]) return a.m[i] < b.m[i];
+                    }
+                    return false;
+                }
+            };
+            std.mem.sort(Mat4, ctx.queues.instance_matrices.items[0..active_count], SortCtx{ .eye = ctx.eye }, SortCtx.sortFn);
+        }
+
         if (active_count > 0 and sg.isvalid()) {
             if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < active_count) {
                 if (mesh.instance_buffer.id != 0) {
@@ -1848,4 +1873,78 @@ test "parallel setup OOM falls back to serial queues" {
     for (queues_a.instance_matrices.items, queues_b.instance_matrices.items) |a, b| {
         try std.testing.expectEqual(a, b);
     }
+}
+
+test "transparent instanced mesh sorts its instance matrices strictly back-to-front" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var mesh = Mesh{
+        .name = "inst_sort_test",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 36,
+        .index_type = .UINT16,
+    };
+
+    var trans_mat = StandardMaterial.init("trans_mat");
+    trans_mat.alpha_mode = .blend;
+    mesh.material = .{ .standard = &trans_mat };
+
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &mesh, .position = Vec3.new(0, 0, 10) };
+    var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &mesh, .position = Vec3.new(0, 0, 30) };
+    var inst2 = InstancedMesh{ .name = "i2", .source_mesh = &mesh, .position = Vec3.new(0, 0, 20) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1, &inst2 };
+    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 };
+
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+
+    const meshes = [_]*Mesh{&mesh};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), queues.instance_matrices.items.len);
+    // Back-to-front: z=30 (farthest), then z=20, then z=10 (nearest)
+    try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[0].m[14]);
+    try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[1].m[14]);
+    try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[2].m[14]);
+
+    // Opaque instanced mesh preserves original instance creation order
+    var opaque_mat = StandardMaterial.init("opaque_mat");
+    opaque_mat.alpha_mode = .@"opaque";
+    mesh.material = .{ .standard = &opaque_mat };
+
+    queues.reset();
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 2,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), queues.instance_matrices.items.len);
+    // Original insertion order: z=10, z=30, z=20
+    try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[0].m[14]);
+    try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[1].m[14]);
+    try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[2].m[14]);
 }

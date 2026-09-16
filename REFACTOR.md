@@ -136,8 +136,9 @@ Known limitations of the shipped split:
 - **Coarse payload.** Phase ownership means an update spike delays render
   for its duration. Strictly non-blocking render needs the full per-item
   payload (below).
-- **Per-instance transparency sorting (OIT)** remains a documented gap: a
-  transparent instanced group sorts as one batch. Instanced picking is
+- **Per-instance transparency sorting (OIT)** implemented: transparent instanced
+  batches and instanced decals sort instance matrices back-to-front relative to camera eye
+  in `submitInstancedMesh` with deterministic tie-breaking. Instanced picking is
   implemented: `pickWithRay` tests every visible instance in the drawn space
   (`cached_world_matrix`, refreshed with the same call the render path uses)
   and reports `PickingInfo.picked_instance`.
@@ -361,9 +362,9 @@ Known limitations of the shipped split:
    отложенные create/update/destroy, чистка referent'ов при удалении и
    OOM-политики без off-context `sg.*`. Осталось: полный per-item payload и
    instanced picking.
-4. Сохранение игры: устойчивые ID, связи объектов, игровое состояние, версия
-   формата. Текущий serializer намеренно хранит только состояние существующей
-   сцены (`src/agate/serialization.zig:55-61`).
+4. [x] Сохранение игры: устойчивые entity ID (`u64 id`), связи объектов (parent-child иерархия),
+   пользовательские свойства (`SceneState.game_properties: []GameProperty`) и версионирование
+   формата (v3 с сохранением полной обратной совместимости с v2).
 5. [~] Метрики: `SceneStats` отдаёт `update_ms`/`prepare_ms`/`shadow_ms`/
    `main_ms`/`post_ms` и `uploaded_textures_frame`/`uploaded_bytes_frame`
    (текстуры; байты буферных аплоадов — следующая волна); agate печатает
@@ -460,7 +461,7 @@ visual regression и нагрузочная матрица остаются не
   путь подтверждён runtime-харнессом;
 - `zig build fmt` впервые зелёный (7 файлов отформатированы).
 
-### Волна 5 — оставшиеся пункты плана (текущая)
+### Волна 5 — оставшиеся пункты плана
 - instanced picking: `pickWithRay` тестирует каждый видимый инстанс в
   нарисованном пространстве (`cached_world_matrix`/`cached_bounding_box`
   после `updateCachedTransforms`); скрытый источник с видимыми инстансами
@@ -475,6 +476,35 @@ visual regression и нагрузочная матрица остаются не
 - sandbox `--test-stress`: 200+ мешей, instanced-группа 1×64, CPU-частицы
   cap 5000, churn create/destroy + декали на игровом потоке, 240 кадров,
   `errors=0`, без графических ассертов.
+
+### Волна 6 — OIT, multi-producer forkJoin, дедупликация текстур и сохранения
+- **Per-instance transparency sorting (OIT)**: в `submitInstancedMesh` для прозрачных
+  инстансированных мешей (`materialIsTransparent` или `is_decal`) матрицы инстансов
+  сортируются строго back-to-front относительно `ctx.eye` с детерминированным
+  тай-брейком;
+- **Multi-producer jobs.Pool.forkJoin**: добавлен `dispatch_mutex: Mutex` в `jobs.Pool`,
+  обеспечивающий потокобезопасность при одновременных диспатчах из игрового и
+  рендеринг-потоков без повреждения mailbox воркеров;
+- **Дедупликация текстур в UploadQueue**: добавлены `findFile` и `getOrRequestFile`,
+  предотвращающие дублирование декодирования и загрузки одинаковых текстур; слоты
+  уже загруженных текстур патчатся немедленно;
+- **Персистентность сохранений сцены (формат v3)**:
+  - Устойчивые идентификаторы сущностей (`Mesh.id: u64`);
+  - Сохранение и восстановление иерархии `parent`/`child` мешей;
+  - Произвольные строковые свойства игры (`SceneState.game_properties`, `setGameProperty`, `getGameProperty`);
+  - Полная обратная совместимость со старыми файлами формата v2.
+
+### Волна 7 — встроенный профилировщик и снапшоты памяти (Profiler / Flight Recorder)
+- **Встроенный модуль Profiler**:
+  - Запись кадровых метрик в реальном времени с разбиением по фазам (`Update`, `Prepare`, `Shadow Pass`, `Main Pass`, `PostFX`), подсчетом draw calls, полигонов, смен шейдерных пайплайнов и объема загрузок VRAM;
+  - Снапшоты памяти (`MemorySnapshot`): полный учет распределения памяти CPU и VRAM GPU (текстуры, меши/буферы, таргеты рендера и теневые карты);
+  - Экспорт в интерактивный HTML-отчет (темная тема, интерактивный график-таймлайн SVG со стаком фаз, top spike frames, таблицы VRAM ассетов);
+  - Экспорт в подробный Markdown-отчет (`.md`);
+  - Экспорт в Chrome Trace Event JSON (`.json`) для анализа в `chrome://tracing` и `ui.perfetto.dev`;
+  - Автоматическая диагностика узких мест («Что не так»): автоматический анализ просадок FPS, длинных фаз рендера, избытка draw calls, частых переключений пайплайнов, тяжелых несжатых текстур 2K+ и высокого потребления VRAM с выдачей конкретных рекомендаций;
+  - Интеграция в Scene API (`scene.startProfiling()`, `scene.stopProfiling()`, `scene.saveProfileReports("...")`);
+  - Интеграция в демо agate и sandbox: горячая клавиша `F8` для включения/выключения записи на лету и CLI-флаг `--profile`;
+  - Число тестов выросло с 601 до 605 (все проходят в Debug и ReleaseSafe без утечек памяти).
 
 ### Инварианты (закреплены ассертами и тестами)
 1. `sg.*` — только на графическом потоке; иначе отложить и завершить на

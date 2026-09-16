@@ -6,3 +6,7 @@ zig-out/
 
 # macOS
 .DS_Store
+
+# Profiler reports
+profile.*
+*.trace

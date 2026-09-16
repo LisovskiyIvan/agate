@@ -16,6 +16,8 @@
 const std = @import("std");
 const Scene = @import("scene.zig").Scene;
 const Mesh = @import("mesh.zig").Mesh;
+const Texture = @import("texture.zig").Texture;
+const CubeTexture = @import("texture.zig").CubeTexture;
 
 /// Minimal CPU-only Scene for subsystem tests (serialization capture/restore,
 /// material loading): only `.allocator` is dereferenced. The default textures
@@ -23,9 +25,10 @@ const Mesh = @import("mesh.zig").Mesh;
 pub fn testScene(alloc: std.mem.Allocator) Scene {
     return .{
         .allocator = alloc,
-        .default_white_texture = undefined,
-        .default_normal_texture = undefined,
-        .default_cube_texture = undefined,
+        .profiler = @import("profiler.zig").Profiler.init(alloc),
+        .default_white_texture = std.mem.zeroes(Texture),
+        .default_normal_texture = std.mem.zeroes(Texture),
+        .default_cube_texture = std.mem.zeroes(CubeTexture),
         .lights = .{},
         .shadows = .{ .pass = undefined },
         .sky = .{ .pass = undefined },

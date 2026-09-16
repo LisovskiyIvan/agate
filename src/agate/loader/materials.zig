@@ -259,10 +259,11 @@ pub const AsyncTexCtx = struct {
                 std.fs.path.join(self.scene.allocator, &.{ dir, uri }) catch return
             else
                 self.scene.allocator.dupe(u8, uri) catch return;
-            pending = self.queue.requestFile(path, tex_options, decode_opts) catch {
+            pending = self.queue.getOrRequestFile(path, tex_options, decode_opts) catch {
                 self.scene.allocator.free(path);
                 return;
             };
+            self.scene.allocator.free(path);
         } else return;
 
         pending.?.addTarget(slot);

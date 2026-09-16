@@ -94,6 +94,10 @@ const scene_msaa = @import("scene/msaa.zig");
 pub const scene_snapshot = @import("scene/snapshot.zig");
 pub const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
 pub const CameraSnapshot = scene_snapshot.CameraSnapshot;
+pub const profiler_mod = @import("profiler.zig");
+pub const Profiler = profiler_mod.Profiler;
+pub const FrameRecord = profiler_mod.FrameRecord;
+pub const MemorySnapshot = profiler_mod.MemorySnapshot;
 
 pub const CameraEntry = struct {
     name: []const u8,
@@ -254,11 +258,15 @@ pub const Scene = struct {
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
 
+    // Built-in flight recorder & memory profiler.
+    profiler: profiler_mod.Profiler,
+
     // Frame uniform types shared with the draw path (see scene/uniforms.zig).
 
     pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
         self.* = Scene{
             .allocator = allocator,
+            .profiler = profiler_mod.Profiler.init(allocator),
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
             .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
@@ -1466,9 +1474,14 @@ pub const Scene = struct {
 
         sg.commit();
         self.stats.post_ms = msSince(t_post);
+
+        if (self.profiler.isRecording()) {
+            self.profiler.recordFrame(self.frame_id, &self.stats);
+        }
     }
 
     pub fn deinit(self: *Scene) void {
+        self.profiler.deinit();
         // In-flight decodes target material fields; join them before any
         // mesh/material teardown can free those fields.
         if (self.uploads) |*q| {
@@ -1546,6 +1559,54 @@ pub const Scene = struct {
         if (self.ui_canvas) |*u| {
             u.deinit();
         }
+    }
+
+    // ---- Profiling & Diagnostics API ----
+
+    /// Starts recording per-frame performance metrics.
+    pub fn startProfiling(self: *Scene) void {
+        self.profiler.start();
+    }
+
+    /// Stops recording per-frame performance metrics.
+    pub fn stopProfiling(self: *Scene) void {
+        self.profiler.stop();
+    }
+
+    /// Clears any recorded frame history.
+    pub fn resetProfiling(self: *Scene) void {
+        self.profiler.reset();
+    }
+
+    /// Returns true if profiling is currently active.
+    pub fn isProfiling(self: *const Scene) bool {
+        return self.profiler.isRecording();
+    }
+
+    /// Captures a snapshot of current memory allocations (CPU objects & GPU VRAM).
+    pub fn captureMemorySnapshot(self: *Scene) !*const profiler_mod.MemorySnapshot {
+        return self.profiler.captureMemorySnapshot(self);
+    }
+
+    /// Saves an interactive HTML report to `path`.
+    pub fn saveProfileReportHtml(self: *Scene, path: []const u8) !void {
+        try self.profiler.saveReportHtml(self, path);
+    }
+
+    /// Saves a Markdown report to `path`.
+    pub fn saveProfileReportMd(self: *Scene, path: []const u8) !void {
+        try self.profiler.saveReportMd(self, path);
+    }
+
+    /// Saves Chrome Trace Event JSON to `path`.
+    pub fn saveProfileTraceJson(self: *Scene, path: []const u8) !void {
+        try self.profiler.saveTraceJson(path);
+    }
+
+    /// Saves all reports (HTML, Markdown, Chrome Trace JSON) to `<base_path>.html`,
+    /// `<base_path>.md`, and `<base_path>.json`.
+    pub fn saveProfileReports(self: *Scene, base_path: []const u8) !void {
+        try self.profiler.saveReports(self, base_path);
     }
 };
 

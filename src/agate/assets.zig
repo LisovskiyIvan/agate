@@ -81,6 +81,10 @@ pub const PendingTexture = struct {
     texture: ?Texture = null,
 
     pub fn addTarget(self: *PendingTexture, slot: *?Texture) void {
+        if (self.state.load(.acquire) == .uploaded and self.texture != null) {
+            slot.* = self.texture;
+            return;
+        }
         self.targets.append(self.allocator, slot) catch {};
     }
 
@@ -194,6 +198,34 @@ pub const UploadQueue = struct {
 
         self.runner.post(p, decodeTask);
         return p;
+    }
+
+    /// Looks for an existing pending or uploaded texture for `path`.
+    /// Returns the matching slot if it is still valid (not failed or taken).
+    pub fn findFile(self: *UploadQueue, path: []const u8) ?*PendingTexture {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.pending.items) |p| {
+            if (p.path.len > 0 and std.mem.eql(u8, p.path, path)) {
+                const s = p.state.load(.acquire);
+                if (s != .failed and s != .taken) return p;
+            }
+        }
+        return null;
+    }
+
+    /// Deduplicating asset pipeline request: reuses an in-flight or uploaded
+    /// texture for the same path instead of issuing redundant decodes and GPU uploads.
+    pub fn getOrRequestFile(
+        self: *UploadQueue,
+        path: []const u8,
+        options: Texture.Options,
+        decode_opts: Texture.DecodeOptions,
+    ) !*PendingTexture {
+        if (self.findFile(path)) |existing| {
+            return existing;
+        }
+        return self.requestFile(path, options, decode_opts);
     }
 
     /// Starts an async decode of an owned embedded payload. `bytes`
@@ -545,4 +577,30 @@ test "unbounded collect takes every ready slot and skips the rest" {
         p.state.store(.uploaded, .release);
     }
     queue.release(failed);
+}
+
+test "UploadQueue.getOrRequestFile deduplicates in-flight and uploaded textures" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    const p1 = try queue.getOrRequestFile(path.?, .{}, .{});
+    const p2 = try queue.getOrRequestFile(path.?, .{}, .{});
+    try testing.expectEqual(p1, p2);
+
+    const found = queue.findFile(path.?);
+    try testing.expectEqual(p1, found);
+
+    try testing.expect(waitForState(p1, &.{.ready}));
+
+    // Simulating upload to .uploaded state
+    p1.raw.deinit(a);
+    p1.state.store(.uploaded, .release);
+
+    // After upload, requesting the same path again still returns the same slot
+    const p3 = try queue.getOrRequestFile(path.?, .{}, .{});
+    try testing.expectEqual(p1, p3);
 }

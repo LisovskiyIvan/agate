@@ -90,6 +90,7 @@ test {
     _ = @import("physics/world.zig");
     _ = @import("physics_mesh.zig");
     _ = @import("postprocess.zig");
+    _ = @import("profiler.zig");
     _ = @import("ragdoll.zig");
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");

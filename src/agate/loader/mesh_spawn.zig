@@ -384,6 +384,7 @@ pub fn parsePrimitive(
         .owns_name = true,
         .vertex_buffer = vbuf,
         .index_buffer = ibuf,
+        .vertex_count = @intCast(vertices.len),
         .index_count = index_count,
         .index_type = index_type,
         .skeleton = skeleton,

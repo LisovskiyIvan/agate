@@ -296,6 +296,7 @@ pub const Voice = audio.Voice;
 
 pub const serialization = @import("serialization.zig");
 pub const SceneState = serialization.SceneState;
+pub const GameProperty = serialization.GameProperty;
 pub const captureSceneState = serialization.capture;
 pub const restoreSceneState = serialization.restore;
 pub const serializeSceneState = serialization.serializeAlloc;
@@ -347,6 +348,14 @@ pub const visibility = @import("visibility/mod.zig");
 pub const HiZBuffer = visibility.HiZBuffer;
 pub const SoftwareRasterizer = visibility.SoftwareRasterizer;
 pub const OcclusionCuller = visibility.OcclusionCuller;
+
+pub const profiler = @import("profiler.zig");
+pub const Profiler = profiler.Profiler;
+pub const FrameRecord = profiler.FrameRecord;
+pub const MemorySnapshot = profiler.MemorySnapshot;
+pub const SessionSummary = profiler.SessionSummary;
+pub const DiagnosticFinding = profiler.DiagnosticFinding;
+pub const DiagnosticSeverity = profiler.DiagnosticSeverity;
 
 pub const sokol = @import("sokol");
 

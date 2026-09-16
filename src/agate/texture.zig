@@ -109,12 +109,27 @@ fn checkedFaceBytes(size: u32) !usize {
     return @as(usize, bytes);
 }
 
+/// Approximate bytes per pixel for a Sokol pixel format.
+pub fn pixelFormatBytes(format: sg.PixelFormat) usize {
+    return switch (format) {
+        .R8, .R8UI, .R8SI, .R8SN => 1,
+        .R16F, .R16UI, .R16SI, .R16, .R16SN, .RG8, .RG8UI, .RG8SI, .RG8SN => 2,
+        .RGBA8, .BGRA8, .RGBA8UI, .RGBA8SI, .RGBA8SN, .RG16F, .RG16UI, .RG16SI, .RG16, .RG16SN, .R32F, .R32UI, .R32SI, .DEPTH, .DEPTH_STENCIL => 4,
+        .RGBA16F, .RGBA16UI, .RGBA16SI, .RGBA16, .RGBA16SN, .RG32F, .RG32UI, .RG32SI => 8,
+        .RGBA32F, .RGBA32UI, .RGBA32SI => 16,
+        .BC1_RGBA, .BC4_R, .BC4_RSN, .ETC2_RGB8, .ETC2_RGB8A1 => 1,
+        .BC2_RGBA, .BC3_RGBA, .BC5_RG, .BC5_RGSN, .BC6H_RGBF, .BC6H_RGBUF, .BC7_RGBA, .ETC2_RGBA8 => 1,
+        else => 4,
+    };
+}
+
 pub const Texture = struct {
     image: sg.Image,
     view: sg.View,
     sampler: sg.Sampler,
     width: u32,
     height: u32,
+    num_mipmaps: u32 = 1,
     /// Pixel format of the GPU image. LDR loaders leave the default RGBA8;
     /// HDR loaders set RGBA16F. Defaults keep existing call sites unchanged.
     format: sg.PixelFormat = .RGBA8,
@@ -190,6 +205,23 @@ pub const Texture = struct {
             .width = width,
             .height = height,
         };
+    }
+
+    /// Total estimated GPU memory in bytes for this texture (including all mip levels).
+    pub fn getGpuMemoryBytes(self: *const Texture) usize {
+        if (self.image.id == 0) return 0;
+        const bpp = pixelFormatBytes(self.format);
+        var total: usize = 0;
+        var w = @max(1, self.width);
+        var h = @max(1, self.height);
+        const mips = @max(1, self.num_mipmaps);
+        for (0..mips) |_| {
+            total += @as(usize, w) * @as(usize, h) * bpp;
+            if (w == 1 and h == 1) break;
+            w = @max(1, w / 2);
+            h = @max(1, h / 2);
+        }
+        return total;
     }
     /// Box-filter downsample of one RGBA8 level. Dims floor at 1, source coords
     /// clamp at edges (handles NPOT). Thin wrapper over the shared
@@ -304,6 +336,7 @@ pub const Texture = struct {
             .sampler = smp,
             .width = raw.width,
             .height = raw.height,
+            .num_mipmaps = raw.num_levels,
         };
     }
 
@@ -731,6 +764,21 @@ pub const CubeTexture = struct {
         sg.destroyView(self.view);
         sg.destroyImage(self.image);
         sg.destroySampler(self.sampler);
+    }
+
+    /// Total estimated GPU memory in bytes for this cube texture (all 6 faces, including mips).
+    pub fn getGpuMemoryBytes(self: *const CubeTexture) usize {
+        if (self.image.id == 0) return 0;
+        const bpp = pixelFormatBytes(self.format);
+        var total: usize = 0;
+        var s = @max(1, self.size);
+        const mips = @max(1, self.num_mipmaps);
+        for (0..mips) |_| {
+            total += @as(usize, s) * @as(usize, s) * bpp * 6;
+            if (s == 1) break;
+            s = @max(1, s / 2);
+        }
+        return total;
     }
 
     pub fn createDefault1x1(color: [4]u8) CubeTexture {

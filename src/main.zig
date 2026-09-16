@@ -26,6 +26,7 @@ var camera: z.ArcRotateCamera = undefined;
 var frame_limit: u32 = 0;
 var frame_count: u32 = 0;
 var particle_mode: ?z.SimulationMode = null;
+var profile_mode: bool = false;
 /// --stats gate: frame-metrics summary every `stats_interval` frames.
 /// Off by default so normal runs see no stdout change.
 var show_stats: bool = false;
@@ -67,6 +68,8 @@ fn parseArgs(args: std.process.Args) void {
             msaa_samples = std.fmt.parseInt(i32, n, 10) catch 1;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             show_stats = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile_mode = true;
         }
     }
 }
@@ -179,6 +182,11 @@ export fn init() callconv(.c) void {
             break :blk null;
         };
         if (game_thread == null) threaded = false;
+    }
+
+    if (profile_mode) {
+        scene.startProfiling();
+        std.log.info("Profiling started via --profile CLI flag", .{});
     }
 }
 
@@ -304,6 +312,13 @@ export fn cleanup() callconv(.c) void {
         pool.deinit();
         z.jobs.global = null;
     }
+    if (scene.isProfiling()) {
+        scene.stopProfiling();
+        scene.saveProfileReports("profile") catch |err| {
+            std.log.err("Failed to save profile: {s}", .{@errorName(err)});
+        };
+        std.log.info("Saved profile reports to profile.html, profile.md, profile.json", .{});
+    }
     scene.deinit();
     _ = gpa.deinit();
     sg.shutdown();
@@ -326,6 +341,21 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     switch (ev.*.type) {
         .MOUSE_DOWN => pushInput(.mouse_down),
         .KEY_DOWN => switch (ev.*.key_code) {
+            .F8 => {
+                phase_mutex.lock();
+                defer phase_mutex.unlock();
+                if (scene.isProfiling()) {
+                    scene.stopProfiling();
+                    scene.saveProfileReports("profile") catch |err| {
+                        std.log.err("Failed to save profile: {s}", .{@errorName(err)});
+                        return;
+                    };
+                    std.log.info("Profiling stopped. Reports written to profile.html, profile.md, profile.json", .{});
+                } else {
+                    scene.startProfiling();
+                    std.log.info("Profiling started... Press F8 again to stop and save reports.", .{});
+                }
+            },
             .SPACE, .ESCAPE => pushInput(.{ .key_down = ev.*.key_code }),
             else => {},
         },
