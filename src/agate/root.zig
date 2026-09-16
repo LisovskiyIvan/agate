@@ -291,6 +291,11 @@ pub const VehicleOptions = @import("vehicle.zig").VehicleOptions;
 
 pub const audio = @import("audio.zig");
 pub const AudioEngine = audio.AudioEngine;
+pub const AudioConfig = audio.AudioConfig;
+pub const AudioEngineConfig = audio.AudioEngineConfig;
+pub const default_max_buses = audio.default_max_buses;
+pub const max_bus_capacity = audio.max_bus_capacity;
+pub const max_buses = audio.max_buses;
 pub const AudioClip = audio.AudioClip;
 pub const VoiceKind = audio.VoiceKind;
 pub const Voice = audio.Voice;

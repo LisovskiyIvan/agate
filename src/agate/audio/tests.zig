@@ -1037,3 +1037,46 @@ test "AudioEngine bus hierarchy and effective volume/mute propagation" {
     // Now child routes directly to root: 0.5 * 0.8 = 0.40
     try std.testing.expectApproxEqAbs(@as(f32, 0.40), eng.getBusEffectiveVolume(child), 1e-4);
 }
+
+test "AudioEngine configurable bus capacity at initialization" {
+    // 1. Default initialization has max_buses = 32
+    var def_eng = AudioEngine{};
+    try std.testing.expectEqual(@as(usize, 32), def_eng.getBusCapacity());
+
+    // 2. Custom small capacity: max_buses = 8
+    var small_eng = AudioEngine.init(.{ .max_buses = 8 });
+    try std.testing.expectEqual(@as(usize, 8), small_eng.getBusCapacity());
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "bus_{d}", .{i}) catch "b";
+        const b = small_eng.createNonSpatialBus(name, 1.0);
+        try std.testing.expect(b != null);
+    }
+    // 9th bus creation MUST fail (returns null) because capacity is 8!
+    try std.testing.expect(small_eng.createNonSpatialBus("overflow", 1.0) == null);
+    try std.testing.expectEqual(@as(usize, 8), small_eng.getBusCount());
+
+    // 3. Custom large capacity: max_buses = 64 (well above default 32)
+    var large_eng = AudioEngine.init(.{ .max_buses = 64 });
+    try std.testing.expectEqual(@as(usize, 64), large_eng.getBusCapacity());
+    var created_ids: [48]BusId = undefined;
+    for (0..48) |idx| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "wide_{d}", .{idx}) catch "w";
+        const b = large_eng.createSpatialBus(name, .{ .volume = 0.8 });
+        try std.testing.expect(b != null);
+        created_ids[idx] = b.?;
+    }
+    try std.testing.expectEqual(@as(usize, 48), large_eng.getBusCount());
+
+    // Test parent-child relationship on buses above 32 (e.g. 45 -> 40)
+    large_eng.setBusParent(created_ids[45], created_ids[40]);
+    try std.testing.expectEqual(created_ids[40], large_eng.getBusParent(created_ids[45]).?);
+    large_eng.setBusMuted(created_ids[40], true);
+    try std.testing.expectEqual(@as(f32, 0.0), large_eng.getBusEffectiveVolume(created_ids[45]));
+
+    // 4. Clamping behavior
+    var clamped_eng = AudioEngine.init(.{ .max_buses = 500 });
+    try std.testing.expectEqual(@as(usize, 128), clamped_eng.getBusCapacity());
+}
