@@ -6,6 +6,8 @@ const AudioEngine = audio.AudioEngine;
 const AudioClip = audio.AudioClip;
 const VoiceKind = audio.VoiceKind;
 const Voice = audio.Voice;
+const BusId = audio.BusId;
+const AudioBus = audio.AudioBus;
 
 fn peakAbs(buf: []const f32, from_frame: usize, to_frame: usize) f32 {
     var peak: f32 = 0.0;
@@ -855,4 +857,178 @@ test "AudioEngine attenuation models and Doppler shift calculation" {
     const recede_vel = Vec3.new(0.0, 34.3, 0.0);
     const dop_rec = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 10.0, 0.0), 1.0, 1.0, 30.0, 1.0, .linear, recede_vel);
     try std.testing.expect(dop_rec.doppler < 0.95); // pitch shifted down!
+}
+
+test "AudioEngine dynamic bus creation, lookup, and configuration" {
+    var eng = AudioEngine{};
+    const initial_count = eng.getBusCount();
+    try std.testing.expectEqual(@as(usize, 5), initial_count); // master, sfx, music, ambient, ui
+
+    // Create spatial and non-spatial buses
+    const weapons_bus = eng.createSpatialBus("weapons", .{
+        .volume = 0.9,
+        .min_distance = 2.0,
+        .max_distance = 40.0,
+        .rolloff = 1.2,
+    }) orelse return error.BusCreationFailed;
+
+    const voiceover_bus = eng.createNonSpatialBus("voiceover", 0.75) orelse return error.BusCreationFailed;
+
+    try std.testing.expectEqual(@as(usize, 7), eng.getBusCount());
+    try std.testing.expect(eng.isBusActive(weapons_bus));
+    try std.testing.expect(eng.isBusActive(voiceover_bus));
+
+    // Lookup by name
+    try std.testing.expectEqual(weapons_bus, eng.findBus("weapons").?);
+    try std.testing.expectEqual(voiceover_bus, eng.findBus("voiceover").?);
+    try std.testing.expect(eng.findBus("nonexistent") == null);
+
+    // Verify spatial flags
+    try std.testing.expect(eng.isBusSpatial(weapons_bus));
+    try std.testing.expect(!eng.isBusSpatial(voiceover_bus));
+
+    // Verify volumes
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), eng.getBusVolume(weapons_bus), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), eng.getBusVolume(voiceover_bus), 1e-4);
+
+    // Verify names
+    try std.testing.expectEqualStrings("weapons", eng.getBusName(weapons_bus));
+    try std.testing.expectEqualStrings("voiceover", eng.getBusName(voiceover_bus));
+
+    // Verify attenuation configuration
+    const attn = eng.getBusAttenuation(weapons_bus);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), attn.min_distance, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0), attn.max_distance, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), attn.rolloff, 1e-4);
+
+    // Destroy voiceover bus
+    eng.destroyBus(voiceover_bus);
+    try std.testing.expect(!eng.isBusActive(voiceover_bus));
+    try std.testing.expectEqual(@as(usize, 6), eng.getBusCount());
+    try std.testing.expect(eng.findBus("voiceover") == null);
+}
+
+test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
+    var eng = AudioEngine{};
+    eng.updateListener(Vec3.zero, Vec3.new(1.0, 0.0, 0.0));
+
+    // Create a dynamic spatial bus (max distance 30)
+    const sp_bus = eng.createSpatialBus("sp_effects", .{
+        .max_distance = 30.0,
+    }) orelse return error.BusCreationFailed;
+
+    // Create a dynamic non-spatial bus
+    const flat_bus = eng.createNonSpatialBus("flat_cues", 1.0) orelse return error.BusCreationFailed;
+
+    // 1. Play sound at (0, 100, 0) on spatial bus -> beyond max_distance, MUST be silent!
+    eng.play(.{
+        .kind = .thump,
+        .bus = sp_bus,
+        .position = Vec3.new(0.0, 100.0, 0.0),
+        .volume = 0.8,
+        .duration = 0.1,
+    });
+    var buf_silent: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_silent);
+    try std.testing.expect(peakAbs(&buf_silent, 0, 2205) < 1e-6);
+
+    // 2. Play identical sound with identical position (0, 100, 0) on non-spatial bus -> MUST be audible!
+    eng.play(.{
+        .kind = .thump,
+        .bus = flat_bus,
+        .position = Vec3.new(0.0, 100.0, 0.0), // distance is ignored by non-spatial bus!
+        .volume = 0.8,
+        .duration = 0.1,
+    });
+    var buf_audible: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_audible);
+    try std.testing.expect(channelEnergy(&buf_audible, 0) > 0.01);
+
+    // 3. Non-spatial bus direct stereo panning (pan = -1.0 -> left speaker only)
+    eng.stopAll();
+    eng.play(.{
+        .kind = .thump,
+        .bus = flat_bus,
+        .pan = -1.0,
+        .volume = 0.8,
+        .duration = 0.1,
+    });
+    var buf_left: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_left);
+    try std.testing.expect(channelEnergy(&buf_left, 0) > 0.01);
+    try std.testing.expect(channelEnergy(&buf_left, 1) < 1e-6);
+
+    // 4. Runtime toggling: toggle sp_bus to non-spatial via setBusSpatial(false)!
+    eng.stopAll();
+    eng.setBusSpatial(sp_bus, false);
+    try std.testing.expect(!eng.isBusSpatial(sp_bus));
+
+    // Play again at 100m on sp_bus -> now that it is non-spatial, it MUST be audible!
+    eng.play(.{
+        .kind = .thump,
+        .bus = sp_bus,
+        .position = Vec3.new(0.0, 100.0, 0.0),
+        .volume = 0.8,
+        .duration = 0.1,
+    });
+    var buf_toggled: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_toggled);
+    try std.testing.expect(channelEnergy(&buf_toggled, 0) > 0.01);
+
+    // Toggle back to spatial -> distant sound is silent again!
+    eng.stopAll();
+    eng.setBusSpatial(sp_bus, true);
+    try std.testing.expect(eng.isBusSpatial(sp_bus));
+    eng.play(.{
+        .kind = .thump,
+        .bus = sp_bus,
+        .position = Vec3.new(0.0, 100.0, 0.0),
+        .volume = 0.8,
+        .duration = 0.1,
+    });
+    var buf_back: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf_back);
+    try std.testing.expect(peakAbs(&buf_back, 0, 2205) < 1e-6);
+}
+
+test "AudioEngine bus hierarchy and effective volume/mute propagation" {
+    var eng = AudioEngine{};
+    // Create parent bus
+    const parent = eng.createNonSpatialBus("combat_mix", 0.5) orelse return error.BusCreationFailed;
+    // Create child bus routing into parent
+    const child = eng.createNonSpatialBus("gunshots", 0.5) orelse return error.BusCreationFailed;
+    eng.setBusParent(child, parent);
+
+    try std.testing.expectEqual(parent, eng.getBusParent(child).?);
+
+    // Master volume is 0.8 by default.
+    // child local = 0.5, parent local = 0.5, master = 0.8.
+    // child effective = 0.5 * 0.5 * 0.8 = 0.20
+    const eff_child = eng.getBusEffectiveVolume(child);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.20), eff_child, 1e-4);
+
+    // Muting parent mutes child effectively
+    eng.setBusMuted(parent, true);
+    try std.testing.expect(eng.isBusMuted(parent));
+    try std.testing.expect(!eng.isBusMuted(child)); // child local flag is false
+    try std.testing.expectEqual(@as(f32, 0.0), eng.getBusEffectiveVolume(child)); // but effective volume is 0!
+
+    // Rendering on child while parent is muted produces silence
+    eng.play(.{ .kind = .thump, .bus = child, .volume = 0.8, .duration = 0.1 });
+    var buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    eng.renderFrames(&buf);
+    try std.testing.expect(peakAbs(&buf, 0, 2205) < 1e-6);
+
+    // Unmute parent, child becomes audible again
+    eng.setBusMuted(parent, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.20), eng.getBusEffectiveVolume(child), 1e-4);
+    eng.play(.{ .kind = .thump, .bus = child, .volume = 0.8, .duration = 0.1 });
+    eng.renderFrames(&buf);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.001);
+
+    // Destroying parent re-parents child to master (0)
+    eng.destroyBus(parent);
+    try std.testing.expectEqual(@as(BusId, .master), eng.getBusParent(child).?);
+    // Now child routes directly to master: 0.5 * 0.8 = 0.40
+    try std.testing.expectApproxEqAbs(@as(f32, 0.40), eng.getBusEffectiveVolume(child), 1e-4);
 }
