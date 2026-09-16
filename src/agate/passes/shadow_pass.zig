@@ -8,6 +8,7 @@ const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
 const scene_render_queue = @import("../scene/render_queue.zig");
 const Vertex = mesh_mod.Vertex;
+const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const jobs = @import("../jobs.zig");
 
 // Resolution of the shadow atlas texture (square). Must match the
@@ -47,11 +48,34 @@ pub const ShadowPass = struct {
     skinned_shader: sg.Shader = .{},
     allocator: std.mem.Allocator,
     binned_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    binned_items: std.ArrayListUnmanaged(ShadowDrawItem) = .empty,
+    last_bin_result: BinResult = .{
+        .counts = [_]usize{0} ** 6,
+        .offsets = [_]usize{0} ** 6,
+    },
 
     // Pipeline buckets in fixed order; the grouping key is defined once per
     // render so each cascade issues at most one applyPipeline per bucket.
-    const Bucket = enum { regular_u16, regular_u32, inst_u16, inst_u32, skinned_u16, skinned_u32 };
-    const bucket_order: [6]Bucket = .{ .regular_u16, .regular_u32, .inst_u16, .inst_u32, .skinned_u16, .skinned_u32 };
+    pub const Bucket = enum { regular_u16, regular_u32, inst_u16, inst_u32, skinned_u16, skinned_u32 };
+    pub const bucket_order: [6]Bucket = .{ .regular_u16, .regular_u32, .inst_u16, .inst_u32, .skinned_u16, .skinned_u32 };
+
+    /// Self-contained per-item payload for shadow rendering. Decouples shadow
+    /// execution from live *Mesh pointers and transforms during render.
+    pub const ShadowDrawItem = struct {
+        vertex_buffer: sg.Buffer = .{},
+        index_buffer: sg.Buffer = .{},
+        index_count: u32 = 0,
+        instance_buffer: sg.Buffer = .{},
+        visible_instance_count: u32 = 0,
+        model: Mat4 = Mat4.identity,
+        world_aabb: math.BoundingBox = math.BoundingBox.zero,
+        skin_matrices: ?*const [MAX_BONES]Mat4 = null,
+        bucket: Bucket = .regular_u16,
+        is_instanced: bool = false,
+        gpu_pending: bool = false,
+        is_visible: bool = true,
+        mesh: ?*Mesh = null,
+    };
 
     // Matches Scene.render's pipeline pick: instanced wins over skinned.
     fn bucketFor(mesh: *const Mesh) Bucket {
@@ -246,7 +270,6 @@ pub const ShadowPass = struct {
         frustum: math.Frustum,
         counts: [6]usize,
         offsets: [6]usize,
-        frame_id: u64,
         cascade_idx: ?usize,
         last_pipeline_id: *u32,
         draw_calls: *u32,
@@ -259,13 +282,11 @@ pub const ShadowPass = struct {
             const pip_id = self.pipelineFor(bucket);
             if (pip_id == 0) continue;
 
-            const bucket_meshes = self.binned_meshes.items[offsets[b_idx] .. offsets[b_idx] + count];
-            for (bucket_meshes) |mesh| {
-                // Deferred-creation meshes (off-context uploadGeometry) have
-                // no buffers yet: drawing them would bind invalid handles.
-                if (mesh.gpu_pending) continue;
-                if (mesh.instances.items.len > 0) {
-                    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) continue;
+            const bucket_items = self.binned_items.items[offsets[b_idx] .. offsets[b_idx] + count];
+            for (bucket_items) |item| {
+                if (item.gpu_pending) continue;
+                if (item.is_instanced) {
+                    if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) continue;
 
                     if (pip_id != last_pipeline_id.*) {
                         sg.applyPipeline(.{ .id = pip_id });
@@ -273,23 +294,20 @@ pub const ShadowPass = struct {
                     }
 
                     var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = mesh.vertex_buffer;
-                    bind.vertex_buffers[1] = mesh.instance_buffer;
-                    bind.index_buffer = mesh.index_buffer;
+                    bind.vertex_buffers[0] = item.vertex_buffer;
+                    bind.vertex_buffers[1] = item.instance_buffer;
+                    bind.index_buffer = item.index_buffer;
                     sg.applyBindings(bind);
 
                     const inst_vs = shadow_shd.VsInstParams{
                         .light_view_proj = light_view_proj,
                     };
                     sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
-                    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+                    sg.draw(0, item.index_count, item.visible_instance_count);
                     draw_calls.* += 1;
                 } else {
-                    if (!mesh.is_visible) continue;
-                    // Cached world transforms, filled here on first touch
-                    // and reused by the main pass's queue build (same frame
-                    // id). Bone attachment semantics match Mesh.getWorldMatrix.
-                    const aabb_w = scene_render_queue.worldAABBCached(frame_id, mesh);
+                    if (!item.is_visible) continue;
+                    const aabb_w = item.world_aabb;
                     if (!frustum.intersectsAABB(aabb_w)) continue;
 
                     // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
@@ -306,24 +324,23 @@ pub const ShadowPass = struct {
                     }
 
                     var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = mesh.vertex_buffer;
-                    bind.index_buffer = mesh.index_buffer;
+                    bind.vertex_buffers[0] = item.vertex_buffer;
+                    bind.index_buffer = item.index_buffer;
                     sg.applyBindings(bind);
 
-                    const model = scene_render_queue.worldMatrixCached(frame_id, mesh);
                     const shadow_vs = shadow_shd.VsParams{
-                        .mvp = Mat4.mul(light_view_proj, model),
+                        .mvp = Mat4.mul(light_view_proj, item.model),
                     };
                     sg.applyUniforms(shadow_shd.UB_vs_params, sg.asRange(&shadow_vs));
 
-                    if (mesh.skeleton) |skel| {
+                    if (item.skin_matrices) |bones| {
                         const vs_skin = shadow_shd.VsSkin{
-                            .bones = skel.getRenderSkinMatrices().*,
+                            .bones = bones.*,
                         };
                         sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
                     }
 
-                    sg.draw(0, mesh.index_count, 1);
+                    sg.draw(0, item.index_count, 1);
                     draw_calls.* += 1;
                 }
             }
@@ -461,13 +478,61 @@ pub const ShadowPass = struct {
         return .{ .counts = counts, .offsets = offsets };
     }
 
-    pub fn render(
+    pub fn prepare(
         self: *ShadowPass,
         meshes: []const *Mesh,
         frame_id: u64,
+        pool: ?*jobs.Pool,
+    ) BinResult {
+        const binned = self.binMeshes(meshes, pool);
+        const total = self.binned_meshes.items.len;
+        if (total > self.binned_items.items.len) {
+            self.binned_items.resize(self.allocator, total) catch return binned;
+        } else {
+            self.binned_items.shrinkRetainingCapacity(total);
+        }
+
+        for (self.binned_meshes.items, 0..) |mesh, idx| {
+            const is_inst = mesh.instances.items.len > 0;
+            const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(frame_id, mesh) else mesh.cached_aabb;
+            const model = if (!is_inst) scene_render_queue.worldMatrixCached(frame_id, mesh) else Mat4.identity;
+            const skin_bones = if (mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null;
+
+            self.binned_items.items[idx] = ShadowDrawItem{
+                .vertex_buffer = mesh.vertex_buffer,
+                .index_buffer = mesh.index_buffer,
+                .index_count = mesh.index_count,
+                .instance_buffer = mesh.instance_buffer,
+                .visible_instance_count = mesh.visible_instance_count,
+                .model = model,
+                .world_aabb = aabb_w,
+                .skin_matrices = skin_bones,
+                .bucket = bucketFor(mesh),
+                .is_instanced = is_inst,
+                .gpu_pending = mesh.gpu_pending,
+                .is_visible = mesh.is_visible,
+                .mesh = mesh,
+            };
+        }
+
+        self.last_bin_result = binned;
+        return binned;
+    }
+
+    pub fn renderPrepared(
+        self: *ShadowPass,
         cascades: [4]Mat4,
         spot_shadows: []const SpotShadowRenderInfo,
-        pool: ?*jobs.Pool,
+    ) u32 {
+        return self.renderItems(cascades, spot_shadows, self.last_bin_result.counts, self.last_bin_result.offsets);
+    }
+
+    pub fn renderItems(
+        self: *ShadowPass,
+        cascades: [4]Mat4,
+        spot_shadows: []const SpotShadowRenderInfo,
+        counts: [6]usize,
+        offsets: [6]usize,
     ) u32 {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
@@ -486,11 +551,6 @@ pub const ShadowPass = struct {
         // Kept across cascades: identical re-applies are skipped.
         var last_pipeline_id: u32 = 0;
 
-        // 1. Pre-bin shadow-casting meshes into the 6 pipeline buckets once.
-        const binned = self.binMeshes(meshes, pool);
-        const counts = binned.counts;
-        const offsets = binned.offsets;
-
         for (0..4) |c_idx| {
             const light_view_proj = cascades[c_idx];
             const vx: i32 = if (c_idx % 2 == 1) CASCADE_RES else 0;
@@ -500,7 +560,7 @@ pub const ShadowPass = struct {
             sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
             const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
-            self.renderBuckets(light_view_proj, c_frustum, counts, offsets, frame_id, c_idx, &last_pipeline_id, &draw_calls);
+            self.renderBuckets(light_view_proj, c_frustum, counts, offsets, c_idx, &last_pipeline_id, &draw_calls);
         }
 
         sg.endPass();
@@ -526,7 +586,7 @@ pub const ShadowPass = struct {
                 sg.applyScissorRect(vx, 0, SPOT_SHADOW_RES, SPOT_SHADOW_RES, false);
 
                 const spot_frustum = math.Frustum.fromViewProjection(spot_info.view_proj);
-                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, frame_id, null, &spot_last_pipeline_id, &draw_calls);
+                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, null, &spot_last_pipeline_id, &draw_calls);
             }
 
             sg.endPass();
@@ -536,8 +596,21 @@ pub const ShadowPass = struct {
         return draw_calls;
     }
 
+    pub fn render(
+        self: *ShadowPass,
+        meshes: []const *Mesh,
+        frame_id: u64,
+        cascades: [4]Mat4,
+        spot_shadows: []const SpotShadowRenderInfo,
+        pool: ?*jobs.Pool,
+    ) u32 {
+        _ = self.prepare(meshes, frame_id, pool);
+        return self.renderPrepared(cascades, spot_shadows);
+    }
+
     pub fn deinit(self: *ShadowPass) void {
         self.binned_meshes.deinit(self.allocator);
+        self.binned_items.deinit(self.allocator);
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.inst_pipeline_u16);

@@ -35,6 +35,7 @@ const Camera = camera_mod.Camera;
 const Viewport = camera_mod.Viewport;
 const debug_shd = @import("debug_shader");
 const debug_pass = @import("passes/debug_pass.zig");
+const outline_pass = @import("passes/outline_pass.zig");
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
 const DirectionalLight = lights.DirectionalLight;
@@ -243,7 +244,8 @@ pub const Scene = struct {
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    render_outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    render_outline_items: std.ArrayListUnmanaged(outline_pass.OutlineDrawItem) = .empty,
+    view_queues: [scene_snapshot.MAX_CAMERAS]scene_render_queue.RenderQueues = [_]scene_render_queue.RenderQueues{.{}} ** scene_snapshot.MAX_CAMERAS,
 
     /// Mailbox for publishing frame-level camera/light/pass state from the
     /// simulation thread. Meshes and materials are still live scene objects,
@@ -967,50 +969,59 @@ pub const Scene = struct {
         sg.draw(0, 6, 1);
     }
 
+    fn prepareViewQueues(
+        self: *Scene,
+        queues: *scene_render_queue.RenderQueues,
+        cam_snap: scene_snapshot.CameraSnapshot,
+        sky_texture: ?CubeTexture,
+        ibl_intensity: f32,
+    ) void {
+        queues.reset();
+
+        scene_render_queue.buildFrameQueues(.{
+            .allocator = self.allocator,
+            .meshes = self.meshes.items,
+            .frame_id = self.frame_id,
+            .view_proj = cam_snap.view_proj,
+            .eye = cam_snap.eye,
+            .cull_frustum = self.enable_frustum_culling,
+            .cull_occlusion = self.enable_occlusion_culling,
+            .culling_mask = cam_snap.culling_mask,
+            .occlusion_culler = &self.occlusion_culler,
+            .stats = &self.stats,
+            .queues = queues,
+            .default_white_id = self.default_white_texture.view.id,
+            .default_material = &self.default_material,
+            .default_white = &self.default_white_texture,
+            .default_normal = &self.default_normal_texture,
+            .default_cube = &self.default_cube_texture,
+            .sky_texture = sky_texture,
+            .ibl_intensity = ibl_intensity,
+            .default_morph_view = self.forward.default_morph_view,
+            .thread_pool = jobs.global,
+        });
+
+        std.mem.sort(RenderMeshItem, queues.items.items, {}, scene_render_queue.sortRenderItems);
+        // Unified transparent order: regular + instanced groups globally
+        // back-to-front by group distance (one entry per batch).
+        std.mem.sort(
+            scene_render_queue.TransparentDrawEntry,
+            queues.transparent_order.items,
+            {},
+            scene_render_queue.sortTransparentDrawOrder,
+        );
+    }
+
     fn renderSceneView(
         self: *Scene,
         cam_snap: scene_snapshot.CameraSnapshot,
+        queues: *const scene_render_queue.RenderQueues,
         samples: i32,
         snap: *const scene_snapshot.SceneFrameSnapshot,
         env: scene_draw.Environment,
     ) void {
         const view_proj = cam_snap.view_proj;
         const eye = cam_snap.eye;
-
-        self.queues.reset();
-
-        scene_render_queue.buildFrameQueues(.{
-            .allocator = self.allocator,
-            .meshes = self.meshes.items,
-            .frame_id = self.frame_id,
-            .view_proj = view_proj,
-            .eye = eye,
-            .cull_frustum = self.enable_frustum_culling,
-            .cull_occlusion = self.enable_occlusion_culling,
-            .culling_mask = cam_snap.culling_mask,
-            .occlusion_culler = &self.occlusion_culler,
-            .stats = &self.stats,
-            .queues = &self.queues,
-            .default_white_id = self.default_white_texture.view.id,
-            .default_material = &self.default_material,
-            .default_white = &self.default_white_texture,
-            .default_normal = &self.default_normal_texture,
-            .default_cube = &self.default_cube_texture,
-            .sky_texture = env.sky_texture,
-            .ibl_intensity = env.ibl_intensity,
-            .default_morph_view = self.forward.default_morph_view,
-            .thread_pool = jobs.global,
-        });
-
-        std.mem.sort(RenderMeshItem, self.queues.items.items, {}, scene_render_queue.sortRenderItems);
-        // Unified transparent order: regular + instanced groups globally
-        // back-to-front by group distance (one entry per batch).
-        std.mem.sort(
-            scene_render_queue.TransparentDrawEntry,
-            self.queues.transparent_order.items,
-            {},
-            scene_render_queue.sortTransparentDrawOrder,
-        );
 
         const frame_ctx = FrameContext{
             .view_proj = view_proj,
@@ -1033,38 +1044,38 @@ pub const Scene = struct {
         var current_pipeline_id: u32 = 0;
 
         // Opaque regular meshes first (front-to-back, early-Z).
-        for (self.queues.items.items) |item| {
+        for (queues.items.items) |item| {
             scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id);
         }
 
         // Opaque instanced meshes.
-        for (self.queues.opaque_instanced.items) |mesh| {
-            scene_draw.drawInstancedMesh(&env, mesh, &frame_ctx, &current_pipeline_id);
+        for (queues.opaque_instanced.items) |batch| {
+            scene_draw.drawInstancedBatch(&env, batch, &frame_ctx, &current_pipeline_id);
         }
 
         // Transparent pass: regular items and instanced groups interleaved in
         // one global back-to-front order (each instanced group draws as a
         // single batch at its sorted position; no per-instance sorting).
-        for (self.queues.transparent_order.items) |entry| {
+        for (queues.transparent_order.items) |entry| {
             switch (entry.kind) {
                 .regular => {
-                    if (entry.index < self.queues.transparent.items.len) {
-                        scene_draw.drawRegularItem(&env, self.queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id);
+                    if (entry.index < queues.transparent.items.len) {
+                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id);
                     }
                 },
                 .instanced => {
-                    if (entry.index < self.queues.transparent_instanced.items.len) {
-                        scene_draw.drawInstancedMesh(&env, self.queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id);
+                    if (entry.index < queues.transparent_instanced.items.len) {
+                        scene_draw.drawInstancedBatch(&env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id);
                     }
                 },
             }
         }
 
         // Inverse-hull outline for highlighted meshes
-        self.postfx.renderOutlineExplicit(
+        self.postfx.renderOutlineItems(
             view_proj,
             eye,
-            self.render_outline_meshes.items,
+            self.render_outline_items.items,
             samples,
             &self.stats,
             snap.outline_enabled,
@@ -1196,11 +1207,20 @@ pub const Scene = struct {
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;
     pub fn prepareFrame(self: *Scene) void {
+        const keep_update_ms = self.stats.update_ms;
+        const keep_prepare_ms = self.stats.prepare_ms;
+        self.stats = .{};
+        self.stats.update_ms = keep_update_ms;
+        self.stats.prepare_ms = keep_prepare_ms;
+        self.frame_id +%= 1;
+
         if (self.uploads) |*q| {
             self.frame_uploads = q.drainCounted(upload_budget_per_frame);
         } else {
             self.frame_uploads = .{};
         }
+        self.stats.uploaded_textures_frame = std.math.cast(u32, self.frame_uploads.count) orelse std.math.maxInt(u32);
+        self.stats.uploaded_bytes_frame = self.frame_uploads.bytes;
         self.flushPendingGpuUploads();
 
         var snap = self.frame_snapshot;
@@ -1213,12 +1233,35 @@ pub const Scene = struct {
             self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
         }
 
-        self.render_outline_meshes.clearRetainingCapacity();
-        // Skip meshes whose GPU buffers are still pending (deferred creation
-        // on an off-context thread): outline draws bind raw handles.
+        self.render_outline_items.clearRetainingCapacity();
         for (self.outline_meshes.items) |m| {
-            if (m.gpu_pending) continue;
-            self.render_outline_meshes.append(self.allocator, m) catch {};
+            if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
+            self.render_outline_items.append(self.allocator, outline_pass.makeOutlineDrawItem(m)) catch {};
+        }
+
+        const is_gpu_init = (self.default_white_texture.view.id != 0);
+        if (is_gpu_init) {
+            // Shadow pass preparation
+            if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
+                _ = self.shadows.pass.prepare(self.meshes.items, self.frame_id, jobs.global);
+            }
+
+            // View queues preparation
+            const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
+            const ibl_int = self.frame_snapshot.ibl_intensity;
+            if (self.frame_snapshot.has_camera) {
+                if (self.frame_snapshot.enable_multi_camera and self.frame_snapshot.camera_count > 0) {
+                    const active_idx = self.frame_snapshot.active_camera_idx;
+                    const primary_snap = if (active_idx < self.frame_snapshot.camera_count) self.frame_snapshot.cameras[active_idx] else self.frame_snapshot.primary_cam;
+                    self.prepareViewQueues(&self.queues, primary_snap, sky_tex, ibl_int);
+                    for (self.frame_snapshot.cameras[0..self.frame_snapshot.camera_count], 0..) |entry, i| {
+                        if (i == active_idx or !entry.enabled) continue;
+                        self.prepareViewQueues(&self.view_queues[i], entry, sky_tex, ibl_int);
+                    }
+                } else {
+                    self.prepareViewQueues(&self.queues, self.frame_snapshot.primary_cam, sky_tex, ibl_int);
+                }
+            }
         }
 
         self.frame_prepared = true;
@@ -1332,19 +1375,6 @@ pub const Scene = struct {
             );
         }
 
-        // Preserve cross-phase values across the per-frame reset: update_ms /
-        // prepare_ms are measured by the app around Scene.update/prepareFrame
-        // (before this reset runs), and the texture-upload tally is staged by
-        // prepareFrame above.
-        const keep_update_ms = self.stats.update_ms;
-        const keep_prepare_ms = self.stats.prepare_ms;
-        self.stats = .{};
-        self.stats.update_ms = keep_update_ms;
-        self.stats.prepare_ms = keep_prepare_ms;
-        self.stats.uploaded_textures_frame = std.math.cast(u32, self.frame_uploads.count) orelse std.math.maxInt(u32);
-        self.stats.uploaded_bytes_frame = self.frame_uploads.bytes;
-        self.frame_id +%= 1;
-
         // 1. Directional Light Cascaded Shadow View-Projections
         const cascades = snap.cascades;
         const light_pack = snap.light_pack;
@@ -1354,12 +1384,9 @@ pub const Scene = struct {
         // ==============================================
         if (snap.shadows_enabled) {
             const t_shadow = sokol.time.now();
-            const shadow_draws = self.shadows.pass.render(
-                self.meshes.items,
-                self.frame_id,
+            const shadow_draws = self.shadows.pass.renderPrepared(
                 cascades,
                 light_pack.spot_shadows[0..light_pack.num_spot_shadows],
-                jobs.global,
             );
             self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;
@@ -1410,7 +1437,7 @@ pub const Scene = struct {
             const primary_rect = primary_snap.viewport.toPixelRect(cur_w, cur_h);
             sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
             sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
-            self.renderSceneView(primary_snap, samples, snap, env);
+            self.renderSceneView(primary_snap, &self.queues, samples, snap, env);
 
             for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
                 if (i == active_idx or !entry.enabled) continue;
@@ -1423,7 +1450,7 @@ pub const Scene = struct {
                     self.clearCurrentViewport(clr, samples);
                 }
 
-                self.renderSceneView(entry, samples, snap, env);
+                self.renderSceneView(entry, &self.view_queues[i], samples, snap, env);
             }
             // Restore full viewport
             sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -1434,7 +1461,7 @@ pub const Scene = struct {
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-            self.renderSceneView(snap.primary_cam, samples, snap, env);
+            self.renderSceneView(snap.primary_cam, &self.queues, samples, snap, env);
 
             if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
                 sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -1532,6 +1559,7 @@ pub const Scene = struct {
 
         self.lights.deinit(self.allocator);
 
+        for (&self.view_queues) |*q| q.deinit(self.allocator);
         self.queues.deinit(self.allocator);
 
         self.trails.deinit(self.allocator);
@@ -1551,7 +1579,7 @@ pub const Scene = struct {
         scene_content.deinitAnimations(self.allocator, &self.animation_groups, &self.skeletons);
 
         self.outline_meshes.deinit(self.allocator);
-        self.render_outline_meshes.deinit(self.allocator);
+        self.render_outline_items.deinit(self.allocator);
         self.postfx.deinit();
 
         self.particles.deinit(self.allocator);

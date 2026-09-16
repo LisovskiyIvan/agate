@@ -20,6 +20,7 @@ const passes = @import("../passes/mod.zig");
 
 const render_queue = @import("render_queue.zig");
 const RenderMeshItem = render_queue.RenderMeshItem;
+const RenderInstancedBatch = render_queue.RenderInstancedBatch;
 const Mesh = @import("../mesh.zig").Mesh;
 const morph_gpu = @import("../mesh/morph_gpu.zig");
 const uniforms = @import("uniforms.zig");
@@ -64,7 +65,6 @@ pub const Environment = struct {
 // Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
 // in-shader discard. Updates stats.
 pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *const FrameContext, current_pipeline_id: *u32) void {
-    const mesh = item.mesh;
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
     const rec = item.draw_record;
@@ -86,8 +86,8 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
     }
 
     var bind = sg.Bindings{};
-    bind.vertex_buffers[0] = mesh.vertex_buffer;
-    bind.index_buffer = mesh.index_buffer;
+    bind.vertex_buffers[0] = item.vertex_buffer;
+    bind.index_buffer = item.index_buffer;
 
     const morph_view = item.morph_view;
     const morph_uniforms = item.morph_uniforms;
@@ -124,7 +124,7 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         };
         sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
-        const skel_bones = item.skin_matrices orelse (if (mesh.skeleton) |sk| sk.getRenderSkinMatrices() else null);
+        const skel_bones = item.skin_matrices;
         if (skel_bones) |bones| {
             const vs_skin = skinned_pbr_shd.VsSkin{
                 .bones = bones.*,
@@ -217,10 +217,10 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
 
-    sg.draw(0, mesh.index_count, 1);
+    sg.draw(item.base_vertex, item.index_count, 1);
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
-    env.stats.triangles += mesh.index_count / 3;
+    env.stats.triangles += item.index_count / 3;
 }
 
 // Draws one regular queue item whose material is a .shader_material.
@@ -243,13 +243,12 @@ fn drawShaderMaterialItem(
     sm: *const ShaderMaterial,
     mvp: Mat4,
 ) void {
-    const mesh = item.mesh;
-    if (mesh.skeleton != null) return; // see limitation note above
+    if (item.is_skinned) return; // see limitation note above
 
     const entry = shader_material.entry(sm.entry_index) orelse return;
     const set = env.pipelines.shader_materials.getOrCreate(entry.key) orelse return;
 
-    const is_u32 = mesh.index_type == .UINT32;
+    const is_u32 = item.is_u32;
     const pip_id = set.pipelineFor(item.transparent, is_u32, sm.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
@@ -259,8 +258,8 @@ fn drawShaderMaterialItem(
     }
 
     var bind = sg.Bindings{};
-    bind.vertex_buffers[0] = mesh.vertex_buffer;
-    bind.index_buffer = mesh.index_buffer;
+    bind.vertex_buffers[0] = item.vertex_buffer;
+    bind.index_buffer = item.index_buffer;
 
     const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
     const alpha_cutoff = item.draw_record.alpha_cutoff;
@@ -396,10 +395,10 @@ fn drawShaderMaterialItem(
         sg.applyUniforms(ub, sg.asRange(&sm.uniforms));
     }
 
-    sg.draw(0, mesh.index_count, 1);
+    sg.draw(item.base_vertex, item.index_count, 1);
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
-    env.stats.triangles += mesh.index_count / 3;
+    env.stats.triangles += item.index_count / 3;
 }
 
 fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) uniforms.FrameUniforms {
@@ -518,16 +517,14 @@ pub fn instancedDrawFlags(material: ?Material, is_decal: bool) struct { transpar
 // binds morph resources, so a morph mesh placed in an instanced queue
 // renders its base pose. CPU mode (the default) is unaffected: instanced
 // meshes share the already-blended dynamic vertex buffer.
-pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
-    if (mesh.instances.items.len == 0) return;
-    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
+pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+    if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return;
 
-    const is_pbr = if (mesh.material) |m| (m == .pbr) else false;
-    const flags = instancedDrawFlags(mesh.material, mesh.is_decal);
-    const is_u32 = mesh.index_type == .UINT32;
+    const is_pbr = batch.is_pbr;
+    const is_u32 = batch.index_type == .UINT32;
     // Double-sided instanced meshes use the cull-off twins when the set
     // provides them; otherwise the regular pipelines (legacy behavior).
-    const pip_id = env.pipelines.forInstancedMesh(is_pbr, flags.transparent, is_u32, flags.double_sided);
+    const pip_id = env.pipelines.forInstancedMesh(is_pbr, batch.transparent, is_u32, batch.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
         sg.applyPipeline(.{ .id = pip_id });
@@ -536,36 +533,25 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
     }
 
     var bind = sg.Bindings{};
-    bind.vertex_buffers[0] = mesh.vertex_buffer;
-    bind.vertex_buffers[1] = mesh.instance_buffer;
-    bind.index_buffer = mesh.index_buffer;
+    bind.vertex_buffers[0] = batch.vertex_buffer;
+    bind.vertex_buffers[1] = batch.instance_buffer;
+    bind.index_buffer = batch.index_buffer;
 
+    const rec = batch.draw_record;
     if (is_pbr) {
-        const pbr_mat = if (mesh.material) |m| m.pbr else null;
-        const albedo_tex = if (pbr_mat) |p| (p.albedo_texture orelse env.default_white.*) else env.default_white.*;
-        const normal_tex = if (pbr_mat) |p| (p.normal_texture orelse env.default_normal.*) else env.default_normal.*;
-        const mr_tex = if (pbr_mat) |p| (p.metallic_roughness_texture orelse env.default_white.*) else env.default_white.*;
-        const emissive_tex = if (pbr_mat) |p| (p.emissive_texture orelse env.default_white.*) else env.default_white.*;
-        const occlusion_tex = if (pbr_mat) |p| (p.occlusion_texture orelse env.default_white.*) else env.default_white.*;
-
-        bind.views[inst_pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
-        bind.views[inst_pbr_shd.VIEW_normal_tex] = normal_tex.view;
-        bind.views[inst_pbr_shd.VIEW_metallic_roughness_tex] = mr_tex.view;
-        bind.views[inst_pbr_shd.VIEW_emissive_tex] = emissive_tex.view;
-        bind.views[inst_pbr_shd.VIEW_occlusion_tex] = occlusion_tex.view;
-        bind.samplers[inst_pbr_shd.SMP_smp] = albedo_tex.sampler;
-        // Data-slot sampler: first present data texture wins, mirroring the
-        // regular draw path.
-        const data_sampler_tex = if (pbr_mat) |p|
-            (p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex)
-        else
-            albedo_tex;
-        bind.samplers[inst_pbr_shd.SMP_data_smp] = data_sampler_tex.sampler;
+        bind.views[inst_pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
+        bind.views[inst_pbr_shd.VIEW_normal_tex] = rec.normal_view;
+        bind.views[inst_pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
+        bind.views[inst_pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
+        bind.views[inst_pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+        bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
+        bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map
-        const cube = (if (pbr_mat) |p| p.environment_texture else null) orelse env.sky_texture orelse env.default_cube.*;
-        bind.views[inst_pbr_shd.VIEW_env_tex] = cube.view;
-        bind.samplers[inst_pbr_shd.SMP_env_smp] = cube.sampler;
+        const cube_view = rec.env_view orelse (if (env.sky_texture) |s| s.view else env.default_cube.view);
+        const cube_sampler = rec.env_sampler orelse (if (env.sky_texture) |s| s.sampler else env.default_cube.sampler);
+        bind.views[inst_pbr_shd.VIEW_env_tex] = cube_view;
+        bind.samplers[inst_pbr_shd.SMP_env_smp] = cube_sampler;
 
         bind.views[inst_pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[inst_pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
@@ -580,22 +566,15 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
         };
         sg.applyUniforms(inst_pbr_shd.UB_vs_params, sg.asRange(&inst_vs));
 
-        const mat_albedo = if (pbr_mat) |p| p.getAlbedoColor4() else [4]f32{ 1, 1, 1, 1 };
-        const metallic = if (pbr_mat) |p| p.metallic else 0.0;
-        const roughness = if (pbr_mat) |p| p.roughness else 0.5;
-        const env_intensity = if (pbr_mat) |p| env.ibl_intensity * p.environment_intensity else env.ibl_intensity;
-        const emissive_col = if (pbr_mat) |p| [4]f32{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 } else [4]f32{ 0, 0, 0, 1 };
-        const occlusion_strength = if (pbr_mat) |p| p.occlusion_strength else 1.0;
-
-        const f = frameUniformsFor(env, mesh, ctx);
+        const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
         const inst_fs = inst_pbr_shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
-            .base_color_factor = mat_albedo,
-            .pbr_factors = .{ metallic, roughness, occlusion_strength, env_intensity },
-            .emissive_factor = emissive_col,
+            .base_color_factor = rec.base_color,
+            .pbr_factors = rec.pbr_factors,
+            .emissive_factor = rec.emissive_color,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -609,26 +588,16 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
             .spot_intensity = f.spot_intensity,
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
-            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
-            .normal_scale = if (pbr_mat) |p| p.normal_scale else 1.0,
-            .uv_matrix = pbrUvMatrices(pbr_mat),
-            .uv_offset = pbrUvOffsets(pbr_mat),
-            .channel_selectors = pbrChannelSelectors(pbr_mat),
+            .alpha_cutoff = rec.alpha_cutoff,
+            .normal_scale = rec.normal_scale,
+            .uv_matrix = rec.uv_matrices,
+            .uv_offset = rec.uv_offsets,
+            .channel_selectors = rec.channel_selectors,
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {
-        // Documented limitation: instanced shader-material meshes render with
-        // the default standard material in this version (the hook materials
-        // are compiled from the non-instanced templates).
-        const std_mat = if (mesh.material) |m| switch (m) {
-            .standard => |s| s,
-            .pbr => env.default_material,
-            .shader_material => env.default_material,
-        } else env.default_material;
-        const tex = if (std_mat.diffuse_texture) |t| t else env.default_white.*;
-
-        bind.views[inst_shd.VIEW_diffuse_tex] = tex.view;
-        bind.samplers[inst_shd.SMP_smp] = tex.sampler;
+        bind.views[inst_shd.VIEW_diffuse_tex] = rec.albedo_view;
+        bind.samplers[inst_shd.SMP_smp] = rec.albedo_sampler;
 
         bind.views[inst_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[inst_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
@@ -643,16 +612,16 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
         };
         sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
 
-        const f = frameUniformsFor(env, mesh, ctx);
+        const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
         const inst_fs = inst_shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
             .light_color = f.light_color,
             .ambient_color = f.ambient_color,
-            .diffuse_color = std_mat.getDiffuseColor4(),
-            .alpha_cutoff = uniforms.alphaCutoffFor(mesh.material),
-            .uv_matrix = std_mat.diffuse_uv_transform.matrixRows(),
-            .uv_offset = std_mat.diffuse_uv_transform.offsetPacked(),
+            .diffuse_color = rec.base_color,
+            .alpha_cutoff = rec.alpha_cutoff,
+            .uv_matrix = rec.standard_uv_matrix,
+            .uv_offset = rec.standard_uv_offset,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -670,10 +639,42 @@ pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const Frame
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }
 
-    sg.draw(0, mesh.index_count, mesh.visible_instance_count);
+    sg.draw(0, batch.index_count, batch.visible_instance_count);
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
-    env.stats.triangles += (mesh.index_count / 3) * mesh.visible_instance_count;
+    env.stats.triangles += (batch.index_count / 3) * batch.visible_instance_count;
+}
+
+pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+    if (mesh.instances.items.len == 0) return;
+    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
+    const flags = instancedDrawFlags(mesh.material, mesh.is_decal);
+    const dummy_std = StandardMaterial.init("default");
+    const rec = material_mod.buildDrawRecord(
+        mesh.material,
+        &dummy_std,
+        env.default_white,
+        env.default_normal,
+        env.default_cube,
+        env.sky_texture,
+        env.ibl_intensity,
+    );
+    const batch = RenderInstancedBatch{
+        .vertex_buffer = mesh.vertex_buffer,
+        .instance_buffer = mesh.instance_buffer,
+        .index_buffer = mesh.index_buffer,
+        .index_count = mesh.index_count,
+        .index_type = mesh.index_type,
+        .visible_instance_count = mesh.visible_instance_count,
+        .is_pbr = if (mesh.material) |m| (m == .pbr) else false,
+        .transparent = flags.transparent,
+        .double_sided = flags.double_sided,
+        .is_decal = mesh.is_decal,
+        .receive_shadows = mesh.receive_shadows,
+        .draw_record = rec,
+        .mesh = mesh,
+    };
+    drawInstancedBatch(env, batch, ctx, current_pipeline_id);
 }
 
 // ---------------------------------------------------------------------------

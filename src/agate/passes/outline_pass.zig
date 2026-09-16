@@ -9,6 +9,7 @@ const Color4 = math.Color4;
 const Mesh = @import("../mesh.zig").Mesh;
 const Vertex = @import("../mesh.zig").Vertex;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
+const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("../scene/uniforms.zig");
 
 // Inverse-hull outline/highlight layer: highlighted meshes are redrawn with
@@ -225,6 +226,58 @@ pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
     };
 }
 
+/// Self-contained per-item payload for outline rendering. Decouples outline
+/// execution from live *Mesh pointers and transforms during render.
+pub const OutlineDrawItem = struct {
+    vertex_buffer: sg.Buffer = .{},
+    index_buffer: sg.Buffer = .{},
+    index_count: u32 = 0,
+    instance_buffer: sg.Buffer = .{},
+    visible_instance_count: u32 = 1,
+    model: Mat4 = Mat4.identity,
+    skin_matrices: ?*const [MAX_BONES]Mat4 = null,
+    cutout_view: ?sg.View = null,
+    cutout_sampler: ?sg.Sampler = null,
+    cutout_cutoff: f32 = 0.0,
+    world_center: Vec3 = Vec3.zero,
+    is_skinned: bool = false,
+    is_instanced: bool = false,
+    is_cutout: bool = false,
+    is_u32: bool = false,
+    gpu_pending: bool = false,
+    is_visible: bool = true,
+    mesh: ?*Mesh = null,
+};
+
+pub fn makeOutlineDrawItem(mesh: *const Mesh) OutlineDrawItem {
+    const skinned = mesh.skeleton != null;
+    const instanced = !skinned and mesh.instances.items.len > 0;
+    const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
+    const aabb = mesh.cached_aabb;
+    const center = if (aabb.isValid()) aabb.center() else mesh.position;
+
+    return OutlineDrawItem{
+        .vertex_buffer = mesh.vertex_buffer,
+        .index_buffer = mesh.index_buffer,
+        .index_count = mesh.index_count,
+        .instance_buffer = mesh.instance_buffer,
+        .visible_instance_count = if (instanced) mesh.visible_instance_count else 1,
+        .model = mesh.getWorldMatrix(),
+        .skin_matrices = if (mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null,
+        .cutout_view = if (cutout) |c| c.texture.view else null,
+        .cutout_sampler = if (cutout) |c| c.texture.sampler else null,
+        .cutout_cutoff = if (cutout) |c| c.cutoff else 0.0,
+        .world_center = center,
+        .is_skinned = skinned,
+        .is_instanced = instanced,
+        .is_cutout = (cutout != null),
+        .is_u32 = (mesh.index_type == .UINT32),
+        .gpu_pending = mesh.gpu_pending,
+        .is_visible = mesh.is_visible,
+        .mesh = @constCast(mesh),
+    };
+}
+
 pub const OutlinePass = struct {
     pipeline_u16: sg.Pipeline = .{},
     pipeline_u32: sg.Pipeline = .{},
@@ -316,85 +369,106 @@ pub const OutlinePass = struct {
         viewport_size[1] = @max(1.0, @as(f32, @floatFromInt(h)));
     }
 
-    /// Draws the outline rim for `meshes` into the currently open main pass.
-    /// Each mesh routes to its pipeline family (rigid / instanced / skinned /
-    /// alpha-cutout); meshes failing shouldOutlineMesh are skipped silently.
-    /// Empty list and zero width are GPU-free no-ops.
-    pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
-        // Reserved for view-dependent effects (distance fade); the width is
-        // depth-invariant by construction (clip-scaled NDC offset).
+    /// Renders immutable outline items into the currently open main pass.
+    pub fn renderItems(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, items: []const OutlineDrawItem, color: Color4, width_px: f32) void {
         _ = camera_pos;
-        if (meshes.len == 0) return;
+        if (items.len == 0) return;
         const width = clampWidthPx(width_px);
         if (width <= 0.0) return;
         if (self.pipeline_u16.id == 0 and self.pipeline_u32.id == 0) return;
 
-        for (meshes) |mesh| {
-            if (!shouldOutlineMesh(mesh)) continue;
-            const skinned = mesh.skeleton != null;
-            const instanced = !skinned and mesh.instances.items.len > 0;
-            const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
-            const is_u32 = mesh.index_type == .UINT32;
+        for (items) |item| {
+            if (!item.is_visible or item.gpu_pending or item.index_count == 0) continue;
+            if (item.vertex_buffer.id == 0 or item.index_buffer.id == 0) continue;
+
+            const skinned = item.is_skinned;
+            const instanced = !skinned and item.is_instanced;
+            const is_cutout = !skinned and !instanced and item.is_cutout;
+            const is_u32 = item.is_u32;
             const pip = if (skinned)
                 (if (is_u32) self.pipeline_skinned_u32 else self.pipeline_skinned_u16)
             else if (instanced)
                 (if (is_u32) self.pipeline_inst_u32 else self.pipeline_inst_u16)
-            else if (cutout != null)
+            else if (is_cutout)
                 (if (is_u32) self.pipeline_cutout_u32 else self.pipeline_cutout_u16)
             else
                 (if (is_u32) self.pipeline_u32 else self.pipeline_u16);
             if (pip.id == 0) continue;
 
             var bind = sg.Bindings{};
-            bind.vertex_buffers[0] = mesh.vertex_buffer;
+            bind.vertex_buffers[0] = item.vertex_buffer;
             if (instanced) {
-                // Occlusion-culled instances are compacted into the visible
-                // prefix; nothing visible means nothing to outline.
-                if (mesh.instance_buffer.id == 0 or mesh.visible_instance_count == 0) continue;
-                bind.vertex_buffers[1] = mesh.instance_buffer;
+                if (item.instance_buffer.id == 0 or item.visible_instance_count == 0) continue;
+                bind.vertex_buffers[1] = item.instance_buffer;
             }
-            if (cutout != null) {
-                // Dilate + alpha-test: the halo is masked by the leaf texture.
-                bind.views[outline_shd.VIEW_albedo_tex] = cutout.?.texture.view;
-                bind.samplers[outline_shd.SMP_smp] = cutout.?.texture.sampler;
+            if (is_cutout and item.cutout_view != null and item.cutout_sampler != null) {
+                bind.views[outline_shd.VIEW_albedo_tex] = item.cutout_view.?;
+                bind.samplers[outline_shd.SMP_smp] = item.cutout_sampler.?;
             }
-            bind.index_buffer = mesh.index_buffer;
+            bind.index_buffer = item.index_buffer;
             sg.applyPipeline(pip);
             sg.applyBindings(bind);
 
-            const model = mesh.getWorldMatrix();
+            const model = item.model;
             const mvp = Mat4.mul(view_proj, model);
             const vs_params = outline_shd.VsParams{
                 .mvp = mvp,
                 .model = model,
                 .color = color.toArray(),
-                .params = if (cutout != null) blk: {
+                .params = if (is_cutout) blk: {
                     var p = outlineParamsFor(width);
                     p[3] = cutout_depth_bias;
                     break :blk p;
                 } else outlineParamsFor(width),
             };
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
-            if (skinned) {
+            if (skinned and item.skin_matrices != null) {
                 const vs_skin = outline_shd.VsSkin{
-                    .bones = mesh.skeleton.?.getRenderSkinMatrices().*,
+                    .bones = item.skin_matrices.?.*,
                 };
                 sg.applyUniforms(outline_shd.UB_vs_skin, sg.asRange(&vs_skin));
             }
-            if (cutout) |ci| {
+            if (is_cutout) {
+                const clip = toClip(view_proj, item.world_center);
+                const center_ndc: [4]f32 = if (clip[3] <= 0.001)
+                    .{ 0, 0, 0, -1.0 }
+                else
+                    .{ clip[0] / clip[3], clip[1] / clip[3], 0, 1.0 };
                 const vs_center = outline_shd.VsCenter{
-                    .center_ndc = projectedCenterNdc(view_proj, mesh),
+                    .center_ndc = center_ndc,
                 };
                 sg.applyUniforms(outline_shd.UB_vs_center, sg.asRange(&vs_center));
                 const fs_cutout = outline_shd.FsCutoutParams{
-                    .cutout = .{ ci.cutoff, 0, 0, 0 },
+                    .cutout = .{ item.cutout_cutoff, 0, 0, 0 },
                 };
                 sg.applyUniforms(outline_shd.UB_fs_cutout_params, sg.asRange(&fs_cutout));
             }
 
-            const instance_count: u32 = if (instanced) mesh.visible_instance_count else 1;
-            sg.draw(0, mesh.index_count, instance_count);
+            const instance_count: u32 = if (instanced) item.visible_instance_count else 1;
+            sg.draw(0, item.index_count, instance_count);
         }
+    }
+
+    /// Each mesh routes to its pipeline family (rigid / instanced / skinned /
+    /// alpha-cutout); meshes failing shouldOutlineMesh are skipped silently.
+    /// Empty list and zero width are GPU-free no-ops.
+    pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
+        if (meshes.len == 0) return;
+        var stack_items: [32]OutlineDrawItem = undefined;
+        var items: []OutlineDrawItem = undefined;
+        var heap_buf: ?[]OutlineDrawItem = null;
+        if (meshes.len <= 32) {
+            items = stack_items[0..meshes.len];
+        } else {
+            heap_buf = std.heap.c_allocator.alloc(OutlineDrawItem, meshes.len) catch return;
+            items = heap_buf.?;
+        }
+        defer if (heap_buf) |h| std.heap.c_allocator.free(h);
+
+        for (meshes, 0..) |m, i| {
+            items[i] = makeOutlineDrawItem(m);
+        }
+        self.renderItems(view_proj, camera_pos, items, color, width_px);
     }
 
     pub fn deinit(self: *OutlinePass) void {

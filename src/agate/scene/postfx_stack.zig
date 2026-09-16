@@ -140,6 +140,26 @@ pub const PostFXStack = struct {
         }
     }
 
+    pub fn renderOutlineItems(
+        self: *PostFXStack,
+        view_proj: Mat4,
+        eye: Vec3,
+        outline_items: []const passes.OutlineDrawItem,
+        samples: i32,
+        stats: *SceneStats,
+        enabled: bool,
+        color: Color4,
+        width_px: f32,
+    ) void {
+        if (enabled and outline_items.len > 0) {
+            const pass = self.outlinePassFor(samples);
+            pass.renderItems(view_proj, eye, outline_items, color, width_px);
+            const outline_count: u32 = @intCast(outline_items.len);
+            stats.main_draw_calls += outline_count;
+            stats.draw_calls += outline_count;
+        }
+    }
+
     /// Outline pipeline set matching the target sample count; the MSAA twin
     /// is created lazily (and recreated on count changes, e.g. when a
     /// device-specific clamp narrows a requested 8x to 4x).

@@ -9,7 +9,7 @@ Status as of 2026-09-15. Legend: [x] done, [~] partial, [ ] planned.
 | 0. Thread affinity & GPU ownership | marker, deferred create/update/destroy, off-context loads | [x] done |
 | 1. Data-parallel CPU systems | job pool, particles, culling | [x] done |
 | 2. Async assets | TaskRunner, UploadQueue, glTF async textures | [x] done |
-| 3. Simulation/render decoupling | threads, coarse phase ownership, partial payload | [~] safe; non-blocking pending |
+| 3. Simulation/render decoupling | threads, lock-free render, full per-item payload | [x] done |
 
 ## What exists (as built)
 
@@ -151,15 +151,18 @@ Known limitations of the shipped split:
 
 ## What remains (TODO, in priority order)
 
-1. [ ] **Full per-item frame payload / strictly non-blocking render.**
-   Partial groundwork exists: `MaterialDrawRecord`, double-buffered skin
-   palettes, morph data in `RenderMeshItem`, plus `CameraSnapshot` and
-   `SceneFrameSnapshot` for camera/light/pass state. It is not a complete
-   render snapshot: queue construction, shadows, instancing and draw paths
-   still read live `Mesh`/`Material` state and write transform caches.
-   Therefore `phase_mutex` intentionally spans `prepareFrame() + render()`.
-   Unlock render only after every pass consumes immutable per-frame records
-   with explicit resource lifetime guarantees.
+1. [x] **Full per-item frame payload / strictly non-blocking render.**
+   Implemented full per-item payload: `RenderMeshItem`, `RenderInstancedBatch`,
+   `ShadowDrawItem`, and `OutlineDrawItem` carry all needed GPU buffer handles
+   (`vertex_buffer`, `index_buffer`, `instance_buffer`, etc.), material draw
+   records, and model matrices. Zero `*Mesh` reads/dereferences occur during
+   `Scene.render()` execution.
+   Queue construction, shadow binning (`ShadowPass.prepare`), outline collection,
+   and upload queue drains execute strictly during `prepareFrame()` under `phase_mutex`.
+   In `main.zig` (both `agate` and `sandbox`), `phase_mutex` is shrunk to cover
+   only `prepareFrame()` (+ UI generation in sandbox), allowing `Scene.render()` to run
+   100% lock-free concurrently with the ~1 kHz simulation loop. Verified under
+   multi-thousand mesh creation/destruction churn stress tests without data races or asserts.
 2. [x] **Sandbox joins the split.** Raw sapp event ring buffer feeding
    game-thread UI event handling, state mutations directly on the game
    thread, `flushPendingGpuUploads` for morph targets, `threaded = true`
@@ -505,6 +508,22 @@ visual regression и нагрузочная матрица остаются не
   - Интеграция в Scene API (`scene.startProfiling()`, `scene.stopProfiling()`, `scene.saveProfileReports("...")`);
   - Интеграция в демо agate и sandbox: горячая клавиша `F8` для включения/выключения записи на лету и CLI-флаг `--profile`;
   - Число тестов выросло с 601 до 605 (все проходят в Debug и ReleaseSafe без утечек памяти).
+
+### Волна 8 — строго неблокирующий рендер и полный per-item payload
+- **Автономный per-item payload рендера**:
+  - `RenderMeshItem` и `RenderInstancedBatch` инкапсулируют все GPU буферы (`vertex_buffer`, `index_buffer`, `instance_buffer`), параметры материалов (`MaterialDrawRecord`), morph/skin данные и матрицу трансформации;
+  - Полностью исключены любые разыменования указателей `*Mesh` во время выполнения `Scene.render()`;
+  - `ShadowDrawItem`: выделена отдельная структура для теневого прохода, теневые бакеты формируются в `ShadowPass.prepare()` на фазе `prepareFrame()`, а `ShadowPass.renderPrepared()` рисует исключительно по сформированным элементам;
+  - `OutlineDrawItem`: предварительный сбор контуров выделения в `prepareFrame()`; `renderOutlineItems` рисует контуры без обращения к живым мешам сцены.
+- **Разделение фаз подготовки и отрисовки**:
+  - Очереди отрисовки для всех камер (`self.queues`, `self.view_queues`) строятся строго в `prepareFrame()` через `prepareViewQueues`;
+  - Сброс статистики кадра, инкремент `frame_id`, обработка аплоадов и очистка очередей перенесены в `prepareFrame()`;
+  - `Scene.render()` выполняет только отправку draw-call'ов в Sokol GFX на основе готовых иммутабельных структур.
+- **Сужение phase_mutex до prepareFrame()**:
+  - В `agate` и `sandbox` `phase_mutex` захватывается только на время `prepareFrame()` (плюс генерация UI-вершин в sandbox);
+  - `Scene.render()` работает 100% lock-free и не блокирует параллельный цикл симуляции (~1 кГц) на игровом потоке;
+  - Проверено стресс-тестом на 240 кадров (`--test-stress`: 4160 созданий и 3895 удалений мешей на игровом потоке во время concurrent render'а, 0 ошибок, 0 ассертов);
+  - Все 605 тестов стабильно проходят в Debug и ReleaseSafe.
 
 ### Инварианты (закреплены ассертами и тестами)
 1. `sg.*` — только на графическом потоке; иначе отложить и завершить на

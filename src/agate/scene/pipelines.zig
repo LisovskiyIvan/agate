@@ -272,12 +272,36 @@ pub const DoubleSidedPipelines = struct {
 // `scene` is generic (anytype) to avoid a scene.zig import cycle; it must
 // expose the 12 pipeline_* fields. `item` must expose .mesh/.is_pbr/.transparent.
 pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
-    const mesh = item.mesh;
-    const is_u32 = mesh.index_type == .UINT32;
+    const is_u32 = blk: {
+        if (@hasField(@TypeOf(item), "mesh")) {
+            if (@typeInfo(@TypeOf(item.mesh)) == .optional) {
+                if (item.mesh) |m| break :blk (m.index_type == .UINT32);
+            } else {
+                break :blk (item.mesh.index_type == .UINT32);
+            }
+        }
+        if (@hasField(@TypeOf(item), "index_type") and item.index_type == .UINT32) break :blk true;
+        if (@hasField(@TypeOf(item), "is_u32") and item.is_u32) break :blk true;
+        break :blk false;
+    };
+
+    const is_skinned = blk: {
+        if (@hasField(@TypeOf(item), "mesh")) {
+            if (@typeInfo(@TypeOf(item.mesh)) == .optional) {
+                if (item.mesh) |m| break :blk (m.skeleton != null);
+            } else {
+                break :blk (item.mesh.skeleton != null);
+            }
+        }
+        if (@hasField(@TypeOf(item), "is_skinned") and item.is_skinned) break :blk true;
+        if (@hasField(@TypeOf(item), "skin_matrices") and item.skin_matrices != null) break :blk true;
+        break :blk false;
+    };
+
     const ds = sceneDoubleSided(scene);
     const want_ds = if (ds) |_| itemDoubleSided(item) else false;
     if (item.is_pbr) {
-        if (mesh.skeleton != null) {
+        if (is_skinned) {
             if (item.transparent) {
                 if (want_ds) {
                     const id = if (is_u32) ds.?.skinned_pbr_blend_u32.id else ds.?.skinned_pbr_blend_u16.id;

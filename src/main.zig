@@ -269,20 +269,19 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Stabilization: hold phase_mutex across prepareFrame AND render.
-        // render() reads live meshes/materials and uses the shared
-        // single-producer jobs.global pool, so it must not overlap gameLoop.
+        // Prepare phase under lock: extracts snapshot, builds render queues,
+        // prepares shadow maps and outline items, drains upload queues.
         phase_mutex.lock();
         const t_prepare = sokol.time.now();
         scene.prepareFrame();
         const prepare_ms = msSince(t_prepare);
-        scene.render();
-        // Assigned after render: render's per-frame stats reset preserves
-        // update_ms/prepare_ms, so either order would survive, but writing
-        // the finished measurement here keeps measure-then-publish local.
         scene.stats.prepare_ms = prepare_ms;
-        if (show_stats) printFrameStats();
         phase_mutex.unlock();
+
+        // Non-blocking render: consumes immutable payload built in
+        // prepareFrame with zero live mesh/material reads.
+        scene.render();
+        if (show_stats) printFrameStats();
     } else {
         simulate(@floatCast(sapp.frameDuration()));
         // Explicit prepare (render would do it internally): same total work,
