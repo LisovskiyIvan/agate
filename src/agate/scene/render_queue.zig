@@ -106,6 +106,60 @@ pub const TransparentDrawEntry = struct {
     is_decal: bool,
 };
 
+/// Reusable scratch for the parallel cull pass (buildFrameQueuesParallel):
+/// per-chunk record buffers plus per-chunk stats. Owned per `RenderQueues`
+/// (each view queue builds independently, so each keeps its own scratch)
+/// and retained across frames: `ensure` grows the outer list and the
+/// per-record capacities only when the chunk/span demand exceeds what is
+/// already held, `reset` clears lengths for reuse, and `deinit` (via
+/// `RenderQueues.deinit`) frees everything at shutdown. Steady-state frames
+/// therefore perform zero allocations in the parallel setup path.
+pub const ParallelCullScratch = struct {
+    records: std.ArrayListUnmanaged(std.ArrayListUnmanaged(RenderMeshItem)) = .empty,
+    chunk_stats: std.ArrayListUnmanaged(SceneStats) = .empty,
+
+    /// Fit to hold `chunk_count` chunks of `span` records each. All fallible
+    /// growth happens here, before any queue/stats write and before
+    /// `forkJoin`, so callers keep the OOM→serial-fallback contract:
+    /// failure leaves queues/stats untouched. Growth is atomic:
+    /// on error the scratch is freed back to empty (same as the old
+    /// per-call cleanup), so a failed setup owns no buffers even if the
+    /// caller never runs deinit; the next call simply regrows.
+    pub fn ensure(self: *ParallelCullScratch, allocator: std.mem.Allocator, chunk_count: usize, span: usize) !void {
+        errdefer {
+            self.deinit(allocator);
+            self.* = .{};
+        }
+        try self.records.ensureTotalCapacity(allocator, chunk_count);
+        while (self.records.items.len < chunk_count) self.records.appendAssumeCapacity(.empty);
+        // Shrinking must release the trailing records' owned buffers before
+        // truncating the list, otherwise they become unreachable and leak.
+        while (self.records.items.len > chunk_count) {
+            var r = self.records.pop().?;
+            r.deinit(allocator);
+        }
+        for (self.records.items) |*r| try r.ensureTotalCapacity(allocator, span);
+        try self.chunk_stats.ensureTotalCapacity(allocator, chunk_count);
+        while (self.chunk_stats.items.len < chunk_count) self.chunk_stats.appendAssumeCapacity(.{});
+        if (self.chunk_stats.items.len > chunk_count) self.chunk_stats.items.len = chunk_count;
+    }
+
+    /// Clear per-chunk record lengths and stats for reuse. The outer record
+    /// list length is kept — its elements own the retained buffers, and
+    /// truncating it would leak them; `ensure` re-fits lengths to the next
+    /// call's chunk count.
+    pub fn reset(self: *ParallelCullScratch) void {
+        for (self.records.items) |*r| r.clearRetainingCapacity();
+        self.chunk_stats.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *ParallelCullScratch, allocator: std.mem.Allocator) void {
+        for (self.records.items) |*r| r.deinit(allocator);
+        self.records.deinit(allocator);
+        self.chunk_stats.deinit(allocator);
+    }
+};
+
 /// The four draw queues plus the per-frame instance-matrix staging buffer.
 /// Cleared and refilled by buildFrameQueues each render(); ownership stays
 /// with Scene via a single field.
@@ -121,6 +175,12 @@ pub const RenderQueues = struct {
     // sorted by sortTransparentDrawOrder in renderSceneView. Retained
     // across frames (clearRetainingCapacity in reset: no per-frame churn).
     transparent_order: std.ArrayListUnmanaged(TransparentDrawEntry) = .empty,
+    // Parallel-cull scratch (per-chunk record buffers + stats). Lives with
+    // the view queues and is retained across frames (reset + ensure per
+    // buildFrameQueuesParallel call, freed once in deinit), so repeated
+    // per-view parallel culls reuse the same memory instead of
+    // allocating/freeing chunk buffers on every call.
+    parallel_scratch: ParallelCullScratch = .{},
 
     pub fn reset(self: *RenderQueues) void {
         self.items.clearRetainingCapacity();
@@ -138,6 +198,7 @@ pub const RenderQueues = struct {
         self.transparent_instanced.deinit(allocator);
         self.instance_matrices.deinit(allocator);
         self.transparent_order.deinit(allocator);
+        self.parallel_scratch.deinit(allocator);
     }
 };
 
@@ -830,20 +891,16 @@ fn buildFrameQueuesParallel(
     const chunk_count = (pool.workerCount() + 1) * 4;
     const span = (ctx.meshes.len + chunk_count - 1) / chunk_count;
 
-    const records = try ctx.allocator.alloc(std.ArrayListUnmanaged(RenderMeshItem), chunk_count);
-    // Zero every element and register cleanup BEFORE the first fallible
-    // initCapacity: a failure at element k then frees buffers 0..k (the
-    // rest are still .empty, so deinit is a no-op) instead of leaking them.
-    for (records) |*r| r.* = .empty;
-    defer {
-        for (records) |*r| r.deinit(ctx.allocator);
-        ctx.allocator.free(records);
-    }
-    for (records) |*r| {
-        r.* = try std.ArrayListUnmanaged(RenderMeshItem).initCapacity(ctx.allocator, span);
-    }
-    const chunk_stats = try ctx.allocator.alloc(SceneStats, chunk_count);
-    defer ctx.allocator.free(chunk_stats);
+    // Reusable per-view scratch, retained across frames: reset clears the
+    // previous call's lengths, ensure grows only when the chunk/span demand
+    // exceeds what is already held. ALL fallible growth happens here,
+    // before any queue/stats write and before forkJoin, so OOM still fails
+    // with queues/stats untouched and the caller falls back to serial.
+    const scratch = &ctx.queues.parallel_scratch;
+    scratch.reset();
+    try scratch.ensure(ctx.allocator, chunk_count, span);
+    const records = scratch.records.items[0..chunk_count];
+    const chunk_stats = scratch.chunk_stats.items[0..chunk_count];
     @memset(chunk_stats, .{});
 
     var pass = ParallelCull{
@@ -1242,6 +1299,113 @@ test "parallel cull produces serial-identical queues" {
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
         try std.testing.expectEqual(a.texture_id, b.texture_id);
         try std.testing.expectEqual(a.transparent, b.transparent);
+    }
+}
+
+test "parallel cull reuses scratch across calls" {
+    const ally = std.testing.allocator;
+
+    // Deterministic scene, forced onto the parallel path; no frustum or
+    // occlusion culling so every mesh queues identically each frame.
+    const count = 512;
+    const meshes = try ally.alloc(Mesh, count);
+    defer ally.free(meshes);
+    const ptrs = try ally.alloc(*Mesh, count);
+    defer ally.free(ptrs);
+    for (0..count) |i| {
+        meshes[i] = .{
+            .name = "m",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 3,
+        };
+        const f: f32 = @floatFromInt(i);
+        meshes[i].position = Vec3.new(f * 0.01, 0.0, f * 0.005);
+        ptrs[i] = &meshes[i];
+    }
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    var culler = visibility.OcclusionCuller.init();
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    const chunk_count = (pool.workerCount() + 1) * 4;
+    const span = (count + chunk_count - 1) / chunk_count;
+
+    // First parallel frame.
+    var stats_a = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_a,
+        .queues = &queues,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+    try std.testing.expectEqual(@as(usize, count), queues.items.items.len);
+    const snapshot = try ally.alloc(RenderMeshItem, queues.items.items.len);
+    defer ally.free(snapshot);
+    @memcpy(snapshot, queues.items.items);
+
+    // Scratch grew to the demand: outer capacity covers every chunk and
+    // each per-chunk record buffer covers its full span.
+    try std.testing.expectEqual(chunk_count, queues.parallel_scratch.records.items.len);
+    try std.testing.expect(queues.parallel_scratch.records.capacity >= chunk_count);
+    for (queues.parallel_scratch.records.items) |*r| {
+        try std.testing.expect(r.capacity >= span);
+    }
+    const outer_cap = queues.parallel_scratch.records.capacity;
+    const inner_caps = try ally.alloc(usize, chunk_count);
+    defer ally.free(inner_caps);
+    for (queues.parallel_scratch.records.items, 0..) |*r, i| inner_caps[i] = r.capacity;
+
+    // Second parallel frame reuses the same queues (draw queues reset;
+    // scratch retained) and must reproduce the first frame exactly.
+    queues.reset();
+    var stats_b = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 2,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_b,
+        .queues = &queues,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+    try std.testing.expectEqual(stats_a.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_a.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(stats_a.culled_meshes, stats_b.culled_meshes);
+    try std.testing.expectEqual(stats_a.occluded_meshes, stats_b.occluded_meshes);
+    try std.testing.expectEqual(snapshot.len, queues.items.items.len);
+    for (snapshot, queues.items.items) |a, b| {
+        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+        try std.testing.expectEqual(a.texture_id, b.texture_id);
+        try std.testing.expectEqual(a.transparent, b.transparent);
+    }
+
+    // No regrowth on the second call: identical demand reuses the retained
+    // buffers (same capacities, leak-checked by the testing allocator via
+    // queues.deinit).
+    try std.testing.expectEqual(outer_cap, queues.parallel_scratch.records.capacity);
+    for (queues.parallel_scratch.records.items, 0..) |*r, i| {
+        try std.testing.expectEqual(inner_caps[i], r.capacity);
     }
 }
 
