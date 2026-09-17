@@ -94,6 +94,7 @@ const scene_trails = @import("scene/trail_layer.zig");
 const scene_nav = @import("scene/nav_layer.zig");
 const scene_physics = @import("scene/physics_layer.zig");
 const scene_project = @import("scene/project_cache.zig");
+const scene_retire = @import("scene/gpu_retire.zig");
 const scene_content = @import("scene/content.zig");
 const scene_animation = @import("scene/animation_runtime.zig");
 const scene_picking = @import("scene/picking.zig");
@@ -135,19 +136,18 @@ pub const Scene = struct {
 
     // ---- Content registries (kept flat: external code iterates them). ----
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    /// Meshes removed off-context whose GPU teardown is deferred to the next
-    /// flushPendingGpuUploads on the context thread (see destroyMesh). Already
-    /// unlinked from `meshes`/`outline_meshes`, so deinitMeshes never sees
-    /// them twice.
-    pending_gpu_destroys: std.ArrayListUnmanaged(*Mesh) = .empty,
-    /// Allocation-free spillover for destroyMesh queue-append OOM
-    /// off-context: append cannot allocate here, so the mesh pointer parks
-    /// in a fixed slot instead. Drained alongside `pending_gpu_destroys`
-    /// in flushPendingGpuUploads and deinit, both on the context thread.
-    /// If this is also full the mesh is leaked (err-logged) rather than
-    /// touching sg.* off-context.
-    pending_gpu_destroys_overflow: [8]?*Mesh = [_]?*Mesh{null} ** 8,
-    pending_gpu_destroys_overflow_len: usize = 0,
+    /// P3: очередь ретенции GPU-мешей с epoch-семантикой
+    /// (scene/gpu_retire.zig). destroyMesh вне context-потока только отвязывает
+    /// меш и кладёт его сюда (retireMesh — с любого потока); уничтожает
+    /// (sg.* + free) только context-поток во flush (начало кадра) и в deinit.
+    /// Уже отвязанные меши невидимы для deinitMeshes — двойного free нет.
+    /// Tripwire P5/P6: новые kind'ы записей (не только меши) добавлять в
+    /// GpuRetireQueue, новых очередей в Scene не заводить.
+    gpu_retire: scene_retire.GpuRetireQueue = .{},
+    /// Epoch, начатый последним prepareFrame. render завершает его на ВСЕХ
+    /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
+    /// а не на камеру/view.
+    retire_epoch: scene_retire.Epoch = 0,
     materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
@@ -503,42 +503,14 @@ pub const Scene = struct {
         }
         // Decal expiration calls this from Scene.update on the game thread,
         // where sg.destroyBuffer is illegal: unlink now, destroy the GPU
-        // resources at the next render-start flush on the context thread.
+        // resources at the next render-start flush on the context thread
+        // (epoch-ретенция: запись ждёт завершения текущего кадра).
         if (!gpu_thread.isOnContextThread()) {
-            self.pending_gpu_destroys.append(self.allocator, mesh) catch {
-                // Queue-append OOM: park the pointer in the allocation-free
-                // overflow instead of touching sg.* off-context.
-                if (self.pending_gpu_destroys_overflow_len < self.pending_gpu_destroys_overflow.len) {
-                    self.pending_gpu_destroys_overflow[self.pending_gpu_destroys_overflow_len] = mesh;
-                    self.pending_gpu_destroys_overflow_len += 1;
-                } else {
-                    // Both queues exhausted under pathological OOM: leak the
-                    // mesh (err-logged) rather than breach thread affinity.
-                    std.log.err("scene: destroy queues exhausted, leaking mesh '{s}'", .{mesh.name});
-                }
-            };
+            self.gpu_retire.retireMesh(self.allocator, mesh);
             return;
         }
         mesh.deinit(self.allocator);
         self.allocator.destroy(mesh);
-    }
-
-    /// Completes deferred off-context destroys (main queue + OOM overflow)
-    /// on the context thread. Called at render start and from deinit.
-    fn drainPendingGpuDestroys(self: *Scene) void {
-        for (self.pending_gpu_destroys.items) |m| {
-            m.deinit(self.allocator);
-            self.allocator.destroy(m);
-        }
-        self.pending_gpu_destroys.clearRetainingCapacity();
-        for (self.pending_gpu_destroys_overflow[0..self.pending_gpu_destroys_overflow_len]) |slot| {
-            if (slot) |m| {
-                m.deinit(self.allocator);
-                self.allocator.destroy(m);
-            }
-        }
-        @memset(&self.pending_gpu_destroys_overflow, null);
-        self.pending_gpu_destroys_overflow_len = 0;
     }
 
     // ---- Decals / particles / trails / CSG / nav. ----
@@ -1284,6 +1256,10 @@ pub const Scene = struct {
         // Update-поток сюда не заходит; при будущем выносе prepare на
         // update-поток этот ассерт укажет на место перевода sg за handoff.
         gpu_thread.assertOnContextThread();
+        // Начало кадра (P3): новый epoch ретенции. flush ниже (внутри
+        // flushPendingGpuUploads) уничтожит только завершённые эпохи —
+        // запись текущего кадра ждёт его конца.
+        self.retire_epoch = self.gpu_retire.begin();
         const keep_update_ms = self.stats.update_ms;
         const keep_prepare_ms = self.stats.prepare_ms;
         self.stats = .{};
@@ -1430,8 +1406,9 @@ pub const Scene = struct {
     pub fn flushPendingGpuUploads(self: *Scene) void {
         gpu_thread.assertOnContextThread();
         // Deferred off-context destroys first: unlinking already happened in
-        // destroyMesh, this completes the GPU teardown (deinit + free).
-        self.drainPendingGpuDestroys();
+        // destroyMesh, this completes the GPU teardown (deinit + free) for
+        // entries whose epoch already completed (see GpuRetireQueue.flush).
+        self.gpu_retire.flush(self.allocator);
         // Deferred off-context creations (uploadGeometry): finish the vertex/
         // index buffers before queue building can reference them. Plain scan
         // over meshes — the loop below already visits every mesh, so the
@@ -1449,6 +1426,10 @@ pub const Scene = struct {
             self.prepareFrame();
         }
         self.frame_prepared = false;
+        // Конец кадра (P3): epoch, начатый в prepareFrame, закрывается на ВСЕХ
+        // выходах render — включая ранний возврат без камеры ниже. Поэтому
+        // epoch — на кадр, а не на камеру/view.
+        defer self.gpu_retire.complete(self.retire_epoch);
 
         const snap = &self.frame_snapshot;
         if (!snap.has_camera) {
@@ -1650,9 +1631,9 @@ pub const Scene = struct {
 
         // Deferred off-context destroys that never reached a render-start
         // flush (queued meshes are already unlinked from `meshes`, so this
-        // cannot double-free with deinitMeshes below).
-        self.drainPendingGpuDestroys();
-        self.pending_gpu_destroys.deinit(self.allocator);
+        // cannot double-free with deinitMeshes below). deinit забирает и
+        // незавершённые эпохи: приложения без render не оставляют хвостов.
+        self.gpu_retire.deinit(self.allocator);
 
         // Physics before meshes: bodies keep raw `mesh` pointers and bulk
         // teardown does not remove them individually (per-mesh destroyMesh
@@ -1910,7 +1891,7 @@ test "destroyMesh removes the physics body" {
     defer scene.lights.deinit(alloc);
     defer scene.physics.deinit(alloc);
     defer scene.meshes.deinit(alloc);
-    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
     defer scene.outline_meshes.deinit(alloc);
 
     const m = try alloc.create(Mesh);
@@ -1930,7 +1911,7 @@ test "destroyMesh orphans children and detaches bone links" {
     var scene = @import("testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.meshes.deinit(alloc);
-    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
     defer scene.outline_meshes.deinit(alloc);
 
     const parent = try alloc.create(Mesh);
@@ -1961,7 +1942,7 @@ test "destroyMesh removes LOD entries preserving order" {
     var scene = @import("testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.meshes.deinit(alloc);
-    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
     defer scene.outline_meshes.deinit(alloc);
 
     const parent = try alloc.create(Mesh);
@@ -2001,7 +1982,7 @@ test "destroyMesh drops decal instances and frees material" {
     defer scene.decals.deinit();
     defer scene.meshes.deinit(alloc);
     defer scene.pbr_materials.deinit(alloc);
-    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
     defer scene.outline_meshes.deinit(alloc);
 
     // Manual instance (no projection/GPU): the manager only stores the
@@ -2031,21 +2012,58 @@ test "pending destroy overflow drains on flush" {
     var scene = @import("testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.meshes.deinit(alloc);
-    defer scene.pending_gpu_destroys.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
 
     // Drive the allocation-free spillover directly: the off-context OOM
     // enqueue itself needs fault injection, but the drain path (flush and
-    // deinit share drainPendingGpuDestroys) is covered here with a
-    // buffer-free mesh, so no sg.* call is involved.
+    // deinit share it) is covered here with a buffer-free mesh, so no sg.*
+    // call is involved. Запись помечена завершённым epoch, чтобы flush её
+    // забрал — правило epoch относится и к overflow.
     const m = try alloc.create(Mesh);
     m.* = @import("testing.zig").testMesh("overflow_mesh");
-    scene.pending_gpu_destroys_overflow[0] = m;
-    scene.pending_gpu_destroys_overflow_len = 1;
+    const e = scene.gpu_retire.begin();
+    scene.gpu_retire.overflow[0] = .{ .mesh = m, .epoch = e };
+    scene.gpu_retire.overflow_len = 1;
+    scene.gpu_retire.complete(e);
 
     scene.flushPendingGpuUploads();
-    try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys_overflow_len);
-    try std.testing.expect(scene.pending_gpu_destroys_overflow[0] == null);
-    try std.testing.expectEqual(@as(usize, 0), scene.pending_gpu_destroys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+}
+
+test "destroyMesh вне контекста: ретенция + flush на контекстном потоке" {
+    const alloc = std.testing.allocator;
+    // Маркер идемпотентен: главный поток тестов уже помечен gpu_thread-тестами
+    // (идут раньше по реестру), воркер ниже всё равно чужой. Без маркера тест
+    // был бы синхронным и бессмысленным.
+    gpu_thread.markContextThread();
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("testing.zig").testMesh("offctx_mesh");
+    try scene.meshes.append(alloc, m);
+
+    // Воркер — не-контекстный поток: destroyMesh обязан только отвязать меш
+    // (физика/иерархия/LOD зачищены) и положить его в ретенцию, без sg.*.
+    const Job = struct {
+        scene: *Scene,
+        mesh: *Mesh,
+        fn run(j: @This()) void {
+            j.scene.destroyMesh(j.mesh);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Job.run, .{Job{ .scene = &scene, .mesh = m }});
+    t.join();
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+
+    // Конец кадра + flush на контекстном потоке: ретенция освобождена.
+    scene.gpu_retire.complete(scene.gpu_retire.current());
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
 }
 
 test "prepareFrame stages an empty upload tally without an upload queue" {
