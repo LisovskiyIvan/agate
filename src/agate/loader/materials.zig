@@ -10,8 +10,22 @@ const Scene = @import("../scene.zig").Scene;
 const Material = @import("../material.zig").Material;
 const UvTransform = @import("../material.zig").UvTransform;
 const Texture = @import("../texture.zig").Texture;
+const ktx2 = @import("../ktx2.zig");
 const assets = @import("../assets.zig");
 const gpu_thread = @import("../gpu_thread.zig");
+
+/// Резолвинг рабочего изображения текстуры с учётом KHR_texture_basisu:
+/// при использовании расширения `textures[i].source` отсутствует, а
+/// изображение (обычно .ktx2) лежит в `basisu_image`. Без расширения —
+/// обычное `image`. Возвращает null, когда текстуры нет вообще.
+pub fn textureImage(tex: [*c]const c.cgltf_texture) ?[*c]const c.cgltf_image {
+    if (tex == null) return null;
+    // Явные сравнения с null: нулевой C-указатель при неявном приведении
+    // к ?[*c] дал бы ненулевой optional с нулевым payload.
+    if (tex.*.image != null) return tex.*.image;
+    if (tex.*.has_basisu != 0 and tex.*.basisu_image != null) return tex.*.basisu_image;
+    return null;
+}
 
 const DecodeJob = struct {
     allocator: std.mem.Allocator,
@@ -21,15 +35,16 @@ const DecodeJob = struct {
     /// External URI path, owned by the job.
     path: ?[]const u8 = null,
     /// sRGB -> linear conversion before mip generation (color-slot images).
+    /// Действует только на .rgba: блочные уровни грузятся как в файле.
     srgb: bool = false,
-    out: ?Texture.RawTexture = null,
+    out: ?Texture.DecodedImage = null,
 
     fn run(self: *DecodeJob) void {
         const opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = self.srgb };
         if (self.bytes) |b| {
-            self.out = Texture.decodeMemory(self.allocator, b, opts) catch null;
+            self.out = Texture.decodeImageMemory(self.allocator, b, opts) catch null;
         } else if (self.path) |p| {
-            self.out = Texture.decodeFile(self.allocator, p, opts) catch null;
+            self.out = Texture.decodeImageFile(self.allocator, p, opts) catch null;
         }
     }
 };
@@ -65,7 +80,7 @@ pub fn colorSlotImageFlags(allocator: std.mem.Allocator, gltf: *c.cgltf_data) ![
 
 fn markColorSlotImage(gltf: *c.cgltf_data, view: c.cgltf_texture_view, flags: []bool) void {
     const tex = view.texture orelse return;
-    const img = tex.*.image orelse return;
+    const img = textureImage(tex) orelse return;
     if (imageIndexFor(gltf, img)) |idx| {
         if (idx < flags.len) flags[idx] = true;
     }
@@ -81,7 +96,7 @@ fn imageIndexFor(gltf: *c.cgltf_data, img: [*c]const c.cgltf_image) ?usize {
 /// Decodes every GLB/GLTF image on worker threads. This never fails the
 /// load: images that could not be decoded stay null and loadTextureFromView
 /// falls back to the synchronous path.
-pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Texture.RawTexture, base_dir: ?[]const u8) void {
+pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Texture.DecodedImage, base_dir: ?[]const u8) void {
     if (gltf.images_count == 0) return;
 
     const jobs = scene.allocator.alloc(DecodeJob, gltf.images_count) catch return;
@@ -226,8 +241,8 @@ pub const AsyncTexCtx = struct {
         if (view == null) return;
         if (view.*.texture == null) return;
         const tex = view.*.texture.?;
-        if (tex.*.image == null) return;
-        const img_idx = imageIndexFor(self.gltf, tex.*.image.?) orelse return;
+        const img_ptr = textureImage(tex) orelse return;
+        const img_idx = imageIndexFor(self.gltf, img_ptr) orelse return;
         const key = img_idx * 2 + (if (srgb) @as(usize, 1) else @as(usize, 0));
 
         if (self.seen.get(key)) |existing| {
@@ -279,7 +294,7 @@ pub fn loadTextureSlot(
     scene: *Scene,
     gltf: *c.cgltf_data,
     image_cache: []?Texture,
-    decoded: []?Texture.RawTexture,
+    decoded: []?Texture.DecodedImage,
     view: [*c]const c.cgltf_texture_view,
     base_dir: ?[]const u8,
     srgb_to_linear: bool,
@@ -301,7 +316,7 @@ pub fn loadTextureFromView(
     scene: *Scene,
     gltf: *c.cgltf_data,
     image_cache: []?Texture,
-    decoded: []?Texture.RawTexture,
+    decoded: []?Texture.DecodedImage,
     view: [*c]const c.cgltf_texture_view,
     base_dir: ?[]const u8,
     srgb_to_linear: bool,
@@ -310,8 +325,7 @@ pub fn loadTextureFromView(
     if (view == null) return null;
     if (view.*.texture == null) return null;
     const tex = view.*.texture.?;
-    if (tex.*.image == null) return null;
-    const img = tex.*.image.?;
+    const img = textureImage(tex) orelse return null;
 
     const img_idx = imageIndexFor(gltf, img);
     const cache_idx: ?usize = if (img_idx) |idx| blk: {
@@ -334,19 +348,44 @@ pub fn loadTextureFromView(
     tex_options.srgb_to_linear = srgb_to_linear;
 
     // Pre-decoded on worker threads: only the GPU upload runs here.
+    // .rgba идёт старым путём (декод чужого sRGB-варианта не трогаем);
+    // .block грузится через fromRawBlock: sRGB-ность уже в варианте
+    // GPU-формата, srgb_to_linear/gen_mipmaps к блочным уровням не
+    // применяются (цепочка — как в файле). Кэш общий с RGBA-веткой, но
+    // алиасинга нет: ячейка хранит готовый Texture, а не декод.
     if (img_idx) |idx| {
         if (idx < decoded.len and decoded[idx] != null) {
-            if (decoded[idx].?.is_srgb == srgb_to_linear) {
+            const usable = switch (decoded[idx].?) {
+                .rgba => |raw| raw.is_srgb == srgb_to_linear,
+                .block => true,
+            };
+            if (usable) {
                 // GPU upload of a pre-decoded image (sg.makeImage).
                 gpu_thread.assertOnContextThread();
-                var raw = decoded[idx].?;
+                var owned = decoded[idx].?;
                 decoded[idx] = null;
-                const loaded = Texture.fromRaw(&raw, tex_options);
-                raw.deinit(scene.allocator);
-                if (cache_idx) |c_idx| {
-                    image_cache[c_idx] = loaded;
+                switch (owned) {
+                    .rgba => |*raw| {
+                        const loaded = Texture.fromRaw(raw, tex_options);
+                        owned.deinit(scene.allocator);
+                        if (cache_idx) |c_idx| {
+                            image_cache[c_idx] = loaded;
+                        }
+                        return loaded;
+                    },
+                    .block => |*blk| {
+                        // Слот уже занулён выше, deinit — здесь: при
+                        // BlockFormatNotSupportedByBackend уходим в null
+                        // (дальше — async-регистрация или пустой слот),
+                        // как при любой другой ошибке декода.
+                        defer owned.deinit(scene.allocator);
+                        const loaded = Texture.fromRawBlock(blk, tex_options) catch return null;
+                        if (cache_idx) |c_idx| {
+                            image_cache[c_idx] = loaded;
+                        }
+                        return loaded;
+                    },
                 }
-                return loaded;
             }
         }
     }
@@ -365,12 +404,12 @@ pub fn loadTextureFromView(
         if (bv.*.buffer != null and bv.*.buffer.*.data != null) {
             const raw_buf = @as([*]const u8, @ptrCast(bv.*.buffer.*.data));
             const img_data = (raw_buf + bv.*.offset)[0..bv.*.size];
-            if (Texture.fromMemory(scene.allocator, img_data, tex_options)) |loaded| {
+            if (uploadDecodedMemory(scene, img_data, tex_options)) |loaded| {
                 if (cache_idx) |c_idx| {
                     image_cache[c_idx] = loaded;
                 }
                 return loaded;
-            } else |_| {}
+            }
         }
     }
 
@@ -381,24 +420,56 @@ pub fn loadTextureFromView(
             const full_path = std.fs.path.join(scene.allocator, &.{ dir, uri }) catch null;
             if (full_path) |fp| {
                 defer scene.allocator.free(fp);
-                if (Texture.fromFile(scene.allocator, fp, tex_options)) |loaded| {
+                if (uploadDecodedFile(scene, fp, tex_options)) |loaded| {
                     if (cache_idx) |c_idx| {
                         image_cache[c_idx] = loaded;
                     }
                     return loaded;
-                } else |_| {}
+                }
             }
         } else {
-            if (Texture.fromFile(scene.allocator, uri, tex_options)) |loaded| {
+            if (uploadDecodedFile(scene, uri, tex_options)) |loaded| {
                 if (cache_idx) |c_idx| {
                     image_cache[c_idx] = loaded;
                 }
                 return loaded;
-            } else |_| {}
+            }
         }
     }
 
     return null;
+}
+
+/// Синхронный decode+upload для фолбэка loadTextureFromView: декод через
+/// decodeImageMemory/File, загрузка — fromRaw (.rgba) или fromRawBlock
+/// (.block). Ошибки декода и BlockFormatNotSupportedByBackend глотаются в
+/// null — так же, как раньше глотались ошибки fromMemory/fromFile.
+/// Декод GPU-free, но fromRaw/fromRawBlock делают sg.makeImage: вызывать
+/// только на context-потоке.
+/// Для .block gen_mipmaps/srgb_to_linear не действуют: цепочка мипов — как
+/// в файле, а sRGB-ность несёт сам вариант GPU-формата.
+fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Options) ?Texture {
+    var dec = Texture.decodeImageMemory(scene.allocator, bytes, .{
+        .gen_mipmaps = tex_options.mipmaps,
+        .srgb_to_linear = tex_options.srgb_to_linear,
+    }) catch return null;
+    defer dec.deinit(scene.allocator);
+    return switch (dec) {
+        .rgba => |*raw| Texture.fromRaw(raw, tex_options),
+        .block => |*blk| Texture.fromRawBlock(blk, tex_options) catch null,
+    };
+}
+
+fn uploadDecodedFile(scene: *Scene, path: []const u8, tex_options: Texture.Options) ?Texture {
+    var dec = Texture.decodeImageFile(scene.allocator, path, .{
+        .gen_mipmaps = tex_options.mipmaps,
+        .srgb_to_linear = tex_options.srgb_to_linear,
+    }) catch return null;
+    defer dec.deinit(scene.allocator);
+    return switch (dec) {
+        .rgba => |*raw| Texture.fromRaw(raw, tex_options),
+        .block => |*blk| Texture.fromRawBlock(blk, tex_options) catch null,
+    };
 }
 
 pub fn loadMaterials(
@@ -407,7 +478,7 @@ pub fn loadMaterials(
     base_dir: ?[]const u8,
     materials: []?Material,
     image_cache: []?Texture,
-    decoded: []?Texture.RawTexture,
+    decoded: []?Texture.DecodedImage,
     actx: ?*AsyncTexCtx,
 ) !void {
     for (0..gltf.materials_count) |i| {
@@ -514,8 +585,8 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
 
     var out: [3]?Material = .{ null, null, null };
     const empty_tex: []?Texture = &.{};
-    const empty_raw: []?Texture.RawTexture = &.{};
-    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_raw, null);
+    const empty_dec: []?Texture.DecodedImage = &.{};
+    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_dec, null);
 
     try std.testing.expect(out[0].? == .pbr);
     try std.testing.expect(out[0].?.pbr.alpha_mode == .@"opaque");
@@ -612,8 +683,8 @@ test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
     // stay null: the texture has neither buffer view nor URI, so the load
     // cleanly returns null without touching the GPU.
     var tex_cache: [2]?Texture = .{ null, null };
-    var raw_cache: [1]?Texture.RawTexture = .{null};
-    try loadMaterials(&scene, &data, null, &out, &tex_cache, &raw_cache, null);
+    var dec_cache: [1]?Texture.DecodedImage = .{null};
+    try loadMaterials(&scene, &data, null, &out, &tex_cache, &dec_cache, null);
 
     try std.testing.expectEqual(@as(f32, 1.0), out[0].?.pbr.normal_scale);
     try std.testing.expectEqual(@as(f32, 0.5), out[1].?.pbr.normal_scale);
@@ -726,15 +797,15 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
 
     // Cache has 2 slots for image 0: slot 0 (linear) and slot 1 (sRGB)
     var image_cache: [2]?Texture = .{ null, null };
-    var decoded: [1]?Texture.RawTexture = .{null};
+    var decoded: [1]?Texture.DecodedImage = .{null};
 
     // Pre-populate predecoded buffer with an sRGB decoded raw texture
-    decoded[0] = Texture.RawTexture{
+    decoded[0] = .{ .rgba = .{
         .width = 1,
         .height = 1,
         .num_levels = 1,
         .is_srgb = true,
-    };
+    } };
 
     // Requesting as linear (srgb_to_linear = false) MUST NOT consume or alias with the sRGB decoded texture
     const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true);
@@ -768,4 +839,115 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
     const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true, true);
     try std.testing.expect(query_srgb != null);
     try std.testing.expectEqual(@as(u32, 102), query_srgb.?.image.id);
+}
+
+test "textureImage resolves basisu image when source is absent (GPU-free)" {
+    var img = std.mem.zeroes(c.cgltf_image);
+    var basisu_img = std.mem.zeroes(c.cgltf_image);
+
+    // Обычная текстура: рабочее изображение — image.
+    var plain = std.mem.zeroes(c.cgltf_texture);
+    plain.image = &img;
+    try std.testing.expect(@intFromPtr(textureImage(&plain).?) == @intFromPtr(&img));
+
+    // KHR_texture_basisu: source отсутствует, рабочее изображение —
+    // basisu_image (обычно .ktx2).
+    var basisu = std.mem.zeroes(c.cgltf_texture);
+    basisu.has_basisu = 1;
+    basisu.basisu_image = &basisu_img;
+    try std.testing.expect(@intFromPtr(textureImage(&basisu).?) == @intFromPtr(&basisu_img));
+
+    // Ни source, ни basisu — null.
+    var empty = std.mem.zeroes(c.cgltf_texture);
+    try std.testing.expect(textureImage(&empty) == null);
+    try std.testing.expect(textureImage(null) == null);
+
+    // Оба заданы (не по спеке, но в терпимости): приоритет у source.
+    var both = std.mem.zeroes(c.cgltf_texture);
+    both.image = &img;
+    both.has_basisu = 1;
+    both.basisu_image = &basisu_img;
+    try std.testing.expect(@intFromPtr(textureImage(&both).?) == @intFromPtr(&img));
+
+    // Флаг без указателя — тоже null, а не висячий доступ.
+    var flag_only = std.mem.zeroes(c.cgltf_texture);
+    flag_only.has_basisu = 1;
+    try std.testing.expect(textureImage(&flag_only) == null);
+}
+
+test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    // Минимальный ASTC 4x4 UNORM контейнер (vkFormat 157): 80 байт
+    // header+index, одна 24-байтная level-запись, 16 байт блочного пейлоада —
+    // та же раскладка, что в assets.zig "requestMemory routes block KTX2".
+    var file: [80 + 24 + 16]u8 = [_]u8{0} ** (80 + 24 + 16);
+    @memcpy(file[0..12], &[12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A });
+    std.mem.writeInt(u32, file[12..16], 157, .little); // vkFormat ASTC_4x4_UNORM_BLOCK
+    std.mem.writeInt(u32, file[16..20], 1, .little); // typeSize
+    std.mem.writeInt(u32, file[20..24], 4, .little); // width
+    std.mem.writeInt(u32, file[24..28], 4, .little); // height
+    std.mem.writeInt(u32, file[36..40], 1, .little); // faceCount
+    std.mem.writeInt(u32, file[40..44], 1, .little); // levelCount
+    std.mem.writeInt(u64, file[80..88], 104, .little); // byteOffset
+    std.mem.writeInt(u64, file[88..96], 16, .little); // byteLength
+    std.mem.writeInt(u64, file[96..104], 16, .little); // uncompressedByteLength
+    for (file[104..], 0..) |*b, i| b.* = @intCast(i);
+
+    var garbage = [_]u8{0} ** 32;
+    @memcpy(garbage[0..16], "not an image!!!!");
+
+    var buffer0 = std.mem.zeroes(c.cgltf_buffer);
+    buffer0.data = @ptrCast(&file);
+    buffer0.size = file.len;
+    var buffer1 = std.mem.zeroes(c.cgltf_buffer);
+    buffer1.data = @ptrCast(&garbage);
+    buffer1.size = garbage.len;
+
+    var bv0 = std.mem.zeroes(c.cgltf_buffer_view);
+    bv0.buffer = &buffer0;
+    bv0.offset = 0;
+    bv0.size = file.len;
+    var bv1 = std.mem.zeroes(c.cgltf_buffer_view);
+    bv1.buffer = &buffer1;
+    bv1.offset = 0;
+    bv1.size = garbage.len;
+
+    var images: [2]c.cgltf_image = .{ std.mem.zeroes(c.cgltf_image), std.mem.zeroes(c.cgltf_image) };
+    images[0].buffer_view = &bv0;
+    images[1].buffer_view = &bv1;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.images = &images[0];
+    data.images_count = images.len;
+
+    var decoded: [2]?Texture.DecodedImage = .{ null, null };
+    decodeImagesInParallel(&scene, &data, &decoded, null);
+    defer {
+        for (0..decoded.len) |i| {
+            if (decoded[i]) |*dec| dec.deinit(alloc);
+        }
+    }
+
+    // [0]: блочный ASTC попал в .block как в файле (один уровень, без
+    // синтеза мипов и без sRGB-конверсии); RGBA8-сторона пуста.
+    try std.testing.expect(decoded[0] != null);
+    switch (decoded[0].?) {
+        .block => |b| {
+            try std.testing.expectEqual(ktx2.BlockFormat.astc_4x4_unorm, b.format);
+            try std.testing.expect(!b.format.isSrgb());
+            try std.testing.expectEqual(@as(u32, 4), b.width);
+            try std.testing.expectEqual(@as(u32, 4), b.height);
+            try std.testing.expectEqual(@as(u32, 1), b.num_levels);
+            try std.testing.expectEqualSlices(u8, file[104..], b.levels[0].?);
+            try std.testing.expectEqual(@as(usize, 16), decoded[0].?.totalBytes());
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+
+    // [1]: битый декод — null, как раньше для RawTexture.
+    try std.testing.expect(decoded[1] == null);
 }
