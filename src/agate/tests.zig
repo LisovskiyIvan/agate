@@ -131,6 +131,7 @@ test {
     _ = @import("ui.zig");
     _ = @import("ui/css_parser.zig");
     _ = @import("ui/css_parser_fuzz.zig");
+    _ = @import("ui/layout.zig");
     _ = @import("ui/theme.zig");
     _ = @import("ui/transition.zig");
     _ = @import("ui/types.zig");

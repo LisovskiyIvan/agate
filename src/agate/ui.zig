@@ -19,6 +19,23 @@ const ui_types = @import("ui/types.zig");
 const ui_theme_mod = @import("ui/theme.zig");
 const ui_transition = @import("ui/transition.zig");
 const css_parser = @import("ui/css_parser.zig");
+const ui_layout = @import("ui/layout.zig");
+
+// Re-exports from layout module
+pub const UISize = ui_layout.UISize;
+pub const UIEdges = ui_layout.UIEdges;
+pub const UIAnchor = ui_layout.UIAnchor;
+pub const UIDock = ui_layout.UIDock;
+pub const anchorRect = ui_layout.anchorRect;
+pub const dockRect = ui_layout.dockRect;
+pub const FlexDirection = ui_layout.FlexDirection;
+pub const JustifyContent = ui_layout.JustifyContent;
+pub const AlignItems = ui_layout.AlignItems;
+pub const LayoutItem = ui_layout.LayoutItem;
+pub const solveFlex = ui_layout.solveFlex;
+pub const GridTrack = ui_layout.GridTrack;
+pub const solveGridTracks = ui_layout.solveGridTracks;
+pub const AdvancedGridSpec = ui_layout.AdvancedGridSpec;
 
 const font_png_data = @embedFile("assets/font_sdf.png");
 
@@ -192,6 +209,16 @@ pub const UICanvas = struct {
     /// (immediate-mode callers have no global clock); variable-rate callers
     /// set it before begin() each frame.
     frame_dt_ms: f32 = 1000.0 / 60.0,
+    /// Mouse input state for immediate-mode layout widgets (button, slider, checkbox, etc.)
+    mouse_pos: [2]f32 = .{ -1000.0, -1000.0 },
+    mouse_down: bool = false,
+    mouse_clicked: bool = false,
+
+    pub fn setInput(self: *UICanvas, mx: f32, my: f32, is_down: bool, is_clicked: bool) void {
+        self.mouse_pos = .{ mx, my };
+        self.mouse_down = is_down;
+        self.mouse_clicked = is_clicked;
+    }
 
     // Shared solid-quad constants (same values as the previous per-call literals).
     const solid_mode: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
@@ -1288,16 +1315,28 @@ pub const LayoutGridSpec = struct {
     }
 };
 
+fn effectivePadding(layout_pad: f32, style_pad: f32) f32 {
+    return @max(@max(layout_pad, style_pad), 0.0);
+}
+
 pub const LayoutFlowOptions = struct {
     padding: f32 = 0.0,
+    padding_edges: ?UIEdges = null,
     spacing: f32 = 0.0,
     align_cross: LayoutAlignCross = .start,
     class: ?[]const u8 = null,
     style: ?UIStyleOverride = null,
+
+    pub fn getEdges(self: LayoutFlowOptions, style_pad: f32) UIEdges {
+        if (self.padding_edges) |e| return e;
+        const p = effectivePadding(self.padding, style_pad);
+        return UIEdges.all(p);
+    }
 };
 
 pub const LayoutGridOptions = struct {
     padding: f32 = 0.0,
+    padding_edges: ?UIEdges = null,
     spacing: f32 = 0.0,
     columns: usize,
     rows: usize,
@@ -1307,6 +1346,81 @@ pub const LayoutGridOptions = struct {
     align_cross: LayoutAlign = .start,
     class: ?[]const u8 = null,
     style: ?UIStyleOverride = null,
+
+    pub fn getEdges(self: LayoutGridOptions, style_pad: f32) UIEdges {
+        if (self.padding_edges) |e| return e;
+        const p = effectivePadding(self.padding, style_pad);
+        return UIEdges.all(p);
+    }
+};
+
+pub const LayoutFlexOptions = struct {
+    direction: FlexDirection = .row,
+    padding: f32 = 0.0,
+    padding_edges: ?UIEdges = null,
+    spacing: f32 = 0.0,
+    align_cross: LayoutAlignCross = .start,
+    class: ?[]const u8 = null,
+    style: ?UIStyleOverride = null,
+
+    pub fn getEdges(self: LayoutFlexOptions, style_pad: f32) UIEdges {
+        if (self.padding_edges) |e| return e;
+        const p = effectivePadding(self.padding, style_pad);
+        return UIEdges.all(p);
+    }
+};
+
+pub const LayoutLabelOptions = struct {
+    font_size: f32 = 13.0,
+    color: Color4 = Color4.white,
+    width: UISize = .auto,
+    height: UISize = .auto,
+    outline_width: f32 = 0.16,
+};
+
+pub const LayoutButtonOptions = struct {
+    width: UISize = .auto,
+    height: UISize = .px(28.0),
+    font_size: f32 = 12.0,
+    is_hovered: ?bool = null,
+    is_pressed: ?bool = null,
+    class: ?[]const u8 = null,
+    style: ?UIStyleOverride = null,
+};
+
+pub const LayoutCheckboxOptions = struct {
+    size: f32 = 18.0,
+    label_size: f32 = 12.5,
+    is_hovered: ?bool = null,
+    class: ?[]const u8 = null,
+    style: ?UIStyleOverride = null,
+};
+
+pub const LayoutSliderOptions = struct {
+    width: UISize = .fill,
+    height: UISize = .px(20.0),
+    is_hovered: ?bool = null,
+    is_dragging: ?bool = null,
+    class: ?[]const u8 = null,
+    style: ?UIStyleOverride = null,
+};
+
+pub const LayoutProgressOptions = struct {
+    width: UISize = .fill,
+    height: UISize = .px(16.0),
+    bg_color: Color4 = Color4.new(0.1, 0.12, 0.18, 0.8),
+    fill_color: Color4 = Color4.new(0.2, 0.6, 1.0, 0.95),
+};
+
+pub const LayoutDividerOptions = struct {
+    thickness: f32 = 1.0,
+    color: Color4 = Color4.new(0.3, 0.4, 0.5, 0.5),
+};
+
+pub const LayoutBadgeOptions = struct {
+    font_size: f32 = 11.0,
+    bg_color: Color4 = Color4.new(0.14, 0.25, 0.4, 0.9),
+    text_color: Color4 = Color4.white,
 };
 
 pub const LayoutStack = struct {
@@ -1358,26 +1472,37 @@ pub const LayoutStack = struct {
         return self.beginFlow(rect, opts, .vstack);
     }
 
+    pub fn beginFlex(self: *LayoutStack, rect: [4]f32, opts: LayoutFlexOptions) bool {
+        return self.beginFlow(rect, .{
+            .padding = opts.padding,
+            .padding_edges = opts.padding_edges,
+            .spacing = opts.spacing,
+            .align_cross = opts.align_cross,
+            .class = opts.class,
+            .style = opts.style,
+        }, if (opts.direction.isRow()) .hstack else .vstack);
+    }
+
     pub fn beginGrid(self: *LayoutStack, rect: [4]f32, opts: LayoutGridOptions) bool {
         if (self.depth >= max_depth) return false;
         const s = self.resolveContainerStyle(opts.class, opts.style);
-        // CSS-like padding: the style participates, the explicit layout
-        // padding is the baseline; the larger of the two wins.
-        const pad = effectivePadding(opts.padding, s.padding);
+        const pad = opts.getEdges(s.padding);
         self.canvas.drawStyleRect(rect, s);
+        const inner_w = @max(rect[2] - pad.hTotal(), 0.0);
+        const inner_h = @max(rect[3] - pad.vTotal(), 0.0);
         const f = Frame{
             .kind = .grid,
             .x = rect[0],
             .y = rect[1],
             .w = rect[2],
             .h = rect[3],
-            .ix = rect[0] + pad,
-            .iy = rect[1] + pad,
-            .iw = @max(rect[2] - 2.0 * pad, 0.0),
-            .ih = @max(rect[3] - 2.0 * pad, 0.0),
+            .ix = rect[0] + pad.left,
+            .iy = rect[1] + pad.top,
+            .iw = inner_w,
+            .ih = inner_h,
             .cell = 0,
             .grid = .{
-                .inner = .{ rect[0] + pad, rect[1] + pad, @max(rect[2] - 2.0 * pad, 0.0), @max(rect[3] - 2.0 * pad, 0.0) },
+                .inner = .{ rect[0] + pad.left, rect[1] + pad.top, inner_w, inner_h },
                 .columns = @max(opts.columns, 1),
                 .rows = @max(opts.rows, 1),
                 .spacing = @max(opts.spacing, 0.0),
@@ -1394,6 +1519,15 @@ pub const LayoutStack = struct {
 
     pub fn end(self: *LayoutStack) void {
         if (self.depth > 0) self.depth -= 1;
+    }
+    pub const endFlow = end;
+    pub const endGrid = end;
+
+    /// Returns the inner content bounds [x, y, w, h] of the current container.
+    pub fn innerRect(self: *const LayoutStack) [4]f32 {
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        return .{ f.ix, f.iy, f.iw, f.ih };
     }
 
     /// Places the next widget with the container's cross alignment.
@@ -1422,6 +1556,227 @@ pub const LayoutStack = struct {
                 return clampToFrame(r, f);
             },
         }
+    }
+
+    /// Places a widget dimensioned via UISize (fixed, percent, flex, or auto).
+    pub fn placeSize(self: *LayoutStack, w: UISize, h: UISize) [4]f32 {
+        return self.placeSizeWithAuto(w, h, 0.0, 0.0);
+    }
+
+    /// Places a widget dimensioned via UISize with explicit auto content dimensions.
+    pub fn placeSizeWithAuto(self: *LayoutStack, w: UISize, h: UISize, auto_w: f32, auto_h: f32) [4]f32 {
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        const rem_main = if (f.kind == .hstack) @max(f.ix + f.iw - f.cursor, 0.0) else @max(f.iy + f.ih - f.cursor, 0.0);
+
+        const actual_w: f32 = switch (w) {
+            .fixed => |v| v,
+            .percent => |p| f.iw * (p * 0.01),
+            .auto => auto_w,
+            .flex => if (f.kind == .hstack) rem_main else f.iw,
+        };
+
+        const actual_h: f32 = switch (h) {
+            .fixed => |v| v,
+            .percent => |p| f.ih * (p * 0.01),
+            .auto => auto_h,
+            .flex => if (f.kind == .vstack) rem_main else f.ih,
+        };
+
+        return self.place(actual_w, actual_h);
+    }
+
+    /// Places a widget that expands across remaining space along the main axis.
+    pub fn placeFlex(self: *LayoutStack, weight: f32) [4]f32 {
+        _ = weight;
+        return self.placeSize(.fill, .fill);
+    }
+
+    /// Advances the layout cursor by taking up all remaining main-axis space.
+    pub fn spacer(self: *LayoutStack) [4]f32 {
+        return self.spacerWeight(1.0);
+    }
+
+    pub fn spacerWeight(self: *LayoutStack, weight: f32) [4]f32 {
+        _ = weight;
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        if (f.kind == .hstack) {
+            const rem = @max(f.ix + f.iw - f.cursor, 0.0);
+            return self.place(rem, 0.0);
+        } else if (f.kind == .vstack) {
+            const rem = @max(f.iy + f.ih - f.cursor, 0.0);
+            return self.place(0.0, rem);
+        }
+        return .{ 0, 0, 0, 0 };
+    }
+
+    /// Places a widget in a grid container spanning `col_span` columns and `row_span` rows.
+    pub fn placeGridSpan(
+        self: *LayoutStack,
+        col: usize,
+        row: usize,
+        col_span: usize,
+        row_span: usize,
+        w: UISize,
+        h: UISize,
+    ) [4]f32 {
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        if (f.kind != .grid) return .{ 0, 0, 0, 0 };
+
+        const c0 = f.grid.cellRect(col, row);
+        const cols = @max(f.grid.columns, 1);
+        const rows = @max(f.grid.rows, 1);
+        const max_c = @min(col + @max(col_span, 1) - 1, cols - 1);
+        const max_r = @min(row + @max(row_span, 1) - 1, rows - 1);
+        const c1 = f.grid.cellRect(max_c, max_r);
+
+        const spanned_w = (c1[0] + c1[2]) - c0[0];
+        const spanned_h = (c1[1] + c1[3]) - c0[1];
+
+        const actual_w = w.resolve(spanned_w, spanned_w);
+        const actual_h = h.resolve(spanned_h, spanned_h);
+
+        var r: [4]f32 = .{ c0[0], c0[1], actual_w, actual_h };
+        r[0] += layoutAlignOffset(spanned_w, actual_w, f.grid.align_main);
+        r[1] += layoutAlignOffset(spanned_h, actual_h, f.grid.align_cross);
+        return clampToFrame(r, f);
+    }
+
+    /// Positions a widget relative to the container frame using 9-point anchor.
+    pub fn anchor(self: *LayoutStack, w: f32, h: f32, anchor_pt: UIAnchor, margin: UIEdges) [4]f32 {
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        return anchorRect(.{ f.ix, f.iy, f.iw, f.ih }, w, h, anchor_pt, margin);
+    }
+
+    /// Docks an element to a side of the current frame and shrinks the remaining inner area.
+    pub fn dock(self: *LayoutStack, dock_side: UIDock, size: f32, margin: UIEdges) [4]f32 {
+        if (self.depth == 0) return .{ 0, 0, 0, 0 };
+        const f = &self.frames[self.depth - 1];
+        var current: [4]f32 = .{ f.ix, f.iy, f.iw, f.ih };
+        const r = dockRect(&current, dock_side, size, margin);
+        f.ix = current[0];
+        f.iy = current[1];
+        f.iw = current[2];
+        f.ih = current[3];
+        return r;
+    }
+
+    // ========================================================================
+    // Immediate-Mode Layout Widgets
+    // ========================================================================
+
+    /// Places and renders a label widget inside the current container.
+    pub fn label(self: *LayoutStack, text: []const u8, opts: LayoutLabelOptions) void {
+        const auto_w = @as(f32, @floatFromInt(text.len)) * opts.font_size * 0.5;
+        const auto_h = opts.font_size;
+        const r = self.placeSizeWithAuto(opts.width, opts.height, auto_w, auto_h);
+        const tx = r[0] + @max((r[2] - auto_w) * 0.5, 0.0);
+        const ty = r[1] + @max((r[3] - auto_h) * 0.5, 0.0);
+        self.canvas.drawTextWithOutline(text, tx, ty, opts.font_size, opts.color, opts.outline_width);
+    }
+
+    /// Places and renders a button widget. Returns true if clicked.
+    pub fn button(self: *LayoutStack, text: []const u8, opts: LayoutButtonOptions) bool {
+        const auto_w = @as(f32, @floatFromInt(text.len)) * opts.font_size * 0.5 + 24.0;
+        const auto_h = opts.font_size + 14.0;
+        const r = self.placeSizeWithAuto(opts.width, opts.height, auto_w, auto_h);
+        const hov = opts.is_hovered orelse UICanvas.isPointInRect(self.canvas.mouse_pos[0], self.canvas.mouse_pos[1], r[0], r[1], r[2], r[3]);
+        const press = opts.is_pressed orelse (hov and self.canvas.mouse_down);
+
+        if (opts.class != null or opts.style != null) {
+            const state = UIState.fromFlags(hov, press, false, false);
+            self.canvas.drawStyledButton(text, r, opts.font_size, .{
+                .class = opts.class,
+                .style = opts.style,
+                .state = state,
+            });
+        } else {
+            self.canvas.drawButton(text, r[0], r[1], r[2], r[3], opts.font_size, hov, press);
+        }
+
+        return hov and self.canvas.mouse_clicked;
+    }
+
+    /// Places and renders a checkbox widget. Toggles state and returns true if clicked.
+    pub fn checkbox(self: *LayoutStack, label_text: ?[]const u8, checked: *bool, opts: LayoutCheckboxOptions) bool {
+        const text_w = if (label_text) |t| @as(f32, @floatFromInt(t.len)) * opts.label_size * 0.5 + 8.0 else 0.0;
+        const total_w = opts.size + text_w;
+        const r = self.place(total_w, @max(opts.size, opts.label_size));
+        const hov = opts.is_hovered orelse UICanvas.isPointInRect(self.canvas.mouse_pos[0], self.canvas.mouse_pos[1], r[0], r[1], r[2], r[3]);
+
+        if (opts.class != null or opts.style != null) {
+            const state = UIState.fromFlags(hov, false, false, false);
+            self.canvas.drawStyledCheckbox(r, checked.*, label_text, opts.label_size, .{
+                .class = opts.class,
+                .style = opts.style,
+                .state = state,
+            });
+        } else {
+            self.canvas.drawCheckbox(r[0], r[1], opts.size, checked.*, hov, label_text, opts.label_size);
+        }
+
+        if (hov and self.canvas.mouse_clicked) {
+            checked.* = !checked.*;
+            return true;
+        }
+        return false;
+    }
+
+    /// Places and renders an interactive slider widget. Returns the new value.
+    pub fn slider(self: *LayoutStack, value: f32, min_val: f32, max_val: f32, opts: LayoutSliderOptions) f32 {
+        const r = self.placeSizeWithAuto(opts.width, opts.height, 120.0, 20.0);
+        const hov = opts.is_hovered orelse UICanvas.isPointInRect(self.canvas.mouse_pos[0], self.canvas.mouse_pos[1], r[0], r[1], r[2], r[3]);
+        const drag = opts.is_dragging orelse (hov and self.canvas.mouse_down);
+
+        const norm = if (max_val > min_val) std.math.clamp((value - min_val) / (max_val - min_val), 0.0, 1.0) else 0.0;
+        var new_norm = norm;
+
+        if (drag) {
+            new_norm = UICanvas.sliderValueAt(r[0], r[2], self.canvas.mouse_pos[0]);
+        }
+
+        if (opts.class != null or opts.style != null) {
+            const state = UIState.fromFlags(hov, drag, false, false);
+            _ = self.canvas.drawStyledSlider(r, new_norm, .{
+                .class = opts.class,
+                .style = opts.style,
+                .state = state,
+            });
+        } else {
+            _ = self.canvas.drawSlider(r[0], r[1], r[2], r[3], new_norm, hov, drag);
+        }
+
+        return min_val + new_norm * (max_val - min_val);
+    }
+
+    /// Places and renders a progress bar widget.
+    pub fn progressBar(self: *LayoutStack, fraction: f32, opts: LayoutProgressOptions) void {
+        const r = self.placeSizeWithAuto(opts.width, opts.height, 100.0, 16.0);
+        self.canvas.drawProgressBar(r[0], r[1], r[2], r[3], fraction, opts.bg_color, opts.fill_color);
+    }
+
+    /// Places and renders a dividing line widget.
+    pub fn divider(self: *LayoutStack, opts: LayoutDividerOptions) void {
+        if (self.depth == 0) return;
+        const f = &self.frames[self.depth - 1];
+        if (f.kind == .hstack) {
+            const r = self.place(opts.thickness, f.ih);
+            self.canvas.drawLine(r[0], r[1], r[0], r[1] + r[3], opts.thickness, opts.color);
+        } else {
+            const r = self.place(f.iw, opts.thickness);
+            self.canvas.drawDivider(r[0], r[1], r[2], opts.thickness, opts.color);
+        }
+    }
+
+    /// Places and renders a badge tag widget.
+    pub fn badge(self: *LayoutStack, text: []const u8, opts: LayoutBadgeOptions) void {
+        const auto_w = @as(f32, @floatFromInt(text.len)) * opts.font_size * 0.5 + 14.0;
+        const auto_h = opts.font_size + 8.0;
+        const r = self.place(auto_w, auto_h);
+        self.canvas.drawBadge(text, r[0], r[1], opts.font_size, opts.bg_color, opts.text_color);
     }
 
     /// Places a widget box with a resolved style `margin` around it (the
@@ -1458,21 +1813,21 @@ pub const LayoutStack = struct {
     fn beginFlow(self: *LayoutStack, rect: [4]f32, opts: LayoutFlowOptions, kind: FrameKind) bool {
         if (self.depth >= max_depth) return false;
         const s = self.resolveContainerStyle(opts.class, opts.style);
-        const pad = effectivePadding(opts.padding, s.padding);
-        // Containers draw their resolved style (a transparent default draws
-        // nothing, so layout never changes what is on screen by itself).
+        const pad = opts.getEdges(s.padding);
         self.canvas.drawStyleRect(rect, s);
+        const inner_w = @max(rect[2] - pad.hTotal(), 0.0);
+        const inner_h = @max(rect[3] - pad.vTotal(), 0.0);
         const f = Frame{
             .kind = kind,
             .x = rect[0],
             .y = rect[1],
             .w = rect[2],
             .h = rect[3],
-            .ix = rect[0] + pad,
-            .iy = rect[1] + pad,
-            .iw = @max(rect[2] - 2.0 * pad, 0.0),
-            .ih = @max(rect[3] - 2.0 * pad, 0.0),
-            .cursor = if (kind == .hstack) rect[0] + pad else rect[1] + pad,
+            .ix = rect[0] + pad.left,
+            .iy = rect[1] + pad.top,
+            .iw = inner_w,
+            .ih = inner_h,
+            .cursor = if (kind == .hstack) rect[0] + pad.left else rect[1] + pad.top,
             .spacing = @max(opts.spacing, 0.0),
             .align_cross = opts.align_cross,
         };
@@ -1531,10 +1886,6 @@ pub const LayoutStack = struct {
         if (extent <= 0.0 or size <= 0.0) return pos;
         if (size >= extent) return origin;
         return std.math.clamp(pos, origin, origin + extent - size);
-    }
-
-    fn effectivePadding(layout_pad: f32, style_pad: f32) f32 {
-        return @max(@max(layout_pad, style_pad), 0.0);
     }
 };
 
@@ -2442,4 +2793,152 @@ test "animated styled widgets draw their interpolated style" {
     canvas.drawStyledButton("Ok", .{ 0, 0, 80, 24 }, 14, .{ .anim_key = "btn", .transition = .{ .duration_ms = 100 } });
     try t.expect(quadCount(&canvas) >= 7);
     try t.expectEqual(@as(usize, 1), usedTransitionSlots(&canvas));
+}
+
+test "LayoutStack with UIEdges padding and spacer in HStack and VStack" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+
+    var stack = LayoutStack.init(&canvas);
+    _ = stack.beginHStack(.{ 0, 0, 300, 100 }, .{
+        .padding_edges = UIEdges.trbl(10, 20, 10, 15),
+        .spacing = 10,
+    });
+
+    const r1 = stack.placeSize(UISize.px(50), UISize.px(30));
+    try t.expectEqual(@as(f32, 15.0), r1[0]); // x = 0 + left(15)
+    try t.expectEqual(@as(f32, 10.0), r1[1]); // y = 0 + top(10)
+    try t.expectEqual(@as(f32, 50.0), r1[2]);
+    try t.expectEqual(@as(f32, 30.0), r1[3]);
+
+    // Push spacer: takes remaining inner space
+    const sp = stack.spacer();
+    try t.expect(sp[2] > 0.0);
+
+    const r2 = stack.place(40, 30);
+    // When placed after a spacer taking full inner width, item clamps to container frame right (300 - 40 = 260)
+    try t.expectEqual(@as(f32, 260.0), r2[0]);
+
+    stack.endFlow();
+}
+
+test "LayoutStack beginFlex and placeFlex proportional sizing" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+
+    var stack = LayoutStack.init(&canvas);
+    _ = stack.beginFlex(.{ 0, 0, 400, 100 }, .{
+        .direction = .row,
+        .padding = 10,
+        .spacing = 10,
+    });
+
+    const r1 = stack.placeSize(UISize.px(80), UISize.px(40));
+    try t.expectEqual(@as(f32, 10.0), r1[0]);
+    try t.expectEqual(@as(f32, 80.0), r1[2]);
+
+    const r_flex = stack.placeFlex(1.0);
+    // Inner w = 400 - 20 = 380. Cursor is at 10 + 80 + 10 = 100.
+    // Remaining = (10 + 380) - 100 = 290.
+    try t.expectEqual(@as(f32, 100.0), r_flex[0]);
+    try t.expectEqual(@as(f32, 290.0), r_flex[2]);
+
+    stack.endFlow();
+}
+
+test "LayoutStack placeGridSpan multi-cell spanning" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+
+    var stack = LayoutStack.init(&canvas);
+    _ = stack.beginGrid(.{ 0, 0, 210, 110 }, .{
+        .columns = 2,
+        .rows = 2,
+        .spacing = 10,
+        .padding = 0,
+    });
+
+    // 2x2 grid in 210x110: each cell is 100x50 with 10px spacing.
+    // Span cols 0..1 (2 cols) and row 0 (1 row) -> width is 100 + 10 + 100 = 210.
+    const span_rect = stack.placeGridSpan(0, 0, 2, 1, .auto, .auto);
+    try t.expectEqual(@as(f32, 0.0), span_rect[0]);
+    try t.expectEqual(@as(f32, 0.0), span_rect[1]);
+    try t.expectEqual(@as(f32, 210.0), span_rect[2]);
+    try t.expectEqual(@as(f32, 50.0), span_rect[3]);
+
+    stack.endGrid();
+}
+
+test "LayoutStack anchor and dock placement" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+
+    var stack = LayoutStack.init(&canvas);
+    _ = stack.beginVStack(.{ 0, 0, 800, 600 }, .{});
+
+    // Dock top navigation bar
+    const nav = stack.dock(.top, 60.0, UIEdges.zero);
+    try t.expectEqual(@as(f32, 0.0), nav[0]);
+    try t.expectEqual(@as(f32, 0.0), nav[1]);
+    try t.expectEqual(@as(f32, 800.0), nav[2]);
+    try t.expectEqual(@as(f32, 60.0), nav[3]);
+
+    // Anchor floating modal dialog in the remaining screen center
+    const modal = stack.anchor(300, 200, .center, UIEdges.all(20));
+    try t.expectEqual(@as(f32, 250.0), modal[0]); // (800 - 300) / 2
+    try t.expectEqual(@as(f32, 230.0), modal[1]); // 60 + (540 - 200) / 2
+    try t.expectEqual(@as(f32, 300.0), modal[2]);
+    try t.expectEqual(@as(f32, 200.0), modal[3]);
+
+    stack.end();
+}
+
+test "LayoutStack immediate mode widgets emit geometry and handle input" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+
+    // Simulate mouse clicked at (50, 60)
+    canvas.setInput(50.0, 60.0, true, true);
+
+    var stack = LayoutStack.init(&canvas);
+    _ = stack.beginVStack(.{ 0, 0, 200, 400 }, .{ .padding = 10, .spacing = 10 });
+
+    // Label: takes y in [10..26]
+    stack.label("Test Title", .{ .font_size = 14.0 });
+
+    // Button: at y in [36..76] -> contains mouse (50, 60)!
+    const clicked = stack.button("Click Me", .{
+        .width = UISize.px(120),
+        .height = UISize.px(40),
+    });
+    try t.expect(clicked);
+
+    // Checkbox: at y in [86..106] -> does NOT contain mouse (50, 60)
+    var is_checked = false;
+    const cb_clicked = stack.checkbox("Enable", &is_checked, .{});
+    try t.expect(!cb_clicked);
+    try t.expect(!is_checked);
+
+    // Slider: value update
+    var val: f32 = 0.25;
+    val = stack.slider(val, 0.0, 1.0, .{});
+
+    // Progress bar
+    stack.progressBar(0.5, .{});
+
+    // Divider
+    stack.divider(.{});
+
+    // Badge
+    stack.badge("HOT", .{});
+
+    stack.endFlow();
+
+    // Verify all widgets generated vertex geometry
+    try t.expect(quadCount(&canvas) > 10);
 }

@@ -53,8 +53,8 @@
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
-| UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
-| Layout-контейнеры, 3D GUI | — | ❌ |
+| UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input, CSS-темы, анимации переходов | ✅ |
+| Layout-контейнеры, Flex/Grid UI | LayoutStack: HStack, VStack, Flexbox, CSS Grid (fr/px/%), 9-point Anchors, Docking (top/bottom/left/right/fill), Spacers, Spans | ✅ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb, звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling), OGG/MP3/WAV потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы и кроссфейдинг музыки | ✅ |
 | mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) | ✅ |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
@@ -63,7 +63,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 639 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 653 unit-теста, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -418,6 +418,22 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 639/639 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
 
+### Волна 23: UI Layout Containers, Flexbox, CSS Grid и 9-точечное позиционирование (17.09.2026)
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Гибкие размеры `UISize` | `ui/layout.zig`, `ui.zig`, `root.zig` | `UISize`: `.fixed(px)`, `.percent(%)`, `.flex(weight)` / `.fill`, `.auto` с чистым разрешением `resolve(available, auto_content)` | ✅ |
+| Инденты и отступы `UIEdges` | `ui/layout.zig`, `ui.zig`, `root.zig` | 4-сторонние отступы `UIEdges`: `.all(v)`, `.symmetric(h, v)`, `.trbl(t, r, b, l)`, `.horizontal(h)`, `.vertical(v)`, операции `inset` и `outset` прямоугольников | ✅ |
+| 9-точечные якоря `UIAnchor` | `ui/layout.zig`, `ui.zig`, `root.zig` | `UIAnchor` (top_left, top_center, top_right, center_left, center, center_right, bottom_left, bottom_center, bottom_right) с автоматическим учётом полей `margin` через `anchorRect` | ✅ |
+| Докинг панелей `UIDock` | `ui/layout.zig`, `ui.zig`, `root.zig` | `UIDock` (top, bottom, left, right, fill): последовательное «вырезание» экранного пространства под тулбары, сайдбары и статус-бары через `dockRect` с мутацией оставшегося прямоугольника | ✅ |
+| Flexbox Solver `solveFlex` | `ui/layout.zig`, `ui.zig`, `root.zig` | 1D Flexbox солвер без аллокаций памяти: row/column, реверс, распределение `flex`-весов, `JustifyContent` (start, center, end, space_between, space_around, space_evenly), `AlignItems` (start, center, end, stretch) и `align_self` | ✅ |
+| CSS Grid Solver `solveGridTracks` | `ui/layout.zig`, `ui.zig`, `root.zig` | Многоколоночный и многострочный солвер треков: поддержка пикселей (`.px`), процентов (`.percent`) и долей (`.fr`), многоячеечные спаны `placeGridSpan` (colspan / rowspan) в `AdvancedGridSpec` | ✅ |
+| Интеграция с `LayoutStack` | `ui.zig`, `root.zig` | Методы `beginFlex`, `beginHStack`, `beginVStack`, `beginGrid` с `UIEdges`-паддингом, `placeSize`, `placeFlex`, `spacer`, `spacerWeight`, `placeGridSpan`, `anchor`, `dock` | ✅ |
+| Immediate-mode виджеты | `ui.zig`, `root.zig` | Размещение виджетов прямо на `LayoutStack` в 1 строчку: `label`, `button` (возвращает `bool` клика), `checkbox`, `slider`, `progressBar`, `divider`, `badge` с автоматическим mouse input canvas (`setInput`) | ✅ |
+| Модульные тесты | `ui/layout.zig`, `ui.zig` | 14 новых unit-тестов: размеры UISize, UIEdges inset/outset, 9-точечные якоря, докинг, Flexbox flow, CSS grid tracks & spans, LayoutStack padding/spacer/flex/grid/anchor/dock и immediate-mode виджеты | ✅ |
+
+Проверки: 653/653 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
+
 ---
 
 ## ✅ Что сделано
@@ -625,7 +641,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Soft bodies; импорт коллайдеров из файлов сцен.
 
 **UI/GUI**
-* Grid/layout-контейнеры, привязки/анимации UI, 3D-GUI, загрузка TTF/OTF-шрифтов и Unicode (сейчас зашитый SDF-атлас, ASCII).
+* 3D-GUI (billboard/world-space), загрузка TTF/OTF-шрифтов и Unicode (LayoutStack, HStack/VStack/Flexbox/CSS Grid, 9-точечные якоря, докинг панелей, анимации переходов и CSS-темы уже реализованы).
 
 **Аудио**
 * Высокоуровневый интерактивный секвенсер / FMOD-style нодовый звуковой граф (потоковый стриминг OGG/MP3/WAV, SPSC ring buffer, кроссфейд музыки, динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры, Freeverb-реверберация и звуковая окклюзия уже реализованы).

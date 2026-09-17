@@ -222,6 +222,30 @@ pub const LayoutFlowOptions = ui.LayoutFlowOptions;
 pub const LayoutGridOptions = ui.LayoutGridOptions;
 pub const LayoutAlign = ui.LayoutAlign;
 pub const LayoutAlignCross = ui.LayoutAlignCross;
+pub const LayoutFlexOptions = ui.LayoutFlexOptions;
+pub const LayoutLabelOptions = ui.LayoutLabelOptions;
+pub const LayoutButtonOptions = ui.LayoutButtonOptions;
+pub const LayoutCheckboxOptions = ui.LayoutCheckboxOptions;
+pub const LayoutSliderOptions = ui.LayoutSliderOptions;
+pub const LayoutProgressOptions = ui.LayoutProgressOptions;
+pub const LayoutDividerOptions = ui.LayoutDividerOptions;
+pub const LayoutBadgeOptions = ui.LayoutBadgeOptions;
+
+// Layout system: flexible dimensions, anchors, docking, flexbox & CSS grid solvers
+pub const UISize = ui.UISize;
+pub const UIEdges = ui.UIEdges;
+pub const UIAnchor = ui.UIAnchor;
+pub const UIDock = ui.UIDock;
+pub const anchorRect = ui.anchorRect;
+pub const dockRect = ui.dockRect;
+pub const FlexDirection = ui.FlexDirection;
+pub const JustifyContent = ui.JustifyContent;
+pub const AlignItems = ui.AlignItems;
+pub const LayoutItem = ui.LayoutItem;
+pub const solveFlex = ui.solveFlex;
+pub const GridTrack = ui.GridTrack;
+pub const solveGridTracks = ui.solveGridTracks;
+pub const AdvancedGridSpec = ui.AdvancedGridSpec;
 // Style system phase 2: CSS theming + style transitions.
 pub const TransitionOptions = ui.TransitionOptions;
 pub const UIStyleTransition = ui.UIStyleTransition;
