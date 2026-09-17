@@ -714,7 +714,7 @@ pub const Profiler = struct {
                         .severity = .warning,
                         .title = try allocator.dupe(u8, "Массовые динамические обновления GPU-буферов"),
                         .details = try std.fmt.allocPrint(allocator, "В кадре #{d} динамические буферы (sg.updateBuffer: инстансы, морфы, частицы) записали {d:.2} МБ.", .{ worst_frame.frame_index, @as(f32, @floatFromInt(worst_frame.updated_bytes)) / (1024.0 * 1024.0) }),
-                        .recommendation = try allocator.dupe(u8, "Проверьте частоту полных перезаливок instance-буферов (dedup по instance_hash уже пропускает неизменные), вес CPU-морфов и число активных частиц."),
+                        .recommendation = try allocator.dupe(u8, "Проверьте частоту полных перезаливок instance-буферов (dedup по hash+count уже пропускает неизменные), вес CPU-морфов и число активных частиц."),
                     });
                 }
             }

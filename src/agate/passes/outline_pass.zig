@@ -258,7 +258,11 @@ pub fn makeOutlineDrawItem(
     const skinned = mesh.skeleton != null;
     const instanced = !skinned and mesh.instances.items.len > 0;
     const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
-    const aabb = mesh.cached_aabb;
+    // P5: instanced outline reads the frame's published render state
+    // (Scene stages before capturing outline items); the regular cached
+    // center path below is unchanged.
+    const staged = mesh.instance_render;
+    const aabb = if (instanced) staged.bounds else mesh.cached_aabb;
     const center = if (aabb.isValid()) aabb.center() else mesh.position;
 
     var skin_index: ?u32 = null;
@@ -273,8 +277,8 @@ pub fn makeOutlineDrawItem(
         .vertex_buffer = mesh.vertex_buffer,
         .index_buffer = mesh.index_buffer,
         .index_count = mesh.index_count,
-        .instance_buffer = mesh.instance_buffer,
-        .visible_instance_count = if (instanced) mesh.visible_instance_count else 1,
+        .instance_buffer = staged.buffer,
+        .visible_instance_count = if (instanced) staged.count else 1,
         .model = mesh.getWorldMatrix(),
         .skin_index = skin_index,
         .cutout_view = if (cutout) |c| c.texture.view else null,
