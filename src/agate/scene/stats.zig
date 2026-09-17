@@ -9,6 +9,21 @@
 // written by the app around Scene.update/prepareFrame (see agate main),
 // shadow/main/post_ms are timed inside Scene.render. All default to zero,
 // so `SceneStats{}` and `self.stats = .{}` stay valid resets.
+//
+// Владение при будущем parallel update/render (P2):
+// - update_ms пишет игровой поток (app вокруг Scene.update), читает
+//   render-поток (Profiler.recordFrame в конце Scene.render). Гонки сегодня
+//   нет: обе фазы держит phase_mutex (frame() в main), а сброс prepareFrame
+//   сохраняет оба значения (handoff через keep_update_ms/keep_prepare_ms).
+// - prepare_ms, uploaded_*, shadow/main/post_ms и все счётчики пишет
+//   context-поток (prepareFrame/render); updated_bytes_frame идёт через
+//   атомарный gpu_upload_meter (воркеры стейджинга пишут record(),
+//   render забирает takeAndReset()).
+// - Profiler целиком render-owned: recordFrame вызывается только в конце
+//   render, captureMemorySnapshot/summarize/analyze — с render-потока или
+//   тулов. Игровой поток к Profiler не прикасается.
+// Поля остаются обычными (не атомарными): синхронизация фазовая
+// (phase_mutex + границы prepare/render), а не поточечная.
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
     rendered_meshes: u32 = 0,

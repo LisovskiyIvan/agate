@@ -11,6 +11,7 @@ const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const material_mod = @import("../material.zig");
 const Material = material_mod.Material;
 const jobs = @import("../jobs.zig");
+const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 
 /// Mirrors render_queue.materialIsTransparent: a mesh is transparent when its
@@ -179,6 +180,13 @@ pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
         }
 
         if (active_count > 0 and sg.isvalid()) {
+            // Владение GPU (P1): CPU-стейджинг выше может идти с воркеров
+            // пула, но создание/обновление instance-буфера — только
+            // context-поток. prepareFrame сегодня выполняется на нём
+            // (покрыт ассертом Scene.prepareFrame/render), это внутренний
+            // трипвайр: при выносе prepare на update-поток sg-блок уедет за
+            // handoff во flushPendingGpuUploads.
+            gpu_thread.assertOnContextThread();
             if (mesh.instance_buffer.id == 0 or mesh.instance_buffer_capacity < active_count) {
                 if (mesh.instance_buffer.id != 0) {
                     sg.destroyBuffer(mesh.instance_buffer);

@@ -1277,6 +1277,13 @@ pub const Scene = struct {
     /// still makes progress. Tune only with a profiled reason.
     pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
     pub fn prepareFrame(self: *Scene) void {
+        // Владение фазой (P1): prepare выполняется на context-потоке вместе
+        // с render (frame() в main держит phase_mutex через обе фазы).
+        // Внутри — только контекстные операции: flushPendingGpuUploads,
+        // стейджинг инстансов, shadow prepare, построение очередей.
+        // Update-поток сюда не заходит; при будущем выносе prepare на
+        // update-поток этот ассерт укажет на место перевода sg за handoff.
+        gpu_thread.assertOnContextThread();
         const keep_update_ms = self.stats.update_ms;
         const keep_prepare_ms = self.stats.prepare_ms;
         self.stats = .{};
@@ -2057,6 +2064,32 @@ test "prepareFrame stages an empty upload tally without an upload queue" {
     // счётчик meter сброшен в начале prepareFrame.
     try std.testing.expectEqual(@as(u64, 0), scene.stats.updated_bytes_frame);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+}
+
+test "prepareFrame preserves cross-phase timings (update_ms/prepare_ms handoff)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // Игровая фаза записала update_ms, прошлый кадр оставил счётчики и
+    // post_ms: сброс prepareFrame обязан сохранить только кросс-фазные
+    // тайминги, остальное обнулить под новый кадр.
+    scene.stats.update_ms = 2.5;
+    scene.stats.prepare_ms = 1.25;
+    scene.stats.draw_calls = 41;
+    scene.stats.triangles = 1000;
+    scene.stats.post_ms = 3.0;
+
+    scene.prepareFrame();
+
+    try std.testing.expectEqual(@as(f32, 2.5), scene.stats.update_ms);
+    try std.testing.expectEqual(@as(f32, 1.25), scene.stats.prepare_ms);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.draw_calls);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.triangles);
+    try std.testing.expectEqual(@as(f32, 0.0), scene.stats.post_ms);
+    // prepare_ms следующего кадра app перезапишет поверх после prepareFrame
+    // (frame() в main) — handoff не мешает новому замеру.
 }
 
 test "async save/load report NoTaskRunner without an io runner" {
