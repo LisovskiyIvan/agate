@@ -217,6 +217,8 @@ pub const Scene = struct {
     decals: scene_decals.DecalLayer = .{},
     // Trail meshes.
     trails: scene_trails.TrailLayer = .{},
+    // Greased line meshes.
+    greased_lines: std.ArrayListUnmanaged(*GreasedLineMesh) = .empty,
     // Nav meshes and agents.
     nav: scene_nav.NavLayer = .{},
     // Physics world + debug wireframe overlay.
@@ -577,7 +579,9 @@ pub const Scene = struct {
     }
 
     pub fn createGreasedLineMesh(self: *Scene, name: []const u8, options: GreasedLineOptions) !*GreasedLineMesh {
-        return GreasedLineMesh.init(self, name, options);
+        const gl = try GreasedLineMesh.init(self, name, options);
+        try self.greased_lines.append(self.allocator, gl);
+        return gl;
     }
 
     pub fn simplifyMesh(self: *Scene, name: []const u8, source_mesh: *Mesh, options: SimplifyOptions) !*Mesh {
@@ -1411,6 +1415,7 @@ pub const Scene = struct {
         for (self.meshes.items) |m| m.finishGpuUpload(self.allocator);
         for (self.particles.systems.items) |ps| ps.flushGpuUploads();
         for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
+        for (self.greased_lines.items) |gl| gl.flushGpuUploads();
         for (self.meshes.items) |m| m.flushGpuUploads();
     }
 
@@ -1631,6 +1636,8 @@ pub const Scene = struct {
         self.queues.deinit(self.allocator);
 
         self.trails.deinit(self.allocator);
+        for (self.greased_lines.items) |gl| gl.deinit();
+        self.greased_lines.deinit(self.allocator);
         self.nav.deinit(self.allocator);
 
         self.default_white_texture.deinit();

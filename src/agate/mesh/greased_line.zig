@@ -370,13 +370,15 @@ pub const GreasedLineMesh = struct {
         const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = total_verts * @sizeOf(Vertex),
-            .data = sg.asRange(vertices),
         });
         const ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .index_buffer = true, .dynamic_update = true },
             .size = total_indices * @sizeOf(u32),
-            .data = sg.asRange(indices),
         });
+        if (!deferred) {
+            sg.updateBuffer(vb, sg.asRange(vertices));
+            sg.updateBuffer(ib, sg.asRange(indices));
+        }
 
         const mesh = try allocator.create(Mesh);
         errdefer allocator.destroy(mesh);
@@ -474,6 +476,20 @@ pub const GreasedLineMesh = struct {
     pub fn flushGpuUploads(self: *GreasedLineMesh) void {
         if (!self.gpu_dirty) return;
         self.gpu_dirty = false;
+        if (!sg.isvalid()) return;
+        if (self.mesh.vertex_buffer.id == 0 and self.vertices.len > 0) {
+            self.mesh.vertex_buffer = sg.makeBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.vertices.len * @sizeOf(Vertex),
+            });
+            self.mesh.index_buffer = sg.makeBuffer(.{
+                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .size = self.indices.len * @sizeOf(u32),
+            });
+            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
+            sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices));
+            return;
+        }
         if (self.mesh.vertex_buffer.id != 0 and self.vertices.len > 0) {
             sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
         }
