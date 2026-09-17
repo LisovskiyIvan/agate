@@ -265,6 +265,27 @@ pub const ShadowPass = struct {
         };
     }
 
+    // Union of the regular and instanced shadow culling checks, applied to
+    // both paths. Batch-AABB semantics for instanced items: world_aabb is
+    // the fresh combined AABB of the whole batch for the frame, so the
+    // frustum test is conservative — the whole batch is skipped only when
+    // it lies fully outside the light frustum. max_dim is that batch
+    // AABB's max extent, and far-cascade small-batch culling uses the same
+    // 0.12/0.35/0.75 policy as regular items.
+    fn shadowItemCulled(item: ShadowDrawItem, frustum: math.Frustum, cascade_idx: ?usize) bool {
+        if (!item.is_visible) return true;
+        if (!frustum.intersectsAABB(item.world_aabb)) return true;
+        if (item.is_instanced) {
+            if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) return true;
+        }
+        if (cascade_idx) |c_idx| {
+            if (c_idx == 1 and item.max_dim < 0.12) return true;
+            if (c_idx == 2 and item.max_dim < 0.35) return true;
+            if (c_idx == 3 and item.max_dim < 0.75) return true;
+        }
+        return false;
+    }
+
     fn renderBuckets(
         self: *ShadowPass,
         light_view_proj: Mat4,
@@ -289,9 +310,8 @@ pub const ShadowPass = struct {
             const bucket_items = self.binned_items.items[offsets[b_idx] .. offsets[b_idx] + count];
             for (bucket_items) |item| {
                 if (item.gpu_pending) continue;
+                if (shadowItemCulled(item, frustum, cascade_idx)) continue;
                 if (item.is_instanced) {
-                    if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) continue;
-
                     if (pip_id != last_pipeline_id.*) {
                         sg.applyPipeline(.{ .id = pip_id });
                         last_pipeline_id.* = pip_id;
@@ -314,17 +334,6 @@ pub const ShadowPass = struct {
                     sg.draw(0, item.index_count, item.visible_instance_count);
                     draw_calls.* += 1;
                 } else {
-                    if (!item.is_visible) continue;
-                    const aabb_w = item.world_aabb;
-                    if (!frustum.intersectsAABB(aabb_w)) continue;
-
-                    // Far cascade small object culling: tiny details produce sub-pixel shadows in distance
-                    if (cascade_idx) |c_idx| {
-                        if (c_idx == 1 and item.max_dim < 0.12) continue;
-                        if (c_idx == 2 and item.max_dim < 0.35) continue;
-                        if (c_idx == 3 and item.max_dim < 0.75) continue;
-                    }
-
                     if (pip_id != last_pipeline_id.*) {
                         sg.applyPipeline(.{ .id = pip_id });
                         last_pipeline_id.* = pip_id;
@@ -742,4 +751,106 @@ test "parallel shadow binning produces serial-identical results" {
     for (pass_s.binned_meshes.items, pass_p.binned_meshes.items) |m_s, m_p| {
         try std.testing.expectEqual(m_s, m_p);
     }
+}
+
+test "shadow item culling skips regular items outside the light frustum" {
+    const frustum = math.Frustum.fromViewProjection(Mat4.identity);
+    const inside_aabb = math.BoundingBox.init(
+        math.Vec3.new(-0.5, -0.5, 0.2),
+        math.Vec3.new(0.5, 0.5, 0.8),
+    );
+    const outside_aabb = math.BoundingBox.init(
+        math.Vec3.new(5.0, 5.0, 5.0),
+        math.Vec3.new(6.0, 6.0, 6.0),
+    );
+
+    var inside = ShadowPass.ShadowDrawItem{
+        .world_aabb = inside_aabb,
+        .max_dim = 1.0,
+    };
+    try std.testing.expect(!ShadowPass.shadowItemCulled(inside, frustum, 0));
+
+    inside.world_aabb = outside_aabb;
+    try std.testing.expect(ShadowPass.shadowItemCulled(inside, frustum, 0));
+}
+
+test "shadow item culling applies batch AABB and instance checks to instanced items" {
+    const frustum = math.Frustum.fromViewProjection(Mat4.identity);
+    const inside_aabb = math.BoundingBox.init(
+        math.Vec3.new(-0.5, -0.5, 0.2),
+        math.Vec3.new(0.5, 0.5, 0.8),
+    );
+    const outside_aabb = math.BoundingBox.init(
+        math.Vec3.new(5.0, 5.0, 5.0),
+        math.Vec3.new(6.0, 6.0, 6.0),
+    );
+
+    var item = ShadowPass.ShadowDrawItem{
+        .world_aabb = outside_aabb,
+        .max_dim = 1.0,
+        .is_instanced = true,
+        .visible_instance_count = 4,
+        .instance_buffer = .{ .id = 1 },
+    };
+    try std.testing.expect(ShadowPass.shadowItemCulled(item, frustum, 0));
+
+    item.world_aabb = inside_aabb;
+    try std.testing.expect(!ShadowPass.shadowItemCulled(item, frustum, 0));
+
+    item.visible_instance_count = 0;
+    try std.testing.expect(ShadowPass.shadowItemCulled(item, frustum, 0));
+
+    item.visible_instance_count = 4;
+    item.instance_buffer = .{};
+    try std.testing.expect(ShadowPass.shadowItemCulled(item, frustum, 0));
+}
+
+test "shadow item culling applies far-cascade max_dim policy to all items" {
+    const frustum = math.Frustum.fromViewProjection(Mat4.identity);
+    const inside_aabb = math.BoundingBox.init(
+        math.Vec3.new(-0.5, -0.5, 0.2),
+        math.Vec3.new(0.5, 0.5, 0.8),
+    );
+
+    const item = ShadowPass.ShadowDrawItem{
+        .world_aabb = inside_aabb,
+        .max_dim = 0.5,
+    };
+    try std.testing.expect(ShadowPass.shadowItemCulled(item, frustum, 3));
+    try std.testing.expect(!ShadowPass.shadowItemCulled(item, frustum, 0));
+
+    const inst = ShadowPass.ShadowDrawItem{
+        .world_aabb = inside_aabb,
+        .max_dim = 0.5,
+        .is_instanced = true,
+        .visible_instance_count = 4,
+        .instance_buffer = .{ .id = 1 },
+    };
+    try std.testing.expect(ShadowPass.shadowItemCulled(inst, frustum, 3));
+    try std.testing.expect(!ShadowPass.shadowItemCulled(inst, frustum, 0));
+}
+
+test "shadow item culling skips invisible items" {
+    const frustum = math.Frustum.fromViewProjection(Mat4.identity);
+    const inside_aabb = math.BoundingBox.init(
+        math.Vec3.new(-0.5, -0.5, 0.2),
+        math.Vec3.new(0.5, 0.5, 0.8),
+    );
+
+    const hidden = ShadowPass.ShadowDrawItem{
+        .world_aabb = inside_aabb,
+        .max_dim = 1.0,
+        .is_visible = false,
+    };
+    try std.testing.expect(ShadowPass.shadowItemCulled(hidden, frustum, 0));
+
+    const hidden_inst = ShadowPass.ShadowDrawItem{
+        .world_aabb = inside_aabb,
+        .max_dim = 1.0,
+        .is_visible = false,
+        .is_instanced = true,
+        .visible_instance_count = 4,
+        .instance_buffer = .{ .id = 1 },
+    };
+    try std.testing.expect(ShadowPass.shadowItemCulled(hidden_inst, frustum, 0));
 }
