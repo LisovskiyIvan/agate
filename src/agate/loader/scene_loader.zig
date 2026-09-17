@@ -97,11 +97,11 @@ pub const SceneLoader = struct {
         defer scene.allocator.free(image_cache);
         @memset(image_cache, null);
 
-        const decoded = try scene.allocator.alloc(?Texture.RawTexture, gltf.images_count);
+        const decoded = try scene.allocator.alloc(?Texture.DecodedImage, gltf.images_count);
         @memset(decoded, null);
         defer {
             for (decoded) |*d| {
-                if (d.*) |*raw| raw.deinit(scene.allocator);
+                if (d.*) |*img| img.deinit(scene.allocator);
             }
             scene.allocator.free(decoded);
         }
