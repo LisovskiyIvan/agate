@@ -26,6 +26,7 @@ const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const Scene = @import("../scene.zig").Scene;
 const gpu_thread = @import("../gpu_thread.zig");
 const morph_gpu = @import("morph_gpu.zig");
+const tangents = @import("tangents.zig");
 
 pub const Mesh = struct {
     id: u64 = 0,
@@ -286,6 +287,54 @@ pub const Mesh = struct {
         }
         if (self.cpu_skin.len > 0) allocator.free(self.cpu_skin);
         self.cpu_skin = skin;
+    }
+
+    /// Reconstructs GeometryData from retained CPU vertices, morph base, or cpu_positions/indices.
+    pub fn toGeometryData(self: *const Mesh, allocator: std.mem.Allocator) !GeometryData {
+        if (self.pending_vertices.len > 0 and self.cpu_indices.len > 0) {
+            const verts = try allocator.dupe(Vertex, self.pending_vertices);
+            errdefer allocator.free(verts);
+            const idxs = try allocator.dupe(u32, self.cpu_indices);
+            errdefer allocator.free(idxs);
+            return .{
+                .vertices = verts,
+                .indices = idxs,
+                .bounds = self.local_bounding_box,
+            };
+        }
+        if (self.morph_base.len > 0 and self.cpu_indices.len > 0) {
+            const verts = try allocator.dupe(Vertex, self.morph_base);
+            errdefer allocator.free(verts);
+            const idxs = try allocator.dupe(u32, self.cpu_indices);
+            errdefer allocator.free(idxs);
+            return .{
+                .vertices = verts,
+                .indices = idxs,
+                .bounds = self.local_bounding_box,
+            };
+        }
+        if (self.cpu_positions.len > 0 and self.cpu_indices.len > 0) {
+            const verts = try allocator.alloc(Vertex, self.cpu_positions.len);
+            errdefer allocator.free(verts);
+            for (self.cpu_positions, 0..) |pos, i| {
+                verts[i] = .{
+                    .position = pos.toArray(),
+                    .normal = .{ 0.0, 1.0, 0.0 },
+                    .uv = .{ 0.0, 0.0 },
+                    .color = .{ 1.0, 1.0, 1.0, 1.0 },
+                    .tangent = .{ 1.0, 0.0, 0.0, 1.0 },
+                };
+            }
+            tangents.computeNormals(verts, self.cpu_indices, null);
+            const idxs = try allocator.dupe(u32, self.cpu_indices);
+            errdefer allocator.free(idxs);
+            return .{
+                .vertices = verts,
+                .indices = idxs,
+                .bounds = self.local_bounding_box,
+            };
+        }
+        return error.NoCpuGeometry;
     }
 
     pub fn hasMorphTargets(self: *const Mesh) bool {

@@ -61,8 +61,10 @@ test {
     _ = @import("mesh/csg.zig");
     _ = @import("mesh/csg_tests.zig");
     _ = @import("mesh/decal.zig");
+    _ = @import("mesh/greased_line.zig");
     _ = @import("mesh/mesh.zig");
     _ = @import("mesh/morph_gpu.zig");
+    _ = @import("mesh/simplify.zig");
     _ = @import("mesh/tangents.zig");
     _ = @import("mesh/tests.zig");
     _ = @import("mesh/trail.zig");

@@ -7,6 +7,8 @@ const builders = @import("builders.zig");
 const decal = @import("decal.zig");
 const trail = @import("trail.zig");
 const csg = @import("csg.zig");
+const greased_line = @import("greased_line.zig");
+const simplify = @import("simplify.zig");
 // Private aliases: the option/data types are re-exported publicly by the
 // `mesh.zig` facade straight from their source modules; MeshBuilder methods
 // just reference them locally.
@@ -14,6 +16,10 @@ const DecalOptions = decal.DecalOptions;
 const TrailOptions = trail.TrailOptions;
 const TrailMesh = trail.TrailMesh;
 const CSG = csg.CSG;
+const GreasedLineOptions = greased_line.GreasedLineOptions;
+const GreasedLineMesh = greased_line.GreasedLineMesh;
+const SimplifyOptions = simplify.SimplifyOptions;
+const LODLevelSpec = simplify.LODLevelSpec;
 const BoxOptions = builders.BoxOptions;
 const SphereOptions = builders.SphereOptions;
 const GroundOptions = builders.GroundOptions;
@@ -148,5 +154,23 @@ pub const MeshBuilder = struct {
 
     pub fn createCSG(scene: *Scene, name: []const u8, csg_solid: *const CSG) !*Mesh {
         return csg_solid.toMesh(scene, name);
+    }
+
+    pub fn createGreasedLine(scene: *Scene, name: []const u8, options: GreasedLineOptions) !*Mesh {
+        var data = try greased_line.buildGreasedLineData(scene.allocator, options);
+        defer data.deinit(scene.allocator);
+        return uploadGeometry(scene, name, data);
+    }
+
+    pub fn createGreasedLineMesh(scene: *Scene, name: []const u8, options: GreasedLineOptions) !*GreasedLineMesh {
+        return GreasedLineMesh.init(scene, name, options);
+    }
+
+    pub fn simplifyMesh(allocator: std.mem.Allocator, scene: *Scene, name: []const u8, source_mesh: *Mesh, options: SimplifyOptions) !*Mesh {
+        return simplify.simplifyMesh(allocator, scene, name, source_mesh, options);
+    }
+
+    pub fn generateLODLevels(allocator: std.mem.Allocator, scene: *Scene, source_mesh: *Mesh, specs: []const LODLevelSpec) !void {
+        return simplify.generateLODLevels(allocator, scene, source_mesh, specs);
     }
 };

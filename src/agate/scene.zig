@@ -52,6 +52,12 @@ const trail_mod = @import("mesh/trail.zig");
 const TrailMesh = trail_mod.TrailMesh;
 const TrailOptions = trail_mod.TrailOptions;
 const csg_mod = @import("mesh/csg.zig");
+const greased_mod = @import("mesh/greased_line.zig");
+const GreasedLineOptions = greased_mod.GreasedLineOptions;
+const GreasedLineMesh = greased_mod.GreasedLineMesh;
+const simplify_mod = @import("mesh/simplify.zig");
+const SimplifyOptions = simplify_mod.SimplifyOptions;
+const LODLevelSpec = simplify_mod.LODLevelSpec;
 const ai_mod = @import("ai.zig");
 const NavMesh = ai_mod.NavMesh;
 const NavAgent = ai_mod.NavAgent;
@@ -562,6 +568,24 @@ pub const Scene = struct {
 
     pub fn createCSGMesh(self: *Scene, name: []const u8, csg_solid: *const csg_mod.CSG) !*Mesh {
         return csg_solid.toMesh(self, name);
+    }
+
+    pub fn createGreasedLine(self: *Scene, name: []const u8, options: GreasedLineOptions) !*Mesh {
+        var data = try greased_mod.buildGreasedLineData(self.allocator, options);
+        defer data.deinit(self.allocator);
+        return @import("mesh/mesh.zig").uploadGeometry(self, name, data);
+    }
+
+    pub fn createGreasedLineMesh(self: *Scene, name: []const u8, options: GreasedLineOptions) !*GreasedLineMesh {
+        return GreasedLineMesh.init(self, name, options);
+    }
+
+    pub fn simplifyMesh(self: *Scene, name: []const u8, source_mesh: *Mesh, options: SimplifyOptions) !*Mesh {
+        return simplify_mod.simplifyMesh(self.allocator, self, name, source_mesh, options);
+    }
+
+    pub fn generateLODLevels(self: *Scene, source_mesh: *Mesh, specs: []const LODLevelSpec) !void {
+        return simplify_mod.generateLODLevels(self.allocator, self, source_mesh, specs);
     }
 
     pub fn createNavMeshFromTriangles(

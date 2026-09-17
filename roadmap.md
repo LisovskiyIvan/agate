@@ -47,7 +47,7 @@
 | Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines, Polygon, TrailMesh | ✅ |
 | LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
 | CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
-| Упрощение мешей (Mesh simplification) | — | ❌ |
+| Упрощение мешей (Mesh simplification) & Greased Lines | Garland-Heckbert QEM edge-collapse + автоматическая генерация LOD-уровней; GreasedLine: ribbon/billboard толстые 3D-линии, miter joints, multi-path, per-vertex width/color, UV/dashed modes | ✅ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали | 🟡 |
 | Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (несжатые LDR-форматы) в glTF-загрузке | 🟡 |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
@@ -63,7 +63,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 653 unit-теста, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 662 unit-теста (+9), встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -434,6 +434,19 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 653/653 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
 
+### Волна 24: Greased Lines и QEM-упрощение мешей с автоматической генерацией LOD (17.09.2026)
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Greased Lines Builder & Mesh | `mesh/greased_line.zig`, `mesh.zig`, `scene.zig`, `root.zig` | `GreasedLineOptions`, `buildGreasedLineData`: 3D-полилинии с настраиваемой шириной (константная или per-vertex `widths`), сглаживание стыков (miter joints с `miter_limit`), единая геометрия для multi-path линий, поддержка замкнутых петель (`closed`), UV-режимы (`.relative`, `.unit_length`) для пунктиров/дашей (`dash_ratio`, `dash_length`), режимы цветов (`.single`, `.per_vertex`, `.gradient`). `GreasedLineMesh`: динамический меш с real-time обновлением точек (`setPoints`), толщины (`setWidth`), цвета (`setColor`) и ориентации на камеру (`update(camera_pos)`). | ✅ |
+| Garland-Heckbert QEM Quadric3D | `mesh/simplify.zig`, `mesh.zig`, `root.zig` | Симметричная 4x4 матрица ошибки `Quadric3D` (10 float параметров): построение из уравнений плоскостей `fromPlane` с весом площади треугольников, сложение `add`, вычисление квадратичной ошибки `evaluate(p)`, точное аналитическое решение `solveOptimal(p0, p1)` с проверкой обусловленности/детерминанта матрицы и робастным фоллбэком на граничные и среднюю точку. | ✅ |
+| Децимация мешей `simplifyGeometry` | `mesh/simplify.zig`, `mesh.zig`, `scene.zig`, `root.zig` | QEM-децимация геометрии: вычисление топологических ребер, взвешивание плоскостей по площади треугольников, обнаружение границ сетки и наложение штрафных квадрик (`border_penalty: 500.0`) для сохранения контуров и силуэтов (`preserve_border`), проверка переворота нормалей (`prevent_normal_flips`), интерполяция UV, цветов вершин и тангенсов (`preserve_attributes`), пересчет сглаженных нормалей surviving граней. | ✅ |
+| `Mesh.toGeometryData` & `simplifyMesh` | `mesh/mesh.zig`, `mesh/simplify.zig`, `scene.zig`, `root.zig` | Извлечение CPU-геометрии из `Mesh` через `toGeometryData` (с поддержкой `pending_vertices`, `morph_base` и `cpu_positions`), генерация упрощенного меша `Scene.simplifyMesh` и `MeshBuilder.simplifyMesh`. | ✅ |
+| Автоматическая генерация LOD | `mesh/simplify.zig`, `scene.zig`, `root.zig` | `generateLODLevels`: пакетная генерация уровней детализации по спецификациям `[]const LODLevelSpec` (дистанция, целевое соотношение треугольников, опции упрощения) с автоматической регистрацией в `source_mesh.addLODLevel`. | ✅ |
+| Модульные тесты | `mesh/tests.zig` | 9 новых тестов: GreasedLine single path ribbon vertices/indices, multi-path per-vertex widths/colors/dash, closed loop closure, GreasedLineMesh lifecycle/updates, Quadric3D plane accumulation and analytical evaluation, simplifyGeometry box decimation, preserve_border retention on open planes, Scene.simplifyMesh with toGeometryData, Scene.generateLODLevels distance bracket switching. | ✅ |
+
+Проверки: 662/662 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
+
 ---
 
 ## ✅ Что сделано
@@ -627,8 +640,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Glow layer, highlight layer, lens flares, snapshot-рендер, SSR/SSAO более высокого качества.
 
 **Геометрия**
-* Толстые GreasedLine-линии, mesh simplification.
-* Инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют).
+* Инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют; GreasedLine и QEM-упрощение мешей с автоматической генерацией LOD уже реализованы).
 * Морфы >8 таргетов (GPU-блендинг через delta-текстуру реализован).
 
 **Анимация**

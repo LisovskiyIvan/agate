@@ -100,6 +100,21 @@ pub const CSGPlane = csg.CSGPlane;
 pub const CSGPolygon = csg.CSGPolygon;
 pub const CSGNode = csg.CSGNode;
 
+pub const greased_line = @import("mesh/greased_line.zig");
+pub const GreasedLineOptions = greased_line.GreasedLineOptions;
+pub const GreasedLineUVMode = greased_line.GreasedLineUVMode;
+pub const GreasedLineColorMode = greased_line.GreasedLineColorMode;
+pub const GreasedLineMesh = greased_line.GreasedLineMesh;
+pub const buildGreasedLineData = greased_line.buildGreasedLineData;
+
+pub const simplify = @import("mesh/simplify.zig");
+pub const Quadric3D = simplify.Quadric3D;
+pub const SimplifyOptions = simplify.SimplifyOptions;
+pub const LODLevelSpec = simplify.LODLevelSpec;
+pub const simplifyGeometry = simplify.simplifyGeometry;
+pub const simplifyMesh = simplify.simplifyMesh;
+pub const generateLODLevels = simplify.generateLODLevels;
+
 test {
     _ = @import("mesh/tests.zig");
     _ = @import("mesh/csg_tests.zig");

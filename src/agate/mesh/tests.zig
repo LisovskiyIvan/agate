@@ -38,6 +38,15 @@ const DecalSpawnOptions = mesh_mod.DecalSpawnOptions;
 const SkinJointWeight = mesh_mod.SkinJointWeight;
 const Scene = @import("../scene.zig").Scene;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
+const GreasedLineOptions = mesh_mod.GreasedLineOptions;
+const GreasedLineMesh = mesh_mod.GreasedLineMesh;
+const buildGreasedLineData = mesh_mod.buildGreasedLineData;
+const Quadric3D = mesh_mod.Quadric3D;
+const SimplifyOptions = mesh_mod.SimplifyOptions;
+const LODLevelSpec = mesh_mod.LODLevelSpec;
+const simplifyGeometry = mesh_mod.simplifyGeometry;
+const simplifyMesh = mesh_mod.simplifyMesh;
+const generateLODLevels = mesh_mod.generateLODLevels;
 
 test "Mesh attachToBone world matrix computation" {
     const ally = std.testing.allocator;
@@ -1631,4 +1640,312 @@ test "MorphGpu vsUniforms enable and packing" {
     try std.testing.expectEqual(@as(f32, 2), gpu_u.params[2]);
     try std.testing.expectEqual([4]f32{ 0.25, 0.75, 0, 0 }, gpu_u.weights0);
     try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, gpu_u.weights1);
+}
+
+test "GreasedLine: buildGreasedLineData single path generates ribbon" {
+    const ally = std.testing.allocator;
+    const pts = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 0, 0),
+        Vec3.new(2, 1, 0),
+        Vec3.new(3, 1, 0),
+    };
+
+    var data = try buildGreasedLineData(ally, .{
+        .points = &pts,
+        .width = 0.2,
+        .uv_mode = .relative,
+    });
+    defer data.deinit(ally);
+
+    // 4 points -> 8 vertices
+    try std.testing.expectEqual(@as(usize, 8), data.vertices.len);
+    // 3 segments -> 3 * 6 = 18 indices
+    try std.testing.expectEqual(@as(usize, 18), data.indices.len);
+
+    // Bounding box should enclose points with width margin
+    try std.testing.expect(data.bounds.isValid());
+    try std.testing.expect(data.bounds.min.x <= 0.0);
+    try std.testing.expect(data.bounds.max.x >= 3.0);
+
+    // First pair of vertices: u should be 0.0, v should be 1.0 (left) and 0.0 (right)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.vertices[0].uv[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.vertices[0].uv[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.vertices[1].uv[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.vertices[1].uv[1], 1e-4);
+
+    // Last pair of vertices: u should be 1.0 (relative mode)
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.vertices[6].uv[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.vertices[7].uv[0], 1e-4);
+}
+
+test "GreasedLine: multi-path with per-vertex widths and colors" {
+    const ally = std.testing.allocator;
+    const path1 = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 0, 0),
+        Vec3.new(2, 0, 0),
+    };
+    const path2 = [_]Vec3{
+        Vec3.new(0, 2, 0),
+        Vec3.new(1, 2, 0),
+    };
+    const paths = [_][]const Vec3{ &path1, &path2 };
+
+    const widths = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5 };
+    const colors = [_]Color4{
+        Color4.new(1, 0, 0, 1),
+        Color4.new(0, 1, 0, 1),
+        Color4.new(0, 0, 1, 1),
+        Color4.new(1, 1, 0, 1),
+        Color4.new(1, 0, 1, 1),
+    };
+
+    var data = try buildGreasedLineData(ally, .{
+        .paths = &paths,
+        .widths = &widths,
+        .colors = &colors,
+        .color_mode = .per_vertex,
+        .uv_mode = .unit_length,
+    });
+    defer data.deinit(ally);
+
+    // 5 points total -> 10 vertices
+    try std.testing.expectEqual(@as(usize, 10), data.vertices.len);
+    // (2 segments in path1 + 1 segment in path2) * 6 = 18 indices
+    try std.testing.expectEqual(@as(usize, 18), data.indices.len);
+
+    // Check per-vertex colors
+    try std.testing.expectEqual(colors[0].toArray(), data.vertices[0].color);
+    try std.testing.expectEqual(colors[0].toArray(), data.vertices[1].color);
+    try std.testing.expectEqual(colors[4].toArray(), data.vertices[8].color);
+    try std.testing.expectEqual(colors[4].toArray(), data.vertices[9].color);
+}
+
+test "GreasedLine: closed loop ribbon connects last to first" {
+    const ally = std.testing.allocator;
+    const loop_pts = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 0, 0),
+        Vec3.new(0, 1, 0),
+    };
+
+    var data = try buildGreasedLineData(ally, .{
+        .points = &loop_pts,
+        .width = 0.1,
+        .closed = true,
+    });
+    defer data.deinit(ally);
+
+    // 3 points -> 6 vertices
+    try std.testing.expectEqual(@as(usize, 6), data.vertices.len);
+    // 3 segments closed -> 3 * 6 = 18 indices
+    try std.testing.expectEqual(@as(usize, 18), data.indices.len);
+
+    // Last quad should reference vertex 0 and 1 (loop closure)
+    var found_first_vertex_in_last_quad = false;
+    for (data.indices[12..18]) |idx| {
+        if (idx == 0 or idx == 1) found_first_vertex_in_last_quad = true;
+    }
+    try std.testing.expect(found_first_vertex_in_last_quad);
+}
+
+test "GreasedLine: dynamic GreasedLineMesh lifecycle" {
+    const ally = std.testing.allocator;
+    var mock_scene: Scene = undefined;
+    mock_scene.allocator = ally;
+    mock_scene.meshes = .empty;
+    defer {
+        for (mock_scene.meshes.items) |m| {
+            m.deinit(ally);
+            ally.destroy(m);
+        }
+        mock_scene.meshes.deinit(ally);
+    }
+
+    const pts = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(2, 0, 0),
+        Vec3.new(4, 0, 0),
+    };
+
+    const greased = try GreasedLineMesh.init(&mock_scene, "dyn_line", .{
+        .points = &pts,
+        .width = 0.2,
+    });
+    defer greased.deinit();
+
+    try std.testing.expectEqual(@as(u32, 6), greased.mesh.vertex_count);
+    try std.testing.expectEqual(@as(u32, 12), greased.mesh.index_count);
+
+    // Update width
+    greased.setWidth(0.5);
+    try std.testing.expect(greased.gpu_dirty);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), greased.options.width, 1e-4);
+
+    // Update points
+    const new_pts = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 1, 0),
+        Vec3.new(2, 2, 0),
+        Vec3.new(3, 3, 0),
+    };
+    try greased.setPoints(&new_pts);
+
+    // Update camera position
+    greased.update(Vec3.new(0, 10, 5));
+
+    // Flush GPU uploads (safe in headless/contextless test)
+    greased.flushGpuUploads();
+    try std.testing.expect(!greased.gpu_dirty);
+}
+
+test "Simplify: Quadric3D plane accumulation and evaluation" {
+    // Plane y = 0, normal = (0, 1, 0), d = 0
+    const q1 = Quadric3D.fromPlane(Vec3.new(0, 1, 0), 0.0, 1.0);
+    // Point on plane has 0 error
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), q1.evaluate(Vec3.new(5, 0, 3)), 1e-5);
+    // Point at y = 2 has error = 2^2 = 4
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), q1.evaluate(Vec3.new(5, 2, 3)), 1e-4);
+
+    // Plane x = 0, normal = (1, 0, 0), d = 0
+    const q2 = Quadric3D.fromPlane(Vec3.new(1, 0, 0), 0.0, 1.0);
+    const q_sum = q1.add(q2);
+
+    // Point at (3, 4, 10): error = 3^2 + 4^2 = 25
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), q_sum.evaluate(Vec3.new(3, 4, 10)), 1e-3);
+
+    // solveOptimal on line segment
+    const opt = q_sum.solveOptimal(Vec3.new(-1, -1, 0), Vec3.new(1, 1, 0));
+    // Intersection of x=0 and y=0 is (0, 0, z)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), opt.x, 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), opt.y, 1e-2);
+}
+
+test "Simplify: simplifyGeometry decimates box by target ratio" {
+    const ally = std.testing.allocator;
+    var box_data = try mesh_mod.builders.buildBoxData(ally, .{
+        .width = 2.0,
+        .height = 2.0,
+        .depth = 2.0,
+    });
+    defer box_data.deinit(ally);
+
+    const initial_tris = box_data.indices.len / 3;
+    try std.testing.expect(initial_tris >= 12);
+
+    var simplified = try simplifyGeometry(ally, &box_data, .{
+        .target_ratio = 0.5,
+        .preserve_border = false,
+        .prevent_normal_flips = false,
+    });
+    defer simplified.deinit(ally);
+
+    const simp_tris = simplified.indices.len / 3;
+    try std.testing.expect(simp_tris < initial_tris);
+    try std.testing.expect(simplified.indices.len % 3 == 0);
+
+    // Ensure all index references are valid
+    for (simplified.indices) |idx| {
+        try std.testing.expect(idx < simplified.vertices.len);
+    }
+}
+
+test "Simplify: preserve_border retains boundary vertices on open plane" {
+    const ally = std.testing.allocator;
+    var plane_data = try buildPlaneData(ally, .{
+        .width = 4.0,
+        .height = 4.0,
+        .subdivisions_x = 4,
+        .subdivisions_y = 4,
+    });
+    defer plane_data.deinit(ally);
+
+    const initial_tris = plane_data.indices.len / 3;
+
+    var simplified = try simplifyGeometry(ally, &plane_data, .{
+        .target_ratio = 0.5,
+        .preserve_border = true,
+        .border_penalty = 1000.0,
+    });
+    defer simplified.deinit(ally);
+
+    try std.testing.expect(simplified.indices.len / 3 < initial_tris);
+    // Extents should match original bounds (-2 to +2) because boundary is preserved
+    try std.testing.expectApproxEqAbs(plane_data.bounds.min.x, simplified.bounds.min.x, 0.1);
+    try std.testing.expectApproxEqAbs(plane_data.bounds.max.x, simplified.bounds.max.x, 0.1);
+}
+
+test "Simplify: Mesh.toGeometryData and simplifyMesh in Scene" {
+    const ally = std.testing.allocator;
+    var mock_scene: Scene = undefined;
+    mock_scene.allocator = ally;
+    mock_scene.meshes = .empty;
+    defer {
+        for (mock_scene.meshes.items) |m| {
+            m.deinit(ally);
+            ally.destroy(m);
+        }
+        mock_scene.meshes.deinit(ally);
+    }
+
+    const box_mesh = try MeshBuilder.createBox(&mock_scene, "source_box", .{
+        .width = 1.0,
+        .height = 1.0,
+        .depth = 1.0,
+    });
+
+    var extracted_geom = try box_mesh.toGeometryData(ally);
+    defer extracted_geom.deinit(ally);
+
+    try std.testing.expect(extracted_geom.vertices.len > 0);
+    try std.testing.expect(extracted_geom.indices.len > 0);
+
+    const simp_mesh = try mock_scene.simplifyMesh("simp_box", box_mesh, .{
+        .target_ratio = 0.6,
+    });
+
+    try std.testing.expect(simp_mesh.vertex_count > 0);
+    try std.testing.expect(simp_mesh.index_count > 0);
+}
+
+test "Simplify: generateLODLevels creates automated distance brackets" {
+    const ally = std.testing.allocator;
+    var mock_scene: Scene = undefined;
+    mock_scene.allocator = ally;
+    mock_scene.meshes = .empty;
+    defer {
+        for (mock_scene.meshes.items) |m| {
+            m.deinit(ally);
+            ally.destroy(m);
+        }
+        mock_scene.meshes.deinit(ally);
+    }
+
+    const box_mesh = try MeshBuilder.createBox(&mock_scene, "lod_source", .{
+        .width = 2.0,
+        .height = 2.0,
+        .depth = 2.0,
+    });
+
+    try mock_scene.generateLODLevels(box_mesh, &[_]LODLevelSpec{
+        .{ .distance = 15.0, .ratio = 0.75 },
+        .{ .distance = 35.0, .ratio = 0.5 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), box_mesh.lod_levels.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), box_mesh.lod_levels.items[0].distance, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 35.0), box_mesh.lod_levels.items[1].distance, 1e-4);
+
+    // Near distance: returns base mesh
+    const lod_near = box_mesh.getLOD(5.0);
+    try std.testing.expectEqual(box_mesh, lod_near.?);
+
+    // Mid distance: returns lod level 0
+    const lod_mid = box_mesh.getLOD(20.0);
+    try std.testing.expectEqual(box_mesh.lod_levels.items[0].mesh.?, lod_mid.?);
+
+    // Far distance: returns lod level 1
+    const lod_far = box_mesh.getLOD(50.0);
+    try std.testing.expectEqual(box_mesh.lod_levels.items[1].mesh.?, lod_far.?);
 }
