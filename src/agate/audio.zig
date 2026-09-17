@@ -28,6 +28,13 @@ pub const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
 pub const AudioOcclusionTracker = occlusion_mod.AudioOcclusionTracker;
 pub const AudioEmitter = occlusion_mod.AudioEmitter;
 
+const stream_mod = @import("audio/stream.zig");
+pub const StreamFormat = stream_mod.StreamFormat;
+pub const StreamState = stream_mod.StreamState;
+pub const StreamError = stream_mod.StreamError;
+pub const StreamOptions = stream_mod.StreamOptions;
+pub const AudioStream = stream_mod.AudioStream;
+
 pub const BusId = enum(u8) {
     _,
 
@@ -93,6 +100,7 @@ pub const AudioEngine = struct {
     pub const max_reverbs: usize = 4;
     pub const chunk_frames: usize = 64;
     pub const chunk_samples: usize = chunk_frames * 2;
+    pub const max_streams: usize = 8;
 
     const Command = union(enum) {
         voice: struct {
@@ -189,6 +197,11 @@ pub const AudioEngine = struct {
     sample_rate: f32 = 44100.0,
     next_seed: u32 = 0x12345678,
 
+    // Audio streams (background music, ambient loops, dialogue)
+    streams: [max_streams]?*AudioStream = [_]?*AudioStream{null} ** max_streams,
+    music_stream: ?*AudioStream = null,
+    music_fade_stream: ?*AudioStream = null,
+
     pub fn init(config: AudioConfig) AudioEngine {
         var eng = AudioEngine{};
         eng.configure(config);
@@ -230,6 +243,9 @@ pub const AudioEngine = struct {
         if (!self.started) return;
         saudio.shutdown();
         self.started = false;
+        for (&self.streams) |*slot| {
+            if (slot.*) |s| s.stop();
+        }
     }
 
     /// One-shot procedural voice trigger: kind + spatial position + the
@@ -1171,6 +1187,166 @@ pub const AudioEngine = struct {
         }
     }
 
+    // --- Audio Stream & Music Management ---
+
+    pub fn registerStream(self: *AudioEngine, stream: *AudioStream) !void {
+        for (&self.streams) |*slot| {
+            if (slot.* == null) {
+                slot.* = stream;
+                return;
+            }
+        }
+        return error.StreamLimitReached;
+    }
+
+    pub fn unregisterStream(self: *AudioEngine, stream: *AudioStream) void {
+        for (&self.streams) |*slot| {
+            if (slot.* == stream) {
+                slot.* = null;
+                break;
+            }
+        }
+        if (self.music_stream == stream) self.music_stream = null;
+        if (self.music_fade_stream == stream) self.music_fade_stream = null;
+    }
+
+    pub fn createStreamFromFile(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        options: StreamOptions,
+    ) !*AudioStream {
+        const stream = try AudioStream.openFile(allocator, path, self.sample_rate, options);
+        errdefer stream.deinit();
+        try self.registerStream(stream);
+        return stream;
+    }
+
+    pub fn createStreamFromMemory(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        format: StreamFormat,
+        options: StreamOptions,
+    ) !*AudioStream {
+        const stream = try AudioStream.openMemory(allocator, bytes, format, self.sample_rate, options);
+        errdefer stream.deinit();
+        try self.registerStream(stream);
+        return stream;
+    }
+
+    pub fn destroyStream(self: *AudioEngine, stream: *AudioStream) void {
+        self.unregisterStream(stream);
+        stream.deinit();
+    }
+
+    pub fn updateStreams(self: *AudioEngine, dt: f32) void {
+        for (&self.streams) |maybe_s| {
+            if (maybe_s) |s| {
+                s.update(dt);
+            }
+        }
+        if (self.music_fade_stream) |fade_s| {
+            if (fade_s.isStopped()) {
+                self.destroyStream(fade_s);
+                self.music_fade_stream = null;
+            }
+        }
+    }
+
+    pub fn playMusic(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        options: StreamOptions,
+    ) !*AudioStream {
+        if (self.music_stream) |old_s| {
+            self.destroyStream(old_s);
+            self.music_stream = null;
+        }
+        var opt = options;
+        if (opt.bus == null) {
+            opt.bus = @enumFromInt(2); // default music bus
+        }
+        const s = try self.createStreamFromFile(allocator, path, opt);
+        self.music_stream = s;
+        return s;
+    }
+
+    pub fn playMusicFromMemory(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        format: StreamFormat,
+        options: StreamOptions,
+    ) !*AudioStream {
+        if (self.music_stream) |old_s| {
+            self.destroyStream(old_s);
+            self.music_stream = null;
+        }
+        var opt = options;
+        if (opt.bus == null) {
+            opt.bus = @enumFromInt(2); // default music bus
+        }
+        const s = try self.createStreamFromMemory(allocator, bytes, format, opt);
+        self.music_stream = s;
+        return s;
+    }
+
+    pub fn crossfadeMusic(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        fade_duration: f32,
+        options: StreamOptions,
+    ) !*AudioStream {
+        if (self.music_stream) |old_s| {
+            old_s.fadeTo(0.0, fade_duration, true);
+            self.music_fade_stream = old_s;
+            self.music_stream = null;
+        }
+
+        var opt = options;
+        if (opt.bus == null) {
+            opt.bus = @enumFromInt(2);
+        }
+        const target_vol = opt.volume;
+        opt.volume = 0.0;
+        const new_s = try self.createStreamFromFile(allocator, path, opt);
+        new_s.fadeTo(target_vol, fade_duration, false);
+        self.music_stream = new_s;
+        return new_s;
+    }
+
+    pub fn stopMusic(self: *AudioEngine, fade_duration: f32) void {
+        if (self.music_stream) |s| {
+            if (fade_duration > 0.0) {
+                s.fadeTo(0.0, fade_duration, true);
+                self.music_fade_stream = s;
+                self.music_stream = null;
+            } else {
+                self.destroyStream(s);
+                self.music_stream = null;
+            }
+        }
+    }
+
+    pub fn pauseMusic(self: *AudioEngine) void {
+        if (self.music_stream) |s| s.pause();
+    }
+
+    pub fn resumeMusic(self: *AudioEngine) void {
+        if (self.music_stream) |s| s.unpause();
+    }
+
+    pub fn setMusicVolume(self: *AudioEngine, vol: f32) void {
+        if (self.music_stream) |s| s.setVolume(vol);
+    }
+
+    pub fn getMusicStream(self: *const AudioEngine) ?*AudioStream {
+        return self.music_stream;
+    }
+
     pub const MusicPlayOptions = struct {
         bus: ?BusId = null,
         volume: f32 = 1.0,
@@ -1178,7 +1354,7 @@ pub const AudioEngine = struct {
         rate: f32 = 1.0,
     };
 
-    pub fn playMusic(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void {
+    pub fn playMusicClip(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void {
         if (options.bus) |b| {
             self.stopBus(b);
         }
@@ -1345,7 +1521,7 @@ pub const AudioEngine = struct {
             voice_count += 1;
         }
 
-        // Fast-path: if no voices and no active reverbs, silence buffer
+        // Fast-path: if no voices, no active reverbs, and no active streams, silence buffer
         var any_reverb = false;
         for (&self.reverbs) |*r| {
             if (r.active) {
@@ -1353,7 +1529,16 @@ pub const AudioEngine = struct {
                 break;
             }
         }
-        if (voice_count == 0 and !any_reverb) {
+        var any_stream = false;
+        for (&self.streams) |*maybe_s| {
+            if (maybe_s.*) |s| {
+                if (s.state.load(.acquire) == .playing) {
+                    any_stream = true;
+                    break;
+                }
+            }
+        }
+        if (voice_count == 0 and !any_reverb and !any_stream) {
             @memset(buffer, 0.0);
             return;
         }
@@ -1390,6 +1575,23 @@ pub const AudioEngine = struct {
                     .blip => renderTone(false, a.*, dt, target),
                     .sample => renderSample(a.*, dt, target),
                 }
+            }
+
+            // Render active audio streams
+            for (&self.streams) |*maybe_s| {
+                const s = maybe_s.* orelse continue;
+                if (s.state.load(.acquire) != .playing) continue;
+                const bus_opt = s.getBus();
+                const target = if (bus_opt) |b_id| blk: {
+                    const idx = @intFromEnum(b_id);
+                    if (idx < cap and self.bus_active[idx].load(.acquire)) {
+                        bus_has_audio[idx] = true;
+                        break :blk self.bus_chunks[idx][0..cur_samples];
+                    }
+                    break :blk master_chunk[0..cur_samples];
+                } else master_chunk[0..cur_samples];
+
+                _ = s.renderToBuffer(target);
             }
 
             // Process buses in leaf-to-root topological order

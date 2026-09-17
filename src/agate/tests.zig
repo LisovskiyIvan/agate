@@ -27,6 +27,7 @@ test {
     _ = @import("audio/decode_fuzz.zig");
     _ = @import("audio/dsp.zig");
     _ = @import("audio/occlusion.zig");
+    _ = @import("audio/stream.zig");
     _ = @import("audio/tests.zig");
     _ = @import("c.zig");
     _ = @import("camera.zig");

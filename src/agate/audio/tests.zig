@@ -1434,3 +1434,197 @@ test "PhysicsWorld audio occlusion raycast integration" {
     const occ_clear = pw.evaluateAudioOcclusion(listener, emitter_clear, .{});
     try std.testing.expectEqual(@as(f32, 0.0), occ_clear);
 }
+
+test "AudioStream OGG Vorbis streaming from memory" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var stream = try audio.AudioStream.openMemory(alloc, ogg_bytes, .ogg, 44100.0, .{
+        .volume = 0.75,
+        .pan = 0.0,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(stream.isPlaying());
+    try std.testing.expect(!stream.isPaused());
+    try std.testing.expect(!stream.isStopped());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), stream.getVolume(), 1e-4);
+    try std.testing.expect(stream.getDurationSeconds() > 0.0);
+
+    var buf: [2048]f32 = [_]f32{0.0} ** 2048;
+    const rendered = stream.renderToBuffer(&buf);
+    try std.testing.expectEqual(@as(usize, 1024), rendered);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+
+    // Pause
+    stream.pause();
+    try std.testing.expect(stream.isPaused());
+    try std.testing.expect(!stream.isPlaying());
+
+    // Resume
+    stream.unpause();
+    try std.testing.expect(stream.isPlaying());
+
+    // Refill and render again
+    stream.update(0.05);
+    @memset(&buf, 0.0);
+    const rendered2 = stream.renderToBuffer(&buf);
+    try std.testing.expect(rendered2 > 0);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+
+    // Stop
+    stream.stop();
+    try std.testing.expect(stream.isStopped());
+    try std.testing.expectEqual(@as(f32, 0.0), stream.getPositionSeconds());
+}
+
+test "AudioStream MP3 streaming from memory" {
+    const alloc = std.testing.allocator;
+    const mp3_bytes = @embedFile("fixtures/tone_440_880.mp3");
+
+    var stream = try audio.AudioStream.openMemory(alloc, mp3_bytes, .mp3, 44100.0, .{
+        .volume = 0.9,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(stream.isPlaying());
+
+    var buf: [2048]f32 = [_]f32{0.0} ** 2048;
+    const rendered = stream.renderToBuffer(&buf);
+    try std.testing.expectEqual(@as(usize, 1024), rendered);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+}
+
+test "AudioStream WAV streaming from memory and auto-stop when loop is false" {
+    const alloc = std.testing.allocator;
+    // 2205 frames of 440 Hz sine = 0.05s
+    const pcm = try sineI16(alloc, 2205, 44100, 440.0, 20000.0);
+    defer alloc.free(pcm);
+    const raw = try encodeI16(alloc, pcm);
+    defer alloc.free(raw);
+    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
+    defer alloc.free(wav);
+
+    var stream = try audio.AudioStream.openMemory(alloc, wav, .wav, 44100.0, .{
+        .volume = 0.8,
+        .loop = false,
+        .buffer_frames = 1024,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(stream.isPlaying());
+
+    var total_rendered: usize = 0;
+    var buf: [1024]f32 = [_]f32{0.0} ** 1024;
+    while (!stream.isStopped()) {
+        stream.update(0.02);
+        @memset(&buf, 0.0);
+        const got = stream.renderToBuffer(&buf);
+        if (got == 0) break;
+        total_rendered += got;
+        if (total_rendered > 5000) break; // safety breaker
+    }
+
+    try std.testing.expectEqual(@as(usize, 2205), total_rendered);
+    try std.testing.expect(stream.isStopped());
+}
+
+test "AudioStream seamless looping renders continuously past track length" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var stream = try audio.AudioStream.openMemory(alloc, ogg_bytes, .ogg, 44100.0, .{
+        .loop = true,
+        .buffer_frames = 2048,
+    });
+    defer stream.deinit();
+
+    var buf: [1024]f32 = [_]f32{0.0} ** 1024;
+    // Track is 2646 frames. Render 4 x 512 = 2048 frames, then refill and render 2048 more = 4096 frames (> 2646)
+    var total_frames: usize = 0;
+    for (0..8) |_| {
+        stream.update(0.02);
+        @memset(&buf, 0.0);
+        const got = stream.renderToBuffer(&buf);
+        try std.testing.expect(got > 0);
+        try std.testing.expect(channelEnergy(&buf, 0) > 0.005);
+        total_frames += got;
+    }
+
+    try std.testing.expect(total_frames > 2646);
+    try std.testing.expect(stream.isPlaying());
+}
+
+test "AudioStream volume fadeTo smoothly interpolates and stops on fade out" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var stream = try audio.AudioStream.openMemory(alloc, ogg_bytes, .ogg, 44100.0, .{
+        .volume = 1.0,
+        .loop = true,
+        .buffer_frames = 2048,
+    });
+    defer stream.deinit();
+
+    stream.fadeTo(0.0, 0.1, true); // fade to 0 in 0.1s and stop
+
+    // Halfway through fade (0.05s)
+    stream.update(0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), stream.getVolume(), 0.05);
+    try std.testing.expect(stream.isPlaying());
+
+    // Complete fade (0.06s more = 0.11s total)
+    stream.update(0.06);
+    try std.testing.expect(stream.getVolume() <= 0.001);
+    try std.testing.expect(stream.isStopped());
+}
+
+test "AudioEngine plays and mixes streaming audio into bus with DSP filter" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+    const music_bus = eng.createNonSpatialBus("streamed_music_bus", 0.8) orelse return error.BusCreationFailed;
+
+    // Apply a lowpass filter to the bus
+    eng.setBusMuffled(music_bus);
+
+    const stream = try eng.createStreamFromMemory(alloc, ogg_bytes, .ogg, .{
+        .bus = music_bus,
+        .volume = 0.9,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+    defer eng.destroyStream(stream);
+
+    var out_buf: [2048]f32 = [_]f32{0.0} ** 2048;
+    eng.renderFrames(&out_buf);
+
+    // Filtered streaming music rendered into out_buf
+    const e = channelEnergy(&out_buf, 0);
+    try std.testing.expect(e > 0.01);
+}
+
+test "AudioEngine music stream crossfade lifecycle" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+
+    // 1. Play first music track
+    const s1 = try eng.playMusicFromMemory(alloc, ogg_bytes, .ogg, .{
+        .volume = 0.8,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+    try std.testing.expectEqual(s1, eng.getMusicStream().?);
+    try std.testing.expect(s1.isPlaying());
+
+    // 2. Stop music immediately
+    eng.stopMusic(0.0);
+    try std.testing.expect(eng.getMusicStream() == null);
+}

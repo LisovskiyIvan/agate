@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 16.09.2026).
+> Дата: 10.09.2026 (обновлено 17.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -55,15 +55,15 @@
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input | 🟡 |
 | Layout-контейнеры, 3D GUI | — | ❌ |
-| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb и звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling) | ✅ |
-| mp3/ogg, стриминг, шины, эффекты | Динамические шины (DAG-дерево, spatial/non-spatial, attenuation, Doppler, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) есть; mp3/ogg, стриминг в бэклоге | 🟡 |
+| Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb, звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling), OGG/MP3/WAV потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы и кроссфейдинг музыки | ✅ |
+| mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) | ✅ |
 | Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 629 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 636 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -403,6 +403,20 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 629/629 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят без ошибок.
 
+### Волна 22: Потоковый стриминг аудио (OGG Vorbis, MP3, WAV), музыка и кроссфейд (17.09.2026)
+
+| Направление | Файлы | Описание | Статус |
+|---|---|---|---|
+| Форматы и декодеры | `audio/stream.zig`, `audio.zig`, `root.zig` | Инкрементальное декодирование чанками для OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`) и WAV (RIFF/PCM 8/16/24/32-bit и IEEE float32) из файлов и памяти | ✅ |
+| SPSC Lock-free Ring Buffer | `audio/stream.zig` | Безопасная передача аудиоданных из фонового/главного потока в аудиопоток sokol-audio; бинарная маска степеней двойки (65536 стерео-фреймов), 0 динамических аллокаций и 0 I/O в аудиоколлбэке | ✅ |
+| Бесшовный лупинг и ресемплинг | `audio/stream.zig` | Gapless looping при достижении конца трека, линейная интерполяция/ресемплинг произвольных sample rate (22.05, 44.1, 48 кГц и др.) к целевой частоте дискретизации движка | ✅ |
+| Управление стримами | `audio/stream.zig`, `audio.zig` | Управление громкостью, панорамой, шиной назначения (`setBus`), пауза, возобновление (`unpause`/`resume`), остановка, точный сик по секундам и фреймам (`seekToSeconds`/`seekToFrame`) | ✅ |
+| Плавный фейдинг и кроссфейд | `audio/stream.zig`, `audio.zig` | Встроенный `fadeTo` (fade-in / fade-out с авто-остановкой), высокоуровневый кроссфейдинг музыки `crossfadeMusic(source, duration, options)` с одновременным затуханием старого трека и нарастанием нового | ✅ |
+| Интеграция с DAG-шинами и DSP | `audio.zig` | Стримы микшируются прямо в чанки назначенных шин (`bus_chunks[idx]`), автоматически наследуя все эффекты шин: Biquad IIR EQ/фильтры, глушение окклюзией и стерео-реверберацию Freeverb | ✅ |
+| Модульные тесты | `audio/tests.zig`, `tests.zig` | 7 новых модульных тестов: OGG/MP3/WAV стриминг из памяти, авто-остановка, бесшовный лупинг, кроссфейд жизненного цикла, маршрутизация в шину с IIR LPF фильтром | ✅ |
+
+Проверки: 636/636 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
+
 ---
 
 ## ✅ Что сделано
@@ -529,14 +543,18 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 * Процедурный синтез на sokol.audio: thump, noise burst, blip — без внешних аудиоассетов.
 * `AudioClip.fromWavMemory` / `fromWavFile` — WAV PCM 8/16/24/32-bit и float32, mono/stereo, потоковый ресемплинг; `AudioEngine.playClip` с loop/rate/позиционированием.
+* Потоковый стриминг аудио с диска и памяти (`AudioStream`, `stream.zig`): фоновое инкрементальное декодирование OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`) и WAV, SPSC lock-free кольцевой буфер (65536 стерео-фреймов), 0 динамических аллокаций и 0 I/O в аудиоколлбэке sokol-audio.
+* Высокоуровневая подсистема музыки: `playMusic`, `playMusicFromMemory`, `crossfadeMusic`, `pauseMusic`, `resumeMusic`, `stopMusic`, плавный `fadeTo` с авто-остановкой, бесшовный лупинг (gapless loop) и точный сик (`seekToSeconds`/`seekToFrame`).
 * Динамический открытый реестр шин (`BusId = enum(u8) { _, pub const invalid }`): пользователь сам объявляет любые шины (Master, SFX, Music, Ambient, UI, Weapons и др.).
 * Прямой роутинг по умолчанию: воспроизведение звуков без шины (`bus: ?BusId = null`) направляет поток напрямую на мастер-выход.
 * DAG-дерево шин (Parent-Child): каскадное наследование эффективной громкости и mute с защитой от циклов (`getBusEffectiveVolume`), авто-переподключение дочерних шин при удалении родителя.
 * Статическая память без аллокаций: потолок 128 шин (`max_bus_capacity`), конфигурируемый активный лимит при старте через `AudioConfig{ .max_buses = 32 }` — 100% real-time safety в потоке аудио.
 * 3D Spatial Audio & затухание: модели `linear`, `inverse`, `exponential` с параметрами `min_distance`, `max_distance`, `rolloff`. Динамическое переключение spatial/non-spatial на лету (`setBusSpatial`).
 * 3D Эффект Доплера: расчёт сдвига высоты тона по взаимным скоростям слушателя и источников (`setListenerVelocity`, скорость эмиттера, `doppler_factor`).
+* DSP-фильтры (Biquad IIR) и реверберация (Freeverb): lowpass, highpass, bandpass, notch, stereo reverb, геймплейные пресеты (`setBusUnderwater`, `setBusMuffled`, `setBusCaveReverb` и др.).
+* Акустическая окклюзия геометрией/физикой: `evaluateAudioOcclusion`, multi-tap raycast, сглаживание фильтром, выделенные фильтры окклюзии на шинах.
 * Хелперы синтезатора с привязкой к шинам: `playImpactOn(bus, pos, speed)`, `playExplosionOn(bus, pos, size)`, `playBlipOn(bus, freq)`.
-* 24 аппаратных голоса с вытеснением, lock-free SPSC кольцо команд, атомики громкости/mute.
+* 24 аппаратных голоса с вытеснением + 8 одновременных фоновых стримов, lock-free SPSC кольца команд, атомики громкости/mute.
 
 ### Пикинг и ввод
 
@@ -564,7 +582,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider/dropdown/скролл/text input | Layout-контейнеров, 3D-виджетов, загрузки шрифтов, фокуса/состояния, редактора |
-| Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV-файлы, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler | mp3/ogg, потоковый стриминг музыки с диска, DSP-эффекты (reverb/lowpass/highpass) |
+| Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
 | Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
 
@@ -609,7 +627,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Grid/layout-контейнеры, привязки/анимации UI, 3D-GUI, загрузка TTF/OTF-шрифтов и Unicode (сейчас зашитый SDF-атлас, ASCII).
 
 **Аудио**
-* mp3/ogg (WAV уже поддержан), потоковый стриминг музыки с диска (динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры, Freeverb-реверберация и звуковая окклюзия геометрией/физикой уже реализованы).
+* Высокоуровневый интерактивный секвенсер / FMOD-style нодовый звуковой граф (потоковый стриминг OGG/MP3/WAV, SPSC ring buffer, кроссфейд музыки, динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры, Freeverb-реверберация и звуковая окклюзия уже реализованы).
 
 **Ассеты и данные**
 * Экспорт glTF, AssetManager с прогрессом и кэшем.

@@ -315,6 +315,11 @@ pub const RaycastFn = audio.RaycastFn;
 pub const evaluateRaycastOcclusion = audio.evaluateRaycastOcclusion;
 pub const AudioOcclusionTracker = audio.AudioOcclusionTracker;
 pub const AudioEmitter = audio.AudioEmitter;
+pub const StreamFormat = audio.StreamFormat;
+pub const StreamState = audio.StreamState;
+pub const StreamError = audio.StreamError;
+pub const StreamOptions = audio.StreamOptions;
+pub const AudioStream = audio.AudioStream;
 
 pub const serialization = @import("serialization.zig");
 pub const SceneState = serialization.SceneState;
