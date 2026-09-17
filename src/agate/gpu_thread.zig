@@ -44,3 +44,39 @@ pub fn assertOnContextThread() void {
         .ReleaseFast, .ReleaseSmall => {},
     }
 }
+
+// --- tests (P1: инвариант владения sg-ресурсами) ---
+
+test "без маркера любой поток считается контекстным (синхронный fallback)" {
+    // NOTE: идёт первым в файле: маркер глобален на процесс, до mark-теста
+    // ниже состояние обязано быть немаркированным.
+    try std.testing.expect(isOnContextThread());
+    const Probe = struct {
+        fn run(out: *bool) void {
+            out.* = isOnContextThread();
+        }
+    };
+    var seen: bool = false;
+    const t = try std.Thread.spawn(.{}, Probe.run, .{&seen});
+    t.join();
+    try std.testing.expect(seen);
+}
+
+test "маркированный поток: владелец проходит, чужой отклоняется" {
+    // Маркер ставит вызывающий (main init до спавна игровых потоков);
+    // дальше isOnContextThread — чистая функция сравнения id, без гонок.
+    markContextThread();
+    try std.testing.expect(isOnContextThread());
+    const Probe = struct {
+        fn run(out: *bool) void {
+            out.* = isOnContextThread();
+        }
+    };
+    var foreign: bool = true;
+    const t = try std.Thread.spawn(.{}, Probe.run, .{&foreign});
+    t.join();
+    // join синхронизирует запись потомка с чтением родителя.
+    try std.testing.expect(!foreign);
+    // Маркер остаётся на тестовом потоке: последующие тесты того же потока
+    // видят true как и раньше, воркеры других тестов gpu_thread не читают.
+}
