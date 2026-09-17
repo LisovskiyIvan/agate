@@ -1226,14 +1226,15 @@ test "Mesh decal manager lifecycle and fade" {
     mock_scene.outline_meshes = .empty;
     // destroyMesh now scans these referent registries: keep them zeroed
     // instead of 0xAA garbage (physics world absent, no decals, no queue).
-    mock_scene.pending_gpu_destroys = .empty;
-    mock_scene.pending_gpu_destroys_overflow_len = 0;
+    // P3: очередь ретенции — штатным нулём (defer deinit ниже её освобождает).
+    mock_scene.gpu_retire = .{};
     mock_scene.physics = .{};
     mock_scene.decals = .{};
     mock_scene.animation_groups = .empty;
     // Mock scene owns no GPU objects; its list buffers still need freeing.
     defer mock_scene.meshes.deinit(ally);
     defer mock_scene.pbr_materials.deinit(ally);
+    defer mock_scene.gpu_retire.deinit(ally);
 
     var mgr = DecalManager.init(&mock_scene, 2);
     defer mgr.deinit();
