@@ -1264,6 +1264,14 @@ pub const Scene = struct {
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;
+    /// Per-frame texture-upload byte cap. A 2K RGBA8 map with mips is ~21 MiB,
+    /// so a pure count budget lets a few big textures stall a frame (frames
+    /// #1-#3 of the live profile uploaded 85/65/46 MB at 4 textures/frame).
+    /// 8 MiB keeps the worst single-frame burst under one small mip chain
+    /// while still finishing a 2K map in ~3 frames; the overshoot rule always
+    /// uploads at least one texture per call so a lone oversized texture
+    /// still makes progress. Tune only with a profiled reason.
+    pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
     pub fn prepareFrame(self: *Scene) void {
         const keep_update_ms = self.stats.update_ms;
         const keep_prepare_ms = self.stats.prepare_ms;
@@ -1273,7 +1281,7 @@ pub const Scene = struct {
         self.frame_id +%= 1;
 
         if (self.uploads) |*q| {
-            self.frame_uploads = q.drainCounted(upload_budget_per_frame);
+            self.frame_uploads = q.drainCountedBudget(upload_budget_per_frame, upload_byte_budget_per_frame);
         } else {
             self.frame_uploads = .{};
         }
