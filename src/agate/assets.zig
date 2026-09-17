@@ -139,6 +139,19 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
+/// Byte-budget stop decision for texture-upload drains. Pure (no sg), so it
+/// is unit-testable. Overshoot rule: the first texture of a call always
+/// uploads (`uploaded_count == 0` never stops) — a single texture bigger
+/// than the whole budget must still make progress, or it would never
+/// upload. Once at least one texture has uploaded, reaching `max_bytes`
+/// (`uploaded_bytes >= budget`) stops the drain; leftover `.ready` slots
+/// ride to the next call. A null budget never exhausts (count-only drain).
+pub fn uploadBudgetExhausted(uploaded_count: usize, uploaded_bytes: u64, max_bytes: ?u64) bool {
+    const budget = max_bytes orelse return false;
+    if (uploaded_count == 0) return false;
+    return uploaded_bytes >= budget;
+}
+
 pub const UploadQueue = struct {
     allocator: std.mem.Allocator,
     runner: *jobs.TaskRunner,
@@ -301,16 +314,41 @@ pub const UploadQueue = struct {
     /// tools) this is a safe no-op that leaves `.ready` slots intact for a
     /// later real drain.
     pub fn drainCounted(self: *UploadQueue, max: ?usize) DrainResult {
+        return self.drainCountedBudget(max, null);
+    }
+
+    /// Byte-aware drain: like `drainCounted` but additionally stops once
+    /// accumulated uploaded bytes reach `max_bytes` (null = no byte limit,
+    /// identical to `drainCounted`). The budget is checked between slot
+    /// uploads via `uploadBudgetExhausted`, never after queuing work beyond
+    /// it: each collected chunk uploads only its affordable prefix and the
+    /// rest stays `.ready` for the next call (collection itself mutates no
+    /// slot state). Overshoot rule: at least ONE texture uploads per call
+    /// even when it alone exceeds the budget, so huge textures still make
+    /// progress. Without an sg context this is a safe no-op, same as
+    /// `drainCounted`.
+    pub fn drainCountedBudget(self: *UploadQueue, max_count: ?usize, max_bytes: ?u64) DrainResult {
         gpu_thread.assertOnContextThread();
         if (!sg.isvalid()) return .{};
         var res: DrainResult = .{};
         var buf: [drain_chunk]*PendingTexture = undefined;
-        while (max == null or res.count < max.?) {
-            const want = if (max) |m| @min(m - res.count, drain_chunk) else drain_chunk;
+        while (max_count == null or res.count < max_count.?) {
+            // Byte budget stops the drain before collecting more work; the
+            // first upload of the call is always allowed (see helper).
+            if (uploadBudgetExhausted(res.count, res.bytes, max_bytes)) break;
+            const want = if (max_count) |m| @min(m - res.count, drain_chunk) else drain_chunk;
             if (want == 0) break;
             const n = self.collectReady(buf[0..want]);
             if (n == 0) break;
+            var stopped_by_budget = false;
             for (buf[0..n]) |p| {
+                // Re-check between uploads: bytes are only known while a
+                // slot is being uploaded, so the next slot starts only when
+                // the tally so far is still under budget.
+                if (uploadBudgetExhausted(res.count, res.bytes, max_bytes)) {
+                    stopped_by_budget = true;
+                    break;
+                }
                 // Defensive only: per the module contract no other thread can
                 // advance a collected `.ready` slot (worker never leaves it;
                 // release/deinit are serialized by phase ownership).
@@ -328,6 +366,9 @@ pub const UploadQueue = struct {
                 res.count += 1;
                 res.bytes += bytes;
             }
+            // Budget stopped us mid-chunk: remaining collected slots were
+            // never touched and stay `.ready` for the next call.
+            if (stopped_by_budget) break;
             // Fewer ready slots than requested: the queue is exhausted for
             // this call (a defensive skip above does not change that).
             if (n < want) break;
@@ -652,4 +693,110 @@ test "requestMemory decodes font PNG and frees input before publish" {
     try testing.expect(p.memory == null);
     try testing.expect(p.raw.width > 0);
     // No sg context in tests: the .ready decode is torn down by queue deinit.
+}
+
+test "uploadBudgetExhausted gates byte pacing without an sg context" {
+    // Null budget never exhausts, even with uploads already tallied.
+    try testing.expect(!uploadBudgetExhausted(0, 0, null));
+    try testing.expect(!uploadBudgetExhausted(4, 64 * 1024 * 1024, null));
+    // First-upload (overshoot) rule: count == 0 never stops, so a lone
+    // texture bigger than the whole budget still makes progress.
+    try testing.expect(!uploadBudgetExhausted(0, 0, 8 * 1024 * 1024));
+    try testing.expect(!uploadBudgetExhausted(0, 100 * 1024 * 1024, 8 * 1024 * 1024));
+    // Below budget continues once progress exists.
+    try testing.expect(!uploadBudgetExhausted(1, 1024, 8 * 1024 * 1024));
+    try testing.expect(!uploadBudgetExhausted(2, 8 * 1024 * 1024 - 1, 8 * 1024 * 1024));
+    // At budget and above stop.
+    try testing.expect(uploadBudgetExhausted(1, 8 * 1024 * 1024, 8 * 1024 * 1024));
+    try testing.expect(uploadBudgetExhausted(1, 21 * 1024 * 1024, 8 * 1024 * 1024));
+    try testing.expect(uploadBudgetExhausted(3, 9 * 1024 * 1024, 8 * 1024 * 1024));
+    // Zero budget still uploads exactly one texture per call, then stops.
+    try testing.expect(!uploadBudgetExhausted(0, 0, 0));
+    try testing.expect(uploadBudgetExhausted(1, 1, 0));
+}
+
+test "byte budgeting paces ready slots across calls without an sg context" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    var slots: [3]*PendingTexture = undefined;
+    for (&slots) |*slot| {
+        slot.* = try queue.requestFile(path.?, .{}, .{ .gen_mipmaps = true });
+    }
+    for (slots) |p| {
+        try testing.expect(waitForState(p, &.{.ready}));
+    }
+
+    // No sg context: the byte-aware drain is the same safe no-op as the
+    // count-only one and leaves every .ready slot intact (null byte budget
+    // behaves exactly like drainCounted).
+    const noop = queue.drainCountedBudget(1, 1024);
+    try testing.expectEqual(@as(usize, 0), noop.count);
+    try testing.expectEqual(@as(u64, 0), noop.bytes);
+    const noop_null = queue.drainCountedBudget(null, null);
+    try testing.expectEqual(@as(usize, 0), noop_null.count);
+    try testing.expectEqual(@as(u64, 0), noop_null.bytes);
+    for (slots) |p| {
+        try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
+    }
+
+    // Mocked byte sizes: real uploads sum raw mip level lengths while the
+    // slot is being uploaded, so measure the same way here.
+    var sizes: [3]u64 = undefined;
+    for (slots, 0..) |p, i| {
+        var bytes: u64 = 0;
+        for (p.raw.levels[0..p.raw.num_levels]) |level| {
+            if (level) |level_buf| bytes += level_buf.len;
+        }
+        try testing.expect(bytes > 0);
+        sizes[i] = bytes;
+    }
+
+    // Budget for exactly one texture: after the mandatory first upload the
+    // tally hits the budget, so the simulated frame stops with two leftover
+    // .ready slots — mirroring drainCountedBudget's between-upload check.
+    const budget: u64 = sizes[0];
+    var batch: [1]*PendingTexture = undefined;
+
+    var frame_count: usize = 0;
+    var frame_bytes: u64 = 0;
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..1]));
+    try testing.expect(batch[0] == slots[0]);
+    frame_bytes += sizes[0];
+    frame_count += 1;
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+    // Budget reached: the next slot must wait for the following call even
+    // though it is already collected-ready.
+    try testing.expect(uploadBudgetExhausted(frame_count, frame_bytes, budget));
+    for (slots[1..]) |p| {
+        try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
+    }
+
+    // Next call picks up where the previous one stopped: the leftovers are
+    // still queued as .ready (overshoot rule restarts the count at zero).
+    frame_count = 0;
+    frame_bytes = 0;
+    try testing.expect(!uploadBudgetExhausted(frame_count, frame_bytes, budget));
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..1]));
+    try testing.expect(batch[0] == slots[1]);
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+    frame_count += 1;
+    frame_bytes += sizes[1];
+
+    // A single texture bigger than the whole remaining budget still uploads
+    // (overshoot): the stop decision only applies after progress.
+    try testing.expect(uploadBudgetExhausted(frame_count, frame_bytes, sizes[1]));
+    try testing.expectEqual(TextureState.ready, slots[2].state.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), queue.collectReady(batch[0..1]));
+    try testing.expect(batch[0] == slots[2]);
+    batch[0].raw.deinit(a);
+    batch[0].state.store(.uploaded, .release);
+
+    try testing.expectEqual(@as(usize, 0), queue.collectReady(batch[0..1]));
 }
