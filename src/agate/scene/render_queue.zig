@@ -419,19 +419,34 @@ const ParallelInstanceStage = struct {
     }
 };
 
-/// Instance-bearing mesh handling: per-frame instance-matrix staging (parallel
-/// when attached to a pool and exceeding parallel_min_instances), sg buffer
-/// (re)creation/upload on the context thread, frustum test on the combined AABB,
-/// instanced queue fill.
-fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mesh_index: usize) void {
+/// Minimal per-frame input for instance staging, extracted from
+/// FrameCullContext. Scene.prepareFrame pre-stages through this before the
+/// shadow pass so ShadowPass.prepare snapshots the same frame's
+/// cached_aabb / instance_buffer / visible_instance_count instead of the
+/// previous frame's. The `instance_uploaded_frame != frame_id` guard keeps
+/// staging once per frame, shared by all view queues.
+pub const InstanceStageContext = struct {
+    allocator: std.mem.Allocator,
+    queues: *RenderQueues,
+    thread_pool: ?*jobs.Pool,
+    frame_id: u64,
+    eye: Vec3,
+};
+
+/// Per-frame instance-matrix staging for one mesh: per-instance
+/// transforms/AABB (parallel at >=256 instances), cached_aabb /
+/// visible_instance_count update, transparent back-to-front sort by eye,
+/// and sg instance-buffer create/update on the context thread. No-op when
+/// already staged this frame.
+pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
     // Deferred-creation meshes have no vertex/index buffers yet; staging
     // instance data for them would produce a draw against invalid handles.
     if (mesh.gpu_pending) return;
-    if (mesh.instance_uploaded_frame != ctx.frame_id) {
-        mesh.instance_uploaded_frame = ctx.frame_id;
-        ctx.queues.instance_matrices.clearRetainingCapacity();
+    if (mesh.instance_uploaded_frame != sc.frame_id) {
+        mesh.instance_uploaded_frame = sc.frame_id;
+        sc.queues.instance_matrices.clearRetainingCapacity();
 
-        const pool = ctx.thread_pool;
+        const pool = sc.thread_pool;
         const parallel_min_instances: usize = 256;
         if (pool != null and pool.?.workerCount() > 0 and mesh.instances.items.len >= parallel_min_instances) {
             const p = pool.?;
@@ -468,9 +483,9 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             }
             mesh.cached_aabb = combined_aabb;
 
-            ctx.queues.instance_matrices.resize(ctx.allocator, total_visible) catch return;
+            sc.queues.instance_matrices.resize(sc.allocator, total_visible) catch return;
             if (total_visible > 0) {
-                stage.out_matrices = ctx.queues.instance_matrices.items;
+                stage.out_matrices = sc.queues.instance_matrices.items;
                 p.forkJoin(ParallelInstanceStage, &stage, ParallelInstanceStage.scatterMatrices, chunk_count);
             }
         } else {
@@ -478,7 +493,7 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             for (mesh.instances.items) |inst| {
                 if (!inst.is_visible) continue;
                 inst.updateCachedTransforms();
-                ctx.queues.instance_matrices.append(ctx.allocator, inst.cached_world_matrix) catch return;
+                sc.queues.instance_matrices.append(sc.allocator, inst.cached_world_matrix) catch return;
                 if (combined_aabb.isValid()) {
                     combined_aabb = combined_aabb.merge(inst.cached_bounding_box);
                 } else {
@@ -487,7 +502,7 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             }
             mesh.cached_aabb = combined_aabb;
         }
-        const active_count = ctx.queues.instance_matrices.items.len;
+        const active_count = sc.queues.instance_matrices.items.len;
         mesh.visible_instance_count = @intCast(active_count);
 
         // Per-instance transparency sorting (OIT):
@@ -511,7 +526,7 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
                     return false;
                 }
             };
-            std.mem.sort(Mat4, ctx.queues.instance_matrices.items[0..active_count], SortCtx{ .eye = ctx.eye }, SortCtx.sortFn);
+            std.mem.sort(Mat4, sc.queues.instance_matrices.items[0..active_count], SortCtx{ .eye = sc.eye }, SortCtx.sortFn);
         }
 
         if (active_count > 0 and sg.isvalid()) {
@@ -525,19 +540,52 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
                     .size = new_cap * @sizeOf(Mat4),
                 });
                 mesh.instance_buffer_capacity = new_cap;
-                sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
-                mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                sg.updateBuffer(mesh.instance_buffer, sg.asRange(sc.queues.instance_matrices.items[0..active_count]));
+                mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sc.queues.instance_matrices.items[0..active_count]));
                 mesh.instance_uploaded_count = active_count;
             } else {
-                const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ctx.queues.instance_matrices.items[0..active_count]));
+                const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sc.queues.instance_matrices.items[0..active_count]));
                 if (active_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
-                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(ctx.queues.instance_matrices.items[0..active_count]));
+                    sg.updateBuffer(mesh.instance_buffer, sg.asRange(sc.queues.instance_matrices.items[0..active_count]));
                     mesh.instance_hash = h;
                     mesh.instance_uploaded_count = active_count;
                 }
             }
         }
     }
+}
+
+/// Pre-stage every instance-bearing mesh once per frame. Skips LOD children,
+/// GPU-pending meshes, and meshes with no instances; staging itself is
+/// guarded per mesh by `instance_uploaded_frame`, so calling this before the
+/// view queues and again implicitly via submitInstancedMesh stays once-only.
+pub fn stageInstances(sc: InstanceStageContext, meshes: []const *Mesh) void {
+    for (meshes) |mesh| {
+        if (mesh.is_lod_child) continue;
+        if (mesh.gpu_pending) continue;
+        if (mesh.instances.items.len == 0) continue;
+        stageInstancedMesh(sc, mesh);
+    }
+}
+
+/// Instance-bearing mesh handling: per-frame instance-matrix staging (parallel
+/// when attached to a pool and exceeding parallel_min_instances), sg buffer
+/// (re)creation/upload on the context thread, frustum test on the combined AABB,
+/// instanced queue fill.
+fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mesh_index: usize) void {
+    // Deferred-creation meshes have no vertex/index buffers yet; staging
+    // instance data for them would produce a draw against invalid handles.
+    if (mesh.gpu_pending) return;
+    // Pre-staged by stageInstances before the shadow pass when running under
+    // Scene.prepareFrame; the frame guard makes this a no-op then, while
+    // direct callers (tests, parallel merge tail) still stage here.
+    stageInstancedMesh(.{
+        .allocator = ctx.allocator,
+        .queues = ctx.queues,
+        .thread_pool = ctx.thread_pool,
+        .frame_id = ctx.frame_id,
+        .eye = ctx.eye,
+    }, mesh);
 
     if (mesh.visible_instance_count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
         if (ctx.cull_frustum and mesh.cached_aabb.isValid() and !frustum.intersectsAABB(mesh.cached_aabb)) {
@@ -2170,4 +2218,174 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
     try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[0].m[14]);
     try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[1].m[14]);
     try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[2].m[14]);
+}
+
+test "stageInstances stages visible count and combined AABB" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "stage_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "inst0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "inst1", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
+    var inst2 = InstancedMesh{ .name = "inst2", .source_mesh = &src, .position = Vec3.new(10, 0, 0), .is_visible = false };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1, &inst2 };
+    var parent = Mesh{
+        .name = "stage_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    stageInstances(.{
+        .allocator = ally,
+        .queues = &queues,
+        .thread_pool = null,
+        .frame_id = 7,
+        .eye = Vec3.zero,
+    }, &meshes);
+
+    // sg has no context in tests, so the upload half is skipped; the
+    // transform/count staging must still run.
+    try std.testing.expectEqual(@as(u32, 2), parent.visible_instance_count);
+    try std.testing.expect(parent.cached_aabb.isValid());
+    // inst0 covers [-1,1], inst1 covers [4,6]: the combined AABB spans both.
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.cached_aabb.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), parent.cached_aabb.max.x, 1e-4);
+}
+
+test "stageInstances is idempotent within a frame" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "idem_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "inst0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "inst1", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
+    var parent = Mesh{
+        .name = "idem_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    const sc = InstanceStageContext{
+        .allocator = ally,
+        .queues = &queues,
+        .thread_pool = null,
+        .frame_id = 7,
+        .eye = Vec3.zero,
+    };
+    stageInstances(sc, &meshes);
+    const first_aabb = parent.cached_aabb;
+    const first_count = parent.visible_instance_count;
+
+    // Mutating an instance after staging must not change this frame's
+    // snapshot: the frame guard makes the second call a no-op.
+    inst0.position = Vec3.new(100, 0, 0);
+    stageInstances(sc, &meshes);
+    try std.testing.expectEqual(first_count, parent.visible_instance_count);
+    try std.testing.expectEqual(first_aabb, parent.cached_aabb);
+}
+
+test "stageInstances skips gpu_pending meshes" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "pend_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "inst0", .source_mesh = &src, .position = Vec3.zero };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    var parent = Mesh{
+        .name = "pend_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .gpu_pending = true,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    stageInstances(.{
+        .allocator = ally,
+        .queues = &queues,
+        .thread_pool = null,
+        .frame_id = 7,
+        .eye = Vec3.zero,
+    }, &meshes);
+
+    try std.testing.expectEqual(@as(u32, 0), parent.visible_instance_count);
+}
+
+test "pre-staged instances feed buildFrameQueues batch" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "batch_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "inst0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "inst1", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
+    var inst2 = InstancedMesh{ .name = "inst2", .source_mesh = &src, .position = Vec3.new(10, 0, 0), .is_visible = false };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1, &inst2 };
+    var parent = Mesh{
+        .name = "batch_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    stageInstances(.{
+        .allocator = ally,
+        .queues = &queues,
+        .thread_pool = null,
+        .frame_id = 9,
+        .eye = Vec3.zero,
+    }, &meshes);
+
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 9,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 2), queues.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(&parent, queues.opaque_instanced.items[0].mesh);
 }

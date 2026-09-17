@@ -1295,6 +1295,20 @@ pub const Scene = struct {
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
         if (is_gpu_init) {
+            // Pre-stage instance data before the shadow pass: ShadowPass.prepare
+            // snapshots cached_aabb / instance_buffer / visible_instance_count,
+            // so staging must run first or shadows lag one frame. Same scratch
+            // and eye the first view queue would use; the frame guard keeps it
+            // once per frame, shared by all view queues.
+            if (self.frame_snapshot.has_camera) {
+                scene_render_queue.stageInstances(.{
+                    .allocator = self.allocator,
+                    .queues = &self.queues,
+                    .thread_pool = jobs.global,
+                    .frame_id = self.frame_id,
+                    .eye = self.frame_snapshot.primary_cam.eye,
+                }, self.meshes.items);
+            }
             // Shadow pass preparation
             if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
                 _ = self.shadows.pass.prepare(self.meshes.items, self.frame_id, jobs.global);
