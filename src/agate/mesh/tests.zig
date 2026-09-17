@@ -1795,9 +1795,11 @@ test "GreasedLine: dynamic GreasedLineMesh lifecycle" {
     // Update camera position
     greased.update(Vec3.new(0, 10, 5));
 
-    // Flush GPU uploads (safe in headless/contextless test)
+    // Flush GPU uploads without an sg context: a safe no-op that keeps the
+    // update staged (gpu_dirty stays set), so the next context-thread flush
+    // uploads it instead of losing it.
     greased.flushGpuUploads();
-    try std.testing.expect(!greased.gpu_dirty);
+    try std.testing.expect(greased.gpu_dirty);
 }
 
 test "Simplify: Quadric3D plane accumulation and evaluation" {
