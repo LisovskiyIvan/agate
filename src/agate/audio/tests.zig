@@ -1628,3 +1628,124 @@ test "AudioEngine music stream crossfade lifecycle" {
     eng.stopMusic(0.0);
     try std.testing.expect(eng.getMusicStream() == null);
 }
+
+test "AudioEngine playSound and sound management: volume, pause, resume, stop" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+    const snd = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{
+        .volume = 0.5,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+    try std.testing.expect(snd.isPlaying());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), snd.getVolume(), 0.01);
+
+    // Pause and resume
+    eng.pauseSound(snd);
+    try std.testing.expect(snd.isPaused());
+
+    eng.resumeSound(snd);
+    try std.testing.expect(snd.isPlaying());
+
+    // Volume adjustment
+    eng.setSoundVolume(snd, 0.75);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), snd.getVolume(), 0.01);
+
+    // Stop immediately destroys and unregisters the stream
+    eng.stopSound(snd, 0.0);
+    var found = false;
+    for (eng.streams) |maybe_s| {
+        if (maybe_s == snd) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found);
+}
+
+test "AudioEngine playSoundOnce auto-destroys on stream completion" {
+    const alloc = std.testing.allocator;
+    const pcm = try sineI16(alloc, 50, 44100, 440.0, 20000.0);
+    defer alloc.free(pcm);
+    const raw = try encodeI16(alloc, pcm);
+    defer alloc.free(raw);
+    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
+    defer alloc.free(wav);
+
+    var eng = AudioEngine{};
+
+    try eng.playSoundOnceFromMemory(alloc, wav, .wav, .{
+        .buffer_frames = 512,
+    });
+
+    // Verify stream was registered
+    var active_stream: ?*audio.AudioStream = null;
+    for (eng.streams) |maybe_s| {
+        if (maybe_s) |s| {
+            active_stream = s;
+            break;
+        }
+    }
+    try std.testing.expect(active_stream != null);
+    try std.testing.expect(active_stream.?.auto_destroy);
+
+    // Render enough frames to consume 50 frames and hit EOF
+    var out_buf: [256]f32 = [_]f32{0.0} ** 256;
+    eng.renderFrames(&out_buf);
+
+    // Main thread updates streams: stream hit EOF and stopped, should auto-destroy
+    eng.updateStreams(0.01);
+
+    // Stream slot should now be null
+    var has_any = false;
+    for (eng.streams) |maybe_s| {
+        if (maybe_s != null) {
+            has_any = true;
+            break;
+        }
+    }
+    try std.testing.expect(!has_any);
+}
+
+test "AudioEngine crossfadeSound and stopAllSounds" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+
+    const s1 = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{
+        .volume = 0.8,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+
+    const s2 = try eng.crossfadeSoundFromMemory(s1, alloc, ogg_bytes, .ogg, 0.05, .{
+        .volume = 0.9,
+        .loop = true,
+        .buffer_frames = 4096,
+    });
+
+    // Advance fade past 0.05s
+    eng.updateStreams(0.06);
+
+    // s1 should have stopped and auto-cleaned up, s2 should be at full volume
+    var has_s1 = false;
+    for (eng.streams) |maybe_s| {
+        if (maybe_s == s1) has_s1 = true;
+    }
+    try std.testing.expect(!has_s1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), s2.getVolume(), 0.01);
+
+    // Now test stopAllSounds with fade-out
+    eng.stopAllSounds(0.05);
+    eng.updateStreams(0.06);
+
+    // All streams should be cleaned up
+    var count: usize = 0;
+    for (eng.streams) |maybe_s| {
+        if (maybe_s != null) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+}

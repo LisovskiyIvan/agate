@@ -33,6 +33,7 @@ pub const StreamFormat = stream_mod.StreamFormat;
 pub const StreamState = stream_mod.StreamState;
 pub const StreamError = stream_mod.StreamError;
 pub const StreamOptions = stream_mod.StreamOptions;
+pub const PlaySoundOptions = stream_mod.PlaySoundOptions;
 pub const AudioStream = stream_mod.AudioStream;
 
 pub const BusId = enum(u8) {
@@ -100,7 +101,7 @@ pub const AudioEngine = struct {
     pub const max_reverbs: usize = 4;
     pub const chunk_frames: usize = 64;
     pub const chunk_samples: usize = chunk_frames * 2;
-    pub const max_streams: usize = 8;
+    pub const max_streams: usize = 32;
 
     const Command = union(enum) {
         voice: struct {
@@ -1241,9 +1242,15 @@ pub const AudioEngine = struct {
     }
 
     pub fn updateStreams(self: *AudioEngine, dt: f32) void {
-        for (&self.streams) |maybe_s| {
-            if (maybe_s) |s| {
+        for (&self.streams) |*slot| {
+            if (slot.*) |s| {
                 s.update(dt);
+                if (s.isStopped() and (s.auto_destroy or s.stop_on_fade_out)) {
+                    if (self.music_stream == s) self.music_stream = null;
+                    if (self.music_fade_stream == s) self.music_fade_stream = null;
+                    slot.* = null;
+                    s.deinit();
+                }
             }
         }
         if (self.music_fade_stream) |fade_s| {
@@ -1254,21 +1261,161 @@ pub const AudioEngine = struct {
         }
     }
 
+    // ========================================================================
+    // Sound Playback & Streaming API
+    // ========================================================================
+
+    /// Plays a sound from a file path (OGG, MP3, WAV).
+    /// Streams audio in background with real-time safety.
+    pub fn playSound(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        options: PlaySoundOptions,
+    ) !*AudioStream {
+        return self.createStreamFromFile(allocator, path, options);
+    }
+
+    /// Plays a sound from an in-memory byte slice (OGG, MP3, WAV).
+    pub fn playSoundFromMemory(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        format: StreamFormat,
+        options: PlaySoundOptions,
+    ) !*AudioStream {
+        return self.createStreamFromMemory(allocator, bytes, format, options);
+    }
+
+    /// Fire-and-forget sound playback: automatically destroys and frees the stream
+    /// when playback finishes or is stopped.
+    pub fn playSoundOnce(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        options: PlaySoundOptions,
+    ) !void {
+        var opt = options;
+        opt.loop = false;
+        opt.auto_destroy = true;
+        _ = try self.playSound(allocator, path, opt);
+    }
+
+    /// Fire-and-forget in-memory sound playback.
+    pub fn playSoundOnceFromMemory(
+        self: *AudioEngine,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        format: StreamFormat,
+        options: PlaySoundOptions,
+    ) !void {
+        var opt = options;
+        opt.loop = false;
+        opt.auto_destroy = true;
+        _ = try self.playSoundFromMemory(allocator, bytes, format, opt);
+    }
+
+    /// Stops a sound stream immediately, or over `fade_duration` seconds.
+    pub fn stopSound(self: *AudioEngine, stream: *AudioStream, fade_duration: f32) void {
+        if (fade_duration > 0.0) {
+            stream.fadeTo(0.0, fade_duration, true);
+        } else {
+            self.destroyStream(stream);
+        }
+    }
+
+    /// Pauses an active sound stream.
+    pub fn pauseSound(self: *AudioEngine, stream: *AudioStream) void {
+        _ = self;
+        stream.pause();
+    }
+
+    /// Resumes a paused sound stream.
+    pub fn resumeSound(self: *AudioEngine, stream: *AudioStream) void {
+        _ = self;
+        stream.unpause();
+    }
+
+    /// Sets the volume of an active sound stream.
+    pub fn setSoundVolume(self: *AudioEngine, stream: *AudioStream, vol: f32) void {
+        _ = self;
+        stream.setVolume(vol);
+    }
+
+    /// Stops all currently active sound streams.
+    pub fn stopAllSounds(self: *AudioEngine, fade_duration: f32) void {
+        for (&self.streams) |maybe_s| {
+            if (maybe_s) |s| {
+                if (fade_duration > 0.0) {
+                    s.fadeTo(0.0, fade_duration, true);
+                } else {
+                    self.destroyStream(s);
+                }
+            }
+        }
+    }
+
+    /// Crossfades from an existing sound stream to a new sound file.
+    pub fn crossfadeSound(
+        self: *AudioEngine,
+        old_stream: ?*AudioStream,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        fade_duration: f32,
+        options: PlaySoundOptions,
+    ) !*AudioStream {
+        if (old_stream) |s| {
+            s.fadeTo(0.0, fade_duration, true);
+        }
+
+        var opt = options;
+        const target_vol = opt.volume;
+        opt.volume = 0.0;
+        const new_s = try self.createStreamFromFile(allocator, path, opt);
+        new_s.fadeTo(target_vol, fade_duration, false);
+        return new_s;
+    }
+
+    /// Crossfades from an existing sound stream to a new in-memory sound.
+    pub fn crossfadeSoundFromMemory(
+        self: *AudioEngine,
+        old_stream: ?*AudioStream,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        format: StreamFormat,
+        fade_duration: f32,
+        options: PlaySoundOptions,
+    ) !*AudioStream {
+        if (old_stream) |s| {
+            s.fadeTo(0.0, fade_duration, true);
+        }
+
+        var opt = options;
+        const target_vol = opt.volume;
+        opt.volume = 0.0;
+        const new_s = try self.createStreamFromMemory(allocator, bytes, format, opt);
+        new_s.fadeTo(target_vol, fade_duration, false);
+        return new_s;
+    }
+
+    // ========================================================================
+    // Dedicated Music Slot Convenience Helpers
+    // ========================================================================
+
+    /// Convenience helper for playing background music / looping track.
     pub fn playMusic(
         self: *AudioEngine,
         allocator: std.mem.Allocator,
         path: []const u8,
-        options: StreamOptions,
+        options: PlaySoundOptions,
     ) !*AudioStream {
         if (self.music_stream) |old_s| {
             self.destroyStream(old_s);
             self.music_stream = null;
         }
         var opt = options;
-        if (opt.bus == null) {
-            opt.bus = @enumFromInt(2); // default music bus
-        }
-        const s = try self.createStreamFromFile(allocator, path, opt);
+        opt.loop = true;
+        const s = try self.playSound(allocator, path, opt);
         self.music_stream = s;
         return s;
     }
@@ -1278,17 +1425,15 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         bytes: []const u8,
         format: StreamFormat,
-        options: StreamOptions,
+        options: PlaySoundOptions,
     ) !*AudioStream {
         if (self.music_stream) |old_s| {
             self.destroyStream(old_s);
             self.music_stream = null;
         }
         var opt = options;
-        if (opt.bus == null) {
-            opt.bus = @enumFromInt(2); // default music bus
-        }
-        const s = try self.createStreamFromMemory(allocator, bytes, format, opt);
+        opt.loop = true;
+        const s = try self.playSoundFromMemory(allocator, bytes, format, opt);
         self.music_stream = s;
         return s;
     }
@@ -1298,36 +1443,21 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         fade_duration: f32,
-        options: StreamOptions,
+        options: PlaySoundOptions,
     ) !*AudioStream {
-        if (self.music_stream) |old_s| {
-            old_s.fadeTo(0.0, fade_duration, true);
-            self.music_fade_stream = old_s;
-            self.music_stream = null;
-        }
-
+        const old_s = self.music_stream;
+        self.music_stream = null;
         var opt = options;
-        if (opt.bus == null) {
-            opt.bus = @enumFromInt(2);
-        }
-        const target_vol = opt.volume;
-        opt.volume = 0.0;
-        const new_s = try self.createStreamFromFile(allocator, path, opt);
-        new_s.fadeTo(target_vol, fade_duration, false);
+        opt.loop = true;
+        const new_s = try self.crossfadeSound(old_s, allocator, path, fade_duration, opt);
         self.music_stream = new_s;
         return new_s;
     }
 
     pub fn stopMusic(self: *AudioEngine, fade_duration: f32) void {
         if (self.music_stream) |s| {
-            if (fade_duration > 0.0) {
-                s.fadeTo(0.0, fade_duration, true);
-                self.music_fade_stream = s;
-                self.music_stream = null;
-            } else {
-                self.destroyStream(s);
-                self.music_stream = null;
-            }
+            self.stopSound(s, fade_duration);
+            self.music_stream = null;
         }
     }
 

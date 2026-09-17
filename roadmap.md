@@ -63,7 +63,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 636 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 639 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -403,19 +403,20 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 629/629 unit-тестов, `zig build test` (agate) и `zig build` (sandbox) проходят без ошибок.
 
-### Волна 22: Потоковый стриминг аудио (OGG Vorbis, MP3, WAV), музыка и кроссфейд (17.09.2026)
+### Волна 22: Воспроизведение звуков и потоковый стриминг playSound (OGG, MP3, WAV), кроссфейд и управление стримами (17.09.2026)
 
 | Направление | Файлы | Описание | Статус |
 |---|---|---|---|
 | Форматы и декодеры | `audio/stream.zig`, `audio.zig`, `root.zig` | Инкрементальное декодирование чанками для OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`) и WAV (RIFF/PCM 8/16/24/32-bit и IEEE float32) из файлов и памяти | ✅ |
 | SPSC Lock-free Ring Buffer | `audio/stream.zig` | Безопасная передача аудиоданных из фонового/главного потока в аудиопоток sokol-audio; бинарная маска степеней двойки (65536 стерео-фреймов), 0 динамических аллокаций и 0 I/O в аудиоколлбэке | ✅ |
 | Бесшовный лупинг и ресемплинг | `audio/stream.zig` | Gapless looping при достижении конца трека, линейная интерполяция/ресемплинг произвольных sample rate (22.05, 44.1, 48 кГц и др.) к целевой частоте дискретизации движка | ✅ |
-| Управление стримами | `audio/stream.zig`, `audio.zig` | Управление громкостью, панорамой, шиной назначения (`setBus`), пауза, возобновление (`unpause`/`resume`), остановка, точный сик по секундам и фреймам (`seekToSeconds`/`seekToFrame`) | ✅ |
-| Плавный фейдинг и кроссфейд | `audio/stream.zig`, `audio.zig` | Встроенный `fadeTo` (fade-in / fade-out с авто-остановкой), высокоуровневый кроссфейдинг музыки `crossfadeMusic(source, duration, options)` с одновременным затуханием старого трека и нарастанием нового | ✅ |
+| Унифицированный API `playSound` | `audio.zig`, `audio/stream.zig` | `playSound` (файл), `playSoundFromMemory` (память), `playSoundOnce` / `playSoundOnceFromMemory` с автоматическим освобождением `auto_destroy` по завершении; потолок увеличен до 32 одновременных стримов (`max_streams = 32`) | ✅ |
+| Управление звуковыми потоками | `audio.zig`, `audio/stream.zig` | `stopSound`, `pauseSound`, `resumeSound`, `setSoundVolume`, `stopAllSounds` с опциональным плавным фейд-аутом (`fade_duration`), точный сик (`seekToSeconds`/`seekToFrame`) | ✅ |
+| Плавный фейдинг и кроссфейд | `audio/stream.zig`, `audio.zig` | Встроенный `fadeTo` (fade-in / fade-out с авто-остановкой), универсальный кроссфейдинг `crossfadeSound` / `crossfadeSoundFromMemory` с одновременным затуханием старого звука и нарастанием нового | ✅ |
 | Интеграция с DAG-шинами и DSP | `audio.zig` | Стримы микшируются прямо в чанки назначенных шин (`bus_chunks[idx]`), автоматически наследуя все эффекты шин: Biquad IIR EQ/фильтры, глушение окклюзией и стерео-реверберацию Freeverb | ✅ |
-| Модульные тесты | `audio/tests.zig`, `tests.zig` | 7 новых модульных тестов: OGG/MP3/WAV стриминг из памяти, авто-остановка, бесшовный лупинг, кроссфейд жизненного цикла, маршрутизация в шину с IIR LPF фильтром | ✅ |
+| Модульные тесты | `audio/tests.zig`, `tests.zig` | 10 модульных тестов: OGG/MP3/WAV воспроизведение, авто-освобождение памяти по завершении, бесшовный лупинг, кроссфейд, пауза/возобновление/громкость, маршрутизация в шину с IIR LPF | ✅ |
 
-Проверки: 636/636 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
+Проверки: 639/639 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
 
 ---
 
@@ -543,8 +544,8 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 * Процедурный синтез на sokol.audio: thump, noise burst, blip — без внешних аудиоассетов.
 * `AudioClip.fromWavMemory` / `fromWavFile` — WAV PCM 8/16/24/32-bit и float32, mono/stereo, потоковый ресемплинг; `AudioEngine.playClip` с loop/rate/позиционированием.
-* Потоковый стриминг аудио с диска и памяти (`AudioStream`, `stream.zig`): фоновое инкрементальное декодирование OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`) и WAV, SPSC lock-free кольцевой буфер (65536 стерео-фреймов), 0 динамических аллокаций и 0 I/O в аудиоколлбэке sokol-audio.
-* Высокоуровневая подсистема музыки: `playMusic`, `playMusicFromMemory`, `crossfadeMusic`, `pauseMusic`, `resumeMusic`, `stopMusic`, плавный `fadeTo` с авто-остановкой, бесшовный лупинг (gapless loop) и точный сик (`seekToSeconds`/`seekToFrame`).
+* Воспроизведение и потоковый стриминг аудио с диска и памяти (`AudioStream`, `playSound`, `playSoundFromMemory`, `playSoundOnce`, `playSoundOnceFromMemory`): фоновое инкрементальное декодирование OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`) и WAV, SPSC lock-free кольцевой буфер (65536 стерео-фреймов), автоматическое освобождение памяти (`auto_destroy`), 0 динамических аллокаций и 0 I/O в аудиоколлбэке sokol-audio.
+* Управление звуковыми потоками и кроссфейдинг: `stopSound`, `pauseSound`, `resumeSound`, `setSoundVolume`, `stopAllSounds`, `crossfadeSound` / `crossfadeSoundFromMemory`, плавный `fadeTo` с авто-остановкой, бесшовный лупинг (gapless loop) и точный сик (`seekToSeconds`/`seekToFrame`).
 * Динамический открытый реестр шин (`BusId = enum(u8) { _, pub const invalid }`): пользователь сам объявляет любые шины (Master, SFX, Music, Ambient, UI, Weapons и др.).
 * Прямой роутинг по умолчанию: воспроизведение звуков без шины (`bus: ?BusId = null`) направляет поток напрямую на мастер-выход.
 * DAG-дерево шин (Parent-Child): каскадное наследование эффективной громкости и mute с защитой от циклов (`getBusEffectiveVolume`), авто-переподключение дочерних шин при удалении родителя.
@@ -554,7 +555,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * DSP-фильтры (Biquad IIR) и реверберация (Freeverb): lowpass, highpass, bandpass, notch, stereo reverb, геймплейные пресеты (`setBusUnderwater`, `setBusMuffled`, `setBusCaveReverb` и др.).
 * Акустическая окклюзия геометрией/физикой: `evaluateAudioOcclusion`, multi-tap raycast, сглаживание фильтром, выделенные фильтры окклюзии на шинах.
 * Хелперы синтезатора с привязкой к шинам: `playImpactOn(bus, pos, speed)`, `playExplosionOn(bus, pos, size)`, `playBlipOn(bus, freq)`.
-* 24 аппаратных голоса с вытеснением + 8 одновременных фоновых стримов, lock-free SPSC кольца команд, атомики громкости/mute.
+* 24 аппаратных голоса с вытеснением + 32 одновременных фоновых стрима (`max_streams = 32`), lock-free SPSC кольца команд, атомики громкости/mute.
 
 ### Пикинг и ввод
 

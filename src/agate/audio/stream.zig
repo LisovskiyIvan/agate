@@ -46,12 +46,15 @@ pub const StreamOptions = struct {
     bus: ?BusId = null,
     volume: f32 = 1.0,
     pan: f32 = 0.0,
-    loop: bool = true,
+    loop: bool = false,
     buffer_frames: usize = AudioStream.default_buffer_frames,
     start_paused: bool = false,
     format: StreamFormat = .auto,
     fade_in_time: f32 = 0.0,
+    auto_destroy: bool = false,
 };
+
+pub const PlaySoundOptions = StreamOptions;
 
 /// Internal decoder backend abstraction.
 const Decoder = union(enum) {
@@ -686,6 +689,7 @@ pub const AudioStream = struct {
 
     // Preallocated scratch for decoding raw source frames
     source_scratch: []f32,
+    auto_destroy: bool = false,
 
     pub fn openFile(
         allocator: std.mem.Allocator,
@@ -765,6 +769,7 @@ pub const AudioStream = struct {
         stream.setPan(options.pan);
         stream.bus_id.store(b_id, .release);
         stream.loop.store(options.loop, .release);
+        stream.auto_destroy = options.auto_destroy;
 
         if (options.fade_in_time > 0.0) {
             stream.setVolume(0.0);

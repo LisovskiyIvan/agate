@@ -319,6 +319,7 @@ pub const StreamFormat = audio.StreamFormat;
 pub const StreamState = audio.StreamState;
 pub const StreamError = audio.StreamError;
 pub const StreamOptions = audio.StreamOptions;
+pub const PlaySoundOptions = audio.PlaySoundOptions;
 pub const AudioStream = audio.AudioStream;
 
 pub const serialization = @import("serialization.zig");
