@@ -351,6 +351,11 @@ pub const GreasedLineMesh = struct {
     vertices: []Vertex,
     indices: []u32,
     gpu_dirty: bool = false,
+    /// Vertex data has never reached the GPU (or the buffers were just
+    /// created): the next flush uploads both vertex and index buffers.
+    /// Cleared after the first full upload; later rebuilds update vertices
+    /// only (indices depend on topology, which does not change).
+    gpu_needs_full_upload: bool = false,
 
     pub fn init(scene: *Scene, name: []const u8, options: GreasedLineOptions) !*GreasedLineMesh {
         const allocator = scene.allocator;
@@ -367,6 +372,13 @@ pub const GreasedLineMesh = struct {
         errdefer allocator.free(indices);
 
         const deferred = !gpu_thread.isOnContextThread() or !sg.isvalid();
+        // Immediate creation makes empty dynamic buffers; the actual data
+        // upload happens in flushGpuUploads on the context thread. Uploading
+        // here would collide with the first frame's flush — it runs before
+        // the first sg.commit and therefore lands in the same sokol frame,
+        // and sokol allows only one update per buffer per frame
+        // (VALIDATE_UPDATEBUF_ONCE). `.data` at creation is not an option:
+        // this sokol rejects desc.data for .write_* (dynamic_update) buffers.
         const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = total_verts * @sizeOf(Vertex),
@@ -375,10 +387,6 @@ pub const GreasedLineMesh = struct {
             .usage = .{ .index_buffer = true, .dynamic_update = true },
             .size = total_indices * @sizeOf(u32),
         });
-        if (!deferred) {
-            sg.updateBuffer(vb, sg.asRange(vertices));
-            sg.updateBuffer(ib, sg.asRange(indices));
-        }
 
         const mesh = try allocator.create(Mesh);
         errdefer allocator.destroy(mesh);
@@ -403,6 +411,10 @@ pub const GreasedLineMesh = struct {
             .options = options,
             .vertices = vertices,
             .indices = indices,
+            // Buffers are empty until the first flush (immediate creation has
+            // no data yet; deferred creation has no buffers at all).
+            .gpu_dirty = true,
+            .gpu_needs_full_upload = true,
         };
 
         if (options.points.len > 0) {
@@ -472,26 +484,41 @@ pub const GreasedLineMesh = struct {
         self.gpu_dirty = true;
     }
 
-    /// Uploads dirty CPU vertices to the GPU buffer.
+    /// Uploads dirty CPU geometry to the GPU buffers. Runs on the context
+    /// thread (Scene.flushPendingGpuUploads). Never uploads the same buffer
+    /// twice in one frame: the first call after creation does the full
+    /// upload (vertex + index), later rebuilds update vertices only.
     pub fn flushGpuUploads(self: *GreasedLineMesh) void {
         if (!self.gpu_dirty) return;
-        self.gpu_dirty = false;
-        if (!sg.isvalid()) return;
-        if (self.mesh.vertex_buffer.id == 0 and self.vertices.len > 0) {
-            self.mesh.vertex_buffer = sg.makeBuffer(.{
+        if (!sg.isvalid()) return; // keep dirty: retry once a context exists
+        if (self.mesh.vertex_buffer.id == 0) {
+            if (self.vertices.len == 0) return;
+            const vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
             });
-            self.mesh.index_buffer = sg.makeBuffer(.{
+            const ib = sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true, .dynamic_update = true },
                 .size = self.indices.len * @sizeOf(u32),
             });
+            if (vb.id == 0 or ib.id == 0) {
+                // Partial creation (pool exhaustion): destroy what was made
+                // and retry next frame instead of leaking handles.
+                if (vb.id != 0) sg.destroyBuffer(vb);
+                if (ib.id != 0) sg.destroyBuffer(ib);
+                return;
+            }
+            self.mesh.vertex_buffer = vb;
+            self.mesh.index_buffer = ib;
+            self.gpu_needs_full_upload = true;
+        }
+        if (self.vertices.len > 0) {
             sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
+        }
+        if (self.gpu_needs_full_upload and self.indices.len > 0) {
             sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices));
-            return;
+            self.gpu_needs_full_upload = false;
         }
-        if (self.mesh.vertex_buffer.id != 0 and self.vertices.len > 0) {
-            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
-        }
+        self.gpu_dirty = false;
     }
 };
