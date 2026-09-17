@@ -104,6 +104,7 @@ test {
     _ = @import("scene/decal_layer.zig");
     _ = @import("scene/draw.zig");
     _ = @import("scene/forward_pipelines.zig");
+    _ = @import("scene/instance_staging.zig");
     _ = @import("scene/light_rig.zig");
     _ = @import("scene/light_selection.zig");
     _ = @import("scene/msaa.zig");

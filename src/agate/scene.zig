@@ -76,6 +76,7 @@ const serialization = @import("serialization.zig");
 const scene_stats = @import("scene/stats.zig");
 pub const SceneStats = scene_stats.SceneStats;
 const scene_render_queue = @import("scene/render_queue.zig");
+const scene_instance_staging = @import("scene/instance_staging.zig");
 const jobs = @import("jobs.zig");
 const assets_mod = @import("assets.zig");
 const handoff_mod = @import("handoff.zig");
@@ -1313,9 +1314,9 @@ pub const Scene = struct {
             // and eye the first view queue would use; the frame guard keeps it
             // once per frame, shared by all view queues.
             if (self.frame_snapshot.has_camera) {
-                scene_render_queue.stageInstances(.{
+                scene_instance_staging.stageInstances(.{
                     .allocator = self.allocator,
-                    .queues = &self.queues,
+                    .instance_matrices = &self.queues.instance_matrices,
                     .thread_pool = jobs.global,
                     .frame_id = self.frame_id,
                     .eye = self.frame_snapshot.primary_cam.eye,
