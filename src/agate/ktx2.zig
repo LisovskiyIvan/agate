@@ -5,7 +5,8 @@ const Texture = texture.Texture;
 const CubeTexture = texture.CubeTexture;
 
 // ---------------------------------------------------------------------------
-// KTX2 container reader — the honest uncompressed subset.
+// KTX2 container reader — the honest uncompressed subset PLUS a
+// no-transcode block-compressed subset (BC7 / ASTC 4x4).
 //
 // Supports (KTX2 spec v2.0, all little-endian):
 //   - supercompressionScheme 0 (NONE) only. BasisLZ (1), Zstandard (2) and
@@ -13,17 +14,29 @@ const CubeTexture = texture.CubeTexture;
 //     zstd); see TEXTURE_AUDIT.md "Честно НЕ сделано" — future work.
 //   - 8-bit UNORM/SRGB formats that map onto the engine's RGBA8 LDR upload
 //     path: R8, R8G8, R8G8B8A8, B8G8R8A8, A8B8G8R8_PACK32 (same LE byte
-//     order as R8G8B8A8). Everything else (16F/32F, packed 16-bit, BC/ETC/
-//     ASTC blocks) errors with UnsupportedVkFormat.
+//     order as R8G8B8A8). Everything else uncompressed (16F/32F, packed
+//     16-bit, BC1-BC6, ETC/EAC, other ASTC footprints) errors with
+//     UnsupportedVkFormat.
+//   - block-compressed BC7_UNORM/SRGB (vk 145/146) and ASTC_4x4_UNORM/SRGB
+//     (vk 157/158), uploaded WITHOUT decoding: decodeBlock2D returns owned
+//     per-level slices for Texture.fromRawBlock. No BasisLZ/UASTC, no
+//     supercompression, no CPU mip synthesis (a decoder/encoder pair would
+//     be a new dependency). Cube block files are rejected — only 2D.
 //   - full file-provided mip chains (level index, largest level first) and
-//     optional chain generation for single-level files (gen_mipmaps).
-//   - cube maps (faceCount 6, faces +X,-X,+Y,-Y,+Z,-Z — the engine's order).
+//     optional chain generation for single-level files (gen_mipmaps, RGBA8
+//     only — block levels upload exactly as authored).
+//   - cube maps (faceCount 6, faces +X,-X,+Y,-Y,+Z,-Z — the engine's order),
+//     RGBA8 only.
 //
 // Deliberately NOT interpreted: the data format descriptor (DFD) and the
 // key/value data are skipped by offset — the numeric vkFormat alone drives
 // the texel interpretation, which is exact for the supported subset. KTX2
 // stores no orientation; glTF/KTX2 assets are top-left like the engine's
 // other LDR loaders, so rows upload unflipped.
+//
+// NOTE on "DXGI codes": the KTX2 header carries only vkFormat (offset 12);
+// there is no DXGI field to read. The SRGB block variants (146/158) are the
+// counterparts of DXGI_BC7_UNORM_SRGB / DXGI ASTC sRGB encodings.
 // ---------------------------------------------------------------------------
 
 /// The 12-byte KTX2 identifier: «KTX 20» + CR LF ^Z LF.
@@ -92,10 +105,75 @@ pub fn formatFromVk(vk_format: u32) ?Format {
     return null;
 }
 
+/// Block-compressed formats uploaded WITHOUT decoding (no transcoder
+/// dependency). Vulkan enum numbers (Vulkan registry):
+///   145/146 = VK_FORMAT_BC7_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
+///   157/158 = VK_FORMAT_ASTC_4x4_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block).
+/// BC1/BC3 are deliberately out of scope: each adds two vk codes plus an
+/// sg mapping that must be verified per GPU backend (see report).
+pub const BlockFormat = enum(u32) {
+    bc7_unorm = 145,
+    bc7_srgb = 146,
+    astc_4x4_unorm = 157,
+    astc_4x4_srgb = 158,
+
+    /// Texel footprint of one compression block (both families are 4x4).
+    pub fn blockExtent(self: BlockFormat) struct { w: u32, h: u32 } {
+        _ = self;
+        return .{ .w = 4, .h = 4 };
+    }
+
+    /// Storage bytes of one compression block (both families: 16 B).
+    pub fn blockByteSize(self: BlockFormat) usize {
+        _ = self;
+        return 16;
+    }
+
+    /// True for the _SRGB variants: sampling must go through the sRGB GPU
+    /// format (hardware converts to linear); no CPU conversion is possible
+    /// without a decoder.
+    pub fn isSrgb(self: BlockFormat) bool {
+        return switch (self) {
+            .bc7_srgb, .astc_4x4_srgb => true,
+            else => false,
+        };
+    }
+
+    /// Exact tightly-packed byte size of one 2D level: ceil-divided block
+    /// grid times the block size. Checked arithmetic: absurd dimensions
+    /// (level size not representable in u64) report null and the caller
+    /// rejects the level as InvalidLevelData.
+    pub fn levelByteSize(self: BlockFormat, width: u32, height: u32) ?u64 {
+        const ext = self.blockExtent();
+        const bw: u64 = (@as(u64, width) + ext.w - 1) / ext.w;
+        const bh: u64 = (@as(u64, height) + ext.h - 1) / ext.h;
+        const blocks = std.math.mul(u64, bw, bh) catch return null;
+        return std.math.mul(u64, blocks, self.blockByteSize()) catch null;
+    }
+};
+
+/// Maps a Vulkan vkFormat number onto the supported block subset.
+pub fn blockFormatFromVk(vk_format: u32) ?BlockFormat {
+    inline for (@typeInfo(BlockFormat).@"enum".fields) |field| {
+        if (vk_format == field.value) return @enumFromInt(vk_format);
+    }
+    return null;
+}
+
 /// True when `bytes` starts with the KTX2 identifier. Cheap guard used to
 /// route assets between the KTX2 reader and stb_image.
 pub fn sniff(bytes: []const u8) bool {
     return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], &magic);
+}
+
+/// True when `bytes` look like a BLOCK-compressed KTX2 (identifier plus a
+/// vkFormat from the BlockFormat subset). Routing-only: supercompression,
+/// dimensions and level data are validated later by decodeBlock2D, so a
+/// `true` here never implies uploadability.
+pub fn isBlockKtx2(bytes: []const u8) bool {
+    if (!sniff(bytes)) return false;
+    if (bytes.len < header_and_index_size) return false;
+    return blockFormatFromVk(readU32(bytes, 12)) != null;
 }
 
 /// Decode switches. `srgb_to_linear: null` = auto: convert exactly the
@@ -123,6 +201,16 @@ pub const DecodeOptions = struct {
 /// a level, so every level is exactly w*h*texelBlockSize*(faces) bytes and
 /// the face stride is w*h*texelBlockSize.
 fn parseHeader(bytes: []const u8) DecodeError!Header {
+    const h = try parseHeaderFields(bytes);
+    if (formatFromVk(h.vk_format) == null) return error.UnsupportedVkFormat;
+    return h;
+}
+
+/// Header + index validation shared by the RGBA8 and block paths: every
+/// check EXCEPT the format-subset gate, in the same order, so both paths
+/// report identical errors for malformed containers (notably
+/// UnsupportedSupercompression precedes UnsupportedVkFormat).
+fn parseHeaderFields(bytes: []const u8) DecodeError!Header {
     if (!sniff(bytes)) return error.NotKtx2;
     if (bytes.len < header_and_index_size) return error.Truncated;
 
@@ -139,7 +227,7 @@ fn parseHeader(bytes: []const u8) DecodeError!Header {
     };
 
     if (h.supercompression_scheme != scheme_none) return error.UnsupportedSupercompression;
-    if (h.type_size != 1) return error.UnsupportedTypeSize; // all supported formats are byte-typed
+    if (h.type_size != 1) return error.UnsupportedTypeSize; // byte-typed incl. block formats
     if (h.pixel_width == 0 or h.pixel_height == 0) return error.UnsupportedDimensions;
     if (h.pixel_depth > 1) return error.Unsupported3D;
     if (h.layer_count > 1) return error.UnsupportedLayers;
@@ -147,7 +235,6 @@ fn parseHeader(bytes: []const u8) DecodeError!Header {
     // levelCount 0 means one level (the index holds max(1, levelCount)
     // entries); > 16 does not fit the engine's mip storage.
     if (h.level_count > 16) return error.TooManyLevels;
-    if (formatFromVk(h.vk_format) == null) return error.UnsupportedVkFormat;
     return h;
 }
 
@@ -221,7 +308,99 @@ fn parseLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, 
 }
 
 // ---------------------------------------------------------------------------
-// Texel expansion: supported file formats -> engine RGBA8 (unorm bytes).
+// Block-compressed upload without decoding: per-level slices for
+// Texture.fromRawBlock. Levels are tightly packed block grids
+// (ceil(w/4) x ceil(h/4) x 16 B); the level index byteOffset values are
+// absolute file offsets, validated the same way as the RGBA8 path.
+// ---------------------------------------------------------------------------
+
+/// Owned per-level block payloads (copies, not views: the source buffer is
+/// freed right after decode by the asset queue). Pair with
+/// Texture.fromRawBlock on the main thread. 2D only: cube block files are
+/// rejected with UnsupportedFaceCount (no block cube uploader exists).
+pub const RawBlockTexture = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    num_levels: u32 = 0,
+    format: BlockFormat = .bc7_unorm,
+    levels: [16]?[]u8 = @splat(null),
+
+    pub fn deinit(self: *RawBlockTexture, allocator: std.mem.Allocator) void {
+        for (self.levels[0..self.num_levels]) |level| {
+            if (level) |buf| allocator.free(buf);
+        }
+        self.* = .{};
+    }
+
+    /// Exact bytes handed to sg on upload (drives the asset byte budget).
+    pub fn totalBytes(self: *const RawBlockTexture) usize {
+        var total: usize = 0;
+        for (self.levels[0..self.num_levels]) |level| {
+            if (level) |buf| total += buf.len;
+        }
+        return total;
+    }
+};
+
+/// Validates every level-index entry against the file bounds and the exact
+/// block-grid size (scheme NONE: byteLength == uncompressedByteLength ==
+/// blockLevelByteSize * faceCount, faces tightly packed — always 1 face
+/// here, enforced by decodeBlock2D).
+fn parseBlockLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, format: BlockFormat) DecodeError![]Level {
+    const level_count = header.effectiveLevelCount();
+    const index_end = header_and_index_size + level_count * level_index_entry_size;
+    if (bytes.len < index_end) return error.Truncated;
+
+    const face_count: usize = header.face_count;
+    const levels = try allocator.alloc(Level, level_count);
+    errdefer allocator.free(levels);
+
+    for (0..level_count) |m| {
+        const entry = header_and_index_size + m * level_index_entry_size;
+        const byte_offset = readU64(bytes, entry);
+        const byte_length = readU64(bytes, entry + 8);
+        const uncompressed_length = readU64(bytes, entry + 16);
+
+        const dims = levelDims(header.pixel_width, header.pixel_height, @intCast(m));
+        const level_bytes = format.levelByteSize(dims.w, dims.h) orelse return error.InvalidLevelData;
+        const expected = std.math.mul(u64, level_bytes, face_count) catch return error.InvalidLevelData;
+        if (byte_length != uncompressed_length or uncompressed_length != expected) {
+            return error.InvalidLevelData;
+        }
+        const start: usize = std.math.cast(usize, byte_offset) orelse return error.InvalidLevelData;
+        const len: usize = std.math.cast(usize, byte_length) orelse return error.InvalidLevelData;
+        if (start < index_end or @as(u64, start) + byte_length > bytes.len) return error.Truncated;
+        levels[m] = .{ .data = bytes[start .. start + len], .width = dims.w, .height = dims.h };
+    }
+    return levels;
+}
+
+/// Reads a 2D block-compressed KTX2 file into owned per-level slices.
+/// GPU-free and thread-safe. No mip synthesis: levels upload exactly as
+/// authored (a single-level file uploads one level; the backend clamps LOD
+/// to the smallest present level). Cube files are rejected — the 2D block
+/// path must never silently drop faces.
+pub fn decodeBlock2D(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!RawBlockTexture {
+    const header = try parseHeaderFields(bytes);
+    const format = blockFormatFromVk(header.vk_format) orelse return error.UnsupportedVkFormat;
+    if (header.face_count != 1) return error.UnsupportedFaceCount;
+    const levels = try parseBlockLevels(allocator, bytes, header, format);
+    defer allocator.free(levels);
+
+    var raw = RawBlockTexture{
+        .width = header.pixel_width,
+        .height = header.pixel_height,
+        .num_levels = @intCast(levels.len),
+        .format = format,
+    };
+    errdefer raw.deinit(allocator);
+    for (levels, 0..) |level, m| {
+        const owned = try allocator.alloc(u8, level.data.len);
+        @memcpy(owned, level.data);
+        raw.levels[m] = owned;
+    }
+    return raw;
+}
 // `srgb` converts COLOR lanes (never alpha) with the shared golden LUT, so
 // KTX2 color assets match the PNG sRGB path bit for bit.
 // ---------------------------------------------------------------------------
@@ -318,6 +497,9 @@ fn decodeLevels2D(
         return raw;
     }
 
+    // ---------------------------------------------------------------------------
+    // Texel expansion: supported file formats -> engine RGBA8 (unorm bytes).
+
     var raw = Texture.RawTexture{
         .width = header.pixel_width,
         .height = header.pixel_height,
@@ -398,8 +580,11 @@ const TestKtx2 = struct {
     truncate_last_level: bool = false,
 
     fn texelBlockSize(self: TestKtx2) usize {
-        const f = formatFromVk(self.vk_format) orelse return 4;
-        return f.texelBlockSize();
+        if (formatFromVk(self.vk_format)) |f| return f.texelBlockSize();
+        // Block payloads align to the 16-byte block (lcm(16, 4) per the
+        // KTX2 mipPadding rule), matching real encoders (toktx/ktx).
+        if (blockFormatFromVk(self.vk_format)) |b| return b.blockByteSize();
+        return 4;
     }
 
     fn build(self: TestKtx2, allocator: std.mem.Allocator) ![]u8 {
@@ -726,4 +911,234 @@ test "Texture.decodeMemory routes KTX2 payloads by magic sniff" {
     var raw = try Texture.decodeMemory(allocator, ktx, .{ .srgb_to_linear = false });
     defer raw.deinit(allocator);
     try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, raw.levels[0].?[0..4].*);
+}
+
+test "blockFormatFromVk covers exactly BC7 and ASTC 4x4" {
+    try testing.expectEqual(BlockFormat.bc7_unorm, blockFormatFromVk(145).?);
+    try testing.expectEqual(BlockFormat.bc7_srgb, blockFormatFromVk(146).?);
+    try testing.expectEqual(BlockFormat.astc_4x4_unorm, blockFormatFromVk(157).?);
+    try testing.expectEqual(BlockFormat.astc_4x4_srgb, blockFormatFromVk(158).?);
+    try testing.expect(blockFormatFromVk(0) == null); // UNDEFINED
+    try testing.expect(blockFormatFromVk(37) == null); // RGBA8 is NOT a block format
+    try testing.expect(blockFormatFromVk(135) == null); // BC3 stays out of scope
+    try testing.expect(blockFormatFromVk(159) == null); // ASTC 5x4: neighboring footprint, unsupported
+    try testing.expect(blockFormatFromVk(110) == null); // RGBA16F
+    try testing.expect(BlockFormat.bc7_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.bc7_srgb.isSrgb() == true);
+    try testing.expect(BlockFormat.astc_4x4_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.astc_4x4_srgb.isSrgb() == true);
+    try testing.expect(BlockFormat.bc7_unorm.blockByteSize() == 16);
+    try testing.expect(BlockFormat.astc_4x4_unorm.blockByteSize() == 16);
+}
+
+test "BlockFormat.levelByteSize does ceil-divided block math" {
+    const bc7 = BlockFormat.bc7_unorm;
+    try testing.expectEqual(@as(?u64, 16), bc7.levelByteSize(4, 4)); // one block
+    try testing.expectEqual(@as(?u64, 16), bc7.levelByteSize(1, 1)); // sub-block still one block
+    try testing.expectEqual(@as(?u64, 64), bc7.levelByteSize(8, 8)); // 2x2 blocks
+    try testing.expectEqual(@as(?u64, 64), bc7.levelByteSize(5, 5)); // ceil to 2x2 blocks
+    try testing.expectEqual(@as(?u64, 32), bc7.levelByteSize(5, 3)); // 2x1 blocks
+    try testing.expectEqual(@as(?u64, 16), bc7.levelByteSize(2, 1)); // 1x1 blocks
+}
+
+test "isBlockKtx2 routes by vkFormat without validating the container" {
+    const allocator = testing.allocator;
+    var block_payload: [16]u8 = undefined;
+    for (&block_payload, 0..) |*b, i| b.* = @intCast(i);
+    const block_ktx = try (TestKtx2{
+        .vk_format = 145, // BC7_UNORM
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&block_payload},
+    }).build(allocator);
+    defer allocator.free(block_ktx);
+    try testing.expect(isBlockKtx2(block_ktx));
+
+    const rgba_payload = [_]u8{0} ** 4;
+    const rgba_ktx = try (TestKtx2{
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgba_payload},
+    }).build(allocator);
+    defer allocator.free(rgba_ktx);
+    try testing.expect(!isBlockKtx2(rgba_ktx));
+
+    try testing.expect(!isBlockKtx2("png data pretending"));
+    try testing.expect(!isBlockKtx2(&.{}));
+    try testing.expect(!isBlockKtx2(magic[0..8])); // truncated identifier
+}
+
+test "decodeBlock2D reads a BC7 8x8 two-level file exactly as authored" {
+    const allocator = testing.allocator;
+    // Level 0: 8x8 -> 2x2 blocks -> 64 B; level 1: 4x4 -> 1 block -> 16 B.
+    var level0: [64]u8 = undefined;
+    for (&level0, 0..) |*b, i| b.* = @intCast(i % 251);
+    const level1 = [_]u8{ 7, 7, 7, 7, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const ktx = try (TestKtx2{
+        .vk_format = 145, // BC7_UNORM_BLOCK
+        .width = 8,
+        .height = 8,
+        .level_count = 2,
+        .level_payloads = &.{ &level0, &level1 },
+    }).build(allocator);
+    defer allocator.free(ktx);
+
+    var raw = try decodeBlock2D(allocator, ktx);
+    defer raw.deinit(allocator);
+    try testing.expectEqual(@as(u32, 8), raw.width);
+    try testing.expectEqual(@as(u32, 8), raw.height);
+    try testing.expectEqual(@as(u32, 2), raw.num_levels);
+    try testing.expectEqual(BlockFormat.bc7_unorm, raw.format);
+    try testing.expectEqualSlices(u8, &level0, raw.levels[0].?);
+    try testing.expectEqualSlices(u8, &level1, raw.levels[1].?);
+    try testing.expectEqual(@as(usize, 64 + 16), raw.totalBytes());
+    // Owned copies (the asset queue frees the source right after decode):
+    // clobbering the file leaves the decoded levels intact.
+    @memset(ktx, 0xFF);
+    try testing.expectEqual(@as(u8, 0), raw.levels[0].?[0]);
+}
+
+test "decodeBlock2D handles non-multiple dimensions and sRGB tags" {
+    const allocator = testing.allocator;
+    // 5x3 ASTC: ceil to 2x1 blocks -> 32 B; mip 1 is 2x1 -> 1 block -> 16 B.
+    var level0: [32]u8 = undefined;
+    for (&level0, 0..) |*b, i| b.* = @intCast(100 + i);
+    const level1 = [_]u8{0xAA} ** 16;
+    const ktx = try (TestKtx2{
+        .vk_format = 158, // ASTC_4x4_SRGB_BLOCK
+        .width = 5,
+        .height = 3,
+        .level_count = 2,
+        .level_payloads = &.{ &level0, &level1 },
+    }).build(allocator);
+    defer allocator.free(ktx);
+
+    var raw = try decodeBlock2D(allocator, ktx);
+    defer raw.deinit(allocator);
+    try testing.expectEqual(BlockFormat.astc_4x4_srgb, raw.format);
+    try testing.expect(raw.format.isSrgb());
+    try testing.expectEqualSlices(u8, &level0, raw.levels[0].?);
+    try testing.expectEqualSlices(u8, &level1, raw.levels[1].?);
+    try testing.expectEqual(@as(usize, 32 + 16), raw.totalBytes());
+}
+
+test "decodeBlock2D rejects supercompressed, foreign and cube block files" {
+    const allocator = testing.allocator;
+    var payload: [16]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i);
+
+    // Supercompression is rejected before the format gate (same order as
+    // the RGBA8 path): scheme 1 on a BC7 file is UnsupportedSupercompression.
+    const zstd_ktx = try (TestKtx2{
+        .vk_format = 145,
+        .width = 4,
+        .height = 4,
+        .supercompression = 1,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(zstd_ktx);
+    try testing.expectError(error.UnsupportedSupercompression, decodeBlock2D(allocator, zstd_ktx));
+
+    // Unknown vkFormat (ASTC 5x4 neighbors the supported 4x4 footprint).
+    const footprint_ktx = try (TestKtx2{
+        .vk_format = 159,
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(footprint_ktx);
+    try testing.expectError(error.UnsupportedVkFormat, decodeBlock2D(allocator, footprint_ktx));
+
+    // 16-bit typeSize is rejected even for block formats.
+    const type_ktx = try (TestKtx2{
+        .vk_format = 145,
+        .type_size = 2,
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(type_ktx);
+    try testing.expectError(error.UnsupportedTypeSize, decodeBlock2D(allocator, type_ktx));
+
+    // Cube block files: the 2D block path must not silently drop faces.
+    var cube_level: [16 * 6]u8 = undefined;
+    for (&cube_level, 0..) |*b, i| b.* = @intCast(i % 251);
+    const cube_ktx = try (TestKtx2{
+        .vk_format = 145,
+        .width = 4,
+        .height = 4,
+        .face_count = 6,
+        .level_payloads = &.{&cube_level},
+    }).build(allocator);
+    defer allocator.free(cube_ktx);
+    try testing.expectError(error.UnsupportedFaceCount, decodeBlock2D(allocator, cube_ktx));
+
+    // Truncated level payloads disagree with the block-grid size.
+    const short_ktx = try (TestKtx2{
+        .vk_format = 157,
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&payload},
+        .truncate_last_level = true,
+    }).build(allocator);
+    defer allocator.free(short_ktx);
+    try testing.expectError(error.InvalidLevelData, decodeBlock2D(allocator, short_ktx));
+
+    // The RGBA8 path stays closed to block formats (regression: no silent
+    // widening of decode2D).
+    const bc7_ktx = try (TestKtx2{
+        .vk_format = 145,
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(bc7_ktx);
+    try testing.expectError(error.UnsupportedVkFormat, decode2D(allocator, bc7_ktx, .{}));
+    try testing.expect(!sniff("definitely not ktx2"));
+    try testing.expectError(error.NotKtx2, decodeBlock2D(allocator, "definitely not ktx2"));
+}
+
+test "Texture.decodeImageMemory routes block payloads without touching the RGBA8 path" {
+    const allocator = testing.allocator;
+    // Block fixture: 4x4 BC7, one 16-byte level.
+    var payload: [16]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i);
+    const block_file = try (TestKtx2{
+        .vk_format = 145,
+        .width = 4,
+        .height = 4,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(block_file);
+
+    var block_img = try Texture.decodeImageMemory(allocator, block_file, .{});
+    defer block_img.deinit(allocator);
+    switch (block_img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.bc7_unorm, b.format);
+            try testing.expectEqualSlices(u8, &payload, b.levels[0].?);
+            try testing.expectEqual(@as(usize, 16), block_img.totalBytes());
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+
+    // Uncompressed KTX2 still routes to .rgba with identical bytes and the
+    // same byte tally the asset budget consumes.
+    const rgba_level = [_]u8{ 200, 0, 0, 255 };
+    const rgba_file = try (TestKtx2{
+        .vk_format = 37,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgba_level},
+    }).build(allocator);
+    defer allocator.free(rgba_file);
+    var rgba_img = try Texture.decodeImageMemory(allocator, rgba_file, .{ .srgb_to_linear = false });
+    defer rgba_img.deinit(allocator);
+    switch (rgba_img) {
+        .rgba => |r| {
+            try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, r.levels[0].?[0..4].*);
+            try testing.expectEqual(@as(usize, 4), rgba_img.totalBytes());
+        },
+        .block => return error.TestUnexpectedResult,
+    }
 }

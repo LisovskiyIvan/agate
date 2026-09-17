@@ -1,9 +1,10 @@
 //! Async texture pipeline (stage 2 of REFACTOR.md).
 //!
-//! Decode runs off-thread on a `jobs.TaskRunner` (`Texture.decodeFile` is
-//! documented GPU-free and thread-safe); the `sg.*` upload happens later on
-//! the thread that calls `drain`/`drainBudget` — usually main — via
-//! `Texture.fromRaw`.
+//! Decode runs off-thread on a `jobs.TaskRunner` (`Texture.decodeFile` /
+//! `decodeImageFile` are documented GPU-free and thread-safe); the `sg.*`
+//! upload happens later on the thread that calls `drain`/`drainBudget` —
+//! usually main — via `Texture.fromRaw` (RGBA8) or `Texture.fromRawBlock`
+//! (KTX2 BC7/ASTC, gated by backend support).
 //!
 //! Ownership model:
 //!   - `requestFile` allocates a `PendingTexture` and posts the decode.
@@ -45,6 +46,7 @@ const sg = sokol.gfx;
 const jobs = @import("jobs.zig");
 const gpu_thread = @import("gpu_thread.zig");
 const Texture = @import("texture.zig").Texture;
+const ktx2 = @import("ktx2.zig");
 
 pub const TextureState = enum(u8) {
     /// Worker is reading/decoding the file.
@@ -78,6 +80,10 @@ pub const PendingTexture = struct {
     targets: std.ArrayListUnmanaged(*?Texture) = .empty,
     allocator: std.mem.Allocator = undefined,
     raw: Texture.RawTexture = .{},
+    /// Block-compressed decode (KTX2 BC7/ASTC): owned per-level slices for
+    /// Texture.fromRawBlock. Exactly one of `raw` / `block_raw` is populated
+    /// per slot (an empty RawTexture has num_levels 0; block uses null).
+    block_raw: ?ktx2.RawBlockTexture = null,
     texture: ?Texture = null,
 
     pub fn addTarget(self: *PendingTexture, slot: *?Texture) void {
@@ -93,11 +99,16 @@ pub const PendingTexture = struct {
             // Invariant: no field writes after the terminal release store —
             // a consumer observing .ready/.failed may release() and destroy
             // the slot, so free/null inputs and assign raw/err first.
-            const result = Texture.decodeMemory(self.allocator, bytes, self.decode_opts);
+            // decodeImageMemory routes block KTX2 to the block path and
+            // everything else to the unchanged RGBA8 decode.
+            const result = Texture.decodeImageMemory(self.allocator, bytes, self.decode_opts);
             self.allocator.free(bytes);
             self.memory = null;
-            if (result) |raw| {
-                self.raw = raw;
+            if (result) |img| {
+                switch (img) {
+                    .rgba => |raw| self.raw = raw,
+                    .block => |raw| self.block_raw = raw,
+                }
                 self.state.store(.ready, .release);
             } else |e| {
                 self.err = e;
@@ -107,12 +118,16 @@ pub const PendingTexture = struct {
         }
         // File branch upholds the same invariant: raw/err are assigned
         // before the terminal store, with no field writes after it.
-        const raw = Texture.decodeFile(self.allocator, self.path, self.decode_opts) catch |e| {
+        // decodeImageFile applies the same block/RGBA8 routing to files.
+        const img = Texture.decodeImageFile(self.allocator, self.path, self.decode_opts) catch |e| {
             self.err = e;
             self.state.store(.failed, .release);
             return;
         };
-        self.raw = raw;
+        switch (img) {
+            .rgba => |raw| self.raw = raw,
+            .block => |raw| self.block_raw = raw,
+        }
         self.state.store(.ready, .release);
     }
 
@@ -178,7 +193,10 @@ pub const UploadQueue = struct {
         for (self.pending.items) |p| {
             switch (p.state.load(.acquire)) {
                 .uploaded => if (p.texture) |*t| t.deinit(),
-                .ready => p.raw.deinit(self.allocator),
+                .ready => {
+                    p.raw.deinit(self.allocator);
+                    if (p.block_raw) |*b| b.deinit(self.allocator);
+                },
                 else => {},
             }
             p.deinitResources();
@@ -317,6 +335,19 @@ pub const UploadQueue = struct {
         return self.drainCountedBudget(max, null);
     }
 
+    /// Shared post-upload bookkeeping for the RGBA8 and block pixel paths
+    /// (runs on the sg-context thread, right after the fromRaw/fromRawBlock
+    /// call): patches material targets, publishes .uploaded, tallies the
+    /// per-call count + the exact bytes handed to sg.
+    fn finishUpload(p: *PendingTexture, bytes: u64, res: *DrainResult) void {
+        for (p.targets.items) |slot| slot.* = p.texture.?;
+        p.targets.deinit(p.allocator);
+        p.targets = .empty;
+        p.state.store(.uploaded, .release);
+        res.count += 1;
+        res.bytes += bytes;
+    }
+
     /// Byte-aware drain: like `drainCounted` but additionally stops once
     /// accumulated uploaded bytes reach `max_bytes` (null = no byte limit,
     /// identical to `drainCounted`). The budget is checked between slot
@@ -353,18 +384,32 @@ pub const UploadQueue = struct {
                 // advance a collected `.ready` slot (worker never leaves it;
                 // release/deinit are serialized by phase ownership).
                 if (p.state.load(.acquire) != .ready) continue;
+                if (p.block_raw) |*br| {
+                    // Block path: the backend gate can still fail here (no
+                    // CPU fallback exists), so the slot reports .failed with
+                    // the reason instead of uploading. Bytes are tallied
+                    // only on success — exactly what reaches sg.
+                    const bytes: u64 = br.totalBytes();
+                    const tex = Texture.fromRawBlock(br, p.options) catch |e| {
+                        br.deinit(p.allocator);
+                        p.block_raw = null;
+                        p.err = e;
+                        p.state.store(.failed, .release);
+                        continue;
+                    };
+                    p.texture = tex;
+                    br.deinit(p.allocator);
+                    p.block_raw = null;
+                    finishUpload(p, bytes, &res);
+                    continue;
+                }
                 var bytes: u64 = 0;
                 for (p.raw.levels[0..p.raw.num_levels]) |level| {
                     if (level) |level_buf| bytes += level_buf.len;
                 }
                 p.texture = Texture.fromRaw(&p.raw, p.options);
                 p.raw.deinit(p.allocator);
-                for (p.targets.items) |slot| slot.* = p.texture.?;
-                p.targets.deinit(p.allocator);
-                p.targets = .empty;
-                p.state.store(.uploaded, .release);
-                res.count += 1;
-                res.bytes += bytes;
+                finishUpload(p, bytes, &res);
             }
             // Budget stopped us mid-chunk: remaining collected slots were
             // never touched and stay `.ready` for the next call.
@@ -666,6 +711,54 @@ test "requestMemory failure frees input before publishing failed" {
     try testing.expect(p.memory == null);
     queue.release(p);
     try testing.expectEqual(@as(usize, 0), queue.drain());
+}
+
+test "requestMemory routes block KTX2 to the block upload path" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    // Minimal BC7 4x4 container: 80-byte header+index, one 24-byte level
+    // entry, one 16-byte block payload. (Full spec-shaped fixtures live in
+    // ktx2.zig; this only exercises the queue routing decision.)
+    var file: [80 + 24 + 16]u8 = [_]u8{0} ** (80 + 24 + 16);
+    @memcpy(file[0..12], &[12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A });
+    std.mem.writeInt(u32, file[12..16], 145, .little); // vkFormat BC7_UNORM_BLOCK
+    std.mem.writeInt(u32, file[16..20], 1, .little); // typeSize
+    std.mem.writeInt(u32, file[20..24], 4, .little); // width
+    std.mem.writeInt(u32, file[24..28], 4, .little); // height
+    // depth/layers zero, scheme NONE zero.
+    std.mem.writeInt(u32, file[36..40], 1, .little); // faceCount
+    std.mem.writeInt(u32, file[40..44], 1, .little); // levelCount
+    std.mem.writeInt(u64, file[80..88], 104, .little); // byteOffset
+    std.mem.writeInt(u64, file[88..96], 16, .little); // byteLength
+    std.mem.writeInt(u64, file[96..104], 16, .little); // uncompressedByteLength
+    for (file[104..], 0..) |*b, i| b.* = @intCast(i);
+
+    const owned = try a.dupe(u8, &file);
+    const p = try queue.requestMemory(owned, .{}, .{});
+    try testing.expect(waitForState(p, &.{.ready}));
+    try testing.expect(p.memory == null); // input freed before publish
+    try testing.expect(p.block_raw != null);
+    try testing.expectEqual(ktx2.BlockFormat.bc7_unorm, p.block_raw.?.format);
+    try testing.expectEqual(@as(u32, 4), p.block_raw.?.width);
+    try testing.expectEqual(@as(usize, 16), p.block_raw.?.totalBytes());
+    // The RGBA8 side stays empty for block files (no double decode).
+    try testing.expectEqual(@as(u32, 0), p.raw.num_levels);
+    // No sg context in tests: the .ready block decode is torn down by
+    // queue deinit (which must free block_raw without leaking).
+
+    // A supercompressed block file fails decode with the ktx2 reason and
+    // never populates either pixel side.
+    var zstd_file = file;
+    std.mem.writeInt(u32, zstd_file[44..48], 1, .little); // BasisLZ scheme
+    const zstd_owned = try a.dupe(u8, &zstd_file);
+    const q = try queue.requestMemory(zstd_owned, .{}, .{});
+    try testing.expect(waitForState(q, &.{.failed}));
+    try testing.expect(q.err != null);
+    try testing.expect(q.block_raw == null);
+    try testing.expectEqual(@as(u32, 0), q.raw.num_levels);
+    queue.release(q);
 }
 
 test "requestMemory decodes font PNG and frees input before publish" {
