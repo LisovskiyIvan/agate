@@ -11,6 +11,7 @@ const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("types.zig").Vertex;
 const Scene = @import("../scene.zig").Scene;
 const gpu_thread = @import("../gpu_thread.zig");
+const upload_meter = @import("../gpu_upload_meter.zig");
 
 pub const TrailOptions = struct {
     /// Width of the ribbon at the head (most recent position).
@@ -315,9 +316,13 @@ pub const TrailMesh = struct {
         self.gpu_dirty = false;
         if (self.mesh.vertex_buffer.id != 0) {
             sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices[0..self.pending_vertex_count]));
+            // Учёт динамики: только staged-префикс вершин.
+            upload_meter.record(self.pending_vertex_count * @sizeOf(Vertex));
         }
         if (self.mesh.index_buffer.id != 0) {
             sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices[0..self.pending_index_count]));
+            // Учёт динамики: только staged-префикс индексов (u16).
+            upload_meter.record(self.pending_index_count * @sizeOf(u16));
         }
         self.mesh.index_count = @intCast(self.pending_index_count);
         self.mesh.local_bounding_box = BoundingBox.init(self.pending_min_pt, self.pending_max_pt);

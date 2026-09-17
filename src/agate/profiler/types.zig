@@ -38,7 +38,12 @@ pub const FrameRecord = struct {
     rendered_meshes: u32 = 0,
     culled_objects: u32 = 0,
     uploaded_textures: u32 = 0,
+    /// Байты стриминга текстур за кадр (UploadQueue, лимит 8 MiB).
     uploaded_bytes: usize = 0,
+    /// Байты динамических обновлений GPU-буферов за кадр
+    /// (sg.updateBuffer/appendBuffer: инстансы, морфы, частицы, трейлы,
+    /// UI, debug-линии). Uncounted-budget, на троттлинг текстур не влияет.
+    updated_bytes: usize = 0,
 };
 
 /// Information about a single texture in GPU memory.
@@ -157,7 +162,10 @@ pub const SessionSummary = struct {
     avg_triangles: u32 = 0,
     max_triangles: u32 = 0,
     avg_pipeline_switches: u32 = 0,
+    /// Суммарные байты стриминга текстур за сессию.
     total_uploaded_bytes: usize = 0,
+    /// Суммарные байты динамических обновлений буферов за сессию.
+    total_updated_bytes: usize = 0,
 
     // Hitches / dropped frames derived from the CPU-submit sum (not wall pacing).
     hitches_over_16ms: u32 = 0, // CPU-submit time > 16.67ms

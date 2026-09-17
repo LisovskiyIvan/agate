@@ -5,6 +5,7 @@ const debug_shd = @import("debug_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
 const DebugLine = @import("../physics.zig").DebugLine;
+const upload_meter = @import("../gpu_upload_meter.zig");
 
 // Interleaved line-list vertex: position + unpacked linear-space RGBA.
 // RGBA8 packing (UBYTE4N) would halve vertex bandwidth, but debug overlays
@@ -170,6 +171,8 @@ pub const DebugPass = struct {
         if (self.staging.items.len == 0) return;
 
         sg.updateBuffer(self.vertex_buffer, sg.asRange(self.staging.items));
+        // Учёт динамики: все staged debug-вершины кадра.
+        upload_meter.record(self.staging.items.len * @sizeOf(Vertex));
         sg.applyPipeline(self.pipeline);
 
         var bind = sg.Bindings{};

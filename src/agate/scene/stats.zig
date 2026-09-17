@@ -24,11 +24,17 @@ pub const SceneStats = struct {
     pipeline_switches: u32 = 0,
     /// Textures uploaded by prepareFrame's bounded drain this frame.
     uploaded_textures_frame: u32 = 0,
-    /// GPU bytes uploaded this frame. Currently tallies texture uploads
-    /// (sum of decoded mip bytes handed to sg); per-frame sg.updateBuffer
-    /// ranges (instance/morph/particle/trail buffers) are not yet tallied —
-    /// those flush paths live in subsystems outside this change.
+    /// GPU bytes uploaded this frame: ТОЛЬКО текстуры из UploadQueue
+    /// (drainCountedBudget, бюджет upload_byte_budget_per_frame = 8 MiB).
+    /// Динамические обновления буферов через sg.updateBuffer/appendBuffer
+    /// (инстансы, морфы, частицы, трейлы, UI, debug-линии) учитываются
+    /// отдельно в updated_bytes_frame и на троттлинг не влияют.
     uploaded_bytes_frame: u64 = 0,
+    /// Байты динамических обновлений GPU-буферов за кадр (uncounted-budget):
+    /// сумма диапазонов всех фактических sg.updateBuffer/appendBuffer,
+    /// накопленная через gpu_upload_meter (сброс в prepareFrame, перенос
+    /// в render перед Profiler.recordFrame).
+    updated_bytes_frame: u64 = 0,
     /// Wall-clock phase timings in milliseconds (see header for writers).
     update_ms: f32 = 0,
     prepare_ms: f32 = 0,

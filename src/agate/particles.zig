@@ -10,6 +10,7 @@ const Texture = @import("texture.zig").Texture;
 const Mesh = @import("mesh.zig").Mesh;
 const jobs = @import("jobs.zig");
 const gpu_thread = @import("gpu_thread.zig");
+const upload_meter = @import("gpu_upload_meter.zig");
 
 pub const ParticleBlendMode = enum {
     additive,
@@ -668,6 +669,8 @@ pub const ParticleSystem = struct {
         if (self.gpu_slot_buffer.id == 0) return;
         if (self.gpuUploadRange()) |range| {
             sg.updateBuffer(self.gpu_slot_buffer, sg.asRange(range));
+            // Учёт динамики: весь переданный диапазон ушёл в GPU-буфер.
+            upload_meter.record(range.len * @sizeOf(GpuParticleSlot));
         }
         self.gpu_dirty = false;
         self.gpu_dirty_wrapped = false;
@@ -713,6 +716,8 @@ pub const ParticleSystem = struct {
             self.instance_dirty = false;
             if (self.active_count > 0 and self.instance_buffer.id != 0) {
                 sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+                // Учёт динамики: active_count инстансов целиком.
+                upload_meter.record(self.active_count * @sizeOf(ParticleInstanceData));
             }
         }
         // Deferred first-use creation (staged by update): without a valid sg

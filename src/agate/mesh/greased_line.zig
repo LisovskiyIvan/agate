@@ -19,6 +19,7 @@ const Vertex = @import("types.zig").Vertex;
 const GeometryData = @import("types.zig").GeometryData;
 const Scene = @import("../scene.zig").Scene;
 const gpu_thread = @import("../gpu_thread.zig");
+const upload_meter = @import("../gpu_upload_meter.zig");
 const tangents = @import("tangents.zig");
 
 pub const GreasedLineUVMode = enum {
@@ -514,9 +515,13 @@ pub const GreasedLineMesh = struct {
         }
         if (self.vertices.len > 0) {
             sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
+            // Учёт динамики: весь вершинный массив линии.
+            upload_meter.record(self.vertices.len * @sizeOf(Vertex));
         }
         if (self.gpu_needs_full_upload and self.indices.len > 0) {
             sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices));
+            // Учёт динамики: индексный массив (полная заливка при создании).
+            upload_meter.record(self.indices.len * @sizeOf(u32));
             self.gpu_needs_full_upload = false;
         }
         self.gpu_dirty = false;

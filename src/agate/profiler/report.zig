@@ -468,7 +468,8 @@ pub fn generateReportHtml(
         \\      <th class="num">Draw Calls</th>
         \\      <th class="num">Треугольники</th>
         \\      <th class="num">Pipeline Switches</th>
-        \\      <th class="num">Uploads (КБ)</th>
+        \\      <th class="num">Текстуры (КБ)</th>
+        \\      <th class="num">Динамика (КБ)</th>
         \\    </tr>
         \\  </thead>
         \\  <tbody>
@@ -489,6 +490,7 @@ pub fn generateReportHtml(
         for (sorted_frames[0..spike_count], 1..) |sf, rank| {
             const culprit = dominantPhase(sf);
             const upload_kb: f32 = @as(f32, @floatFromInt(sf.uploaded_bytes)) / 1024.0;
+            const update_kb: f32 = @as(f32, @floatFromInt(sf.updated_bytes)) / 1024.0;
             const row = try std.fmt.allocPrint(allocator,
                 \\    <tr>
                 \\      <td><strong>#{d}</strong></td>
@@ -499,6 +501,7 @@ pub fn generateReportHtml(
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
+                \\      <td class="num">{d:.1}</td>
                 \\      <td class="num">{d:.1}</td>
                 \\    </tr>
             , .{
@@ -514,6 +517,7 @@ pub fn generateReportHtml(
                 sf.triangles,
                 sf.pipeline_switches,
                 upload_kb,
+                update_kb,
             });
             defer allocator.free(row);
             try buf.appendSlice(allocator, row);
@@ -796,8 +800,8 @@ pub fn generateReportMd(
     try buf.appendSlice(allocator,
         \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
         \\
-        \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Uploads |
-        \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+        \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
+        \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
     );
 
     if (frames.len > 0) {
@@ -814,8 +818,9 @@ pub fn generateReportMd(
         for (sorted_frames[0..spike_count], 1..) |sf, rank| {
             const culprit = dominantPhase(sf);
             const upload_kb: f32 = @as(f32, @floatFromInt(sf.uploaded_bytes)) / 1024.0;
+            const update_kb: f32 = @as(f32, @floatFromInt(sf.updated_bytes)) / 1024.0;
             const row = try std.fmt.allocPrint(allocator,
-                \\| #{d} | {d} | **{d:.2} мс** | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB |
+                \\| #{d} | {d} | **{d:.2} мс** | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
             , .{
                 rank,
                 sf.frame_index,
@@ -827,6 +832,7 @@ pub fn generateReportMd(
                 sf.draw_calls,
                 sf.triangles,
                 upload_kb,
+                update_kb,
             });
             defer allocator.free(row);
             try buf.appendSlice(allocator, row);
