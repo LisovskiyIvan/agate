@@ -1108,12 +1108,22 @@ pub const UICanvas = struct {
         self.drawText(text, rect[0] + font_size * 0.4, rect[1] + font_size * 0.25, font_size, mulAlpha(s.text_color, op));
     }
 
+    /// Bytes handed to sg by one rendered UI batch (clamped vertex prefix +
+    /// full index list). Must stay in usize: the vertex cap times
+    /// @sizeOf(UIVertex) overflows u16 arithmetic, so this must never run in
+    /// the clamped vertex type.
+    fn batchUploadBytes(vert_count: usize, index_count: usize) usize {
+        return vert_count * @sizeOf(UIVertex) + index_count * @sizeOf(u16);
+    }
+
     /// Uploads dynamic batch buffers and executes the UI render pass
     pub fn render(self: *UICanvas, screen_w: f32, screen_h: f32) void {
         if (self.vertices.items.len == 0 or self.indices.items.len == 0) return;
         if (screen_w <= 0.0 or screen_h <= 0.0) return;
 
-        const vert_count = @min(self.vertices.items.len, std.math.maxInt(u16));
+        // usize on purpose: `@min(usize, u16)` resolves to u16 in Zig 0.16, and
+        // 48 B/vertex would then overflow the u16 multiply at 1366 vertices.
+        const vert_count: usize = @min(self.vertices.items.len, @as(usize, std.math.maxInt(u16)));
         if (vert_count > self.capacity_vertices) {
             if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
             self.capacity_vertices = @max(self.capacity_vertices * 2, vert_count);
@@ -1134,7 +1144,7 @@ pub const UICanvas = struct {
         sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items[0..vert_count]));
         sg.updateBuffer(self.index_buffer, sg.asRange(self.indices.items));
         // Учёт динамики: весь UI-батч кадра (вершины + u16-индексы).
-        upload_meter.record(vert_count * @sizeOf(UIVertex) + self.indices.items.len * @sizeOf(u16));
+        upload_meter.record(batchUploadBytes(vert_count, self.indices.items.len));
 
         if (self.pipeline.id == 0) return;
         sg.applyPipeline(self.pipeline);
@@ -2944,4 +2954,13 @@ test "LayoutStack immediate mode widgets emit geometry and handle input" {
 
     // Verify all widgets generated vertex geometry
     try t.expect(quadCount(&canvas) > 10);
+}
+
+test "batchUploadBytes keeps the u16 vertex cap in usize arithmetic" {
+    // 65535 vertices x 48 B ~= 3.1 MB: u16 arithmetic would already trap at
+    // 1366 vertices, so the helper must compute in usize in every build mode.
+    const verts: usize = std.math.maxInt(u16);
+    const idx: usize = std.math.maxInt(u16);
+    const expected = verts * @sizeOf(UIVertex) + idx * @sizeOf(u16);
+    try std.testing.expectEqual(expected, UICanvas.batchUploadBytes(verts, idx));
 }
