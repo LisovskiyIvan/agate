@@ -96,6 +96,8 @@ test {
     _ = @import("physics_mesh.zig");
     _ = @import("postprocess.zig");
     _ = @import("profiler.zig");
+    _ = @import("profiler/report.zig");
+    _ = @import("profiler/types.zig");
     _ = @import("ragdoll.zig");
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");
