@@ -17,11 +17,21 @@ const SPOT_SHADOW_MAP_WIDTH = @import("passes/shadow_pass.zig").SPOT_SHADOW_MAP_
 const SPOT_SHADOW_MAP_HEIGHT = @import("passes/shadow_pass.zig").SPOT_SHADOW_MAP_HEIGHT;
 
 /// Record of a single frame's timing and counters.
+///
+/// `dt_s` / `frame_interval_ms` / `fps` describe the observed wall-clock
+/// interval between consecutive `recordFrame` calls (real frame pacing).
+/// `total_frame_ms` and the phase fields are CPU-submit times measured with
+/// CPU timers around submit calls — NOT GPU execution time and NOT wall time.
 pub const FrameRecord = struct {
     frame_index: u64 = 0,
     timestamp_us: u64 = 0,
     dt_s: f32 = 0,
+    /// Observed wall-clock FPS (= 1/dt_s when dt_s is valid).
     fps: f32 = 0,
+    /// Wall-clock frame interval in ms (= dt_s * 1000). Real pacing.
+    frame_interval_ms: f32 = 0,
+    /// Sum of CPU phase timings (update+prepare+shadow+main+post).
+    /// CPU-submit time, not wall time and not GPU time.
     total_frame_ms: f32 = 0,
 
     // Phase breakdown (ms)
@@ -119,16 +129,24 @@ pub const MemorySnapshot = struct {
 };
 
 /// Aggregate statistical summary of a recorded profiling session.
+///
+/// Fields named `avg/p50/p95/p99/min/max_frame_ms`, `avg_fps`,
+/// `fps_1pct/01pct_low`, `total_time_ms` and `hitches_over_*ms` are derived
+/// from `total_frame_ms` (the CPU-submit sum) — NOT wall time.
+/// Fields prefixed with `observed_` / `interval_` / `avg_interval` / `p*_interval`
+/// / `max_interval` are derived from the wall-clock frame intervals
+/// (`frame_interval_ms`) and describe real frame pacing.
 pub const SessionSummary = struct {
     frame_count: usize = 0,
+    /// Sum of CPU-submit frame times (not wall duration).
     total_time_ms: f64 = 0,
 
-    // FPS metrics
+    // FPS metrics derived from the CPU-submit sum (not wall pacing).
     avg_fps: f32 = 0,
     fps_1pct_low: f32 = 0,
     fps_01pct_low: f32 = 0,
 
-    // Frame times (ms)
+    // CPU-submit frame times (ms), not wall intervals.
     min_frame_ms: f32 = 0,
     avg_frame_ms: f32 = 0,
     max_frame_ms: f32 = 0,
@@ -151,10 +169,23 @@ pub const SessionSummary = struct {
     avg_pipeline_switches: u32 = 0,
     total_uploaded_bytes: usize = 0,
 
-    // Hitches / dropped frames
-    hitches_over_16ms: u32 = 0, // Frame time > 16.67ms (< 60 FPS)
-    hitches_over_33ms: u32 = 0, // Frame time > 33.33ms (< 30 FPS)
-    hitches_over_50ms: u32 = 0, // Major hitch > 50ms (< 20 FPS)
+    // Hitches / dropped frames derived from the CPU-submit sum (not wall pacing).
+    hitches_over_16ms: u32 = 0, // CPU-submit time > 16.67ms
+    hitches_over_33ms: u32 = 0, // CPU-submit time > 33.33ms
+    hitches_over_50ms: u32 = 0, // CPU-submit time > 50ms
+
+    // Wall-clock frame pacing derived from frame_interval_ms (real pacing).
+    // Frames with dt_s <= 0 are skipped; all zeros when no valid intervals.
+    avg_interval_ms: f32 = 0,
+    p50_interval_ms: f32 = 0,
+    p99_interval_ms: f32 = 0,
+    max_interval_ms: f32 = 0,
+    observed_avg_fps: f32 = 0,
+    observed_fps_1pct_low: f32 = 0,
+    observed_fps_01pct_low: f32 = 0,
+    interval_hitches_over_16ms: u32 = 0, // Wall interval > 16.67ms (< 60 FPS)
+    interval_hitches_over_33ms: u32 = 0, // Wall interval > 33.33ms (< 30 FPS)
+    interval_hitches_over_50ms: u32 = 0, // Wall interval > 50ms (< 20 FPS)
 };
 
 pub const DiagnosticSeverity = enum {
@@ -178,7 +209,7 @@ pub const DiagnosticFinding = struct {
     }
 };
 
-/// Attribution of the dominant phase in a frame.
+/// Attribution of the dominant CPU-submit phase in a frame (not GPU time).
 pub const PhaseCulprit = struct {
     name: []const u8,
     ms: f32,
@@ -282,7 +313,10 @@ pub const Profiler = struct {
         self.last_frame_ticks = now;
 
         const total_ms = stats.update_ms + stats.prepare_ms + stats.shadow_ms + stats.main_ms + stats.post_ms;
-        const fps: f32 = if (total_ms > 0.001) 1000.0 / total_ms else (if (dt_s > 0.0001) 1.0 / dt_s else 60.0);
+        // Observed wall-clock pacing: fps derives from the real frame interval.
+        // total_ms is the CPU-submit sum (timers around sg submit calls), not wall/GPU time.
+        const frame_interval_ms: f32 = dt_s * 1000.0;
+        const fps: f32 = if (dt_s > 0.0001) 1.0 / dt_s else (if (total_ms > 0.001) 1000.0 / total_ms else 60.0);
         const rel_us: u64 = if (self.start_time_ticks > 0)
             @intFromFloat(sokol.time.us(sokol.time.diff(now, self.start_time_ticks)))
         else
@@ -293,6 +327,7 @@ pub const Profiler = struct {
             .timestamp_us = rel_us,
             .dt_s = dt_s,
             .fps = fps,
+            .frame_interval_ms = frame_interval_ms,
             .total_frame_ms = total_ms,
             .update_ms = stats.update_ms,
             .prepare_ms = stats.prepare_ms,
@@ -606,6 +641,8 @@ pub const Profiler = struct {
     }
 
     /// Computes statistical summary across all recorded frames.
+    /// CPU-submit fields come from `total_frame_ms`; pacing fields come from
+    /// wall-clock `frame_interval_ms` (frames with dt_s <= 0 are skipped).
     pub fn summarize(self: *const Profiler) SessionSummary {
         const n = self.frames.items.len;
         if (n == 0) return .{};
@@ -632,6 +669,16 @@ pub const Profiler = struct {
         var times = self.allocator.alloc(f32, n) catch return .{};
         defer self.allocator.free(times);
 
+        // Wall-clock intervals for real frame pacing (subset of frames).
+        var intervals = self.allocator.alloc(f32, n) catch return .{};
+        defer self.allocator.free(intervals);
+        var interval_count: usize = 0;
+        var sum_interval: f64 = 0;
+        var max_interval: f32 = 0;
+        var interval_hitches_16: u32 = 0;
+        var interval_hitches_33: u32 = 0;
+        var interval_hitches_50: u32 = 0;
+
         var min_ms: f32 = std.math.floatMax(f32);
         var max_ms: f32 = 0;
 
@@ -641,6 +688,17 @@ pub const Profiler = struct {
             sum_time += ms;
             min_ms = @min(min_ms, ms);
             max_ms = @max(max_ms, ms);
+
+            if (frame.dt_s > 0) {
+                const iv_ms = frame.frame_interval_ms;
+                intervals[interval_count] = iv_ms;
+                interval_count += 1;
+                sum_interval += iv_ms;
+                max_interval = @max(max_interval, iv_ms);
+                if (iv_ms > 50.0) interval_hitches_50 += 1;
+                if (iv_ms > 33.33) interval_hitches_33 += 1;
+                if (iv_ms > 16.67) interval_hitches_16 += 1;
+            }
 
             sum_update += frame.update_ms;
             sum_prepare += frame.prepare_ms;
@@ -694,6 +752,41 @@ pub const Profiler = struct {
         const avg_01pct_ms: f32 = @floatCast(sum_01pct / @as(f64, @floatFromInt(count_01pct)));
         const fps_01pct_low: f32 = if (avg_01pct_ms > 0.001) 1000.0 / avg_01pct_ms else 0;
 
+        // Wall-clock pacing from observed frame intervals.
+        var avg_interval_ms: f32 = 0;
+        var p50_interval_ms: f32 = 0;
+        var p99_interval_ms: f32 = 0;
+        var observed_avg_fps: f32 = 0;
+        var observed_fps_1pct_low: f32 = 0;
+        var observed_fps_01pct_low: f32 = 0;
+        if (interval_count > 0) {
+            const valid = intervals[0..interval_count];
+            std.mem.sort(f32, valid, {}, struct {
+                fn lessThan(_: void, a: f32, b: f32) bool {
+                    return a < b;
+                }
+            }.lessThan);
+            const m = interval_count;
+            avg_interval_ms = @floatCast(sum_interval / @as(f64, @floatFromInt(m)));
+            observed_avg_fps = if (avg_interval_ms > 0.001) 1000.0 / avg_interval_ms else 0;
+            const p50_iv_idx = @min(m - 1, @as(usize, @intFromFloat(@as(f32, @floatFromInt(m)) * 0.50)));
+            const p99_iv_idx = @min(m - 1, @as(usize, @intFromFloat(@as(f32, @floatFromInt(m)) * 0.99)));
+            p50_interval_ms = valid[p50_iv_idx];
+            p99_interval_ms = valid[p99_iv_idx];
+
+            const count_iv_1pct = @max(1, m / 100);
+            var sum_iv_1pct: f64 = 0;
+            for (valid[m - count_iv_1pct ..]) |t| sum_iv_1pct += t;
+            const avg_iv_1pct_ms: f32 = @floatCast(sum_iv_1pct / @as(f64, @floatFromInt(count_iv_1pct)));
+            observed_fps_1pct_low = if (avg_iv_1pct_ms > 0.001) 1000.0 / avg_iv_1pct_ms else 0;
+
+            const count_iv_01pct = @max(1, m / 1000);
+            var sum_iv_01pct: f64 = 0;
+            for (valid[m - count_iv_01pct ..]) |t| sum_iv_01pct += t;
+            const avg_iv_01pct_ms: f32 = @floatCast(sum_iv_01pct / @as(f64, @floatFromInt(count_iv_01pct)));
+            observed_fps_01pct_low = if (avg_iv_01pct_ms > 0.001) 1000.0 / avg_iv_01pct_ms else 0;
+        }
+
         const nf = @as(f64, @floatFromInt(n));
         return .{
             .frame_count = n,
@@ -721,6 +814,16 @@ pub const Profiler = struct {
             .hitches_over_16ms = hitches_16,
             .hitches_over_33ms = hitches_33,
             .hitches_over_50ms = hitches_50,
+            .avg_interval_ms = avg_interval_ms,
+            .p50_interval_ms = p50_interval_ms,
+            .p99_interval_ms = p99_interval_ms,
+            .max_interval_ms = max_interval,
+            .observed_avg_fps = observed_avg_fps,
+            .observed_fps_1pct_low = observed_fps_1pct_low,
+            .observed_fps_01pct_low = observed_fps_01pct_low,
+            .interval_hitches_over_16ms = interval_hitches_16,
+            .interval_hitches_over_33ms = interval_hitches_33,
+            .interval_hitches_over_50ms = interval_hitches_50,
         };
     }
 
@@ -734,34 +837,35 @@ pub const Profiler = struct {
 
         const summary = self.summarize();
 
-        // 1. Frame Pacing / Target FPS Check
-        if (summary.frame_count >= 5) {
-            if (summary.avg_fps >= 58.0 and summary.p99_frame_ms <= 18.0 and summary.hitches_over_33ms == 0) {
+        // 1. Frame Pacing / Target FPS Check (observed wall-clock intervals).
+        // Phase attribution in section 2 stays CPU-submit based.
+        if (summary.frame_count >= 5 and summary.max_interval_ms > 0) {
+            if (summary.observed_avg_fps >= 58.0 and summary.p99_interval_ms <= 18.0 and summary.interval_hitches_over_33ms == 0) {
                 try findings.append(allocator, .{
                     .severity = .good,
                     .title = try allocator.dupe(u8, "Стабильный кадровый темп 60+ FPS"),
-                    .details = try std.fmt.allocPrint(allocator, "Средний FPS: {d:.1}, 99-й перцентиль: {d:.1} мс. Просадок ниже 30 FPS не зафиксировано.", .{ summary.avg_fps, summary.p99_frame_ms }),
+                    .details = try std.fmt.allocPrint(allocator, "Наблюдаемый средний FPS (wall-интервал): {d:.1}, P99 интервала: {d:.1} мс, средний CPU-submit: {d:.2} мс. Просадок ниже 30 FPS не зафиксировано.", .{ summary.observed_avg_fps, summary.p99_interval_ms, summary.avg_frame_ms }),
                     .recommendation = try allocator.dupe(u8, "Производительность соответствует целевому бюджету времени кадра (16.6 мс)."),
                 });
-            } else if (summary.hitches_over_33ms > 0) {
-                const sev: DiagnosticSeverity = if (summary.hitches_over_33ms > summary.frame_count / 10 or summary.max_frame_ms > 50.0) .critical else .warning;
+            } else if (summary.interval_hitches_over_33ms > 0) {
+                const sev: DiagnosticSeverity = if (summary.interval_hitches_over_33ms > summary.frame_count / 10 or summary.max_interval_ms > 50.0) .critical else .warning;
                 try findings.append(allocator, .{
                     .severity = sev,
                     .title = try allocator.dupe(u8, "Просадки кадровой частоты ниже 30 FPS"),
-                    .details = try std.fmt.allocPrint(allocator, "Зафиксировано {d} кадров длительностью > 33.3 мс (худший кадр: {d:.1} мс, 1% Low: {d:.1} FPS).", .{ summary.hitches_over_33ms, summary.max_frame_ms, summary.fps_1pct_low }),
-                    .recommendation = try allocator.dupe(u8, "Изучите таблицу Spike Frames для определения виновной фазы и исключите блокирующие операции на главном потоке."),
+                    .details = try std.fmt.allocPrint(allocator, "Зафиксировано {d} wall-интервалов > 33.3 мс (худший интервал: {d:.1} мс, 1% Low (wall): {d:.1} FPS). Пиковый CPU-submit кадра: {d:.1} мс.", .{ summary.interval_hitches_over_33ms, summary.max_interval_ms, summary.observed_fps_1pct_low, summary.max_frame_ms }),
+                    .recommendation = try allocator.dupe(u8, "Изучите таблицу Spike Frames (время CPU-submit) для определения виновной фазы и исключите блокирующие операции на главном потоке."),
                 });
-            } else if (summary.hitches_over_16ms > 0) {
+            } else if (summary.interval_hitches_over_16ms > 0) {
                 try findings.append(allocator, .{
                     .severity = .info,
                     .title = try allocator.dupe(u8, "Периодические просадки ниже 60 FPS"),
-                    .details = try std.fmt.allocPrint(allocator, "Зафиксировано {d} кадров длительностью от 16.7 до 33.3 мс.", .{summary.hitches_over_16ms}),
-                    .recommendation = try allocator.dupe(u8, "Оптимизируйте наиболее тяжелые фазы (Main pass, Shadows) для достижения чистых 60 FPS."),
+                    .details = try std.fmt.allocPrint(allocator, "Зафиксировано {d} wall-интервалов длительностью от 16.7 до 33.3 мс.", .{summary.interval_hitches_over_16ms}),
+                    .recommendation = try allocator.dupe(u8, "Оптимизируйте наиболее тяжелые CPU-фазы (Main pass, Shadows) для достижения чистых 60 FPS."),
                 });
             }
         }
 
-        // 2. Worst Phase Attribution on Spikes
+        // 2. Worst Phase Attribution on Spikes (CPU-submit times, not GPU time)
         if (self.frames.items.len > 0) {
             var worst_frame = self.frames.items[0];
             for (self.frames.items) |f| {
@@ -774,28 +878,28 @@ pub const Profiler = struct {
                     try findings.append(allocator, .{
                         .severity = .warning,
                         .title = try allocator.dupe(u8, "Узкое горлышко: Main Render Pass"),
-                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} ({d:.1} мс) фаза Main Pass заняла {d:.1} мс ({d:.1}% всего кадра).", .{ worst_frame.frame_index, worst_frame.total_frame_ms, culprit.ms, culprit.percent }),
+                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} (CPU-submit {d:.1} мс) фаза Main Pass (CPU submit) заняла {d:.1} мс ({d:.1}% всего кадра).", .{ worst_frame.frame_index, worst_frame.total_frame_ms, culprit.ms, culprit.percent }),
                         .recommendation = try allocator.dupe(u8, "Сократите количество вызовов отрисовки через InstancedMesh, объедините меши с одинаковыми материалами и включите Occlusion Culling."),
                     });
                 } else if (std.mem.eql(u8, culprit.name, "Shadow Pass") and culprit.percent > 35.0) {
                     try findings.append(allocator, .{
                         .severity = .warning,
                         .title = try allocator.dupe(u8, "Узкое горлышко: CSM Shadow Pass"),
-                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} рендеринг теней занял {d:.1} мс ({d:.1}% кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
+                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} рендеринг теней (CPU submit) занял {d:.1} мс ({d:.1}% кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
                         .recommendation = try allocator.dupe(u8, "Отключите cast_shadows для мелких мешей, уменьшите дистанцию теневых каскадов или отключите тени для точечных источников."),
                     });
                 } else if (std.mem.eql(u8, culprit.name, "Update") and culprit.percent > 40.0) {
                     try findings.append(allocator, .{
                         .severity = .warning,
                         .title = try allocator.dupe(u8, "Узкое горлышко: CPU Update / Скрипты"),
-                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} обновление логики заняло {d:.1} мс ({d:.1}% кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
+                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} обновление логики заняло {d:.1} мс ({d:.1}% CPU-submit кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
                         .recommendation = try allocator.dupe(u8, "Оптимизируйте анимации, физическую симуляцию или перенесите тяжелые расчеты в фоновый пул jobs.TaskRunner."),
                     });
                 } else if (std.mem.eql(u8, culprit.name, "PostFX") and culprit.percent > 40.0) {
                     try findings.append(allocator, .{
                         .severity = .warning,
                         .title = try allocator.dupe(u8, "Узкое горлышко: PostFX Stack"),
-                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} пост-обработка заняла {d:.1} мс ({d:.1}% кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
+                        .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} пост-обработка (CPU submit) заняла {d:.1} мс ({d:.1}% кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
                         .recommendation = try allocator.dupe(u8, "Проверьте настройки SSAO (уменьшите sample count), снизьте bloom pyramid mips или уменьшите разрешение буфера."),
                     });
                 }
@@ -1150,13 +1254,13 @@ pub const Profiler = struct {
             \\  <div style="text-align: right;">
         );
 
-        // Header metadata
+        // Header metadata: wall-clock pacing is primary; CPU-submit sum is separate.
         const total_sec = summary.total_time_ms / 1000.0;
         const meta_str = try std.fmt.allocPrint(allocator,
-            \\<div style="font-size: 14px; font-weight: 700; color: #fff;">{d} Кадров ({d:.2} с)</div>
-            \\<div class="meta-sub">Avg {d:.1} FPS | P99: {d:.1} мс</div>
+            \\<div style="font-size: 14px; font-weight: 700; color: #fff;">{d} Кадров ({d:.2} с CPU-submit)</div>
+            \\<div class="meta-sub">Avg {d:.1} FPS (wall) | P99 интервала: {d:.1} мс | CPU-submit avg: {d:.2} мс</div>
             \\</div></header>
-        , .{ summary.frame_count, total_sec, summary.avg_fps, summary.p99_frame_ms });
+        , .{ summary.frame_count, total_sec, summary.observed_avg_fps, summary.p99_interval_ms, summary.avg_frame_ms });
         defer allocator.free(meta_str);
         try buf.appendSlice(allocator, meta_str);
 
@@ -1169,19 +1273,19 @@ pub const Profiler = struct {
         const kpi_html = try std.fmt.allocPrint(allocator,
             \\<div class="kpi-grid">
             \\  <div class="kpi-card">
-            \\    <div class="kpi-label">Average FPS</div>
+            \\    <div class="kpi-label">Average FPS (wall)</div>
             \\    <div class="kpi-val" style="color: {s};">{d:.1}</div>
-            \\    <div class="kpi-sub">Avg frame: {d:.2} ms</div>
+            \\    <div class="kpi-sub">Avg interval: {d:.2} ms | CPU-submit avg: {d:.2} ms</div>
             \\  </div>
             \\  <div class="kpi-card">
-            \\    <div class="kpi-label">1% Low FPS</div>
+            \\    <div class="kpi-label">1% Low FPS (wall)</div>
             \\    <div class="kpi-val" style="color: {s};">{d:.1}</div>
-            \\    <div class="kpi-sub">0.1% low: {d:.1} FPS</div>
+            \\    <div class="kpi-sub">0.1% low (wall): {d:.1} FPS</div>
             \\  </div>
             \\  <div class="kpi-card">
-            \\    <div class="kpi-label">P95 Frame Time</div>
+            \\    <div class="kpi-label">P99 Frame Interval (wall)</div>
             \\    <div class="kpi-val">{d:.1} <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">ms</span></div>
-            \\    <div class="kpi-sub">P50: {d:.1} ms | P99: {d:.1} ms</div>
+            \\    <div class="kpi-sub">P50 interval: {d:.1} ms | CPU-submit P99: {d:.1} ms</div>
             \\  </div>
             \\  <div class="kpi-card">
             \\    <div class="kpi-label">Average Draw Calls</div>
@@ -1200,14 +1304,15 @@ pub const Profiler = struct {
             \\  </div>
             \\</div>
         , .{
-            if (summary.avg_fps >= 55.0) "#22c55e" else if (summary.avg_fps >= 30.0) "#eab308" else "#ef4444",
-            summary.avg_fps,
+            if (summary.observed_avg_fps >= 55.0) "#22c55e" else if (summary.observed_avg_fps >= 30.0) "#eab308" else "#ef4444",
+            summary.observed_avg_fps,
+            summary.avg_interval_ms,
             summary.avg_frame_ms,
-            if (summary.fps_1pct_low >= 45.0) "#22c55e" else if (summary.fps_1pct_low >= 25.0) "#eab308" else "#ef4444",
-            summary.fps_1pct_low,
-            summary.fps_01pct_low,
-            summary.p95_frame_ms,
-            summary.p50_frame_ms,
+            if (summary.observed_fps_1pct_low >= 45.0) "#22c55e" else if (summary.observed_fps_1pct_low >= 25.0) "#eab308" else "#ef4444",
+            summary.observed_fps_1pct_low,
+            summary.observed_fps_01pct_low,
+            summary.p99_interval_ms,
+            summary.p50_interval_ms,
             summary.p99_frame_ms,
             summary.avg_draw_calls,
             summary.max_draw_calls,
@@ -1310,10 +1415,10 @@ pub const Profiler = struct {
 
                 var cur_y = chart_y_bottom;
 
-                // Group with native tooltip
+                // Group with native tooltip (stacked bars show CPU-submit phases, not GPU time)
                 const tooltip_open = try std.fmt.allocPrint(allocator,
-                    \\<g><title>Кадр #{d}: {d:.2} мс (FPS: {d:.1})&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow: {d:.2} мс&#10;Main: {d:.2} мс&#10;Post: {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
-                , .{ f.frame_index, f.total_frame_ms, f.fps, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
+                    \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
                 defer allocator.free(tooltip_open);
                 try buf.appendSlice(allocator, tooltip_open);
 
@@ -1373,11 +1478,11 @@ pub const Profiler = struct {
             \\</div>
         );
 
-        // Section: Top Spike Frames Table
+        // Section: Top Spike Frames Table (ranked by CPU-submit time, not GPU/wall time)
         try buf.appendSlice(allocator,
             \\<div class="section-title">
             \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            \\  Топ пиковых кадров (Spike Frames)
+            \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
             \\</div>
             \\<div class="card-table">
             \\<table>
@@ -1385,9 +1490,9 @@ pub const Profiler = struct {
             \\    <tr>
             \\      <th>Ранг</th>
             \\      <th>Кадр #</th>
-            \\      <th class="num">Время кадра</th>
-            \\      <th class="num">FPS</th>
-            \\      <th>Главная причина (фаза)</th>
+            \\      <th class="num">Время CPU-submit</th>
+            \\      <th class="num">FPS (wall)</th>
+            \\      <th>Главная причина (CPU-фаза)</th>
             \\      <th class="num">Draw Calls</th>
             \\      <th class="num">Треугольники</th>
             \\      <th class="num">Pipeline Switches</th>
@@ -1397,7 +1502,7 @@ pub const Profiler = struct {
             \\  <tbody>
         );
 
-        // Sort frames by total_frame_ms descending
+        // Sort frames by total_frame_ms (CPU-submit sum) descending
         if (self.frames.items.len > 0) {
             const spike_count = @min(10, self.frames.items.len);
             const sorted_frames = try allocator.dupe(FrameRecord, self.frames.items);
@@ -1653,32 +1758,35 @@ pub const Profiler = struct {
         const overview_table = try std.fmt.allocPrint(allocator,
             \\| Метрика | Значение | Метрика | Значение |
             \\| :--- | :--- | :--- | :--- |
-            \\| **Всего кадров** | {d} | **Длительность** | {d:.2} с |
-            \\| **Средний FPS** | {d:.1} FPS | **1% Low FPS** | {d:.1} FPS |
-            \\| **Мин. время кадра** | {d:.2} мс | **Макс. время кадра** | {d:.2} мс |
-            \\| **50% перцентиль (P50)** | {d:.2} мс | **95% перцентиль (P95)** | {d:.2} мс |
-            \\| **99% перцентиль (P99)** | {d:.2} мс | **Просадки > 33.3 мс** | {d} кадров |
+            \\| **Всего кадров** | {d} | **Длительность (сумма CPU-submit)** | {d:.2} с |
+            \\| **Средний FPS (wall, интервал)** | {d:.1} FPS | **1% Low FPS (wall)** | {d:.1} FPS |
+            \\| **Средний интервал (wall)** | {d:.2} мс | **P99 интервал (wall)** | {d:.2} мс |
+            \\| **Средний CPU-submit** | {d:.2} мс | **Макс. CPU-submit** | {d:.2} мс |
+            \\| **CPU-submit P50 / P95 / P99** | {d:.2} / {d:.2} / {d:.2} мс | **Просадки интервала > 33.3 мс (wall)** | {d} кадров (CPU-submit > 33.3: {d}) |
             \\| **Средний Draw Calls** | {d} | **Макс. Draw Calls** | {d} |
             \\| **Средний треугольников** | {d} | **Макс. треугольников** | {d} |
             \\| **Суммарный VRAM** | {s} | **CPU геометрия** | {s} |
             \\
-            \\### Фазы кадра в среднем (Frame Phases)
+            \\### Фазы кадра в среднем (CPU-submit, не GPU-время)
             \\- **Update (CPU логика/анимация):** {d:.2} мс
             \\- **Prepare (подготовка очередей):** {d:.2} мс
-            \\- **Shadow Pass (CSM тени):** {d:.2} мс
-            \\- **Main Pass (основной рендер):** {d:.2} мс
-            \\- **PostFX (пост-процессинг):** {d:.2} мс
+            \\- **Shadow Pass (CPU submit, не GPU):** {d:.2} мс
+            \\- **Main Pass (CPU submit, не GPU):** {d:.2} мс
+            \\- **PostFX (CPU submit, не GPU):** {d:.2} мс
             \\
         , .{
             summary.frame_count,
             summary.total_time_ms / 1000.0,
-            summary.avg_fps,
-            summary.fps_1pct_low,
-            summary.min_frame_ms,
+            summary.observed_avg_fps,
+            summary.observed_fps_1pct_low,
+            summary.avg_interval_ms,
+            summary.p99_interval_ms,
+            summary.avg_frame_ms,
             summary.max_frame_ms,
             summary.p50_frame_ms,
             summary.p95_frame_ms,
             summary.p99_frame_ms,
+            summary.interval_hitches_over_33ms,
             summary.hitches_over_33ms,
             summary.avg_draw_calls,
             summary.max_draw_calls,
@@ -1718,11 +1826,11 @@ pub const Profiler = struct {
             try buf.appendSlice(allocator, f_md);
         }
 
-        // Section: Spike Frames
+        // Section: Spike Frames (ranked by CPU-submit time, not GPU/wall time)
         try buf.appendSlice(allocator,
-            \\## 3. Топ пиковых кадров (Spike Frames)
+            \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
             \\
-            \\| Ранг | Кадр # | Время (мс) | FPS | Главная причина | Draw Calls | Треугольники | Uploads |
+            \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Uploads |
             \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
         );
 
@@ -1858,15 +1966,18 @@ pub const Profiler = struct {
             const ts = f.timestamp_us;
             const dur_us: u64 = @intFromFloat(f.total_frame_ms * 1000.0);
 
-            // Complete event for whole frame
+            // Complete event for whole frame. dur covers the CPU-submit span;
+            // fps/interval are observed wall-clock pacing.
             const frame_event = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "Frame #{d}", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps": {d:.1}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
-            , .{ f.frame_index, ts, dur_us, f.fps, f.draw_calls, f.triangles, f.pipeline_switches });
+                \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
+            , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.draw_calls, f.triangles, f.pipeline_switches });
             defer allocator.free(frame_event);
             try buf.appendSlice(allocator, frame_event);
             try buf.appendSlice(allocator, "\n");
 
-            // Sub-phase slices inside the frame
+            // Sub-phase slices inside the frame (CPU-submit times, not GPU execution).
+            // All phases use "cpu": Shadow/Main/Post measure CPU timers around
+            // sg submit calls, never GPU timestamps.
             var cur_ts = ts;
             const u_us: u64 = @intFromFloat(f.update_ms * 1000.0);
             const p_us: u64 = @intFromFloat(f.prepare_ms * 1000.0);
@@ -1894,7 +2005,7 @@ pub const Profiler = struct {
 
             // Shadow
             const s_ev = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "Shadow Pass", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}},
+                \\    {{"name": "Shadow Pass (CPU submit)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}},
             , .{ cur_ts, s_us });
             defer allocator.free(s_ev);
             try buf.appendSlice(allocator, s_ev);
@@ -1903,7 +2014,7 @@ pub const Profiler = struct {
 
             // Main
             const m_ev = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "Main Pass", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}},
+                \\    {{"name": "Main Pass (CPU submit)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}},
             , .{ cur_ts, m_us });
             defer allocator.free(m_ev);
             try buf.appendSlice(allocator, m_ev);
@@ -1913,7 +2024,7 @@ pub const Profiler = struct {
             // PostFX
             const post_comma = if (is_last_frame) "" else ",";
             const post_ev = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "PostFX", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}}{s}
+                \\    {{"name": "PostFX (CPU submit)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}}{s}
             , .{ cur_ts, post_us, post_comma });
             defer allocator.free(post_ev);
             try buf.appendSlice(allocator, post_ev);
@@ -1972,6 +2083,13 @@ pub const Profiler = struct {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// Sleep helper for pacing-sensitive tests (Zig 0.16 has no Thread.sleep).
+fn testSleepMs(ms: u64) void {
+    const ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&ts, &rem);
+}
 
 test "Profiler start, recordFrame, and summarize" {
     const ally = std.testing.allocator;
@@ -2053,7 +2171,16 @@ test "Profiler report HTML, MD, and JSON generation" {
     const json = try prof.generateTraceJson(ally);
     defer ally.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"traceEvents\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"Frame #1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"Frame #1 (CPU submit)\"") != null);
+    // Submit times must never be presented as GPU time.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cat\": \"gpu\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cat\": \"cpu\"") != null);
+
+    // Reports must label CPU-submit vs wall-clock pacing explicitly.
+    try std.testing.expect(std.mem.indexOf(u8, html, "wall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "CPU-submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "wall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "CPU-submit") != null);
 }
 
 test "Profiler memory snapshot and file saving" {
@@ -2106,7 +2233,9 @@ test "Profiler analyzer detects bottlenecks" {
     defer prof.deinit();
 
     prof.start();
-    // Simulate high draw calls and severe hitch
+    // Simulate high draw calls and severe hitch. Pacing findings now come from
+    // real wall-clock intervals, so sleep ~40ms between records to register
+    // genuine interval hitches (~0.4s total for 10 frames).
     var stats: SceneStats = .{
         .update_ms = 1.0,
         .prepare_ms = 0.5,
@@ -2118,9 +2247,14 @@ test "Profiler analyzer detects bottlenecks" {
         .pipeline_switches = 150,
     };
     for (0..10) |i| {
+        if (i > 0) testSleepMs(40);
         prof.recordFrame(i, &stats);
     }
     prof.stop();
+
+    const summary = prof.summarize();
+    // Pacing hitches must be observed on the wall clock, not just CPU sums.
+    try std.testing.expect(summary.interval_hitches_over_33ms > 0);
 
     const findings = try prof.analyze(null, ally);
     defer {
@@ -2141,4 +2275,101 @@ test "Profiler analyzer detects bottlenecks" {
     try std.testing.expect(found_draw_calls);
     try std.testing.expect(found_main_pass);
     try std.testing.expect(found_hitch);
+}
+
+test "Profiler summarize uses frame intervals for pacing" {
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+
+    prof.start();
+    var stats: SceneStats = .{
+        .update_ms = 1.0,
+        .prepare_ms = 0.5,
+        .shadow_ms = 1.0,
+        .main_ms = 6.0,
+        .post_ms = 1.0,
+        .draw_calls = 10,
+        .triangles = 1000,
+        .pipeline_switches = 1,
+    };
+    const n_frames = 6;
+    for (0..n_frames) |i| {
+        // Keep every interval comfortably above the 0.1ms fps-validity gate
+        // so fps == 1/dt_s holds exactly for every record.
+        testSleepMs(2);
+        prof.recordFrame(i, &stats);
+    }
+    prof.stop();
+
+    try std.testing.expectEqual(n_frames, prof.frames.items.len);
+
+    // Each record's wall-clock fields derive from its own dt_s.
+    for (prof.frames.items) |rec| {
+        try std.testing.expect(rec.dt_s > 0);
+        try std.testing.expectEqual(rec.dt_s * 1000.0, rec.frame_interval_ms);
+        try std.testing.expect(rec.dt_s > 0.0001);
+        try std.testing.expectEqual(@as(f32, 1.0) / rec.dt_s, rec.fps);
+    }
+
+    // Recompute pacing directly from the recorded dt_s values
+    // (exact comparison, no wall-clock thresholds).
+    const summary = prof.summarize();
+
+    // CPU-submit average is untouched by pacing: 1+0.5+1+6+1 == 9.5.
+    try std.testing.expectEqual(@as(f32, 9.5), summary.avg_frame_ms);
+
+    var expected = try ally.alloc(f32, n_frames);
+    defer ally.free(expected);
+    var m: usize = 0;
+    var sum: f64 = 0;
+    var max_iv: f32 = 0;
+    var eh16: u32 = 0;
+    var eh33: u32 = 0;
+    var eh50: u32 = 0;
+    for (prof.frames.items) |rec| {
+        if (rec.dt_s > 0) {
+            const iv = rec.frame_interval_ms;
+            expected[m] = iv;
+            m += 1;
+            sum += iv;
+            max_iv = @max(max_iv, iv);
+            if (iv > 50.0) eh50 += 1;
+            if (iv > 33.33) eh33 += 1;
+            if (iv > 16.67) eh16 += 1;
+        }
+    }
+    try std.testing.expect(m > 0);
+    const valid = expected[0..m];
+    std.mem.sort(f32, valid, {}, struct {
+        fn lessThan(_: void, a: f32, b: f32) bool {
+            return a < b;
+        }
+    }.lessThan);
+
+    const exp_avg: f32 = @floatCast(sum / @as(f64, @floatFromInt(m)));
+    const exp_fps: f32 = if (exp_avg > 0.001) 1000.0 / exp_avg else 0;
+    const p50_idx = @min(m - 1, @as(usize, @intFromFloat(@as(f32, @floatFromInt(m)) * 0.50)));
+    const p99_idx = @min(m - 1, @as(usize, @intFromFloat(@as(f32, @floatFromInt(m)) * 0.99)));
+    const c1 = @max(1, m / 100);
+    var s1: f64 = 0;
+    for (valid[m - c1 ..]) |t| s1 += t;
+    const a1: f32 = @floatCast(s1 / @as(f64, @floatFromInt(c1)));
+    const exp_1pct: f32 = if (a1 > 0.001) 1000.0 / a1 else 0;
+    const c01 = @max(1, m / 1000);
+    var s01: f64 = 0;
+    for (valid[m - c01 ..]) |t| s01 += t;
+    const a01: f32 = @floatCast(s01 / @as(f64, @floatFromInt(c01)));
+    const exp_01pct: f32 = if (a01 > 0.001) 1000.0 / a01 else 0;
+
+    try std.testing.expectEqual(exp_avg, summary.avg_interval_ms);
+    try std.testing.expectEqual(exp_fps, summary.observed_avg_fps);
+    try std.testing.expectEqual(valid[p50_idx], summary.p50_interval_ms);
+    try std.testing.expectEqual(valid[p99_idx], summary.p99_interval_ms);
+    try std.testing.expectEqual(max_iv, summary.max_interval_ms);
+    try std.testing.expectEqual(exp_1pct, summary.observed_fps_1pct_low);
+    try std.testing.expectEqual(exp_01pct, summary.observed_fps_01pct_low);
+    try std.testing.expectEqual(eh16, summary.interval_hitches_over_16ms);
+    try std.testing.expectEqual(eh33, summary.interval_hitches_over_33ms);
+    try std.testing.expectEqual(eh50, summary.interval_hitches_over_50ms);
 }
