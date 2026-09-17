@@ -36,8 +36,12 @@ pub const CameraSnapshot = struct {
 };
 
 /// Frame-level camera/light/pass state published by the simulation side.
-/// This deliberately does not contain per-mesh render records yet; threaded
-/// applications retain coarse phase ownership while render reads live scene data.
+/// Это frame mailbox (камеры/свет/конфиг проходов), а НЕ подготовленные
+/// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
+/// outline-items строятся позже в prepareFrame и живут отдельно.
+/// P4 покрывает только mesh-payload очередей; фазовый мьютекс по-прежнему
+/// обязателен (GPU-ресурсы заимствуются, а UI/debug/particles/trails —
+/// вне P4, см. P5-P7).
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,

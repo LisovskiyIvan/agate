@@ -16,7 +16,8 @@ const StandardMaterial = material_mod.StandardMaterial;
 const Texture = @import("../texture.zig").Texture;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const skeleton_mod = @import("../animation/skeleton.zig");
-const MAX_BONES = skeleton_mod.MAX_BONES;
+/// Переэкспорт для потребителей снапшот-хранилищ (postfx/scene/outline).
+pub const MAX_BONES = skeleton_mod.MAX_BONES;
 const morph_gpu = @import("../mesh/morph_gpu.zig");
 const visibility = @import("../visibility/mod.zig");
 const jobs = @import("../jobs.zig");
@@ -25,12 +26,10 @@ const SceneStats = stats_mod.SceneStats;
 const instance_staging = @import("instance_staging.zig");
 
 pub const RenderMeshItem = struct {
-    mesh: *Mesh,
     model: Mat4,
     distance_sq: f32,
     is_pbr: bool,
     texture_id: u32,
-    material: ?Material = null,
     /// Index of the source mesh in FrameCullContext.meshes. Feeds the
     /// transparent order tie-break (see TransparentDrawEntry.seq) so serial
     /// and parallel paths break exact-distance ties identically.
@@ -42,8 +41,8 @@ pub const RenderMeshItem = struct {
     // build time; defaults to false so opaque behavior is unchanged.
     transparent: bool = false,
     // True when the mesh material is double-sided (face culling disabled).
-    // Set at queue build time from materialIsDoubleSided; when the flag is
-    // stale/missing, pipeline selection re-derives it from mesh.material.
+    // Set at queue build time from materialIsDoubleSided; pipeline selection
+    // reads only this snapshot, never the live material.
     // Defaults to false so single-sided behavior is unchanged.
     double_sided: bool = false,
     // True when the mesh is a projected decal. Decals route to the transparent
@@ -51,8 +50,14 @@ pub const RenderMeshItem = struct {
     // eliminating depth-buffer z-fighting against the underlying surface.
     is_decal: bool = false,
     receive_shadows: bool = true,
-    /// Pointer to the published double-buffered skin matrices slot for this mesh's skeleton
-    skin_matrices: ?*const [MAX_BONES]Mat4 = null,
+    /// Индекс копии скин-матриц в RenderQueues.skin_storage (null = не скин).
+    /// Указывает на render-owned снимок, а не на mutable-слоты скелета:
+    /// draw-путь резолвит его через хранилище той же очереди уже после всех
+    /// реаллокаций prepare-фазы, поэтому индекс стабилен при росте буфера.
+    skin_index: ?u32 = null,
+    /// Индекс ShaderDrawSnapshot в RenderQueues.shader_storage (null = не hook).
+    /// Draw-путь hook-материалов читает только этот снимок.
+    shader_index: ?u32 = null,
     /// Per-mesh morph uniforms (weights and delta dimensions)
     morph_uniforms: morph_gpu.VsUniforms = .{
         .weights0 = .{ 0, 0, 0, 0 },
@@ -87,7 +92,36 @@ pub const RenderInstancedBatch = struct {
     is_decal: bool = false,
     receive_shadows: bool = true,
     draw_record: MaterialDrawRecord = .{},
-    mesh: ?*Mesh = null,
+};
+
+/// Render-owned хранилище копий скин-матриц: один слот на skinned-draw кадра
+/// (а не MAX_BONES на каждый item). Живёт в RenderQueues, переживает кадры
+/// (clearRetainingCapacity в reset — без per-frame churn). Элементы резолвятся
+/// по индексу уже на draw-фазе, поэтому реаллокации prepare-фазы безопасны.
+pub const SkinStorage = std.ArrayListUnmanaged([MAX_BONES]Mat4);
+/// Render-owned снимки hook-материалов: один на shader-draw кадра.
+pub const ShaderStorage = std.ArrayListUnmanaged(material_mod.ShaderDrawSnapshot);
+
+/// Чистый резолв копии скина по индексу (draw-фаза): null/out-of-range дают
+/// null вместо чтения чужих данных. Skinned-вызывающий такой draw пропускает
+/// (stale GPU-униформа предыдущего draw исключена); через билдеры недостижимо.
+pub fn skinAt(skins: []const [MAX_BONES]Mat4, index: ?u32) ?*const [MAX_BONES]Mat4 {
+    const i = index orelse return null;
+    if (i >= skins.len) return null;
+    return &skins[i];
+}
+
+/// Prepare-локальный результат куллинга одного меша: готовый item плюс
+/// заимствования живых данных, которые appendRenderItem копирует в
+/// render-owned хранилища (и только потом кладёт item в очередь).
+/// skin_src/shader_snap никогда не попадают в очереди и не читаются на draw.
+pub const CulledMesh = struct {
+    item: RenderMeshItem,
+    /// Заимствованный опубликованный слот скелета (prepare-время; фазовый
+    /// мьютекс держит update-поток вне prepare/render, слот стабилен до копии).
+    skin_src: ?*const [MAX_BONES]Mat4 = null,
+    /// Готовый снимок hook-материала (чистая копия, без живых указателей).
+    shader_snap: ?material_mod.ShaderDrawSnapshot = null,
 };
 
 /// One transparent draw in the unified back-to-front pass. Regular items
@@ -116,7 +150,7 @@ pub const TransparentDrawEntry = struct {
 /// `RenderQueues.deinit`) frees everything at shutdown. Steady-state frames
 /// therefore perform zero allocations in the parallel setup path.
 pub const ParallelCullScratch = struct {
-    records: std.ArrayListUnmanaged(std.ArrayListUnmanaged(RenderMeshItem)) = .empty,
+    records: std.ArrayListUnmanaged(std.ArrayListUnmanaged(CulledMesh)) = .empty,
     chunk_stats: std.ArrayListUnmanaged(SceneStats) = .empty,
 
     /// Fit to hold `chunk_count` chunks of `span` records each. All fallible
@@ -176,6 +210,11 @@ pub const RenderQueues = struct {
     // sorted by sortTransparentDrawOrder in renderSceneView. Retained
     // across frames (clearRetainingCapacity in reset: no per-frame churn).
     transparent_order: std.ArrayListUnmanaged(TransparentDrawEntry) = .empty,
+    // Render-owned копии скин-матриц skinned-draws (резолв по skin_index на
+    // draw-фазе) и снимки hook-материалов (резолв по shader_index). Рост
+    // буферов в prepare-фазе безопасен: очереди хранят индексы, а не указатели.
+    skin_storage: SkinStorage = .empty,
+    shader_storage: ShaderStorage = .empty,
     // Parallel-cull scratch (per-chunk record buffers + stats). Lives with
     // the view queues and is retained across frames (reset + ensure per
     // buildFrameQueuesParallel call, freed once in deinit), so repeated
@@ -190,6 +229,8 @@ pub const RenderQueues = struct {
         self.transparent_instanced.clearRetainingCapacity();
         self.instance_matrices.clearRetainingCapacity();
         self.transparent_order.clearRetainingCapacity();
+        self.skin_storage.clearRetainingCapacity();
+        self.shader_storage.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderQueues, allocator: std.mem.Allocator) void {
@@ -199,6 +240,8 @@ pub const RenderQueues = struct {
         self.transparent_instanced.deinit(allocator);
         self.instance_matrices.deinit(allocator);
         self.transparent_order.deinit(allocator);
+        self.skin_storage.deinit(allocator);
+        self.shader_storage.deinit(allocator);
         self.parallel_scratch.deinit(allocator);
     }
 };
@@ -407,8 +450,8 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
             submitInstancedMesh(ctx, frustum, mesh, mesh_index);
             continue;
         }
-        if (cullNonInstancedMesh(ctx, frustum, eye, mesh, ctx.stats, mesh_index)) |item| {
-            appendRenderItem(ctx, item);
+        if (cullNonInstancedMesh(ctx, frustum, eye, mesh, ctx.stats, mesh_index)) |culled| {
+            appendRenderItem(ctx, culled);
         }
     }
 }
@@ -417,7 +460,25 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
 /// regulars also append a unified order entry (index into
 /// queues.transparent); instanced transparents append theirs in
 /// submitInstancedMesh so both share one mesh-index sequence.
-fn appendRenderItem(ctx: FrameCullContext, item: RenderMeshItem) void {
+///
+/// Перед постановкой заимствования prepare-фазы копируются в render-owned
+/// хранилища и item получает только индексы: в очередях не остаётся живых
+/// указателей на Mesh/Material/Skeleton. OOM на копии роняет весь item
+/// (а не рисует его с живыми матрицами): контракт как у OOM очередей.
+fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
+    var item = culled.item;
+    if (culled.skin_src) |src| {
+        ctx.queues.skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        const idx: u32 = @intCast(ctx.queues.skin_storage.items.len);
+        ctx.queues.skin_storage.appendAssumeCapacity(src.*);
+        item.skin_index = idx;
+    }
+    if (culled.shader_snap) |snap| {
+        ctx.queues.shader_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        const idx: u32 = @intCast(ctx.queues.shader_storage.items.len);
+        ctx.queues.shader_storage.appendAssumeCapacity(snap);
+        item.shader_index = idx;
+    }
     if (item.transparent) {
         // Reserve both slots up front: if either allocation fails the item
         // is dropped entirely, never an undrawn orphan in one array.
@@ -484,7 +545,6 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             .is_decal = mesh.is_decal,
             .receive_shadows = mesh.receive_shadows,
             .draw_record = draw_rec,
-            .mesh = mesh,
         };
 
         if (is_trans) {
@@ -545,7 +605,7 @@ fn cullNonInstancedMesh(
     mesh: *Mesh,
     stats: *SceneStats,
     mesh_index: usize,
-) ?RenderMeshItem {
+) ?CulledMesh {
     stats.total_meshes += 1;
     if (!mesh.is_visible) return null;
 
@@ -619,28 +679,33 @@ fn cullNonInstancedMesh(
     const d_sq = world_aabb.center().sub(eye).lengthSq();
     const is_decal = render_mesh.is_decal or mesh.is_decal;
     const transparent = materialIsTransparent(mat) or is_decal;
+    // Снимок hook-материала строится здесь же (prepare-фаза, живые данные
+    // ещё доступны); в очередь попадёт только после копии в appendRenderItem.
+    const dummy_white = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
+    const shader_snap = material_mod.buildShaderSnapshot(mat, ctx.default_white orelse &dummy_white);
     return .{
-        .mesh = render_mesh,
-        .material = mat,
-        .draw_record = draw_rec,
-        .model = model,
-        .distance_sq = d_sq,
-        .is_pbr = is_pbr,
-        .texture_id = tex_id,
-        .mesh_index = @intCast(mesh_index),
-        .transparent = transparent,
-        .double_sided = materialIsDoubleSided(mat) or is_decal,
-        .is_decal = is_decal,
-        .receive_shadows = render_mesh.receive_shadows,
-        .skin_matrices = skin_mat,
-        .morph_uniforms = morph_u,
-        .morph_view = morph_v,
-        .vertex_buffer = render_mesh.vertex_buffer,
-        .index_buffer = render_mesh.index_buffer,
-        .index_count = render_mesh.index_count,
-        .index_type = render_mesh.index_type,
-        .is_u32 = render_mesh.index_type == .UINT32,
-        .is_skinned = render_mesh.skeleton != null,
+        .item = .{
+            .draw_record = draw_rec,
+            .model = model,
+            .distance_sq = d_sq,
+            .is_pbr = is_pbr,
+            .texture_id = tex_id,
+            .mesh_index = @intCast(mesh_index),
+            .transparent = transparent,
+            .double_sided = materialIsDoubleSided(mat) or is_decal,
+            .is_decal = is_decal,
+            .receive_shadows = render_mesh.receive_shadows,
+            .morph_uniforms = morph_u,
+            .morph_view = morph_v,
+            .vertex_buffer = render_mesh.vertex_buffer,
+            .index_buffer = render_mesh.index_buffer,
+            .index_count = render_mesh.index_count,
+            .index_type = render_mesh.index_type,
+            .is_u32 = render_mesh.index_type == .UINT32,
+            .is_skinned = render_mesh.skeleton != null,
+        },
+        .skin_src = skin_mat,
+        .shader_snap = shader_snap,
     };
 }
 
@@ -654,7 +719,7 @@ const ParallelCull = struct {
     eye: Vec3,
     /// Meshes per chunk (ceil split; the last chunk may be short).
     span: usize,
-    records: []std.ArrayListUnmanaged(RenderMeshItem),
+    records: []std.ArrayListUnmanaged(CulledMesh),
     chunk_stats: []SceneStats,
 
     fn cullChunkRange(pass: *ParallelCull, start: usize, end: usize) void {
@@ -676,8 +741,8 @@ const ParallelCull = struct {
                 // tail (sg buffer management); skip them here so they are
                 // never culled as plain meshes and double-queued.
                 if (mesh.instances.items.len > 0) continue;
-                if (cullNonInstancedMesh(pass.ctx, pass.frustum, pass.eye, mesh, &local, mesh_index)) |item| {
-                    pass.records[chunk_id].appendAssumeCapacity(item);
+                if (cullNonInstancedMesh(pass.ctx, pass.frustum, pass.eye, mesh, &local, mesh_index)) |culled| {
+                    pass.records[chunk_id].appendAssumeCapacity(culled);
                 }
             }
             pass.chunk_stats[chunk_id] = local;
@@ -731,13 +796,15 @@ fn buildFrameQueuesParallel(
     ctx.queues.items.ensureUnusedCapacity(ctx.allocator, total_rendered) catch {};
 
     // Deterministic merge: chunk order == mesh order, so the queues land
-    // exactly as the serial loop would have filled them.
+    // exactly as the serial loop would have filled them. Копии скинов/
+    // шейдеров делаются здесь же, серийно и в том же порядке — параллельные
+    // воркеры только заимствовали живые данные в скретч.
     for (records, chunk_stats) |*list, local| {
         ctx.stats.total_meshes += local.total_meshes;
         ctx.stats.rendered_meshes += local.rendered_meshes;
         ctx.stats.culled_meshes += local.culled_meshes;
         ctx.stats.occluded_meshes += local.occluded_meshes;
-        for (list.items) |item| appendRenderItem(ctx, item);
+        for (list.items) |culled| appendRenderItem(ctx, culled);
     }
 
     // Instance-bearing meshes: serial submission (sg buffer management).
@@ -805,12 +872,11 @@ test "transparent classification follows material alpha mode" {
 }
 
 test "opaque sort unchanged: state groups, front-to-back" {
-    var m: Mesh = undefined;
     var items = [_]RenderMeshItem{
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 2 },
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
-        .{ .mesh = &m, .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
+        .{ .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
+        .{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 2 },
+        .{ .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
+        .{ .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
     };
     // Default transparent flag is false, so legacy items sort as before.
     try std.testing.expect(!items[0].transparent);
@@ -887,34 +953,39 @@ test "worldMatrixCached caches per frame and resolves parents" {
 test "shared LOD mesh preserves entity transforms without mutation" {
     const ally = std.testing.allocator;
 
-    var shared_lod: Mesh = undefined;
-    shared_lod.position = Vec3.zero;
-    shared_lod.rotation = Vec3.zero;
-    shared_lod.scaling = Vec3.new(1.0, 1.0, 1.0);
-    shared_lod.base_matrix = Mat4.identity;
-    shared_lod.local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+    // Полностью инициализированный общий LOD-ребёнок (никаких undefined):
+    // сентинел-хендлы геометрии отличают его от родителей.
+    var shared_lod = Mesh{
+        .name = "shared_lod",
+        .vertex_buffer = .{ .id = 77 },
+        .index_buffer = .{ .id = 78 },
+        .index_count = 9,
+        .position = Vec3.zero,
+        .rotation = Vec3.zero,
+        .scaling = Vec3.new(1.0, 1.0, 1.0),
+        .base_matrix = Mat4.identity,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+        .culling_strategy = .always_render,
+    };
     shared_lod.cached_aabb = shared_lod.local_bounding_box;
     shared_lod.cached_matrix = Mat4.identity;
     shared_lod.cached_frame = 0;
-    shared_lod.parent = null;
-    shared_lod.material = null;
-    shared_lod.is_visible = true;
-    shared_lod.is_decal = false;
-    shared_lod.is_occluder = false;
-    shared_lod.culling_strategy = .always_render;
-    shared_lod.lod_levels = .empty;
-    shared_lod.instances = .empty;
-    shared_lod.skeleton = null;
-    shared_lod.attach_bone = null;
-    shared_lod.index_type = .UINT16;
 
     var mesh1: Mesh = shared_lod;
+    mesh1.name = "entity_a";
+    mesh1.vertex_buffer = .{ .id = 11 };
+    mesh1.index_buffer = .{ .id = 12 };
+    mesh1.index_count = 3;
     mesh1.position = Vec3.new(10.0, 0.0, 0.0);
     mesh1.cached_frame = 0;
     try mesh1.lod_levels.append(ally, .{ .distance = 0.0, .mesh = &shared_lod });
     defer mesh1.lod_levels.deinit(ally);
 
     var mesh2: Mesh = shared_lod;
+    mesh2.name = "entity_b";
+    mesh2.vertex_buffer = .{ .id = 13 };
+    mesh2.index_buffer = .{ .id = 14 };
+    mesh2.index_count = 3;
     mesh2.position = Vec3.new(20.0, 0.0, 0.0);
     mesh2.cached_frame = 0;
     try mesh2.lod_levels.append(ally, .{ .distance = 0.0, .mesh = &shared_lod });
@@ -945,9 +1016,14 @@ test "shared LOD mesh preserves entity transforms without mutation" {
     try std.testing.expectEqual(@as(f32, 0.0), shared_lod.position.x);
     try std.testing.expectEqual(@as(usize, 2), queues.items.items.len);
 
-    // Both items render with the shared LOD mesh geometry
-    try std.testing.expectEqual(&shared_lod, queues.items.items[0].mesh);
-    try std.testing.expectEqual(&shared_lod, queues.items.items[1].mesh);
+    // P4: живых указателей в очередях нет — выбор общего LOD-ребёнка доказан
+    // сентинел-хендлами: оба item несут геометрию shared_lod (77/78/9),
+    // а не родителей (11/12, 13/14), но свои матрицы мира.
+    for (queues.items.items) |it| {
+        try std.testing.expectEqual(@as(u32, 77), it.vertex_buffer.id);
+        try std.testing.expectEqual(@as(u32, 78), it.index_buffer.id);
+        try std.testing.expectEqual(@as(u32, 9), it.index_count);
+    }
 
     // But each entity keeps its own distinct world matrix!
     const m0_x = queues.items.items[0].model.m[12];
@@ -997,7 +1073,7 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
         .default_white_id = 1,
     });
     try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
-    try std.testing.expectEqual(&mesh1, queues.items.items[0].mesh);
+    try std.testing.expectEqual(@as(u32, 0), queues.items.items[0].mesh_index);
 
     // Cull with mask 0b10: only mesh2 should be queued
     queues.reset();
@@ -1016,7 +1092,7 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
         .default_white_id = 1,
     });
     try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
-    try std.testing.expectEqual(&mesh2, queues.items.items[0].mesh);
+    try std.testing.expectEqual(@as(u32, 1), queues.items.items[0].mesh_index);
 }
 
 test "parallel cull produces serial-identical queues" {
@@ -1104,7 +1180,7 @@ test "parallel cull produces serial-identical queues" {
     // …and identical records in identical order (chunk merge order ==
     // serial mesh order, and the same world matrices feed both passes).
     for (queues_a.items.items, queues_b.items.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
         try std.testing.expectEqual(a.model, b.model);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
         try std.testing.expectEqual(a.texture_id, b.texture_id);
@@ -1203,7 +1279,7 @@ test "parallel cull reuses scratch across calls" {
     try std.testing.expectEqual(stats_a.occluded_meshes, stats_b.occluded_meshes);
     try std.testing.expectEqual(snapshot.len, queues.items.items.len);
     for (snapshot, queues.items.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
         try std.testing.expectEqual(a.model, b.model);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
         try std.testing.expectEqual(a.texture_id, b.texture_id);
@@ -1227,7 +1303,9 @@ test "stale AABB does not drive LOD selection" {
         .name = "lod_far",
         .vertex_buffer = .{},
         .index_buffer = .{},
-        .index_count = 3,
+        // Маркер выбора LOD: очереди больше не несут живой указатель,
+        // поэтому дальний уровень помечен отличным index_count.
+        .index_count = 9,
         .local_bounding_box = unit_box,
         .culling_strategy = .always_render,
     };
@@ -1272,7 +1350,7 @@ test "stale AABB does not drive LOD selection" {
     });
 
     try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
-    try std.testing.expectEqual(&lod_far, queues.items.items[0].mesh);
+    try std.testing.expectEqual(@as(u32, 9), queues.items.items[0].index_count);
 }
 
 test "stale AABB LOD selection matches parallel path" {
@@ -1283,7 +1361,7 @@ test "stale AABB LOD selection matches parallel path" {
         .name = "lod_far_s",
         .vertex_buffer = .{},
         .index_buffer = .{},
-        .index_count = 3,
+        .index_count = 9,
         .local_bounding_box = unit_box,
         .culling_strategy = .always_render,
     };
@@ -1306,7 +1384,7 @@ test "stale AABB LOD selection matches parallel path" {
         .name = "lod_far_p",
         .vertex_buffer = .{},
         .index_buffer = .{},
-        .index_count = 3,
+        .index_count = 9,
         .local_bounding_box = unit_box,
         .culling_strategy = .always_render,
     };
@@ -1374,8 +1452,8 @@ test "stale AABB LOD selection matches parallel path" {
     // Both paths must agree on the fresh (far) LOD despite the stale seed.
     try std.testing.expectEqual(@as(usize, 1), queues_s.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), queues_p.items.items.len);
-    try std.testing.expectEqual(&lod_far_s, queues_s.items.items[0].mesh);
-    try std.testing.expectEqual(&lod_far_p, queues_p.items.items[0].mesh);
+    try std.testing.expectEqual(@as(u32, 9), queues_s.items.items[0].index_count);
+    try std.testing.expectEqual(@as(u32, 9), queues_p.items.items[0].index_count);
 }
 
 test "worldMatrixCached honors bone attachment like getWorldMatrix" {
@@ -1622,9 +1700,10 @@ test "transparent regular+instanced groups share one back-to-front order" {
     try std.testing.expectEqual(@as(usize, 2), queues.transparent_instanced.items.len);
     try std.testing.expectEqual(@as(usize, 3), queues.transparent_order.items.len);
     try std.testing.expectEqual(@as(u32, 3), stats.rendered_meshes);
-    // Material snapshot survives the queue: regular item kept its material.
-    try std.testing.expect(queues.transparent.items[0].material != null);
+    // Material snapshot survives the queue: regular item kept the blend
+    // record (transparent flag + draw_record), без живых указателей.
     try std.testing.expect(queues.transparent.items[0].transparent);
+    try std.testing.expectEqual(@as(f32, 1.0), queues.transparent.items[0].draw_record.base_color[3]);
 
     std.mem.sort(TransparentDrawEntry, queues.transparent_order.items, {}, sortTransparentDrawOrder);
     const ordered = queues.transparent_order.items;
@@ -1635,9 +1714,12 @@ test "transparent regular+instanced groups share one back-to-front order" {
     try std.testing.expectEqual(TransparentKind.instanced, ordered[0].kind);
     try std.testing.expectEqual(TransparentKind.regular, ordered[1].kind);
     try std.testing.expectEqual(TransparentKind.instanced, ordered[2].kind);
-    try std.testing.expectEqual(&far_parent, queues.transparent_instanced.items[ordered[0].index].mesh);
+    // P4: батчи без живых указателей — принадлежность проверяем по seq
+    // (mesh_index исходника): far_parent — meshes[1], near_parent — meshes[2].
+    try std.testing.expectEqual(@as(u32, 1), ordered[0].seq);
+    try std.testing.expectEqual(@as(u32, 0), ordered[1].seq);
     try std.testing.expectEqual(@as(u32, 0), ordered[1].index);
-    try std.testing.expectEqual(&near_parent, queues.transparent_instanced.items[ordered[2].index].mesh);
+    try std.testing.expectEqual(@as(u32, 2), ordered[2].seq);
 
     // Deterministic tie-break: exactly equal distances keep seq order.
     var ties = [_]TransparentDrawEntry{
@@ -1700,9 +1782,11 @@ test "parallel cull mixed scene matches serial on all queues" {
     var op_ptrs = [_]*InstancedMesh{ &inst_op_0, &inst_op_1 };
     var inst_opaque = Mesh{
         .name = "inst_opaque",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
+        // Сентинел-хендлы батча: вместо живых указателей принадлежность
+        // доказывается снимками геометрии родителя.
+        .vertex_buffer = .{ .id = 51 },
+        .index_buffer = .{ .id = 52 },
+        .index_count = 30,
         .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &op_ptrs, .capacity = 2 },
     };
     var tie_regular = Mesh{
@@ -1727,9 +1811,9 @@ test "parallel cull mixed scene matches serial on all queues" {
     var tie_ptrs = [_]*InstancedMesh{&inst_tie};
     var inst_trans_tie = Mesh{
         .name = "inst_trans_tie",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
+        .vertex_buffer = .{ .id = 61 },
+        .index_buffer = .{ .id = 62 },
+        .index_count = 33,
         .material = blend,
         .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &tie_ptrs, .capacity = 1 },
     };
@@ -1761,9 +1845,9 @@ test "parallel cull mixed scene matches serial on all queues" {
     var far_ptrs = [_]*InstancedMesh{&inst_far};
     var inst_trans_far = Mesh{
         .name = "inst_trans_far",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
+        .vertex_buffer = .{ .id = 71 },
+        .index_buffer = .{ .id = 72 },
+        .index_count = 36,
         .material = blend,
         .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
     };
@@ -1821,7 +1905,6 @@ test "parallel cull mixed scene matches serial on all queues" {
     try std.testing.expectEqual(queues_a.items.items.len, queues_b.items.items.len);
     try std.testing.expectEqual(@as(usize, 2), queues_a.items.items.len);
     for (queues_a.items.items, queues_b.items.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
         try std.testing.expectEqual(a.model, b.model);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
         try std.testing.expectEqual(a.texture_id, b.texture_id);
@@ -1834,7 +1917,6 @@ test "parallel cull mixed scene matches serial on all queues" {
     try std.testing.expectEqual(queues_a.transparent.items.len, queues_b.transparent.items.len);
     try std.testing.expectEqual(@as(usize, 3), queues_a.transparent.items.len);
     for (queues_a.transparent.items, queues_b.transparent.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
         try std.testing.expectEqual(a.model, b.model);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
         try std.testing.expectEqual(a.is_decal, b.is_decal);
@@ -1842,17 +1924,27 @@ test "parallel cull mixed scene matches serial on all queues" {
     }
 
     // Instanced groups: submitted once each, in mesh order, on both paths.
+    // P4: принадлежность и порядок — по сентинел-снимкам геометрии
+    // (inst_opaque → 51/52/30, tie → 61/62/33, far → 71/72/36), без указателей.
     try std.testing.expectEqual(queues_a.opaque_instanced.items.len, queues_b.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(usize, 1), queues_a.opaque_instanced.items.len);
-    try std.testing.expectEqual(queues_a.opaque_instanced.items[0].mesh, queues_b.opaque_instanced.items[0].mesh);
-    try std.testing.expectEqual(&inst_opaque, queues_a.opaque_instanced.items[0].mesh);
-    try std.testing.expectEqual(queues_a.transparent_instanced.items.len, queues_b.transparent_instanced.items.len);
-    try std.testing.expectEqual(@as(usize, 2), queues_a.transparent_instanced.items.len);
-    for (queues_a.transparent_instanced.items, queues_b.transparent_instanced.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+    for ([2]*const RenderQueues{ &queues_a, &queues_b }) |qs| {
+        const b = qs.opaque_instanced.items[0];
+        try std.testing.expectEqual(@as(u32, 51), b.vertex_buffer.id);
+        try std.testing.expectEqual(@as(u32, 52), b.index_buffer.id);
+        try std.testing.expectEqual(@as(u32, 30), b.index_count);
+        try std.testing.expectEqual(@as(usize, 2), qs.transparent_instanced.items.len);
+        const t0 = qs.transparent_instanced.items[0];
+        try std.testing.expectEqual(@as(u32, 61), t0.vertex_buffer.id);
+        try std.testing.expectEqual(@as(u32, 62), t0.index_buffer.id);
+        try std.testing.expectEqual(@as(u32, 33), t0.index_count);
+        try std.testing.expect(t0.transparent);
+        const t1 = qs.transparent_instanced.items[1];
+        try std.testing.expectEqual(@as(u32, 71), t1.vertex_buffer.id);
+        try std.testing.expectEqual(@as(u32, 72), t1.index_buffer.id);
+        try std.testing.expectEqual(@as(u32, 36), t1.index_count);
+        try std.testing.expect(t1.transparent);
     }
-    try std.testing.expectEqual(&inst_trans_tie, queues_a.transparent_instanced.items[0].mesh);
-    try std.testing.expectEqual(&inst_trans_far, queues_a.transparent_instanced.items[1].mesh);
 
     // Staged instance matrices: identical contents.
     try std.testing.expectEqual(queues_a.instance_matrices.items.len, queues_b.instance_matrices.items.len);
@@ -1876,20 +1968,28 @@ test "parallel cull mixed scene matches serial on all queues" {
         try std.testing.expectEqual(a.is_decal, b.is_decal);
         if (a.kind == .regular) {
             try std.testing.expectEqual(
-                queues_a.transparent.items[a.index].mesh,
-                queues_b.transparent.items[b.index].mesh,
+                queues_a.transparent.items[a.index].mesh_index,
+                queues_b.transparent.items[b.index].mesh_index,
+            );
+            try std.testing.expectEqual(
+                queues_a.transparent.items[a.index].model,
+                queues_b.transparent.items[b.index].model,
             );
         } else {
             try std.testing.expectEqual(
-                queues_a.transparent_instanced.items[a.index].mesh,
-                queues_b.transparent_instanced.items[b.index].mesh,
+                queues_a.transparent_instanced.items[a.index].visible_instance_count,
+                queues_b.transparent_instanced.items[b.index].visible_instance_count,
+            );
+            try std.testing.expectEqual(
+                queues_a.transparent_instanced.items[a.index].index_count,
+                queues_b.transparent_instanced.items[b.index].index_count,
             );
         }
     }
 
     // Exact-distance tie (regular mesh 3 + instanced group 4 at 7^2 = 49):
     // the entries are bit-identical distances and mesh-index order wins on
-    // both paths.
+    // both paths. Резолв order-записи ведёт ровно в tie-батч (61/62/33).
     const ordered = queues_a.transparent_order.items;
     try std.testing.expect(ordered[1].distance_sq == ordered[2].distance_sq);
     try std.testing.expectEqual(@as(f32, 49.0), ordered[1].distance_sq);
@@ -1897,6 +1997,9 @@ test "parallel cull mixed scene matches serial on all queues" {
     try std.testing.expectEqual(TransparentKind.instanced, ordered[2].kind);
     try std.testing.expectEqual(@as(u32, 3), ordered[1].seq);
     try std.testing.expectEqual(@as(u32, 4), ordered[2].seq);
+    const tie_batch = queues_a.transparent_instanced.items[ordered[2].index];
+    try std.testing.expectEqual(@as(u32, 61), tie_batch.vertex_buffer.id);
+    try std.testing.expectEqual(@as(u32, 33), tie_batch.index_count);
 }
 
 test "parallel setup OOM fails cleanly without leaking" {
@@ -2097,16 +2200,17 @@ test "parallel setup OOM falls back to serial queues" {
     try std.testing.expectEqual(queues_a.transparent_instanced.items.len, queues_b.transparent_instanced.items.len);
     try std.testing.expectEqual(queues_a.transparent_order.items.len, queues_b.transparent_order.items.len);
     for (queues_a.items.items, queues_b.items.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
         try std.testing.expectEqual(a.model, b.model);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
     }
     for (queues_a.transparent.items, queues_b.transparent.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
     }
     for (queues_a.opaque_instanced.items, queues_b.opaque_instanced.items) |a, b| {
-        try std.testing.expectEqual(a.mesh, b.mesh);
+        try std.testing.expectEqual(a.visible_instance_count, b.visible_instance_count);
+        try std.testing.expectEqual(a.index_count, b.index_count);
     }
     for (queues_a.transparent_order.items, queues_b.transparent_order.items) |a, b| {
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
@@ -2361,5 +2465,743 @@ test "pre-staged instances feed buildFrameQueues batch" {
 
     try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 2), queues.opaque_instanced.items[0].visible_instance_count);
-    try std.testing.expectEqual(&parent, queues.opaque_instanced.items[0].mesh);
+    try std.testing.expectEqual(@as(u32, 3), queues.opaque_instanced.items[0].index_count);
+}
+
+// ---- P4 render-owned draw snapshot: регрессия владения. ----
+
+// Чистый селектор skinAt: null/out-of-range не читают чужое, валидный индекс
+// отдаёт именно свою копию (draw-пути main/shadow/outline на нём же).
+test "P4: skinAt resolves owned copies without stale reads" {
+    var empty: [0][MAX_BONES]Mat4 = .{};
+    try std.testing.expect(skinAt(&empty, null) == null);
+    try std.testing.expect(skinAt(&empty, 0) == null);
+    try std.testing.expect(skinAt(&empty, std.math.maxInt(u32)) == null);
+
+    var one: [1][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** MAX_BONES};
+    one[0][3] = Mat4.translation(Vec3.new(2, 0, 0));
+    const got = skinAt(&one, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), got[3].m[12], 1e-6);
+    try std.testing.expect(skinAt(&one, 1) == null);
+    try std.testing.expect(skinAt(&one, std.math.maxInt(u32)) == null);
+}
+
+// Очереди не хранят живых указателей: скриншот пережил мутацию TRS/
+// материала и две публикации скелета, перезаписавшие исходный слот.
+test "P4: queued snapshot survives source mutation and skeleton republication" {
+    const ally = std.testing.allocator;
+    const Skeleton = skeleton_mod.Skeleton;
+
+    var std_mat = material_mod.StandardMaterial.init("snap");
+    std_mat.diffuse_color = math.Color3.new(0.2, 0.4, 0.6);
+    const mat: Material = .{ .standard = &std_mat };
+
+    var blend_mat = material_mod.StandardMaterial.init("snap_blend");
+    blend_mat.alpha_mode = .blend;
+    blend_mat.diffuse_color = math.Color3.new(0.1, 0.2, 0.3);
+    const blend: Material = .{ .standard = &blend_mat };
+
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+    var opaque_mesh = Mesh{
+        .name = "skinned_opaque",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(10, 0, 0),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+        .material = mat,
+        .skeleton = skel,
+    };
+    var trans_mesh = Mesh{
+        .name = "skinned_trans",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 10),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+        .material = blend,
+        .skeleton = skel,
+    };
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    const meshes = [_]*Mesh{ &opaque_mesh, &trans_mesh };
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 7,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queues.transparent.items.len);
+    try std.testing.expectEqual(@as(usize, 2), queues.skin_storage.items.len);
+
+    const oq = queues.items.items[0];
+    const tq = queues.transparent.items[0];
+    try std.testing.expect(oq.skin_index != null and tq.skin_index != null);
+
+    // Мутация источников: TRS, материал, две публикации скелета (вторая
+    // перезаписывает исходный слот новым значением x=5).
+    opaque_mesh.position = Vec3.new(99, 99, 99);
+    trans_mesh.position = Vec3.new(99, 99, 99);
+    std_mat.diffuse_color = math.Color3.new(9, 9, 9);
+    blend_mat.diffuse_color = math.Color3.new(9, 9, 9);
+    skel.bones[0].local_position = Vec3.new(5, 0, 0);
+    skel.update();
+    skel.update();
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), skel.getRenderSkinMatrices()[0].m[12], 1e-4);
+
+    // Снимки неизменны: модель, draw_record и копии скинов.
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), queues.items.items[0].model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), queues.items.items[0].draw_record.base_color[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), queues.transparent.items[0].draw_record.base_color[2], 1e-6);
+    for ([_]RenderMeshItem{ queues.items.items[0], queues.transparent.items[0] }) |it| {
+        const bones = queues.skin_storage.items[it.skin_index.?];
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), bones[0].m[12], 1e-4);
+    }
+}
+
+// Instanced-запись тоже snapshot: мутация материала/TRS после prepare
+// не меняет draw_record батча.
+test "P4: instanced batch record survives source mutation" {
+    const ally = std.testing.allocator;
+
+    var inst_mat = material_mod.StandardMaterial.init("inst_snap");
+    inst_mat.diffuse_color = math.Color3.new(0.5, 0.25, 0.125);
+    const unit_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+    var src = Mesh{
+        .name = "inst_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+    };
+    var mesh = Mesh{
+        .name = "inst_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 36,
+        .index_type = .UINT16,
+        .material = .{ .standard = &inst_mat },
+    };
+    var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 10) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 };
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    const meshes = [_]*Mesh{&mesh};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 3,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+
+    inst_mat.diffuse_color = math.Color3.new(9, 9, 9);
+    mesh.position = Vec3.new(99, 0, 0);
+    const batch = queues.opaque_instanced.items[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), batch.draw_record.base_color[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.125), batch.draw_record.base_color[2], 1e-6);
+}
+
+// Копии скинов масштабируются числом skinned-draws (а не MAX_BONES на item),
+// индексы стабильны при росте хранилища и независимы между видами.
+test "P4: skin storage scales with skinned draws and stays stable across growth" {
+    const ally = std.testing.allocator;
+    const Skeleton = skeleton_mod.Skeleton;
+    const count = 160;
+
+    const skels = try ally.alloc(*Skeleton, count);
+    defer ally.free(skels);
+    const meshes_arr = try ally.alloc(Mesh, count);
+    defer ally.free(meshes_arr);
+    const ptrs = try ally.alloc(*Mesh, count);
+    defer ally.free(ptrs);
+    for (0..count) |i| {
+        const sk = try Skeleton.init(ally, 1);
+        skels[i] = sk;
+        sk.bones[0].local_position = Vec3.new(@floatFromInt(i), 0, 0);
+        sk.update();
+        meshes_arr[i] = .{
+            .name = "sk",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 3,
+            .culling_strategy = .always_render,
+            .skeleton = sk,
+        };
+        ptrs[i] = &meshes_arr[i];
+    }
+    defer for (skels) |sk| sk.deinit();
+
+    var culler = visibility.OcclusionCuller.init();
+    var qa = RenderQueues{};
+    defer qa.deinit(ally);
+    var qb = RenderQueues{};
+    defer qb.deinit(ally);
+
+    // Два вида (multi-camera): у каждой очереди своё хранилище.
+    var sa = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 11,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &sa,
+        .queues = &qa,
+        .default_white_id = 1,
+    });
+    var sb = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 11,
+        .view_proj = Mat4.mul(Mat4.identity, Mat4.translation(Vec3.new(0, 0, 5))),
+        .eye = Vec3.new(0, 0, 5),
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &sb,
+        .queues = &qb,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, count), qa.items.items.len);
+    try std.testing.expectEqual(@as(usize, count), qa.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, count), qb.skin_storage.items.len);
+    // Хранилище пережило несколько реаллокаций: каждый индекс резолвится
+    // в копию своего скелета (x == номер меша).
+    for (qa.items.items, qb.items.items) |a, b| {
+        const ea: f32 = @floatFromInt(a.mesh_index);
+        const eb: f32 = @floatFromInt(b.mesh_index);
+        try std.testing.expectApproxEqAbs(ea, qa.skin_storage.items[a.skin_index.?][0].m[12], 1e-4);
+        try std.testing.expectApproxEqAbs(eb, qb.skin_storage.items[b.skin_index.?][0].m[12], 1e-4);
+    }
+
+    // Мутация всех скелетов (x=1000+i, две публикации) — снимки целы.
+    for (skels, 0..) |sk, i| {
+        sk.bones[0].local_position = Vec3.new(1000.0 + @as(f32, @floatFromInt(i)), 0, 0);
+        sk.update();
+        sk.update();
+    }
+    for (qa.items.items) |a| {
+        const ea: f32 = @floatFromInt(a.mesh_index);
+        try std.testing.expectApproxEqAbs(ea, qa.skin_storage.items[a.skin_index.?][0].m[12], 1e-4);
+    }
+
+    // Reset/reuse: ёмкости retained, содержимое пересобрано корректно.
+    const cap = qa.skin_storage.capacity;
+    try std.testing.expect(cap >= count);
+    qa.reset();
+    try std.testing.expectEqual(@as(usize, 0), qa.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), qa.skin_storage.items.len);
+    try std.testing.expectEqual(cap, qa.skin_storage.capacity);
+    var sa2 = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 12,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &sa2,
+        .queues = &qa,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, count), qa.items.items.len);
+    for (qa.items.items) |a| {
+        const ea: f32 = 1000.0 + @as(f32, @floatFromInt(a.mesh_index));
+        try std.testing.expectApproxEqAbs(ea, qa.skin_storage.items[a.skin_index.?][0].m[12], 1e-4);
+    }
+}
+
+// Фиксированная цена item не содержит MAX_BONES-матриц; пустые хранилища
+// ничего не стоят, когда skinned/shader-draws отсутствуют.
+test "P4: no fixed huge per-item skin cost" {
+    try std.testing.expect(@sizeOf(RenderMeshItem) < 1024);
+    try std.testing.expect(@sizeOf(RenderInstancedBatch) < 1024);
+    // Один MAX_BONES-слот — 4 КиБ: item обязан быть кратно меньше.
+    try std.testing.expect(@sizeOf(RenderMeshItem) * 8 < @sizeOf([MAX_BONES]Mat4));
+
+    const ally = std.testing.allocator;
+    var mesh = Mesh{
+        .name = "plain",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+    };
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    const meshes = [_]*Mesh{&mesh};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), queues.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 0), queues.shader_storage.items.len);
+    try std.testing.expect(queues.items.items[0].skin_index == null);
+    try std.testing.expect(queues.items.items[0].shader_index == null);
+}
+
+fn expectP4QueueRefsValid(queues: *const RenderQueues) !void {
+    for (queues.items.items) |it| {
+        if (it.is_skinned) {
+            try std.testing.expect(it.skin_index != null);
+            try std.testing.expect(it.skin_index.? < queues.skin_storage.items.len);
+        } else {
+            try std.testing.expect(it.skin_index == null);
+        }
+        if (it.shader_index) |s| try std.testing.expect(s < queues.shader_storage.items.len);
+    }
+    for (queues.transparent.items) |it| {
+        if (it.is_skinned) {
+            try std.testing.expect(it.skin_index != null);
+            try std.testing.expect(it.skin_index.? < queues.skin_storage.items.len);
+        } else {
+            try std.testing.expect(it.skin_index == null);
+        }
+        if (it.shader_index) |s| try std.testing.expect(s < queues.shader_storage.items.len);
+    }
+    // Нет orphan-ссылок порядка: каждая запись указывает в существующий слот.
+    for (queues.transparent_order.items) |e| {
+        if (e.kind == .regular) {
+            try std.testing.expect(e.index < queues.transparent.items.len);
+        } else {
+            try std.testing.expect(e.index < queues.transparent_instanced.items.len);
+        }
+    }
+}
+
+// OOM в любой точке prepare-фазы: item либо целиком в очереди с валидными
+// индексами, либо отсутствует. Тихого отката к живым матрицам нет.
+// std.testing.FailingAllocator роняет ровно n-ю аллокацию при прочих успешных —
+// так достигаются и поздние отказы (transparent/skin/shader) после ранних успехов.
+test "P4: OOM never leaves items with dangling or live skin refs" {
+    const ally = std.testing.allocator;
+    const Skeleton = skeleton_mod.Skeleton;
+
+    var std_mat = material_mod.StandardMaterial.init("oom");
+    const mat: Material = .{ .standard = &std_mat };
+    var blend_mat = material_mod.StandardMaterial.init("oom_blend");
+    blend_mat.alpha_mode = .blend;
+    const blend: Material = .{ .standard = &blend_mat };
+    var hook_mat = material_mod.ShaderMaterial.init("oom_hook");
+    const hook: Material = .{ .shader_material = &hook_mat };
+    var hook_blend_mat = material_mod.ShaderMaterial.init("oom_hook_blend");
+    hook_blend_mat.alpha_mode = .blend;
+    const hook_blend: Material = .{ .shader_material = &hook_blend_mat };
+
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(2, 0, 0);
+    skel.update();
+
+    var skinned = Mesh{
+        .name = "oom_skinned",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = mat,
+        .skeleton = skel,
+    };
+    var skinned_trans = Mesh{
+        .name = "oom_skinned_trans",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = blend,
+        .skeleton = skel,
+    };
+    var plain = Mesh{
+        .name = "oom_plain",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = mat,
+    };
+    var hooked = Mesh{
+        .name = "oom_hook",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = hook,
+    };
+    var hooked_trans = Mesh{
+        .name = "oom_hook_trans",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = hook_blend,
+    };
+    const meshes = [_]*Mesh{ &skinned, &skinned_trans, &plain, &hooked, &hooked_trans };
+    var culler = visibility.OcclusionCuller.init();
+
+    var full = RenderQueues{};
+    defer full.deinit(ally);
+    var stats_full = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_full,
+        .queues = &full,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 3), full.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), full.transparent.items.len);
+    try std.testing.expectEqual(@as(usize, 2), full.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 2), full.shader_storage.items.len);
+    try expectP4QueueRefsValid(&full);
+
+    // Прогон по каждому n-му отказу отдельно: ранние успехи + поздний отказ.
+    var saw_induced = false;
+    var saw_partial = false;
+    var n: usize = 0;
+    while (n <= 40) : (n += 1) {
+        var failing = std.testing.FailingAllocator.init(ally, .{ .fail_index = n });
+        var q = RenderQueues{};
+        defer q.deinit(failing.allocator());
+        var st = SceneStats{};
+        buildFrameQueues(.{
+            .allocator = failing.allocator(),
+            .meshes = &meshes,
+            .frame_id = 2,
+            .view_proj = Mat4.identity,
+            .eye = Vec3.zero,
+            .cull_frustum = false,
+            .cull_occlusion = false,
+            .occlusion_culler = &culler,
+            .stats = &st,
+            .queues = &q,
+            .default_white_id = 1,
+        });
+        try std.testing.expect(q.items.items.len <= full.items.items.len);
+        try std.testing.expect(q.transparent.items.len <= full.transparent.items.len);
+        try expectP4QueueRefsValid(&q);
+        if (failing.has_induced_failure) saw_induced = true;
+        if (q.items.items.len < full.items.items.len or q.transparent.items.len < full.transparent.items.len) saw_partial = true;
+    }
+    // Хотя бы один отказ реально сработал и хотя бы один уронил item.
+    try std.testing.expect(saw_induced);
+    try std.testing.expect(saw_partial);
+}
+
+// Hook-снимки на уровне очередей: opaque/transparent записи несут точные копии
+// tint/uniforms/texture/entry, мутация источника их не меняет; parallel-merge
+// копирует shader-значения эквивалентно серийному пути.
+test "P4: queue shader snapshots are exact and merge-equivalent" {
+    const ally = std.testing.allocator;
+
+    var hook_opaque = material_mod.ShaderMaterial.init("hook_opaque");
+    hook_opaque.entry_index = 11;
+    hook_opaque.tint_color = math.Color3.new(0.1, 0.2, 0.3);
+    hook_opaque.alpha = 0.8;
+    hook_opaque.texture = Texture{ .image = .{}, .view = .{ .id = 51 }, .sampler = .{ .id = 52 }, .width = 4, .height = 4 };
+    hook_opaque.uniforms[0] = .{ 1, 2, 3, 4 };
+    hook_opaque.uniforms[7] = .{ 5, 6, 7, 8 };
+
+    var hook_blend = material_mod.ShaderMaterial.init("hook_blend");
+    hook_blend.entry_index = 13;
+    hook_blend.alpha_mode = .blend;
+    hook_blend.tint_color = math.Color3.new(0.4, 0.5, 0.6);
+    hook_blend.alpha = 0.7;
+    hook_blend.texture = Texture{ .image = .{}, .view = .{ .id = 53 }, .sampler = .{ .id = 54 }, .width = 4, .height = 4 };
+    hook_blend.uniforms[0] = .{ 9, 9, 9, 9 };
+
+    var mo = Mesh{
+        .name = "hook_opaque_mesh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = .{ .shader_material = &hook_opaque },
+    };
+    var mt = Mesh{
+        .name = "hook_blend_mesh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = .{ .shader_material = &hook_blend },
+    };
+    const meshes = [_]*Mesh{ &mo, &mt };
+    var culler = visibility.OcclusionCuller.init();
+
+    var qs = RenderQueues{};
+    defer qs.deinit(ally);
+    var ss = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 41,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &ss,
+        .queues = &qs,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), qs.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qs.transparent.items.len);
+    try std.testing.expectEqual(@as(usize, 2), qs.shader_storage.items.len);
+
+    // Parallel-merge копирует shader-значения эквивалентно серийному пути
+    // (те же снимки в том же порядке).
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+    var qp = RenderQueues{};
+    defer qp.deinit(ally);
+    var sp = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 42,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &sp,
+        .queues = &qp,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+    try std.testing.expectEqual(qs.shader_storage.items.len, qp.shader_storage.items.len);
+    for (qs.shader_storage.items, qp.shader_storage.items) |a, b| {
+        try std.testing.expectEqual(a.entry_index, b.entry_index);
+        try std.testing.expectEqual(a.tint, b.tint);
+        try std.testing.expectEqual(a.tex_view.id, b.tex_view.id);
+        try std.testing.expectEqual(a.tex_sampler.id, b.tex_sampler.id);
+        try std.testing.expectEqual(a.uniforms, b.uniforms);
+    }
+    try std.testing.expectEqual(
+        qs.items.items[0].shader_index,
+        qp.items.items[0].shader_index,
+    );
+    try std.testing.expectEqual(
+        qs.transparent.items[0].shader_index,
+        qp.transparent.items[0].shader_index,
+    );
+
+    // Мутация источников после prepare: обе очереди хранят точные копии.
+    hook_opaque.tint_color = math.Color3.new(9, 9, 9);
+    hook_opaque.alpha = 0.0;
+    hook_opaque.texture = null;
+    hook_opaque.uniforms[0] = .{ 9, 9, 9, 9 };
+    hook_opaque.entry_index = 99;
+    hook_blend.tint_color = math.Color3.new(8, 8, 8);
+    hook_blend.uniforms[0] = .{ 8, 8, 8, 8 };
+    hook_blend.entry_index = 98;
+
+    for ([2]*const RenderQueues{ &qs, &qp }) |qq| {
+        const so = qq.shader_storage.items[qq.items.items[0].shader_index.?];
+        try std.testing.expectEqual(@as(u32, 11), so.entry_index);
+        try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0.3, 0.8 }, so.tint);
+        try std.testing.expectEqual(@as(u32, 51), so.tex_view.id);
+        try std.testing.expectEqual(@as(u32, 52), so.tex_sampler.id);
+        try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, so.uniforms[0]);
+        try std.testing.expectEqual([4]f32{ 5, 6, 7, 8 }, so.uniforms[7]);
+        const s_t = qq.shader_storage.items[qq.transparent.items[0].shader_index.?];
+        try std.testing.expectEqual(@as(u32, 13), s_t.entry_index);
+        try std.testing.expectEqual([4]f32{ 0.4, 0.5, 0.6, 0.7 }, s_t.tint);
+        try std.testing.expectEqual(@as(u32, 53), s_t.tex_view.id);
+        try std.testing.expectEqual([4]f32{ 9, 9, 9, 9 }, s_t.uniforms[0]);
+    }
+}
+
+// Hook-sidedness как до P4: draw-путь hook-материалов использует собственный
+// double_sided снимка, а не item.double_sided (куда decal- meshes форсят true
+// для regular-пути). Decal с single-sided hook-материалом: item — double-sided
+// (regular-контракт), снимок — single-sided (hook-контракт).
+test "P4: hook shader snapshot preserves material sidedness without decal forcing" {
+    const ally = std.testing.allocator;
+
+    var hook_single = material_mod.ShaderMaterial.init("hook_single");
+    hook_single.double_sided = false;
+
+    var decal_hook = Mesh{
+        .name = "decal_hook",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .culling_strategy = .always_render,
+        .material = .{ .shader_material = &hook_single },
+        .is_decal = true,
+    };
+    const meshes = [_]*Mesh{&decal_hook};
+    var culler = visibility.OcclusionCuller.init();
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 43,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    // Decal едет в transparent-очередь с форсированным double_sided (regular).
+    try std.testing.expectEqual(@as(usize, 1), queues.transparent.items.len);
+    const it = queues.transparent.items[0];
+    try std.testing.expect(it.transparent and it.is_decal and it.double_sided);
+    // А hook-снимок — single-sided, как sm.double_sided материала.
+    const snap = queues.shader_storage.items[it.shader_index.?];
+    try std.testing.expect(!snap.double_sided);
+
+    // Мутация материала после prepare снимок не меняет.
+    hook_single.double_sided = true;
+    try std.testing.expect(!queues.shader_storage.items[it.shader_index.?].double_sided);
+}
+
+// Серийный и параллельный пути дают идентичные очереди включая копии скинов:
+// воркеры только заимствуют слоты в скретч, копии делаются серийно в merge.
+test "P4: parallel cull matches serial on skinned snapshots" {
+    const ally = std.testing.allocator;
+    const Skeleton = skeleton_mod.Skeleton;
+    const count = 40;
+
+    const skels = try ally.alloc(*Skeleton, count);
+    defer ally.free(skels);
+    const meshes_arr = try ally.alloc(Mesh, count);
+    defer ally.free(meshes_arr);
+    const ptrs = try ally.alloc(*Mesh, count);
+    defer ally.free(ptrs);
+    for (0..count) |i| {
+        const sk = try Skeleton.init(ally, 2);
+        skels[i] = sk;
+        sk.bones[0].local_position = Vec3.new(@floatFromInt(i), 0, 0);
+        sk.bones[1].local_position = Vec3.new(0, @floatFromInt(i), 0);
+        sk.update();
+        meshes_arr[i] = .{
+            .name = "psk",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 3,
+            .position = Vec3.new(@as(f32, @floatFromInt(i)) * 0.05, 0, 0),
+            .culling_strategy = .always_render,
+            .skeleton = sk,
+        };
+        ptrs[i] = &meshes_arr[i];
+    }
+    defer for (skels) |sk| sk.deinit();
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    var culler = visibility.OcclusionCuller.init();
+    var qs = RenderQueues{};
+    defer qs.deinit(ally);
+    var qp = RenderQueues{};
+    defer qp.deinit(ally);
+    var ss = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 21,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &ss,
+        .queues = &qs,
+        .default_white_id = 1,
+    });
+    var sp = SceneStats{};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = ptrs,
+        .frame_id = 21,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &sp,
+        .queues = &qp,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+
+    try std.testing.expectEqual(qs.items.items.len, qp.items.items.len);
+    try std.testing.expectEqual(@as(usize, count), qs.items.items.len);
+    for (qs.items.items, qp.items.items) |a, b| {
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expect(a.skin_index != null and b.skin_index != null);
+        const sa = qs.skin_storage.items[a.skin_index.?];
+        const sb = qp.skin_storage.items[b.skin_index.?];
+        try std.testing.expectEqual(sa, sb);
+        const ea: f32 = @floatFromInt(a.mesh_index);
+        try std.testing.expectApproxEqAbs(ea, sa[0].m[12], 1e-4);
+        try std.testing.expectApproxEqAbs(ea, sa[1].m[13], 1e-4);
+    }
 }

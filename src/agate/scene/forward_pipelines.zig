@@ -397,39 +397,40 @@ test "pipeline selection follows transparency flag" {
         .pipeline_skinned_pbr_blend_u32 = .{ .id = 34 },
     };
 
-    const Mesh = @import("../mesh.zig").Mesh;
-    const Skeleton = @import("../animation/skeleton.zig").Skeleton;
     const Mat4 = @import("math").Mat4;
 
-    var mesh_obj: Mesh = undefined;
-    mesh_obj.index_type = .UINT16;
-    mesh_obj.skeleton = null;
-    // forRegularItem probes mesh material for double-sidedness.
-    mesh_obj.material = null;
-
-    const opaque_std = RenderMeshItem{ .mesh = &mesh_obj, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = false };
+    // forRegularItem читает только render-owned снимки (P4: без живого меша).
+    const opaque_std = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = false };
     var blend_std = opaque_std;
     blend_std.transparent = true;
     try std.testing.expect(pipelines.forRegularItem(opaque_std) == 11);
     try std.testing.expect(pipelines.forRegularItem(blend_std) == 13);
 
-    mesh_obj.index_type = .UINT32;
-    try std.testing.expect(pipelines.forRegularItem(opaque_std) == 12);
-    try std.testing.expect(pipelines.forRegularItem(blend_std) == 14);
+    var opaque_u32 = opaque_std;
+    opaque_u32.is_u32 = true;
+    var blend_u32 = blend_std;
+    blend_u32.is_u32 = true;
+    try std.testing.expect(pipelines.forRegularItem(opaque_u32) == 12);
+    try std.testing.expect(pipelines.forRegularItem(blend_u32) == 14);
 
-    const opaque_pbr = RenderMeshItem{ .mesh = &mesh_obj, .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = true, .texture_id = 0, .transparent = false };
+    const opaque_pbr = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = true, .texture_id = 0, .transparent = false };
     var blend_pbr = opaque_pbr;
     blend_pbr.transparent = true;
-    try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 22);
-    try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 24);
+    try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 21);
+    try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 23);
 
-    var skel: Skeleton = undefined;
-    mesh_obj.skeleton = &skel;
-    try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 32);
-    try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 34);
-    mesh_obj.index_type = .UINT16;
-    try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 31);
-    try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 33);
+    var skinned_pbr = opaque_pbr;
+    skinned_pbr.is_skinned = true;
+    var skinned_blend = blend_pbr;
+    skinned_blend.is_skinned = true;
+    var skinned_u32 = skinned_pbr;
+    skinned_u32.is_u32 = true;
+    var skinned_blend_u32 = skinned_blend;
+    skinned_blend_u32.is_u32 = true;
+    try std.testing.expect(pipelines.forRegularItem(skinned_u32) == 32);
+    try std.testing.expect(pipelines.forRegularItem(skinned_blend_u32) == 34);
+    try std.testing.expect(pipelines.forRegularItem(skinned_pbr) == 31);
+    try std.testing.expect(pipelines.forRegularItem(skinned_blend) == 33);
 }
 
 test "ShaderMaterialSet.pipelineFor mirrors the built-in selection contract" {
