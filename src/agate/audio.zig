@@ -240,13 +240,25 @@ pub const AudioEngine = struct {
         }
     }
 
+    /// Stops the audio backend and frees every stream still registered.
+    /// Streams live in engine slots from registerStream until
+    /// unregisterStream, so a stream the caller never destroyed (e.g. a
+    /// looping song kept for the app's lifetime) is freed here — without
+    /// this, shutdown only stopped it and its decoder/ring buffers leaked.
+    /// Caller-held stream pointers are invalid after shutdown.
     pub fn shutdown(self: *AudioEngine) void {
         if (!self.started) return;
         saudio.shutdown();
         self.started = false;
         for (&self.streams) |*slot| {
-            if (slot.*) |s| s.stop();
+            if (slot.*) |s| {
+                s.stop();
+                slot.* = null;
+                s.deinit();
+            }
         }
+        self.music_stream = null;
+        self.music_fade_stream = null;
     }
 
     /// One-shot procedural voice trigger: kind + spatial position + the
