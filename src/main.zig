@@ -269,28 +269,26 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Prepare phase under lock: extracts snapshot, builds render queues,
-        // prepares shadow maps and outline items, drains upload queues.
+        // Phase ownership spans prepareFrame() AND render(): render still
+        // reads live mesh/material state, so the lock stays held until
+        // render returns.
         phase_mutex.lock();
         const t_prepare = sokol.time.now();
         scene.prepareFrame();
-        const prepare_ms = msSince(t_prepare);
-        scene.stats.prepare_ms = prepare_ms;
+        scene.stats.prepare_ms = msSince(t_prepare);
+        scene.render();
         phase_mutex.unlock();
 
-        // Non-blocking render: consumes immutable payload built in
-        // prepareFrame with zero live mesh/material reads.
-        scene.render();
         if (show_stats) printFrameStats();
     } else {
         simulate(@floatCast(sapp.frameDuration()));
         // Explicit prepare (render would do it internally): same total work,
-        // but the prepare phase gets its own timing attribution.
+        // but the prepare phase gets its own timing attribution. Assigned
+        // before render so recordFrame at the end of render sees it.
         const t_prepare = sokol.time.now();
         scene.prepareFrame();
-        const prepare_ms = msSince(t_prepare);
+        scene.stats.prepare_ms = msSince(t_prepare);
         scene.render();
-        scene.stats.prepare_ms = prepare_ms;
         if (show_stats) printFrameStats();
     }
 
