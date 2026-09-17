@@ -90,11 +90,13 @@ pub const PendingTexture = struct {
 
     fn decode(self: *PendingTexture) void {
         if (self.memory) |bytes| {
-            defer {
-                self.allocator.free(bytes);
-                self.memory = null;
-            }
-            if (Texture.decodeMemory(self.allocator, bytes, self.decode_opts)) |raw| {
+            // Invariant: no field writes after the terminal release store —
+            // a consumer observing .ready/.failed may release() and destroy
+            // the slot, so free/null inputs and assign raw/err first.
+            const result = Texture.decodeMemory(self.allocator, bytes, self.decode_opts);
+            self.allocator.free(bytes);
+            self.memory = null;
+            if (result) |raw| {
                 self.raw = raw;
                 self.state.store(.ready, .release);
             } else |e| {
@@ -103,6 +105,8 @@ pub const PendingTexture = struct {
             }
             return;
         }
+        // File branch upholds the same invariant: raw/err are assigned
+        // before the terminal store, with no field writes after it.
         const raw = Texture.decodeFile(self.allocator, self.path, self.decode_opts) catch |e| {
             self.err = e;
             self.state.store(.failed, .release);
@@ -603,4 +607,49 @@ test "UploadQueue.getOrRequestFile deduplicates in-flight and uploaded textures"
     // After upload, requesting the same path again still returns the same slot
     const p3 = try queue.getOrRequestFile(path.?, .{}, .{});
     try testing.expectEqual(p1, p3);
+}
+
+test "requestMemory failure frees input before publishing failed" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const garbage = try a.dupe(u8, "this is definitely not a valid image payload!!!");
+    const p = queue.requestMemory(garbage, .{}, .{}) catch |e| {
+        a.free(garbage);
+        return e;
+    };
+    try testing.expect(waitForState(p, &.{.failed}));
+    // Input bytes must be freed/nulled before the terminal store, while the
+    // slot is still alive (release destroys it).
+    try testing.expect(p.memory == null);
+    queue.release(p);
+    try testing.expectEqual(@as(usize, 0), queue.drain());
+}
+
+test "requestMemory decodes font PNG and frees input before publish" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    // Same Io pattern as Texture.decodeFile (Zig 0.16 removed std.fs.cwd).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.cwd().openFile(io, path.?, .{});
+    defer file.close(io);
+    const file_size = try file.length(io);
+    const bytes = try a.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+    const read = try file.readPositionalAll(io, bytes, 0);
+    try testing.expectEqual(bytes.len, read);
+
+    const p = queue.requestMemory(bytes, .{}, .{ .gen_mipmaps = true }) catch |e| {
+        a.free(bytes);
+        return e;
+    };
+    try testing.expect(waitForState(p, &.{.ready}));
+    try testing.expect(p.memory == null);
+    try testing.expect(p.raw.width > 0);
+    // No sg context in tests: the .ready decode is torn down by queue deinit.
 }
