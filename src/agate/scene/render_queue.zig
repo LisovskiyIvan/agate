@@ -615,9 +615,10 @@ fn buildMaterialRecord(ctx: FrameCullContext, mat: ?Material) MaterialDrawRecord
 }
 
 /// Plain-mesh cull: LOD pick, world AABB, frustum + occlusion tests, record
-/// build. Pure with respect to the mesh (world matrix must already be warm
-/// in the parallel path — see buildFrameQueuesParallel). Stats go to the
-/// caller-supplied counter block so parallel chunks can merge locally.
+/// build. Resolves the fresh world matrix first so LOD picking reads the
+/// current-frame AABB (the parallel path pre-warms the same cache — see
+/// buildFrameQueuesParallel). Stats go to the caller-supplied counter block
+/// so parallel chunks can merge locally.
 fn cullNonInstancedMesh(
     ctx: FrameCullContext,
     frustum: Frustum,
@@ -629,6 +630,11 @@ fn cullNonInstancedMesh(
     stats.total_meshes += 1;
     if (!mesh.is_visible) return null;
 
+    // Fresh world matrix first: it refreshes mesh.cached_aabb for this
+    // frame, so the LOD distance below never reads a stale AABB tagged with
+    // a previous frame id (the parallel path pre-warms this cache; the
+    // serial path must pick the same LOD at distance thresholds).
+    const model = worldMatrixCached(ctx.frame_id, mesh);
     var render_mesh = mesh;
     if (mesh.lod_levels.items.len > 0) {
         const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
@@ -646,7 +652,6 @@ fn cullNonInstancedMesh(
     // (deferred creation): never queue it for drawing with dead handles.
     if (render_mesh.gpu_pending) return null;
 
-    const model = worldMatrixCached(ctx.frame_id, mesh);
     const world_aabb = if (render_mesh != mesh and render_mesh.local_bounding_box.isValid())
         render_mesh.local_bounding_box.transform(model)
     else
@@ -1190,6 +1195,165 @@ test "parallel cull produces serial-identical queues" {
         try std.testing.expectEqual(a.texture_id, b.texture_id);
         try std.testing.expectEqual(a.transparent, b.transparent);
     }
+}
+
+test "stale AABB does not drive LOD selection" {
+    const ally = std.testing.allocator;
+    const unit_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+
+    var lod_far = Mesh{
+        .name = "lod_far",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    var base = Mesh{
+        .name = "lod_base",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        // Fresh position is beyond the switch distance (far).
+        .position = Vec3.new(100, 0, 0),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    try base.addLODLevel(ally, 50.0, &lod_far);
+    defer base.lod_levels.deinit(ally);
+
+    // Seed a stale AABB tagged with an older frame: as if the mesh sat at
+    // the origin (near, distance 0 < 50) last frame, while its fresh
+    // position is far (distance 100 >= 50). Reading it would pick the near
+    // LOD (self); the fresh AABB must pick the far child.
+    base.cached_aabb = unit_box;
+    base.cached_matrix = Mat4.identity;
+    base.cached_frame = 0;
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    const meshes = [_]*Mesh{&base};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), queues.items.items.len);
+    try std.testing.expectEqual(&lod_far, queues.items.items[0].mesh);
+}
+
+test "stale AABB LOD selection matches parallel path" {
+    const ally = std.testing.allocator;
+    const unit_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+
+    var lod_far_s = Mesh{
+        .name = "lod_far_s",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    var base_s = Mesh{
+        .name = "lod_base_s",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(100, 0, 0),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    try base_s.addLODLevel(ally, 50.0, &lod_far_s);
+    defer base_s.lod_levels.deinit(ally);
+    base_s.cached_aabb = unit_box;
+    base_s.cached_matrix = Mat4.identity;
+    base_s.cached_frame = 0;
+
+    var lod_far_p = Mesh{
+        .name = "lod_far_p",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    var base_p = Mesh{
+        .name = "lod_base_p",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(100, 0, 0),
+        .local_bounding_box = unit_box,
+        .culling_strategy = .always_render,
+    };
+    try base_p.addLODLevel(ally, 50.0, &lod_far_p);
+    defer base_p.lod_levels.deinit(ally);
+    base_p.cached_aabb = unit_box;
+    base_p.cached_matrix = Mat4.identity;
+    base_p.cached_frame = 0;
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    var culler = visibility.OcclusionCuller.init();
+
+    // Serial pass (no pool attached).
+    var stats_s = SceneStats{};
+    var queues_s = RenderQueues{};
+    defer queues_s.deinit(ally);
+    const meshes_s = [_]*Mesh{&base_s};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes_s,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_s,
+        .queues = &queues_s,
+        .default_white_id = 1,
+    });
+
+    // Parallel pass (forced past the mesh threshold, 2 workers): pre-warms
+    // the world-matrix cache, so it always decided from the fresh AABB.
+    var stats_p = SceneStats{};
+    var queues_p = RenderQueues{};
+    defer queues_p.deinit(ally);
+    const meshes_p = [_]*Mesh{&base_p};
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes_p,
+        .frame_id = 1,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats_p,
+        .queues = &queues_p,
+        .default_white_id = 1,
+        .thread_pool = pool,
+        .parallel_min_meshes = 1,
+    });
+
+    // Both paths must agree on the fresh (far) LOD despite the stale seed.
+    try std.testing.expectEqual(@as(usize, 1), queues_s.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queues_p.items.items.len);
+    try std.testing.expectEqual(&lod_far_s, queues_s.items.items[0].mesh);
+    try std.testing.expectEqual(&lod_far_p, queues_p.items.items[0].mesh);
 }
 
 test "worldMatrixCached honors bone attachment like getWorldMatrix" {
