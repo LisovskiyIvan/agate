@@ -11,6 +11,7 @@ const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const material_mod = @import("../material.zig");
 const Material = material_mod.Material;
 const jobs = @import("../jobs.zig");
+const upload_meter = @import("../gpu_upload_meter.zig");
 
 /// Mirrors render_queue.materialIsTransparent: a mesh is transparent when its
 /// material opts into .blend alpha mode. Kept local so this module never
@@ -189,12 +190,16 @@ pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
                 });
                 mesh.instance_buffer_capacity = new_cap;
                 sg.updateBuffer(mesh.instance_buffer, sg.asRange(sc.instance_matrices.items[0..active_count]));
+                // Учёт динамики: active_count матриц Mat4 (потокобезопасно — счётчик атомарный).
+                upload_meter.record(active_count * @sizeOf(Mat4));
                 mesh.instance_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sc.instance_matrices.items[0..active_count]));
                 mesh.instance_uploaded_count = active_count;
             } else {
                 const h = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sc.instance_matrices.items[0..active_count]));
                 if (active_count != mesh.instance_uploaded_count or h != mesh.instance_hash) {
                     sg.updateBuffer(mesh.instance_buffer, sg.asRange(sc.instance_matrices.items[0..active_count]));
+                    // Учёт динамики: только при реальном изменении (dedup по хешу выше).
+                    upload_meter.record(active_count * @sizeOf(Mat4));
                     mesh.instance_hash = h;
                     mesh.instance_uploaded_count = active_count;
                 }

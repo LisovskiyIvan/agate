@@ -35,6 +35,7 @@ test {
     _ = @import("export/obj.zig");
     _ = @import("export/stl.zig");
     _ = @import("gpu_thread.zig");
+    _ = @import("gpu_upload_meter.zig");
     _ = @import("handoff.zig");
     _ = @import("jobs.zig");
     _ = @import("ktx2.zig");

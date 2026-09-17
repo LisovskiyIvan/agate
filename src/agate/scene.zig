@@ -81,6 +81,7 @@ const jobs = @import("jobs.zig");
 const assets_mod = @import("assets.zig");
 const handoff_mod = @import("handoff.zig");
 const gpu_thread = @import("gpu_thread.zig");
+const upload_meter = @import("gpu_upload_meter.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
@@ -1003,6 +1004,8 @@ pub const Scene = struct {
         };
         const offset = sg.appendBuffer(self.clear_vb, sg.asRange(&clear_verts));
         if (offset < 0) return;
+        // Учёт динамики: 6 вершин clear-квада через appendBuffer (байты те же — стрим в GPU-буфер).
+        upload_meter.record(clear_verts.len * @sizeOf(debug_pass.Vertex));
 
         sg.applyPipeline(pip);
         var bind = sg.Bindings{};
@@ -1279,6 +1282,11 @@ pub const Scene = struct {
         self.stats = .{};
         self.stats.update_ms = keep_update_ms;
         self.stats.prepare_ms = keep_prepare_ms;
+        // Сброс счётчика динамических обновлений на начало кадра: всё, что
+        // запишут flushPendingGpuUploads и стейджинг инстансов ниже, плюс
+        // UI/debug-апдейты внутри render, сложится в stats.updated_bytes_frame
+        // перед Profiler.recordFrame. На троттлинг текстур не влияет.
+        _ = upload_meter.takeAndReset();
         self.frame_id +%= 1;
 
         if (self.uploads) |*q| {
@@ -1436,7 +1444,12 @@ pub const Scene = struct {
         self.frame_prepared = false;
 
         const snap = &self.frame_snapshot;
-        if (!snap.has_camera) return;
+        if (!snap.has_camera) {
+            // Камеры нет — UI/debug-проходов не будет: переносим только
+            // prepare-фазу динамики, чтобы счётчик не утёк в следующий кадр.
+            self.stats.updated_bytes_frame = upload_meter.takeAndReset();
+            return;
+        }
 
         const cur_w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
         const cur_h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
@@ -1583,6 +1596,11 @@ pub const Scene = struct {
 
         sg.commit();
         self.stats.post_ms = msSince(t_post);
+
+        // Перенос динамики в кадровую метрику: prepare-фаза уже накоплена
+        // в счётчике с prepareFrame, сюда добавились UI/debug/clear-апдейты
+        // из проходов выше. После take счётчик чист для следующего кадра.
+        self.stats.updated_bytes_frame += upload_meter.takeAndReset();
 
         if (self.profiler.isRecording()) {
             self.profiler.recordFrame(self.frame_id, &self.stats);
@@ -2035,6 +2053,10 @@ test "prepareFrame stages an empty upload tally without an upload queue" {
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 0), scene.frame_uploads.count);
     try std.testing.expectEqual(@as(u64, 0), scene.frame_uploads.bytes);
+    // Без GPU-контекста динамических апдейтов нет: метрика нулевая,
+    // счётчик meter сброшен в начале prepareFrame.
+    try std.testing.expectEqual(@as(u64, 0), scene.stats.updated_bytes_frame);
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
 }
 
 test "async save/load report NoTaskRunner without an io runner" {

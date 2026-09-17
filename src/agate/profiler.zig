@@ -129,6 +129,7 @@ pub const Profiler = struct {
             .culled_objects = stats.culled_meshes + stats.occluded_meshes,
             .uploaded_textures = stats.uploaded_textures_frame,
             .uploaded_bytes = @intCast(stats.uploaded_bytes_frame),
+            .updated_bytes = @intCast(stats.updated_bytes_frame),
         };
 
         if (self.frames.items.len >= self.max_frames) {
@@ -448,6 +449,7 @@ pub const Profiler = struct {
         var max_triangles: u32 = 0;
         var sum_switches: u64 = 0;
         var sum_uploaded_bytes: usize = 0;
+        var sum_updated_bytes: usize = 0;
 
         var hitches_16: u32 = 0;
         var hitches_33: u32 = 0;
@@ -500,6 +502,7 @@ pub const Profiler = struct {
             max_triangles = @max(max_triangles, frame.triangles);
             sum_switches += frame.pipeline_switches;
             sum_uploaded_bytes += frame.uploaded_bytes;
+            sum_updated_bytes += frame.updated_bytes;
 
             if (ms > 50.0) {
                 hitches_50 += 1;
@@ -599,6 +602,7 @@ pub const Profiler = struct {
             .max_triangles = max_triangles,
             .avg_pipeline_switches = @intCast(sum_switches / n),
             .total_uploaded_bytes = sum_uploaded_bytes,
+            .total_updated_bytes = sum_updated_bytes,
             .hitches_over_16ms = hitches_16,
             .hitches_over_33ms = hitches_33,
             .hitches_over_50ms = hitches_50,
@@ -695,9 +699,22 @@ pub const Profiler = struct {
                 if (worst_frame.uploaded_bytes > 4 * 1024 * 1024) {
                     try findings.append(allocator, .{
                         .severity = .warning,
-                        .title = try allocator.dupe(u8, "Задержка из-за загрузки текстур на GPU"),
-                        .details = try std.fmt.allocPrint(allocator, "В кадре #{d} произошла загрузка {d:.2} МБ текстур на видеокарту.", .{ worst_frame.frame_index, @as(f32, @floatFromInt(worst_frame.uploaded_bytes)) / (1024.0 * 1024.0) }),
+                        .title = try allocator.dupe(u8, "Задержка из-за стриминга текстур на GPU"),
+                        .details = try std.fmt.allocPrint(allocator, "В кадре #{d} стрим текстур (UploadQueue) записал {d:.2} МБ на видеокарту.", .{ worst_frame.frame_index, @as(f32, @floatFromInt(worst_frame.uploaded_bytes)) / (1024.0 * 1024.0) }),
                         .recommendation = try allocator.dupe(u8, "Используйте асинхронную очередь Scene.uploads (UploadQueue) с лимитом байт на кадр (max_bytes_per_frame)."),
+                    });
+                }
+
+                // Порог 16 MiB = 2x текстурного бюджета: легитимные массовые
+                // изменения (полная перезаливка инстансов/морфов) дают единицы
+                // МБ (100k инстансов x 64 Б = 6.4 МБ), а UI/debug/трейлы —
+                // десятки-сотни КБ. Выше — патологическая перезапись динамики.
+                if (worst_frame.updated_bytes > 16 * 1024 * 1024) {
+                    try findings.append(allocator, .{
+                        .severity = .warning,
+                        .title = try allocator.dupe(u8, "Массовые динамические обновления GPU-буферов"),
+                        .details = try std.fmt.allocPrint(allocator, "В кадре #{d} динамические буферы (sg.updateBuffer: инстансы, морфы, частицы) записали {d:.2} МБ.", .{ worst_frame.frame_index, @as(f32, @floatFromInt(worst_frame.updated_bytes)) / (1024.0 * 1024.0) }),
+                        .recommendation = try allocator.dupe(u8, "Проверьте частоту полных перезаливок instance-буферов (dedup по instance_hash уже пропускает неизменные), вес CPU-морфов и число активных частиц."),
                     });
                 }
             }
@@ -968,6 +985,38 @@ test "Profiler start, recordFrame, and summarize" {
         ally.free(findings);
     }
     try std.testing.expect(findings.len > 0);
+}
+
+test "Profiler переносит динамику буферов отдельно от текстур" {
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+    prof.start();
+    defer prof.stop();
+
+    // Кадр 1: только текстуры; кадр 2: только динамика — метрики не смешиваются.
+    var stats: SceneStats = .{
+        .update_ms = 1.0,
+        .prepare_ms = 1.0,
+        .shadow_ms = 1.0,
+        .main_ms = 5.0,
+        .post_ms = 1.0,
+        .uploaded_bytes_frame = 1024,
+        .updated_bytes_frame = 0,
+    };
+    prof.recordFrame(1, &stats);
+    stats.uploaded_bytes_frame = 0;
+    stats.updated_bytes_frame = 2048;
+    prof.recordFrame(2, &stats);
+
+    try std.testing.expectEqual(@as(usize, 1024), prof.frames.items[0].uploaded_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prof.frames.items[0].updated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prof.frames.items[1].uploaded_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), prof.frames.items[1].updated_bytes);
+
+    const summary = prof.summarize();
+    try std.testing.expectEqual(@as(usize, 1024), summary.total_uploaded_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), summary.total_updated_bytes);
 }
 
 test "Profiler memory snapshot and file saving" {

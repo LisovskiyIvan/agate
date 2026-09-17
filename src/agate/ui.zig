@@ -20,6 +20,7 @@ const ui_theme_mod = @import("ui/theme.zig");
 const ui_transition = @import("ui/transition.zig");
 const css_parser = @import("ui/css_parser.zig");
 const ui_layout = @import("ui/layout.zig");
+const upload_meter = @import("gpu_upload_meter.zig");
 
 // Re-exports from layout module
 pub const UISize = ui_layout.UISize;
@@ -1132,6 +1133,8 @@ pub const UICanvas = struct {
 
         sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items[0..vert_count]));
         sg.updateBuffer(self.index_buffer, sg.asRange(self.indices.items));
+        // Учёт динамики: весь UI-батч кадра (вершины + u16-индексы).
+        upload_meter.record(vert_count * @sizeOf(UIVertex) + self.indices.items.len * @sizeOf(u16));
 
         if (self.pipeline.id == 0) return;
         sg.applyPipeline(self.pipeline);

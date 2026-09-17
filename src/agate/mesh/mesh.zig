@@ -25,6 +25,7 @@ const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const Scene = @import("../scene.zig").Scene;
 const gpu_thread = @import("../gpu_thread.zig");
+const upload_meter = @import("../gpu_upload_meter.zig");
 const morph_gpu = @import("morph_gpu.zig");
 const tangents = @import("tangents.zig");
 
@@ -464,6 +465,8 @@ pub const Mesh = struct {
         const n = @min(self.morph_base.len, self.morph_staging.len);
         if (n > 0 and self.vertex_buffer.id != 0) {
             sg.updateBuffer(self.vertex_buffer, sg.asRange(self.morph_staging[0..n]));
+            // Учёт динамики: полный морф-стейджинг (n вершин).
+            upload_meter.record(n * @sizeOf(Vertex));
         }
     }
 
