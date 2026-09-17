@@ -11,6 +11,7 @@ const Vertex = @import("../mesh.zig").Vertex;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("../scene/uniforms.zig");
+const scene_render_queue = @import("../scene/render_queue.zig");
 
 // Inverse-hull outline/highlight layer: highlighted meshes are redrawn with
 // front-face culling (the inflated "inside out" hull), LESS_EQUAL depth
@@ -116,17 +117,6 @@ fn toClip(m: Mat4, p: Vec3) [4]f32 {
     };
 }
 
-/// Projects the mesh's world-bounds center to NDC for the cutout dilation
-/// direction. w <= 0 marks the center as behind the camera: the shader then
-/// skips the dilation (a degenerate direction would smear the card).
-fn projectedCenterNdc(view_proj: Mat4, mesh: *const Mesh) [4]f32 {
-    const aabb = mesh.cached_aabb;
-    const center = if (aabb.isValid()) aabb.center() else mesh.position;
-    const clip = toClip(view_proj, center);
-    if (clip[3] <= 0.001) return .{ 0, 0, 0, -1.0 };
-    return .{ clip[0] / clip[3], clip[1] / clip[3], 0, 1.0 };
-}
-
 /// Shared inverse-hull pipeline state (culling, depth, blend). Vertex layout
 /// is configured per family by the configure*Desc functions below.
 fn setInverseHullState(desc: *sg.PipelineDesc) void {
@@ -226,8 +216,9 @@ pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
     };
 }
 
-/// Self-contained per-item payload for outline rendering. Decouples outline
-/// execution from live *Mesh pointers and transforms during render.
+/// Self-contained per-item payload for outline rendering. Хранит только
+/// render-owned снимки (модель, хендлы, индекс копии скина): живых указателей
+/// на Mesh/Skeleton здесь нет.
 pub const OutlineDrawItem = struct {
     vertex_buffer: sg.Buffer = .{},
     index_buffer: sg.Buffer = .{},
@@ -235,7 +226,9 @@ pub const OutlineDrawItem = struct {
     instance_buffer: sg.Buffer = .{},
     visible_instance_count: u32 = 1,
     model: Mat4 = Mat4.identity,
-    skin_matrices: ?*const [MAX_BONES]Mat4 = null,
+    /// Индекс копии скин-матриц во внешнем SkinStorage (null = не скин).
+    /// Хранилище переживает item и резолвится на draw-фазе.
+    skin_index: ?u32 = null,
     cutout_view: ?sg.View = null,
     cutout_sampler: ?sg.Sampler = null,
     cutout_cutoff: f32 = 0.0,
@@ -246,15 +239,35 @@ pub const OutlineDrawItem = struct {
     is_u32: bool = false,
     gpu_pending: bool = false,
     is_visible: bool = true,
-    mesh: ?*Mesh = null,
 };
 
-pub fn makeOutlineDrawItem(mesh: *const Mesh) OutlineDrawItem {
+/// Строит OutlineDrawItem из живого меша (только prepare-фаза). Скин
+/// копируется в render-owned хранилище; OOM возвращает null — вызывающий
+/// пропускает item, а не рисует с живыми матрицами.
+/// Матрица мира — через mesh.getWorldMatrix() (тот же расчёт, что и
+/// worldMatrixCached; поведение не менялось: Scene строит контур ДО очередей,
+/// так что «прогретый очередями кеш» здесь неверен — просто свежий пересчёт,
+/// контурный список короткий, значения идентичны кешированным).
+/// P4: сигнатура расширена хранилищем/аллокатором — осознанное изменение
+/// low-level API (см. passes/mod.zig); Scene и OutlinePass.render стабильны.
+pub fn makeOutlineDrawItem(
+    allocator: std.mem.Allocator,
+    skins: *scene_render_queue.SkinStorage,
+    mesh: *const Mesh,
+) ?OutlineDrawItem {
     const skinned = mesh.skeleton != null;
     const instanced = !skinned and mesh.instances.items.len > 0;
     const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
     const aabb = mesh.cached_aabb;
     const center = if (aabb.isValid()) aabb.center() else mesh.position;
+
+    var skin_index: ?u32 = null;
+    if (mesh.skeleton) |skel| {
+        const src = skel.getRenderSkinMatrices();
+        skins.ensureUnusedCapacity(allocator, 1) catch return null;
+        skin_index = @intCast(skins.items.len);
+        skins.appendAssumeCapacity(src.*);
+    }
 
     return OutlineDrawItem{
         .vertex_buffer = mesh.vertex_buffer,
@@ -263,7 +276,7 @@ pub fn makeOutlineDrawItem(mesh: *const Mesh) OutlineDrawItem {
         .instance_buffer = mesh.instance_buffer,
         .visible_instance_count = if (instanced) mesh.visible_instance_count else 1,
         .model = mesh.getWorldMatrix(),
-        .skin_matrices = if (mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null,
+        .skin_index = skin_index,
         .cutout_view = if (cutout) |c| c.texture.view else null,
         .cutout_sampler = if (cutout) |c| c.texture.sampler else null,
         .cutout_cutoff = if (cutout) |c| c.cutoff else 0.0,
@@ -274,7 +287,6 @@ pub fn makeOutlineDrawItem(mesh: *const Mesh) OutlineDrawItem {
         .is_u32 = (mesh.index_type == .UINT32),
         .gpu_pending = mesh.gpu_pending,
         .is_visible = mesh.is_visible,
-        .mesh = @constCast(mesh),
     };
 }
 
@@ -370,7 +382,17 @@ pub const OutlinePass = struct {
     }
 
     /// Renders immutable outline items into the currently open main pass.
-    pub fn renderItems(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, items: []const OutlineDrawItem, color: Color4, width_px: f32) void {
+    /// skins — то же хранилище, в которое makeOutlineDrawItem складывал копии
+    /// (резолв по skin_index уже после всех реаллокаций prepare-фазы).
+    pub fn renderItems(
+        self: *OutlinePass,
+        view_proj: Mat4,
+        camera_pos: Vec3,
+        items: []const OutlineDrawItem,
+        skins: []const [MAX_BONES]Mat4,
+        color: Color4,
+        width_px: f32,
+    ) void {
         _ = camera_pos;
         if (items.len == 0) return;
         const width = clampWidthPx(width_px);
@@ -422,9 +444,11 @@ pub const OutlinePass = struct {
                 } else outlineParamsFor(width),
             };
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
-            if (skinned and item.skin_matrices != null) {
+            if (skinned) {
+                // Битый индекс (билдером недостижимо): пропуск вместо stale-униформы.
+                const bones = scene_render_queue.skinAt(skins, item.skin_index) orelse continue;
                 const vs_skin = outline_shd.VsSkin{
-                    .bones = item.skin_matrices.?.*,
+                    .bones = bones.*,
                 };
                 sg.applyUniforms(outline_shd.UB_vs_skin, sg.asRange(&vs_skin));
             }
@@ -452,6 +476,9 @@ pub const OutlinePass = struct {
     /// Each mesh routes to its pipeline family (rigid / instanced / skinned /
     /// alpha-cutout); meshes failing shouldOutlineMesh are skipped silently.
     /// Empty list and zero width are GPU-free no-ops.
+    /// Immediate-режим: снимки (включая копии скинов) строятся здесь же во
+    /// временное хранилище и рисуются синхронно до возврата — за пределы
+    /// вызова живые указатели не утекают.
     pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
         if (meshes.len == 0) return;
         var stack_items: [32]OutlineDrawItem = undefined;
@@ -465,10 +492,12 @@ pub const OutlinePass = struct {
         }
         defer if (heap_buf) |h| std.heap.c_allocator.free(h);
 
+        var skins: scene_render_queue.SkinStorage = .empty;
+        defer skins.deinit(std.heap.c_allocator);
         for (meshes, 0..) |m, i| {
-            items[i] = makeOutlineDrawItem(m);
+            items[i] = makeOutlineDrawItem(std.heap.c_allocator, &skins, m) orelse .{};
         }
-        self.renderItems(view_proj, camera_pos, items, color, width_px);
+        self.renderItems(view_proj, camera_pos, items, skins.items, color, width_px);
     }
 
     pub fn deinit(self: *OutlinePass) void {
@@ -652,3 +681,146 @@ test "configureOutlineCutoutDesc binds position and uv without culling" {
         desc.layout.attrs[outline_shd.ATTR_outline_cutout_texcoord0].offset,
     );
 }
+
+// ---- P4 render-owned draw snapshot: регрессия владения. ----
+
+// Подготовленный outline-item не ссылается на живые данные: модель, копия
+// скина и cutout-снимок пережили мутацию TRS/материала и две публикации скелета.
+test "P4: outline item owns model, skin and cutout snapshots" {
+    const ally = std.testing.allocator;
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    var mesh = Mesh{
+        .name = "outline_skinned",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(4, 0, 0),
+        .skeleton = skel,
+    };
+    var skins: scene_render_queue.SkinStorage = .empty;
+    defer skins.deinit(ally);
+
+    const it = makeOutlineDrawItem(ally, &skins, &mesh) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(it.skin_index != null);
+    try std.testing.expectEqual(@as(usize, 1), skins.items.len);
+
+    mesh.position = Vec3.new(99, 99, 99);
+    skel.bones[0].local_position = Vec3.new(5, 0, 0);
+    skel.update();
+    skel.update();
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), skel.getRenderSkinMatrices()[0].m[12], 1e-4);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), it.model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), skins.items[it.skin_index.?][0].m[12], 1e-4);
+
+    // Cutout-снимок: вью/сэмплер/катoff скопированы, живой материал не читается.
+    const material_mod = @import("../material.zig");
+    const texture_mod = @import("../texture.zig");
+    var cut_mat = material_mod.StandardMaterial.init("outline_cut");
+    cut_mat.alpha_mode = .cutout;
+    cut_mat.alpha_cutoff = 0.3;
+    cut_mat.diffuse_texture = texture_mod.Texture{
+        .image = .{},
+        .view = .{ .id = 77 },
+        .sampler = .{ .id = 78 },
+        .width = 4,
+        .height = 4,
+    };
+    var rigid = Mesh{
+        .name = "outline_cutout",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = .{ .standard = &cut_mat },
+    };
+    var skins2: scene_render_queue.SkinStorage = .empty;
+    defer skins2.deinit(ally);
+    const cut = makeOutlineDrawItem(ally, &skins2, &rigid) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cut.is_cutout);
+    try std.testing.expectEqual(@as(usize, 0), skins2.items.len);
+
+    cut_mat.alpha_cutoff = 0.9;
+    cut_mat.diffuse_texture = null;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), cut.cutout_cutoff, 1e-6);
+    try std.testing.expectEqual(@as(u32, 77), cut.cutout_view.?.id);
+    try std.testing.expectEqual(@as(u32, 78), cut.cutout_sampler.?.id);
+}
+
+// OOM копии скина: makeOutlineDrawItem возвращает null (вызывающий пропускает
+// item), нескinned-меш строится без аллокаций даже падающим аллокатором.
+test "P4: outline skin OOM returns null, rigid build stays allocation-free" {
+    const ally = std.testing.allocator;
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    var skinned = Mesh{
+        .name = "oom_outline_skinned",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .skeleton = skel,
+    };
+    var rigid = Mesh{
+        .name = "oom_outline_rigid",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+
+    var limited = FailNthP4Outline{ .backing = ally, .fail_on = 1 };
+    var skins: scene_render_queue.SkinStorage = .empty;
+    defer skins.deinit(limited.allocator());
+    // Первая же аллокация (копия скина) падает — item не строится.
+    try std.testing.expect(makeOutlineDrawItem(limited.allocator(), &skins, &skinned) == null);
+    try std.testing.expectEqual(@as(usize, 0), skins.items.len);
+    // Rigid-путь аллокаций не делает — тем же падающим аллокатором строится.
+    const it = makeOutlineDrawItem(limited.allocator(), &skins, &rigid) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(it.skin_index == null);
+    try std.testing.expectEqual(@as(usize, 0), skins.items.len);
+}
+
+const FailNthP4Outline = struct {
+    backing: std.mem.Allocator,
+    fail_on: usize,
+    count: usize = 0,
+
+    fn allocator(self: *FailNthP4Outline) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailNthP4Outline = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        if (self.count == self.fail_on) return null;
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FailNthP4Outline = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FailNthP4Outline = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *FailNthP4Outline = @ptrCast(@alignCast(ctx));
+        return self.backing.rawFree(memory, alignment, ra);
+    }
+};

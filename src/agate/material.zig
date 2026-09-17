@@ -650,10 +650,41 @@ pub const MaterialDrawRecord = struct {
     // Standard material diffuse UV matrix / offset
     standard_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
     standard_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
-
-    // Shader material hook
-    shader_material: ?*const ShaderMaterial = null,
 };
+
+/// Render-owned копия изменяемых CPU-данных hook-материала: draw-путь читает
+/// только этот снимок, живой ShaderMaterial (tint/uniforms/texture/entry)
+/// во время отрисовки не трогается. Резолюция entry_index через глобальный
+/// реестр остаётся заимствованием (как GPU-хендлы под фазовым мьютексом P3).
+/// Хранится в side-таблице очередей (только для shader-draws), чтобы не
+/// раздувать каждую запись фиксированной ценой uniform-блока.
+pub const ShaderDrawSnapshot = struct {
+    entry_index: u32 = shader_material.invalid_index,
+    tint: [4]f32 = .{ 1, 1, 1, 1 },
+    tex_view: sg.View = .{},
+    tex_sampler: sg.Sampler = .{},
+    uniforms: shader_material.UniformStorage = .{.{ 0, 0, 0, 0 }} ** shader_material.merge.user_slot_count,
+    /// Собственный double_sided материала (без decal-форсинга item: раньше draw
+    /// читал sm.double_sided напрямую, поведение сохранено точь-в-точь).
+    double_sided: bool = false,
+};
+
+/// Строит ShaderDrawSnapshot из живого материала (только prepare-фаза).
+/// Null для всех не-shader материалов — их draw-пути снимок не используют.
+pub fn buildShaderSnapshot(mat: ?Material, default_white: *const Texture) ?ShaderDrawSnapshot {
+    const m = mat orelse return null;
+    if (m != .shader_material) return null;
+    const sm = m.shader_material;
+    const tex = sm.texture orelse default_white.*;
+    return .{
+        .entry_index = sm.entry_index,
+        .tint = sm.getTintColor4(),
+        .tex_view = tex.view,
+        .tex_sampler = tex.sampler,
+        .uniforms = sm.uniforms,
+        .double_sided = sm.double_sided,
+    };
+}
 
 pub fn buildDrawRecord(
     mat: ?Material,
@@ -737,7 +768,6 @@ pub fn buildDrawRecord(
                 if (s.unlit) rec.standard_uv_offset[2] = 1.0;
             },
             .shader_material => |sm| {
-                rec.shader_material = sm;
                 const tex = sm.texture orelse default_white.*;
                 rec.albedo_view = tex.view;
                 rec.albedo_sampler = tex.sampler;
@@ -805,4 +835,44 @@ test "Material unlit mode properly routes to DrawRecord" {
 
     const rec_std = buildDrawRecord(mat_std, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_std.standard_uv_offset[2]);
+}
+
+test "P4: buildShaderSnapshot copies hook material CPU state" {
+    var sm = ShaderMaterial.init("hook");
+    sm.entry_index = 3;
+    sm.tint_color = Color3.new(0.1, 0.2, 0.3);
+    sm.alpha = 0.5;
+    sm.double_sided = true;
+    sm.texture = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 4, .height = 4 };
+    sm.uniforms[0] = .{ 1, 2, 3, 4 };
+
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 7 }, .sampler = .{ .id = 8 }, .width = 1, .height = 1 };
+    const snap = buildShaderSnapshot(.{ .shader_material = &sm }, &dummy_tex) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 3), snap.entry_index);
+    try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0.3, 0.5 }, snap.tint);
+    try std.testing.expectEqual(@as(u32, 42), snap.tex_view.id);
+    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, snap.uniforms[0]);
+    try std.testing.expect(snap.double_sided);
+
+    // Мутация живого материала после снимка: снимок неизменен.
+    sm.tint_color = Color3.new(9, 9, 9);
+    sm.alpha = 0.0;
+    sm.double_sided = false;
+    sm.texture = null;
+    sm.uniforms[0] = .{ 9, 9, 9, 9 };
+    sm.entry_index = 9;
+    try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0.3, 0.5 }, snap.tint);
+    try std.testing.expectEqual(@as(u32, 42), snap.tex_view.id);
+    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, snap.uniforms[0]);
+    try std.testing.expectEqual(@as(u32, 3), snap.entry_index);
+    try std.testing.expect(snap.double_sided);
+
+    // Без текстуры — дефолт из prepare-фазы, а не живой указатель.
+    const fallback = buildShaderSnapshot(.{ .shader_material = &sm }, &dummy_tex) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 7), fallback.tex_view.id);
+
+    // Не-hook материалы снимка не дают.
+    var std_mat = StandardMaterial.init("s");
+    try std.testing.expect(buildShaderSnapshot(.{ .standard = &std_mat }, &dummy_tex) == null);
+    try std.testing.expect(buildShaderSnapshot(null, &dummy_tex) == null);
 }

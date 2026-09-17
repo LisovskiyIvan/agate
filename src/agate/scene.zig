@@ -256,6 +256,9 @@ pub const Scene = struct {
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
     render_outline_items: std.ArrayListUnmanaged(outline_pass.OutlineDrawItem) = .empty,
+    /// Render-owned копии скинов outline-draws (резолв по skin_index).
+    /// Сбрасывается вместе с render_outline_items в prepareFrame.
+    render_outline_skins: scene_render_queue.SkinStorage = .empty,
     view_queues: [scene_snapshot.MAX_CAMERAS]scene_render_queue.RenderQueues = [_]scene_render_queue.RenderQueues{.{}} ** scene_snapshot.MAX_CAMERAS,
 
     /// Mailbox for publishing frame-level camera/light/pass state from the
@@ -1079,7 +1082,7 @@ pub const Scene = struct {
 
         // Opaque regular meshes first (front-to-back, early-Z).
         for (queues.items.items) |item| {
-            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items);
         }
 
         // Opaque instanced meshes.
@@ -1094,7 +1097,7 @@ pub const Scene = struct {
             switch (entry.kind) {
                 .regular => {
                     if (entry.index < queues.transparent.items.len) {
-                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id);
+                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items);
                     }
                 },
                 .instanced => {
@@ -1110,6 +1113,7 @@ pub const Scene = struct {
             view_proj,
             eye,
             self.render_outline_items.items,
+            self.render_outline_skins.items,
             samples,
             &self.stats,
             snap.outline_enabled,
@@ -1236,7 +1240,12 @@ pub const Scene = struct {
 
     /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.
     /// Threaded callers hold phase ownership through this call and render():
-    /// render still reads live mesh/material state not carried by the snapshot.
+    /// draw-фаза (P4) читает только render-owned снимки MESH-payload
+    /// (regular/instanced очереди, shadow-bins, outline-items: модель/материал/
+    /// скин-копии по индексам); живые Mesh/Material/Skeleton во время их
+    /// отрисовки недоступны. Заимствованными остаются только GPU-хендлы под
+    /// фазовым мьютексом/P3 (буферы/вью/сэмплеры/пайплайны), а UI/debug/
+    /// particles/trails и прочие живые подсистемы — вне P4 (см. P5-P7).
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;
@@ -1292,9 +1301,12 @@ pub const Scene = struct {
         }
 
         self.render_outline_items.clearRetainingCapacity();
+        self.render_outline_skins.clearRetainingCapacity();
         for (self.outline_meshes.items) |m| {
             if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
-            self.render_outline_items.append(self.allocator, outline_pass.makeOutlineDrawItem(m)) catch {};
+            if (outline_pass.makeOutlineDrawItem(self.allocator, &self.render_outline_skins, m)) |it| {
+                self.render_outline_items.append(self.allocator, it) catch {};
+            }
         }
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
@@ -1670,6 +1682,7 @@ pub const Scene = struct {
 
         self.outline_meshes.deinit(self.allocator);
         self.render_outline_items.deinit(self.allocator);
+        self.render_outline_skins.deinit(self.allocator);
         self.postfx.deinit();
 
         self.particles.deinit(self.allocator);

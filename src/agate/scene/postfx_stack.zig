@@ -12,6 +12,7 @@ const Color4 = math.Color4;
 const Mesh = @import("../mesh.zig").Mesh;
 const Camera = @import("../camera.zig").Camera;
 const passes = @import("../passes/mod.zig");
+const scene_render_queue = @import("render_queue.zig");
 const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao_mod = @import("../ssao.zig");
@@ -149,6 +150,7 @@ pub const PostFXStack = struct {
         view_proj: Mat4,
         eye: Vec3,
         outline_items: []const passes.OutlineDrawItem,
+        outline_skins: []const [scene_render_queue.MAX_BONES]math.Mat4,
         samples: i32,
         stats: *SceneStats,
         enabled: bool,
@@ -157,7 +159,7 @@ pub const PostFXStack = struct {
     ) void {
         if (enabled and outline_items.len > 0) {
             const pass = self.outlinePassFor(samples);
-            pass.renderItems(view_proj, eye, outline_items, color, width_px);
+            pass.renderItems(view_proj, eye, outline_items, outline_skins, color, width_px);
             const outline_count: u32 = @intCast(outline_items.len);
             stats.main_draw_calls += outline_count;
             stats.draw_calls += outline_count;

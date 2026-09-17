@@ -263,38 +263,23 @@ pub const DoubleSidedPipelines = struct {
 // Selects the forward pipeline for a regular (non-instanced) queue item.
 // Transparent items resolve to the blend twins; opaque selection is
 // identical to the legacy logic, so existing pipeline ids are untouched.
-// Double-sided items (item.double_sided OR mesh material double_sided)
-// resolve to the cull-off twins in scene.ds_pipelines when that set is
-// present and the twin id is non-zero, otherwise they fall back to the
-// regular pipelines. Scenes without a ds_pipelines field (legacy) and
-// items without a double_sided field behave exactly as before.
+// Reads ONLY render-owned snapshots (is_u32/is_skinned/double_sided flags):
+// draw-фаза не трогает живой Mesh/Material. `scene` is generic (anytype)
+// to avoid a scene.zig import cycle; it must expose the 12 pipeline_*
+// fields. `item` must expose .is_pbr/.transparent plus the snapshot flags
+// (.is_u32/.index_type and .is_skinned/.skin_index fallbacks cover foreign
+// mocks; живого .mesh здесь больше нет — P4 удалил его из очередей).
 // Cutout items are opaque (transparent == false) and resolve to opaque ids.
-// `scene` is generic (anytype) to avoid a scene.zig import cycle; it must
-// expose the 12 pipeline_* fields. `item` must expose .mesh/.is_pbr/.transparent.
 pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
     const is_u32 = blk: {
-        if (@hasField(@TypeOf(item), "mesh")) {
-            if (@typeInfo(@TypeOf(item.mesh)) == .optional) {
-                if (item.mesh) |m| break :blk (m.index_type == .UINT32);
-            } else {
-                break :blk (item.mesh.index_type == .UINT32);
-            }
-        }
-        if (@hasField(@TypeOf(item), "index_type") and item.index_type == .UINT32) break :blk true;
         if (@hasField(@TypeOf(item), "is_u32") and item.is_u32) break :blk true;
+        if (@hasField(@TypeOf(item), "index_type") and item.index_type == .UINT32) break :blk true;
         break :blk false;
     };
 
     const is_skinned = blk: {
-        if (@hasField(@TypeOf(item), "mesh")) {
-            if (@typeInfo(@TypeOf(item.mesh)) == .optional) {
-                if (item.mesh) |m| break :blk (m.skeleton != null);
-            } else {
-                break :blk (item.mesh.skeleton != null);
-            }
-        }
         if (@hasField(@TypeOf(item), "is_skinned") and item.is_skinned) break :blk true;
-        if (@hasField(@TypeOf(item), "skin_matrices") and item.skin_matrices != null) break :blk true;
+        if (@hasField(@TypeOf(item), "skin_index") and item.skin_index != null) break :blk true;
         break :blk false;
     };
 
@@ -370,20 +355,13 @@ test "cullOffDescFor disables culling and preserves everything else" {
 // --- GPU-free selection tests use lightweight mocks (no Mesh import:
 // mesh.zig -> scene.zig -> pipelines.zig would be an import cycle). ---
 
-const TestMaterial = @import("../material.zig");
-const TestFakeSkel = struct {};
-
-const TestMesh = struct {
-    index_type: sg.IndexType = .UINT16,
-    skeleton: ?*TestFakeSkel = null,
-    material: ?TestMaterial.Material = null,
-};
-
 const TestItem = struct {
-    mesh: *TestMesh,
     is_pbr: bool = false,
     transparent: bool = false,
     double_sided: bool = false,
+    is_u32: bool = false,
+    is_skinned: bool = false,
+    skin_index: ?u32 = null,
 };
 
 fn testLegacyScene() struct {
@@ -459,42 +437,40 @@ const TestDsScene = struct {
 test "legacy scenes keep existing pipeline ids; cutout resolves opaque" {
     const std = @import("std");
     const scene = testLegacyScene();
-    var mesh = TestMesh{};
-    var skel = TestFakeSkel{};
 
     // Opaque/transparent matrix, u16 + u32, standard + pbr + skinned.
-    var item = TestItem{ .mesh = &mesh };
+    // Флаги — только render-owned снимки (P4: живого меша здесь больше нет).
+    var item = TestItem{};
     try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 13), pipelineForRegularItem(scene, item));
     item.transparent = false;
-    mesh.index_type = .UINT32;
+    item.is_u32 = true;
     try std.testing.expectEqual(@as(u32, 12), pipelineForRegularItem(scene, item));
 
     item.is_pbr = true;
-    mesh.index_type = .UINT16;
+    item.is_u32 = false;
     try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 23), pipelineForRegularItem(scene, item));
 
-    mesh.skeleton = &skel;
+    item.is_skinned = true;
     item.transparent = false;
     try std.testing.expectEqual(@as(u32, 31), pipelineForRegularItem(scene, item));
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 33), pipelineForRegularItem(scene, item));
+    // P4: флаг is_skinned может отсутствовать — skin_index тоже ведёт в skinned-пайплайн.
+    item = TestItem{ .is_pbr = true, .skin_index = 5 };
+    try std.testing.expectEqual(@as(u32, 31), pipelineForRegularItem(scene, item));
 
     // Cutout material classifies opaque (transparent == false) and must
     // resolve to the opaque pipeline id, never a blend twin.
-    var cutout_mat = TestMaterial.StandardMaterial.init("c");
-    cutout_mat.alpha_mode = .cutout;
-    mesh.skeleton = null;
-    mesh.material = .{ .standard = &cutout_mat };
-    item = TestItem{ .mesh = &mesh, .transparent = false };
+    item = TestItem{ .transparent = false };
     try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
-    mesh.index_type = .UINT32;
+    item.is_u32 = true;
     try std.testing.expectEqual(@as(u32, 12), pipelineForRegularItem(scene, item));
     item.is_pbr = true;
-    mesh.index_type = .UINT16;
+    item.is_u32 = false;
     // Note: std cutout material on a pbr item still picks the pbr pipe;
     // the point is opaque (not blend) selection.
     try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
@@ -534,37 +510,24 @@ test "double-sided items select cull-off twins, with regular fallback" {
             .instanced_pbr_u16 = .{ .id = 151 },
         },
     };
-    var mesh = TestMesh{};
-    var mat = TestMaterial.StandardMaterial.init("ds");
-    mat.double_sided = true;
-
-    // Explicit item flag selects the cull-off twin.
-    var item = TestItem{ .mesh = &mesh, .double_sided = true };
+    var item = TestItem{ .double_sided = true };
     try std.testing.expectEqual(@as(u32, 111), pipelineForRegularItem(scene, item));
-    mesh.index_type = .UINT32;
+    item.is_u32 = true;
     try std.testing.expectEqual(@as(u32, 112), pipelineForRegularItem(scene, item));
-    mesh.index_type = .UINT16;
+    item.is_u32 = false;
 
     // Blend + double-sided selects the cull-off blend twin.
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 113), pipelineForRegularItem(scene, item));
 
     // Missing twin (id 0) falls back to the regular pipeline.
-    mesh.index_type = .UINT32;
+    item.is_u32 = true;
     try std.testing.expectEqual(@as(u32, 14), pipelineForRegularItem(scene, item));
-    mesh.index_type = .UINT16;
+    item.is_u32 = false;
     item.transparent = false;
 
-    // Material-derived: flag unset, but mesh material is double-sided.
-    mesh.material = .{ .standard = &mat };
-    item = TestItem{ .mesh = &mesh };
-    try std.testing.expectEqual(@as(u32, 111), pipelineForRegularItem(scene, item));
-
     // Single-sided items keep regular ids even when the ds set exists.
-    mat.double_sided = false;
-    try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
-    item.double_sided = false;
-    mesh.material = null;
+    item = TestItem{};
     try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
 
     // PBR family honors the same contract.
@@ -572,7 +535,7 @@ test "double-sided items select cull-off twins, with regular fallback" {
     item.double_sided = true;
     try std.testing.expectEqual(@as(u32, 121), pipelineForRegularItem(scene, item));
     item.transparent = true;
-    mesh.index_type = .UINT32;
+    item.is_u32 = true;
     try std.testing.expectEqual(@as(u32, 124), pipelineForRegularItem(scene, item));
 
     // Instanced helper: ds twin, blend twin fallback, legacy scene.
@@ -642,27 +605,13 @@ fn sceneDoubleSided(scene: anytype) ?DoubleSidedPipelines {
     return null;
 }
 
-// True when the queue item wants face culling disabled: either the item
-// carries an explicit double_sided flag, or its mesh material is
-// double-sided (covers queue items built before the flag existed).
+// True when the queue item wants face culling disabled: the item carries
+// an explicit double_sided snapshot (P4: живых материалов на draw-фазе нет,
+// фолбэк на mesh.material удалён).
 fn itemDoubleSided(item: anytype) bool {
     const I = @TypeOf(item);
     if (@typeInfo(I) == .@"struct" and @hasField(I, "double_sided")) {
-        if (item.double_sided) return true;
-    }
-    return meshDoubleSided(item.mesh);
-}
-
-// Derives double-sidedness from a mesh-like value exposing .material.
-// Meshes without a .material field (foreign mocks) count as single-sided.
-fn meshDoubleSided(mesh: anytype) bool {
-    const M = @TypeOf(mesh);
-    const T = switch (@typeInfo(M)) {
-        .pointer => |p| p.child,
-        else => M,
-    };
-    if (@typeInfo(T) == .@"struct" and @hasField(T, "material")) {
-        return render_queue.materialIsDoubleSided(mesh.material);
+        return item.double_sided;
     }
     return false;
 }

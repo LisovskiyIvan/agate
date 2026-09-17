@@ -21,13 +21,12 @@ const passes = @import("../passes/mod.zig");
 const render_queue = @import("render_queue.zig");
 const RenderMeshItem = render_queue.RenderMeshItem;
 const RenderInstancedBatch = render_queue.RenderInstancedBatch;
-const Mesh = @import("../mesh.zig").Mesh;
 const morph_gpu = @import("../mesh/morph_gpu.zig");
+const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("uniforms.zig");
 const forward_pipelines = @import("forward_pipelines.zig");
 const ForwardPipelines = forward_pipelines.ForwardPipelines;
 const shader_material = @import("../shader_material.zig");
-const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 
@@ -64,7 +63,18 @@ pub const Environment = struct {
 // resolve to the cull-off twins via pipelines.forRegularItem).
 // Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
 // in-shader discard. Updates stats.
-pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+//
+// P4: читает только render-owned данные item/draw_record плюс срезы хранилищ
+// той же очереди (skins/shaders уже после всех реаллокаций prepare-фазы).
+// Живые Mesh/Material/Skeleton здесь недоступны по построению.
+pub fn drawRegularItem(
+    env: *const Environment,
+    item: RenderMeshItem,
+    ctx: *const FrameContext,
+    current_pipeline_id: *u32,
+    skins: []const [MAX_BONES]Mat4,
+    shaders: []const material_mod.ShaderDrawSnapshot,
+) void {
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
     const rec = item.draw_record;
@@ -72,8 +82,11 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
     // Shader materials take their own path: pipeline from the lazy
     // ShaderMaterialCache, bindings/uniforms per the registration's base
     // template contract (identical layouts — see drawShaderMaterialItem).
-    if (rec.shader_material) |sm| {
-        return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, sm, mvp);
+    if (item.shader_index) |s_idx| {
+        if (s_idx < shaders.len) {
+            return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, shaders[s_idx], mvp);
+        }
+        return;
     }
 
     const pip_id = env.pipelines.forRegularItem(item);
@@ -124,7 +137,12 @@ pub fn drawRegularItem(env: *const Environment, item: RenderMeshItem, ctx: *cons
         };
         sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
-        const skel_bones = item.skin_matrices;
+        const skel_bones: ?*const [MAX_BONES]Mat4 = if (item.is_skinned)
+            // Битый индекс skinned-записи (билдером недостижимо): пропуск draw
+            // вместо аплоада stale-униформы чужого draw.
+            render_queue.skinAt(skins, item.skin_index) orelse return
+        else
+            null;
         if (skel_bones) |bones| {
             const vs_skin = skinned_pbr_shd.VsSkin{
                 .bones = bones.*,
@@ -240,16 +258,18 @@ fn drawShaderMaterialItem(
     item: RenderMeshItem,
     ctx: *const FrameContext,
     current_pipeline_id: *u32,
-    sm: *const ShaderMaterial,
+    snap: material_mod.ShaderDrawSnapshot,
     mvp: Mat4,
 ) void {
     if (item.is_skinned) return; // see limitation note above
 
-    const entry = shader_material.entry(sm.entry_index) orelse return;
+    const entry = shader_material.entry(snap.entry_index) orelse return;
     const set = env.pipelines.shader_materials.getOrCreate(entry.key) orelse return;
 
     const is_u32 = item.is_u32;
-    const pip_id = set.pipelineFor(item.transparent, is_u32, sm.double_sided);
+    // P4: sidedness hook-материала — из снимка (sm.double_sided), без
+    // decal-форсинга item.double_sided: поведение как до P4.
+    const pip_id = set.pipelineFor(item.transparent, is_u32, snap.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
         sg.applyPipeline(.{ .id = pip_id });
@@ -269,14 +289,14 @@ fn drawShaderMaterialItem(
         const morph_uniforms = item.morph_uniforms;
         if (entry.base == .pbr) {
             // PBR-base hook material: full PBR lighting with engine defaults
-            // for the maps the material does not override.
-            const albedo_tex = sm.texture orelse env.default_white.*;
-            bind.views[pbr_shd.VIEW_albedo_tex] = albedo_tex.view;
+            // for the maps the material does not override. Текстура — из
+            // prepare-снимка (дефолт уже подставлен при построении).
+            bind.views[pbr_shd.VIEW_albedo_tex] = snap.tex_view;
             bind.views[pbr_shd.VIEW_normal_tex] = env.default_normal.view;
             bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
             bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
             bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
-            bind.samplers[pbr_shd.SMP_smp] = albedo_tex.sampler;
+            bind.samplers[pbr_shd.SMP_smp] = snap.tex_sampler;
             // Hook materials have no per-slot data textures; the flat normal
             // default's sampler keeps the data_smp contract satisfied.
             bind.samplers[pbr_shd.SMP_data_smp] = env.default_normal.sampler;
@@ -301,7 +321,7 @@ fn drawShaderMaterialItem(
                 .light_dir = f.light_dir,
                 .light_color = f.light_color,
                 .ambient_color = f.ambient_color,
-                .base_color_factor = sm.getTintColor4(),
+                .base_color_factor = snap.tint,
                 .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
                 .emissive_factor = .{ 0, 0, 0, 1 },
                 .alpha_cutoff = alpha_cutoff,
@@ -327,10 +347,9 @@ fn drawShaderMaterialItem(
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
-            // Standard-base hook material.
-            const tex = sm.texture orelse env.default_white.*;
-            bind.views[shd.VIEW_diffuse_tex] = tex.view;
-            bind.samplers[shd.SMP_smp] = tex.sampler;
+            // Standard-base hook material (текстура из снимка).
+            bind.views[shd.VIEW_diffuse_tex] = snap.tex_view;
+            bind.samplers[shd.SMP_smp] = snap.tex_sampler;
             bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
             bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
             bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
@@ -349,7 +368,7 @@ fn drawShaderMaterialItem(
                 .light_dir = f.light_dir,
                 .light_color = f.light_color,
                 .ambient_color = f.ambient_color,
-                .diffuse_color = sm.getTintColor4(),
+                .diffuse_color = snap.tint,
                 .alpha_cutoff = alpha_cutoff,
                 // Hook materials have no UV transform: identity.
                 .uv_matrix = material_mod.UvTransform.identity.matrixRows(),
@@ -376,9 +395,9 @@ fn drawShaderMaterialItem(
         // shader does not declare; shaders that declare nothing get white).
         // Contract: UB 0 carries {mat4 mvp, mat4 model} like every forward
         // shader (runtime sources must declare it, see registerRuntime docs).
-        const tex = sm.texture orelse env.default_white.*;
-        bind.views[0] = tex.view;
-        bind.samplers[0] = tex.sampler;
+        // Текстура view slot 0 — из снимка.
+        bind.views[0] = snap.tex_view;
+        bind.samplers[0] = snap.tex_sampler;
         sg.applyBindings(bind);
 
         const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
@@ -389,10 +408,10 @@ fn drawShaderMaterialItem(
     // materials with vertex-stage params carry the same payload on the
     // fs-stage and vs-stage blocks.
     if (entry.user_ub) |ub| {
-        sg.applyUniforms(ub, sg.asRange(&sm.uniforms));
+        sg.applyUniforms(ub, sg.asRange(&snap.uniforms));
     }
     if (entry.vs_user_ub) |ub| {
-        sg.applyUniforms(ub, sg.asRange(&sm.uniforms));
+        sg.applyUniforms(ub, sg.asRange(&snap.uniforms));
     }
 
     sg.draw(item.base_vertex, item.index_count, 1);
@@ -413,26 +432,6 @@ fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_sha
     state.mesh_receive_shadows = mesh_receive_shadows;
     fallback_uniforms = uniforms.buildFrameUniforms(state, ctx);
     return &fallback_uniforms;
-}
-
-// Packs the shared fragment uniforms for one mesh: the scene-level state is
-// copied and the per-mesh receive_shadows flag patched in.
-fn frameUniformsFor(env: *const Environment, mesh: *const @import("../mesh.zig").Mesh, ctx: *const FrameContext) *const uniforms.FrameUniforms {
-    return frameUniformsForState(env.shadow_uniforms, mesh.receive_shadows, ctx);
-}
-
-// GPU-morph bind resources for one regular draw. Every draw must bind the
-// morph view and apply the vs_morph uniforms: sokol binding/uniform state
-// persists across draws, so a skipped draw would inherit the previous
-// mesh's delta texture and weights. CPU-morph and non-morph meshes bind
-// the pipeline-owned 1x1 zero texture with the enable flag off, keeping
-// the shader's fetch loop a no-op.
-fn morphBindFor(env: *const Environment, mesh: *const Mesh) struct { view: sg.View, uniforms: morph_gpu.VsUniforms } {
-    const gpu = mesh.morph_mode == .gpu; // missing delta texture panics in vsUniforms
-    return .{
-        .view = if (gpu) mesh.morph_delta_view else env.pipelines.default_morph_view,
-        .uniforms = morph_gpu.vsUniforms(mesh),
-    };
 }
 
 // Builds the module-specific VsMorph struct (identical layout in all three
@@ -651,38 +650,6 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
     env.stats.triangles += (batch.index_count / 3) * batch.visible_instance_count;
-}
-
-pub fn drawInstancedMesh(env: *const Environment, mesh: *Mesh, ctx: *const FrameContext, current_pipeline_id: *u32) void {
-    if (mesh.instances.items.len == 0) return;
-    if (mesh.visible_instance_count == 0 or mesh.instance_buffer.id == 0) return;
-    const flags = instancedDrawFlags(mesh.material, mesh.is_decal);
-    const dummy_std = StandardMaterial.init("default");
-    const rec = material_mod.buildDrawRecord(
-        mesh.material,
-        &dummy_std,
-        env.default_white,
-        env.default_normal,
-        env.default_cube,
-        env.sky_texture,
-        env.ibl_intensity,
-    );
-    const batch = RenderInstancedBatch{
-        .vertex_buffer = mesh.vertex_buffer,
-        .instance_buffer = mesh.instance_buffer,
-        .index_buffer = mesh.index_buffer,
-        .index_count = mesh.index_count,
-        .index_type = mesh.index_type,
-        .visible_instance_count = mesh.visible_instance_count,
-        .is_pbr = if (mesh.material) |m| (m == .pbr) else false,
-        .transparent = flags.transparent,
-        .double_sided = flags.double_sided,
-        .is_decal = mesh.is_decal,
-        .receive_shadows = mesh.receive_shadows,
-        .draw_record = rec,
-        .mesh = mesh,
-    };
-    drawInstancedBatch(env, batch, ctx, current_pipeline_id);
 }
 
 // ---------------------------------------------------------------------------
