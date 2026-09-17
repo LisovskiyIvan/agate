@@ -2,13 +2,14 @@
 //! механизм отложенного уничтожения GPU-ресурсов.
 //!
 //! Ownership-блок:
-//! - ПИШЕТ любой поток через `retireMesh` (сегодня — только Scene.destroyMesh
-//!   вне context-потока; в будущем — update-поток, выводящий объекты из
-//!   эксплуатации). Под мьютексом только штамп epoch + append указателя,
-//!   никаких sg.* и никакого освобождения памяти.
+//! - ПИШЕТ любой поток через `retireMesh`/`retireBuffer` (сегодня — только
+//!   Scene.destroyMesh вне context-потока и рост instance-буферов в стейджинге;
+//!   в будущем — update-поток, выводящий объекты из эксплуатации). Под
+//!   мьютексом только штамп epoch + append записи, никаких sg.* и никакого
+//!   освобождения памяти.
 //! - ЧИТАЕТ/УНИЧТОЖАЕТ только context-поток: `flush` (начало render-кадра) и
 //!   `deinit` (конец жизни сцены). Только здесь вызываются `Mesh.deinit`
-//!   (sg.destroy*) и `allocator.destroy`.
+//!   (sg.destroy*) / `sg.destroyBuffer` и `allocator.destroy`.
 //! Правила epoch:
 //! - `begin` открывает новый epoch кадра; `complete(e)` закрывает epoch e;
 //!   кадры строго последовательны, поэтому `begin` заодно закрывает
@@ -23,11 +24,18 @@
 //! и `Scene.deinit` (через `deinit`, уничтожающий и незавершённые эпохи).
 //! OOM-контракт как раньше: очередь не растёт бесконечно — при OOM append
 //! запись паркуется в безаллокационный overflow[8], при переполнении и его —
-//! лог + утечка меша, но никогда sg.* вне context-потока.
-//! Tripwire P5/P6: новые kind'ы записей (не меши) добавлять сюда же — расширять
-//! запись/очередь, а не заводить новые очереди в Scene.
+//! лог + утечка записи, но никогда sg.* вне context-потока.
+//! P5 (instance staging ownership): выросший instance-буфер уходит сюда же
+//! записью kind=.buffer — СНАЧАЛА новый буфер создан+залит успешно, затем
+//! старый ретайрится (никакого немедленного destroy старого). Mesh.deinit
+//! уничтожает только текущий instance_render.buffer — ретайренные старые
+//! буферы принадлежат очереди, двойного free нет.
+//! Tripwire P6: новые kind'ы записей (не меши/буферы) добавлять сюда же —
+//! расширять запись/очередь, а не заводить новые очереди в Scene.
 
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 const Mesh = @import("../mesh.zig").Mesh;
 const gpu_thread = @import("../gpu_thread.zig");
 
@@ -38,11 +46,16 @@ pub const Epoch = u64;
 /// в Scene (`pending_gpu_destroys_overflow`).
 const overflow_cap: usize = 8;
 
-/// Одна отложенная запись: уже отвязанный от сцены меш + кадр ухода в ретенцию.
+/// Одна отложенная запись: уже отвязанный от сцены меш либо вытесненный
+/// старый instance-буфер (P5) + кадр ухода в ретенцию.
 const Entry = struct {
-    mesh: *Mesh,
+    kind: Kind,
+    mesh: ?*Mesh = null,
+    buffer: sg.Buffer = .{},
     epoch: Epoch,
 };
+
+pub const Kind = enum { mesh, buffer };
 
 /// Спин по образцу assets.UploadQueue: критические секции — bump счётчика или
 /// append одного указателя, вызовы retire редкие.
@@ -110,7 +123,7 @@ pub const GpuRetireQueue = struct {
     pub fn retireMesh(self: *Self, allocator: std.mem.Allocator, mesh: *Mesh) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        const entry = Entry{ .mesh = mesh, .epoch = self.current_epoch };
+        const entry = Entry{ .kind = .mesh, .mesh = mesh, .epoch = self.current_epoch };
         self.pending.append(allocator, entry) catch {
             // OOM в append: слот overflow не требует аллокации, поэтому
             // thread-affinity не нарушается и здесь.
@@ -121,6 +134,27 @@ pub const GpuRetireQueue = struct {
                 // Обе очереди исчерпаны при патологическом OOM: утечка меша
                 // (с логом), но не sg.* вне context-потока.
                 std.log.err("scene: destroy queues exhausted, leaking mesh '{s}'", .{mesh.name});
+            }
+        };
+    }
+
+    /// Уход старого instance-буфера в ретенцию (P5: рост буфера в стейджинге —
+    /// новый создан+залит, затем старый сюда). Можно звать с любого потока;
+    /// тот же epoch/overflow[8]/log+leak контракт, что у retireMesh: под
+    /// мьютексом только штамп epoch + append, никаких sg.*. Пустой handle —
+    /// no-op (нечего ретайрить). Уничтожение (`sg.destroyBuffer`) — только
+    /// context-поток во flush/deinit.
+    pub fn retireBuffer(self: *Self, allocator: std.mem.Allocator, buf: sg.Buffer) void {
+        if (buf.id == 0) return;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = Entry{ .kind = .buffer, .buffer = buf, .epoch = self.current_epoch };
+        self.pending.append(allocator, entry) catch {
+            if (self.overflow_len < self.overflow.len) {
+                self.overflow[self.overflow_len] = entry;
+                self.overflow_len += 1;
+            } else {
+                std.log.err("scene: destroy queues exhausted, leaking instance buffer (id {})", .{buf.id});
             }
         };
     }
@@ -165,8 +199,16 @@ pub const GpuRetireQueue = struct {
         var kept: usize = 0;
         for (self.pending.items) |entry| {
             if (entry.epoch <= done) {
-                entry.mesh.deinit(allocator);
-                allocator.destroy(entry.mesh);
+                switch (entry.kind) {
+                    .mesh => {
+                        entry.mesh.?.deinit(allocator);
+                        allocator.destroy(entry.mesh.?);
+                    },
+                    // P5: вытесненный старый instance-буфер — только GPU-хендл,
+                    // CPU-памяти за ним нет. Контекстный поток гарантирован
+                    // вызывающими flush/deinit.
+                    .buffer => sg.destroyBuffer(entry.buffer),
+                }
             } else {
                 self.pending.items[kept] = entry;
                 kept += 1;
@@ -177,8 +219,13 @@ pub const GpuRetireQueue = struct {
         for (self.overflow[0..self.overflow_len]) |slot| {
             if (slot) |entry| {
                 if (entry.epoch <= done) {
-                    entry.mesh.deinit(allocator);
-                    allocator.destroy(entry.mesh);
+                    switch (entry.kind) {
+                        .mesh => {
+                            entry.mesh.?.deinit(allocator);
+                            allocator.destroy(entry.mesh.?);
+                        },
+                        .buffer => sg.destroyBuffer(entry.buffer),
+                    }
                     continue;
                 }
                 self.overflow[okept] = entry;
@@ -292,7 +339,7 @@ test "deinit уничтожает хвосты, включая незаверш�
     q.retireMesh(alloc, m2);
     // Overflow-хвост тоже: буфер-free меш, ни одного sg.* не будет.
     const m3 = try makeMesh(alloc, "tail_overflow");
-    q.overflow[0] = .{ .mesh = m3, .epoch = q.current_epoch };
+    q.overflow[0] = .{ .kind = .mesh, .mesh = m3, .epoch = q.current_epoch };
     q.overflow_len = 1;
     try std.testing.expectEqual(@as(usize, 3), q.retainedCount());
 
@@ -301,4 +348,66 @@ test "deinit уничтожает хвосты, включая незаверш�
     // помечает self как undefined); что все три меша уничтожены ровно по
     // разу и очередей не осталось, проверяет сам testing.allocator
     // (утечка/двойной free уронили бы тест).
+}
+
+test "retireBuffer штампует текущий epoch; пустой handle — no-op" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    // Ручная чистка вместо q.deinit: fake-хендлы буферов (id без живого
+    // GPU-контекста) нельзя прогонять через sg.destroyBuffer; за ними нет
+    // ни GPU-ресурса, ни CPU-памяти — достаточно освободить список.
+    defer q.pending.deinit(alloc);
+
+    const e = q.begin();
+    q.retireBuffer(alloc, .{});
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+
+    const m = try makeMesh(alloc, "mixed_probe");
+    q.retireMesh(alloc, m);
+    q.retireBuffer(alloc, .{ .id = 41 });
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+    try std.testing.expectEqual(Kind.mesh, q.pending.items[0].kind);
+    try std.testing.expectEqual(Kind.buffer, q.pending.items[1].kind);
+    try std.testing.expectEqual(e, q.pending.items[1].epoch);
+    try std.testing.expectEqual(@as(u32, 41), q.pending.items[1].buffer.id);
+
+    // Flush до complete(e): записи текущего незавершённого epoch ждут,
+    // sg.* не вызывается ни по одной из них.
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+
+    // Ручная чистка в том же порядке, что drainLocked: меш — штатно
+    // (буферов у testMesh нет, sg.* не вызывается), fake-буфер — дроп
+    // записи без destroy (ресурса за id 41 не существует).
+    m.deinit(alloc);
+    alloc.destroy(m);
+    q.pending.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+}
+
+test "retireBuffer OOM уходит в overflow[8]" {
+    const alloc = std.testing.allocator;
+    var q: GpuRetireQueue = .{};
+    defer q.pending.deinit(alloc);
+    defer {
+        @memset(&q.overflow, null);
+        q.overflow_len = 0;
+    }
+    _ = q.begin();
+
+    // Каждый append падает: все записи паркуются в безаллокационный
+    // overflow, thread-affinity не нарушается. (Полное переполнение
+    // overflow — лог+утечка — тестом не дёргается: кастомный test_runner
+    // считает любой std.log.err падением сборки; ветка — трёхстрочное
+    // зеркало давно существующего mesh-пути.)
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        q.retireBuffer(failing.allocator(), .{ .id = 100 + i });
+    }
+    try std.testing.expectEqual(@as(usize, 8), q.retainedCount());
+    try std.testing.expectEqual(@as(u32, 100), q.overflow[0].?.buffer.id);
+    try std.testing.expectEqual(@as(u32, 107), q.overflow[7].?.buffer.id);
+    try std.testing.expectEqual(Kind.buffer, q.overflow[7].?.kind);
 }

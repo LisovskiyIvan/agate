@@ -24,6 +24,7 @@ const jobs = @import("../jobs.zig");
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 const instance_staging = @import("instance_staging.zig");
+const gpu_retire_mod = @import("gpu_retire.zig");
 
 pub const RenderMeshItem = struct {
     model: Mat4,
@@ -385,6 +386,19 @@ pub const FrameCullContext = struct {
     occlusion_culler: *visibility.OcclusionCuller,
     stats: *SceneStats,
     queues: *RenderQueues,
+    /// P5: retire queue for grown instance buffers, threaded into staging by
+    /// Scene (null in standalone/test contexts → the old buffer is destroyed
+    /// immediately on the context thread; see InstanceStageContext docs).
+    gpu_retire: ?*gpu_retire_mod.GpuRetireQueue = null,
+    /// P5 revision: true when Scene already pre-staged this frame. The
+    /// pre-stage publish is then DEFINITIVE for the frame: view-queue builds
+    /// consume the published render state as-is and never retry staging —
+    /// a failed pre-stage (scratch OOM, buffer failure) keeps the previous
+    /// complete state, and the shadow snapshot taken from it stays coherent
+    /// with main/outline even if a retry would have succeeded. Default
+    /// false: standalone builds (tests, tooling) stage here, with the
+    /// success-gated same-frame retry intact while no snapshot is consumed.
+    instances_prepared: bool = false,
 };
 
 /// Phase -1 (occluder rasterization) and Phase 0 (frustum/occlusion
@@ -506,26 +520,35 @@ fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
 fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mesh_index: usize) void {
     // Deferred-creation meshes have no vertex/index buffers yet; staging
     // instance data for them would produce a draw against invalid handles.
+    // Checked here (not only inside staging) so a definitive pre-stage
+    // (instances_prepared) still skips them in the view builds.
     if (mesh.gpu_pending) return;
     // Pre-staged by instance_staging.stageInstances before the shadow pass
     // when running under Scene.prepareFrame; the frame guard makes this a
     // no-op then, while direct callers (tests, parallel merge tail) still
-    // stage here.
-    instance_staging.stageInstancedMesh(.{
-        .allocator = ctx.allocator,
-        .instance_matrices = &ctx.queues.instance_matrices,
-        .thread_pool = ctx.thread_pool,
-        .frame_id = ctx.frame_id,
-        .eye = ctx.eye,
-    }, mesh);
+    // stage here. With instances_prepared the pre-stage publish is
+    // definitive: consume it as-is, never retry mid-frame. LOD children
+    // stay on the per-mesh guard (pre-stage and shadow both skip them, so
+    // the views still share a single guard-stage, as before).
+    if (!ctx.instances_prepared or mesh.is_lod_child) {
+        instance_staging.stageInstancedMesh(.{
+            .allocator = ctx.allocator,
+            .instance_matrices = &ctx.queues.instance_matrices,
+            .thread_pool = ctx.thread_pool,
+            .frame_id = ctx.frame_id,
+            .eye = ctx.eye,
+            .retire_queue = ctx.gpu_retire,
+        }, mesh);
+    }
 
-    if (mesh.visible_instance_count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
-        if (ctx.cull_frustum and mesh.cached_aabb.isValid() and !frustum.intersectsAABB(mesh.cached_aabb)) {
+    const staged = mesh.instance_render;
+    if (staged.count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
+        if (ctx.cull_frustum and staged.bounds.isValid() and !frustum.intersectsAABB(staged.bounds)) {
             ctx.stats.culled_meshes += @intCast(mesh.instances.items.len);
             return;
         }
         ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
-        ctx.stats.rendered_meshes += mesh.visible_instance_count;
+        ctx.stats.rendered_meshes += staged.count;
 
         const is_pbr = if (mesh.material) |m| (m == .pbr) else false;
         const is_trans = materialIsTransparent(mesh.material) or mesh.is_decal;
@@ -534,11 +557,11 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
 
         const batch = RenderInstancedBatch{
             .vertex_buffer = mesh.vertex_buffer,
-            .instance_buffer = mesh.instance_buffer,
+            .instance_buffer = staged.buffer,
             .index_buffer = mesh.index_buffer,
             .index_count = mesh.index_count,
             .index_type = mesh.index_type,
-            .visible_instance_count = mesh.visible_instance_count,
+            .visible_instance_count = staged.count,
             .is_pbr = is_pbr,
             .transparent = is_trans,
             .double_sided = is_ds,
@@ -552,10 +575,10 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             // and its order entry are appended atomically under OOM.
             ctx.queues.transparent_instanced.ensureUnusedCapacity(ctx.allocator, 1) catch return;
             ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch return;
-            // Group distance key: combined AABB center (batch draws as one;
-            // no per-instance sorting). Falls back to the mesh position when
-            // the combined AABB is degenerate.
-            const center = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center() else mesh.position;
+            // Group distance key: combined staged bounds center (batch draws
+            // as one; no per-instance sorting). Falls back to the mesh
+            // position when the staged bounds are degenerate.
+            const center = if (staged.bounds.isValid()) staged.bounds.center() else mesh.position;
             const idx: u32 = @intCast(ctx.queues.transparent_instanced.items.len);
             const seq: u32 = @intCast(mesh_index);
             ctx.queues.transparent_instanced.appendAssumeCapacity(batch);
@@ -1600,8 +1623,14 @@ test "parallel instanced staging produces serial-identical instance matrices" {
     };
     submitInstancedMesh(ctx_p, Frustum.fromViewProjection(Mat4.identity), &mesh_parallel, 0);
 
-    // Verify bit-identical results
-    try std.testing.expectEqual(mesh_serial.cached_aabb, mesh_parallel.cached_aabb);
+    // Verify bit-identical results, including the published render state
+    // (bounds/count/frame — not pointer identity, and never a weaker
+    // count-only check: 300 instances with every 7th hidden stage 257).
+    try std.testing.expectEqual(mesh_serial.instance_render.bounds, mesh_parallel.instance_render.bounds);
+    try std.testing.expectEqual(@as(u32, 257), mesh_serial.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 257), mesh_parallel.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 1), mesh_serial.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u64, 2), mesh_parallel.instance_render.staged_frame);
     try std.testing.expectEqual(queues_s.instance_matrices.items.len, queues_p.instance_matrices.items.len);
     try std.testing.expect(queues_s.instance_matrices.items.len > 0);
     for (queues_s.instance_matrices.items, queues_p.instance_matrices.items) |m_s, m_p| {
@@ -2331,12 +2360,12 @@ test "stageInstances stages visible count and combined AABB" {
     }, &meshes);
 
     // sg has no context in tests, so the upload half is skipped; the
-    // transform/count staging must still run.
-    try std.testing.expectEqual(@as(u32, 2), parent.visible_instance_count);
-    try std.testing.expect(parent.cached_aabb.isValid());
+    // transform/count staging must still run into the published render state.
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expect(parent.instance_render.bounds.isValid());
     // inst0 covers [-1,1], inst1 covers [4,6]: the combined AABB spans both.
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.cached_aabb.min.x, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), parent.cached_aabb.max.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), parent.instance_render.bounds.max.x, 1e-4);
 }
 
 test "stageInstances is idempotent within a frame" {
@@ -2370,15 +2399,17 @@ test "stageInstances is idempotent within a frame" {
         .eye = Vec3.zero,
     };
     instance_staging.stageInstances(sc, &meshes);
-    const first_aabb = parent.cached_aabb;
-    const first_count = parent.visible_instance_count;
+    const first_bounds = parent.instance_render.bounds;
+    const first_count = parent.instance_render.count;
+    const first_frame = parent.instance_render.staged_frame;
 
     // Mutating an instance after staging must not change this frame's
     // snapshot: the frame guard makes the second call a no-op.
     inst0.position = Vec3.new(100, 0, 0);
     instance_staging.stageInstances(sc, &meshes);
-    try std.testing.expectEqual(first_count, parent.visible_instance_count);
-    try std.testing.expectEqual(first_aabb, parent.cached_aabb);
+    try std.testing.expectEqual(first_count, parent.instance_render.count);
+    try std.testing.expectEqual(first_bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(first_frame, parent.instance_render.staged_frame);
 }
 
 test "stageInstances skips gpu_pending meshes" {
@@ -2412,7 +2443,8 @@ test "stageInstances skips gpu_pending meshes" {
         .eye = Vec3.zero,
     }, &meshes);
 
-    try std.testing.expectEqual(@as(u32, 0), parent.visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), parent.instance_render.staged_frame);
 }
 
 test "pre-staged instances feed buildFrameQueues batch" {
@@ -2466,6 +2498,511 @@ test "pre-staged instances feed buildFrameQueues batch" {
     try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 2), queues.opaque_instanced.items[0].visible_instance_count);
     try std.testing.expectEqual(@as(u32, 3), queues.opaque_instanced.items[0].index_count);
+}
+
+// ---- P5 instance staging ownership: регрессия владения и публикации. ----
+
+// Staging is pure: it computes from read-only instance/source TRS,
+// base_matrix and local_box and must NOT mutate the InstancedMesh game
+// caches (cached_*/dirty/last_*) or the regular Mesh caches — those stay
+// functional for picking and game APIs. Sentinels prove non-writes; exact
+// staged numbers prove the read path (source base translation included).
+test "P5: staging leaves source TRS and game caches untouched" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "pure_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .base_matrix = Mat4.translation(Vec3.new(10, 0, 0)),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+        .cached_matrix = Mat4.translation(Vec3.new(777, 0, 0)),
+        .cached_aabb = BoundingBox.init(Vec3.new(777, 777, 777), Vec3.new(778, 778, 778)),
+        .cached_frame = 4242,
+    };
+    var inst = InstancedMesh{
+        .name = "pure_inst",
+        .source_mesh = &src,
+        .position = Vec3.new(3, 4, 5),
+        .cached_world_matrix = Mat4.translation(Vec3.new(999, 0, 0)),
+        .cached_bounding_box = BoundingBox.init(Vec3.new(999, 999, 999), Vec3.new(1000, 1000, 1000)),
+        .last_position = Vec3.new(111, 0, 0),
+        .last_rotation = Vec3.new(0, 222, 0),
+        .last_scaling = Vec3.new(0, 0, 333),
+        .dirty = true,
+    };
+    var ptrs = [_]*InstancedMesh{&inst};
+    var parent = Mesh{
+        .name = "pure_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .cached_matrix = Mat4.translation(Vec3.new(555, 0, 0)),
+        .cached_aabb = BoundingBox.init(Vec3.new(555, 555, 555), Vec3.new(556, 556, 556)),
+        .cached_frame = 8484,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 11,
+        .eye = Vec3.zero,
+    }, &meshes);
+
+    // Published state: count 1, staged frame advanced, bounds read through
+    // the source base translation: unit box at (3,4,5)+(10,0,0) = [12,14]x[3,5]x[4,6].
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 11), parent.instance_render.staged_frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 14.0), parent.instance_render.bounds.max.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), parent.instance_render.bounds.min.y, 1e-4);
+    // Scratch carries the same world translation (13,4,5).
+    try std.testing.expectEqual(@as(usize, 1), queues.instance_matrices.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 13.0), queues.instance_matrices.items[0].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), queues.instance_matrices.items[0].m[13], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), queues.instance_matrices.items[0].m[14], 1e-4);
+
+    // Game caches: every sentinel bit-identical, dirty flag untouched.
+    try std.testing.expectApproxEqAbs(@as(f32, 999.0), inst.cached_world_matrix.m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 999.0), inst.cached_bounding_box.min.x, 1e-6);
+    try std.testing.expectEqual(Vec3.new(111, 0, 0), inst.last_position);
+    try std.testing.expectEqual(Vec3.new(0, 222, 0), inst.last_rotation);
+    try std.testing.expectEqual(Vec3.new(0, 0, 333), inst.last_scaling);
+    try std.testing.expect(inst.dirty);
+    // Regular mesh caches (source template and instance parent): untouched.
+    try std.testing.expectApproxEqAbs(@as(f32, 777.0), src.cached_matrix.m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 777.0), src.cached_aabb.min.x, 1e-6);
+    try std.testing.expectEqual(@as(u64, 4242), src.cached_frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 555.0), parent.cached_matrix.m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 555.0), parent.cached_aabb.min.x, 1e-6);
+    try std.testing.expectEqual(@as(u64, 8484), parent.cached_frame);
+}
+
+// A completed stage stays once-per-frame even when a second view (different
+// eye) restages: no recompute, no re-sort, same scratch bytes. The next
+// frame picks the mutation up.
+test "P5: staged frame survives a second eye; next frame restages" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "eye_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "e0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "e1", .source_mesh = &src, .position = Vec3.new(8, 0, 0) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
+    var parent = Mesh{
+        .name = "eye_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+    };
+    const meshes = [_]*Mesh{&parent};
+
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 21,
+        .eye = Vec3.new(-50, 0, 0),
+    }, &meshes);
+    const first_scratch = try ally.dupe(Mat4, queues.instance_matrices.items);
+    defer ally.free(first_scratch);
+    const first_bounds = parent.instance_render.bounds;
+
+    // Same frame, other eye, mutated TRS: must be a no-op (shadow + N
+    // cameras share the frame's publish; no same-frame retry).
+    inst0.position = Vec3.new(100, 0, 0);
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 21,
+        .eye = Vec3.new(50, 0, 0),
+    }, &meshes);
+    try std.testing.expectEqual(@as(u64, 21), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(first_bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(first_scratch.len, queues.instance_matrices.items.len);
+    for (first_scratch, queues.instance_matrices.items) |a, b| {
+        try std.testing.expectEqual(a, b);
+    }
+
+    // Next frame: the mutation lands (inst0 now covers [99,101]).
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 22,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u64, 22), parent.instance_render.staged_frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 101.0), parent.instance_render.bounds.max.x, 1e-4);
+}
+
+// Visible-set transitions publish coherent bounds/count every frame, and the
+// empty set publishes a consistent empty state (count 0, invalid bounds)
+// that recovers when instances return.
+test "P5: visible transitions and the empty path stay coherent" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "trans_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "t0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMesh{ .name = "t1", .source_mesh = &src, .position = Vec3.new(20, 0, 0) };
+    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
+    var parent = Mesh{
+        .name = "trans_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    const stage = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            matrices: *std.ArrayListUnmanaged(Mat4),
+            frame: u64,
+            list: []const *Mesh,
+        ) void {
+            instance_staging.stageInstances(.{
+                .allocator = allocator,
+                .instance_matrices = matrices,
+                .thread_pool = null,
+                .frame_id = frame,
+                .eye = Vec3.zero,
+            }, list);
+        }
+    }.run;
+
+    stage(ally, &queues.instance_matrices, 31, &meshes);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), parent.instance_render.bounds.max.x, 1e-4);
+
+    inst1.is_visible = false;
+    stage(ally, &queues.instance_matrices, 32, &meshes);
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 32), parent.instance_render.staged_frame);
+    // Only inst0's box remains: a count-only check would miss stale bounds.
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), parent.instance_render.bounds.max.x, 1e-4);
+
+    inst0.is_visible = false;
+    // GPU-side sentinels (no GPU context here, so the upload half is skipped
+    // and these must survive untouched): a live GPU probe covers the same
+    // preservation against real buffers separately.
+    parent.instance_render.buffer = .{ .id = 123 };
+    parent.instance_render.capacity = 7;
+    parent.instance_render.hash = 0xABCD;
+    parent.instance_render.uploaded_count = 5;
+    stage(ally, &queues.instance_matrices, 33, &meshes);
+    try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 33), parent.instance_render.staged_frame);
+    try std.testing.expect(!parent.instance_render.bounds.isValid());
+    // The empty publish touches count/bounds/frame only: no mixing of new
+    // emptiness with old GPU identity.
+    try std.testing.expectEqual(@as(u32, 123), parent.instance_render.buffer.id);
+    try std.testing.expectEqual(@as(usize, 7), parent.instance_render.capacity);
+    try std.testing.expectEqual(@as(u64, 0xABCD), parent.instance_render.hash);
+    try std.testing.expectEqual(@as(usize, 5), parent.instance_render.uploaded_count);
+
+    inst0.is_visible = true;
+    inst1.is_visible = true;
+    stage(ally, &queues.instance_matrices, 34, &meshes);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expect(parent.instance_render.bounds.isValid());
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), parent.instance_render.bounds.max.x, 1e-4);
+}
+
+// Scratch OOM publishes nothing: the previous complete state stays in place
+// (no mixed new-bounds/old-count) and the guard stays back so a later call
+// with a working allocator retries successfully.
+test "P5: scratch OOM keeps the previous publish and allows retry" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "oom_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "o0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    var parent = Mesh{
+        .name = "oom_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+    };
+    const meshes = [_]*Mesh{&parent};
+
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 41,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+
+    // Fresh scratch (no retained capacity) + failing allocator: the first
+    // append/resize fails. Mutation is staged for the retry below.
+    var bare = RenderQueues{};
+    defer bare.deinit(ally);
+    inst0.position = Vec3.new(30, 0, 0);
+    var failing = std.testing.FailingAllocator.init(ally, .{ .fail_index = 0 });
+    instance_staging.stageInstances(.{
+        .allocator = failing.allocator(),
+        .instance_matrices = &bare.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 42,
+        .eye = Vec3.zero,
+    }, &meshes);
+    // Previous complete publish intact, guard not advanced.
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 41), parent.instance_render.staged_frame);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
+
+    // Retry with a working allocator lands the mutation (box [29,31]).
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &bare.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 42,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u64, 42), parent.instance_render.staged_frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 29.0), parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 31.0), parent.instance_render.bounds.max.x, 1e-4);
+}
+
+// Without a GPU context there is no upload: hash/uploaded_count must keep
+// describing "no upload yet" (zeros), so the dedup gate cannot mistake a
+// CPU-only publish for uploaded data when a context appears later.
+test "P5: CPU-only staging publishes no upload identity" {
+    const ally = std.testing.allocator;
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+
+    var src = Mesh{
+        .name = "noupload_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMesh{ .name = "n0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var ptrs = [_]*InstancedMesh{&inst0};
+    var parent = Mesh{
+        .name = "noupload_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+    };
+    const meshes = [_]*Mesh{&parent};
+    const ctx = instance_staging.InstanceStageContext{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 51,
+        .eye = Vec3.zero,
+    };
+    instance_staging.stageInstances(ctx, &meshes);
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 51), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u64, 0), parent.instance_render.hash);
+    try std.testing.expectEqual(@as(usize, 0), parent.instance_render.uploaded_count);
+
+    // Second identical frame: still no upload identity invented.
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 52,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u64, 0), parent.instance_render.hash);
+    try std.testing.expectEqual(@as(usize, 0), parent.instance_render.uploaded_count);
+}
+
+// Baseline bug this guards (live: candidate 19441 tris vs P4 baseline
+// 105620): the pre-stage used to publish combined instance bounds into
+// Mesh.cached_aabb, and the parallel cull's worldMatrixCached pre-warm of
+// ALL meshes overwrote them with the tiny origin template — the frame guard
+// then blocked any restage, so the offscreen group drew. With the isolated
+// instance_render.bounds, a warmed origin cached_aabb must not move culling.
+// Controlled identity-frustum proof: template box at the origin (inside),
+// instances far outside (x=50) plus one inside-visible sentinel group, so a
+// pass is impossible by merely dropping every instanced batch.
+test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
+    const ally = std.testing.allocator;
+    const origin_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+
+    var src = Mesh{
+        .name = "cull_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = origin_box,
+    };
+    var far_inst = InstancedMesh{ .name = "far", .source_mesh = &src, .position = Vec3.new(50, 0, 0) };
+    var near_inst = InstancedMesh{ .name = "near", .source_mesh = &src, .position = Vec3.zero };
+    var far_ptrs = [_]*InstancedMesh{&far_inst};
+    var near_ptrs = [_]*InstancedMesh{&near_inst};
+    var far_parent = Mesh{
+        .name = "far_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = origin_box,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+    };
+    var near_parent = Mesh{
+        .name = "near_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = origin_box,
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1 },
+    };
+    // Sentinel GPU identity on the inside group (no sg context here, so the
+    // upload half is skipped and staging preserves these untouched): the
+    // surviving batch must carry exactly this handle.
+    near_parent.instance_render.buffer = .{ .id = 77 };
+    const meshes = [_]*Mesh{ &far_parent, &near_parent };
+
+    // Scene-like pre-stage (frame 81): far bounds [49.5, 50.5], near bounds
+    // [-0.5, 0.5], both count 1.
+    var stage_queues = RenderQueues{};
+    defer stage_queues.deinit(ally);
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &stage_queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 81,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 1), far_parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 1), near_parent.instance_render.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 49.5), far_parent.instance_render.bounds.min.x, 1e-4);
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    var serial_stats: ?SceneStats = null;
+    var serial_batch: ?RenderInstancedBatch = null;
+    var parallel_stats: ?SceneStats = null;
+    var parallel_batch: ?RenderInstancedBatch = null;
+
+    // Serial build (Scene-like: pre-stage definitive, identity frustum).
+    {
+        var queues = RenderQueues{};
+        defer queues.deinit(ally);
+        var stats = SceneStats{};
+        var culler = visibility.OcclusionCuller.init();
+        buildFrameQueues(.{
+            .allocator = ally,
+            .meshes = &meshes,
+            .frame_id = 81,
+            .view_proj = Mat4.identity,
+            .eye = Vec3.zero,
+            .cull_frustum = true,
+            .cull_occlusion = false,
+            .occlusion_culler = &culler,
+            .stats = &stats,
+            .queues = &queues,
+            .default_white_id = 1,
+            .instances_prepared = true,
+        });
+        try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+        serial_batch = queues.opaque_instanced.items[0];
+        serial_stats = stats;
+    }
+
+    // Parallel build (parallel_min_meshes=1 forces the pre-warm path over
+    // both instance parents on worker threads).
+    {
+        var queues = RenderQueues{};
+        defer queues.deinit(ally);
+        var stats = SceneStats{};
+        var culler = visibility.OcclusionCuller.init();
+        buildFrameQueues(.{
+            .allocator = ally,
+            .thread_pool = pool,
+            .parallel_min_meshes = 1,
+            .meshes = &meshes,
+            .frame_id = 81,
+            .view_proj = Mat4.identity,
+            .eye = Vec3.zero,
+            .cull_frustum = true,
+            .cull_occlusion = false,
+            .occlusion_culler = &culler,
+            .stats = &stats,
+            .queues = &queues,
+            .default_white_id = 1,
+            .instances_prepared = true,
+        });
+        try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+        parallel_batch = queues.opaque_instanced.items[0];
+        parallel_stats = stats;
+    }
+
+    // The surviving batch is the inside sentinel group in both paths —
+    // not an empty queue, and identical across paths.
+    const sb = serial_batch orelse return error.TestUnexpectedResult;
+    const pb = parallel_batch orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), sb.visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 77), sb.instance_buffer.id);
+    try std.testing.expectEqual(sb.visible_instance_count, pb.visible_instance_count);
+    try std.testing.expectEqual(sb.instance_buffer.id, pb.instance_buffer.id);
+    try std.testing.expectEqual(sb.index_count, pb.index_count);
+
+    // Cull stats: the far group (1 instance) omitted, the near group (1
+    // instance) drawn — equal in both paths.
+    const ss = serial_stats orelse return error.TestUnexpectedResult;
+    const ps = parallel_stats orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), ss.culled_meshes);
+    try std.testing.expectEqual(@as(u32, 1), ss.total_meshes);
+    try std.testing.expectEqual(@as(u32, 1), ss.rendered_meshes);
+    try std.testing.expectEqual(ss.culled_meshes, ps.culled_meshes);
+    try std.testing.expectEqual(ss.total_meshes, ps.total_meshes);
+    try std.testing.expectEqual(ss.rendered_meshes, ps.rendered_meshes);
+
+    // The crux: the parallel pre-warm rewrote the regular cached_aabb to
+    // the origin template, yet the staged far bounds survived for culling
+    // and no restage happened (frame still 81, count still 1, not 0).
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), far_parent.cached_aabb.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), far_parent.cached_aabb.max.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 49.5), far_parent.instance_render.bounds.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 50.5), far_parent.instance_render.bounds.max.x, 1e-4);
+    try std.testing.expectEqual(@as(u32, 1), far_parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 81), far_parent.instance_render.staged_frame);
 }
 
 // ---- P4 render-owned draw snapshot: регрессия владения. ----

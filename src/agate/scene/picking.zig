@@ -161,9 +161,10 @@ fn sphereHit(r: Ray, model: Mat4, radius: f32) ?RayHit {
 /// and instances alike.
 ///
 /// Instance picking uses the drawn model matrix: each candidate is refreshed
-/// with the same CPU-only `updateCachedTransforms()` the render path calls,
+/// with CPU-only `updateCachedTransforms()` — the same TRS(instance) *
+/// source.base_matrix formula the pure render staging (P5) computes from —
 /// and the ray tests `cached_bounding_box` / the source-local sphere in that
-/// exact space. The cached matrix is `TRS(instance) * source.base_matrix` —
+/// exact space. Render staging itself never mutates these game caches. The cached matrix is `TRS(instance) * source.base_matrix` —
 /// the source mesh's own TRS and parent chain never reach the instanced draw,
 /// so they must not move picks either. Resolution is AABB-level, matching the
 /// mesh-level AABB path (no triangle tests exist in picking). The nearest hit
@@ -199,9 +200,10 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
             }
             for (mesh.instances.items, 0..) |inst, idx| {
                 if (!inst.is_visible) continue;
-                // Same CPU-only refresh the render path performs; the cached
-                // matrix is exactly the model matrix the instanced draw
-                // uploads, so picks land where instances draw.
+                // Same formula the pure render staging computes (P5 leaves
+                // these game caches untouched); the cached matrix is exactly
+                // the model matrix the instanced draw uploads, so picks land
+                // where instances draw.
                 inst.updateCachedTransforms();
                 if (sphere_radius) |radius| {
                     if (sphereHit(r, inst.cached_world_matrix, radius)) |hit| {

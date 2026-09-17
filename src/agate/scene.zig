@@ -141,8 +141,9 @@ pub const Scene = struct {
     /// меш и кладёт его сюда (retireMesh — с любого потока); уничтожает
     /// (sg.* + free) только context-поток во flush (начало кадра) и в deinit.
     /// Уже отвязанные меши невидимы для deinitMeshes — двойного free нет.
-    /// Tripwire P5/P6: новые kind'ы записей (не только меши) добавлять в
-    /// GpuRetireQueue, новых очередей в Scene не заводить.
+    /// Tripwire P6: новые kind'ы записей (не только меши/буферы) добавлять в
+    /// GpuRetireQueue, новых очередей в Scene не заводить. (P5 — instance
+    /// buffer payload — уже там: см. retireBuffer.)
     gpu_retire: scene_retire.GpuRetireQueue = .{},
     /// Epoch, начатый последним prepareFrame. render завершает его на ВСЕХ
     /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
@@ -1025,6 +1026,11 @@ pub const Scene = struct {
             .ibl_intensity = ibl_intensity,
             .default_morph_view = self.forward.default_morph_view,
             .thread_pool = jobs.global,
+            // P5: grown instance buffers retire into the epoch queue; the
+            // pre-stage above is definitive for this frame, so view builds
+            // never retry staging mid-frame (failure coherence).
+            .gpu_retire = &self.gpu_retire,
+            .instances_prepared = true,
         });
 
         std.mem.sort(RenderMeshItem, queues.items.items, {}, scene_render_queue.sortRenderItems);
@@ -1300,6 +1306,33 @@ pub const Scene = struct {
             self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
         }
 
+        const is_gpu_init = (self.default_white_texture.view.id != 0);
+        if (is_gpu_init) {
+            // Pre-stage instance data before the shadow pass: ShadowPass.prepare
+            // snapshots the published render state (bounds/buffer/count),
+            // so staging must run first or shadows lag one frame. Same scratch
+            // and eye the first view queue would use; the frame guard keeps it
+            // once per frame, shared by all view queues. Grown-away old
+            // buffers retire into the epoch queue (P5), never destroyed inline.
+            if (self.frame_snapshot.has_camera) {
+                scene_instance_staging.stageInstances(.{
+                    .allocator = self.allocator,
+                    .instance_matrices = &self.queues.instance_matrices,
+                    .thread_pool = jobs.global,
+                    .frame_id = self.frame_id,
+                    .eye = self.frame_snapshot.primary_cam.eye,
+                    .retire_queue = &self.gpu_retire,
+                }, self.meshes.items);
+            }
+        }
+
+        // P5: outline capture is unconditional, as before — immediately
+        // after the conditional pre-stage above and before conditional
+        // shadow/view warming below. With a GPU context instanced items
+        // snapshot this frame's staged bounds/count/handle; regular
+        // items are captured before worldMatrixCached warming, exactly
+        // like the historical pre-queue capture, so their cached-center
+        // behavior is unchanged.
         self.render_outline_items.clearRetainingCapacity();
         self.render_outline_skins.clearRetainingCapacity();
         for (self.outline_meshes.items) |m| {
@@ -1309,22 +1342,7 @@ pub const Scene = struct {
             }
         }
 
-        const is_gpu_init = (self.default_white_texture.view.id != 0);
         if (is_gpu_init) {
-            // Pre-stage instance data before the shadow pass: ShadowPass.prepare
-            // snapshots cached_aabb / instance_buffer / visible_instance_count,
-            // so staging must run first or shadows lag one frame. Same scratch
-            // and eye the first view queue would use; the frame guard keeps it
-            // once per frame, shared by all view queues.
-            if (self.frame_snapshot.has_camera) {
-                scene_instance_staging.stageInstances(.{
-                    .allocator = self.allocator,
-                    .instance_matrices = &self.queues.instance_matrices,
-                    .thread_pool = jobs.global,
-                    .frame_id = self.frame_id,
-                    .eye = self.frame_snapshot.primary_cam.eye,
-                }, self.meshes.items);
-            }
             // Shadow pass preparation
             if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
                 _ = self.shadows.pass.prepare(self.meshes.items, self.frame_id, jobs.global);
@@ -2035,7 +2053,7 @@ test "pending destroy overflow drains on flush" {
     const m = try alloc.create(Mesh);
     m.* = @import("testing.zig").testMesh("overflow_mesh");
     const e = scene.gpu_retire.begin();
-    scene.gpu_retire.overflow[0] = .{ .mesh = m, .epoch = e };
+    scene.gpu_retire.overflow[0] = .{ .kind = .mesh, .mesh = m, .epoch = e };
     scene.gpu_retire.overflow_len = 1;
     scene.gpu_retire.complete(e);
 
@@ -2095,6 +2113,39 @@ test "prepareFrame stages an empty upload tally without an upload queue" {
     // счётчик meter сброшен в начале prepareFrame.
     try std.testing.expectEqual(@as(u64, 0), scene.stats.updated_bytes_frame);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+}
+
+test "prepareFrame rebuilds outline snapshots without GPU" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.render_outline_items.deinit(alloc);
+    defer scene.render_outline_skins.deinit(alloc);
+
+    // No GPU context on the fixture (default textures zeroed): outline
+    // capture still runs unconditionally after the (skipped) pre-stage, as
+    // before P5 — snapshots clear and rebuild every prepareFrame.
+    var mesh = Mesh{
+        .name = "headless_outline",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(4, 0, 0),
+    };
+    try scene.outline_meshes.append(alloc, &mesh);
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 1), scene.render_outline_items.items.len);
+    // Rebuild, not accumulate.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 1), scene.render_outline_items.items.len);
+    // Clearing works: a hidden mesh rebuilds to empty.
+    mesh.is_visible = false;
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 0), scene.render_outline_items.items.len);
 }
 
 test "prepareFrame preserves cross-phase timings (update_ms/prepare_ms handoff)" {

@@ -29,6 +29,41 @@ const upload_meter = @import("../gpu_upload_meter.zig");
 const morph_gpu = @import("morph_gpu.zig");
 const tangents = @import("tangents.zig");
 
+/// Render-side published instance state (P5 «parallel update/render»):
+/// the single ownership point for per-mesh instancing data consumed by the
+/// main/shadow/outline passes. Physically embedded in Mesh; published as one
+/// coherent unit by the once-per-frame prepare stage
+/// (scene/instance_staging.zig) under phase ownership (P1 phase_mutex on the
+/// context thread — plain fields, not atomics), read by the snapshot
+/// readers. Holds ONLY published GPU/scalar bounds/count data — the staging
+/// scratch (RenderQueues.instance_matrices) stays shared, and the
+/// per-instance TRS/game caches (InstancedMesh.cached_*/dirty/last_*, Mesh
+/// regular cached_aabb) are never touched by staging.
+///
+/// Coherence: a failed publish (scratch OOM, new-buffer failure) leaves the
+/// previous complete state (or the empty state) in place and does NOT advance
+/// `staged_frame`, so a later call may retry. `staged_frame` advances only on
+/// a complete publish, which keeps staging once per scene frame across
+/// shadow + N cameras.
+pub const InstanceRenderState = struct {
+    /// Current GPU instance buffer (dynamic_update, .size-created).
+    buffer: sg.Buffer = .{},
+    /// Buffer capacity in Mat4 slots (geometric growth).
+    capacity: usize = 0,
+    /// Visible instance count published this frame (draw count).
+    count: u32 = 0,
+    /// Combined world AABB of the staged visible instances (invalid when
+    /// none). Separate from Mesh.cached_aabb, which stays the regular
+    /// mesh cache for picking/game APIs.
+    bounds: BoundingBox = BoundingBox.zero,
+    /// Upload dedup: Wyhash of the last uploaded matrix bytes.
+    hash: u64 = 0,
+    /// Matrix count of the last upload (hash+count gate sg.updateBuffer).
+    uploaded_count: usize = 0,
+    /// Frame id of the last complete publish (maxInt = never staged).
+    staged_frame: u64 = std.math.maxInt(u64),
+};
+
 pub const Mesh = struct {
     id: u64 = 0,
     name: []const u8,
@@ -87,19 +122,15 @@ pub const Mesh = struct {
     morph_tex_width: u32 = 0,
     morph_tex_height: u32 = 0,
 
-    // Instancing support
+    // Instancing support: live game objects plus the render-owned
+    // published state (P5). Mesh.instances and the InstancedMesh TRS/game
+    // APIs are unchanged; staging publishes into instance_render only.
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
-    instance_buffer: sg.Buffer = .{},
-    instance_buffer_capacity: usize = 0,
-    visible_instance_count: u32 = 0,
+    instance_render: InstanceRenderState = .{},
     // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
     cached_matrix: Mat4 = Mat4.identity,
     cached_aabb: BoundingBox = BoundingBox.zero,
     cached_frame: u64 = std.math.maxInt(u64),
-    // Instance buffer upload dedup: skip sg.updateBuffer when data unchanged.
-    instance_hash: u64 = 0,
-    instance_uploaded_count: usize = 0,
-    instance_uploaded_frame: u64 = std.math.maxInt(u64),
 
     // Level of Detail (LOD)
     lod_levels: std.ArrayListUnmanaged(LODLevel) = .empty,
@@ -572,8 +603,8 @@ pub const Mesh = struct {
         if (self.morph_delta_image.id != 0) {
             total += @as(usize, self.morph_tex_width) * @as(usize, self.morph_tex_height) * 16;
         }
-        if (self.instance_buffer.id != 0) {
-            total += self.instance_buffer_capacity * @sizeOf(Mat4);
+        if (self.instance_render.buffer.id != 0) {
+            total += self.instance_render.capacity * @sizeOf(Mat4);
         }
         return total;
     }
@@ -613,8 +644,8 @@ pub const Mesh = struct {
         if (self.index_buffer.id != 0) {
             sg.destroyBuffer(self.index_buffer);
         }
-        if (self.instance_buffer.id != 0) {
-            sg.destroyBuffer(self.instance_buffer);
+        if (self.instance_render.buffer.id != 0) {
+            sg.destroyBuffer(self.instance_render.buffer);
         }
         for (self.instances.items) |inst| {
             allocator.destroy(inst);

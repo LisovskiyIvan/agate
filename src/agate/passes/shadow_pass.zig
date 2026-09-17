@@ -6,7 +6,10 @@ const math = @import("math");
 const Mat4 = math.Mat4;
 const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
+const InstancedMeshForP5 = mesh_mod.InstancedMesh;
 const scene_render_queue = @import("../scene/render_queue.zig");
+const instance_staging = @import("../scene/instance_staging.zig");
+const outline_pass = @import("outline_pass.zig");
 const Vertex = mesh_mod.Vertex;
 const jobs = @import("../jobs.zig");
 
@@ -556,7 +559,11 @@ pub const ShadowPass = struct {
 
         for (self.binned_meshes.items, 0..) |mesh, idx| {
             const is_inst = mesh.instances.items.len > 0;
-            const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(frame_id, mesh) else mesh.cached_aabb;
+            // P5: instanced meshes read the frame's published render state
+            // (staged before this prepare); regular meshes use the fresh
+            // world cache. No live instance/game-cache reads here.
+            const staged = mesh.instance_render;
+            const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(frame_id, mesh) else staged.bounds;
             const model = if (!is_inst) scene_render_queue.worldMatrixCached(frame_id, mesh) else Mat4.identity;
             // Копия скина в render-owned хранилище (prepare-фаза). Раскладка
             // binned_items обязана оставаться 1:1 с binned_meshes (бакеты
@@ -582,8 +589,8 @@ pub const ShadowPass = struct {
                 .vertex_buffer = mesh.vertex_buffer,
                 .index_buffer = mesh.index_buffer,
                 .index_count = mesh.index_count,
-                .instance_buffer = mesh.instance_buffer,
-                .visible_instance_count = mesh.visible_instance_count,
+                .instance_buffer = staged.buffer,
+                .visible_instance_count = staged.count,
                 .model = model,
                 .world_aabb = aabb_w,
                 .max_dim = max_dim,
@@ -1251,4 +1258,245 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     try std.testing.expectEqual(@as(usize, 130), pass.binned_items.items.len);
     try std.testing.expectEqual(@as(usize, 10), pass.skin_storage.items.len);
     for (re.counts, re.offsets) |c, o| try std.testing.expect(o + c <= pass.binned_items.items.len);
+}
+
+// ---- P5 instance staging ownership: читатели одного published state. ----
+
+// Shadow/main/outline обязаны читать одно и то же опубликованное состояние
+// кадра (bounds/count/handle) — ни прошлокадровых значений, ни живых
+// instance/game-кешей. Без GPU-контекста хендлы пустые, но равенство
+// источников и точные count/bounds ловят рассинхрон читателей.
+test "P5: shadow, main batch and outline read identical published state" {
+    const ally = std.testing.allocator;
+    const Vec3 = math.Vec3;
+    const BoundingBox = math.BoundingBox;
+
+    var src = Mesh{
+        .name = "shared_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMeshForP5{ .name = "s0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMeshForP5{ .name = "s1", .source_mesh = &src, .position = Vec3.new(6, 0, 0) };
+    var inst2 = InstancedMeshForP5{ .name = "s2", .source_mesh = &src, .position = Vec3.new(12, 0, 0), .is_visible = false };
+    var ptrs = [_]*InstancedMeshForP5{ &inst0, &inst1, &inst2 };
+    var parent = Mesh{
+        .name = "shared_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 3 },
+    };
+    const meshes = [_]*Mesh{&parent};
+
+    // Pre-stage кадра (как Scene.prepareFrame до shadow prepare).
+    var stage_queues = scene_render_queue.RenderQueues{};
+    defer stage_queues.deinit(ally);
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &stage_queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 61,
+        .eye = Vec3.zero,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 61), parent.instance_render.staged_frame);
+
+    // Shadow-читатель.
+    var pass = testShadowPass(ally);
+    defer pass.binned_meshes.deinit(ally);
+    defer pass.binned_items.deinit(ally);
+    defer pass.skin_storage.deinit(ally);
+    _ = pass.prepare(&meshes, 61, null);
+    try std.testing.expectEqual(@as(usize, 1), pass.binned_items.items.len);
+    const shadow_item = pass.binned_items.items[0];
+    try std.testing.expect(shadow_item.is_instanced);
+
+    // Main-читатель (view queue batch).
+    var queues = scene_render_queue.RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = @import("../scene/stats.zig").SceneStats{};
+    var culler = @import("../visibility/mod.zig").OcclusionCuller.init();
+    scene_render_queue.buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 61,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+    const batch = queues.opaque_instanced.items[0];
+
+    // Outline-читатель.
+    var skins = scene_render_queue.SkinStorage.empty;
+    defer skins.deinit(ally);
+    const outline_item = outline_pass.makeOutlineDrawItem(ally, &skins, &parent) orelse
+        return error.TestUnexpectedResult;
+
+    // Все трое — один count (2 видимых, не 3 всего: count-only по
+    // instances.len провалился бы), один хендл, одни границы.
+    try std.testing.expectEqual(parent.instance_render.count, shadow_item.visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.count, batch.visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.count, outline_item.visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, shadow_item.instance_buffer.id);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, batch.instance_buffer.id);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, outline_item.instance_buffer.id);
+    try std.testing.expectEqual(parent.instance_render.bounds, shadow_item.world_aabb);
+    try std.testing.expectEqual(parent.instance_render.bounds.center(), outline_item.world_center);
+    // Точное значение: inst0 [-1,1] + inst1 [5,7] → центр staged границ x=3.
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), outline_item.world_center.x, 1e-4);
+}
+
+// ---- P5 revision: сбойный пре-стейдж дефинитивен для кадра. ----
+
+// Transient pre-stage failure (scratch OOM) keeps the previous complete
+// publish; the shadow snapshot taken from it must stay coherent with every
+// main view even though a retry with a working allocator would succeed —
+// Scene view builds (instances_prepared) consume the old state and never
+// retry mid-frame. Next frame's successful pre-stage updates all readers.
+// The transparent parent additionally pins primary-eye sort order: extra
+// views with other eyes must not re-sort.
+test "P5: failed pre-stage is definitive — views consume the old snapshot" {
+    const ally = std.testing.allocator;
+    const Vec3 = math.Vec3;
+    const BoundingBox = math.BoundingBox;
+    const material = @import("../material.zig");
+    var blend_mat = material.StandardMaterial.init("blend");
+    blend_mat.alpha_mode = .blend;
+
+    var src = Mesh{
+        .name = "defin_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var inst0 = InstancedMeshForP5{ .name = "d0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
+    var inst1 = InstancedMeshForP5{ .name = "d1", .source_mesh = &src, .position = Vec3.new(6, 0, 0) };
+    var ptrs = [_]*InstancedMeshForP5{ &inst0, &inst1 };
+    var parent = Mesh{
+        .name = "defin_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = .{ .standard = &blend_mat },
+        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 2 },
+    };
+    const meshes = [_]*Mesh{&parent};
+
+    // Frame 71: successful pre-stage with the primary eye — count 2,
+    // transparent sort back-to-front puts the farther inst1 (x=6) first.
+    var stage_queues = scene_render_queue.RenderQueues{};
+    defer stage_queues.deinit(ally);
+    const primary_eye = Vec3.new(-50, 0, 0);
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &stage_queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 71,
+        .eye = primary_eye,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(usize, 2), stage_queues.instance_matrices.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), stage_queues.instance_matrices.items[0].m[12], 1e-4);
+    const old_bounds = parent.instance_render.bounds;
+
+    // Frame 72: hide inst1, then FAIL the pre-stage (fresh scratch +
+    // failing allocator) — the frame-71 publish stays intact.
+    inst1.is_visible = false;
+    var bare = scene_render_queue.RenderQueues{};
+    defer bare.deinit(ally);
+    var failing = std.testing.FailingAllocator.init(ally, .{ .fail_index = 0 });
+    instance_staging.stageInstances(.{
+        .allocator = failing.allocator(),
+        .instance_matrices = &bare.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 72,
+        .eye = primary_eye,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
+
+    // Shadow snapshot captures the OLD state (count 2, old bounds).
+    var pass = testShadowPass(ally);
+    defer pass.binned_meshes.deinit(ally);
+    defer pass.binned_items.deinit(ally);
+    defer pass.skin_storage.deinit(ally);
+    _ = pass.prepare(&meshes, 72, null);
+    try std.testing.expectEqual(@as(usize, 1), pass.binned_items.items.len);
+    const shadow_item = pass.binned_items.items[0];
+    try std.testing.expectEqual(@as(u32, 2), shadow_item.visible_instance_count);
+    try std.testing.expectEqual(old_bounds, shadow_item.world_aabb);
+
+    // Main build with a WORKING allocator: instances_prepared (as Scene
+    // sets) forbids the mid-frame retry — the batch consumes the same old
+    // state the shadow saw, and the view build stages nothing itself.
+    var queues = scene_render_queue.RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = @import("../scene/stats.zig").SceneStats{};
+    var culler = @import("../visibility/mod.zig").OcclusionCuller.init();
+    scene_render_queue.buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 72,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+        .instances_prepared = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), queues.transparent_instanced.items.len);
+    try std.testing.expectEqual(shadow_item.visible_instance_count, queues.transparent_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(usize, 0), queues.instance_matrices.items.len);
+
+    // Extra view with the opposite eye: still no retry, and the pre-stage
+    // scratch keeps primary-eye order (inst1 first).
+    var queues2 = scene_render_queue.RenderQueues{};
+    defer queues2.deinit(ally);
+    var stats2 = @import("../scene/stats.zig").SceneStats{};
+    scene_render_queue.buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .frame_id = 72,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.new(50, 0, 0),
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats2,
+        .queues = &queues2,
+        .default_white_id = 1,
+        .instances_prepared = true,
+    });
+    try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), stage_queues.instance_matrices.items[0].m[12], 1e-4);
+
+    // Frame 73: successful pre-stage updates every reader to count 1.
+    instance_staging.stageInstances(.{
+        .allocator = ally,
+        .instance_matrices = &stage_queues.instance_matrices,
+        .thread_pool = null,
+        .frame_id = 73,
+        .eye = primary_eye,
+    }, &meshes);
+    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 73), parent.instance_render.staged_frame);
+    _ = pass.prepare(&meshes, 73, null);
+    try std.testing.expectEqual(@as(u32, 1), pass.binned_items.items[0].visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.bounds, pass.binned_items.items[0].world_aabb);
 }
