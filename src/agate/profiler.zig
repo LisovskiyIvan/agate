@@ -63,8 +63,13 @@ pub const Profiler = struct {
     }
 
     /// Begins recording frames.
+    /// Precondition: the app-owned sokol.time clock is already initialized
+    /// exactly once before any thread reads it (main.zig init calls
+    /// sokol.time.setup() ahead of the game-thread spawn). Never
+    /// re-initializes the clock here: stm_setup memsets the global origin,
+    /// so calling it per start would reset time.now for concurrent readers
+    /// (gameLoop) and move previously taken anchors backward.
     pub fn start(self: *Profiler) void {
-        sokol.time.setup();
         self.is_recording = true;
         self.start_time_ticks = sokol.time.now();
         self.last_frame_ticks = self.start_time_ticks;
@@ -943,6 +948,10 @@ fn testSleepMs(ms: u64) void {
 }
 
 test "Profiler start, recordFrame, and summarize" {
+    // App-owned monotonic clock: initialized once, single-threaded here.
+    // (Runtime: main.zig init calls sokol.time.setup() before threads spawn;
+    // Profiler.start must never re-initialize it.)
+    sokol.time.setup();
     const ally = std.testing.allocator;
     var prof = Profiler.init(ally);
     defer prof.deinit();
@@ -988,6 +997,7 @@ test "Profiler start, recordFrame, and summarize" {
 }
 
 test "Profiler переносит динамику буферов отдельно от текстур" {
+    sokol.time.setup();
     const ally = std.testing.allocator;
     var prof = Profiler.init(ally);
     defer prof.deinit();
@@ -1020,6 +1030,7 @@ test "Profiler переносит динамику буферов отдельн
 }
 
 test "Profiler memory snapshot and file saving" {
+    sokol.time.setup();
     const ally = std.testing.allocator;
     const testScene = @import("testing.zig").testScene;
     var scene = testScene(ally);
@@ -1064,6 +1075,7 @@ test "Profiler memory snapshot and file saving" {
 }
 
 test "Profiler analyzer detects bottlenecks" {
+    sokol.time.setup();
     const ally = std.testing.allocator;
     var prof = Profiler.init(ally);
     defer prof.deinit();
@@ -1114,6 +1126,7 @@ test "Profiler analyzer detects bottlenecks" {
 }
 
 test "Profiler summarize uses frame intervals for pacing" {
+    sokol.time.setup();
     const ally = std.testing.allocator;
     var prof = Profiler.init(ally);
     defer prof.deinit();
@@ -1208,4 +1221,78 @@ test "Profiler summarize uses frame intervals for pacing" {
     try std.testing.expectEqual(eh16, summary.interval_hitches_over_16ms);
     try std.testing.expectEqual(eh33, summary.interval_hitches_over_33ms);
     try std.testing.expectEqual(eh50, summary.interval_hitches_over_50ms);
+}
+
+test "Profiler restart preserves monotonic app clock" {
+    // Timer is app-owned, initialized once before threads (main.zig init).
+    // Standalone unit context: single-threaded explicit setup.
+    sokol.time.setup();
+    // Let the anchor sit comfortably above call overhead so a clock origin
+    // reset (old Profiler.start calling setup) shows up as a deterministic
+    // backward step, not timer granularity noise.
+    testSleepMs(5);
+    const anchor = sokol.time.now();
+    try std.testing.expect(anchor > 0);
+
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+
+    prof.start();
+    const t1 = sokol.time.now();
+    // Source clock must not reset on start: still at/after pre-start anchor.
+    try std.testing.expect(t1 >= anchor);
+    try std.testing.expect(prof.start_time_ticks >= anchor);
+
+    testSleepMs(2);
+    prof.stop();
+    prof.start();
+    const t2 = sokol.time.now();
+    try std.testing.expect(t2 >= t1);
+    try std.testing.expect(t2 >= anchor);
+    try std.testing.expect(prof.start_time_ticks >= t1);
+    prof.stop();
+}
+
+test "Profiler start/stop never moves app clock backward for concurrent readers" {
+    sokol.time.setup();
+    testSleepMs(5);
+
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+
+    const Ctx = struct {
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        backward: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        fn run(c: *@This()) void {
+            var last = sokol.time.now();
+            c.ready.store(true, .release);
+            while (!c.stop.load(.acquire)) {
+                const now = sokol.time.now();
+                if (now < last) _ = c.backward.fetchAdd(1, .monotonic);
+                last = now;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var ctx = Ctx{};
+    const reader = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    // Wait until the reader holds a pre-restart anchor so every restart
+    // below races a live read (otherwise a fast restart loop can finish
+    // before the thread's first read and miss the window entirely).
+    while (!ctx.ready.load(.acquire)) std.atomic.spinLoopHint();
+    // Only the context thread touches the Profiler; the worker only reads
+    // the shared app clock, mirroring gameLoop's time.now use.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        prof.start();
+        var k: usize = 0;
+        while (k < 200) : (k += 1) std.atomic.spinLoopHint();
+        prof.stop();
+    }
+    ctx.stop.store(true, .release);
+    reader.join();
+    try std.testing.expectEqual(@as(u32, 0), ctx.backward.load(.acquire));
 }
