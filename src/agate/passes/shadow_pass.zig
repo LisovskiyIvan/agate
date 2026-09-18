@@ -50,14 +50,11 @@ pub const ShadowPass = struct {
     skinned_shader: sg.Shader = .{},
     allocator: std.mem.Allocator,
     binned_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    binned_items: std.ArrayListUnmanaged(ShadowDrawItem) = .empty,
-    /// Render-owned копии скин-матриц shadow-draws (резолв по skin_index).
-    /// Сбрасывается в prepare, переживает кадры (без per-frame churn).
-    skin_storage: scene_render_queue.SkinStorage = .empty,
-    last_bin_result: BinResult = .{
-        .counts = [_]usize{0} ** 6,
-        .offsets = [_]usize{0} ** 6,
-    },
+    /// Standalone owned prepared payload (P4 render-owned snapshot contract):
+    /// `prepare` publishes here, `renderPrepared` consumes it. Scene drives
+    /// per-slot payloads through `prepareInto`/`renderPreparedFrom` instead,
+    /// sharing the same algorithm — no duplication.
+    prepared: PreparedShadowDraws = .{},
 
     // Pipeline buckets in fixed order; the grouping key is defined once per
     // render so each cascade issues at most one applyPipeline per bucket.
@@ -76,7 +73,7 @@ pub const ShadowPass = struct {
         model: Mat4 = Mat4.identity,
         world_aabb: math.BoundingBox = math.BoundingBox.zero,
         max_dim: f32 = 0.0,
-        /// Индекс копии скин-матриц в ShadowPass.skin_storage (null = не скин).
+        /// Индекс копии скин-матриц в PreparedShadowDraws.skins (null = не скин).
         skin_index: ?u32 = null,
         bucket: Bucket = .regular_u16,
         is_instanced: bool = false,
@@ -294,10 +291,9 @@ pub const ShadowPass = struct {
 
     fn renderBuckets(
         self: *ShadowPass,
+        prepared: *const PreparedShadowDraws,
         light_view_proj: Mat4,
         frustum: math.Frustum,
-        counts: [6]usize,
-        offsets: [6]usize,
         cascade_idx: ?usize,
         last_pipeline_id: *u32,
         draw_calls: *u32,
@@ -307,13 +303,13 @@ pub const ShadowPass = struct {
 
         for (bucket_order) |bucket| {
             const b_idx = @intFromEnum(bucket);
-            const count = counts[b_idx];
+            const count = prepared.bin.counts[b_idx];
             if (count == 0) continue;
 
             const pip_id = self.pipelineFor(bucket);
             if (pip_id == 0) continue;
 
-            const bucket_items = self.binned_items.items[offsets[b_idx] .. offsets[b_idx] + count];
+            const bucket_items = prepared.items.items[prepared.bin.offsets[b_idx] .. prepared.bin.offsets[b_idx] + count];
             for (bucket_items) |item| {
                 if (item.gpu_pending) continue;
                 if (shadowItemCulled(item, frustum, cascade_idx)) continue;
@@ -364,7 +360,7 @@ pub const ShadowPass = struct {
                     // Skinned-бакет без валидной копии (билдером недостижимо):
                     // пропуск draw вместо stale-униформы чужого draw.
                     if (item.bucket == .skinned_u16 or item.bucket == .skinned_u32) {
-                        const bones = scene_render_queue.skinAt(self.skin_storage.items, item.skin_index) orelse continue;
+                        const bones = scene_render_queue.skinAt(prepared.skins.items, item.skin_index) orelse continue;
                         const vs_skin = shadow_shd.VsSkin{
                             .bones = bones.*,
                         };
@@ -381,6 +377,37 @@ pub const ShadowPass = struct {
     pub const BinResult = struct {
         counts: [6]usize,
         offsets: [6]usize,
+    };
+
+    /// Small owning prepared payload: shadow items + skin copies + bin
+    /// ranges. Render-owned CPU snapshots (model/AABB/handles/skin index);
+    /// GPU handles inside are BORROWED (phase mutex / P3 epochs), never
+    /// destroyed or duplicated here. Counts/offsets always stay inside
+    /// items (coherent-empty on OOM, never stale ranges).
+    pub const PreparedShadowDraws = struct {
+        items: std.ArrayListUnmanaged(ShadowDrawItem) = .empty,
+        /// Render-owned копии скин-матриц shadow-draws (резолв по skin_index).
+        /// Сбрасывается в prepareInto, переживает кадры (без per-frame churn).
+        skins: scene_render_queue.SkinStorage = .empty,
+        bin: BinResult = .{
+            .counts = [_]usize{0} ** 6,
+            .offsets = [_]usize{0} ** 6,
+        },
+
+        /// Clear lengths for reuse, retaining capacity (coherent-empty).
+        pub fn reset(self: *PreparedShadowDraws) void {
+            self.items.clearRetainingCapacity();
+            self.skins.clearRetainingCapacity();
+            self.bin = .{
+                .counts = [_]usize{0} ** 6,
+                .offsets = [_]usize{0} ** 6,
+            };
+        }
+
+        pub fn deinit(self: *PreparedShadowDraws, allocator: std.mem.Allocator) void {
+            self.items.deinit(allocator);
+            self.skins.deinit(allocator);
+        }
     };
 
     const ParallelShadowBinning = struct {
@@ -531,31 +558,40 @@ pub const ShadowPass = struct {
         return .{ .counts = counts, .offsets = offsets };
     }
 
-    pub fn prepare(
+    /// Core prepare algorithm, parameterized by the destination payload: bins
+    /// meshes into the pass-owned `binned_meshes` scratch, then snapshots
+    /// items + skin copies into `out`. `out` may be the standalone
+    /// `prepared` (via `prepare`) or a Scene double-buffer slot (P7) — the
+    /// algorithm runs once here, never duplicated. OOM semantics preserved:
+    /// growth failure publishes a coherent-empty snapshot (items + skins +
+    /// zero counts, never stale), skin-copy failure flags the single item
+    /// gpu_pending without shifting bucket layout.
+    pub fn prepareInto(
         self: *ShadowPass,
+        out: *PreparedShadowDraws,
         meshes: []const *Mesh,
         frame_id: u64,
         pool: ?*jobs.Pool,
     ) BinResult {
         const binned = self.binMeshes(meshes, pool);
         const total = self.binned_meshes.items.len;
-        if (total > self.binned_items.items.len) {
-            self.binned_items.resize(self.allocator, total) catch {
+        if (total > out.items.items.len) {
+            out.items.resize(self.allocator, total) catch {
                 // Атомарность публикации (P4): рост не удался — пустой
                 // coherent-снимок (предметы + скины + counts), а не stale-items
                 // при очищенных скинах. Следующий кадр строится заново.
-                self.binned_items.clearRetainingCapacity();
-                self.skin_storage.clearRetainingCapacity();
-                self.last_bin_result = .{
+                out.items.clearRetainingCapacity();
+                out.skins.clearRetainingCapacity();
+                out.bin = .{
                     .counts = [_]usize{0} ** 6,
                     .offsets = [_]usize{0} ** 6,
                 };
-                return self.last_bin_result;
+                return out.bin;
             };
         } else {
-            self.binned_items.shrinkRetainingCapacity(total);
+            out.items.shrinkRetainingCapacity(total);
         }
-        self.skin_storage.clearRetainingCapacity();
+        out.skins.clearRetainingCapacity();
 
         for (self.binned_meshes.items, 0..) |mesh, idx| {
             const is_inst = mesh.instances.items.len > 0;
@@ -566,7 +602,7 @@ pub const ShadowPass = struct {
             const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(frame_id, mesh) else staged.bounds;
             const model = if (!is_inst) scene_render_queue.worldMatrixCached(frame_id, mesh) else Mat4.identity;
             // Копия скина в render-owned хранилище (prepare-фаза). Раскладка
-            // binned_items обязана оставаться 1:1 с binned_meshes (бакеты
+            // items обязана оставаться 1:1 с binned_meshes (бакеты
             // режутся по counts/offsets), поэтому OOM помечает item флагом
             // gpu_pending — renderBuckets его пропускает, но слайсы бакетов
             // не съезжают. Живые матрицы и неверная поза исключены.
@@ -574,18 +610,18 @@ pub const ShadowPass = struct {
             var skin_oom = false;
             if (mesh.skeleton) |skel| {
                 const src = skel.getRenderSkinMatrices();
-                self.skin_storage.ensureUnusedCapacity(self.allocator, 1) catch {
+                out.skins.ensureUnusedCapacity(self.allocator, 1) catch {
                     skin_oom = true;
                 };
                 if (!skin_oom) {
-                    skin_index = @intCast(self.skin_storage.items.len);
-                    self.skin_storage.appendAssumeCapacity(src.*);
+                    skin_index = @intCast(out.skins.items.len);
+                    out.skins.appendAssumeCapacity(src.*);
                 }
             }
             const ext = aabb_w.extents();
             const max_dim = @max(ext.x, @max(ext.y, ext.z));
 
-            self.binned_items.items[idx] = ShadowDrawItem{
+            out.items.items[idx] = ShadowDrawItem{
                 .vertex_buffer = mesh.vertex_buffer,
                 .index_buffer = mesh.index_buffer,
                 .index_count = mesh.index_count,
@@ -602,24 +638,27 @@ pub const ShadowPass = struct {
             };
         }
 
-        self.last_bin_result = binned;
+        out.bin = binned;
         return binned;
     }
 
-    pub fn renderPrepared(
+    pub fn prepare(
         self: *ShadowPass,
-        cascades: [4]Mat4,
-        spot_shadows: []const SpotShadowRenderInfo,
-    ) u32 {
-        return self.renderItems(cascades, spot_shadows, self.last_bin_result.counts, self.last_bin_result.offsets);
+        meshes: []const *Mesh,
+        frame_id: u64,
+        pool: ?*jobs.Pool,
+    ) BinResult {
+        return self.prepareInto(&self.prepared, meshes, frame_id, pool);
     }
 
-    pub fn renderItems(
+    /// Core shadow render, parameterized by a prepared payload (standalone
+    /// `prepared` or a Scene P7 slot). Reads only the payload's const
+    /// snapshot plus the pass pipelines.
+    pub fn renderPreparedFrom(
         self: *ShadowPass,
+        prepared: *const PreparedShadowDraws,
         cascades: [4]Mat4,
         spot_shadows: []const SpotShadowRenderInfo,
-        counts: [6]usize,
-        offsets: [6]usize,
     ) u32 {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
@@ -647,7 +686,7 @@ pub const ShadowPass = struct {
             sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
 
             const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
-            self.renderBuckets(light_view_proj, c_frustum, counts, offsets, c_idx, &last_pipeline_id, &draw_calls);
+            self.renderBuckets(prepared, light_view_proj, c_frustum, c_idx, &last_pipeline_id, &draw_calls);
         }
 
         sg.endPass();
@@ -673,7 +712,7 @@ pub const ShadowPass = struct {
                 sg.applyScissorRect(vx, 0, SPOT_SHADOW_RES, SPOT_SHADOW_RES, false);
 
                 const spot_frustum = math.Frustum.fromViewProjection(spot_info.view_proj);
-                self.renderBuckets(spot_info.view_proj, spot_frustum, counts, offsets, null, &spot_last_pipeline_id, &draw_calls);
+                self.renderBuckets(prepared, spot_info.view_proj, spot_frustum, null, &spot_last_pipeline_id, &draw_calls);
             }
 
             sg.endPass();
@@ -681,6 +720,14 @@ pub const ShadowPass = struct {
         }
 
         return draw_calls;
+    }
+
+    pub fn renderPrepared(
+        self: *ShadowPass,
+        cascades: [4]Mat4,
+        spot_shadows: []const SpotShadowRenderInfo,
+    ) u32 {
+        return self.renderPreparedFrom(&self.prepared, cascades, spot_shadows);
     }
 
     pub fn render(
@@ -697,8 +744,7 @@ pub const ShadowPass = struct {
 
     pub fn deinit(self: *ShadowPass) void {
         self.binned_meshes.deinit(self.allocator);
-        self.binned_items.deinit(self.allocator);
-        self.skin_storage.deinit(self.allocator);
+        self.prepared.deinit(self.allocator);
         sg.destroyPipeline(self.pipeline_u16);
         sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.inst_pipeline_u16);
@@ -963,14 +1009,13 @@ test "P4: shadow item owns model and skin snapshots" {
     };
     var pass = testShadowPass(ally);
     defer pass.binned_meshes.deinit(ally);
-    defer pass.binned_items.deinit(ally);
-    defer pass.skin_storage.deinit(ally);
+    defer pass.prepared.deinit(ally);
 
     const meshes = [_]*Mesh{&mesh};
     _ = pass.prepare(&meshes, 5, null);
-    try std.testing.expectEqual(@as(usize, 1), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 1), pass.skin_storage.items.len);
-    const it = pass.binned_items.items[0];
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.skins.items.len);
+    const it = pass.prepared.items.items[0];
     try std.testing.expect(it.skin_index != null);
 
     mesh.position = math.Vec3.new(99, 99, 99);
@@ -979,8 +1024,8 @@ test "P4: shadow item owns model and skin snapshots" {
     skel.update();
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), skel.getRenderSkinMatrices()[0].m[12], 1e-4);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), pass.binned_items.items[0].model.m[12], 1e-4);
-    const bones = pass.skin_storage.items[pass.binned_items.items[0].skin_index.?];
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), pass.prepared.items.items[0].model.m[12], 1e-4);
+    const bones = pass.prepared.skins.items[pass.prepared.items.items[0].skin_index.?];
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), bones[0].m[12], 1e-4);
 }
 
@@ -1082,30 +1127,29 @@ test "P4: shadow skin OOM keeps bucket layout and skips the item" {
     };
     const meshes = [_]*Mesh{ &skinned, &plain };
 
-    // Аллокации свежего prepare: 1) binned_meshes.resize, 2) binned_items.resize,
-    // 3) skin_storage.ensure для skinned-меша. Роняем третью.
+    // Аллокации свежего prepare: 1) binned_meshes.resize, 2) prepared.items.resize,
+    // 3) prepared.skins.ensure для skinned-меша. Роняем третью.
     var limited = FailNthP4{ .backing = ally, .fail_on = 3 };
     var pass = testShadowPass(limited.allocator());
     defer pass.binned_meshes.deinit(limited.allocator());
-    defer pass.binned_items.deinit(limited.allocator());
-    defer pass.skin_storage.deinit(limited.allocator());
+    defer pass.prepared.deinit(limited.allocator());
 
     const res = pass.prepare(&meshes, 9, null);
-    try std.testing.expectEqual(pass.binned_meshes.items.len, pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 2), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.skin_storage.items.len);
+    try std.testing.expectEqual(pass.binned_meshes.items.len, pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.skins.items.len);
     // Counts бакетов обязаны оставаться внутри длин (иначе renderBuckets
     // срежет за границу).
     var total: usize = 0;
     for (res.counts) |c| total += c;
     try std.testing.expectEqual(@as(usize, 2), total);
-    for (res.counts, res.offsets) |c, o| try std.testing.expect(o + c <= pass.binned_items.items.len);
+    for (res.counts, res.offsets) |c, o| try std.testing.expect(o + c <= pass.prepared.items.items.len);
 
     // Явная побакетная проверка: skinned-item помечен gpu_pending (рендер его
     // пропустит, в нескinned-позе он НЕ рисуется), plain-item чист.
     var skinned_seen = false;
     var plain_seen = false;
-    for (pass.binned_items.items) |it| {
+    for (pass.prepared.items.items) |it| {
         if (it.index_count == 9) {
             skinned_seen = true;
             try std.testing.expect(it.gpu_pending);
@@ -1163,8 +1207,7 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
 
     var pass = testShadowPass(ally);
     defer pass.binned_meshes.deinit(ally);
-    defer pass.binned_items.deinit(ally);
-    defer pass.skin_storage.deinit(ally);
+    defer pass.prepared.deinit(ally);
 
     // Успешный SKINNED-кадр N: heap-меш + skinned-меш. Очередь и skin storage
     // непусты, skinned-item валиден. Heap-меш затем уничтожается (модель
@@ -1183,8 +1226,8 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     var ok_total: usize = 0;
     for (ok.counts) |c| ok_total += c;
     try std.testing.expectEqual(@as(usize, 2), ok_total);
-    try std.testing.expectEqual(@as(usize, 2), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 1), pass.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 2), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.skins.items.len);
 
     // destroyMesh между кадрами: указатель в binned_meshes висячий до
     // следующего binMeshes; prepare при OOM не должен его разыменовывать.
@@ -1196,20 +1239,20 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     pass.allocator = lim_a.allocator();
     const ra = pass.prepare(&many, 2, null);
     for (ra.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
-    for (pass.last_bin_result.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
+    for (pass.prepared.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
     try std.testing.expectEqual(@as(usize, 0), pass.binned_meshes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.skins.items.len);
 
-    // Стадия B: binned_meshes вырос, падает рост binned_items — пустой
+    // Стадия B: binned_meshes вырос, падает рост prepared.items — пустой
     // снимок: ни предметов, ни скинов, counts нулевые.
     var lim_b = FailNthP4{ .backing = ally, .fail_on = 2 };
     pass.allocator = lim_b.allocator();
     const rb = pass.prepare(&many, 3, null);
     for (rb.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
-    for (pass.last_bin_result.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
-    try std.testing.expectEqual(@as(usize, 0), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.skin_storage.items.len);
+    for (pass.prepared.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.skins.items.len);
 
     // Восстановление следующим кадром с рабочим аллокатором.
     pass.allocator = ally;
@@ -1217,12 +1260,12 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     var rc_total: usize = 0;
     for (rc.counts) |c| rc_total += c;
     try std.testing.expectEqual(@as(usize, 32), rc_total);
-    try std.testing.expectEqual(@as(usize, 32), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 8), pass.skin_storage.items.len);
-    for (rc.counts, rc.offsets) |c, o| try std.testing.expect(o + c <= pass.binned_items.items.len);
-    for (pass.binned_items.items) |it| {
+    try std.testing.expectEqual(@as(usize, 32), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 8), pass.prepared.skins.items.len);
+    for (rc.counts, rc.offsets) |c, o| try std.testing.expect(o + c <= pass.prepared.items.items.len);
+    for (pass.prepared.items.items) |it| {
         if (it.skin_index) |s| {
-            try std.testing.expect(s < pass.skin_storage.items.len);
+            try std.testing.expect(s < pass.prepared.skins.items.len);
             try std.testing.expect(!it.gpu_pending);
         }
     }
@@ -1244,10 +1287,10 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     pass.allocator = lim_c.allocator();
     const rd = pass.prepare(big_ptrs, 5, pool);
     for (rd.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
-    for (pass.last_bin_result.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
+    for (pass.prepared.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
     try std.testing.expectEqual(@as(usize, 0), pass.binned_meshes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), pass.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pass.prepared.skins.items.len);
 
     // Финальное восстановление parallel-кадром: все 130 на месте.
     pass.allocator = ally;
@@ -1255,9 +1298,9 @@ test "P4: shadow prepare growth OOM publishes empty snapshot and recovers" {
     var re_total: usize = 0;
     for (re.counts) |c| re_total += c;
     try std.testing.expectEqual(@as(usize, 130), re_total);
-    try std.testing.expectEqual(@as(usize, 130), pass.binned_items.items.len);
-    try std.testing.expectEqual(@as(usize, 10), pass.skin_storage.items.len);
-    for (re.counts, re.offsets) |c, o| try std.testing.expect(o + c <= pass.binned_items.items.len);
+    try std.testing.expectEqual(@as(usize, 130), pass.prepared.items.items.len);
+    try std.testing.expectEqual(@as(usize, 10), pass.prepared.skins.items.len);
+    for (re.counts, re.offsets) |c, o| try std.testing.expect(o + c <= pass.prepared.items.items.len);
 }
 
 // ---- P5 instance staging ownership: читатели одного published state. ----
@@ -1307,11 +1350,10 @@ test "P5: shadow, main batch and outline read identical published state" {
     // Shadow-читатель.
     var pass = testShadowPass(ally);
     defer pass.binned_meshes.deinit(ally);
-    defer pass.binned_items.deinit(ally);
-    defer pass.skin_storage.deinit(ally);
+    defer pass.prepared.deinit(ally);
     _ = pass.prepare(&meshes, 61, null);
-    try std.testing.expectEqual(@as(usize, 1), pass.binned_items.items.len);
-    const shadow_item = pass.binned_items.items[0];
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.items.items.len);
+    const shadow_item = pass.prepared.items.items[0];
     try std.testing.expect(shadow_item.is_instanced);
 
     // Main-читатель (view queue batch).
@@ -1429,11 +1471,10 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
     // Shadow snapshot captures the OLD state (count 2, old bounds).
     var pass = testShadowPass(ally);
     defer pass.binned_meshes.deinit(ally);
-    defer pass.binned_items.deinit(ally);
-    defer pass.skin_storage.deinit(ally);
+    defer pass.prepared.deinit(ally);
     _ = pass.prepare(&meshes, 72, null);
-    try std.testing.expectEqual(@as(usize, 1), pass.binned_items.items.len);
-    const shadow_item = pass.binned_items.items[0];
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.items.items.len);
+    const shadow_item = pass.prepared.items.items[0];
     try std.testing.expectEqual(@as(u32, 2), shadow_item.visible_instance_count);
     try std.testing.expectEqual(old_bounds, shadow_item.world_aabb);
 
@@ -1497,6 +1538,6 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
     try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 73), parent.instance_render.staged_frame);
     _ = pass.prepare(&meshes, 73, null);
-    try std.testing.expectEqual(@as(u32, 1), pass.binned_items.items[0].visible_instance_count);
-    try std.testing.expectEqual(parent.instance_render.bounds, pass.binned_items.items[0].world_aabb);
+    try std.testing.expectEqual(@as(u32, 1), pass.prepared.items.items[0].visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.bounds, pass.prepared.items.items[0].world_aabb);
 }

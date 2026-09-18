@@ -197,8 +197,11 @@ pub const ParallelCullScratch = struct {
 };
 
 /// The four draw queues plus the per-frame instance-matrix staging buffer.
-/// Cleared and refilled by buildFrameQueues each render(); ownership stays
-/// with Scene via a single field.
+/// One view's worth: P7 retains 1 + MAX_CAMERAS of these inside the two
+/// FrameDrawSlot slabs (Scene.draws) — buildFrameQueues fills the BACK
+/// slot's queues during prepareFrame, render reads the published FRONT
+/// slot's through Scene.preparedDraws. reset() clears lengths (retaining
+/// capacity) for the next build; deinit frees once per slot at shutdown.
 pub const RenderQueues = struct {
     items: std.ArrayListUnmanaged(RenderMeshItem) = .empty,
     // Transparent meshes (material alpha_mode == .blend), sorted strictly
