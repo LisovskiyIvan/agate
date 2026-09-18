@@ -18,7 +18,9 @@
 // - prepare_ms, uploaded_*, shadow/main/post_ms и все счётчики пишет
 //   context-поток (prepareFrame/render); updated_bytes_frame идёт через
 //   атомарный gpu_upload_meter (воркеры стейджинга пишут record(),
-//   render забирает takeAndReset()).
+//   render забирает takeAndReset()). UI-байты с P6 записываются в prepare
+//   (capture-upload в prepareFrame), а не в render — сумма за кадр та же,
+//   меняется только prepare-vs-render атрибуция.
 // - Profiler целиком render-owned: recordFrame вызывается только в конце
 //   render, captureMemorySnapshot/summarize/analyze — с render-потока или
 //   тулов. Игровой поток к Profiler не прикасается.

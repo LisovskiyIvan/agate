@@ -95,6 +95,8 @@ const scene_nav = @import("scene/nav_layer.zig");
 const scene_physics = @import("scene/physics_layer.zig");
 const scene_project = @import("scene/project_cache.zig");
 const scene_retire = @import("scene/gpu_retire.zig");
+const scene_ui_frame = @import("scene/ui_frame.zig");
+pub const UiFrame = scene_ui_frame.UiFrame;
 const scene_content = @import("scene/content.zig");
 const scene_animation = @import("scene/animation_runtime.zig");
 const scene_picking = @import("scene/picking.zig");
@@ -274,6 +276,11 @@ pub const Scene = struct {
 
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
+    /// P6 render-owned UI frame: prepareFrame captures CPU geometry + draw
+    /// params out of `ui_canvas` and uploads at the prepare/context
+    /// boundary; render draws this frame (upload-free), never the live
+    /// canvas. Single-frame Scene ownership, no registry, no P7 overlap.
+    ui_frame: UiFrame = .{},
 
     // Built-in flight recorder & memory profiler.
     profiler: profiler_mod.Profiler,
@@ -1250,8 +1257,9 @@ pub const Scene = struct {
     /// (regular/instanced очереди, shadow-bins, outline-items: модель/материал/
     /// скин-копии по индексам); живые Mesh/Material/Skeleton во время их
     /// отрисовки недоступны. Заимствованными остаются только GPU-хендлы под
-    /// фазовым мьютексом/P3 (буферы/вью/сэмплеры/пайплайны), а UI/debug/
-    /// particles/trails и прочие живые подсистемы — вне P4 (см. P5-P7).
+    /// фазовым мьютексом/P3 (буферы/вью/сэмплеры/пайплайны); UI покрыт P6
+    /// (render-owned кадр, upload на границе prepare), а debug/particles/
+    /// trails и прочие живые подсистемы — вне P4-P6 (см. P7).
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;
@@ -1263,6 +1271,44 @@ pub const Scene = struct {
     /// uploads at least one texture per call so a lone oversized texture
     /// still makes progress. Tune only with a profiled reason.
     pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
+    /// P6 UI handoff: captures CPU geometry + draw parameters out of the
+    /// live canvas into the render-owned frame and uploads at this
+    /// prepare/context boundary (phase mutex held, context thread). Runs
+    /// after the UI build (sandbox builds under the same mutex before
+    /// prepareFrame) and after the frame snapshot above is final, so the
+    /// captured screen size matches the selected scene snapshot (same
+    /// fallback as render: snapshot dims when positive, live sapp dims
+    /// otherwise — a zero placeholder snapshot never hides a valid GPU
+    /// frame). Snapshots canvas presence separately from nonempty/gpu_ready
+    /// so the historical phantom+1 counters survive empty frames. Missing
+    /// canvas or camera-less frames fail close to coherent-empty — never a
+    /// stale prior overlay, never an unsafe upload/draw.
+    fn captureUiFrame(self: *Scene) void {
+        const canvas = if (self.ui_canvas) |*c| c else {
+            self.ui_frame.clearEmpty();
+            self.ui_frame.canvas_present = false;
+            return;
+        };
+        self.ui_frame.canvas_present = true;
+        if (!self.frame_snapshot.has_camera) {
+            self.ui_frame.clearEmpty();
+            self.ui_frame.canvas_present = true;
+            return;
+        }
+        const w = if (self.frame_snapshot.screen_w > 0) self.frame_snapshot.screen_w else sapp.width();
+        const h = if (self.frame_snapshot.screen_h > 0) self.frame_snapshot.screen_h else sapp.height();
+        self.ui_frame.capture(
+            self.allocator,
+            canvas,
+            @floatFromInt(w),
+            @floatFromInt(h),
+        );
+        _ = self.ui_frame.upload(canvas, .{
+            .allocator = self.allocator,
+            .retire_queue = &self.gpu_retire,
+        });
+    }
+
     pub fn prepareFrame(self: *Scene) void {
         // Владение фазой (P1): prepare выполняется на context-потоке вместе
         // с render (frame() в main держит phase_mutex через обе фазы).
@@ -1365,6 +1411,8 @@ pub const Scene = struct {
                 }
             }
         }
+
+        self.captureUiFrame();
 
         self.frame_prepared = true;
     }
@@ -1583,8 +1631,17 @@ pub const Scene = struct {
         }
 
         if (!snap.post_process.enabled) {
-            if (self.ui_canvas) |*ui_c| {
-                ui_c.render(sapp.widthf(), sapp.heightf());
+            // P6: single fullscreen UI draw AFTER the per-view
+            // viewport/scissor restoration above (both single- and
+            // multi-camera paths restore before this point). Draw site
+            // selection reads ONLY the prepared presence flag — never the
+            // live canvas — so the snapshot boundary is complete at
+            // prepare; the frame itself carries no canvas reference.
+            // Counter semantics unchanged (including the historical +1
+            // whenever a canvas existed at prepare, even for an empty
+            // frame).
+            if (self.ui_frame.canvas_present) {
+                self.ui_frame.drawPrepared();
                 self.stats.post_draw_calls += 1;
                 self.stats.draw_calls += 1;
             }
@@ -1608,7 +1665,7 @@ pub const Scene = struct {
             .sun_color = snap.sun_color,
             .default_white_view = self.default_white_texture.view,
             .main_samples = samples,
-            .ui = if (self.ui_canvas) |*u| u else null,
+            .ui = if (self.ui_frame.canvas_present) &self.ui_frame else null,
             .stats = &self.stats,
         }, cur_w, cur_h);
 
@@ -1708,6 +1765,8 @@ pub const Scene = struct {
         if (self.ui_canvas) |*u| {
             u.deinit();
         }
+        // Borrowed GPU IDs only — frees the frame-owned CPU copies.
+        self.ui_frame.deinit(self.allocator);
     }
 
     // ---- Profiling & Diagnostics API ----
@@ -2184,4 +2243,143 @@ test "async save/load report NoTaskRunner without an io runner" {
     // NoTaskRunner (and frees the snapshot — testing.allocator verifies).
     try std.testing.expectError(error.NoTaskRunner, scene.saveStateFileAsync("no_runner.agsc"));
     try std.testing.expectError(error.NoTaskRunner, scene.loadStateFileAsync("no_runner.agsc"));
+}
+
+test "P6: prepareFrame captures UI into the render-owned frame" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    // Headless canvas (no GPU init): draws only fill CPU-side lists.
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    const canvas_ui = &scene.ui_canvas.?;
+    canvas_ui.drawRect(10, 20, 30, 40, Color4.white);
+    canvas_ui.drawText("ok", 0, 0, 16.0, Color4.white);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    // Frame owns copies of the full geometry; dims come from the scene
+    // snapshot (not live sapp values); borrowed handle IDs are captured.
+    try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expectEqual(canvas_ui.vertices.items.len, scene.ui_frame.vertices.items.len);
+    try std.testing.expectEqual(canvas_ui.indices.items.len, scene.ui_frame.indices.items.len);
+    try std.testing.expectEqual(@as(f32, 1920.0), scene.ui_frame.screen_w);
+    try std.testing.expectEqual(@as(f32, 1080.0), scene.ui_frame.screen_h);
+    try std.testing.expectEqual(canvas_ui.pipeline.id, scene.ui_frame.pipeline.id);
+    // Headless: staged but not drawable, zero meter bytes, stats clean.
+    try std.testing.expect(!scene.ui_frame.gpu_ready);
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+    try std.testing.expectEqual(@as(u64, 0), scene.stats.updated_bytes_frame);
+    // Upload-free draw of a never-uploaded frame: safe no-op.
+    scene.ui_frame.drawPrepared();
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Newest capture wins across prepares.
+    canvas_ui.drawRect(1, 2, 3, 4, Color4.white);
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    scene.prepareFrame();
+    try std.testing.expectEqual(canvas_ui.vertices.items.len, scene.ui_frame.vertices.items.len);
+}
+
+test "P6: camera-less prepare clears stale UI (no prior overlay)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expect(scene.ui_frame.has_capture);
+
+    // Camera lost: the next prepare must not redisplay the prior overlay.
+    for (scene.cameras.items) |entry| {
+        if (entry.owns_name) alloc.free(entry.name);
+    }
+    scene.cameras.clearRetainingCapacity();
+    scene.active_camera = null;
+    scene.active_camera_index = null;
+    scene.prepareFrame();
+    try std.testing.expect(!scene.ui_frame.has_capture);
+    try std.testing.expectEqual(@as(usize, 0), scene.ui_frame.vertices.items.len);
+    scene.ui_frame.drawPrepared();
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+}
+
+test "P6: prepare snapshots canvas presence apart from content" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // No canvas at all: presence false, content empty.
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expect(!scene.ui_frame.canvas_present);
+    try std.testing.expect(!scene.ui_frame.has_capture);
+
+    // Canvas exists but drew nothing: presence true (draw sites still
+    // select the frame, preserving the phantom+1 counters), no capture.
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expect(scene.ui_frame.canvas_present);
+    try std.testing.expect(!scene.ui_frame.has_capture);
+    scene.ui_frame.drawPrepared();
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Canvas removed again: presence follows prepare, never sticks.
+    if (scene.ui_canvas) |*c| {
+        c.vertices.deinit(alloc);
+        c.indices.deinit(alloc);
+    }
+    scene.ui_canvas = null;
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expect(!scene.ui_frame.canvas_present);
 }

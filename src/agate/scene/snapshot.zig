@@ -40,8 +40,9 @@ pub const CameraSnapshot = struct {
 /// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
 /// outline-items строятся позже в prepareFrame и живут отдельно.
 /// P4 покрывает только mesh-payload очередей; фазовый мьютекс по-прежнему
-/// обязателен (GPU-ресурсы заимствуются, а UI/debug/particles/trails —
-/// вне P4, см. P5-P7).
+/// обязателен (GPU-ресурсы заимствуются, а debug/particles/trails —
+/// вне P4-P6, см. P7). UI покрыт отдельно P6 (render-owned кадр в Scene,
+/// не часть этого snapshot: variable-length слайсы через mailbox не ездят).
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,
