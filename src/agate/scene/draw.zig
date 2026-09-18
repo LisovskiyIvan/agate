@@ -33,21 +33,26 @@ const SceneStats = stats_mod.SceneStats;
 pub const FrameContext = uniforms.FrameContext;
 
 /// Per-frame render state the draw helpers need, passed explicitly (this
-/// module must not import scene.zig). Scene fills it once per frame; the
-/// values are read-only snapshots except stats and the per-mesh
-/// receive_shadows patch on shadow_uniforms.
+/// module must not import scene.zig). Scene fills it once per frame from the
+/// consumed frame snapshot; every value below is a render-owned COPY — the
+/// draw never dereferences game-mutatable Scene fields, so update may run
+/// concurrently with render. The only mutations are the lazy shader-material
+/// pipeline cache inside `pipelines` (render thread only) and `stats`
+/// (context-owned counters).
 pub const Environment = struct {
     // Mutable: shader-material pipelines are created lazily on first use
-    // (ShaderMaterialCache.getOrCreate); everything else is read-only.
+    // (ShaderMaterialCache.getOrCreate, render thread only); everything else
+    // is a read-only snapshot copy.
     pipelines: *ForwardPipelines,
     stats: *SceneStats,
-    // Fallbacks for meshes/materials without their own textures.
-    default_material: *const StandardMaterial,
-    default_white: *const Texture,
-    default_normal: *const Texture,
-    default_cube: *const CubeTexture,
+    // Fallback textures for meshes/materials without their own textures:
+    // render-owned COPIES from the frame snapshot (Scene.default_* captured
+    // at prepare), never the live Scene fields.
+    default_white: Texture,
+    default_normal: Texture,
+    default_cube: CubeTexture,
     // Environment IBL cubemap: a material-level probe overrides the skybox,
-    // which in turn falls back to default_cube.
+    // which in turn falls back to default_cube. Snapshot copy as well.
     sky_texture: ?CubeTexture,
     ibl_intensity: f32,
     // Shadow map views/samplers from the CSM/spot atlas.
@@ -115,8 +120,8 @@ pub fn drawRegularItem(
         bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map
-        const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube.*).view;
-        const cube_sampler = rec.env_sampler orelse (env.sky_texture orelse env.default_cube.*).sampler;
+        const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube).view;
+        const cube_sampler = rec.env_sampler orelse (env.sky_texture orelse env.default_cube).sampler;
         bind.views[pbr_shd.VIEW_env_tex] = cube_view;
         bind.samplers[pbr_shd.SMP_env_smp] = cube_sampler;
 
@@ -300,7 +305,7 @@ fn drawShaderMaterialItem(
             // Hook materials have no per-slot data textures; the flat normal
             // default's sampler keeps the data_smp contract satisfied.
             bind.samplers[pbr_shd.SMP_data_smp] = env.default_normal.sampler;
-            const cube = env.sky_texture orelse env.default_cube.*;
+            const cube = env.sky_texture orelse env.default_cube;
             bind.views[pbr_shd.VIEW_env_tex] = cube.view;
             bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
             bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;

@@ -138,6 +138,17 @@ fn msSince(t0: u64) f32 {
 /// tooling and serialization), a handful of cross-cutting config flags, and
 /// one field per render subsystem. New features should add state to the
 /// matching subsystem in scene/, not to this struct.
+///
+/// Threading body contract (actual update||render): the Scene allocator
+/// MUST be thread-safe (GPA `.thread_safe = true` — prepare/render lazy
+/// caches and jobs workers allocate from it). The frame snapshot and every
+/// render pass / render-owned cache live EXCLUSIVELY on the context thread
+/// (prepare + render, sequential); workers and the update side never touch
+/// them. No raw `sg.destroy*` from workers or the update side — all GPU
+/// teardown funnels through `gpu_retire` (context-thread flush) or deinit.
+/// The `light_pack` consumed-copy fallback in `updateLights` stays
+/// game-owned under update-vs-prepare exclusion (render reads only the
+/// snapshot copy) — no atomic mailbox needed there.
 pub const Scene = struct {
     allocator: std.mem.Allocator,
 
@@ -183,7 +194,17 @@ pub const Scene = struct {
     enable_frustum_culling: bool = true,
     enable_occlusion_culling: bool = true,
     occlusion_culler: visibility.OcclusionCuller = visibility.OcclusionCuller.init(),
+    /// Context-owned per-frame counters/timings (see scene/stats.zig).
+    /// Update-side code NEVER writes here directly (render reads it
+    /// concurrently with update); the update tick arrives via
+    /// `pending_update_ms` + `recordUpdateTime` and is transferred by
+    /// prepareFrame.
     stats: SceneStats = .{},
+    /// Staged update-phase timing: the game side writes ONLY this field via
+    /// `recordUpdateTime` (under update-vs-prepare exclusion); prepareFrame
+    /// transfers the last tick into `stats.update_ms`. Separate word from
+    /// every stats field, so update||render shares no memory here.
+    pending_update_ms: f32 = 0,
     // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
     frame_id: u64 = 0,
 
@@ -333,7 +354,12 @@ pub const Scene = struct {
     /// (postprocess, bloom, SSAO, outline). The per-frame post chain resizes
     /// postprocess/bloom lazily, but SSAO has no other resize path — call
     /// this when the window size changes and post-processing/SSAO is in use.
+    ///
+    /// Render-owned targets: CONTEXT THREAD ONLY (asserted), never a worker
+    /// or the update side — a concurrent update must never observe
+    /// half-resized attachments, and sokol resizes are context-bound.
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
+        gpu_thread.assertOnContextThread();
         self.postfx.resizeAll(width, height);
     }
 
@@ -427,6 +453,22 @@ pub const Scene = struct {
         return mat;
     }
 
+    /// Stages the update-phase wall time measured by the app around
+    /// Scene.update. Update-side write (game thread, under update-vs-prepare
+    /// phase ownership); prepareFrame transfers the last tick into
+    /// stats.update_ms. This is the ONLY update-side timing write — direct
+    /// `scene.stats.*` writes from the update thread are forbidden (stats is
+    /// context-owned; render reads it concurrently with update).
+    pub fn recordUpdateTime(self: *Scene, ms: f32) void {
+        self.pending_update_ms = ms;
+    }
+
+    /// Unlinks `mat` from the registry and frees the CPU material. Safe under
+    /// update||render WITHOUT any GPU retire: prepared draw records carry
+    /// GPU handle VALUES (views/samplers), never CPU material refs, and
+    /// materials own no GPU objects needing deinit — the in-flight frame's
+    /// baked copies stay valid. (No audit-driven retire-all-materials/textures
+    /// queue: that would be a false-positive fix for a non-issue.)
     pub fn destroyPBRMaterial(self: *Scene, mat: *PBRMaterial) void {
         for (self.pbr_materials.items, 0..) |m, i| {
             if (m == mat) {
@@ -1144,14 +1186,27 @@ pub const Scene = struct {
             snap.outline_width_px,
         );
 
-        // Physics debug lines
-        self.physics.renderDebug(self.allocator, view_proj, samples, &self.stats);
+        // Physics debug lines: prepared capture only — no live world,
+        // no show_debug read at draw time (update may step the world
+        // concurrently). One committed upload (prepare), one draw per view.
+        self.physics.renderDebugPrepared(view_proj, samples, &self.stats);
 
-        // Skybox Pass
-        self.sky.render(cam_snap.camera, cam_snap.aspect, self.default_cube_texture, samples, &self.stats);
+        // Skybox Pass: captured enabled/texture/exposure only. The cube is
+        // the snapshot sky texture orelse the snapshot's render-owned
+        // default copy — never self.sky.* / self.default_cube_texture live.
+        self.sky.renderPrepared(
+            snap.sky_enabled,
+            cam_snap.camera,
+            cam_snap.aspect,
+            snap.sky_texture orelse snap.default_cube,
+            snap.sky_exposure,
+            samples,
+            &self.stats,
+        );
 
-        // Particle Pass
-        self.particles.render(cam_snap.camera, cam_snap.aspect, samples, &self.stats);
+        // Particle Pass: prepared frame only — no live ParticleSystem reads
+        // at draw time (the update side may step systems concurrently).
+        self.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, &self.stats);
     }
 
     /// Packs the current camera, light, shadow, and environment state into an immutable
@@ -1225,7 +1280,14 @@ pub const Scene = struct {
         snap.shadows_enabled = self.shadows.enabled;
         snap.shadow_uniforms = self.shadows.uniformState(self.lights.hemi.ground_color);
         snap.sky_texture = self.sky.texture;
+        snap.sky_enabled = self.sky.enabled;
+        snap.sky_exposure = self.sky.exposure;
         snap.ibl_intensity = self.sky.ibl_intensity;
+        // Render-owned default copies (plain GPU-handle values): the draw
+        // binds these, never the live Scene.default_*_texture fields.
+        snap.default_white = self.default_white_texture;
+        snap.default_normal = self.default_normal_texture;
+        snap.default_cube = self.default_cube_texture;
         snap.clear_color = self.clear_color;
         snap.msaa_sample_count = self.msaa_sample_count;
         snap.post_process = self.post_process;
@@ -1242,6 +1304,14 @@ pub const Scene = struct {
     /// published), stale published slots are drained first so the NEWEST
     /// snapshot wins — otherwise prepareFrame's takeLatest would resurface
     /// an older published frame over the newer fallback.
+    ///
+    /// Render-ownership: the saturated fallback NEVER writes the consumed
+    /// `frame_snapshot` directly. Render reads `frame_snapshot`
+    /// concurrently with update (update||render overlap), so a producer-side
+    /// overwrite would race the draw; the last-unclaimable tick is DROPPED
+    /// instead (newest published frame stays, this one is skipped). Producer
+    /// (update) vs consumer (prepare) stay excluded under phase_mutex, which
+    /// is what makes releasePublished safe here.
     pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
         const snap = self.packFrameSnapshot(aspect, cur_w, cur_h);
         if (self.frame_handoff.claim()) |i| {
@@ -1249,27 +1319,34 @@ pub const Scene = struct {
             self.frame_handoff.publish(i);
         } else {
             // Saturated: drop stale published frames (consumer is excluded
-            // by phase ownership here) and publish the newest; the direct
-            // fallback only remains for a claim that still fails.
+            // by phase ownership here) and publish the newest.
             self.frame_handoff.releasePublished();
             if (self.frame_handoff.claim()) |i| {
                 self.frame_handoff.slot(i).* = snap;
                 self.frame_handoff.publish(i);
-            } else {
-                self.frame_snapshot = snap;
             }
+            // Still unclaimable (a slot is held in WRITING state): DROP.
+            // Never fall back to `self.frame_snapshot = snap` — the
+            // consumed snapshot belongs to the in-flight render.
         }
     }
 
     /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.
-    /// Threaded callers hold phase ownership through this call and render():
-    /// draw-фаза (P4) читает только render-owned снимки MESH-payload
-    /// (regular/instanced очереди, shadow-bins, outline-items: модель/материал/
-    /// скин-копии по индексам); живые Mesh/Material/Skeleton во время их
-    /// отрисовки недоступны. Заимствованными остаются только GPU-хендлы под
-    /// фазовым мьютексом/P3 (буферы/вью/сэмплеры/пайплайны); UI покрыт P6
-    /// (render-owned кадр, upload на границе prepare), а debug/particles/
-    /// trails и прочие живые подсистемы — вне P4-P6 (см. P7).
+    /// Phase contract (actual update||render): prepare + render run
+    /// SEQUENTIALLY on the context thread (next prepare NEVER concurrent
+    /// with render); update-vs-prepare stay excluded under phase_mutex, but
+    /// update CAN overlap render — so phase ownership NO LONGER spans
+    /// prepareFrame() AND render(), only update-vs-prepare. The draw phase
+    /// therefore reads ONLY render-owned captures: P4 mesh payload
+    /// (regular/instanced очереди, shadow-bins, outline-items — trails
+    /// included: Trail.update is CPU-only staging, the prepare flush
+    /// uploads it, and P7 bakes handle/model/count values), P6 UI frame,
+    /// physics-debug capture + committed upload, particle prepared frame,
+    /// sky params + default texture copies (snapshot), light pack
+    /// (snapshot). Живые Mesh/Material/Skeleton/мир физики/sky/системы
+    /// частиц во время отрисовки недоступны. Заимствованными остаются
+    /// только GPU-хендлы под фазовым мьютексом/P3
+    /// (буферы/вью/сэмплеры/пайплайны).
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;
@@ -1324,8 +1401,12 @@ pub const Scene = struct {
     /// outline items+skins, prepared shadow items+skins+bin ranges), with the
     /// frame_id/retire_epoch that built them. The ONLY low-level draw
     /// accessor — render and P5/P7 tests read through here, never raw fields.
-    /// Scope is mesh draws only: UI (P6 ui_frame), particles, physics-debug
-    /// lines, trails, and sky are NOT part of this payload.
+    /// Scope is mesh draws only: UI (P6 ui_frame), physics-debug lines
+    /// (prepared_lines + committed DebugPass upload), sky params + default
+    /// copies (frame_snapshot), and particles (prepared frame) are separate
+    /// payloads — none of them reads live subsystems at draw time. Trail
+    /// meshes ride these same queues: Trail.update stages CPU-side, the
+    /// prepare flush uploads, and the queue build bakes the values.
     ///
     /// Borrow rules: every GPU handle inside is BORROWED (phase mutex / P3
     /// epochs, no second GPU copies); CPU slot retention is NOT a GPU
@@ -1338,18 +1419,21 @@ pub const Scene = struct {
     /// taken from it) is consumable only while frame_prepared is set or
     /// during the render call consuming this frame — never across a prepare
     /// boundary. Render completes the frame epoch on all returns (no-camera
-    /// too). One pending frame, no concurrent prepare/render.
+    /// too). One pending frame, no concurrent prepare/render — but update
+    /// CAN overlap render (update-vs-prepare stay excluded instead).
     pub fn preparedDraws(self: *const Scene) *const FrameDrawSlot {
         return &self.draws.slots[self.draws.front];
     }
 
     pub fn prepareFrame(self: *Scene) void {
-        // Владение фазой (P1): prepare выполняется на context-потоке вместе
-        // с render (frame() в main держит phase_mutex через обе фазы).
-        // Внутри — только контекстные операции: flushPendingGpuUploads,
-        // стейджинг инстансов, shadow prepare, построение очередей.
-        // Update-поток сюда не заходит; при будущем выносе prepare на
-        // update-поток этот ассерт укажет на место перевода sg за handoff.
+        // Владение фазой: prepare выполняется на context-потоке
+        // ПОСЛЕДОВАТЕЛЬНО с render (один поток, next prepare NEVER
+        // concurrent with render); update-поток в это время ИСКЛЮЧЁН
+        // (phase_mutex update-vs-prepare), а во время render — НЕТ: update
+        // CAN overlap render. Внутри prepare — только контекстные операции:
+        // flushPendingGpuUploads, стейджинг инстансов, shadow prepare,
+        // построение очередей + CPU-capture (debug/particles/UI) и их GPU
+        // upload. Draw-фаза ниже читает только render-owned снимки.
         gpu_thread.assertOnContextThread();
         // P7: repeated prepare discards the previous pending frame BEFORE
         // GpuRetire.begin/flush below: its borrowed handles may be torn down
@@ -1363,15 +1447,20 @@ pub const Scene = struct {
         // запись текущего кадра ждёт его конца. begin заодно закрывает
         // предыдущий незакрытый epoch (discarded-pending контракт выше).
         self.retire_epoch = self.gpu_retire.begin();
-        const keep_update_ms = self.stats.update_ms;
+        // update_ms приходит staged (recordUpdateTime -> pending_update_ms,
+        // игровой поток), prepare_ms пишет app на этом же context-потоке
+        // вокруг prepareFrame (см. main): оба сохраняются через сброс, всё
+        // остальное обнуляется под новый кадр. Прямых stats-записей с
+        // update-потока нет — stats читает render конкурентно с update.
         const keep_prepare_ms = self.stats.prepare_ms;
         self.stats = .{};
-        self.stats.update_ms = keep_update_ms;
+        self.stats.update_ms = self.pending_update_ms;
         self.stats.prepare_ms = keep_prepare_ms;
         // Сброс счётчика динамических обновлений на начало кадра: всё, что
-        // запишут flushPendingGpuUploads и стейджинг инстансов ниже, плюс
-        // UI/debug-апдейты внутри render, сложится в stats.updated_bytes_frame
-        // перед Profiler.recordFrame. На троттлинг текстур не влияет.
+        // запишут flushPendingGpuUploads, стейджинг инстансов и UI/debug
+        // upload'ы ниже — всё внутри prepare — плюс clear-append'ы внутри
+        // render, сложится в stats.updated_bytes_frame перед
+        // Profiler.recordFrame. На троттлинг текстур не влияет.
         _ = upload_meter.takeAndReset();
         self.frame_id +%= 1;
 
@@ -1384,6 +1473,17 @@ pub const Scene = struct {
         self.stats.uploaded_bytes_frame = self.frame_uploads.bytes;
         self.flushPendingGpuUploads();
 
+        // Particle prepared frame: capture the retained plain frame here,
+        // after the flush above and BEFORE the update/render unlock below.
+        // Reads live systems for the LAST time this frame; the draw below
+        // sees only the capture.
+        self.particles.captureFrame(self.allocator);
+
+        // Physics debug wireframe capture (CPU): world.appendDebugLines runs
+        // HERE in prepare — never inside render. The draw below reads only
+        // the capture (prepared_visible/prepared_lines).
+        self.physics.captureDebug(self.allocator);
+
         var snap = self.frame_snapshot;
         if (self.frame_handoff.takeLatest(&snap)) {
             self.frame_snapshot = snap;
@@ -1392,6 +1492,20 @@ pub const Scene = struct {
             const cur_h = sapp.height();
             const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
             self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+        }
+
+        // Debug line upload (GPU): the frame's single updateBuffer, once per
+        // prepare no matter how many PIP views render below. Samples follow
+        // the same MSAA policy as render (same snapshot inputs, same
+        // result). Headless the whole upload is skipped (the CPU capture
+        // above already ran for tests) — no sg.* without a context.
+        if (sg.isvalid()) {
+            const upload_samples = scene_msaa.effectiveSampleCount(self.frame_snapshot.msaa_sample_count, .{
+                .post_enabled = self.frame_snapshot.post_process.enabled,
+                .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
+                .backend = sg.queryBackend(),
+            });
+            self.physics.uploadDebug(self.allocator, upload_samples);
         }
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
@@ -1478,7 +1592,11 @@ pub const Scene = struct {
     /// point/spot lights for the camera (advancing the incumbency-
     /// hysteresis fades with `dt`) and stores the uniform-ready pack.
     /// Called once per frame BEFORE render(); render consumes
-    /// `self.light_pack` without touching light state.
+    /// `snapshot.light_pack` (via frame_snapshot), never `self.light_pack`
+    /// and never live light state — so the direct `self.light_pack` fallback
+    /// below stays game/prepare-side ownership (update vs prepare excluded
+    /// under phase_mutex) and needs no atomic mailbox. No new mailbox: the
+    /// render reads the snapshot copy taken by packFrameSnapshot.
     pub fn updateLights(self: *Scene, dt: f32) void {
         // Zero-eye fallback keeps the pack defined for camera-less scenes
         // (render early-returns without a camera anyway).
@@ -1514,12 +1632,26 @@ pub const Scene = struct {
     /// Stage 3, slice 2: the game-side update entry point. Everything the
     /// simulation advances per frame, in one call, in the canonical order
     /// (camera -> lights -> physics -> animations -> particles -> decals);
-    /// render() then consumes the published frame values (light_pack, frame_snapshot)
-    /// without simulating anything itself.
+    /// render() then consumes the published frame values (light_pack,
+    /// frame_snapshot, prepared draws/UI/debug/sky/particles) without
+    /// simulating anything itself.
+    ///
+    /// Runs on the game side and MAY overlap render (update||render): it must
+    /// touch ONLY update-owned state (live cameras/lights/world/meshes/
+    /// materials/canvas/particles/trails/nav + the mailboxes +
+    /// pending_update_ms). It must NEVER touch stats/Profiler/render-owned
+    /// caches or prepared payloads, and never call sg.* (uploads flush on
+    /// the context thread in prepare). Update-vs-prepare stay excluded
+    /// under phase_mutex.
     ///
     /// Deliberately NOT included: `updateTrails` and `updateNavAgents` —
     /// both require real-seconds dt (the 60fps-normalized dt breaks their
     /// SI tuning), so apps drive them explicitly with their own time base.
+    /// Those explicit CPU mutators run under the SAME update-vs-prepare
+    /// exclusion as this entry point (game side, never concurrent with
+    /// prepare; render sees only their staged/uploaded results) — the fact
+    /// that `Scene.update` skips them is a dt-base distinction, not a
+    /// thread-ownership one: no render path traces into their live state.
     pub fn update(self: *Scene, dt: f32) particles.UpdateError!void {
         self.updateCamera(dt);
         self.updateLights(dt);
@@ -1555,6 +1687,16 @@ pub const Scene = struct {
         for (self.meshes.items) |m| m.flushGpuUploads();
     }
 
+    /// Render entry: draws the frame prepared by prepareFrame (context
+    /// thread, SEQUENTIAL with prepare — never concurrent; update MAY run
+    /// concurrently on the game side). Reads ONLY render-owned captures
+    /// (prepared draws, frame_snapshot incl. sky/default copies, ui_frame,
+    /// debug capture + committed upload, particle prepared frame) plus
+    /// BORROWED GPU handles under P3 epochs. No global phase lock is taken
+    /// here: the app unlocks update-vs-prepare ownership BEFORE calling
+    /// render (see main), and prepare already ran. Takes no sg.* outside the
+    /// context thread (asserted). Every subsystem above is snapshot-driven;
+    /// no live subsystem reads remain on this path.
     pub fn render(self: *Scene) void {
         gpu_thread.assertOnContextThread();
         if (!self.frame_prepared) {
@@ -1638,16 +1780,27 @@ pub const Scene = struct {
         const t_main = sokol.time.now();
         self.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
 
+        // Render-owned draw environment: every fallback below is a snapshot
+        // COPY (default textures + sky captured at prepare) — the draw never
+        // dereferences game-mutatable Scene.default_*_texture / sky fields,
+        // so update may run concurrently with this whole pass. (The
+        // default_material pointer is gone: null-material draws were already
+        // baked into draw_record at prepare; the draw never needed it.)
         const env = scene_draw.Environment{
             // Pipeline set must match the main target's sample count: the
             // 1x set for the legacy/swapchain path, the MSAA twin otherwise.
+            // Render-owned lazy caches (forward_msaa, clear_*, sky/debug/
+            // particle/outline MSAA twins, postfx targets, shader-material
+            // cache): touched ONLY on this context thread in prepare/render,
+            // never by update — safe under overlap given the thread-safe
+            // Scene allocator (GPA .thread_safe = true); no prewarm needed
+            // just because the fields live in Scene.
             .pipelines = if (samples > 1) self.ensureForwardMsaa(samples) else &self.forward,
             .stats = &self.stats,
-            .default_material = &self.default_material,
-            .default_white = &self.default_white_texture,
-            .default_normal = &self.default_normal_texture,
-            .default_cube = &self.default_cube_texture,
-            .sky_texture = snap.sky_texture orelse self.sky.texture,
+            .default_white = snap.default_white,
+            .default_normal = snap.default_normal,
+            .default_cube = snap.default_cube,
+            .sky_texture = snap.sky_texture,
             .ibl_intensity = snap.ibl_intensity,
             .shadow_pass = &self.shadows.pass,
             .shadow_uniforms = snap.shadow_uniforms,
@@ -1724,7 +1877,7 @@ pub const Scene = struct {
             .eye = snap.primary_cam.eye,
             .sun_dir = snap.sun_dir,
             .sun_color = snap.sun_color,
-            .default_white_view = self.default_white_texture.view,
+            .default_white_view = snap.default_white.view,
             .main_samples = samples,
             .ui = if (self.ui_frame.canvas_present) &self.ui_frame else null,
             .stats = &self.stats,
@@ -1733,9 +1886,10 @@ pub const Scene = struct {
         sg.commit();
         self.stats.post_ms = msSince(t_post);
 
-        // Перенос динамики в кадровую метрику: prepare-фаза уже накоплена
-        // в счётчике с prepareFrame, сюда добавились UI/debug/clear-апдейты
-        // из проходов выше. После take счётчик чист для следующего кадра.
+        // Перенос динамики в кадровую метрику: prepare-фаза (flush, стейджинг,
+        // UI/debug upload'ы) уже накоплена в счётчике с prepareFrame, сюда
+        // добавились только clear-append'ы main-прохода выше. После take
+        // счётчик чист для следующего кадра.
         self.stats.updated_bytes_frame += upload_meter.takeAndReset();
 
         if (self.profiler.isRecording()) {
@@ -1828,6 +1982,15 @@ pub const Scene = struct {
     }
 
     // ---- Profiling & Diagnostics API ----
+    //
+    // Ownership (actual update||render): the Profiler is render-owned.
+    // start/stop/reset/recordFrame/save* run on the CONTEXT thread between
+    // submissions (the F8 window callback shares that thread — no concurrent
+    // render there; no broad IO-backend refactor). recordFrame is called only
+    // at the end of render. captureMemorySnapshot reads LIVE registries
+    // (meshes/materials/textures), so it additionally requires update
+    // exclusion (phase lock held) — never from a worker, never concurrently
+    // with update. The game/update side never touches the Profiler.
 
     /// Starts recording per-frame performance metrics.
     pub fn startProfiling(self: *Scene) void {
@@ -1850,6 +2013,7 @@ pub const Scene = struct {
     }
 
     /// Captures a snapshot of current memory allocations (CPU objects & GPU VRAM).
+    /// Context thread + update excluded (phase lock): reads live registries.
     pub fn captureMemorySnapshot(self: *Scene) !*const profiler_mod.MemorySnapshot {
         return self.profiler.captureMemorySnapshot(self);
     }
@@ -2265,16 +2429,18 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().outline_items.items.len);
 }
 
-test "prepareFrame preserves cross-phase timings (update_ms/prepare_ms handoff)" {
+test "prepareFrame transfers staged update tick, preserves prepare_ms" {
     const alloc = std.testing.allocator;
     var scene = @import("testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
 
-    // Игровая фаза записала update_ms, прошлый кадр оставил счётчики и
-    // post_ms: сброс prepareFrame обязан сохранить только кросс-фазные
-    // тайминги, остальное обнулить под новый кадр.
-    scene.stats.update_ms = 2.5;
+    // Игровая фаза сложила тик через recordUpdateTime (НЕ в stats),
+    // прошлый кадр оставил счётчики и post_ms: сброс prepareFrame обязан
+    // перенести staged update_ms и сохранить prepare_ms, остальное обнулить.
+    // Прямая запись stats.update_ms с update-стороны запрещена (контракт
+    // recordUpdateTime): этот тест пишет только staged поле + prepare_ms.
+    scene.recordUpdateTime(2.5);
     scene.stats.prepare_ms = 1.25;
     scene.stats.draw_calls = 41;
     scene.stats.triangles = 1000;
@@ -2289,6 +2455,27 @@ test "prepareFrame preserves cross-phase timings (update_ms/prepare_ms handoff)"
     try std.testing.expectEqual(@as(f32, 0.0), scene.stats.post_ms);
     // prepare_ms следующего кадра app перезапишет поверх после prepareFrame
     // (frame() в main) — handoff не мешает новому замеру.
+}
+
+test "recordUpdateTime stages without touching stats (update||render disjoint)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(f32, 0.0), scene.stats.update_ms);
+
+    // Update-сторона (game thread): только staged поле, stats не тронуты —
+    // render может читать stats конкурентно.
+    scene.recordUpdateTime(7.5);
+    try std.testing.expectEqual(@as(f32, 7.5), scene.pending_update_ms);
+    try std.testing.expectEqual(@as(f32, 0.0), scene.stats.update_ms);
+
+    // Последний тик wins до prepare; prepare переносит его в stats.
+    scene.recordUpdateTime(8.25);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(f32, 8.25), scene.stats.update_ms);
 }
 
 test "async save/load report NoTaskRunner without an io runner" {
@@ -2951,4 +3138,317 @@ test "P7: allocator-failure back stays coherent and recovers without stale items
     try std.testing.expectEqual(@as(usize, 1), rec.shadow.skins.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), rec.outline_items.items[0].model.m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), p7FindByMeshIndex(rec.primary.items.items, 0).?.model.m[12], 1e-4);
+}
+
+// ---- Actual update||render boundary: render-owned captures. ----
+
+test "saturated frame mailbox drops instead of overwriting the consumed snapshot" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // Consumed snapshot (screen dims are set before the no-camera
+    // early-out, so no camera is needed for this ownership proof).
+    scene.publishFrameSnapshot(1.0, 111, 111);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(i32, 111), scene.frame_snapshot.screen_w);
+
+    // Force the last-unclaimable case: hold BOTH slots in WRITING (a lagging
+    // holder). releasePublished only drains PUBLISHED slots, so the claim
+    // still fails — the tick must DROP, never overwrite the consumed
+    // snapshot under a concurrent render.
+    const a = scene.frame_handoff.claim().?;
+    const b = scene.frame_handoff.claim().?;
+    try std.testing.expect(scene.frame_handoff.claim() == null);
+    scene.publishFrameSnapshot(1.0, 999, 999);
+    try std.testing.expectEqual(@as(i32, 111), scene.frame_snapshot.screen_w);
+
+    // Finish the held claims as stale publishes; the next real tick drains
+    // them and the newest wins (no resurfacing of 222/333).
+    scene.frame_handoff.slot(a).* = scene.packFrameSnapshot(1.0, 222, 222);
+    scene.frame_handoff.publish(a);
+    scene.frame_handoff.slot(b).* = scene.packFrameSnapshot(1.0, 333, 333);
+    scene.frame_handoff.publish(b);
+    scene.publishFrameSnapshot(1.0, 444, 444);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(i32, 444), scene.frame_snapshot.screen_w);
+}
+
+test "debug capture: off/world-empty stay empty, capture immutable, OOM coherent" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.physics.deinit(alloc);
+
+    // No world + off: empty, invisible.
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(!scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.prepared_lines.items.len);
+
+    _ = scene.physics.enable(alloc, null);
+    const m = try alloc.create(Mesh);
+    defer alloc.destroy(m);
+    m.* = @import("testing.zig").testMesh("dbg_cap");
+    _ = try scene.physics.getWorld().?.createBody(m, .box, 0.0);
+
+    // World present but off: still empty (draw site selects on the capture).
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(!scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.prepared_lines.items.len);
+
+    scene.physics.show_debug = true;
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+
+    // Immutable under later mutation without recapture (the update side may
+    // step/move while render draws the capture).
+    const x0 = scene.physics.prepared_lines.items[0].a.x;
+    m.position = Vec3.new(5, 0, 0);
+    scene.physics.captureDebug(alloc);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+    try std.testing.expectApproxEqAbs(x0 + 5.0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
+    scene.physics.step(0.016);
+    try std.testing.expectApproxEqAbs(x0 + 5.0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
+
+    // Headless upload/draw: safe no-ops, stats clean, no pass created.
+    var stats = SceneStats{};
+    scene.physics.uploadDebug(alloc, 1);
+    try std.testing.expect(scene.physics.debug_pass == null);
+    scene.physics.renderDebugPrepared(Mat4.identity, 1, &stats);
+    try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
+    try std.testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
+
+    // Non-empty capture + present-but-empty upload: still no count (the
+    // counters gate on the issued-draw report, never on visibility alone).
+    scene.physics.debug_pass = @import("passes/debug_pass.zig").DebugPass{ .allocator = alloc };
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+    scene.physics.renderDebugPrepared(Mat4.identity, 1, &stats);
+    try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
+    try std.testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
+    // Pull the fake pass back out: DebugPass.deinit issues sg.destroy*
+    // (context-only, traps headless) — headless teardown is staging-only,
+    // so the fixture deinit below must see null here.
+    var fake_pass = scene.physics.debug_pass.?;
+    scene.physics.debug_pass = null;
+    fake_pass.staging.deinit(alloc);
+
+    // Off clears (no stale overlay).
+    scene.physics.show_debug = false;
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(!scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.prepared_lines.items.len);
+    // Retained capacity survives the clear (no per-frame churn).
+    try std.testing.expect(scene.physics.prepared_lines.capacity >= 12);
+}
+
+test "debug capture OOM fail-closes coherent-empty then recovers" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.physics.deinit(alloc);
+
+    _ = scene.physics.enable(alloc, null);
+    const m = try alloc.create(Mesh);
+    defer alloc.destroy(m);
+    m.* = @import("testing.zig").testMesh("dbg_oom");
+    _ = try scene.physics.getWorld().?.createBody(m, .box, 0.0);
+    scene.physics.show_debug = true;
+
+    // Unfunded capture on empty capacity: the upfront reserve fails ->
+    // coherent-empty (never a partial half).
+    var failing_fresh = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    scene.physics.captureDebug(failing_fresh.allocator());
+    try std.testing.expect(!scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.prepared_lines.items.len);
+
+    // Funded prime (12 lines, retained capacity high-water).
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+
+    // Force growth past retained capacity: a second body needs 24 lines,
+    // so the reserve MUST allocate -> the failing allocator fails ->
+    // coherent-empty with capacity retained (no shrink, no partial).
+    const m2 = try alloc.create(Mesh);
+    defer alloc.destroy(m2);
+    m2.* = @import("testing.zig").testMesh("dbg_oom2");
+    _ = try scene.physics.getWorld().?.createBody(m2, .box, 0.0);
+    var failing_grow = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    scene.physics.captureDebug(failing_grow.allocator());
+    try std.testing.expect(!scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.physics.prepared_lines.items.len);
+    try std.testing.expect(scene.physics.prepared_lines.capacity >= 12);
+
+    // Recovery funds the full 24.
+    scene.physics.captureDebug(alloc);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 24), scene.physics.prepared_lines.items.len);
+
+    // Warm capture refuses fresh allocs entirely: steady-state captures
+    // are allocation-free (no per-frame churn).
+    var refusing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    scene.physics.captureDebug(refusing.allocator());
+    try std.testing.expect(!refusing.has_induced_failure);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 24), scene.physics.prepared_lines.items.len);
+}
+
+test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Fake cube: plain-data handles, no GPU involved.
+    var cube = std.mem.zeroes(CubeTexture);
+    cube.view.id = 77;
+    cube.sampler.id = 78;
+    scene.sky.setSkybox(cube);
+    scene.sky.exposure = 2.0;
+    scene.sky.ibl_intensity = 0.5;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.sky_enabled);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(f32, 0.5), scene.frame_snapshot.ibl_intensity);
+    try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
+
+    // Mutate live AFTER prepare: the consumed snapshot stays frozen
+    // (a concurrent update cannot change the in-flight packet). Covers
+    // every render-owned sky/default field: enabled, exposure, the sky
+    // cube, and all three default copies. (Sampler ids, not view ids: the
+    // fixture has no GPU init, and a nonzero default-white view id would
+    // open the GPU queue-build path with an uninitialized shadow pass.)
+    scene.sky.enabled = false;
+    scene.sky.exposure = 9.0;
+    scene.sky.texture = null;
+    scene.default_white_texture.sampler.id = 5;
+    scene.default_normal_texture.sampler.id = 6;
+    scene.default_cube_texture.sampler.id = 7;
+    try std.testing.expect(scene.frame_snapshot.sky_enabled);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.frame_snapshot.default_white.sampler.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.frame_snapshot.default_normal.sampler.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.frame_snapshot.default_cube.sampler.id);
+
+    // Headless prepared draw: safe no-op, stats clean (the fixture pass is
+    // undefined, but the sg.isvalid() short-circuit returns first).
+    var stats = SceneStats{};
+    scene.sky.renderPrepared(
+        scene.frame_snapshot.sky_enabled,
+        scene.frame_snapshot.primary_cam.camera,
+        scene.frame_snapshot.primary_cam.aspect,
+        scene.frame_snapshot.sky_texture orelse scene.frame_snapshot.default_cube,
+        scene.frame_snapshot.sky_exposure,
+        1,
+        &stats,
+    );
+    try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
+
+    // A disabled snapshot draws nothing even with the live layer enabled.
+    scene.sky.enabled = true;
+    scene.sky.renderPrepared(
+        false,
+        scene.frame_snapshot.primary_cam.camera,
+        scene.frame_snapshot.primary_cam.aspect,
+        scene.frame_snapshot.sky_texture orelse scene.frame_snapshot.default_cube,
+        scene.frame_snapshot.sky_exposure,
+        1,
+        &stats,
+    );
+    try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
+
+    // pack/publish/prepare round-trip: the NEXT publish captures the newest
+    // live values (nothing stale), proving each stage reads live state at
+    // prepare time and freezes it after.
+    scene.sky.enabled = true;
+    scene.sky.exposure = 4.0;
+    var cube2 = std.mem.zeroes(CubeTexture);
+    cube2.view.id = 88;
+    scene.sky.setSkybox(cube2);
+    scene.default_normal_texture.sampler.id = 66;
+    scene.default_cube_texture.sampler.id = 67;
+    // Direct pack reads live.
+    const repacked = scene.packFrameSnapshot(16.0 / 9.0, 800, 600);
+    try std.testing.expect(repacked.sky_enabled);
+    try std.testing.expectEqual(@as(f32, 4.0), repacked.sky_exposure);
+    try std.testing.expectEqual(@as(u32, 88), repacked.sky_texture.?.view.id);
+    try std.testing.expectEqual(@as(u32, 66), repacked.default_normal.sampler.id);
+    try std.testing.expectEqual(@as(u32, 67), repacked.default_cube.sampler.id);
+    // Publish + prepare consume the newest mailbox frame.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.sky_enabled);
+    try std.testing.expectEqual(@as(f32, 4.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(u32, 88), scene.frame_snapshot.sky_texture.?.view.id);
+    try std.testing.expectEqual(@as(u32, 5), scene.frame_snapshot.default_white.sampler.id);
+    try std.testing.expectEqual(@as(u32, 66), scene.frame_snapshot.default_normal.sampler.id);
+    try std.testing.expectEqual(@as(u32, 67), scene.frame_snapshot.default_cube.sampler.id);
+}
+
+test "worker churn after prepare cannot mutate consumed snapshot/timings" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.physics.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.sky.enabled = true;
+    scene.sky.exposure = 1.5;
+    scene.recordUpdateTime(3.0);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(f32, 3.0), scene.stats.update_ms);
+
+    const snap_w = scene.frame_snapshot.screen_w;
+    const snap_exp = scene.frame_snapshot.sky_exposure;
+    const snap_clear_r = scene.frame_snapshot.clear_color.r;
+
+    // Worker = the next update tick hammering live state. Spawned AFTER
+    // prepare (a happens-before edge — deterministic, no sleeps/timing).
+    // It mutates ONLY update-owned words: live sky fields, the staged tick,
+    // clear color. Snapshot/stats are never touched by it (disjoint fields).
+    const Worker = struct {
+        scene: *Scene,
+        iters: usize,
+        fn run(self: @This()) void {
+            var i: usize = 0;
+            while (i < self.iters) : (i += 1) {
+                self.scene.sky.exposure = 9.0;
+                self.scene.sky.enabled = false;
+                self.scene.recordUpdateTime(99.0);
+                self.scene.clear_color = Color4.new(1, 0, 0, 1);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .scene = &scene, .iters = 500 }});
+    t.join();
+
+    // Consumed render state frozen despite the churn.
+    try std.testing.expectEqual(snap_w, scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(snap_exp, scene.frame_snapshot.sky_exposure);
+    try std.testing.expect(scene.frame_snapshot.sky_enabled);
+    try std.testing.expectEqual(snap_clear_r, scene.frame_snapshot.clear_color.r);
+    try std.testing.expectEqual(@as(f32, 3.0), scene.stats.update_ms);
+    try std.testing.expectEqual(@as(f32, 99.0), scene.pending_update_ms);
+
+    // Next prepare picks up the newest live state (newest wins).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(!scene.frame_snapshot.sky_enabled);
+    try std.testing.expectEqual(@as(f32, 9.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(f32, 99.0), scene.stats.update_ms);
 }

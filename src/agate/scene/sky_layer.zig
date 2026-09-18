@@ -47,16 +47,48 @@ pub const SkyboxLayer = struct {
         self.setSkybox(cube);
     }
 
-    /// Renders the skybox inside the main pass. `fallback` is the shared
-    /// default cubemap used when no custom skybox texture is set; `samples`
-    /// is the effective main-target sample count (scene/msaa.zig).
-    pub fn render(self: *SkyboxLayer, camera: Camera, aspect: f32, fallback: CubeTexture, samples: i32, stats: *SceneStats) void {
-        if (!self.enabled) return;
+    /// Renders the skybox inside the main pass from CAPTURED params only:
+    /// `enabled`/`cube_tex`/`exposure` travel in the frame snapshot (the
+    /// caller resolves `cube_tex` as snapshot sky texture orelse the
+    /// snapshot's render-owned default copy — never the game-mutatable
+    /// shared default), so a concurrent update mutating the live layer
+    /// cannot race the draw. `samples` is the effective main-target sample
+    /// count (scene/msaa.zig). Headless-safe: no `sg.*` without a context,
+    /// and the counters bump only when the pass actually draws.
+    pub fn renderPrepared(
+        self: *SkyboxLayer,
+        enabled: bool,
+        camera: Camera,
+        aspect: f32,
+        cube_tex: CubeTexture,
+        exposure: f32,
+        samples: i32,
+        stats: *SceneStats,
+    ) void {
+        if (!enabled) return;
+        const sokol = @import("sokol");
+        // Context first (before touching the pass: headless fixtures may
+        // hold an uninitialized pass, and MSAA twins create GPU objects).
+        if (!sokol.gfx.isvalid()) return;
         const pass = self.passFor(samples);
-        pass.render(camera, aspect, self.texture orelse fallback, self.exposure);
+        // Consumability guard (FAILED pipeline): the pass itself early-outs
+        // there, so check first to keep counters exact.
+        if (pass.pipeline.id == 0) return;
+        pass.render(camera, aspect, cube_tex, exposure);
         stats.main_draw_calls += 1;
         stats.draw_calls += 1;
         stats.triangles += 12;
+    }
+
+    /// Renders the skybox inside the main pass. `fallback` is the shared
+    /// default cubemap used when no custom skybox texture is set; `samples`
+    /// is the effective main-target sample count (scene/msaa.zig).
+    ///
+    /// Legacy live-state path: Scene.render no longer calls this — it draws
+    /// from the snapshot via renderPrepared. Kept for standalone/tooling.
+    pub fn render(self: *SkyboxLayer, camera: Camera, aspect: f32, fallback: CubeTexture, samples: i32, stats: *SceneStats) void {
+        if (!self.enabled) return;
+        self.renderPrepared(true, camera, aspect, self.texture orelse fallback, self.exposure, samples, stats);
     }
 
     /// Pass variant matching the target sample count.

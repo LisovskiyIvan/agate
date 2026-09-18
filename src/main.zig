@@ -6,7 +6,7 @@ const slog = sokol.log;
 const sglue = sokol.glue;
 const z = @import("agate");
 
-var gpa = std.heap.DebugAllocator(.{}){};
+var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
 var scene: z.Scene = undefined;
 var box: *z.Mesh = undefined;
 var camera: z.ArcRotateCamera = undefined;
@@ -29,15 +29,22 @@ var particle_mode: ?z.SimulationMode = null;
 var profile_mode: bool = false;
 /// --stats gate: frame-metrics summary every `stats_interval` frames.
 /// Off by default so normal runs see no stdout change.
+/// Reads context-owned stats AFTER render; the update side never writes
+/// stats (only pending_update_ms), so no lock is needed here even though
+/// the game thread may already run the next update.
 var show_stats: bool = false;
 const stats_interval: u32 = 120;
 var stats_tick: u32 = 0;
-/// Stage 3: real thread split. The game thread owns simulation
-/// (Scene.update + input consumption), the sapp thread owns windowing +
-/// render. Coarse phase ownership: one mutex, held by whichever side is
-/// inside its phase, so update and render never overlap. sg.* calls only
-/// happen on the sapp thread (render + the deferred flushes at render
-/// start); the update phase is free of them.
+/// Actual update||render split. The game thread owns simulation
+/// (Scene.update + input consumption + recordUpdateTime staging), the sapp
+/// (context) thread owns prepare + render. Phase ownership (phase_mutex)
+/// covers update-vs-prepare ONLY: frame() unlocks right after prepare so the
+/// next update overlaps render. This is sound because render reads ONLY
+/// render-owned captures (prepared draws/UI/debug/sky/particle frames +
+/// frame_snapshot + borrowed GPU handles under P3 epochs) — see Scene docs.
+/// sg.* calls only happen on the sapp thread; the update phase is free of
+/// them. The Scene allocator is thread-safe (GPA .thread_safe = true):
+/// prepare/render lazy caches and jobs workers allocate from it.
 var threaded: bool = true;
 var phase_mutex: z.jobs.Mutex = .{};
 var game_running = std.atomic.Value(bool).init(false);
@@ -81,10 +88,13 @@ fn msSince(t0: u64) f32 {
 }
 
 /// Compact one-line frame metrics, printed every `stats_interval` frames
-/// when `--stats` is passed. update/prepare are measured here around
-/// Scene.update/prepareFrame; shadow/main/post are timed inside
-/// Scene.render. Under threading this runs inside phase ownership (called
-/// before phase_mutex.unlock), so the game thread cannot race the read.
+/// when `--stats` is passed. update/prepare are measured around
+/// Scene.update (staged via recordUpdateTime) / prepareFrame; shadow/main/
+/// post are timed inside Scene.render. Runs AFTER render on the context
+/// thread: stats is context-owned and the update side never writes it, so
+/// the game thread running the next update concurrently cannot race this
+/// read (it only stages pending_update_ms + mutates live sim state, both
+/// disjoint from stats).
 fn printFrameStats() void {
     stats_tick += 1;
     if (stats_tick % stats_interval != 0) return;
@@ -243,7 +253,9 @@ fn simulate(dt_sec: f32) void {
             if (particle_mode) |m| @tagName(m) else "off",
         });
     };
-    scene.stats.update_ms = msSince(t_update);
+    // Stage the update tick WITHOUT touching stats (context-owned; render
+    // may read it concurrently): prepareFrame transfers it next frame.
+    scene.recordUpdateTime(msSince(t_update));
 }
 
 fn gameLoop() void {
@@ -253,6 +265,9 @@ fn gameLoop() void {
         const dt_sec: f32 = @floatCast(sokol.time.ms(now -% last) / 1000.0);
         last = now;
 
+        // Update-vs-prepare exclusion only: simulate() may overlap the
+        // context thread's render (it touches live sim state + stages
+        // pending_update_ms, never stats/Profiler/prepared payloads).
         phase_mutex.lock();
         if (game_running.load(.acquire)) simulate(dt_sec);
         phase_mutex.unlock();
@@ -269,15 +284,18 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Phase ownership spans prepareFrame() AND render(): render still
-        // reads live mesh/material state, so the lock stays held until
-        // render returns.
+        // Actual update||render: phase ownership covers prepare ONLY.
+        // Unlock BEFORE render so the game thread's next update overlaps
+        // the draw — render reads only render-owned captures (see Scene).
+        // Next prepare NEVER runs concurrently with render (same thread,
+        // sequential frames). prepare_ms is written here on the context
+        // thread, same as render — no cross-thread stats write.
         phase_mutex.lock();
         const t_prepare = sokol.time.now();
         scene.prepareFrame();
         scene.stats.prepare_ms = msSince(t_prepare);
-        scene.render();
         phase_mutex.unlock();
+        scene.render();
 
         if (show_stats) printFrameStats();
     } else {
@@ -339,6 +357,11 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
         .MOUSE_DOWN => pushInput(.mouse_down),
         .KEY_DOWN => switch (ev.*.key_code) {
             .F8 => {
+                // Window callbacks run on the sapp (context) thread: no
+                // render runs concurrently here. The lock excludes the
+                // update side (profiler reports + memory capture read live
+                // state); the Profiler itself is context-owned and workers
+                // never touch it.
                 phase_mutex.lock();
                 defer phase_mutex.unlock();
                 if (scene.isProfiling()) {
