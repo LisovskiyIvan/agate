@@ -31,6 +31,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("gpu_thread.zig");
 
 // Build-time generated registry (may be empty). One-way dependency: this
 // module imports it; it never imports back into agate.
@@ -161,9 +162,14 @@ pub const RuntimeDesc = struct {
     params: []const Param = &.{},
 };
 
-/// Registers a runtime shader material. Not thread-safe (single render
-/// thread contract, like the rest of the engine's GPU state).
+/// Registers a runtime shader material. Single-context-thread contract
+/// (asserted): the draw resolves entries (`entry`/`entryForKey`) from render
+/// while holding no lock, so a worker registering concurrently would race
+/// the render's pipeline-cache lookup. Register during setup / on the
+/// context thread between submissions — never from the update side or a
+/// jobs worker while render is in flight.
 pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName }!u32 {
+    gpu_thread.assertOnContextThread();
     if (runtime_len >= max_runtime_entries) return error.RegistryFull;
     if (indexForName(desc.name) != null) return error.DuplicateName;
     const index: u32 = @intCast(static_len + runtime_len);

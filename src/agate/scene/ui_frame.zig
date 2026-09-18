@@ -59,9 +59,12 @@
 //!   (a FAILED state is possible with a nonzero id, so the id is never the
 //!   validity check); any failure keeps the owned GPU pair valid and drops
 //!   the frame to coherent-empty for a next-frame retry.
-//! - Still phase-locked, still single-frame Scene ownership (no P7 double
-//!   buffering / actual overlap). Variable-length slices never cross a frame
-//!   mailbox: Scene holds this frame directly.
+//! - Single-frame Scene ownership, prepare/render SEQUENTIAL on the context
+//!   thread (no P7 double buffering). Variable-length slices never cross a
+//!   frame mailbox: Scene holds this frame directly. Update CAN overlap
+//!   render (actual update||render boundary) — safe because the draw reads
+//!   only this committed frame (upload-free), never the live canvas; update
+//!   vs prepare stay excluded under phase_mutex.
 //!
 //! Headless note: every `sg.*` WRITE sits behind `sg.isvalid()`, so unit
 //! tests exercise capture/packet/policy purely on CPU. `capture` may query

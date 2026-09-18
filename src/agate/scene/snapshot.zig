@@ -41,11 +41,13 @@ pub const CameraSnapshot = struct {
 /// outline-items строятся позже в prepareFrame и живут отдельно — P7: в двух
 /// retained-слотах Scene.draws (см. scene/frame_draws.zig: FrameDrawSlot),
 /// а не в этом snapshot.
-/// P4 покрывает только mesh-payload очередей; фазовый мьютекс по-прежнему
-/// обязателен (GPU-ресурсы заимствуются, а debug/particles/trails — вне
-/// P4–P7: P7 покрывает только mesh draw lists, остальное читает живые
-/// подсистемы под тем же фазовым гардом). UI покрыт отдельно P6 (render-owned кадр в Scene,
-/// не часть этого snapshot: variable-length слайсы через mailbox не ездят).
+/// P4 покрывает только mesh-payload очередей; update-vs-prepare остаются
+/// исключены фазовым мьютексом (producer update, consumer prepare), а update
+/// CAN overlap render — поэтому saturated-фолбэк publishFrameSnapshot
+/// НИКОГДА не пишет consumed frame_snapshot (только drop), иначе гонка с
+/// draw. GPU-ресурсы заимствуются под фазовым мьютексом/P3; UI покрыт P6
+/// (render-owned кадр в Scene), debug — prepared capture + committed upload,
+/// sky/defaults — копии в этом snapshot, light pack — snapshot-копия.
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,
@@ -81,6 +83,36 @@ pub const SceneFrameSnapshot = struct {
         .splits = .{ 0, 0, 0, 0 },
     },
     sky_texture: ?CubeTexture = null,
+    /// Captured skybox switch + exposure: render reads ONLY these, never the
+    /// live SkyboxLayer fields (update may mutate them concurrently with
+    /// render once update||render overlap is real).
+    sky_enabled: bool = false,
+    sky_exposure: f32 = 1.0,
+    /// Render-owned copies of the shared default textures, captured at
+    /// prepare. The draw path (scene/draw.zig Environment) binds these
+    /// values — never the game-mutatable Scene.default_*_texture fields —
+    /// so a concurrent update cannot race the draw's fallback sampling.
+    /// Plain GPU-handle structs (no CPU refs), copied by value.
+    default_white: texture_mod.Texture = .{
+        .image = .{},
+        .view = .{},
+        .sampler = .{},
+        .width = 1,
+        .height = 1,
+    },
+    default_normal: texture_mod.Texture = .{
+        .image = .{},
+        .view = .{},
+        .sampler = .{},
+        .width = 1,
+        .height = 1,
+    },
+    default_cube: CubeTexture = .{
+        .image = .{},
+        .view = .{},
+        .sampler = .{},
+        .size = 1,
+    },
     ibl_intensity: f32 = 1.0,
     clear_color: Color4 = Color4.new(0, 0, 0, 1),
     msaa_sample_count: i32 = 1,

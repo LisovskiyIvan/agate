@@ -84,6 +84,17 @@ pub const DebugPass = struct {
     /// Main-target sample count the pipeline was built for (scene/msaa.zig).
     sample_count: i32 = 1,
     shader: sg.Shader = .{},
+    /// Vertices committed by the last upload(), drawn by drawPrepared().
+    /// Upload-free draws read this, never the caller's slice — one upload
+    /// serves all PIP views of the frame.
+    prepared_verts: usize = 0,
+    /// Same-sokol-frame guard (P6 UiFrame policy, pass-owned variant): the
+    /// commit watermark of the last successful upload. A repeated prepare
+    /// before the next sg.commit keeps the committed upload — sokol spends a
+    /// single updateBuffer per buffer per frame. Headless (no commits exist)
+    /// the window never opens, so repeated prepares always restage newest.
+    upload_commit: u32 = 0,
+    upload_armed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !DebugPass {
         return initSampled(allocator, 1);
@@ -140,25 +151,71 @@ pub const DebugPass = struct {
         const new_cap = grownCapacity(self.capacity_lines, needed_lines);
         if (new_cap <= self.capacity_lines) return; // already at max; caller clamps
         self.staging.ensureTotalCapacity(self.allocator, verticesForLineCount(new_cap)) catch return;
+        if (!sg.isvalid()) {
+            // Headless: CPU staging grows, but there is no GPU buffer to
+            // replace (sg.makeBuffer traps without a context) — capacity
+            // tracks the staging so clamping stays exact; draws no-op.
+            self.capacity_lines = new_cap;
+            return;
+        }
         const new_vb = sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = verticesForLineCount(new_cap) * @sizeOf(Vertex),
         });
-        if (new_vb.id == 0) return;
+        // A failed makeBuffer may hand out a nonzero FAILED id (pool
+        // exhaustion is id == 0 only): validity is the state query, same as
+        // the P5/P6 growth paths. Only the failed replacement is destroyed;
+        // the current buffer and capacity stay, and the caller clamps to
+        // them. No retire queue: prepare runs sequentially on the context
+        // thread after the previous draw, so the replaced buffer is
+        // already consumed.
+        if (new_vb.id == 0 or sg.queryBufferState(new_vb) != .VALID) {
+            if (new_vb.id != 0) sg.destroyBuffer(new_vb);
+            return;
+        }
         sg.destroyBuffer(self.vertex_buffer);
         self.vertex_buffer = new_vb;
         self.capacity_lines = new_cap;
     }
 
-    /// Draws `lines` into the currently open pass (same contract as
-    /// SkyboxPass.render: caller must have begun the main pass, whose depth
-    /// attachment is reused for the LESS_EQUAL test). No depth view param
-    /// needed — the pass reads the already-bound depth buffer.
+    /// True when this sokol frame's single `updateBuffer` is already spent on
+    /// the line buffer. Read-only SDK metadata (`queryStats`, no GPU writes),
+    /// `isvalid`-gated and headless-safe: without a context no commit can
+    /// exist, so the window never opens and repeated prepares always restage
+    /// the newest lines (CPU-only, no sg.* fires headless anyway).
+    fn isUploadOpen(self: *const DebugPass) bool {
+        if (!self.upload_armed) return false;
+        if (!sg.isvalid()) return false;
+        return sg.queryStats().prev_frame.frame_index == self.upload_commit;
+    }
+
+    fn markUploaded(self: *DebugPass) void {
+        self.upload_commit = if (sg.isvalid()) sg.queryStats().prev_frame.frame_index else 0;
+        self.upload_armed = true;
+    }
+
+    /// Stages `lines` into the GPU line buffer: pack (sanitize + clamp) +
+    /// the frame's single `sg.updateBuffer`. Call ONCE per prepare; every PIP
+    /// view of the frame then draws from the same upload via drawPrepared()
+    /// with no per-view re-upload.
+    ///
     /// Overflow beyond max_capacity_lines is clamped (oldest lines win:
-    /// prefix is drawn, tail dropped).
-    pub fn render(self: *DebugPass, view_proj: Mat4, lines: []const DebugLine) void {
-        if (lines.len == 0) return;
-        if (self.pipeline.id == 0 or self.vertex_buffer.id == 0) return;
+    /// prefix is drawn, tail dropped) — same as the legacy render().
+    /// Headless-safe: packing + staging are pure CPU, every `sg.*` sits
+    /// behind `sg.isvalid()` (no meter bytes headless either).
+    /// Returns true when drawable data is staged (live: on the GPU).
+    pub fn upload(self: *DebugPass, lines: []const DebugLine) bool {
+        if (lines.len == 0) {
+            self.prepared_verts = 0;
+            return false;
+        }
+        if (self.pipeline.id == 0 or self.vertex_buffer.id == 0) {
+            self.prepared_verts = 0;
+            return false;
+        }
+        // Repeat prepare inside one sokol frame: keep the committed upload
+        // (first-wins, P6 policy); the next frame's prepare restages newest.
+        if (self.isUploadOpen()) return self.prepared_verts > 0;
         self.ensureCapacity(lines.len);
         const drawable = lines[0..@min(lines.len, self.capacity_lines)];
 
@@ -168,11 +225,35 @@ pub const DebugPass = struct {
             packDebugLine(line, &pair);
             self.staging.appendSliceAssumeCapacity(&pair);
         }
-        if (self.staging.items.len == 0) return;
+        if (self.staging.items.len == 0) {
+            self.prepared_verts = 0;
+            return false;
+        }
+        self.prepared_verts = self.staging.items.len;
+        if (!sg.isvalid()) return true; // headless: staged, no GPU calls
 
         sg.updateBuffer(self.vertex_buffer, sg.asRange(self.staging.items));
         // Учёт динамики: все staged debug-вершины кадра.
         upload_meter.record(self.staging.items.len * @sizeOf(Vertex));
+        self.markUploaded();
+        return true;
+    }
+
+    /// Upload-free draw of the last uploaded lines into the currently open
+    /// pass (same contract as SkyboxPass.render: caller must have begun the
+    /// main pass, whose depth attachment is reused for the LESS_EQUAL test).
+    /// Reads ONLY the committed upload + the view projection — never the
+    /// physics world, never the caller's line slice. Headless-safe no-op.
+    /// Returns true only when the draw was actually issued (consumable
+    /// upload + live context); counters belong to the caller and must be
+    /// gated on this.
+    pub fn drawPrepared(self: *DebugPass, view_proj: Mat4) bool {
+        if (!sg.isvalid()) return false;
+        if (self.prepared_verts == 0) return false;
+        if (self.pipeline.id == 0 or self.vertex_buffer.id == 0) return false;
+        if (self.staging.items.len == 0) return false;
+        const count = @min(self.prepared_verts, self.staging.items.len);
+        if (count == 0) return false;
         sg.applyPipeline(self.pipeline);
 
         var bind = sg.Bindings{};
@@ -184,7 +265,21 @@ pub const DebugPass = struct {
         };
         sg.applyUniforms(debug_shd.UB_vs_params, sg.asRange(&vs_params));
 
-        sg.draw(0, @intCast(self.staging.items.len), 1);
+        sg.draw(0, @intCast(count), 1);
+        return true;
+    }
+
+    /// Draws `lines` into the currently open pass (same contract as
+    /// SkyboxPass.render: caller must have begun the main pass, whose depth
+    /// attachment is reused for the LESS_EQUAL test). No depth view param
+    /// needed — the pass reads the already-bound depth buffer.
+    /// Overflow beyond max_capacity_lines is clamped (oldest lines win:
+    /// prefix is drawn, tail dropped).
+    /// Legacy single-view path (upload + draw); multi-view callers upload
+    /// once and drawPrepared per view instead.
+    pub fn render(self: *DebugPass, view_proj: Mat4, lines: []const DebugLine) void {
+        if (!self.upload(lines)) return;
+        _ = self.drawPrepared(view_proj);
     }
 
     pub fn deinit(self: *DebugPass) void {
@@ -239,4 +334,84 @@ test "grownCapacity doubles and clamps at max" {
     try std.testing.expectEqual(@as(usize, 8192), grownCapacity(4096, 4097));
     try std.testing.expectEqual(@as(usize, 16384), grownCapacity(4096, 16383));
     try std.testing.expectEqual(max_capacity_lines, grownCapacity(4096, max_capacity_lines * 4));
+}
+
+test "upload stages once headless, drawPrepared is a safe no-op" {
+    const t = std.testing;
+    _ = upload_meter.takeAndReset();
+    // Fake handles, no sokol context: upload packs CPU-side only (no sg.*,
+    // no meter bytes); drawPrepared must never trap headless.
+    var pass = DebugPass{
+        .allocator = t.allocator,
+        .pipeline = .{ .id = 1 },
+        .vertex_buffer = .{ .id = 2 },
+        .capacity_lines = 1,
+    };
+    defer pass.staging.deinit(t.allocator);
+    try pass.staging.ensureTotalCapacity(t.allocator, verticesForLineCount(4));
+
+    const lines = [_]DebugLine{
+        .{ .a = .{ .x = 0, .y = 0, .z = 0 }, .b = .{ .x = 1, .y = 0, .z = 0 }, .color = .{ 1, 0, 0 } },
+        .{ .a = .{ .x = 0, .y = 1, .z = 0 }, .b = .{ .x = 0, .y = 2, .z = 0 }, .color = .{ 0, 1, 0 } },
+    };
+    // Headless growth (2 lines > capacity 1): CPU staging grows with no
+    // sg.makeBuffer (which traps without a context); clamping stays exact.
+    try t.expect(pass.upload(&lines));
+    try t.expectEqual(@as(usize, 2), pass.capacity_lines);
+    try t.expectEqual(@as(usize, 4), pass.prepared_verts);
+    try t.expectEqual(@as(usize, 4), pass.staging.items.len);
+    try t.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Headless the same-frame window never opens (no commits exist): a
+    // repeated upload restages the newest lines instead of first-wins.
+    const moved = [_]DebugLine{
+        .{ .a = .{ .x = 9, .y = 0, .z = 0 }, .b = .{ .x = 10, .y = 0, .z = 0 }, .color = .{ 0, 0, 1 } },
+    };
+    try t.expect(pass.upload(&moved));
+    try t.expectEqual(@as(usize, 2), pass.prepared_verts);
+    try t.expectEqual(@as(f32, 9.0), pass.staging.items[0].position[0]);
+
+    // Empty input fail-closes the prepared count; draws stay safe no-ops.
+    try t.expect(!pass.upload(&.{}));
+    try t.expectEqual(@as(usize, 0), pass.prepared_verts);
+    try t.expect(!pass.drawPrepared(Mat4.identity));
+    try t.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Zero handles fail close without touching staging.
+    var dead = DebugPass{ .allocator = t.allocator };
+    defer dead.staging.deinit(t.allocator);
+    try t.expect(!dead.upload(&lines));
+    try t.expectEqual(@as(usize, 0), dead.prepared_verts);
+}
+
+test "upload clamps at max capacity, oldest lines win" {
+    const t = std.testing;
+    var pass = DebugPass{
+        .allocator = t.allocator,
+        .pipeline = .{ .id = 1 },
+        .vertex_buffer = .{ .id = 2 },
+        .capacity_lines = max_capacity_lines,
+    };
+    defer pass.staging.deinit(t.allocator);
+    try pass.staging.ensureTotalCapacity(t.allocator, verticesForLineCount(max_capacity_lines));
+
+    // max + 2 lines: growth is capped, so the prefix draws, tail drops —
+    // same clamp as the legacy render().
+    const n = max_capacity_lines + 2;
+    const lines = try t.allocator.alloc(DebugLine, n);
+    defer t.allocator.free(lines);
+    for (lines, 0..) |*ln, i| {
+        const x: f32 = @floatFromInt(i);
+        ln.* = .{
+            .a = .{ .x = x, .y = 0, .z = 0 },
+            .b = .{ .x = x + 0.5, .y = 0, .z = 0 },
+            .color = .{ 1, 0, 0 },
+        };
+    }
+    try t.expect(pass.upload(lines));
+    try t.expectEqual(verticesForLineCount(max_capacity_lines), pass.prepared_verts);
+    try t.expectEqual(@as(f32, 0.0), pass.staging.items[0].position[0]);
+    const last: f32 = @floatFromInt(max_capacity_lines - 1);
+    try t.expectEqual(last, pass.staging.items[pass.staging.items.len - 2].position[0]);
+    try t.expectEqual(last + 0.5, pass.staging.items[pass.staging.items.len - 1].position[0]);
 }

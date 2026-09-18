@@ -11,6 +11,79 @@ const ParticleSystem = particles.ParticleSystem;
 const Texture = @import("../texture.zig").Texture;
 
 pub const ParticlePass = struct {
+    /// One prepared particle draw: PLAIN render-owned record (values only —
+    /// no *ParticleSystem, no game-texture pointer). The prepared frame in
+    /// scene/particle_layer.zig retains a list of these; render selects the
+    /// pass variant (MSAA) and draws the list without touching live game
+    /// state. GPU handles below are BORROWED values: the owning
+    /// ParticleSystem (instance/gpu-slot buffers, texture) must outlive the
+    /// prepared frame — in practice the layer owns every system until
+    /// context teardown, and captureFrame runs after flushGpuUploads so
+    /// deferred buffer creations are already visible as real ids.
+    /// No full CPU geometry copy: the instance/slot bytes already sit in
+    /// the borrowed GPU buffers after the prepare flush.
+    pub const ParticleDraw = struct {
+        active_count: usize = 0,
+        simulation_mode: particles.SimulationMode = .cpu,
+        instance_buffer: sg.Buffer = .{},
+        gpu_slot_buffer: sg.Buffer = .{},
+        blend_mode: particles.ParticleBlendMode = .additive,
+        /// Borrowed texture view; null selects the pass default dot.
+        texture_view: ?sg.View = null,
+        clock_seconds: f32 = 0.0,
+        drag: f32 = 0.0,
+        gravity: Vec3 = Vec3.zero,
+        spritesheet_columns: u32 = 1,
+        spritesheet_rows: u32 = 1,
+        spritesheet_loops: f32 = 1.0,
+
+        /// Pure snapshot of a live system: copies VALUES only (no sg.* calls,
+        /// GPU-free, safe to run in prepare or in tests without a context).
+        pub fn fromSystem(ps: *const ParticleSystem) ParticleDraw {
+            return .{
+                .active_count = ps.active_count,
+                .simulation_mode = ps.simulation_mode,
+                .instance_buffer = ps.instance_buffer,
+                .gpu_slot_buffer = ps.gpu_slot_buffer,
+                .blend_mode = ps.blend_mode,
+                .texture_view = if (ps.texture) |t| t.view else null,
+                .clock_seconds = ps.clock_seconds,
+                .drag = ps.drag,
+                .gravity = ps.gravity,
+                .spritesheet_columns = ps.spritesheet_columns,
+                .spritesheet_rows = ps.spritesheet_rows,
+                .spritesheet_loops = ps.spritesheet_loops,
+            };
+        }
+
+        /// Buffer the draw binds: mode-selected mirror of the legacy
+        /// `if (gpu) ps.gpu_slot_buffer else ps.instance_buffer` choice.
+        /// Pure (no sg.*), so fixtures can assert the selection headless.
+        pub fn drawBuffer(self: ParticleDraw) sg.Buffer {
+            return if (self.simulation_mode == .gpu) self.gpu_slot_buffer else self.instance_buffer;
+        }
+    };
+
+    /// Legacy billboard stats in draw units, computed from snapshot counts
+    /// (active_count > 0 counts one draw call + two triangles per particle —
+    /// the exact legacy semantics, including draws whose buffer id is still
+    /// zero). Pure: shared by the immediate and the prepared stats paths.
+    pub const DrawStats = struct {
+        draw_calls: u32 = 0,
+        triangles: u32 = 0,
+    };
+
+    pub fn statsForDraws(draws: []const ParticleDraw) DrawStats {
+        var s = DrawStats{};
+        for (draws) |d| {
+            if (d.active_count > 0) {
+                s.draw_calls += 1;
+                s.triangles += 2 * @as(u32, @intCast(d.active_count));
+            }
+        }
+        return s;
+    }
+
     pipeline_additive: sg.Pipeline,
     pipeline_alphablend: sg.Pipeline,
     // GPU-simulation variants (shader program particle_gpu): same blend
@@ -192,6 +265,71 @@ pub const ParticlePass = struct {
         };
     }
 
+    /// Single shared draw algorithm for one prepared record (render side
+    /// only: issues sg.* against the pass-owned pipelines/quad/sampler).
+    /// Both `render` (immediate, from live systems) and `renderDraws`
+    /// (prepared, from the retained frame) funnel through here so the
+    /// pipeline/bind/uniform sequence exists exactly once.
+    fn drawRecord(
+        self: *ParticlePass,
+        draw: ParticleDraw,
+        view_proj: Mat4,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        current_pipeline: *sg.Pipeline,
+    ) void {
+        const gpu = draw.simulation_mode == .gpu;
+        const instance_buf = draw.drawBuffer();
+        if (draw.active_count == 0 or instance_buf.id == 0) return;
+
+        const pip_id = switch (draw.blend_mode) {
+            .additive => if (gpu) self.pipeline_gpu_additive.id else self.pipeline_additive.id,
+            .alpha_blend => if (gpu) self.pipeline_gpu_alphablend.id else self.pipeline_alphablend.id,
+        };
+        if (pip_id == 0) return;
+        if (current_pipeline.id != pip_id) {
+            current_pipeline.id = pip_id;
+            sg.applyPipeline(.{ .id = pip_id });
+        }
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = self.quad_vb;
+        bind.vertex_buffers[1] = instance_buf;
+        bind.index_buffer = self.quad_ib;
+
+        bind.views[part_shd.VIEW_particle_tex] = draw.texture_view orelse self.default_texture.view;
+        bind.samplers[part_shd.SMP_smp] = self.sampler;
+        sg.applyBindings(bind);
+
+        const vs_params = part_shd.VsParams{
+            .view_proj = view_proj,
+            .camera_right = .{ cam_right.x, cam_right.y, cam_right.z, 0.0 },
+            .camera_up = .{ cam_up.x, cam_up.y, cam_up.z, 0.0 },
+        };
+        sg.applyUniforms(part_shd.UB_vs_params, sg.asRange(&vs_params));
+
+        if (gpu) {
+            // Analytic-simulation parameters (uniform block gpu_params).
+            // Slot spawn times and the clock share the system epoch, so
+            // both stay small float32 magnitudes.
+            const gpu_params = part_shd.GpuParams{
+                .time_drag = .{ draw.clock_seconds, draw.drag, 0.0, 0.0 },
+                .gravity = .{ draw.gravity.x, draw.gravity.y, draw.gravity.z, 0.0 },
+                .sprite = .{
+                    @floatFromInt(if (draw.spritesheet_columns == 0) 1 else draw.spritesheet_columns),
+                    @floatFromInt(if (draw.spritesheet_rows == 0) 1 else draw.spritesheet_rows),
+                    draw.spritesheet_loops,
+                    0.0,
+                },
+            };
+            sg.applyUniforms(part_shd.UB_gpu_params, sg.asRange(&gpu_params));
+        }
+
+        // active_count is the exact live count on CPU and the written-slot
+        // high-water mark on GPU (dead slots cull in the vertex shader).
+        sg.draw(0, 6, @intCast(draw.active_count));
+    }
+
     pub fn render(
         self: *ParticlePass,
         systems: []const *ParticleSystem,
@@ -206,57 +344,28 @@ pub const ParticlePass = struct {
         var current_pipeline: sg.Pipeline = .{};
 
         for (systems) |ps| {
-            const gpu = ps.simulation_mode == .gpu;
-            const instance_buf = if (gpu) ps.gpu_slot_buffer else ps.instance_buffer;
-            if (ps.active_count == 0 or instance_buf.id == 0) continue;
+            self.drawRecord(ParticleDraw.fromSystem(ps), view_proj, cam_right, cam_up, &current_pipeline);
+        }
+    }
 
-            const pip_id = switch (ps.blend_mode) {
-                .additive => if (gpu) self.pipeline_gpu_additive.id else self.pipeline_additive.id,
-                .alpha_blend => if (gpu) self.pipeline_gpu_alphablend.id else self.pipeline_alphablend.id,
-            };
-            if (pip_id == 0) continue;
-            if (current_pipeline.id != pip_id) {
-                current_pipeline.id = pip_id;
-                sg.applyPipeline(.{ .id = pip_id });
-            }
+    /// Prepared-frame draw: renders ONLY the retained `ParticleDraw` records
+    /// (never live systems), upload-free — the prepare flush already moved
+    /// every staged byte into the borrowed buffers.
+    pub fn renderDraws(
+        self: *ParticlePass,
+        draws: []const ParticleDraw,
+        camera: Camera,
+        aspect: f32,
+    ) void {
+        const view_proj = camera.getViewProjection(aspect);
+        const view_mat = camera.getViewMatrix();
+        const cam_right = Vec3.new(view_mat.m[0], view_mat.m[4], view_mat.m[8]);
+        const cam_up = Vec3.new(view_mat.m[1], view_mat.m[5], view_mat.m[9]);
 
-            var bind = sg.Bindings{};
-            bind.vertex_buffers[0] = self.quad_vb;
-            bind.vertex_buffers[1] = instance_buf;
-            bind.index_buffer = self.quad_ib;
+        var current_pipeline: sg.Pipeline = .{};
 
-            const tex_view = if (ps.texture) |*t| t.view else self.default_texture.view;
-            bind.views[part_shd.VIEW_particle_tex] = tex_view;
-            bind.samplers[part_shd.SMP_smp] = self.sampler;
-            sg.applyBindings(bind);
-
-            const vs_params = part_shd.VsParams{
-                .view_proj = view_proj,
-                .camera_right = .{ cam_right.x, cam_right.y, cam_right.z, 0.0 },
-                .camera_up = .{ cam_up.x, cam_up.y, cam_up.z, 0.0 },
-            };
-            sg.applyUniforms(part_shd.UB_vs_params, sg.asRange(&vs_params));
-
-            if (gpu) {
-                // Analytic-simulation parameters (uniform block gpu_params).
-                // Slot spawn times and the clock share the system epoch, so
-                // both stay small float32 magnitudes.
-                const gpu_params = part_shd.GpuParams{
-                    .time_drag = .{ ps.clock_seconds, ps.drag, 0.0, 0.0 },
-                    .gravity = .{ ps.gravity.x, ps.gravity.y, ps.gravity.z, 0.0 },
-                    .sprite = .{
-                        @floatFromInt(if (ps.spritesheet_columns == 0) 1 else ps.spritesheet_columns),
-                        @floatFromInt(if (ps.spritesheet_rows == 0) 1 else ps.spritesheet_rows),
-                        ps.spritesheet_loops,
-                        0.0,
-                    },
-                };
-                sg.applyUniforms(part_shd.UB_gpu_params, sg.asRange(&gpu_params));
-            }
-
-            // active_count is the exact live count on CPU and the written-slot
-            // high-water mark on GPU (dead slots cull in the vertex shader).
-            sg.draw(0, 6, @intCast(ps.active_count));
+        for (draws) |draw| {
+            self.drawRecord(draw, view_proj, cam_right, cam_up, &current_pipeline);
         }
     }
     pub fn deinit(self: *ParticlePass) void {
@@ -274,3 +383,106 @@ pub const ParticlePass = struct {
         self.default_texture.deinit();
     }
 };
+
+// --- GPU-free prepared-record tests (no sg.* calls below this line;
+// fake borrowed handle ids only) ---
+
+fn makePassTestSystem(allocator: std.mem.Allocator, capacity: usize) !ParticleSystem {
+    const parts = try allocator.alloc(particles.Particle, capacity);
+    errdefer allocator.free(parts);
+    const insts = try allocator.alloc(particles.ParticleInstanceData, capacity);
+    errdefer allocator.free(insts);
+    const scratch = try allocator.alloc(u8, capacity);
+    errdefer allocator.free(scratch);
+    return ParticleSystem{
+        .name = "test",
+        .allocator = allocator,
+        .particles = parts,
+        .instances = insts,
+        .alive_scratch = scratch,
+        .capacity = capacity,
+        .instance_buffer = .{ .id = 11 },
+        .prng = std.Random.DefaultPrng.init(42),
+    };
+}
+
+fn freePassTestSystem(ps: *ParticleSystem) void {
+    if (ps.gpu_slots.len > 0) ps.allocator.free(ps.gpu_slots);
+    ps.allocator.free(ps.particles);
+    ps.allocator.free(ps.instances);
+    if (ps.alive_scratch.len > 0) ps.allocator.free(ps.alive_scratch);
+}
+
+test "ParticleDraw.fromSystem copies values, never live references" {
+    const t = std.testing;
+    const math_mod = @import("math");
+    var ps = try makePassTestSystem(t.allocator, 4);
+    defer freePassTestSystem(&ps);
+    ps.active_count = 3;
+    ps.simulation_mode = .gpu;
+    ps.instance_buffer = .{ .id = 11 };
+    ps.gpu_slot_buffer = .{ .id = 12 };
+    ps.blend_mode = .alpha_blend;
+    var tex: Texture = std.mem.zeroes(Texture);
+    tex.view = .{ .id = 77 };
+    ps.texture = tex;
+    ps.clock_seconds = 1.5;
+    ps.drag = 2.0;
+    ps.gravity = math_mod.Vec3.new(1.0, -2.0, 3.0);
+    ps.spritesheet_columns = 4;
+    ps.spritesheet_rows = 2;
+    ps.spritesheet_loops = 3.0;
+
+    const draw = ParticlePass.ParticleDraw.fromSystem(&ps);
+    try t.expectEqual(@as(usize, 3), draw.active_count);
+    try t.expectEqual(particles.SimulationMode.gpu, draw.simulation_mode);
+    try t.expectEqual(@as(u32, 11), draw.instance_buffer.id);
+    try t.expectEqual(@as(u32, 12), draw.gpu_slot_buffer.id);
+    try t.expectEqual(particles.ParticleBlendMode.alpha_blend, draw.blend_mode);
+    try t.expect(draw.texture_view != null);
+    try t.expectEqual(@as(u32, 77), draw.texture_view.?.id);
+    try t.expectEqual(@as(f32, 1.5), draw.clock_seconds);
+    try t.expectEqual(@as(f32, 2.0), draw.drag);
+    try t.expectEqual(math_mod.Vec3.new(1.0, -2.0, 3.0), draw.gravity);
+    try t.expectEqual(@as(u32, 4), draw.spritesheet_columns);
+    try t.expectEqual(@as(u32, 2), draw.spritesheet_rows);
+    try t.expectEqual(@as(f32, 3.0), draw.spritesheet_loops);
+
+    // No texture -> null (pass substitutes its default dot at draw).
+    ps.texture = null;
+    try t.expectEqual(@as(?sg.View, null), ParticlePass.ParticleDraw.fromSystem(&ps).texture_view);
+
+    // Mutating the live system leaves the earlier snapshot untouched.
+    ps.active_count = 0;
+    ps.clock_seconds = 9.0;
+    try t.expectEqual(@as(usize, 3), draw.active_count);
+    try t.expectEqual(@as(f32, 1.5), draw.clock_seconds);
+}
+
+test "ParticleDraw.drawBuffer follows the simulation mode" {
+    const t = std.testing;
+    var cpu = ParticlePass.ParticleDraw{
+        .simulation_mode = .cpu,
+        .instance_buffer = .{ .id = 11 },
+        .gpu_slot_buffer = .{ .id = 12 },
+    };
+    try t.expectEqual(@as(u32, 11), cpu.drawBuffer().id);
+    cpu.simulation_mode = .gpu;
+    try t.expectEqual(@as(u32, 12), cpu.drawBuffer().id);
+}
+
+test "statsForDraws preserves the legacy count semantics" {
+    const t = std.testing;
+    // Zero-count draws contribute nothing (legacy render skips them and the
+    // stats loop only counts active_count > 0).
+    const draws = [_]ParticlePass.ParticleDraw{
+        .{ .active_count = 0 },
+        .{ .active_count = 3 },
+        .{ .active_count = 5 },
+    };
+    const s = ParticlePass.statsForDraws(&draws);
+    try t.expectEqual(@as(u32, 2), s.draw_calls);
+    try t.expectEqual(@as(u32, 2 * (3 + 5)), s.triangles);
+    const empty: []const ParticlePass.ParticleDraw = &[_]ParticlePass.ParticleDraw{};
+    try t.expectEqual(ParticlePass.DrawStats{}, ParticlePass.statsForDraws(empty));
+}

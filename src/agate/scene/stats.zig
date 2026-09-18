@@ -5,27 +5,40 @@
 //
 // Frame-metric fields (uploaded_*, *_ms) are published by Scene at render
 // start and measured around the phase boundaries: upload counters are
-// staged by prepareFrame (texture drain tally), update_ms/prepare_ms are
-// written by the app around Scene.update/prepareFrame (see agate main),
-// shadow/main/post_ms are timed inside Scene.render. All default to zero,
-// so `SceneStats{}` and `self.stats = .{}` stay valid resets.
+// staged by prepareFrame (texture drain tally), prepare_ms is written by the
+// app around prepareFrame (same context thread as render), update_ms arrives
+// via Scene.recordUpdateTime -> pending_update_ms -> prepare transfer (see
+// ownership below), shadow/main/post_ms are timed inside Scene.render. All
+// default to zero, so `SceneStats{}` and `self.stats = .{}` stay valid resets.
 //
-// Владение при будущем parallel update/render (P2):
-// - update_ms пишет игровой поток (app вокруг Scene.update), читает
-//   render-поток (Profiler.recordFrame в конце Scene.render). Гонки сегодня
-//   нет: обе фазы держит phase_mutex (frame() в main), а сброс prepareFrame
-//   сохраняет оба значения (handoff через keep_update_ms/keep_prepare_ms).
-// - prepare_ms, uploaded_*, shadow/main/post_ms и все счётчики пишет
-//   context-поток (prepareFrame/render); updated_bytes_frame идёт через
-//   атомарный gpu_upload_meter (воркеры стейджинга пишут record(),
+// Владение при actual update||render (update CAN overlap render; prepare and
+// render stay SEQUENTIAL on the context thread, next prepare NEVER runs
+// concurrently with render):
+// - update_ms пишет ТОЛЬКО context-поток: prepareFrame переносит в stats
+//   последний тик pending_update_ms, который игровой поток сложил через
+//   Scene.recordUpdateTime (фазовый мьютекс update-vs-prepare; это staged
+//   f32, НЕ stats). Прямая запись scene.stats.update_ms с игрового потока
+//   ЗАПРЕЩЕНА: stats читает render (Profiler.recordFrame в конце
+//   Scene.render) конкурентно с update — поле обязано быть context-owned.
+//   prepareFrame сбрасывает stats, сохраняя перенесённый update_ms и
+//   app-записанный prepare_ms (handoff через pending/keep).
+// - prepare_ms пишет app на context-потоке (frame() вокруг prepareFrame —
+//   тот же поток, что render); uploaded_*, shadow/main/post_ms и все
+//   счётчики пишет context-поток (prepareFrame/render); updated_bytes_frame
+//   идёт через атомарный gpu_upload_meter (воркеры стейджинга пишут record(),
 //   render забирает takeAndReset()). UI-байты с P6 записываются в prepare
 //   (capture-upload в prepareFrame), а не в render — сумма за кадр та же,
 //   меняется только prepare-vs-render атрибуция.
 // - Profiler целиком render-owned: recordFrame вызывается только в конце
-//   render, captureMemorySnapshot/summarize/analyze — с render-потока или
-//   тулов. Игровой поток к Profiler не прикасается.
+//   render, start/stop/reset/saveReports — с context-потока между
+//   submissions (окно/тулы; F8-колбэк того же потока, конкурентного render
+//   там нет), captureMemorySnapshot — с context-потока под фазовым мьютексом
+//   (читает живые регистры, update исключён). Воркеры/игровой поток к
+//   Profiler не прикасаются никогда.
 // Поля остаются обычными (не атомарными): синхронизация фазовая
-// (phase_mutex + границы prepare/render), а не поточечная.
+// (phase_mutex update-vs-prepare + границы prepare/render), а не поточечная;
+// update_ms/статистика и pending тик — РАЗНЫЕ поля, поэтому update||render
+// не делят ни одного слова памяти.
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
     rendered_meshes: u32 = 0,

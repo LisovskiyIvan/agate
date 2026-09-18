@@ -1,9 +1,11 @@
 //! P7 double-buffered prepared draw payload: two retained owning queue slots
 //! covering the prepared mesh draw lists — PRIMARY + ALL PIP view queues
 //! (with their skin/shader side stores), outline items+skins, and prepared
-//! shadow items+skins+bin ranges. Scope is mesh draws only: UI stays outside
-//! (P6 single-owned ui_frame), and particles, physics-debug lines, trails,
-//! and sky read live subsystems or their own frames — never these slots.
+//! shadow items+skins+bin ranges. Scope is mesh draws only (trail meshes
+//! ride these same queues — Trail.update stages CPU-side and the prepare
+//! flush uploads before the queue build bakes the values): UI stays outside
+//! (P6 single-owned ui_frame), and particles, physics-debug lines, and sky
+//! carry their own prepared frames/payloads — never these slots.
 //!
 //! Ownership / lifecycle block:
 //! - Owns only CPU-side queue storage (ArrayList buffers, skin/shader copies,
@@ -14,10 +16,13 @@
 //!   lifetime pin: a retained slot may reference handles a GpuRetire flush
 //!   already destroyed.
 //! - Sequential phase contract: ONE pending frame, no concurrent
-//!   prepare/render. prepare builds the BACK slot in place (reset first),
-//!   then publishes with a single index flip — never a shallow ArrayList
-//!   copy (that would double-free), never a per-frame deep clone. Render
-//!   reads only the published FRONT slot through const payloads.
+//!   prepare/render (same context thread). prepare builds the BACK slot in
+//!   place (reset first), then publishes with a single index flip — never a
+//!   shallow ArrayList copy (that would double-free), never a per-frame deep
+//!   clone. Render reads only the published FRONT slot through const
+//!   payloads. Update CAN overlap render (actual update||render boundary):
+//!   the mailbox producer (update) vs consumer (prepare) stay excluded under
+//!   phase_mutex instead — phase ownership no longer spans prepare+render.
 //! - GPU consumability of a published slot ends at the consuming render's
 //!   return or — when no render consumes it — at the START of the next
 //!   prepareFrame: a repeated prepare discards the pending frame BEFORE
