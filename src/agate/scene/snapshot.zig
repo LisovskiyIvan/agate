@@ -38,10 +38,13 @@ pub const CameraSnapshot = struct {
 /// Frame-level camera/light/pass state published by the simulation side.
 /// Это frame mailbox (камеры/свет/конфиг проходов), а НЕ подготовленные
 /// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
-/// outline-items строятся позже в prepareFrame и живут отдельно.
+/// outline-items строятся позже в prepareFrame и живут отдельно — P7: в двух
+/// retained-слотах Scene.draws (см. scene/frame_draws.zig: FrameDrawSlot),
+/// а не в этом snapshot.
 /// P4 покрывает только mesh-payload очередей; фазовый мьютекс по-прежнему
-/// обязателен (GPU-ресурсы заимствуются, а debug/particles/trails —
-/// вне P4-P6, см. P7). UI покрыт отдельно P6 (render-owned кадр в Scene,
+/// обязателен (GPU-ресурсы заимствуются, а debug/particles/trails — вне
+/// P4–P7: P7 покрывает только mesh draw lists, остальное читает живые
+/// подсистемы под тем же фазовым гардом). UI покрыт отдельно P6 (render-owned кадр в Scene,
 /// не часть этого snapshot: variable-length слайсы через mailbox не ездят).
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,

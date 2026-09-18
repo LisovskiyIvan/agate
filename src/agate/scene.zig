@@ -97,6 +97,11 @@ const scene_project = @import("scene/project_cache.zig");
 const scene_retire = @import("scene/gpu_retire.zig");
 const scene_ui_frame = @import("scene/ui_frame.zig");
 pub const UiFrame = scene_ui_frame.UiFrame;
+const scene_frame_draws = @import("scene/frame_draws.zig");
+/// P7 published consumable draw payload (one coherent prepared frame).
+pub const FrameDrawSlot = scene_frame_draws.FrameDrawSlot;
+/// P7 two retained owning queue slots (the variable-list double buffer).
+pub const FrameDraws = scene_frame_draws.FrameDraws;
 const scene_content = @import("scene/content.zig");
 const scene_animation = @import("scene/animation_runtime.zig");
 const scene_picking = @import("scene/picking.zig");
@@ -229,7 +234,13 @@ pub const Scene = struct {
     // Physics world + debug wireframe overlay.
     physics: scene_physics.PhysicsIntegration = .{},
     // Per-frame draw queues + instance staging.
-    queues: scene_render_queue.RenderQueues = .{},
+    // P7 double buffer: two retained owning slots encompassing PRIMARY +
+    // ALL PIP view queues, outline items+skins, and prepared shadow
+    // items+skins+bin ranges. prepare builds the back slot, render reads the
+    // published front slot via preparedDraws() — the ONLY low-level draw
+    // accessor (no legacy field aliases). See scene/frame_draws.zig for the
+    // ownership/lifecycle contract.
+    draws: scene_frame_draws.FrameDraws = .{},
     // projectPoint view-projection cache.
     project: scene_project.ProjectCache = .{},
 
@@ -257,12 +268,8 @@ pub const Scene = struct {
 
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
+    // The prepared outline items+skins live in the P7 slots (preparedDraws).
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    render_outline_items: std.ArrayListUnmanaged(outline_pass.OutlineDrawItem) = .empty,
-    /// Render-owned копии скинов outline-draws (резолв по skin_index).
-    /// Сбрасывается вместе с render_outline_items в prepareFrame.
-    render_outline_skins: scene_render_queue.SkinStorage = .empty,
-    view_queues: [scene_snapshot.MAX_CAMERAS]scene_render_queue.RenderQueues = [_]scene_render_queue.RenderQueues{.{}} ** scene_snapshot.MAX_CAMERAS,
 
     /// Mailbox for publishing frame-level camera/light/pass state from the
     /// simulation thread. Meshes and materials are still live scene objects,
@@ -1055,6 +1062,8 @@ pub const Scene = struct {
         self: *Scene,
         cam_snap: scene_snapshot.CameraSnapshot,
         queues: *const scene_render_queue.RenderQueues,
+        outline_items: []const outline_pass.OutlineDrawItem,
+        outline_skins: []const [scene_render_queue.MAX_BONES]Mat4,
         samples: i32,
         snap: *const scene_snapshot.SceneFrameSnapshot,
         env: scene_draw.Environment,
@@ -1121,12 +1130,13 @@ pub const Scene = struct {
             }
         }
 
-        // Inverse-hull outline for highlighted meshes
+        // Inverse-hull outline for highlighted meshes (P7: published slot
+        // payload, never live Scene fields).
         self.postfx.renderOutlineItems(
             view_proj,
             eye,
-            self.render_outline_items.items,
-            self.render_outline_skins.items,
+            outline_items,
+            outline_skins,
             samples,
             &self.stats,
             snap.outline_enabled,
@@ -1309,6 +1319,30 @@ pub const Scene = struct {
         });
     }
 
+    /// P7 published consumable draw payload: the prepared mesh draw lists
+    /// (PRIMARY + ALL PIP view queues with their skin/shader side stores,
+    /// outline items+skins, prepared shadow items+skins+bin ranges), with the
+    /// frame_id/retire_epoch that built them. The ONLY low-level draw
+    /// accessor — render and P5/P7 tests read through here, never raw fields.
+    /// Scope is mesh draws only: UI (P6 ui_frame), particles, physics-debug
+    /// lines, trails, and sky are NOT part of this payload.
+    ///
+    /// Borrow rules: every GPU handle inside is BORROWED (phase mutex / P3
+    /// epochs, no second GPU copies); CPU slot retention is NOT a GPU
+    /// lifetime pin. GPU consumability ends at the consuming render's return
+    /// or — when no render consumes the frame — at the START of the next
+    /// prepareFrame (a repeated prepare discards the pending frame before
+    /// GpuRetire.begin/flush, and that flush may tear down its borrowed
+    /// handles); it also ends at deinit. Retained CPU storage may be reused
+    /// as back scratch by any prepare, so the returned pointer (and any slice
+    /// taken from it) is consumable only while frame_prepared is set or
+    /// during the render call consuming this frame — never across a prepare
+    /// boundary. Render completes the frame epoch on all returns (no-camera
+    /// too). One pending frame, no concurrent prepare/render.
+    pub fn preparedDraws(self: *const Scene) *const FrameDrawSlot {
+        return &self.draws.slots[self.draws.front];
+    }
+
     pub fn prepareFrame(self: *Scene) void {
         // Владение фазой (P1): prepare выполняется на context-потоке вместе
         // с render (frame() в main держит phase_mutex через обе фазы).
@@ -1317,9 +1351,17 @@ pub const Scene = struct {
         // Update-поток сюда не заходит; при будущем выносе prepare на
         // update-поток этот ассерт укажет на место перевода sg за handoff.
         gpu_thread.assertOnContextThread();
+        // P7: repeated prepare discards the previous pending frame BEFORE
+        // GpuRetire.begin/flush below: its borrowed handles may be torn down
+        // by the flush, so preparedDraws() payloads from that frame lose GPU
+        // consumability from this point (retained CPU storage may be reused
+        // as back scratch). The new publish at the end re-associates
+        // frame_id/retire_epoch.
+        self.frame_prepared = false;
         // Начало кадра (P3): новый epoch ретенции. flush ниже (внутри
         // flushPendingGpuUploads) уничтожит только завершённые эпохи —
-        // запись текущего кадра ждёт его конца.
+        // запись текущего кадра ждёт его конца. begin заодно закрывает
+        // предыдущий незакрытый epoch (discarded-pending контракт выше).
         self.retire_epoch = self.gpu_retire.begin();
         const keep_update_ms = self.stats.update_ms;
         const keep_prepare_ms = self.stats.prepare_ms;
@@ -1353,6 +1395,16 @@ pub const Scene = struct {
         }
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
+        // P7: build the BACK slot in place (reset first — every list,
+        // including disabled views/shadow bins, so a skipped path can never
+        // resurface the other slot's prior frame), then publish with one
+        // index flip at the end. The front slot is untouched during the
+        // build: allocator failure in the back corrupts nothing consumable.
+        const back_idx = self.draws.backIndex();
+        const back = &self.draws.slots[back_idx];
+        back.reset();
+        back.frame_id = self.frame_id;
+        back.retire_epoch = self.retire_epoch;
         if (is_gpu_init) {
             // Pre-stage instance data before the shadow pass: ShadowPass.prepare
             // snapshots the published render state (bounds/buffer/count),
@@ -1360,10 +1412,12 @@ pub const Scene = struct {
             // and eye the first view queue would use; the frame guard keeps it
             // once per frame, shared by all view queues. Grown-away old
             // buffers retire into the epoch queue (P5), never destroyed inline.
+            // Staging scratch is the back primary's list (view builds with
+            // instances_prepared never retry mid-frame — failure coherence).
             if (self.frame_snapshot.has_camera) {
                 scene_instance_staging.stageInstances(.{
                     .allocator = self.allocator,
-                    .instance_matrices = &self.queues.instance_matrices,
+                    .instance_matrices = &back.primary.instance_matrices,
                     .thread_pool = jobs.global,
                     .frame_id = self.frame_id,
                     .eye = self.frame_snapshot.primary_cam.eye,
@@ -1379,19 +1433,19 @@ pub const Scene = struct {
         // items are captured before worldMatrixCached warming, exactly
         // like the historical pre-queue capture, so their cached-center
         // behavior is unchanged.
-        self.render_outline_items.clearRetainingCapacity();
-        self.render_outline_skins.clearRetainingCapacity();
         for (self.outline_meshes.items) |m| {
             if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
-            if (outline_pass.makeOutlineDrawItem(self.allocator, &self.render_outline_skins, m)) |it| {
-                self.render_outline_items.append(self.allocator, it) catch {};
+            if (outline_pass.makeOutlineDrawItem(self.allocator, &back.outline_skins, m)) |it| {
+                back.outline_items.append(self.allocator, it) catch {};
             }
         }
 
         if (is_gpu_init) {
-            // Shadow pass preparation
+            // Shadow pass preparation into the back slot (disabled shadows —
+            // or no camera — leave the reset-empty payload: coherent, never
+            // the front slot's prior bins).
             if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
-                _ = self.shadows.pass.prepare(self.meshes.items, self.frame_id, jobs.global);
+                _ = self.shadows.pass.prepareInto(&back.shadow, self.meshes.items, self.frame_id, jobs.global);
             }
 
             // View queues preparation
@@ -1401,19 +1455,22 @@ pub const Scene = struct {
                 if (self.frame_snapshot.enable_multi_camera and self.frame_snapshot.camera_count > 0) {
                     const active_idx = self.frame_snapshot.active_camera_idx;
                     const primary_snap = if (active_idx < self.frame_snapshot.camera_count) self.frame_snapshot.cameras[active_idx] else self.frame_snapshot.primary_cam;
-                    self.prepareViewQueues(&self.queues, primary_snap, sky_tex, ibl_int);
+                    self.prepareViewQueues(&back.primary, primary_snap, sky_tex, ibl_int);
                     for (self.frame_snapshot.cameras[0..self.frame_snapshot.camera_count], 0..) |entry, i| {
                         if (i == active_idx or !entry.enabled) continue;
-                        self.prepareViewQueues(&self.view_queues[i], entry, sky_tex, ibl_int);
+                        self.prepareViewQueues(&back.views[i], entry, sky_tex, ibl_int);
                     }
                 } else {
-                    self.prepareViewQueues(&self.queues, self.frame_snapshot.primary_cam, sky_tex, ibl_int);
+                    self.prepareViewQueues(&back.primary, self.frame_snapshot.primary_cam, sky_tex, ibl_int);
                 }
             }
         }
 
         self.captureUiFrame();
 
+        // P7 publish: one index flip, no list copies. Newest wins — a repeated
+        // prepare's back overwrote nothing consumable until this point.
+        self.draws.publish(back_idx);
         self.frame_prepared = true;
     }
 
@@ -1509,6 +1566,9 @@ pub const Scene = struct {
         // epoch — на кадр, а не на камеру/view.
         defer self.gpu_retire.complete(self.retire_epoch);
 
+        // P7: consume the published front slot (const payloads only). Valid
+        // for this render; the next prepareFrame invalidates it.
+        const draws = self.preparedDraws();
         const snap = &self.frame_snapshot;
         if (!snap.has_camera) {
             // Камеры нет — UI/debug-проходов не будет: переносим только
@@ -1545,7 +1605,8 @@ pub const Scene = struct {
         // ==============================================
         if (snap.shadows_enabled) {
             const t_shadow = sokol.time.now();
-            const shadow_draws = self.shadows.pass.renderPrepared(
+            const shadow_draws = self.shadows.pass.renderPreparedFrom(
+                &draws.shadow,
                 cascades,
                 light_pack.spot_shadows[0..light_pack.num_spot_shadows],
             );
@@ -1598,7 +1659,7 @@ pub const Scene = struct {
             const primary_rect = primary_snap.viewport.toPixelRect(cur_w, cur_h);
             sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
             sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
-            self.renderSceneView(primary_snap, &self.queues, samples, snap, env);
+            self.renderSceneView(primary_snap, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
 
             for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
                 if (i == active_idx or !entry.enabled) continue;
@@ -1611,7 +1672,7 @@ pub const Scene = struct {
                     self.clearCurrentViewport(clr, samples);
                 }
 
-                self.renderSceneView(entry, &self.view_queues[i], samples, snap, env);
+                self.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
             }
             // Restore full viewport
             sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -1622,7 +1683,7 @@ pub const Scene = struct {
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-            self.renderSceneView(snap.primary_cam, &self.queues, samples, snap, env);
+            self.renderSceneView(snap.primary_cam, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
 
             if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
                 sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -1734,8 +1795,7 @@ pub const Scene = struct {
 
         self.lights.deinit(self.allocator);
 
-        for (&self.view_queues) |*q| q.deinit(self.allocator);
-        self.queues.deinit(self.allocator);
+        self.draws.deinit(self.allocator);
 
         self.trails.deinit(self.allocator);
         for (self.greased_lines.items) |gl| gl.deinit();
@@ -1756,8 +1816,6 @@ pub const Scene = struct {
         scene_content.deinitAnimations(self.allocator, &self.animation_groups, &self.skeletons);
 
         self.outline_meshes.deinit(self.allocator);
-        self.render_outline_items.deinit(self.allocator);
-        self.render_outline_skins.deinit(self.allocator);
         self.postfx.deinit();
 
         self.particles.deinit(self.allocator);
@@ -2180,12 +2238,12 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
     defer scene.outline_meshes.deinit(alloc);
-    defer scene.render_outline_items.deinit(alloc);
-    defer scene.render_outline_skins.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
     // No GPU context on the fixture (default textures zeroed): outline
     // capture still runs unconditionally after the (skipped) pre-stage, as
-    // before P5 — snapshots clear and rebuild every prepareFrame.
+    // before P5 — snapshots clear and rebuild every prepareFrame (P7: into
+    // the published slot, read via preparedDraws()).
     var mesh = Mesh{
         .name = "headless_outline",
         .vertex_buffer = .{},
@@ -2197,14 +2255,14 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
 
     scene.prepareFrame();
     try std.testing.expect(scene.frame_prepared);
-    try std.testing.expectEqual(@as(usize, 1), scene.render_outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     // Rebuild, not accumulate.
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(usize, 1), scene.render_outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     // Clearing works: a hidden mesh rebuilds to empty.
     mesh.is_visible = false;
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(usize, 0), scene.render_outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().outline_items.items.len);
 }
 
 test "prepareFrame preserves cross-phase timings (update_ms/prepare_ms handoff)" {
@@ -2382,4 +2440,515 @@ test "P6: prepare snapshots canvas presence apart from content" {
     scene.publishFrameSnapshot(1.0, 640, 480);
     scene.prepareFrame();
     try std.testing.expect(!scene.ui_frame.canvas_present);
+}
+
+// ---- P7 double-buffered prepared draws. ----
+
+// Headless full-path integration runs prepareFrame with a faked GPU-init
+// flag (default_white_texture.view.id != 0) plus a CPU-only shadow pass
+// (allocator + empty scratch/payload, zero GPU handles). No sg.* fires on
+// the prepare path for plain/skinned/hook meshes: instance staging skips
+// non-instanced meshes (and guards the rest with sg.isvalid), shadow
+// prepareInto and the view-queue builds are pure CPU snapshots, and UI
+// capture is sg-guarded (P6). Render never runs headless.
+fn p7CpuShadowPass(scene: *Scene, alloc: std.mem.Allocator) void {
+    // CPU-only stand-in: prepareInto/binMeshes never touch GPU handles
+    // headless (render never runs), so every handle field is safely zero and
+    // only allocator + scratch/payload carry state. Full literal — no
+    // undefined fields left unread.
+    scene.shadows.pass = .{
+        .allocator = alloc,
+        .image = .{},
+        .attachment_view = .{},
+        .texture_view = .{},
+        .sampler = .{},
+        .depth_sampler = .{},
+        .spot_image = .{},
+        .spot_attachment_view = .{},
+        .spot_texture_view = .{},
+        .spot_needs_clear = false,
+        .pipeline_u16 = .{},
+        .pipeline_u32 = .{},
+        .inst_pipeline_u16 = .{},
+        .inst_pipeline_u32 = .{},
+        .skinned_pipeline_u16 = .{},
+        .skinned_pipeline_u32 = .{},
+        .shadow_shader = .{},
+        .inst_shader = .{},
+        .skinned_shader = .{},
+        .binned_meshes = .empty,
+        .prepared = .{},
+    };
+}
+
+fn p7ShadowTotal(draws: *const FrameDrawSlot) usize {
+    var total: usize = 0;
+    for (draws.shadow.bin.counts) |c| total += c;
+    return total;
+}
+
+fn p7FindByMeshIndex(items: []const RenderMeshItem, idx: u32) ?RenderMeshItem {
+    for (items) |it| {
+        if (it.mesh_index == idx) return it;
+    }
+    return null;
+}
+
+test "P7: slots alternate, newest wins, front intact while building back" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.default_white_texture.view.id = 1;
+    p7CpuShadowPass(&scene, alloc);
+
+    const skel = try Skeleton.init(alloc, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    var hook_mat = ShaderMaterial{ .name = "p7_hook" };
+    var mesh_a = Mesh{
+        .name = "p7_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(4, 0, 0),
+    };
+    var mesh_s = Mesh{
+        .name = "p7_s",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(1, 0, 0),
+        .skeleton = skel,
+    };
+    var mesh_h = Mesh{
+        .name = "p7_h",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(2, 0, 0),
+        .material = .{ .shader_material = &hook_mat },
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_s);
+    try scene.meshes.append(alloc, &mesh_h);
+    try scene.outline_meshes.append(alloc, &mesh_a);
+
+    // PIP enabled so a views[i] output is part of every frame (and of the
+    // zero-alloc proof below): the second camera sees all three meshes.
+    scene.enable_multi_camera = true;
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    const cam2 = Camera{ .free = camera_mod.FreeCamera.init("Cam2", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
+    scene.active_camera_index = 0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    const front0 = scene.draws.front;
+    const d0 = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 3), d0.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d0.primary.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d0.primary.shader_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 3), d0.views[1].items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d0.outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 3), p7ShadowTotal(d0));
+    try std.testing.expectEqual(@as(usize, 3), d0.shadow.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d0.shadow.skins.items.len);
+    try std.testing.expectEqual(scene.frame_id, d0.frame_id);
+    try std.testing.expectEqual(scene.retire_epoch, d0.retire_epoch);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), d0.outline_items.items[0].model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), p7FindByMeshIndex(d0.primary.items.items, 0).?.model.m[12], 1e-4);
+
+    // Front intact while building back: move mesh_a, build the OTHER slot
+    // directly, and prove the published front is untouched (lists, skins,
+    // shader, outline, shadow ranges) while the back sees the new state.
+    mesh_a.position = Vec3.new(9, 0, 0);
+    const back_idx = 1 - front0;
+    // New frame id for the manual back build (as prepareFrame would bump):
+    // the world-matrix cache keys on it, and the published front snapshot
+    // must stay at the old pose regardless.
+    scene.frame_id +%= 1;
+    scene.prepareViewQueues(&scene.draws.slots[back_idx].primary, scene.frame_snapshot.primary_cam, null, 1.0);
+    const front_still = &scene.draws.slots[front0];
+    try std.testing.expectEqual(@as(usize, 3), front_still.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), front_still.primary.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 1), front_still.primary.shader_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 1), front_still.outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 3), front_still.shadow.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), front_still.shadow.skins.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), front_still.outline_items.items[0].model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), p7FindByMeshIndex(front_still.primary.items.items, 0).?.model.m[12], 1e-4);
+    const back_built = &scene.draws.slots[back_idx];
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), p7FindByMeshIndex(back_built.primary.items.items, 0).?.model.m[12], 1e-4);
+    // View builds never touch outline: the scratch back holds none.
+    try std.testing.expectEqual(@as(usize, 0), back_built.outline_items.items.len);
+
+    // Warmup: the second slot is still cold, so build it with a full prepare
+    // first — the refusal proof below needs both slots warm.
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    scene.prepareFrame();
+    try std.testing.expectEqual(1 - front0, scene.draws.front);
+    const d1 = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 3), d1.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d1.primary.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 1), d1.primary.shader_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 3), d1.views[1].items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), d1.outline_items.items[0].model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), p7FindByMeshIndex(d1.primary.items.items, 0).?.model.m[12], 1e-4);
+    try std.testing.expectEqual(@as(usize, 3), p7ShadowTotal(d1));
+    try std.testing.expectEqual(@as(usize, 1), d1.shadow.skins.items.len);
+    // The discarded front is retained as scratch, not cleared or copied.
+    const old_slot = &scene.draws.slots[front0];
+    try std.testing.expectEqual(@as(usize, 3), old_slot.primary.items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), old_slot.outline_items.items[0].model.m[12], 1e-4);
+
+    // Zero-alloc proof: both slots are warm now (slot B built by prepare#1,
+    // slot A by prepare#2), so two further prepares — one per slot as back —
+    // must not touch the allocator at all. The wrapper refuses ANY fresh
+    // alloc (fail_index=0, flagged in has_induced_failure) and ANY
+    // resize/remap (resize_fail_index=0); a refused growth always degrades
+    // the frame (dropped items/counts), so the flag plus the expected
+    // counts + selected poses under allocation refusal together prove zero
+    // allocator traffic. Same wrapper feeds
+    // scene.allocator and the shadow pass allocator.
+    // Scope (narrow): this fixture exercises 3 regular meshes
+    // (plain/skinned/hook), the serial cull path (no worker pool), one
+    // outline item, shadow bin+snapshot, and primary+PIP view builds — with
+    // no canvas, no instancing, no LOD/morphs. NOT covered by this proof:
+    // parallel_scratch growth, instanced staging/buffer growth, UI capture
+    // growth, or any parallel/GPU path.
+    var expect_front = scene.draws.front;
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        var refusing = std.testing.FailingAllocator.init(alloc, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+        const saved_alloc = scene.allocator;
+        scene.allocator = refusing.allocator();
+        scene.shadows.pass.allocator = refusing.allocator();
+        scene.prepareFrame();
+        scene.allocator = saved_alloc;
+        scene.shadows.pass.allocator = saved_alloc;
+        try std.testing.expect(!refusing.has_induced_failure);
+        expect_front = 1 - expect_front;
+        try std.testing.expectEqual(expect_front, scene.draws.front);
+        const dz = scene.preparedDraws();
+        try std.testing.expectEqual(@as(usize, 3), dz.primary.items.items.len);
+        try std.testing.expectEqual(@as(usize, 1), dz.primary.skin_storage.items.len);
+        try std.testing.expectEqual(@as(usize, 1), dz.primary.shader_storage.items.len);
+        try std.testing.expectEqual(@as(usize, 3), dz.views[1].items.items.len);
+        try std.testing.expectEqual(@as(usize, 1), dz.outline_items.items.len);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.0), dz.outline_items.items[0].model.m[12], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.0), p7FindByMeshIndex(dz.primary.items.items, 0).?.model.m[12], 1e-4);
+        try std.testing.expectEqual(@as(usize, 3), dz.shadow.items.items.len);
+        try std.testing.expectEqual(@as(usize, 1), dz.shadow.skins.items.len);
+        try std.testing.expectEqual(@as(usize, 3), p7ShadowTotal(dz));
+        try std.testing.expectEqual(scene.frame_id, dz.frame_id);
+        try std.testing.expectEqual(scene.retire_epoch, dz.retire_epoch);
+    }
+}
+
+test "P7: main and PIP view slots stay isolated" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.enable_multi_camera = true;
+    scene.default_white_texture.view.id = 1;
+    p7CpuShadowPass(&scene, alloc);
+
+    var mesh_a = Mesh{
+        .name = "pip_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .layer_mask = 0b01,
+    };
+    var mesh_b = Mesh{
+        .name = "pip_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .layer_mask = 0b10,
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_b);
+
+    const cam0 = Camera{ .free = camera_mod.FreeCamera.init("Main", .{}) };
+    const cam1 = Camera{ .free = camera_mod.FreeCamera.init("Pip", .{}) };
+    const cam2 = Camera{ .free = camera_mod.FreeCamera.init("Off", .{}) };
+    _ = try scene.addCamera(.{ .name = "Main", .camera = cam0 });
+    _ = try scene.addCamera(.{ .name = "Pip", .camera = cam1 });
+    _ = try scene.addCamera(.{ .name = "Off", .camera = cam2 });
+    scene.cameras.items[1].culling_mask = 0b10;
+    scene.cameras.items[2].enabled = false;
+    scene.active_camera_index = 0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // Primary (all-mask active camera) sees both meshes.
+    try std.testing.expectEqual(@as(usize, 2), draws.primary.items.items.len);
+    // PIP slot 1 (mask 0b10) sees only mesh_b; slot 2 (disabled) is
+    // reset-empty so no prior frame can resurface through it.
+    try std.testing.expectEqual(@as(usize, 1), draws.views[1].items.items.len);
+    try std.testing.expectEqual(@as(u32, 1), draws.views[1].items.items[0].mesh_index);
+    try std.testing.expectEqual(@as(usize, 0), draws.views[2].items.items.len);
+    // Shadow ignores view masks: both meshes binned in the same slot.
+    try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(draws));
+
+    // Disable the PIP view: the next publish clears its slot instead of
+    // resurfacing the mesh_b frame above.
+    scene.cameras.items[1].enabled = false;
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    scene.prepareFrame();
+    const draws2 = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 0), draws2.views[1].items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), draws2.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(draws2));
+}
+
+test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    const canvas_ui = &scene.ui_canvas.?;
+    canvas_ui.drawRect(10, 20, 30, 40, Color4.white);
+
+    var mesh = Mesh{
+        .name = "rep_outline",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(4, 0, 0),
+    };
+    try scene.outline_meshes.append(alloc, &mesh);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+
+    scene.prepareFrame();
+    const front0 = scene.draws.front;
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
+    const ui_n = canvas_ui.vertices.items.len;
+    try std.testing.expectEqual(ui_n, scene.ui_frame.vertices.items.len);
+
+    // More UI + moved outline, then a repeated prepare with no new camera
+    // publish (fallback snapshot path): newest wins, nothing accumulates.
+    canvas_ui.drawRect(1, 2, 3, 4, Color4.white);
+    mesh.position = Vec3.new(7, 0, 0);
+    scene.prepareFrame();
+    try std.testing.expectEqual(1 - front0, scene.draws.front);
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), scene.preparedDraws().outline_items.items[0].model.m[12], 1e-4);
+    try std.testing.expectEqual(canvas_ui.vertices.items.len, scene.ui_frame.vertices.items.len);
+    try std.testing.expect(canvas_ui.vertices.items.len > ui_n);
+}
+
+test "P7: no-camera/headless and disabled shadows clear coherently, epochs consumed" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.default_white_texture.view.id = 1;
+    p7CpuShadowPass(&scene, alloc);
+
+    var mesh = Mesh{
+        .name = "clr_mesh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    try scene.meshes.append(alloc, &mesh);
+    try scene.outline_meshes.append(alloc, &mesh);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), p7ShadowTotal(scene.preparedDraws()));
+    const epoch1 = scene.retire_epoch;
+
+    // Camera lost: views + shadow publish coherent-empty (no resurface of
+    // the frame above); outline stays unconditional (existing semantics).
+    for (scene.cameras.items) |entry| {
+        if (entry.owns_name) alloc.free(entry.name);
+    }
+    scene.cameras.clearRetainingCapacity();
+    scene.active_camera = null;
+    scene.active_camera_index = null;
+    scene.prepareFrame();
+    const cleared = scene.preparedDraws();
+    try std.testing.expect(!scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(usize, 0), cleared.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cleared.views[0].items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cleared.shadow.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cleared.shadow.skins.items.len);
+    for (cleared.shadow.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
+    try std.testing.expectEqual(@as(usize, 1), cleared.outline_items.items.len);
+    // Repeated prepare discarded the pending frame: begin auto-closed its
+    // epoch before the flush tore down anything it borrowed.
+    try std.testing.expectEqual(epoch1 + 1, scene.retire_epoch);
+    try std.testing.expectEqual(epoch1, scene.gpu_retire.lastCompleted());
+
+    // No-camera render still completes the current epoch (headless-safe:
+    // the early return runs before any sg.*).
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(scene.retire_epoch, scene.gpu_retire.lastCompleted());
+
+    // Camera back but shadows disabled: primary rebuilds, shadow stays empty.
+    const cam2 = Camera{ .free = camera_mod.FreeCamera.init("Cam2", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
+    scene.shadows.enabled = false;
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    const noshadow = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), noshadow.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), noshadow.shadow.items.items.len);
+    for (noshadow.shadow.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
+}
+
+test "P7: allocator-failure back stays coherent and recovers without stale items" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.default_white_texture.view.id = 1;
+    p7CpuShadowPass(&scene, alloc);
+
+    const skel = try Skeleton.init(alloc, 1);
+    defer skel.deinit();
+    skel.bones[0].local_position = Vec3.new(1, 0, 0);
+    skel.update();
+
+    var mesh_a = Mesh{
+        .name = "oom_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(4, 0, 0),
+    };
+    var mesh_s = Mesh{
+        .name = "oom_s",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .skeleton = skel,
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_s);
+    try scene.outline_meshes.append(alloc, &mesh_a);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 2), scene.preparedDraws().primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(scene.preparedDraws()));
+
+    // Failing back build: everything fallible drops (existing per-item /
+    // coherent-empty OOM semantics — never a full-frame transaction abort),
+    // and the publish stays index-coherent: no skin/shader/order index
+    // escapes its side store, no bin range escapes the items.
+    const real_alloc = scene.allocator;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    scene.allocator = failing.allocator();
+    scene.shadows.pass.allocator = failing.allocator();
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    scene.allocator = real_alloc;
+    scene.shadows.pass.allocator = real_alloc;
+    const oom = scene.preparedDraws();
+    for (oom.primary.items.items) |it| {
+        if (it.skin_index) |s| try std.testing.expect(s < oom.primary.skin_storage.items.len);
+        if (it.shader_index) |s| try std.testing.expect(s < oom.primary.shader_storage.items.len);
+    }
+    for (oom.primary.transparent.items) |it| {
+        if (it.skin_index) |s| try std.testing.expect(s < oom.primary.skin_storage.items.len);
+        if (it.shader_index) |s| try std.testing.expect(s < oom.primary.shader_storage.items.len);
+    }
+    for (oom.outline_items.items) |it| {
+        if (it.skin_index) |s| try std.testing.expect(s < oom.outline_skins.items.len);
+    }
+    for (oom.primary.transparent_order.items) |e| {
+        switch (e.kind) {
+            .regular => try std.testing.expect(e.index < oom.primary.transparent.items.len),
+            .instanced => try std.testing.expect(e.index < oom.primary.transparent_instanced.items.len),
+        }
+    }
+    for (oom.shadow.bin.counts, oom.shadow.bin.offsets) |c, o| {
+        try std.testing.expect(o + c <= oom.shadow.items.items.len);
+    }
+    for (oom.shadow.items.items) |it| {
+        if (it.skin_index) |s| try std.testing.expect(s < oom.shadow.skins.items.len);
+    }
+
+    // Recovery with the working allocator: no stale items, full frame back.
+    mesh_a.position = Vec3.new(6, 0, 0);
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    const rec = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 2), rec.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), rec.primary.skin_storage.items.len);
+    try std.testing.expectEqual(@as(usize, 1), rec.outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(rec));
+    try std.testing.expectEqual(@as(usize, 1), rec.shadow.skins.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), rec.outline_items.items[0].model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), p7FindByMeshIndex(rec.primary.items.items, 0).?.model.m[12], 1e-4);
 }
