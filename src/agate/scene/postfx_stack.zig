@@ -18,8 +18,8 @@ const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao_mod = @import("../ssao.zig");
 const SSAOOptions = ssao_mod.SSAOOptions;
 const msaa = @import("msaa.zig");
-const ui = @import("../ui.zig");
-const UICanvas = ui.UICanvas;
+const ui_frame_mod = @import("ui_frame.zig");
+const UiFrame = ui_frame_mod.UiFrame;
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 
@@ -195,7 +195,11 @@ pub const PostFXStack = struct {
         // Main-target sample count; see scene/msaa.zig for the clamp policy.
         main_samples: i32 = 1,
         // Optional 2D overlay drawn on top of the post-processed swapchain.
-        ui: ?*UICanvas = null,
+        // P6: the prepared render-owned frame (upload-free draw), never the
+        // live canvas. Intentional low-level break: `?*UICanvas` became
+        // `?*const UiFrame` (P6 migration); Scene/UICanvas methods stay
+        // stable, only this internal chain signature moves with the frame.
+        ui: ?*const UiFrame = null,
     };
 
     /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 3 (fullscreen
@@ -304,9 +308,10 @@ pub const PostFXStack = struct {
             params.stats.draw_calls += 1;
             params.stats.triangles += 2;
 
-            // Render 2D UI overlay on top of post-processed swapchain
-            if (params.ui) |ui_c| {
-                ui_c.render(@floatFromInt(cur_w), @floatFromInt(cur_h));
+            // Render 2D UI overlay on top of post-processed swapchain.
+            // Counter semantics unchanged (see Scene.render direct path).
+            if (params.ui) |frame| {
+                frame.drawPrepared();
                 params.stats.post_draw_calls += 1;
                 params.stats.draw_calls += 1;
             }

@@ -194,6 +194,23 @@ pub const UICanvas = struct {
     capacity_vertices: usize = 32768,
     capacity_indices: usize = 49152,
 
+    /// P6 same-frame window (automatic, no manual reset): commit watermark
+    /// of the last successful upload into the canvas-owned pair, read from
+    /// `sg.queryStats().prev_frame.frame_index` (rotates at every
+    /// `sg.commit`, even with stats disabled). `isUploadOpen` compares the
+    /// stored watermark with the current marker (EQUALITY, wrap-safe): a
+    /// real commit changes the marker and reopens the window with no caller
+    /// action. Buffer state lives with the buffers (canvas-owned); frames
+    /// only borrow the IDs. `armed` marks a completed upload; headless (no
+    /// commits exist) it alone decides, which doubles as the test override.
+    /// `upload_seq` counts every successful upload to this canvas (any
+    /// path) and pairs with the buffer IDs as the committed-upload identity
+    /// a frame stamps: any other writer between a frame's upload and its
+    /// next capture invalidates the borrowed packet (see `UiFrame`).
+    ui_upload_commit: u32 = 0,
+    ui_upload_armed: bool = false,
+    ui_upload_seq: u64 = 0,
+
     // Style system state (see the Styling section below the canvas).
     /// Default styles per widget kind; overridden wholesale by assignment
     /// (theme = "all widgets at once") or per kind (`canvas.theme.button = ...`).
@@ -1111,49 +1128,157 @@ pub const UICanvas = struct {
     /// Bytes handed to sg by one rendered UI batch (clamped vertex prefix +
     /// full index list). Must stay in usize: the vertex cap times
     /// @sizeOf(UIVertex) overflows u16 arithmetic, so this must never run in
-    /// the clamped vertex type.
-    fn batchUploadBytes(vert_count: usize, index_count: usize) usize {
+    /// the clamped vertex type. Shared with the P6 frame path (same bytes
+    /// whether the upload runs in prepare or in the legacy render).
+    pub fn batchUploadBytes(vert_count: usize, index_count: usize) usize {
         return vert_count * @sizeOf(UIVertex) + index_count * @sizeOf(u16);
     }
 
-    /// Uploads dynamic batch buffers and executes the UI render pass
-    pub fn render(self: *UICanvas, screen_w: f32, screen_h: f32) void {
-        if (self.vertices.items.len == 0 or self.indices.items.len == 0) return;
-        if (screen_w <= 0.0 or screen_h <= 0.0) return;
+    /// True when this sokol frame's single `updateBuffer` per buffer is
+    /// already spent on the canvas-owned pair. Read-only SDK metadata
+    /// (`queryStats`, no GPU writes), `isvalid`-gated and headless-safe:
+    /// without a context no commit can exist, so the armed flag alone
+    /// decides (never-uploaded canvases stay closed; tests override it
+    /// directly to simulate an open window).
+    pub fn isUploadOpen(self: *const UICanvas) bool {
+        if (!self.ui_upload_armed) return false;
+        if (!sg.isvalid()) return true;
+        return sg.queryStats().prev_frame.frame_index == self.ui_upload_commit;
+    }
 
-        // usize on purpose: `@min(usize, u16)` resolves to u16 in Zig 0.16, and
-        // 48 B/vertex would then overflow the u16 multiply at 1366 vertices.
-        const vert_count: usize = @min(self.vertices.items.len, @as(usize, std.math.maxInt(u16)));
-        if (vert_count > self.capacity_vertices) {
-            if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
-            self.capacity_vertices = @max(self.capacity_vertices * 2, vert_count);
-            self.vertex_buffer = sg.makeBuffer(.{
+    /// Marks a successful upload: arms the window with the current commit
+    /// watermark and bumps the upload sequence. Called by both upload paths
+    /// (frame + legacy immediate) right after their `updateBuffer` pair
+    /// lands — so the sequence identifies the last writer unambiguously,
+    /// even for two uploads inside one sokol frame (the watermark alone
+    /// cannot: the marker rotates only at commit).
+    pub fn markUiUploaded(self: *UICanvas) void {
+        self.ui_upload_commit = if (sg.isvalid()) sg.queryStats().prev_frame.frame_index else 0;
+        self.ui_upload_armed = true;
+        self.ui_upload_seq +%= 1;
+    }
+
+    /// u16-clamped drawable vertex prefix (indices address vertices as
+    /// u16). Pure for tests; shared by the legacy render and the P6 frame.
+    pub fn clampedVertCount(len: usize) usize {
+        return @min(len, @as(usize, std.math.maxInt(u16)));
+    }
+
+    /// Replacement capacity on growth (same formula as the legacy path).
+    /// Pure for tests.
+    pub fn grownCapacity(current: usize, need: usize) usize {
+        return @max(current * 2, need);
+    }
+
+    /// Outcome of `ensureUiBufferPair`: buffers to upload into + install,
+    /// with per-buffer replacement flags. On `ok == false` the current
+    /// pair is untouched (only uncommitted new handles were destroyed).
+    pub const UiBufferEnsure = struct {
+        ok: bool = false,
+        vertex_buffer: sg.Buffer = .{},
+        index_buffer: sg.Buffer = .{},
+        capacity_vertices: usize = 0,
+        capacity_indices: usize = 0,
+        replaced_vb: bool = false,
+        replaced_ib: bool = false,
+    };
+
+    /// Ensures canvas GPU buffers cover the batch: creates + VALIDates ALL
+    /// needed replacements BEFORE returning, never installs a FAILED
+    /// handle. Current handles are VALID-checked too — an id==0 (or
+    /// otherwise invalid) current with a large capacity is recreated, never
+    /// updated blindly. On any failure only the uncommitted new handle(s)
+    /// are destroyed and `ok` is false with the current pair untouched.
+    /// No retire here: the caller installs the pair and retires/destroys
+    /// the replaced handles itself (queue for the Scene frame path with
+    /// live epochs; immediate destroy for the standalone immediate path,
+    /// whose caller asserts no outstanding snapshots). Caller must hold a
+    /// sokol context (all `sg.*` below assert it).
+    pub fn ensureUiBufferPair(
+        cur_vb: sg.Buffer,
+        cur_ib: sg.Buffer,
+        cap_v: usize,
+        cap_i: usize,
+        need_v: usize,
+        need_i: usize,
+    ) UiBufferEnsure {
+        // A failed makeBuffer may hand out a nonzero FAILED id (pool
+        // exhaustion is id == 0 only): validity is the state query, here
+        // and for the current pair.
+        const want_vb = need_v > cap_v or cur_vb.id == 0 or sg.queryBufferState(cur_vb) != .VALID;
+        const want_ib = need_i > cap_i or cur_ib.id == 0 or sg.queryBufferState(cur_ib) != .VALID;
+        const target_cap_v = if (need_v > cap_v) grownCapacity(cap_v, need_v) else cap_v;
+        const target_cap_i = if (need_i > cap_i) grownCapacity(cap_i, need_i) else cap_i;
+        var new_vb: sg.Buffer = .{};
+        var new_ib: sg.Buffer = .{};
+        if (want_vb) {
+            new_vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = self.capacity_vertices * @sizeOf(UIVertex),
+                .size = target_cap_v * @sizeOf(UIVertex),
             });
+            if (new_vb.id == 0 or sg.queryBufferState(new_vb) != .VALID) {
+                if (new_vb.id != 0) sg.destroyBuffer(new_vb);
+                return .{ .ok = false };
+            }
         }
-        if (self.indices.items.len > self.capacity_indices) {
-            if (self.index_buffer.id != 0) sg.destroyBuffer(self.index_buffer);
-            self.capacity_indices = @max(self.capacity_indices * 2, self.indices.items.len);
-            self.index_buffer = sg.makeBuffer(.{
+        if (want_ib) {
+            new_ib = sg.makeBuffer(.{
                 .usage = .{ .index_buffer = true, .dynamic_update = true },
-                .size = self.capacity_indices * @sizeOf(u16),
+                .size = target_cap_i * @sizeOf(u16),
             });
+            if (new_ib.id == 0 or sg.queryBufferState(new_ib) != .VALID) {
+                if (new_ib.id != 0) sg.destroyBuffer(new_ib);
+                if (new_vb.id != 0) sg.destroyBuffer(new_vb);
+                return .{ .ok = false };
+            }
         }
+        return .{
+            .ok = true,
+            .vertex_buffer = if (want_vb) new_vb else cur_vb,
+            .index_buffer = if (want_ib) new_ib else cur_ib,
+            .capacity_vertices = target_cap_v,
+            .capacity_indices = target_cap_i,
+            .replaced_vb = want_vb,
+            .replaced_ib = want_ib,
+        };
+    }
 
-        sg.updateBuffer(self.vertex_buffer, sg.asRange(self.vertices.items[0..vert_count]));
-        sg.updateBuffer(self.index_buffer, sg.asRange(self.indices.items));
+    /// Uploads one UI batch into the given buffers (the single allowed
+    /// update per buffer per sokol frame) and records the exact bytes.
+    /// Shared by the legacy immediate render and the P6 frame upload; both
+    /// callers resolve WHICH buffers first (growth ownership differs).
+    pub fn uploadUiBuffers(
+        vertex_buffer: sg.Buffer,
+        index_buffer: sg.Buffer,
+        verts: []const UIVertex,
+        indices: []const u16,
+    ) void {
+        sg.updateBuffer(vertex_buffer, sg.asRange(verts));
+        sg.updateBuffer(index_buffer, sg.asRange(indices));
         // Учёт динамики: весь UI-батч кадра (вершины + u16-индексы).
-        upload_meter.record(batchUploadBytes(vert_count, self.indices.items.len));
+        upload_meter.record(batchUploadBytes(verts.len, indices.len));
+    }
 
-        if (self.pipeline.id == 0) return;
-        sg.applyPipeline(self.pipeline);
+    /// Draws an already-uploaded UI batch (no upload, no meter). Shared by
+    /// the legacy immediate render and the P6 upload-free frame draw.
+    pub fn drawUiBuffers(
+        pipeline: sg.Pipeline,
+        vertex_buffer: sg.Buffer,
+        index_buffer: sg.Buffer,
+        font_view: sg.View,
+        font_sampler: sg.Sampler,
+        screen_w: f32,
+        screen_h: f32,
+        index_count: usize,
+    ) void {
+        if (pipeline.id == 0) return;
+        sg.applyPipeline(pipeline);
 
         var bind = sg.Bindings{};
-        bind.vertex_buffers[0] = self.vertex_buffer;
-        bind.index_buffer = self.index_buffer;
-        bind.views[ui_shd.VIEW_font_tex] = self.font_texture.view;
-        bind.samplers[ui_shd.SMP_smp] = self.font_texture.sampler;
+        bind.vertex_buffers[0] = vertex_buffer;
+        bind.index_buffer = index_buffer;
+        bind.views[ui_shd.VIEW_font_tex] = font_view;
+        bind.samplers[ui_shd.SMP_smp] = font_sampler;
         sg.applyBindings(bind);
 
         const vs_params = ui_shd.VsParams{
@@ -1161,7 +1286,78 @@ pub const UICanvas = struct {
         };
         sg.applyUniforms(ui_shd.UB_vs_params, sg.asRange(&vs_params));
 
-        sg.draw(0, @intCast(self.indices.items.len), 1);
+        sg.draw(0, @intCast(index_count), 1);
+    }
+
+    /// Uploads dynamic batch buffers and executes the UI render pass.
+    /// Standalone immediate path, signature unchanged: the caller owns the
+    /// frame discipline (a `sg.commit` between renders reopens the window
+    /// automatically — no manual reset, standalone `render();
+    /// sg.commit(); render()` draws twice).
+    ///
+    /// Borrower lifetime: this call is a buffer WRITER — it invalidates any
+    /// previously committed `UiFrame` on this canvas (same buffers
+    /// overwritten, or replaced on growth). Drawing an old frame after this
+    /// render without a recapture is invalid; Scene fail-closes that mix via
+    /// the upload identity, standalone callers own the discipline. No
+    /// blanket ban: epochs between uploads are freely usable — only
+    /// cross-writer consumption without recapture is invalid, and retired /
+    /// destroyed snapshots must never be consumed.
+    pub fn render(self: *UICanvas, screen_w: f32, screen_h: f32) void {
+        if (self.vertices.items.len == 0 or self.indices.items.len == 0) return;
+        if (screen_w <= 0.0 or screen_h <= 0.0) return;
+        // P6 same-frame guard: this sokol frame's single update on these
+        // buffers is already spent — fail close (no upload, no draw: the
+        // live lists may differ from the GPU-resident data). Checked before
+        // the context gate so the policy holds headless too.
+        if (self.isUploadOpen()) return;
+        // Headless/tools (no sokol context): safe no-op instead of an
+        // assert trap inside sg.*.
+        if (!sg.isvalid()) return;
+
+        // usize on purpose: `@min(usize, u16)` resolves to u16 in Zig 0.16, and
+        // 48 B/vertex would then overflow the u16 multiply at 1366 vertices.
+        const vert_count: usize = clampedVertCount(self.vertices.items.len);
+        // Shared validate-all routine (same as the Scene frame path):
+        // every needed replacement is created + VALIDated before any
+        // upload/install, so a FAILED handle is never installed and the
+        // current pair survives a pair failure untouched.
+        const ensured = ensureUiBufferPair(
+            self.vertex_buffer,
+            self.index_buffer,
+            self.capacity_vertices,
+            self.capacity_indices,
+            vert_count,
+            self.indices.items.len,
+        );
+        if (!ensured.ok) return;
+        // Standalone ownership: replaced handles are destroyed immediately —
+        // the caller asserts no outstanding snapshots reference them (the
+        // Scene frame path retires through the epoch queue instead).
+        if (ensured.replaced_vb) {
+            if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
+            self.vertex_buffer = ensured.vertex_buffer;
+            self.capacity_vertices = ensured.capacity_vertices;
+        }
+        if (ensured.replaced_ib) {
+            if (self.index_buffer.id != 0) sg.destroyBuffer(self.index_buffer);
+            self.index_buffer = ensured.index_buffer;
+            self.capacity_indices = ensured.capacity_indices;
+        }
+
+        uploadUiBuffers(self.vertex_buffer, self.index_buffer, self.vertices.items[0..vert_count], self.indices.items);
+        self.markUiUploaded();
+
+        drawUiBuffers(
+            self.pipeline,
+            self.vertex_buffer,
+            self.index_buffer,
+            self.font_texture.view,
+            self.font_texture.sampler,
+            screen_w,
+            screen_h,
+            self.indices.items.len,
+        );
     }
 };
 
