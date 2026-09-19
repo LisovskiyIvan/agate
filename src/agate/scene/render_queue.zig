@@ -80,6 +80,13 @@ pub const RenderMeshItem = struct {
 
 /// Self-contained per-batch payload for instanced meshes. Decouples render execution
 /// from *Mesh lifetime and state.
+///
+/// Identity (stage-2 increment A, refactor-only): `source_uid` is the source
+/// mesh's `Mesh.uid` (nonzero, stable for lifetime), `source_mesh` is the
+/// mesh-list index at build time. `instance_buffer`/`visible_instance_count`
+/// are provisional for game-built (`.build_view`) payloads until the latch
+/// `patchInstanceRefs` finalizes them from the post-latch `instance_render`;
+/// identity is validated by uid at patch time (fail-closed zero on mismatch).
 pub const RenderInstancedBatch = struct {
     vertex_buffer: sg.Buffer = .{},
     instance_buffer: sg.Buffer = .{},
@@ -93,6 +100,8 @@ pub const RenderInstancedBatch = struct {
     is_decal: bool = false,
     receive_shadows: bool = true,
     draw_record: MaterialDrawRecord = .{},
+    source_uid: u64 = 0,
+    source_mesh: u32 = 0,
 };
 
 /// Render-owned хранилище копий скин-матриц: один слот на skinned-draw кадра
@@ -318,41 +327,45 @@ pub fn blendDescFor(base: sg.PipelineDesc) sg.PipelineDesc {
     return desc;
 }
 
-/// World matrix computed at most once per render() call (tagged with the
-/// frame id on the mesh). Semantics mirror Mesh.getWorldMatrix exactly —
+/// World matrix computed at most once per cache key (fallback: the frame id
+/// on the mesh). Semantics mirror Mesh.getWorldMatrix exactly —
 /// including bone attachment, which replaces the parent chain when the
 /// host skeleton is live — so every pass sees the same transform. Parent
 /// and host chains resolve through the same cache, so hierarchies stay
 /// O(depth) total.
-pub fn worldMatrixCached(frame_id: u64, mesh: *Mesh) Mat4 {
-    if (mesh.cached_frame == frame_id) return mesh.cached_matrix;
+///
+/// `cache_key` parameterization (stage-2 increment A): the fallback passes
+/// `Scene.frame_id`; a future game-side build passes its own key. No new
+/// caches, no invalidation change.
+pub fn worldMatrixCached(cache_key: u64, mesh: *Mesh) Mat4 {
+    if (mesh.cached_frame == cache_key) return mesh.cached_matrix;
     const trs = Mat4.fromRotationTranslationScale(mesh.position, mesh.rotation, mesh.scaling);
     const local = Mat4.mul(trs, mesh.base_matrix);
     var world: Mat4 = undefined;
     if (mesh.attach_bone) |att| {
         if (att.host_mesh.skeleton) |skel| {
-            const host_mat = worldMatrixCached(frame_id, att.host_mesh);
+            const host_mat = worldMatrixCached(cache_key, att.host_mesh);
             const bone_mat = skel.getBoneWorldMatrix(att.bone_index, host_mat);
             world = Mat4.mul(Mat4.mul(bone_mat, att.offset_matrix), local);
         } else if (mesh.parent) |p| {
-            world = Mat4.mul(worldMatrixCached(frame_id, p), local);
+            world = Mat4.mul(worldMatrixCached(cache_key, p), local);
         } else {
             world = local;
         }
     } else if (mesh.parent) |p| {
-        world = Mat4.mul(worldMatrixCached(frame_id, p), local);
+        world = Mat4.mul(worldMatrixCached(cache_key, p), local);
     } else {
         world = local;
     }
     mesh.cached_matrix = world;
     mesh.cached_aabb = mesh.local_bounding_box.transform(world);
-    mesh.cached_frame = frame_id;
+    mesh.cached_frame = cache_key;
     return world;
 }
 
-pub fn worldAABBCached(frame_id: u64, mesh: *Mesh) BoundingBox {
-    if (mesh.cached_frame == frame_id) return mesh.cached_aabb;
-    _ = worldMatrixCached(frame_id, mesh);
+pub fn worldAABBCached(cache_key: u64, mesh: *Mesh) BoundingBox {
+    if (mesh.cached_frame == cache_key) return mesh.cached_aabb;
+    _ = worldMatrixCached(cache_key, mesh);
     return mesh.cached_aabb;
 }
 
@@ -380,7 +393,19 @@ pub const FrameCullContext = struct {
     ibl_intensity: f32 = 1.0,
     default_morph_view: sg.View = .{},
     meshes: []const *Mesh,
-    frame_id: u64,
+    /// Cache key for worldMatrixCached/worldAABBCached (stage-2 increment A).
+    /// Replaces the direct `frame_id` read: the fallback passes
+    /// `Scene.frame_id` (identical behavior); a game-side build passes its
+    /// own build-unique key `(build_seq | (1<<63))`. No new caches, no
+    /// invalidation change.
+    cache_key: u64,
+    /// Which instance state instanced builders resolve (stage-2 increment B):
+    /// `.published` reads `instance_render` (fallback, today's exact
+    /// behavior); `.build_view` reads the game-frozen `instance_build_view`
+    /// (provisional buffer/count until the latch patch). Threaded through
+    /// from `QueueBuildParams.instance_source`; serial + parallel paths both
+    /// honor it (the parallel merge tail reuses the same ctx).
+    instance_source: @import("../mesh.zig").InstanceSource = .published,
     view_proj: Mat4,
     eye: Vec3,
     cull_frustum: bool,
@@ -419,13 +444,17 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
     const frustum = Frustum.fromViewProjection(ctx.view_proj);
     const eye = ctx.eye;
 
+    // Stage-2A identity: assign render uids serially before any parallel
+    // read (binning/culling workers only read). Idempotent, no behavior change.
+    for (ctx.meshes) |m| _ = m.ensureUid();
+
     // Phase -1: Occlusion Culling setup & occluder rasterization (serial:
     // the Hi-Z rasterizer is stateful).
     if (ctx.cull_occlusion) {
         ctx.occlusion_culler.beginFrame(ctx.view_proj);
         for (ctx.meshes) |m| {
             if (!m.is_lod_child and m.is_visible and m.is_occluder and ((m.layer_mask & ctx.culling_mask) != 0)) {
-                const m_world = worldMatrixCached(ctx.frame_id, m);
+                const m_world = worldMatrixCached(ctx.cache_key, m);
                 ctx.occlusion_culler.rasterizeOccluderMesh(
                     m.cpu_positions,
                     m.cpu_indices,
@@ -538,13 +567,13 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             .allocator = ctx.allocator,
             .instance_matrices = &ctx.queues.instance_matrices,
             .thread_pool = ctx.thread_pool,
-            .frame_id = ctx.frame_id,
+            .frame_id = ctx.cache_key,
             .eye = ctx.eye,
             .retire_queue = ctx.gpu_retire,
         }, mesh);
     }
 
-    const staged = mesh.instance_render;
+    const staged = mesh.instanceRenderSource(ctx.instance_source).*;
     if (staged.count > 0 and ((mesh.layer_mask & ctx.culling_mask) != 0)) {
         if (ctx.cull_frustum and staged.bounds.isValid() and !frustum.intersectsAABB(staged.bounds)) {
             ctx.stats.culled_meshes += @intCast(mesh.instances.items.len);
@@ -571,6 +600,8 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             .is_decal = mesh.is_decal,
             .receive_shadows = mesh.receive_shadows,
             .draw_record = draw_rec,
+            .source_uid = mesh.uid,
+            .source_mesh = @intCast(mesh_index),
         };
 
         if (is_trans) {
@@ -637,9 +668,9 @@ fn cullNonInstancedMesh(
 
     // Fresh world matrix first: it refreshes mesh.cached_aabb for this
     // frame, so the LOD distance below never reads a stale AABB tagged with
-    // a previous frame id (the parallel path pre-warms this cache; the
+    // a previous cache key (the parallel path pre-warms this cache; the
     // serial path must pick the same LOD at distance thresholds).
-    const model = worldMatrixCached(ctx.frame_id, mesh);
+    const model = worldMatrixCached(ctx.cache_key, mesh);
     var render_mesh = mesh;
     if (mesh.lod_levels.items.len > 0) {
         const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
@@ -785,9 +816,9 @@ fn buildFrameQueuesParallel(
     // World matrices cache per mesh with parent-chain recursion; lazy fill
     // from two workers could race on a shared parent's cache. Warm the
     // cache in mesh order first — pure TRS work, O(meshes), and a no-op
-    // for meshes already tagged with this frame id (e.g. second camera of
+    // for meshes already tagged with this cache key (e.g. second camera of
     // a PIP render).
-    for (ctx.meshes) |m| _ = worldMatrixCached(ctx.frame_id, m);
+    for (ctx.meshes) |m| _ = worldMatrixCached(ctx.cache_key, m);
 
     const chunk_count = (pool.workerCount() + 1) * 4;
     const span = (ctx.meshes.len + chunk_count - 1) / chunk_count;
@@ -1027,7 +1058,7 @@ test "shared LOD mesh preserves entity transforms without mutation" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 42,
+        .cache_key = 42,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1087,7 +1118,7 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1106,7 +1137,7 @@ test "culling_mask filters out meshes with disjoint layer_mask" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 2,
+        .cache_key = 2,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1166,7 +1197,7 @@ test "parallel cull produces serial-identical queues" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = true,
@@ -1181,7 +1212,7 @@ test "parallel cull produces serial-identical queues" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 2,
+        .cache_key = 2,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = true,
@@ -1251,7 +1282,7 @@ test "parallel cull reuses scratch across calls" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1287,7 +1318,7 @@ test "parallel cull reuses scratch across calls" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 2,
+        .cache_key = 2,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1364,7 +1395,7 @@ test "stale AABB does not drive LOD selection" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1442,7 +1473,7 @@ test "stale AABB LOD selection matches parallel path" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes_s,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1462,7 +1493,7 @@ test "stale AABB LOD selection matches parallel path" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes_p,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1585,7 +1616,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .thread_pool = null,
         .default_white_id = 1,
         .meshes = &.{},
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1615,7 +1646,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .thread_pool = pool,
         .default_white_id = 1,
         .meshes = &.{},
-        .frame_id = 2,
+        .cache_key = 2,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1714,7 +1745,7 @@ test "transparent regular+instanced groups share one back-to-front order" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 11,
+        .cache_key = 11,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1900,7 +1931,7 @@ test "parallel cull mixed scene matches serial on all queues" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 21,
+        .cache_key = 21,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -1913,7 +1944,7 @@ test "parallel cull mixed scene matches serial on all queues" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 22,
+        .cache_key = 22,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2066,7 +2097,7 @@ test "parallel setup OOM fails cleanly without leaking" {
         const result = buildFrameQueuesParallel(.{
             .allocator = failing.allocator(),
             .meshes = ptrs,
-            .frame_id = 100 + fail_index,
+            .cache_key = 100 + fail_index,
             .view_proj = Mat4.identity,
             .eye = Vec3.zero,
             .cull_frustum = false,
@@ -2186,7 +2217,7 @@ test "parallel setup OOM falls back to serial queues" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 31,
+        .cache_key = 31,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2208,7 +2239,7 @@ test "parallel setup OOM falls back to serial queues" {
     buildFrameQueues(.{
         .allocator = limited.allocator(),
         .meshes = &meshes,
-        .frame_id = 32,
+        .cache_key = 32,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2286,7 +2317,7 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2312,7 +2343,7 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 2,
+        .cache_key = 2,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2487,7 +2518,7 @@ test "pre-staged instances feed buildFrameQueues batch" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 9,
+        .cache_key = 9,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -2932,7 +2963,7 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
         buildFrameQueues(.{
             .allocator = ally,
             .meshes = &meshes,
-            .frame_id = 81,
+            .cache_key = 81,
             .view_proj = Mat4.identity,
             .eye = Vec3.zero,
             .cull_frustum = true,
@@ -2960,7 +2991,7 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
             .thread_pool = pool,
             .parallel_min_meshes = 1,
             .meshes = &meshes,
-            .frame_id = 81,
+            .cache_key = 81,
             .view_proj = Mat4.identity,
             .eye = Vec3.zero,
             .cull_frustum = true,
@@ -3078,7 +3109,7 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 7,
+        .cache_key = 7,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3153,7 +3184,7 @@ test "P4: instanced batch record survives source mutation" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 3,
+        .cache_key = 3,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3213,7 +3244,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 11,
+        .cache_key = 11,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3227,7 +3258,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 11,
+        .cache_key = 11,
         .view_proj = Mat4.mul(Mat4.identity, Mat4.translation(Vec3.new(0, 0, 5))),
         .eye = Vec3.new(0, 0, 5),
         .cull_frustum = false,
@@ -3272,7 +3303,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 12,
+        .cache_key = 12,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3313,7 +3344,7 @@ test "P4: no fixed huge per-item skin cost" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3434,7 +3465,7 @@ test "P4: OOM never leaves items with dangling or live skin refs" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 1,
+        .cache_key = 1,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3462,7 +3493,7 @@ test "P4: OOM never leaves items with dangling or live skin refs" {
         buildFrameQueues(.{
             .allocator = failing.allocator(),
             .meshes = &meshes,
-            .frame_id = 2,
+            .cache_key = 2,
             .view_proj = Mat4.identity,
             .eye = Vec3.zero,
             .cull_frustum = false,
@@ -3530,7 +3561,7 @@ test "P4: queue shader snapshots are exact and merge-equivalent" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 41,
+        .cache_key = 41,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3554,7 +3585,7 @@ test "P4: queue shader snapshots are exact and merge-equivalent" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 42,
+        .cache_key = 42,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3636,7 +3667,7 @@ test "P4: hook shader snapshot preserves material sidedness without decal forcin
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = &meshes,
-        .frame_id = 43,
+        .cache_key = 43,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3704,7 +3735,7 @@ test "P4: parallel cull matches serial on skinned snapshots" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 21,
+        .cache_key = 21,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3718,7 +3749,7 @@ test "P4: parallel cull matches serial on skinned snapshots" {
     buildFrameQueues(.{
         .allocator = ally,
         .meshes = ptrs,
-        .frame_id = 21,
+        .cache_key = 21,
         .view_proj = Mat4.identity,
         .eye = Vec3.zero,
         .cull_frustum = false,
@@ -3744,4 +3775,61 @@ test "P4: parallel cull matches serial on skinned snapshots" {
         try std.testing.expectApproxEqAbs(ea, sa[0].m[12], 1e-4);
         try std.testing.expectApproxEqAbs(ea, sa[1].m[13], 1e-4);
     }
+}
+
+test "stage-2A: instanced batch carries source uid and list index" {
+    const ally = std.testing.allocator;
+    var src = Mesh{
+        .name = "id_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var mem: [2]InstancedMesh = .{
+        .{ .name = "i0", .source_mesh = &src, .position = Vec3.zero },
+        .{ .name = "i1", .source_mesh = &src, .position = Vec3.new(2, 0, 0) },
+    };
+    var ptrs = [_]*InstancedMesh{ &mem[0], &mem[1] };
+    var plain = Mesh{
+        .name = "plain0",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    var parent = Mesh{
+        .name = "inst1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = &ptrs, .capacity = 2 },
+    };
+    const meshes = [_]*Mesh{ &plain, &parent };
+
+    var queues = RenderQueues{};
+    defer queues.deinit(ally);
+    var stats = SceneStats{};
+    var culler = visibility.OcclusionCuller.init();
+    buildFrameQueues(.{
+        .allocator = ally,
+        .meshes = &meshes,
+        .cache_key = 99,
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .cull_frustum = false,
+        .cull_occlusion = false,
+        .occlusion_culler = &culler,
+        .stats = &stats,
+        .queues = &queues,
+        .default_white_id = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
+    const b = queues.opaque_instanced.items[0];
+    // source_mesh equals the mesh-list index at build time (parent is index 1).
+    try std.testing.expectEqual(@as(u32, 1), b.source_mesh);
+    try std.testing.expect(b.source_uid != 0);
+    try std.testing.expectEqual(parent.uid, b.source_uid);
+    try std.testing.expect(parent.uid != 0);
+    try std.testing.expect(plain.uid != 0);
 }

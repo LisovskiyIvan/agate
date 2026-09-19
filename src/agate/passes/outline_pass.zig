@@ -219,6 +219,13 @@ pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
 /// Self-contained per-item payload for outline rendering. Хранит только
 /// render-owned снимки (модель, хендлы, индекс копии скина): живых указателей
 /// на Mesh/Skeleton здесь нет.
+///
+/// Identity (stage-2 increment A, refactor-only): `source_uid` is the source
+/// mesh's `Mesh.uid` (nonzero, stable for lifetime), `source_mesh` is the
+/// mesh-list index at build time. `instance_buffer`/`visible_instance_count`
+/// are provisional for game-built (`.build_view`) payloads until the latch
+/// `patchInstanceRefs` finalizes them; identity is validated by uid at patch
+/// time.
 pub const OutlineDrawItem = struct {
     vertex_buffer: sg.Buffer = .{},
     index_buffer: sg.Buffer = .{},
@@ -239,6 +246,8 @@ pub const OutlineDrawItem = struct {
     is_u32: bool = false,
     gpu_pending: bool = false,
     is_visible: bool = true,
+    source_uid: u64 = 0,
+    source_mesh: u32 = 0,
 };
 
 /// Строит OutlineDrawItem из живого меша (только prepare-фаза). Скин
@@ -250,18 +259,29 @@ pub const OutlineDrawItem = struct {
 /// контурный список короткий, значения идентичны кешированным).
 /// P4: сигнатура расширена хранилищем/аллокатором — осознанное изменение
 /// low-level API (см. passes/mod.zig); Scene и OutlinePass.render стабильны.
+/// Stage-2B: `instance_source` selects the staged state (`.published` =
+/// fallback's `instance_render`, `.build_view` = game-frozen provisional);
+/// `cache_key` still tags nothing here (regular-center source stays
+/// `mesh.cached_aabb`); `source_mesh` is the mesh-list index at build time
+/// (uid validated by the latch patch). `mesh` is mutable for lazy `ensureUid`.
 pub fn makeOutlineDrawItem(
     allocator: std.mem.Allocator,
     skins: *scene_render_queue.SkinStorage,
-    mesh: *const Mesh,
+    mesh: *Mesh,
+    cache_key: u64,
+    source_mesh: u32,
+    instance_source: @import("../mesh.zig").InstanceSource,
 ) ?OutlineDrawItem {
+    _ = mesh.ensureUid();
+    _ = cache_key;
     const skinned = mesh.skeleton != null;
     const instanced = !skinned and mesh.instances.items.len > 0;
     const cutout = if (!skinned and !instanced) cutoutInfoFor(mesh) else null;
-    // P5: instanced outline reads the frame's published render state
-    // (Scene stages before capturing outline items); the regular cached
-    // center path below is unchanged.
-    const staged = mesh.instance_render;
+    // P5: instanced outline reads the frame's staged render state (Scene
+    // stages before capturing outline items); the regular cached center path
+    // below is unchanged. Stage-2B: the state resolves via instance_source
+    // (fallback `.published`, game build `.build_view` provisional).
+    const staged = mesh.instanceRenderSource(instance_source).*;
     const aabb = if (instanced) staged.bounds else mesh.cached_aabb;
     const center = if (aabb.isValid()) aabb.center() else mesh.position;
 
@@ -291,6 +311,8 @@ pub fn makeOutlineDrawItem(
         .is_u32 = (mesh.index_type == .UINT32),
         .gpu_pending = mesh.gpu_pending,
         .is_visible = mesh.is_visible,
+        .source_uid = mesh.uid,
+        .source_mesh = source_mesh,
     };
 }
 
@@ -499,7 +521,10 @@ pub const OutlinePass = struct {
         var skins: scene_render_queue.SkinStorage = .empty;
         defer skins.deinit(std.heap.c_allocator);
         for (meshes, 0..) |m, i| {
-            items[i] = makeOutlineDrawItem(std.heap.c_allocator, &skins, m) orelse .{};
+            // Immediate mode has no frame cache: cache_key 0 is unused for
+            // instance data (`.published` = instance_render, identical
+            // behavior); source_mesh is the input slice index at build time.
+            items[i] = makeOutlineDrawItem(std.heap.c_allocator, &skins, m, 0, @intCast(i), .published) orelse .{};
         }
         self.renderItems(view_proj, camera_pos, items, skins.items, color, width_px);
     }
@@ -708,9 +733,12 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     var skins: scene_render_queue.SkinStorage = .empty;
     defer skins.deinit(ally);
 
-    const it = makeOutlineDrawItem(ally, &skins, &mesh) orelse return error.TestUnexpectedResult;
+    const it = makeOutlineDrawItem(ally, &skins, &mesh, 7, 3, .published) orelse return error.TestUnexpectedResult;
     try std.testing.expect(it.skin_index != null);
     try std.testing.expectEqual(@as(usize, 1), skins.items.len);
+    try std.testing.expect(it.source_uid != 0);
+    try std.testing.expectEqual(it.source_uid, mesh.uid);
+    try std.testing.expectEqual(@as(u32, 3), it.source_mesh);
 
     mesh.position = Vec3.new(99, 99, 99);
     skel.bones[0].local_position = Vec3.new(5, 0, 0);
@@ -743,9 +771,11 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     };
     var skins2: scene_render_queue.SkinStorage = .empty;
     defer skins2.deinit(ally);
-    const cut = makeOutlineDrawItem(ally, &skins2, &rigid) orelse return error.TestUnexpectedResult;
+    const cut = makeOutlineDrawItem(ally, &skins2, &rigid, 7, 5, .published) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cut.is_cutout);
     try std.testing.expectEqual(@as(usize, 0), skins2.items.len);
+    try std.testing.expect(cut.source_uid != 0);
+    try std.testing.expectEqual(@as(u32, 5), cut.source_mesh);
 
     cut_mat.alpha_cutoff = 0.9;
     cut_mat.diffuse_texture = null;
@@ -781,10 +811,10 @@ test "P4: outline skin OOM returns null, rigid build stays allocation-free" {
     var skins: scene_render_queue.SkinStorage = .empty;
     defer skins.deinit(limited.allocator());
     // Первая же аллокация (копия скина) падает — item не строится.
-    try std.testing.expect(makeOutlineDrawItem(limited.allocator(), &skins, &skinned) == null);
+    try std.testing.expect(makeOutlineDrawItem(limited.allocator(), &skins, &skinned, 0, 0, .published) == null);
     try std.testing.expectEqual(@as(usize, 0), skins.items.len);
     // Rigid-путь аллокаций не делает — тем же падающим аллокатором строится.
-    const it = makeOutlineDrawItem(limited.allocator(), &skins, &rigid) orelse return error.TestUnexpectedResult;
+    const it = makeOutlineDrawItem(limited.allocator(), &skins, &rigid, 0, 1, .published) orelse return error.TestUnexpectedResult;
     try std.testing.expect(it.skin_index == null);
     try std.testing.expectEqual(@as(usize, 0), skins.items.len);
 }
@@ -828,3 +858,30 @@ const FailNthP4Outline = struct {
         return self.backing.rawFree(memory, alignment, ra);
     }
 };
+
+test "stage-2A: outline item carries source uid and list index" {
+    const ally = std.testing.allocator;
+    var m0 = Mesh{
+        .name = "outline0",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    var m1 = Mesh{
+        .name = "outline1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    var skins: scene_render_queue.SkinStorage = .empty;
+    defer skins.deinit(ally);
+    const it0 = makeOutlineDrawItem(ally, &skins, &m0, 11, 0, .published) orelse return error.TestUnexpectedResult;
+    const it1 = makeOutlineDrawItem(ally, &skins, &m1, 11, 1, .published) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(it0.source_uid != 0);
+    try std.testing.expect(it1.source_uid != 0);
+    try std.testing.expect(it0.source_uid != it1.source_uid);
+    try std.testing.expectEqual(m0.uid, it0.source_uid);
+    try std.testing.expectEqual(m1.uid, it1.source_uid);
+    try std.testing.expectEqual(@as(u32, 0), it0.source_mesh);
+    try std.testing.expectEqual(@as(u32, 1), it1.source_mesh);
+}

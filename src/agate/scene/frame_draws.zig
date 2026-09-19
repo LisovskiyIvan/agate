@@ -54,9 +54,18 @@ pub const PreparedShadowDraws = shadow_pass.ShadowPass.PreparedShadowDraws;
 pub const Epoch = retire_mod.Epoch;
 
 /// One coherent prepared frame: the prepared mesh draw lists (view queues,
-/// outline, shadow) the render phase consumes. Built whole into the BACK
-/// slot, then published by index flip; render touches it only through const
-/// references while it is the consumable front (see header).
+// outline, shadow) the render phase consumes. Built whole into the BACK
+// slot, then published by index flip; render touches it only through const
+// references while it is the consumable front (see header).
+//
+// Stage-2 increment B payload identity: every instanced batch / shadow item /
+// outline item carries `source_uid` (stable `Mesh.uid`) + `source_mesh`
+// (mesh-list index at build time). Game-built (`.build_view`) payloads hold
+// provisional `instance_buffer`/`visible_instance_count` (plus shadow
+// `world_aabb`/`max_dim`, outline `world_center`) until the latch
+// `patchInstanceRefs` finalizes them from the post-latch `instance_render`
+// (fail-closed zero on uid mismatch or stale publish); fallback
+// (`.published`) payloads are final at build time.
 pub const FrameDrawSlot = struct {
     primary: RenderQueues = .{},
     views: [snapshot_mod.MAX_CAMERAS]RenderQueues = [_]RenderQueues{.{}} ** snapshot_mod.MAX_CAMERAS,
