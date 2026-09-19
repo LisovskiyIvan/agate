@@ -48,6 +48,10 @@ pub const CameraSnapshot = struct {
 /// draw. GPU-ресурсы заимствуются под фазовым мьютексом/P3; UI покрыт P6
 /// (render-owned кадр в Scene), debug — prepared capture + committed upload,
 /// sky/defaults — копии в этом snapshot, light pack — snapshot-копия.
+/// Producer-билд (`buildPreparedFrame`) владеет отдельной копией этого же
+/// типа (`Scene.build_snapshot`): очереди строятся против неё, а latch
+/// копирует её в consumed `frame_snapshot` один в один — build НИКОГДА не
+/// читает/пишет `frame_snapshot`, иначе гонка с draw при update||render.
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,

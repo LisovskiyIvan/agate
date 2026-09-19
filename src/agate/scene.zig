@@ -294,11 +294,19 @@ pub const Scene = struct {
 
     /// Mailbox for publishing frame-level camera/light/pass state from the
     /// simulation thread. Meshes and materials are still live scene objects,
-    /// so threaded applications must keep coarse phase ownership through the
-    /// complete render until a full per-item render payload exists.
+    /// so threaded applications must keep update-vs-prepare exclusion
+    /// (producer update, consumer prepare); update may overlap render.
     frame_handoff: handoff_mod.Handoff(scene_snapshot.SceneFrameSnapshot, 2) = .{},
-    /// Last consumed frame snapshot.
+    /// Last consumed frame snapshot (context/prepare + render ownership:
+    /// prepare writes it, render reads it; update/build NEVER touch it, so a
+    /// concurrent update cannot race the in-flight draw).
     frame_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
+    /// Producer-owned build snapshot (game/update phase ownership): the exact
+    /// generation the last `buildPreparedFrame` culled/built queues against.
+    /// Plain value camera/pass state (Camera.name slices alias, but draw
+    /// never dereferences names — no deep copy). The latch copies it into
+    /// `frame_snapshot` verbatim; render never reads this.
+    build_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
     /// Flag indicating whether prepareFrame() has already run for this frame.
     frame_prepared: bool = false,
 
@@ -1081,14 +1089,16 @@ pub const Scene = struct {
 
     /// Shared queue/shadow/outline build parameters (stage-2 increment B):
     /// one internal function `buildQueuesInto` fills a `FrameDrawSlot` from
-    /// these plus `Scene.frame_snapshot` cameras. Fallback passes `frame_id`
-    /// as `cache_key`, `&self.stats`, the snapshot primary eye, the resolved
-    /// snapshot sky/ibl, `true`, and `.published` (today's exact behavior).
-    /// The game-side build passes the build-unique key
-    /// `(build_seq | (1<<63))` (high bit set: cannot collide with any
-    /// context `frame_id`, which counts up from 0), `&self.build_stats`,
-    /// the live eye, sky/ibl from `frame_snapshot` orelse live sky, `true`,
-    /// and `.build_view` (provisional buffer/count until the latch patch).
+    /// these plus the explicit `snap` cameras (never `Scene.frame_snapshot`:
+    /// the build must not read the consumed render snapshot). Fallback passes
+    /// `&frame_snapshot` with `frame_id` as `cache_key`, `&self.stats`, the
+    /// snapshot primary eye, the resolved snapshot sky/ibl, `true`, and
+    /// `.published` (today's exact behavior). The game-side build passes
+    /// `&build_snapshot` with the build-unique key `(build_seq | (1<<63))`
+    /// (high bit set: cannot collide with any context `frame_id`, which
+    /// counts up from 0), `&self.build_stats`, the frozen snapshot eye,
+    /// the exact snapshot sky/ibl, `true`, and `.build_view`
+    /// (provisional buffer/count until the latch patch).
     /// Payload identity invariant: every instanced batch / shadow item /
     /// outline item carries `source_uid` (stable `Mesh.uid`) + `source_mesh`
     /// (mesh-list index at build time); the latch validates uid before
@@ -1098,6 +1108,7 @@ pub const Scene = struct {
     /// and for the instance CPU staging eye, which is threaded separately).
     /// `stats` stays a direct pointer (deferred via `build_stats` + merge).
     pub const QueueBuildParams = struct {
+        snap: *const SceneFrameSnapshot,
         cache_key: u64,
         stats: *SceneStats,
         eye: Vec3,
@@ -1164,13 +1175,19 @@ pub const Scene = struct {
     /// previously inline in `prepareFrame` (outline capture loop + shadow
     /// `prepareInto` + view-queue `prepareViewQueues` calls) in one internal
     /// function, callable from the game-side `buildPreparedFrame` (with
-    /// `.build_view` + build-unique cache key + `&build_stats`) and from the
-    /// fallback latch (with `.published` + frame_id + `&self.stats`).
+    /// `&build_snapshot` + `.build_view` + build-unique cache key +
+    /// `&build_stats`) and from the fallback latch (with `&frame_snapshot` +
+    /// `.published` + frame_id + `&self.stats`). Reads cameras ONLY from
+    /// `params.snap` (never `self.frame_snapshot`/`self.build_snapshot`
+    /// directly), so the build generation stays frozen. Producer `.build_view`
+    /// freezes on the snapshot shadow switch alone; fallback keeps the
+    /// historical live `shadows.enabled` gate.
     /// Fallback passes today's exact values (see `prepareFrame`) and stays
     /// bit-identical to the old inline path. Does NOT reset `back` (the
     /// caller reset before consume, as before). sg-free when
     /// `instances_prepared=true` (view builds never retry staging mid-frame).
     fn buildQueuesInto(self: *Scene, back: *FrameDrawSlot, params: QueueBuildParams) void {
+        const snap = params.snap;
         // `eye` is informational today: views sort by their own snapshot eye
         // (see prepareViewQueues); the build passes the live eye for future
         // transparent-sort use. The instance CPU staging eye is threaded
@@ -1214,23 +1231,24 @@ pub const Scene = struct {
 
         // Shadow pass preparation into the back slot (disabled shadows —
         // or no camera — leave the reset-empty payload: coherent, never
-        // the front slot's prior bins).
-        if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
+        // the front slot's prior bins). Producer `.build_view` freezes on the
+        // snapshot switch alone; fallback keeps the historical live gate.
+        if (snap.has_camera and snap.shadows_enabled and (params.instance_source == .build_view or self.shadows.enabled)) {
             _ = self.shadows.pass.prepareInto(&back.shadow, self.meshes.items, params.cache_key, params.instance_source, jobs.global);
         }
 
         // View queues preparation (params carry the resolved sky/ibl).
-        if (self.frame_snapshot.has_camera) {
-            if (self.frame_snapshot.enable_multi_camera and self.frame_snapshot.camera_count > 0) {
-                const active_idx = self.frame_snapshot.active_camera_idx;
-                const primary_snap = if (active_idx < self.frame_snapshot.camera_count) self.frame_snapshot.cameras[active_idx] else self.frame_snapshot.primary_cam;
+        if (snap.has_camera) {
+            if (snap.enable_multi_camera and snap.camera_count > 0) {
+                const active_idx = snap.active_camera_idx;
+                const primary_snap = if (active_idx < snap.camera_count) snap.cameras[active_idx] else snap.primary_cam;
                 self.prepareViewQueues(&back.primary, primary_snap, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
-                for (self.frame_snapshot.cameras[0..self.frame_snapshot.camera_count], 0..) |entry, i| {
+                for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
                     if (i == active_idx or !entry.enabled) continue;
                     self.prepareViewQueues(&back.views[i], entry, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
                 }
             } else {
-                self.prepareViewQueues(&back.primary, self.frame_snapshot.primary_cam, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
+                self.prepareViewQueues(&back.primary, snap.primary_cam, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
             }
         }
     }
@@ -1729,11 +1747,14 @@ pub const Scene = struct {
     /// resolves instanced state via `.build_view`; the latch `patchInstanceRefs`
     /// finalizes handles after `stageInstancesLatch`.
     ///
-    /// Snapshot: refreshes `frame_snapshot` from the handoff when a newer
-    /// tick was published (else packs from live, same fallback as prepare)
-    /// so the game-side queue build culls against this tick's cameras
-    /// (frozen; a live mutation between build and latch never alters this
-    /// frame's sets). Sky/ibl come from that snapshot orelse live sky.
+    /// Snapshot: consumes the newest published tick into the producer-owned
+    /// `build_snapshot` (update-vs-prepare excluded) BEFORE any CPU staging;
+    /// when nothing new was published ALWAYS packs fresh live state — never
+    /// reuses the consumed render `frame_snapshot`, so the build works
+    /// without a publish and after camera removal. Staging eye, queue
+    /// culling, shadow switch, and sky/ibl all freeze on this generation
+    /// (fixed-size snapshot values only; live meshes/materials/culling flags
+    /// stay live by design). Never reads or writes `frame_snapshot`.
     /// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
     /// cannot collide with any context `frame_id`). Stats accumulate into
     /// game-owned `build_stats` (cleared at build start), merged by the latch.
@@ -1743,7 +1764,7 @@ pub const Scene = struct {
     /// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
     /// no `self.stats`, no profiler. Mutates under game-phase ownership only:
     /// back-slot queues/shadow/outline + scratch, previews/build_views,
-    /// particle/physics build frames, `frame_snapshot` (refreshed), shadow
+    /// particle/physics build frames, `build_snapshot` (refreshed), shadow
     /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
     /// with the build key), and `build_stats`.
     ///
@@ -1766,14 +1787,23 @@ pub const Scene = struct {
         const back = &self.draws.slots[back_idx];
         back.reset();
         self.build_slot = back_idx;
-        // Freshest post-mutation eye (same source shape as updateLights):
-        // the live camera, else the first registered camera, else zero.
-        const eye = if (self.active_camera) |cam|
-            cam.getPosition()
-        else if (self.cameras.items.len > 0)
-            self.cameras.items[0].camera.getPosition()
-        else
-            Vec3.zero;
+        // Producer snapshot FIRST (update-vs-prepare excluded): consume the
+        // newest published tick into the producer-owned build_snapshot. When
+        // nothing new was published, ALWAYS pack fresh live state — never
+        // reuse the consumed render snapshot, so the build works without a
+        // publish and after camera removal. Never touches frame_snapshot
+        // (update may overlap render). Everything below freezes on this
+        // generation (fixed-size snapshot values only; live meshes/materials/
+        // culling flags stay live by design).
+        if (!self.frame_handoff.takeLatest(&self.build_snapshot)) {
+            const cur_w = sapp.width();
+            const cur_h = sapp.height();
+            const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
+            self.build_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+        }
+        // Frozen snapshot eye (zero when camera-less): the CPU staging sort
+        // and the queue build both use this generation, never the live eye.
+        const eye = if (self.build_snapshot.has_camera) self.build_snapshot.primary_cam.eye else Vec3.zero;
         scene_instance_staging.stageInstancesCpu(.{
             .allocator = self.allocator,
             .scratch = &back.primary.instance_matrices,
@@ -1799,21 +1829,6 @@ pub const Scene = struct {
         }
         self.particles.buildCapture(self.allocator, seq);
         self.physics.buildDebug(self.allocator, seq);
-        // Refresh the snapshot so the game-side queue build sees this tick's
-        // cameras (frozen; latch publishes with the same or a newer snapshot
-        // but never rebuilds the sets). Same takeLatest-else-pack shape as
-        // prepareFrame (sapp dims fallback).
-        {
-            var snap = self.frame_snapshot;
-            if (self.frame_handoff.takeLatest(&snap)) {
-                self.frame_snapshot = snap;
-            } else if (!self.frame_snapshot.has_camera) {
-                const cur_w = sapp.width();
-                const cur_h = sapp.height();
-                const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
-                self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
-            }
-        }
         // Game-side queue/shadow/outline build (sg-free: instances_prepared).
         // The shared builder resets each view queue (including primary's
         // instance_matrices scratch) — but that scratch holds the CPU-staged
@@ -1822,11 +1837,12 @@ pub const Scene = struct {
         // never appends to it, so the staged segments survive intact.
         {
             const build_key = seq | (@as(u64, 1) << 63);
-            const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
-            const ibl_int = self.frame_snapshot.ibl_intensity;
+            const sky_tex = self.build_snapshot.sky_texture;
+            const ibl_int = self.build_snapshot.ibl_intensity;
             const saved_scratch = back.primary.instance_matrices;
             back.primary.instance_matrices = .empty;
             self.buildQueuesInto(back, .{
+                .snap = &self.build_snapshot,
                 .cache_key = build_key,
                 .stats = &self.build_stats,
                 .eye = eye,
@@ -1914,14 +1930,23 @@ pub const Scene = struct {
             self.physics.captureDebug(self.allocator);
         }
 
-        var snap = self.frame_snapshot;
-        if (self.frame_handoff.takeLatest(&snap)) {
-            self.frame_snapshot = snap;
+        // Snapshot generations: with a fresh game build the latch publishes
+        // the EXACT build generation (`build_snapshot`, by value) — a newer
+        // publication after the build stays queued for the next build or
+        // fallback and never mixes culling/camera generations into these
+        // queues. Without a build the historical takeLatest-else-pack runs.
+        if (have_build) {
+            self.frame_snapshot = self.build_snapshot;
         } else {
-            const cur_w = sapp.width();
-            const cur_h = sapp.height();
-            const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
-            self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+            var snap = self.frame_snapshot;
+            if (self.frame_handoff.takeLatest(&snap)) {
+                self.frame_snapshot = snap;
+            } else {
+                const cur_w = sapp.width();
+                const cur_h = sapp.height();
+                const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
+                self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+            }
         }
 
         // Debug line upload (GPU): the frame's single updateBuffer, once per
@@ -2016,14 +2041,16 @@ pub const Scene = struct {
 
         // Shared builder — fallback only (stage-2B): when no fresh game build
         // exists, outline + shadow + view queues build here with exactly
-        // today's values (frame_id as cache_key, &self.stats, snapshot eye,
-        // resolved sky/ibl, true, `.published`) — bit-identical to the old
-        // inline path. When have_build the payload was already built game-side
-        // (`.build_view` + patch above); rebuilding would unfreeze the sets.
+        // today's values (&frame_snapshot, frame_id as cache_key, &self.stats,
+        // snapshot eye, resolved sky/ibl, true, `.published`) — bit-identical
+        // to the old inline path. When have_build the payload was already
+        // built game-side (`.build_view` + patch above); rebuilding would
+        // unfreeze the sets.
         if (!have_build) {
             const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
             const ibl_int = self.frame_snapshot.ibl_intensity;
             self.buildQueuesInto(back, .{
+                .snap = &self.frame_snapshot,
                 .cache_key = self.frame_id,
                 .stats = &self.stats,
                 .eye = self.frame_snapshot.primary_cam.eye,
@@ -4697,6 +4724,7 @@ test "stage-2A: buildQueuesInto with fallback params equals two runs" {
     defer slot_b.deinit(alloc);
 
     scene.buildQueuesInto(&slot_a, .{
+        .snap = &scene.frame_snapshot,
         .cache_key = scene.frame_id,
         .stats = &stats_a,
         .eye = scene.frame_snapshot.primary_cam.eye,
@@ -4706,6 +4734,7 @@ test "stage-2A: buildQueuesInto with fallback params equals two runs" {
         .instance_source = .published,
     });
     scene.buildQueuesInto(&slot_b, .{
+        .snap = &scene.frame_snapshot,
         .cache_key = scene.frame_id,
         .stats = &stats_b,
         .eye = scene.frame_snapshot.primary_cam.eye,
@@ -5832,4 +5861,305 @@ test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
     try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 2), draws.primary.opaque_instanced.items[0].visible_instance_count);
+}
+
+test "snapshot ownership repro: build must not touch consumed frame_snapshot" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.sky.enabled = true;
+    scene.sky.exposure = 2.0;
+
+    // Frame A: publish + latch (fallback, no build).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.has_camera);
+    const eye_a = scene.frame_snapshot.primary_cam.eye;
+    try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+
+    // Mutate live camera + environment, publish B, then build B.
+    if (scene.active_camera) |*c| c.free.position = Vec3.new(10, 0, 0);
+    if (scene.cameras.items.len > 0) scene.cameras.items[0].camera.free.position = Vec3.new(10, 0, 0);
+    scene.sky.exposure = 9.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
+    scene.buildPreparedFrame();
+
+    // The consumed render snapshot must still be A: the producer build owns
+    // its own snapshot and never overwrites frame_snapshot (update may
+    // overlap render).
+    try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(eye_a, scene.frame_snapshot.primary_cam.eye);
+}
+
+test "snapshot ownership: latch freezes B incl PIP/shadow; post-build C waits" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam0 = Camera{ .free = camera_mod.FreeCamera.init("Main", .{}) };
+    const cam1 = Camera{ .free = camera_mod.FreeCamera.init("Pip", .{}) };
+    _ = try scene.addCamera(.{ .name = "Main", .camera = cam0 });
+    _ = try scene.addCamera(.{ .name = "Pip", .camera = cam1 });
+    scene.enable_multi_camera = true;
+    scene.active_camera_index = 0;
+    scene.shadows.enabled = true;
+    scene.sky.enabled = true;
+    scene.sky.exposure = 2.0;
+
+    var mesh = Mesh{
+        .name = "snap_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &mesh);
+
+    // Prime A so the latch below is a B-vs-C comparison, not empty-vs-B.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+
+    // Build B (frozen generation).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    const eye_b = scene.build_snapshot.primary_cam.eye;
+    try std.testing.expect(scene.build_snapshot.has_camera);
+    try std.testing.expect(scene.build_snapshot.shadows_enabled);
+    try std.testing.expect(scene.build_snapshot.enable_multi_camera);
+    try std.testing.expectEqual(@as(usize, 2), scene.build_snapshot.camera_count);
+
+    // Mutate + publish C AFTER the build, before the latch.
+    mesh.position = Vec3.new(50, 0, 0);
+    scene.sky.exposure = 9.0;
+    scene.shadows.enabled = false;
+    scene.cameras.items[1].enabled = false;
+    scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
+
+    // Latch: frame_snapshot must be exactly B, queues frozen at B.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expect(scene.frame_snapshot.shadows_enabled);
+    try std.testing.expect(scene.frame_snapshot.enable_multi_camera);
+    try std.testing.expectEqual(@as(usize, 2), scene.frame_snapshot.camera_count);
+    try std.testing.expectEqual(eye_b, scene.frame_snapshot.primary_cam.eye);
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), draws.primary.items.items[0].model.m[12], 1e-4);
+    try std.testing.expectEqual(@as(usize, 1), draws.views[1].items.items.len);
+    try std.testing.expect(p7ShadowTotal(draws) > 0);
+
+    // C waited: the next fallback (no build) sees it.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(i32, 640), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 9.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expect(!scene.frame_snapshot.shadows_enabled);
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().shadow.items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 50.0), scene.preparedDraws().primary.items.items[0].model.m[12], 1e-4);
+}
+
+test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; fallback" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.sky.enabled = true;
+    scene.sky.exposure = 1.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+
+    // Two builds before one latch: newest wins.
+    scene.sky.exposure = 2.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.sky.exposure = 5.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(f32, 5.0), scene.build_snapshot.sky_exposure);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(f32, 5.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(i32, 640), scene.frame_snapshot.screen_w);
+
+    // No-publish build packs fresh live state (works without publish).
+    scene.sky.exposure = 7.0;
+    if (scene.active_camera) |*c| c.free.position = Vec3.new(3, 0, 0);
+    if (scene.cameras.items.len > 0) scene.cameras.items[0].camera.free.position = Vec3.new(3, 0, 0);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(f32, 7.0), scene.build_snapshot.sky_exposure);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(f32, 7.0), scene.frame_snapshot.sky_exposure);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
+
+    // Camera removal: fresh pack is camera-less, latch copies it coherently.
+    for (scene.cameras.items) |entry| {
+        if (entry.owns_name) alloc.free(entry.name);
+    }
+    scene.cameras.clearRetainingCapacity();
+    scene.active_camera = null;
+    scene.active_camera_index = null;
+    scene.buildPreparedFrame();
+    try std.testing.expect(!scene.build_snapshot.has_camera);
+    scene.prepareFrame();
+    try std.testing.expect(!scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().shadow.items.items.len);
+
+    // Fallback unchanged: publish + prepare without a build takes the publish.
+    const cam2 = Camera{ .free = camera_mod.FreeCamera.init("Cam2", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
+    scene.sky.exposure = 4.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 320, 240);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(i32, 320), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 4.0), scene.frame_snapshot.sky_exposure);
+}
+
+test "snapshot ownership: producer shadow freezes on snapshot, ignores live toggle" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var mesh = Mesh{
+        .name = "snap_shadow",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &mesh);
+
+    // Publish with shadows enabled, then toggle live OFF before the build
+    // (no new publish): the producer must still build the snapshot gen.
+    scene.shadows.enabled = true;
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.shadows.enabled = false;
+    scene.buildPreparedFrame();
+    try std.testing.expect(scene.build_snapshot.shadows_enabled);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_snapshot.shadows_enabled);
+    try std.testing.expect(p7ShadowTotal(scene.preparedDraws()) > 0);
+
+    // Fallback keeps the historical live gate: no build, live still off, so
+    // the fresh pack disables shadows and the payload is empty.
+    scene.prepareFrame();
+    try std.testing.expect(!scene.frame_snapshot.shadows_enabled);
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().shadow.items.items.len);
+}
+
+test "snapshot ownership: producer staging uses published eye, not live mutation" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const material_mod = @import("material.zig");
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+    scene.shadows.enabled = false;
+
+    var blend_mat = material_mod.StandardMaterial.init("snap_eye_blend");
+    blend_mat.alpha_mode = .blend;
+    var src = Mesh{
+        .name = "snap_eye_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var mem: [2]InstancedMesh = .{
+        .{ .name = "t0", .source_mesh = &src, .position = Vec3.new(-10, 0, 0) },
+        .{ .name = "t1", .source_mesh = &src, .position = Vec3.new(10, 0, 0) },
+    };
+    var ptrs = [_]*InstancedMesh{ &mem[0], &mem[1] };
+    var parent = Mesh{
+        .name = "snap_eye_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = .{ .standard = &blend_mat },
+        .instances = .{ .items = &ptrs, .capacity = 2 },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Publish with the eye on the left, then move live to the right BEFORE
+    // the build (no new publish): the build must freeze on the published eye.
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{ .position = Vec3.new(-100, 0, 0) }) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var cube_a = std.mem.zeroes(CubeTexture);
+    cube_a.view.id = 77;
+    scene.sky.setSkybox(cube_a);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    if (scene.active_camera) |*c| c.free.position = Vec3.new(100, 0, 0);
+    if (scene.cameras.items.len > 0) scene.cameras.items[0].camera.free.position = Vec3.new(100, 0, 0);
+    var cube_b = std.mem.zeroes(CubeTexture);
+    cube_b.view.id = 88;
+    scene.sky.setSkybox(cube_b);
+    scene.buildPreparedFrame();
+
+    // Frozen generation: published eye/sky, not the live mutation.
+    try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
+    try std.testing.expectEqual(@as(u32, 77), scene.build_snapshot.sky_texture.?.view.id);
+    // Staging sorted farthest-from-published-eye first (+10 before -10).
+    const scratch = scene.draws.slots[scene.build_slot].primary.instance_matrices.items;
+    try std.testing.expectEqual(@as(usize, 2), scratch.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch[0].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch[1].m[12], 1e-4);
+    scene.prepareFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
+    try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
 }
