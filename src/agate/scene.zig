@@ -309,6 +309,18 @@ pub const Scene = struct {
     build_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
     /// Flag indicating whether prepareFrame() has already run for this frame.
     frame_prepared: bool = false,
+    /// Reuse guard owned by `renderReuse` on the context thread (set around
+    /// the inner `render()` call, never observed concurrently): tells render
+    /// to skip the `prepareFrame` fallback and the profiler `recordFrame`
+    /// tail, so the already-consumed front is re-drawn as-is.
+    rendering_reuse: bool = false,
+    /// Monotonic presented-frame counter, written only on the context thread:
+    /// every presented frame (normal renders and `renderReuse` re-presents
+    /// alike) bumps it once and uses it as the profiler `recordFrame`
+    /// frame_id label, so wall-pacing stats see consecutive presents with no
+    /// gaps. Re-presented rows repeat the consumed frame's counters while
+    /// pacing/timestamps are real.
+    profiler_frame_seq: u64 = 0,
 
     /// Stage 1 producer-build handoff (game/update phase → prepare latch):
     /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages instance
@@ -1570,9 +1582,12 @@ pub const Scene = struct {
     /// handles); it also ends at deinit. Retained CPU storage may be reused
     /// as back scratch by any prepare, so the returned pointer (and any slice
     /// taken from it) is consumable only while frame_prepared is set or
-    /// during the render call consuming this frame — never across a prepare
-    /// boundary. Render completes the frame epoch on all returns (no-camera
-    /// too). One pending frame, no concurrent prepare/render — but update
+    /// during the render call consuming this frame (including the inner
+    /// render of `renderReuse`, which re-draws the already-consumed front
+    /// without a prepare) — never across a prepare boundary. Render
+    /// completes the frame epoch on all returns (no-camera too); the reuse
+    /// re-run re-completes the same epoch, which is idempotent (no-op).
+    /// One pending frame, no concurrent prepare/render — but update
     /// CAN overlap render (update-vs-prepare stay excluded instead).
     pub fn preparedDraws(self: *const Scene) *const FrameDrawSlot {
         return &self.draws.slots[self.draws.front];
@@ -2184,9 +2199,17 @@ pub const Scene = struct {
     /// render (see main), and prepare already ran. Takes no sg.* outside the
     /// context thread (asserted). Every subsystem above is snapshot-driven;
     /// no live subsystem reads remain on this path.
+    ///
+    /// Non-blocking consumer: when the app skipped the phase-lock acquire it
+    /// calls `renderReuse` instead, which re-draws the already-consumed front
+    /// through this same function with `rendering_reuse` set — the
+    /// `prepareFrame` fallback below is skipped and the profiler tail is
+    /// suppressed while the stats are still accumulating inside; the
+    /// `renderReuse` wrapper records the re-presented frame after restoring
+    /// them. Every presented frame is recorded once, including reuses.
     pub fn render(self: *Scene) void {
         gpu_thread.assertOnContextThread();
-        if (!self.frame_prepared) {
+        if (!self.frame_prepared and !self.rendering_reuse) {
             self.prepareFrame();
         }
         self.frame_prepared = false;
@@ -2379,8 +2402,76 @@ pub const Scene = struct {
         // счётчик чист для следующего кадра.
         self.stats.updated_bytes_frame += upload_meter.takeAndReset();
 
+        if (self.profiler.isRecording() and !self.rendering_reuse) {
+            self.profiler_frame_seq +%= 1;
+            self.profiler.recordFrame(self.profiler_frame_seq, &self.stats);
+        }
+    }
+
+    /// True once a prepare published a frame (front slot `frame_id != 0`).
+    /// The app blocks once for the first prepare while this is false instead
+    /// of reusing: before the first successful prepare nothing is consumable,
+    /// and reuse must not prepare without phase ownership (the game side may
+    /// be mid-mutation).
+    pub fn hasConsumableFrame(self: *const Scene) bool {
+        return self.draws.slots[self.draws.front].frame_id != 0;
+    }
+
+    /// Non-blocking render-consumer reuse: re-draws the current front slot
+    /// without a prepare, for frames where the app skipped the phase-lock
+    /// acquire (lock contended) instead of stalling the present.
+    ///
+    /// Reuse contract: the caller reuses only when `hasConsumableFrame()`
+    /// is true (debug assert below enforces it: front slot `frame_id != 0`,
+    /// i.e. at least one prepare published a frame). The app skipped prepare
+    /// because the phase lock was busy, so `frame_prepared` is false and the
+    /// front slot holds the last consumed frame. Calling with a pending
+    /// prepared frame (`frame_prepared` true) is a contract violation
+    /// (debug assert) — consume pending frames with `render`, never
+    /// `renderReuse`.
+    ///
+    /// No GpuRetire begin/flush runs here (no prepare): pending retire
+    /// entries (queue + overflow[8]) stay queued until the next successful
+    /// prepare's leading flush, which destroys only entries whose epoch
+    /// already completed — the reused frame's borrowed handles stay valid
+    /// precisely because no prepare ran. The inner render's
+    /// `complete(retire_epoch)` re-run is idempotent (same epoch: no-op), as
+    /// is the `frame_prepared = false` store; no other render step is
+    /// prepare-frame-epoch dependent.
+    ///
+    /// Skip-streak retention (honest bound): every skipped prepare defers
+    /// flush AND pending-upload completion, so `GpuRetireQueue.pending`
+    /// grows with skip-streak × destroy-rate until the next successful
+    /// prepare drains it (overflow[8] covers only OOM appends, not streak
+    /// growth). Previously this was bounded by the phase-mutex coupling
+    /// (every frame ran prepare+flush); with reuse the bound is the app's
+    /// contract — do not streak reuse indefinitely — documented, not capped.
+    /// Borrowed handles stay valid throughout the streak (no flush ran), and
+    /// new meshes stay `gpu_pending` (invisible: queue builds skip them until
+    /// a successful prepare completes their uploads) — staleness visible as
+    /// missing objects, never corruption.
+    ///
+    /// Stats are saved and restored around the inner render because the frame
+    /// was already recorded; the upload meter is still drained by the inner
+    /// render and its tally discarded with the restored stats.
+    ///
+    /// Recording: every presented frame is recorded once, including reuses.
+    /// After the restore above, while still recording, the seq is bumped and
+    /// the re-shown frame recorded with the consumed frame's metrics
+    /// (identical draws; wall pacing/timestamps are real). The inner render's
+    /// own tail stays suppressed via `rendering_reuse`, so no double record.
+    pub fn renderReuse(self: *Scene) void {
+        gpu_thread.assertOnContextThread();
+        std.debug.assert(!self.frame_prepared);
+        std.debug.assert(self.draws.slots[self.draws.front].frame_id != 0);
+        const saved_stats = self.stats;
+        self.rendering_reuse = true;
+        defer self.rendering_reuse = false;
+        self.render();
+        self.stats = saved_stats;
         if (self.profiler.isRecording()) {
-            self.profiler.recordFrame(self.frame_id, &self.stats);
+            self.profiler_frame_seq +%= 1;
+            self.profiler.recordFrame(self.profiler_frame_seq, &self.stats);
         }
     }
 
@@ -6162,4 +6253,131 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     scene.prepareFrame();
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
     try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
+}
+
+test "renderReuse re-draws the consumed front without a prepare" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    // Camera-less headless fixture: prepare publishes a consumable front
+    // (frame_id != 0), render consumes it via the no-camera early return
+    // (no sg.* headless).
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expect(scene.draws.slots[scene.draws.front].frame_id != 0);
+    const front0 = scene.draws.front;
+    const slot_id0 = scene.preparedDraws().frame_id;
+
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(front0, scene.draws.front);
+
+    // Seed the already-recorded stats: reuse must leave them untouched, and
+    // must not advance any frame/epoch identity.
+    const fid = scene.frame_id;
+    const bseq = scene.build_seq;
+    const epoch = scene.retire_epoch;
+    const completed = scene.gpu_retire.lastCompleted();
+    scene.stats.draw_calls = 41;
+    scene.stats.triangles = 1000;
+
+    scene.renderReuse();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expect(!scene.rendering_reuse);
+    try std.testing.expectEqual(front0, scene.draws.front);
+    try std.testing.expectEqual(slot_id0, scene.preparedDraws().frame_id);
+    try std.testing.expectEqual(fid, scene.frame_id);
+    try std.testing.expectEqual(bseq, scene.build_seq);
+    try std.testing.expectEqual(epoch, scene.retire_epoch);
+    try std.testing.expectEqual(completed, scene.gpu_retire.lastCompleted());
+    try std.testing.expectEqual(@as(u32, 41), scene.stats.draw_calls);
+    try std.testing.expectEqual(@as(u32, 1000), scene.stats.triangles);
+
+    // Repeated reuse is stable: same front, same identities, same stats.
+    scene.renderReuse();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(front0, scene.draws.front);
+    try std.testing.expectEqual(slot_id0, scene.preparedDraws().frame_id);
+    try std.testing.expectEqual(fid, scene.frame_id);
+    try std.testing.expectEqual(epoch, scene.retire_epoch);
+    try std.testing.expectEqual(completed, scene.gpu_retire.lastCompleted());
+    try std.testing.expectEqual(@as(u32, 41), scene.stats.draw_calls);
+}
+
+test "pending prepared frame is consumed by render, not renderReuse" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    // Fresh prepare leaves a pending frame: the reuse contract requires
+    // frame_prepared == false (debug assert), so a pending frame must go
+    // through render(). This pins the documented pending-frame behavior
+    // without tripping the assert (which traps in Debug/ReleaseSafe).
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    const pending_front = scene.draws.front;
+    const pending_slot = scene.preparedDraws().frame_id;
+    try std.testing.expect(pending_slot != 0);
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(pending_front, scene.draws.front);
+    try std.testing.expectEqual(pending_slot, scene.preparedDraws().frame_id);
+}
+
+test "renderReuse records the re-presented frame with the consumed stats" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    sokol.time.setup();
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+    scene.profiler.start();
+    defer scene.profiler.stop();
+
+    // Camera-less headless fixture: the no-camera render early-returns
+    // before the profiler tail, so prepare+render records nothing here —
+    // the full sg draw path (where render() itself records) cannot run
+    // headless. The renderReuse wrapper path below is camera-independent,
+    // so this exercises the real new recording code end to end (no helper
+    // indirection needed).
+    scene.prepareFrame();
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.profiler.frames.items.len);
+    try std.testing.expectEqual(@as(u64, 0), scene.profiler_frame_seq);
+
+    // Seed representative counters for the consumed frame (headless
+    // no-camera yields zeros); the reuse record must repeat them exactly.
+    scene.stats.draw_calls = 41;
+    scene.stats.triangles = 1000;
+    const consumed = scene.stats;
+
+    scene.renderReuse();
+    try std.testing.expectEqual(@as(usize, 1), scene.profiler.frames.items.len);
+    try std.testing.expectEqual(@as(u64, 1), scene.profiler_frame_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.profiler.frames.items[0].frame_index);
+    try std.testing.expectEqual(consumed.draw_calls, scene.profiler.frames.items[0].draw_calls);
+    try std.testing.expectEqual(consumed.triangles, scene.profiler.frames.items[0].triangles);
+    try std.testing.expectEqual(consumed.draw_calls, scene.stats.draw_calls);
+
+    // Second reuse: one more record, unique monotonic frame_index, no dup.
+    scene.renderReuse();
+    try std.testing.expectEqual(@as(usize, 2), scene.profiler.frames.items.len);
+    try std.testing.expectEqual(@as(u64, 2), scene.profiler_frame_seq);
+    try std.testing.expectEqual(@as(u64, 2), scene.profiler.frames.items[1].frame_index);
+    try std.testing.expect(scene.profiler.frames.items[1].frame_index != scene.profiler.frames.items[0].frame_index);
+    try std.testing.expectEqual(consumed.draw_calls, scene.profiler.frames.items[1].draw_calls);
+    try std.testing.expectEqual(consumed.triangles, scene.profiler.frames.items[1].triangles);
 }

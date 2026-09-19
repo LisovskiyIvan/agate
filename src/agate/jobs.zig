@@ -269,6 +269,12 @@ pub const Mutex = struct {
         _ = std.c.pthread_mutex_lock(&self.mutex);
     }
 
+    /// Non-blocking ownership probe for the phase mutex; false means
+    /// contended, caller falls back; no waiting.
+    pub fn tryLock(self: *Mutex) bool {
+        return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
+    }
+
     pub fn unlock(self: *Mutex) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
@@ -688,6 +694,39 @@ test "Mutex serializes concurrent sections" {
     t1.join();
     t2.join();
     try std.testing.expectEqual(@as(u32, 20_000), counter.load(.acquire));
+}
+
+test "Mutex tryLock probes ownership without blocking" {
+    var m = Mutex{};
+    // Free: tryLock acquires.
+    try std.testing.expect(m.tryLock());
+    m.unlock();
+
+    // Held by a worker: tryLock reports contended (false) without waiting.
+    // The worker signals via atomics; both waits are bounded spins, no sleeps.
+    var locked = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const H = struct {
+        fn run(mu: *Mutex, held: *std.atomic.Value(bool), rel: *std.atomic.Value(bool)) void {
+            mu.lock();
+            held.store(true, .release);
+            while (!rel.load(.acquire)) std.atomic.spinLoopHint();
+            mu.unlock();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, H.run, .{ &m, &locked, &release });
+    var spins: usize = 0;
+    while (!locked.load(.acquire)) : (spins += 1) {
+        if (spins > 10_000_000) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(!m.tryLock());
+    release.store(true, .release);
+    t.join();
+
+    // Released again: tryLock acquires.
+    try std.testing.expect(m.tryLock());
+    m.unlock();
 }
 
 test "Pool.forkJoin is multi-producer safe under concurrent callers" {
