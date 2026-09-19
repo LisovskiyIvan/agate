@@ -59,6 +59,10 @@ pub const PointLightOptions = struct {
     color: Color3 = Color3.white,
     intensity: f32 = 1.0,
     range: f32 = 10.0,
+    cast_shadows: bool = false,
+    shadow_bias: f32 = 0.002,
+    shadow_normal_bias: f32 = 0.005,
+    shadow_near: f32 = 0.1,
 };
 
 pub const PointLight = struct {
@@ -70,6 +74,10 @@ pub const PointLight = struct {
     intensity: f32 = 1.0,
     range: f32 = 10.0,
     is_enabled: bool = true,
+    cast_shadows: bool = false,
+    shadow_bias: f32 = 0.002,
+    shadow_normal_bias: f32 = 0.005,
+    shadow_near: f32 = 0.1,
 
     pub fn init(name: []const u8, options: PointLightOptions) PointLight {
         return .{
@@ -78,7 +86,44 @@ pub const PointLight = struct {
             .color = options.color,
             .intensity = options.intensity,
             .range = options.range,
+            .cast_shadows = options.cast_shadows,
+            .shadow_bias = options.shadow_bias,
+            .shadow_normal_bias = options.shadow_normal_bias,
+            .shadow_near = options.shadow_near,
         };
+    }
+
+    /// Cube face order for point shadow tiles (matches the shader
+    /// pointFaceIndex and ShadowPass.pointFaceForDir): +X, -X, +Y, -Y, +Z, -Z.
+    pub const shadow_face_count: usize = 6;
+
+    /// Computes the light view-projection matrix for one cube face of the
+    /// point shadow atlas (90-degree perspective, aspect 1). The tile layout
+    /// lives in passes/shadow_pass.zig (pointTileOrigin).
+    pub fn getShadowFaceViewProj(self: PointLight, face: usize) Mat4 {
+        const eye = self.position;
+        const dirs = [_]Vec3{
+            Vec3.new(1, 0, 0),
+            Vec3.new(-1, 0, 0),
+            Vec3.new(0, 1, 0),
+            Vec3.new(0, -1, 0),
+            Vec3.new(0, 0, 1),
+            Vec3.new(0, 0, -1),
+        };
+        const ups = [_]Vec3{
+            Vec3.up,
+            Vec3.up,
+            Vec3.new(0, 0, -1),
+            Vec3.new(0, 0, 1),
+            Vec3.up,
+            Vec3.up,
+        };
+        const f = face % shadow_face_count;
+        const view = Mat4.lookAt(eye, eye.add(dirs[f]), ups[f]);
+        const near = @max(self.shadow_near, 0.05);
+        const far = @max(self.range, near + 0.1);
+        const proj = Mat4.perspective(90.0, 1.0, near, far);
+        return Mat4.mul(proj, view);
     }
 };
 
@@ -239,4 +284,43 @@ test "SpotLight.getShadowViewProj transforms points in front of spotlight" {
     try std.testing.expectApproxEqAbs(ndc_y, 0.0, 1e-4);
     // Depth is within [0, 1]
     try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
+}
+
+test "PointLight shadows are off by default" {
+    const pl = PointLight.init("lamp", .{});
+    try std.testing.expect(!pl.cast_shadows);
+    try std.testing.expectEqual(@as(f32, 0.002), pl.shadow_bias);
+    try std.testing.expectEqual(@as(f32, 0.005), pl.shadow_normal_bias);
+    try std.testing.expectEqual(@as(f32, 0.1), pl.shadow_near);
+    // A literal without the new fields keeps the same defaults.
+    const bare = PointLight{};
+    try std.testing.expect(!bare.cast_shadows);
+}
+
+test "PointLight.getShadowFaceViewProj centers each axis on its face" {
+    const pl = PointLight.init("lamp", .{
+        .position = Vec3.new(1, 2, 3),
+        .range = 10.0,
+        .cast_shadows = true,
+    });
+    const targets = [_]Vec3{
+        Vec3.new(2, 2, 3), // +X
+        Vec3.new(0, 2, 3), // -X
+        Vec3.new(1, 3, 3), // +Y
+        Vec3.new(1, 1, 3), // -Y
+        Vec3.new(1, 2, 4), // +Z
+        Vec3.new(1, 2, 2), // -Z
+    };
+    for (targets, 0..) |t, face| {
+        const vp = pl.getShadowFaceViewProj(face);
+        const cx = vp.m[0] * t.x + vp.m[4] * t.y + vp.m[8] * t.z + vp.m[12];
+        const cy = vp.m[1] * t.x + vp.m[5] * t.y + vp.m[9] * t.z + vp.m[13];
+        const cz = vp.m[2] * t.x + vp.m[6] * t.y + vp.m[10] * t.z + vp.m[14];
+        const cw = vp.m[3] * t.x + vp.m[7] * t.y + vp.m[11] * t.z + vp.m[15];
+        try std.testing.expect(cw > 0.0);
+        try std.testing.expectApproxEqAbs(cx / cw, 0.0, 1e-4);
+        try std.testing.expectApproxEqAbs(cy / cw, 0.0, 1e-4);
+        const ndc_z = cz / cw;
+        try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
+    }
 }

@@ -120,6 +120,10 @@ pub const LightRig = struct {
     // declarations (4 point + 2 spot slots); selection picks the best subset.
     pub const point_slots = 4;
     pub const spot_slots = 2;
+    // Point-light shadow slots: at most this many packed point lights carry
+    // a 6-face tile row in the point shadow atlas (matches the shader
+    // point_view_proj[12] layout and ShadowPass.POINT_SHADOW_SLOTS).
+    pub const point_shadow_slots = 2;
 
     /// Everything the renderer needs from the light rig for one frame:
     /// packed uniform arrays plus the spot shadow list for the depth pass.
@@ -137,7 +141,64 @@ pub const LightRig = struct {
         spot_shadow_params: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_shadows: [2]passes.SpotShadowRenderInfo = [_]passes.SpotShadowRenderInfo{.{}} ** 2,
         num_spot_shadows: usize = 0,
+        // Point-light shadows, keyed by PACKED point slot (the shader light
+        // loop index): x carries shadow_slot + 1 (0 = no shadow), y/z the
+        // light's bias/normal-bias knobs. The 6 face matrices of shadow slot
+        // s live in point_view_proj[s * 6 .. s * 6 + 6]; the depth pass tiles
+        // come from point_shadows (6 entries per slot). All zeroed when no
+        // point light casts shadows, so the shaders early-out with zero cost.
+        point_view_proj: [12]Mat4 = [_]Mat4{Mat4.identity} ** 12,
+        point_shadow_params: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+        point_shadows: [12]passes.PointShadowRenderInfo = [_]passes.PointShadowRenderInfo{.{}} ** 12,
+        num_point_shadows: usize = 0,
     };
+
+    /// Picks up to point_shadow_slots shadow casters among the packed point
+    /// lights (pack order; ties resolve to the earlier pack index) by raw
+    /// significance, and fills the point shadow uniforms + depth-pass tiles.
+    /// Non-casters keep zeroed params, so their shader cost is one early-out.
+    fn packPointShadows(pack: *FramePack, in_lights: []const *PointLight, eye: Vec3, shadows_enabled: bool) void {
+        var best_idx: [point_shadow_slots]usize = undefined;
+        var best_score: [point_shadow_slots]f32 = undefined;
+        var n: usize = 0;
+        for (in_lights, 0..) |pl, i| {
+            if (!(pl.cast_shadows and shadows_enabled and pl.is_enabled)) continue;
+            const s = light_selection.scorePoint(pl, eye);
+            var pos: usize = n;
+            for (0..n) |j| {
+                if (s > best_score[j]) {
+                    pos = j;
+                    break;
+                }
+            }
+            if (pos < point_shadow_slots) {
+                const end = if (n < point_shadow_slots) n else point_shadow_slots - 1;
+                var k = end;
+                while (k > pos) : (k -= 1) {
+                    best_idx[k] = best_idx[k - 1];
+                    best_score[k] = best_score[k - 1];
+                }
+                best_idx[pos] = i;
+                best_score[pos] = s;
+                if (n < point_shadow_slots) n += 1;
+            }
+        }
+        for (best_idx[0..n], 0..) |pack_i, slot| {
+            const pl = in_lights[pack_i];
+            pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, 0.0 };
+            for (0..passes.POINT_SHADOW_FACES) |f| {
+                const vp = pl.getShadowFaceViewProj(f);
+                pack.point_view_proj[slot * passes.POINT_SHADOW_FACES + f] = vp;
+                const o = passes.pointTileOrigin(slot, f);
+                pack.point_shadows[pack.num_point_shadows] = .{
+                    .tile_x = o.x,
+                    .tile_y = o.y,
+                    .view_proj = vp,
+                };
+                pack.num_point_shadows += 1;
+            }
+        }
+    }
 
     /// Packs point & spot lights for the camera. Directions are normalized
     /// once here so the fragment shaders can use them raw (no per-pixel
@@ -157,6 +218,10 @@ pub const LightRig = struct {
             .spot_shadow_params = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
             .spot_shadows = undefined,
             .num_spot_shadows = 0,
+            .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
+            .point_shadow_params = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+            .point_shadows = undefined,
+            .num_point_shadows = 0,
         };
 
         // Pick the most relevant lights for the camera before packing; the
@@ -180,6 +245,10 @@ pub const LightRig = struct {
                 pack.point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity * p.factor };
             }
             pack.counts[0] = @floatFromInt(num_point);
+
+            var point_buf_h: [point_slots]*PointLight = undefined;
+            for (point_packed[0..num_point], 0..) |p, i| point_buf_h[i] = p.light;
+            packPointShadows(&pack, point_buf_h[0..num_point], eye, shadows_enabled);
 
             var spot_packed: [spot_slots]light_selection.Hysteresis(SpotLight, spot_slots, light_selection.scoreSpot).Packed = undefined;
             const num_spot = self.spot_hysteresis.update(
@@ -229,6 +298,7 @@ pub const LightRig = struct {
             pack.point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
         }
         pack.counts[0] = @floatFromInt(num_point);
+        packPointShadows(&pack, point_buf[0..num_point], eye, shadows_enabled);
 
         var spot_buf: [spot_slots]*SpotLight = undefined;
         const num_spot = light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
@@ -355,4 +425,102 @@ test "packFrame scales intensity by the slot fade factor" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), pack.point_color_int[0][3], 1e-6);
     pack = rig.packFrame(eye, false, dt);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), pack.point_color_int[0][3], 1e-6);
+}
+
+test "packFrame leaves point shadow uniforms zeroed when nothing casts" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    // Empty rig: neutrality by construction.
+    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
+    for (pack.point_shadow_params) |p| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, p);
+    }
+
+    // A non-casting point light keeps the shadow lanes zeroed (off by
+    // default): lighting still packs, the shader shadow path early-outs.
+    _ = try rig.createPointLight(allocator, "lamp", .{
+        .position = Vec3.new(1, 2, 3),
+        .range = 10.0,
+        .intensity = 2.0,
+    });
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(f32, 1.0), pack.counts[0]);
+    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
+    for (pack.point_shadow_params) |p| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, p);
+    }
+    for (pack.point_view_proj) |m| try std.testing.expectEqual(Mat4.identity, m);
+}
+
+test "packFrame caps point shadow casters at two by significance" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+    const eye = Vec3.zero;
+
+    // Scores at the eye (intensity * range / (1 + dist^2)):
+    // c0 at (1,0,0): 1*10/2 = 5; c1 at origin: 3*10/1 = 30;
+    // c2 at (3,0,0): 4*10/10 = 4. Pack order (instant): c1, c0, c2.
+    _ = try rig.createPointLight(allocator, "c0", .{ .position = Vec3.new(1, 0, 0), .intensity = 1.0, .range = 10.0, .cast_shadows = true });
+    const c1 = try rig.createPointLight(allocator, "c1", .{ .position = Vec3.zero, .intensity = 3.0, .range = 10.0, .cast_shadows = true });
+    _ = try rig.createPointLight(allocator, "c2", .{ .position = Vec3.new(3, 0, 0), .intensity = 4.0, .range = 10.0, .cast_shadows = true });
+    c1.shadow_bias = 0.25;
+    c1.shadow_normal_bias = 0.5;
+
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(f32, 3.0), pack.counts[0]);
+    // Two shadow slots taken (6 face tiles each), the weakest caster drops.
+    try std.testing.expectEqual(@as(usize, 12), pack.num_point_shadows);
+    // Pack indices: 0 = c1 (strongest), 1 = c0, 2 = c2 (dropped).
+    try std.testing.expectEqual([4]f32{ 1.0, 0.25, 0.5, 0.0 }, pack.point_shadow_params[0]);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[1][0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.point_shadow_params[2]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.point_shadow_params[3]);
+    // Tiles cover both slot rows: faces 0..5 at y 0 and y 256.
+    for (pack.point_shadows[0..6], 0..) |t, f| {
+        try std.testing.expectEqual(@as(i32, @intCast(f)) * 256, t.tile_x);
+        try std.testing.expectEqual(@as(i32, 0), t.tile_y);
+    }
+    for (pack.point_shadows[6..12], 0..) |t, f| {
+        try std.testing.expectEqual(@as(i32, @intCast(f)) * 256, t.tile_x);
+        try std.testing.expectEqual(@as(i32, 256), t.tile_y);
+    }
+}
+
+test "packFrame gates point shadows on enabled lights and global shadows" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+    const eye = Vec3.zero;
+
+    const caster = try rig.createPointLight(allocator, "caster", .{
+        .position = Vec3.zero,
+        .intensity = 5.0,
+        .range = 10.0,
+        .cast_shadows = true,
+    });
+
+    // Global shadows off: no tiles, zeroed params, light still packs.
+    var pack = rig.packFrame(eye, false, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(f32, 1.0), pack.counts[0]);
+    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.point_shadow_params[0]);
+
+    // Disabled light: skipped even with shadows on.
+    caster.is_enabled = false;
+    pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.counts[0]);
+    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
+
+    // Re-enabled: one slot, six face tiles.
+    caster.is_enabled = true;
+    pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 6), pack.num_point_shadows);
+    try std.testing.expectEqual(@as(f32, 1.0), pack.point_shadow_params[0][0]);
 }
