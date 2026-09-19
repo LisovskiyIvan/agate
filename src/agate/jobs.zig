@@ -275,10 +275,61 @@ pub const Mutex = struct {
         return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
     }
 
+    /// Bounded acquisition for the phase mutex: tries `tryLock` until
+    /// `timeout_ns` elapses on the monotonic clock, parking briefly
+    /// between attempts instead of spinning hot. A render consumer uses
+    /// this when it prefers a fresh prepare but must stay bounded and
+    /// fall back to frame reuse on timeout. Never unbounded, never spins
+    /// hot. Total wait exceeds `timeout_ns` by at most one sleep step
+    /// (plus scheduling jitter). Deliberately a sleep loop, not
+    /// pthread_mutex_timedlock (darwin declaration issues); the sleep
+    /// loop is the portable contract.
+    pub fn tryLockWithin(self: *Mutex, timeout_ns: u64) bool {
+        if (self.tryLock()) return true;
+        if (timeout_ns == 0) return false;
+        const start = monoNs();
+        var slept: u64 = 0;
+        while (true) {
+            const now = monoNs();
+            const clock_elapsed: u64 = if (now >= start) now - start else 0;
+            // `slept` bounds the wait even if the clock ever stalls, so
+            // termination never depends on clock progress alone.
+            const elapsed: u64 = @max(clock_elapsed, slept);
+            if (elapsed >= timeout_ns) return false;
+            const remaining = timeout_ns - elapsed;
+            const step: u64 = @min(remaining, 50_000); // 50us park
+            sleepNs(step);
+            slept += step;
+            if (self.tryLock()) return true;
+        }
+    }
+
     pub fn unlock(self: *Mutex) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
 };
+
+/// Monotonic nanoseconds via `clock_gettime(CLOCK.MONOTONIC)` — the same
+/// source `std.time.Timer` wraps (removed in Zig 0.16, so jobs.zig calls
+/// libc directly). Returns 0 if the call ever fails; callers pair it with
+/// sleep accounting so a clock stall can never hang the wait.
+fn monoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    const sec: i64 = @intCast(ts.sec);
+    const nsec: i64 = @intCast(ts.nsec);
+    if (sec <= 0) return @intCast(@max(nsec, @as(i64, 0)));
+    return @as(u64, @intCast(sec)) * 1_000_000_000 + @as(u64, @intCast(nsec));
+}
+
+/// Parks the caller for `ns` nanoseconds via `nanosleep`.
+fn sleepNs(ns: u64) void {
+    const ts = std.c.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
 
 /// Fire-and-forget background tasks on dedicated threads — the asset
 /// loading half of the threading story (decode while frames render).
@@ -727,6 +778,88 @@ test "Mutex tryLock probes ownership without blocking" {
     // Released again: tryLock acquires.
     try std.testing.expect(m.tryLock());
     m.unlock();
+}
+
+test "Mutex tryLockWithin acquires a free lock immediately" {
+    var m = Mutex{};
+    // Zero budget on a free lock still acquires via the first probe.
+    try std.testing.expect(m.tryLockWithin(0));
+    m.unlock();
+
+    const start = monoNs();
+    try std.testing.expect(m.tryLockWithin(2_000_000));
+    m.unlock();
+    const elapsed = monoNs() - start;
+    // Immediate: well under the budget plus generous scheduling slack.
+    try std.testing.expect(elapsed <= 2_000_000 + 10_000_000);
+}
+
+test "Mutex tryLockWithin times out while the lock is held" {
+    var m = Mutex{};
+    var locked = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const H = struct {
+        fn run(mu: *Mutex, held: *std.atomic.Value(bool), rel: *std.atomic.Value(bool)) void {
+            mu.lock();
+            held.store(true, .release);
+            while (!rel.load(.acquire)) std.atomic.spinLoopHint();
+            mu.unlock();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, H.run, .{ &m, &locked, &release });
+    var spins: usize = 0;
+    while (!locked.load(.acquire)) : (spins += 1) {
+        if (spins > 10_000_000) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    const timeout: u64 = 2_000_000; // 2ms
+    const start = monoNs();
+    try std.testing.expect(!m.tryLockWithin(timeout));
+    const elapsed = monoNs() - start;
+    // Waited out (near) the full budget, never more than one sleep step
+    // over it plus generous scheduling slack.
+    try std.testing.expect(elapsed >= 1_000_000);
+    try std.testing.expect(elapsed <= timeout + 10_000_000);
+
+    // True only after release.
+    release.store(true, .release);
+    t.join();
+    try std.testing.expect(m.tryLockWithin(timeout));
+    m.unlock();
+}
+
+test "Mutex tryLockWithin acquires after a mid-wait release" {
+    var m = Mutex{};
+    var held = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    const H = struct {
+        fn run(mu: *Mutex, h: *std.atomic.Value(bool), flag: *std.atomic.Value(bool)) void {
+            mu.lock(); // owner locks ...
+            h.store(true, .release);
+            sleepNs(1_000_000); // ... holds ~1ms, then releases mid-wait itself
+            mu.unlock();
+            flag.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, H.run, .{ &m, &held, &done });
+    // Wait until the holder owns the lock (generous bounded spin); the
+    // tryLockWithin below then either contends mid-hold or — if scheduling
+    // slipped past the ~1ms hold — acquires an already-free lock. Both
+    // outcomes must return true within budget+slack.
+    var spins: usize = 0;
+    while (!held.load(.acquire)) : (spins += 1) {
+        if (spins > 10_000_000) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    const timeout: u64 = 20_000_000; // 20ms budget
+    const start = monoNs();
+    try std.testing.expect(m.tryLockWithin(timeout));
+    const elapsed = monoNs() - start;
+    m.unlock();
+    // Acquired within budget (plus one sleep step and slack), not via timeout.
+    try std.testing.expect(elapsed <= timeout + 10_000_000);
+    t.join();
+    try std.testing.expect(done.load(.acquire));
 }
 
 test "Pool.forkJoin is multi-producer safe under concurrent callers" {
