@@ -22,6 +22,8 @@ pub const FrameContext = struct {
     spot_intensity: [2][4]f32,
     spot_view_proj: [2]Mat4,
     spot_shadow_params: [2][4]f32,
+    point_view_proj: [12]Mat4,
+    point_shadow_params: [4][4]f32,
     uniforms_with_shadows: ?*const FrameUniforms = null,
     uniforms_without_shadows: ?*const FrameUniforms = null,
 };
@@ -48,6 +50,8 @@ pub const FrameUniforms = struct {
     spot_intensity: [2][4]f32,
     spot_view_proj: [2]Mat4,
     spot_shadow_params: [2][4]f32,
+    point_view_proj: [12]Mat4,
+    point_shadow_params: [4][4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -114,6 +118,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .spot_intensity = ctx.spot_intensity,
         .spot_view_proj = ctx.spot_view_proj,
         .spot_shadow_params = ctx.spot_shadow_params,
+        .point_view_proj = ctx.point_view_proj,
+        .point_shadow_params = ctx.point_shadow_params,
     };
 }
 

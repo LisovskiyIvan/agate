@@ -1296,6 +1296,8 @@ pub const Scene = struct {
             .spot_intensity = snap.light_pack.spot_intensity,
             .spot_view_proj = snap.light_pack.spot_view_proj,
             .spot_shadow_params = snap.light_pack.spot_shadow_params,
+            .point_view_proj = snap.light_pack.point_view_proj,
+            .point_shadow_params = snap.light_pack.point_shadow_params,
         };
 
         var shadow_state_with = env.shadow_uniforms;
@@ -2263,6 +2265,7 @@ pub const Scene = struct {
                 &draws.shadow,
                 cascades,
                 light_pack.spot_shadows[0..light_pack.num_spot_shadows],
+                light_pack.point_shadows[0..light_pack.num_point_shadows],
             );
             self.stats.shadow_draw_calls += shadow_draws;
             self.stats.draw_calls += shadow_draws;

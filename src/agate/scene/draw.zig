@@ -129,6 +129,7 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
@@ -191,6 +192,8 @@ pub fn drawRegularItem(
             .spot_intensity = f.spot_intensity,
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
+            .point_view_proj = f.point_view_proj,
+            .point_shadow_params = f.point_shadow_params,
         };
         if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -204,6 +207,7 @@ pub fn drawRegularItem(
         bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
@@ -242,6 +246,8 @@ pub fn drawRegularItem(
             .spot_intensity = f.spot_intensity,
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
+            .point_view_proj = f.point_view_proj,
+            .point_shadow_params = f.point_shadow_params,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -360,6 +366,8 @@ fn drawShaderMaterialItem(
                 .spot_intensity = f.spot_intensity,
                 .spot_view_proj = f.spot_view_proj,
                 .spot_shadow_params = f.spot_shadow_params,
+                .point_view_proj = f.point_view_proj,
+                .point_shadow_params = f.point_shadow_params,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
@@ -402,6 +410,8 @@ fn drawShaderMaterialItem(
                 .spot_intensity = f.spot_intensity,
                 .spot_view_proj = f.spot_view_proj,
                 .spot_shadow_params = f.spot_shadow_params,
+                .point_view_proj = f.point_view_proj,
+                .point_shadow_params = f.point_shadow_params,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         }
@@ -587,6 +597,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[inst_pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[inst_pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[inst_pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
@@ -620,6 +631,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .spot_intensity = f.spot_intensity,
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
+            .point_view_proj = f.point_view_proj,
+            .point_shadow_params = f.point_shadow_params,
             .alpha_cutoff = rec.alpha_cutoff,
             .normal_scale = rec.normal_scale,
             .uv_matrix = rec.uv_matrices,
@@ -638,6 +651,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[inst_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[inst_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[inst_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[inst_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[inst_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
@@ -671,6 +685,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .spot_intensity = f.spot_intensity,
             .spot_view_proj = f.spot_view_proj,
             .spot_shadow_params = f.spot_shadow_params,
+            .point_view_proj = f.point_view_proj,
+            .point_shadow_params = f.point_shadow_params,
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }

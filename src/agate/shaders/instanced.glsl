@@ -66,6 +66,11 @@ layout(binding = 1) uniform fs_params {
     // APPENDED LAST (wave/ktx2): diffuse-slot KHR_texture_transform UV map.
     vec4 uv_matrix; // rotation*scale rows [m00, m01, m10, m11]
     vec4 uv_offset; // xy offset, zw unused
+    // APPENDED LAST (point shadows): 2 shadow slots x 6 cube faces
+    // (+X,-X,+Y,-Y,+Z,-Z). Zeroed by default: the shader early-outs with
+    // zero cost when no point light casts shadows.
+    mat4 point_view_proj[12];
+    vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: unused
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -73,6 +78,10 @@ layout(binding = 1) uniform texture2D shadow_tex;
 @image_sample_type shadow_depth_tex unfilterable_float
 layout(binding = 2) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
 layout(binding = 3) uniform texture2D spot_shadow_tex;
+// Point shadow atlas (passes/shadow_pass.zig POINT_SHADOW_* layout).
+// Binding 4: the instanced vs uses no textures, fs uses 0..3.
+// Sampled through the shared shadow_smp compare sampler.
+layout(binding = 4) uniform texture2D point_shadow_tex;
 layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
 @sampler_type depth_smp nonfiltering
@@ -287,6 +296,60 @@ float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
     return (1.0 - lit) * shadow_params.y;
 }
 
+int pointFaceIndex(vec3 d) {
+    vec3 a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) return d.x >= 0.0 ? 0 : 1;
+    if (a.y >= a.x && a.y >= a.z) return d.y >= 0.0 ? 2 : 3;
+    return d.z >= 0.0 ? 4 : 5;
+}
+
+// Point-light shadows: each shadow-casting point light owns 6 cube-face
+// tiles (one atlas row, 256px tiles in the 1536x512 point atlas). The face
+// is picked from the world-space direction to the light, then the fragment
+// is projected by that face's view-projection matrix and PCF-sampled with
+// the same 2D compare path as the spot atlas (4 taps + bias, shadow
+// strength from shadow_params.y like every other shadow term here).
+float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
+    if (point_shadow_params[light_idx].x < 0.5) return 0.0;
+    if (shadow_params.y <= 0.001) return 0.0;
+
+    int slot = int(point_shadow_params[light_idx].x - 1.0);
+    vec3 to_frag = world_pos - point_pos_range[light_idx].xyz;
+    int face = pointFaceIndex(to_frag);
+
+    float cos_theta = max(dot(N, L), 0.0);
+    float bias = point_shadow_params[light_idx].y;
+    float depth_bias = max(bias * (1.0 - cos_theta), bias * 0.2);
+    vec3 normal_offset = N * (point_shadow_params[light_idx].z * (1.0 - cos_theta));
+
+    vec4 lpos = point_view_proj[slot * 6 + face] * vec4(world_pos + normal_offset, 1.0);
+    #if !SOKOL_GLSL
+        lpos.y = -lpos.y;
+    #endif
+
+    vec3 proj = lpos.xyz / lpos.w;
+    if (proj.z > 1.0 || proj.z < 0.0) return 0.0;
+
+    vec2 local_uv = (proj.xy + 1.0) * 0.5;
+    if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) return 0.0;
+
+    // Point atlas layout (must match ShadowPass.pointTileOrigin):
+    // 6 faces left-to-right, one row per shadow slot.
+    vec2 clamped_uv = clamp(local_uv, 0.002, 0.998);
+    vec2 atlas_uv = vec2((float(face) + clamped_uv.x) / 6.0, float(slot) * 0.5 + clamped_uv.y * 0.5);
+    float depth = proj.z - depth_bias;
+
+    vec2 texel = vec2(1.0 / 1536.0, 1.0 / 512.0);
+    float lit = 0.0;
+    lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(atlas_uv + vec2(-texel.x, -texel.y), depth));
+    lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(atlas_uv + vec2( texel.x, -texel.y), depth));
+    lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(atlas_uv + vec2(-texel.x,  texel.y), depth));
+    lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(atlas_uv + vec2( texel.x,  texel.y), depth));
+    lit *= 0.25;
+
+    return (1.0 - lit) * shadow_params.y;
+}
+
 void main() {
     vec3 N = normalize(v_normal);
 
@@ -331,7 +394,8 @@ void main() {
             float d_norm = dist / p_range;
             float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
             float att = (factor * factor) / (dist * dist + 1.0);
-            diffuse += p_col * (p_NdotL * p_int * att);
+            float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
+            diffuse += p_col * (p_NdotL * p_int * att * (1.0 - point_shadow));
         }
     }
 

@@ -22,10 +22,55 @@ pub const SPOT_SHADOW_MAP_WIDTH: u32 = 1024;
 pub const SPOT_SHADOW_MAP_HEIGHT: u32 = 512;
 pub const SPOT_SHADOW_RES: i32 = 512;
 
+// Point-light shadow atlas: 2 shadow slots x 6 cube faces as 256px tiles in
+// one 2D depth texture, sampled with the same 2D compare + PCF path as the
+// spot atlas (no cube textures anywhere).
+//
+// Final atlas budget (all atlases are separate depth textures):
+//   CSM atlas   2048x2048: 4 cascades of 1024x1024 (2x2 grid, unchanged).
+//   Spot atlas  1024x512:  2 tiles of 512x512 side by side (unchanged).
+//   Point atlas 1536x512:  12 tiles of 256x256 — 6 faces per row, one row
+//     per shadow slot (slot 0: y 0..256, slot 1: y 256..512).
+// SHADOW_ATLAS_SIZE stays 2048: the CSM layout is untouched, so no shader
+// fallback needs updating.
+pub const POINT_SHADOW_SLOTS: usize = 2;
+pub const POINT_SHADOW_FACES: usize = 6;
+pub const POINT_SHADOW_RES: i32 = 256;
+pub const POINT_SHADOW_MAP_WIDTH: u32 = 1536;
+pub const POINT_SHADOW_MAP_HEIGHT: u32 = 512;
+
 pub const SpotShadowRenderInfo = struct {
     spot_index: usize = 0,
     view_proj: Mat4 = Mat4.identity,
 };
+
+pub const PointShadowRenderInfo = struct {
+    tile_x: i32 = 0,
+    tile_y: i32 = 0,
+    view_proj: Mat4 = Mat4.identity,
+};
+
+/// Cube-face index for a light-space direction, mirroring the GLSL
+/// pointFaceIndex in the forward shaders: major axis wins, ties prefer
+/// X over Y over Z, the sign picks the positive/negative face
+/// (order +X, -X, +Y, -Y, +Z, -Z, matching PointLight face order).
+pub fn pointFaceForDir(d: math.Vec3) usize {
+    const ax = @abs(d.x);
+    const ay = @abs(d.y);
+    const az = @abs(d.z);
+    if (ax >= ay and ax >= az) return if (d.x >= 0.0) 0 else 1;
+    if (ay >= ax and ay >= az) return if (d.y >= 0.0) 2 else 3;
+    return if (d.z >= 0.0) 4 else 5;
+}
+
+/// Pixel origin of a point-shadow tile: faces run left to right, one row
+/// per shadow slot.
+pub fn pointTileOrigin(slot: usize, face: usize) struct { x: i32, y: i32 } {
+    return .{
+        .x = @as(i32, @intCast(face % POINT_SHADOW_FACES)) * POINT_SHADOW_RES,
+        .y = @as(i32, @intCast(slot % POINT_SHADOW_SLOTS)) * POINT_SHADOW_RES,
+    };
+}
 
 pub const ShadowPass = struct {
     image: sg.Image,
@@ -39,6 +84,10 @@ pub const ShadowPass = struct {
     spot_attachment_view: sg.View,
     spot_texture_view: sg.View,
     spot_needs_clear: bool = true,
+    point_image: sg.Image,
+    point_attachment_view: sg.View,
+    point_texture_view: sg.View,
+    point_needs_clear: bool = true,
     pipeline_u16: sg.Pipeline,
     pipeline_u32: sg.Pipeline,
     inst_pipeline_u16: sg.Pipeline,
@@ -258,6 +307,22 @@ pub const ShadowPass = struct {
             .texture = .{ .image = spot_depth_img },
         });
 
+        // Point-light shadow atlas: 6 cube faces x 2 slots as 256px tiles
+        // (see the layout note on the POINT_SHADOW_* constants above).
+        const point_depth_img = sg.makeImage(.{
+            .usage = .{ .depth_stencil_attachment = true },
+            .pixel_format = .DEPTH,
+            .width = POINT_SHADOW_MAP_WIDTH,
+            .height = POINT_SHADOW_MAP_HEIGHT,
+            .sample_count = 1,
+        });
+        const point_att_view = sg.makeView(.{
+            .depth_stencil_attachment = .{ .image = point_depth_img },
+        });
+        const point_tex_view = sg.makeView(.{
+            .texture = .{ .image = point_depth_img },
+        });
+
         return .{
             .allocator = allocator,
             .binned_meshes = .empty,
@@ -270,6 +335,10 @@ pub const ShadowPass = struct {
             .spot_attachment_view = spot_att_view,
             .spot_texture_view = spot_tex_view,
             .spot_needs_clear = true,
+            .point_image = point_depth_img,
+            .point_attachment_view = point_att_view,
+            .point_texture_view = point_tex_view,
+            .point_needs_clear = true,
             .pipeline_u16 = pip_u16,
             .pipeline_u32 = pip_u32,
             .inst_pipeline_u16 = inst_pip_u16,
@@ -711,6 +780,7 @@ pub const ShadowPass = struct {
         prepared: *const PreparedShadowDraws,
         cascades: [4]Mat4,
         spot_shadows: []const SpotShadowRenderInfo,
+        point_shadows: []const PointShadowRenderInfo,
     ) u32 {
         var shadow_action = sg.PassAction{};
         shadow_action.depth = .{
@@ -771,6 +841,35 @@ pub const ShadowPass = struct {
             self.spot_needs_clear = false;
         }
 
+        // 3. Point light shadow pass: each entry is one cube-face tile of
+        // the point atlas (regular/instanced/skinned bins via renderBuckets,
+        // per-face frustum culling, no cascade size policy).
+        if (point_shadows.len > 0 or self.point_needs_clear) {
+            var point_action = sg.PassAction{};
+            point_action.depth = .{
+                .load_action = .CLEAR,
+                .clear_value = 1.0,
+                .store_action = .STORE,
+            };
+            var point_pass = sg.Pass{
+                .action = point_action,
+            };
+            point_pass.attachments.depth_stencil = self.point_attachment_view;
+            sg.beginPass(point_pass);
+            var point_last_pipeline_id: u32 = 0;
+
+            for (point_shadows) |point_info| {
+                sg.applyViewport(point_info.tile_x, point_info.tile_y, POINT_SHADOW_RES, POINT_SHADOW_RES, false);
+                sg.applyScissorRect(point_info.tile_x, point_info.tile_y, POINT_SHADOW_RES, POINT_SHADOW_RES, false);
+
+                const point_frustum = math.Frustum.fromViewProjection(point_info.view_proj);
+                self.renderBuckets(prepared, point_info.view_proj, point_frustum, null, &point_last_pipeline_id, &draw_calls);
+            }
+
+            sg.endPass();
+            self.point_needs_clear = false;
+        }
+
         return draw_calls;
     }
 
@@ -778,8 +877,9 @@ pub const ShadowPass = struct {
         self: *ShadowPass,
         cascades: [4]Mat4,
         spot_shadows: []const SpotShadowRenderInfo,
+        point_shadows: []const PointShadowRenderInfo,
     ) u32 {
-        return self.renderPreparedFrom(&self.prepared, cascades, spot_shadows);
+        return self.renderPreparedFrom(&self.prepared, cascades, spot_shadows, point_shadows);
     }
 
     pub fn render(
@@ -792,7 +892,7 @@ pub const ShadowPass = struct {
         pool: ?*jobs.Pool,
     ) u32 {
         _ = self.prepare(meshes, cache_key, instance_source, pool);
-        return self.renderPrepared(cascades, spot_shadows);
+        return self.renderPrepared(cascades, spot_shadows, &.{});
     }
 
     pub fn deinit(self: *ShadowPass) void {
@@ -815,10 +915,13 @@ pub const ShadowPass = struct {
         sg.destroyView(self.texture_view);
         sg.destroyView(self.spot_attachment_view);
         sg.destroyView(self.spot_texture_view);
+        sg.destroyView(self.point_attachment_view);
+        sg.destroyView(self.point_texture_view);
         sg.destroySampler(self.sampler);
         sg.destroySampler(self.depth_sampler);
         sg.destroyImage(self.image);
         sg.destroyImage(self.spot_image);
+        sg.destroyImage(self.point_image);
     }
 };
 
@@ -856,6 +959,10 @@ test "parallel shadow binning produces serial-identical results" {
         .spot_attachment_view = .{},
         .spot_texture_view = .{},
         .spot_needs_clear = false,
+        .point_image = .{},
+        .point_attachment_view = .{},
+        .point_texture_view = .{},
+        .point_needs_clear = false,
         .pipeline_u16 = .{},
         .pipeline_u32 = .{},
         .inst_pipeline_u16 = .{},
@@ -881,6 +988,10 @@ test "parallel shadow binning produces serial-identical results" {
         .spot_attachment_view = .{},
         .spot_texture_view = .{},
         .spot_needs_clear = false,
+        .point_image = .{},
+        .point_attachment_view = .{},
+        .point_texture_view = .{},
+        .point_needs_clear = false,
         .pipeline_u16 = .{},
         .pipeline_u32 = .{},
         .inst_pipeline_u16 = .{},
@@ -1032,6 +1143,10 @@ fn testShadowPass(ally: std.mem.Allocator) ShadowPass {
         .spot_attachment_view = .{},
         .spot_texture_view = .{},
         .spot_needs_clear = false,
+        .point_image = .{},
+        .point_attachment_view = .{},
+        .point_texture_view = .{},
+        .point_needs_clear = false,
         .pipeline_u16 = .{},
         .pipeline_u32 = .{},
         .inst_pipeline_u16 = .{},
@@ -1649,4 +1764,43 @@ test "stage-2A: shadow items carry source uid and list index" {
         if (it.source_mesh == 2) try std.testing.expectEqual(b.uid, it.source_uid);
     }
     try std.testing.expect(a.uid != 0 and b.uid != 0 and a.uid != b.uid);
+}
+
+// ---- Point-light shadow atlas: face math + tile bookkeeping. ----
+
+test "pointFaceForDir selects the major-axis face with X>Y>Z tie-break" {
+    const V = math.Vec3.new;
+    try std.testing.expectEqual(@as(usize, 0), pointFaceForDir(V(1, 0, 0)));
+    try std.testing.expectEqual(@as(usize, 1), pointFaceForDir(V(-2, 0.5, 0.5)));
+    try std.testing.expectEqual(@as(usize, 2), pointFaceForDir(V(0.1, 3, 0.1)));
+    try std.testing.expectEqual(@as(usize, 3), pointFaceForDir(V(0, -1, 0)));
+    try std.testing.expectEqual(@as(usize, 4), pointFaceForDir(V(0, 0, 5)));
+    try std.testing.expectEqual(@as(usize, 5), pointFaceForDir(V(0.2, 0.1, -4)));
+    // Ties prefer X, then Y, then Z (mirrors the GLSL pointFaceIndex).
+    try std.testing.expectEqual(@as(usize, 0), pointFaceForDir(V(1, 1, 0)));
+    try std.testing.expectEqual(@as(usize, 1), pointFaceForDir(V(-1, 1, 1)));
+    try std.testing.expectEqual(@as(usize, 2), pointFaceForDir(V(0, 1, 1)));
+    try std.testing.expectEqual(@as(usize, 3), pointFaceForDir(V(0, -1, -1)));
+    try std.testing.expectEqual(@as(usize, 4), pointFaceForDir(V(0, 0, 1)));
+}
+
+test "pointTileOrigin tiles 2 slots x 6 faces inside the atlas without overlap" {
+    try std.testing.expectEqual(@as(u32, 6 * POINT_SHADOW_RES), POINT_SHADOW_MAP_WIDTH);
+    try std.testing.expectEqual(@as(u32, 2 * POINT_SHADOW_RES), POINT_SHADOW_MAP_HEIGHT);
+    var seen: [POINT_SHADOW_SLOTS * POINT_SHADOW_FACES]@TypeOf(pointTileOrigin(0, 0)) = undefined;
+    var n: usize = 0;
+    for (0..POINT_SHADOW_SLOTS) |slot| {
+        for (0..POINT_SHADOW_FACES) |face| {
+            const o = pointTileOrigin(slot, face);
+            try std.testing.expectEqual(@as(i32, @intCast(face)) * POINT_SHADOW_RES, o.x);
+            try std.testing.expectEqual(@as(i32, @intCast(slot)) * POINT_SHADOW_RES, o.y);
+            // Tile stays inside the atlas.
+            try std.testing.expect(o.x >= 0 and o.x + POINT_SHADOW_RES <= POINT_SHADOW_MAP_WIDTH);
+            try std.testing.expect(o.y >= 0 and o.y + POINT_SHADOW_RES <= POINT_SHADOW_MAP_HEIGHT);
+            for (seen[0..n]) |prev| try std.testing.expect(prev.x != o.x or prev.y != o.y);
+            seen[n] = o;
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), n);
 }

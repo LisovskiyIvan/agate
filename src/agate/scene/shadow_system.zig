@@ -144,6 +144,8 @@ test "frameUniforms packs shared lighting state verbatim" {
         .spot_intensity = [_][4]f32{.{ 3, 0, 0, 0 }} ** 2,
         .spot_view_proj = [_]Mat4{ Mat4.identity, Mat4.identity },
         .spot_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
+        .point_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
     };
 
     var state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
@@ -160,6 +162,10 @@ test "frameUniforms packs shared lighting state verbatim" {
     try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0005, 0.01 }, f.light_counts);
     try std.testing.expectEqual(ctx.point_pos_range, f.point_pos_range);
     try std.testing.expectEqual(ctx.spot_intensity, f.spot_intensity);
+    // Point shadow lanes ride through verbatim; zeroed params (the default)
+    // keep the shader shadow path gated off.
+    try std.testing.expectEqual(ctx.point_shadow_params, f.point_shadow_params);
+    try std.testing.expectEqual(ctx.point_view_proj, f.point_view_proj);
 
     // Disabled shadows (globally or per-mesh) zero the bias/intensity lanes
     // but keep normal bias and softness, exactly like the legacy literals.
