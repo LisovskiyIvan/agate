@@ -41,7 +41,7 @@ layout(binding = 0) uniform fs_params {
     vec4 grade_shadows; // xyz: shadows lift [-1,1], w: unused
     vec4 grade_midtones; // xyz: midtones lift [-1,1], w: unused
     vec4 grade_highlights; // xyz: highlights lift [-1,1], w: unused
-    vec4 lut_params; // x: lut_enabled (1/0), y: lut_intensity [0,1], z: lut size N, w: unused
+    vec4 lut_params; // x: lut_enabled (1/0), y: lut_strength [0,1], z: lut size N, w: unused
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
     mat4 prev_view_proj; // previous frame view-projection matrix
@@ -539,7 +539,7 @@ vec3 applyColorCurves(vec3 c) {
 // half-texel-inset t = b*(N-1); hardware bilinear interpolates r/g inside
 // one layer, and the manual mix of layers floor(t) and floor(t)+1 by the
 // fraction f adds the third (trilinear) axis. The graded color then blends
-// back toward the curve-graded input by lut_intensity, so intensity 0 is
+// back toward the curve-graded input by lut_strength, so strength 0 is
 // an exact no-op. All zeros in lut_params (no LUT bound) short-circuit to
 // the unchanged pre-LUT path.
 vec3 applyLut(vec3 color) {
