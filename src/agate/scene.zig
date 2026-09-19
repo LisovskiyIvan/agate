@@ -1311,12 +1311,12 @@ pub const Scene = struct {
 
         // Opaque regular meshes first (front-to-back, early-Z).
         for (queues.items.items) |item| {
-            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items);
+            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
         }
 
         // Opaque instanced meshes.
         for (queues.opaque_instanced.items) |batch| {
-            scene_draw.drawInstancedBatch(&env, batch, &frame_ctx, &current_pipeline_id);
+            scene_draw.drawInstancedBatch(&env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
         }
 
         // Transparent pass: regular items and instanced groups interleaved in
@@ -1326,12 +1326,12 @@ pub const Scene = struct {
             switch (entry.kind) {
                 .regular => {
                     if (entry.index < queues.transparent.items.len) {
-                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items);
+                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
                     }
                 },
                 .instanced => {
                     if (entry.index < queues.transparent_instanced.items.len) {
-                        scene_draw.drawInstancedBatch(&env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id);
+                        scene_draw.drawInstancedBatch(&env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
                     }
                 },
             }

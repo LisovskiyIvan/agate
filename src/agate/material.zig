@@ -133,6 +133,74 @@ pub const StandardMaterial = struct {
     }
 };
 
+/// Scalar-only clearcoat layer (Babylon parity, OpenPBR-adjacent subset).
+/// A dielectric coat (car paint, lacquered wood) over the base PBR layer:
+/// separate GGX specular lobe with its own roughness, F0 = 0.04 tinted by
+/// `color`, and an energy-conserving (1 - F_cc) attenuation of the BASE
+/// specular (direct + IBL). No textures this wave (no clearcoat map/roughness
+/// map/normal map) and no second normal layer — the coat reuses the base N.
+///
+/// Gating: `intensity == 0` (the default) disables the lobe. Every shader
+/// term is multiplied by the intensity and the base attenuation becomes
+/// exactly (1 - 0), so disabled materials render bit-identically to before.
+/// Babylon mapping: intensity = clearCoat.intensity (Babylon default 1 when
+/// the coat is enabled; here 0 = off replaces the isEnabled flag),
+/// roughness = clearCoat.roughness, color = clearCoat.tintColor (white =
+/// untinted, matching glTF KHR_materials_clearcoat clearcoatColorFactor).
+pub const Clearcoat = struct {
+    intensity: f32 = 0.0,
+    roughness: f32 = 0.03,
+    color: Color3 = Color3.white,
+};
+
+/// Scalar-only sheen layer (Babylon parity, OpenPBR-adjacent subset).
+/// A view-dependent fabric/fuzz lobe (Charlie distribution + Neubelt
+/// visibility, Karis-style grazing response), additive over the base layer.
+/// No textures this wave (no sheen color/roughness maps).
+///
+/// Gating: `intensity == 0` (the default) disables the lobe — every shader
+/// term is multiplied by the intensity, so disabled materials render
+/// bit-identically to before. Babylon mapping: intensity = sheen.intensity,
+/// roughness = sheen.roughness (0 = mirror-smooth fuzz, 1 = fully rough),
+/// color = sheen.color (the retroreflective tint; white = untinted).
+pub const Sheen = struct {
+    color: Color3 = Color3.white,
+    intensity: f32 = 0.0,
+    roughness: f32 = 0.5,
+};
+
+/// Render-owned, GPU-ready clearcoat + sheen factors (scalar/color only).
+/// Lives in the render-queue side table (RenderQueues.coat_storage, resolved
+/// by index at draw time like skin_storage), NOT in MaterialDrawRecord: 64 B
+/// of per-draw factors would bust the P4 size guard on RenderMeshItem, so
+/// only draws with an enabled lobe occupy a slot. Every other draw resolves
+/// to `neutral` at draw time and shades bit-identically to before.
+pub const CoatParams = struct {
+    clearcoat_factors: [4]f32 = .{ 0, 0.03, 0, 0 }, // x: intensity, y: roughness
+    clearcoat_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb tint, w unused
+    sheen_factors: [4]f32 = .{ 0, 0.5, 0, 0 }, // x: intensity, y: roughness
+    sheen_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb tint, w unused
+
+    pub const neutral: CoatParams = .{};
+};
+
+/// Builds the side-table snapshot for a material: non-null only for PBR
+/// materials with an enabled coat/fabric lobe (either intensity > 0).
+/// Materials without these features (including every non-PBR material) yield
+/// null and draw from CoatParams.neutral. Pure function (no GPU calls).
+pub fn coatParamsFor(mat: ?Material) ?CoatParams {
+    const m = mat orelse return null;
+    if (m != .pbr) return null;
+    const p = m.pbr;
+    if (p.clearcoat.intensity <= 0 and p.sheen.intensity <= 0) return null;
+    return .{
+        .clearcoat_factors = .{ p.clearcoat.intensity, p.clearcoat.roughness, 0, 0 },
+        .clearcoat_color = .{ p.clearcoat.color.r, p.clearcoat.color.g, p.clearcoat.color.b, 1.0 },
+        .sheen_factors = .{ p.sheen.intensity, p.sheen.roughness, 0, 0 },
+        .sheen_color = .{ p.sheen.color.r, p.sheen.color.g, p.sheen.color.b, 1.0 },
+    };
+}
+
 pub const PBRMaterial = struct {
     name: []const u8 = "PBRMaterial",
     albedo_color: Color3 = Color3.white,
@@ -181,6 +249,13 @@ pub const PBRMaterial = struct {
 
     environment_texture: ?CubeTexture = null,
     environment_intensity: f32 = 1.0,
+
+    /// Clearcoat coat layer (default OFF: intensity 0 = lobe disabled,
+    /// neutral tint/roughness). Scalar/color only — no textures this wave.
+    clearcoat: Clearcoat = .{},
+    /// Sheen fabric lobe (default OFF: intensity 0 = lobe disabled,
+    /// neutral tint/roughness). Scalar/color only — no textures this wave.
+    sheen: Sheen = .{},
 
     pub fn init(name: []const u8) PBRMaterial {
         return .{
@@ -600,6 +675,49 @@ test "UvTransform packs the KHR_texture_transform matrix rows" {
     const v_prime = m[2] * u + m[3] * v + t.offset[1];
     try std.testing.expectApproxEqAbs(cos_h * 2 * u - sin_h * 4 * v + 0.25, u_prime, 1e-5);
     try std.testing.expectApproxEqAbs(sin_h * 2 * u + cos_h * 4 * v - 0.5, v_prime, 1e-5);
+}
+
+test "PBRMaterial clearcoat/sheen defaults are disabled and neutral" {
+    const mat = PBRMaterial.init("m");
+    // Disabled: intensity 0 keeps every shader term at zero.
+    try std.testing.expectEqual(@as(f32, 0.0), mat.clearcoat.intensity);
+    try std.testing.expectEqual(@as(f32, 0.0), mat.sheen.intensity);
+    // Neutral companions: untinted colors, sane roughnesses.
+    try std.testing.expectEqual(@as(f32, 0.03), mat.clearcoat.roughness);
+    try std.testing.expectEqual(@as(f32, 0.5), mat.sheen.roughness);
+    try std.testing.expectEqual(Color3.white, mat.clearcoat.color);
+    try std.testing.expectEqual(Color3.white, mat.sheen.color);
+}
+
+test "CoatParams snapshot is present when enabled, neutral when disabled" {
+    // Disabled (default): no side-table entry — draws use CoatParams.neutral.
+    var off = PBRMaterial.init("off");
+    try std.testing.expect(coatParamsFor(.{ .pbr = &off }) == null);
+    try std.testing.expect(coatParamsFor(null) == null);
+    var std_mat = StandardMaterial.init("s");
+    try std.testing.expect(coatParamsFor(.{ .standard = &std_mat }) == null);
+
+    // Neutral fallback: intensities zero, companion defaults.
+    const n = CoatParams.neutral;
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0.03, 0, 0 }, &n.clearcoat_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.clearcoat_color);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0.5, 0, 0 }, &n.sheen_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.sheen_color);
+
+    // Enabled (either lobe): material values flow through verbatim.
+    var on = PBRMaterial.init("on");
+    on.clearcoat = .{ .intensity = 0.8, .roughness = 0.12, .color = Color3.new(0.9, 0.8, 0.7) };
+    on.sheen = .{ .color = Color3.new(0.2, 0.4, 0.6), .intensity = 0.5, .roughness = 0.35 };
+    const cp = coatParamsFor(.{ .pbr = &on }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(f32, &.{ 0.8, 0.12, 0, 0 }, &cp.clearcoat_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.9, 0.8, 0.7, 1 }, &cp.clearcoat_color);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.35, 0, 0 }, &cp.sheen_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.2, 0.4, 0.6, 1 }, &cp.sheen_color);
+
+    // One lobe alone still opts in.
+    var half = PBRMaterial.init("half");
+    half.sheen.intensity = 0.25;
+    try std.testing.expect(coatParamsFor(.{ .pbr = &half }) != null);
 }
 
 test "PBRMaterial slot defaults reproduce the glTF conventions" {

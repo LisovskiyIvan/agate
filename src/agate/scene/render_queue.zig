@@ -59,6 +59,11 @@ pub const RenderMeshItem = struct {
     /// Индекс ShaderDrawSnapshot в RenderQueues.shader_storage (null = не hook).
     /// Draw-путь hook-материалов читает только этот снимок.
     shader_index: ?u32 = null,
+    /// Индекс CoatParams в RenderQueues.coat_storage (null = lobe выключен).
+    /// Только PBR-draws с включённым clearcoat/sheen занимают слот; все
+    /// остальные рисуют из CoatParams.neutral. 8-байтовый индекс вместо
+    /// 64-байтовых факторов держит размер item в P4-лимите.
+    coat_index: ?u32 = null,
     /// Per-mesh morph uniforms (weights and delta dimensions)
     morph_uniforms: morph_gpu.VsUniforms = .{
         .weights0 = .{ 0, 0, 0, 0 },
@@ -102,6 +107,8 @@ pub const RenderInstancedBatch = struct {
     draw_record: MaterialDrawRecord = .{},
     source_uid: u64 = 0,
     source_mesh: u32 = 0,
+    /// Как RenderMeshItem.coat_index, но для инстансированных групп.
+    coat_index: ?u32 = null,
 };
 
 /// Render-owned хранилище копий скин-матриц: один слот на skinned-draw кадра
@@ -111,6 +118,10 @@ pub const RenderInstancedBatch = struct {
 pub const SkinStorage = std.ArrayListUnmanaged([MAX_BONES]Mat4);
 /// Render-owned снимки hook-материалов: один на shader-draw кадра.
 pub const ShaderStorage = std.ArrayListUnmanaged(material_mod.ShaderDrawSnapshot);
+/// Render-owned снимки clearcoat/sheen-факторов: один на coat-draw кадра
+/// (только PBR с включённым lobe; остальные draws хранят coat_index = null
+/// и рисуют из CoatParams.neutral — пустое хранилище ничего не стоит).
+pub const CoatStorage = std.ArrayListUnmanaged(material_mod.CoatParams);
 
 /// Чистый резолв копии скина по индексу (draw-фаза): null/out-of-range дают
 /// null вместо чтения чужих данных. Skinned-вызывающий такой draw пропускает
@@ -119,6 +130,15 @@ pub fn skinAt(skins: []const [MAX_BONES]Mat4, index: ?u32) ?*const [MAX_BONES]Ma
     const i = index orelse return null;
     if (i >= skins.len) return null;
     return &skins[i];
+}
+
+/// Чистый резолв CoatParams по индексу (draw-фаза): null/out-of-range дают
+/// null вместо чтения чужих данных; вызывающий подставляет
+/// CoatParams.neutral (lobe выключен — бит-идентично легаси).
+pub fn coatAt(coats: []const material_mod.CoatParams, index: ?u32) ?*const material_mod.CoatParams {
+    const i = index orelse return null;
+    if (i >= coats.len) return null;
+    return &coats[i];
 }
 
 /// Prepare-локальный результат куллинга одного меша: готовый item плюс
@@ -132,6 +152,10 @@ pub const CulledMesh = struct {
     skin_src: ?*const [MAX_BONES]Mat4 = null,
     /// Готовый снимок hook-материала (чистая копия, без живых указателей).
     shader_snap: ?material_mod.ShaderDrawSnapshot = null,
+    /// Готовый снимок clearcoat/sheen-факторов (чистая копия 64 Б; в скретче
+    /// параллельного пути — только значение, в очередь попадает через копию
+    /// в appendRenderItem).
+    coat: ?material_mod.CoatParams = null,
 };
 
 /// One transparent draw in the unified back-to-front pass. Regular items
@@ -228,6 +252,10 @@ pub const RenderQueues = struct {
     // буферов в prepare-фазе безопасен: очереди хранят индексы, а не указатели.
     skin_storage: SkinStorage = .empty,
     shader_storage: ShaderStorage = .empty,
+    // Render-owned снимки clearcoat/sheen-факторов (резолв по coat_index на
+    // draw-фазе). Рост буферов в prepare-фазе безопасен: очереди хранят
+    // индексы, а не указатели.
+    coat_storage: CoatStorage = .empty,
     // Parallel-cull scratch (per-chunk record buffers + stats). Lives with
     // the view queues and is retained across frames (reset + ensure per
     // buildFrameQueuesParallel call, freed once in deinit), so repeated
@@ -244,6 +272,7 @@ pub const RenderQueues = struct {
         self.transparent_order.clearRetainingCapacity();
         self.skin_storage.clearRetainingCapacity();
         self.shader_storage.clearRetainingCapacity();
+        self.coat_storage.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderQueues, allocator: std.mem.Allocator) void {
@@ -255,6 +284,7 @@ pub const RenderQueues = struct {
         self.transparent_order.deinit(allocator);
         self.skin_storage.deinit(allocator);
         self.shader_storage.deinit(allocator);
+        self.coat_storage.deinit(allocator);
         self.parallel_scratch.deinit(allocator);
     }
 };
@@ -525,6 +555,12 @@ fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
         ctx.queues.shader_storage.appendAssumeCapacity(snap);
         item.shader_index = idx;
     }
+    if (culled.coat) |cp| {
+        ctx.queues.coat_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        const idx: u32 = @intCast(ctx.queues.coat_storage.items.len);
+        ctx.queues.coat_storage.appendAssumeCapacity(cp);
+        item.coat_index = idx;
+    }
     if (item.transparent) {
         // Reserve both slots up front: if either allocation fails the item
         // is dropped entirely, never an undrawn orphan in one array.
@@ -587,6 +623,16 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
         const is_ds = materialIsDoubleSided(mesh.material);
         const draw_rec = buildMaterialRecord(ctx, mesh.material);
 
+        // Coat-слот только для групп с включённым lobe (иначе null →
+        // CoatParams.neutral на draw-фазе). OOM роняет всю группу, как
+        // OOM очередей в appendRenderItem.
+        var coat_index: ?u32 = null;
+        if (material_mod.coatParamsFor(mesh.material)) |cp| {
+            ctx.queues.coat_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+            coat_index = @intCast(ctx.queues.coat_storage.items.len);
+            ctx.queues.coat_storage.appendAssumeCapacity(cp);
+        }
+
         const batch = RenderInstancedBatch{
             .vertex_buffer = mesh.vertex_buffer,
             .instance_buffer = staged.buffer,
@@ -602,6 +648,7 @@ fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh, mes
             .draw_record = draw_rec,
             .source_uid = mesh.uid,
             .source_mesh = @intCast(mesh_index),
+            .coat_index = coat_index,
         };
 
         if (is_trans) {
@@ -740,6 +787,9 @@ fn cullNonInstancedMesh(
     // ещё доступны); в очередь попадёт только после копии в appendRenderItem.
     const dummy_white = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
     const shader_snap = material_mod.buildShaderSnapshot(mat, ctx.default_white orelse &dummy_white);
+    // Снимок coat-факторов (null для всех draws без включённого lobe —
+    // такие draws рисуют из CoatParams.neutral без слота в хранилище).
+    const coat = material_mod.coatParamsFor(mat);
     return .{
         .item = .{
             .draw_record = draw_rec,
@@ -763,6 +813,7 @@ fn cullNonInstancedMesh(
         },
         .skin_src = skin_mat,
         .shader_snap = shader_snap,
+        .coat = coat,
     };
 }
 
@@ -3055,6 +3106,23 @@ test "P4: skinAt resolves owned copies without stale reads" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), got[3].m[12], 1e-6);
     try std.testing.expect(skinAt(&one, 1) == null);
     try std.testing.expect(skinAt(&one, std.math.maxInt(u32)) == null);
+}
+
+test "coatAt resolves owned copies without stale reads" {
+    const CoatParams = material_mod.CoatParams;
+    var empty: [0]CoatParams = .{};
+    try std.testing.expect(coatAt(&empty, null) == null);
+    try std.testing.expect(coatAt(&empty, 0) == null);
+
+    var one = [_]CoatParams{.{ .clearcoat_factors = .{ 0.8, 0.12, 0, 0 } }};
+    const got = coatAt(&one, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(f32, &.{ 0.8, 0.12, 0, 0 }, &got.clearcoat_factors);
+    // Neutral fallback for every miss (disabled lobe path).
+    try std.testing.expect(coatAt(&one, 1) == null);
+    try std.testing.expect(coatAt(&one, null) == null);
+    const fallback = coatAt(&one, null) orelse &CoatParams.neutral;
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.clearcoat_factors[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.sheen_factors[0]);
 }
 
 // Очереди не хранят живых указателей: скриншот пережил мутацию TRS/
