@@ -40,6 +40,7 @@ pub const ParticleBlendMode = enum {
 /// | rotation + angular velocity          | yes       | yes                          |
 /// | additive / alpha blend               | yes       | yes                          |
 /// | world-space emitter                  | yes       | yes                          |
+/// | sub-emitters (on-death spawn)        | yes       | parent never fires (4)       |
 /// | local_space (moving emitter frame)   | yes       | error.LocalSpaceNeedsCpu (2) |
 /// | collisions, noise, arbitrary forces  | (3)       | error (3)                    |
 ///
@@ -54,6 +55,11 @@ pub const ParticleBlendMode = enum {
 ///     must stay CPU-only until the state layout grows. If such a flag is
 ///     ever added it must reject `.gpu` in update() with an error — never
 ///     downgrade.
+/// (4) Deaths happen in the vertex shader, unobservable on CPU, so a `.gpu`
+///     parent never fires its sub-emitters (silently not firing is correct
+///     here: erroring would break the steady-state emission the ring was
+///     built for). A `.gpu` child still accepts spawns into its slot ring;
+///     being stateless it tracks no chain depth, so chains stop there.
 ///
 /// Integration semantics differ by construction: `.cpu` advances with the
 /// frame dt (semi-implicit Euler), `.gpu` evaluates the exact closed form
@@ -162,6 +168,12 @@ pub const Particle = struct {
     rotation: f32 = 0.0,
     /// Spin speed in degrees per second (integrated into rotation by update).
     angular_velocity: f32 = 0.0,
+    /// Sub-emitter chain generation: 0 for normally emitted particles, set to
+    /// parent + 1 for sub-emitter spawns. Deaths at
+    /// `sub_depth >= max_sub_emitter_depth` spawn no children, which bounds
+    /// cyclic graphs (A→B→A, self-emitters). Always 0 on systems without
+    /// sub-emitters.
+    sub_depth: u8 = 0,
 };
 
 pub const ParticleInstanceData = extern struct {
@@ -245,6 +257,94 @@ pub fn worldScaleFactor(matrix: Mat4) f32 {
     const sy = Vec3.new(matrix.m[4], matrix.m[5], matrix.m[6]).length();
     const sz = Vec3.new(matrix.m[8], matrix.m[9], matrix.m[10]).length();
     return (sx + sy + sz) / 3.0;
+}
+
+/// Sub-emitter trigger point. Only `.on_death` exists today (Babylon.js
+/// parity target): a parent particle spawns children in another system on the
+/// tick its age reaches its lifetime.
+pub const SubEmitterTrigger = enum {
+    on_death,
+};
+
+/// One child-spawn rule evaluated when a particle of the owning system dies.
+/// Off by default: a system with zero sub-emitters takes no extra PRNG draws
+/// and follows the legacy update path bit-for-bit.
+pub const SubEmitter = struct {
+    /// Child system receiving the spawned particles. May be the owner itself;
+    /// see the chain rule on `max_sub_emitter_depth`.
+    system: *ParticleSystem,
+    trigger: SubEmitterTrigger = .on_death,
+    /// Spawn chance per dying particle, in [0, 1]. Evaluated from a
+    /// deterministic per-death hash (seed + tick + death index), never from
+    /// the shared PRNG, so attaching a sub-emitter never perturbs the parent
+    /// emission stream and results are worker-count invariant.
+    probability: f32 = 1.0,
+    /// Children spawned per triggered death (bounded per tick by
+    /// `max_sub_emitter_spawns_per_tick`).
+    count: u32 = 1,
+    /// child.velocity = parent.velocity * inherit_velocity +
+    ///     sampled.velocity * (1 - inherit_velocity), clamped to [0, 1].
+    /// 1.0 keeps the full parent velocity, 0.0 uses the child system's own
+    /// sampled velocity.
+    inherit_velocity: f32 = 0.5,
+    /// True: children start at the death position (+ spawn_radius jitter).
+    /// False: children keep their own system's sampled spawn position.
+    inherit_position: bool = true,
+    /// Uniform cube half-extent around the death position added to each
+    /// child (>= 0; negative clamps to 0). Drawn from the per-death hash
+    /// stream, so jitter is deterministic and worker-count invariant.
+    spawn_radius: f32 = 0.0,
+};
+
+/// Maximum sub-emitters per system. Fixed inline storage: attaching them
+/// allocates nothing, per-frame or otherwise.
+pub const max_sub_emitters: usize = 4;
+
+/// Chain rule: a particle with `sub_depth >= max_sub_emitter_depth` spawns no
+/// children on death. Every sub-emitter spawn sets
+/// child.sub_depth = parent.sub_depth + 1, so a cyclic graph (A→B→A, or a
+/// self-emitter) fires at most this many generations and cannot recurse
+/// infinitely. Chains additionally stop at GPU-mode systems: a `.gpu` parent
+/// never fires (deaths are shader-side and unobservable on CPU) and a `.gpu`
+/// child accepts spawns but tracks no depth.
+pub const max_sub_emitter_depth: u8 = 4;
+
+/// Explosion bound: at most this many child particles are spawned from one
+/// parent system in a single updateCpu tick, across all its sub-emitters.
+/// Deaths beyond the recorded prefix still compact normally, they just do not
+/// spawn.
+pub const max_sub_emitter_spawns_per_tick: usize = 256;
+
+/// SplitMix64 step: the per-death hash stream for sub-emitter rolls/jitter.
+/// Hash-based (not PRNG-based) so evaluation order and worker count cannot
+/// affect the outcome.
+fn splitmix64(state: *u64) u64 {
+    state.* +%= 0x9E3779B97F4A7C15;
+    var z = state.*;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+/// Maps a 64-bit hash to f32 in [0, 1] (top 32 bits over 2^32; may round to
+/// exactly 1.0 for the all-ones hash, which callers treat as "no fire").
+fn hash01(h: u64) f32 {
+    return @as(f32, @floatFromInt(h >> 32)) / 4294967296.0;
+}
+
+/// One avalanche of the sub-emitter seed, tick, death index, emitter index
+/// and salt into a hash state. Distinct salts give independent streams for
+/// the probability roll vs each jitter component.
+fn subHash(seed: u64, tick: u64, death_idx: usize, emitter_idx: usize, salt: u64) u64 {
+    var h: u64 = seed ^ (tick *% 0x9E3779B97F4A7C15) ^
+        (@as(u64, @intCast(death_idx)) *% 0xBF58476D1CE4E5B9) ^
+        (@as(u64, @intCast(emitter_idx)) *% 0x94D049BB133111EB) ^ (salt *% 0xDA942042E4DD58B5);
+    h ^= h >> 30;
+    h *%= 0xBF58476D1CE4E5B9;
+    h ^= h >> 27;
+    h *%= 0x94D049BB133111EB;
+    h ^= h >> 31;
+    return h;
 }
 
 pub const ParticleSystem = struct {
@@ -355,6 +455,19 @@ pub const ParticleSystem = struct {
     local_space: bool = false,
     emitter_mesh: ?*Mesh = null,
 
+    // --- Sub-emitters (CPU on-death triggers; zero cost when unused) ---
+    // Inline fixed storage: addSubEmitter never allocates, per-frame or
+    // otherwise. updateCpu only records deaths when count > 0, so systems
+    // without sub-emitters keep the legacy path bit-for-bit.
+    sub_emitter_store: [max_sub_emitters]SubEmitter = undefined,
+    sub_emitter_count: usize = 0,
+    /// Seed for the per-death sub-emitter hash stream (probability rolls and
+    /// spawn jitter). Fixed default keeps runs reproducible; override per
+    /// system to decorrelate sibling systems sharing one child.
+    sub_emitter_seed: u64 = 0x9E3779B97F4A7C15,
+    /// updateCpu tick counter feeding the per-death hash. Reset by reset().
+    sub_tick: u64 = 0,
+
     prng: std.Random.DefaultPrng,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, capacity: usize) !*ParticleSystem {
@@ -427,6 +540,10 @@ pub const ParticleSystem = struct {
     pub fn reset(self: *ParticleSystem) void {
         self.active_count = 0;
         self.emit_accumulator = 0.0;
+        // Sub-emitter hash stream restarts so a reset system behaves like a
+        // fresh one; the sub-emitter configuration itself persists (like the
+        // emission settings above).
+        self.sub_tick = 0;
         // GPU ring: re-anchor the epoch and drop all slots. Old slot records
         // (if the buffer is not cleared) carry spawn times far ahead of the
         // new epoch, so they cull as unborn (t < 0) in the shader.
@@ -505,8 +622,23 @@ pub const ParticleSystem = struct {
             .lifetime = sample.lifetime,
             .rotation = sample.rotation_deg,
             .angular_velocity = sample.angular_velocity,
+            .sub_depth = 0,
         };
         self.active_count += 1;
+    }
+
+    /// Attaches an on-death child-spawn rule. Fixed inline storage (up to
+    /// `max_sub_emitters`); never allocates. Asserts in Debug when full —
+    /// size the constant, not the heap, if you need more.
+    pub fn addSubEmitter(self: *ParticleSystem, sub: SubEmitter) void {
+        std.debug.assert(self.sub_emitter_count < max_sub_emitters);
+        self.sub_emitter_store[self.sub_emitter_count] = sub;
+        self.sub_emitter_count += 1;
+    }
+
+    /// Attached sub-emitter rules (empty when unused).
+    pub fn subEmitters(self: *const ParticleSystem) []const SubEmitter {
+        return self.sub_emitter_store[0..self.sub_emitter_count];
     }
 
     /// Writes the next ring slot for the GPU path. The ring overwrites the
@@ -518,8 +650,13 @@ pub const ParticleSystem = struct {
         // Slots are provisioned by updateGpu; emissions before the first
         // update (no ring yet) drop instead of allocating on the hot path.
         if (self.capacity == 0 or self.gpu_slots.len < self.capacity) return;
-        const sample = self.sampleSpawn(self.prng.random());
+        self.pushGpuSlot(self.sampleSpawn(self.prng.random()));
+    }
 
+    /// Appends one sampled spawn to the GPU ring. Shared by emitGpuSlot and
+    /// sub-emitter child spawns so both take the same slot layout and upload
+    /// bookkeeping.
+    fn pushGpuSlot(self: *ParticleSystem, sample: SpawnSample) void {
         const cap = self.capacity;
         const c = self.gpu_write_cursor;
         if (!self.gpu_dirty) {
@@ -558,6 +695,100 @@ pub const ParticleSystem = struct {
         }
     }
 
+    /// Spawns one sub-emitter child. Lifetime/rotation/color come from the
+    /// child system's own sampler (PRNG order stays serial and
+    /// deterministic); position/velocity blend toward the dead parent per the
+    /// rule. Drops when full (CPU) or unprovisioned (GPU ring), same policy
+    /// as the matching emit path. A `.gpu` child accepts the spawn into its
+    /// slot ring (stateless: depth untracked, chains stop there).
+    fn emitChild(
+        self: *ParticleSystem,
+        spawn_pos: Vec3,
+        parent_velocity: Vec3,
+        inherit_velocity: f32,
+        inherit_position: bool,
+        depth: u8,
+    ) void {
+        const sample = self.sampleSpawn(self.prng.random());
+        const velocity = parent_velocity.scale(inherit_velocity).add(sample.velocity.scale(1.0 - inherit_velocity));
+        if (self.simulation_mode == .gpu) {
+            if (self.capacity == 0 or self.gpu_slots.len < self.capacity) return;
+            self.pushGpuSlot(.{
+                .position = if (inherit_position) spawn_pos else sample.position,
+                .velocity = velocity,
+                .lifetime = sample.lifetime,
+                .rotation_deg = sample.rotation_deg,
+                .angular_velocity = sample.angular_velocity,
+            });
+            return;
+        }
+        if (self.active_count >= self.capacity) return;
+        self.particles[self.active_count] = .{
+            .position = if (inherit_position) spawn_pos else sample.position,
+            .velocity = velocity,
+            .size = self.size_start,
+            .size_end = self.size_end,
+            .color = self.color_start,
+            .color_end = self.color_end,
+            .age = 0.0,
+            .lifetime = sample.lifetime,
+            .rotation = sample.rotation_deg,
+            .angular_velocity = sample.angular_velocity,
+            .sub_depth = depth,
+        };
+        self.active_count += 1;
+    }
+
+    /// Record of one death for the serial sub-emitter pass: copied out during
+    /// compaction so firing (which may append to this same system for
+    /// self-emitters) never runs while the array is being compacted.
+    const DeathEvent = struct {
+        position: Vec3,
+        velocity: Vec3,
+        depth: u8,
+    };
+
+    /// Serial on-death pass over the deaths recorded by the compaction loop.
+    /// Runs between compaction (phase B) and instance fill (phase C) so
+    /// self-spawned children land in valid instance data the same tick.
+    /// Bounded: at most `max_sub_emitter_spawns_per_tick` children per call.
+    fn fireSubEmitters(self: *ParticleSystem, deaths: []const DeathEvent) void {
+        var spawned_total: usize = 0;
+        var di: usize = 0;
+        while (di < deaths.len) : (di += 1) {
+            const d = deaths[di];
+            // Chain rule: deep-enough deaths spawn nothing.
+            if (d.depth >= max_sub_emitter_depth) continue;
+            const child_depth = d.depth + 1;
+            for (self.sub_emitter_store[0..self.sub_emitter_count], 0..) |sub, ei| {
+                if (sub.trigger != .on_death) continue;
+                const probability = std.math.clamp(sub.probability, 0.0, 1.0);
+                if (probability <= 0.0) continue;
+                if (probability < 1.0) {
+                    const roll = hash01(subHash(self.sub_emitter_seed, self.sub_tick, di, ei, 0));
+                    if (roll >= probability) continue;
+                }
+                const inherit_velocity = std.math.clamp(sub.inherit_velocity, 0.0, 1.0);
+                const radius = @max(sub.spawn_radius, 0.0);
+                var k: u32 = 0;
+                while (k < sub.count) : (k += 1) {
+                    if (spawned_total >= max_sub_emitter_spawns_per_tick) return;
+                    var spawn_pos = d.position;
+                    if (sub.inherit_position and radius > 0.0) {
+                        var js: u64 = subHash(self.sub_emitter_seed, self.sub_tick, di, ei, 1 + @as(u64, k));
+                        spawn_pos = spawn_pos.add(Vec3.new(
+                            (hash01(splitmix64(&js)) * 2.0 - 1.0) * radius,
+                            (hash01(splitmix64(&js)) * 2.0 - 1.0) * radius,
+                            (hash01(splitmix64(&js)) * 2.0 - 1.0) * radius,
+                        ));
+                    }
+                    sub.system.emitChild(spawn_pos, d.velocity, inherit_velocity, sub.inherit_position, child_depth);
+                    spawned_total += 1;
+                }
+            }
+        }
+    }
+
     /// Emitter world matrix for local-space rendering, or null when world-space
     /// rendering applies (local_space == false or no emitter_mesh bound).
     /// With local_space == true but emitter_mesh == null the local coordinates
@@ -574,6 +805,9 @@ pub const ParticleSystem = struct {
     ///   A (parallel)  — age + integrate every live slot exactly once,
     ///                   recording survival in `alive_scratch`;
     ///   B (serial)    — legacy swap-compaction of dead slots;
+    ///   B2 (serial)   — on-death sub-emitter spawns, only when sub-emitters
+    ///                   are attached AND deaths were recorded (skipped
+    ///                   entirely otherwise: no PRNG draws, no state touched);
     ///   C (parallel)  — fill render instance data for the compacted range.
     /// Each slot is touched only through its own index in A and C, so no
     /// locks are needed; emission (PRNG-driven) stays serial up front.
@@ -597,11 +831,23 @@ pub const ParticleSystem = struct {
         jobs.parallelFor(pool, IntegrateCtx, &ictx, integrateRange, self.active_count);
 
         // Phase B: compact. Same swap-with-last recycling as the legacy
-        // loop (dead slot at i replaced by the last integrated slot).
+        // loop (dead slot at i replaced by the last integrated slot). When
+        // sub-emitters are attached, deaths are additionally recorded (up to
+        // the per-tick bound) for the serial fire pass below; the recording
+        // touches no simulation state, so the legacy path is untouched when
+        // sub_emitter_count == 0.
         const alive = self.alive_scratch;
+        var deaths: [max_sub_emitter_spawns_per_tick]DeathEvent = undefined;
+        var death_count: usize = 0;
+        const want_deaths = self.sub_emitter_count > 0;
         var i: usize = 0;
         while (i < self.active_count) {
             if (alive[i] == 0) {
+                if (want_deaths and death_count < deaths.len) {
+                    const d = self.particles[i];
+                    deaths[death_count] = .{ .position = d.position, .velocity = d.velocity, .depth = d.sub_depth };
+                    death_count += 1;
+                }
                 self.active_count -= 1;
                 if (i < self.active_count) {
                     self.particles[i] = self.particles[self.active_count];
@@ -613,6 +859,12 @@ pub const ParticleSystem = struct {
             }
             i += 1;
         }
+
+        // Phase B2: on-death sub-emitters (serial, deterministic death order).
+        // Post-compaction so self-emitter appends are safe; pre-fill so
+        // same-tick children get valid instance data.
+        if (death_count > 0) self.fireSubEmitters(deaths[0..death_count]);
+        self.sub_tick += 1;
 
         // Phase C: render-data fill over the compacted range.
         var fctx = FillCtx{
@@ -1278,4 +1530,287 @@ test "gpu update stages buffer creation without an sg context" {
     ps.flushGpuUploads();
     try std.testing.expectEqual(true, ps.gpu_slot_buffer_pending);
     try std.testing.expectEqual(@as(u32, 0), ps.gpu_slot_buffer.id);
+}
+
+// --- Sub-emitter tests (CPU on-death triggers; headless, deterministic) ---
+
+/// Quiescent test system: no emission, no gravity, zero sampled velocity, so
+/// tests control the live set exactly (manual placement or burst) and deaths
+/// come only from aging past a fixed lifetime.
+fn makeQuiescentSystem(allocator: std.mem.Allocator, capacity: usize) !ParticleSystem {
+    var ps = try makeTestSystem(allocator, capacity);
+    ps.is_emitting = false;
+    ps.emit_rate = 0.0;
+    ps.gravity = Vec3.zero;
+    ps.direction_min = Vec3.zero;
+    ps.direction_max = Vec3.zero;
+    ps.speed_min = 0.0;
+    ps.speed_max = 0.0;
+    ps.lifetime_min = 0.5;
+    ps.lifetime_max = 0.5;
+    return ps;
+}
+
+test "sub-emitter probability 0 never fires, 1 always fires" {
+    const a = std.testing.allocator;
+    var parent = try makeQuiescentSystem(a, 4);
+    defer freeTestSystem(&parent);
+    var child = try makeQuiescentSystem(a, 8);
+    defer freeTestSystem(&child);
+    child.lifetime_min = 10.0;
+    child.lifetime_max = 10.0;
+
+    parent.addSubEmitter(.{ .system = &child, .probability = 0.0, .count = 3 });
+    parent.burst(2);
+    parent.updateCpu(1.0);
+    // Deaths compact away, the zero-probability rule spawns nothing.
+    try std.testing.expectEqual(@as(usize, 0), parent.active_count);
+    try std.testing.expectEqual(@as(usize, 0), child.active_count);
+
+    parent.sub_emitter_store[0].probability = 1.0;
+    parent.burst(2);
+    parent.updateCpu(1.0);
+    // Both deaths fire count=3 each.
+    try std.testing.expectEqual(@as(usize, 0), parent.active_count);
+    try std.testing.expectEqual(@as(usize, 6), child.active_count);
+    // Children are fresh (age 0) with the child system's long lifetime.
+    for (child.particles[0..child.active_count]) |p| {
+        try std.testing.expectEqual(@as(f32, 0.0), p.age);
+        try std.testing.expectEqual(@as(f32, 10.0), p.lifetime);
+        try std.testing.expectEqual(@as(u8, 1), p.sub_depth);
+    }
+}
+
+test "sub-emitter inherits death position and blended velocity" {
+    const a = std.testing.allocator;
+    var parent = try makeQuiescentSystem(a, 4);
+    defer freeTestSystem(&parent);
+    var child = try makeQuiescentSystem(a, 8);
+    defer freeTestSystem(&child);
+    child.lifetime_min = 10.0;
+    child.lifetime_max = 10.0;
+    child.emitter_position = Vec3.new(9.0, 9.0, 9.0);
+
+    parent.addSubEmitter(.{
+        .system = &child,
+        .probability = 1.0,
+        .count = 1,
+        .inherit_velocity = 0.5,
+        .inherit_position = true,
+        .spawn_radius = 0.0,
+    });
+    // Hand-placed death: position/velocity known exactly. The death tick ages
+    // past lifetime WITHOUT integrating position, so the death position is
+    // the stored one verbatim.
+    parent.particles[0] = .{
+        .position = Vec3.new(1.0, 2.0, 3.0),
+        .velocity = Vec3.new(4.0, 0.0, 0.0),
+        .size = 0.2,
+        .size_end = 0.0,
+        .color = Color4.new(1.0, 1.0, 1.0, 1.0),
+        .color_end = Color4.new(1.0, 1.0, 1.0, 0.0),
+        .age = 0.0,
+        .lifetime = 0.5,
+    };
+    parent.active_count = 1;
+    parent.updateCpu(1.0);
+    try std.testing.expectEqual(@as(usize, 1), child.active_count);
+    // Death position inherited verbatim (radius 0); velocity blended
+    // 0.5 * parent + 0.5 * sampled(0,0,0) = (2,0,0).
+    try std.testing.expectEqual(Vec3.new(1.0, 2.0, 3.0), child.particles[0].position);
+    try std.testing.expectEqual(Vec3.new(2.0, 0.0, 0.0), child.particles[0].velocity);
+
+    // Full inheritance keeps the whole parent velocity.
+    parent.sub_emitter_store[0].inherit_velocity = 1.0;
+    parent.particles[0] = child.particles[0];
+    parent.particles[0].age = 0.0;
+    parent.particles[0].lifetime = 0.5;
+    parent.particles[0].sub_depth = 0;
+    parent.active_count = 1;
+    child.active_count = 0;
+    parent.updateCpu(1.0);
+    try std.testing.expectEqual(Vec3.new(2.0, 0.0, 0.0), child.particles[0].velocity);
+
+    // Zero inheritance uses the child system's own sampled velocity (0 here).
+    parent.sub_emitter_store[0].inherit_velocity = 0.0;
+    parent.particles[0].velocity = Vec3.new(4.0, 0.0, 0.0);
+    parent.particles[0].age = 0.0;
+    parent.active_count = 1;
+    child.active_count = 0;
+    parent.updateCpu(1.0);
+    try std.testing.expectEqual(Vec3.zero, child.particles[0].velocity);
+
+    // inherit_position=false keeps the child system's sampled spawn (9,9,9).
+    parent.sub_emitter_store[0].inherit_position = false;
+    parent.particles[0].age = 0.0;
+    parent.active_count = 1;
+    child.active_count = 0;
+    parent.updateCpu(1.0);
+    try std.testing.expectEqual(Vec3.new(9.0, 9.0, 9.0), child.particles[0].position);
+
+    // Radius jitter stays inside the cube half-extent per component.
+    parent.sub_emitter_store[0].inherit_position = true;
+    parent.sub_emitter_store[0].spawn_radius = 2.0;
+    parent.particles[0].age = 0.0;
+    parent.active_count = 1;
+    child.active_count = 0;
+    parent.updateCpu(1.0);
+    const jp = child.particles[0].position;
+    try std.testing.expect(@abs(jp.x - 1.0) <= 2.0);
+    try std.testing.expect(@abs(jp.y - 2.0) <= 2.0);
+    try std.testing.expect(@abs(jp.z - 3.0) <= 2.0);
+}
+
+test "sub-emitter cycle A->B->A extinguishes at the depth bound" {
+    const a = std.testing.allocator;
+    var sys_a = try makeQuiescentSystem(a, 32);
+    defer freeTestSystem(&sys_a);
+    var sys_b = try makeQuiescentSystem(a, 32);
+    defer freeTestSystem(&sys_b);
+    sys_a.lifetime_min = 0.25;
+    sys_a.lifetime_max = 0.25;
+    sys_b.lifetime_min = 0.25;
+    sys_b.lifetime_max = 0.25;
+    sys_a.addSubEmitter(.{ .system = &sys_b, .probability = 1.0, .count = 2 });
+    sys_b.addSubEmitter(.{ .system = &sys_a, .probability = 1.0, .count = 2 });
+
+    sys_a.burst(1);
+    var max_depth_seen: u8 = 0;
+    var frame: usize = 0;
+    while (frame < 30) : (frame += 1) {
+        sys_a.updateCpu(0.5);
+        sys_b.updateCpu(0.5);
+        // Bounded throughout: never exceeds capacity, never hangs.
+        try std.testing.expect(sys_a.active_count <= 32);
+        try std.testing.expect(sys_b.active_count <= 32);
+        for (sys_a.particles[0..sys_a.active_count]) |p| max_depth_seen = @max(max_depth_seen, p.sub_depth);
+        for (sys_b.particles[0..sys_b.active_count]) |p| max_depth_seen = @max(max_depth_seen, p.sub_depth);
+    }
+    // The chain fired (generations beyond the seed existed) but the depth
+    // rule extinguished it: depth-4 deaths spawn nothing, so both systems
+    // drain instead of ping-ponging forever.
+    try std.testing.expect(max_depth_seen > 0);
+    try std.testing.expect(max_depth_seen <= max_sub_emitter_depth);
+    try std.testing.expectEqual(@as(usize, 0), sys_a.active_count);
+    try std.testing.expectEqual(@as(usize, 0), sys_b.active_count);
+}
+
+test "sub-emitter self-cycle terminates at the depth bound" {
+    const a = std.testing.allocator;
+    var ps = try makeQuiescentSystem(a, 64);
+    defer freeTestSystem(&ps);
+    ps.lifetime_min = 0.25;
+    ps.lifetime_max = 0.25;
+    ps.addSubEmitter(.{ .system = &ps, .probability = 1.0, .count = 1 });
+
+    ps.burst(1);
+    var max_depth_seen: u8 = 0;
+    var frame: usize = 0;
+    while (frame < 15) : (frame += 1) {
+        ps.updateCpu(0.5);
+        try std.testing.expect(ps.active_count <= 64);
+        for (ps.particles[0..ps.active_count]) |p| max_depth_seen = @max(max_depth_seen, p.sub_depth);
+    }
+    // One seed -> one depth-1 child -> ... -> depth-4 deaths spawn nothing.
+    try std.testing.expectEqual(max_sub_emitter_depth, max_depth_seen);
+    try std.testing.expectEqual(@as(usize, 0), ps.active_count);
+}
+
+test "sub-emitter plumbing is bit-identical when nothing fires" {
+    const a = std.testing.allocator;
+    var baseline = try makeTestSystem(a, 64);
+    defer freeTestSystem(&baseline);
+    var plumbed = try makeTestSystem(a, 64);
+    defer freeTestSystem(&plumbed);
+    var child = try makeQuiescentSystem(a, 64);
+    defer freeTestSystem(&child);
+    child.lifetime_min = 10.0;
+    child.lifetime_max = 10.0;
+    for ([2]*ParticleSystem{ &baseline, &plumbed }) |ps| {
+        ps.gravity = Vec3.new(0.0, -3.0, 0.0);
+        ps.emit_rate = 120.0;
+        ps.is_emitting = true;
+        ps.lifetime_min = 0.5;
+        ps.lifetime_max = 1.0;
+    }
+    // Attached but probability 0: the record+roll path executes on every
+    // death yet must perturb neither the parent stream nor the child.
+    plumbed.addSubEmitter(.{ .system = &child, .probability = 0.0, .count = 2 });
+
+    var frame: usize = 0;
+    while (frame < 60) : (frame += 1) {
+        baseline.updateCpu(1.0 / 60.0);
+        plumbed.updateCpu(1.0 / 60.0);
+        try std.testing.expectEqual(baseline.active_count, plumbed.active_count);
+        const live = baseline.active_count;
+        try std.testing.expect(live > 0);
+        try std.testing.expect(std.mem.eql(
+            u8,
+            std.mem.sliceAsBytes(baseline.particles[0..live]),
+            std.mem.sliceAsBytes(plumbed.particles[0..live]),
+        ));
+        try std.testing.expect(std.mem.eql(
+            u8,
+            std.mem.sliceAsBytes(baseline.instances[0..live]),
+            std.mem.sliceAsBytes(plumbed.instances[0..live]),
+        ));
+    }
+    // Deaths happened (the roll path ran) but the child stayed empty.
+    try std.testing.expect(baseline.sub_tick > 0);
+    try std.testing.expectEqual(plumbed.sub_tick, baseline.sub_tick);
+    try std.testing.expectEqual(@as(usize, 0), child.active_count);
+}
+
+test "sub-emitter per-tick spawn bound" {
+    const a = std.testing.allocator;
+    var parent = try makeQuiescentSystem(a, 1024);
+    defer freeTestSystem(&parent);
+    var child = try makeQuiescentSystem(a, 4096);
+    defer freeTestSystem(&child);
+    child.lifetime_min = 10.0;
+    child.lifetime_max = 10.0;
+    // 512 deaths x count 4 = 2048 potential spawns, child capacity is not
+    // the limiter (4096) — the per-tick bound is.
+    parent.addSubEmitter(.{ .system = &child, .probability = 1.0, .count = 4 });
+    parent.burst(512);
+    try std.testing.expectEqual(@as(usize, 512), parent.active_count);
+    parent.updateCpu(1.0);
+    try std.testing.expectEqual(@as(usize, 0), parent.active_count);
+    try std.testing.expectEqual(max_sub_emitter_spawns_per_tick, child.active_count);
+}
+
+test "sub-emitter spawns into a gpu child slot ring" {
+    const a = std.testing.allocator;
+    var parent = try makeQuiescentSystem(a, 4);
+    defer freeTestSystem(&parent);
+    var child = try makeQuiescentSystem(a, 4);
+    defer freeTestSystem(&child);
+    child.simulation_mode = .gpu;
+    child.lifetime_min = 10.0;
+    child.lifetime_max = 10.0;
+    // Provision the ring without emitting (steady clock, no emission).
+    try child.updateGpu(0.0);
+
+    parent.addSubEmitter(.{ .system = &child, .probability = 1.0, .count = 1 });
+    parent.particles[0] = .{
+        .position = Vec3.new(1.0, 2.0, 3.0),
+        .velocity = Vec3.new(4.0, 0.0, 0.0),
+        .size = 0.2,
+        .size_end = 0.0,
+        .color = Color4.new(1.0, 1.0, 1.0, 1.0),
+        .color_end = Color4.new(1.0, 1.0, 1.0, 0.0),
+        .age = 0.0,
+        .lifetime = 0.5,
+    };
+    parent.active_count = 1;
+    parent.updateCpu(1.0);
+    // One slot written at the death position with the inherited velocity
+    // (0.5 * (4,0,0) + 0.5 * sampled(0,0,0) = (2,0,0)).
+    try std.testing.expectEqual(@as(usize, 1), child.gpu_high_water);
+    try std.testing.expectEqual(@as(f32, 1.0), child.gpu_slots[0].spawn_pos_time[0]);
+    try std.testing.expectEqual(@as(f32, 2.0), child.gpu_slots[0].spawn_pos_time[1]);
+    try std.testing.expectEqual(@as(f32, 3.0), child.gpu_slots[0].spawn_pos_time[2]);
+    try std.testing.expectEqual(@as(f32, 2.0), child.gpu_slots[0].velocity_lifetime[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), child.gpu_slots[0].velocity_lifetime[1]);
+    try std.testing.expectEqual(@as(f32, 10.0), child.gpu_slots[0].velocity_lifetime[3]);
 }
