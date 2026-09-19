@@ -20,6 +20,7 @@ pub const pickOrthogonal = tangents.pickOrthogonal;
 pub const mesh_impl = @import("mesh/mesh.zig");
 pub const Mesh = mesh_impl.Mesh;
 pub const InstanceRenderState = mesh_impl.InstanceRenderState;
+pub const InstancePreviewState = mesh_impl.InstancePreviewState;
 pub const uploadGeometry = mesh_impl.uploadGeometry;
 
 /// GPU morph blending: delta-texture packing plus the pure Zig mirror of

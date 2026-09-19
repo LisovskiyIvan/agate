@@ -39,6 +39,12 @@
 // (phase_mutex update-vs-prepare + границы prepare/render), а не поточечная;
 // update_ms/статистика и pending тик — РАЗНЫЕ поля, поэтому update||render
 // не делят ни одного слова памяти.
+//
+// Stage 1 producer build (`Scene.buildPreparedFrame`, game/update side)
+// intentionally writes NO stats here — not even counters: stats stay
+// context-owned (prepare/render), and the build's `build_seq` counters live
+// on Scene/the subsystems, never in this struct. A concurrent update must
+// never observe a half-written stats word while render reads it.
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
     rendered_meshes: u32 = 0,

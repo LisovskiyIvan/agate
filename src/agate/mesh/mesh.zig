@@ -64,6 +64,41 @@ pub const InstanceRenderState = struct {
     staged_frame: u64 = std.math.maxInt(u64),
 };
 
+/// CPU-side per-mesh preview of the last game-side build (stage 1 producer
+/// handoff, `Scene.buildPreparedFrame`): small plain data only — combined
+/// bounds, visible count, matrix-bytes hash, the producing build_seq, and the
+/// segment offset into the back-slot staging scratch where this mesh's
+/// matrices land ([scratch_lo, scratch_lo + count)). The matrix bytes
+/// themselves live ONLY in the scratch, never here.
+///
+/// Ownership: written on the game/update side by `stageInstancesCpu` (sg-free,
+/// any non-pool thread under update-vs-prepare exclusion), consumed on the
+/// context side by `stageInstancesGpu` during the prepare latch. Plain
+/// fields, no atomics (phase ownership, like `instance_render`). The GPU
+/// handles stay borrowed under the P3 epochs — no lifetime change.
+///
+/// Coherence: a failed build segment (scratch OOM) leaves the previous
+/// preview in place (`build_seq` NOT advanced for that mesh), so the latch
+/// skips it and the previous complete `instance_render` stands; the next
+/// funded build recomputes and the next latch consumes. An all-hidden mesh
+/// records a coherent empty preview (invalid bounds, count 0), which the
+/// latch publishes — never a stale prior frame.
+pub const InstancePreviewState = struct {
+    /// Combined world AABB of the staged visible instances (invalid when
+    /// none). Same type the shadow/view readers consume from
+    /// `instance_render.bounds` — the latch publishes this value there.
+    bounds: BoundingBox = BoundingBox.zero,
+    /// Visible instance count staged by the build (draw count).
+    count: u32 = 0,
+    /// Wyhash of the staged matrix bytes (feeds the GPU upload dedup gate).
+    hash: u64 = 0,
+    /// Scene `build_seq` that produced this preview (0 = never built).
+    build_seq: u64 = 0,
+    /// Offset of this mesh's matrix segment into the back-slot staging
+    /// scratch (`draws.backSlot().primary.instance_matrices`).
+    scratch_lo: usize = 0,
+};
+
 pub const Mesh = struct {
     id: u64 = 0,
     name: []const u8,
@@ -125,8 +160,11 @@ pub const Mesh = struct {
     // Instancing support: live game objects plus the render-owned
     // published state (P5). Mesh.instances and the InstancedMesh TRS/game
     // APIs are unchanged; staging publishes into instance_render only.
+    // instance_preview is the game-side CPU preview feeding the stage 1
+    // build→latch handoff (plain data, no GPU handles, no deinit needed).
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
     instance_render: InstanceRenderState = .{},
+    instance_preview: InstancePreviewState = .{},
     // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
     cached_matrix: Mat4 = Mat4.identity,
     cached_aabb: BoundingBox = BoundingBox.zero,
