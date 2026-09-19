@@ -2,6 +2,8 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 
+const texture_mod = @import("texture.zig");
+
 pub const TonemappingType = enum(u32) {
     none = 0,
     aces = 1,
@@ -20,21 +22,20 @@ pub const BLOOM_MAX_MIPS: usize = 7;
 pub const DOF_GOLDEN_ANGLE: f32 = 2.3999632;
 pub const DOF_TAPS: u32 = 14;
 
-// LUT color grading (2D strip): an N^3 color cube packed as an N*N wide,
-// N tall RGBA8 image. N is the cube edge; 32 (1024x32) and 64 (4096x64)
-// are the sizes the engine validates. The cap keeps the blue-derived
-// layer math comfortably exact in f32 and stops absurd uploads.
+// LUT color grading (2D strip, Babylon.js ColorGradingTexture parity): an
+// N^3 color cube packed as an N*N wide, N tall RGBA8 image. N is the cube
+// edge; 16 (256x16) and 32 (1024x32) are the recommended sizes, the math
+// stays generic over 2..64. The cap keeps the blue-derived layer math
+// comfortably exact in f32 and stops absurd uploads.
 pub const LUT_SIZE_MIN: u32 = 2;
 pub const LUT_SIZE_MAX: u32 = 64;
 
-/// GPU binding for a LUT strip texture: a texture view into an N*N x N
-/// RGBA8 image plus the cube edge N. Handles only — decode/upload stays
-/// with the parent via the public texture.zig API (Texture.fromFile with
-/// mipmaps=false, CLAMP_TO_EDGE wraps, then validate the strip with
-/// lutStripLayout before building this).
-pub const LutBinding = struct {
-    view: sg.View = .{},
-    size: u32 = 0,
+/// LUT texture packing. Only the 2D strip is supported (an N*N x N RGBA8
+/// image uploaded with mipmaps=false and CLAMP_TO_EDGE wraps); the enum
+/// exists so future packings (3D texture, .cube decode) extend here rather
+/// than in PostProcessOptions.
+pub const LutFormat = enum(u8) {
+    strip_2d = 0,
 };
 
 /// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
@@ -80,12 +81,18 @@ pub const PostProcessOptions = struct {
     grade_midtones: [3]f32 = .{ 0.0, 0.0, 0.0 },
     grade_highlights: [3]f32 = .{ 0.0, 0.0, 0.0 },
 
-    // Texture LUT color grading, sampled after the parametric curves.
-    // With lut == null (the default) the shader skips the LUT branch
-    // entirely and the composite path stays bit-identical to pre-LUT.
-    lut: ?LutBinding = null,
+    // Texture LUT color grading (Babylon.js parity), sampled after the
+    // parametric curves. With lut_texture == null (the default) the shader
+    // skips the LUT branch entirely and the composite path stays
+    // bit-identical to pre-LUT. The handle is a by-value Texture (plain
+    // GPU handles, no CPU refs), so the whole struct — including the LUT —
+    // copies into SceneFrameSnapshot.post_process with a plain assignment
+    // (scene.zig packFrameSnapshot) and needs no snapshot-side support.
     lut_enabled: bool = false,
-    lut_intensity: f32 = 1.0,
+    lut_strength: f32 = 1.0,
+    lut_size: u8 = 16,
+    lut_format: LutFormat = .strip_2d,
+    lut_texture: ?texture_mod.Texture = null,
 
     // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
     fxaa_enabled: bool = true,
@@ -138,14 +145,40 @@ pub const PostProcessOptions = struct {
         out.grade_shadows = clampGrade(self.grade_shadows);
         out.grade_midtones = clampGrade(self.grade_midtones);
         out.grade_highlights = clampGrade(self.grade_highlights);
-        out.lut_intensity = std.math.clamp(self.lut_intensity, 0.0, 1.0);
-        // A binding without a live view or supported size can never be
-        // sampled; drop it so the pass keeps its no-LUT path instead of
-        // binding a dead handle.
-        if (out.lut) |lut| {
-            if (lut.view.id == 0 or !validLutSize(lut.size)) out.lut = null;
+        out.lut_strength = std.math.clamp(self.lut_strength, 0.0, 1.0);
+        // A binding without a live view, a supported size, or matching
+        // strip dims can never be sampled; drop it so the pass keeps its
+        // no-LUT path instead of binding a dead handle.
+        if (out.lut_texture) |tex| {
+            if (!lutTextureValid(tex, out.lut_size)) out.lut_texture = null;
         }
         return out;
+    }
+
+    /// Bind a 2D-strip LUT texture (Babylon.js parity) and enable grading.
+    /// The strip geometry is validated (width == size*size, height == size,
+    /// live view); invalid input — including null — clears the binding and
+    /// disables grading, so the shader can never sample garbage. Consumed
+    /// per frame by PostFXStack.renderChain via ChainParams.post, which is
+    /// copied from the render-owned SceneFrameSnapshot; that is why the
+    /// setter lives on the config struct and not on PostFXStack.
+    pub fn setColorGradingLut(self: *PostProcessOptions, tex: ?texture_mod.Texture, size: u8) void {
+        if (tex) |t| {
+            if (lutTextureValid(t, size)) {
+                self.lut_texture = t;
+                self.lut_size = size;
+                self.lut_enabled = true;
+                return;
+            }
+        }
+        self.clearColorGradingLut();
+    }
+
+    /// Unbind the LUT and disable grading (back to the bit-identical
+    /// no-LUT composite path).
+    pub fn clearColorGradingLut(self: *PostProcessOptions) void {
+        self.lut_texture = null;
+        self.lut_enabled = false;
     }
 };
 
@@ -166,6 +199,15 @@ pub fn clampGrade(v: [3]f32) [3]f32 {
 // True when `size` is a supported LUT cube edge (strip is N*N x N).
 pub fn validLutSize(size: u32) bool {
     return size >= LUT_SIZE_MIN and size <= LUT_SIZE_MAX;
+}
+
+// True when `tex` can be sampled as a 2D-strip LUT of cube edge `size`:
+// live view plus exact strip dims (width == size*size, height == size).
+pub fn lutTextureValid(tex: texture_mod.Texture, size: u8) bool {
+    if (tex.view.id == 0) return false;
+    const n: u32 = @as(u32, size);
+    if (!validLutSize(n)) return false;
+    return tex.width == n * n and tex.height == n;
 }
 
 // Validated 2D strip geometry for one LUT.
@@ -232,6 +274,16 @@ pub fn lutStripUv(r: f32, g: f32, b: f32, size: u32) LutStripSample {
     };
 }
 
+// Single-layer strip uv for one color lookup: the per-slice coordinate of
+// the 2D-strip formula (u = (b*size + r + 0.5)/(size*size),
+// v = (g + 0.5)/size, up to the texel-center quantization used here). This
+// is uv0 of lutStripUv for the floor(b) layer; the full trilinear path
+// (lutStripUv + applyLutStrip) lerps toward the next layer explicitly
+// because hardware bilinear only interpolates r/g inside one slice.
+pub fn lutSampleUv(r: f32, g: f32, b: f32, size: u32) [2]f32 {
+    return lutStripUv(r, g, b, size).uv0;
+}
+
 // Final LUT blend. Mirrors applyLut in postprocess.glsl: mix the two
 // sampled layers by the trilinear weight, then blend the graded color
 // back toward the curve-graded input by `intensity` in [0, 1].
@@ -255,20 +307,64 @@ pub fn applyLutStrip(
     };
 }
 
-// Pack the shader lut_params vec4: (enabled 1/0, intensity, size N, 0).
-// Anything that cannot sample — no binding, dead view, bad size, disabled
-// flag — packs all zeros, which is exactly the pre-LUT uniform state, so
-// the no-LUT path stays unchanged. Kept beside the Zig LUT math so tests
-// pin what postprocess_pass uploads.
+fn quantizeLutChannel(v: u32, denom: f32) u8 {
+    const f: f32 = @floatFromInt(v);
+    return @intFromFloat(@round(f / denom * 255.0));
+}
+
+// Fill `buf` with an identity 2D-strip LUT for cube edge `size`: texel
+// (column b*size + r, row g) stores the lattice color
+// (r/(size-1), g/(size-1), b/(size-1), opaque). CPU-side helper for tests
+// and the sandbox; GPU upload stays with Texture.initRaw using
+// mipmaps=false and CLAMP_TO_EDGE wraps (see the LutFormat note above).
+pub fn writeIdentityLutStrip(buf: []u8, size: u32) !void {
+    if (!validLutSize(size)) return error.InvalidLutStrip;
+    const n: usize = @as(usize, size);
+    if (buf.len != n * n * n * 4) return error.InvalidLutStrip;
+    const denom: f32 = @floatFromInt(size - 1);
+    var b: u32 = 0;
+    while (b < size) : (b += 1) {
+        var g: u32 = 0;
+        while (g < size) : (g += 1) {
+            var r: u32 = 0;
+            while (r < size) : (r += 1) {
+                const x: usize = @as(usize, b * size + r);
+                const y: usize = @as(usize, g);
+                const off = (y * n * n + x) * 4;
+                buf[off] = quantizeLutChannel(r, denom);
+                buf[off + 1] = quantizeLutChannel(g, denom);
+                buf[off + 2] = quantizeLutChannel(b, denom);
+                buf[off + 3] = 255;
+            }
+        }
+    }
+}
+
+/// Allocate and fill an identity 2D-strip LUT (size*size*size*4 RGBA8
+/// bytes) for tests and the sandbox. Caller owns the returned slice.
+pub fn buildIdentityLutStrip(allocator: std.mem.Allocator, size: u32) ![]u8 {
+    if (!validLutSize(size)) return error.InvalidLutStrip;
+    const n: usize = @as(usize, size);
+    const buf = try allocator.alloc(u8, n * n * n * 4);
+    errdefer allocator.free(buf);
+    try writeIdentityLutStrip(buf, size);
+    return buf;
+}
+
+// Pack the shader lut_params vec4: (enabled 1/0, strength, size N, 0).
+// Anything that cannot sample — no binding, dead view, bad size,
+// mismatched strip dims, disabled flag — packs all zeros, which is exactly
+// the pre-LUT uniform state, so the no-LUT path stays unchanged. Kept
+// beside the Zig LUT math so tests pin what postprocess_pass uploads.
 pub fn lutParams(cfg: PostProcessOptions) [4]f32 {
-    const lut = cfg.lut orelse return .{ 0.0, 0.0, 0.0, 0.0 };
-    if (!cfg.lut_enabled or lut.view.id == 0 or !validLutSize(lut.size)) {
+    const tex = cfg.lut_texture orelse return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.lut_enabled or !lutTextureValid(tex, cfg.lut_size)) {
         return .{ 0.0, 0.0, 0.0, 0.0 };
     }
     return .{
         1.0,
-        std.math.clamp(cfg.lut_intensity, 0.0, 1.0),
-        @floatFromInt(lut.size),
+        std.math.clamp(cfg.lut_strength, 0.0, 1.0),
+        @floatFromInt(cfg.lut_size),
         0.0,
     };
 }
@@ -604,38 +700,202 @@ test "lut intensity mix" {
 test "lut params packing and default path" {
     // Defaults: no LUT, disabled — the pre-LUT composite path.
     const def = PostProcessOptions{};
-    try std.testing.expect(def.lut == null);
+    try std.testing.expect(def.lut_texture == null);
     try std.testing.expect(!def.lut_enabled);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def.clamped()));
 
     // A live binding enables the uniform triplet.
-    const live = PostProcessOptions{
-        .lut = .{ .view = .{ .id = 7 }, .size = 32 },
+    var live = PostProcessOptions{
+        .lut_texture = .{
+            .image = .{ .id = 1 },
+            .view = .{ .id = 7 },
+            .sampler = .{ .id = 3 },
+            .width = 1024,
+            .height = 32,
+        },
         .lut_enabled = true,
-        .lut_intensity = 1.0,
+        .lut_size = 32,
+        .lut_strength = 1.0,
     };
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 32.0, 0.0 }, lutParams(live));
 
-    // Intensity packs clamped.
-    var hot = live;
-    hot.lut_intensity = 3.0;
-    try std.testing.expectEqual(@as(f32, 1.0), hot.clamped().lut_intensity);
-    hot.lut_intensity = -0.5;
-    try std.testing.expectEqual(@as(f32, 0.0), hot.clamped().lut_intensity);
+    // Strength packs clamped.
+    live.lut_strength = 3.0;
+    try std.testing.expectEqual(@as(f32, 1.0), live.clamped().lut_strength);
+    live.lut_strength = -0.5;
+    try std.testing.expectEqual(@as(f32, 0.0), live.clamped().lut_strength);
 
-    // clamped() drops bindings that can never sample.
-    const dead = PostProcessOptions{ .lut = .{ .view = .{}, .size = 32 }, .lut_enabled = true };
-    try std.testing.expect(dead.clamped().lut == null);
-    // Any N inside [2, 64] stays (33 is legal, the strip math is generic);
-    // only out-of-range sizes are dropped.
-    const keep = PostProcessOptions{ .lut = .{ .view = .{ .id = 5 }, .size = 33 }, .lut_enabled = true };
-    try std.testing.expect(keep.clamped().lut != null);
-    const bogus = PostProcessOptions{ .lut = .{ .view = .{ .id = 3 }, .size = 100 }, .lut_enabled = true };
-    try std.testing.expect(bogus.clamped().lut == null);
+    // clamped() drops bindings that can never sample: dead view, or strip
+    // dims that do not match the cube edge.
+    var dead = live;
+    dead.lut_texture.?.view.id = 0;
+    try std.testing.expect(dead.clamped().lut_texture == null);
+    var dim_mismatch = live;
+    dim_mismatch.lut_texture.?.width = 100;
+    try std.testing.expect(dim_mismatch.clamped().lut_texture == null);
+    // Any N inside [2, 64] with matching strip dims stays (33 is legal,
+    // the strip math is generic); only out-of-range sizes are dropped.
+    var keep = live;
+    keep.lut_size = 33;
+    keep.lut_texture.?.width = 33 * 33;
+    keep.lut_texture.?.height = 33;
+    try std.testing.expect(keep.clamped().lut_texture != null);
+    var bogus = live;
+    bogus.lut_size = 100;
+    try std.testing.expect(bogus.clamped().lut_texture == null);
 
     // Present but disabled still packs zeros.
     var idle = live;
     idle.lut_enabled = false;
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(idle));
+}
+
+test "color grading LUT setter, clear, and defaults" {
+    const T = texture_mod.Texture;
+    var cfg = PostProcessOptions{};
+    // Defaults: OFF, full strength, 16-edge strip format, no texture —
+    // the pre-LUT composite path.
+    try std.testing.expect(!cfg.lut_enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.lut_strength, 1e-6);
+    try std.testing.expectEqual(@as(u8, 16), cfg.lut_size);
+    try std.testing.expectEqual(LutFormat.strip_2d, cfg.lut_format);
+    try std.testing.expect(cfg.lut_texture == null);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
+
+    // Null and dead bindings clear instead of binding garbage (no GPU
+    // touched here — the setter only copies handles).
+    cfg.setColorGradingLut(null, 16);
+    try std.testing.expect(!cfg.lut_enabled);
+    const dead = T{
+        .image = .{ .id = 1 },
+        .view = .{},
+        .sampler = .{ .id = 3 },
+        .width = 256,
+        .height = 16,
+    };
+    cfg.setColorGradingLut(dead, 16);
+    try std.testing.expect(cfg.lut_texture == null);
+    try std.testing.expect(!cfg.lut_enabled);
+
+    // Wrong strip dims for the size are rejected too.
+    const wrong = T{
+        .image = .{ .id = 1 },
+        .view = .{ .id = 9 },
+        .sampler = .{ .id = 3 },
+        .width = 100,
+        .height = 16,
+    };
+    cfg.setColorGradingLut(wrong, 16);
+    try std.testing.expect(cfg.lut_texture == null);
+    try std.testing.expect(!cfg.lut_enabled);
+
+    // Live 16-strip binds and enables; strength 0 still packs enabled
+    // (the shader-side mix is the no-op) while disabled packs zeros.
+    var tex = T{
+        .image = .{ .id = 1 },
+        .view = .{ .id = 7 },
+        .sampler = .{ .id = 3 },
+        .width = 256,
+        .height = 16,
+    };
+    cfg.setColorGradingLut(tex, 16);
+    try std.testing.expect(cfg.lut_enabled);
+    try std.testing.expectEqual(@as(u8, 16), cfg.lut_size);
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 16.0, 0.0 }, lutParams(cfg));
+    cfg.lut_strength = 0.0;
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 16.0, 0.0 }, lutParams(cfg));
+    cfg.clearColorGradingLut();
+    try std.testing.expect(cfg.lut_texture == null);
+    try std.testing.expect(!cfg.lut_enabled);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
+
+    // 32-strip binds the same way.
+    tex.width = 1024;
+    tex.height = 32;
+    cfg.setColorGradingLut(tex, 32);
+    try std.testing.expect(cfg.lut_enabled);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 32.0, 0.0 }, lutParams(cfg));
+}
+
+test "lut sample uv matches strip formula" {
+    // 2D-strip formula: u = (b*size + r + 0.5)/(size*size),
+    // v = (g + 0.5)/size, evaluated on lattice colors where no inter-slice
+    // lerp applies.
+    const uv = lutSampleUv(0.0, 0.0, 0.0, 16);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5 / 256.0), uv[0], 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5 / 16.0), uv[1], 1e-7);
+
+    // White lands on the last texel center.
+    const w = lutSampleUv(1.0, 1.0, 1.0, 16);
+    try std.testing.expectApproxEqAbs(@as(f32, 255.5 / 256.0), w[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.5 / 16.0), w[1], 1e-6);
+
+    // Equals the floor-layer uv0 of the trilinear sample everywhere.
+    const s = lutStripUv(0.3, 0.6, 0.8, 32);
+    const u = lutSampleUv(0.3, 0.6, 0.8, 32);
+    try std.testing.expectApproxEqAbs(s.uv0[0], u[0], 1e-7);
+    try std.testing.expectApproxEqAbs(s.uv0[1], u[1], 1e-7);
+}
+
+test "identity LUT strip maps color to itself" {
+    const size: u32 = 16;
+    const buf = try buildIdentityLutStrip(std.testing.allocator, size);
+    defer std.testing.allocator.free(buf);
+    try std.testing.expectEqual(@as(usize, 16 * 16 * 16 * 4), buf.len);
+
+    // Corners: black texel at (0, 0), white at (255, 15).
+    try std.testing.expectEqual(@as(u8, 0), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0), buf[1]);
+    try std.testing.expectEqual(@as(u8, 0), buf[2]);
+    try std.testing.expectEqual(@as(u8, 255), buf[3]);
+    const woff: usize = (15 * 256 + 255) * 4;
+    try std.testing.expectEqual(@as(u8, 255), buf[woff]);
+    try std.testing.expectEqual(@as(u8, 255), buf[woff + 1]);
+    try std.testing.expectEqual(@as(u8, 255), buf[woff + 2]);
+    try std.testing.expectEqual(@as(u8, 255), buf[woff + 3]);
+
+    // Bad sizes and short buffers are hard errors, never silent garbage.
+    try std.testing.expectError(error.InvalidLutStrip, buildIdentityLutStrip(std.testing.allocator, 1));
+    var tiny = [_]u8{0} ** 16;
+    try std.testing.expectError(error.InvalidLutStrip, writeIdentityLutStrip(&tiny, 16));
+
+    // Round-trip sample colors through the strip bytes: quantize to the
+    // lattice, read the stored texel, compare in f32. Error stays under
+    // half a lattice step plus byte rounding.
+    const samples = [_][3]f32{
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .{ 1.0, 0.0, 0.0 },
+        .{ 0.5, 0.25, 0.75 },
+        .{ 0.13, 0.87, 0.42 },
+    };
+    const step: f32 = 1.0 / 15.0;
+    for (samples) |c| {
+        const ri: u32 = @intFromFloat(@round(std.math.clamp(c[0], 0.0, 1.0) * 15.0));
+        const gi: u32 = @intFromFloat(@round(std.math.clamp(c[1], 0.0, 1.0) * 15.0));
+        const bi: u32 = @intFromFloat(@round(std.math.clamp(c[2], 0.0, 1.0) * 15.0));
+        const off: usize = @as(usize, gi * 256 + bi * 16 + ri) * 4;
+        const back = [3]f32{
+            @as(f32, @floatFromInt(buf[off])) / 255.0,
+            @as(f32, @floatFromInt(buf[off + 1])) / 255.0,
+            @as(f32, @floatFromInt(buf[off + 2])) / 255.0,
+        };
+        try std.testing.expectApproxEqAbs(c[0], back[0], step * 0.5 + 0.003);
+        try std.testing.expectApproxEqAbs(c[1], back[1], step * 0.5 + 0.003);
+        try std.testing.expectApproxEqAbs(c[2], back[2], step * 0.5 + 0.003);
+
+        // The sampling math points at the same texel: lutSampleUv of the
+        // quantized color lands on the texel center.
+        const q = [3]f32{
+            @as(f32, @floatFromInt(ri)) / 15.0,
+            @as(f32, @floatFromInt(gi)) / 15.0,
+            @as(f32, @floatFromInt(bi)) / 15.0,
+        };
+        const uv = lutSampleUv(q[0], q[1], q[2], size);
+        const cx = (@as(f32, @floatFromInt(bi * 16 + ri)) + 0.5) / 256.0;
+        const cy = (@as(f32, @floatFromInt(gi)) + 0.5) / 16.0;
+        try std.testing.expectApproxEqAbs(cx, uv[0], 1e-5);
+        try std.testing.expectApproxEqAbs(cy, uv[1], 1e-5);
+    }
 }

@@ -262,7 +262,7 @@ pub const PostProcessPass = struct {
         // LUT when the config carries a live binding; otherwise the resolved
         // scene view as a valid placeholder the shader never samples
         // (lut_params.x = 0 gates the LUT branch off).
-        const lut_view: sg.View = if (config.lut) |l| l.view else .{};
+        const lut_view: sg.View = if (config.lut_texture) |t| t.view else .{};
         post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
             lut_view
         else
