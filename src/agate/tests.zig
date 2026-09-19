@@ -127,6 +127,7 @@ test {
     _ = @import("scene/sky_layer.zig");
     _ = @import("scene/snapshot.zig");
     _ = @import("scene/stats.zig");
+    _ = @import("scene/tests.zig");
     _ = @import("scene/trail_layer.zig");
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
