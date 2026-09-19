@@ -79,6 +79,7 @@ pub fn drawRegularItem(
     current_pipeline_id: *u32,
     skins: []const [MAX_BONES]Mat4,
     shaders: []const material_mod.ShaderDrawSnapshot,
+    coats: []const material_mod.CoatParams,
 ) void {
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
@@ -159,6 +160,7 @@ pub fn drawRegularItem(
         }
 
         const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
+        const coat = resolveCoat(coats, item.coat_index);
         const fs_params = pbr_shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
@@ -172,6 +174,10 @@ pub fn drawRegularItem(
             .uv_matrix = rec.uv_matrices,
             .uv_offset = rec.uv_offsets,
             .channel_selectors = rec.channel_selectors,
+            .clearcoat_factors = coat.clearcoat_factors,
+            .clearcoat_color = coat.clearcoat_color,
+            .sheen_factors = coat.sheen_factors,
+            .sheen_color = coat.sheen_color,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -336,6 +342,11 @@ fn drawShaderMaterialItem(
                 .uv_matrix = identityUvMatrices(),
                 .uv_offset = identityUvOffsets(),
                 .channel_selectors = pbrChannelSelectors(null),
+                // Hook materials carry no coat/fabric layers: neutral-disabled.
+                .clearcoat_factors = material_mod.CoatParams.neutral.clearcoat_factors,
+                .clearcoat_color = material_mod.CoatParams.neutral.clearcoat_color,
+                .sheen_factors = material_mod.CoatParams.neutral.sheen_factors,
+                .sheen_color = material_mod.CoatParams.neutral.sheen_color,
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -439,6 +450,14 @@ fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_sha
     return &fallback_uniforms;
 }
 
+// Resolves the coat/fabric factors for a draw: the owned side-table copy by
+// index, CoatParams.neutral when the lobe is off (null) or the index is
+// stale (unreachable via the builders). Pure (no GPU calls).
+fn resolveCoat(coats: []const material_mod.CoatParams, index: ?u32) material_mod.CoatParams {
+    if (render_queue.coatAt(coats, index)) |cp| return cp.*;
+    return material_mod.CoatParams.neutral;
+}
+
 // Builds the module-specific VsMorph struct (identical layout in all three
 // forward shader modules) from the packed per-draw values.
 fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMorph {
@@ -529,7 +548,7 @@ pub fn instancedDrawFlags(material: ?Material, is_decal: bool) struct { transpar
 // binds morph resources, so a morph mesh placed in an instanced queue
 // renders its base pose. CPU mode (the default) is unaffected: instanced
 // meshes share the already-blended dynamic vertex buffer.
-pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, ctx: *const FrameContext, current_pipeline_id: *u32) void {
+pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, ctx: *const FrameContext, current_pipeline_id: *u32, coats: []const material_mod.CoatParams) void {
     if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return;
 
     const is_pbr = batch.is_pbr;
@@ -579,6 +598,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         sg.applyUniforms(inst_pbr_shd.UB_vs_params, sg.asRange(&inst_vs));
 
         const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
+        const coat = resolveCoat(coats, batch.coat_index);
         const inst_fs = inst_pbr_shd.FsParams{
             .eye_pos = f.eye_pos,
             .light_dir = f.light_dir,
@@ -605,6 +625,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .uv_matrix = rec.uv_matrices,
             .uv_offset = rec.uv_offsets,
             .channel_selectors = rec.channel_selectors,
+            .clearcoat_factors = coat.clearcoat_factors,
+            .clearcoat_color = coat.clearcoat_color,
+            .sheen_factors = coat.sheen_factors,
+            .sheen_color = coat.sheen_color,
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {
@@ -671,6 +695,10 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
             if (!@hasField(P, "channel_selectors")) @compileError("FsParams missing channel_selectors");
+            if (!@hasField(P, "clearcoat_factors")) @compileError("FsParams missing clearcoat_factors");
+            if (!@hasField(P, "clearcoat_color")) @compileError("FsParams missing clearcoat_color");
+            if (!@hasField(P, "sheen_factors")) @compileError("FsParams missing sheen_factors");
+            if (!@hasField(P, "sheen_color")) @compileError("FsParams missing sheen_color");
         }
     }
     // Standard family: one diffuse slot.
@@ -680,6 +708,34 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
         }
     }
+}
+
+test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
+    // drawRegularItem builds one pbr_shd.FsParams value and uploads it to
+    // either UB_fs_params slot (regular or skinned); the structs must stay
+    // field- and size-identical or the skinned upload would misread.
+    try std.testing.expectEqual(@sizeOf(pbr_shd.FsParams), @sizeOf(skinned_pbr_shd.FsParams));
+    try std.testing.expectEqual(@sizeOf(pbr_shd.FsParams), @sizeOf(inst_pbr_shd.FsParams));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clearcoat_factors"), @offsetOf(skinned_pbr_shd.FsParams, "clearcoat_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sheen_color"), @offsetOf(inst_pbr_shd.FsParams, "sheen_color"));
+}
+
+test "resolveCoat falls back to neutral when the lobe is off" {
+    const CoatParams = material_mod.CoatParams;
+    // No entry (lobe off): neutral — intensities zero.
+    const neutral = resolveCoat(&.{}, null);
+    try std.testing.expectEqual(@as(f32, 0.0), neutral.clearcoat_factors[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), neutral.sheen_factors[0]);
+    try std.testing.expectEqual(CoatParams.neutral, neutral);
+
+    // Stale index (unreachable via builders): neutral as well.
+    try std.testing.expectEqual(CoatParams.neutral, resolveCoat(&.{}, 7));
+
+    // Owned entry: values flow through to the uniforms.
+    const owned = [_]CoatParams{.{ .sheen_factors = .{ 0.5, 0.35, 0, 0 } }};
+    const got = resolveCoat(&owned, 0);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.35, 0, 0 }, &got.sheen_factors);
+    try std.testing.expectEqual(CoatParams.neutral, resolveCoat(&owned, 1));
 }
 
 test "pbr uniform packing defaults are identity and glTF conventions" {
