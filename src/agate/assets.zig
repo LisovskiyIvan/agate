@@ -4,7 +4,7 @@
 //! `decodeImageFile` are documented GPU-free and thread-safe); the `sg.*`
 //! upload happens later on the thread that calls `drain`/`drainBudget` —
 //! usually main — via `Texture.fromRaw` (RGBA8) or `Texture.fromRawBlock`
-//! (KTX2 BC7/ASTC, gated by backend support).
+//! (block-compressed KTX2/DDS, gated by backend support).
 //!
 //! Ownership model:
 //!   - `requestFile` allocates a `PendingTexture` and posts the decode.
@@ -80,7 +80,7 @@ pub const PendingTexture = struct {
     targets: std.ArrayListUnmanaged(*?Texture) = .empty,
     allocator: std.mem.Allocator = undefined,
     raw: Texture.RawTexture = .{},
-    /// Block-compressed decode (KTX2 BC7/ASTC): owned per-level slices for
+    /// Block-compressed decode (KTX2/DDS BC/ASTC): owned per-level slices for
     /// Texture.fromRawBlock. Exactly one of `raw` / `block_raw` is populated
     /// per slot (an empty RawTexture has num_levels 0; block uses null).
     block_raw: ?ktx2.RawBlockTexture = null,

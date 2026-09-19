@@ -15,13 +15,17 @@ const CubeTexture = texture.CubeTexture;
 //   - 8-bit UNORM/SRGB formats that map onto the engine's RGBA8 LDR upload
 //     path: R8, R8G8, R8G8B8A8, B8G8R8A8, A8B8G8R8_PACK32 (same LE byte
 //     order as R8G8B8A8). Everything else uncompressed (16F/32F, packed
-//     16-bit, BC1-BC6, ETC/EAC, other ASTC footprints) errors with
+//     16-bit, BC4-BC6, ETC/EAC, other ASTC footprints) errors with
 //     UnsupportedVkFormat.
-//   - block-compressed BC7_UNORM/SRGB (vk 145/146) and ASTC_4x4_UNORM/SRGB
-//     (vk 157/158), uploaded WITHOUT decoding: decodeBlock2D returns owned
-//     per-level slices for Texture.fromRawBlock. No BasisLZ/UASTC, no
-//     supercompression, no CPU mip synthesis (a decoder/encoder pair would
-//     be a new dependency). Cube block files are rejected — only 2D.
+//   - block-compressed BC1_UNORM (vk 133), BC2_UNORM (135),
+//     BC3_UNORM/SRGB (vk 137/138), BC7_UNORM/SRGB (vk 145/146) and
+//     ASTC_4x4_UNORM/SRGB (vk 157/158), uploaded WITHOUT decoding:
+//     decodeBlock2D returns owned per-level slices for
+//     Texture.fromRawBlock. No BasisLZ/UASTC, no supercompression, no CPU
+//     mip synthesis (a decoder/encoder pair would be a new dependency).
+//     Cube block files are rejected — only 2D. The BC1/BC2/BC3 codes also
+//     serve the DDS reader (dds.zig), which decodes into the same
+//     RawBlockTexture.
 //   - full file-provided mip chains (level index, largest level first) and
 //     optional chain generation for single-level files (gen_mipmaps, RGBA8
 //     only — block levels upload exactly as authored).
@@ -107,26 +111,38 @@ pub fn formatFromVk(vk_format: u32) ?Format {
 
 /// Block-compressed formats uploaded WITHOUT decoding (no transcoder
 /// dependency). Vulkan enum numbers (Vulkan registry):
+///   133 = VK_FORMAT_BC1_RGBA_UNORM_BLOCK (DXT1, 4x4, 8 B/block),
+///   135 = VK_FORMAT_BC2_UNORM_BLOCK (DXT3, 4x4, 16 B/block),
+///   137/138 = VK_FORMAT_BC3_UNORM_BLOCK / _SRGB_BLOCK (DXT5, 4x4, 16 B/block),
 ///   145/146 = VK_FORMAT_BC7_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
 ///   157/158 = VK_FORMAT_ASTC_4x4_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block).
-/// BC1/BC3 are deliberately out of scope: each adds two vk codes plus an
-/// sg mapping that must be verified per GPU backend (see report).
+/// BC1/BC2 have no sRGB GPU variant in this sokol checkout (only BC3_SRGBA
+/// and BC7_SRGBA exist), so their _SRGB Vulkan/DXGI counterparts upload as
+/// UNORM — documented on the DDS side (dds.zig), which shares this enum.
+/// BC4/BC5/BC6 stay out of scope (no engine use case yet).
 pub const BlockFormat = enum(u32) {
+    bc1_unorm = 133,
+    bc2_unorm = 135,
+    bc3_unorm = 137,
+    bc3_srgb = 138,
     bc7_unorm = 145,
     bc7_srgb = 146,
     astc_4x4_unorm = 157,
     astc_4x4_srgb = 158,
 
-    /// Texel footprint of one compression block (both families are 4x4).
+    /// Texel footprint of one compression block (all families are 4x4).
     pub fn blockExtent(self: BlockFormat) struct { w: u32, h: u32 } {
         _ = self;
         return .{ .w = 4, .h = 4 };
     }
 
-    /// Storage bytes of one compression block (both families: 16 B).
+    /// Storage bytes of one compression block (BC1 packs two texels per
+    /// byte: 8 B; every other family is 16 B).
     pub fn blockByteSize(self: BlockFormat) usize {
-        _ = self;
-        return 16;
+        return switch (self) {
+            .bc1_unorm => 8,
+            else => 16,
+        };
     }
 
     /// True for the _SRGB variants: sampling must go through the sRGB GPU
@@ -134,7 +150,7 @@ pub const BlockFormat = enum(u32) {
     /// without a decoder.
     pub fn isSrgb(self: BlockFormat) bool {
         return switch (self) {
-            .bc7_srgb, .astc_4x4_srgb => true,
+            .bc3_srgb, .bc7_srgb, .astc_4x4_srgb => true,
             else => false,
         };
     }
@@ -581,8 +597,9 @@ const TestKtx2 = struct {
 
     fn texelBlockSize(self: TestKtx2) usize {
         if (formatFromVk(self.vk_format)) |f| return f.texelBlockSize();
-        // Block payloads align to the 16-byte block (lcm(16, 4) per the
-        // KTX2 mipPadding rule), matching real encoders (toktx/ktx).
+        // Block payloads align to the block size rounded up to 4
+        // (lcm(block, 4) per the KTX2 mipPadding rule: 8 for BC1, 16 for
+        // the other families), matching real encoders (toktx/ktx).
         if (blockFormatFromVk(self.vk_format)) |b| return b.blockByteSize();
         return 4;
     }
@@ -828,7 +845,7 @@ test "decode2D rejects unsupported containers and formats" {
         .{ .name = "BasisLZ", .spec = .{ .width = 1, .height = 1, .supercompression = 1, .level_payloads = &.{&level0} }, .expected = error.UnsupportedSupercompression },
         .{ .name = "Zstandard", .spec = .{ .width = 1, .height = 1, .supercompression = 2, .level_payloads = &.{&level0} }, .expected = error.UnsupportedSupercompression },
         .{ .name = "ZLIB", .spec = .{ .width = 1, .height = 1, .supercompression = 3, .level_payloads = &.{&level0} }, .expected = error.UnsupportedSupercompression },
-        .{ .name = "BC3 (block compressed)", .spec = .{ .vk_format = 135, .width = 4, .height = 4, .level_payloads = &.{&level0} }, .expected = error.UnsupportedVkFormat },
+        .{ .name = "BC2 (block compressed)", .spec = .{ .vk_format = 135, .width = 4, .height = 4, .level_payloads = &.{&level0} }, .expected = error.UnsupportedVkFormat },
         .{ .name = "RGBA16F", .spec = .{ .vk_format = 110, .width = 1, .height = 1, .level_payloads = &.{&level0} }, .expected = error.UnsupportedVkFormat },
         .{ .name = "3D texture", .spec = .{ .width = 2, .height = 2, .depth = 2, .level_payloads = &.{&level0} }, .expected = error.Unsupported3D },
         .{ .name = "texture array", .spec = .{ .width = 1, .height = 1, .layer_count = 2, .level_payloads = &.{&level0} }, .expected = error.UnsupportedLayers },
@@ -913,20 +930,32 @@ test "Texture.decodeMemory routes KTX2 payloads by magic sniff" {
     try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, raw.levels[0].?[0..4].*);
 }
 
-test "blockFormatFromVk covers exactly BC7 and ASTC 4x4" {
+test "blockFormatFromVk covers exactly the BC and ASTC 4x4 subsets" {
+    try testing.expectEqual(BlockFormat.bc1_unorm, blockFormatFromVk(133).?);
+    try testing.expectEqual(BlockFormat.bc2_unorm, blockFormatFromVk(135).?);
+    try testing.expectEqual(BlockFormat.bc3_unorm, blockFormatFromVk(137).?);
+    try testing.expectEqual(BlockFormat.bc3_srgb, blockFormatFromVk(138).?);
     try testing.expectEqual(BlockFormat.bc7_unorm, blockFormatFromVk(145).?);
     try testing.expectEqual(BlockFormat.bc7_srgb, blockFormatFromVk(146).?);
     try testing.expectEqual(BlockFormat.astc_4x4_unorm, blockFormatFromVk(157).?);
     try testing.expectEqual(BlockFormat.astc_4x4_srgb, blockFormatFromVk(158).?);
     try testing.expect(blockFormatFromVk(0) == null); // UNDEFINED
     try testing.expect(blockFormatFromVk(37) == null); // RGBA8 is NOT a block format
-    try testing.expect(blockFormatFromVk(135) == null); // BC3 stays out of scope
+    try testing.expect(blockFormatFromVk(131) == null); // BC1_RGB_UNORM (no-alpha flavor, out of scope)
+    try testing.expect(blockFormatFromVk(139) == null); // BC4: single-channel, out of scope
     try testing.expect(blockFormatFromVk(159) == null); // ASTC 5x4: neighboring footprint, unsupported
     try testing.expect(blockFormatFromVk(110) == null); // RGBA16F
+    try testing.expect(BlockFormat.bc1_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.bc2_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.bc3_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.bc3_srgb.isSrgb() == true);
     try testing.expect(BlockFormat.bc7_unorm.isSrgb() == false);
     try testing.expect(BlockFormat.bc7_srgb.isSrgb() == true);
     try testing.expect(BlockFormat.astc_4x4_unorm.isSrgb() == false);
     try testing.expect(BlockFormat.astc_4x4_srgb.isSrgb() == true);
+    try testing.expect(BlockFormat.bc1_unorm.blockByteSize() == 8);
+    try testing.expect(BlockFormat.bc2_unorm.blockByteSize() == 16);
+    try testing.expect(BlockFormat.bc3_unorm.blockByteSize() == 16);
     try testing.expect(BlockFormat.bc7_unorm.blockByteSize() == 16);
     try testing.expect(BlockFormat.astc_4x4_unorm.blockByteSize() == 16);
 }

@@ -3,6 +3,7 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const c = @import("c.zig").c;
 const ktx2 = @import("ktx2.zig");
+const dds = @import("dds.zig");
 
 /// Shared RGBA8 box-filter downsample of one mip level. Dims floor at 1,
 /// source coords clamp at edges (handles NPOT). Fast path for the exact
@@ -118,7 +119,7 @@ pub fn pixelFormatBytes(format: sg.PixelFormat) usize {
         .RGBA16F, .RGBA16UI, .RGBA16SI, .RGBA16, .RGBA16SN, .RG32F, .RG32UI, .RG32SI => 8,
         .RGBA32F, .RGBA32UI, .RGBA32SI => 16,
         .BC1_RGBA, .BC4_R, .BC4_RSN, .ETC2_RGB8, .ETC2_RGB8A1 => 1,
-        .BC2_RGBA, .BC3_RGBA, .BC5_RG, .BC5_RGSN, .BC6H_RGBF, .BC6H_RGBUF, .BC7_RGBA, .ETC2_RGBA8 => 1,
+        .BC2_RGBA, .BC3_RGBA, .BC3_SRGBA, .BC5_RG, .BC5_RGSN, .BC6H_RGBF, .BC6H_RGBUF, .BC7_RGBA, .ETC2_RGBA8 => 1,
         else => 4,
     };
 }
@@ -225,10 +226,21 @@ pub const Texture = struct {
     }
 
     /// Exact level bytes for one mip level: block-grid math for the
-    /// compressed formats fromRawBlock uploads (4x4 blocks, 16 B each),
-    /// w*h*bpp otherwise. `bpp` is the pixelFormatBytes of the format.
+    /// compressed formats fromRawBlock uploads (4x4 blocks, 8 B each for
+    /// BC1, 16 B each for BC2/BC3/BC7/ASTC 4x4), w*h*bpp otherwise. `bpp`
+    /// is the pixelFormatBytes of the format.
     fn gpuLevelBytes(format: sg.PixelFormat, w: u32, h: u32, bpp: usize) usize {
         switch (format) {
+            .BC1_RGBA => {
+                const bw = (@as(usize, w) + 3) / 4;
+                const bh = (@as(usize, h) + 3) / 4;
+                return bw * bh * 8;
+            },
+            .BC2_RGBA, .BC3_RGBA, .BC3_SRGBA => {
+                const bw = (@as(usize, w) + 3) / 4;
+                const bh = (@as(usize, h) + 3) / 4;
+                return bw * bh * 16;
+            },
             .BC7_RGBA, .BC7_SRGBA, .ASTC_4x4_RGBA, .ASTC_4x4_SRGBA => {
                 const bw = (@as(usize, w) + 3) / 4;
                 const bh = (@as(usize, h) + 3) / 4;
@@ -362,7 +374,8 @@ pub const Texture = struct {
     };
 
     // -----------------------------------------------------------------------
-    // Block-compressed textures (KTX2 BC7 / ASTC 4x4, never decoded).
+    // Block-compressed textures (KTX2 BC1/BC2/BC3/BC7 / ASTC 4x4 and DDS
+    // BC1/BC2/BC3/BC7, never decoded).
     //
     // Backend gate: compressed formats are uploaded only when
     // sg.queryPixelformat reports sample support for the EXACT variant
@@ -386,9 +399,16 @@ pub const Texture = struct {
     // drops to NEAREST when the backend reports sample-without-filter.
     // -----------------------------------------------------------------------
 
-    /// Backend capability snapshot for both block families. Fill with
-    /// queryBlockSupport(); the decision helpers are pure and unit-tested.
+    /// Backend capability snapshot for every block family the engine can
+    /// upload. Fill with queryBlockSupport(); the decision helpers are pure
+    /// and unit-tested. BC2 shares the BC3 (S3TC) feature bit: desktop GL
+    /// exposes BC1-BC3 as one extension, and sokol has no separate BC2
+    /// query target that would behave differently.
     pub const BlockSupport = struct {
+        bc1_sample: bool = false,
+        bc1_filter: bool = false,
+        bc3_sample: bool = false,
+        bc3_filter: bool = false,
         bc7_sample: bool = false,
         bc7_filter: bool = false,
         astc_sample: bool = false,
@@ -397,27 +417,37 @@ pub const Texture = struct {
         /// True when the backend can sample the exact sg format. Pure.
         pub fn supportsFormat(self: BlockSupport, fmt: sg.PixelFormat) bool {
             return switch (fmt) {
+                .BC1_RGBA => self.bc1_sample,
+                .BC2_RGBA, .BC3_RGBA, .BC3_SRGBA => self.bc3_sample,
                 .BC7_RGBA, .BC7_SRGBA => self.bc7_sample,
                 .ASTC_4x4_RGBA, .ASTC_4x4_SRGBA => self.astc_sample,
                 else => false,
             };
         }
 
-        /// Preference order BC7 → ASTC 4x4 (UNORM representatives). Pure.
-        /// Feeds the unsupported-format log hint so authors learn which
-        /// encoding the current backend prefers.
+        /// Preference order BC7 → BC3 → BC1 → ASTC 4x4 (UNORM
+        /// representatives). Pure. Feeds the unsupported-format log hint so
+        /// authors learn which encoding the current backend prefers.
         pub fn preferred(self: BlockSupport) ?sg.PixelFormat {
             if (self.bc7_sample) return .BC7_RGBA;
+            if (self.bc3_sample) return .BC3_RGBA;
+            if (self.bc1_sample) return .BC1_RGBA;
             if (self.astc_sample) return .ASTC_4x4_RGBA;
             return null;
         }
     };
 
-    /// Exact sg format for a KTX2 block format. Pure: UNORM stays UNORM;
-    /// _SRGB files upload to the sRGB GPU variant (hardware linearizes on
-    /// sample — the no-decoder equivalent of the CPU sRGB→linear path).
+    /// Exact sg format for a block format. Pure: UNORM stays UNORM; _SRGB
+    /// files upload to the sRGB GPU variant (hardware linearizes on sample
+    /// — the no-decoder equivalent of the CPU sRGB→linear path). BC1/BC2
+    /// have no sRGB variant in this sokol checkout and always map to UNORM
+    /// (see dds.zig).
     pub fn sgPixelFormatForBlock(format: ktx2.BlockFormat) sg.PixelFormat {
         return switch (format) {
+            .bc1_unorm => .BC1_RGBA,
+            .bc2_unorm => .BC2_RGBA,
+            .bc3_unorm => .BC3_RGBA,
+            .bc3_srgb => .BC3_SRGBA,
             .bc7_unorm => .BC7_RGBA,
             .bc7_srgb => .BC7_SRGBA,
             .astc_4x4_unorm => .ASTC_4x4_RGBA,
@@ -425,13 +455,19 @@ pub const Texture = struct {
         };
     }
 
-    /// Live backend support for both block families (UNORM representatives;
+    /// Live backend support for every block family (UNORM representatives;
     /// the upload gate additionally checks the exact variant). Requires a
     /// valid sg context; keep the pure logic in BlockSupport for tests.
     pub fn queryBlockSupport() BlockSupport {
+        const bc1 = sg.queryPixelformat(.BC1_RGBA);
+        const bc3 = sg.queryPixelformat(.BC3_RGBA);
         const bc7 = sg.queryPixelformat(.BC7_RGBA);
         const astc = sg.queryPixelformat(.ASTC_4x4_RGBA);
         return .{
+            .bc1_sample = bc1.sample,
+            .bc1_filter = bc1.filter,
+            .bc3_sample = bc3.sample,
+            .bc3_filter = bc3.filter,
             .bc7_sample = bc7.sample,
             .bc7_filter = bc7.filter,
             .astc_sample = astc.sample,
@@ -441,16 +477,17 @@ pub const Texture = struct {
 
     /// Creates the GPU image from owned block-compressed levels. Main
     /// thread only. Precondition: raw holds ≥1 authored level from
-    /// ktx2.decodeBlock2D (an empty default is a programming error).
-    /// Fails with BlockFormatNotSupportedByBackend when the backend cannot
-    /// sample the format — re-encode the asset, there is no decoder.
+    /// ktx2.decodeBlock2D or dds.decodeBlock2D (an empty default is a
+    /// programming error). Fails with BlockFormatNotSupportedByBackend when
+    /// the backend cannot sample the format — re-encode the asset, there is
+    /// no decoder.
     pub fn fromRawBlock(raw: *const ktx2.RawBlockTexture, options: Options) error{BlockFormatNotSupportedByBackend}!Texture {
         std.debug.assert(raw.num_levels >= 1 and raw.num_levels <= 16);
         const sg_format = sgPixelFormatForBlock(raw.format);
         const info = sg.queryPixelformat(sg_format);
         if (!info.sample) {
             const hint = queryBlockSupport().preferred();
-            std.log.err("KTX2 block texture ({s} {d}x{d}, {d} level(s)) not sampleable on this backend; closest supported block format: {?}; re-encode the asset (no CPU decoder exists)", .{
+            std.log.err("Block-compressed texture ({s} {d}x{d}, {d} level(s)) not sampleable on this backend; closest supported block format: {?}; re-encode the asset (no CPU decoder exists)", .{
                 @tagName(raw.format), raw.width, raw.height, raw.num_levels, hint,
             });
             return error.BlockFormatNotSupportedByBackend;
@@ -499,8 +536,20 @@ pub const Texture = struct {
     /// touching the GPU. Thread-safe; pair with `fromRaw`. KTX2 payloads
     /// (magic sniff) route to the ktx2 reader: only its uncompressed LDR
     /// subset decodes here — cube KTX2 files are rejected with
-    /// error.UnsupportedFaceCount (use ktx2.decodeCube instead).
+    /// error.UnsupportedFaceCount (use ktx2.decodeCube instead). DDS
+    /// payloads are block-compressed and have no RGBA8 form: they fail
+    /// here (malformed files with their own validation error, valid ones
+    /// with DdsRequiresBlockDecode) — use decodeImageMemory or
+    /// fromDdsMemory instead.
     pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
+        if (dds.sniff(bytes)) {
+            // Report the file's own validation error when malformed, so a
+            // corrupt DDS never degrades into a generic stb failure; a
+            // valid DDS names the correct API instead.
+            var tmp = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = opts.srgb_to_linear });
+            tmp.deinit(allocator);
+            return error.DdsRequiresBlockDecode;
+        }
         if (ktx2.sniff(bytes)) {
             return ktx2.decode2D(allocator, bytes, .{
                 .gen_mipmaps = opts.gen_mipmaps,
@@ -586,17 +635,22 @@ pub const Texture = struct {
         }
     };
 
-    /// decodeMemory plus block routing: KTX2 BC7/ASTC payloads decode to
-    /// .block (owned slices, mip chain as authored, no synthesis);
-    /// everything else behaves exactly like decodeMemory (.rgba).
-    /// Thread-safe; pair with fromRaw/fromRawBlock. A block file that fails
-    /// validation (supercompression, truncated levels, ...) surfaces the
-    /// ktx2 error — never a silent RGBA8 fallback. decode_opts are RGBA8-
-    /// only: gen_mipmaps/srgb_to_linear have no effect on .block (chain and
-    /// sRGB-ness ride in the authored levels and the GPU format).
+    /// decodeMemory plus block routing: KTX2 BC/ASTC and DDS BC payloads
+    /// decode to .block (owned slices, mip chain as authored, no
+    /// synthesis); everything else behaves exactly like decodeMemory
+    /// (.rgba). Thread-safe; pair with fromRaw/fromRawBlock. A block file
+    /// that fails validation (supercompression, truncated levels, ...)
+    /// surfaces the reader error — never a silent RGBA8 fallback.
+    /// decode_opts are RGBA8-only, except srgb_to_linear, which doubles as
+    /// the DDS legacy sRGB decision (DX10/KTX2 files carry their own tag):
+    /// gen_mipmaps has no effect on .block (chain and sRGB-ness ride in
+    /// the authored levels and the GPU format).
     pub fn decodeImageMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !DecodedImage {
         if (ktx2.isBlockKtx2(bytes)) {
             return .{ .block = try ktx2.decodeBlock2D(allocator, bytes) };
+        }
+        if (dds.sniff(bytes)) {
+            return .{ .block = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = opts.srgb_to_linear }) };
         }
         return .{ .rgba = try decodeMemory(allocator, bytes, opts) };
     }
@@ -752,6 +806,38 @@ pub const Texture = struct {
         });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
+    }
+
+    /// Decodes a block-compressed DDS file (BC1/BC2/BC3/BC7, mip chain as
+    /// authored) from memory and uploads it via fromRawBlock. Main thread
+    /// only (GPU upload); use dds.decodeBlock2D + fromRawBlock to split
+    /// worker-thread decode from main-thread upload. options.srgb_to_linear
+    /// is the legacy sRGB decision (DX10 files carry their own tag):
+    /// color-slot DDS textures pass true to select the sRGB GPU variant
+    /// (BC3_SRGBA/BC7_SRGBA; BC1/BC2 have no sRGB variant and stay UNORM).
+    /// glTF never references .dds (the spec has no such image MIME), so
+    /// there is no glTF wiring — this is the standalone entry point.
+    pub fn fromDdsMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
+        var raw = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = options.srgb_to_linear });
+        defer raw.deinit(allocator);
+        return fromRawBlock(&raw, options);
+    }
+
+    /// File variant of `fromDdsMemory`. Main thread only (GPU upload); the
+    /// buffered read matches decodeFile so the async UploadQueue
+    /// (decodeImageFile → decodeImageMemory) sees identical bytes.
+    pub fn fromDdsFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
+
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return fromDdsMemory(allocator, bytes, options);
     }
 
     /// Converts one f32 channel to an IEEE-754 half-precision bit pattern.
@@ -1662,6 +1748,10 @@ test "mipLevelCount covers powers of two and minimums" {
 }
 
 test "sgPixelFormatForBlock maps UNORM/SRGB variants exactly" {
+    try std.testing.expectEqual(sg.PixelFormat.BC1_RGBA, Texture.sgPixelFormatForBlock(.bc1_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC2_RGBA, Texture.sgPixelFormatForBlock(.bc2_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC3_RGBA, Texture.sgPixelFormatForBlock(.bc3_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC3_SRGBA, Texture.sgPixelFormatForBlock(.bc3_srgb));
     try std.testing.expectEqual(sg.PixelFormat.BC7_RGBA, Texture.sgPixelFormatForBlock(.bc7_unorm));
     try std.testing.expectEqual(sg.PixelFormat.BC7_SRGBA, Texture.sgPixelFormatForBlock(.bc7_srgb));
     try std.testing.expectEqual(sg.PixelFormat.ASTC_4x4_RGBA, Texture.sgPixelFormatForBlock(.astc_4x4_unorm));
@@ -1694,6 +1784,25 @@ test "BlockSupport gates exact variants and prefers BC7 over ASTC" {
     const none: Texture.BlockSupport = .{};
     try std.testing.expect(none.preferred() == null);
     try std.testing.expect(!none.supportsFormat(.BC7_RGBA));
+}
+
+test "BlockSupport gates the BC1/BC2/BC3 families for the DDS path" {
+    // BC2 rides the BC3 (S3TC) feature bit; BC3_SRGBA needs no extra bit.
+    const s3tc: Texture.BlockSupport = .{ .bc3_sample = true };
+    try std.testing.expect(s3tc.supportsFormat(.BC2_RGBA));
+    try std.testing.expect(s3tc.supportsFormat(.BC3_RGBA));
+    try std.testing.expect(s3tc.supportsFormat(.BC3_SRGBA));
+    try std.testing.expect(!s3tc.supportsFormat(.BC1_RGBA));
+    try std.testing.expect(!s3tc.supportsFormat(.BC7_RGBA));
+
+    const bc1_only: Texture.BlockSupport = .{ .bc1_sample = true };
+    try std.testing.expect(bc1_only.supportsFormat(.BC1_RGBA));
+    try std.testing.expect(!bc1_only.supportsFormat(.BC2_RGBA));
+    try std.testing.expectEqual(sg.PixelFormat.BC1_RGBA, bc1_only.preferred().?);
+
+    // Preference order BC7 -> BC3 -> BC1 -> ASTC 4x4.
+    const bc3_astc: Texture.BlockSupport = .{ .bc3_sample = true, .astc_sample = true };
+    try std.testing.expectEqual(sg.PixelFormat.BC3_RGBA, bc3_astc.preferred().?);
 }
 
 test "downsampleLevel handles odd dimensions and averages correctly" {
