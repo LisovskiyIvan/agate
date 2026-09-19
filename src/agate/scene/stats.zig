@@ -77,4 +77,29 @@ pub const SceneStats = struct {
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
     post_ms: f32 = 0,
+
+    /// Deferred merge of a game-side queue build (stage-2 increment B): adds
+    /// the counter fields `buildFrameQueues` produces into the context-owned
+    /// latch stats, then the caller resets the build stats to `.{}`.
+    /// Per-field mapping (see render_queue.zig writes):
+    /// - total_meshes/rendered_meshes/culled_meshes/occluded_meshes: `+=`
+    ///   (queue builds accumulate per mesh/view; parallel chunks merge the
+    ///   same way).
+    /// - occluders_count/occluder_triangles: `=` (queue builds ASSIGN from
+    ///   the occlusion culler per view, last view wins; the merge mirrors
+    ///   that assignment — with `self` starting from the latch reset the two
+    ///   forms coincide for one build, and `=` keeps multi-view overwrite
+    ///   semantics instead of summing).
+    /// Timing/upload/size fields (update_ms/prepare_ms/shadow_ms/main_ms/
+    /// post_ms, uploaded_*/updated_bytes_frame, draw_calls/triangles/etc.)
+    /// are NEVER merged: they are context-owned (prepare/render), and the
+    /// game-side build must not observe or disturb them.
+    pub fn mergeFrom(self: *SceneStats, other: *const SceneStats) void {
+        self.total_meshes += other.total_meshes;
+        self.rendered_meshes += other.rendered_meshes;
+        self.culled_meshes += other.culled_meshes;
+        self.occluded_meshes += other.occluded_meshes;
+        self.occluders_count = other.occluders_count;
+        self.occluder_triangles = other.occluder_triangles;
+    }
 };

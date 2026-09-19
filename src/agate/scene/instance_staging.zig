@@ -160,6 +160,9 @@ pub const InstanceStageContext = struct {
 /// runs the CPU half into the caller's scratch and immediately the GPU half.
 /// Behavior is unchanged — see `stageSegmentCpu` + `stageInstancesGpu`.
 pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
+    // Stage-2A identity: lazy uid before any early-out (pending meshes get
+    // one too; idempotent, no behavior change).
+    _ = mesh.ensureUid();
     // Deferred-creation meshes have no vertex/index buffers yet; staging
     // instance data for them would produce a draw against invalid handles.
     if (mesh.gpu_pending) return;
@@ -431,6 +434,7 @@ pub const CpuStageContext = struct {
 
 pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq: u64) void {
     for (meshes) |mesh| {
+        _ = mesh.ensureUid();
         if (mesh.is_lod_child) continue;
         if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len == 0) continue;
@@ -456,6 +460,7 @@ pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq:
 /// (scratch reset between build and latch) can never slice out of bounds.
 pub fn stageInstancesLatch(gctx: GpuStageContext, meshes: []const *Mesh, scratch: *const std.ArrayListUnmanaged(Mat4)) void {
     for (meshes) |mesh| {
+        _ = mesh.ensureUid();
         if (mesh.is_lod_child) continue;
         if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len == 0) continue;
@@ -478,6 +483,7 @@ pub fn stageInstancesLatch(gctx: GpuStageContext, meshes: []const *Mesh, scratch
 /// stays once-only.
 pub fn stageInstances(sc: InstanceStageContext, meshes: []const *Mesh) void {
     for (meshes) |mesh| {
+        _ = mesh.ensureUid();
         if (mesh.is_lod_child) continue;
         if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len == 0) continue;

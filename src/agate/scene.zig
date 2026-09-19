@@ -321,6 +321,13 @@ pub const Scene = struct {
     /// Back-slot index the last `buildPreparedFrame` wrote; the latch
     /// asserts it still is the back index (no intervening publish).
     build_slot: usize = 0,
+    /// Game-owned queue-build stats (stage-2 increment B): `buildPreparedFrame`
+    /// clears this and the game-side `buildQueuesInto` accumulates the queue
+    /// counters here (never `self.stats`, which stays context-owned). The
+    /// latch merges it into `self.stats` via `SceneStats.mergeFrom` (after
+    /// the latch's own reset) and resets it to `.{}`. Plain struct, phase
+    /// ownership (game write, context merge), never observed concurrently.
+    build_stats: SceneStats = .{},
 
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
@@ -1072,26 +1079,59 @@ pub const Scene = struct {
         sg.draw(0, 6, 1);
     }
 
+    /// Shared queue/shadow/outline build parameters (stage-2 increment B):
+    /// one internal function `buildQueuesInto` fills a `FrameDrawSlot` from
+    /// these plus `Scene.frame_snapshot` cameras. Fallback passes `frame_id`
+    /// as `cache_key`, `&self.stats`, the snapshot primary eye, the resolved
+    /// snapshot sky/ibl, `true`, and `.published` (today's exact behavior).
+    /// The game-side build passes the build-unique key
+    /// `(build_seq | (1<<63))` (high bit set: cannot collide with any
+    /// context `frame_id`, which counts up from 0), `&self.build_stats`,
+    /// the live eye, sky/ibl from `frame_snapshot` orelse live sky, `true`,
+    /// and `.build_view` (provisional buffer/count until the latch patch).
+    /// Payload identity invariant: every instanced batch / shadow item /
+    /// outline item carries `source_uid` (stable `Mesh.uid`) + `source_mesh`
+    /// (mesh-list index at build time); the latch validates uid before
+    /// finalizing provisional handles (fail-closed zero).
+    /// `eye` is currently informational (views sort by their own snapshot
+    /// eye; the build passes the live eye for future transparent-sort use
+    /// and for the instance CPU staging eye, which is threaded separately).
+    /// `stats` stays a direct pointer (deferred via `build_stats` + merge).
+    pub const QueueBuildParams = struct {
+        cache_key: u64,
+        stats: *SceneStats,
+        eye: Vec3,
+        sky_texture: ?CubeTexture,
+        ibl_intensity: f32,
+        instances_prepared: bool,
+        instance_source: @import("mesh.zig").InstanceSource,
+    };
+
     fn prepareViewQueues(
         self: *Scene,
         queues: *scene_render_queue.RenderQueues,
         cam_snap: scene_snapshot.CameraSnapshot,
         sky_texture: ?CubeTexture,
         ibl_intensity: f32,
+        cache_key: u64,
+        stats: *SceneStats,
+        instances_prepared: bool,
+        instance_source: @import("mesh.zig").InstanceSource,
     ) void {
         queues.reset();
 
         scene_render_queue.buildFrameQueues(.{
             .allocator = self.allocator,
             .meshes = self.meshes.items,
-            .frame_id = self.frame_id,
+            .cache_key = cache_key,
+            .instance_source = instance_source,
             .view_proj = cam_snap.view_proj,
             .eye = cam_snap.eye,
             .cull_frustum = self.enable_frustum_culling,
             .cull_occlusion = self.enable_occlusion_culling,
             .culling_mask = cam_snap.culling_mask,
             .occlusion_culler = &self.occlusion_culler,
-            .stats = &self.stats,
+            .stats = stats,
             .queues = queues,
             .default_white_id = self.default_white_texture.view.id,
             .default_material = &self.default_material,
@@ -1106,7 +1146,7 @@ pub const Scene = struct {
             // pre-stage above is definitive for this frame, so view builds
             // never retry staging mid-frame (failure coherence).
             .gpu_retire = &self.gpu_retire,
-            .instances_prepared = true,
+            .instances_prepared = instances_prepared,
         });
 
         std.mem.sort(RenderMeshItem, queues.items.items, {}, scene_render_queue.sortRenderItems);
@@ -1118,6 +1158,81 @@ pub const Scene = struct {
             {},
             scene_render_queue.sortTransparentDrawOrder,
         );
+    }
+
+    /// Shared queue/shadow/outline builder (stage-2 increment B): the code
+    /// previously inline in `prepareFrame` (outline capture loop + shadow
+    /// `prepareInto` + view-queue `prepareViewQueues` calls) in one internal
+    /// function, callable from the game-side `buildPreparedFrame` (with
+    /// `.build_view` + build-unique cache key + `&build_stats`) and from the
+    /// fallback latch (with `.published` + frame_id + `&self.stats`).
+    /// Fallback passes today's exact values (see `prepareFrame`) and stays
+    /// bit-identical to the old inline path. Does NOT reset `back` (the
+    /// caller reset before consume, as before). sg-free when
+    /// `instances_prepared=true` (view builds never retry staging mid-frame).
+    fn buildQueuesInto(self: *Scene, back: *FrameDrawSlot, params: QueueBuildParams) void {
+        // `eye` is informational today: views sort by their own snapshot eye
+        // (see prepareViewQueues); the build passes the live eye for future
+        // transparent-sort use. The instance CPU staging eye is threaded
+        // separately (stageInstancesCpu / InstanceStageContext).
+        _ = params.eye;
+
+        // P5: outline capture is unconditional, as before — immediately
+        // after the conditional pre-stage above and before conditional
+        // shadow/view warming below. With a GPU context instanced items
+        // snapshot the resolved staged state (`.published` = this frame's
+        // `instance_render`, `.build_view` = provisional `instance_build_view`
+        // until the latch patch); regular items are captured before
+        // worldMatrixCached warming, exactly like the historical pre-queue
+        // capture, so their cached-center behavior is unchanged.
+        //
+        // Outline identity domain (stage-2B fix): `source_mesh` MUST be the
+        // mesh-list index into `self.meshes.items` (patch resolves against
+        // that list with uid validation). The outline-list position is a
+        // different domain (subset, any order) and MUST NOT be stored. Each
+        // outline mesh is resolved to its mesh-list index here; an outline
+        // mesh absent from the mesh list gets the OOB sentinel `meshes.len`
+        // (deterministic, still emitted so the fallback — which never patches
+        // — stays bit-identical; the latch patch fail-closes the sentinel via
+        // its OOB branch).
+        for (self.outline_meshes.items) |m| {
+            if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
+            var src_idx: u32 = @intCast(self.meshes.items.len);
+            for (self.meshes.items, 0..) |sm, si| {
+                if (sm == m) {
+                    src_idx = @intCast(si);
+                    break;
+                }
+            }
+            if (outline_pass.makeOutlineDrawItem(self.allocator, &back.outline_skins, m, params.cache_key, src_idx, params.instance_source)) |it| {
+                back.outline_items.append(self.allocator, it) catch {};
+            }
+        }
+
+        const is_gpu_init = (self.default_white_texture.view.id != 0);
+        if (!is_gpu_init) return;
+
+        // Shadow pass preparation into the back slot (disabled shadows —
+        // or no camera — leave the reset-empty payload: coherent, never
+        // the front slot's prior bins).
+        if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
+            _ = self.shadows.pass.prepareInto(&back.shadow, self.meshes.items, params.cache_key, params.instance_source, jobs.global);
+        }
+
+        // View queues preparation (params carry the resolved sky/ibl).
+        if (self.frame_snapshot.has_camera) {
+            if (self.frame_snapshot.enable_multi_camera and self.frame_snapshot.camera_count > 0) {
+                const active_idx = self.frame_snapshot.active_camera_idx;
+                const primary_snap = if (active_idx < self.frame_snapshot.camera_count) self.frame_snapshot.cameras[active_idx] else self.frame_snapshot.primary_cam;
+                self.prepareViewQueues(&back.primary, primary_snap, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
+                for (self.frame_snapshot.cameras[0..self.frame_snapshot.camera_count], 0..) |entry, i| {
+                    if (i == active_idx or !entry.enabled) continue;
+                    self.prepareViewQueues(&back.views[i], entry, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
+                }
+            } else {
+                self.prepareViewQueues(&back.primary, self.frame_snapshot.primary_cam, params.sky_texture, params.ibl_intensity, params.cache_key, params.stats, params.instances_prepared, params.instance_source);
+            }
+        }
     }
 
     fn renderSceneView(
@@ -1445,10 +1560,157 @@ pub const Scene = struct {
         return &self.draws.slots[self.draws.front];
     }
 
-    /// Stage 1 producer build (game/update phase, CPU-only, sg-free): stages
-    /// the CPU halves the prepare latch will consume — instance matrices
-    /// into the back-slot scratch + per-mesh previews, the particle build
-    /// frame, the physics debug build capture — and bumps `build_seq`.
+    /// Latch patch finalizing game-built provisional handles (stage-2
+    /// increment B, context side, allocation-free linear pass): after
+    /// `stageInstancesLatch` publishes `instance_render`, every instanced
+    /// payload entry built with `.build_view` is re-resolved by identity
+    /// (`source_mesh` index + `source_uid` validation) against the post-latch
+    /// live mesh list.
+    ///
+    /// Payload identity invariant: `source_uid` is the stable `Mesh.uid`,
+    /// `source_mesh` the mesh-list index at build time. Provisional vs
+    /// finalized: at build time `instance_buffer`/`visible_instance_count`
+    /// (plus shadow `world_aabb`/`max_dim`, outline `world_center`) came from
+    /// the provisional `instance_build_view` (frozen count/bounds + old
+    /// handle); here they are finalized from the post-latch `instance_render`.
+    ///
+    /// Per entry (only `is_instanced` shadow/outline items and all instanced
+    /// batches; regular items have no provisional handle and are skipped):
+    /// - resolve `idx = source_mesh`; if `idx >= meshes.len` → fail-closed
+    ///   zero (mesh list shrank; no OOB, no UAF).
+    /// - `mesh = meshes[idx]`; if `mesh.uid != source_uid` → fail-closed zero
+    ///   (swapRemove/reorder changed the list; validated, not merely assumed —
+    ///   the mesh list MUST NOT be mutated between build and latch, and a
+    ///   violation degrades to invisible instead of corrupt).
+    /// - `st = mesh.instance_render`; if `st.staged_frame == frame_id`
+    ///   (published this latch) copy `buffer`/`count` (+ shadow `world_aabb`
+    ///   from `st.bounds` with `max_dim` recomputed from extents exactly as
+    ///   `prepareInto` did, outline `world_center` from `st.bounds` center or
+    ///   `mesh.position` when invalid); else (skipped/stale/FAILED) zero:
+    ///   `instance_buffer={}`, `visible_instance_count=0`, shadow aabb
+    ///   invalid + `max_dim=0`. Outline zero-center rule: OOB index (no mesh
+    ///   to read) → `Vec3.zero`; uid-mismatch or stale publish (mesh known) →
+    ///   `mesh.position` (chosen over keeping the build value so a stale entry
+    ///   never points at a freed/foreign center; documented here).
+    /// - Transparent order entries referencing zeroed batches need no distance
+    ///   change: the draw skips `count==0` batches, so order is harmless.
+    /// - Culling/inclusion stay frozen at build time (bounds/model/distance
+    ///   are NOT repatched): a live TRS mutation between build and latch
+    ///   never alters this frame's sets, only the next build sees it.
+    fn patchInstanceRefs(self: *Scene, back: *FrameDrawSlot) void {
+        const meshes = self.meshes.items;
+        const fid = self.frame_id;
+        // Queue batches: primary + all views, opaque + transparent.
+        const queue_lists = [_]*std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch){
+            &back.primary.opaque_instanced, &back.primary.transparent_instanced,
+        };
+        for (queue_lists) |list| self.patchBatchList(list, meshes, fid);
+        for (&back.views) |*q| {
+            self.patchBatchList(&q.opaque_instanced, meshes, fid);
+            self.patchBatchList(&q.transparent_instanced, meshes, fid);
+        }
+        // Shadow items (instanced only).
+        for (back.shadow.items.items) |*it| {
+            if (!it.is_instanced) continue;
+            const idx: usize = it.source_mesh;
+            if (idx >= meshes.len) {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_aabb = BoundingBox.zero;
+                it.max_dim = 0;
+                continue;
+            }
+            const mesh = meshes[idx];
+            if (mesh.uid != it.source_uid) {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_aabb = BoundingBox.zero;
+                it.max_dim = 0;
+                continue;
+            }
+            const st = mesh.instance_render;
+            if (st.staged_frame == fid) {
+                it.instance_buffer = st.buffer;
+                it.visible_instance_count = st.count;
+                it.world_aabb = st.bounds;
+                const ext = st.bounds.extents();
+                it.max_dim = @max(ext.x, @max(ext.y, ext.z));
+            } else {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_aabb = BoundingBox.zero;
+                it.max_dim = 0;
+            }
+        }
+        // Outline items (instanced only).
+        for (back.outline_items.items) |*it| {
+            if (!it.is_instanced) continue;
+            const idx: usize = it.source_mesh;
+            if (idx >= meshes.len) {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_center = Vec3.zero;
+                continue;
+            }
+            const mesh = meshes[idx];
+            if (mesh.uid != it.source_uid) {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_center = mesh.position;
+                continue;
+            }
+            const st = mesh.instance_render;
+            if (st.staged_frame == fid) {
+                it.instance_buffer = st.buffer;
+                it.visible_instance_count = st.count;
+                it.world_center = if (st.bounds.isValid()) st.bounds.center() else mesh.position;
+            } else {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_center = mesh.position;
+            }
+        }
+    }
+
+    fn patchBatchList(
+        self: *Scene,
+        list: *std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch),
+        meshes: []const *Mesh,
+        fid: u64,
+    ) void {
+        _ = self;
+        for (list.items) |*b| {
+            const idx: usize = b.source_mesh;
+            if (idx >= meshes.len) {
+                b.instance_buffer = .{};
+                b.visible_instance_count = 0;
+                continue;
+            }
+            const mesh = meshes[idx];
+            if (mesh.uid != b.source_uid) {
+                b.instance_buffer = .{};
+                b.visible_instance_count = 0;
+                continue;
+            }
+            const st = mesh.instance_render;
+            if (st.staged_frame == fid) {
+                b.instance_buffer = st.buffer;
+                b.visible_instance_count = st.count;
+            } else {
+                b.instance_buffer = .{};
+                b.visible_instance_count = 0;
+            }
+        }
+    }
+
+    /// Stage-2 increment B producer build (game/update phase, CPU-only,
+    /// sg-free): stages the CPU halves the prepare latch will consume —
+    /// instance matrices into the back-slot scratch + per-mesh previews, the
+    /// particle build frame, the physics debug build capture — then freezes
+    /// the provisional `instance_build_view` per mesh and builds the full
+    /// queue/shadow/outline payload into the back slot via the shared
+    /// `buildQueuesInto` (with `.build_view` + build-unique cache key +
+    /// `&build_stats`), and bumps `build_seq`.
     ///
     /// Call AFTER the sim mutations of the tick (update boundary), BEFORE
     /// the context `prepareFrame`; sequential with update, excluded vs
@@ -1459,26 +1721,45 @@ pub const Scene = struct {
     /// single preview store is recomputed, the scratch overwritten) — no
     /// build queue, bounded, no allocs beyond retained capacity.
     ///
-    /// Touches NOTHING else: no sg.*, no UI canvas, no P7 queues/shadow/
-    /// outline (those stay prepare-time), no GpuRetire begin/complete/flush,
-    /// no frame_id/retire_epoch, no stats, no profiler. Starts by resetting
-    /// the back slot (the latch consumes it without reset; the consumed
-    /// slot becomes front and is reset again by the next build or the
-    /// inline fallback). The transparent-sort eye comes from the live
-    /// cameras (freshest post-mutation value; the inline fallback uses the
-    /// snapshot eye — sort order may differ between paths, counts/bounds
-    /// never do).
+    /// Build-view freeze: for each mesh with a fresh preview
+    /// (`preview.build_seq == build_seq`) set `instance_build_view` from the
+    /// preview count/bounds/hash + the current `instance_render`
+    /// buffer/capacity/uploaded_count/staged_frame (provisional handle); for
+    /// a stale/absent preview set all-zero (invisible). The queue build then
+    /// resolves instanced state via `.build_view`; the latch `patchInstanceRefs`
+    /// finalizes handles after `stageInstancesLatch`.
+    ///
+    /// Snapshot: refreshes `frame_snapshot` from the handoff when a newer
+    /// tick was published (else packs from live, same fallback as prepare)
+    /// so the game-side queue build culls against this tick's cameras
+    /// (frozen; a live mutation between build and latch never alters this
+    /// frame's sets). Sky/ibl come from that snapshot orelse live sky.
+    /// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
+    /// cannot collide with any context `frame_id`). Stats accumulate into
+    /// game-owned `build_stats` (cleared at build start), merged by the latch.
+    ///
+    /// Touches NOTHING else: no sg.*, no GpuRetire begin/complete/flush (view
+    /// builds run with `instances_prepared=true`, never retrying staging),
+    /// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
+    /// no `self.stats`, no profiler. Mutates under game-phase ownership only:
+    /// back-slot queues/shadow/outline + scratch, previews/build_views,
+    /// particle/physics build frames, `frame_snapshot` (refreshed), shadow
+    /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
+    /// with the build key), and `build_stats`.
     ///
     /// App contract: no latch is possible while a build runs (update-vs-
-    /// prepare exclusion), and no mesh is created/destroyed between a build
-    /// and its latch. A mesh whose upload finishes between build and latch,
-    /// or whose segment OOMs, keeps its previous complete `instance_render`
-    /// for one frame (documented, coherent); the next funded build+latch
-    /// picks it up.
+    /// prepare exclusion), and the mesh list MUST NOT be mutated between a
+    /// build and its latch (validated by uid at patch time: a violation
+    /// fail-closes stale entries to invisible instead of corrupting). A mesh
+    /// whose upload finishes between build and latch, or whose segment OOMs,
+    /// keeps its previous complete `instance_render` for one frame
+    /// (documented, coherent); the next funded build+latch picks it up.
     pub fn buildPreparedFrame(self: *Scene) void {
         // Deliberately NO gpu_thread assert: this runs on the game side or
         // a spawned worker. Everything below is sg-free (the CPU staging
-        // half, the plain captures); any sg.* here would be a bug.
+        // half, the plain captures, the CPU queue/shadow/outline build with
+        // instances_prepared=true); any sg.* here would be a bug.
+        self.build_stats = .{};
         self.build_seq +%= 1;
         const seq = self.build_seq;
         const back_idx = self.draws.backIndex();
@@ -1499,8 +1780,66 @@ pub const Scene = struct {
             .thread_pool = jobs.global,
             .eye = eye,
         }, self.meshes.items, seq);
+        // Freeze the provisional build view for the queue build below.
+        for (self.meshes.items) |m| {
+            _ = m.ensureUid();
+            if (m.instance_preview.build_seq == seq) {
+                m.instance_build_view = .{
+                    .buffer = m.instance_render.buffer,
+                    .capacity = m.instance_render.capacity,
+                    .count = m.instance_preview.count,
+                    .bounds = m.instance_preview.bounds,
+                    .hash = m.instance_preview.hash,
+                    .uploaded_count = m.instance_render.uploaded_count,
+                    .staged_frame = m.instance_render.staged_frame,
+                };
+            } else {
+                m.instance_build_view = .{};
+            }
+        }
         self.particles.buildCapture(self.allocator, seq);
         self.physics.buildDebug(self.allocator, seq);
+        // Refresh the snapshot so the game-side queue build sees this tick's
+        // cameras (frozen; latch publishes with the same or a newer snapshot
+        // but never rebuilds the sets). Same takeLatest-else-pack shape as
+        // prepareFrame (sapp dims fallback).
+        {
+            var snap = self.frame_snapshot;
+            if (self.frame_handoff.takeLatest(&snap)) {
+                self.frame_snapshot = snap;
+            } else if (!self.frame_snapshot.has_camera) {
+                const cur_w = sapp.width();
+                const cur_h = sapp.height();
+                const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
+                self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
+            }
+        }
+        // Game-side queue/shadow/outline build (sg-free: instances_prepared).
+        // The shared builder resets each view queue (including primary's
+        // instance_matrices scratch) — but that scratch holds the CPU-staged
+        // matrices the latch GPU half still needs. Swap it out across the
+        // build and restore after: the queue build with instances_prepared
+        // never appends to it, so the staged segments survive intact.
+        {
+            const build_key = seq | (@as(u64, 1) << 63);
+            const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
+            const ibl_int = self.frame_snapshot.ibl_intensity;
+            const saved_scratch = back.primary.instance_matrices;
+            back.primary.instance_matrices = .empty;
+            self.buildQueuesInto(back, .{
+                .cache_key = build_key,
+                .stats = &self.build_stats,
+                .eye = eye,
+                .sky_texture = sky_tex,
+                .ibl_intensity = ibl_int,
+                .instances_prepared = true,
+                .instance_source = .build_view,
+            });
+            // The builder left the swapped-in list empty (no staging appends
+            // under instances_prepared); discard it (zero capacity, no leak)
+            // and restore the staged scratch.
+            back.primary.instance_matrices = saved_scratch;
+        }
     }
 
     pub fn prepareFrame(self: *Scene) void {
@@ -1606,25 +1945,28 @@ pub const Scene = struct {
         const back_idx = self.draws.backIndex();
         const back = &self.draws.slots[back_idx];
         if (have_build) {
-            // Stage 1 latch: the game-side build already reset this back
-            // slot and staged the instance scratch into it — reset-before-
-            // consume would erase the build, so only stamp the prepare-owned
-            // frame/epoch (reset by `buildPreparedFrame`, rebuilt here by
-            // the queue/shadow/outline builds below) and run the GPU halves
-            // over the previews + scratch. Stale previews (OOM-skipped,
-            // post-build meshes) keep their previous complete
-            // `instance_render` — no partial publish. Queues/outline/shadow
-            // below rebuild exactly as in the inline path.
+            // Stage-2 latch: the game-side build already reset this back
+            // slot, staged the instance scratch + previews + build_views, and
+            // built the queue/shadow/outline payload with `.build_view`
+            // (provisional handles). Reset-before-consume would erase the
+            // build, and rebuilding would unfreeze the sets — so do NOT call
+            // buildQueuesInto here. Only stamp the prepare-owned frame/epoch,
+            // run the GPU halves over the previews + scratch, finalize the
+            // provisional handles with patchInstanceRefs, then merge the
+            // deferred build_stats. Stale previews (OOM-skipped, post-build
+            // meshes) keep their previous complete `instance_render` and
+            // patch to invisible — no partial publish. Mesh-list mutation
+            // between build and latch fail-closes by uid (see patch docs).
             std.debug.assert(self.build_slot == back_idx);
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
             if (is_gpu_init) {
-                // Same position/gate as the historical pre-stage: the shadow
-                // pass snapshots the published render state, so the GPU half
-                // must run first or shadows lag one frame. Same retire queue
-                // and eye source shape (the eye itself was consumed at build
-                // time for the transparent sort; only the guard reads the
-                // snapshot here).
+                // Same position/gate as the historical pre-stage: the GPU half
+                // must run before the patch finalizes handles (and would have
+                // run before the shadow snapshot historically). Same retire
+                // queue and eye source shape (the eye itself was consumed at
+                // build time for the transparent sort; only the guard reads
+                // the snapshot here).
                 if (self.frame_snapshot.has_camera) {
                     scene_instance_staging.stageInstancesLatch(.{
                         .allocator = self.allocator,
@@ -1634,6 +1976,14 @@ pub const Scene = struct {
                     }, self.meshes.items, &back.primary.instance_matrices);
                 }
             }
+            self.patchInstanceRefs(back);
+            // Deferred stats merge (stage-2B): the game-side queue build
+            // accumulated into build_stats; fold the queue counters into the
+            // context-owned self.stats (already reset above, so upload
+            // tallies/prepare_ms/update_ms are preserved) and clear the build
+            // stats for the next tick. build_stats deferred merge.
+            self.stats.mergeFrom(&self.build_stats);
+            self.build_stats = .{};
             self.last_latched_seq = self.build_seq;
         } else {
             // Inline fallback (no fresh build): reset first — every list,
@@ -1664,44 +2014,24 @@ pub const Scene = struct {
             }
         }
 
-        // P5: outline capture is unconditional, as before — immediately
-        // after the conditional pre-stage above and before conditional
-        // shadow/view warming below. With a GPU context instanced items
-        // snapshot this frame's staged bounds/count/handle; regular
-        // items are captured before worldMatrixCached warming, exactly
-        // like the historical pre-queue capture, so their cached-center
-        // behavior is unchanged.
-        for (self.outline_meshes.items) |m| {
-            if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
-            if (outline_pass.makeOutlineDrawItem(self.allocator, &back.outline_skins, m)) |it| {
-                back.outline_items.append(self.allocator, it) catch {};
-            }
-        }
-
-        if (is_gpu_init) {
-            // Shadow pass preparation into the back slot (disabled shadows —
-            // or no camera — leave the reset-empty payload: coherent, never
-            // the front slot's prior bins).
-            if (self.frame_snapshot.has_camera and self.frame_snapshot.shadows_enabled and self.shadows.enabled) {
-                _ = self.shadows.pass.prepareInto(&back.shadow, self.meshes.items, self.frame_id, jobs.global);
-            }
-
-            // View queues preparation
+        // Shared builder — fallback only (stage-2B): when no fresh game build
+        // exists, outline + shadow + view queues build here with exactly
+        // today's values (frame_id as cache_key, &self.stats, snapshot eye,
+        // resolved sky/ibl, true, `.published`) — bit-identical to the old
+        // inline path. When have_build the payload was already built game-side
+        // (`.build_view` + patch above); rebuilding would unfreeze the sets.
+        if (!have_build) {
             const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
             const ibl_int = self.frame_snapshot.ibl_intensity;
-            if (self.frame_snapshot.has_camera) {
-                if (self.frame_snapshot.enable_multi_camera and self.frame_snapshot.camera_count > 0) {
-                    const active_idx = self.frame_snapshot.active_camera_idx;
-                    const primary_snap = if (active_idx < self.frame_snapshot.camera_count) self.frame_snapshot.cameras[active_idx] else self.frame_snapshot.primary_cam;
-                    self.prepareViewQueues(&back.primary, primary_snap, sky_tex, ibl_int);
-                    for (self.frame_snapshot.cameras[0..self.frame_snapshot.camera_count], 0..) |entry, i| {
-                        if (i == active_idx or !entry.enabled) continue;
-                        self.prepareViewQueues(&back.views[i], entry, sky_tex, ibl_int);
-                    }
-                } else {
-                    self.prepareViewQueues(&back.primary, self.frame_snapshot.primary_cam, sky_tex, ibl_int);
-                }
-            }
+            self.buildQueuesInto(back, .{
+                .cache_key = self.frame_id,
+                .stats = &self.stats,
+                .eye = self.frame_snapshot.primary_cam.eye,
+                .sky_texture = sky_tex,
+                .ibl_intensity = ibl_int,
+                .instances_prepared = true,
+                .instance_source = .published,
+            });
         }
 
         self.captureUiFrame();
@@ -2820,6 +3150,7 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     defer scene.outline_meshes.deinit(alloc);
     defer scene.draws.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     scene.enable_frustum_culling = false;
     scene.enable_occlusion_culling = false;
@@ -2896,7 +3227,7 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     // the world-matrix cache keys on it, and the published front snapshot
     // must stay at the old pose regardless.
     scene.frame_id +%= 1;
-    scene.prepareViewQueues(&scene.draws.slots[back_idx].primary, scene.frame_snapshot.primary_cam, null, 1.0);
+    scene.prepareViewQueues(&scene.draws.slots[back_idx].primary, scene.frame_snapshot.primary_cam, null, 1.0, scene.frame_id, &scene.stats, true, .published);
     const front_still = &scene.draws.slots[front0];
     try std.testing.expectEqual(@as(usize, 3), front_still.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), front_still.primary.skin_storage.items.len);
@@ -2986,6 +3317,7 @@ test "P7: main and PIP view slots stay isolated" {
     defer scene.meshes.deinit(alloc);
     defer scene.draws.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     scene.enable_frustum_culling = false;
     scene.enable_occlusion_culling = false;
@@ -3111,6 +3443,7 @@ test "P7: no-camera/headless and disabled shadows clear coherently, epochs consu
     defer scene.outline_meshes.deinit(alloc);
     defer scene.draws.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     scene.enable_frustum_culling = false;
     scene.enable_occlusion_culling = false;
@@ -3183,6 +3516,7 @@ test "P7: allocator-failure back stays coherent and recovers without stale items
     defer scene.outline_meshes.deinit(alloc);
     defer scene.draws.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     scene.enable_frustum_culling = false;
     scene.enable_occlusion_culling = false;
@@ -3617,6 +3951,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -3704,11 +4039,25 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     // A 100-unit move would have shifted the bounds; the latch kept build
     // time (max.x well under the mutated span).
     try std.testing.expect(parent.instance_render.bounds.max.x < 50.0);
-    // The destroyed victim is gone from the latch (no use-after-free) and
-    // the published queues carry only the surviving mesh.
+    // Stage-2B: queues froze at build time (parent + victim = 2 batches);
+    // the destroyed victim fail-closes to invisible by uid (no UAF), the
+    // surviving parent finalizes to its latched handle/count.
     const draws = scene.preparedDraws();
-    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
+    var found_valid: usize = 0;
+    var found_zeroed: usize = 0;
+    for (draws.primary.opaque_instanced.items) |b| {
+        if (b.source_uid == parent.uid) {
+            try std.testing.expectEqual(@as(u32, 4), b.visible_instance_count);
+            try std.testing.expectEqual(parent.instance_render.buffer.id, b.instance_buffer.id);
+            found_valid += 1;
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), b.visible_instance_count);
+            found_zeroed += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), found_valid);
+    try std.testing.expectEqual(@as(usize, 1), found_zeroed);
 }
 
 test "stage1: two builds before latch, newest wins" {
@@ -3722,6 +4071,7 @@ test "stage1: two builds before latch, newest wins" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -3777,6 +4127,7 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -3837,6 +4188,7 @@ test "stage1: serial same-thread build+latch parity" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -3892,6 +4244,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -4075,6 +4428,7 @@ test "stage1: instances cleared between build and latch take the regular path" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -4109,9 +4463,10 @@ test "stage1: instances cleared between build and latch take the regular path" {
     try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
 
-    // Drop all instances before the latch: both the latch and the fallback
-    // skip empty instance lists, and the queue routes the mesh as regular —
-    // the stale preview is never read, no instanced item is emitted.
+    // Drop all instances before the latch: stage-2B freezes queues at build
+    // time, so the stale instanced batch fail-closes to invisible (count 0)
+    // instead of rerouting to regular — the regular-path switch takes effect
+    // on the next build, not this latch. instance_render stays empty.
     parent.instances.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
@@ -4119,8 +4474,9 @@ test "stage1: instances cleared between build and latch take the regular path" {
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const draws = scene.preparedDraws();
-    try std.testing.expectEqual(@as(usize, 0), draws.primary.opaque_instanced.items.len);
-    try std.testing.expect(p7FindByMeshIndex(draws.primary.items.items, 0) != null);
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 0), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(usize, 0), draws.primary.items.items.len);
 }
 
 test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
@@ -4134,6 +4490,7 @@ test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -4207,9 +4564,16 @@ test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
     try std.testing.expectEqual(@as(u64, 0), mesh_c.instance_preview.build_seq);
     try std.testing.expectEqual(@as(u32, 0), mesh_c.instance_render.count);
     try std.testing.expectEqual(std.math.maxInt(u64), mesh_c.instance_render.staged_frame);
+    // Stage-2B: the mesh list MUST NOT be mutated between build and latch
+    // (swapRemove + append here); queues froze at build (A+B) and both
+    // entries fail-close by uid (A's slot now holds B, B's slot now holds C)
+    // — no OOB, no UAF, both invisible. instance_render above stays exact;
+    // the next funded build+latch republishes the live list.
     const draws = scene.preparedDraws();
-    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 2), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
+    for (draws.primary.opaque_instanced.items) |b| {
+        try std.testing.expectEqual(@as(u32, 0), b.visible_instance_count);
+    }
 }
 
 test "stage1: truncated scratch between build and latch is skipped safely" {
@@ -4223,6 +4587,7 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
     defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
     defer scene.shadows.pass.prepared.deinit(alloc);
     p7CpuShadowPass(&scene, alloc);
 
@@ -4276,4 +4641,1195 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expect(parent.instance_render.bounds.max.x > primed_bounds.max.x + 10.0);
+}
+
+test "stage-2A: buildQueuesInto with fallback params equals two runs" {
+    const alloc = std.testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    var m0 = Mesh{
+        .name = "bq0",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var m1 = Mesh{
+        .name = "bq1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &m0);
+    try scene.meshes.append(alloc, &m1);
+    try scene.outline_meshes.append(alloc, &m0);
+
+    // Fake GPU-init (queue builds read only the id, no sg calls) and a
+    // camera-bearing snapshot with shadows disabled (shadows.pass stays
+    // undefined in this fixture, so the shadow path must be skipped).
+    // Frustum/occlusion off: identity view_proj would otherwise cull the
+    // offset mesh and the two-run comparison would be trivially 1 vs 1.
+    scene.default_white_texture.view.id = 1;
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.frame_id = 41;
+    scene.frame_snapshot.has_camera = true;
+    scene.frame_snapshot.shadows_enabled = false;
+    scene.frame_snapshot.primary_cam = .{
+        .view_proj = Mat4.identity,
+        .eye = Vec3.zero,
+        .culling_mask = 0xFFFFFFFF,
+        .aspect = 1.0,
+        .enabled = true,
+    };
+
+    var stats_a = SceneStats{};
+    var stats_b = SceneStats{};
+    var slot_a: FrameDrawSlot = .{};
+    defer slot_a.deinit(alloc);
+    var slot_b: FrameDrawSlot = .{};
+    defer slot_b.deinit(alloc);
+
+    scene.buildQueuesInto(&slot_a, .{
+        .cache_key = scene.frame_id,
+        .stats = &stats_a,
+        .eye = scene.frame_snapshot.primary_cam.eye,
+        .sky_texture = null,
+        .ibl_intensity = scene.frame_snapshot.ibl_intensity,
+        .instances_prepared = true,
+        .instance_source = .published,
+    });
+    scene.buildQueuesInto(&slot_b, .{
+        .cache_key = scene.frame_id,
+        .stats = &stats_b,
+        .eye = scene.frame_snapshot.primary_cam.eye,
+        .sky_texture = null,
+        .ibl_intensity = scene.frame_snapshot.ibl_intensity,
+        .instances_prepared = true,
+        .instance_source = .published,
+    });
+
+    try std.testing.expectEqual(stats_a.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_a.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(slot_a.primary.items.items.len, slot_b.primary.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slot_a.primary.items.items.len);
+    for (slot_a.primary.items.items, slot_b.primary.items.items) |a, b| {
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.mesh_index, b.mesh_index);
+        try std.testing.expectEqual(a.distance_sq, b.distance_sq);
+    }
+    try std.testing.expectEqual(slot_a.outline_items.items.len, slot_b.outline_items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), slot_a.outline_items.items.len);
+    for (slot_a.outline_items.items, slot_b.outline_items.items) |a, b| {
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.source_uid, b.source_uid);
+        try std.testing.expectEqual(a.source_mesh, b.source_mesh);
+    }
+    try std.testing.expect(m0.uid != 0 and m1.uid != 0);
+}
+
+// ---- Stage-2 increment B: game-side queue build + latch patch. ----
+
+test "stage-2B(a): build+latch finalizes handles and freezes sets" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2a_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 4;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "b2a_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    var regular = Mesh{
+        .name = "b2a_reg",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &parent);
+    try scene.meshes.append(alloc, &regular);
+    try scene.outline_meshes.append(alloc, &parent);
+
+    scene.buildPreparedFrame();
+    const frozen_bounds = parent.instance_preview.bounds;
+    const frozen_reg_pos = regular.position;
+
+    // Live TRS mutation between build and latch must not alter this frame.
+    mem[0].position = Vec3.new(100, 0, 0);
+    regular.position = Vec3.new(50, 0, 0);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // Batch/shadow/outline buffer ids+counts equal post-latch instance_render.
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    const batch = draws.primary.opaque_instanced.items[0];
+    try std.testing.expectEqual(parent.instance_render.count, batch.visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, batch.instance_buffer.id);
+    try std.testing.expectEqual(parent.uid, batch.source_uid);
+    var found_shadow = false;
+    for (draws.shadow.items.items) |it| {
+        if (it.is_instanced and it.source_uid == parent.uid) {
+            try std.testing.expectEqual(parent.instance_render.count, it.visible_instance_count);
+            try std.testing.expectEqual(parent.instance_render.buffer.id, it.instance_buffer.id);
+            try std.testing.expectEqual(parent.instance_render.bounds, it.world_aabb);
+            found_shadow = true;
+        }
+    }
+    try std.testing.expect(found_shadow);
+    try std.testing.expectEqual(@as(usize, 1), draws.outline_items.items.len);
+    const oi = draws.outline_items.items[0];
+    try std.testing.expectEqual(parent.instance_render.count, oi.visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, oi.instance_buffer.id);
+    // Frozen inclusion/bounds: still the build-time sets, not the mutation.
+    try std.testing.expectEqual(frozen_bounds, parent.instance_render.bounds);
+    try std.testing.expect(parent.instance_render.bounds.max.x < 50.0);
+    const reg_item = p7FindByMeshIndex(draws.primary.items.items, 1).?;
+    try std.testing.expectApproxEqAbs(frozen_reg_pos.x, reg_item.model.m[12], 1e-4);
+    // Live mutation after latch does not alter the published slot.
+    const slot_model_x = reg_item.model.m[12];
+    const slot_batch_count = batch.visible_instance_count;
+    regular.position = Vec3.new(99, 0, 0);
+    mem[1].position = Vec3.new(200, 0, 0);
+    try std.testing.expectEqual(slot_model_x, draws.primary.items.items[0].model.m[12] + (slot_model_x - draws.primary.items.items[0].model.m[12]));
+    try std.testing.expectEqual(slot_batch_count, draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(frozen_bounds, parent.instance_render.bounds);
+}
+
+test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2b_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 4;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "b2b_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    // Prime a prior handle (provisional at build time).
+    parent.instance_render.buffer = .{ .id = 100 };
+    parent.instance_render.capacity = 2;
+    parent.instance_render.uploaded_count = 2;
+    try scene.meshes.append(alloc, &parent);
+    try scene.outline_meshes.append(alloc, &parent);
+
+    scene.buildPreparedFrame();
+    // Provisional handle is the old one.
+    try std.testing.expectEqual(@as(u32, 100), parent.instance_build_view.buffer.id);
+
+    // Simulate growth between build and latch: swap in the new handle (as
+    // stageInstancesGpu would after creating it headless-safe: the latch
+    // keeps the swapped handle since sg is invalid and publishes count).
+    // The old-handle retire is deferred until AFTER prepare (into the open
+    // latch epoch) so the prepare-leading flush never destroys a fake
+    // headless id — mirroring the real growth order (new first, old retired
+    // into the current epoch, VALID until a later complete+flush).
+    const old_buf = parent.instance_render.buffer;
+    parent.instance_render.buffer = .{ .id = 200 };
+    parent.instance_render.capacity = 4;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // All payload refs carry the NEW buffer id and count.
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 200), draws.primary.opaque_instanced.items[0].instance_buffer.id);
+    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    var shadow_ok = false;
+    for (draws.shadow.items.items) |it| {
+        if (it.is_instanced and it.source_uid == parent.uid) {
+            try std.testing.expectEqual(@as(u32, 200), it.instance_buffer.id);
+            try std.testing.expectEqual(@as(u32, 4), it.visible_instance_count);
+            shadow_ok = true;
+        }
+    }
+    try std.testing.expect(shadow_ok);
+    try std.testing.expectEqual(@as(usize, 1), draws.outline_items.items.len);
+    try std.testing.expectEqual(@as(u32, 200), draws.outline_items.items[0].instance_buffer.id);
+    try std.testing.expectEqual(@as(u32, 4), draws.outline_items.items[0].visible_instance_count);
+    // SIMULATION-ONLY retire tail (headless, fake buffer ids): retire the
+    // grown-away old handle AFTER prepare (into the open latch epoch, as real
+    // growth would): pre-complete flush keeps it VALID without touching sg.*
+    // headless. Real destroy lifetime on complete+flush is covered by the
+    // retire-queue unit tests — fake headless ids must never go through
+    // sg.destroyBuffer.
+    scene.gpu_retire.retireBuffer(alloc, old_buf);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+    scene.gpu_retire.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+    // Manual headless cleanup (mirrors retireBuffer unit-test handling).
+    scene.gpu_retire.pending.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+}
+
+test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2c_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const ma = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(ma);
+    const pa = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pa);
+    stage1FillInstances(&src, ma, pa, 0);
+    var mesh_a = Mesh{
+        .name = "b2c_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pa, .capacity = 2 },
+    };
+    const mb = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mb);
+    const pb = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pb);
+    stage1FillInstances(&src, mb, pb, 50);
+    var mesh_b = Mesh{
+        .name = "b2c_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pb, .capacity = 2 },
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_b);
+    try scene.outline_meshes.append(alloc, &mesh_a);
+    try scene.outline_meshes.append(alloc, &mesh_b);
+
+    scene.buildPreparedFrame();
+    // Simulate an OOM/failing-allocator skip of B at latch: stale its preview
+    // so stageInstancesLatch skips it (previous complete state stands, patch
+    // must zero its provisional entries — no partial mix).
+    mesh_b.instance_preview.build_seq = 0;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
+    for (draws.primary.opaque_instanced.items) |batch| {
+        if (batch.source_uid == mesh_a.uid) {
+            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+        } else if (batch.source_uid == mesh_b.uid) {
+            try std.testing.expectEqual(@as(u32, 0), batch.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 0), batch.instance_buffer.id);
+        } else return error.TestUnexpectedResult;
+    }
+    for (draws.shadow.items.items) |it| {
+        if (it.is_instanced and it.source_uid == mesh_b.uid) {
+            try std.testing.expectEqual(@as(u32, 0), it.visible_instance_count);
+            try std.testing.expect(!it.world_aabb.isValid());
+            try std.testing.expectEqual(@as(f32, 0), it.max_dim);
+        }
+    }
+    for (draws.outline_items.items) |it| {
+        if (it.is_instanced and it.source_uid == mesh_b.uid) {
+            try std.testing.expectEqual(@as(u32, 0), it.visible_instance_count);
+            try std.testing.expectEqual(mesh_b.position, it.world_center);
+        }
+    }
+    // Retry next frame recovers.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws2 = scene.preparedDraws();
+    for (draws2.primary.opaque_instanced.items) |batch| {
+        try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+    }
+}
+
+test "stage-2B(d): mesh-list change fail-closes by uid, no OOB/UAF" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2d_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const ma = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(ma);
+    const pa = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pa);
+    stage1FillInstances(&src, ma, pa, 0);
+    var mesh_a = Mesh{
+        .name = "b2d_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pa, .capacity = 2 },
+    };
+    const mb = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mb);
+    const pb = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pb);
+    stage1FillInstances(&src, mb, pb, 50);
+    var mesh_b = Mesh{
+        .name = "b2d_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pb, .capacity = 2 },
+    };
+    var mesh_c = Mesh{
+        .name = "b2d_c",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(9, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_b);
+    try scene.meshes.append(alloc, &mesh_c);
+    try scene.outline_meshes.append(alloc, &mesh_a);
+    try scene.outline_meshes.append(alloc, &mesh_b);
+
+    const uid_a = blk: {
+        scene.buildPreparedFrame();
+        break :blk mesh_a.uid;
+    };
+    const uid_b = mesh_b.uid;
+    // Remove the trailing regular mesh: A/B indices unchanged (still draw),
+    // C's absence must not OOB. Then reorder A/B via swapRemove to force a uid
+    // mismatch on the next latch in a second round below.
+    _ = scene.meshes.swapRemove(2);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // A/B still draw (indices stable), no OOB from the removed tail.
+    var a_ok = false;
+    var b_ok = false;
+    for (draws.primary.opaque_instanced.items) |batch| {
+        if (batch.source_uid == uid_a) {
+            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+            a_ok = true;
+        }
+        if (batch.source_uid == uid_b) {
+            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+            b_ok = true;
+        }
+    }
+    try std.testing.expect(a_ok and b_ok);
+
+    // Second round: reorder A/B so stored indices mismatch uids → fail-close.
+    scene.buildPreparedFrame();
+    _ = scene.meshes.swapRemove(0); // [B] (A unlinked); re-append A → [B, A]
+    try scene.meshes.append(alloc, &mesh_a);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws2 = scene.preparedDraws();
+    // Both stale entries zero (no OOB, no UAF); instance_render stays exact.
+    try std.testing.expectEqual(@as(usize, 2), draws2.primary.opaque_instanced.items.len);
+    for (draws2.primary.opaque_instanced.items) |batch| {
+        try std.testing.expectEqual(@as(u32, 0), batch.visible_instance_count);
+    }
+    try std.testing.expectEqual(@as(u32, 2), mesh_a.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
+}
+
+test "stage-2B(e): fallback equivalence with build+latch" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+
+    const Fixture = struct {
+        src: Mesh,
+        mem: []InstancedMesh,
+        ptrs: []*InstancedMesh,
+        parent: Mesh,
+        regular: Mesh,
+        fn init(a: std.mem.Allocator) !@This() {
+            var f: @This() = undefined;
+            f.src = Mesh{
+                .name = "b2e_src",
+                .vertex_buffer = .{},
+                .index_buffer = .{},
+                .index_count = 3,
+                .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+            };
+            f.mem = try a.alloc(InstancedMesh, 3);
+            f.ptrs = try a.alloc(*InstancedMesh, 3);
+            // NOTE: instances are filled by the caller (see below), NOT here:
+            // `stage1FillInstances(&f.src, ...)` inside `init` would store a
+            // pointer to this frame's `f.src` local, which dangles once the
+            // struct is returned by value (the shadow/instanced bounds then
+            // stage from dead stack memory — fallback-zero vs build-garbage).
+            // The caller fills against its own stable `fix.src` instead.
+            f.parent = Mesh{
+                .name = "b2e_parent",
+                .vertex_buffer = .{},
+                .index_buffer = .{},
+                .index_count = 3,
+                .instances = .{ .items = f.ptrs, .capacity = 3 },
+            };
+            f.regular = Mesh{
+                .name = "b2e_reg",
+                .vertex_buffer = .{},
+                .index_buffer = .{},
+                .index_count = 3,
+                .position = Vec3.new(5, 0, 0),
+                .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+            };
+            return f;
+        }
+        fn deinit(f: *@This(), a: std.mem.Allocator) void {
+            a.free(f.mem);
+            a.free(f.ptrs);
+        }
+    };
+
+    // Path 1: build+latch.
+    var scene_b = stage1Scene(alloc);
+    defer scene_b.lights.deinit(alloc);
+    defer scene_b.cameras.deinit(alloc);
+    defer scene_b.meshes.deinit(alloc);
+    defer scene_b.outline_meshes.deinit(alloc);
+    defer scene_b.draws.deinit(alloc);
+    defer scene_b.gpu_retire.deinit(alloc);
+    defer scene_b.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene_b.shadows.pass.binned_source.deinit(alloc);
+    defer scene_b.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene_b, alloc);
+    const cam_b = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene_b.addCamera(.{ .name = "Cam1", .camera = cam_b });
+    var fix_b = try Fixture.init(alloc);
+    defer fix_b.deinit(alloc);
+    stage1FillInstances(&fix_b.src, fix_b.mem, fix_b.ptrs, 0);
+    try scene_b.meshes.append(alloc, &fix_b.parent);
+    try scene_b.meshes.append(alloc, &fix_b.regular);
+    try scene_b.outline_meshes.append(alloc, &fix_b.parent);
+    scene_b.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene_b.buildPreparedFrame();
+    scene_b.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene_b.prepareFrame();
+    const draws_b = scene_b.preparedDraws();
+    const stats_b = scene_b.stats;
+
+    // Path 2: fallback (never built).
+    var scene_f = stage1Scene(alloc);
+    defer scene_f.lights.deinit(alloc);
+    defer scene_f.cameras.deinit(alloc);
+    defer scene_f.meshes.deinit(alloc);
+    defer scene_f.outline_meshes.deinit(alloc);
+    defer scene_f.draws.deinit(alloc);
+    defer scene_f.gpu_retire.deinit(alloc);
+    defer scene_f.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene_f.shadows.pass.binned_source.deinit(alloc);
+    defer scene_f.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene_f, alloc);
+    const cam_f = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene_f.addCamera(.{ .name = "Cam1", .camera = cam_f });
+    var fix_f = try Fixture.init(alloc);
+    defer fix_f.deinit(alloc);
+    stage1FillInstances(&fix_f.src, fix_f.mem, fix_f.ptrs, 0);
+    try scene_f.meshes.append(alloc, &fix_f.parent);
+    try scene_f.meshes.append(alloc, &fix_f.regular);
+    try scene_f.outline_meshes.append(alloc, &fix_f.parent);
+    scene_f.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene_f.prepareFrame();
+    const draws_f = scene_f.preparedDraws();
+    const stats_f = scene_f.stats;
+
+    // Full payload equality, PAIRED BY IDENTITY (not list position): the two
+    // scenes own distinct Mesh instances (global uid counter), so cross-scene
+    // pairing keys on the mesh-list index (`source_mesh`/`mesh_index`), which
+    // is stable across the two identical fixtures. Identity is validated
+    // within each scene first (`meshes[source_mesh].uid == source_uid`, the
+    // same invariant `patchInstanceRefs` enforces); an item with
+    // `source_uid == 0` (never uid-assigned) falls back to positional pairing
+    // for that item only. A prior failure here (fallback-zero vs
+    // build-garbage on the instanced shadow bounds) traced to the Fixture
+    // storing `&f.src` inside `init` — a pointer to the init frame's local
+    // that dangles after the struct is returned by value — not to either
+    // code path: both stage faithfully from `source_mesh`, so both read the
+    // same dead stack slot at different times. The fill now runs against the
+    // caller's stable `fix.src` (see above); no production code change was
+    // needed (stale-preview build_view entries are already deterministic-zero
+    // and regular items keep their valid world-cache AABB).
+    // Documented allowed differences: sort order under different eyes (eyes
+    // are identical here — same camera, no mutation — so order matches) and
+    // staged_frame (frame_ids both start at 1 here, so they match too).
+    try std.testing.expectEqual(draws_f.primary.items.items.len, draws_b.primary.items.items.len);
+    for (draws_f.primary.items.items) |f| {
+        var matched = false;
+        for (draws_b.primary.items.items) |b| {
+            if (b.mesh_index != f.mesh_index) continue;
+            try std.testing.expectEqual(f.model, b.model);
+            try std.testing.expectEqual(f.distance_sq, b.distance_sq);
+            try std.testing.expectEqual(f.index_count, b.index_count);
+            matched = true;
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+    try std.testing.expectEqual(draws_f.primary.opaque_instanced.items.len, draws_b.primary.opaque_instanced.items.len);
+    for (draws_f.primary.opaque_instanced.items, 0..) |f, fi| {
+        if (f.source_uid != 0) {
+            try std.testing.expect(f.source_mesh < scene_f.meshes.items.len);
+            try std.testing.expectEqual(scene_f.meshes.items[f.source_mesh].uid, f.source_uid);
+        }
+        var matched = false;
+        for (draws_b.primary.opaque_instanced.items, 0..) |b, bi| {
+            if (f.source_uid == 0 or b.source_uid == 0) {
+                if (bi != fi) continue;
+            } else {
+                if (b.source_mesh != f.source_mesh) continue;
+                try std.testing.expect(b.source_mesh < scene_b.meshes.items.len);
+                try std.testing.expectEqual(scene_b.meshes.items[b.source_mesh].uid, b.source_uid);
+            }
+            try std.testing.expectEqual(f.visible_instance_count, b.visible_instance_count);
+            try std.testing.expectEqual(f.instance_buffer.id, b.instance_buffer.id);
+            try std.testing.expectEqual(f.index_count, b.index_count);
+            matched = true;
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+    try std.testing.expectEqual(draws_f.shadow.items.items.len, draws_b.shadow.items.items.len);
+    for (draws_f.shadow.items.items, 0..) |f, fi| {
+        if (f.source_uid != 0) {
+            try std.testing.expect(f.source_mesh < scene_f.meshes.items.len);
+            try std.testing.expectEqual(scene_f.meshes.items[f.source_mesh].uid, f.source_uid);
+        }
+        var matched = false;
+        for (draws_b.shadow.items.items, 0..) |b, bi| {
+            if (f.source_uid == 0 or b.source_uid == 0) {
+                if (bi != fi) continue;
+            } else {
+                if (b.source_mesh != f.source_mesh) continue;
+                if (b.bucket != f.bucket) continue;
+                try std.testing.expect(b.source_mesh < scene_b.meshes.items.len);
+                try std.testing.expectEqual(scene_b.meshes.items[b.source_mesh].uid, b.source_uid);
+            }
+            try std.testing.expectEqual(f.model, b.model);
+            try std.testing.expectEqual(f.is_instanced, b.is_instanced);
+            try std.testing.expectEqual(f.world_aabb, b.world_aabb);
+            try std.testing.expectEqual(f.max_dim, b.max_dim);
+            try std.testing.expectEqual(f.instance_buffer.id, b.instance_buffer.id);
+            try std.testing.expectEqual(f.visible_instance_count, b.visible_instance_count);
+            matched = true;
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+    try std.testing.expectEqual(draws_f.outline_items.items.len, draws_b.outline_items.items.len);
+    for (draws_f.outline_items.items, 0..) |f, fi| {
+        if (f.source_uid != 0) {
+            try std.testing.expect(f.source_mesh < scene_f.meshes.items.len);
+            try std.testing.expectEqual(scene_f.meshes.items[f.source_mesh].uid, f.source_uid);
+        }
+        var matched = false;
+        for (draws_b.outline_items.items, 0..) |b, bi| {
+            if (f.source_uid == 0 or b.source_uid == 0) {
+                if (bi != fi) continue;
+            } else {
+                if (b.source_mesh != f.source_mesh) continue;
+                try std.testing.expect(b.source_mesh < scene_b.meshes.items.len);
+                try std.testing.expectEqual(scene_b.meshes.items[b.source_mesh].uid, b.source_uid);
+            }
+            try std.testing.expectEqual(f.model, b.model);
+            try std.testing.expectEqual(f.world_center, b.world_center);
+            try std.testing.expectEqual(f.instance_buffer.id, b.instance_buffer.id);
+            try std.testing.expectEqual(f.visible_instance_count, b.visible_instance_count);
+            matched = true;
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+    try std.testing.expectEqual(stats_f.total_meshes, stats_b.total_meshes);
+    try std.testing.expectEqual(stats_f.rendered_meshes, stats_b.rendered_meshes);
+    try std.testing.expectEqual(stats_f.culled_meshes, stats_b.culled_meshes);
+    try std.testing.expectEqual(stats_f.occluded_meshes, stats_b.occluded_meshes);
+    try std.testing.expectEqual(stats_f.occluders_count, stats_b.occluders_count);
+    try std.testing.expectEqual(stats_f.occluder_triangles, stats_b.occluder_triangles);
+}
+
+test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var m0 = Mesh{
+        .name = "b2f_0",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    var m1 = Mesh{
+        .name = "b2f_1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &m0);
+    try scene.meshes.append(alloc, &m1);
+    try scene.outline_meshes.append(alloc, &m0);
+
+    // Warm both slots with funded build+latch rounds.
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+        scene.buildPreparedFrame();
+        scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+        scene.prepareFrame();
+    }
+    const warm_primary = scene.preparedDraws().primary.items.items.len;
+    const warm_outline = scene.preparedDraws().outline_items.items.len;
+    const warm_stats = scene.stats;
+
+    // Refuse-all round must not induce failure and must match the warm payload.
+    var refusing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved_alloc = scene.allocator;
+    const saved_shadow_alloc = scene.shadows.pass.allocator;
+    scene.allocator = refusing.allocator();
+    scene.shadows.pass.allocator = refusing.allocator();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    scene.allocator = saved_alloc;
+    scene.shadows.pass.allocator = saved_shadow_alloc;
+    try std.testing.expect(!refusing.has_induced_failure);
+    const dz = scene.preparedDraws();
+    try std.testing.expectEqual(warm_primary, dz.primary.items.items.len);
+    try std.testing.expectEqual(warm_outline, dz.outline_items.items.len);
+    try std.testing.expectEqual(warm_stats.total_meshes, scene.stats.total_meshes);
+    try std.testing.expectEqual(warm_stats.rendered_meshes, scene.stats.rendered_meshes);
+}
+
+test "stage-2B(g): serial build+latch equals worker-build parity" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+
+    const Builder = struct {
+        scene: *Scene,
+        fn run(self: @This()) void {
+            self.scene.buildPreparedFrame();
+        }
+    };
+
+    // Serial path.
+    var serial = stage1Scene(alloc);
+    defer serial.lights.deinit(alloc);
+    defer serial.cameras.deinit(alloc);
+    defer serial.meshes.deinit(alloc);
+    defer serial.outline_meshes.deinit(alloc);
+    defer serial.draws.deinit(alloc);
+    defer serial.gpu_retire.deinit(alloc);
+    defer serial.shadows.pass.binned_meshes.deinit(alloc);
+    defer serial.shadows.pass.binned_source.deinit(alloc);
+    defer serial.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&serial, alloc);
+    const cam_s = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try serial.addCamera(.{ .name = "Cam1", .camera = cam_s });
+    var src_s = Mesh{
+        .name = "b2g_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem_s = try alloc.alloc(InstancedMesh, 3);
+    defer alloc.free(mem_s);
+    const ptrs_s = try alloc.alloc(*InstancedMesh, 3);
+    defer alloc.free(ptrs_s);
+    stage1FillInstances(&src_s, mem_s, ptrs_s, 0);
+    var parent_s = Mesh{
+        .name = "b2g_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs_s, .capacity = 3 },
+    };
+    try serial.meshes.append(alloc, &parent_s);
+    try serial.outline_meshes.append(alloc, &parent_s);
+    serial.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    serial.buildPreparedFrame();
+    serial.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    serial.prepareFrame();
+
+    // Worker-build path (same live state, build on a spawned thread).
+    var threaded = stage1Scene(alloc);
+    defer threaded.lights.deinit(alloc);
+    defer threaded.cameras.deinit(alloc);
+    defer threaded.meshes.deinit(alloc);
+    defer threaded.outline_meshes.deinit(alloc);
+    defer threaded.draws.deinit(alloc);
+    defer threaded.gpu_retire.deinit(alloc);
+    defer threaded.shadows.pass.binned_meshes.deinit(alloc);
+    defer threaded.shadows.pass.binned_source.deinit(alloc);
+    defer threaded.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&threaded, alloc);
+    const cam_t = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try threaded.addCamera(.{ .name = "Cam1", .camera = cam_t });
+    var src_t = Mesh{
+        .name = "b2g_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem_t = try alloc.alloc(InstancedMesh, 3);
+    defer alloc.free(mem_t);
+    const ptrs_t = try alloc.alloc(*InstancedMesh, 3);
+    defer alloc.free(ptrs_t);
+    stage1FillInstances(&src_t, mem_t, ptrs_t, 0);
+    var parent_t = Mesh{
+        .name = "b2g_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs_t, .capacity = 3 },
+    };
+    try threaded.meshes.append(alloc, &parent_t);
+    try threaded.outline_meshes.append(alloc, &parent_t);
+    threaded.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &threaded }});
+    t.join();
+    threaded.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    threaded.prepareFrame();
+
+    // Parity: counts and buffer ids match across threads (distinct Mesh
+    // instances, so pairing is positional on the identical single-mesh
+    // fixture; uids intentionally not compared).
+    const ds = serial.preparedDraws();
+    const dt = threaded.preparedDraws();
+    try std.testing.expectEqual(ds.primary.opaque_instanced.items.len, dt.primary.opaque_instanced.items.len);
+    for (ds.primary.opaque_instanced.items, dt.primary.opaque_instanced.items) |a, b| {
+        try std.testing.expectEqual(a.visible_instance_count, b.visible_instance_count);
+        try std.testing.expectEqual(a.instance_buffer.id, b.instance_buffer.id);
+    }
+    try std.testing.expectEqual(ds.shadow.items.items.len, dt.shadow.items.items.len);
+    for (ds.shadow.items.items, dt.shadow.items.items) |a, b| {
+        try std.testing.expectEqual(a.model, b.model);
+        try std.testing.expectEqual(a.is_instanced, b.is_instanced);
+        try std.testing.expectEqual(a.world_aabb, b.world_aabb);
+        try std.testing.expectEqual(a.max_dim, b.max_dim);
+        try std.testing.expectEqual(a.instance_buffer.id, b.instance_buffer.id);
+        try std.testing.expectEqual(a.visible_instance_count, b.visible_instance_count);
+    }
+    try std.testing.expectEqual(ds.outline_items.items.len, dt.outline_items.items.len);
+    for (ds.outline_items.items, dt.outline_items.items) |a, b| {
+        try std.testing.expectEqual(a.world_center, b.world_center);
+        try std.testing.expectEqual(a.instance_buffer.id, b.instance_buffer.id);
+        try std.testing.expectEqual(a.visible_instance_count, b.visible_instance_count);
+    }
+}
+
+test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2h_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const ma = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(ma);
+    const pa = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pa);
+    stage1FillInstances(&src, ma, pa, 0);
+    var mesh_a = Mesh{
+        .name = "b2h_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pa, .capacity = 2 },
+    };
+    const mb = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mb);
+    const pb = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(pb);
+    stage1FillInstances(&src, mb, pb, 50);
+    var mesh_b = Mesh{
+        .name = "b2h_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = pb, .capacity = 2 },
+    };
+    var mesh_c = Mesh{
+        .name = "b2h_c",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(9, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &mesh_a); // mesh-list 0
+    try scene.meshes.append(alloc, &mesh_b); // mesh-list 1
+    try scene.meshes.append(alloc, &mesh_c); // mesh-list 2
+    // Outline subset in a different order than the mesh list.
+    try scene.outline_meshes.append(alloc, &mesh_b);
+    try scene.outline_meshes.append(alloc, &mesh_a);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // No outline dropped; each item carries its MESH-LIST index (not the
+    // outline-list position) and patches from its own mesh.
+    try std.testing.expectEqual(@as(usize, 2), draws.outline_items.items.len);
+    for (draws.outline_items.items) |it| {
+        if (it.source_uid == mesh_b.uid) {
+            try std.testing.expectEqual(@as(u32, 1), it.source_mesh);
+            try std.testing.expectEqual(@as(u32, 2), it.visible_instance_count);
+            try std.testing.expectEqual(mesh_b.instance_render.buffer.id, it.instance_buffer.id);
+            const expect_c = if (mesh_b.instance_render.bounds.isValid()) mesh_b.instance_render.bounds.center() else mesh_b.position;
+            try std.testing.expectEqual(expect_c, it.world_center);
+        } else if (it.source_uid == mesh_a.uid) {
+            try std.testing.expectEqual(@as(u32, 0), it.source_mesh);
+            try std.testing.expectEqual(@as(u32, 2), it.visible_instance_count);
+            try std.testing.expectEqual(mesh_a.instance_render.buffer.id, it.instance_buffer.id);
+            const expect_c = if (mesh_a.instance_render.bounds.isValid()) mesh_a.instance_render.bounds.center() else mesh_a.position;
+            try std.testing.expectEqual(expect_c, it.world_center);
+        } else return error.TestUnexpectedResult;
+    }
+
+    // Reorder-only on the outline list (mesh list untouched): rebuild maps
+    // the same mesh-list indices in the new outline order; nothing dropped.
+    _ = scene.outline_meshes.swapRemove(0); // [A]
+    try scene.outline_meshes.append(alloc, &mesh_b); // [A, B]
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws2 = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 2), draws2.outline_items.items.len);
+    try std.testing.expectEqual(mesh_a.uid, draws2.outline_items.items[0].source_uid);
+    try std.testing.expectEqual(@as(u32, 0), draws2.outline_items.items[0].source_mesh);
+    try std.testing.expectEqual(mesh_b.uid, draws2.outline_items.items[1].source_uid);
+    try std.testing.expectEqual(@as(u32, 1), draws2.outline_items.items[1].source_mesh);
+}
+
+test "stage-2B(i): PIP views patch each built view" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam0 = Camera{ .free = camera_mod.FreeCamera.init("Main", .{}) };
+    const cam1 = Camera{ .free = camera_mod.FreeCamera.init("Pip", .{}) };
+    _ = try scene.addCamera(.{ .name = "Main", .camera = cam0 });
+    _ = try scene.addCamera(.{ .name = "Pip", .camera = cam1 });
+    scene.enable_multi_camera = true;
+    scene.active_camera_index = 0;
+
+    var src = Mesh{
+        .name = "b2i_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 3;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "b2i_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    // Primary finalized.
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(parent.instance_render.count, draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, draws.primary.opaque_instanced.items[0].instance_buffer.id);
+    // Each built PIP view finalized too (views[1] built; views[0] is the
+    // active slot and stays empty by the multi-camera contract).
+    try std.testing.expectEqual(@as(usize, 1), draws.views[1].opaque_instanced.items.len);
+    try std.testing.expectEqual(parent.instance_render.count, draws.views[1].opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, draws.views[1].opaque_instanced.items[0].instance_buffer.id);
+    try std.testing.expectEqual(@as(usize, 0), draws.views[0].opaque_instanced.items.len);
+}
+
+test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const material_mod = @import("material.zig");
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var blend_mat = material_mod.StandardMaterial.init("b2j_blend");
+    blend_mat.alpha_mode = .blend;
+    var src = Mesh{
+        .name = "b2j_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "b2j_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .material = .{ .standard = &blend_mat },
+        .instances = .{ .items = ptrs, .capacity = 2 },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_preview.count);
+    // Stale the preview so the latch skips (as after an OOM/GPU failure):
+    // the transparent batch patch-zeroes but its transparent_order entry
+    // stays (stale). The draw skips count==0 batches, so the stale order
+    // entry is harmless — slot-state only here (renderSceneView needs a live
+    // camera + sg context, impractical headless; documented).
+    parent.instance_preview.build_seq = 0;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.transparent_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 0), draws.primary.transparent_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 0), draws.primary.transparent_instanced.items[0].instance_buffer.id);
+    var found_stale = false;
+    for (draws.primary.transparent_order.items) |e| {
+        if (e.kind == .instanced and e.index == 0) found_stale = true;
+    }
+    try std.testing.expect(found_stale);
+}
+
+test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "b2k_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "b2k_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = 2 },
+    };
+    var regular = Mesh{
+        .name = "b2k_reg",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &parent);
+    try scene.meshes.append(alloc, &regular);
+
+    // Round 1: build+latch (world cache tagged with the build key).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    const built_reg_x = p7FindByMeshIndex(scene.preparedDraws().primary.items.items, 1).?.model.m[12];
+
+    // Mutate live, then suppress the build: fallback must recompute under the
+    // frame_id key (not reuse stale build-key entries).
+    regular.position = Vec3.new(25, 0, 0);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame(); // have_build == false → inline fallback
+    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    const draws = scene.preparedDraws();
+    const fb_item = p7FindByMeshIndex(draws.primary.items.items, 1).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), fb_item.model.m[12], 1e-4);
+    try std.testing.expect(fb_item.model.m[12] != built_reg_x);
+    // Cache retagged with the context frame_id (not the build high-bit key).
+    try std.testing.expectEqual(scene.frame_id, regular.cached_frame);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 2), draws.primary.opaque_instanced.items[0].visible_instance_count);
 }

@@ -99,8 +99,34 @@ pub const InstancePreviewState = struct {
     scratch_lo: usize = 0,
 };
 
+/// Which instance state a queue/shadow/outline builder resolves (stage-2
+/// increment B): `.published` reads the context-published `instance_render`
+/// (today's exact fallback behavior); `.build_view` reads the game-side
+/// provisional `instance_build_view` frozen at `buildPreparedFrame` time
+/// (finalized by the later latch `patchInstanceRefs`). Builders receive this
+/// via `QueueBuildParams.instance_source` / `FrameCullContext.instance_source`
+/// — never a bare cache_key for instance data.
+pub const InstanceSource = enum { published, build_view };
+/// Mesh-module uid counter for `Mesh.ensureUid` (stage-2 increment A).
+/// Chosen over `Scene.next_mesh_uid`: queue/shadow/outline/instance-staging
+/// builders have no Scene handle, so a Scene counter would require threading
+/// through every context struct; the module counter keeps increment A minimal
+/// and behavior-identical. Starts at 1 (0 = unassigned, never assigned);
+/// wraps with +% and skips 0, never reuses a live uid (2^64 space).
+var mesh_uid_next: u64 = 1;
+
 pub const Mesh = struct {
     id: u64 = 0,
+    /// Render identity for queue/shadow/outline payloads (stage-2 increment A,
+    /// refactor-only): stable for the mesh lifetime, never reused after free
+    /// (0 = unassigned, assigned lazily by `ensureUid`). Distinct from `id`
+    /// (serialization/persistent id): `uid` is a runtime render key validated
+    /// at patch time by a later latch patch. Assignment is a no-op once set,
+    /// so calling it during queue/shadow/outline/instance-staging builds has
+    /// no behavior impact. Callers must assign serially before any parallel
+    /// read (builders ensure before forkJoin); the counter itself is plain
+    /// (phase ownership, like `instance_render`).
+    uid: u64 = 0,
     name: []const u8,
     owns_name: bool = false,
     position: Vec3 = Vec3.zero,
@@ -165,6 +191,21 @@ pub const Mesh = struct {
     instances: std.ArrayListUnmanaged(*InstancedMesh) = .empty,
     instance_render: InstanceRenderState = .{},
     instance_preview: InstancePreviewState = .{},
+    /// Game-side provisional instance view (stage-2 increment B): frozen by
+    /// `Scene.buildPreparedFrame` AFTER `stageInstancesCpu` and BEFORE the
+    /// game-side queue build, from the fresh preview + the then-current
+    /// `instance_render` handle. For a fresh preview
+    /// (`preview.build_seq == build_seq`): count/bounds/hash from the preview,
+    /// buffer/capacity/uploaded_count/staged_frame from `instance_render`
+    /// (provisional handle until the latch `patchInstanceRefs` finalizes it).
+    /// For a stale/absent preview: all-zero (invisible: count 0, invalid
+    /// bounds, null buffer). Regular (non-instanced) meshes have no preview
+    /// and stay zero — their queue/shadow/outline paths ignore the instanced
+    /// fields (regular draws use index_count/model, not count/buffer).
+    /// Ownership: game-side write (build), context-side read (build_view
+    /// resolvers) + latch patch; plain fields, phase ownership like
+    /// `instance_render`. Never read by the fallback (`.published`).
+    instance_build_view: InstanceRenderState = .{},
     // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
     cached_matrix: Mat4 = Mat4.identity,
     cached_aabb: BoundingBox = BoundingBox.zero,
@@ -209,6 +250,35 @@ pub const Mesh = struct {
         };
         try self.instances.append(scene.allocator, inst);
         return inst;
+    }
+
+    /// Lazily assigns a nonzero render uid (0 = unassigned), stable for the
+    /// mesh lifetime and never reused. Idempotent: a second call returns the
+    /// same value without touching the counter. Serial-use only before
+    /// parallel reads (see `uid` docs).
+    pub fn ensureUid(self: *Mesh) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = mesh_uid_next;
+        if (id == 0) {
+            id = 1;
+            mesh_uid_next = 1;
+        }
+        mesh_uid_next +%= 1;
+        if (mesh_uid_next == 0) mesh_uid_next = 1;
+        self.uid = id;
+        return id;
+    }
+
+    /// Resolves which instance state a queue/shadow/outline builder should
+    /// read for this mesh (stage-2 increment B): `.published` returns
+    /// `&instance_render` (fallback, today's exact behavior); `.build_view`
+    /// returns `&instance_build_view` (game-built payloads, provisional
+    /// buffer/count until the latch `patchInstanceRefs` finalizes them).
+    pub fn instanceRenderSource(self: *const Mesh, source: InstanceSource) *const InstanceRenderState {
+        return switch (source) {
+            .published => &self.instance_render,
+            .build_view => &self.instance_build_view,
+        };
     }
 
     pub fn setStandardMaterial(self: *Mesh, mat: *StandardMaterial) void {
@@ -900,4 +970,30 @@ test "uploadGeometry defers without sg context and finish preserves pending" {
     m.finishGpuUpload(alloc);
     try std.testing.expect(m.gpu_pending);
     try std.testing.expectEqual(@as(usize, 3), m.pending_vertices.len);
+}
+
+test "stage-2A: mesh uid assigned lazily, stable, never zero" {
+    var a: Mesh = .{ .name = "uid_a", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
+    var b: Mesh = .{ .name = "uid_b", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
+    try std.testing.expectEqual(@as(u64, 0), a.uid);
+    const ua1 = a.ensureUid();
+    const ua2 = a.ensureUid();
+    try std.testing.expect(ua1 != 0);
+    try std.testing.expectEqual(ua1, ua2);
+    try std.testing.expectEqual(ua1, a.uid);
+    const ub = b.ensureUid();
+    try std.testing.expect(ub != 0);
+    try std.testing.expect(ub != ua1);
+}
+
+test "stage-2A: instanceRenderSource returns instance_render" {
+    var m: Mesh = .{ .name = "src", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
+    m.instance_render.count = 7;
+    m.instance_build_view.count = 9;
+    const pub_src = m.instanceRenderSource(.published);
+    try std.testing.expectEqual(@as(u32, 7), pub_src.count);
+    try std.testing.expectEqual(&m.instance_render, pub_src);
+    const bv_src = m.instanceRenderSource(.build_view);
+    try std.testing.expectEqual(@as(u32, 9), bv_src.count);
+    try std.testing.expectEqual(&m.instance_build_view, bv_src);
 }
