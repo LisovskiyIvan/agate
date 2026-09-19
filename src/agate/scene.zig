@@ -302,6 +302,26 @@ pub const Scene = struct {
     /// Flag indicating whether prepareFrame() has already run for this frame.
     frame_prepared: bool = false,
 
+    /// Stage 1 producer-build handoff (game/update phase → prepare latch):
+    /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages instance
+    /// matrices into the back-slot scratch + per-mesh previews and captures
+    /// the particle/physics CPU build frames, then bumps `build_seq`.
+    /// `prepareFrame` (context side) consumes the build when `build_seq !=
+    /// last_latched_seq` (GPU halves + latch copies, no CPU restaging) and
+    /// otherwise runs the historical inline path — so behavior stays correct
+    /// when `buildPreparedFrame` is never called. Two builds before a latch:
+    /// newest wins (single preview store recomputed, scratch overwritten).
+    /// A missed build never resurfaces a stale frame: every prepare (latch
+    /// or fallback) publishes a fresh slot; render reuses the last published
+    /// front only when prepare itself is not called (unchanged).
+    /// Plain counters, no atomics (update-vs-prepare exclusion); the build
+    /// touches no stats/profiler/frame_id/retire_epoch.
+    build_seq: u64 = 0,
+    last_latched_seq: u64 = 0,
+    /// Back-slot index the last `buildPreparedFrame` wrote; the latch
+    /// asserts it still is the back index (no intervening publish).
+    build_slot: usize = 0,
+
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
     /// P6 render-owned UI frame: prepareFrame captures CPU geometry + draw
@@ -1425,6 +1445,64 @@ pub const Scene = struct {
         return &self.draws.slots[self.draws.front];
     }
 
+    /// Stage 1 producer build (game/update phase, CPU-only, sg-free): stages
+    /// the CPU halves the prepare latch will consume — instance matrices
+    /// into the back-slot scratch + per-mesh previews, the particle build
+    /// frame, the physics debug build capture — and bumps `build_seq`.
+    ///
+    /// Call AFTER the sim mutations of the tick (update boundary), BEFORE
+    /// the context `prepareFrame`; sequential with update, excluded vs
+    /// prepare (phase ownership, plain fields, no atomics). Callable from
+    /// any non-pool thread (game thread or a spawned worker — never
+    /// concurrent with update or prepare); also callable on the
+    /// context/single thread. Two builds before a latch: newest wins (the
+    /// single preview store is recomputed, the scratch overwritten) — no
+    /// build queue, bounded, no allocs beyond retained capacity.
+    ///
+    /// Touches NOTHING else: no sg.*, no UI canvas, no P7 queues/shadow/
+    /// outline (those stay prepare-time), no GpuRetire begin/complete/flush,
+    /// no frame_id/retire_epoch, no stats, no profiler. Starts by resetting
+    /// the back slot (the latch consumes it without reset; the consumed
+    /// slot becomes front and is reset again by the next build or the
+    /// inline fallback). The transparent-sort eye comes from the live
+    /// cameras (freshest post-mutation value; the inline fallback uses the
+    /// snapshot eye — sort order may differ between paths, counts/bounds
+    /// never do).
+    ///
+    /// App contract: no latch is possible while a build runs (update-vs-
+    /// prepare exclusion), and no mesh is created/destroyed between a build
+    /// and its latch. A mesh whose upload finishes between build and latch,
+    /// or whose segment OOMs, keeps its previous complete `instance_render`
+    /// for one frame (documented, coherent); the next funded build+latch
+    /// picks it up.
+    pub fn buildPreparedFrame(self: *Scene) void {
+        // Deliberately NO gpu_thread assert: this runs on the game side or
+        // a spawned worker. Everything below is sg-free (the CPU staging
+        // half, the plain captures); any sg.* here would be a bug.
+        self.build_seq +%= 1;
+        const seq = self.build_seq;
+        const back_idx = self.draws.backIndex();
+        const back = &self.draws.slots[back_idx];
+        back.reset();
+        self.build_slot = back_idx;
+        // Freshest post-mutation eye (same source shape as updateLights):
+        // the live camera, else the first registered camera, else zero.
+        const eye = if (self.active_camera) |cam|
+            cam.getPosition()
+        else if (self.cameras.items.len > 0)
+            self.cameras.items[0].camera.getPosition()
+        else
+            Vec3.zero;
+        scene_instance_staging.stageInstancesCpu(.{
+            .allocator = self.allocator,
+            .scratch = &back.primary.instance_matrices,
+            .thread_pool = jobs.global,
+            .eye = eye,
+        }, self.meshes.items, seq);
+        self.particles.buildCapture(self.allocator, seq);
+        self.physics.buildDebug(self.allocator, seq);
+    }
+
     pub fn prepareFrame(self: *Scene) void {
         // Владение фазой: prepare выполняется на context-потоке
         // ПОСЛЕДОВАТЕЛЬНО с render (один поток, next prepare NEVER
@@ -1476,13 +1554,26 @@ pub const Scene = struct {
         // Particle prepared frame: capture the retained plain frame here,
         // after the flush above and BEFORE the update/render unlock below.
         // Reads live systems for the LAST time this frame; the draw below
-        // sees only the capture.
-        self.particles.captureFrame(self.allocator);
+        // sees only the capture. Stage 1: when the game side built a fresh
+        // frame (`build_seq` newer than `last_latched_seq`), latch the build
+        // instead of restaging from live systems; otherwise the historical
+        // inline capture (apps without `buildPreparedFrame` are unchanged).
+        const have_build = self.build_seq != self.last_latched_seq;
+        if (have_build) {
+            self.particles.latchFrame(self.allocator);
+        } else {
+            self.particles.captureFrame(self.allocator);
+        }
 
         // Physics debug wireframe capture (CPU): world.appendDebugLines runs
         // HERE in prepare — never inside render. The draw below reads only
-        // the capture (prepared_visible/prepared_lines).
-        self.physics.captureDebug(self.allocator);
+        // the capture (prepared_visible/prepared_lines). Same stage 1 shape
+        // as particles: latch a fresh build, else capture inline.
+        if (have_build) {
+            self.physics.latchDebug(self.allocator);
+        } else {
+            self.physics.captureDebug(self.allocator);
+        }
 
         var snap = self.frame_snapshot;
         if (self.frame_handoff.takeLatest(&snap)) {
@@ -1509,34 +1600,67 @@ pub const Scene = struct {
         }
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
-        // P7: build the BACK slot in place (reset first — every list,
-        // including disabled views/shadow bins, so a skipped path can never
-        // resurface the other slot's prior frame), then publish with one
-        // index flip at the end. The front slot is untouched during the
-        // build: allocator failure in the back corrupts nothing consumable.
+        // P7: build the BACK slot in place, then publish with one index flip
+        // at the end. The front slot is untouched during the build:
+        // allocator failure in the back corrupts nothing consumable.
         const back_idx = self.draws.backIndex();
         const back = &self.draws.slots[back_idx];
-        back.reset();
-        back.frame_id = self.frame_id;
-        back.retire_epoch = self.retire_epoch;
-        if (is_gpu_init) {
-            // Pre-stage instance data before the shadow pass: ShadowPass.prepare
-            // snapshots the published render state (bounds/buffer/count),
-            // so staging must run first or shadows lag one frame. Same scratch
-            // and eye the first view queue would use; the frame guard keeps it
-            // once per frame, shared by all view queues. Grown-away old
-            // buffers retire into the epoch queue (P5), never destroyed inline.
-            // Staging scratch is the back primary's list (view builds with
-            // instances_prepared never retry mid-frame — failure coherence).
-            if (self.frame_snapshot.has_camera) {
-                scene_instance_staging.stageInstances(.{
-                    .allocator = self.allocator,
-                    .instance_matrices = &back.primary.instance_matrices,
-                    .thread_pool = jobs.global,
-                    .frame_id = self.frame_id,
-                    .eye = self.frame_snapshot.primary_cam.eye,
-                    .retire_queue = &self.gpu_retire,
-                }, self.meshes.items);
+        if (have_build) {
+            // Stage 1 latch: the game-side build already reset this back
+            // slot and staged the instance scratch into it — reset-before-
+            // consume would erase the build, so only stamp the prepare-owned
+            // frame/epoch (reset by `buildPreparedFrame`, rebuilt here by
+            // the queue/shadow/outline builds below) and run the GPU halves
+            // over the previews + scratch. Stale previews (OOM-skipped,
+            // post-build meshes) keep their previous complete
+            // `instance_render` — no partial publish. Queues/outline/shadow
+            // below rebuild exactly as in the inline path.
+            std.debug.assert(self.build_slot == back_idx);
+            back.frame_id = self.frame_id;
+            back.retire_epoch = self.retire_epoch;
+            if (is_gpu_init) {
+                // Same position/gate as the historical pre-stage: the shadow
+                // pass snapshots the published render state, so the GPU half
+                // must run first or shadows lag one frame. Same retire queue
+                // and eye source shape (the eye itself was consumed at build
+                // time for the transparent sort; only the guard reads the
+                // snapshot here).
+                if (self.frame_snapshot.has_camera) {
+                    scene_instance_staging.stageInstancesLatch(.{
+                        .allocator = self.allocator,
+                        .frame_id = self.frame_id,
+                        .retire_queue = &self.gpu_retire,
+                        .build_seq = self.build_seq,
+                    }, self.meshes.items, &back.primary.instance_matrices);
+                }
+            }
+            self.last_latched_seq = self.build_seq;
+        } else {
+            // Inline fallback (no fresh build): reset first — every list,
+            // including disabled views/shadow bins, so a skipped path can never
+            // resurface the other slot's prior frame — then stage fully.
+            back.reset();
+            back.frame_id = self.frame_id;
+            back.retire_epoch = self.retire_epoch;
+            if (is_gpu_init) {
+                // Pre-stage instance data before the shadow pass: ShadowPass.prepare
+                // snapshots the published render state (bounds/buffer/count),
+                // so staging must run first or shadows lag one frame. Same scratch
+                // and eye the first view queue would use; the frame guard keeps it
+                // once per frame, shared by all view queues. Grown-away old
+                // buffers retire into the epoch queue (P5), never destroyed inline.
+                // Staging scratch is the back primary's list (view builds with
+                // instances_prepared never retry mid-frame — failure coherence).
+                if (self.frame_snapshot.has_camera) {
+                    scene_instance_staging.stageInstances(.{
+                        .allocator = self.allocator,
+                        .instance_matrices = &back.primary.instance_matrices,
+                        .thread_pool = jobs.global,
+                        .frame_id = self.frame_id,
+                        .eye = self.frame_snapshot.primary_cam.eye,
+                        .retire_queue = &self.gpu_retire,
+                    }, self.meshes.items);
+                }
             }
         }
 
@@ -1652,6 +1776,12 @@ pub const Scene = struct {
     /// prepare; render sees only their staged/uploaded results) — the fact
     /// that `Scene.update` skips them is a dt-base distinction, not a
     /// thread-ownership one: no render path traces into their live state.
+    ///
+    /// Stage 1: after this (and any explicit mutators), the app may call
+    /// `buildPreparedFrame` — still on the game side, still under the same
+    /// exclusion — to stage the CPU halves the prepare latch will consume.
+    /// Skipping the build is always legal: `prepareFrame` then runs the
+    /// historical inline path.
     pub fn update(self: *Scene, dt: f32) particles.UpdateError!void {
         self.updateCamera(dt);
         self.updateLights(dt);
@@ -3451,4 +3581,699 @@ test "worker churn after prepare cannot mutate consumed snapshot/timings" {
     try std.testing.expect(!scene.frame_snapshot.sky_enabled);
     try std.testing.expectEqual(@as(f32, 9.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectEqual(@as(f32, 99.0), scene.stats.update_ms);
+}
+
+// ---- Stage 1 producer-build handoff: buildPreparedFrame + prepare latch. ---
+//
+// Headless full-path pattern (mirrors the P7 tests): faked GPU-init flag
+// (default_white_texture.view.id != 0) + CPU-only shadow pass + disabled
+// culling. sg.isvalid() stays false, so the GPU halves publish bounds/count
+// without touching sg.*. Render never runs headless past no-camera.
+
+fn stage1FillInstances(src: *Mesh, mem: []@import("mesh.zig").InstancedMesh, ptrs: []*@import("mesh.zig").InstancedMesh, x0: f32) void {
+    for (mem, 0..) |*inst, i| {
+        const fi: f32 = @floatFromInt(i);
+        inst.* = .{ .name = "s1", .source_mesh = src, .position = Vec3.new(x0 + fi * 2.0, 0, 0) };
+        ptrs[i] = inst;
+    }
+}
+
+fn stage1Scene(alloc: std.mem.Allocator) Scene {
+    var scene = @import("testing.zig").testScene(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.default_white_texture.view.id = 1;
+    return scene;
+}
+
+test "stage1: worker build + main latch publishes previews; post-build mutation invisible" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 4;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Victim: heap mesh (destroyMesh frees it via the retire queue) with
+    // heap instances (Mesh.deinit destroys them at flush).
+    const victim = try alloc.create(Mesh);
+    victim.* = @import("testing.zig").testMesh("s1_victim");
+    victim.local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
+    for (0..2) |i| {
+        const inst = try alloc.create(InstancedMesh);
+        inst.* = .{ .name = "v", .source_mesh = victim, .position = Vec3.new(@floatFromInt(i), 0, 0) };
+        try victim.instances.append(alloc, inst);
+    }
+    try scene.meshes.append(alloc, victim);
+
+    // Mark the context on main: the worker below is off-context, so its
+    // destroyMesh must take the retire-queue path (never sg.* off-thread).
+    gpu_thread.markContextThread();
+
+    // Worker = the game side: build, then destroy the victim inside the
+    // build→latch window (sequential in the worker — no data race; the
+    // spawn/join edges carry the happens-before). Main only joins.
+    const Builder = struct {
+        scene: *Scene,
+        victim: *Mesh,
+        fn run(self: @This()) void {
+            self.scene.buildPreparedFrame();
+            self.scene.destroyMesh(self.victim);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene, .victim = victim }});
+    t.join();
+
+    // Off-context destroy unlinked the victim into the retire queue; the
+    // build recorded previews for both meshes (victim included).
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
+    try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), parent.instance_preview.build_seq);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u64, 1), victim.instance_preview.build_seq);
+
+    // Live mutation AFTER the build: the published instance_render must
+    // reflect the build, not the mutation.
+    mem[0].position = Vec3.new(100, 0, 0);
+    const preview_bounds = parent.instance_preview.bounds;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(preview_bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
+    // The CPU preview carries the matrix-bytes hash for the GPU dedup gate;
+    // headless (no sg context) the GPU half is skipped, so instance_render
+    // keeps the stale hash (0) by design — bounds/count still publish.
+    try std.testing.expect(parent.instance_preview.hash != 0);
+    try std.testing.expectEqual(@as(u64, 0), parent.instance_render.hash);
+    // A 100-unit move would have shifted the bounds; the latch kept build
+    // time (max.x well under the mutated span).
+    try std.testing.expect(parent.instance_render.bounds.max.x < 50.0);
+    // The destroyed victim is gone from the latch (no use-after-free) and
+    // the published queues carry only the surviving mesh.
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
+}
+
+test "stage1: two builds before latch, newest wins" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 3;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    scene.buildPreparedFrame();
+    const first_bounds = parent.instance_preview.bounds;
+    // Mutate, rebuild: the single preview store is recomputed in place.
+    mem[2].position = Vec3.new(40, 0, 0);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u64, 2), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
+    try std.testing.expect(parent.instance_preview.bounds.max.x > first_bounds.max.x + 10.0);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq);
+    try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
+    try std.testing.expect(parent.instance_render.bounds.max.x > first_bounds.max.x + 10.0);
+}
+
+test "stage1: no build runs the inline fallback with identical counts/bounds" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 5;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    mem[4].is_visible = false;
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Latch path first.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    const latched_bounds = parent.instance_render.bounds;
+    const latched_count = parent.instance_render.count;
+    const latched_hash = parent.instance_render.hash;
+    try std.testing.expectEqual(@as(u32, 4), latched_count);
+
+    // Same live state, no fresh build: the inline fallback must publish the
+    // identical counts/bounds/hash (only staged_frame advances).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(latched_count, parent.instance_render.count);
+    try std.testing.expectEqual(latched_bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(latched_hash, parent.instance_render.hash);
+}
+
+test "stage1: serial same-thread build+latch parity" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 6;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 10);
+    mem[1].is_visible = false;
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    try std.testing.expectEqual(parent.instance_preview.count, parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
+    try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
+    try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
+    try std.testing.expectEqual(scene.retire_epoch, scene.preparedDraws().retire_epoch);
+}
+
+test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 4;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Prime: funded build + latch publishes the complete state.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const primed_bounds = parent.instance_render.bounds;
+    const primed_hash = parent.instance_render.hash;
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+
+    // Mutate live, then build unfunded: drop ALL scratch capacity so the
+    // segment really allocates, and refuse the first alloc. The preview
+    // must not advance (scene seq still does — the latch will skip it).
+    mem[0].position = Vec3.new(100, 0, 0);
+    for (&scene.draws.slots) |*slot| slot.primary.instance_matrices.clearAndFree(alloc);
+    const real_alloc = scene.allocator;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    scene.allocator = failing.allocator();
+    scene.buildPreparedFrame();
+    scene.allocator = real_alloc;
+    try std.testing.expectEqual(@as(u64, 2), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 1), parent.instance_preview.build_seq);
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Latch: the stale mesh is skipped — previous complete state stands,
+    // no partial publish.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(primed_hash, parent.instance_render.hash);
+
+    // Recovery: a funded build + latch publishes the mutated state.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 3), parent.instance_preview.build_seq);
+    try std.testing.expect(parent.instance_render.bounds.max.x > primed_bounds.max.x + 10.0);
+}
+
+test "stage1: particle build on worker + latch on main freezes the frame" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.particles.systems.deinit(alloc);
+    defer scene.particles.frame.deinit(alloc);
+    defer scene.particles.build_frame.deinit(alloc);
+
+    // CPU-only system with fake borrowed handle ids (never deinited via
+    // ps.deinit — that would issue sg.destroy* on the fake ids; members are
+    // freed manually below).
+    const parts = try alloc.alloc(particles.Particle, 4);
+    defer alloc.free(parts);
+    const insts = try alloc.alloc(particles.ParticleInstanceData, 4);
+    defer alloc.free(insts);
+    const scratch = try alloc.alloc(u8, 4);
+    defer alloc.free(scratch);
+    var ps = ParticleSystem{
+        .name = "s1",
+        .allocator = alloc,
+        .particles = parts,
+        .instances = insts,
+        .alive_scratch = scratch,
+        .capacity = 4,
+        .instance_buffer = .{ .id = 11 },
+        .prng = std.Random.DefaultPrng.init(42),
+    };
+    ps.active_count = 3;
+    try scene.particles.systems.append(alloc, &ps);
+
+    // Worker = the game side: build only. Main only joins, then prepares.
+    const Builder = struct {
+        scene: *Scene,
+        fn run(self: @This()) void {
+            self.scene.buildPreparedFrame();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
+    t.join();
+    try std.testing.expectEqual(@as(u64, 1), scene.particles.build_seq);
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.build_frame.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.particles.frame.items.len);
+
+    // Live mutation after the build must not reach the render-owned frame.
+    ps.active_count = 1;
+    ps.instance_buffer = .{ .id = 99 };
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u64, 1), scene.particles.latched_seq);
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
+    try std.testing.expectEqual(@as(usize, 3), scene.particles.frame.items[0].active_count);
+    try std.testing.expectEqual(@as(u32, 11), scene.particles.frame.items[0].instance_buffer.id);
+    // renderPrepared keeps reading `frame` only (headless no-op here).
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.build_frame.items.len);
+    ps.active_count = 4;
+    try std.testing.expectEqual(@as(usize, 3), scene.particles.frame.items[0].active_count);
+}
+
+test "stage1: physics build on worker + latch on main freezes the capture" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.physics.deinit(alloc);
+
+    _ = scene.physics.enable(alloc, null);
+    var pmesh = @import("testing.zig").testMesh("s1_phys");
+    _ = try scene.physics.getWorld().?.createBody(&pmesh, .box, 0.0);
+    scene.physics.show_debug = true;
+
+    const Builder = struct {
+        scene: *Scene,
+        fn run(self: @This()) void {
+            self.scene.buildPreparedFrame();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
+    t.join();
+    try std.testing.expectEqual(@as(u64, 1), scene.physics.build_seq);
+    try std.testing.expect(scene.physics.build_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.build_lines.items.len);
+    try std.testing.expect(!scene.physics.prepared_visible);
+
+    // Live mutation after the build must not reach the prepared capture.
+    const x0 = scene.physics.build_lines.items[0].a.x;
+    pmesh.position = Vec3.new(5, 0, 0);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u64, 1), scene.physics.latched_seq);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+    try std.testing.expectApproxEqAbs(x0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
+    scene.physics.step(0.016);
+    try std.testing.expectApproxEqAbs(x0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
+}
+
+test "stage1: instances cleared between build and latch take the regular path" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 3;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Build while instanced: the preview records 3 (the build never
+    // publishes — instance_render stays empty until a latch or fallback).
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
+
+    // Drop all instances before the latch: both the latch and the fallback
+    // skip empty instance lists, and the queue routes the mesh as regular —
+    // the stale preview is never read, no instanced item is emitted.
+    parent.instances.clearRetainingCapacity();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 0), draws.primary.opaque_instanced.items.len);
+    try std.testing.expect(p7FindByMeshIndex(draws.primary.items.items, 0) != null);
+}
+
+test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem_a = try alloc.alloc(InstancedMesh, 3);
+    defer alloc.free(mem_a);
+    const ptrs_a = try alloc.alloc(*InstancedMesh, 3);
+    defer alloc.free(ptrs_a);
+    stage1FillInstances(&src, mem_a, ptrs_a, 0);
+    var mesh_a = Mesh{
+        .name = "s1_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs_a, .capacity = 3 },
+    };
+    const mem_b = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mem_b);
+    const ptrs_b = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(ptrs_b);
+    stage1FillInstances(&src, mem_b, ptrs_b, 50);
+    var mesh_b = Mesh{
+        .name = "s1_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs_b, .capacity = 2 },
+    };
+    try scene.meshes.append(alloc, &mesh_a);
+    try scene.meshes.append(alloc, &mesh_b);
+
+    // Scratch is concatenated [A0 A1 A2 B0 B1]: A.lo=0, B.lo=3.
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(usize, 0), mesh_a.instance_preview.scratch_lo);
+    try std.testing.expectEqual(@as(usize, 3), mesh_b.instance_preview.scratch_lo);
+
+    // Reorder (swapRemove unlinks A) and add a fresh mesh C whose preview
+    // predates every build (build_seq 0).
+    _ = scene.meshes.swapRemove(0);
+    const mem_c = try alloc.alloc(InstancedMesh, 2);
+    defer alloc.free(mem_c);
+    const ptrs_c = try alloc.alloc(*InstancedMesh, 2);
+    defer alloc.free(ptrs_c);
+    stage1FillInstances(&src, mem_c, ptrs_c, 200);
+    var mesh_c = Mesh{
+        .name = "s1_c",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs_c, .capacity = 2 },
+    };
+    try scene.meshes.append(alloc, &mesh_c);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    // B's slice [3,5) is exact: bounds match its own preview (A's segment
+    // would give min.x near 0, B's gives 49).
+    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
+    try std.testing.expectEqual(mesh_b.instance_preview.bounds, mesh_b.instance_render.bounds);
+    try std.testing.expectApproxEqAbs(@as(f32, 49.0), mesh_b.instance_render.bounds.min.x, 1e-4);
+    // C (never built) is skipped: no publish, no queue batch.
+    try std.testing.expectEqual(@as(u64, 0), mesh_c.instance_preview.build_seq);
+    try std.testing.expectEqual(@as(u32, 0), mesh_c.instance_render.count);
+    try std.testing.expectEqual(std.math.maxInt(u64), mesh_c.instance_render.staged_frame);
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 2), draws.primary.opaque_instanced.items[0].visible_instance_count);
+}
+
+test "stage1: truncated scratch between build and latch is skipped safely" {
+    const InstancedMesh = @import("mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 2;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Prime: funded build + latch publishes the complete state.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const primed_bounds = parent.instance_render.bounds;
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+
+    // Mutate, rebuild, then truncate the scratch before the latch (a
+    // contract violation the latch must survive): the out-of-range slice is
+    // skipped via the bounds check and the previous state stands.
+    mem[0].position = Vec3.new(100, 0, 0);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
+    scene.draws.backSlot().primary.instance_matrices.clearRetainingCapacity();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
+
+    // Recovery: a funded build + latch publishes the mutated state.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(parent.instance_render.bounds.max.x > primed_bounds.max.x + 10.0);
 }

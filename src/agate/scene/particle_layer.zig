@@ -5,16 +5,27 @@
 //!   `ParticleSystem.update` stages instance/slot bytes and sets the dirty
 //!   flags, never touching sg.* (see particles.zig: the init defers buffer
 //!   creation off-context, update only stages, flushGpuUploads owns sg).
-//! - PREPARE (`captureFrame`, context side, called by the integrator AFTER
-//!   `flushGpuUploads` and BEFORE publish): copies one plain
+//! - BUILD (`buildCapture`, game side, stage 1): copies one plain
 //!   `ParticleDraw` value per live system out of `systems` into the retained
-//!   `frame` list. sg-free (handle ids are copied as values, no sg.*
-//!   calls). Capture-after-flush matters: the flush creates deferred
-//!   buffers, so capturing earlier would snapshot stale zero ids.
+//!   game-owned `build_frame` and stamps `build_seq`. sg-free (handle ids
+//!   are copied as values, no sg.* calls), callable from any non-pool thread
+//!   under update-vs-prepare exclusion. Capture-after-flush still matters
+//!   for the latch below: the prepare flush creates deferred buffers, so a
+//!   build from before the flush would snapshot stale zero ids — apps must
+//!   call `Scene.buildPreparedFrame` AFTER the sim mutations of the tick
+//!   whose flush the prepare will run (same ordering the inline path had).
+//! - PREPARE (`captureFrame` inline fallback, or `latchFrame` consuming a
+//!   fresh build, context side, called by the integrator AFTER
+//!   `flushGpuUploads` and BEFORE publish): publishes the retained `frame`
+//!   list. `latchFrame` copies `build_frame` → `frame` when `build_seq` is
+//!   newer than `latched_seq` (reserve-once, OOM coherent-empty, same as
+//!   the inline path); otherwise it runs the historical live capture, so a
+//!   latch without a fresh build stays coherent.
 //! - RENDER (`renderPrepared`, context side): draws ONLY `frame` through the
 //!   render-owned pass (MSAA twin lazy-created here, disjoint from game
-//!   state) plus snapshot-count stats. Never reads `systems`, never the
-//!   live texture pointer — only the borrowed view id in the record.
+//!   state) plus snapshot-count stats. Never reads `systems`, never
+//!   `build_frame`, never the live texture pointer — only the borrowed view
+//!   id in the record.
 //! - GPU handles in the frame are BORROWED: instance/gpu-slot buffers and
 //!   texture views stay owned by their ParticleSystem (via this layer's
 //!   `systems` list). The owner must live until context teardown; replacing
@@ -68,8 +79,18 @@ pub const ParticleLayer = struct {
     systems: std.ArrayListUnmanaged(*ParticleSystem) = .empty,
 
     /// Retained owning prepared frame: one plain `ParticleDraw` per live
-    /// system, published by `captureFrame`, consumed by `renderPrepared`.
+    /// system, published by `captureFrame` (inline path) or `latchFrame`
+    /// (stage 1 build path), consumed by `renderPrepared`.
     frame: std.ArrayListUnmanaged(ParticleDraw) = .empty,
+
+    /// Game-owned build frame (stage 1): written by `buildCapture` on the
+    /// update side, consumed by `latchFrame` on the context side. Plain
+    /// values only, same shape as `frame`; freed in deinit.
+    build_frame: std.ArrayListUnmanaged(ParticleDraw) = .empty,
+    /// `Scene.build_seq` stamped by the last `buildCapture` (0 = never).
+    build_seq: u64 = 0,
+    /// Last `build_seq` consumed by `latchFrame`.
+    latched_seq: u64 = 0,
 
     pass: passes.ParticlePass,
 
@@ -93,6 +114,7 @@ pub const ParticleLayer = struct {
         }
         self.systems.deinit(allocator);
         self.frame.deinit(allocator);
+        self.build_frame.deinit(allocator);
         self.pass.deinit();
         if (self.pass_msaa) |*p| p.deinit();
         self.pass_msaa = null;
@@ -120,25 +142,71 @@ pub const ParticleLayer = struct {
     /// side. Zero systems — or no system with active_count > 0 — captures a
     /// coherent empty frame. OOM fail-closes to coherent-empty (no stale
     /// records); retained capacity is reused, never shrunk here.
+    ///
+    /// Inline fallback path: `Scene.prepareFrame` calls this when no fresh
+    /// game-side build exists, so apps that never call `buildPreparedFrame`
+    /// behave exactly as before.
     pub fn captureFrame(self: *ParticleLayer, allocator: std.mem.Allocator) void {
-        if (self.systems.items.len == 0) {
-            self.clearFrame();
+        captureInto(self.systems.items, allocator, &self.frame);
+    }
+
+    /// Game-side CPU capture (stage 1): the exact `captureFrame` logic
+    /// writing the retained game-owned `build_frame` instead of `frame`,
+    /// stamped with the scene `build_seq`. sg-free; callable from any
+    /// non-pool thread under update-vs-prepare exclusion. OOM fail-closes
+    /// `build_frame` to coherent-empty (mirroring `captureFrame`); the seq
+    /// still advances — the empty IS the new state — so the latch publishes
+    /// it instead of a stale prior frame.
+    pub fn buildCapture(self: *ParticleLayer, allocator: std.mem.Allocator, seq: u64) void {
+        self.build_seq = seq;
+        captureInto(self.systems.items, allocator, &self.build_frame);
+    }
+
+    /// Context-side latch (stage 1): when a fresh build exists (`build_seq`
+    /// newer than `latched_seq`), copies `build_frame` → `frame`
+    /// (reserve-once, OOM coherent-empty) and advances `latched_seq`.
+    /// Otherwise runs the historical live capture, so a latch without a
+    /// fresh build stays coherent. `renderPrepared` keeps reading `frame`
+    /// only — never `build_frame`, never live systems.
+    pub fn latchFrame(self: *ParticleLayer, allocator: std.mem.Allocator) void {
+        if (self.build_seq == self.latched_seq) {
+            self.captureFrame(allocator);
             return;
         }
-        // Single reserve BEFORE publish: either the whole frame lands or the
-        // frame is coherent-empty (no old-record/new-record mix on OOM).
-        self.frame.ensureTotalCapacity(allocator, self.systems.items.len) catch {
+        self.latched_seq = self.build_seq;
+        self.frame.ensureTotalCapacity(allocator, self.build_frame.items.len) catch {
             self.clearFrame();
             return;
         };
         self.frame.clearRetainingCapacity();
-        for (self.systems.items) |ps| {
+        for (self.build_frame.items) |draw| {
+            self.frame.appendAssumeCapacity(draw);
+        }
+    }
+
+    /// Shared capture body: one plain `ParticleDraw` per live system with
+    /// active_count > 0 into `out`. Single reserve BEFORE publish (either
+    /// the whole frame lands or the frame is coherent-empty); retained
+    /// capacity is reused, never shrunk here.
+    fn captureInto(systems: []*ParticleSystem, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(ParticleDraw)) void {
+        if (systems.len == 0) {
+            out.clearRetainingCapacity();
+            return;
+        }
+        // Single reserve BEFORE publish: either the whole frame lands or the
+        // frame is coherent-empty (no old-record/new-record mix on OOM).
+        out.ensureTotalCapacity(allocator, systems.len) catch {
+            out.clearRetainingCapacity();
+            return;
+        };
+        out.clearRetainingCapacity();
+        for (systems) |ps| {
             // Zero-count systems draw and count nothing under the legacy
             // semantics, so they occupy no frame slot; an all-empty layer
             // captures a coherent empty frame.
             if (ps.active_count == 0) continue;
-            self.frame.append(allocator, ParticleDraw.fromSystem(ps)) catch {
-                self.clearFrame();
+            out.append(allocator, ParticleDraw.fromSystem(ps)) catch {
+                out.clearRetainingCapacity();
                 return;
             };
         }
@@ -444,4 +512,101 @@ test "particle renderPrepared is a headless no-op over a nonempty frame" {
     try t.expectEqual(stats_mod.SceneStats{}, stats);
     try t.expectEqual(@as(u64, 0), meter.peek());
     try t.expect(layer.pass_msaa == null);
+}
+
+test "particle buildCapture+latchFrame isolates live mutations" {
+    const t = std.testing;
+    var layer: ParticleLayer = .{ .pass = undefined };
+    defer layer.systems.deinit(t.allocator);
+    defer layer.frame.deinit(t.allocator);
+    defer layer.build_frame.deinit(t.allocator);
+
+    var ps = try makeLayerTestSystem(t.allocator, 4);
+    defer freeLayerTestSystem(&ps);
+    ps.active_count = 3;
+    try layer.systems.append(t.allocator, &ps);
+
+    // Game-side build: fills the build frame, stamps the seq, leaves the
+    // render-owned frame untouched.
+    layer.buildCapture(t.allocator, 9);
+    try t.expectEqual(@as(u64, 9), layer.build_seq);
+    try t.expectEqual(@as(usize, 1), layer.build_frame.items.len);
+    try t.expectEqual(@as(usize, 0), layer.frame.items.len);
+
+    // Live mutation after the build: the build frame stays frozen.
+    ps.active_count = 1;
+    ps.instance_buffer = .{ .id = 99 };
+    try t.expectEqual(@as(usize, 3), layer.build_frame.items[0].active_count);
+    try t.expectEqual(@as(u32, 11), layer.build_frame.items[0].instance_buffer.id);
+
+    // Context-side latch publishes the build-time snapshot; a second live
+    // mutation cannot reach the render-owned frame.
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(u64, 9), layer.latched_seq);
+    try t.expectEqual(@as(usize, 1), layer.frame.items.len);
+    try t.expectEqual(@as(usize, 3), layer.frame.items[0].active_count);
+    try t.expectEqual(@as(u32, 11), layer.frame.items[0].instance_buffer.id);
+    ps.active_count = 4;
+    try t.expectEqual(@as(usize, 3), layer.frame.items[0].active_count);
+}
+
+test "particle two builds before latch: newest wins, no build reuses last" {
+    const t = std.testing;
+    var layer: ParticleLayer = .{ .pass = undefined };
+    defer layer.systems.deinit(t.allocator);
+    defer layer.frame.deinit(t.allocator);
+    defer layer.build_frame.deinit(t.allocator);
+
+    var ps = try makeLayerTestSystem(t.allocator, 4);
+    defer freeLayerTestSystem(&ps);
+    ps.active_count = 2;
+    try layer.systems.append(t.allocator, &ps);
+
+    layer.buildCapture(t.allocator, 1);
+    ps.active_count = 3;
+    layer.buildCapture(t.allocator, 2);
+    try t.expectEqual(@as(usize, 1), layer.build_frame.items.len);
+    try t.expectEqual(@as(usize, 3), layer.build_frame.items[0].active_count);
+
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 3), layer.frame.items[0].active_count);
+
+    // Latch without a fresh build falls back to the live capture (old
+    // behavior): the frame tracks live state, never a stale build.
+    ps.active_count = 1;
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 1), layer.frame.items[0].active_count);
+}
+
+test "particle buildCapture OOM fail-closes the build frame, latch publishes empty" {
+    const t = std.testing;
+    var layer: ParticleLayer = .{ .pass = undefined };
+    defer layer.systems.deinit(t.allocator);
+    defer layer.frame.deinit(t.allocator);
+    defer layer.build_frame.deinit(t.allocator);
+
+    var ps = try makeLayerTestSystem(t.allocator, 4);
+    defer freeLayerTestSystem(&ps);
+    ps.active_count = 2;
+    try layer.systems.append(t.allocator, &ps);
+
+    layer.buildCapture(t.allocator, 1);
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 1), layer.frame.items.len);
+
+    // Unfunded build fail-closes to coherent-empty (mirrors captureFrame),
+    // but the seq still advances — the latch publishes the empty, never the
+    // stale prior frame.
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    layer.build_frame.clearAndFree(t.allocator);
+    layer.buildCapture(failing.allocator(), 2);
+    try t.expectEqual(@as(usize, 0), layer.build_frame.items.len);
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 0), layer.frame.items.len);
+
+    // Recovery: a funded build+latch publishes the full frame again.
+    layer.buildCapture(t.allocator, 3);
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 1), layer.frame.items.len);
+    try t.expectEqual(@as(usize, 2), layer.frame.items[0].active_count);
 }

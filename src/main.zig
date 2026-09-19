@@ -253,6 +253,10 @@ fn simulate(dt_sec: f32) void {
             if (particle_mode) |m| @tagName(m) else "off",
         });
     };
+    // Stage 1 producer build at the update boundary (CPU-only, sg-free):
+    // stages instance matrices + particle/physics captures for the prepare
+    // latch. prepareFrame consumes the build when fresh, else stages inline.
+    scene.buildPreparedFrame();
     // Stage the update tick WITHOUT touching stats (context-owned; render
     // may read it concurrently): prepareFrame transfers it next frame.
     scene.recordUpdateTime(msSince(t_update));

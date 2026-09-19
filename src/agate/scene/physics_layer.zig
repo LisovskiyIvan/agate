@@ -25,6 +25,14 @@ const SceneStats = stats_mod.SceneStats;
 /// draws — the draw only sees the capture. `show_debug`/world presence are
 /// snapshotted into `prepared_visible` for the same reason: no live reads
 /// at draw time.
+///
+/// Stage 1 splits the capture: `buildDebug` (game side, any non-pool thread
+/// under update-vs-prepare exclusion) snapshots the same lines into the
+/// game-owned `build_lines`/`build_visible`, stamped with the scene
+/// `build_seq`; `latchDebug` (prepare, context thread) copies the build
+/// into the render-owned `prepared_lines`/`prepared_visible` when the seq is
+/// newer, else runs the historical live capture. Plain fields, no atomics;
+/// GPU handles stay borrowed under the P3 epochs.
 pub const PhysicsIntegration = struct {
     world: ?PhysicsWorld = null,
     // Toggles the physics debug wireframe rendering in the main pass.
@@ -37,6 +45,16 @@ pub const PhysicsIntegration = struct {
     /// Snapshotted visibility for the prepared frame (show_debug && world at
     /// capture time). Draw site selection reads this, never live fields.
     prepared_visible: bool = false,
+    /// Game-owned build capture (stage 1): written by `buildDebug` on the
+    /// update side, consumed by `latchDebug` on the context side. Same
+    /// shape as the prepared capture; freed in deinit.
+    build_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty,
+    /// Snapshotted visibility for the build frame.
+    build_visible: bool = false,
+    /// Scene `build_seq` stamped by the last `buildDebug` (0 = never).
+    build_seq: u64 = 0,
+    /// Last `build_seq` consumed by `latchDebug`.
+    latched_seq: u64 = 0,
     // Lazily created on first use; renders physics debug wireframes in 3D.
     debug_pass: ?passes.DebugPass = null,
     // MSAA twin (pipeline sample count must match the main target); lazily
@@ -50,6 +68,7 @@ pub const PhysicsIntegration = struct {
         }
         self.debug_lines.deinit(allocator);
         self.prepared_lines.deinit(allocator);
+        self.build_lines.deinit(allocator);
         if (self.debug_pass) |*dp| dp.deinit();
         self.debug_pass = null;
         if (self.debug_pass_msaa) |*dp| dp.deinit();
@@ -84,28 +103,72 @@ pub const PhysicsIntegration = struct {
     /// prepare; OOM fail-closes to coherent-empty (never a partial half) and
     /// recovers on the next funded prepare. Pure CPU + allocator: headless
     /// tests exercise it fully with no `sg.*`.
+    ///
+    /// Inline fallback path: `Scene.prepareFrame` calls this when no fresh
+    /// game-side build exists, so apps that never call `buildPreparedFrame`
+    /// behave exactly as before. Kept callable by tooling as well.
     pub fn captureDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
-        if (!self.show_debug or self.world == null) {
-            self.prepared_lines.clearRetainingCapacity();
-            self.prepared_visible = false;
+        captureInto(self, allocator, &self.prepared_lines, &self.prepared_visible);
+    }
+
+    /// Game-side CPU capture (stage 1): the exact `captureDebug` logic
+    /// writing the game-owned `build_lines`/`build_visible`, stamped with
+    /// the scene `build_seq`. Pure CPU + allocator; callable from any
+    /// non-pool thread under update-vs-prepare exclusion. OOM fail-closes
+    /// to coherent-empty (mirroring `captureDebug`); the seq still advances
+    /// — the empty IS the new state — so the latch publishes it instead of
+    /// a stale prior frame.
+    pub fn buildDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator, seq: u64) void {
+        self.build_seq = seq;
+        captureInto(self, allocator, &self.build_lines, &self.build_visible);
+    }
+
+    /// Context-side latch (stage 1): when a fresh build exists (`build_seq`
+    /// newer than `latched_seq`), copies `build_lines`/`build_visible` into
+    /// the render-owned `prepared_lines`/`prepared_visible` (reserve-once,
+    /// OOM coherent-empty) and advances `latched_seq`. Otherwise runs the
+    /// historical live capture, so a latch without a fresh build stays
+    /// coherent. Draws keep reading the prepared capture only.
+    pub fn latchDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
+        if (self.build_seq == self.latched_seq) {
+            self.captureDebug(allocator);
             return;
         }
-        const pw = &self.world.?;
-        // Build DIRECTLY into the render-owned capture: prepare and render
-        // are sequential, so no consumer reads prepared_lines during this
-        // prepare — no transactional scratch copy is needed. OOM mid-append
-        // fail-closes to coherent-empty (the partial prefix is cleared, the
-        // frame marked invisible). Steady-state appends never reallocate
-        // (appendDebugLines reserves the exact count once up front), so warm
-        // captures are allocation-free; retained capacity is reused and the
-        // next funded prepare recovers.
-        self.prepared_lines.clearRetainingCapacity();
-        pw.appendDebugLines(allocator, &self.prepared_lines) catch {
+        self.latched_seq = self.build_seq;
+        self.prepared_lines.ensureTotalCapacity(allocator, self.build_lines.items.len) catch {
             self.prepared_lines.clearRetainingCapacity();
             self.prepared_visible = false;
             return;
         };
-        self.prepared_visible = true;
+        self.prepared_lines.clearRetainingCapacity();
+        for (self.build_lines.items) |line| {
+            self.prepared_lines.appendAssumeCapacity(line);
+        }
+        self.prepared_visible = self.build_visible;
+    }
+
+    /// Shared capture body: snapshots `world.appendDebugLines` into `out`
+    /// with `visible` set. Builds DIRECTLY into the target: capture and its
+    /// consumer are sequential, so no transactional scratch copy is needed.
+    /// OOM mid-append fail-closes to coherent-empty (the partial prefix is
+    /// cleared, the frame marked invisible). Steady-state appends never
+    /// reallocate (appendDebugLines reserves the exact count once up front),
+    /// so warm captures are allocation-free; retained capacity is reused and
+    /// the next funded capture recovers.
+    fn captureInto(self: *PhysicsIntegration, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(physics.DebugLine), visible: *bool) void {
+        if (!self.show_debug or self.world == null) {
+            out.clearRetainingCapacity();
+            visible.* = false;
+            return;
+        }
+        const pw = &self.world.?;
+        out.clearRetainingCapacity();
+        pw.appendDebugLines(allocator, out) catch {
+            out.clearRetainingCapacity();
+            visible.* = false;
+            return;
+        };
+        visible.* = true;
     }
 
     /// Spends the frame's single `sg.updateBuffer` for the captured lines.
@@ -193,3 +256,106 @@ pub const PhysicsIntegration = struct {
         return if (self.debug_pass_msaa) |*dp| dp else null;
     }
 };
+
+// --- Stage 1 build/latch tests (pure CPU + allocator, no sg.*). ---
+
+const TestMesh = @import("../mesh.zig").Mesh;
+
+fn makeDebugFixture(allocator: std.mem.Allocator) !struct {
+    integ: PhysicsIntegration,
+    mesh: *TestMesh,
+} {
+    var integ = PhysicsIntegration{};
+    _ = integ.enable(allocator, null);
+    const m = try allocator.create(TestMesh);
+    m.* = .{ .name = "build_dbg", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    _ = try integ.getWorld().?.createBody(m, .box, 0.0);
+    integ.show_debug = true;
+    return .{ .integ = integ, .mesh = m };
+}
+
+test "physics buildDebug+latchDebug isolates live mutations" {
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    // Game-side build: fills the build capture, stamps the seq, leaves the
+    // render-owned capture untouched.
+    integ.buildDebug(t.allocator, 9);
+    try t.expectEqual(@as(u64, 9), integ.build_seq);
+    try t.expect(integ.build_visible);
+    try t.expectEqual(@as(usize, 12), integ.build_lines.items.len);
+    try t.expect(!integ.prepared_visible);
+    try t.expectEqual(@as(usize, 0), integ.prepared_lines.items.len);
+
+    // Live mutation after the build: the build capture stays frozen.
+    const x0 = integ.build_lines.items[0].a.x;
+    fx.mesh.position = Vec3.new(5, 0, 0);
+    try t.expectEqual(x0, integ.build_lines.items[0].a.x);
+
+    // Context-side latch publishes the build-time snapshot; stepping the
+    // world afterwards cannot reach the render-owned capture.
+    integ.latchDebug(t.allocator);
+    try t.expectEqual(@as(u64, 9), integ.latched_seq);
+    try t.expect(integ.prepared_visible);
+    try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+    try t.expectApproxEqAbs(x0, integ.prepared_lines.items[0].a.x, 1e-4);
+    integ.step(0.016);
+    try t.expectApproxEqAbs(x0, integ.prepared_lines.items[0].a.x, 1e-4);
+}
+
+test "physics two builds before latch: newest wins, stale latch recaptures" {
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    integ.buildDebug(t.allocator, 1);
+    const x0 = integ.build_lines.items[0].a.x;
+    fx.mesh.position = Vec3.new(5, 0, 0);
+    integ.buildDebug(t.allocator, 2);
+    try t.expectApproxEqAbs(x0 + 5.0, integ.build_lines.items[0].a.x, 1e-4);
+
+    integ.latchDebug(t.allocator);
+    try t.expectApproxEqAbs(x0 + 5.0, integ.prepared_lines.items[0].a.x, 1e-4);
+
+    // Latch without a fresh build falls back to the live capture (old
+    // behavior): the capture tracks live state, never a stale build.
+    fx.mesh.position = Vec3.new(9, 0, 0);
+    integ.latchDebug(t.allocator);
+    try t.expectApproxEqAbs(x0 + 9.0, integ.prepared_lines.items[0].a.x, 1e-4);
+}
+
+test "physics buildDebug OOM fail-closes, latch publishes empty, then recovers" {
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    integ.buildDebug(t.allocator, 1);
+    integ.latchDebug(t.allocator);
+    try t.expect(integ.prepared_visible);
+    try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+
+    // Unfunded build fail-closes to coherent-empty (mirrors captureDebug),
+    // but the seq still advances — the latch publishes the empty, never the
+    // stale prior frame.
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    integ.build_lines.clearAndFree(t.allocator);
+    integ.buildDebug(failing.allocator(), 2);
+    try t.expect(!integ.build_visible);
+    try t.expectEqual(@as(usize, 0), integ.build_lines.items.len);
+    integ.latchDebug(t.allocator);
+    try t.expect(!integ.prepared_visible);
+    try t.expectEqual(@as(usize, 0), integ.prepared_lines.items.len);
+
+    // Recovery: a funded build+latch publishes the full capture again.
+    integ.buildDebug(t.allocator, 3);
+    integ.latchDebug(t.allocator);
+    try t.expect(integ.prepared_visible);
+    try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+}
