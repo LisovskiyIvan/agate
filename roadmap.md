@@ -31,17 +31,17 @@
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP | 🟡 |
 | Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
-| Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) | ✅ |
+| Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) + тени PointLight (до 2, 2D-атлас 1536×512, 4-tap PCF, OFF по умолчанию) | ✅ |
 | Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
 | OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color; без текстур) | 🟡 |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
-| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance | 🟡 |
+| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur | 🟡 |
 | DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, цветовые curves и LUT-стрип (2D strip + API) есть; MSAA — только offscreen main target | 🟡 |
-| Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот | 🟡 |
-| GPU-симуляция, sub-emitters, flow maps | — | ❌ |
+| Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот, sub-emitters (on-death, SplitMix), flow maps (`setFlowMap`) | 🟡 |
+| GPU-симуляция | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
 | События анимаций, ретаргетинг | События/колбэки + ретаргетинг скелетов (name/index/bone_map, rotation_only) | ✅ |
 | Меш-билдеры | Box, Sphere, Cylinder, Capsule, Ground, Terrain, Torus, TorusKnot, Disc, Ribbon, Lathe, Plane, Tube, Extrude, Lines, Polygon, TrailMesh | ✅ |
@@ -49,7 +49,7 @@
 | CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
 | Упрощение мешей (Mesh simplification) & Greased Lines | Garland-Heckbert QEM edge-collapse + автоматическая генерация LOD-уровней; GreasedLine: ribbon/billboard толстые 3D-линии, miter joints, multi-path, per-vertex width/color, UV/dashed modes | ✅ |
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали | 🟡 |
-| Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (LDR + BC7-батч через `sandbox/tools/convert_ktx2.sh`) в glTF-загрузке | 🟡 |
+| Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (LDR + BC7-батч через `sandbox/tools/convert_ktx2.sh`) в glTF-загрузке, `KHR_texture_basisu` в whitelist `extensionsRequired` | 🟡 |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
@@ -601,13 +601,13 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 |---|---|---|
 | Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP) | Камера-ригов, touch/pinch, инерции |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + 1 directional (солнце) + 4 point + 2 spot (выбор лучших по камере) | Area-света, кластерного освещения, light probes, нескольких directional |
-| Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight | Теней от point-светов, ESM, каскадных настроек per-light |
+| Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
-| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`) | EXR, DDS, KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (BC1/BC3/ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/reflection probe текстуры |
+| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | EXR, KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/reflection probe текстуры |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, camera motion blur, цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | TAA, glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | GPU-морфов, редактора |
-| Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство | GPU-симуляции, sub-emitters, flow maps, коллизий с физикой |
+| Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps | GPU-симуляции, коллизий с физикой |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
@@ -626,13 +626,13 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 **Свет и тени**
 * Несколько directional-светов одновременно.
-* Тени от point-светов, PCSS/contact hardening для точечных источников, ESM, blur-exponential.
+* Тени от point-светов сверх лимита (3+), PCSS/contact hardening для точечных источников, ESM, blur-exponential.
 * Area (rect) свет, light probes, динамический IBL, кластерное освещение (сотни источников), объёмный свет/атмосфера.
 
 **Материалы и текстуры**
 * OpenPBR, текстуры clearcoat/sheen, anisotropic, transmission, subsurface.
 * NodeMaterial/ShaderMaterial (кастомные шейдеры без пересборки движка), библиотека материалов.
-* EXR/DDS, рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), BC1/BC3/ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды (офлайн BC7-батч моделей уже сделан, см. 🟡).
+* EXR, рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡).
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
@@ -646,7 +646,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Редактор анимаций (ретаргетинг скелетов name/index/bone_map уже реализован).
 
 **Частицы**
-* GPU-симуляция, sub-emitters, flow maps, нодовый редактор частиц, коллизии с физикой.
+* GPU-симуляция, нодовый редактор частиц, коллизии с физикой (sub-emitters и flow maps уже реализованы).
 
 **Физика**
 * Soft bodies; импорт коллайдеров из файлов сцен.
