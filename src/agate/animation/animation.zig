@@ -20,6 +20,13 @@ pub const AnimationGroup = group.AnimationGroup;
 pub const eval = @import("eval.zig");
 pub const evaluateSkeleton = eval.evaluateSkeleton;
 
+pub const retarget = @import("retarget.zig");
+pub const TranslationMode = retarget.TranslationMode;
+pub const RetargetOptions = retarget.RetargetOptions;
+pub const retargetAnimationGroup = retarget.retargetAnimationGroup;
+pub const boneRestLength = retarget.boneRestLength;
+pub const translationScaleFactor = retarget.translationScaleFactor;
+
 test {
     _ = @import("tests.zig");
 }

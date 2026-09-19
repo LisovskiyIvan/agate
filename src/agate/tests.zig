@@ -17,6 +17,7 @@ test {
     _ = @import("animation/easing.zig");
     _ = @import("animation/eval.zig");
     _ = @import("animation/group.zig");
+    _ = @import("animation/retarget.zig");
     _ = @import("animation/sampler.zig");
     _ = @import("animation/skeleton.zig");
     _ = @import("animation/tests.zig");
