@@ -172,6 +172,13 @@ pub fn isExtensionSupported(name: []const u8) bool {
         "KHR_lights_punctual",
         "KHR_texture_transform",
         "KHR_materials_unlit",
+        // KTX2/Basisu textures: the material loader resolves
+        // KHR_texture_basisu images (materials.textureImage prefers
+        // basisu_image when source is absent) and the KTX2 reader decodes
+        // both the uncompressed and the block-compressed subsets, so a
+        // file that requires this extension stays loadable. Gated on that
+        // path existing — without it this entry must go.
+        "KHR_texture_basisu",
     };
     for (supported) |s| {
         if (std.mem.eql(u8, s, name)) return true;
@@ -185,9 +192,15 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(isExtensionSupported("KHR_lights_punctual"));
     try std.testing.expect(isExtensionSupported("KHR_texture_transform"));
     try std.testing.expect(isExtensionSupported("KHR_materials_unlit"));
+    // KTX2 images ride on KHR_texture_basisu: required-and-supported
+    // files load through the basisu resolve path (see
+    // materials.textureImage), so the gate must accept it.
+    try std.testing.expect(isExtensionSupported("KHR_texture_basisu"));
 
     // Unsupported extensions that must be rejected when required:
     try std.testing.expect(!isExtensionSupported("KHR_draco_mesh_compression"));
     try std.testing.expect(!isExtensionSupported("KHR_materials_volume"));
+    try std.testing.expect(!isExtensionSupported("KHR_materials_specular"));
+    try std.testing.expect(!isExtensionSupported("KHR_texture_basisu_extra"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
 }

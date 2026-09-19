@@ -72,10 +72,16 @@ pub const shader_material = @import("shader_material.zig");
 
 pub const texture = @import("texture.zig");
 /// KTX2 container reader: uncompressed LDR subset plus block-compressed
-/// BC7 / ASTC 4x4 upload-without-transcoding (BC7/ASTC 4x4 files only).
-/// Texture.decodeMemory/decodeImageMemory route KTX2 payloads here
-/// automatically by magic sniff.
+/// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding. Texture.
+/// decodeMemory/decodeImageMemory route KTX2 payloads here automatically by
+/// magic sniff.
 pub const ktx2 = @import("ktx2.zig");
+/// DDS container reader: block-compressed BC1/BC2/BC3/BC7 subset (legacy
+/// DXT1/DXT3/DXT5 fourCC plus the DX10 header), decoded into the same
+/// RawBlockTexture the KTX2 block path uploads. Routed automatically by
+/// Texture.decodeImageMemory; standalone uploads via
+/// Texture.fromDdsMemory/fromDdsFile (glTF cannot reference .dds).
+pub const dds = @import("dds.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;

@@ -33,6 +33,7 @@ test {
     _ = @import("c.zig");
     _ = @import("camera.zig");
     _ = @import("compute.zig");
+    _ = @import("dds.zig");
     _ = @import("export/obj.zig");
     _ = @import("export/stl.zig");
     _ = @import("gpu_thread.zig");
