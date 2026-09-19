@@ -1,59 +1,18 @@
 //! Compact binary snapshot of a scene (".babylon"-style, but binary).
 //!
-//! Only what is listed below is captured; everything else is intentionally
-//! left out (see NOT SERIALIZED). All strings/slices in SceneState are owned
-//! (allocator.dupe) and released by SceneState.deinit.
+//! Facade: the implementation lives in serialization/ (free functions + thin
+//! forwarders; Zig 0.16 has no usingnamespace). Public entry points keep
+//! identical signatures/behavior:
+//!   format.zig - header/version constants, caps, binary primitives (Writer,
+//!     Reader, options-field codec, postprocess persistence contract).
+//!   props.zig  - snapshot types (SceneState and entries), custom game
+//!     properties, entity IDs / hierarchy + material-kind helpers.
+//!   writer.zig - scene -> bytes (capture, serializeAlloc, saveFile, async save).
+//!   reader.zig - bytes -> scene (deserializeAlloc, restore, loadFile, async load).
 //!
-//! Binary layout (all integers little-endian, f32 as IEEE754 LE bits,
-//! bool as u8 0/1, string as u32 length + raw bytes, no padding):
-//!   magic[4] = "AGSC", version u32,
-//!   mesh_count u32, meshes[],
-//!     per mesh (v3): id u64, name str, parent_name str,
-//!       (v2: name str),
-//!       position[3]f32, rotation[3]f32 (euler deg),
-//!       scaling[3]f32, flags u8 (bit0 visible, bit1 cast, bit2 receive),
-//!       material_kind u8 (0 standard, 1 pbr),
-//!       standard: diffuse[3]f32, alpha f32, alpha_mode u8 (0 opaque, 1 blend,
-//!         2 cutout), alpha_cutoff f32, double_sided u8,
-//!       pbr: albedo[3]f32, metallic f32, roughness f32, emissive[3]f32,
-//!         alpha f32, alpha_mode u8 (0 opaque, 1 blend, 2 cutout),
-//!         alpha_cutoff f32, double_sided u8,
-//!   hemi: name str, direction[3]f32, diffuse[3]f32, ground[3]f32,
-//!     intensity f32,
-//!   directional_present u8, [direction[3]f32, diffuse[3]f32, intensity f32],
-//!   point_count u32, per point: name str, position[3]f32, diffuse[3]f32,
-//!     intensity f32, range f32,
-//!   spot_count u32, per spot: name str, position[3]f32, direction[3]f32,
-//!     diffuse[3]f32, intensity f32, range f32, inner_deg f32, outer_deg f32,
-//!   camera_kind u8 (0 none, 1 arc_rotate, 2 free, 3 follow, 4 target, 5 fly),
-//!     arc_rotate: name str, alpha f32, beta f32, radius f32, target[3]f32,
-//!       fov f32, near f32, far f32,
-//!     free: name str, position[3]f32, rotation[3]f32 (euler deg), fov f32,
-//!       near f32, far f32, speed f32, angular_sensitivity f32,
-//!     follow: name str, position[3]f32, target_position[3]f32, radius f32,
-//!       height_offset f32, rotation_offset_deg f32, fov f32, near f32,
-//!       far f32, lerp_speed f32,
-//!     target: name str, position[3]f32, target[3]f32, up[3]f32, fov f32,
-//!       near f32, far f32, smoothing f32,
-//!     fly: name str, position[3]f32, rotation[3]f32 (euler deg), fov f32,
-//!       near f32, far f32, speed f32, boost_multiplier f32,
-//!       angular_sensitivity f32, roll_speed_deg f32,
-//!   (v2 layout: camera kinds appended as 4 target, 5 fly; material tails
-//!   extended with alpha_cutoff + double_sided. v1 bytes are NOT readable:
-//!   any version < 2 or > 3 reports UnsupportedVersion.)
-//!   render: skybox_enabled u8, skybox_exposure f32, shadows_enabled u8,
-//!     shadow_softness f32, ibl_intensity f32,
-//!   postprocess (PostProcessOptions field order): enabled u8, exposure f32,
-//!     tonemapping u32, bloom_enabled u8, bloom_threshold f32,
-//!     bloom_intensity f32, bloom_radius f32, vignette_enabled u8,
-//!     vignette_intensity f32, vignette_radius f32, saturation f32,
-//!     contrast f32, chromatic_aberration f32, fxaa_enabled u8, fog_enabled u8,
-//!     fog_density f32, fog_height_falloff f32, fog_start_distance f32,
-//!     fog_color[3]f32, fog_sun_scattering f32, ssr_enabled u8,
-//!     ssr_intensity f32, ssr_max_distance f32, ssr_thickness f32,
-//!     sharpen_enabled u8, sharpen_amount f32, grain_enabled u8,
-//!     grain_intensity f32, temperature f32, tint f32.
-//!   (v3 tail: game_property_count u32, per property: key str, value str).
+//! Only what is listed in format/writer is captured; everything else is
+//! intentionally left out (see NOT SERIALIZED). All strings/slices in
+//! SceneState are owned (allocator.dupe) and released by SceneState.deinit.
 //!
 //! NOT SERIALIZED (by design): geometry (vertices/indices), textures and
 //! cube maps (skybox/IBL contents), skeletons/animations, morph targets,
@@ -67,1546 +26,63 @@ const std = @import("std");
 const jobs = @import("jobs.zig");
 const math = @import("math");
 const Vec3 = math.Vec3;
-const Color3 = math.Color3;
-const SceneModule = @import("scene.zig");
-const Scene = SceneModule.Scene;
+const format_mod = @import("serialization/format.zig");
+const props_mod = @import("serialization/props.zig");
+const writer_mod = @import("serialization/writer.zig");
+const reader_mod = @import("serialization/reader.zig");
 const PostProcessOptions = @import("postprocess.zig").PostProcessOptions;
-const TonemappingType = @import("postprocess.zig").TonemappingType;
 const CameraModule = @import("camera.zig");
 const Camera = CameraModule.Camera;
 const TargetCamera = CameraModule.TargetCamera;
 const FlyCamera = CameraModule.FlyCamera;
-const Lights = @import("lights.zig");
-const HemisphericLight = Lights.HemisphericLight;
 const MaterialModule = @import("material.zig");
 const StandardMaterial = MaterialModule.StandardMaterial;
-const PBRMaterial = MaterialModule.PBRMaterial;
-const AlphaMode = MaterialModule.AlphaMode;
-const Mesh = @import("mesh.zig").Mesh;
 
-pub const MAGIC: [4]u8 = .{ 'A', 'G', 'S', 'C' };
-/// v3: adds mesh stable entity `id` (u64) and `parent_name` (string) for hierarchy
-/// persistence, plus custom game key-value properties table at file tail.
-/// Backwards-compatible: v2 files parse cleanly without parent/game-properties.
-pub const VERSION: u32 = 3;
-
-/// Hard caps for untrusted input. Counts above max_entries and strings above
-/// max_string_bytes report TooLarge instead of driving wild allocations.
-pub const MAX_ENTRIES: u32 = 1_000_000;
-pub const MAX_STRING_BYTES: u32 = 8 * 1024 * 1024;
-pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
-
-pub const DecodeError = error{
-    BadMagic,
-    UnsupportedVersion,
-    Truncated,
-    TooLarge,
-};
-
-// ---------------------------------------------------------------------------
-// Snapshot types (all strings/slices owned, see deinit)
-// ---------------------------------------------------------------------------
-
-pub const StandardEntry = struct {
-    diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    alpha: f32 = 1.0,
-    alpha_mode: u8 = 0, // 0 opaque, 1 blend, 2 cutout
-    alpha_cutoff: f32 = 0.5,
-    double_sided: bool = false,
-};
-
-pub const PbrEntry = struct {
-    albedo: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    metallic: f32 = 0.0,
-    roughness: f32 = 0.5,
-    emissive: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    alpha: f32 = 1.0,
-    alpha_mode: u8 = 0, // 0 opaque, 1 blend, 2 cutout
-    alpha_cutoff: f32 = 0.5,
-    double_sided: bool = false,
-};
-
-pub const MaterialEntry = union(enum) {
-    standard: StandardEntry,
-    pbr: PbrEntry,
-};
-
-pub const MeshEntry = struct {
-    id: u64 = 0,
-    name: []const u8 = "",
-    parent_name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    rotation: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    scaling: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    is_visible: bool = true,
-    cast_shadows: bool = true,
-    receive_shadows: bool = true,
-    material: MaterialEntry = .{ .standard = .{} },
-
-    pub fn deinit(self: *MeshEntry, allocator: std.mem.Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-        if (self.parent_name.len > 0) allocator.free(self.parent_name);
-    }
-};
-
-pub const HemiEntry = struct {
-    name: []const u8 = "",
-    direction: [3]f32 = .{ 0.0, 1.0, 0.0 },
-    diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    ground: [3]f32 = .{ 0.2, 0.25, 0.3 },
-    intensity: f32 = 1.0,
-
-    pub fn deinit(self: *HemiEntry, allocator: std.mem.Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-    }
-};
-
-pub const DirectionalEntry = struct {
-    name: []const u8 = "",
-    direction: [3]f32 = .{ 0.5, 1.0, 0.5 },
-    diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    intensity: f32 = 1.0,
-
-    pub fn deinit(self: *DirectionalEntry, allocator: std.mem.Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-    }
-};
-
-pub const PointEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    intensity: f32 = 1.0,
-    range: f32 = 10.0,
-
-    pub fn deinit(self: *PointEntry, allocator: std.mem.Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-    }
-};
-
-pub const SpotEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    direction: [3]f32 = .{ 0.0, -1.0, 0.0 },
-    diffuse: [3]f32 = .{ 1.0, 1.0, 1.0 },
-    intensity: f32 = 1.0,
-    range: f32 = 15.0,
-    inner_deg: f32 = 15.0,
-    outer_deg: f32 = 30.0,
-
-    pub fn deinit(self: *SpotEntry, allocator: std.mem.Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-    }
-};
-
-pub const ArcRotateEntry = struct {
-    name: []const u8 = "",
-    alpha: f32 = 0.0,
-    beta: f32 = std.math.pi / 3.0,
-    radius: f32 = 5.0,
-    target: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 100.0,
-};
-
-pub const FreeEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    rotation: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 100.0,
-    speed: f32 = 6.0,
-    angular_sensitivity: f32 = 0.25,
-};
-
-pub const FollowEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    target_position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    radius: f32 = 5.0,
-    height_offset: f32 = 2.0,
-    rotation_offset_deg: f32 = 0.0,
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 100.0,
-    lerp_speed: f32 = 8.0,
-};
-
-pub const TargetEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    target: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    up: [3]f32 = .{ 0.0, 1.0, 0.0 },
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 100.0,
-    smoothing: f32 = 8.0,
-};
-
-pub const FlyEntry = struct {
-    name: []const u8 = "",
-    position: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    rotation: [3]f32 = .{ 0.0, 0.0, 0.0 },
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 100.0,
-    speed: f32 = 6.0,
-    boost_multiplier: f32 = 4.0,
-    angular_sensitivity: f32 = 0.25,
-    roll_speed_deg: f32 = 90.0,
-};
-
-/// Camera snapshot, one variant per Camera union type (follow target_mesh
-/// link is dropped, target_position is kept; target desired goals are
-/// transient and not stored).
-pub const CameraEntry = union(enum) {
-    none,
-    arc_rotate: ArcRotateEntry,
-    free: FreeEntry,
-    follow: FollowEntry,
-    target: TargetEntry,
-    fly: FlyEntry,
-
-    pub fn deinit(self: *CameraEntry, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .none => {},
-            .arc_rotate => |*c| if (c.name.len > 0) allocator.free(c.name),
-            .free => |*c| if (c.name.len > 0) allocator.free(c.name),
-            .follow => |*c| if (c.name.len > 0) allocator.free(c.name),
-            .target => |*c| if (c.name.len > 0) allocator.free(c.name),
-            .fly => |*c| if (c.name.len > 0) allocator.free(c.name),
-        }
-    }
-};
-
-pub const RenderEntry = struct {
-    skybox_enabled: bool = false,
-    skybox_exposure: f32 = 1.0,
-    shadows_enabled: bool = true,
-    shadow_softness: f32 = 1.5,
-    ibl_intensity: f32 = 1.0,
-};
-
-pub const GameProperty = struct {
-    key: []const u8 = "",
-    value: []const u8 = "",
-
-    pub fn deinit(self: *GameProperty, allocator: std.mem.Allocator) void {
-        if (self.key.len > 0) allocator.free(self.key);
-        if (self.value.len > 0) allocator.free(self.value);
-    }
-};
-
-pub const SceneState = struct {
-    meshes: []MeshEntry = &.{},
-    hemi: HemiEntry = .{},
-    directional: ?DirectionalEntry = null,
-    point_lights: []PointEntry = &.{},
-    spot_lights: []SpotEntry = &.{},
-    camera: CameraEntry = .none,
-    render: RenderEntry = .{},
-    postprocess: PostProcessOptions = .{},
-    game_properties: []GameProperty = &.{},
-
-    pub fn getGameProperty(self: *const SceneState, key: []const u8) ?[]const u8 {
-        for (self.game_properties) |p| {
-            if (std.mem.eql(u8, p.key, key)) return p.value;
-        }
-        return null;
-    }
-
-    pub fn setGameProperty(self: *SceneState, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-        for (self.game_properties) |*p| {
-            if (std.mem.eql(u8, p.key, key)) {
-                if (p.value.len > 0) allocator.free(p.value);
-                p.value = try allocator.dupe(u8, value);
-                return;
-            }
-        }
-        const old_len = self.game_properties.len;
-        const new_slice = try allocator.alloc(GameProperty, old_len + 1);
-        if (old_len > 0) {
-            @memcpy(new_slice[0..old_len], self.game_properties);
-            allocator.free(self.game_properties);
-        }
-        new_slice[old_len] = .{
-            .key = try allocator.dupe(u8, key),
-            .value = try allocator.dupe(u8, value),
-        };
-        self.game_properties = new_slice;
-    }
-
-    pub fn deinit(self: *SceneState, allocator: std.mem.Allocator) void {
-        for (self.meshes) |*m| m.deinit(allocator);
-        if (self.meshes.len > 0) allocator.free(self.meshes);
-        self.hemi.deinit(allocator);
-        if (self.directional) |*d| d.deinit(allocator);
-        for (self.point_lights) |*p| p.deinit(allocator);
-        if (self.point_lights.len > 0) allocator.free(self.point_lights);
-        for (self.spot_lights) |*s| s.deinit(allocator);
-        if (self.spot_lights.len > 0) allocator.free(self.spot_lights);
-        self.camera.deinit(allocator);
-        for (self.game_properties) |*gp| gp.deinit(allocator);
-        if (self.game_properties.len > 0) allocator.free(self.game_properties);
-        self.* = .{};
-    }
-};
-
-// ---------------------------------------------------------------------------
-// capture / restore
-// ---------------------------------------------------------------------------
-
-fn alphaModeToU8(mode: AlphaMode) u8 {
-    return switch (mode) {
-        .@"opaque" => 0,
-        .blend => 1,
-        .cutout => 2,
-    };
-}
-
-fn alphaModeFromU8(v: u8) AlphaMode {
-    return switch (v) {
-        0 => .@"opaque",
-        1 => .blend,
-        2 => .cutout,
-        else => .@"opaque",
-    };
-}
-
-/// POD snapshot of a live scene. Meshes without a material snapshot as the
-/// standard default (white, alpha 1, opaque).
-pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
-    var state = SceneState{};
-    errdefer state.deinit(allocator);
-
-    var meshes: std.ArrayListUnmanaged(MeshEntry) = .empty;
-    errdefer {
-        for (meshes.items) |*m| m.deinit(allocator);
-        meshes.deinit(allocator);
-    }
-    for (scene.meshes.items) |mesh| {
-        const name = try allocator.dupe(u8, mesh.name);
-        errdefer allocator.free(name);
-        const parent_name = if (mesh.parent) |p| try allocator.dupe(u8, p.name) else "";
-        errdefer if (parent_name.len > 0) allocator.free(parent_name);
-        const material: MaterialEntry = if (mesh.material) |mat| blk: {
-            // PBR keeps its own entry shape (metallic / roughness / emissive).
-            if (mat == .pbr) {
-                const p = mat.pbr;
-                break :blk .{ .pbr = .{
-                    .albedo = .{ p.albedo_color.r, p.albedo_color.g, p.albedo_color.b },
-                    .metallic = p.metallic,
-                    .roughness = p.roughness,
-                    .emissive = .{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b },
-                    .alpha = p.alpha,
-                    .alpha_mode = alphaModeToU8(p.alpha_mode),
-                    .alpha_cutoff = p.alpha_cutoff,
-                    .double_sided = p.double_sided,
-                } };
-            }
-            // Standard-shaped entries for every other variant. Documented
-            // limitation: shader materials serialize as plain standard
-            // materials carrying the tint/alpha state. The custom shader
-            // registration is not part of the snapshot format; after a
-            // roundtrip the mesh renders with the built-in shader (reassign
-            // the .shader_material variant after restore if needed).
-            const base = mat.baseColor3();
-            break :blk .{ .standard = .{
-                .diffuse = .{ base.r, base.g, base.b },
-                .alpha = mat.alpha(),
-                .alpha_mode = alphaModeToU8(mat.alphaMode()),
-                .alpha_cutoff = mat.alphaCutoff(),
-                .double_sided = mat.isDoubleSided(),
-            } };
-        } else .{ .standard = .{} };
-        try meshes.append(allocator, .{
-            .id = mesh.id,
-            .name = name,
-            .parent_name = parent_name,
-            .position = .{ mesh.position.x, mesh.position.y, mesh.position.z },
-            .rotation = .{ mesh.rotation.x, mesh.rotation.y, mesh.rotation.z },
-            .scaling = .{ mesh.scaling.x, mesh.scaling.y, mesh.scaling.z },
-            .is_visible = mesh.is_visible,
-            .cast_shadows = mesh.cast_shadows,
-            .receive_shadows = mesh.receive_shadows,
-            .material = material,
-        });
-    }
-    state.meshes = try meshes.toOwnedSlice(allocator);
-
-    state.hemi = .{
-        .name = try allocator.dupe(u8, scene.lights.hemi.name),
-        .direction = .{ scene.lights.hemi.direction.x, scene.lights.hemi.direction.y, scene.lights.hemi.direction.z },
-        .diffuse = .{ scene.lights.hemi.diffuse.r, scene.lights.hemi.diffuse.g, scene.lights.hemi.diffuse.b },
-        .ground = .{ scene.lights.hemi.ground_color.r, scene.lights.hemi.ground_color.g, scene.lights.hemi.ground_color.b },
-        .intensity = scene.lights.hemi.intensity,
-    };
-
-    if (scene.lights.directional) |dl| {
-        state.directional = .{
-            .name = try allocator.dupe(u8, dl.name),
-            .direction = .{ dl.direction.x, dl.direction.y, dl.direction.z },
-            .diffuse = .{ dl.diffuse.r, dl.diffuse.g, dl.diffuse.b },
-            .intensity = dl.intensity,
-        };
-    }
-
-    var points: std.ArrayListUnmanaged(PointEntry) = .empty;
-    errdefer {
-        for (points.items) |*p| p.deinit(allocator);
-        points.deinit(allocator);
-    }
-    for (scene.lights.point_lights.items) |pl| {
-        const name = try allocator.dupe(u8, pl.name);
-        errdefer allocator.free(name);
-        try points.append(allocator, .{
-            .name = name,
-            .position = .{ pl.position.x, pl.position.y, pl.position.z },
-            .diffuse = .{ pl.color.r, pl.color.g, pl.color.b },
-            .intensity = pl.intensity,
-            .range = pl.range,
-        });
-    }
-    state.point_lights = try points.toOwnedSlice(allocator);
-
-    var spots: std.ArrayListUnmanaged(SpotEntry) = .empty;
-    errdefer {
-        for (spots.items) |*s| s.deinit(allocator);
-        spots.deinit(allocator);
-    }
-    for (scene.lights.spot_lights.items) |sl| {
-        const name = try allocator.dupe(u8, sl.name);
-        errdefer allocator.free(name);
-        try spots.append(allocator, .{
-            .name = name,
-            .position = .{ sl.position.x, sl.position.y, sl.position.z },
-            .direction = .{ sl.direction.x, sl.direction.y, sl.direction.z },
-            .diffuse = .{ sl.color.r, sl.color.g, sl.color.b },
-            .intensity = sl.intensity,
-            .range = sl.range,
-            .inner_deg = sl.inner_angle_deg,
-            .outer_deg = sl.outer_angle_deg,
-        });
-    }
-    state.spot_lights = try spots.toOwnedSlice(allocator);
-
-    if (scene.active_camera) |cam| {
-        state.camera = switch (cam) {
-            .arc_rotate => |c| .{ .arc_rotate = .{
-                .name = try allocator.dupe(u8, c.name),
-                .alpha = c.alpha,
-                .beta = c.beta,
-                .radius = c.radius,
-                .target = .{ c.target.x, c.target.y, c.target.z },
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-            } },
-            .free => |c| .{ .free = .{
-                .name = try allocator.dupe(u8, c.name),
-                .position = .{ c.position.x, c.position.y, c.position.z },
-                .rotation = .{ c.rotation.x, c.rotation.y, c.rotation.z },
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .angular_sensitivity = c.angular_sensitivity,
-            } },
-            .follow => |c| .{ .follow = .{
-                .name = try allocator.dupe(u8, c.name),
-                .position = .{ c.position.x, c.position.y, c.position.z },
-                .target_position = .{ c.target_position.x, c.target_position.y, c.target_position.z },
-                .radius = c.radius,
-                .height_offset = c.height_offset,
-                .rotation_offset_deg = c.rotation_offset_deg,
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .lerp_speed = c.lerp_speed,
-            } },
-            .target => |c| .{ .target = .{
-                .name = try allocator.dupe(u8, c.name),
-                .position = .{ c.position.x, c.position.y, c.position.z },
-                .target = .{ c.target.x, c.target.y, c.target.z },
-                .up = .{ c.up.x, c.up.y, c.up.z },
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .smoothing = c.smoothing,
-            } },
-            .fly => |c| .{ .fly = .{
-                .name = try allocator.dupe(u8, c.name),
-                .position = .{ c.position.x, c.position.y, c.position.z },
-                .rotation = .{ c.rotation.x, c.rotation.y, c.rotation.z },
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .boost_multiplier = c.boost_multiplier,
-                .angular_sensitivity = c.angular_sensitivity,
-                .roll_speed_deg = c.roll_speed_deg,
-            } },
-        };
-    }
-
-    state.render = .{
-        .skybox_enabled = scene.sky.enabled,
-        .skybox_exposure = scene.sky.exposure,
-        .shadows_enabled = scene.shadows.enabled,
-        .shadow_softness = scene.shadows.softness,
-        .ibl_intensity = scene.sky.ibl_intensity,
-    };
-    state.postprocess = scene.post_process;
-
-    return state;
-}
-
-fn findMesh(scene: *Scene, name: []const u8) ?*Mesh {
-    for (scene.meshes.items) |m| {
-        if (std.mem.eql(u8, m.name, name)) return m;
-    }
-    return null;
-}
-
-fn findMeshByIdOrName(scene: *Scene, id: u64, name: []const u8) ?*Mesh {
-    if (id != 0) {
-        for (scene.meshes.items) |m| {
-            if (m.id == id) return m;
-        }
-    }
-    return findMesh(scene, name);
-}
-
-/// Applies one snapshot material to a live mesh. Mutates the existing
-/// material in place when the kind matches (note: shared materials change
-/// for every mesh using them); otherwise allocates a fresh scene material
-/// (silently keeps the old one on OOM).
-fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) void {
-    switch (src.*) {
-        .standard => |*s| {
-            const sm: *StandardMaterial = blk: {
-                if (mesh.material) |m| {
-                    if (m == .standard) break :blk m.standard;
-                }
-                const mat = scene.createStandardMaterial(mesh.name) catch return;
-                break :blk mat;
-            };
-            sm.diffuse_color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]);
-            sm.alpha = s.alpha;
-            sm.alpha_mode = alphaModeFromU8(s.alpha_mode);
-            sm.alpha_cutoff = s.alpha_cutoff;
-            sm.double_sided = s.double_sided;
-            mesh.material = .{ .standard = sm };
-        },
-        .pbr => |*p| {
-            const pm: *PBRMaterial = blk: {
-                if (mesh.material) |m| {
-                    if (m == .pbr) break :blk m.pbr;
-                }
-                const mat = scene.createPBRMaterial(mesh.name) catch return;
-                break :blk mat;
-            };
-            pm.albedo_color = Color3.new(p.albedo[0], p.albedo[1], p.albedo[2]);
-            pm.metallic = p.metallic;
-            pm.roughness = p.roughness;
-            pm.emissive_color = Color3.new(p.emissive[0], p.emissive[1], p.emissive[2]);
-            pm.alpha = p.alpha;
-            pm.alpha_mode = alphaModeFromU8(p.alpha_mode);
-            pm.alpha_cutoff = p.alpha_cutoff;
-            pm.double_sided = p.double_sided;
-            mesh.material = .{ .pbr = pm };
-        },
-    }
-}
-
-/// Applies a snapshot to a live scene. Meshes match by id (if non-zero) or by name,
-/// unknown names are ignored. Parent-child hierarchy is reconstructed.
-/// Point/spot lights are destroyed and recreated; the directional light is
-/// replaced via createDirectionalLight. Follow-camera target_mesh resets to null
-/// (target_position is kept).
-pub fn restore(scene: *Scene, state: *const SceneState) void {
-    for (state.meshes) |*entry| {
-        const mesh = findMeshByIdOrName(scene, entry.id, entry.name) orelse continue;
-        mesh.position = Vec3.new(entry.position[0], entry.position[1], entry.position[2]);
-        mesh.rotation = Vec3.new(entry.rotation[0], entry.rotation[1], entry.rotation[2]);
-        mesh.scaling = Vec3.new(entry.scaling[0], entry.scaling[1], entry.scaling[2]);
-        mesh.is_visible = entry.is_visible;
-        mesh.cast_shadows = entry.cast_shadows;
-        mesh.receive_shadows = entry.receive_shadows;
-        if (entry.id != 0) mesh.id = entry.id;
-        restoreMeshMaterial(scene, mesh, &entry.material);
-    }
-
-    // Second pass: restore parent links across meshes
-    for (state.meshes) |*entry| {
-        const mesh = findMeshByIdOrName(scene, entry.id, entry.name) orelse continue;
-        if (entry.parent_name.len == 0) {
-            mesh.parent = null;
-        } else if (findMesh(scene, entry.parent_name)) |parent_mesh| {
-            mesh.parent = parent_mesh;
-        }
-    }
-
-    scene.lights.hemi = HemisphericLight.init(scene.lights.hemi.name, .{
-        .direction = Vec3.new(state.hemi.direction[0], state.hemi.direction[1], state.hemi.direction[2]),
-        .diffuse = Color3.new(state.hemi.diffuse[0], state.hemi.diffuse[1], state.hemi.diffuse[2]),
-        .ground_color = Color3.new(state.hemi.ground[0], state.hemi.ground[1], state.hemi.ground[2]),
-        .intensity = state.hemi.intensity,
-    });
-
-    if (state.directional) |*d| {
-        // createDirectionalLight destroys the previous sun internally.
-        const owned: ?[]u8 = scene.allocator.dupe(u8, d.name) catch null;
-        if (scene.createDirectionalLight(owned orelse d.name, .{
-            .direction = Vec3.new(d.direction[0], d.direction[1], d.direction[2]),
-            .diffuse = Color3.new(d.diffuse[0], d.diffuse[1], d.diffuse[2]),
-            .intensity = d.intensity,
-        })) |dl| {
-            if (owned != null) dl.owns_name = true;
-        } else |_| {
-            if (owned) |o| scene.allocator.free(o);
-        }
-    } else if (scene.lights.directional) |old| {
-        if (old.owns_name) scene.allocator.free(old.name);
-        scene.allocator.destroy(old);
-        scene.lights.directional = null;
-    }
-
-    for (scene.lights.point_lights.items) |pl| {
-        if (pl.owns_name) scene.allocator.free(pl.name);
-        scene.allocator.destroy(pl);
-    }
-    scene.lights.point_lights.clearRetainingCapacity();
-    for (state.point_lights) |*p| {
-        const owned: ?[]u8 = scene.allocator.dupe(u8, p.name) catch null;
-        if (scene.createPointLight(owned orelse p.name, .{
-            .position = Vec3.new(p.position[0], p.position[1], p.position[2]),
-            .color = Color3.new(p.diffuse[0], p.diffuse[1], p.diffuse[2]),
-            .intensity = p.intensity,
-            .range = p.range,
-        })) |pl| {
-            if (owned != null) pl.owns_name = true;
-        } else |_| {
-            if (owned) |o| scene.allocator.free(o);
-        }
-    }
-
-    for (scene.lights.spot_lights.items) |sl| {
-        if (sl.owns_name) scene.allocator.free(sl.name);
-        scene.allocator.destroy(sl);
-    }
-    scene.lights.spot_lights.clearRetainingCapacity();
-    for (state.spot_lights) |*s| {
-        const owned: ?[]u8 = scene.allocator.dupe(u8, s.name) catch null;
-        if (scene.createSpotLight(owned orelse s.name, .{
-            .position = Vec3.new(s.position[0], s.position[1], s.position[2]),
-            .direction = Vec3.new(s.direction[0], s.direction[1], s.direction[2]),
-            .color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]),
-            .intensity = s.intensity,
-            .range = s.range,
-            .inner_angle_deg = s.inner_deg,
-            .outer_angle_deg = s.outer_deg,
-        })) |sl| {
-            if (owned != null) sl.owns_name = true;
-        } else |_| {
-            if (owned) |o| scene.allocator.free(o);
-        }
-    }
-
-    switch (state.camera) {
-        .none => scene.setActiveCamera(null, null),
-        .arc_rotate => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .arc_rotate = .{
-                .name = owned orelse c.name,
-                .alpha = c.alpha,
-                .beta = c.beta,
-                .radius = c.radius,
-                .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-            } }, owned);
-        },
-        .free => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .free = .{
-                .name = owned orelse c.name,
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .angular_sensitivity = c.angular_sensitivity,
-            } }, owned);
-        },
-        .follow => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .follow = .{
-                .name = owned orelse c.name,
-                .target_mesh = null,
-                .target_position = Vec3.new(c.target_position[0], c.target_position[1], c.target_position[2]),
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .radius = c.radius,
-                .height_offset = c.height_offset,
-                .rotation_offset_deg = c.rotation_offset_deg,
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .lerp_speed = c.lerp_speed,
-            } }, owned);
-        },
-        .target => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .target = TargetCamera.init(owned orelse c.name, .{
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
-                .up = Vec3.new(c.up[0], c.up[1], c.up[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .smoothing = c.smoothing,
-            }) }, owned);
-        },
-        .fly => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .fly = FlyCamera.init(owned orelse c.name, .{
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .boost_multiplier = c.boost_multiplier,
-                .angular_sensitivity = c.angular_sensitivity,
-                .roll_speed_deg = c.roll_speed_deg,
-            }) }, owned);
-        },
-    }
-
-    scene.sky.enabled = state.render.skybox_enabled;
-    scene.sky.exposure = state.render.skybox_exposure;
-    scene.shadows.enabled = state.render.shadows_enabled;
-    scene.shadows.softness = state.render.shadow_softness;
-    scene.sky.ibl_intensity = state.render.ibl_intensity;
-    scene.post_process = state.postprocess;
-}
-
-// ---------------------------------------------------------------------------
-// Binary codec
-// ---------------------------------------------------------------------------
-
-const Writer = struct {
-    alloc: std.mem.Allocator,
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-
-    fn bytes(self: *Writer, data: []const u8) !void {
-        try self.buf.appendSlice(self.alloc, data);
-    }
-
-    fn byte(self: *Writer, v: u8) !void {
-        try self.buf.append(self.alloc, v);
-    }
-
-    fn u32le(self: *Writer, v: u32) !void {
-        var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, v, .little);
-        try self.bytes(&b);
-    }
-
-    fn u64le(self: *Writer, v: u64) !void {
-        var b: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b, v, .little);
-        try self.bytes(&b);
-    }
-
-    fn f32le(self: *Writer, v: f32) !void {
-        var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, @as(u32, @bitCast(v)), .little);
-        try self.bytes(&b);
-    }
-
-    fn bool8(self: *Writer, v: bool) !void {
-        try self.byte(if (v) 1 else 0);
-    }
-
-    fn vec3(self: *Writer, v: [3]f32) !void {
-        try self.f32le(v[0]);
-        try self.f32le(v[1]);
-        try self.f32le(v[2]);
-    }
-
-    fn str(self: *Writer, s: []const u8) !void {
-        const len = std.math.cast(u32, s.len) orelse return error.TooLarge;
-        try self.u32le(len);
-        try self.bytes(s);
-    }
-};
-
-const Reader = struct {
-    bytes: []const u8,
-    pos: usize = 0,
-
-    fn readU8(self: *Reader) DecodeError!u8 {
-        if (self.pos >= self.bytes.len) return error.Truncated;
-        const v = self.bytes[self.pos];
-        self.pos += 1;
-        return v;
-    }
-
-    fn readU32(self: *Reader) DecodeError!u32 {
-        const raw = try self.readRaw(4);
-        return std.mem.readInt(u32, raw[0..4], .little);
-    }
-
-    fn readU64(self: *Reader) DecodeError!u64 {
-        const raw = try self.readRaw(8);
-        return std.mem.readInt(u64, raw[0..8], .little);
-    }
-
-    fn readF32(self: *Reader) DecodeError!f32 {
-        const raw = try self.readRaw(4);
-        return @as(f32, @bitCast(std.mem.readInt(u32, raw[0..4], .little)));
-    }
-
-    fn readBool(self: *Reader) DecodeError!bool {
-        return switch (try self.readU8()) {
-            0 => false,
-            1 => true,
-            else => error.Truncated,
-        };
-    }
-
-    fn readRaw(self: *Reader, n: u32) DecodeError![]const u8 {
-        const len = std.math.cast(usize, n) orelse return error.TooLarge;
-        const end = std.math.add(usize, self.pos, len) catch return error.TooLarge;
-        if (end > self.bytes.len) return error.Truncated;
-        const out = self.bytes[self.pos..end];
-        self.pos = end;
-        return out;
-    }
-
-    /// Validated element count for a variable-length list.
-    fn readCount(self: *Reader) DecodeError!u32 {
-        const n = try self.readU32();
-        if (n > MAX_ENTRIES) return error.TooLarge;
-        return n;
-    }
-
-    fn readString(self: *Reader, allocator: std.mem.Allocator) (DecodeError || std.mem.Allocator.Error)![]u8 {
-        const n = try self.readU32();
-        if (n > MAX_STRING_BYTES) return error.TooLarge;
-        const raw = try self.readRaw(n);
-        return allocator.dupe(u8, raw);
-    }
-
-    fn readVec3(self: *Reader) DecodeError![3]f32 {
-        return .{ try self.readF32(), try self.readF32(), try self.readF32() };
-    }
-};
-
-/// Comptime field codec for plain options structs. The explicit
-/// `persisted` name list IS the on-disk contract: list order == byte
-/// order, and fields absent from the list stay session-local instead of
-/// silently changing the format. Field types dispatch at comptime:
-/// bool -> bool8, f32 -> f32le, u32 -> u32le, [3]f32 -> vec3,
-/// enum -> u32le(@intFromEnum). The enum mapping is derived from the
-/// enum declaration itself, so a name<->int mismatch between the writer
-/// and the reader is impossible by construction.
-fn writeField(w: *Writer, value: anytype) !void {
-    const T = @TypeOf(value);
-    if (T == bool) return w.bool8(value);
-    if (T == f32) return w.f32le(value);
-    if (T == u32) return w.u32le(value);
-    if (T == [3]f32) return w.vec3(value);
-    if (@typeInfo(T) == .@"enum") return w.u32le(@intFromEnum(value));
-    @compileError("serialization: unsupported options field type " ++ @typeName(T));
-}
-
-fn readFieldAs(comptime T: type, r: *Reader) DecodeError!T {
-    if (T == bool) return r.readBool();
-    if (T == f32) return r.readF32();
-    if (T == u32) return r.readU32();
-    if (T == [3]f32) return r.readVec3();
-    if (@typeInfo(T) == .@"enum") {
-        const raw = try r.readU32();
-        inline for (@typeInfo(T).@"enum".fields) |f| {
-            if (f.value == raw) return @enumFromInt(f.value);
-        }
-        return error.Truncated;
-    }
-    @compileError("serialization: unsupported options field type " ++ @typeName(T));
-}
-
-fn writeOptions(w: *Writer, options: anytype, comptime persisted: []const []const u8) !void {
-    inline for (persisted) |name| {
-        try writeField(w, @field(options, name));
-    }
-}
-
-fn readOptions(comptime T: type, r: *Reader, comptime persisted: []const []const u8) DecodeError!T {
-    var out: T = .{};
-    inline for (persisted) |name| {
-        @field(out, name) = try readFieldAs(@TypeOf(@field(out, name)), r);
-    }
-    return out;
-}
-
-/// PostProcessOptions fields persisted in save states, in byte order.
-/// Anything not listed here (transient knobs like bloom_pyramid, dof_*,
-/// grade_*) is rebuilt from defaults on load.
-const postprocess_persisted = [_][]const u8{
-    "enabled",              "exposure",           "tonemapping",
-    "bloom_enabled",        "bloom_threshold",    "bloom_intensity",
-    "bloom_radius",         "vignette_enabled",   "vignette_intensity",
-    "vignette_radius",      "saturation",         "contrast",
-    "chromatic_aberration", "fxaa_enabled",       "fog_enabled",
-    "fog_density",          "fog_height_falloff", "fog_start_distance",
-    "fog_color",            "fog_sun_scattering", "ssr_enabled",
-    "ssr_intensity",        "ssr_max_distance",   "ssr_thickness",
-    "sharpen_enabled",      "sharpen_amount",     "grain_enabled",
-    "grain_intensity",      "temperature",        "tint",
-};
-
-fn writePostProcess(w: *Writer, pp: *const PostProcessOptions) !void {
-    try writeOptions(w, pp.*, &postprocess_persisted);
-}
-
-fn readPostProcess(r: *Reader) DecodeError!PostProcessOptions {
-    return readOptions(PostProcessOptions, r, &postprocess_persisted);
-}
-
-/// Serializes a snapshot into a freshly allocated byte buffer (little-endian
-/// layout documented at the top of this file). Fails with TooLarge when a
-/// slice/string length does not fit into u32.
-pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![]u8 {
-    var w = Writer{ .alloc = allocator };
-    errdefer w.buf.deinit(allocator);
-
-    try w.bytes(MAGIC[0..]);
-    try w.u32le(VERSION);
-
-    try w.u32le(std.math.cast(u32, state.meshes.len) orelse return error.TooLarge);
-    for (state.meshes) |*m| {
-        try w.u64le(m.id);
-        try w.str(m.name);
-        try w.str(m.parent_name);
-        try w.vec3(m.position);
-        try w.vec3(m.rotation);
-        try w.vec3(m.scaling);
-        var flags: u8 = 0;
-        if (m.is_visible) flags |= 1;
-        if (m.cast_shadows) flags |= 2;
-        if (m.receive_shadows) flags |= 4;
-        try w.byte(flags);
-        switch (m.material) {
-            .standard => |*s| {
-                try w.byte(0);
-                try w.vec3(s.diffuse);
-                try w.f32le(s.alpha);
-                try w.byte(s.alpha_mode);
-                try w.f32le(s.alpha_cutoff);
-                try w.bool8(s.double_sided);
-            },
-            .pbr => |*p| {
-                try w.byte(1);
-                try w.vec3(p.albedo);
-                try w.f32le(p.metallic);
-                try w.f32le(p.roughness);
-                try w.vec3(p.emissive);
-                try w.f32le(p.alpha);
-                try w.byte(p.alpha_mode);
-                try w.f32le(p.alpha_cutoff);
-                try w.bool8(p.double_sided);
-            },
-        }
-    }
-
-    try w.str(state.hemi.name);
-    try w.vec3(state.hemi.direction);
-    try w.vec3(state.hemi.diffuse);
-    try w.vec3(state.hemi.ground);
-    try w.f32le(state.hemi.intensity);
-
-    if (state.directional) |*d| {
-        try w.byte(1);
-        try w.str(d.name);
-        try w.vec3(d.direction);
-        try w.vec3(d.diffuse);
-        try w.f32le(d.intensity);
-    } else {
-        try w.byte(0);
-    }
-
-    try w.u32le(std.math.cast(u32, state.point_lights.len) orelse return error.TooLarge);
-    for (state.point_lights) |*p| {
-        try w.str(p.name);
-        try w.vec3(p.position);
-        try w.vec3(p.diffuse);
-        try w.f32le(p.intensity);
-        try w.f32le(p.range);
-    }
-
-    try w.u32le(std.math.cast(u32, state.spot_lights.len) orelse return error.TooLarge);
-    for (state.spot_lights) |*s| {
-        try w.str(s.name);
-        try w.vec3(s.position);
-        try w.vec3(s.direction);
-        try w.vec3(s.diffuse);
-        try w.f32le(s.intensity);
-        try w.f32le(s.range);
-        try w.f32le(s.inner_deg);
-        try w.f32le(s.outer_deg);
-    }
-
-    switch (state.camera) {
-        .none => try w.byte(0),
-        .arc_rotate => |*c| {
-            try w.byte(1);
-            try w.str(c.name);
-            try w.f32le(c.alpha);
-            try w.f32le(c.beta);
-            try w.f32le(c.radius);
-            try w.vec3(c.target);
-            try w.f32le(c.fov_deg);
-            try w.f32le(c.near);
-            try w.f32le(c.far);
-        },
-        .free => |*c| {
-            try w.byte(2);
-            try w.str(c.name);
-            try w.vec3(c.position);
-            try w.vec3(c.rotation);
-            try w.f32le(c.fov_deg);
-            try w.f32le(c.near);
-            try w.f32le(c.far);
-            try w.f32le(c.speed);
-            try w.f32le(c.angular_sensitivity);
-        },
-        .follow => |*c| {
-            try w.byte(3);
-            try w.str(c.name);
-            try w.vec3(c.position);
-            try w.vec3(c.target_position);
-            try w.f32le(c.radius);
-            try w.f32le(c.height_offset);
-            try w.f32le(c.rotation_offset_deg);
-            try w.f32le(c.fov_deg);
-            try w.f32le(c.near);
-            try w.f32le(c.far);
-            try w.f32le(c.lerp_speed);
-        },
-        .target => |*c| {
-            try w.byte(4);
-            try w.str(c.name);
-            try w.vec3(c.position);
-            try w.vec3(c.target);
-            try w.vec3(c.up);
-            try w.f32le(c.fov_deg);
-            try w.f32le(c.near);
-            try w.f32le(c.far);
-            try w.f32le(c.smoothing);
-        },
-        .fly => |*c| {
-            try w.byte(5);
-            try w.str(c.name);
-            try w.vec3(c.position);
-            try w.vec3(c.rotation);
-            try w.f32le(c.fov_deg);
-            try w.f32le(c.near);
-            try w.f32le(c.far);
-            try w.f32le(c.speed);
-            try w.f32le(c.boost_multiplier);
-            try w.f32le(c.angular_sensitivity);
-            try w.f32le(c.roll_speed_deg);
-        },
-    }
-
-    try w.bool8(state.render.skybox_enabled);
-    try w.f32le(state.render.skybox_exposure);
-    try w.bool8(state.render.shadows_enabled);
-    try w.f32le(state.render.shadow_softness);
-    try w.f32le(state.render.ibl_intensity);
-
-    try writePostProcess(&w, &state.postprocess);
-
-    try w.u32le(std.math.cast(u32, state.game_properties.len) orelse return error.TooLarge);
-    for (state.game_properties) |gp| {
-        try w.str(gp.key);
-        try w.str(gp.value);
-    }
-
-    return w.buf.toOwnedSlice(allocator);
-}
-
-fn readMeshes(allocator: std.mem.Allocator, r: *Reader, version: u32) ![]MeshEntry {
-    const count = try r.readCount();
-    var list: std.ArrayListUnmanaged(MeshEntry) = .empty;
-    errdefer {
-        for (list.items) |*m| m.deinit(allocator);
-        list.deinit(allocator);
-    }
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        var entry = MeshEntry{};
-        if (version >= 3) {
-            entry.id = try r.readU64();
-            entry.name = try r.readString(allocator);
-            errdefer entry.deinit(allocator);
-            entry.parent_name = try r.readString(allocator);
-        } else {
-            entry.name = try r.readString(allocator);
-        }
-        errdefer entry.deinit(allocator);
-        entry.position = try r.readVec3();
-        entry.rotation = try r.readVec3();
-        entry.scaling = try r.readVec3();
-        const flags = try r.readU8();
-        if (flags & ~@as(u8, 7) != 0) return error.Truncated;
-        entry.is_visible = flags & 1 != 0;
-        entry.cast_shadows = flags & 2 != 0;
-        entry.receive_shadows = flags & 4 != 0;
-        switch (try r.readU8()) {
-            0 => entry.material = .{ .standard = .{
-                .diffuse = try r.readVec3(),
-                .alpha = try r.readF32(),
-                .alpha_mode = try r.readU8(),
-                .alpha_cutoff = try r.readF32(),
-                .double_sided = try r.readBool(),
-            } },
-            1 => entry.material = .{ .pbr = .{
-                .albedo = try r.readVec3(),
-                .metallic = try r.readF32(),
-                .roughness = try r.readF32(),
-                .emissive = try r.readVec3(),
-                .alpha = try r.readF32(),
-                .alpha_mode = try r.readU8(),
-                .alpha_cutoff = try r.readF32(),
-                .double_sided = try r.readBool(),
-            } },
-            else => return error.Truncated,
-        }
-        if (entry.material == .standard and entry.material.standard.alpha_mode > 2) return error.Truncated;
-        if (entry.material == .pbr and entry.material.pbr.alpha_mode > 2) return error.Truncated;
-        try list.append(allocator, entry);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
-fn readPoints(allocator: std.mem.Allocator, r: *Reader) ![]PointEntry {
-    const count = try r.readCount();
-    var list: std.ArrayListUnmanaged(PointEntry) = .empty;
-    errdefer {
-        for (list.items) |*p| p.deinit(allocator);
-        list.deinit(allocator);
-    }
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        var entry = PointEntry{};
-        entry.name = try r.readString(allocator);
-        errdefer entry.deinit(allocator);
-        entry.position = try r.readVec3();
-        entry.diffuse = try r.readVec3();
-        entry.intensity = try r.readF32();
-        entry.range = try r.readF32();
-        try list.append(allocator, entry);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
-fn readSpots(allocator: std.mem.Allocator, r: *Reader) ![]SpotEntry {
-    const count = try r.readCount();
-    var list: std.ArrayListUnmanaged(SpotEntry) = .empty;
-    errdefer {
-        for (list.items) |*s| s.deinit(allocator);
-        list.deinit(allocator);
-    }
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        var entry = SpotEntry{};
-        entry.name = try r.readString(allocator);
-        errdefer entry.deinit(allocator);
-        entry.position = try r.readVec3();
-        entry.direction = try r.readVec3();
-        entry.diffuse = try r.readVec3();
-        entry.intensity = try r.readF32();
-        entry.range = try r.readF32();
-        entry.inner_deg = try r.readF32();
-        entry.outer_deg = try r.readF32();
-        try list.append(allocator, entry);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
-fn readDirectional(allocator: std.mem.Allocator, r: *Reader) !DirectionalEntry {
-    var d = DirectionalEntry{};
-    errdefer d.deinit(allocator);
-    d.name = try r.readString(allocator);
-    d.direction = try r.readVec3();
-    d.diffuse = try r.readVec3();
-    d.intensity = try r.readF32();
-    return d;
-}
-
-fn readCamera(allocator: std.mem.Allocator, r: *Reader) !CameraEntry {
-    switch (try r.readU8()) {
-        0 => return .none,
-        1 => {
-            var c = ArcRotateEntry{};
-            errdefer if (c.name.len > 0) allocator.free(c.name);
-            c.name = try r.readString(allocator);
-            c.alpha = try r.readF32();
-            c.beta = try r.readF32();
-            c.radius = try r.readF32();
-            c.target = try r.readVec3();
-            c.fov_deg = try r.readF32();
-            c.near = try r.readF32();
-            c.far = try r.readF32();
-            return .{ .arc_rotate = c };
-        },
-        2 => {
-            var c = FreeEntry{};
-            errdefer if (c.name.len > 0) allocator.free(c.name);
-            c.name = try r.readString(allocator);
-            c.position = try r.readVec3();
-            c.rotation = try r.readVec3();
-            c.fov_deg = try r.readF32();
-            c.near = try r.readF32();
-            c.far = try r.readF32();
-            c.speed = try r.readF32();
-            c.angular_sensitivity = try r.readF32();
-            return .{ .free = c };
-        },
-        3 => {
-            var c = FollowEntry{};
-            errdefer if (c.name.len > 0) allocator.free(c.name);
-            c.name = try r.readString(allocator);
-            c.position = try r.readVec3();
-            c.target_position = try r.readVec3();
-            c.radius = try r.readF32();
-            c.height_offset = try r.readF32();
-            c.rotation_offset_deg = try r.readF32();
-            c.fov_deg = try r.readF32();
-            c.near = try r.readF32();
-            c.far = try r.readF32();
-            c.lerp_speed = try r.readF32();
-            return .{ .follow = c };
-        },
-        4 => {
-            var c = TargetEntry{};
-            errdefer if (c.name.len > 0) allocator.free(c.name);
-            c.name = try r.readString(allocator);
-            c.position = try r.readVec3();
-            c.target = try r.readVec3();
-            c.up = try r.readVec3();
-            c.fov_deg = try r.readF32();
-            c.near = try r.readF32();
-            c.far = try r.readF32();
-            c.smoothing = try r.readF32();
-            return .{ .target = c };
-        },
-        5 => {
-            var c = FlyEntry{};
-            errdefer if (c.name.len > 0) allocator.free(c.name);
-            c.name = try r.readString(allocator);
-            c.position = try r.readVec3();
-            c.rotation = try r.readVec3();
-            c.fov_deg = try r.readF32();
-            c.near = try r.readF32();
-            c.far = try r.readF32();
-            c.speed = try r.readF32();
-            c.boost_multiplier = try r.readF32();
-            c.angular_sensitivity = try r.readF32();
-            c.roll_speed_deg = try r.readF32();
-            return .{ .fly = c };
-        },
-        else => return error.Truncated,
-    }
-}
-
-/// Parses a snapshot from bytes. Strictly validates magic, version, counts,
-/// string lengths and offset arithmetic (overflow-safe via std.math.add/cast,
-/// capped via MAX_ENTRIES/MAX_STRING_BYTES); any short read or invalid
-/// discriminant (material/camera/present/bool/tonemapping) reports Truncated.
-/// On error nothing leaks (per-section errdefer + state errdefer).
-pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneState {
-    if (bytes.len < MAGIC.len) return error.Truncated;
-    if (!std.mem.eql(u8, bytes[0..MAGIC.len], MAGIC[0..])) return error.BadMagic;
-    var r = Reader{ .bytes = bytes, .pos = MAGIC.len };
-
-    const version = try r.readU32();
-    if (version != 2 and version != 3) return error.UnsupportedVersion;
-
-    var state = SceneState{};
-    errdefer state.deinit(allocator);
-
-    state.meshes = try readMeshes(allocator, &r, version);
-
-    state.hemi.name = try r.readString(allocator);
-    state.hemi.direction = try r.readVec3();
-    state.hemi.diffuse = try r.readVec3();
-    state.hemi.ground = try r.readVec3();
-    state.hemi.intensity = try r.readF32();
-
-    switch (try r.readU8()) {
-        0 => state.directional = null,
-        1 => state.directional = try readDirectional(allocator, &r),
-        else => return error.Truncated,
-    }
-
-    state.point_lights = try readPoints(allocator, &r);
-    state.spot_lights = try readSpots(allocator, &r);
-    state.camera = try readCamera(allocator, &r);
-
-    state.render.skybox_enabled = try r.readBool();
-    state.render.skybox_exposure = try r.readF32();
-    state.render.shadows_enabled = try r.readBool();
-    state.render.shadow_softness = try r.readF32();
-    state.render.ibl_intensity = try r.readF32();
-
-    state.postprocess = try readPostProcess(&r);
-
-    if (version >= 3) {
-        const count = try r.readCount();
-        var props: std.ArrayListUnmanaged(GameProperty) = .empty;
-        errdefer {
-            for (props.items) |*p| p.deinit(allocator);
-            props.deinit(allocator);
-        }
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            var prop = GameProperty{};
-            prop.key = try r.readString(allocator);
-            errdefer prop.deinit(allocator);
-            prop.value = try r.readString(allocator);
-            try props.append(allocator, prop);
-        }
-        state.game_properties = try props.toOwnedSlice(allocator);
-    }
-
-    return state;
-}
-
-// ---------------------------------------------------------------------------
-// File helpers (std.Io, same pattern as AudioClip.fromWavFile)
-// ---------------------------------------------------------------------------
-
-/// Writes serializeAlloc output to path (created/truncated).
-pub fn saveFile(allocator: std.mem.Allocator, state: *const SceneState, path: []const u8) !void {
-    const bytes = try serializeAlloc(allocator, state);
-    defer allocator.free(bytes);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
-}
-
-/// Reads a whole file and parses it with deserializeAlloc.
-pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !SceneState {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const len = try file.length(io);
-    if (len > MAX_FILE_BYTES) return error.TooLarge;
-    const n = std.math.cast(usize, len) orelse return error.TooLarge;
-    const bytes = try allocator.alloc(u8, n);
-    defer allocator.free(bytes);
-    const read = try file.readPositionalAll(io, bytes, 0);
-    if (read < bytes.len) return error.Truncated;
-    return deserializeAlloc(allocator, bytes);
-}
-
-// ---------------------------------------------------------------------------
-// Async off-thread file serialization (TaskRunner)
-// ---------------------------------------------------------------------------
-
-pub const AsyncSaveTask = struct {
-    pub const State = enum(u8) {
-        pending = 0,
-        serializing = 1,
-        writing = 2,
-        completed = 3,
-        failed = 4,
-    };
-
-    allocator: std.mem.Allocator,
-    path: []u8,
-    scene_state: SceneState,
-    state: std.atomic.Value(State) = std.atomic.Value(State).init(.pending),
-    bytes_written: usize = 0,
-    err_name: ?[:0]const u8 = null,
-
-    pub fn isDone(self: *const AsyncSaveTask) bool {
-        const s = self.state.load(.acquire);
-        return s == .completed or s == .failed;
-    }
-
-    pub fn isSuccess(self: *const AsyncSaveTask) bool {
-        return self.state.load(.acquire) == .completed;
-    }
-
-    pub fn deinit(self: *AsyncSaveTask) void {
-        self.scene_state.deinit(self.allocator);
-        self.allocator.free(self.path);
-        self.allocator.destroy(self);
-    }
-};
-
-fn runSaveTask(ctx: *anyopaque) void {
-    const task: *AsyncSaveTask = @ptrCast(@alignCast(ctx));
-    task.state.store(.serializing, .release);
-
-    const bytes = serializeAlloc(task.allocator, &task.scene_state) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-    defer task.allocator.free(bytes);
-
-    task.state.store(.writing, .release);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = task.path, .data = bytes }) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-
-    task.bytes_written = bytes.len;
-    task.state.store(.completed, .release);
-}
-
-/// Dispatches serializing and writing the scene state to path on a background
-/// task thread. Ownership of `scene_state` transfers into the returned task.
-/// The caller polls `task.isDone()` and must call `task.deinit()` when finished.
-pub fn saveFileAsync(allocator: std.mem.Allocator, runner: *jobs.TaskRunner, scene_state: SceneState, path: []const u8) !*AsyncSaveTask {
-    const task = try allocator.create(AsyncSaveTask);
-    errdefer allocator.destroy(task);
-
-    const owned_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(owned_path);
-
-    task.* = .{
-        .allocator = allocator,
-        .path = owned_path,
-        .scene_state = scene_state,
-        .state = std.atomic.Value(AsyncSaveTask.State).init(.pending),
-        .bytes_written = 0,
-        .err_name = null,
-    };
-
-    runner.post(task, runSaveTask);
-    return task;
-}
-
-pub const AsyncLoadTask = struct {
-    pub const State = enum(u8) {
-        pending = 0,
-        reading = 1,
-        deserializing = 2,
-        completed = 3,
-        failed = 4,
-    };
-
-    allocator: std.mem.Allocator,
-    path: []u8,
-    state: std.atomic.Value(State) = std.atomic.Value(State).init(.pending),
-    result: ?SceneState = null,
-    err_name: ?[:0]const u8 = null,
-
-    pub fn isDone(self: *const AsyncLoadTask) bool {
-        const s = self.state.load(.acquire);
-        return s == .completed or s == .failed;
-    }
-
-    pub fn isSuccess(self: *const AsyncLoadTask) bool {
-        return self.state.load(.acquire) == .completed;
-    }
-
-    pub fn deinit(self: *AsyncLoadTask) void {
-        if (self.result) |*r| r.deinit(self.allocator);
-        self.allocator.free(self.path);
-        self.allocator.destroy(self);
-    }
-};
-
-fn runLoadTask(ctx: *anyopaque) void {
-    const task: *AsyncLoadTask = @ptrCast(@alignCast(ctx));
-    task.state.store(.reading, .release);
-
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = std.Io.Dir.cwd().openFile(io, task.path, .{}) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-    defer file.close(io);
-
-    const len = file.length(io) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-    if (len > MAX_FILE_BYTES) {
-        task.err_name = @errorName(error.TooLarge);
-        task.state.store(.failed, .release);
-        return;
-    }
-    const n = std.math.cast(usize, len) orelse {
-        task.err_name = @errorName(error.TooLarge);
-        task.state.store(.failed, .release);
-        return;
-    };
-    const bytes = task.allocator.alloc(u8, n) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-    defer task.allocator.free(bytes);
-
-    const read = file.readPositionalAll(io, bytes, 0) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-    if (read < bytes.len) {
-        task.err_name = @errorName(error.Truncated);
-        task.state.store(.failed, .release);
-        return;
-    }
-
-    task.state.store(.deserializing, .release);
-    const scene_state = deserializeAlloc(task.allocator, bytes) catch |err| {
-        task.err_name = @errorName(err);
-        task.state.store(.failed, .release);
-        return;
-    };
-
-    task.result = scene_state;
-    task.state.store(.completed, .release);
-}
-
-/// Dispatches reading and deserializing a scene state file on a background
-/// task thread. The caller polls `task.isDone()`, uses `task.result` on success,
-/// and must call `task.deinit()` when finished.
-pub fn loadFileAsync(allocator: std.mem.Allocator, runner: *jobs.TaskRunner, path: []const u8) !*AsyncLoadTask {
-    const task = try allocator.create(AsyncLoadTask);
-    errdefer allocator.destroy(task);
-
-    const owned_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(owned_path);
-
-    task.* = .{
-        .allocator = allocator,
-        .path = owned_path,
-        .state = std.atomic.Value(AsyncLoadTask.State).init(.pending),
-        .result = null,
-        .err_name = null,
-    };
-
-    runner.post(task, runLoadTask);
-    return task;
-}
+// Format re-exports (header/version constants, caps, decode errors).
+pub const MAGIC = format_mod.MAGIC;
+pub const VERSION = format_mod.VERSION;
+pub const MAX_ENTRIES = format_mod.MAX_ENTRIES;
+pub const MAX_STRING_BYTES = format_mod.MAX_STRING_BYTES;
+pub const MAX_FILE_BYTES = format_mod.MAX_FILE_BYTES;
+pub const DecodeError = format_mod.DecodeError;
+
+// Snapshot-type re-exports (props.zig owns them).
+pub const StandardEntry = props_mod.StandardEntry;
+pub const PbrEntry = props_mod.PbrEntry;
+pub const MaterialEntry = props_mod.MaterialEntry;
+pub const MeshEntry = props_mod.MeshEntry;
+pub const HemiEntry = props_mod.HemiEntry;
+pub const DirectionalEntry = props_mod.DirectionalEntry;
+pub const PointEntry = props_mod.PointEntry;
+pub const SpotEntry = props_mod.SpotEntry;
+pub const ArcRotateEntry = props_mod.ArcRotateEntry;
+pub const FreeEntry = props_mod.FreeEntry;
+pub const FollowEntry = props_mod.FollowEntry;
+pub const TargetEntry = props_mod.TargetEntry;
+pub const FlyEntry = props_mod.FlyEntry;
+pub const CameraEntry = props_mod.CameraEntry;
+pub const RenderEntry = props_mod.RenderEntry;
+pub const GameProperty = props_mod.GameProperty;
+pub const SceneState = props_mod.SceneState;
+
+// Scene -> bytes (writer.zig).
+pub const capture = writer_mod.capture;
+pub const serializeAlloc = writer_mod.serializeAlloc;
+pub const saveFile = writer_mod.saveFile;
+pub const AsyncSaveTask = writer_mod.AsyncSaveTask;
+pub const saveFileAsync = writer_mod.saveFileAsync;
+
+// Bytes -> scene (reader.zig).
+pub const restore = reader_mod.restore;
+pub const deserializeAlloc = reader_mod.deserializeAlloc;
+pub const loadFile = reader_mod.loadFile;
+pub const AsyncLoadTask = reader_mod.AsyncLoadTask;
+pub const loadFileAsync = reader_mod.loadFileAsync;
+
+// Private test-only aliases: Writer/writePostProcess lived in this file
+// before the split; tests below keep their original bodies via these.
+const Writer = format_mod.Writer;
+const writePostProcess = format_mod.writePostProcess;
 
 // ---------------------------------------------------------------------------
 // GPU-free tests
@@ -2506,4 +982,95 @@ test "game properties set and get roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), loaded.game_properties.len);
     try std.testing.expectEqualStrings("dungeon_01", loaded.getGameProperty("level").?);
     try std.testing.expectEqualStrings("85", loaded.getGameProperty("player_hp").?);
+}
+
+test "serialization v3 split preserves byte-identical output" {
+    // Split-guard: the move into serialization/* must not change a single
+    // byte. Builds the same representative v3 snapshot the pre-split code
+    // produced (len 466, fnv1a64 0xc250f36ab4430269, magic AGSC, version 3,
+    // mesh_count 2), then requires header invariants, a golden checksum,
+    // deterministic re-encoding, and field-by-field equivalence.
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    defer original.deinit(alloc);
+
+    const meshes = try alloc.alloc(MeshEntry, 2);
+    meshes[0] = .{
+        .id = 101,
+        .name = try dupeStr(alloc, "box"),
+        .parent_name = try dupeStr(alloc, "sphere"),
+        .position = .{ 1.0, 2.0, 3.0 },
+        .rotation = .{ 10.0, 20.0, 30.0 },
+        .scaling = .{ 1.0, 1.0, 1.0 },
+        .is_visible = true,
+        .cast_shadows = false,
+        .receive_shadows = true,
+        .material = .{ .standard = .{ .diffuse = .{ 0.5, 0.25, 0.125 }, .alpha = 0.75, .alpha_mode = 1 } },
+    };
+    meshes[1] = .{
+        .id = 102,
+        .name = try dupeStr(alloc, "sphere"),
+        .position = .{ -4.0, 0.5, 8.0 },
+        .rotation = .{ 0.0, 90.0, 0.0 },
+        .scaling = .{ 2.0, 2.0, 2.0 },
+        .is_visible = false,
+        .cast_shadows = true,
+        .receive_shadows = false,
+        .material = .{ .pbr = .{
+            .albedo = .{ 0.1, 0.2, 0.3 },
+            .metallic = 0.9,
+            .roughness = 0.15,
+            .emissive = .{ 1.0, 0.5, 0.0 },
+            .alpha = 1.0,
+            .alpha_mode = 0,
+        } },
+    };
+    original.meshes = meshes;
+    original.hemi = .{
+        .name = try dupeStr(alloc, "hemi"),
+        .direction = .{ 0.5, 1.0, 0.3 },
+        .diffuse = .{ 1.0, 1.0, 1.0 },
+        .ground = .{ 0.2, 0.25, 0.3 },
+        .intensity = 0.8,
+    };
+    original.camera = .{ .arc_rotate = .{
+        .name = try dupeStr(alloc, "orbit"),
+        .alpha = 0.7,
+        .beta = 1.1,
+        .radius = 9.0,
+        .target = .{ 1.0, 2.0, 3.0 },
+        .fov_deg = 55.0,
+        .near = 0.5,
+        .far = 500.0,
+    } };
+    original.postprocess.enabled = true;
+    original.postprocess.exposure = 1.1;
+    try original.setGameProperty(alloc, "quest_stage", "3");
+    try original.setGameProperty(alloc, "difficulty", "hard");
+
+    const bytes = try serializeAlloc(alloc, &original);
+    defer alloc.free(bytes);
+
+    // Header invariants: magic + v3 + mesh_count 2.
+    try std.testing.expectEqualSlices(u8, MAGIC[0..], bytes[0..4]);
+    try std.testing.expectEqual(VERSION, std.mem.readInt(u32, bytes[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[8..12], .little));
+
+    // Golden checksum/length from the pre-split encoder (/tmp/serial_golden_pre.bin).
+    try std.testing.expectEqual(@as(usize, 466), bytes.len);
+    var h: u64 = 14695981039346656037;
+    for (bytes) |b| {
+        h ^= b;
+        h = h *% 1099511628211;
+    }
+    try std.testing.expectEqual(@as(u64, 0xc250f36ab4430269), h);
+
+    // Round-trip: field equivalence plus deterministic re-encoding.
+    var parsed = try deserializeAlloc(alloc, bytes);
+    defer parsed.deinit(alloc);
+    try expectStatesEqual(&original, &parsed);
+    const bytes2 = try serializeAlloc(alloc, &parsed);
+    defer alloc.free(bytes2);
+    try std.testing.expectEqualSlices(u8, bytes, bytes2);
 }

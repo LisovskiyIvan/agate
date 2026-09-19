@@ -133,6 +133,10 @@ test {
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
     _ = @import("serialization.zig");
+    _ = @import("serialization/format.zig");
+    _ = @import("serialization/props.zig");
+    _ = @import("serialization/reader.zig");
+    _ = @import("serialization/writer.zig");
     _ = @import("serialization_fuzz.zig");
     _ = @import("shader_material.zig");
     _ = @import("shader_material/merge.zig");
