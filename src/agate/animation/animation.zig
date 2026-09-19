@@ -22,6 +22,7 @@ pub const evaluateSkeleton = eval.evaluateSkeleton;
 
 pub const retarget = @import("retarget.zig");
 pub const TranslationMode = retarget.TranslationMode;
+pub const BoneMap = retarget.BoneMap;
 pub const RetargetOptions = retarget.RetargetOptions;
 pub const retargetAnimationGroup = retarget.retargetAnimationGroup;
 pub const boneRestLength = retarget.boneRestLength;

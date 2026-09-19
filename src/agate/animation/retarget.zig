@@ -18,12 +18,25 @@ pub const TranslationMode = enum {
     drop,
 };
 
+/// Explicit source-bone-name → target-bone-name override for
+/// `retargetAnimationGroup`. Lets clips transfer between rigs that share no
+/// bone names (e.g. Fox `b_Hip_01` → CesiumMan `Skeleton_torso_joint_1`).
+pub const BoneMap = struct {
+    source: []const u8,
+    target: []const u8,
+};
+
 /// Knobs for `retargetAnimationGroup`. All fields defaulted.
 pub const RetargetOptions = struct {
     /// When true, only rotation channels are kept; translation, scale and
     /// weights channels are dropped regardless of `translation_mode`.
     rotation_only: bool = false,
     translation_mode: TranslationMode = .scale_by_bone_length,
+    /// Explicit per-bone mapping, matched by source bone name. Checked
+    /// before the default name lookup; unmatched bones keep the existing
+    /// behavior (same-name lookup, then same-index fallback for unnamed
+    /// bones). Empty by default (pure name mapping).
+    bone_map: []const BoneMap = &.{},
 };
 
 /// Rest length of a bone: the bind-pose offset length from its parent joint.
@@ -48,11 +61,12 @@ pub fn translationScaleFactor(source_bone: Bone, target_bone: Bone) f32 {
 /// free). The returned group's `skeleton` is bound to `target_skeleton` and
 /// its `duration`/`from`/`to` are copied from the source group.
 ///
-/// Mapping: channels match by source bone NAME via `findBoneIndex` on the
-/// target. Bones with an empty source name fall back to the same bone index
-/// when it is in range of the target; named bones with no target match are
-/// skipped. Out-of-range source bone indexes with no name are resolved by
-/// index fallback the same way, otherwise skipped.
+/// Mapping: per source bone, in order: (1) explicit `options.bone_map`
+/// entry matched by source bone name → target bone of that name; (2) target
+/// bone with the same name via `findBoneIndex`; (3) same bone index when
+/// the source bone is unnamed (existing fallback). Named bones with no
+/// target match are skipped. Out-of-range source bone indexes with no name
+/// are resolved by index fallback the same way, otherwise skipped.
 ///
 /// Channel policy: rotations are copied verbatim; translations follow
 /// `options.translation_mode` (`scale_by_bone_length` multiplies every
@@ -96,15 +110,24 @@ pub fn retargetAnimationGroup(
         };
         if (!keep_path) continue;
 
-        // Resolve the target bone: by name when the source bone has one,
-        // otherwise by index fallback.
+        // Resolve the target bone: explicit map entry by source name
+        // first, then same-name lookup, otherwise index fallback for
+        // unnamed bones.
         var target_index: ?usize = null;
         var source_bone: ?Bone = null;
         if (src_ch.bone_index < source_skeleton.bones.len) {
             const src_bone = source_skeleton.bones[src_ch.bone_index];
             source_bone = src_bone;
             if (src_bone.name.len > 0) {
-                target_index = target_skeleton.findBoneIndex(src_bone.name);
+                for (options.bone_map) |entry| {
+                    if (std.mem.eql(u8, entry.source, src_bone.name)) {
+                        target_index = target_skeleton.findBoneIndex(entry.target);
+                        break;
+                    }
+                }
+                if (target_index == null) {
+                    target_index = target_skeleton.findBoneIndex(src_bone.name);
+                }
             } else if (src_ch.bone_index < target_skeleton.bones.len) {
                 target_index = src_ch.bone_index;
             }
@@ -459,4 +482,77 @@ test "retarget falls back to index for unnamed bones" {
     defer retargeted.deinit();
     try testing.expectEqual(@as(usize, 1), retargeted.channels.len);
     try testing.expectEqual(@as(usize, 0), retargeted.channels[0].bone_index);
+}
+
+test "retarget explicit bone_map transfers rotations across disjoint names" {
+    const allocator = testing.allocator;
+    // Source and target rigs share NO bone names; without a map nothing
+    // resolves, with a map every channel lands on its anatomical peer.
+    const src = try makeTestSkeleton(allocator, &.{ "src_hip", "src_arm", "src_tail" });
+    defer src.deinit();
+    const dst = try makeTestSkeleton(allocator, &.{ "dst_hip", "dst_arm" });
+    defer dst.deinit();
+
+    const q_rest = Quat.identity;
+    const q_pose = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
+
+    var list = std.ArrayList(AnimationChannel).empty;
+    defer {
+        for (list.items) |ch| {
+            allocator.free(ch.sampler.timestamps);
+            allocator.free(ch.sampler.outputs);
+        }
+        list.deinit(allocator);
+    }
+    const times = [_]f32{ 0.0, 1.0 };
+    const outputs = [_]f32{ q_rest.x, q_rest.y, q_rest.z, q_rest.w, q_pose.x, q_pose.y, q_pose.z, q_pose.w };
+    try addTestChannel(allocator, &list, 0, .rotation, &times, &outputs);
+    try addTestChannel(allocator, &list, 1, .rotation, &times, &outputs);
+    try addTestChannel(allocator, &list, 2, .rotation, &times, &outputs);
+
+    const owned = try list.toOwnedSlice(allocator);
+    const src_group = try AnimationGroup.init(allocator, "disjoint", owned, 1.0);
+    defer src_group.deinit();
+    src_group.skeleton = src;
+
+    // No map: disjoint names resolve nothing.
+    const unmapped = try retargetAnimationGroup(allocator, src_group, src, dst, .{});
+    defer unmapped.deinit();
+    try testing.expectEqual(@as(usize, 0), unmapped.channels.len);
+
+    // Explicit map: hip+arm transfer, tail (no peer) is honestly skipped.
+    const map = [_]BoneMap{
+        .{ .source = "src_hip", .target = "dst_hip" },
+        .{ .source = "src_arm", .target = "dst_arm" },
+    };
+    const retargeted = try retargetAnimationGroup(allocator, src_group, src, dst, .{ .bone_map = &map });
+    defer retargeted.deinit();
+    try testing.expectEqual(@as(usize, 2), retargeted.channels.len);
+
+    const dst_hip = dst.findBoneIndex("dst_hip").?;
+    const dst_arm = dst.findBoneIndex("dst_arm").?;
+    for (retargeted.channels) |ch| {
+        try testing.expect(ch.bone_index == dst_hip or ch.bone_index == dst_arm);
+
+        // Sampled rotation matches the source pose at t=1 and is genuinely
+        // off rest (real motion, not bind pose).
+        var sp: ?Vec3 = null;
+        var sr: ?Quat = null;
+        var ss: ?Vec3 = null;
+        src_group.sampleBoneAtTime(if (ch.bone_index == dst_hip) 0 else 1, 1.0, &sp, &sr, &ss);
+        var dp: ?Vec3 = null;
+        var dr: ?Quat = null;
+        var ds: ?Vec3 = null;
+        retargeted.sampleBoneAtTime(ch.bone_index, 1.0, &dp, &dr, &ds);
+        try testing.expect(sr != null and dr != null);
+        try testing.expect(quatDot(sr.?, dr.?) > 0.9999);
+        try testing.expect(quatDot(dr.?, Quat.identity) < 0.999);
+
+        // Full evaluation path: the mapped local rotation leaves rest.
+        retargeted.current_time = 1.0;
+        retargeted.weight = 1.0;
+        const dst_base = [_]*AnimationGroup{retargeted};
+        @import("eval.zig").evaluateSkeleton(dst, &dst_base, &.{});
+        try testing.expect(quatDot(dst.bones[ch.bone_index].local_rotation, Quat.identity) < 0.999);
+    }
 }
