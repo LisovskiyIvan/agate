@@ -194,8 +194,9 @@ pub fn drawScrollbar(canvas: anytype, track: [4]f32, content_h: f32, view_h: f32
 /// Single-line field: panel, text, and a 2px cursor bar at the cursor
 /// byte offset when focused. No blink timer (static line) and no
 /// clipping: overlong text overflows the frame, the caller may shorten
-/// or scroll it. The cursor x reuses measureText so it matches the
-/// drawText advances exactly, byte for byte.
+/// or scroll it. The cursor x reuses canvas-aware measurement so it
+/// matches the drawText advances exactly, byte for byte (TTF metrics
+/// when a font is set, legacy monospace otherwise).
 pub fn drawTextInput(canvas: anytype, rect: [4]f32, state: *const TextInputState, focused: bool, font_size: f32) void {
     const bg = if (focused) Color4.new(0.09, 0.11, 0.16, 0.95) else Color4.new(0.10, 0.12, 0.18, 0.9);
     const border = if (focused) Color4.new(0.4, 0.75, 1.0, 1.0) else Color4.new(0.3, 0.4, 0.52, 0.75);
@@ -206,7 +207,9 @@ pub fn drawTextInput(canvas: anytype, rect: [4]f32, state: *const TextInputState
     canvas.drawText(state.text(), tx, ty, font_size, Color4.white);
     if (focused) {
         const cur = @min(state.cursor, state.len);
-        const cx = tx + text_mod.measureText(state.buf[0..cur], font_size).x;
+        // Canvas-aware measurement: matches whichever font drawText used
+        // (TTF advances when a font is set, legacy monospace otherwise).
+        const cx = tx + text_mod.measureForCanvas(canvas, state.buf[0..cur], font_size).x;
         canvas.drawRect(cx, ty, 2.0, font_size, Color4.white);
     }
 }
