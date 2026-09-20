@@ -399,31 +399,51 @@ pub const Scene = struct {
     /// A missed build never resurfaces a stale frame: every prepare (latch
     /// or fallback) publishes a fresh slot; render reuses the last published
     /// front only when prepare itself is not called (unchanged).
-    /// Plain counters, no atomics (update-vs-prepare exclusion); the build
-    /// touches no stats/profiler/frame_id/retire_epoch.
-    build_seq: u64 = 0,
-    last_latched_seq: u64 = 0,
+    /// Handoff edge (wave 30, atomic): `build_seq` is release-stored by the
+    /// producer (`BuildClaim.publish`) only after the whole build payload is
+    /// staged (slot queues/records/snapshot, particle/physics build frames,
+    /// `build_slot`), and acquire-loaded by the context latch (`prepareFrame`
+    /// freshness check + `last_latched_seq` stamp) — the release/acquire pair
+    /// orders the payload before the generation the latch consumes. The claim
+    /// reserve (`tryClaimBuildSlot`) monotonic-loads the committed generation
+    /// (single producer: no commit races, the publish is the release edge).
+    /// `last_latched_seq` is stamped context-side only (monotonic store; the
+    /// producer never touches it) — atomic so the handoff-edge comparison
+    /// itself is race-free once game||prepare overlap. The build touches no
+    /// stats/profiler/frame_id/retire_epoch.
+    build_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_latched_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Game-side UI CPU packet sequence (lock-free-publication slice 2, b):
     /// `stageUiPacket` (game side, sg-free) records live canvas geometry
     /// into the back slot's `ui_vertices`/`ui_indices` + `ui_packet` header
     /// and bumps `ui_packet_seq`; `prepareFrame` latches the packet into
     /// `ui_frame` when `ui_packet_seq != last_latched_ui_seq` and stamps it
     /// consumed. Independent of `build_seq`: UI-only apps never call
-    /// `buildPreparedFrame`. Plain counters, no atomics (update-vs-prepare
-    /// exclusion); the stage touches no stats/profiler/frame_id/epoch and
+    /// `buildPreparedFrame`. Handoff edge (wave 30, atomic):
+    /// `stageUiPacketInto` release-bumps `ui_packet_seq` only after the slot
+    /// packet bytes + header are staged, and the context latch
+    /// (`captureUiFrame`) acquire-loads it before consuming the packet and
+    /// monotonic-stamping `last_latched_ui_seq` consumed — the release/
+    /// acquire pair orders the packet before the generation the latch reads.
+    /// `last_latched_ui_seq` is stamped context-side only (the producer never
+    /// touches it). The stage touches no stats/profiler/frame_id/epoch and
     /// no GPU state at all (CPU list copies + seq bump only).
-    ui_packet_seq: u64 = 0,
-    last_latched_ui_seq: u64 = 0,
+    ui_packet_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_latched_ui_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// How many prepares actually consumed a staged packet as the geometry
     /// source (the `capturePacket` path, not the legacy canvas read and not
     /// the staged-absence clear). Observability only: lets an app/fixture
     /// prove the staged path is live rather than merely staged. Monotonic;
-    /// read via `uiPacketLatchedCount()`.
+    /// read via `uiPacketLatchedCount()`. Plain u64, stays plain: incremented
+    /// only by the context latch (`captureUiFrame`) and read context-side —
+    /// never shared across the handoff edge.
     ui_packet_latched: u64 = 0,
     /// Back-slot index the last `buildPreparedFrame` wrote (stamped by
-    /// `BuildClaim.publish`); the latch
-    /// asserts it still is the back index (no intervening publish).
-    build_slot: usize = 0,
+    /// `BuildClaim.publish` with a release store BEFORE the `build_seq`
+    /// release, so it rides the same handoff edge); the latch acquire-reads
+    /// it after observing a fresh seq and asserts it still is the back index
+    /// (no intervening publish).
+    build_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Game-owned queue-build stats (stage-2 increment B): `buildPreparedFrame`
     /// clears this and the game-side `buildQueuesInto` accumulates the queue
     /// counters here (never `self.stats`, which stays context-owned). The
@@ -2200,7 +2220,9 @@ pub const Scene = struct {
             back.ui_vertices.clearRetainingCapacity();
             back.ui_indices.clearRetainingCapacity();
             back.ui_packet = .{ .valid = true, .canvas_present = false };
-            self.ui_packet_seq +%= 1;
+            // Release: the slot packet bytes + header above are staged before
+            // the generation the latch acquire-reads.
+            _ = self.ui_packet_seq.fetchAdd(1, .release);
             return;
         };
         back.ui_vertices.clearRetainingCapacity();
@@ -2209,14 +2231,16 @@ pub const Scene = struct {
             back.ui_vertices.clearRetainingCapacity();
             back.ui_indices.clearRetainingCapacity();
             back.ui_packet = .{ .valid = false };
-            self.ui_packet_seq +%= 1;
+            // Release: staged-before-bump (see above).
+            _ = self.ui_packet_seq.fetchAdd(1, .release);
             return;
         };
         back.ui_indices.appendSlice(self.allocator, canvas.indices.items) catch {
             back.ui_vertices.clearRetainingCapacity();
             back.ui_indices.clearRetainingCapacity();
             back.ui_packet = .{ .valid = false };
-            self.ui_packet_seq +%= 1;
+            // Release: staged-before-bump (see above).
+            _ = self.ui_packet_seq.fetchAdd(1, .release);
             return;
         };
         back.ui_packet = .{
@@ -2231,7 +2255,9 @@ pub const Scene = struct {
             },
             .upload_seq = canvas.ui_upload_seq,
         };
-        self.ui_packet_seq +%= 1;
+        // Release: the slot packet bytes + header above are staged before
+        // the generation the latch acquire-reads.
+        _ = self.ui_packet_seq.fetchAdd(1, .release);
     }
 
     /// P6 UI handoff: captures CPU geometry + draw parameters out of the
@@ -2254,9 +2280,12 @@ pub const Scene = struct {
         // the game staged a fresh packet, the latch consumes it instead of
         // reading the live canvas lists. The seq is stamped consumed on ALL
         // fresh-packet paths — including the fallbacks — so a stale packet
-        // is never re-latched by a later prepare.
-        if (self.ui_packet_seq != self.last_latched_ui_seq) {
-            self.last_latched_ui_seq = self.ui_packet_seq;
+        // is never re-latched by a later prepare. Acquire: pairs with the
+        // stage's release-bump, so the slot packet bytes are visible here.
+        const staged_seq = self.ui_packet_seq.load(.acquire);
+        if (staged_seq != self.last_latched_ui_seq.load(.monotonic)) {
+            // Context-side stamp only (the producer never touches this word).
+            self.last_latched_ui_seq.store(staged_seq, .monotonic);
             const back = self.draws.backSlot();
             if (back.ui_packet.valid) {
                 if (back.ui_packet.canvas_present) {
@@ -2517,12 +2546,17 @@ pub const Scene = struct {
     /// exclusively (producer writes, no lock needed); the lease mutex pairs
     /// those writes with the consumer's post-pin reads. Everything ELSE the
     /// build touches (live meshes/canvas, `build_snapshot`, particle/
-    /// physics build frames, the seq words) is still phase-excluded today —
-    /// see the adoption checklist in scene/frame_draws.zig. The claim API
-    /// alone does not remove the phase mutex.
+    /// physics build frames and their layer seqs, per-mesh previews) is still
+    /// phase-excluded today — the handoff seq words themselves are atomic
+    /// since wave 30 (release/acquire, see the field docs), but the payload
+    /// they order is not — see the adoption checklist in
+    /// scene/frame_draws.zig. The claim API alone does not remove the phase
+    /// mutex.
     pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
         const slot = self.draws.claimBack() orelse return null;
-        return .{ .scene = self, .slot = slot, .seq = self.build_seq +% 1 };
+        // Single-producer reserve: monotonic load suffices, the publish
+        // below is the release edge that commits the generation.
+        return .{ .scene = self, .slot = slot, .seq = self.build_seq.load(.monotonic) +% 1 };
     }
 
     /// Game-side build claim: a reserved draw slot plus its reserved build
@@ -2563,9 +2597,12 @@ pub const Scene = struct {
             std.debug.assert(!self.completed);
             self.completed = true;
             const s = self.scene;
-            std.debug.assert(self.seq == s.build_seq +% 1);
-            s.build_seq = self.seq;
-            s.build_slot = self.slot;
+            std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
+            // Release edge: the slot index first, then the generation — the
+            // latch acquire-reads `build_seq` before `build_slot`, so both
+            // land ordered after the whole staged payload.
+            s.build_slot.store(self.slot, .release);
+            s.build_seq.store(self.seq, .release);
             s.draws.releaseHandoff(self.slot) catch unreachable;
         }
 
@@ -2598,7 +2635,8 @@ pub const Scene = struct {
     ///
     /// Call AFTER the sim mutations of the tick (update boundary), BEFORE
     /// the context `prepareFrame`; sequential with update, excluded vs
-    /// prepare (phase ownership, plain fields, no atomics). Callable from
+    /// prepare (phase ownership; the handoff seq words are atomic since wave
+    /// 30, everything else plain). Callable from
     /// any non-pool thread (game thread or a spawned worker — never
     /// concurrent with update or prepare); also callable on the
     /// context/single thread. Two builds before a latch: newest wins (the
@@ -2833,7 +2871,9 @@ pub const Scene = struct {
         // frame (`build_seq` newer than `last_latched_seq`), latch the build
         // instead of restaging from live systems; otherwise the historical
         // inline capture (apps without `buildPreparedFrame` are unchanged).
-        const have_build = self.build_seq != self.last_latched_seq;
+        // Acquire: pairs with the publish release-store, so the staged build
+        // payload is visible on the latch path below.
+        const have_build = self.build_seq.load(.acquire) != self.last_latched_seq.load(.monotonic);
         if (have_build) {
             self.particles.latchFrame(self.allocator);
         } else {
@@ -2868,7 +2908,9 @@ pub const Scene = struct {
         const back_idx = self.draws.backIndex();
         const back = &self.draws.slots[back_idx];
         if (have_build) {
-            std.debug.assert(self.build_slot == back_idx);
+            // Acquire: ordered after the observed fresh `build_seq`, so the
+            // published slot index is the one the producer stored.
+            std.debug.assert(self.build_slot.load(.acquire) == back_idx);
             self.frame_snapshot = back.snapshot;
         } else {
             var snap = self.frame_snapshot;
@@ -2970,7 +3012,8 @@ pub const Scene = struct {
             // stats for the next tick. build_stats deferred merge.
             self.stats.mergeFrom(&self.build_stats);
             self.build_stats = .{};
-            self.last_latched_seq = self.build_seq;
+            // Context-side stamp only (the producer never touches this word).
+            self.last_latched_seq.store(self.build_seq.load(.monotonic), .monotonic);
         } else {
             // Inline fallback (no fresh build): reset first — every list
             // plus the staged snapshot, so a skipped path can never resurface

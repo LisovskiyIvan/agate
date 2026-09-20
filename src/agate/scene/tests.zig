@@ -1620,7 +1620,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
 
     // Off-context destroy unlinked the victim into the retire queue; the
     // build recorded previews for both meshes (victim included).
-    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
     try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
     try std.testing.expectEqual(@as(u64, 1), parent.instance_preview.build_seq);
@@ -1638,7 +1638,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expect(scene.frame_prepared);
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     // Latch published the mirrors; live meshes still untouched.
     const latched = scene.preparedDraws().staged_instances.items;
     try std.testing.expectEqual(@as(usize, 2), latched.len);
@@ -1726,13 +1726,13 @@ test "stage1: two builds before latch, newest wins" {
     // Mutate, rebuild: the single preview store is recomputed in place.
     mem[2].position = Vec3.new(40, 0, 0);
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u64, 2), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 2), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
     try std.testing.expect(parent.instance_preview.bounds.max.x > first_bounds.max.x + 10.0);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq.load(.monotonic));
     // Commit (next game-side build) applies the newest publish to live.
     scene.buildPreparedFrame();
     try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
@@ -1785,7 +1785,7 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     scene.buildPreparedFrame();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const mirror = scene.preparedDraws().staged_instances.items[0];
     try std.testing.expectEqual(@as(u32, 4), mirror.count);
@@ -1797,7 +1797,7 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     // advances past the mirror's frame).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(mirror.count, parent.instance_render.count);
     try std.testing.expectEqual(latched_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(latched_hash, parent.instance_render.hash);
@@ -1913,12 +1913,12 @@ test "stage1: serial same-thread build+latch parity" {
     try scene.meshes.append(alloc, &parent);
 
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot);
+    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot.load(.monotonic));
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
 
     try std.testing.expect(scene.frame_prepared);
-    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     // Commit (next game-side build) applies the publish to live.
     scene.buildPreparedFrame();
     try std.testing.expectEqual(parent.instance_preview.count, parent.instance_render.count);
@@ -1989,7 +1989,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     scene.allocator = failing.allocator();
     scene.buildPreparedFrame();
     scene.allocator = real_alloc;
-    try std.testing.expectEqual(@as(u64, 3), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 3), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
     try std.testing.expect(failing.has_induced_failure);
 
@@ -1997,7 +1997,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     // no partial publish.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(primed_hash, parent.instance_render.hash);
@@ -2247,7 +2247,7 @@ test "stage1: instances cleared between build and latch take the regular path" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expect(scene.frame_prepared);
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
@@ -2317,7 +2317,7 @@ test "stage1: latch consumes slot records when live previews are cleared" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expect(scene.frame_prepared);
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     // Post-latch state mirrors into the slot record (the patch source) even
     // though the live previews were wiped; live meshes stay untouched until
     // the game-side commit.
@@ -2651,7 +2651,7 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     scene.draws.backSlot().primary.instance_matrices.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
 
@@ -3928,7 +3928,7 @@ test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
     scene.buildPreparedFrame();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     const built_reg_x = p7FindByMeshIndex(scene.preparedDraws().primary.items.items, 1).?.model.m[12];
 
     // Mutate live, then suppress the build: fallback must recompute under the
@@ -3936,7 +3936,7 @@ test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
     regular.position = Vec3.new(25, 0, 0);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame(); // have_build == false → inline fallback
-    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     const draws = scene.preparedDraws();
     const fb_item = p7FindByMeshIndex(draws.primary.items.items, 1).?;
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), fb_item.model.m[12], 1e-4);
@@ -4240,7 +4240,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
     try std.testing.expectEqual(@as(u32, 77), scene.build_snapshot.sky_texture.?.view.id);
     // Staging sorted farthest-from-published-eye first (+10 before -10).
-    const scratch = scene.draws.slots[scene.build_slot].primary.instance_matrices.items;
+    const scratch = scene.draws.slots[scene.build_slot.load(.monotonic)].primary.instance_matrices.items;
     try std.testing.expectEqual(@as(usize, 2), scratch.len);
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch[0].m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch[1].m[12], 1e-4);
@@ -4274,7 +4274,7 @@ test "renderReuse re-draws the consumed front without a prepare" {
     // Seed the already-recorded stats: reuse must leave them untouched, and
     // must not advance any frame/epoch identity.
     const fid = scene.frame_id;
-    const bseq = scene.build_seq;
+    const bseq = scene.build_seq.load(.monotonic);
     const epoch = scene.retire_epoch;
     const completed = scene.gpu_retire.lastCompleted();
     scene.stats.draw_calls = 41;
@@ -4286,7 +4286,7 @@ test "renderReuse re-draws the consumed front without a prepare" {
     try std.testing.expectEqual(front0, scene.draws.front);
     try std.testing.expectEqual(slot_id0, scene.preparedDraws().frame_id);
     try std.testing.expectEqual(fid, scene.frame_id);
-    try std.testing.expectEqual(bseq, scene.build_seq);
+    try std.testing.expectEqual(bseq, scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(epoch, scene.retire_epoch);
     try std.testing.expectEqual(completed, scene.gpu_retire.lastCompleted());
     try std.testing.expectEqual(@as(u32, 41), scene.stats.draw_calls);
@@ -4481,8 +4481,8 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
 
     // Game-side stage: CPU copies into the back slot, no GPU touched.
     scene.stageUiPacket();
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
-    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq.load(.monotonic));
     const back = scene.draws.backSlot();
     try std.testing.expect(back.ui_packet.valid);
     try std.testing.expect(back.ui_packet.canvas_present);
@@ -4515,7 +4515,7 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     scene.prepareFrame();
 
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(staged_verts, scene.ui_frame.vertices.items.len);
@@ -4537,7 +4537,7 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     // canvas read runs and now reflects the MUTATED canvas.
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expectEqual(canvas.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expect(canvas.vertices.items.len != staged_verts);
@@ -4572,8 +4572,8 @@ test "ui packet unused keeps the legacy path bit-identical" {
 
     // No stageUiPacket call: seqs stay zero, the legacy canvas read runs.
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 0), scene.ui_packet_seq);
-    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.ui_packet_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expectEqual(@as(f32, 640.0), scene.ui_frame.screen_w);
@@ -4609,7 +4609,7 @@ test "ui packet stage OOM degrades to the legacy canvas read" {
     scene.allocator = failing.allocator();
     scene.stageUiPacket();
     scene.allocator = real_alloc;
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
     try std.testing.expect(!scene.draws.backSlot().ui_packet.valid);
 
     // The latch falls back to the legacy canvas read (content intact there):
@@ -4618,7 +4618,7 @@ test "ui packet stage OOM degrades to the legacy canvas read" {
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(1.0, 640, 480);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
 }
@@ -4702,10 +4702,10 @@ test "reflection probe state packs into the frame snapshot" {
     scene.physics.debug_lines = .empty;
     scene.physics.prepared_lines = .empty;
     scene.physics.build_lines = .empty;
-    scene.build_seq = 0;
-    scene.last_latched_seq = 0;
-    scene.ui_packet_seq = 0;
-    scene.last_latched_ui_seq = 0;
+    scene.build_seq.store(0, .monotonic);
+    scene.last_latched_seq.store(0, .monotonic);
+    scene.ui_packet_seq.store(0, .monotonic);
+    scene.last_latched_ui_seq.store(0, .monotonic);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -4872,14 +4872,14 @@ test "wave26: staged records + UI packet latch correctly across all three slots"
         const staged_verts = canvas.vertices.items.len;
 
         scene.buildPreparedFrame();
-        build_slots[frame] = scene.build_slot;
+        build_slots[frame] = scene.build_slot.load(.monotonic);
         scene.stageUiPacket();
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
         scene.prepareFrame();
 
-        try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+        try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
         try std.testing.expectEqual(@as(u64, frame + 1), scene.uiPacketLatchedCount());
-        try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+        try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
         try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
         try std.testing.expectEqual(scene.retire_epoch, scene.preparedDraws().retire_epoch);
         // Staged records: this frame's instances, latched from the slot
@@ -4970,7 +4970,7 @@ test "wave27: build stages the slot snapshot equal to the published generation" 
     scene.buildPreparedFrame();
 
     // The claim slot stages the exact build generation (plain value copy).
-    const staged = &scene.draws.slots[scene.build_slot].snapshot;
+    const staged = &scene.draws.slots[scene.build_slot.load(.monotonic)].snapshot;
     try std.testing.expectEqual(scene.build_snapshot.has_camera, staged.has_camera);
     try std.testing.expectEqual(scene.build_snapshot.screen_w, staged.screen_w);
     try std.testing.expectEqual(scene.build_snapshot.screen_h, staged.screen_h);
@@ -5003,7 +5003,7 @@ test "wave27: post-build live mutation does not change the prepared frame" {
     // Generation B: publish + build (frozen).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(i32, 800), scene.draws.slots[scene.build_slot].snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 800), scene.draws.slots[scene.build_slot.load(.monotonic)].snapshot.screen_w);
 
     // Live mutations AFTER the build: both working copies plus a newer
     // mailbox publication C (stays queued, like the B-vs-C latch test).
@@ -5252,24 +5252,24 @@ test "wave29: claim build+stageUi+publish latches the claimed slot, counters san
     const slot = claim.slot;
     // The handoff is not committed until publish: filling alone moves
     // nothing global, and the slot is held (no longer the back index).
-    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
     claim.build();
-    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
     claim.stageUi(); // no canvas: stages the absence packet, bumps the seq
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
     claim.publish();
-    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
-    try std.testing.expectEqual(slot, scene.build_slot);
-    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot);
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(slot, scene.build_slot.load(.monotonic));
+    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot.load(.monotonic));
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
 
-    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
-    try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
     try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
     // The staged absence packet was consumed (seq stamped, not re-latched).
-    try std.testing.expectEqual(scene.ui_packet_seq, scene.last_latched_ui_seq);
+    try std.testing.expectEqual(scene.ui_packet_seq.load(.monotonic), scene.last_latched_ui_seq.load(.monotonic));
     // Counter sanity: a clean claim flow counts nothing.
     try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
     try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
@@ -5294,19 +5294,19 @@ test "wave29: cancelled claim commits nothing, rotation unaffected" {
     dropped.build();
     dropped.cancel();
     // Nothing committed: no fresh build for prepare, rotation intact.
-    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
     var funded = scene.tryClaimBuildSlot().?;
     // The dropped slot was released: the next claim reuses the same index.
     try std.testing.expectEqual(dropped_slot, funded.slot);
     funded.build();
     funded.publish();
-    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
-    try std.testing.expectEqual(funded.slot, scene.build_slot);
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(funded.slot, scene.build_slot.load(.monotonic));
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
-    try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
     try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
@@ -5342,7 +5342,117 @@ test "wave29: build path never begins/completes retire epochs" {
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
 
-// --- Soft-body cloth (wave 29, v1): scene API, mesh coupling, upload-flag
+// ---- Wave 30: concurrent-build handoff edge (atomic seq words). ----
+//
+// A producer thread runs the adoption-edge claim flow (claim -> stageUi ->
+// publish: the UI stage release-bumps `ui_packet_seq`, the publish
+// release-stores `build_slot` then `build_seq`) while a consumer thread runs
+// the latch half of the edge (acquire-reads `build_seq`/`ui_packet_seq`,
+// stamps `last_latched_seq`/`last_latched_ui_seq`). No full build/prepare
+// runs here: the remaining live touches are still phase-excluded (see the
+// adoption checklist in scene/frame_draws.zig) — this proves exactly the
+// atomic handoff: the consumer never observes a seq older than one already
+// seen (no stale read after publish), and the join-time counters are exact
+// (every publish latched, newest wins, no saturation drop uncongested).
+test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact counters" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    const total_publishes: u64 = 5000;
+
+    const Ctx = struct {
+        scene: *Scene,
+        total: u64,
+        skipped: u64 = 0,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        // Consumer-side observations (consumer thread writes; the test
+        // thread reads after join).
+        max_build_seen: u64 = 0,
+        max_ui_seen: u64 = 0,
+        latches: u64 = 0,
+    };
+
+    const Producer = struct {
+        fn run(c: *Ctx) void {
+            var seq: u64 = 1;
+            while (seq <= c.total) {
+                var claim = while (c.scene.tryClaimBuildSlot()) |cl| break cl else {
+                    c.skipped += 1;
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                // No canvas: stages the absence packet and release-bumps
+                // `ui_packet_seq` (one stage per publish, like the
+                // build+stage claim flow).
+                claim.stageUi();
+                // Release edge: `build_slot` then `build_seq`.
+                claim.publish();
+                seq += 1;
+            }
+            c.done.store(true, .release);
+        }
+    };
+
+    const Consumer = struct {
+        fn latchOnce(c: *Ctx) void {
+            // Acquire: pairs with the publish/stage release-stores — a fresh
+            // generation implies the staged payload is visible.
+            const b = c.scene.build_seq.load(.acquire);
+            // Never stale: generations are strictly increasing by
+            // single-producer construction, so an older read after a newer
+            // one would be a torn handoff.
+            if (b < c.max_build_seen) unreachable;
+            if (b > c.max_build_seen) c.max_build_seen = b;
+            // Context-side stamp only (the producer never touches this word).
+            c.scene.last_latched_seq.store(b, .monotonic);
+            const u = c.scene.ui_packet_seq.load(.acquire);
+            if (u < c.max_ui_seen) unreachable;
+            if (u > c.max_ui_seen) c.max_ui_seen = u;
+            c.scene.last_latched_ui_seq.store(u, .monotonic);
+            c.latches += 1;
+        }
+
+        fn run(c: *Ctx) void {
+            while (!c.done.load(.acquire)) latchOnce(c);
+            // The `done` acquire synchronizes with the producer's release
+            // after its last publish, so this final latch deterministically
+            // observes the tail generation.
+            latchOnce(c);
+        }
+    };
+
+    var ctx = Ctx{ .scene = &scene, .total = total_publishes };
+    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
+    const cons = try std.Thread.spawn(.{}, Consumer.run, .{&ctx});
+    prod.join();
+    cons.join();
+
+    // Uncongested rotation (no consumer pins held): the producer always had
+    // a free slot — zero skips, every publish landed exactly once.
+    try std.testing.expectEqual(@as(u64, 0), ctx.skipped);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
+    try std.testing.expect(ctx.latches > 0);
+    // Exact counter arithmetic against the join-time totals: N publishes
+    // committed generations 1..N on both edges, and the consumer's last
+    // latch stamped exactly the tail (nothing lost, nothing duplicated —
+    // the seqs ARE the counters, no separate tally to drift).
+    try std.testing.expectEqual(total_publishes, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(total_publishes, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(total_publishes, scene.ui_packet_seq.load(.monotonic));
+    try std.testing.expectEqual(total_publishes, scene.last_latched_ui_seq.load(.monotonic));
+    try std.testing.expectEqual(total_publishes, ctx.max_build_seen);
+    try std.testing.expectEqual(total_publishes, ctx.max_ui_seen);
+    // The published slot index rode the same edge: it names a real slot and
+    // the tail handoff is still held (released, never wedged).
+    try std.testing.expect(scene.build_slot.load(.monotonic) < scene.draws.slots.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
 // discipline, retire-on-remove. Headless: no sg.* below (buffers stay
 // deferred without a context; the main test thread is context-marked by the
 // earlier gpu_thread tests, so the flush paths take their real branches).
