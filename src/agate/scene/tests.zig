@@ -5232,3 +5232,167 @@ test "wave28: Scene pickUi3dPanel uses the staged snapshot camera" {
     panel.enabled = false;
     try std.testing.expect(scene.pickUi3dPanel(400, 300) == null);
 }
+
+// --- Soft-body cloth (wave 29, v1): scene API, mesh coupling, upload-flag
+// discipline, retire-on-remove. Headless: no sg.* below (buffers stay
+// deferred without a context; the main test thread is context-marked by the
+// earlier gpu_thread tests, so the flush paths take their real branches).
+
+fn freeSoftbodyFixture(alloc: std.mem.Allocator, scene: *Scene) void {
+    // Bodies first (solver + staging CPU only; meshes stay registered),
+    // then meshes, materials, and the retire queue.
+    scene.softbodies.deinit(alloc);
+    for (scene.meshes.items) |m| {
+        m.deinit(alloc);
+        alloc.destroy(m);
+    }
+    scene.meshes.deinit(alloc);
+    for (scene.materials.items) |m| alloc.destroy(m);
+    scene.materials.deinit(alloc);
+    scene.gpu_retire.deinit(alloc);
+    scene.outline_meshes.deinit(alloc);
+    scene.lights.deinit(alloc);
+}
+
+test "softbody add/get/count/cap/validation/remove errors" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    const b0 = try scene.addSoftBodyCloth("cloth_a", .{ .width = 4, .height = 4 });
+    try std.testing.expectEqual(@as(usize, 1), scene.softBodyCount());
+    try std.testing.expectEqual(b0, scene.getSoftBody(0).?);
+    try std.testing.expectEqual(b0, scene.getSoftBodyByName("cloth_a").?);
+    try std.testing.expect(scene.getSoftBody(7) == null);
+    try std.testing.expect(scene.getSoftBodyByName("nope") == null);
+
+    // Invalid options never register a body.
+    try std.testing.expectError(error.InvalidOptions, scene.addSoftBodyCloth("bad", .{ .width = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), scene.softBodyCount());
+
+    _ = try scene.addSoftBodyCloth("cloth_b", .{ .width = 3, .height = 3 });
+    _ = try scene.addSoftBodyCloth("cloth_c", .{ .width = 3, .height = 3 });
+    _ = try scene.addSoftBodyCloth("cloth_d", .{ .width = 3, .height = 3 });
+    try std.testing.expectEqual(@as(usize, 4), scene.softBodyCount());
+    try std.testing.expectError(error.TooManySoftBodies, scene.addSoftBodyCloth("cloth_e", .{ .width = 3, .height = 3 }));
+    try std.testing.expectError(error.UnknownSoftBody, scene.removeSoftBodyCloth(9));
+    try std.testing.expectEqual(@as(usize, 4), scene.softBodyCount());
+}
+
+test "softbody mesh coupling: vertex layout matches the solver grid" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    const body = try scene.addSoftBodyCloth("weave", .{ .width = 5, .height = 4, .spacing = 0.5 });
+    try std.testing.expectEqual(@as(usize, 20), body.vertices.len);
+    try std.testing.expectEqual(@as(u32, 20), body.mesh.vertex_count);
+    try std.testing.expectEqual(@as(usize, 4 * 3 * 6), body.indices.len);
+    try std.testing.expectEqual(@as(u32, 72), body.mesh.index_count);
+    for (body.indices) |idx| try std.testing.expect(idx < 20);
+    // Rest pose == solver positions; uv spans the unit square.
+    for (body.vertices, body.cloth.pos) |v, p| try std.testing.expectEqual(p.toArray(), v.position);
+    try std.testing.expectEqual([2]f32{ 0.0, 0.0 }, body.vertices[0].uv);
+    try std.testing.expectEqual([2]f32{ 1.0, 1.0 }, body.vertices[19].uv);
+    // Double-sided standard material; mesh registered in the scene.
+    const is_standard = switch (body.mesh.material.?) {
+        .standard => true,
+        else => false,
+    };
+    try std.testing.expect(is_standard);
+    try std.testing.expect(body.mesh.material.?.standard.double_sided);
+    try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+    try std.testing.expect(body.mesh.local_bounding_box.isValid());
+}
+
+test "softbody upload flagged once per changed frame, cleared by flush" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+    _ = upload_meter.takeAndReset();
+
+    const body = try scene.addSoftBodyCloth("flag", .{ .width = 4, .height = 4 });
+    try std.testing.expect(!body.upload_pending);
+    scene.updateSoftBodies(1.0 / 60.0);
+    try std.testing.expect(body.upload_pending);
+    // Second changed frame: still exactly one pending flag, never queued.
+    scene.updateSoftBodies(1.0 / 60.0);
+    try std.testing.expect(body.upload_pending);
+    // Staged vertices track the solver.
+    for (body.vertices, body.cloth.pos) |v, p| try std.testing.expectEqual(p.toArray(), v.position);
+    // Headless flush clears the flag with no sg.* and no meter bytes.
+    scene.flushPendingGpuUploads();
+    try std.testing.expect(!body.upload_pending);
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+    // Zero dt steps nothing and flags nothing.
+    scene.updateSoftBodies(0.0);
+    try std.testing.expect(!body.upload_pending);
+    _ = upload_meter.takeAndReset();
+}
+
+test "softbody remove retires the mesh (retire-safe, epoch-queued)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    const body = try scene.addSoftBodyCloth("bye", .{ .width = 4, .height = 4 });
+    const mesh = body.mesh;
+    try scene.removeSoftBodyCloth(0);
+    try std.testing.expectEqual(@as(usize, 0), scene.softBodyCount());
+    // Mesh unlinked from the registry but alive in the retire queue.
+    for (scene.meshes.items) |m| try std.testing.expect(m != mesh);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+    // Headless flush completes the teardown (bufferless mesh: no sg.*).
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+}
+
+test "softbody remove from a worker retires without sg.* (update||render)" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    _ = try scene.addSoftBodyCloth("worker", .{ .width = 4, .height = 4 });
+    const Job = struct {
+        scene: *Scene,
+        fn run(j: @This()) void {
+            j.scene.removeSoftBodyCloth(0) catch unreachable;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Job.run, .{Job{ .scene = &scene }});
+    t.join();
+    try std.testing.expectEqual(@as(usize, 0), scene.softBodyCount());
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+    scene.gpu_retire.complete(scene.gpu_retire.current());
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+}
+
+test "softbody destroyMesh drops the bound body (referent cleanup)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    const body = try scene.addSoftBodyCloth("doomed", .{ .width = 4, .height = 4 });
+    const mesh = body.mesh;
+    scene.destroyMesh(mesh);
+    try std.testing.expectEqual(@as(usize, 0), scene.softBodyCount());
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "softbody disabled body pauses: no step, no upload flag" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer freeSoftbodyFixture(alloc, &scene);
+
+    const body = try scene.addSoftBodyCloth("paused", .{ .width = 4, .height = 4 });
+    body.cloth.enabled = false;
+    const h = body.cloth.hashState();
+    scene.updateSoftBodies(1.0 / 60.0);
+    try std.testing.expectEqual(h, body.cloth.hashState());
+    try std.testing.expect(!body.upload_pending);
+    body.cloth.enabled = true;
+    scene.updateSoftBodies(1.0 / 60.0);
+    try std.testing.expect(body.upload_pending);
+}
