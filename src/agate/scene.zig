@@ -2983,6 +2983,14 @@ pub const Scene = struct {
             // Камеры нет — UI/debug-проходов не будет: переносим только
             // prepare-фазу динамики, чтобы счётчик не утёк в следующий кадр.
             self.stats.updated_bytes_frame = upload_meter.takeAndReset();
+            // Кадровый command buffer уже мог быть открыт prepare-фазой
+            // (compute-диспетч частиц): commit и здесь — иначе кадр взял
+            // in-flight semaphore и никогда его не вернёт, а sg_shutdown
+            // ждёт SIG_NUM_INFLIGHT_FRAMES сигналов безусловно и виснет
+            // (наблюдалось как редкий зависание на выходе: 1 кадр из ~1245,
+            // waits=commits+1 в инструментированном прогоне). commit с nil
+            // buffer — no-op; headless (sg не поднят) пропускаем целиком.
+            if (sg.isvalid()) sg.commit();
             return;
         }
 
