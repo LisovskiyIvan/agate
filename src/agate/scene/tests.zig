@@ -4163,6 +4163,7 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     scene.prepareFrame();
 
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(staged_verts, scene.ui_frame.vertices.items.len);
     try std.testing.expectEqual(staged_idx, scene.ui_frame.indices.items.len);
@@ -4180,6 +4181,7 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     scene.prepareFrame();
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expectEqual(canvas.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expect(canvas.vertices.items.len != staged_verts);
 }

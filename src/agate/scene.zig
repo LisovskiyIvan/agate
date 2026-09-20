@@ -360,6 +360,12 @@ pub const Scene = struct {
     /// no GPU state at all (CPU list copies + seq bump only).
     ui_packet_seq: u64 = 0,
     last_latched_ui_seq: u64 = 0,
+    /// How many prepares actually consumed a staged packet as the geometry
+    /// source (the `capturePacket` path, not the legacy canvas read and not
+    /// the staged-absence clear). Observability only: lets an app/fixture
+    /// prove the staged path is live rather than merely staged. Monotonic;
+    /// read via `uiPacketLatchedCount()`.
+    ui_packet_latched: u64 = 0,
     /// Back-slot index the last `buildPreparedFrame` wrote; the latch
     /// asserts it still is the back index (no intervening publish).
     build_slot: usize = 0,
@@ -1649,6 +1655,7 @@ pub const Scene = struct {
                             @floatFromInt(w),
                             @floatFromInt(h),
                         );
+                        self.ui_packet_latched +%= 1;
                         _ = self.ui_frame.upload(canvas, .{
                             .allocator = self.allocator,
                             .retire_queue = &self.gpu_retire,
@@ -2599,6 +2606,13 @@ pub const Scene = struct {
     /// can hide: new uploads stay pending, retires stay queued (capped).
     pub fn reuseStreak(self: *const Scene) u64 {
         return self.reuse_streak;
+    }
+
+    /// Prepares that consumed a staged UI packet as the geometry source
+    /// (`capturePacket`), i.e. proof the staged path is live. The legacy
+    /// canvas read and the staged-absence clear do not count.
+    pub fn uiPacketLatchedCount(self: *const Scene) u64 {
+        return self.ui_packet_latched;
     }
 
     /// Retire entries currently awaiting the next successful prepare's
