@@ -45,14 +45,17 @@ pub const CameraSnapshot = struct {
 /// P4 покрывает только mesh-payload очередей; update-vs-prepare остаются
 /// исключены фазовым мьютексом (producer update, consumer prepare), а update
 /// CAN overlap render — поэтому saturated-фолбэк publishFrameSnapshot
-/// НИКОГДА не пишет consumed frame_snapshot (только drop), иначе гонка с
+/// НИКОГДА не пишет consumed snapshot (только drop), иначе гонка с
 /// draw. GPU-ресурсы заимствуются под фазовым мьютексом/P3; UI покрыт P6
 /// (render-owned кадр в Scene), debug — prepared capture + committed upload,
 /// sky/defaults — копии в этом snapshot, light pack — snapshot-копия.
 /// Producer-билд (`buildPreparedFrame`) владеет отдельной копией этого же
-/// типа (`Scene.build_snapshot`): очереди строятся против неё, а latch
-/// копирует её в consumed `frame_snapshot` один в один — build НИКОГДА не
-/// читает/пишет `frame_snapshot`, иначе гонка с draw при update||render.
+/// типа (`Scene.build_snapshot`): очереди строятся против неё, staged-копия
+/// замораживается в claim-слоте (`FrameDrawSlot.snapshot`), а latch
+/// потребляет STAGED-копию (staged wins над пост-билд мутацией
+/// `build_snapshot`; `frame_snapshot` зеркалит staged для совместимости) —
+/// build НИКОГДА не читает/пишет `frame_snapshot`, иначе гонка с draw при
+/// update||render.
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,
