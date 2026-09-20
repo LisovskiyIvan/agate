@@ -27,6 +27,11 @@ pub const ParticlePass = struct {
         simulation_mode: particles.SimulationMode = .cpu,
         instance_buffer: sg.Buffer = .{},
         gpu_slot_buffer: sg.Buffer = .{},
+        /// Compute-baked draw instances (`ParticleInstanceData` layout,
+        /// written by the compute pass): drawn through the EXISTING cpu
+        /// billboard pipeline, so blend/texture/soft-particle behavior is
+        /// identical across modes with no new render pipeline.
+        compute_draw_buffer: sg.Buffer = .{},
         blend_mode: particles.ParticleBlendMode = .additive,
         /// Borrowed texture view; null selects the pass default dot.
         texture_view: ?sg.View = null,
@@ -45,6 +50,7 @@ pub const ParticlePass = struct {
                 .simulation_mode = ps.simulation_mode,
                 .instance_buffer = ps.instance_buffer,
                 .gpu_slot_buffer = ps.gpu_slot_buffer,
+                .compute_draw_buffer = ps.compute_draw_buffer,
                 .blend_mode = ps.blend_mode,
                 .texture_view = if (ps.texture) |t| t.view else null,
                 .clock_seconds = ps.clock_seconds,
@@ -58,9 +64,14 @@ pub const ParticlePass = struct {
 
         /// Buffer the draw binds: mode-selected mirror of the legacy
         /// `if (gpu) ps.gpu_slot_buffer else ps.instance_buffer` choice.
-        /// Pure (no sg.*), so fixtures can assert the selection headless.
+        /// `.compute` binds its baked draw buffer through the cpu pipeline
+        /// (same `ParticleInstanceData` stride), so the analytic gpu branch
+        /// below stays `.gpu`-only. Pure (no sg.*), so fixtures can assert
+        /// the selection headless.
         pub fn drawBuffer(self: ParticleDraw) sg.Buffer {
-            return if (self.simulation_mode == .gpu) self.gpu_slot_buffer else self.instance_buffer;
+            if (self.simulation_mode == .gpu) return self.gpu_slot_buffer;
+            if (self.simulation_mode == .compute) return self.compute_draw_buffer;
+            return self.instance_buffer;
         }
     };
 
@@ -278,6 +289,8 @@ pub const ParticlePass = struct {
         cam_up: Vec3,
         current_pipeline: *sg.Pipeline,
     ) void {
+        // `.compute` draws its baked instances through the cpu pipeline
+        // (gpu == false here); only `.gpu` takes the analytic branch.
         const gpu = draw.simulation_mode == .gpu;
         const instance_buf = draw.drawBuffer();
         if (draw.active_count == 0 or instance_buf.id == 0) return;
@@ -485,4 +498,36 @@ test "statsForDraws preserves the legacy count semantics" {
     try t.expectEqual(@as(u32, 2 * (3 + 5)), s.triangles);
     const empty: []const ParticlePass.ParticleDraw = &[_]ParticlePass.ParticleDraw{};
     try t.expectEqual(ParticlePass.DrawStats{}, ParticlePass.statsForDraws(empty));
+}
+
+test "ParticleDraw.compute mode binds the baked buffer, keeps cpu visuals" {
+    const t = std.testing;
+    const math_mod = @import("math");
+    var ps = try makePassTestSystem(t.allocator, 4);
+    defer freePassTestSystem(&ps);
+    ps.simulation_mode = .compute;
+    ps.active_count = 3;
+    ps.instance_buffer = .{ .id = 11 };
+    ps.gpu_slot_buffer = .{ .id = 12 };
+    ps.compute_draw_buffer = .{ .id = 13 };
+    ps.blend_mode = .alpha_blend;
+    ps.color_start = math_mod.Color4.new(1.0, 0.0, 0.0, 1.0);
+    ps.size_start = 0.5;
+
+    const draw = ParticlePass.ParticleDraw.fromSystem(&ps);
+    try t.expectEqual(particles.SimulationMode.compute, draw.simulation_mode);
+    try t.expectEqual(@as(u32, 13), draw.compute_draw_buffer.id);
+    // Mode-selected buffer: compute binds its baked instances (cpu-pipeline
+    // stride), cpu/gpu selections unchanged.
+    try t.expectEqual(@as(u32, 13), draw.drawBuffer().id);
+    var cpu_draw = draw;
+    cpu_draw.simulation_mode = .cpu;
+    try t.expectEqual(@as(u32, 11), cpu_draw.drawBuffer().id);
+    var gpu_draw = draw;
+    gpu_draw.simulation_mode = .gpu;
+    try t.expectEqual(@as(u32, 12), gpu_draw.drawBuffer().id);
+    // Stats keep the legacy count semantics in every mode.
+    const s = ParticlePass.statsForDraws(&[_]ParticlePass.ParticleDraw{draw});
+    try t.expectEqual(@as(u32, 1), s.draw_calls);
+    try t.expectEqual(@as(u32, 2 * 3), s.triangles);
 }

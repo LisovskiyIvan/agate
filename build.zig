@@ -201,6 +201,15 @@ pub fn build(b: *Build) !void {
         .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
+        // Stateful compute particles (wave 25): compute slang set (410 has
+        // no compute); runtime availability still gates on
+        // compute.supported(), see src/agate/compute.zig.
+        .{
+            .name = "particle_compute_shader",
+            .input = "src/agate/shaders/particle_compute.glsl",
+            .output = "particle_compute_shader.zig",
+            .slang = .{ .glsl430 = true, .metal_macos = true, .hlsl5 = true },
+        },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
         .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },

@@ -1904,6 +1904,80 @@ test "stage1: particle build on worker + latch on main freezes the frame" {
     try std.testing.expectEqual(@as(usize, 3), scene.particles.frame.items[0].active_count);
 }
 
+test "stage1: compute particle capture borrows the baked buffer; retire takes all five" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.particles.systems.deinit(alloc);
+    defer scene.particles.frame.deinit(alloc);
+    defer scene.particles.build_frame.deinit(alloc);
+
+    // Compute-mode system with fake borrowed handle ids (never deinited via
+    // ps.deinit — that would issue sg.destroy* on the fake ids; members are
+    // freed manually below, same idiom as the cpu test above).
+    const parts = try alloc.alloc(particles.Particle, 4);
+    defer alloc.free(parts);
+    const insts = try alloc.alloc(particles.ParticleInstanceData, 4);
+    defer alloc.free(insts);
+    const scratch = try alloc.alloc(u8, 4);
+    defer alloc.free(scratch);
+    const staging = try alloc.alloc(particles.GpuParticleSlot, 4);
+    defer alloc.free(staging);
+    var ps = ParticleSystem{
+        .name = "s1_compute",
+        .allocator = alloc,
+        .particles = parts,
+        .instances = insts,
+        .alive_scratch = scratch,
+        .capacity = 4,
+        .instance_buffer = .{ .id = 11 },
+        .gpu_slot_buffer = .{ .id = 12 },
+        .compute_state_buffer = .{ .id = 21 },
+        .compute_spawn_buffer = .{ .id = 22 },
+        .compute_draw_buffer = .{ .id = 23 },
+        .compute_staging = staging,
+        .prng = std.Random.DefaultPrng.init(42),
+    };
+    ps.simulation_mode = .compute;
+    ps.active_count = 3;
+    ps.compute_high_water = 3;
+    try scene.particles.systems.append(alloc, &ps);
+
+    // Capture borrows the baked draw buffer (not the instance/slot ones) and
+    // snapshots the compute mode.
+    scene.particles.captureFrame(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
+    const draw = scene.particles.frame.items[0];
+    try std.testing.expectEqual(particles.SimulationMode.compute, draw.simulation_mode);
+    try std.testing.expectEqual(@as(u32, 23), draw.compute_draw_buffer.id);
+    try std.testing.expectEqual(@as(u32, 23), draw.drawBuffer().id);
+
+    // Teardown: all five particle buffers retire through the queue from any
+    // thread (fake ids: retire into the open epoch like prepareFrame would,
+    // so the pre-complete flush keeps them without sg.*, then manual cleanup
+    // — mirrors the retireBuffer unit-test handling).
+    _ = scene.gpu_retire.begin();
+    var out = [_]sokol.gfx.Buffer{.{}} ** 8;
+    const n = ps.takeGpuBuffersForRetire(&out);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    for (out[0..n]) |buf| scene.gpu_retire.retireBuffer(alloc, buf);
+    try std.testing.expectEqual(@as(usize, 5), scene.gpu_retire.retainedCount());
+    try std.testing.expectEqual(@as(u64, 0), scene.gpu_retire.duplicateDropCount());
+    scene.gpu_retire.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 5), scene.gpu_retire.retainedCount());
+    scene.gpu_retire.pending.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+    // Handles zeroed: the layer deinit path (ps.deinit) would now skip every
+    // buffer destroy; a second take finds nothing (no double-retire).
+    try std.testing.expectEqual(@as(usize, 0), ps.takeGpuBuffersForRetire(&out));
+    try std.testing.expectEqual(@as(u32, 0), ps.compute_draw_buffer.id);
+}
+
 test "stage1: physics build on worker + latch on main freezes the capture" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
