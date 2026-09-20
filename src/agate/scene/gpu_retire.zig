@@ -59,6 +59,7 @@ const sg = sokol.gfx;
 const Mesh = @import("../mesh.zig").Mesh;
 const gpu_thread = @import("../gpu_thread.zig");
 const probe_layer = @import("probe_layer.zig");
+const gui3d_layer = @import("gui3d_layer.zig");
 
 /// Номер render-кадра. 0 — «кадра ещё не было»; счётчик стартует с 1.
 pub const Epoch = u64;
@@ -69,17 +70,19 @@ const overflow_cap: usize = 8;
 
 /// Одна отложенная запись: уже отвязанный от сцены меш, вытесненный
 /// старый instance-буфер (P5), либо снятый с учёта reflection-проб таргет
-/// (wave 25: куб + его вьюхи/сэмплер + глубина одним значением) + кадр
-/// ухода в ретенцию.
+/// (wave 25: куб + его вьюхи/сэмплер + глубина одним значением), либо снятый
+/// 3D-GUI-панель таргет (wave 28: RT + его вьюхи/сэмплер + панельные
+/// UI-буферы одним значением) + кадр ухода в ретенцию.
 const Entry = struct {
     kind: Kind,
     mesh: ?*Mesh = null,
     buffer: sg.Buffer = .{},
     probe: probe_layer.ProbeGpu = .{},
+    ui3d: gui3d_layer.Ui3dTarget = .{},
     epoch: Epoch,
 };
 
-pub const Kind = enum { mesh, buffer, probe };
+pub const Kind = enum { mesh, buffer, probe, ui3d };
 
 /// Спин по образцу assets.UploadQueue: критические секции — bump счётчика или
 /// append одного указателя, вызовы retire редкие.
@@ -247,6 +250,36 @@ pub const GpuRetireQueue = struct {
         };
     }
 
+    /// Уход снятого 3D-GUI-панель таргета в ретенцию (wave 28: удаление
+    /// панели со стороны игры). Можно звать с любого потока; тот же
+    /// epoch/overflow[8]/log+leak контракт, что у retireMesh, плюс dedup/cap
+    /// выше: под мьютексом только штамп epoch + проверки + append, никаких
+    /// sg.*. Пустой (несозданный) таргет — тоже запись: уничтожать нечего,
+    /// но дисциплина остаётся uniform. Уничтожение (`Ui3dTarget.deinit`) —
+    /// только context-поток во flush/deinit.
+    pub fn retireUi3dTarget(self: *Self, allocator: std.mem.Allocator, target: gui3d_layer.Ui3dTarget) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = Entry{ .kind = .ui3d, .ui3d = target, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.err("scene: retire queue cap {d} reached, leaking ui3d target (image id {})", .{ self.pending_cap, target.image.id });
+            return;
+        }
+        self.pending.append(allocator, entry) catch {
+            if (self.overflow_len < self.overflow.len) {
+                self.overflow[self.overflow_len] = entry;
+                self.overflow_len += 1;
+            } else {
+                std.log.err("scene: destroy queues exhausted, leaking ui3d target (image id {})", .{target.image.id});
+            }
+        };
+    }
+
     /// Уничтожение due-записей (`epoch <= lastCompleted()`): Mesh.deinit
     /// (sg.*) + free. Только context-поток. Идемпотентен на пустой очереди.
     /// Держит спинлок и во время sg-teardown: retire редкий и короткий,
@@ -327,14 +360,15 @@ pub const GpuRetireQueue = struct {
 
     /// Идентичность ретайр-записей: kind совпадает и хендл тот же. Меши —
     /// по указателю (повторный ретайр одного объекта), буферы — по id
-    /// (повторный ретайр одного GPU-хендла), проб-таргеты — по id куб-имиджа
-    /// (повторный ретайр одного таргета).
+    /// (повторный ретайр одного GPU-хендла), проб-таргеты — по id куб-имиджа,
+    /// ui3d-таргеты — по id RT-имиджа (повторный ретайр одного таргета).
     fn sameHandle(a: Entry, b: Entry) bool {
         if (a.kind != b.kind) return false;
         return switch (a.kind) {
             .mesh => a.mesh == b.mesh,
             .buffer => a.buffer.id == b.buffer.id,
             .probe => a.probe.image.id == b.probe.image.id,
+            .ui3d => a.ui3d.image.id == b.ui3d.image.id,
         };
     }
 
@@ -361,6 +395,14 @@ pub const GpuRetireQueue = struct {
                         var target = entry.probe;
                         target.deinit();
                     },
+                    // Wave 28: снятый ui3d-таргет — RT, его вьюхи/сэмплер
+                    // и панельные UI-буферы одним значением (пустой
+                    // pre-capture таргет — no-op destroy'ы, но дисциплина
+                    // uniform).
+                    .ui3d => {
+                        var target = entry.ui3d;
+                        target.deinit();
+                    },
                 }
             } else {
                 self.pending.items[kept] = entry;
@@ -380,6 +422,10 @@ pub const GpuRetireQueue = struct {
                         .buffer => sg.destroyBuffer(entry.buffer),
                         .probe => {
                             var target = entry.probe;
+                            target.deinit();
+                        },
+                        .ui3d => {
+                            var target = entry.ui3d;
                             target.deinit();
                         },
                     }
@@ -683,6 +729,44 @@ test "retireProbeTarget waits for its epoch and dedups by cube image" {
 
     // Drop the fake-id entry by hand, then complete + flush drains the
     // empty one through ProbeGpu.deinit headlessly.
+    _ = q.pending.orderedRemove(1);
+    q.complete(e);
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+}
+
+test "retireUi3dTarget waits for its epoch and dedups by rt image" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    defer q.deinit(alloc);
+    const e = q.begin();
+
+    // Empty (pre-capture) targets retire as uniform no-op-destroy entries:
+    // bookkeeping is identical, sg.destroy* on empty handles is headless-safe.
+    q.retireUi3dTarget(alloc, .{});
+    q.retireUi3dTarget(alloc, .{});
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(Kind.ui3d, q.pending.items[0].kind);
+    try std.testing.expectEqual(e, q.pending.items[0].epoch);
+
+    // A target with a (fake-id) RT image is a distinct entry; a repeat of
+    // the same image dedups. Manual id assignment: no sg.* runs in this
+    // test until flush, and flush only destroys id-0 handles here... the
+    // nonzero entry is dropped from the list by hand instead (fake ids have
+    // no GPU resource behind them, same precedent as the buffer test).
+    q.retireUi3dTarget(alloc, .{ .image = .{ .id = 601 } });
+    q.retireUi3dTarget(alloc, .{ .image = .{ .id = 601 } });
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 2), q.duplicateDropCount());
+
+    // Flush before complete: both entries wait (current epoch open).
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+
+    // Drop the fake-id entry by hand, then complete + flush drains the
+    // empty one through Ui3dTarget.deinit headlessly.
     _ = q.pending.orderedRemove(1);
     q.complete(e);
     q.flush(alloc);

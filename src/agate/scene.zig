@@ -93,6 +93,11 @@ const scene_sky = @import("scene/sky_layer.zig");
 const scene_probes = @import("scene/probe_layer.zig");
 pub const ReflectionProbe = scene_probes.ReflectionProbe;
 pub const ReflectionProbeOptions = scene_probes.ReflectionProbeOptions;
+const scene_gui3d = @import("scene/gui3d_layer.zig");
+pub const Ui3dPanel = scene_gui3d.Ui3dPanel;
+pub const Ui3dPanelOptions = scene_gui3d.Ui3dPanelOptions;
+pub const Ui3dFaceMode = scene_gui3d.Ui3dFaceMode;
+pub const Ui3dPickHit = scene_gui3d.Ui3dPickHit;
 const scene_postfx = @import("scene/postfx_stack.zig");
 const scene_forward = @import("scene/forward_pipelines.zig");
 const scene_particles = @import("scene/particle_layer.zig");
@@ -227,6 +232,10 @@ pub const Scene = struct {
     // PBR/standard ambient terms. Empty by default: with no enabled probe
     // every draw takes today's ambient/skybox path bit-identically.
     probes: scene_probes.ProbeLayer = .{},
+    // 3D GUI panels (wave 28, v1): on-demand world-space UI quads. Empty
+    // by default: with no panels every capture/draw hook early-outs with
+    // zero sg.* calls, so rendering stays bit-identical.
+    gui3d: scene_gui3d.Gui3dLayer = .{},
     // Offscreen target, SSAO, bloom, composite pass + outline highlights.
     postfx: scene_postfx.PostFXStack,
     // Forward GPU pipeline sets (opaque/blend/double-sided per family).
@@ -565,6 +574,105 @@ pub const Scene = struct {
     /// and tooling).
     pub fn probeDirtyCount(self: *const Scene) usize {
         return self.probes.dirtyCount();
+    }
+
+    // ---- 3D GUI panels (wave 28, v1). ----
+    //
+    // On-demand world-space UI: each panel owns a private UICanvas (the app
+    // draws into it with the normal canvas API) rendered into a private
+    // color RT sized to the canvas resolution, then drawn in the main pass
+    // as an unlit/emissive double-sided quad. Captures run on the context
+    // thread inside `render`, at most `max_captures_per_frame` (1) per frame
+    // (lowest dirty + enabled index first; the rest wait), and never inside
+    // `renderReuse`. Before a panel's first capture lands, drawing and
+    // picking skip it, so new (or disabled) panels leave rendering
+    // bit-identical.
+    //
+    // Capacity: at most `scene_gui3d.max_panels` (4); `addUi3dPanel` past
+    // the cap is a hard `error.TooManyUi3dPanels`. Face mode v1 is fixed yaw
+    // only (see scene/gui3d_layer.zig for the policy, picking contract with
+    // `injectPointer`, and the explicit non-goals).
+
+    /// Adds a 3D GUI panel at `position`; returns its index. The name is
+    /// duped (Scene owns panel names; freed on remove/deinit). The panel
+    /// starts dirty + uncaptured: the next `render` captures it (one capture
+    /// per frame) while drawing/picking skip it until then. Headless-safe
+    /// (only CPU lists + name allocation; GPU targets are lazy).
+    pub fn addUi3dPanel(
+        self: *Scene,
+        name: []const u8,
+        position: Vec3,
+        options: Ui3dPanelOptions,
+    ) error{ TooManyUi3dPanels, InvalidUi3dPanelSize, OutOfMemory }!usize {
+        return self.gui3d.add(self.allocator, name, position, options);
+    }
+
+    /// Removes panel `index`, retiring its RT target through the epoch
+    /// retire queue (safe under update||render overlap: the context thread
+    /// destroys at the next flush). Order-preserving: higher indices shift
+    /// down. Out-of-range indices are a no-op.
+    pub fn removeUi3dPanel(self: *Scene, index: usize) void {
+        self.gui3d.remove(self.allocator, &self.gpu_retire, index);
+    }
+
+    /// Live panel state (position/yaw/enabled/canvas are freely mutable
+    /// game-side under update-vs-prepare exclusion). Null when out of range.
+    pub fn getUi3dPanel(self: *Scene, index: usize) ?*Ui3dPanel {
+        return self.gui3d.get(index);
+    }
+
+    /// Live panel state by name. Null when no panel matches.
+    pub fn getUi3dPanelByName(self: *Scene, name: []const u8) ?*Ui3dPanel {
+        return self.gui3d.getByName(name);
+    }
+
+    pub fn ui3dPanelCount(self: *const Scene) usize {
+        return self.gui3d.panelCount();
+    }
+
+    /// Requests an on-demand recapture of panel `index` on the next render
+    /// (actual GPU work happens there, at most one panel per frame).
+    /// Out-of-range is a no-op.
+    pub fn markUi3dPanelDirty(self: *Scene, index: usize) void {
+        self.gui3d.markDirty(index);
+    }
+
+    /// Requests a recapture of every panel (each still captures on its own
+    /// frame: one per frame maximum).
+    pub fn markAllUi3dPanelsDirty(self: *Scene) void {
+        self.gui3d.markAllDirty();
+    }
+
+    /// How many panels currently want a capture (observability for tests
+    /// and tooling).
+    pub fn ui3dDirtyCount(self: *const Scene) usize {
+        return self.gui3d.dirtyCount();
+    }
+
+    /// Picks the nearest drawable 3D panel under the cursor. The ray is
+    /// built from the STAGED snapshot camera (`primary_cam.view_proj`,
+    /// fullscreen mapping — never the live camera), so game-side callers
+    /// under update-vs-prepare exclusion observe the same camera the frame
+    /// was prepared against. Returns the panel index plus canvas pixel
+    /// coordinates; the app routes those into
+    /// `panel.injectPointer(x, y, pressed)` itself (no focus system, no
+    /// keyboard routing in v1). Null when no camera/stage is present or no
+    /// drawable panel is hit. Headless-safe (pure CPU; no `sapp.*` reads —
+    /// snapshot dims gate instead).
+    pub fn pickUi3dPanel(self: *Scene, mouse_x: f32, mouse_y: f32) ?Ui3dPickHit {
+        const front = self.draws.frontIndex();
+        const snap = &self.draws.slots[front].snapshot;
+        if (!snap.has_camera) return null;
+        const w: f32 = @floatFromInt(snap.screen_w);
+        const h: f32 = @floatFromInt(snap.screen_h);
+        if (w <= 0.0 or h <= 0.0) return null;
+        const inv_vp = snap.primary_cam.view_proj.invert() orelse return null;
+        const ndc_x = (2.0 * mouse_x) / w - 1.0;
+        const ndc_y = 1.0 - (2.0 * mouse_y) / h;
+        const near_pt = inv_vp.transformPoint(Vec3.new(ndc_x, ndc_y, 0.0));
+        const far_pt = inv_vp.transformPoint(Vec3.new(ndc_x, ndc_y, 1.0));
+        const dir = far_pt.sub(near_pt).normalize();
+        return self.gui3d.pick(Ray.new(near_pt, dir));
     }
 
     // ---- Lights. ----
@@ -1517,6 +1625,14 @@ pub const Scene = struct {
             }
         }
 
+        // 3D GUI panels (wave 28, v1): world-space UI quads drawn after the
+        // transparent queue (depth-tested, depth-write-off, double-sided —
+        // see scene/gui3d_layer.zig). The layer early-outs on a pure CPU
+        // count with zero sg.* calls when no panel is drawable, so
+        // panel-less frames are bit-identical. Probe face captures never
+        // reach this path (renderProbeFace inlines its own draws).
+        self.gui3d.drawPanels(self.allocator, view_proj, samples, env.stats);
+
         // Inverse-hull outline for highlighted meshes (P7: published slot
         // payload, never live Scene fields).
         self.postfx.renderOutlineItems(
@@ -1600,6 +1716,19 @@ pub const Scene = struct {
         sg.applyScissorRect(0, 0, cur_w, cur_h, true);
 
         self.probes.notifyCaptured(idx);
+    }
+
+    /// Runs at most `max_captures_per_frame` (1) pending 3D-GUI panel
+    /// captures (wave 28, v1). Lowest dirty + enabled index first; the rest
+    /// wait for later frames. Fail-closed like the probe path (headless or
+    /// creation failure keeps the panel dirty for retry). The layer owns the
+    /// upload + offscreen RT pass; this only budgets the count.
+    fn captureDirtyUi3dPanels(self: *Scene) void {
+        var n: usize = 0;
+        while (n < scene_gui3d.max_captures_per_frame) : (n += 1) {
+            const idx = self.gui3d.nextDirtyIndex() orelse return;
+            if (!self.gui3d.capturePanel(self.allocator, &self.gpu_retire, idx)) return;
+        }
     }
 
     /// Renders the prepared primary draw list plus the sky into one cube
@@ -2885,6 +3014,17 @@ pub const Scene = struct {
         }
 
         // ==============================================
+        // PASS 1.6: 3D-GUI PANEL CAPTURE (at most one dirty panel)
+        // ==============================================
+        // Same shape as the probe capture above: on-demand, context thread,
+        // skipped by renderReuse (dirty flags are retained for later) and by
+        // camera-less frames (which return before this point). With no dirty
+        // panels this is one pure-CPU null check — zero sg.* calls.
+        if (!self.rendering_reuse) {
+            self.captureDirtyUi3dPanels();
+        }
+
+        // ==============================================
         // PASS 2: MAIN SCENE RENDER PASS
         // ==============================================
         var main_pass_action = sg.PassAction{};
@@ -3193,6 +3333,7 @@ pub const Scene = struct {
         self.shadows.deinit();
         self.sky.deinit();
         self.probes.deinit();
+        self.gui3d.deinit(self.allocator);
 
         self.forward.deinit();
         if (self.forward_msaa) |*fw| fw.deinit();
