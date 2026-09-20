@@ -8,9 +8,9 @@
 //! from `input_state.zig`. `ui.zig` forwards the `UICanvas` widget methods so
 //! the public API is unchanged.
 //!
-//! Styled variants (`drawStyledButton`, ...) stay on the facade: they couple
+//! Styled variants (`drawStyledButton`, ...) live in `style.zig`: they couple
 //! to the theme cascade and the retained transition storage owned by
-//! `UICanvas`.
+//! `UICanvas` (reached through the canvas forwarders like every other leaf).
 
 const std = @import("std");
 

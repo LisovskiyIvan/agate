@@ -185,11 +185,16 @@ test {
     _ = @import("texture/mip.zig");
     _ = @import("ttf.zig");
     _ = @import("ui.zig");
+    _ = @import("ui/canvas.zig");
     _ = @import("ui/css_parser.zig");
     _ = @import("ui/css_parser_fuzz.zig");
     _ = @import("ui/draw.zig");
+    _ = @import("ui/font.zig");
+    _ = @import("ui/gpu.zig");
     _ = @import("ui/input_state.zig");
     _ = @import("ui/layout.zig");
+    _ = @import("ui/stack.zig");
+    _ = @import("ui/style.zig");
     _ = @import("ui/text.zig");
     _ = @import("ui/theme.zig");
     _ = @import("ui/transition.zig");
