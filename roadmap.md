@@ -24,7 +24,7 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease; lock-free остаток — только снятие phase-mutex | 🟡 |
+| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; lock-free остаток — write-back инстансов + live identity guard + UI latch handle resolution, затем снятие phase-mutex | 🟡 |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
@@ -54,7 +54,7 @@
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
 | Soft body | — | ❌ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
-| UI | Экранный canvas, SDF-текст, кнопки/панели, checkbox, slider, dropdown, скролл, text input, CSS-темы, анимации переходов | ✅ |
+| UI | Экранный canvas, SDF-текст + TrueType (glyf-парсер, cmap 4/12, композитные глифы, kern fmt0, scanline-растеризатор, атлас), кнопки/панели, checkbox, slider, dropdown, скролл, text input, CSS-темы, анимации переходов | ✅ |
 | Layout-контейнеры, Flex/Grid UI | LayoutStack: HStack, VStack, Flexbox, CSS Grid (fr/px/%), 9-point Anchors, Docking (top/bottom/left/right/fill), Spacers, Spans | ✅ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb, звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling), OGG/MP3/WAV потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы и кроссфейдинг музыки | ✅ |
 | mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) | ✅ |
@@ -571,6 +571,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * `UICanvas`: экранный immediate-mode рендер квадов с геометрическим динамическим перевыделением GPU-буферов.
 * Примитивы: rect, outline, panel, прогресс-бар, кнопка, бейдж, checkbox, slider, dropdown, скролл (`ScrollState`), поле ввода текста (`TextInputState`, UTF-8 редактирование), divider, arrow, line (`drawLine`), SDF-текст (обычный/жирный/с обводкой), `measureText`, hit-test.
 * SDF-шрифт зашит в движок (SDF-атлас), масштабируется без потери чёткости, CLI-флаг `--ui-scale N`.
+* TrueType-шрифты (`ttf.zig`: glyf-парсер head/maxp/cmap fmt4+fmt12/hhea/hmtx/loca, простые + композитные глифы ≤8, kern fmt0; scanline coverage-растеризатор, 512px RGBA8 shelf-атлас; явный error set без silent fallback; `UICanvas.setFontTtf/clearFontTtf/hasTtfFont/measureTextCurrent`, битмапный шрифт — дефолт; вне скоупа: хинтинг, лигатуры/шейпинг/RTL, субпиксель, цветные шрифты).
 * `Scene.projectPoint` — мировые точки в экранные (используется для 3D-подписей над объектами).
 
 ### Аудио
@@ -615,7 +616,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
-| UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + checkbox/slider/dropdown/скролл/text input | Layout-контейнеров, 3D-виджетов, загрузки шрифтов, фокуса/состояния, редактора |
+| UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + TrueType-шрифты + checkbox/slider/dropdown/скролл/text input | Layout-контейнеров, 3D-виджетов, фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
 | Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
@@ -655,7 +656,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Soft bodies; импорт коллайдеров из файлов сцен.
 
 **UI/GUI**
-* 3D-GUI (billboard/world-space), загрузка TTF/OTF-шрифтов и Unicode (LayoutStack, HStack/VStack/Flexbox/CSS Grid, 9-точечные якоря, докинг панелей, анимации переходов и CSS-темы уже реализованы).
+* 3D-GUI (billboard/world-space), Unicode-шейпинг поверх TTF (сам TTF — парсинг, растеризация, атлас — уже реализован, см. ✅; LayoutStack, HStack/VStack/Flexbox/CSS Grid, 9-точечные якоря, докинг панелей, анимации переходов и CSS-темы уже реализованы).
 
 **Аудио**
 * Высокоуровневый интерактивный секвенсер / FMOD-style нодовый звуковой граф (потоковый стриминг OGG/MP3/WAV, SPSC ring buffer, кроссфейд музыки, динамические шины, DAG-дерево, затухание, Doppler, biquad IIR-фильтры, Freeverb-реверберация и звуковая окклюзия уже реализованы).
