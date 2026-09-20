@@ -4734,3 +4734,197 @@ test "wave26: render pins/unpins the front; prepare rotates under a held pin" {
     try std.testing.expectEqual(@as(usize, 3), mem_snap.prepared_draws_slots);
     try std.testing.expectEqual(scene.draws.cpuBytes(), mem_snap.prepared_draws_cpu_bytes);
 }
+
+// ---- Wave 27: slot-owned frame snapshot. ----
+//
+// prepare/render/reuse/the UI latch read the consumed slot's staged
+// `FrameDrawSlot.snapshot` — never the live `Scene.frame_snapshot` — so a
+// game-side mutation after staging cannot tear the in-flight frame.
+
+test "wave27: build stages the slot snapshot equal to the published generation" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.sky.enabled = true;
+    scene.sky.exposure = 2.0;
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+
+    // The claim slot stages the exact build generation (plain value copy).
+    const staged = &scene.draws.slots[scene.build_slot].snapshot;
+    try std.testing.expectEqual(scene.build_snapshot.has_camera, staged.has_camera);
+    try std.testing.expectEqual(scene.build_snapshot.screen_w, staged.screen_w);
+    try std.testing.expectEqual(scene.build_snapshot.screen_h, staged.screen_h);
+    try std.testing.expectEqual(@as(i32, 800), staged.screen_w);
+    try std.testing.expectEqual(@as(i32, 600), staged.screen_h);
+    try std.testing.expectEqual(scene.build_snapshot.sky_exposure, staged.sky_exposure);
+    try std.testing.expectEqual(scene.build_snapshot.primary_cam.eye, staged.primary_cam.eye);
+    try std.testing.expectEqual(scene.build_snapshot.camera_count, staged.camera_count);
+    try std.testing.expectEqual(scene.build_snapshot.clear_color, staged.clear_color);
+    // The live consumed copy is untouched by the build (update may overlap
+    // render): still the zero fixture state.
+    try std.testing.expect(!scene.frame_snapshot.has_camera);
+    try std.testing.expectEqual(@as(i32, 0), scene.frame_snapshot.screen_w);
+}
+
+test "wave27: post-build live mutation does not change the prepared frame" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.sky.enabled = true;
+    scene.sky.exposure = 2.0;
+
+    // Generation B: publish + build (frozen).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(i32, 800), scene.draws.slots[scene.build_slot].snapshot.screen_w);
+
+    // Live mutations AFTER the build: both working copies plus a newer
+    // mailbox publication C (stays queued, like the B-vs-C latch test).
+    scene.build_snapshot.sky_exposure = 9.0;
+    scene.build_snapshot.screen_w = 111;
+    scene.build_snapshot.screen_h = 111;
+    scene.frame_snapshot.screen_w = 222;
+    scene.sky.exposure = 5.0;
+    scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
+
+    // Latch: the prepared frame is exactly B — staged wins over every
+    // post-build mutation. The compat mirror follows the staged copy.
+    scene.prepareFrame();
+    const front = scene.preparedDraws();
+    try std.testing.expectEqual(@as(i32, 800), front.snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 600), front.snapshot.screen_h);
+    try std.testing.expectEqual(@as(f32, 2.0), front.snapshot.sky_exposure);
+    try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
+
+    // C waited in the mailbox: the next fallback (no build) sees it.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
+    try std.testing.expectEqual(@as(f32, 5.0), scene.preparedDraws().snapshot.sky_exposure);
+}
+
+test "wave27: fallback stages the slot snapshot; render+reuse present it" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    // Camera-less headless fixture: dims latch before the no-camera
+    // early-out; render consumes via the no-camera return (no sg.*).
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    const front0 = scene.draws.front;
+    try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 480), scene.preparedDraws().snapshot.screen_h);
+    try std.testing.expect(!scene.preparedDraws().snapshot.has_camera);
+
+    // Concurrent-update simulation: hammer the live working copy. Render
+    // must still take the STAGED no-camera early return (a live read would
+    // walk into the sg main-pass path headless).
+    scene.frame_snapshot.has_camera = true;
+    scene.frame_snapshot.screen_w = 999;
+    scene.frame_snapshot.screen_h = 999;
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(front0, scene.draws.front);
+    try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
+
+    // Reuse re-presents the same staged snapshot, untouched by the live
+    // mutation above.
+    scene.renderReuse();
+    try std.testing.expectEqual(@as(u64, 1), scene.reuseStreak());
+    try std.testing.expectEqual(front0, scene.draws.front);
+    try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
+    try std.testing.expectEqual(@as(i32, 480), scene.preparedDraws().snapshot.screen_h);
+    try std.testing.expect(!scene.preparedDraws().snapshot.has_camera);
+}
+
+test "wave27: UI latch reads the staged snapshot dims" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Generation B through the build path; the UI stage lands after the
+    // build (the build reset would wipe an earlier packet).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.stageUiPacket();
+    // Post-build live mutation of the working copy: the latch must still
+    // capture the staged dims.
+    scene.build_snapshot.screen_w = 111;
+    scene.build_snapshot.screen_h = 222;
+    scene.prepareFrame();
+
+    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
+    try std.testing.expectEqual(@as(f32, 800.0), scene.ui_frame.screen_w);
+    try std.testing.expectEqual(@as(f32, 600.0), scene.ui_frame.screen_h);
+    try std.testing.expectEqual(@as(i32, 800), scene.preparedDraws().snapshot.screen_w);
+}
+
+test "wave27: 3-slot rotation keeps per-slot snapshots distinct" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    // Camera-less: dims latch before the no-camera early-out, so the
+    // rotation is observable without any GPU init.
+    var fronts: [3]usize = undefined;
+    const widths = [_]i32{ 111, 222, 333 };
+    for (widths, 0..) |w, i| {
+        scene.publishFrameSnapshot(1.0, w, w);
+        scene.prepareFrame();
+        fronts[i] = scene.draws.front;
+        try std.testing.expectEqual(w, scene.preparedDraws().snapshot.screen_w);
+    }
+    // Three prepares rotated through three distinct slots (1, 2, 0), each
+    // retaining its own generation — no cross-slot copy, no wipe.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, &fronts);
+    for (fronts, widths) |f, w| {
+        try std.testing.expectEqual(w, scene.draws.slots[f].snapshot.screen_w);
+    }
+}

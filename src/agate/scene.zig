@@ -310,15 +310,27 @@ pub const Scene = struct {
     /// so threaded applications must keep update-vs-prepare exclusion
     /// (producer update, consumer prepare); update may overlap render.
     frame_handoff: handoff_mod.Handoff(scene_snapshot.SceneFrameSnapshot, 2) = .{},
-    /// Last consumed frame snapshot (context/prepare + render ownership:
-    /// prepare writes it, render reads it; update/build NEVER touch it, so a
-    /// concurrent update cannot race the in-flight draw).
+    /// Prepare-side working/compat copy of the frame snapshot (wave 27):
+    /// the fallback prepare path latches the mailbox (or a fresh pack) here
+    /// and immediately stages it into the consumed back slot
+    /// (`FrameDrawSlot.snapshot`); the build path mirrors the staged slot
+    /// copy here for compatibility. Prepare reads the CONSUMED SLOT's staged
+    /// copy (never this field past the latch point), and render/reuse/the UI
+    /// latch never read this field at all — they read the front slot's staged
+    /// snapshot — so a concurrent game-side mutation cannot tear the
+    /// in-flight draw. Update/build NEVER touch this field (update||render
+    /// overlap would race the draw); the game-private working copy on the
+    /// producer side is `build_snapshot`.
     frame_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
     /// Producer-owned build snapshot (game/update phase ownership): the exact
     /// generation the last `buildPreparedFrame` culled/built queues against.
     /// Plain value camera/pass state (Camera.name slices alias, but draw
-    /// never dereferences names — no deep copy). The latch copies it into
-    /// `frame_snapshot` verbatim; render never reads this.
+    /// never dereferences names — no deep copy). `buildPreparedFrame` stages
+    /// it into the claim slot's `snapshot` by value; the latch consumes the
+    /// STAGED copy (staged wins over a post-build `build_snapshot` mutation),
+    /// mirroring it into `frame_snapshot` for compatibility. The build NEVER
+    /// reads/writes `frame_snapshot`, otherwise it races the draw under
+    /// update||render.
     build_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
     /// Flag indicating whether prepareFrame() has already run for this frame.
     frame_prepared: bool = false,
@@ -1258,9 +1270,10 @@ pub const Scene = struct {
 
     /// Shared queue/shadow/outline build parameters (stage-2 increment B):
     /// one internal function `buildQueuesInto` fills a `FrameDrawSlot` from
-    /// these plus the explicit `snap` cameras (never `Scene.frame_snapshot`:
-    /// the build must not read the consumed render snapshot). Fallback passes
-    /// `&frame_snapshot` with `frame_id` as `cache_key`, `&self.stats`, the
+    /// these plus the explicit `snap` cameras (never `Scene.frame_snapshot`
+    /// nor the slot's staged copy: the build must not read the consumed
+    /// render snapshot). Fallback passes the staged slot snapshot with
+    /// `frame_id` as `cache_key`, `&self.stats`, the snapshot primary eye,
     /// snapshot primary eye, the resolved snapshot sky/ibl, `true`, and
     /// `.published` (today's exact behavior). The game-side build passes
     /// `&build_snapshot` with the build-unique key `(build_seq | (1<<63))`
@@ -1346,10 +1359,10 @@ pub const Scene = struct {
     /// `prepareInto` + view-queue `prepareViewQueues` calls) in one internal
     /// function, callable from the game-side `buildPreparedFrame` (with
     /// `&build_snapshot` + `.build_view` + build-unique cache key +
-    /// `&build_stats`) and from the fallback latch (with `&frame_snapshot` +
-    /// `.published` + frame_id + `&self.stats`). Reads cameras ONLY from
-    /// `params.snap` (never `self.frame_snapshot`/`self.build_snapshot`
-    /// directly), so the build generation stays frozen. Producer `.build_view`
+    /// `&build_stats`) and from the fallback latch (with the staged slot
+    /// snapshot + `.published` + frame_id + `&self.stats`). Reads cameras
+    /// ONLY from `params.snap` (never `self.frame_snapshot`/
+    /// `self.build_snapshot` directly), so the build generation stays frozen. Producer `.build_view`
     /// freezes on the snapshot shadow switch alone; fallback keeps the
     /// historical live `shadows.enabled` gate.
     /// Fallback passes today's exact values (see `prepareFrame`) and stays
@@ -1544,7 +1557,9 @@ pub const Scene = struct {
     /// Runs at most one pending reflection-probe capture (wave 25, v1).
     /// Context thread only; called from `render` between the shadow depth
     /// pass and the main pass, never from `renderReuse` (which re-presents
-    /// the consumed front, probe snapshot included).
+    /// the consumed front, probe snapshot included). Takes the staged slot
+    /// snapshot from the caller (the front slot's copy `render` already
+    /// reads) — never the live `frame_snapshot`.
     ///
     /// What one capture does, in order: ensure the probe's GPU target (fail
     /// closed when headless or on creation failure — the probe stays dirty
@@ -1560,13 +1575,14 @@ pub const Scene = struct {
     /// per frame maximum). The fresh content reaches draws one prepare
     /// later (the snapshot is packed in `prepareFrame`, before `render`
     /// captures) — a documented one-frame lag.
-    fn captureDirtyProbes(self: *Scene) void {
+    fn captureDirtyProbes(self: *Scene, snap: *const SceneFrameSnapshot) void {
         const idx = self.probes.nextDirtyIndex() orelse return;
         if (!sg.isvalid()) return;
         if (!self.probes.ensureGpu(idx)) return;
         const probe = &self.probes.probes[idx];
         const draws = self.preparedDraws();
-        const snap = &self.frame_snapshot;
+        // Staged slot snapshot (never the live frame_snapshot): the capture
+        // renders the same generation the main pass draws.
         const far = scene_probes.captureFar(probe.radius);
 
         var face_i: u8 = 0;
@@ -1868,12 +1884,13 @@ pub const Scene = struct {
     /// an older published frame over the newer fallback.
     ///
     /// Render-ownership: the saturated fallback NEVER writes the consumed
-    /// `frame_snapshot` directly. Render reads `frame_snapshot`
-    /// concurrently with update (update||render overlap), so a producer-side
-    /// overwrite would race the draw; the last-unclaimable tick is DROPPED
-    /// instead (newest published frame stays, this one is skipped). Producer
-    /// (update) vs consumer (prepare) stay excluded under phase_mutex, which
-    /// is what makes releasePublished safe here.
+    /// snapshot directly. Render reads the front slot's STAGED snapshot
+    /// (`FrameDrawSlot.snapshot`) concurrently with update (update||render
+    /// overlap), so a producer-side overwrite would race the draw; the
+    /// last-unclaimable tick is DROPPED instead (newest published frame
+    /// stays, this one is skipped). Producer (update) vs consumer (prepare)
+    /// stay excluded under phase_mutex, which is what makes
+    /// releasePublished safe here.
     pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
         const snap = self.packFrameSnapshot(aspect, cur_w, cur_h);
         if (self.frame_handoff.claim()) |i| {
@@ -1979,11 +1996,14 @@ pub const Scene = struct {
     /// captured screen size matches the selected scene snapshot (same
     /// fallback as render: snapshot dims when positive, live sapp dims
     /// otherwise — a zero placeholder snapshot never hides a valid GPU
-    /// frame). Snapshots canvas presence separately from nonempty/gpu_ready
+    /// frame). Takes the STAGED slot snapshot from the caller (the slot
+    /// prepare is consuming) — never the live `frame_snapshot` — so the
+    /// latched dims track the prepared frame's generation. Snapshots canvas
+    /// presence separately from nonempty/gpu_ready
     /// so the historical phantom+1 counters survive empty frames. Missing
     /// canvas or camera-less frames fail close to coherent-empty — never a
     /// stale prior overlay, never an unsafe upload/draw.
-    fn captureUiFrame(self: *Scene) void {
+    fn captureUiFrame(self: *Scene, snap: *const SceneFrameSnapshot) void {
         // Slot-owned UI packet first (game-side staging, slice 2 b): when
         // the game staged a fresh packet, the latch consumes it instead of
         // reading the live canvas lists. The seq is stamped consumed on ALL
@@ -1996,13 +2016,13 @@ pub const Scene = struct {
                 if (back.ui_packet.canvas_present) {
                     if (self.ui_canvas) |*canvas| {
                         self.ui_frame.canvas_present = true;
-                        if (!self.frame_snapshot.has_camera) {
+                        if (!snap.has_camera) {
                             self.ui_frame.clearEmpty();
                             self.ui_frame.canvas_present = true;
                             return;
                         }
-                        const w = if (self.frame_snapshot.screen_w > 0) self.frame_snapshot.screen_w else sapp.width();
-                        const h = if (self.frame_snapshot.screen_h > 0) self.frame_snapshot.screen_h else sapp.height();
+                        const w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
+                        const h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
                         self.ui_frame.capturePacket(
                             self.allocator,
                             canvas,
@@ -2039,13 +2059,13 @@ pub const Scene = struct {
             return;
         };
         self.ui_frame.canvas_present = true;
-        if (!self.frame_snapshot.has_camera) {
+        if (!snap.has_camera) {
             self.ui_frame.clearEmpty();
             self.ui_frame.canvas_present = true;
             return;
         }
-        const w = if (self.frame_snapshot.screen_w > 0) self.frame_snapshot.screen_w else sapp.width();
-        const h = if (self.frame_snapshot.screen_h > 0) self.frame_snapshot.screen_h else sapp.height();
+        const w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
+        const h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
         self.ui_frame.capture(
             self.allocator,
             canvas,
@@ -2061,12 +2081,14 @@ pub const Scene = struct {
     /// P7 published consumable draw payload: the prepared mesh draw lists
     /// (PRIMARY + ALL PIP view queues with their skin/shader side stores,
     /// outline items+skins, prepared shadow items+skins+bin ranges), with the
-    /// frame_id/retire_epoch that built them. The ONLY low-level draw
-    /// accessor — render and P5/P7 tests read through here, never raw fields.
+    /// frame_id/retire_epoch that built them, PLUS the staged frame snapshot
+    /// (wave 27: render/reuse read the slot's copy, never live state). The
+    /// ONLY low-level draw accessor — render and P5/P7 tests read through
+    /// here, never raw fields.
     /// Scope is mesh draws only: UI (P6 ui_frame), physics-debug lines
     /// (prepared_lines + committed DebugPass upload), sky params + default
-    /// copies (frame_snapshot), and particles (prepared frame) are separate
-    /// payloads — none of them reads live subsystems at draw time. Trail
+    /// copies (staged slot snapshot), and particles (prepared frame) are
+    /// separate payloads — none of them reads live subsystems at draw time. Trail
     /// meshes ride these same queues: Trail.update stages CPU-side, the
     /// prepare flush uploads, and the queue build bakes the values.
     ///
@@ -2252,13 +2274,16 @@ pub const Scene = struct {
     /// finalizes handles after `stageInstancesLatch`.
     ///
     /// Snapshot: consumes the newest published tick into the producer-owned
-    /// `build_snapshot` (update-vs-prepare excluded) BEFORE any CPU staging;
-    /// when nothing new was published ALWAYS packs fresh live state — never
-    /// reuses the consumed render `frame_snapshot`, so the build works
-    /// without a publish and after camera removal. Staging eye, queue
-    /// culling, shadow switch, and sky/ibl all freeze on this generation
-    /// (fixed-size snapshot values only; live meshes/materials/culling flags
-    /// stay live by design). Never reads or writes `frame_snapshot`.
+    /// `build_snapshot` (update-vs-prepare excluded) BEFORE any CPU staging,
+    /// then freezes that generation into the claim slot's staged `snapshot`
+    /// (wave 27, by value); when nothing new was published ALWAYS packs
+    /// fresh live state — never reuses the consumed render snapshot, so the
+    /// build works without a publish and after camera removal. Staging eye,
+    /// queue culling, shadow switch, and sky/ibl all freeze on this
+    /// generation (fixed-size snapshot values only; live meshes/materials/
+    /// culling flags stay live by design). Never reads or writes
+    /// `frame_snapshot` (the latch consumes the staged slot copy, staged
+    /// wins over a post-build `build_snapshot` mutation).
     /// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
     /// cannot collide with any context `frame_id`). Stats accumulate into
     /// game-owned `build_stats` (cleared at build start), merged by the latch.
@@ -2268,7 +2293,7 @@ pub const Scene = struct {
     /// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
     /// no `self.stats`, no profiler. Mutates under game-phase ownership only:
     /// back-slot queues/shadow/outline + scratch, previews/build_views,
-    /// staged records,
+    /// staged records, the staged slot `snapshot`,
     /// particle/physics build frames, `build_snapshot` (refreshed), shadow
     /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
     /// with the build key), and `build_stats`.
@@ -2306,6 +2331,12 @@ pub const Scene = struct {
             const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
             self.build_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
         }
+        // Wave 27 slot-owned snapshot: freeze this generation into the claim
+        // slot by value (plain copy — Camera.name slices alias but are never
+        // dereferenced by draw; GPU handles are borrowed values under P3).
+        // The prepare latch consumes THIS copy (staged wins over any
+        // post-build `build_snapshot` mutation); `frame_snapshot` is untouched.
+        back.snapshot = self.build_snapshot;
         // Frozen snapshot eye (zero when camera-less): the CPU staging sort
         // and the queue build both use this generation, never the live eye.
         const eye = if (self.build_snapshot.has_camera) self.build_snapshot.primary_cam.eye else Vec3.zero;
@@ -2445,13 +2476,26 @@ pub const Scene = struct {
             self.physics.captureDebug(self.allocator);
         }
 
-        // Snapshot generations: with a fresh game build the latch publishes
-        // the EXACT build generation (`build_snapshot`, by value) — a newer
-        // publication after the build stays queued for the next build or
-        // fallback and never mixes culling/camera generations into these
-        // queues. Without a build the historical takeLatest-else-pack runs.
+        // Snapshot generations (wave 27, slot-owned): the consumed slot
+        // carries the staged copy — prepare reads the slot it is consuming,
+        // never the live working copies past this latch point. With a fresh
+        // game build the slot already stages the EXACT build generation
+        // (frozen by `buildPreparedFrame`; staged wins over a post-build
+        // `build_snapshot` mutation) and the latch mirrors it into
+        // `frame_snapshot` for compatibility — a newer mailbox publication
+        // after the build stays queued for the next build or fallback and
+        // never mixes culling/camera generations into these queues. Without
+        // a build the historical takeLatest-else-pack runs into
+        // `frame_snapshot`; the fallback branch below stages it into the
+        // back slot before consuming it.
+        // The back slot is resolved here, before the UI latch: `front` is
+        // untouched since the last publish, so the index stays stable across
+        // the latch (the staged UI packet lives in this same back slot).
+        const back_idx = self.draws.backIndex();
+        const back = &self.draws.slots[back_idx];
         if (have_build) {
-            self.frame_snapshot = self.build_snapshot;
+            std.debug.assert(self.build_slot == back_idx);
+            self.frame_snapshot = back.snapshot;
         } else {
             var snap = self.frame_snapshot;
             if (self.frame_handoff.takeLatest(&snap)) {
@@ -2463,13 +2507,19 @@ pub const Scene = struct {
                 self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
             }
         }
+        // The staged snapshot prepare consumes from here on: the back slot's
+        // frozen copy on the build path, the just-latched working copy on the
+        // fallback path (staged into the slot by the queue branch below —
+        // same bytes, so the UI latch and the MSAA sample gate already see
+        // the prepared generation either way).
+        const staged: *const SceneFrameSnapshot = if (have_build) &back.snapshot else &self.frame_snapshot;
 
         // UI packet latch BEFORE the queue branches below: the fallback
         // branch resets the back slot (wiping a staged UI packet), while the
         // latch path consumes it — so the packet must land in `ui_frame`
         // first. Order vs debug/instance uploads is irrelevant (disjoint
         // buffers; the meter sums identically).
-        self.captureUiFrame();
+        self.captureUiFrame(staged);
 
         // Debug line upload (GPU): the frame's single updateBuffer, once per
         // prepare no matter how many PIP views render below. Samples follow
@@ -2477,8 +2527,8 @@ pub const Scene = struct {
         // result). Headless the whole upload is skipped (the CPU capture
         // above already ran for tests) — no sg.* without a context.
         if (sg.isvalid()) {
-            const upload_samples = scene_msaa.effectiveSampleCount(self.frame_snapshot.msaa_sample_count, .{
-                .post_enabled = self.frame_snapshot.post_process.enabled,
+            const upload_samples = scene_msaa.effectiveSampleCount(staged.msaa_sample_count, .{
+                .post_enabled = staged.post_process.enabled,
                 .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
                 .backend = sg.queryBackend(),
             });
@@ -2489,8 +2539,8 @@ pub const Scene = struct {
         // P7: build the BACK slot in place, then publish with one index flip
         // at the end. The front slot is untouched during the build:
         // allocator failure in the back corrupts nothing consumable.
-        const back_idx = self.draws.backIndex();
-        const back = &self.draws.slots[back_idx];
+        // (`back_idx`/`back` were resolved before the UI latch above; `front`
+        // has not moved since, so they still address the build scratch.)
         if (have_build) {
             // Stage-2 latch: the game-side build already reset this back
             // slot, staged the instance scratch + previews + staged records +
@@ -2511,8 +2561,9 @@ pub const Scene = struct {
             // Remaining live coupling (next slice): the update-vs-prepare
             // mutex still guards the whole handoff, and the latch still
             // writes back `mesh.instance_render` (mirrored into the record so
-            // the patch itself is self-contained).
-            std.debug.assert(self.build_slot == back_idx);
+            // the patch itself is self-contained). The staged slot snapshot
+            // above is already frozen (wave 27) — the latch reads it, never
+            // the live `build_snapshot`/`frame_snapshot`.
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
             if (is_gpu_init) {
@@ -2525,7 +2576,7 @@ pub const Scene = struct {
                 // staged records frozen by buildPreparedFrame — no live
                 // preview reads; a mesh-list mutation between build and latch
                 // trips the per-record guard and fail-closes.
-                if (self.frame_snapshot.has_camera) {
+                if (back.snapshot.has_camera) {
                     scene_instance_staging.stageInstancesLatch(.{
                         .allocator = self.allocator,
                         .frame_id = self.frame_id,
@@ -2543,12 +2594,16 @@ pub const Scene = struct {
             self.build_stats = .{};
             self.last_latched_seq = self.build_seq;
         } else {
-            // Inline fallback (no fresh build): reset first — every list,
-            // including disabled views/shadow bins, so a skipped path can never
-            // resurface the other slot's prior frame — then stage fully.
+            // Inline fallback (no fresh build): reset first — every list
+            // plus the staged snapshot, so a skipped path can never resurface
+            // the other slot's prior frame — then stage fully.
             back.reset();
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
+            // Wave 27: freeze the just-latched working copy into the consumed
+            // slot before anything reads it below (plain copy, same bytes the
+            // UI latch and the MSAA gate above already consumed via `staged`).
+            back.snapshot = self.frame_snapshot;
             if (is_gpu_init) {
                 // Pre-stage instance data before the shadow pass: ShadowPass.prepare
                 // snapshots the published render state (bounds/buffer/count),
@@ -2558,13 +2613,13 @@ pub const Scene = struct {
                 // buffers retire into the epoch queue (P5), never destroyed inline.
                 // Staging scratch is the back primary's list (view builds with
                 // instances_prepared never retry mid-frame — failure coherence).
-                if (self.frame_snapshot.has_camera) {
+                if (back.snapshot.has_camera) {
                     scene_instance_staging.stageInstances(.{
                         .allocator = self.allocator,
                         .instance_matrices = &back.primary.instance_matrices,
                         .thread_pool = jobs.global,
                         .frame_id = self.frame_id,
-                        .eye = self.frame_snapshot.primary_cam.eye,
+                        .eye = back.snapshot.primary_cam.eye,
                         .retire_queue = &self.gpu_retire,
                     }, self.meshes.items);
                 }
@@ -2573,19 +2628,19 @@ pub const Scene = struct {
 
         // Shared builder — fallback only (stage-2B): when no fresh game build
         // exists, outline + shadow + view queues build here with exactly
-        // today's values (&frame_snapshot, frame_id as cache_key, &self.stats,
-        // snapshot eye, resolved sky/ibl, true, `.published`) — bit-identical
-        // to the old inline path. When have_build the payload was already
-        // built game-side (`.build_view` + patch above); rebuilding would
-        // unfreeze the sets.
+        // today's values (staged slot snapshot, frame_id as cache_key,
+        // &self.stats, snapshot eye, resolved sky/ibl, true, `.published`) —
+        // bit-identical to the old inline path. When have_build the payload
+        // was already built game-side (`.build_view` + patch above);
+        // rebuilding would unfreeze the sets.
         if (!have_build) {
-            const sky_tex = self.frame_snapshot.sky_texture orelse self.sky.texture;
-            const ibl_int = self.frame_snapshot.ibl_intensity;
+            const sky_tex = back.snapshot.sky_texture orelse self.sky.texture;
+            const ibl_int = back.snapshot.ibl_intensity;
             self.buildQueuesInto(back, .{
-                .snap = &self.frame_snapshot,
+                .snap = &back.snapshot,
                 .cache_key = self.frame_id,
                 .stats = &self.stats,
-                .eye = self.frame_snapshot.primary_cam.eye,
+                .eye = back.snapshot.primary_cam.eye,
                 .sky_texture = sky_tex,
                 .ibl_intensity = ibl_int,
                 .instances_prepared = true,
@@ -2604,11 +2659,12 @@ pub const Scene = struct {
     /// point/spot lights for the camera (advancing the incumbency-
     /// hysteresis fades with `dt`) and stores the uniform-ready pack.
     /// Called once per frame BEFORE render(); render consumes
-    /// `snapshot.light_pack` (via frame_snapshot), never `self.light_pack`
-    /// and never live light state — so the direct `self.light_pack` fallback
-    /// below stays game/prepare-side ownership (update vs prepare excluded
-    /// under phase_mutex) and needs no atomic mailbox. No new mailbox: the
-    /// render reads the snapshot copy taken by packFrameSnapshot.
+    /// `snapshot.light_pack` (via the staged slot snapshot), never
+    /// `self.light_pack` and never live light state — so the direct
+    /// `self.light_pack` fallback below stays game/prepare-side ownership
+    /// (update vs prepare excluded under phase_mutex) and needs no atomic
+    /// mailbox. No new mailbox: the render reads the snapshot copy taken by
+    /// packFrameSnapshot.
     pub fn updateLights(self: *Scene, dt: f32) void {
         // Zero-eye fallback keeps the pack defined for camera-less scenes
         // (render early-returns without a camera anyway).
@@ -2645,7 +2701,7 @@ pub const Scene = struct {
     /// simulation advances per frame, in one call, in the canonical order
     /// (camera -> lights -> physics -> animations -> particles -> decals);
     /// render() then consumes the published frame values (light_pack,
-    /// frame_snapshot, prepared draws/UI/debug/sky/particles) without
+    /// staged slot snapshot, prepared draws/UI/debug/sky/particles) without
     /// simulating anything itself.
     ///
     /// Runs on the game side and MAY overlap render (update||render): it must
@@ -2708,10 +2764,10 @@ pub const Scene = struct {
     /// Render entry: draws the frame prepared by prepareFrame (context
     /// thread, SEQUENTIAL with prepare — never concurrent; update MAY run
     /// concurrently on the game side). Reads ONLY render-owned captures
-    /// (prepared draws, frame_snapshot incl. sky/default copies, ui_frame,
-    /// debug capture + committed upload, particle prepared frame) plus
-    /// BORROWED GPU handles under P3 epochs. No global phase lock is taken
-    /// here: the app unlocks update-vs-prepare ownership BEFORE calling
+    /// (prepared draws + the staged slot snapshot incl. sky/default copies,
+    /// ui_frame, debug capture + committed upload, particle prepared frame)
+    /// plus BORROWED GPU handles under P3 epochs. No global phase lock is
+    /// taken here: the app unlocks update-vs-prepare ownership BEFORE calling
     /// render (see main), and prepare already ran. Takes no sg.* outside the
     /// context thread (asserted). Every subsystem above is snapshot-driven;
     /// no live subsystem reads remain on this path.
@@ -2749,7 +2805,11 @@ pub const Scene = struct {
         // pin only extends CPU-slot reuse exclusion, never GPU consumability
         // — see scene/frame_draws.zig).
         const draws = self.preparedDraws();
-        const snap = &self.frame_snapshot;
+        // Wave 27 slot-owned snapshot: the whole draw below reads the front
+        // slot's staged copy — never the live `frame_snapshot` — so a
+        // concurrent game-side mutation cannot tear the in-flight frame.
+        // Staged verbatim at prepare, so sequential usage is bit-identical.
+        const snap = &draws.snapshot;
         if (!snap.has_camera) {
             // Камеры нет — UI/debug-проходов не будет: переносим только
             // prepare-фазу динамики, чтобы счётчик не утёк в следующий кадр.
@@ -2821,7 +2881,7 @@ pub const Scene = struct {
         // (checked below); camera-less frames return before this point, so
         // they skip capture too (dirty flags are retained for later).
         if (!self.rendering_reuse) {
-            self.captureDirtyProbes();
+            self.captureDirtyProbes(snap);
         }
 
         // ==============================================

@@ -89,24 +89,29 @@
 //! Honest scope note — what this is NOT: the phase-mutex removal (true
 //! concurrent update+prepare) is still NOT done and is not claimed. This
 //! file makes the 3-slot rotation and the pin/lease primitives real and
-//! tested, but update-vs-prepare exclusion (phase_mutex) is still required,
-//! because the producer build and the prepare latch still touch LIVE state
-//! outside the slot-owned data:
+//! tested, and wave 27 made the frame snapshot slot-owned (`FrameDrawSlot.
+//! snapshot`: prepare/render/reuse/UI-latch read the staged slot copy, never
+//! the live `Scene.frame_snapshot` — that closes the snapshot-tearing
+//! obstacle), but update-vs-prepare exclusion (phase_mutex) is still
+//! required, because the producer build and the prepare latch still touch
+//! LIVE state outside the slot-owned data:
 //! - `Scene.buildPreparedFrame` reads live meshes (TRS, materials, culling
 //!   flags), the live canvas (stageUiPacket), live particle/physics systems,
 //!   and live camera/light/sky state (packFrameSnapshot), and writes live
 //!   per-mesh previews/build_views;
 //! - the prepare latch writes back live `mesh.instance_render` (guarded
 //!   write-back), reads the live mesh list for the identity guard, and the
-//!   UI latch resolves handles/pipeline/dims from the live canvas;
-//! - `build_snapshot`/`frame_snapshot` publication still assumes the
-//!   producer and the latch never run concurrently.
+//!   UI latch resolves handles/pipeline/font/dims from the live canvas;
+//! - the frame mailbox (`frame_handoff`) producer/consumer pair is still
+//!   phase-excluded (a true concurrent producer would need the claim/pin API
+//!   here instead of the sequential backIndex/publish path).
 //! What IS already slot-owned (and therefore needs no lock once the mutex
-//! goes): the staged instance records, the UI packet lists+header, and the
-//! prepare-gated GPU uploads (P3 epochs + upload meter). Removing the phase
-//! mutex means moving the remaining live reads above under the same
-//! freeze-then-latch shape (or an equivalent mailbox) — the pin/lease here
-//! only covers the variable-length draw payload, deliberately nothing else.
+//! goes): the frame snapshot, the staged instance records, the UI packet
+//! lists+header, and the prepare-gated GPU uploads (P3 epochs + upload
+//! meter). Removing the phase mutex means moving the remaining live reads
+//! above under the same freeze-then-latch shape (or an equivalent mailbox)
+//! — the pin/lease here only covers the variable-length draw payload plus
+//! the staged snapshot, deliberately nothing else.
 
 const std = @import("std");
 const render_queue = @import("render_queue.zig");
@@ -190,6 +195,27 @@ pub const FrameDrawSlot = struct {
     ui_vertices: std.ArrayListUnmanaged(ui_mod.UIVertex) = .empty,
     ui_indices: std.ArrayListUnmanaged(u16) = .empty,
     ui_packet: ui_frame_mod.UiPacketState = .{},
+    /// Slot-owned staged frame snapshot (wave 27, lock-free prerequisite):
+    /// the frame-level camera/light/pass state the prepared payload was
+    /// built against, frozen by value at build time. `Scene.buildPreparedFrame`
+    /// (game side) stages `build_snapshot` here; the fallback prepare path
+    /// stages `frame_snapshot` here after the takeLatest-else-pack latch.
+    /// `prepareFrame`/`render`/`renderReuse`/the UI latch all read THIS copy
+    /// (prepare reads the slot it is consuming, render/reuse read the front
+    /// slot's copy) — never the live `Scene.frame_snapshot`, so a concurrent
+    /// game-side mutation cannot tear the in-flight frame.
+    ///
+    /// Plain struct copy (`slot.snapshot = snap`), never pointers into game
+    /// state: `Camera.name` slices alias the live camera names, but the draw
+    /// path never dereferences names (projection matrices are precomputed in
+    /// the snapshot); GPU handles (`sky_texture`, default copies, probe
+    /// views/samplers) are borrowed VALUES under the P3 epoch discipline
+    /// (same as every other handle in this slot — never destroyed/retired
+    /// through the slot). Fixed-size (no allocation, no deinit); `reset`
+    /// clears it so a skipped path can never resurface a prior frame, and
+    /// `cpuBytes` deliberately excludes it (fixed scalar, like
+    /// `frame_id`/`retire_epoch` — the census counts retained list capacity).
+    snapshot: snapshot_mod.SceneFrameSnapshot = .{},
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -208,6 +234,7 @@ pub const FrameDrawSlot = struct {
         self.ui_vertices.clearRetainingCapacity();
         self.ui_indices.clearRetainingCapacity();
         self.ui_packet = .{};
+        self.snapshot = .{};
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -227,6 +254,8 @@ pub const FrameDrawSlot = struct {
     /// sizes across every owned list, including the parallel-cull scratch
     /// and the staged/UI lists). Census helper for the profiler memory
     /// snapshot: capacities, not lengths, because retention is the cost.
+    /// The fixed-size staged `snapshot` is deliberately excluded (a constant
+    /// scalar like `frame_id`/`retire_epoch`, not retained list capacity).
     pub fn cpuBytes(self: *const FrameDrawSlot) usize {
         var b: usize = 0;
         b += queuesBytes(&self.primary);
