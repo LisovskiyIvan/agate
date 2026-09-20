@@ -100,7 +100,12 @@ test {
     _ = @import("physics_mesh.zig");
     _ = @import("postprocess.zig");
     _ = @import("profiler.zig");
+    _ = @import("profiler/core.zig");
+    _ = @import("profiler/diagnostics.zig");
+    _ = @import("profiler/recording.zig");
     _ = @import("profiler/report.zig");
+    _ = @import("profiler/snapshot.zig");
+    _ = @import("profiler/summary.zig");
     _ = @import("profiler/types.zig");
     _ = @import("ragdoll.zig");
     _ = @import("scene.zig");
