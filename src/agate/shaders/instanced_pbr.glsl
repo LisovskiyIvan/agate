@@ -112,6 +112,16 @@ layout(binding = 1) uniform fs_params {
     // batches in v1 — but the lane must exist for layout parity with the
     // regular/skinned PBR FsParams.)
     vec4 probe_params;
+    // APPENDED LAST (rect area lights, wave 26, v1): up to 2 rects in
+    // creation order. area_center_int xyz = rect center, w = intensity
+    // (0 when disabled/unused — the loop below skips, so zero lights
+    // render bit-identically); area_right/area_up = half-extent vectors;
+    // area_color rgb = emitted color. Appended last so no offset shifts.
+    // No area-light shadows in v1 (unshadowed by design).
+    vec4 area_center_int[2];
+    vec4 area_right[2];
+    vec4 area_up[2];
+    vec4 area_color[2];
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -410,6 +420,44 @@ float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
     return (1.0 - lit) * shadow_params.y;
 }
 
+// Rect area-light irradiance v1 (wave 26): analytic approximation, NOT LTC
+// and NOT a multi-sample integration. The fragment is lit by the closest
+// point Q on the rect (parallelogram projection onto the right/up
+// half-extent axes); the returned factor is
+//   emit * area / (dist^2 + area) * intensity
+// with emit = clamp(dot(rect_normal, -L)) (single-sided front-face
+// emission) and NdotL as an out-param for the caller's lobe. Limits,
+// stated honestly: no LTC lobe, so large/close rects shade harder-edged
+// than reality; no rect-shape specular anisotropy (the standard path uses
+// a Blinn-Phong boost from the same representative direction L, the PBR
+// path reuses its Cook-Torrance lobe); no shadows — an occluded area
+// light still lights (v1 scope). Zero intensity or zero area returns 0,
+// so zero lights are a bit-identical no-op.
+float areaLightFactor(vec3 frag_pos, vec3 N, int area_idx, out vec3 L, out float NdotL) {
+    float a_int = area_center_int[area_idx].w;
+    vec3 r = area_right[area_idx].xyz;
+    vec3 u = area_up[area_idx].xyz;
+    vec3 naxis = cross(r, u);
+    float rect_area = 4.0 * length(naxis);
+    L = N;
+    NdotL = 0.0;
+    if (a_int <= 0.0 || rect_area <= 1e-8) return 0.0;
+    vec3 nrect = naxis / (rect_area * 0.25);
+    vec3 c = area_center_int[area_idx].xyz;
+    vec3 d = frag_pos - c;
+    float x = clamp(dot(d, r) / max(dot(r, r), 1e-6), -1.0, 1.0);
+    float y = clamp(dot(d, u) / max(dot(u, u), 1e-6), -1.0, 1.0);
+    vec3 to_light = (c + r * x + u * y) - frag_pos;
+    float dist = length(to_light);
+    L = to_light / max(dist, 1e-4);
+    NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return 0.0;
+    float emit = clamp(dot(nrect, -L), 0.0, 1.0);
+    if (emit <= 0.0) return 0.0;
+    float att = rect_area / (dist * dist + rect_area);
+    return emit * att * a_int;
+}
+
 float distributionGGX(vec3 N, vec3 H, float roughness) {
     float a = roughness * roughness;
     float a2 = a * a;
@@ -689,6 +737,28 @@ void main() {
             float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
             Lo += (s_kD * albedo / PI + s_spec * s_atten + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
         }
+    }
+
+    // Rect area lights (up to 2, no shadows): zero-intensity lanes skip,
+    // so zero lights add nothing bit-identically. Same Cook-Torrance lobe
+    // as the other punctual lights, driven by the closest-point
+    // representative direction (no LTC in v1 — see areaLightFactor).
+    for (int i = 0; i < 2; i++) {
+        vec3 a_L;
+        float a_NdotL;
+        float a_factor = areaLightFactor(v_world_pos, N, i, a_L, a_NdotL);
+        if (a_factor <= 0.0) continue;
+        vec3 a_H = normalize(V + a_L);
+        float a_NDF = distributionGGX(N, a_H, roughness);
+        float a_G = geometrySmith(N, V, a_L, roughness);
+        vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
+        vec3 a_spec = (a_NDF * a_G * a_F) / (4.0 * NdotV * a_NdotL + 0.0001);
+        vec3 a_kD = (vec3(1.0) - a_F) * (1.0 - metallic);
+        vec3 a_rad = area_color[i].rgb * a_factor;
+        vec3 a_atten;
+        vec3 a_additive;
+        coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, a_atten, a_additive);
+        Lo += (a_kD * albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
     }
 
     // Ambient Occlusion

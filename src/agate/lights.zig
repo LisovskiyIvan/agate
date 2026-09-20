@@ -137,6 +137,64 @@ pub const PointLight = struct {
     }
 };
 
+pub const AreaLightOptions = struct {
+    center: Vec3 = Vec3.zero,
+    /// Local +X half-extent vector: direction AND half-width encoded in one
+    /// vector (corner = center +/- right +/- up). Must be non-zero and
+    /// non-parallel to `up`; degenerate inputs emit nothing (see normal()).
+    right: Vec3 = Vec3.new(0.5, 0.0, 0.0),
+    /// Local +Y half-extent vector (direction and half-height).
+    up: Vec3 = Vec3.new(0.0, 0.5, 0.0),
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    is_enabled: bool = true,
+};
+
+/// Maximum simultaneous rect area lights (wave 26, v1). See
+/// LightRig.addAreaLight for the creation cap.
+pub const max_area_lights: usize = 2;
+
+pub const AreaLight = struct {
+    name: []const u8 = "AreaLight",
+    /// True when `name` was heap-allocated; the scene frees it on
+    /// deinit/removal. Programmatic lights keep string literals.
+    owns_name: bool = false,
+    center: Vec3 = Vec3.zero,
+    right: Vec3 = Vec3.new(0.5, 0.0, 0.0),
+    up: Vec3 = Vec3.new(0.0, 0.5, 0.0),
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    /// Disabled lights pack as zeroed lanes (no contribution).
+    is_enabled: bool = true,
+
+    pub fn init(name: []const u8, options: AreaLightOptions) AreaLight {
+        return .{
+            .name = name,
+            .center = options.center,
+            .right = options.right,
+            .up = options.up,
+            .color = options.color,
+            .intensity = options.intensity,
+            .is_enabled = options.is_enabled,
+        };
+    }
+
+    /// Emitting-face normal: normalize(cross(right, up)). Zero when the
+    /// rect is degenerate (zero-area or parallel axes) — the shader then
+    /// contributes nothing (area gate), and CPU code must treat zero as
+    /// "no emission" rather than normalizing it into NaN.
+    pub fn normal(self: AreaLight) Vec3 {
+        const n = self.right.cross(self.up);
+        if (n.lengthSq() <= 1e-12) return Vec3.zero;
+        return n.normalize();
+    }
+
+    /// Emitting area (4 * |right x up|); zero for degenerate rects.
+    pub fn area(self: AreaLight) f32 {
+        return 4.0 * self.right.cross(self.up).length();
+    }
+};
+
 pub const SpotLightOptions = struct {
     position: Vec3 = Vec3.zero,
     direction: Vec3 = Vec3.new(0, -1, 0),
@@ -330,6 +388,32 @@ test "PointLight shadows are off by default" {
     // A literal without the new fields keeps the same defaults.
     const bare = PointLight{};
     try std.testing.expect(!bare.cast_shadows);
+}
+
+test "area light cap is two" {
+    try std.testing.expectEqual(@as(usize, 2), max_area_lights);
+}
+
+test "AreaLight normal and area follow the right/up half-extents" {
+    const rect = AreaLight.init("rect", .{
+        .center = Vec3.new(0, 2, 0),
+        .right = Vec3.new(1, 0, 0),
+        .up = Vec3.new(0, 0.5, 0),
+    });
+    const n = rect.normal();
+    try std.testing.expectApproxEqAbs(n.x, 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(n.y, 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(n.z, 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(rect.area(), 2.0, 1e-6);
+
+    // Degenerate rects (zero axis, parallel axes) are safe: zero normal
+    // and zero area, never NaN.
+    const flat = AreaLight.init("flat", .{ .right = Vec3.zero, .up = Vec3.new(0, 1, 0) });
+    try std.testing.expectEqual(Vec3.zero, flat.normal());
+    try std.testing.expectEqual(@as(f32, 0.0), flat.area());
+    const parallel = AreaLight.init("par", .{ .right = Vec3.new(1, 0, 0), .up = Vec3.new(2, 0, 0) });
+    try std.testing.expectEqual(Vec3.zero, parallel.normal());
+    try std.testing.expectEqual(@as(f32, 0.0), parallel.area());
 }
 
 test "PointLight.getShadowFaceViewProj centers each axis on its face" {

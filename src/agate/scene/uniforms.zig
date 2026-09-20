@@ -30,6 +30,13 @@ pub const FrameContext = struct {
     spot_shadow_params: [2][4]f32,
     point_view_proj: [12]Mat4,
     point_shadow_params: [4][4]f32,
+    // Rect area lights (wave 26, v1): creation-order lanes mirroring
+    // LightRig.FramePack (xyz + intensity, half-extent vectors, rgb).
+    // Zeroed with zero lights, so the shader skip renders bit-identically.
+    area_center_int: [2][4]f32,
+    area_right: [2][4]f32,
+    area_up: [2][4]f32,
+    area_color: [2][4]f32,
     uniforms_with_shadows: ?*const FrameUniforms = null,
     uniforms_without_shadows: ?*const FrameUniforms = null,
 };
@@ -71,6 +78,15 @@ pub const FrameUniforms = struct {
     // lane from the winning probe selection (or leaves it zeroed), so the
     // no-probe path uploads bit-identical values to before.
     probe_params: [4]f32,
+    // APPENDED LAST (rect area lights, wave 26): creation-order lanes
+    // mirroring LightRig.FramePack. xyz + intensity in area_center_int
+    // (w = 0 when disabled/unused, so the shader skip costs nothing and
+    // zero lights render bit-identically), half-extent vectors and rgb
+    // alongside. Appended last so no existing offset shifts.
+    area_center_int: [2][4]f32,
+    area_right: [2][4]f32,
+    area_up: [2][4]f32,
+    area_color: [2][4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -142,6 +158,10 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .directional_dir = ctx.directional_dir,
         .directional_color_int = ctx.directional_color_int,
         .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .area_center_int = ctx.area_center_int,
+        .area_right = ctx.area_right,
+        .area_up = ctx.area_up,
+        .area_color = ctx.area_color,
     };
 }
 
@@ -190,6 +210,10 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
         .spot_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
         .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
         .point_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+        .area_center_int = .{ .{ 1.0, 2.0, 3.0, 3.0 }, .{ 0, 0, 0, 0 } },
+        .area_right = .{ .{ 2.0, 0.0, 0.0, 0.0 }, .{ 0, 0, 0, 0 } },
+        .area_up = .{ .{ 0.0, 0.5, 0.0, 0.0 }, .{ 0, 0, 0, 0 } },
+        .area_color = .{ .{ 1.0, 0.5, 0.25, 0.0 }, .{ 0, 0, 0, 0 } },
     };
     const f = buildFrameUniforms(shadow, &ctx);
     // Legacy lanes keep their exact legacy values...
@@ -198,10 +222,26 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
     // ...and the directional lanes ride through verbatim.
     try std.testing.expectEqual(ctx.directional_dir, f.directional_dir);
     try std.testing.expectEqual(ctx.directional_color_int, f.directional_color_int);
+    // ...and the area lanes ride through verbatim.
+    try std.testing.expectEqual(ctx.area_center_int, f.area_center_int);
+    try std.testing.expectEqual(ctx.area_right, f.area_right);
+    try std.testing.expectEqual(ctx.area_up, f.area_up);
+    try std.testing.expectEqual(ctx.area_color, f.area_color);
     // The shared per-view uniforms always carry a neutral probe lane (the
     // draw overwrites it per draw from the probe selection, or leaves it —
     // so the no-probe path is bit-identical to before this wave).
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, f.probe_params);
+}
+
+test "FrameUniforms appends area lanes last (existing offsets unmoved)" {
+    const std = @import("std");
+    // Every pre-area field keeps its offset relative to the struct start
+    // regardless of the appended lanes: spot-check the tail neighbors.
+    try std.testing.expect(@offsetOf(FrameUniforms, "area_center_int") > @offsetOf(FrameUniforms, "probe_params"));
+    try std.testing.expect(@offsetOf(FrameUniforms, "area_right") > @offsetOf(FrameUniforms, "area_center_int"));
+    try std.testing.expect(@offsetOf(FrameUniforms, "area_up") > @offsetOf(FrameUniforms, "area_right"));
+    try std.testing.expect(@offsetOf(FrameUniforms, "area_color") > @offsetOf(FrameUniforms, "area_up"));
+    try std.testing.expect(@offsetOf(FrameUniforms, "directional_dir") < @offsetOf(FrameUniforms, "probe_params"));
 }
 
 test "alphaCutoffFor gates the cutoff on cutout mode" {

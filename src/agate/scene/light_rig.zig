@@ -13,6 +13,8 @@ const PointLight = lights.PointLight;
 const PointLightOptions = lights.PointLightOptions;
 const SpotLight = lights.SpotLight;
 const SpotLightOptions = lights.SpotLightOptions;
+const AreaLight = lights.AreaLight;
+const AreaLightOptions = lights.AreaLightOptions;
 const light_selection = @import("light_selection.zig");
 const passes = @import("../passes/mod.zig");
 
@@ -34,6 +36,11 @@ pub const LightRig = struct {
     extra_directionals: std.ArrayListUnmanaged(*DirectionalLight) = .empty,
     point_lights: std.ArrayListUnmanaged(*PointLight) = .empty,
     spot_lights: std.ArrayListUnmanaged(*SpotLight) = .empty,
+    /// Rect area lights (wave 26, v1, creation order, at most
+    /// lights.max_area_lights). Session-local like directional fills:
+    /// save/load never persists them. No shadows, no hysteresis, no
+    /// significance selection — every owned light packs verbatim.
+    area_lights: std.ArrayListUnmanaged(*AreaLight) = .empty,
 
     // Slot hysteresis (see light_selection.Hysteresis): without it two lights
     // trading the 4th/2nd slot pop every frame. `hysteresis_enabled = false`
@@ -115,6 +122,46 @@ pub const LightRig = struct {
         return null;
     }
 
+    /// Appends a rect area light (uniform slots follow creation order).
+    /// Returns error.TooManyAreaLights past lights.max_area_lights — hard
+    /// error, never silent clamp or replacement, so callers notice the cap.
+    /// Area lights are session-local (save/load never persists them),
+    /// API-only in v1 (no KHR_lights_punctual mapping — glTF has no rect
+    /// light type), and shadowless (no area-light shadows in v1).
+    pub fn addAreaLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: AreaLightOptions) !*AreaLight {
+        if (self.area_lights.items.len >= lights.max_area_lights) return error.TooManyAreaLights;
+        const al = try allocator.create(AreaLight);
+        al.* = AreaLight.init(name, options);
+        try self.area_lights.append(allocator, al);
+        return al;
+    }
+
+    /// Removes area light `index`, destroying it. Order-preserving: higher
+    /// indices shift down, so callers must not cache indices across
+    /// removals. Out-of-range indices are a no-op (same contract as
+    /// Scene.removeCamera).
+    pub fn removeAreaLight(self: *LightRig, allocator: std.mem.Allocator, index: usize) void {
+        if (index >= self.area_lights.items.len) return;
+        const al = self.area_lights.items[index];
+        if (al.owns_name) allocator.free(al.name);
+        allocator.destroy(al);
+        for (index..self.area_lights.items.len - 1) |k| self.area_lights.items[k] = self.area_lights.items[k + 1];
+        self.area_lights.items.len -= 1;
+    }
+
+    /// Live area-light state (center/right/up/color/intensity/enabled are
+    /// freely mutable game-side under update-vs-prepare exclusion). Null
+    /// when out of range.
+    pub fn getAreaLight(self: *const LightRig, index: usize) ?*AreaLight {
+        if (index >= self.area_lights.items.len) return null;
+        return self.area_lights.items[index];
+    }
+
+    /// Number of owned area lights (at most lights.max_area_lights).
+    pub fn areaLightCount(self: *const LightRig) usize {
+        return self.area_lights.items.len;
+    }
+
     // Sun resolution helpers (directional override, hemispheric fallback).
     pub fn sunDirection(self: *const LightRig) Vec3 {
         return lights.resolveSunDirection(self.directional, self.hemi);
@@ -152,6 +199,12 @@ pub const LightRig = struct {
             allocator.destroy(dl);
         }
         self.extra_directionals.deinit(allocator);
+
+        for (self.area_lights.items) |al| {
+            if (al.owns_name) allocator.free(al.name);
+            allocator.destroy(al);
+        }
+        self.area_lights.deinit(allocator);
 
         if (self.directional) |dl| {
             if (dl.owns_name) allocator.free(dl.name);
@@ -203,6 +256,16 @@ pub const LightRig = struct {
         point_shadow_params: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
         point_shadows: [12]passes.PointShadowRenderInfo = [_]passes.PointShadowRenderInfo{.{}} ** 12,
         num_point_shadows: usize = 0,
+        // APPENDED LAST (rect area lights, wave 26): up to
+        // lights.max_area_lights rects in creation order. xyz + intensity
+        // in area_center_int (w = 0 when disabled/unused, so the shader
+        // skip on intensity <= 0 renders bit-identically with zero lights),
+        // right/up half-extent vectors and emitted rgb alongside. Appended
+        // last so every existing lane stays bit-identical.
+        area_center_int: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        area_right: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        area_up: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        area_color: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
     };
 
     /// Packs the directional suns for the frame uniforms: slot 0 mirrors
@@ -226,6 +289,23 @@ pub const LightRig = struct {
             const dir = if (dl.direction.lengthSq() > 1e-12) dl.direction.normalize() else Vec3.zero;
             pack.directional_dir[slot] = .{ dir.x, dir.y, dir.z, 0.0 };
             pack.directional_color_int[slot] = .{ dl.diffuse.r, dl.diffuse.g, dl.diffuse.b, dl.intensity };
+        }
+    }
+
+    /// Packs the rect area lights for the frame uniforms: creation order,
+    /// disabled/unused lanes zeroed (the shader skips on intensity <= 0).
+    /// No hysteresis, no significance selection, nothing frame-dependent in
+    /// v1 (dt is ignored): area lights are few and order-stable, and an
+    /// intensity fade would need a second look-dev pass before it earns a
+    /// slot protocol.
+    fn packAreaLights(self: *const LightRig, pack: *FramePack) void {
+        for (self.area_lights.items, 0..) |al, i| {
+            if (i >= lights.max_area_lights) break; // defensive: insert path caps
+            if (!al.is_enabled) continue; // stays zeroed
+            pack.area_center_int[i] = .{ al.center.x, al.center.y, al.center.z, al.intensity };
+            pack.area_right[i] = .{ al.right.x, al.right.y, al.right.z, 0.0 };
+            pack.area_up[i] = .{ al.up.x, al.up.y, al.up.z, 0.0 };
+            pack.area_color[i] = .{ al.color.r, al.color.g, al.color.b, 0.0 };
         }
     }
 
@@ -302,8 +382,10 @@ pub const LightRig = struct {
             .num_point_shadows = 0,
         };
         // Directional suns ride both pack paths verbatim (no hysteresis):
-        // slot 0 is the primary, slots 1..3 the fills.
+        // slot 0 is the primary, slots 1..3 the fills. Area lights ride
+        // both paths verbatim too (no selection, nothing frame-dependent).
         self.packDirectionals(&pack);
+        self.packAreaLights(&pack);
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With
@@ -709,6 +791,105 @@ test "packFrame caps point shadow casters at two by significance" {
         try std.testing.expectEqual(@as(i32, @intCast(f)) * 256, t.tile_x);
         try std.testing.expectEqual(@as(i32, 256), t.tile_y);
     }
+}
+
+test "addAreaLight caps at two with a hard error" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    _ = try rig.addAreaLight(allocator, "a0", .{});
+    _ = try rig.addAreaLight(allocator, "a1", .{});
+    try std.testing.expectEqual(@as(usize, 2), rig.areaLightCount());
+    // Beyond the cap: hard error, never silent clamp or replacement.
+    try std.testing.expectError(error.TooManyAreaLights, rig.addAreaLight(allocator, "a2", .{}));
+    try std.testing.expectEqual(@as(usize, 2), rig.areaLightCount());
+}
+
+test "area lights pack creation-order lanes, disabled entries zeroed" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    // Empty rig: all area lanes zeroed (zero lights render bit-identically).
+    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    for (0..lights.max_area_lights) |i| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_center_int[i]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_right[i]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_up[i]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_color[i]);
+    }
+
+    const a0 = try rig.addAreaLight(allocator, "key", .{
+        .center = Vec3.new(1.0, 2.0, 3.0),
+        .right = Vec3.new(2.0, 0.0, 0.0),
+        .up = Vec3.new(0.0, 0.5, 0.0),
+        .color = Color3.new(1.0, 0.5, 0.25),
+        .intensity = 3.0,
+    });
+    const a1 = try rig.addAreaLight(allocator, "fill", .{
+        .center = Vec3.new(-1.0, 0.0, 0.0),
+        .intensity = 0.5,
+    });
+    a1.is_enabled = false;
+    try std.testing.expect(rig.getAreaLight(0) == a0);
+    try std.testing.expect(rig.getAreaLight(1) == a1);
+    try std.testing.expect(rig.getAreaLight(2) == null);
+
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 3.0 }, pack.area_center_int[0]);
+    try std.testing.expectEqual([4]f32{ 2.0, 0.0, 0.0, 0.0 }, pack.area_right[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.5, 0.0, 0.0 }, pack.area_up[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 0.0 }, pack.area_color[0]);
+    // Disabled light: zeroed lane, unused w stays 0.
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_center_int[1]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.area_color[1]);
+
+    // Re-enable: second lane packs verbatim (defaults: unit axes).
+    a1.is_enabled = true;
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 0.5 }, pack.area_center_int[1]);
+    try std.testing.expectEqual([4]f32{ 0.5, 0.0, 0.0, 0.0 }, pack.area_right[1]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.5, 0.0, 0.0 }, pack.area_up[1]);
+}
+
+test "removeAreaLight destroys order-preserving, out-of-range is a no-op" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    const a0 = try rig.addAreaLight(allocator, "a0", .{});
+    const a1 = try rig.addAreaLight(allocator, "a1", .{});
+    rig.removeAreaLight(allocator, 7); // no-op
+    try std.testing.expectEqual(@as(usize, 2), rig.areaLightCount());
+    rig.removeAreaLight(allocator, 0);
+    try std.testing.expectEqual(@as(usize, 1), rig.areaLightCount());
+    try std.testing.expect(rig.getAreaLight(0) == a1);
+    _ = a0;
+    rig.removeAreaLight(allocator, 0);
+    try std.testing.expectEqual(@as(usize, 0), rig.areaLightCount());
+    try std.testing.expect(rig.getAreaLight(0) == null);
+}
+
+test "area packing is frame-independent (no fade, no selection)" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    // Hysteresis ON here on purpose: area lanes must still pack verbatim
+    // on the very first frame (no enter-fade) and identically for any dt.
+    _ = try rig.addAreaLight(allocator, "key", .{
+        .center = Vec3.new(0.0, 3.0, 0.0),
+        .intensity = 2.0,
+    });
+    const eye = Vec3.new(10.0, 0.0, 0.0);
+    const p0 = rig.packFrame(eye, true, 0.016);
+    const p1 = rig.packFrame(eye, true, 0.5);
+    try std.testing.expectEqual([4]f32{ 0.0, 3.0, 0.0, 2.0 }, p0.area_center_int[0]);
+    try std.testing.expectEqual(p0.area_center_int, p1.area_center_int);
+    try std.testing.expectEqual(p0.area_right, p1.area_right);
+    try std.testing.expectEqual(p0.area_up, p1.area_up);
+    try std.testing.expectEqual(p0.area_color, p1.area_color);
 }
 
 test "packFrame gates point shadows on enabled lights and global shadows" {

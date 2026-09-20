@@ -135,6 +135,70 @@ test "publishFrameSnapshot and prepareFrame snapshot handoff" {
     try std.testing.expectEqual(@as(i32, 1080), scene.frame_snapshot.screen_h);
 }
 
+test "area lights: Scene API, cap, enable, snapshot round-trip" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // Empty scene: zero count, null get, zeroed pack lanes (zero lights
+    // render bit-identically to today).
+    try std.testing.expectEqual(@as(usize, 0), scene.areaLightCount());
+    try std.testing.expect(scene.getAreaLight(0) == null);
+    scene.updateLights(0.016);
+    var pack: scene_lights.LightRig.FramePack = undefined;
+    try std.testing.expect(scene.light_handoff.takeLatest(&pack));
+    for (0..2) |i| {
+        try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.area_center_int[i]);
+        try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.area_right[i]);
+        try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.area_up[i]);
+        try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.area_color[i]);
+    }
+
+    const a0 = try scene.addAreaLight("key", .{
+        .center = Vec3.new(0.0, 3.0, 0.0),
+        .right = Vec3.new(2.0, 0.0, 0.0),
+        .up = Vec3.new(0.0, 1.0, 0.0),
+        .color = Color3.new(1.0, 0.0, 0.0),
+        .intensity = 2.0,
+    });
+    _ = try scene.addAreaLight("rim", .{});
+    try std.testing.expectEqual(@as(usize, 2), scene.areaLightCount());
+    try std.testing.expect(scene.getAreaLight(0) == a0);
+    try std.testing.expect(scene.getAreaLight(2) == null);
+    // Hard cap: third light errors, count unchanged.
+    try std.testing.expectError(error.TooManyAreaLights, scene.addAreaLight("third", .{}));
+    try std.testing.expectEqual(@as(usize, 2), scene.areaLightCount());
+
+    // Disable: lane zeroes out; re-enable restores it (per-light enable).
+    a0.is_enabled = false;
+    scene.updateLights(0.016);
+    _ = scene.light_handoff.takeLatest(&pack);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.area_center_int[0]);
+    a0.is_enabled = true;
+
+    // Update path carries the lanes into the frame snapshot (needs a
+    // camera: packFrameSnapshot early-outs without one).
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.updateLights(0.016);
+    const snap = scene.packFrameSnapshot(1.0, 640, 480);
+    try std.testing.expect(snap.has_camera);
+    try std.testing.expectEqual([4]f32{ 0.0, 3.0, 0.0, 2.0 }, snap.light_pack.area_center_int[0]);
+    try std.testing.expectEqual([4]f32{ 2.0, 0.0, 0.0, 0.0 }, snap.light_pack.area_right[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.0 }, snap.light_pack.area_up[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, snap.light_pack.area_color[0]);
+
+    // Removal is order-preserving; out-of-range is a no-op. Area lights
+    // are session-local (like directional fills): the serialization
+    // SceneState carries no area field, so save/load never persists them.
+    scene.removeAreaLight(7);
+    try std.testing.expectEqual(@as(usize, 2), scene.areaLightCount());
+    scene.removeAreaLight(0);
+    try std.testing.expectEqual(@as(usize, 1), scene.areaLightCount());
+    try std.testing.expectEqualStrings("rim", scene.getAreaLight(0).?.name);
+}
+
 test "saturated frame mailbox keeps the newest snapshot" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);

@@ -21,6 +21,8 @@ const FreeCamera = @import("../camera.zig").FreeCamera;
 //   light_eye = center + dir * dist), so a glTF directional light maps to the
 //   NEGATED travel direction. SpotLight.direction is the beam travel direction
 //   (shader uses dot(-L, s_dir)), so it maps to -Z unnegated.
+// - Rect area lights are API-only in v1 (Scene.addAreaLight): KHR_lights_punctual
+//   has no rect light type, so this importer deliberately maps nothing to them.
 // - The engine owns up to 4 directional lights (createDirectionalLight for
 //   the shadow-casting primary, addDirectionalLight for 3 shadowless fills)
 //   and has a single ?Camera active_camera slot, hence the "first wins"
