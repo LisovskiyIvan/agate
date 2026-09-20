@@ -121,12 +121,14 @@
 //!   here instead of the sequential backIndex/publish path).
 //! What IS already slot-owned (and therefore needs no lock once the mutex
 //! goes): the frame snapshot, the staged instance records (+ their latched
-//! outcomes), the UI packet lists + header + handles, and the prepare-gated
-//! GPU uploads (P3 epochs + upload meter). Removing the phase mutex means
-//! moving the remaining live reads above under the same freeze-then-latch
-//! shape (or an equivalent mailbox) — the pin/lease here only covers the
-//! variable-length draw payload plus the staged snapshot, deliberately
-//! nothing else.
+//! outcomes), the UI packet lists + header + handles, the staged build stats
+//! (`FrameDrawSlot.build_stats`, frozen by the game build and merged by the
+//! prepare latch — the last shared word besides pure flow now lives in the
+//! slot payload), and the prepare-gated GPU uploads (P3 epochs + upload
+//! meter). Removing the phase mutex means moving the remaining live reads
+//! above under the same freeze-then-latch shape (or an equivalent mailbox)
+//! — the pin/lease here only covers the variable-length draw payload plus
+//! the staged snapshot, deliberately nothing else.
 //!
 //! Wave 29 (concurrent-build ENGINE primitive — proof, not adoption): the
 //! game side can now `claimBack` a slot, fill it (`Scene.BuildClaim.build`
@@ -171,6 +173,16 @@
 //!   as before (now via the locked `tryPublish`); a missed slot degrades to
 //!   a counted skip, never a wedge. What REMAINS for adoption is app-side
 //!   flow (the first bullet) + canvas quiesce + freeze-then-latch:
+//! - DONE (wave 31 second slice): `build_stats` is a slot payload — the
+//!   game side accumulates into the live `Scene.build_stats` accumulator
+//!   and the build freezes a plain copy into the claimed slot's
+//!   `build_stats` (staged-wins over post-build accumulation, same
+//!   precedent as the snapshot; `reset` zeroes it so stale stats never
+//!   resurface after slot reuse); `prepareFrame` merges the claimed
+//!   slot's copy into `stats` instead of reading the shared field. This
+//!   was the LAST shared word (besides pure flow) depending on the phase
+//!   mutex. What REMAINS for adoption is app-side flow (the first
+//!   bullet) + canvas quiesce + freeze-then-latch only:
 //! - epochs stay context-owned (`begin`/`complete`/`flush` only in
 //!   prepare/render): the build path must never gain epoch calls (tested).
 //! - remaining live touches (meshes/canvas/cameras/lights/particles +
@@ -183,6 +195,7 @@
 const std = @import("std");
 const render_queue = @import("render_queue.zig");
 const snapshot_mod = @import("snapshot.zig");
+const stats_mod = @import("stats.zig");
 const retire_mod = @import("gpu_retire.zig");
 const ui_frame_mod = @import("ui_frame.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
@@ -287,6 +300,17 @@ pub const FrameDrawSlot = struct {
     /// `cpuBytes` deliberately excludes it (fixed scalar, like
     /// `frame_id`/`retire_epoch` — the census counts retained list capacity).
     snapshot: snapshot_mod.SceneFrameSnapshot = .{},
+    /// Slot-owned staged build stats (wave 31 second slice,
+    /// lock-free-publication slice 3): the game-side queue build
+    /// accumulates into the live `Scene.build_stats` accumulator and
+    /// `Scene.buildIntoClaimedSlot` freezes a plain copy here at build
+    /// time; the prepare latch merges THIS copy into `Scene.stats`
+    /// instead of reading the shared field — so a concurrent game-side
+    /// accumulation cannot race the context-side merge. Plain struct
+    /// copy (counter fields only — `mergeFrom` never touches the
+    /// context-owned timing/upload fields); `reset` zeroes it so a
+    /// reused slot can never resurface a prior frame's stats.
+    build_stats: stats_mod.SceneStats = .{},
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -306,6 +330,7 @@ pub const FrameDrawSlot = struct {
         self.ui_indices.clearRetainingCapacity();
         self.ui_packet = .{};
         self.snapshot = .{};
+        self.build_stats = .{};
         self.frame_id = 0;
         self.retire_epoch = 0;
     }

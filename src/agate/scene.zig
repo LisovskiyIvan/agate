@@ -452,12 +452,17 @@ pub const Scene = struct {
     /// it after observing a fresh seq and asserts it still is the back index
     /// (no intervening publish).
     build_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// Game-owned queue-build stats (stage-2 increment B): `buildPreparedFrame`
-    /// clears this and the game-side `buildQueuesInto` accumulates the queue
-    /// counters here (never `self.stats`, which stays context-owned). The
-    /// latch merges it into `self.stats` via `SceneStats.mergeFrom` (after
-    /// the latch's own reset) and resets it to `.{}`. Plain struct, phase
-    /// ownership (game write, context merge), never observed concurrently.
+    /// Game-owned queue-build stats accumulator (stage-2 increment B,
+    /// slot-staged since wave 31 second slice): `buildIntoClaimedSlot`
+    /// clears this at build start, the game-side `buildQueuesInto`
+    /// accumulates the queue counters here (never `self.stats`, which stays
+    /// context-owned), and the build freezes a plain copy into the claimed
+    /// slot's `build_stats` (staged-wins over any post-build accumulation,
+    /// same precedent as the snapshot). The prepare latch merges the SLOT
+    /// copy into `self.stats` via `SceneStats.mergeFrom` (after the latch's
+    /// own reset) and zeroes both copies. The live field itself never
+    /// crosses the handoff edge — a concurrent game-side accumulation
+    /// cannot race the context-side merge.
     build_stats: SceneStats = .{},
 
     // 2D & 3D UI canvas (lazy; created via createUI()).
@@ -1579,7 +1584,10 @@ pub const Scene = struct {
     /// `eye` is currently informational (views sort by their own snapshot
     /// eye; the build passes the live eye for future transparent-sort use
     /// and for the instance CPU staging eye, which is threaded separately).
-    /// `stats` stays a direct pointer (deferred via `build_stats` + merge).
+    /// `stats` stays a direct pointer: the game-side build passes
+    /// `&self.build_stats` (the live accumulator, frozen into the claim
+    /// slot at build end and merged from there by the latch), the fallback
+    /// passes `&self.stats` directly.
     pub const QueueBuildParams = struct {
         snap: *const SceneFrameSnapshot,
         cache_key: u64,
@@ -2823,7 +2831,9 @@ pub const Scene = struct {
     /// wins over a post-build `build_snapshot` mutation).
     /// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
     /// cannot collide with any context `frame_id`). Stats accumulate into
-    /// game-owned `build_stats` (cleared at build start), merged by the latch.
+    /// the game-owned `build_stats` accumulator (cleared at build start)
+    /// and freeze into the claim slot's staged `build_stats` copy at build
+    /// end; the latch merges the slot copy.
     ///
     /// Touches NOTHING else: no sg.*, no GpuRetire begin/complete/flush (view
     /// builds run with `instances_prepared=true`, never retrying staging),
@@ -2832,10 +2842,11 @@ pub const Scene = struct {
     /// live mesh `instance_render` (commit of the last published latch
     /// outcomes, guarded — see above), back-slot queues/shadow/outline +
     /// scratch, previews/build_views,
-    /// staged records, the staged slot `snapshot`,
+    /// staged records, the staged slot `snapshot`, the staged slot
+    /// `build_stats` copy,
     /// particle/physics build frames, `build_snapshot` (refreshed), shadow
     /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
-    /// with the build key), and `build_stats`.
+    /// with the build key), and the live `build_stats` accumulator.
     ///
     /// App contract: no latch is possible while a build runs (update-vs-
     /// prepare exclusion), and the mesh list MUST NOT be mutated between a
@@ -2962,6 +2973,13 @@ pub const Scene = struct {
             // and restore the staged scratch.
             back.primary.instance_matrices = saved_scratch;
         }
+        // Freeze the accumulated build stats into the claim slot by value
+        // (plain copy — the prepare latch merges THIS copy, never the live
+        // accumulator, so a post-build game-side accumulation cannot race
+        // the context-side merge; staged wins, same precedent as the slot
+        // snapshot above). Rides the same publish release edge as the rest
+        // of the staged payload.
+        back.build_stats = self.build_stats;
     }
 
     pub fn prepareFrame(self: *Scene) void {
@@ -3161,7 +3179,7 @@ pub const Scene = struct {
             // buildQueuesInto here. Only stamp the prepare-owned frame/epoch,
             // run the GPU halves over the slot records + scratch, finalize the
             // provisional handles with patchInstanceRefs, then merge the
-            // deferred build_stats. Meshes with no record (OOM-skipped,
+            // slot-staged build_stats copy. Meshes with no record (OOM-skipped,
             // post-build meshes) keep their previous complete
             // `instance_render` and
             // patch to invisible — no partial publish. A mesh-list mutation
@@ -3177,7 +3195,10 @@ pub const Scene = struct {
             // finalized from the mirrors): the game-side commit at the next
             // build applies the mirrors to the live meshes. The staged slot
             // snapshot above is already frozen (wave 27) — the latch reads
-            // it, never the live `build_snapshot`/`frame_snapshot`.
+            // it, never the live `build_snapshot`/`frame_snapshot` — and
+            // the staged slot build_stats below likewise (wave 31 second
+            // slice): the latch merges the slot copy, never the live
+            // `build_stats` accumulator.
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
             if (is_gpu_init) {
@@ -3199,12 +3220,17 @@ pub const Scene = struct {
                 }
             }
             self.patchInstanceRefs(back);
-            // Deferred stats merge (stage-2B): the game-side queue build
-            // accumulated into build_stats; fold the queue counters into the
+            // Deferred stats merge (stage-2B, slot-staged since wave 31
+            // second slice): the game-side queue build accumulated into the
+            // live `build_stats` accumulator and froze a copy into this
+            // slot; fold the SLOT copy's queue counters into the
             // context-owned self.stats (already reset above, so upload
-            // tallies/prepare_ms/update_ms are preserved) and clear the build
-            // stats for the next tick. build_stats deferred merge.
-            self.stats.mergeFrom(&self.build_stats);
+            // tallies/prepare_ms/update_ms are preserved) and clear both
+            // copies for the next tick. Sourcing the merge from the slot —
+            // never the shared field — is what lets a concurrent game-side
+            // accumulation race nothing here.
+            self.stats.mergeFrom(&back.build_stats);
+            back.build_stats = .{};
             self.build_stats = .{};
             // Context-side stamp only (the producer never touches this word).
             self.last_latched_seq.store(self.build_seq.load(.monotonic), .monotonic);
