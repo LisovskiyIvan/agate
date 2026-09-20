@@ -30,7 +30,7 @@
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP | 🟡 |
-| Свет | Hemispheric + Directional (солнце) + до 4 Point + до 2 Spot | 🟡 |
+| Свет | Hemispheric + до 4 Directional (солнце с CSM + до 3 shadowless fill) + до 4 Point + до 2 Spot | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) + тени PointLight (до 2, 2D-атлас 1536×512, 4-tap PCF, OFF по умолчанию) | ✅ |
 | Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
@@ -38,8 +38,8 @@
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
 | HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
-| Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur | 🟡 |
-| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, цветовые curves и LUT-стрип (2D strip + API) есть; MSAA — только offscreen main target | 🟡 |
+| Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off) | 🟡 |
+| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA — только offscreen main target | 🟡 |
 | Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот, sub-emitters (on-death, SplitMix), flow maps (`setFlowMap`) | 🟡 |
 | GPU-симуляция | — | ❌ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
@@ -488,7 +488,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 ### Свет и тени
 
 * `HemisphericLight` (небо + ground color) — всегда одна.
-* `DirectionalLight` — `Scene.createDirectionalLight`; управляет солнцем (направление, цвет, интенсивность, 4-каскадный CSM), hemi остаётся ambient.
+* `DirectionalLight` — `Scene.createDirectionalLight` (солнце: направление, цвет, интенсивность, 4-каскадный CSM) + до 3 shadowless fill через `Scene.addDirectionalLight` (всего до 4, `is_enabled`), hemi остаётся ambient.
 * До 4 `PointLight` с range/интенсивностью и до 2 `SpotLight` (inner/outer cone) — per-pixel затухание, выбор значимых источников в камере за 1 проход.
 * Тени: 4-каскадный CSM (атлас 2048², 4 × 1024²), 16-выборок Poisson PCF / переменная полутень PCSS, depth bias + normal bias, мягкость, fade дальнего каскада.
 * Перспективные тени SpotLight: depth-атлас 1024×512 (до 2 прожекторов), 4-tap PCF-фильтрация.
@@ -600,12 +600,12 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Возможность Babylon.js | В Agate есть | Чего не хватает |
 |---|---|---|
 | Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP) | Камера-ригов, touch/pinch, инерции |
-| Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + 1 directional (солнце) + 4 point + 2 spot (выбор лучших по камере) | Area-света, кластерного освещения, light probes, нескольких directional |
+| Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + до 4 directional (1 солнце с CSM + до 3 shadowless fill) + 4 point + 2 spot (выбор лучших по камере) | Area-света, кластерного освещения, light probes |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | EXR, KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/reflection probe текстуры |
-| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, camera motion blur, цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | TAA, glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
+| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | GPU-морфов, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps | GPU-симуляции, коллизий с физикой |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
@@ -625,7 +625,6 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Тач-управление, геймпад, виртуальные джойстики; встроенное управление персонажем (кроме physics character controller).
 
 **Свет и тени**
-* Несколько directional-светов одновременно.
 * Тени от point-светов сверх лимита (3+), PCSS/contact hardening для точечных источников, ESM, blur-exponential.
 * Area (rect) свет, light probes, динамический IBL, кластерное освещение (сотни источников), объёмный свет/атмосфера.
 
@@ -636,7 +635,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
-* TAA, MSAA/SSAA (MSAA — только offscreen main target), glow layer, highlight layer, lens flares, snapshot-рендер, SSR/SSAO более высокого качества (LUT-цветокоррекция через 2D-стрип и Camera Motion Blur уже реализованы).
+* MSAA/SSAA (MSAA — только offscreen main target), glow layer, highlight layer, lens flares, snapshot-рендер, SSR/SSAO более высокого качества (TAA через Halton-jitter + history + clamp, LUT-цветокоррекция через 2D-стрип и Camera Motion Blur уже реализованы).
 
 **Геометрия**
 * Инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют; GreasedLine и QEM-упрощение мешей с автоматической генерацией LOD уже реализованы).
@@ -646,7 +645,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Редактор анимаций (ретаргетинг скелетов name/index/bone_map уже реализован).
 
 **Частицы**
-* GPU-симуляция, нодовый редактор частиц, коллизии с физикой (sub-emitters и flow maps уже реализованы).
+* Stateful GPU-симуляция частиц (compute; CPU on-death sub-emitters и flow maps уже реализованы), нодовый редактор частиц, коллизии с физикой.
 
 **Физика**
 * Soft bodies; импорт коллайдеров из файлов сцен.
