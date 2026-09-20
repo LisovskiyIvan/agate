@@ -1754,7 +1754,31 @@ pub const Scene = struct {
         const cl_count = snap.light_pack.clustered_count;
         var cl_params: [4]f32 = .{ 0, 0, 0, 0 };
         var cl_viewport: [4]f32 = .{ 0, 0, 64, 0 };
-        if (cl_count > 0) {
+        if (cl_count > 0 and self.rendering_reuse) {
+            // renderReuse re-presents the SAME staged snapshot the last
+            // real frame built tiles from: keep the existing storage
+            // buffers and descriptor instead of rebuilding — a replay must
+            // stay upload-free (the reuse fixture asserts zero
+            // updateBuffer calls). If the pool went live without a single
+            // real frame since (pure reuse streak), fall back to the
+            // dummy/legacy path until the next real frame.
+            if (self.clustered.gpu_live) {
+                cl_params = .{
+                    @floatFromInt(self.clustered.tiles_x),
+                    @floatFromInt(self.clustered.tiles_y),
+                    @floatFromInt(cl_count),
+                    1.0,
+                };
+                cl_viewport = .{
+                    @floatFromInt(snap.screen_w),
+                    @floatFromInt(snap.screen_h),
+                    @floatFromInt(scene_clustered.tile_size_px),
+                    0.0,
+                };
+            } else {
+                self.clustered.ensureDummyViews();
+            }
+        } else if (cl_count > 0) {
             const rect = cam_snap.viewport.toPixelRect(snap.screen_w, snap.screen_h);
             const view_rect = scene_clustered.ViewRect{ .x = rect.x, .y = rect.y, .w = rect.width, .h = rect.height };
             var rebuilt_ok = true;
