@@ -209,6 +209,10 @@ pub fn drawRegularItem(
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
             .probe_params = prb.params,
+            .area_center_int = f.area_center_int,
+            .area_right = f.area_right,
+            .area_up = f.area_up,
+            .area_color = f.area_color,
         };
         if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -271,6 +275,10 @@ pub fn drawRegularItem(
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
             .probe_params = prb_std.params,
+            .area_center_int = f.area_center_int,
+            .area_right = f.area_right,
+            .area_up = f.area_up,
+            .area_color = f.area_color,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -401,6 +409,10 @@ fn drawShaderMaterialItem(
                 .directional_dir = f.directional_dir,
                 .directional_color_int = f.directional_color_int,
                 .probe_params = prb_hook.params,
+                .area_center_int = f.area_center_int,
+                .area_right = f.area_right,
+                .area_up = f.area_up,
+                .area_color = f.area_color,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
@@ -452,6 +464,10 @@ fn drawShaderMaterialItem(
                 .directional_dir = f.directional_dir,
                 .directional_color_int = f.directional_color_int,
                 .probe_params = prb_hook_std.params,
+                .area_center_int = f.area_center_int,
+                .area_right = f.area_right,
+                .area_up = f.area_up,
+                .area_color = f.area_color,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         }
@@ -707,6 +723,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
             .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
+            .area_center_int = f.area_center_int,
+            .area_right = f.area_right,
+            .area_up = f.area_up,
+            .area_color = f.area_color,
             .alpha_cutoff = rec.alpha_cutoff,
             .normal_scale = rec.normal_scale,
             .uv_matrix = rec.uv_matrices,
@@ -768,6 +788,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
             .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
+            .area_center_int = f.area_center_int,
+            .area_right = f.area_right,
+            .area_up = f.area_up,
+            .area_color = f.area_color,
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }
@@ -799,6 +823,10 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
             if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
+            if (!@hasField(P, "area_center_int")) @compileError("FsParams missing area_center_int");
+            if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
+            if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
+            if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
         }
     }
     // Standard family: one diffuse slot.
@@ -809,6 +837,10 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
             if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
+            if (!@hasField(P, "area_center_int")) @compileError("FsParams missing area_center_int");
+            if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
+            if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
+            if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
         }
     }
 }
@@ -825,6 +857,13 @@ test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
     // draw uploads one struct value to either UB slot).
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(skinned_pbr_shd.FsParams, "probe_params"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(inst_pbr_shd.FsParams, "probe_params"));
+    // The appended area lanes land last and at the same offsets in all
+    // three (same one-struct-uploads-any-slot contract as probe_params).
+    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "area_center_int") > @offsetOf(pbr_shd.FsParams, "probe_params"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_center_int"), @offsetOf(skinned_pbr_shd.FsParams, "area_center_int"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_center_int"), @offsetOf(inst_pbr_shd.FsParams, "area_center_int"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(skinned_pbr_shd.FsParams, "area_color"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(inst_pbr_shd.FsParams, "area_color"));
 }
 
 test "probeForDraw resolves the winning probe or the legacy fallback" {

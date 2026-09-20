@@ -46,6 +46,8 @@ const PointLight = lights.PointLight;
 const PointLightOptions = lights.PointLightOptions;
 const SpotLight = lights.SpotLight;
 const SpotLightOptions = lights.SpotLightOptions;
+const AreaLight = lights.AreaLight;
+const AreaLightOptions = lights.AreaLightOptions;
 const Mesh = @import("mesh.zig").Mesh;
 const StagedInstanceRecord = @import("mesh.zig").StagedInstanceRecord;
 const decal_mod = @import("mesh/decal.zig");
@@ -574,6 +576,51 @@ pub const Scene = struct {
     /// LightRig.addDirectionalLight); fills are session-local.
     pub fn addDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         return self.lights.addDirectionalLight(self.allocator, name, options);
+    }
+
+    // ---- Rect area lights (wave 26, v1). ----
+    //
+    // A bounded, additive, OFF-by-default feature: with zero area lights
+    // every appended uniform lane is zeroed and all five forward shaders
+    // skip the area loop, rendering bit-identically to today.
+    //
+    // Orientation is two half-extent vectors (`right` = local +X axis scaled
+    // by half-width, `up` = local +Y axis scaled by half-height; the
+    // emitting normal is cross(right, up)). Degenerate rects (zero area)
+    // emit nothing.
+    //
+    // Explicit non-goals in v1: area-light shadows (unshadowed, document
+    // accordingly), LTC integration (closest-point approximation instead —
+    // see the shader header), glTF import (KHR_lights_punctual has no rect
+    // type; area lights are API-only), persistence (session-local like
+    // directional fills: save/load never writes them, load never clears
+    // live ones).
+    //
+    // Capacity: at most `lights.max_area_lights` (2); past the cap is a
+    // hard `error.TooManyAreaLights`.
+
+    /// Appends a rect area light; returns the live pointer (creation order
+    /// == uniform slot order). Hard-errors past the cap.
+    pub fn addAreaLight(self: *Scene, name: []const u8, options: AreaLightOptions) !*AreaLight {
+        return self.lights.addAreaLight(self.allocator, name, options);
+    }
+
+    /// Removes area light `index`, destroying it. Order-preserving: higher
+    /// indices shift down. Out-of-range indices are a no-op.
+    pub fn removeAreaLight(self: *Scene, index: usize) void {
+        self.lights.removeAreaLight(self.allocator, index);
+    }
+
+    /// Live area-light state (center/right/up/color/intensity/enabled are
+    /// freely mutable game-side under update-vs-prepare exclusion). Null
+    /// when out of range.
+    pub fn getAreaLight(self: *Scene, index: usize) ?*AreaLight {
+        return self.lights.getAreaLight(index);
+    }
+
+    /// Number of owned area lights (at most lights.max_area_lights).
+    pub fn areaLightCount(self: *const Scene) usize {
+        return self.lights.areaLightCount();
     }
 
     // ---- Content registries: materials & meshes. ----
@@ -1408,6 +1455,10 @@ pub const Scene = struct {
             .spot_shadow_params = snap.light_pack.spot_shadow_params,
             .point_view_proj = snap.light_pack.point_view_proj,
             .point_shadow_params = snap.light_pack.point_shadow_params,
+            .area_center_int = snap.light_pack.area_center_int,
+            .area_right = snap.light_pack.area_right,
+            .area_up = snap.light_pack.area_up,
+            .area_color = snap.light_pack.area_color,
         };
 
         var shadow_state_with = env.shadow_uniforms;
@@ -1611,6 +1662,10 @@ pub const Scene = struct {
             .spot_shadow_params = snap.light_pack.spot_shadow_params,
             .point_view_proj = snap.light_pack.point_view_proj,
             .point_shadow_params = snap.light_pack.point_shadow_params,
+            .area_center_int = snap.light_pack.area_center_int,
+            .area_right = snap.light_pack.area_right,
+            .area_up = snap.light_pack.area_up,
+            .area_color = snap.light_pack.area_color,
         };
 
         var shadow_state_with = env.shadow_uniforms;

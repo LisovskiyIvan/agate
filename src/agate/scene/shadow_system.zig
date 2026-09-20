@@ -148,6 +148,11 @@ test "frameUniforms packs shared lighting state verbatim" {
         .spot_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
         .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
         .point_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+        // Zero area lights: zeroed lanes, shader skip renders bit-identically.
+        .area_center_int = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .area_right = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .area_up = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .area_color = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
     };
 
     var state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
@@ -172,6 +177,12 @@ test "frameUniforms packs shared lighting state verbatim" {
     // slot 0 mirrors the sun, fills zeroed).
     try std.testing.expectEqual(ctx.directional_dir, f.directional_dir);
     try std.testing.expectEqual(ctx.directional_color_int, f.directional_color_int);
+    // Area lanes ride through verbatim as well; zeroed lanes (the default
+    // above) keep the shader area loop gated off bit-identically.
+    try std.testing.expectEqual(ctx.area_center_int, f.area_center_int);
+    try std.testing.expectEqual(ctx.area_right, f.area_right);
+    try std.testing.expectEqual(ctx.area_up, f.area_up);
+    try std.testing.expectEqual(ctx.area_color, f.area_color);
 
     // Disabled shadows (globally or per-mesh) zero the bias/intensity lanes
     // but keep normal bias and softness, exactly like the legacy literals.
