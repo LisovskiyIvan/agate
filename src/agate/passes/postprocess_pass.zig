@@ -37,6 +37,17 @@ pub const PostProcessPass = struct {
     height: i32 = 0,
     sample_count: i32 = 1,
     postprocess_shader: sg.Shader = .{},
+    // TAA history ping-pong (full-size color targets, same format path as
+    // the main target). Created on the context thread via
+    // ensureTaaHistory(); destroyed with the main targets on resize (an
+    // automatic reset trigger). taa_read selects the slot the composite
+    // samples; the capture draw writes 1 - taa_read.
+    taa_images: [2]sg.Image = [_]sg.Image{.{}} ** 2,
+    taa_att_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    taa_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    taa_width: i32 = 0,
+    taa_height: i32 = 0,
+    taa_read: u8 = 0,
     pub fn init() PostProcessPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -139,6 +150,78 @@ pub const PostProcessPass = struct {
         self.offscreen_depth_image = .{};
         self.offscreen_depth_att_view = .{};
         self.offscreen_depth_tex_view = .{};
+        self.destroyTaaHistory();
+    }
+
+    fn destroyTaaHistory(self: *PostProcessPass) void {
+        for (0..2) |i| {
+            if (self.taa_images[i].id != 0) sg.destroyImage(self.taa_images[i]);
+            if (self.taa_att_views[i].id != 0) sg.destroyView(self.taa_att_views[i]);
+            if (self.taa_tex_views[i].id != 0) sg.destroyView(self.taa_tex_views[i]);
+            self.taa_images[i] = .{};
+            self.taa_att_views[i] = .{};
+            self.taa_tex_views[i] = .{};
+        }
+        self.taa_width = 0;
+        self.taa_height = 0;
+        self.taa_read = 0;
+    }
+
+    /// Explicit TAA history reset. Context thread only (destroys GPU
+    /// targets immediately); headless-safe (no-ops when nothing is
+    /// allocated). The update-thread reset path is the snapshot-carried
+    /// PostProcessOptions.taa_camera_cut flag (one frame).
+    pub fn taaReset(self: *PostProcessPass) void {
+        self.destroyTaaHistory();
+    }
+
+    /// Ensures both history slots exist at `width`x`height`. Returns true
+    /// when (re)created — the caller's reset trigger for the frame (the
+    /// fresh targets carry no valid history). Reuses the main-target format
+    /// selection so the composite pipeline renders into the slots without
+    /// a format mismatch.
+    pub fn ensureTaaHistory(self: *PostProcessPass, width: i32, height: i32) bool {
+        if (width <= 0 or height <= 0) return false;
+        if (self.taa_width == width and self.taa_height == height and
+            self.taa_images[0].id != 0 and self.taa_images[1].id != 0) return false;
+
+        self.destroyTaaHistory();
+
+        const env_def = sg.queryDesc().environment.defaults;
+        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+        for (0..2) |i| {
+            const img = sg.makeImage(.{
+                .usage = .{ .color_attachment = true },
+                .width = width,
+                .height = height,
+                .pixel_format = color_fmt,
+                .sample_count = 1,
+            });
+            self.taa_images[i] = img;
+            self.taa_att_views[i] = sg.makeView(.{
+                .color_attachment = .{ .image = img },
+            });
+            self.taa_tex_views[i] = sg.makeView(.{
+                .texture = .{ .image = img },
+            });
+        }
+        self.taa_width = width;
+        self.taa_height = height;
+        self.taa_read = 0;
+        return true;
+    }
+
+    /// History texture view the composite samples (slot taa_read). Empty
+    /// until ensureTaaHistory succeeds; callers fall back to a valid
+    /// placeholder view when it is empty.
+    pub fn taaReadView(self: *const PostProcessPass) sg.View {
+        return self.taa_tex_views[self.taa_read];
+    }
+
+    /// History color-attachment view the capture draw renders into (the
+    /// slot the composite does NOT sample this frame).
+    pub fn taaWriteAttView(self: *const PostProcessPass) sg.View {
+        return self.taa_att_views[1 - self.taa_read];
     }
 
     pub fn resize(self: *PostProcessPass, width: i32, height: i32, sample_count: i32) void {
@@ -244,6 +327,14 @@ pub const PostProcessPass = struct {
         sun_color: Color3,
         near_z: f32,
         far_z: f32,
+        // TAA resolve inputs: history texture sampled reprojected (bilinear
+        // smp) plus the validity latch. Empty view + false keeps the
+        // disabled/first-frame path (the shader early-outs before sampling).
+        // capture_only re-enters the shader to store exactly the post-TAA
+        // early-LDR color into the history slot (PostFXStack capture draw).
+        taa_history_view: sg.View,
+        taa_history_valid: bool,
+        taa_capture_only: bool,
     ) void {
         if (self.postprocess_pipeline.id == 0) return;
         sg.applyPipeline(self.postprocess_pipeline);
@@ -265,6 +356,13 @@ pub const PostProcessPass = struct {
         const lut_view: sg.View = if (config.lut_texture) |t| t.view else .{};
         post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
             lut_view
+        else
+            self.offscreen_resolve_tex_view;
+        // TAA history (bilinear smp in-shader); a valid placeholder the
+        // shader never samples while history is invalid or TAA is off
+        // (taa_params.x/taa_state.x gate the branch off).
+        post_bind.views[post_shd.VIEW_history_tex] = if (taa_history_view.id != 0)
+            taa_history_view
         else
             self.offscreen_resolve_tex_view;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
@@ -393,6 +491,11 @@ pub const PostProcessPass = struct {
                 config.motion_blur_max_blur_px,
                 0.0,
             },
+            // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
+            // which keeps the composite identical to the pre-TAA path.
+            .taa_params = postprocess.taaParams(config),
+            // (history_valid 1/0, capture_only 1/0).
+            .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
         };
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
