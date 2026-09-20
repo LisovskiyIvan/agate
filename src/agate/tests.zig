@@ -96,6 +96,14 @@ test {
     _ = @import("passes/outline_pass.zig");
     _ = @import("passes/particle_pass.zig");
     _ = @import("passes/postprocess_pass.zig");
+    _ = @import("passes/shadow/binning.zig");
+    _ = @import("passes/shadow/buckets.zig");
+    _ = @import("passes/shadow/core.zig");
+    _ = @import("passes/shadow/csm.zig");
+    _ = @import("passes/shadow/point.zig");
+    _ = @import("passes/shadow/prepare.zig");
+    _ = @import("passes/shadow/spot.zig");
+    _ = @import("passes/shadow/types.zig");
     _ = @import("passes/shadow_pass.zig");
     _ = @import("passes/skybox_pass.zig");
     _ = @import("passes/ssao_pass.zig");
