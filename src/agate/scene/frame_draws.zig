@@ -76,13 +76,15 @@
 //!   `unpin`-without-`pin` is an error, never a no-op.
 //! - Threading split (explicit, no silent gap): the lease INDEX words
 //!   (`front`, `pinned`, `writing`, counters) are serialized by the internal
-//!   mutex in `claimBack` / `tryPublish` / `cancelClaim` / `pin` /
-//!   `pinFront` / `unpin` / `frontIndex` / `isPinned` / `pinsHeld`. The legacy
-//!   trio (`backIndex` / `backSlot` / `publish`) plus direct `slots[i]`
-//!   payload access are SINGLE-THREADED ONLY (the sequential
-//!   build/prepare/render path): they read `pinned`/`writing` without the
-//!   mutex and must never run concurrently with lease activity. Concurrent
-//!   producers/consumers must use the claim/pin API exclusively.
+//!   mutex in `claimBack` / `claimSlot` / `tryPublish` / `cancelClaim` /
+//!   `pin` / `pinFront` / `unpin` / `frontIndex` / `isPinned` / `pinsHeld`.
+//!   The legacy trio (`backIndex` / `backSlot` / `publish`) plus direct
+//!   `slots[i]` payload access are SINGLE-THREADED ONLY (the sequential
+//!   legacy `stageUiPacket` path and the wave-26 rotation tests):
+//!   `prepareFrame` itself resolves its working slot through the locked
+//!   claim API since wave 31. The legacy trio reads `pinned`/`writing`
+//!   without the mutex and must never run concurrently with lease activity.
+//!   Concurrent producers/consumers must use the claim/pin API exclusively.
 //! - Do not copy a FrameDraws (it owns a Mutex); Scene holds the single
 //!   instance by value.
 //!
@@ -155,13 +157,20 @@
 //! - stop calling bare `buildPreparedFrame`/`stageUiPacket` across threads:
 //!   use `Scene.tryClaimBuildSlot` + `BuildClaim.build`/`stageUi` +
 //!   `publish`/`cancel` on the game thread; never touch `backIndex`/
-//!   `backSlot`/`publish`/raw `slots[i]` writes concurrently (those stay
-//!   single-threaded-only).
-//! - `prepareFrame`'s back resolution (`backIndex`/`backSlot`, unlocked)
-//!   must become a locked claim so it never targets the game-held slot;
-//!   until then a stage during prepare must use the claim API (targets the
-//!   claimed slot, never the latched one) and legacy `stageUiPacket` must
-//!   not run concurrently with prepare.
+//!   `backSlot`/raw `slots[i]` writes concurrently (those stay
+//!   single-threaded-only, as does legacy `stageUiPacket`, which must not
+//!   run concurrently with prepare).
+//! - DONE (wave 31): `prepareFrame`'s back resolution is a locked claim —
+//!   `claimBack` on the fallback path, `claimSlot(build_slot)` on the latch
+//!   path — held for the whole prepare and released at every exit
+//!   (`tryPublish` on success, `cancelClaim`/early return on contention).
+//!   A concurrent game claim therefore never targets the slot prepare is
+//!   consuming (it skips the WRITING slot or saturates, counted), `pin`
+//!   refuses that slot (`SlotBusy`, counted), and prepare never resets a
+//!   game-held slot. Prepare's own publish flip stays context-owned exactly
+//!   as before (now via the locked `tryPublish`); a missed slot degrades to
+//!   a counted skip, never a wedge. What REMAINS for adoption is app-side
+//!   flow (the first bullet) + canvas quiesce + freeze-then-latch:
 //! - epochs stay context-owned (`begin`/`complete`/`flush` only in
 //!   prepare/render): the build path must never gain epoch calls (tested).
 //! - remaining live touches (meshes/canvas/cameras/lights/particles +
@@ -395,9 +404,11 @@ pub const FrameDraws = struct {
     saturation_skips: u64 = 0,
 
     /// SINGLE-THREADED ONLY (see header): the back index for the sequential
-    /// build/prepare path. First slot after `front` that is neither pinned
-    /// nor claimed; asserts one exists (the sequential path never holds pins
-    /// or claims across the build, so with 3 slots one is always free).
+    /// legacy stage path and the rotation tests. First slot after `front`
+    /// that is neither pinned nor claimed; asserts one exists (the
+    /// sequential path never holds pins or claims across the call, so with
+    /// 3 slots one is always free). `prepareFrame` no longer uses this
+    /// (wave 31: locked claim); concurrent callers must use `claimBack`.
     pub fn backIndex(self: *const FrameDraws) usize {
         var k: usize = 1;
         while (k < SLOT_COUNT) : (k += 1) {
@@ -427,6 +438,8 @@ pub const FrameDraws = struct {
 
     /// SINGLE-THREADED ONLY (see header): publish the sequentially built
     /// back slot. Must be exactly the current back index and unpinned.
+    /// Rotation-test helper since wave 31 (`prepareFrame` publishes via the
+    /// locked `tryPublish` instead).
     pub fn publish(self: *FrameDraws, back_idx: usize) void {
         std.debug.assert(back_idx == self.backIndex());
         std.debug.assert(!self.pinned[back_idx]);
@@ -451,6 +464,33 @@ pub const FrameDraws = struct {
         }
         self.saturation_skips += 1;
         return null;
+    }
+
+    /// Locked specific-slot claim (wave 31, prepare-latch side): reserve
+    /// exactly `idx` for writing — the handoff slot a concurrent game build
+    /// published via `releaseHandoff` (`Scene.build_slot`), which a blind
+    /// `claimBack` is not guaranteed to return once game||prepare overlap.
+    /// Fails closed and counted, state unchanged: `PinnedSlot` (counted in
+    /// `publish_refusals` — a presented frame is never overwritten) when the
+    /// slot is pinned, `SlotBusy` (counted in `saturation_skips` — skip the
+    /// frame, latest-wins) when another producer holds it for writing,
+    /// `InvalidSlot` when out of range. The pinned check runs first: correct
+    /// API use can never produce writing+pinned (claim skips pins, pin
+    /// refuses writing), so either order is defense-in-depth and the
+    /// presented frame wins ties.
+    pub fn claimSlot(self: *FrameDraws, idx: usize) LeaseError!void {
+        if (idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.pinned[idx]) {
+            self.publish_refusals += 1;
+            return LeaseError.PinnedSlot;
+        }
+        if (self.writing[idx]) {
+            self.saturation_skips += 1;
+            return LeaseError.SlotBusy;
+        }
+        self.writing[idx] = true;
     }
 
     /// Concurrent-producer publish: hand a claimed slot to the consumer.
@@ -1086,5 +1126,56 @@ test "wave29: consumer-held pins force the producer to skip, never stall" {
     try draws.pin(tail);
     try testing.expectEqual(total_publishes, draws.slotAtConst(tail).frame_id);
     try draws.unpin(tail);
+    draws.deinit(testing.allocator);
+}
+
+// --- wave-31 tests: prepare-side specific claim (`claimSlot`). ---
+
+// `claimSlot` reserves exactly the handoff slot: success marks WRITING and
+// composes with `tryPublish`; a pinned target refuses with `PinnedSlot`
+// (counted in `publish_refusals`, presented frame never overwritten); an
+// already-claimed target refuses with `SlotBusy` (counted in
+// `saturation_skips`, skip-the-frame); out-of-range is `InvalidSlot`. State
+// is unchanged on every refusal.
+test "wave31: claimSlot reserves the handoff slot, refusals are fail-closed and counted" {
+    var draws = FrameDraws{};
+
+    // Success: the slot is marked WRITING and publishes normally.
+    try draws.claimSlot(1);
+    draws.slotAt(1).frame_id = 11;
+    try draws.tryPublish(1);
+    try testing.expectEqual(@as(usize, 1), draws.front);
+    try testing.expectEqual(@as(u64, 11), draws.slotAtConst(1).frame_id);
+
+    // Already claimed (a concurrent producer mid-fill): SlotBusy + counted.
+    const c = draws.claimBack().?;
+    try testing.expectError(LeaseError.SlotBusy, draws.claimSlot(c));
+    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
+    // Release then re-claim the same slot: now it succeeds.
+    try draws.cancelClaim(c);
+    try draws.claimSlot(c);
+    try draws.cancelClaim(c);
+
+    // Pinned (a presenting consumer): PinnedSlot + counted, front unchanged.
+    const f = draws.front;
+    try draws.pin(f);
+    const front_before = draws.front;
+    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(f));
+    try testing.expectEqual(@as(u64, 1), draws.publish_refusals);
+    try testing.expectEqual(front_before, draws.front);
+    try draws.unpin(f);
+
+    // Out of range: InvalidSlot, no counter moves.
+    try testing.expectError(LeaseError.InvalidSlot, draws.claimSlot(SLOT_COUNT));
+    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
+    try testing.expectEqual(@as(u64, 1), draws.publish_refusals);
+
+    // Clean teardown: no pins held, nothing left WRITING (a claim without a
+    // matching release would wedge the rotation — the wave-31 prepare audit
+    // requires every claim to pair with publish/cancel at every exit).
+    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
+    for (0..SLOT_COUNT) |i| {
+        try testing.expectError(LeaseError.NotClaimed, draws.cancelClaim(i));
+    }
     draws.deinit(testing.allocator);
 }

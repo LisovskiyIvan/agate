@@ -5730,3 +5730,439 @@ test "softbody disabled body pauses: no step, no upload flag" {
     scene.updateSoftBodies(1.0 / 60.0);
     try std.testing.expect(body.upload_pending);
 }
+
+// ---- Wave 31: prepareFrame holds its working slot as a lease claim. ----
+//
+// prepare resolves its slot via `claimBack` (fallback) or
+// `claimSlot(build_slot)` (latch) at the top and releases it at every exit
+// (`tryPublish` on success, `cancelClaim`/early return on contention). These
+// tests prove the three properties that motivated the slice: prepares make
+// progress under a concurrent pinned front, every exit pairs its claim
+// (no leaked WRITING/pins, contention degrades to counted skips), and a
+// concurrent game claim/stageUi can never target prepare's slot.
+
+test "wave31: prepare publishes under a concurrent pinned front (stress), no leaks" {
+    const alloc = std.testing.allocator;
+    const LeaseError = @import("frame_draws.zig").LeaseError;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    const total: usize = 500;
+
+    const Ctx = struct {
+        scene: *Scene,
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        reads: u64 = 0,
+    };
+
+    const Pinner = struct {
+        fn run(c: *Ctx) void {
+            // Consumer-side only: frontIndex/pin/pinned-payload-read/unpin.
+            // A pinned slot is never written by prepare (it builds only its
+            // claimed slot), so these reads need no further locking; every
+            // index word goes through the lease mutex.
+            var held: ?usize = null;
+            while (!c.stop.load(.acquire)) {
+                if (held) |h| {
+                    c.scene.draws.unpin(h) catch unreachable;
+                    held = null;
+                }
+                const f = c.scene.draws.frontIndex();
+                c.scene.draws.pin(f) catch |e| switch (e) {
+                    LeaseError.AlreadyPinned, LeaseError.SlotBusy => continue,
+                    else => unreachable,
+                };
+                held = f;
+                // No-overwrite proof: the pinned pair must be stable for the
+                // whole hold (prepare stamps both words before publish and
+                // never rewrites a pinned slot afterwards).
+                const s = c.scene.draws.slotAtConst(f);
+                const fid0 = s.frame_id;
+                const ep0 = s.retire_epoch;
+                var spins: usize = 0;
+                while (spins < 100) : (spins += 1) {
+                    std.atomic.spinLoopHint();
+                    const s2 = c.scene.draws.slotAtConst(f);
+                    if (s2.frame_id != fid0 or s2.retire_epoch != ep0) unreachable;
+                    c.reads += 1;
+                }
+            }
+            if (held) |h| c.scene.draws.unpin(h) catch unreachable;
+        }
+    };
+
+    const sat0 = scene.draws.saturation_skips;
+    var ctx = Ctx{ .scene = &scene };
+    const t = try std.Thread.spawn(.{}, Pinner.run, .{&ctx});
+    var ok: usize = 0;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        // Per-call success is the front flip (a contended prepare would
+        // keep a stale `frame_prepared` from an earlier pending frame, so
+        // the flag alone cannot tell them apart — the flip can).
+        const f0 = scene.draws.front;
+        scene.prepareFrame();
+        if (scene.draws.front != f0) ok += 1;
+        try std.testing.expect(scene.frame_prepared);
+    }
+    ctx.stop.store(true, .release);
+    t.join();
+
+    // At most one pin held at a time: the 3-slot rotation always has a free
+    // slot, so every prepare succeeds with zero saturation and zero
+    // refusals, and the pinned presents were never overwritten (the pinner
+    // would have hit `unreachable` on any rewrite).
+    try std.testing.expectEqual(total, ok);
+    try std.testing.expectEqual(sat0, scene.draws.saturation_skips);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
+    try std.testing.expect(ctx.reads > 0);
+    try std.testing.expect(scene.hasConsumableFrame());
+    for (0..scene.draws.slots.len) |idx| {
+        try std.testing.expect(scene.draws.slots[idx].frame_id != 0);
+        try std.testing.expect(!scene.draws.writing[idx]);
+        try std.testing.expect(!scene.draws.pinned[idx]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave31: prepare claim accounting — no leaks across exits incl. early returns" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const expectClean = struct {
+        fn run(s: *Scene) !void {
+            try std.testing.expectEqual(@as(usize, 0), s.draws.pinsHeld());
+            for (0..s.draws.slots.len) |idx| {
+                try std.testing.expect(!s.draws.writing[idx]);
+                try std.testing.expect(!s.draws.pinned[idx]);
+            }
+        }
+    }.run;
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Baseline: the fallback and latch exits pair every claim.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    try expectClean(&scene);
+
+    // (a) Latch-path contention: a pending build whose handoff slot is held
+    // for writing (a concurrent game reclaim mid-fill for the NEXT build)
+    // degrades to a counted skip — nothing consumed, the build stays fresh,
+    // the slot payload is untouched, no side effect ran (the claim sits
+    // before the retire/stats/frame prologue).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    const pending_slot = scene.build_slot.load(.monotonic);
+    const pending_seq = scene.build_seq.load(.monotonic);
+    const latched_before = scene.last_latched_seq.load(.monotonic);
+    try std.testing.expect(pending_seq != latched_before);
+    const snap_w = scene.draws.slots[pending_slot].snapshot.screen_w;
+    try scene.draws.claimSlot(pending_slot);
+    const sat0 = scene.draws.saturation_skips;
+    const front0 = scene.draws.front;
+    const fid0 = scene.frame_id;
+    scene.prepareFrame();
+    // Skip discards nothing: the earlier pending frame stays consumable.
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(front0, scene.draws.front);
+    try std.testing.expectEqual(latched_before, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(pending_seq, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(sat0 + 1, scene.draws.saturation_skips);
+    try std.testing.expectEqual(fid0, scene.frame_id);
+    try std.testing.expectEqual(snap_w, scene.draws.slots[pending_slot].snapshot.screen_w);
+    // Release and retry: the pending build latches exactly once.
+    try scene.draws.cancelClaim(pending_slot);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(pending_slot, scene.draws.front);
+    try std.testing.expectEqual(pending_seq, scene.last_latched_seq.load(.monotonic));
+    try expectClean(&scene);
+
+    // (b) Latch-path pinned handoff: a presented frame is never overwritten —
+    // PinnedSlot refusal, counted, build stays fresh; unpin restores.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    const pinned_slot = scene.build_slot.load(.monotonic);
+    const pinned_seq = scene.build_seq.load(.monotonic);
+    try std.testing.expect(pinned_seq != scene.last_latched_seq.load(.monotonic));
+    try scene.draws.pin(pinned_slot);
+    const ref0 = scene.draws.publish_refusals;
+    scene.prepareFrame();
+    // Skip discards nothing: the earlier pending frame stays consumable.
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(ref0 + 1, scene.draws.publish_refusals);
+    try std.testing.expectEqual(pinned_seq, scene.build_seq.load(.monotonic));
+    try std.testing.expect(pinned_seq != scene.last_latched_seq.load(.monotonic));
+    try scene.draws.unpin(pinned_slot);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(pinned_slot, scene.draws.front);
+    try expectClean(&scene);
+
+    // (c) Fallback saturation: every non-front slot held degrades to a
+    // counted skip, never a wedge; releasing restores the rotation.
+    try scene.draws.pin(scene.draws.front);
+    const h1 = scene.draws.claimBack().?;
+    const h2 = scene.draws.claimBack().?;
+    try std.testing.expect(scene.draws.claimBack() == null);
+    const sat1 = scene.draws.saturation_skips;
+    const front1 = scene.draws.front;
+    scene.prepareFrame();
+    // Skip discards nothing: the earlier pending frame stays consumable.
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(front1, scene.draws.front);
+    try std.testing.expectEqual(sat1 + 1, scene.draws.saturation_skips);
+    try scene.draws.cancelClaim(h1);
+    try scene.draws.cancelClaim(h2);
+    try scene.draws.unpin(front1);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try expectClean(&scene);
+}
+
+test "wave31: skip with nothing pending leaves nothing consumable; render drops the present" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    // Fresh scene: saturate every non-front slot, then prepare. With no
+    // earlier pending frame the skip keeps `frame_prepared` false and the
+    // front untouched — and nothing is consumable yet.
+    try scene.draws.pin(scene.draws.front);
+    const g1 = scene.draws.claimBack().?;
+    const g2 = scene.draws.claimBack().?;
+    const sat0 = scene.draws.saturation_skips;
+    scene.prepareFrame();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.front);
+    try std.testing.expectEqual(sat0 + 1, scene.draws.saturation_skips);
+    try std.testing.expect(!scene.hasConsumableFrame());
+
+    // `render` on the skipped state drops the present via its fallback
+    // guard (no pin, no epoch, no stats record) instead of mislabeling the
+    // stale front — then the rotation recovers cleanly once released.
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.front);
+    // The saturation pin is still held (released below): the guard path
+    // must neither pin nor unpin anything, so the count is unchanged at 1.
+    try std.testing.expectEqual(@as(usize, 1), scene.draws.pinsHeld());
+    try scene.draws.cancelClaim(g1);
+    try scene.draws.cancelClaim(g2);
+    try scene.draws.unpin(0);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expect(scene.hasConsumableFrame());
+    // The pending frame consumes through the camera-less render path.
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave31: concurrent game claim can never target prepare's slot (steering + refusal)" {
+    const alloc = std.testing.allocator;
+    const LeaseError = @import("frame_draws.zig").LeaseError;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var regular = Mesh{
+        .name = "w31_reg",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &regular);
+
+    // Prime one fallback frame so the rotation is warm.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const front0 = scene.draws.front;
+
+    // A claim taken exactly the way the fallback prepare takes it.
+    const held = scene.draws.claimBack().?;
+    try std.testing.expect(held != front0);
+
+    // The game-side claim steers to the OTHER free slot — never the held
+    // one — then runs the full adopted flow (build + stageUi after the
+    // build, which resets + publish).
+    var game = scene.tryClaimBuildSlot().?;
+    try std.testing.expect(game.slot != held);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    game.build();
+    game.stageUi();
+    const game_slot = game.slot;
+    game.publish();
+    try std.testing.expectEqual(game_slot, scene.build_slot.load(.monotonic));
+
+    // The held slot is untouched by all of the above: no reset, no UI bytes.
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.slots[held].frame_id);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.slots[held].ui_vertices.items.len);
+    try std.testing.expect(!scene.draws.slots[held].ui_packet.valid);
+
+    // A consumer pin on the prepare-held slot is refused and counted
+    // (SlotBusy): the presenting side can never reclaim it mid-prepare.
+    const den0 = scene.draws.pin_denials;
+    try std.testing.expectError(LeaseError.SlotBusy, scene.draws.pin(held));
+    try std.testing.expectEqual(den0 + 1, scene.draws.pin_denials);
+
+    // The legacy stage path steers away too: it targets the unlocked back
+    // index, which skips WRITING slots — never the held one.
+    try std.testing.expect(scene.draws.backIndex() != held);
+    scene.stageUiPacket();
+    try std.testing.expect(!scene.draws.slots[held].ui_packet.valid);
+
+    // Release the simulated prepare hold, then run the real prepare: it
+    // latches exactly the published handoff slot and pairs every claim.
+    try scene.draws.cancelClaim(held);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(game_slot, scene.draws.front);
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+    for (0..scene.draws.slots.len) |idx| try std.testing.expect(!scene.draws.writing[idx]);
+}
+
+test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters, no tears" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    const total_claims: u64 = 2000;
+    const total_prepares: usize = 2000;
+
+    const Ctx = struct {
+        scene: *Scene,
+        claims: u64,
+        skipped: u64 = 0, // game-side null-claims (saturation)
+        published: u64 = 0,
+        cancelled: u64 = 0,
+    };
+
+    const Producer = struct {
+        fn run(c: *Ctx) void {
+            // Game-side concurrent flow (UI-only claims, the wave-30 shape):
+            // reserve, stage, hand off — or cancel every 16th reservation to
+            // exercise `cancelClaim` under prepare pressure. Never touches
+            // live scene state: the claimed slot payload is producer-owned
+            // (no canvas, so no canvas reads either) and the seq words are
+            // the release edge. Full `build()` calls stay out: the live
+            // mesh/snapshot reads they need are still phase-excluded (the
+            // documented remainder, not this slice).
+            var n: u64 = 0;
+            while (n < c.claims) {
+                // A null-claim is a skip, not a reservation: it must not
+                // consume the claim budget below.
+                var claim = c.scene.tryClaimBuildSlot() orelse {
+                    c.skipped += 1;
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                if (n % 16 == 7) {
+                    claim.cancel();
+                    c.cancelled += 1;
+                } else {
+                    claim.stageUi();
+                    claim.publish();
+                    c.published += 1;
+                }
+                n += 1;
+            }
+        }
+    };
+
+    const sat0 = scene.draws.saturation_skips;
+    var ctx = Ctx{ .scene = &scene, .claims = total_claims };
+    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
+    var prepared_ok: usize = 0;
+    var i: usize = 0;
+    while (i < total_prepares) : (i += 1) {
+        // Per-call success is the front flip: a contended prepare keeps a
+        // stale `frame_prepared` from an earlier pending frame (the skip
+        // discards nothing), so the flag alone cannot count skips — while
+        // every genuine prepare flips to a slot that was not the front.
+        const f0 = scene.draws.front;
+        scene.prepareFrame();
+        if (scene.draws.front != f0) prepared_ok += 1;
+    }
+    prod.join();
+    // Drain: consume any build published after the last prepare. No
+    // contention is left (the producer is joined), so every drain prepare
+    // flips unless nothing is pending.
+    var drain: usize = 0;
+    while (scene.last_latched_seq.load(.monotonic) != scene.build_seq.load(.monotonic) and drain < 10) : (drain += 1) {
+        const f0 = scene.draws.front;
+        scene.prepareFrame();
+        try std.testing.expect(scene.draws.front != f0);
+    }
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+
+    // Exact skip accounting: every game-side null-claim and every contended
+    // prepare (fallback null-claim and latch SlotBusy alike) bumps
+    // `saturation_skips` exactly once — the sum must match, proving no
+    // silent interference in either direction (a missed release would wedge
+    // the drain or leak WRITING below instead).
+    const prepare_skips = total_prepares - prepared_ok;
+    try std.testing.expectEqual(ctx.skipped + prepare_skips, scene.draws.saturation_skips - sat0);
+    // Every non-cancelled reservation published exactly once (the seqs ARE
+    // the counters: one stage + one generation per publish, cancels commit
+    // nothing).
+    try std.testing.expectEqual(ctx.published + ctx.cancelled, total_claims);
+    try std.testing.expectEqual(ctx.published, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(ctx.published, scene.ui_packet_seq.load(.monotonic));
+    try std.testing.expectEqual(ctx.published, scene.last_latched_ui_seq.load(.monotonic));
+    // No pin/refusal activity anywhere in this flow (nothing is presented
+    // mid-loop, nothing publishes onto a pin).
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.pin_denials);
+    // Clean teardown: no pins held, nothing left WRITING, consumable front.
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+    for (0..scene.draws.slots.len) |idx| try std.testing.expect(!scene.draws.writing[idx]);
+    try std.testing.expect(scene.hasConsumableFrame());
+}

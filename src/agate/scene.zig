@@ -2358,7 +2358,11 @@ pub const Scene = struct {
         // Sequential-only: targets the unlocked back index — must never run
         // concurrently with prepareFrame (on the concurrent path use
         // `BuildClaim.stageUi`, which targets the claimed slot, never the
-        // one prepare is latching).
+        // one prepare is latching). Since wave 31 prepare additionally holds
+        // its slot WRITING for the whole prepare, a concurrent legacy stage
+        // would not even target the latched slot (the unlocked back index
+        // skips WRITING slots) — it would stage into a slot nobody latches,
+        // silently dropping the packet. The prohibition stands.
         self.stageUiPacketInto(self.draws.backIndex());
     }
 
@@ -2426,7 +2430,12 @@ pub const Scene = struct {
     /// so the historical phantom+1 counters survive empty frames. Missing
     /// canvas or camera-less frames fail close to coherent-empty — never a
     /// stale prior overlay, never an unsafe upload/draw.
-    fn captureUiFrame(self: *Scene, snap: *const SceneFrameSnapshot) void {
+    ///
+    /// Takes the claimed back slot prepare holds (wave 31) — never
+    /// `backSlot()`: the held claim marks the slot WRITING, which the
+    /// unlocked helper would skip, returning a different slot than the one
+    /// prepare latches.
+    fn captureUiFrame(self: *Scene, snap: *const SceneFrameSnapshot, back: *FrameDrawSlot) void {
         // Slot-owned UI packet first (game-side staging, slice 2 b): when
         // the game staged a fresh packet, the latch consumes it instead of
         // reading the live canvas lists. The seq is stamped consumed on ALL
@@ -2437,7 +2446,6 @@ pub const Scene = struct {
         if (staged_seq != self.last_latched_ui_seq.load(.monotonic)) {
             // Context-side stamp only (the producer never touches this word).
             self.last_latched_ui_seq.store(staged_seq, .monotonic);
-            const back = self.draws.backSlot();
             if (back.ui_packet.valid) {
                 if (back.ui_packet.canvas_present) {
                     if (self.ui_canvas) |*canvas| {
@@ -2966,6 +2974,43 @@ pub const Scene = struct {
         // построение очередей + CPU-capture (debug/particles/UI) и их GPU
         // upload. Draw-фаза ниже читает только render-owned снимки.
         gpu_thread.assertOnContextThread();
+        // Wave-31 lease claim (concurrent-build prerequisite): prepare
+        // resolves AND holds its working slot through the lease protocol for
+        // the duration of the whole prepare. Fallback (no fresh build)
+        // claims any free slot (`claimBack` — sequentially exactly the old
+        // `backIndex`); the latch path claims the handoff slot the game
+        // published (`claimSlot(build_slot)` — sequentially exactly the old
+        // `build_slot == backIndex` assert, now fail-closed instead of
+        // debug-only). While the claim is held a concurrent game
+        // `tryClaimBuildSlot` skips this slot (or saturates, counted) and
+        // `pin` refuses it (`SlotBusy`, counted): no concurrent
+        // `BuildClaim.publish`/`stageUi` can target the slot prepare is
+        // consuming, and prepare never resets a game-held slot. The publish
+        // flip itself stays context-owned exactly as before — now via the
+        // locked `tryPublish` at the end. Contention degrades to a counted
+        // skip, never a wedge: the counters are bumped inside the lease
+        // calls, nothing is consumed yet (no retire/stats/frame side effects
+        // below have run). The skip discards nothing: a pending frame from
+        // an earlier prepare stays consumable (`frame_prepared` untouched —
+        // still the freshest prepared); with nothing pending it stays false,
+        // so `render`'s fallback drops the present instead of mislabeling a
+        // stale front. On the latch path the build stays fresh
+        // (`last_latched_seq` unstamped) for the next prepare.
+        // Acquire: pairs with the publish release-store, so the staged build
+        // payload is visible on the latch path below.
+        const have_build = self.build_seq.load(.acquire) != self.last_latched_seq.load(.monotonic);
+        const back_idx: usize = if (have_build) blk: {
+            const wanted = self.build_slot.load(.acquire);
+            self.draws.claimSlot(wanted) catch {
+                return;
+            };
+            break :blk wanted;
+        } else blk: {
+            break :blk self.draws.claimBack() orelse {
+                return;
+            };
+        };
+        const back = self.draws.slotAt(back_idx);
         // P7: repeated prepare discards the previous pending frame BEFORE
         // GpuRetire.begin/flush below: its borrowed handles may be torn down
         // by the flush, so preparedDraws() payloads from that frame lose GPU
@@ -3019,12 +3064,10 @@ pub const Scene = struct {
         // after the flush above and BEFORE the update/render unlock below.
         // Reads live systems for the LAST time this frame; the draw below
         // sees only the capture. Stage 1: when the game side built a fresh
-        // frame (`build_seq` newer than `last_latched_seq`), latch the build
-        // instead of restaging from live systems; otherwise the historical
-        // inline capture (apps without `buildPreparedFrame` are unchanged).
-        // Acquire: pairs with the publish release-store, so the staged build
-        // payload is visible on the latch path below.
-        const have_build = self.build_seq.load(.acquire) != self.last_latched_seq.load(.monotonic);
+        // frame (`have_build`, latched at the top under the lease claim),
+        // latch the build instead of restaging from live systems; otherwise
+        // the historical inline capture (apps without `buildPreparedFrame`
+        // are unchanged).
         if (have_build) {
             self.particles.latchFrame(self.allocator);
         } else {
@@ -3052,16 +3095,15 @@ pub const Scene = struct {
         // never mixes culling/camera generations into these queues. Without
         // a build the historical takeLatest-else-pack runs into
         // `frame_snapshot`; the fallback branch below stages it into the
-        // back slot before consuming it.
-        // The back slot is resolved here, before the UI latch: `front` is
-        // untouched since the last publish, so the index stays stable across
-        // the latch (the staged UI packet lives in this same back slot).
-        const back_idx = self.draws.backIndex();
-        const back = &self.draws.slots[back_idx];
+        // claimed slot before consuming it.
+        // (`back` is the lease-held slot claimed at the top: `front` moves
+        // only on the publish at the end, so the claim stays stable across
+        // the latch, and the staged UI packet lives in this same slot.)
         if (have_build) {
-            // Acquire: ordered after the observed fresh `build_seq`, so the
-            // published slot index is the one the producer stored.
-            std.debug.assert(self.build_slot.load(.acquire) == back_idx);
+            // The handoff slot is already held via `claimSlot(build_slot)`:
+            // no intervening publish could have moved `front` (only prepare
+            // flips it, and the latch has not run yet), and no concurrent
+            // claim could have taken it (claims skip WRITING slots).
             self.frame_snapshot = back.snapshot;
         } else {
             var snap = self.frame_snapshot;
@@ -3082,11 +3124,11 @@ pub const Scene = struct {
         const staged: *const SceneFrameSnapshot = if (have_build) &back.snapshot else &self.frame_snapshot;
 
         // UI packet latch BEFORE the queue branches below: the fallback
-        // branch resets the back slot (wiping a staged UI packet), while the
-        // latch path consumes it — so the packet must land in `ui_frame`
+        // branch resets the claimed slot (wiping a staged UI packet), while
+        // the latch path consumes it — so the packet must land in `ui_frame`
         // first. Order vs debug/instance uploads is irrelevant (disjoint
         // buffers; the meter sums identically).
-        self.captureUiFrame(staged);
+        self.captureUiFrame(staged, back);
 
         // Debug line upload (GPU): the frame's single updateBuffer, once per
         // prepare no matter how many PIP views render below. Samples follow
@@ -3103,11 +3145,12 @@ pub const Scene = struct {
         }
 
         const is_gpu_init = (self.default_white_texture.view.id != 0);
-        // P7: build the BACK slot in place, then publish with one index flip
-        // at the end. The front slot is untouched during the build:
-        // allocator failure in the back corrupts nothing consumable.
-        // (`back_idx`/`back` were resolved before the UI latch above; `front`
-        // has not moved since, so they still address the build scratch.)
+        // P7: build the CLAIMED slot in place, then publish with one index
+        // flip at the end. The front slot is untouched during the build:
+        // allocator failure in the claimed slot corrupts nothing consumable.
+        // (The claim is held since the top, across the UI latch above;
+        // `front` has not moved since, so `back` still addresses the build
+        // scratch, and no concurrent claim could have taken it.)
         if (have_build) {
             // Stage-2 latch: the game-side build already committed the last
             // publish, reset this back slot, staged the instance scratch +
@@ -3223,7 +3266,18 @@ pub const Scene = struct {
         // P7 publish: one index flip, no list copies. Newest wins — a repeated
         // prepare's back overwrote nothing consumable until this point.
         // (UI already latched above, before the queue branches.)
-        self.draws.publish(back_idx);
+        // Context-owned flip exactly as before, now via the locked publish:
+        // this clears the claim taken at the top and hands the slot to the
+        // consumer in one step. `pin` refuses WRITING slots, so no
+        // concurrent pin could have landed on our slot and the publish
+        // cannot refuse under correct API use; the defensive branch releases
+        // the claim and skips instead of wedging (a missed release degrades
+        // to a counted skip — the refusal itself is counted inside
+        // `tryPublish`).
+        self.draws.tryPublish(back_idx) catch {
+            self.draws.cancelClaim(back_idx) catch {};
+            return;
+        };
         self.frame_prepared = true;
     }
 
@@ -3367,6 +3421,17 @@ pub const Scene = struct {
         gpu_thread.assertOnContextThread();
         if (!self.frame_prepared and !self.rendering_reuse) {
             self.prepareFrame();
+            // Wave-31 counted skip: under lease contention prepare consumes
+            // nothing. When a pending frame from an earlier prepare exists
+            // (`frame_prepared` kept true by the skip) it is consumed below
+            // as usual — still the freshest prepared. With nothing pending
+            // (false) there is no retire epoch to complete (the claim sits
+            // before it) and no frame to present: drop the present instead
+            // of mislabeling the stale front in stats/profiler (latest-wins)
+            // and let the next frame retry. A still-open older epoch is
+            // closed by the next prepare's `begin`. Sequential behavior is
+            // unchanged (prepare never skips there).
+            if (!self.frame_prepared) return;
         }
         self.frame_prepared = false;
         // Конец кадра (P3): epoch, начатый в prepareFrame, закрывается на ВСЕХ
@@ -3672,6 +3737,11 @@ pub const Scene = struct {
     /// Non-blocking render-consumer reuse: re-draws the current front slot
     /// without a prepare, for frames where the app skipped the phase-lock
     /// acquire (lock contended) instead of stalling the present.
+    ///
+    /// Takes no lease claim (nothing is built, nothing publishes): reuse
+    /// only re-presents the pinned front through the inner `render` — the
+    /// claim protocol is untouched, and a concurrent game claim can proceed
+    /// against any other slot while the present holds its pin.
     ///
     /// Reuse contract: the caller reuses only when `hasConsumableFrame()`
     /// is true (debug assert below enforces it: front slot `frame_id != 0`,
