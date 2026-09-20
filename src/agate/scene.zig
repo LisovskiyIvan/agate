@@ -410,7 +410,8 @@ pub const Scene = struct {
     /// prove the staged path is live rather than merely staged. Monotonic;
     /// read via `uiPacketLatchedCount()`.
     ui_packet_latched: u64 = 0,
-    /// Back-slot index the last `buildPreparedFrame` wrote; the latch
+    /// Back-slot index the last `buildPreparedFrame` wrote (stamped by
+    /// `BuildClaim.publish`); the latch
     /// asserts it still is the back index (no intervening publish).
     build_slot: usize = 0,
     /// Game-owned queue-build stats (stage-2 increment B): `buildPreparedFrame`
@@ -2102,8 +2103,18 @@ pub const Scene = struct {
     /// `ui_packet_seq == last_latched_ui_seq` the legacy path runs
     /// bit-identically and the slot lists stay empty.
     pub fn stageUiPacket(self: *Scene) void {
+        // Sequential-only: targets the unlocked back index — must never run
+        // concurrently with prepareFrame (on the concurrent path use
+        // `BuildClaim.stageUi`, which targets the claimed slot, never the
+        // one prepare is latching).
+        self.stageUiPacketInto(self.draws.backIndex());
+    }
+
+    /// Shared UI stage core behind `stageUiPacket` and `BuildClaim.stageUi`:
+    /// the exact historical stage body targeted at `slot`.
+    fn stageUiPacketInto(self: *Scene, slot: usize) void {
         // Deliberately NO gpu_thread assert: game side, sg-free by design.
-        const back = self.draws.backSlot();
+        const back = &self.draws.slots[slot];
         const canvas = if (self.ui_canvas) |*c| c else {
             back.ui_vertices.clearRetainingCapacity();
             back.ui_indices.clearRetainingCapacity();
@@ -2403,8 +2414,98 @@ pub const Scene = struct {
         }
     }
 
+    /// Concurrent-build claim (wave 29, game side): reserve a free draw slot
+    /// for the next build — a slot that is neither pinned nor front under
+    /// the lease protocol. Returns null when every non-front slot is pinned
+    /// or claimed (consumer lagging): skip the frame instead of blocking
+    /// (the documented latest-wins drop, counted in
+    /// `draws.saturation_skips`), never stall.
+    ///
+    /// The claim reserves (but does not commit) the next build generation
+    /// (`seq = build_seq + 1`): `build()` fills the slot against it,
+    /// `publish()` commits it (`build_seq`, `build_slot`) and releases the
+    /// slot into the prepare handoff WITHOUT flipping `front` (the flip
+    /// stays context-owned in `prepareFrame`, so the sequential
+    /// build→prepare flow below is bit-identical), `cancel()` drops the
+    /// claim without committing anything (the slot's provisional contents
+    /// are ignored by prepare and reset by the next claim). Do not
+    /// interleave a legacy `buildPreparedFrame` between claim and publish
+    /// (debug-asserted: the reserved seq must still be exactly next).
+    ///
+    /// Threading: the claim holder owns the claimed slot's payload
+    /// exclusively (producer writes, no lock needed); the lease mutex pairs
+    /// those writes with the consumer's post-pin reads. Everything ELSE the
+    /// build touches (live meshes/canvas, `build_snapshot`, particle/
+    /// physics build frames, the seq words) is still phase-excluded today —
+    /// see the adoption checklist in scene/frame_draws.zig. The claim API
+    /// alone does not remove the phase mutex.
+    pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
+        const slot = self.draws.claimBack() orelse return null;
+        return .{ .scene = self, .slot = slot, .seq = self.build_seq +% 1 };
+    }
+
+    /// Game-side build claim: a reserved draw slot plus its reserved build
+    /// generation. Fill via `build()` (the real build core, shared with the
+    /// sequential path), optionally `stageUi()` (into the claimed slot —
+    /// AFTER `build`, which resets the slot), then exactly one terminal
+    /// call: `publish()` (hand to prepare) or `cancel()` (drop).
+    pub const BuildClaim = struct {
+        scene: *Scene,
+        slot: usize,
+        seq: u64,
+        completed: bool = false,
+
+        /// Run the shared build core into the claimed slot (commit of the
+        /// last published latch outcomes, CPU staging, record freeze, queue/
+        /// shadow/outline build). sg-free, game side. Repeatable (newest
+        /// wins); the generation is only committed by `publish()`.
+        pub fn build(self: *BuildClaim) void {
+            self.scene.buildIntoClaimedSlot(self.slot, self.seq);
+        }
+
+        /// Stage the live canvas CPU packet into the CLAIMED slot (concurrent
+        /// path). Same newest-wins/OOM rules as `stageUiPacket`, but never
+        /// the latched slot: with overlapping build(N+1, game) and
+        /// prepare(N, context) the claim owns a different slot than the one
+        /// prepare latches. Call AFTER `build()` when both are used (the
+        /// build resets the slot); UI-only claims (no `build()`) are legal.
+        pub fn stageUi(self: *BuildClaim) void {
+            self.scene.stageUiPacketInto(self.slot);
+        }
+
+        /// Hand the built slot to prepare: commit the reserved generation
+        /// (`build_seq`, `build_slot`) and release WRITING (payload kept —
+        /// prepare consumes it and flips `front` itself at latch time).
+        /// No front flip here: after publish the slot is still the back
+        /// index, exactly as after the legacy build.
+        pub fn publish(self: *BuildClaim) void {
+            std.debug.assert(!self.completed);
+            self.completed = true;
+            const s = self.scene;
+            std.debug.assert(self.seq == s.build_seq +% 1);
+            s.build_seq = self.seq;
+            s.build_slot = self.slot;
+            s.draws.releaseHandoff(self.slot) catch unreachable;
+        }
+
+        /// Drop the claim without committing (seq/handoff untouched: prepare
+        /// sees no fresh build and runs its fallback; provisional previews
+        /// stamped with the uncommitted seq are overwritten by the next
+        /// build and never latched). The slot is reset by the next claim.
+        /// Safe to call on an unconsumed claim; double-terminal is a bug
+        /// (debug-asserted).
+        pub fn cancel(self: *BuildClaim) void {
+            std.debug.assert(!self.completed);
+            self.completed = true;
+            self.scene.draws.cancelClaim(self.slot) catch {};
+        }
+    };
+
     /// Stage-2 increment B producer build (game/update phase, CPU-only,
-    /// sg-free): commits the last published latch outcomes to the live
+    /// sg-free): sequential convenience over the claim flow above
+    /// (`tryClaimBuildSlot` + `build` + `publish` under one call — the SAME
+    /// code path, so behavior cannot diverge; sequential callers observe no
+    /// change). Commits the last published latch outcomes to the live
     /// meshes, then stages the CPU halves the prepare latch will consume —
     /// instance matrices into the back-slot scratch + per-mesh previews +
     /// the slot-owned staged records, the
@@ -2468,26 +2569,42 @@ pub const Scene = struct {
     /// keeps its previous complete `instance_render` for one frame
     /// (documented, coherent); the next funded build+latch picks it up.
     pub fn buildPreparedFrame(self: *Scene) void {
+        // Sequential path holds no pins or claims across the build, so with
+        // 3 slots one is always free (same guarantee as the old backIndex
+        // assert — a null here is unreachable, never a skip).
+        var claim = self.tryClaimBuildSlot() orelse unreachable;
+        claim.build();
+        claim.publish();
+    }
+
+    /// Shared build core behind `buildPreparedFrame` and `BuildClaim.build`:
+    /// the exact historical build body targeted at the claimed `slot` under
+    /// the reserved generation `seq` (preview stamps, record freeze, build
+    /// cache key). Commits NOTHING global: `build_seq`/`build_slot` are
+    /// stamped by `BuildClaim.publish`, so a cancelled claim leaves no
+    /// handoff behind.
+    ///
+    /// EPOCH DISCIPLINE (wave 29): this core must never call
+    /// `GpuRetire.begin`/`complete`/`flush` and never passes a `retire_queue`
+    /// anywhere — epochs stay context-owned (prepare/render own the
+    /// begin/complete pairing); enforced by test.
+    fn buildIntoClaimedSlot(self: *Scene, slot: usize, seq: u64) void {
         // Deliberately NO gpu_thread assert: this runs on the game side or
         // a spawned worker. Everything below is sg-free (the commit, the CPU
         // staging half, the plain captures, the CPU queue/shadow/outline
         // build with instances_prepared=true); any sg.* here would be a bug.
         self.build_stats = .{};
-        self.build_seq +%= 1;
-        const seq = self.build_seq;
         // Commit the last published latch outcomes FIRST (game side, ordered
         // after publish, never concurrent with the context): the prepare
         // latch stages GPU purely from slot records and mirrors the outcome
         // there; this applies the mirrors to the live meshes under the O(1)
         // identity guard, so the CPU staging + record freeze below observe
         // the just-published prior state. Reads the FRONT slot (the last
-        // published frame); the back-slot reset below never touches it.
+        // published frame); the claimed-slot reset below never touches it.
         const front = &self.draws.slots[self.draws.front];
         scene_instance_staging.commitPublishedRecords(front.staged_instances.items, self.meshes.items, front.frame_id);
-        const back_idx = self.draws.backIndex();
-        const back = &self.draws.slots[back_idx];
+        const back = &self.draws.slots[slot];
         back.reset();
-        self.build_slot = back_idx;
         // Producer snapshot FIRST (update-vs-prepare excluded): consume the
         // newest published tick into the producer-owned build_snapshot. When
         // nothing new was published, ALWAYS pack fresh live state — never

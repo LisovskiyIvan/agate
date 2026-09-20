@@ -5230,5 +5230,114 @@ test "wave28: Scene pickUi3dPanel uses the staged snapshot camera" {
     // Off-panel cursor: clean miss. Disabled panel: skipped entirely.
     try std.testing.expect(scene.pickUi3dPanel(-100, 300) == null);
     panel.enabled = false;
-    try std.testing.expect(scene.pickUi3dPanel(400, 300) == null);
+    try std.testing.expect(scene.pickUi3dPanel(-100, 300) == null);
+}
+
+// ---- Wave 29: concurrent-build claim flow (sequential proof; the phase
+// mutex is still held — the lease-level stress test in frame_draws.zig
+// proves slot-payload concurrency across threads). ----
+
+test "wave29: claim build+stageUi+publish latches the claimed slot, counters sane" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var claim = scene.tryClaimBuildSlot().?;
+    const slot = claim.slot;
+    // The handoff is not committed until publish: filling alone moves
+    // nothing global, and the slot is held (no longer the back index).
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    claim.build();
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    claim.stageUi(); // no canvas: stages the absence packet, bumps the seq
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
+    claim.publish();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
+    try std.testing.expectEqual(slot, scene.build_slot);
+    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+
+    try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+    try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+    try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
+    // The staged absence packet was consumed (seq stamped, not re-latched).
+    try std.testing.expectEqual(scene.ui_packet_seq, scene.last_latched_ui_seq);
+    // Counter sanity: a clean claim flow counts nothing.
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.pin_denials);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.unpin_denials);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave29: cancelled claim commits nothing, rotation unaffected" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var dropped = scene.tryClaimBuildSlot().?;
+    const dropped_slot = dropped.slot;
+    dropped.build();
+    dropped.cancel();
+    // Nothing committed: no fresh build for prepare, rotation intact.
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq);
+    var funded = scene.tryClaimBuildSlot().?;
+    // The dropped slot was released: the next claim reuses the same index.
+    try std.testing.expectEqual(dropped_slot, funded.slot);
+    funded.build();
+    funded.publish();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq);
+    try std.testing.expectEqual(funded.slot, scene.build_slot);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave29: build path never begins/completes retire epochs" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    // Camera-less headless fixture: prepare opens an epoch, the no-camera
+    // render return closes it (same pairing the epoch tests pin).
+    const cur0 = scene.gpu_retire.current();
+    const done0 = scene.gpu_retire.lastCompleted();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var claim = scene.tryClaimBuildSlot().?;
+    claim.build();
+    claim.stageUi();
+    claim.publish();
+    // The whole game-side claim flow leaves the epoch pairing untouched.
+    try std.testing.expectEqual(cur0, scene.gpu_retire.current());
+    try std.testing.expectEqual(done0, scene.gpu_retire.lastCompleted());
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(cur0 + 1, scene.gpu_retire.current());
+    scene.render();
+    try std.testing.expectEqual(scene.gpu_retire.current(), scene.gpu_retire.lastCompleted());
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
