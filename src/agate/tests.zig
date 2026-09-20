@@ -162,6 +162,10 @@ test {
     _ = @import("ssao.zig");
     _ = @import("testing.zig");
     _ = @import("texture.zig");
+    _ = @import("texture/color.zig");
+    _ = @import("texture/core.zig");
+    _ = @import("texture/cube.zig");
+    _ = @import("texture/mip.zig");
     _ = @import("ui.zig");
     _ = @import("ui/css_parser.zig");
     _ = @import("ui/css_parser_fuzz.zig");
