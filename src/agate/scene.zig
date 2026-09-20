@@ -35,6 +35,7 @@ const camera_mod = @import("camera.zig");
 const Camera = camera_mod.Camera;
 const Viewport = camera_mod.Viewport;
 const debug_shd = @import("debug_shader");
+const blit_probe_shd = @import("probe_mip_shader");
 const debug_pass = @import("passes/debug_pass.zig");
 const outline_pass = @import("passes/outline_pass.zig");
 const lights = @import("lights.zig");
@@ -87,6 +88,9 @@ pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
 const scene_shadow = @import("scene/shadow_system.zig");
 const scene_sky = @import("scene/sky_layer.zig");
+const scene_probes = @import("scene/probe_layer.zig");
+pub const ReflectionProbe = scene_probes.ReflectionProbe;
+pub const ReflectionProbeOptions = scene_probes.ReflectionProbeOptions;
 const scene_postfx = @import("scene/postfx_stack.zig");
 const scene_forward = @import("scene/forward_pipelines.zig");
 const scene_particles = @import("scene/particle_layer.zig");
@@ -216,6 +220,10 @@ pub const Scene = struct {
     shadows: scene_shadow.ShadowSystem,
     // Skybox texture/exposure + IBL intensity + skybox pass.
     sky: scene_sky.SkyboxLayer,
+    // Reflection probes (wave 25, v1): on-demand cube captures feeding the
+    // PBR/standard ambient terms. Empty by default: with no enabled probe
+    // every draw takes today's ambient/skybox path bit-identically.
+    probes: scene_probes.ProbeLayer = .{},
     // Offscreen target, SSAO, bloom, composite pass + outline highlights.
     postfx: scene_postfx.PostFXStack,
     // Forward GPU pipeline sets (opaque/blend/double-sided per family).
@@ -476,6 +484,71 @@ pub const Scene = struct {
 
     pub fn createDefaultSkybox(self: *Scene, config: SkyboxOptions) !void {
         try self.sky.createDefault(self.allocator, config);
+    }
+
+    // ---- Reflection probes (wave 25, v1). ----
+    //
+    // On-demand environment captures: each probe renders the prepared draw
+    // list plus the sky into a 128px cube target from its position, then
+    // nearby PBR/standard draws sample it for their ambient terms (nearest
+    // enabled probe within its radius wins, no blending). Captures run on
+    // the context thread inside `render`, at most one per frame (lowest
+    // dirty + enabled index first; the rest wait for later frames), and
+    // never inside `renderReuse` (reuse re-presents the captured state).
+    // Before a probe's first capture lands, selection skips it, so new (or
+    // disabled) probes leave rendering bit-identical.
+    //
+    // Capacity: at most `scene_probes.max_probes` (4); `addReflectionProbe`
+    // past the cap is a hard `error.TooManyReflectionProbes`.
+    //
+    // Explicit non-goals (see scene/probe_layer.zig): box projection /
+    // parallax, probe blending / weights, per-frame real-time updates,
+    // specular occlusion, irradiance SH, editor tooling.
+
+    /// Adds a reflection probe at `position`; returns its index. The probe
+    /// starts dirty + uncaptured: the next `render` captures it (one capture
+    /// per frame) and draws fall back until then.
+    pub fn addReflectionProbe(self: *Scene, position: Vec3, options: ReflectionProbeOptions) error{TooManyReflectionProbes}!usize {
+        return self.probes.add(position, options);
+    }
+
+    /// Removes probe `index`, retiring its cube target through the epoch
+    /// retire queue (safe under update||render overlap: the context thread
+    /// destroys at the next flush). Order-preserving: higher indices shift
+    /// down. Out-of-range indices are a no-op.
+    pub fn removeReflectionProbe(self: *Scene, index: usize) void {
+        self.probes.remove(self.allocator, &self.gpu_retire, index);
+    }
+
+    /// Live probe state (position/radius/enabled/intensity are freely
+    /// mutable game-side under update-vs-prepare exclusion). Null when
+    /// out of range.
+    pub fn getReflectionProbe(self: *Scene, index: usize) ?*ReflectionProbe {
+        if (index >= self.probes.count) return null;
+        return &self.probes.probes[index];
+    }
+
+    pub fn reflectionProbeCount(self: *const Scene) usize {
+        return self.probes.count;
+    }
+
+    /// Requests an on-demand recapture of probe `index` on the next render
+    /// (actual GPU work happens there, at most one probe per frame).
+    /// Out-of-range is a no-op.
+    pub fn captureReflectionProbe(self: *Scene, index: usize) void {
+        self.probes.markDirty(index);
+    }
+
+    /// Requests a recapture of every probe (each still captures on its own
+    /// frame: one per frame maximum).
+    pub fn captureDirtyReflectionProbes(self: *Scene) void {
+        self.probes.markAllDirty();
+    }
+
+    /// How many probes currently want a capture (observability for tests
+    /// and tooling).
+    pub fn probeDirtyCount(self: *const Scene) usize {
+        return self.probes.dirtyCount();
     }
 
     // ---- Lights. ----
@@ -1415,6 +1488,229 @@ pub const Scene = struct {
         self.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, &self.stats);
     }
 
+    /// Runs at most one pending reflection-probe capture (wave 25, v1).
+    /// Context thread only; called from `render` between the shadow depth
+    /// pass and the main pass, never from `renderReuse` (which re-presents
+    /// the consumed front, probe snapshot included).
+    ///
+    /// What one capture does, in order: ensure the probe's GPU target (fail
+    /// closed when headless or on creation failure — the probe stays dirty
+    /// and is retried on a later frame), render the six cube faces from the
+    /// probe position (prepared PRIMARY draw list: opaque + opaque-instanced
+    /// + transparent, plus the sky; no PIP views, outline, particles,
+    /// physics-debug, or UI in v1), then run the box-prefilter blit chain
+    /// over the mip levels. No `UploadQueue`/texture-streaming interaction
+    /// and no `sg.updateBuffer` traffic on this path — only draws into
+    /// probe-owned targets — so the single-upload-per-frame discipline is
+    /// untouched. When several probes are dirty, the lowest dirty + enabled
+    /// index captures now and the rest wait for later frames (one capture
+    /// per frame maximum). The fresh content reaches draws one prepare
+    /// later (the snapshot is packed in `prepareFrame`, before `render`
+    /// captures) — a documented one-frame lag.
+    fn captureDirtyProbes(self: *Scene) void {
+        const idx = self.probes.nextDirtyIndex() orelse return;
+        if (!sg.isvalid()) return;
+        if (!self.probes.ensureGpu(idx)) return;
+        const probe = &self.probes.probes[idx];
+        const draws = self.preparedDraws();
+        const snap = &self.frame_snapshot;
+        const far = scene_probes.captureFar(probe.radius);
+
+        var face_i: u8 = 0;
+        while (face_i < 6) : (face_i += 1) {
+            const face: scene_probes.Face = @enumFromInt(face_i);
+            self.renderProbeFace(idx, face, draws, snap, far);
+        }
+        self.runProbePrefilter(idx);
+
+        // Viewport/scissor restore: the main pass sets its own per-view
+        // rects below, but leave no stale 128px state behind regardless.
+        const cur_w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
+        const cur_h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
+        sg.applyViewport(0, 0, cur_w, cur_h, true);
+        sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+
+        self.probes.notifyCaptured(idx);
+    }
+
+    /// Renders the prepared primary draw list plus the sky into one cube
+    /// face of probe `index` (mip 0). Capture-local state throughout:
+    /// scratch stats (discarded — the frame's counters must not 7x), the 1x
+    /// forward set (the cube target is single-sampled even in MSAA frames),
+    /// and an EMPTY probe pack (capture draws take the legacy env path —
+    /// no probe self-sampling or feedback). Shadow maps are the frame's
+    /// own (captured right after the shadow depth pass).
+    fn renderProbeFace(
+        self: *Scene,
+        index: usize,
+        face: scene_probes.Face,
+        draws: *const FrameDrawSlot,
+        snap: *const SceneFrameSnapshot,
+        far: f32,
+    ) void {
+        const probe = &self.probes.probes[index];
+        const eye = probe.position;
+        const view = scene_probes.faceView(face, eye);
+        const proj = Mat4.perspective(90.0, 1.0, scene_probes.capture_near, far);
+        const view_proj = Mat4.mul(proj, view);
+
+        var pass_action = sg.PassAction{};
+        pass_action.colors[0] = .{
+            .load_action = .CLEAR,
+            .clear_value = .{
+                .r = snap.clear_color.r,
+                .g = snap.clear_color.g,
+                .b = snap.clear_color.b,
+                .a = snap.clear_color.a,
+            },
+        };
+        pass_action.depth = .{
+            .load_action = .CLEAR,
+            .clear_value = 1.0,
+            .store_action = .STORE,
+        };
+        var pass = sg.Pass{ .action = pass_action };
+        pass.attachments.colors[0] = probe.gpu.mip_face_views[0][@intFromEnum(face)];
+        pass.attachments.depth_stencil = probe.gpu.depth_view;
+        sg.beginPass(pass);
+        const res = scene_probes.face_resolution;
+        sg.applyViewport(0, 0, res, res, true);
+        sg.applyScissorRect(0, 0, res, res, true);
+
+        var scratch = SceneStats{};
+        const env = scene_draw.Environment{
+            .pipelines = &self.forward,
+            .stats = &scratch,
+            .default_white = snap.default_white,
+            .default_normal = snap.default_normal,
+            .default_cube = snap.default_cube,
+            .sky_texture = snap.sky_texture,
+            .ibl_intensity = snap.ibl_intensity,
+            .probes = &.{},
+            .shadow_pass = &self.shadows.pass,
+            .shadow_uniforms = snap.shadow_uniforms,
+        };
+
+        var frame_ctx = FrameContext{
+            .view_proj = view_proj,
+            .eye = eye,
+            .sun_dir = snap.sun_dir,
+            .sun_color = snap.sun_color,
+            .sun_intensity = snap.sun_intensity,
+            .directional_dir = snap.light_pack.directional_dir,
+            .directional_color_int = snap.light_pack.directional_color_int,
+            .cascades = snap.cascades,
+            .light_counts = snap.light_pack.counts,
+            .point_pos_range = snap.light_pack.point_pos_range,
+            .point_color_int = snap.light_pack.point_color_int,
+            .spot_pos_range = snap.light_pack.spot_pos_range,
+            .spot_dir_inner = snap.light_pack.spot_dir_inner,
+            .spot_color_outer = snap.light_pack.spot_color_outer,
+            .spot_intensity = snap.light_pack.spot_intensity,
+            .spot_view_proj = snap.light_pack.spot_view_proj,
+            .spot_shadow_params = snap.light_pack.spot_shadow_params,
+            .point_view_proj = snap.light_pack.point_view_proj,
+            .point_shadow_params = snap.light_pack.point_shadow_params,
+        };
+
+        var shadow_state_with = env.shadow_uniforms;
+        shadow_state_with.mesh_receive_shadows = true;
+        const u_with = scene_uniforms.buildFrameUniforms(shadow_state_with, &frame_ctx);
+
+        var shadow_state_no = env.shadow_uniforms;
+        shadow_state_no.mesh_receive_shadows = false;
+        const u_no = scene_uniforms.buildFrameUniforms(shadow_state_no, &frame_ctx);
+
+        frame_ctx.uniforms_with_shadows = &u_with;
+        frame_ctx.uniforms_without_shadows = &u_no;
+
+        // Primary view queues only (v1 scope); same draw order as the main
+        // pass (opaque, opaque-instanced, unified transparent back-to-front).
+        // The transparent sort was built for the main eye — order from the
+        // probe eye is approximate (documented).
+        var current_pipeline_id: u32 = 0;
+        const queues = &draws.primary;
+        for (queues.items.items) |item| {
+            scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+        }
+        for (queues.opaque_instanced.items) |batch| {
+            scene_draw.drawInstancedBatch(&env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+        }
+        for (queues.transparent_order.items) |entry| {
+            switch (entry.kind) {
+                .regular => {
+                    if (entry.index < queues.transparent.items.len) {
+                        scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+                    }
+                },
+                .instanced => {
+                    if (entry.index < queues.transparent_instanced.items.len) {
+                        scene_draw.drawInstancedBatch(&env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+                    }
+                },
+            }
+        }
+
+        // Sky last (depth LESS_EQUAL behind geometry), snapshot switch +
+        // exposure; disabled sky leaves the clear color. Translation-free
+        // view, like SkyboxPass.render.
+        if (snap.sky_enabled) {
+            var rot_view = view;
+            rot_view.m[12] = 0.0;
+            rot_view.m[13] = 0.0;
+            rot_view.m[14] = 0.0;
+            self.sky.pass.renderMatrices(rot_view, proj, snap.sky_texture orelse snap.default_cube, snap.sky_exposure);
+        }
+        sg.endPass();
+    }
+
+    /// Box-prefilter blit chain for probe `index`: mip `m` (every face) is
+    /// rendered from mip `m - 1` through the fullscreen blit pipeline, which
+    /// samples with LINEAR filtering at exact 2:1 texel centers (an exact
+    /// 2x2 box average per texel — the documented roughness approximation,
+    /// not a GGX prefilter). No depth attachment; the pipeline is depth-off.
+    fn runProbePrefilter(self: *Scene, index: usize) void {
+        const probe = &self.probes.probes[index];
+        var mip: u32 = 1;
+        while (mip < scene_probes.max_mips) : (mip += 1) {
+            const size = scene_probes.mipSize(mip);
+            var face_i: u8 = 0;
+            while (face_i < 6) : (face_i += 1) {
+                var pass = sg.Pass{
+                    .action = .{
+                        .colors = [_]sg.ColorAttachmentAction{
+                            .{ .load_action = .DONTCARE },
+                        } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    },
+                };
+                pass.attachments.colors[0] = probe.gpu.mip_face_views[mip][face_i];
+                sg.beginPass(pass);
+                sg.applyPipeline(self.probes.blit_pipeline);
+                sg.applyViewport(0, 0, size, size, true);
+                sg.applyScissorRect(0, 0, size, size, true);
+
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = self.probes.blit_vb;
+                bind.index_buffer = self.probes.blit_ib;
+                bind.views[blit_probe_shd.VIEW_src_tex] = probe.gpu.tex_view;
+                bind.samplers[blit_probe_shd.SMP_smp] = self.probes.blit_sampler;
+                sg.applyBindings(bind);
+
+                const fs_params = blit_probe_shd.FsParams{
+                    .params = .{
+                        @floatFromInt(face_i),
+                        @floatFromInt(mip - 1),
+                        0.0,
+                        0.0,
+                    },
+                };
+                sg.applyUniforms(blit_probe_shd.UB_fs_params, sg.asRange(&fs_params));
+                sg.draw(0, 6, 1);
+                sg.endPass();
+            }
+        }
+    }
+
     /// Packs the current camera, light, shadow, and environment state into an immutable
     /// frame snapshot that can be published to the render thread.
     pub fn packFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) scene_snapshot.SceneFrameSnapshot {
@@ -1489,6 +1785,9 @@ pub const Scene = struct {
         snap.sky_enabled = self.sky.enabled;
         snap.sky_exposure = self.sky.exposure;
         snap.ibl_intensity = self.sky.ibl_intensity;
+        // Reflection-probe state for the draw's per-object selection (plain
+        // data + borrowed cube view/sampler values, never live layer refs).
+        snap.probe_pack = self.probes.packFrame();
         // Render-owned default copies (plain GPU-handle values): the draw
         // binds these, never the live Scene.default_*_texture fields.
         snap.default_white = self.default_white_texture;
@@ -2443,6 +2742,18 @@ pub const Scene = struct {
         }
 
         // ==============================================
+        // PASS 1.5: REFLECTION-PROBE CAPTURE (at most one dirty probe)
+        // ==============================================
+        // Runs after the shadow depth pass (captured draws reuse its maps)
+        // and before the main pass. renderReuse re-presents the consumed
+        // front — including its probe snapshot — and must NOT capture here
+        // (checked below); camera-less frames return before this point, so
+        // they skip capture too (dirty flags are retained for later).
+        if (!self.rendering_reuse) {
+            self.captureDirtyProbes();
+        }
+
+        // ==============================================
         // PASS 2: MAIN SCENE RENDER PASS
         // ==============================================
         var main_pass_action = sg.PassAction{};
@@ -2487,6 +2798,7 @@ pub const Scene = struct {
             .default_cube = snap.default_cube,
             .sky_texture = snap.sky_texture,
             .ibl_intensity = snap.ibl_intensity,
+            .probes = snap.probe_pack.entries[0..snap.probe_pack.count],
             .shadow_pass = &self.shadows.pass,
             .shadow_uniforms = snap.shadow_uniforms,
         };
@@ -2749,6 +3061,7 @@ pub const Scene = struct {
 
         self.shadows.deinit();
         self.sky.deinit();
+        self.probes.deinit();
 
         self.forward.deinit();
         if (self.forward_msaa) |*fw| fw.deinit();

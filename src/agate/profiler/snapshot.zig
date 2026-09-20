@@ -13,6 +13,7 @@ const sg = sokol.gfx;
 const types = @import("types.zig");
 const scene_mod = @import("../scene.zig");
 const texture_mod = @import("../texture.zig");
+const probe_layer = @import("../scene/probe_layer.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 
 const Scene = scene_mod.Scene;
@@ -305,6 +306,27 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
             .samples = 1,
             .gpu_bytes = spot_bytes,
         });
+
+        // Reflection-probe cube targets (wave 25): one mipmapped color cube
+        // plus its depth target per captured probe. Same render-target
+        // convention as the passes above (pure byte math, no GPU calls;
+        // uncaptured probes own no target and contribute nothing).
+        for (0..scene.probes.count) |i| {
+            const probe = &scene.probes.probes[i];
+            if (probe.gpu.image.id == 0) continue;
+            const probe_bytes = probe_layer.targetBytes();
+            snap.render_targets_vram_bytes += probe_bytes;
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "Reflection Probe {d} (cube+mips+depth)", .{i}) catch "Reflection Probe";
+            try rt_list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, name),
+                .width = @intCast(probe_layer.face_resolution),
+                .height = @intCast(probe_layer.face_resolution),
+                .format = .RGBA8,
+                .samples = 1,
+                .gpu_bytes = probe_bytes,
+            });
+        }
     }
 
     snap.render_targets = try rt_list.toOwnedSlice(self.allocator);

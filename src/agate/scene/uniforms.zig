@@ -64,6 +64,13 @@ pub const FrameUniforms = struct {
     // shader fill loop adds nothing.
     directional_dir: [4][4]f32,
     directional_color_int: [4][4]f32,
+    // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
+    // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
+    // The shared per-view uniforms built here always carry zero (probe
+    // off): the draw path copies this struct per draw and overwrites the
+    // lane from the winning probe selection (or leaves it zeroed), so the
+    // no-probe path uploads bit-identical values to before.
+    probe_params: [4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -134,6 +141,7 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .point_shadow_params = ctx.point_shadow_params,
         .directional_dir = ctx.directional_dir,
         .directional_color_int = ctx.directional_color_int,
+        .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
     };
 }
 
@@ -190,6 +198,10 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
     // ...and the directional lanes ride through verbatim.
     try std.testing.expectEqual(ctx.directional_dir, f.directional_dir);
     try std.testing.expectEqual(ctx.directional_color_int, f.directional_color_int);
+    // The shared per-view uniforms always carry a neutral probe lane (the
+    // draw overwrites it per draw from the probe selection, or leaves it —
+    // so the no-probe path is bit-identical to before this wave).
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, f.probe_params);
 }
 
 test "alphaCutoffFor gates the cutoff on cutout mode" {

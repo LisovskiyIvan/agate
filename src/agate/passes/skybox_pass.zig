@@ -103,6 +103,15 @@ pub const SkyboxPass = struct {
         rot_view.m[14] = 0.0;
 
         const proj = camera.getProjectionMatrix(aspect);
+        self.renderMatrices(rot_view, proj, cube_tex, exposure);
+    }
+
+    /// Matrix variant of `render`: draws the skybox from an explicit
+    /// rotation-only view + projection (no camera needed). Used by the
+    /// reflection-probe capture (wave 25), which renders the sky into each
+    /// cube face from the probe position. Same consumability contract as
+    /// `render` (no-op on an invalid pipeline).
+    pub fn renderMatrices(self: *SkyboxPass, rot_view: Mat4, proj: Mat4, cube_tex: CubeTexture, exposure: f32) void {
         const view_proj = Mat4.mul(proj, rot_view);
 
         if (self.pipeline.id == 0) return;
