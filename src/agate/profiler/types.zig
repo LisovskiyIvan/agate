@@ -89,6 +89,13 @@ pub const MemorySnapshot = struct {
 
     // Aggregate CPU memory
     total_cpu_mesh_bytes: usize = 0,
+    /// Retained CPU bytes held by the P7 prepared-draw slots
+    /// (FrameDraws.cpuBytes: retained capacities × element sizes across all
+    /// slots — queues, skins, shadow, staged records, UI packet lists).
+    /// Grows with the slot count (3 slots retain ~3 frames of capacity).
+    prepared_draws_cpu_bytes: usize = 0,
+    /// How many prepared-draw slots the census above covers (rotation depth).
+    prepared_draws_slots: usize = 0,
 
     // Scene inventory
     mesh_count: usize = 0,

@@ -678,7 +678,7 @@ test "P6: prepare snapshots canvas presence apart from content" {
     try std.testing.expect(!scene.ui_frame.canvas_present);
 }
 
-// ---- P7 double-buffered prepared draws. ----
+// ---- P7 triple-buffered prepared draws. ----
 
 // Headless full-path integration runs prepareFrame with a faked GPU-init
 // flag (default_white_texture.view.id != 0) plus a CPU-only shadow pass
@@ -815,7 +815,9 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     // directly, and prove the published front is untouched (lists, skins,
     // shader, outline, shadow ranges) while the back sees the new state.
     mesh_a.position = Vec3.new(9, 0, 0);
-    const back_idx = 1 - front0;
+    // Slot-count agnostic: the scratch is whatever backIndex() reports, not
+    // `1 - front` (that two-slot math is exactly what wave 26 removed).
+    const back_idx = scene.draws.backIndex();
     // New frame id for the manual back build (as prepareFrame would bump):
     // the world-matrix cache keys on it, and the published front snapshot
     // must stay at the old pose regardless.
@@ -835,11 +837,13 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     // View builds never touch outline: the scratch back holds none.
     try std.testing.expectEqual(@as(usize, 0), back_built.outline_items.items.len);
 
-    // Warmup: the second slot is still cold, so build it with a full prepare
-    // first — the refusal proof below needs both slots warm.
+    // Warmup: the other slots are still cold (the manual build above only ran
+    // the primary view queues, never outline/shadow/UI), so run full prepares
+    // until every slot has been built once as back — the refusal proof below
+    // needs all three slots warm.
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     scene.prepareFrame();
-    try std.testing.expectEqual(1 - front0, scene.draws.front);
+    try std.testing.expectEqual(back_idx, scene.draws.front);
     const d1 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 3), d1.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), d1.primary.skin_storage.items.len);
@@ -854,9 +858,19 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     try std.testing.expectEqual(@as(usize, 3), old_slot.primary.items.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), old_slot.outline_items.items[0].model.m[12], 1e-4);
 
-    // Zero-alloc proof: both slots are warm now (slot B built by prepare#1,
-    // slot A by prepare#2), so two further prepares — one per slot as back —
-    // must not touch the allocator at all. The wrapper refuses ANY fresh
+    // Second warmup prepare: with three slots rotating, one full prepare
+    // warms exactly one slot as back — the third slot is still cold.
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    {
+        const want = scene.draws.backIndex();
+        scene.prepareFrame();
+        try std.testing.expectEqual(want, scene.draws.front);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.0), scene.preparedDraws().outline_items.items[0].model.m[12], 1e-4);
+    }
+
+    // Zero-alloc proof: all three slots are warm now (prepare#1, warmup#1,
+    // warmup#2 built one slot each as back), so three further prepares — one
+    // per slot as back — must not touch the allocator at all. The wrapper refuses ANY fresh
     // alloc (fail_index=0, flagged in has_induced_failure) and ANY
     // resize/remap (resize_fail_index=0); a refused growth always degrades
     // the frame (dropped items/counts), so the flag plus the expected
@@ -869,14 +883,16 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     // no canvas, no instancing, no LOD/morphs. NOT covered by this proof:
     // parallel_scratch growth, instanced staging/buffer growth, UI capture
     // growth, or any parallel/GPU path.
-    var expect_front = scene.draws.front;
     var round: usize = 0;
-    while (round < 2) : (round += 1) {
+    while (round < 3) : (round += 1) {
         var refusing = std.testing.FailingAllocator.init(alloc, .{
             .fail_index = 0,
             .resize_fail_index = 0,
         });
         scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+        // Rotation-agnostic expectation: the publish lands on the back index
+        // captured before the build, whatever the slot count.
+        const want_front = scene.draws.backIndex();
         const saved_alloc = scene.allocator;
         scene.allocator = refusing.allocator();
         scene.shadows.pass.allocator = refusing.allocator();
@@ -884,8 +900,7 @@ test "P7: slots alternate, newest wins, front intact while building back" {
         scene.allocator = saved_alloc;
         scene.shadows.pass.allocator = saved_alloc;
         try std.testing.expect(!refusing.has_induced_failure);
-        expect_front = 1 - expect_front;
-        try std.testing.expectEqual(expect_front, scene.draws.front);
+        try std.testing.expectEqual(want_front, scene.draws.front);
         const dz = scene.preparedDraws();
         try std.testing.expectEqual(@as(usize, 3), dz.primary.items.items.len);
         try std.testing.expectEqual(@as(usize, 1), dz.primary.skin_storage.items.len);
@@ -1010,7 +1025,6 @@ test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
 
     scene.prepareFrame();
-    const front0 = scene.draws.front;
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     const ui_n = canvas_ui.vertices.items.len;
     try std.testing.expectEqual(ui_n, scene.ui_frame.vertices.items.len);
@@ -1019,8 +1033,9 @@ test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
     // publish (fallback snapshot path): newest wins, nothing accumulates.
     canvas_ui.drawRect(1, 2, 3, 4, Color4.white);
     mesh.position = Vec3.new(7, 0, 0);
+    const want_rep = scene.draws.backIndex();
     scene.prepareFrame();
-    try std.testing.expectEqual(1 - front0, scene.draws.front);
+    try std.testing.expectEqual(want_rep, scene.draws.front);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), scene.preparedDraws().outline_items.items[0].model.m[12], 1e-4);
     try std.testing.expectEqual(canvas_ui.vertices.items.len, scene.ui_frame.vertices.items.len);
@@ -3280,9 +3295,12 @@ test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
     try scene.meshes.append(alloc, &m1);
     try scene.outline_meshes.append(alloc, &m0);
 
-    // Warm both slots with funded build+latch rounds.
+    // Warm every slot with funded build+latch rounds: with a 3-slot
+    // rotation one round warms exactly one slot as back, so two rounds
+    // would leave the third slot cold (the old two-slot "both slots"
+    // warmup is exactly the assumption wave 26 removed).
     var round: usize = 0;
-    while (round < 2) : (round += 1) {
+    while (round < 3) : (round += 1) {
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
         scene.buildPreparedFrame();
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -4528,4 +4546,191 @@ test "reflection probe state packs into the frame snapshot" {
     try std.testing.expect(scene.frame_handoff.takeLatest(&snap_out));
     try std.testing.expectEqual(@as(usize, 2), snap_out.probe_pack.count);
     try std.testing.expectEqual(@as(f32, 4.0), snap_out.probe_pack.entries[0].radius);
+}
+
+test "wave26: 3-slot prepare rotation visits every slot, newest wins" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    scene.enable_frustum_culling = false;
+    scene.enable_occlusion_culling = false;
+    scene.default_white_texture.view.id = 1;
+    p7CpuShadowPass(&scene, alloc);
+
+    var mesh = Mesh{
+        .name = "rot_mesh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    try scene.meshes.append(alloc, &mesh);
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Four build/publish round-trips with no consumer lag: the rotation must
+    // cycle 1, 2, 0, 1 (no stall, no slot reused before its turn), each
+    // publish carries the building frame's identities, and moving the mesh
+    // between prepares lands newest-wins in the next front.
+    var fronts: [4]usize = undefined;
+    var f: usize = 0;
+    while (f < 4) : (f += 1) {
+        mesh.position = Vec3.new(@floatFromInt(f * 10), 0, 0);
+        scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+        const want = scene.draws.backIndex();
+        scene.prepareFrame();
+        try std.testing.expect(scene.frame_prepared);
+        try std.testing.expectEqual(want, scene.draws.front);
+        fronts[f] = scene.draws.front;
+        const d = scene.preparedDraws();
+        try std.testing.expectEqual(scene.frame_id, d.frame_id);
+        try std.testing.expectEqual(scene.retire_epoch, d.retire_epoch);
+        try std.testing.expectEqual(@as(usize, 1), d.primary.items.items.len);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(f * 10)), p7FindByMeshIndex(d.primary.items.items, 0).?.model.m[12], 1e-4);
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0, 1 }, &fronts);
+    // After three prepares every slot holds a distinct published frame (no
+    // slot was overwritten before its turn); the fourth reuses slot 1.
+    try std.testing.expect(scene.draws.slots[0].frame_id != scene.draws.slots[1].frame_id);
+    try std.testing.expect(scene.draws.slots[1].frame_id != scene.draws.slots[2].frame_id);
+    try std.testing.expect(scene.draws.slots[0].frame_id != scene.draws.slots[2].frame_id);
+}
+
+test "wave26: staged records + UI packet latch correctly across all three slots" {
+    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "rot_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 4;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "rot_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+
+    // Three full build+stage+latch frames: each build must land on a
+    // different slot, each latch must consume exactly that frame's staged
+    // records and UI packet (never a stale slot's).
+    var build_slots: [3]usize = undefined;
+    var frame: usize = 0;
+    while (frame < 3) : (frame += 1) {
+        mem[0].position = Vec3.new(@floatFromInt(frame * 10), 0, 0);
+        const canvas = &scene.ui_canvas.?;
+        canvas.begin();
+        var r: usize = 0;
+        while (r <= frame) : (r += 1) {
+            canvas.drawRect(@floatFromInt(r * 10), 0, 10, 10, Color4.white);
+        }
+        const staged_verts = canvas.vertices.items.len;
+
+        scene.buildPreparedFrame();
+        build_slots[frame] = scene.build_slot;
+        scene.stageUiPacket();
+        scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+        scene.prepareFrame();
+
+        try std.testing.expectEqual(scene.build_seq, scene.last_latched_seq);
+        try std.testing.expectEqual(@as(u64, frame + 1), scene.uiPacketLatchedCount());
+        try std.testing.expectEqual(scene.build_slot, scene.draws.front);
+        try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
+        try std.testing.expectEqual(scene.retire_epoch, scene.preparedDraws().retire_epoch);
+        // Staged records: this frame's instances, latched from the slot.
+        try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+        try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
+        // UI packet: this frame's staged bytes, not a stale slot's.
+        try std.testing.expectEqual(staged_verts, scene.ui_frame.vertices.items.len);
+        try std.testing.expect(scene.ui_frame.has_capture);
+    }
+    // The three builds rotated through three distinct slots (1, 2, 0).
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, &build_slots);
+}
+
+test "wave26: render pins/unpins the front; prepare rotates under a held pin" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    // Camera-less headless fixture: prepare publishes, render consumes via
+    // the no-camera early return (no sg.* headless).
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    const front0 = scene.draws.front;
+
+    // Render holds the pin only for the draw: no pins leak afterwards.
+    scene.render();
+    try std.testing.expect(!scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+    try std.testing.expectEqual(front0, scene.draws.front);
+    const consumed_id = scene.draws.slots[front0].frame_id;
+
+    // A pinned presented frame is never a build target: the next prepare
+    // publishes a different slot and leaves the pinned one untouched.
+    try scene.draws.pin(front0);
+    const want = scene.draws.backIndex();
+    try std.testing.expect(want != front0);
+    scene.prepareFrame();
+    try std.testing.expectEqual(want, scene.draws.front);
+    try std.testing.expectEqual(consumed_id, scene.draws.slots[front0].frame_id);
+    try std.testing.expect(scene.draws.isPinned(front0));
+    try scene.draws.unpin(front0);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+
+    // Memory census covers all three slots the same way (retained
+    // capacities, not lengths): slot count is the rotation depth and the
+    // byte total matches the live census helper exactly.
+    const mem_snap = try scene.profiler.captureMemorySnapshot(&scene);
+    try std.testing.expectEqual(@as(usize, 3), mem_snap.prepared_draws_slots);
+    try std.testing.expectEqual(scene.draws.cpuBytes(), mem_snap.prepared_draws_cpu_bytes);
 }

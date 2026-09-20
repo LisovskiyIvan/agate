@@ -332,6 +332,13 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
     snap.render_targets = try rt_list.toOwnedSlice(self.allocator);
     snap.total_gpu_vram_bytes = snap.textures_vram_bytes + snap.meshes_vram_bytes + snap.render_targets_vram_bytes;
 
+    // P7 prepared-draw slots: retained CPU capacity across ALL rotation
+    // slots (same convention as the mesh CPU census above — capacities, not
+    // lengths, because retention is the cost). One more slot of prepared
+    // data appears here exactly like the existing ones.
+    snap.prepared_draws_cpu_bytes = scene.draws.cpuBytes();
+    snap.prepared_draws_slots = scene.draws.slots.len;
+
     // Store as last snapshot
     if (self.last_memory_snapshot) |*old| old.deinit(self.allocator);
     self.last_memory_snapshot = snap;
