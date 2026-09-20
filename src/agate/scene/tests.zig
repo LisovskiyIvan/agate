@@ -6166,3 +6166,134 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
     for (0..scene.draws.slots.len) |idx| try std.testing.expect(!scene.draws.writing[idx]);
     try std.testing.expect(scene.hasConsumableFrame());
 }
+
+// ---- Wave 31 (second slice): build_stats as a slot payload. ----
+//
+// The game-side queue build accumulates into the live `Scene.build_stats`
+// accumulator; the build freezes a plain copy into the claimed slot's
+// `build_stats` (staged-wins over post-build accumulation, same precedent
+// as the slot snapshot); `prepareFrame` merges the SLOT copy into `stats`
+// instead of reading the shared field. Sequential behavior is bit-identical
+// (the stage-2B equivalence tests below the wave-29 block prove the merged
+// values unchanged); these tests pin the staging points.
+
+test "wave31b: build stages slot build_stats; post-build accumulation never leaks into the merge" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var m0 = Mesh{
+        .name = "bstats_0",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &m0);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var claim = scene.tryClaimBuildSlot().?;
+    claim.build();
+
+    // Staging point: the claimed slot freezes exactly what the build
+    // accumulated (whole-struct equality, plain copy).
+    const slot = claim.slot;
+    try std.testing.expectEqual(scene.build_stats, scene.draws.slots[slot].build_stats);
+    // The fixture is meaningful: the queue build counted the mesh.
+    const staged = scene.draws.slots[slot].build_stats;
+    try std.testing.expect(staged.total_meshes > 0);
+
+    // Post-build game-side accumulation AFTER the freeze: staged wins, so
+    // none of this may reach the prepared frame's merge — including the
+    // assign-merge fields (occluders_* use `=`, not `+=`).
+    scene.build_stats.total_meshes += 1000;
+    scene.build_stats.rendered_meshes += 1000;
+    scene.build_stats.culled_meshes += 1000;
+    scene.build_stats.occluded_meshes += 1000;
+    scene.build_stats.occluders_count = 12345;
+    scene.build_stats.occluder_triangles = 67890;
+    claim.publish();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+
+    // Merge point: stats carry exactly the staged copy, not the live field.
+    try std.testing.expectEqual(staged.total_meshes, scene.stats.total_meshes);
+    try std.testing.expectEqual(staged.rendered_meshes, scene.stats.rendered_meshes);
+    try std.testing.expectEqual(staged.culled_meshes, scene.stats.culled_meshes);
+    try std.testing.expectEqual(staged.occluded_meshes, scene.stats.occluded_meshes);
+    try std.testing.expectEqual(staged.occluders_count, scene.stats.occluders_count);
+    try std.testing.expectEqual(staged.occluder_triangles, scene.stats.occluder_triangles);
+    // Both copies are cleared for the next tick (same reset semantics).
+    try std.testing.expectEqual(SceneStats{}, scene.build_stats);
+    try std.testing.expectEqual(SceneStats{}, scene.draws.slots[scene.draws.front].build_stats);
+}
+
+test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stale stats" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    // Reset semantics: a nonzero staged copy never survives `reset`.
+    scene.draws.slots[1].build_stats.total_meshes = 7;
+    scene.draws.slots[1].build_stats.occluders_count = 9;
+    scene.draws.slots[1].reset();
+    try std.testing.expectEqual(SceneStats{}, scene.draws.slots[1].build_stats);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    var m0 = Mesh{
+        .name = "bstats_reuse",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.zero,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &m0);
+
+    // Round 1 (meshes present): the latch merges nonzero staged stats.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.stats.total_meshes > 0);
+
+    // Round 2 (mesh list emptied, slots reused): the reused slot stages a
+    // fresh zero copy — no stale round-1 stats resurface in the merge.
+    scene.meshes.clearRetainingCapacity();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.total_meshes);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.rendered_meshes);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.culled_meshes);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.occluded_meshes);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.occluders_count);
+    try std.testing.expectEqual(@as(u32, 0), scene.stats.occluder_triangles);
+}
