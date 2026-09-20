@@ -39,7 +39,7 @@ pub const CameraSnapshot = struct {
 /// Frame-level camera/light/pass state published by the simulation side.
 /// Это frame mailbox (камеры/свет/конфиг проходов), а НЕ подготовленные
 /// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
-/// outline-items строятся позже в prepareFrame и живут отдельно — P7: в двух
+/// outline-items строятся позже в prepareFrame и живут отдельно — P7: в трёх
 /// retained-слотах Scene.draws (см. scene/frame_draws.zig: FrameDrawSlot),
 /// а не в этом snapshot.
 /// P4 покрывает только mesh-payload очередей; update-vs-prepare остаются

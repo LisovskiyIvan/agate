@@ -105,7 +105,8 @@ pub const UiFrame = scene_ui_frame.UiFrame;
 const scene_frame_draws = @import("scene/frame_draws.zig");
 /// P7 published consumable draw payload (one coherent prepared frame).
 pub const FrameDrawSlot = scene_frame_draws.FrameDrawSlot;
-/// P7 two retained owning queue slots (the variable-list double buffer).
+/// P7 three retained owning queue slots (the variable-list triple buffer
+/// with a consumer pin/lease protocol).
 pub const FrameDraws = scene_frame_draws.FrameDraws;
 const scene_content = @import("scene/content.zig");
 const scene_animation = @import("scene/animation_runtime.zig");
@@ -264,12 +265,13 @@ pub const Scene = struct {
     // Physics world + debug wireframe overlay.
     physics: scene_physics.PhysicsIntegration = .{},
     // Per-frame draw queues + instance staging.
-    // P7 double buffer: two retained owning slots encompassing PRIMARY +
+    // P7 triple buffer: three retained owning slots encompassing PRIMARY +
     // ALL PIP view queues, outline items+skins, and prepared shadow
-    // items+skins+bin ranges. prepare builds the back slot, render reads the
+    // items+skins+bin ranges. prepare builds a back slot, render reads the
     // published front slot via preparedDraws() — the ONLY low-level draw
-    // accessor (no legacy field aliases). See scene/frame_draws.zig for the
-    // ownership/lifecycle contract.
+    // accessor (no legacy field aliases) — while holding a consumer pin on
+    // it (see scene/frame_draws.zig for the ownership/lifecycle contract
+    // and the pin/lease protocol).
     draws: scene_frame_draws.FrameDraws = .{},
     // projectPoint view-projection cache.
     project: scene_project.ProjectCache = .{},
@@ -2024,7 +2026,9 @@ pub const Scene = struct {
     /// taken from it) is consumable only while frame_prepared is set or
     /// during the render call consuming this frame (including the inner
     /// render of `renderReuse`, which re-draws the already-consumed front
-    /// without a prepare) — never across a prepare boundary. Render
+    /// without a prepare) — never across a prepare boundary — UNLESS the
+    /// caller holds a consumer pin on the slot (`FrameDraws.pin`), which
+    /// render itself does for the whole draw (see render). Render
     /// completes the frame epoch on all returns (no-camera too); the reuse
     /// re-run re-completes the same epoch, which is idempotent (no-op).
     /// One pending frame, no concurrent prepare/render — but update
@@ -2675,8 +2679,20 @@ pub const Scene = struct {
         // epoch — на кадр, а не на камеру/view.
         defer self.gpu_retire.complete(self.retire_epoch);
 
-        // P7: consume the published front slot (const payloads only). Valid
-        // for this render; the next prepareFrame invalidates it.
+        // P7: consume the published front slot (const payloads only) under a
+        // consumer pin: the presenting render holds the lease for the whole
+        // draw, so a future concurrent producer could already build the next
+        // frame without reclaiming this one. Sequential today (prepare and
+        // render never overlap, and the pin is released by the defer below
+        // before any later prepare), so the pin is protocol exercise, not a
+        // behavior change: back-slot selection still sees exactly the same
+        // free set it would without the pin (the front is excluded either
+        // way). Unpin is mandatory — the defer covers every return below.
+        const pinned_idx = self.draws.pinFront();
+        defer self.draws.unpin(pinned_idx) catch unreachable;
+        // Valid for this render; the next prepareFrame invalidates it (the
+        // pin only extends CPU-slot reuse exclusion, never GPU consumability
+        // — see scene/frame_draws.zig).
         const draws = self.preparedDraws();
         const snap = &self.frame_snapshot;
         if (!snap.has_camera) {
