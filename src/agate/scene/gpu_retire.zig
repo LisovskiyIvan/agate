@@ -24,10 +24,24 @@
 //! и `Scene.deinit` (через `deinit`, уничтожающий и незавершённые эпохи).
 //! Каденция flush — context-поток при УСПЕШНОМ prepare: пока prepare не
 //! проходит (длинная серия `Scene.renderReuse` без владения фазой), flush не
-//! наступает и ретенция принципиально не ограничена сверху — растёт как
-//! skip-streak × destroy-rate. Это контракт вызывающей стороны (не стрикать
-//! reuse бесконечно), зафиксированный, а не закапанный: overflow[8] покрывает
-//! только OOM append'ов, не рост за серию скипов.
+//! наступает и ретенция растёт как skip-streak × destroy-rate. Рост НЕ
+//! безграничен: `pending_cap` ограничивает суммарно удерживаемые записи
+//! (основная очередь + overflow); сверх лимита запись считается капнутой —
+//! счётчик `capped_drops` + лог, без молчаливых потерь (та же видимость, что
+//! у исчерпания overflow[8]; капнутая запись утекает, как и там —
+//! разрушать её негде: due-записей после ведущего flush не осталось, а
+//! недозревшие может ещё читать отрисованный фронт). Дефолт 8192: устойчивое
+//! состояние держит единицы записей (ретайр живёт ≤ 1 кадр), так что лимит
+//! срабатывает только при патологическом забросе destroy при длинном reuse-
+//! стрике — т.е. при нарушении контракта вызывающей стороны (не стрикать
+//! reuse бесконечно). Текущая глубина видна через `retainedCount`, капли —
+//! через `cappedDropCount`, длина стрика — через `Scene.reuseStreak`:
+//! вместе они делают staleness наблюдаемой вместо молчаливой.
+//! Дубликаты (тот же меш-указатель / тот же buffer id уже в очереди)
+//! отбрасываются счётно (`duplicateDropCount`): повторный ретайр одного
+//! хендла был бы двойным destroy, так что dedup — fail-safe, а не
+//! оптимизация; у корректных вызывающих дубликатов нет и поведение не
+//! меняется.
 //! OOM-контракт как раньше: очередь не растёт бесконечно — при OOM append
 //! запись паркуется в безаллокационный overflow[8], при переполнении и его —
 //! лог + утечка записи, но никогда sg.* вне context-потока.
@@ -78,6 +92,19 @@ pub const GpuRetireQueue = struct {
     pending: std.ArrayListUnmanaged(Entry) = .empty,
     overflow: [overflow_cap]?Entry = [_]?Entry{null} ** overflow_cap,
     overflow_len: usize = 0,
+    /// Bound on jointly retained entries (`pending.items.len + overflow_len`):
+    /// a skip-streak × destroy-rate burst past this is dropped counted, not
+    /// grown silently (see header for why a drop leaks by necessity). Steady
+    /// state holds a handful of entries (a retire lives <= 1 frame), so the
+    /// default only trips on a pathological streak. Field, not const, so apps
+    /// and tests can tighten it; read under the spinlock, written rarely.
+    pending_cap: usize = 8192,
+    /// Entries dropped by the cap (observable; each also logs — never silent).
+    capped_drops: u64 = 0,
+    /// Duplicate retires skipped (same mesh pointer / buffer id already
+    /// queued): a second destroy of one handle would corrupt, so dedup is a
+    /// fail-safe. Correct callers never produce duplicates.
+    duplicate_drops: u64 = 0,
 
     /// Начало render-кадра: открывает новый epoch и возвращает его. Заодно
     /// закрывает предыдущий незакрытый epoch — кадры строго последовательны
@@ -123,13 +150,24 @@ pub const GpuRetireQueue = struct {
     /// Можно звать с любого потока; вызовы редкие (только destroy вне
     /// контекста). Аллокатор — параметром: очередь принципиально не хранит
     /// аллокатор (им владеет Scene), append под тем же спинлоком.
-    /// Никогда не вызывает sg.* и не освобождает память: при OOM запись
-    /// паркуется в безаллокационный overflow, при переполнении и его — лог +
-    /// утечка меша.
+    /// Никогда не вызывает sg.* и не освобождает память: дубликат уже
+    /// стоящего в очереди меша отбрасывается счётно (fail-safe против
+    /// двойного destroy), сверх `pending_cap` запись отбрасывается счётно
+    /// (счётчик + лог, без молчаливого роста); при OOM запись паркуется в
+    /// безаллокационный overflow, при переполнении и его — лог + утечка меша.
     pub fn retireMesh(self: *Self, allocator: std.mem.Allocator, mesh: *Mesh) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const entry = Entry{ .kind = .mesh, .mesh = mesh, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.err("scene: retire queue cap {d} reached, leaking mesh '{s}' (bound skip-streak destroys; see pending_cap)", .{ self.pending_cap, mesh.name });
+            return;
+        }
         self.pending.append(allocator, entry) catch {
             // OOM в append: слот overflow не требует аллокации, поэтому
             // thread-affinity не нарушается и здесь.
@@ -146,15 +184,24 @@ pub const GpuRetireQueue = struct {
 
     /// Уход старого instance-буфера в ретенцию (P5: рост буфера в стейджинге —
     /// новый создан+залит, затем старый сюда). Можно звать с любого потока;
-    /// тот же epoch/overflow[8]/log+leak контракт, что у retireMesh: под
-    /// мьютексом только штамп epoch + append, никаких sg.*. Пустой handle —
-    /// no-op (нечего ретайрить). Уничтожение (`sg.destroyBuffer`) — только
-    /// context-поток во flush/deinit.
+    /// тот же epoch/overflow[8]/log+leak контракт, что у retireMesh, плюс
+    /// dedup/cap выше: под мьютексом только штамп epoch + проверки + append,
+    /// никаких sg.*. Пустой handle — no-op (нечего ретайрить). Уничтожение
+    /// (`sg.destroyBuffer`) — только context-поток во flush/deinit.
     pub fn retireBuffer(self: *Self, allocator: std.mem.Allocator, buf: sg.Buffer) void {
         if (buf.id == 0) return;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const entry = Entry{ .kind = .buffer, .buffer = buf, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.err("scene: retire queue cap {d} reached, leaking instance buffer (id {})", .{ self.pending_cap, buf.id });
+            return;
+        }
         self.pending.append(allocator, entry) catch {
             if (self.overflow_len < self.overflow.len) {
                 self.overflow[self.overflow_len] = entry;
@@ -196,6 +243,62 @@ pub const GpuRetireQueue = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         return self.pending.items.len + self.overflow_len;
+    }
+
+    /// Сколько записей отброшено капом `pending_cap` (каждая с логом).
+    /// Ненулевое значение = нарушен streak-контракт вызывающей стороны.
+    pub fn cappedDropCount(self: *Self) u64 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.capped_drops;
+    }
+
+    /// Сколько повторных ретайров одного хендла отброшено dedup'ом.
+    /// Ненулевое значение = вызывающий ретайрит дважды (было бы двойным
+    /// destroy без dedup).
+    pub fn duplicateDropCount(self: *Self) u64 {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.duplicate_drops;
+    }
+
+    /// Проба приёма для тестов/конфига: влезет ли ещё одна запись под
+    /// `pending_cap`. Читает под мьютексом; сам приём — через retire*.
+    pub fn admitsOneMore(self: *Self) bool {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        return self.admitsLocked();
+    }
+
+    /// Только под захваченным спинлоком: влезет ли ещё одна запись
+    /// (основная очередь + overflow против `pending_cap`).
+    fn admitsLocked(self: *const Self) bool {
+        return self.pending.items.len + self.overflow_len < self.pending_cap;
+    }
+
+    /// Только под захваченным спинлоком: стоит ли идентичная запись уже в
+    /// очереди (тот же меш-указатель / тот же buffer id того же kind'а).
+    fn containsLocked(self: *const Self, entry: Entry) bool {
+        for (self.pending.items) |e| {
+            if (sameHandle(e, entry)) return true;
+        }
+        for (self.overflow[0..self.overflow_len]) |slot| {
+            if (slot) |e| {
+                if (sameHandle(e, entry)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Идентичность ретайр-записей: kind совпадает и хендл тот же. Меши —
+    /// по указателю (повторный ретайр одного объекта), буферы — по id
+    /// (повторный ретайр одного GPU-хендла).
+    fn sameHandle(a: Entry, b: Entry) bool {
+        if (a.kind != b.kind) return false;
+        return switch (a.kind) {
+            .mesh => a.mesh == b.mesh,
+            .buffer => a.buffer.id == b.buffer.id,
+        };
     }
 
     /// Вызывается только под захваченным спинлоком: уничтожает записи с
@@ -416,4 +519,86 @@ test "retireBuffer OOM уходит в overflow[8]" {
     try std.testing.expectEqual(@as(u32, 100), q.overflow[0].?.buffer.id);
     try std.testing.expectEqual(@as(u32, 107), q.overflow[7].?.buffer.id);
     try std.testing.expectEqual(Kind.buffer, q.overflow[7].?.kind);
+}
+
+test "retire dedups the same handle, counting duplicates" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    defer q.pending.deinit(alloc);
+    _ = q.begin();
+
+    // Same mesh twice: one entry, one counted duplicate — a second destroy
+    // of the same object would corrupt, so the queue keeps exactly one.
+    const m = try makeMesh(alloc, "dup_mesh");
+    q.retireMesh(alloc, m);
+    q.retireMesh(alloc, m);
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+
+    // Same buffer id twice (distinct kinds never collide: mesh pointer vs
+    // buffer id are compared only within their kind).
+    q.retireBuffer(alloc, .{ .id = 77 });
+    q.retireBuffer(alloc, .{ .id = 77 });
+    q.retireBuffer(alloc, .{ .id = 78 });
+    try std.testing.expectEqual(@as(usize, 3), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 2), q.duplicateDropCount());
+
+    // Manual cleanup (fake buffer ids have no GPU resource behind them):
+    // the mesh exactly once — dedup prevented the double destroy.
+    m.deinit(alloc);
+    alloc.destroy(m);
+    q.pending.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+}
+
+test "retire dedups across the overflow spillover" {
+    const alloc = std.testing.allocator;
+    var q: GpuRetireQueue = .{};
+    defer q.pending.deinit(alloc);
+    defer {
+        @memset(&q.overflow, null);
+        q.overflow_len = 0;
+    }
+    _ = q.begin();
+
+    // Every append fails: entries park in overflow; the repeat of id 200
+    // must hit the overflow half of the dedup scan, not append twice.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    q.retireBuffer(failing.allocator(), .{ .id = 200 });
+    q.retireBuffer(failing.allocator(), .{ .id = 200 });
+    q.retireBuffer(failing.allocator(), .{ .id = 201 });
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+    try std.testing.expectEqual(@as(usize, 2), q.overflow_len);
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+}
+
+test "cap admission probe stops at pending_cap without dropping" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    defer q.deinit(alloc);
+    q.pending_cap = 2;
+    const e = q.begin();
+
+    try std.testing.expect(q.admitsOneMore());
+    const m1 = try makeMesh(alloc, "cap_first");
+    q.retireMesh(alloc, m1);
+    try std.testing.expect(q.admitsOneMore());
+    const m2 = try makeMesh(alloc, "cap_second");
+    q.retireMesh(alloc, m2);
+    // At the cap: the probe reports full, nothing was dropped or logged
+    // (the drop+log path itself cannot run under the test runner's
+    // log.err policy — same precedent as the overflow-exhausted branch —
+    // so the test pins the boundary from the admission side).
+    try std.testing.expect(!q.admitsOneMore());
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+
+    q.complete(e);
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+    try std.testing.expect(q.admitsOneMore());
 }
