@@ -24,7 +24,7 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; latch live-touch-free (slot records + `commitPublishedRecords`, UI packet handles); lock-free остаток — app-side build ordering + handoff claim/pin adoption, затем снятие phase-mutex | 🟡 |
+| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; latch live-touch-free (slot records + `commitPublishedRecords`, UI packet handles); concurrent-build primitive landed (`tryClaimBuildSlot`/`BuildClaim`, `releaseHandoff` без flip); lock-free остаток — sandbox adoption (claim/publish) + app-side ordering (atomics, canvas quiesce), затем снятие phase-mutex | 🟡 |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
@@ -52,7 +52,7 @@
 | glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали | 🟡 |
 | Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (LDR + BC7-батч через `sandbox/tools/convert_ktx2.sh`) в glTF-загрузке, `KHR_texture_basisu` в whitelist `extensionsRequired` | 🟡 |
 | Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
-| Soft body | — | ❌ |
+| Soft body | PBD cloth v1 (Verlet 2–64, Jacobi constraints, pinned, sphere/floor коллайдеры, cap 4; non-goals: self-collision, tearing, fluids, box3d coupling, GPU sim, cloth-cloth, persistence) | ✅ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст + TrueType (glyf-парсер, cmap 4/12, композитные глифы, kern fmt0, scanline-растеризатор, атлас), кнопки/панели, checkbox, slider, dropdown, скролл, text input, CSS-темы, анимации переходов + 3D world-space панели (до 4, pick+inject, render-on-demand) | ✅ |
 | Layout-контейнеры, Flex/Grid UI | LayoutStack: HStack, VStack, Flexbox, CSS Grid (fr/px/%), 9-point Anchors, Docking (top/bottom/left/right/fill), Spacers, Spans | ✅ |
@@ -616,7 +616,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps, stateful compute-симуляция | Коллизий с физикой, нодового редактора |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG | GreasedLine, упрощение мешей (decimation) |
 | glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0), glTF-экспорта |
-| Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии | Soft body, рендера debug-линий (данные уже генерируются) |
+| Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии + PBD cloth v1 (cap 4, session-local) | Импорт коллайдеров из файлов; soft body за пределами PBD cloth v1 |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + TrueType-шрифты + checkbox/slider/dropdown/скролл/text input + 3D world-space панели (до 4, pick+inject, render-on-demand) | Фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
@@ -654,7 +654,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Нодовый редактор частиц, коллизии с физикой (stateful GPU-симуляция compute-режимом, CPU on-death sub-emitters и flow maps уже реализованы, см. ✅).
 
 **Физика**
-* Soft bodies; импорт коллайдеров из файлов сцен.
+* Импорт коллайдеров из файлов сцен (PBD cloth v1 done: cap 4, без self-collision/tearing/fluids/GPU/box3d-coupling/cloth-cloth/persistence).
 
 **UI/GUI**
 * Unicode-шейпинг поверх TTF (сам TTF — парсинг, растеризация, атлас — уже реализован, см. ✅; 3D world-space панели — тоже ✅; LayoutStack, HStack/VStack/Flexbox/CSS Grid, 9-точечные якоря, докинг панелей, анимации переходов и CSS-темы уже реализованы).
