@@ -77,6 +77,12 @@ layout(binding = 1) uniform fs_params {
     // skips in the fill loop below).
     vec4 directional_dir[4];
     vec4 directional_color_int[4]; // rgb: color, a: intensity
+    // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
+    // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
+    // Instanced draws always upload zero here — probes skip instanced
+    // batches in v1 — but the lane must exist for layout parity with the
+    // regular standard FsParams.
+    vec4 probe_params;
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -92,6 +98,13 @@ layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
 @sampler_type depth_smp nonfiltering
 layout(binding = 2) uniform sampler depth_smp;
+// Reflection probe cube (wave 25): binding 11 is the next free texture
+// slot in the shared pool (fs uses 0..4, the instanced vs uses no
+// textures), binding 6 the next free sampler slot. Instanced draws bind
+// the default cube with zeroed params (legacy path); the slots must still
+// exist for layout parity with the regular standard family.
+layout(binding = 11) uniform textureCube probe_tex;
+layout(binding = 6) uniform sampler probe_smp;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -449,7 +462,14 @@ void main() {
         }
     }
 
+    // Directional ambient base. Reflection probe (wave 25): same
+    // substitution as the regular standard shader (probe coarsest mip when
+    // probe_params.x > 0.5). Instanced draws always upload zero here, so
+    // this stays legacy.
     vec3 ambient = ambient_color.rgb * ambient_color.a;
+    if (probe_params.x > 0.5) {
+        ambient = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
+    }
 
     vec3 final_rgb = base.rgb * (ambient + diffuse) + debug_tint;
     frag_color = vec4(final_rgb, base.a);

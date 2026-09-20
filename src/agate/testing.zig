@@ -30,6 +30,7 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
         .default_normal_texture = std.mem.zeroes(Texture),
         .default_cube_texture = std.mem.zeroes(CubeTexture),
         .lights = .{},
+        .probes = .{},
         .shadows = .{ .pass = undefined },
         .sky = .{ .pass = undefined },
         .postfx = .{

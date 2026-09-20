@@ -208,6 +208,7 @@ pub fn build(b: *Build) !void {
         .{ .name = "bloom_down_shader", .input = "src/agate/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig" },
         .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig" },
         .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
+        .{ .name = "probe_mip_shader", .input = "src/agate/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});

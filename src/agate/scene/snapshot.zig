@@ -13,6 +13,7 @@ const texture_mod = @import("../texture.zig");
 const CubeTexture = texture_mod.CubeTexture;
 
 const light_rig = @import("light_rig.zig");
+const probe_layer = @import("probe_layer.zig");
 const uniforms = @import("uniforms.zig");
 const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
@@ -72,6 +73,13 @@ pub const SceneFrameSnapshot = struct {
     sun_intensity: f32 = 1.0,
     cascades: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
     light_pack: light_rig.LightRig.FramePack = .{},
+    /// Reflection-probe state for the frame (wave 25): packed per
+    /// `ProbeLayer.packFrame` at snapshot time (plain data + borrowed cube
+    /// view/sampler VALUES, never live layer refs). The draw selects the
+    /// winning probe per object from these entries; empty (count 0) means
+    /// every draw takes today's ambient/skybox path bit-identically.
+    /// Reused verbatim by `renderReuse` (no capture there by design).
+    probe_pack: probe_layer.FramePack = .{},
 
     // Environment & passes config
     shadows_enabled: bool = true,

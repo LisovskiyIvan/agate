@@ -142,6 +142,11 @@ layout(binding = 1) uniform fs_params {
     // skips in the fill loop below).
     vec4 directional_dir[4];
     vec4 directional_color_int[4]; // rgb: color, a: intensity
+    // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
+    // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
+    // Zeroed when no probe applies: the shader then takes the legacy
+    // ambient path bit-identically. Appended last so no offset shifts.
+    vec4 probe_params;
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -157,6 +162,13 @@ layout(binding = 0) uniform sampler smp;
 layout(binding = 1) uniform sampler shadow_smp;
 @sampler_type depth_smp nonfiltering
 layout(binding = 2) uniform sampler depth_smp;
+// Reflection probe cube (wave 25): binding 11 is the next free texture
+// slot in the shared pool (fs uses 0..3 and 5, vs uses 4 for morph),
+// binding 6 the next free sampler slot (fs uses 0..2, vs uses 3).
+// The draw always binds something valid here (probe cube or default cube);
+// the shader only samples it when probe_params.x > 0.5.
+layout(binding = 11) uniform textureCube probe_tex;
+layout(binding = 6) uniform sampler probe_smp;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -527,7 +539,15 @@ void main() {
         }
     }
 
+    // Directional ambient base. Reflection probe (wave 25): when a probe
+    // applies to this object (probe_params.x > 0.5), the hemispheric base
+    // is replaced by the probe's coarsest-mip diffuse sample (documented
+    // approximation), scaled by the probe intensity. Disabled: legacy path,
+    // bit-identical.
     vec3 ambient = ambient_color.rgb * ambient_color.a;
+    if (probe_params.x > 0.5) {
+        ambient = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
+    }
 
     vec3 final_rgb = base.rgb * (ambient + diffuse) + debug_tint;
 

@@ -9,6 +9,7 @@ const inst_pbr_shd = @import("instanced_pbr_shader");
 
 const math = @import("math");
 const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
 
 const Texture = @import("../texture.zig").Texture;
 const CubeTexture = @import("../texture.zig").CubeTexture;
@@ -24,6 +25,7 @@ const RenderInstancedBatch = render_queue.RenderInstancedBatch;
 const morph_gpu = @import("../mesh/morph_gpu.zig");
 const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("uniforms.zig");
+const probe_layer = @import("probe_layer.zig");
 const forward_pipelines = @import("forward_pipelines.zig");
 const ForwardPipelines = forward_pipelines.ForwardPipelines;
 const shader_material = @import("../shader_material.zig");
@@ -55,6 +57,12 @@ pub const Environment = struct {
     // which in turn falls back to default_cube. Snapshot copy as well.
     sky_texture: ?CubeTexture,
     ibl_intensity: f32,
+    // Reflection-probe pack for the frame (wave 25): snapshot-owned borrow
+    // (see SceneFrameSnapshot.probe_pack). Per regular draw the nearest
+    // enabled+captured probe containing the object wins (no blending);
+    // instanced batches skip probes in v1 (no single object position) and
+    // always take the legacy path.
+    probes: []const probe_layer.ProbeFrameEntry = &.{},
     // Shadow map views/samplers from the CSM/spot atlas.
     shadow_pass: *const passes.ShadowPass,
     // Scene-level fragment uniform inputs; mesh.receive_shadows is patched
@@ -129,12 +137,16 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-        bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-
         bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
         bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+
+        // Reflection probe (wave 25): winning probe cube or the default
+        // cube with zeroed params (legacy path) when none applies.
+        const prb = probeForDraw(env, item.model);
+        bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
+        bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
 
         sg.applyBindings(bind);
 
@@ -196,6 +208,7 @@ pub fn drawRegularItem(
             .point_shadow_params = f.point_shadow_params,
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
+            .probe_params = prb.params,
         };
         if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -215,6 +228,11 @@ pub fn drawRegularItem(
 
         bind.views[shd.VIEW_morph_tex] = morph_view;
         bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+
+        // Reflection probe (wave 25): see the PBR branch above.
+        const prb_std = probeForDraw(env, item.model);
+        bind.views[shd.VIEW_probe_tex] = prb_std.view;
+        bind.samplers[shd.SMP_probe_smp] = prb_std.sampler;
 
         sg.applyBindings(bind);
 
@@ -252,6 +270,7 @@ pub fn drawRegularItem(
             .point_shadow_params = f.point_shadow_params,
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
+            .probe_params = prb_std.params,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -327,10 +346,17 @@ fn drawShaderMaterialItem(
             bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
             bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
             bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+            bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
             bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
             bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+
             bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
             bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+            // Reflection probe (wave 25): hook materials resolve like
+            // regular draws (per-object selection from the model).
+            const prb_hook = probeForDraw(env, item.model);
+            bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
+            bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
             sg.applyBindings(bind);
 
             const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
@@ -374,6 +400,7 @@ fn drawShaderMaterialItem(
                 .point_shadow_params = f.point_shadow_params,
                 .directional_dir = f.directional_dir,
                 .directional_color_int = f.directional_color_int,
+                .probe_params = prb_hook.params,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
@@ -387,6 +414,10 @@ fn drawShaderMaterialItem(
             bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
             bind.views[shd.VIEW_morph_tex] = morph_view;
             bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+            // Reflection probe (wave 25): see the PBR hook branch above.
+            const prb_hook_std = probeForDraw(env, item.model);
+            bind.views[shd.VIEW_probe_tex] = prb_hook_std.view;
+            bind.samplers[shd.SMP_probe_smp] = prb_hook_std.sampler;
             sg.applyBindings(bind);
 
             const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
@@ -420,6 +451,7 @@ fn drawShaderMaterialItem(
                 .point_shadow_params = f.point_shadow_params,
                 .directional_dir = f.directional_dir,
                 .directional_color_int = f.directional_color_int,
+                .probe_params = prb_hook_std.params,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         }
@@ -455,6 +487,32 @@ fn drawShaderMaterialItem(
 }
 
 threadlocal var fallback_uniforms: uniforms.FrameUniforms = undefined;
+
+/// Per-draw reflection-probe resolution (wave 25): the nearest
+/// enabled+captured probe containing the object's world position (from the
+/// model translation) wins; otherwise the legacy path (zeroed params, so
+/// the shader takes its bit-identical no-probe branch). The default-cube
+/// binds keep the declared probe texture/sampler slots valid when no probe
+/// applies. Pure (no GPU calls).
+fn probeForDraw(env: *const Environment, model: Mat4) struct {
+    params: [4]f32,
+    view: sg.View,
+    sampler: sg.Sampler,
+} {
+    const pos = Vec3.new(model.m[12], model.m[13], model.m[14]);
+    if (probe_layer.selectProbe(env.probes, pos)) |sel| {
+        return .{
+            .params = .{ 1.0, sel.intensity, sel.max_probe_lod, 0.0 },
+            .view = sel.view,
+            .sampler = sel.sampler,
+        };
+    }
+    return .{
+        .params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .view = env.default_cube.view,
+        .sampler = env.default_cube.sampler,
+    };
+}
 
 fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) *const uniforms.FrameUniforms {
     if (mesh_receive_shadows) {
@@ -609,6 +667,11 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
+        // Reflection probes skip instanced batches in v1 (no single object
+        // position for selection): legacy path with valid binds.
+        bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
+        bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
+
         sg.applyBindings(bind);
 
         const inst_vs = inst_pbr_shd.VsParams{
@@ -643,6 +706,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .point_shadow_params = f.point_shadow_params,
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
+            .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
             .alpha_cutoff = rec.alpha_cutoff,
             .normal_scale = rec.normal_scale,
             .uv_matrix = rec.uv_matrices,
@@ -664,6 +728,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[inst_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[inst_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+
+        // Reflection probes skip instanced batches in v1: legacy path.
+        bind.views[inst_shd.VIEW_probe_tex] = env.default_cube.view;
+        bind.samplers[inst_shd.SMP_probe_smp] = env.default_cube.sampler;
 
         sg.applyBindings(bind);
 
@@ -699,6 +767,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .point_shadow_params = f.point_shadow_params,
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
+            .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }
@@ -729,6 +798,7 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "sheen_color")) @compileError("FsParams missing sheen_color");
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
+            if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
         }
     }
     // Standard family: one diffuse slot.
@@ -738,6 +808,7 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
+            if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
         }
     }
 }
@@ -750,6 +821,58 @@ test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
     try std.testing.expectEqual(@sizeOf(pbr_shd.FsParams), @sizeOf(inst_pbr_shd.FsParams));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clearcoat_factors"), @offsetOf(skinned_pbr_shd.FsParams, "clearcoat_factors"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sheen_color"), @offsetOf(inst_pbr_shd.FsParams, "sheen_color"));
+    // The appended probe lane lands at the same offset in all three (the
+    // draw uploads one struct value to either UB slot).
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(skinned_pbr_shd.FsParams, "probe_params"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(inst_pbr_shd.FsParams, "probe_params"));
+}
+
+test "probeForDraw resolves the winning probe or the legacy fallback" {
+    // probeForDraw only reads env.probes + env.default_cube: every other
+    // Environment field stays undefined here (never dereferenced).
+    const empty_env = Environment{
+        .pipelines = undefined,
+        .stats = undefined,
+        .default_white = std.mem.zeroes(Texture),
+        .default_normal = std.mem.zeroes(Texture),
+        .default_cube = std.mem.zeroes(CubeTexture),
+        .sky_texture = null,
+        .ibl_intensity = 1.0,
+        .shadow_pass = undefined,
+        .shadow_uniforms = undefined,
+        .probes = &.{},
+    };
+    // No probe pack: zeroed params (the shader's bit-identical no-probe
+    // branch) with the default-cube binds keeping the slots valid.
+    const off = probeForDraw(&empty_env, Mat4.identity);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, off.params);
+    try std.testing.expectEqual(@as(u32, 0), off.view.id);
+
+    // A covering probe: enabled lane with its intensity/lod/view/sampler.
+    // The identity model sits at the origin, inside the radius-5 probe.
+    var entries = [_]probe_layer.ProbeFrameEntry{
+        .{
+            .position = Vec3.zero,
+            .radius = 5.0,
+            .enabled = true,
+            .captured = true,
+            .intensity = 0.5,
+            .max_probe_lod = 7.0,
+            .view = .{ .id = 31 },
+            .sampler = .{ .id = 32 },
+        },
+    };
+    var covered_env = empty_env;
+    covered_env.probes = &entries;
+    const on = probeForDraw(&covered_env, Mat4.identity);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 7.0, 0.0 }, on.params);
+    try std.testing.expectEqual(@as(u32, 31), on.view.id);
+    try std.testing.expectEqual(@as(u32, 32), on.sampler.id);
+
+    // Same pack, object outside the radius: legacy fallback again.
+    const far_model = Mat4.translation(Vec3.new(100.0, 0.0, 0.0));
+    const far = probeForDraw(&covered_env, far_model);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, far.params);
 }
 
 test "resolveCoat falls back to neutral when the lobe is off" {

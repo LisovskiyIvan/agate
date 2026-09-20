@@ -127,6 +127,7 @@ test {
     _ = @import("scene/picking.zig");
     _ = @import("scene/pipelines.zig");
     _ = @import("scene/postfx_stack.zig");
+    _ = @import("scene/probe_layer.zig");
     _ = @import("scene/project_cache.zig");
     _ = @import("scene/projection.zig");
     _ = @import("scene/render_queue.zig");

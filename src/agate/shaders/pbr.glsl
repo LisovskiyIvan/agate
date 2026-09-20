@@ -170,6 +170,11 @@ layout(binding = 1) uniform fs_params {
     // skips in the fill loop below).
     vec4 directional_dir[4];
     vec4 directional_color_int[4]; // rgb: color, a: intensity
+    // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
+    // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
+    // Zeroed when no probe applies: the shader then takes the legacy
+    // ambient/IBL path bit-identically. Appended last so no offset shifts.
+    vec4 probe_params;
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -195,6 +200,13 @@ layout(binding = 1) uniform sampler shadow_smp;
 layout(binding = 2) uniform sampler env_smp;
 @sampler_type depth_smp nonfiltering
 layout(binding = 3) uniform sampler depth_smp;
+// Reflection probe cube (wave 25): binding 11 is the next free texture
+// slot in the shared pool (fs uses 0..8 and 10, vs uses 9 for morph),
+// binding 6 the next free sampler slot (fs uses 0..3 and 5, vs uses 4).
+// The draw always binds something valid here (probe cube or default cube);
+// the shader only samples it when probe_params.x > 0.5.
+layout(binding = 11) uniform textureCube probe_tex;
+layout(binding = 6) uniform sampler probe_smp;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -763,14 +775,27 @@ void main() {
     float ao = 1.0 + pbr_factors.z * (ao_sample - 1.0);
 
     // Image-Based Lighting (IBL): two cube fetches + BRDF fit skipped when off.
+    // Reflection probe (wave 25): when a probe applies to this object
+    // (probe_params.x > 0.5), the probe cube replaces env_tex as the IBL
+    // source — specular via textureLod with roughness, diffuse via the
+    // coarsest mip — scaled by the probe intensity. The hemispheric
+    // ambient_color term below is unchanged. Disabled: legacy path,
+    // bit-identical.
     vec3 ibl = vec3(0.0);
     float ibl_intensity = pbr_factors.w;
     if (ibl_intensity > 0.001) {
         vec3 R = reflect(-V, N);
         float max_lod = 7.0;
         float lod = roughness * max_lod;
-        vec3 prefiltered_spec = textureLod(samplerCube(env_tex, env_smp), R, lod).rgb;
-        vec3 irradiance = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
+        vec3 prefiltered_spec;
+        vec3 irradiance;
+        if (probe_params.x > 0.5) {
+            prefiltered_spec = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(lod, 0.0, probe_params.z)).rgb * probe_params.y;
+            irradiance = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
+        } else {
+            prefiltered_spec = textureLod(samplerCube(env_tex, env_smp), R, lod).rgb;
+            irradiance = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
+        }
 
         vec3 F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
         vec2 brdf = envBRDFApprox(roughness, NdotV);
@@ -785,7 +810,12 @@ void main() {
         vec3 cc_spec_ibl = vec3(0.0);
         if (cc_intensity > 0.001) {
             float cc_lod = cc_rough * max_lod;
-            vec3 cc_prefiltered = textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb;
+            vec3 cc_prefiltered;
+            if (probe_params.x > 0.5) {
+                cc_prefiltered = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(cc_lod, 0.0, probe_params.z)).rgb * probe_params.y;
+            } else {
+                cc_prefiltered = textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb;
+            }
             vec2 cc_brdf = envBRDFApprox(cc_rough, NdotV);
             cc_spec_ibl = cc_prefiltered * (cc_F0 * cc_brdf.x + cc_brdf.y) * cc_intensity;
         }
