@@ -14,6 +14,7 @@ const types = @import("types.zig");
 const scene_mod = @import("../scene.zig");
 const texture_mod = @import("../texture.zig");
 const probe_layer = @import("../scene/probe_layer.zig");
+const gui3d_layer = @import("../scene/gui3d_layer.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 
 const Scene = scene_mod.Scene;
@@ -325,6 +326,26 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 .format = .RGBA8,
                 .samples = 1,
                 .gpu_bytes = probe_bytes,
+            });
+        }
+
+        // 3D-GUI panel targets (wave 28): one RGBA8 color RT per panel with
+        // a live target (probe precedent: pure byte math, no GPU calls;
+        // panels without a target contribute nothing).
+        for (0..scene.gui3d.panelCount()) |i| {
+            const panel = &scene.gui3d.panels[i];
+            if (panel.gpu.target.image.id == 0) continue;
+            const panel_bytes = gui3d_layer.targetBytes(panel.canvas_width, panel.canvas_height);
+            snap.render_targets_vram_bytes += panel_bytes;
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "3D GUI Panel {d} (color)", .{i}) catch "3D GUI Panel";
+            try rt_list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, name),
+                .width = @intCast(panel.canvas_width),
+                .height = @intCast(panel.canvas_height),
+                .format = .RGBA8,
+                .samples = 1,
+                .gpu_bytes = panel_bytes,
             });
         }
     }

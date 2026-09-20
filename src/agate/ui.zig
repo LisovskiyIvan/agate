@@ -128,8 +128,12 @@ pub const UICanvas = struct {
         self.mouse_clicked = is_clicked;
     }
 
-    pub fn init(allocator: std.mem.Allocator) !UICanvas {
-        const tex = try Texture.fromMemory(allocator, font_png_data, .{
+    /// Uploads the embedded SDF bitmap font to a GPU texture (context thread
+    /// only, like every other Texture upload). Shared by `init` and by
+    /// out-of-canvas owners that need the same atlas without a full canvas
+    /// (the 3D-GUI layer's shared font, see scene/gui3d_layer.zig).
+    pub fn makeFontTexture(allocator: std.mem.Allocator) !Texture {
+        return Texture.fromMemory(allocator, font_png_data, .{
             .min_filter = .LINEAR,
             .mag_filter = .LINEAR,
             .wrap_u = .CLAMP_TO_EDGE,
@@ -137,6 +141,26 @@ pub const UICanvas = struct {
             // Box-filtered mips blur the distance field beyond legibility.
             .mipmaps = false,
         });
+    }
+
+    /// CPU-only canvas: no GPU handles (zero buffers/pipeline/font texture),
+    /// usable headless for drawing into the CPU-side lists and driving input
+    /// state. `render`/capture/upload need a live context and real handles;
+    /// either complete it with `init`-style GPU creation on the context
+    /// thread or hand its lists to an owner that uploads them itself (the
+    /// 3D-GUI layer path). Never call `deinit` on a canvas whose
+    /// `font_texture` was not created via `makeFontTexture`/`init`
+    /// (`Texture.deinit` issues `sg.destroy*` unconditionally) — free the
+    /// CPU lists directly instead.
+    pub fn initCpuOnly(allocator: std.mem.Allocator) UICanvas {
+        return .{
+            .allocator = allocator,
+            .font_texture = std.mem.zeroes(Texture),
+        };
+    }
+
+    pub fn init(allocator: std.mem.Allocator) !UICanvas {
+        const tex = try makeFontTexture(allocator);
 
         const max_v: usize = 32768;
         const max_i: usize = 49152;
