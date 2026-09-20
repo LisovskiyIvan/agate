@@ -82,6 +82,14 @@ test {
     _ = @import("mesh/types.zig");
     _ = @import("mesh/vat.zig");
     _ = @import("particles.zig");
+    _ = @import("particles/compute_mode.zig");
+    _ = @import("particles/cpu.zig");
+    _ = @import("particles/flow.zig");
+    _ = @import("particles/gpu.zig");
+    _ = @import("particles/sampling.zig");
+    _ = @import("particles/subemitters.zig");
+    _ = @import("particles/system.zig");
+    _ = @import("particles/types.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");
     _ = @import("passes/mod.zig");
