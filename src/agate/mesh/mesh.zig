@@ -109,13 +109,14 @@ pub const InstancePreviewState = struct {
 pub const InstanceSource = enum { published, build_view };
 
 /// Slot-owned staged instance record (lock-free-publication slice 1): the
-/// per-mesh frozen input the prepare latch consumes INSTEAD of the live
-/// `instance_preview` (plus the prior `instance_render` the latch used to
-/// re-read). Written once by `Scene.buildPreparedFrame` (via
-/// `freezeStagedRecords`, only for meshes with a fresh preview) into the
-/// back `FrameDrawSlot.staged_instances`; consumed once by
-/// `stageInstancesLatch`, which mirrors the post-latch state back into the
-/// record so `patchInstanceRefs` finalizes payloads from the record alone.
+/// per-mesh frozen input the prepare latch consumes INSTEAD of any live
+/// mesh state (plus the prior `instance_render` the game-side commit needs).
+/// Written once by `Scene.buildPreparedFrame` (via `freezeStagedRecords`,
+/// only for meshes with a fresh preview) into the back `FrameDrawSlot.
+/// staged_instances`; consumed once by `stageInstancesLatch`, which mirrors
+/// the post-latch state back into the record so `patchInstanceRefs`
+/// finalizes payloads from the record alone and the game-side
+/// `commitPublishedRecords` (next build) applies it to the live mesh.
 ///
 /// Ordering: appended in mesh-list order, so `mesh_index` is strictly
 /// increasing — the patch looks records up by index with an early exit, no
@@ -126,11 +127,13 @@ pub const InstanceSource = enum { published, build_view };
 /// patch: it is never destroyed or retired through the record (lifetime
 /// stays with `instance_render` under the P3 epochs).
 pub const StagedInstanceRecord = struct {
-    /// Owning mesh at build time (write-back target + aliveness guard).
-    /// Never dereferenced before the guard (`meshes[mesh_index] == mesh`
-    /// and uid) passes: a destroyed mesh is unlinked from the list first,
-    /// so the guard fails on the pointer compare without touching freed
-    /// memory; the uid check defends against address reuse.
+    /// Owning mesh at build time (commit target + aliveness guard token).
+    /// The prepare latch never touches this (no dereference, no compare —
+    /// a destroyed mesh's dangling pointer is inert there). The game-side
+    /// commit compares it (`meshes[mesh_index] == mesh`, then uid) without
+    /// dereferencing it first: a destroyed mesh is unlinked from the list
+    /// first, so the guard skips on the pointer compare without touching
+    /// freed memory; the uid check defends against address reuse.
     mesh: *Mesh,
     /// Stable render uid at build time (matches `mesh.uid`).
     uid: u64,

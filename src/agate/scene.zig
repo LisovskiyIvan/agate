@@ -355,13 +355,18 @@ pub const Scene = struct {
     profiler_frame_seq: u64 = 0,
 
     /// Stage 1 producer-build handoff (game/update phase → prepare latch):
-    /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages instance
+    /// `buildPreparedFrame` (game side, CPU-only, sg-free) first commits the
+    /// last published latch outcomes to the live meshes (game-side
+    /// `commitPublishedRecords` over the front slot — the old guarded
+    /// `instance_render` write-back, ordered after publish, never concurrent
+    /// with the context), then stages instance
     /// matrices into the back-slot scratch + per-mesh previews, freezes the
     /// slot-owned staged records, and captures
     /// the particle/physics CPU build frames, then bumps `build_seq`.
     /// `prepareFrame` (context side) consumes the build when `build_seq !=
     /// last_latched_seq` (GPU halves over the slot records + latch copies,
-    /// no CPU restaging, no live preview reads) and
+    /// no CPU restaging, no live mesh reads or writes — outcomes land in
+    /// the slot records for the game-side commit) and
     /// otherwise runs the historical inline path — so behavior stays correct
     /// when `buildPreparedFrame` is never called. Two builds before a latch:
     /// newest wins (single preview store recomputed, scratch overwritten,
@@ -1944,10 +1949,13 @@ pub const Scene = struct {
     ///
     /// Runs on the game side (any non-pool thread under update-vs-prepare
     /// exclusion — same exclusion as `buildPreparedFrame`), sg-free by
-    /// design: CPU list copies into retained slot capacity + one seq bump.
-    /// No GPU upload and no GPU handle mutation on this path — handles,
-    /// pipeline, font, and screen dims resolve at latch time on the context
-    /// thread, exactly like the legacy path. Call AFTER the tick's UI build
+    /// design: CPU list copies into retained slot capacity + plain handle
+    /// stamps + one seq bump. No GPU upload and no GPU handle mutation on
+    /// this path — the draw handles (pipeline, resolved font view/sampler,
+    /// canvas buffer ids) and the writer watermark (`ui_upload_seq`) are
+    /// frozen as plain values for the latch to consume instead of reading
+    /// the live canvas; screen dims already come from the staged slot
+    /// snapshot at latch time. Call AFTER the tick's UI build
     /// (canvas holds the frame's geometry) and, when `buildPreparedFrame`
     /// is also used, AFTER it (the build resets the back slot and would
     /// wipe an earlier packet; the latch then degrades to the legacy canvas
@@ -1984,7 +1992,18 @@ pub const Scene = struct {
             self.ui_packet_seq +%= 1;
             return;
         };
-        back.ui_packet = .{ .valid = true, .canvas_present = true };
+        back.ui_packet = .{
+            .valid = true,
+            .canvas_present = true,
+            .handles = .{
+                .pipeline = canvas.pipeline,
+                .font_view = canvas.activeFontView(),
+                .font_sampler = canvas.activeFontSampler(),
+                .vertex_buffer = canvas.vertex_buffer,
+                .index_buffer = canvas.index_buffer,
+            },
+            .upload_seq = canvas.ui_upload_seq,
+        };
         self.ui_packet_seq +%= 1;
     }
 
@@ -2030,6 +2049,7 @@ pub const Scene = struct {
                             back.ui_indices.items,
                             @floatFromInt(w),
                             @floatFromInt(h),
+                            back.ui_packet.handles,
                         );
                         self.ui_packet_latched +%= 1;
                         _ = self.ui_frame.upload(canvas, .{
@@ -2127,18 +2147,20 @@ pub const Scene = struct {
     /// (plus shadow `world_aabb`/`max_dim`, outline `world_center`) came from
     /// the provisional `instance_build_view` (frozen count/bounds + old
     /// handle); here they are finalized from the post-latch RECORD mirror
-    /// (which the latch copied from its guarded `instance_render`
-    /// write-back, so the values are identical to reading live state —
-    /// without the race).
+    /// (which the game-side commit applies verbatim to `instance_render`,
+    /// so the values are identical to reading live state — without the
+    /// race).
     ///
     /// Records are appended in mesh-list order (strictly increasing
     /// `mesh_index`), so the lookup below is a linear scan with early exit.
     /// A mesh-list mutation between build and latch can therefore NOT slip
-    /// a stale entry through: the latch guard already fail-closed the
-    /// affected records (`staged_frame != frame_id`), and the patch zeroes
-    /// them here. The live mesh list is validated at latch time, not patch
-    /// time — the patch performs zero live reads (outline stale fallbacks
-    /// use the record-frozen `mesh_position`, not live `mesh.position`).
+    /// a stale entry through the COMMIT (the game-side guard skips displaced
+    /// meshes there); the patch itself resolves purely from the records —
+    /// a record the latch published finalizes, a record the latch
+    /// fail-closed (`staged_frame != frame_id`) zeroes. The live mesh list
+    /// is validated at commit time, not patch time — the patch performs
+    /// zero live reads (outline stale fallbacks use the record-frozen
+    /// `mesh_position`, not live `mesh.position`).
     ///
     /// Per entry (only `is_instanced` shadow/outline items and all instanced
     /// batches; regular items have no provisional handle and are skipped):
@@ -2247,7 +2269,8 @@ pub const Scene = struct {
     }
 
     /// Stage-2 increment B producer build (game/update phase, CPU-only,
-    /// sg-free): stages the CPU halves the prepare latch will consume —
+    /// sg-free): commits the last published latch outcomes to the live
+    /// meshes, then stages the CPU halves the prepare latch will consume —
     /// instance matrices into the back-slot scratch + per-mesh previews +
     /// the slot-owned staged records, the
     /// particle build frame, the physics debug build capture — then freezes
@@ -2292,7 +2315,9 @@ pub const Scene = struct {
     /// builds run with `instances_prepared=true`, never retrying staging),
     /// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
     /// no `self.stats`, no profiler. Mutates under game-phase ownership only:
-    /// back-slot queues/shadow/outline + scratch, previews/build_views,
+    /// live mesh `instance_render` (commit of the last published latch
+    /// outcomes, guarded — see above), back-slot queues/shadow/outline +
+    /// scratch, previews/build_views,
     /// staged records, the staged slot `snapshot`,
     /// particle/physics build frames, `build_snapshot` (refreshed), shadow
     /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
@@ -2300,19 +2325,30 @@ pub const Scene = struct {
     ///
     /// App contract: no latch is possible while a build runs (update-vs-
     /// prepare exclusion), and the mesh list MUST NOT be mutated between a
-    /// build and its latch (validated by uid at patch time: a violation
-    /// fail-closes stale entries to invisible instead of corrupting). A mesh
+    /// build and its latch (a violation no longer fail-closes at latch time —
+    /// the latch stages whatever the slot owns — but the commit guard skips
+    /// the displaced meshes and the patch already resolved the payload from
+    /// the records; the next funded build recomputes). A mesh
     /// whose upload finishes between build and latch, or whose segment OOMs,
     /// keeps its previous complete `instance_render` for one frame
     /// (documented, coherent); the next funded build+latch picks it up.
     pub fn buildPreparedFrame(self: *Scene) void {
         // Deliberately NO gpu_thread assert: this runs on the game side or
-        // a spawned worker. Everything below is sg-free (the CPU staging
-        // half, the plain captures, the CPU queue/shadow/outline build with
-        // instances_prepared=true); any sg.* here would be a bug.
+        // a spawned worker. Everything below is sg-free (the commit, the CPU
+        // staging half, the plain captures, the CPU queue/shadow/outline
+        // build with instances_prepared=true); any sg.* here would be a bug.
         self.build_stats = .{};
         self.build_seq +%= 1;
         const seq = self.build_seq;
+        // Commit the last published latch outcomes FIRST (game side, ordered
+        // after publish, never concurrent with the context): the prepare
+        // latch stages GPU purely from slot records and mirrors the outcome
+        // there; this applies the mirrors to the live meshes under the O(1)
+        // identity guard, so the CPU staging + record freeze below observe
+        // the just-published prior state. Reads the FRONT slot (the last
+        // published frame); the back-slot reset below never touches it.
+        const front = &self.draws.slots[self.draws.front];
+        scene_instance_staging.commitPublishedRecords(front.staged_instances.items, self.meshes.items, front.frame_id);
         const back_idx = self.draws.backIndex();
         const back = &self.draws.slots[back_idx];
         back.reset();
@@ -2542,9 +2578,9 @@ pub const Scene = struct {
         // (`back_idx`/`back` were resolved before the UI latch above; `front`
         // has not moved since, so they still address the build scratch.)
         if (have_build) {
-            // Stage-2 latch: the game-side build already reset this back
-            // slot, staged the instance scratch + previews + staged records +
-            // build_views, and
+            // Stage-2 latch: the game-side build already committed the last
+            // publish, reset this back slot, staged the instance scratch +
+            // previews + staged records + build_views, and
             // built the queue/shadow/outline payload with `.build_view`
             // (provisional handles). Reset-before-consume would erase the
             // build, and rebuilding would unfreeze the sets — so do NOT call
@@ -2554,16 +2590,20 @@ pub const Scene = struct {
             // deferred build_stats. Meshes with no record (OOM-skipped,
             // post-build meshes) keep their previous complete
             // `instance_render` and
-            // patch to invisible — no partial publish. Mesh-list mutation
-            // between build and latch fail-closes by guard at latch time and
-            // by record lookup at patch time (see patch docs).
+            // patch to invisible — no partial publish. A mesh-list mutation
+            // between build and latch stages through here untouched (the
+            // latch reads no live list) and is caught by the game-side
+            // commit guard at the next build; the patch finalizes whatever
+            // the records published (see patch docs).
             //
             // Remaining live coupling (next slice): the update-vs-prepare
-            // mutex still guards the whole handoff, and the latch still
-            // writes back `mesh.instance_render` (mirrored into the record so
-            // the patch itself is self-contained). The staged slot snapshot
-            // above is already frozen (wave 27) — the latch reads it, never
-            // the live `build_snapshot`/`frame_snapshot`.
+            // mutex still guards the whole handoff. The latch itself is now
+            // live-touch-free (GPU halves over the slot-owned staged records
+            // + scratch, outcomes mirrored into the records, payloads
+            // finalized from the mirrors): the game-side commit at the next
+            // build applies the mirrors to the live meshes. The staged slot
+            // snapshot above is already frozen (wave 27) — the latch reads
+            // it, never the live `build_snapshot`/`frame_snapshot`.
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
             if (is_gpu_init) {
@@ -2571,17 +2611,17 @@ pub const Scene = struct {
                 // must run before the patch finalizes handles (and would have
                 // run before the shadow snapshot historically). Same retire
                 // queue and eye source shape (the eye itself was consumed at
-                // build time for the transparent sort; only the guard reads
-                // the snapshot here). The latch consumes the slot-owned
-                // staged records frozen by buildPreparedFrame — no live
-                // preview reads; a mesh-list mutation between build and latch
-                // trips the per-record guard and fail-closes.
+                // build time for the transparent sort). The latch consumes
+                // the slot-owned staged records frozen by buildPreparedFrame
+                // plus the slot scratch — no live mesh reads, no live mesh
+                // writes; a mesh-list mutation between build and latch is
+                // caught later by the game-side commit guard, never here.
                 if (back.snapshot.has_camera) {
                     scene_instance_staging.stageInstancesLatch(.{
                         .allocator = self.allocator,
                         .frame_id = self.frame_id,
                         .retire_queue = &self.gpu_retire,
-                    }, back.staged_instances.items, self.meshes.items, &back.primary.instance_matrices);
+                    }, back.staged_instances.items, &back.primary.instance_matrices);
                 }
             }
             self.patchInstanceRefs(back);

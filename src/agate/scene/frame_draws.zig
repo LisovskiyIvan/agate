@@ -89,29 +89,42 @@
 //! Honest scope note — what this is NOT: the phase-mutex removal (true
 //! concurrent update+prepare) is still NOT done and is not claimed. This
 //! file makes the 3-slot rotation and the pin/lease primitives real and
-//! tested, and wave 27 made the frame snapshot slot-owned (`FrameDrawSlot.
+//! tested, wave 27 made the frame snapshot slot-owned (`FrameDrawSlot.
 //! snapshot`: prepare/render/reuse/UI-latch read the staged slot copy, never
 //! the live `Scene.frame_snapshot` — that closes the snapshot-tearing
-//! obstacle), but update-vs-prepare exclusion (phase_mutex) is still
-//! required, because the producer build and the prepare latch still touch
-//! LIVE state outside the slot-owned data:
-//! - `Scene.buildPreparedFrame` reads live meshes (TRS, materials, culling
-//!   flags), the live canvas (stageUiPacket), live particle/physics systems,
-//!   and live camera/light/sky state (packFrameSnapshot), and writes live
-//!   per-mesh previews/build_views;
-//! - the prepare latch writes back live `mesh.instance_render` (guarded
-//!   write-back), reads the live mesh list for the identity guard, and the
-//!   UI latch resolves handles/pipeline/font/dims from the live canvas;
+//! obstacle), and wave 28 closed the last prepare-latch live touches: the
+//! instance latch stages GPU purely from the slot-owned `staged_instances`
+//! records + scratch (outcomes mirrored into the records for the patch, no
+//! live mesh reads, no live mesh writes, not even a `record.mesh` compare)
+//! with the `instance_render` write-back moved game-side as a commit of
+//! published results at the next build (O(1) identity guard included), and
+//! the UI latch consumes staged packet handles (pipeline/font/buffers,
+//! frozen by `stageUiPacket`) instead of live-canvas reads. What still
+//! needs the phase mutex:
+//! - build-side live reads: `Scene.buildPreparedFrame` reads live meshes
+//!   (TRS, materials, culling flags, `instance_render` as the prior state
+//!   for the record freeze + `instance_build_view`), the live canvas
+//!   (`stageUiPacket` geometry + handle stamps), live particle/physics
+//!   systems, and live camera/light/sky state (`packFrameSnapshot`), and
+//!   writes live per-mesh previews/build_views — plus the commit itself
+//!   reads the live mesh list (game-side, ordered after publish, never
+//!   concurrent with the context). This is the app-side ordering problem:
+//!   the game must finish mutating before building, under exclusion.
+//! - the inline fallback paths (no fresh build): context-side `prepareFrame`
+//!   stages instances and captures UI/particles/physics-debug straight from
+//!   live state and writes live `instance_render` — unchanged legacy
+//!   behavior for apps that never call `buildPreparedFrame`/`stageUiPacket`.
 //! - the frame mailbox (`frame_handoff`) producer/consumer pair is still
 //!   phase-excluded (a true concurrent producer would need the claim/pin API
 //!   here instead of the sequential backIndex/publish path).
 //! What IS already slot-owned (and therefore needs no lock once the mutex
-//! goes): the frame snapshot, the staged instance records, the UI packet
-//! lists+header, and the prepare-gated GPU uploads (P3 epochs + upload
-//! meter). Removing the phase mutex means moving the remaining live reads
-//! above under the same freeze-then-latch shape (or an equivalent mailbox)
-//! — the pin/lease here only covers the variable-length draw payload plus
-//! the staged snapshot, deliberately nothing else.
+//! goes): the frame snapshot, the staged instance records (+ their latched
+//! outcomes), the UI packet lists + header + handles, and the prepare-gated
+//! GPU uploads (P3 epochs + upload meter). Removing the phase mutex means
+//! moving the remaining live reads above under the same freeze-then-latch
+//! shape (or an equivalent mailbox) — the pin/lease here only covers the
+//! variable-length draw payload plus the staged snapshot, deliberately
+//! nothing else.
 
 const std = @import("std");
 const render_queue = @import("render_queue.zig");
@@ -180,16 +193,20 @@ pub const FrameDrawSlot = struct {
     /// one per instance-bearing mesh with a fresh preview, frozen by
     /// `Scene.buildPreparedFrame` (`freezeStagedRecords`) and consumed by
     /// the prepare latch (`stageInstancesLatch` + `patchInstanceRefs`)
-    /// instead of live `Mesh.instance_preview` reads. Appended in mesh-list
+    /// instead of any live mesh reads — then by the game-side commit at the
+    /// next build, which applies the latched outcomes to the live meshes.
+    /// Appended in mesh-list
     /// order (strictly increasing `mesh_index`); reset retains capacity, so
     /// the latch/patch allocate nothing. Record `buffer` copies are borrowed
     /// read handles (never destroyed/retired through the record).
     staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
     /// Slot-owned UI CPU packet (lock-free-publication slice 2, b): the
     /// game side (`Scene.stageUiPacket`) records live canvas CPU geometry
-    /// into these back-slot lists and stamps `ui_packet`; the prepare latch
-    /// consumes them into `Scene.ui_frame` instead of reading the live
-    /// canvas lists. Plain CPU data (UIVertex/u16 — no GPU handles); reset
+    /// into these back-slot lists and stamps `ui_packet` (presence + staged
+    /// draw handles); the prepare latch consumes them into `Scene.ui_frame`
+    /// instead of reading the live canvas lists or handles. Plain CPU data
+    /// (UIVertex/u16 + borrowed handle values — never destroyed/retired
+    /// through the packet); reset
     /// retains capacity and clears the header, so the latch/patch allocate
     /// nothing and a stale packet can never resurface.
     ui_vertices: std.ArrayListUnmanaged(ui_mod.UIVertex) = .empty,

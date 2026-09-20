@@ -108,16 +108,41 @@ pub const UploadResult = enum {
 /// geometry into the back `FrameDrawSlot` lists (`ui_vertices`/`ui_indices`)
 /// and stamps this header; the prepare latch consumes the packet into
 /// `UiFrame` instead of reading the live canvas lists. Plain CPU data only —
-/// geometry + presence. Handles/pipeline/font/screen dims resolve at latch
-/// time on the context thread, exactly like the legacy path, so the staged
-/// packet never carries GPU state and the game path never uploads or mutates
-/// a GPU handle.
+/// geometry + presence + staged draw handles (below). The game path never
+/// uploads or mutates a GPU handle.
+///
+/// Handle-liveness contract: the staged handles are BORROWED values under
+/// the same discipline as every other GPU handle in the slot (phase mutex /
+/// P3 epochs — never destroyed/retired through the packet). The app must not
+/// destroy the canvas pipeline/font/buffers between stage and latch; a
+/// violation draws the same way a destroyed borrowed slot handle would
+/// (caller obligation, like the mesh-queue borrowed handles).
+pub const UiPacketHandles = struct {
+    pipeline: sg.Pipeline = .{},
+    font_view: sg.View = .{},
+    font_sampler: sg.Sampler = .{},
+    vertex_buffer: sg.Buffer = .{},
+    index_buffer: sg.Buffer = .{},
+};
+
 pub const UiPacketState = struct {
     /// A stage published a packet (geometry or staged absence) for the latch.
     valid: bool = false,
     /// The canvas existed at stage time. Staged absence (false) latches to
     /// the same clear as the legacy missing-canvas path.
     canvas_present: bool = false,
+    /// Draw handles frozen at stage time (pipeline, resolved font
+    /// view/sampler, canvas buffer ids): the latch consumes these instead of
+    /// reading the live canvas, so a canvas handle mutation between stage
+    /// and latch cannot leak into this frame (staged wins — same precedent
+    /// as the staged geometry). Unused on the staged-absence path.
+    handles: UiPacketHandles = .{},
+    /// Canvas `ui_upload_seq` at stage time: informational only (which canvas
+    /// write the staged bytes came from; debuggability). The same-sokol-frame
+    /// window identity (`decideWindow`) deliberately keeps reading the LIVE
+    /// canvas: an intervening writer between stage and latch must invalidate
+    /// the frame, and only the live watermark can show it.
+    upload_seq: u64 = 0,
 };
 
 /// Context for the GPU half of capture. Mirrors P5's staging context: the
@@ -206,12 +231,14 @@ pub const UiFrame = struct {
         self.upload_seq = 0;
     }
 
-    /// Same-sokol-frame window decision, shared by `capture` (live canvas)
-    /// and `capturePacket` (slot-owned packet): FIRST-COMMITTED-WINS with
+    /// Shared window-policy entry for `capture` (live canvas) and
+    /// `capturePacket` (slot-owned packet): FIRST-COMMITTED-WINS with
     /// the committed-upload identity check. `preserve_committed` leaves the
     /// whole frame untouched (early return, no allocation); `fail_closed`
     /// has already cleared to coherent-empty (early return); `proceed` runs
-    /// the content guards + reserve + copy of the caller.
+    /// the content guards + reserve + copy of the caller. Always reads the
+    /// LIVE canvas: the window and the writer watermark are live context
+    /// state (like the P3 epochs), never freezable.
     const WindowDecision = enum { preserve_committed, fail_closed, proceed };
 
     fn decideWindow(self: *Self, canvas: *const UICanvas) WindowDecision {
@@ -261,22 +288,29 @@ pub const UiFrame = struct {
         }
         self.captureSlices(
             allocator,
-            canvas,
             canvas.vertices.items,
             canvas.indices.items,
             screen_w,
             screen_h,
+            .{
+                .pipeline = canvas.pipeline,
+                .font_view = canvas.activeFontView(),
+                .font_sampler = canvas.activeFontSampler(),
+                .vertex_buffer = canvas.vertex_buffer,
+                .index_buffer = canvas.index_buffer,
+            },
         );
     }
 
     /// Captures out of a slot-owned game-side packet instead of the live
-    /// canvas lists (lock-free-publication slice 2, b): the geometry comes
-    /// from `verts`/`indices` (staged by `Scene.stageUiPacket`), everything
-    /// else — window policy, guards, packet handles, upload identity — reads
-    /// the live canvas exactly like `capture`. The canvas lists themselves
-    /// are never touched here, so a game-side mutation of the canvas between
-    /// stage and latch cannot leak into this frame (staged bytes win) and a
-    /// canvas cleared after the stage still latches the staged content.
+    /// canvas lists (lock-free-publication slice 2, b): the geometry AND the
+    /// draw handles come from the staged packet (`Scene.stageUiPacket`),
+    /// everything else — window policy, guards, upload identity — reads the
+    /// live canvas exactly like `capture`. The canvas lists AND the canvas
+    /// handles are never touched here, so a game-side mutation of the canvas
+    /// between stage and latch cannot leak into this frame (staged bytes and
+    /// staged handles win) and a canvas cleared after the stage still latches
+    /// the staged content.
     pub fn capturePacket(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -285,6 +319,7 @@ pub const UiFrame = struct {
         indices: []const u16,
         screen_w: f32,
         screen_h: f32,
+        handles: UiPacketHandles,
     ) void {
         switch (self.decideWindow(canvas)) {
             .preserve_committed, .fail_closed => return,
@@ -298,22 +333,21 @@ pub const UiFrame = struct {
             self.clearEmpty();
             return;
         }
-        self.captureSlices(allocator, canvas, verts, indices, screen_w, screen_h);
+        self.captureSlices(allocator, verts, indices, screen_w, screen_h, handles);
     }
 
     /// Shared content path of `capture`/`capturePacket`: reserves BOTH lists
     /// before publishing either (OOM → coherent empty, never a partial
     /// half), then copies + publishes the packet (clamped counts, dims,
-    /// borrowed canvas handles). Window + empty/dims guards ran in the
-    /// caller.
+    /// staged handles). Window + empty/dims guards ran in the caller.
     fn captureSlices(
         self: *Self,
         allocator: std.mem.Allocator,
-        canvas: *const UICanvas,
         verts: []const UIVertex,
         indices: []const u16,
         screen_w: f32,
         screen_h: f32,
+        handles: UiPacketHandles,
     ) void {
         const vert_count = UICanvas.clampedVertCount(verts.len);
         const index_count = indices.len;
@@ -341,11 +375,11 @@ pub const UiFrame = struct {
         self.index_count = index_count;
         self.screen_w = screen_w;
         self.screen_h = screen_h;
-        self.pipeline = canvas.pipeline;
-        self.font_view = canvas.activeFontView();
-        self.font_sampler = canvas.activeFontSampler();
-        self.vertex_buffer = canvas.vertex_buffer;
-        self.index_buffer = canvas.index_buffer;
+        self.pipeline = handles.pipeline;
+        self.font_view = handles.font_view;
+        self.font_sampler = handles.font_sampler;
+        self.vertex_buffer = handles.vertex_buffer;
+        self.index_buffer = handles.index_buffer;
         self.has_capture = true;
         self.gpu_ready = false;
         self.needs_upload = true;
@@ -865,9 +899,16 @@ test "slice2b: capturePacket matches capture and ignores later canvas mutation" 
     defer t.allocator.free(staged_v);
     const staged_i = try t.allocator.dupe(u16, canvas.indices.items);
     defer t.allocator.free(staged_i);
+    const staged_handles = UiPacketHandles{
+        .pipeline = canvas.pipeline,
+        .font_view = canvas.activeFontView(),
+        .font_sampler = canvas.activeFontSampler(),
+        .vertex_buffer = canvas.vertex_buffer,
+        .index_buffer = canvas.index_buffer,
+    };
     var packet = UiFrame{};
     defer packet.deinit(t.allocator);
-    packet.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0);
+    packet.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0, staged_handles);
     try t.expect(packet.has_capture);
     try t.expectEqualSlices(UIVertex, legacy.vertices.items, packet.vertices.items);
     try t.expectEqualSlices(u16, legacy.indices.items, packet.indices.items);
@@ -884,7 +925,7 @@ test "slice2b: capturePacket matches capture and ignores later canvas mutation" 
     canvas.drawRect(1, 2, 3, 4, Color4.white);
     var late = UiFrame{};
     defer late.deinit(t.allocator);
-    late.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0);
+    late.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0, staged_handles);
     try t.expect(late.has_capture);
     try t.expectEqualSlices(UIVertex, legacy.vertices.items, late.vertices.items);
     try t.expectEqualSlices(u16, legacy.indices.items, late.indices.items);
@@ -892,10 +933,53 @@ test "slice2b: capturePacket matches capture and ignores later canvas mutation" 
     // Guards mirror capture: empty slices and bad dims fail closed.
     var empty = UiFrame{};
     defer empty.deinit(t.allocator);
-    empty.capturePacket(t.allocator, &canvas, &.{}, &.{}, 800.0, 600.0);
+    empty.capturePacket(t.allocator, &canvas, &.{}, &.{}, 800.0, 600.0, staged_handles);
     try t.expect(!empty.has_capture);
-    empty.capturePacket(t.allocator, &canvas, staged_v, staged_i, 0.0, 600.0);
+    empty.capturePacket(t.allocator, &canvas, staged_v, staged_i, 0.0, 600.0, staged_handles);
     try t.expect(!empty.has_capture);
+}
+
+test "slice2b: staged handles win over post-stage canvas handle mutation" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+    canvas.pipeline = .{ .id = 7 };
+    canvas.font_texture.view = .{ .id = 11 };
+    canvas.font_texture.sampler = .{ .id = 13 };
+    canvas.vertex_buffer = .{ .id = 21 };
+    canvas.index_buffer = .{ .id = 23 };
+    canvas.drawRect(10, 20, 30, 40, Color4.white);
+
+    // Freeze the stage-time handles (what Scene.stageUiPacket stamps).
+    const staged_handles = UiPacketHandles{
+        .pipeline = canvas.pipeline,
+        .font_view = canvas.activeFontView(),
+        .font_sampler = canvas.activeFontSampler(),
+        .vertex_buffer = canvas.vertex_buffer,
+        .index_buffer = canvas.index_buffer,
+    };
+    const staged_v = try t.allocator.dupe(UIVertex, canvas.vertices.items);
+    defer t.allocator.free(staged_v);
+    const staged_i = try t.allocator.dupe(u16, canvas.indices.items);
+    defer t.allocator.free(staged_i);
+
+    // Mutate every live handle past recognition between stage and latch.
+    canvas.pipeline = .{ .id = 70 };
+    canvas.font_texture.view = .{ .id = 110 };
+    canvas.font_texture.sampler = .{ .id = 130 };
+    canvas.vertex_buffer = .{ .id = 210 };
+    canvas.index_buffer = .{ .id = 230 };
+
+    // The latch consumes the STAGED handles: no live handle leaks in.
+    var frame = UiFrame{};
+    defer frame.deinit(t.allocator);
+    frame.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0, staged_handles);
+    try t.expect(frame.has_capture);
+    try t.expectEqual(@as(u32, 7), frame.pipeline.id);
+    try t.expectEqual(@as(u32, 11), frame.font_view.id);
+    try t.expectEqual(@as(u32, 13), frame.font_sampler.id);
+    try t.expectEqual(@as(u32, 21), frame.vertex_buffer.id);
+    try t.expectEqual(@as(u32, 23), frame.index_buffer.id);
 }
 
 test "P6: capture binds the TTF atlas view when a font is set" {
