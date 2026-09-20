@@ -588,6 +588,10 @@ pub const ParticleSystem = struct {
     /// support: subsequent updates return error.ComputeUnsupported (never a
     /// silent fallback). Stays false headless (unknown until a context exists).
     compute_known_unsupported: bool = false,
+    /// Compute dispatches issued since creation (monotonic, wrapped): the
+    /// live proof that the `.compute` path actually ran, exposed via
+    /// `computeDispatchCount()` for apps and GPU fixtures.
+    compute_dispatches: u64 = 0,
     /// Support override (tests/apps): `false` forces
     /// error.ComputeUnsupported out of the mode-selecting API and `update`
     /// without needing a GPU context; `true` forces availability. Null (the
@@ -1330,6 +1334,13 @@ pub const ParticleSystem = struct {
         return !self.compute_known_unsupported;
     }
 
+    /// Compute dispatches issued since creation: > 0 proves the `.compute`
+    /// path ran on a live context (each dispatch is one prepare-boundary
+    /// flush with staged spawns or a pending dt). 0 on headless/unsupported.
+    pub fn computeDispatchCount(self: *const ParticleSystem) u64 {
+        return self.compute_dispatches;
+    }
+
     /// Lazily provisions the compute spawn staging. `false` means allocation
     /// failure; updateCompute surfaces that as error.OutOfMemory — no CPU
     /// fallback. Idempotent (retains capacity across frames, like the
@@ -1527,6 +1538,7 @@ pub const ParticleSystem = struct {
         sg.applyUniforms(pc_shd.UB_cs_params, sg.asRange(&params));
         sg.dispatch(@intCast(self.computeGroups()), 1, 1);
         sg.endPass();
+        self.compute_dispatches +%= 1;
     }
 
     /// Prepare-boundary compute work: creation, spawn upload, state clear and
