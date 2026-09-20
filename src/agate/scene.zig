@@ -355,6 +355,12 @@ pub const Scene = struct {
     /// pileup, `retainedCount`/`cappedDropCount` expose it). Read via
     /// `reuseStreak()`; never written by update.
     reuse_streak: u64 = 0,
+    /// True only while prepareFrame's own flushPendingGpuUploads runs
+    /// (context thread): the render pipeline commits that frame's buffer,
+    /// so the flush must not. Standalone flushes (quiesced-context
+    /// completion outside the frame pipeline) commit themselves — see the
+    /// flushPendingGpuUploads tail.
+    flush_in_prepare: bool = false,
     /// Monotonic presented-frame counter, written only on the context thread:
     /// every presented frame (normal renders and `renderReuse` re-presents
     /// alike) bumps it once and uses it as the profiler `recordFrame`
@@ -2615,7 +2621,12 @@ pub const Scene = struct {
         }
         self.stats.uploaded_textures_frame = std.math.cast(u32, self.frame_uploads.count) orelse std.math.maxInt(u32);
         self.stats.uploaded_bytes_frame = self.frame_uploads.bytes;
+        // The render pipeline commits this frame's buffer at the end of
+        // render(); a standalone flushPendingGpuUploads (quiesced-context
+        // completion) has no following render and must commit itself.
+        self.flush_in_prepare = true;
         self.flushPendingGpuUploads();
+        self.flush_in_prepare = false;
 
         // Particle prepared frame: capture the retained plain frame here,
         // after the flush above and BEFORE the update/render unlock below.
@@ -2928,6 +2939,15 @@ pub const Scene = struct {
         for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
         for (self.greased_lines.items) |gl| gl.flushGpuUploads();
         for (self.meshes.items) |m| m.flushGpuUploads();
+        // Standalone completion (quiesced-context drains — NOT the
+        // prepareFrame path, whose frame a render commits): the
+        // compute-particle dispatch above can open the frame's command
+        // buffer, and a buffer that is never committed keeps its in-flight
+        // semaphore forever — sg_shutdown waits NUM_INFLIGHT_FRAMES signals
+        // unconditionally and hangs at exit (observed: waits=commits+1 in
+        // an instrumented soak). Nil-buffer commit is a no-op; headless
+        // (no sg.setup) skips.
+        if (!self.flush_in_prepare and sg.isvalid()) sg.commit();
     }
 
     /// Render entry: draws the frame prepared by prepareFrame (context
