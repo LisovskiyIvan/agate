@@ -134,6 +134,8 @@ test "frameUniforms packs shared lighting state verbatim" {
         .sun_dir = math.Vec3.new(0.5, 1.0, 0.3),
         .sun_color = Color3.new(1.0, 0.9, 0.8),
         .sun_intensity = 2.0,
+        .directional_dir = [_][4]f32{.{ 0.5, 1.0, 0.3, 0.0 }} ++ [_][4]f32{.{ 0, 0, 0, 0 }} ** 3,
+        .directional_color_int = [_][4]f32{.{ 1.0, 0.9, 0.8, 2.0 }} ++ [_][4]f32{.{ 0, 0, 0, 0 }} ** 3,
         .cascades = cascades,
         .light_counts = .{ 1.0, 0.0, 0.0, 0.0 },
         .point_pos_range = [_][4]f32{.{ 1, 2, 3, 10 }} ** 4,
@@ -166,6 +168,10 @@ test "frameUniforms packs shared lighting state verbatim" {
     // keep the shader shadow path gated off.
     try std.testing.expectEqual(ctx.point_shadow_params, f.point_shadow_params);
     try std.testing.expectEqual(ctx.point_view_proj, f.point_view_proj);
+    // Directional lanes ride through verbatim too (single-sun neutrality:
+    // slot 0 mirrors the sun, fills zeroed).
+    try std.testing.expectEqual(ctx.directional_dir, f.directional_dir);
+    try std.testing.expectEqual(ctx.directional_color_int, f.directional_color_int);
 
     // Disabled shadows (globally or per-mesh) zero the bias/intensity lanes
     // but keep normal bias and softness, exactly like the legacy literals.

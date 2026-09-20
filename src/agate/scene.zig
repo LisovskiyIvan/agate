@@ -468,6 +468,13 @@ pub const Scene = struct {
         return self.lights.createDirectionalLight(self.allocator, name, options);
     }
 
+    /// Appends a shadowless directional fill (uniform slots 1..3, creation
+    /// order). Hard-errors past 4 suns total (see
+    /// LightRig.addDirectionalLight); fills are session-local.
+    pub fn addDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
+        return self.lights.addDirectionalLight(self.allocator, name, options);
+    }
+
     // ---- Content registries: materials & meshes. ----
 
     pub fn createStandardMaterial(self: *Scene, name: []const u8) !*StandardMaterial {
@@ -1286,6 +1293,8 @@ pub const Scene = struct {
             .sun_dir = snap.sun_dir,
             .sun_color = snap.sun_color,
             .sun_intensity = snap.sun_intensity,
+            .directional_dir = snap.light_pack.directional_dir,
+            .directional_color_int = snap.light_pack.directional_color_int,
             .cascades = snap.cascades,
             .light_counts = snap.light_pack.counts,
             .point_pos_range = snap.light_pack.point_pos_range,

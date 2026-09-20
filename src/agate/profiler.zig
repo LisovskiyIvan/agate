@@ -153,7 +153,7 @@ pub const Profiler = struct {
 
     /// Captures a complete snapshot of CPU memory and GPU VRAM allocations in the scene.
     pub fn captureMemorySnapshot(self: *Profiler, scene: *const Scene) !*const MemorySnapshot {
-        const dir_count: usize = if (scene.lights.directional != null) 1 else 0;
+        const dir_count: usize = scene.lights.directionalCount();
         var snap: MemorySnapshot = .{
             .timestamp_us = if (self.start_time_ticks > 0)
                 @intFromFloat(sokol.time.us(sokol.time.diff(sokol.time.now(), self.start_time_ticks)))
