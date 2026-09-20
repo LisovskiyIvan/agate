@@ -2073,6 +2073,131 @@ test "stage1: latch consumes slot records when live previews are cleared" {
     try std.testing.expectEqual(@as(u32, 3), draws.staged_instances.items[0].count);
 }
 
+test "stage1: failed latch keeps previous complete state, patch fail-closes" {
+    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const mem = try alloc.alloc(InstancedMesh, 4);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, 4);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        // Two live now; grown to four for the failing round below.
+        .instances = .{ .items = ptrs[0..2], .capacity = 4 },
+    };
+    try scene.meshes.append(alloc, &parent);
+    try scene.outline_meshes.append(alloc, &parent);
+
+    // Round 1: funded build + latch publishes the complete state.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expect(parent.instance_render.bounds.isValid());
+
+    // Distinctive prior values in every preserved field (headless buffers
+    // are id 0, so a fake id proves the buffer slot is untouched too).
+    parent.instance_render.buffer = .{ .id = 100 };
+    parent.instance_render.capacity = 7;
+    parent.instance_render.hash = 0xABCD;
+    parent.instance_render.uploaded_count = 5;
+    const prior = parent.instance_render;
+
+    // Round 2: grow to 4 instances (a live GPU would need growth here),
+    // build, then break the mesh-list link so the latch guard fail-closes
+    // this record through the exact same path a GPU-half failure takes
+    // (failRecord + continue, live untouched — ST2-C covers the
+    // makeBuffer-failure detection itself on a real GPU).
+    parent.instances.items = ptrs[0..4];
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
+    _ = scene.meshes.swapRemove(0);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+
+    // Previous COMPLETE state kept in every field; staged_frame NOT advanced
+    // to the current frame (residual readers can tell nothing new published).
+    try std.testing.expectEqual(prior.buffer.id, parent.instance_render.buffer.id);
+    try std.testing.expectEqual(prior.capacity, parent.instance_render.capacity);
+    try std.testing.expectEqual(prior.count, parent.instance_render.count);
+    try std.testing.expectEqual(prior.bounds, parent.instance_render.bounds);
+    try std.testing.expectEqual(prior.hash, parent.instance_render.hash);
+    try std.testing.expectEqual(prior.uploaded_count, parent.instance_render.uploaded_count);
+    try std.testing.expectEqual(prior.staged_frame, parent.instance_render.staged_frame);
+    try std.testing.expect(parent.instance_render.staged_frame != scene.frame_id);
+
+    // The record carries the not-published state.
+    const recs = scene.preparedDraws().staged_instances.items;
+    try std.testing.expectEqual(@as(usize, 1), recs.len);
+    try std.testing.expectEqual(std.math.maxInt(u64), recs[0].staged_frame);
+    try std.testing.expectEqual(@as(u32, 0), recs[0].buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), recs[0].count);
+
+    // Payload fail-closed: the frozen batch/shadow/outline entries for the
+    // mesh go invisible (count 0, zeroed handles).
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 0), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 0), draws.primary.opaque_instanced.items[0].instance_buffer.id);
+    var shadow_found = false;
+    for (draws.shadow.items.items) |it| {
+        if (it.is_instanced and it.source_uid == parent.uid) {
+            try std.testing.expectEqual(@as(u32, 0), it.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 0), it.instance_buffer.id);
+            try std.testing.expect(!it.world_aabb.isValid());
+            try std.testing.expectEqual(@as(f32, 0), it.max_dim);
+            shadow_found = true;
+        }
+    }
+    try std.testing.expect(shadow_found);
+    var outline_found = false;
+    for (draws.outline_items.items) |it| {
+        if (it.is_instanced and it.source_uid == parent.uid) {
+            try std.testing.expectEqual(@as(u32, 0), it.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 0), it.instance_buffer.id);
+            outline_found = true;
+        }
+    }
+    try std.testing.expect(outline_found);
+    // No retirement happened.
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+
+    // Recovery: restore the list, rebuild + latch publishes the grown state.
+    try scene.meshes.append(alloc, &parent);
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u32, 4), scene.preparedDraws().primary.opaque_instanced.items[0].visible_instance_count);
+}
+
 test "stage1: mesh reorder + post-build add fail-closes at latch, recovers next" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;

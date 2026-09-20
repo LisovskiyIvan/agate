@@ -514,9 +514,10 @@ pub fn freezeStagedRecords(
 }
 
 /// Zero the mirrored (post-latch) half of a record fail-closed: null buffer,
-/// count 0, `staged_frame` back to never-staged, so `patchInstanceRefs`
-/// zeroes every payload entry resolving to this record. The frozen input
-/// half (scratch range/bounds/hash) is left intact for debuggability.
+/// zero capacities/counts, `staged_frame` back to never-staged, so
+/// `patchInstanceRefs` zeroes every payload entry resolving to this record.
+/// The frozen input half (identity/scratch_lo/bounds/hash/mesh_position) is
+/// left intact for debuggability.
 fn failRecord(rec: *StagedInstanceRecord) void {
     rec.buffer = .{};
     rec.capacity = 0;
@@ -543,8 +544,22 @@ fn failRecord(rec: *StagedInstanceRecord) void {
 ///   fail-closed zeroing, previous complete `instance_render` stands.
 /// - Today's skip conditions (LOD child, GPU-pending, emptied between build
 ///   and latch): fail-closed zeroing, previous state stands.
+/// - Already latched this frame (`staged_frame == frame_id` on entry):
+///   nothing left to do — the mirror is final, live state stands as
+///   published. (Same once-per-frame contract as the old `staged_frame`
+///   dedup inside the GPU core.)
 /// - Bounds-checked slice (truncated-scratch contract violation): skip with
 ///   fail-closed zeroing, previous state stands — never an OOB slice.
+/// - GPU-half failure (growth `makeBuffer` failure: the core returns WITHOUT
+///   publishing, `st.staged_frame` still holds the old frame): the mesh's
+///   `instance_render` stays COMPLETELY untouched (old buffer/capacity/
+///   count/hash/uploaded_count/staged_frame preserved — previous complete
+///   state kept, retry next build), no retirement happens, and the record
+///   is fail-closed so the patch zeroes the payload entries. The
+///   `staged_frame != frame_id` check below is the publication detector:
+///   the core advances `staged_frame` if and only if it completely
+///   published, so a failed call is indistinguishable from "never ran" and
+///   must take the exact same no-write-back path.
 /// Meshes with no record for this build (OOM-skipped, created after the
 /// build) never reach the latch: previous complete state stands.
 pub fn stageInstancesLatch(
@@ -564,6 +579,7 @@ pub fn stageInstancesLatch(
             failRecord(rec);
             continue;
         }
+        if (rec.staged_frame == gctx.frame_id) continue;
         const count: usize = rec.count;
         const end = rec.scratch_lo + count;
         if (rec.scratch_lo > scratch.items.len or end > scratch.items.len) {
@@ -583,6 +599,14 @@ pub fn stageInstancesLatch(
             .bounds = rec.bounds,
             .hash = rec.hash,
         });
+        if (st.staged_frame != gctx.frame_id) {
+            // The GPU half did not publish (growth buffer failure): leave
+            // `mesh.instance_render` completely untouched and fail-close the
+            // record mirror — the patch then zeroes every payload entry
+            // resolving here, exactly like a skipped record.
+            failRecord(rec);
+            continue;
+        }
         mesh.instance_render = st;
         rec.buffer = st.buffer;
         rec.capacity = st.capacity;
@@ -937,6 +961,50 @@ test "stage1: truncated scratch skips the record, previous stands" {
     try std.testing.expectEqual(primed, f.mesh.instance_render.bounds);
     try std.testing.expectEqual(@as(u64, 50), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(std.math.maxInt(u64), records.items[0].staged_frame);
+}
+
+test "stage1: failRecord zeroes the not-published mirror, keeps frozen input" {
+    var mesh = Mesh{
+        .name = "failrec",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+    };
+    const frozen_bounds = BoundingBox.init(Vec3.new(1, 2, 3), Vec3.new(4, 5, 6));
+    var rec = StagedInstanceRecord{
+        .mesh = &mesh,
+        .uid = 42,
+        .mesh_index = 3,
+        .scratch_lo = 5,
+        .count = 7,
+        .bounds = frozen_bounds,
+        .hash = 123,
+        .uploaded_hash = 456,
+        .mesh_position = Vec3.new(9, 0, 0),
+        .buffer = .{ .id = 9 },
+        .capacity = 11,
+        .uploaded_count = 13,
+        .staged_frame = 77,
+    };
+    failRecord(&rec);
+    // Not-published mirror: null buffer, zero counts, never-staged frame —
+    // `staged_frame != frame_id` is what makes `patchInstanceRefs` zero
+    // every payload entry resolving here (and what tells any residual
+    // reader nothing new was published).
+    try std.testing.expectEqual(@as(u32, 0), rec.buffer.id);
+    try std.testing.expectEqual(@as(usize, 0), rec.capacity);
+    try std.testing.expectEqual(@as(u32, 0), rec.count);
+    try std.testing.expectEqual(@as(usize, 0), rec.uploaded_count);
+    try std.testing.expectEqual(@as(u64, 0), rec.uploaded_hash);
+    try std.testing.expectEqual(std.math.maxInt(u64), rec.staged_frame);
+    // Frozen input half intact for debuggability.
+    try std.testing.expect(rec.mesh == &mesh);
+    try std.testing.expectEqual(@as(u64, 42), rec.uid);
+    try std.testing.expectEqual(@as(u32, 3), rec.mesh_index);
+    try std.testing.expectEqual(@as(usize, 5), rec.scratch_lo);
+    try std.testing.expectEqual(@as(u64, 123), rec.hash);
+    try std.testing.expectEqual(frozen_bounds, rec.bounds);
+    try std.testing.expectEqual(Vec3.new(9, 0, 0), rec.mesh_position);
 }
 
 test "stage1: two record freezes, newest wins" {
