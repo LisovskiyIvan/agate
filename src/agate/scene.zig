@@ -315,6 +315,13 @@ pub const Scene = struct {
     /// to skip the `prepareFrame` fallback and the profiler `recordFrame`
     /// tail, so the already-consumed front is re-drawn as-is.
     rendering_reuse: bool = false,
+    /// Consecutive `renderReuse` presents without an intervening successful
+    /// prepare (context thread only: reset by `prepareFrame`, bumped by
+    /// `renderReuse`). Observable staleness: retire/upload intents pile up
+    /// for exactly this many frames (`GpuRetireQueue.pending_cap` bounds the
+    /// pileup, `retainedCount`/`cappedDropCount` expose it). Read via
+    /// `reuseStreak()`; never written by update.
+    reuse_streak: u64 = 0,
     /// Monotonic presented-frame counter, written only on the context thread:
     /// every presented frame (normal renders and `renderReuse` re-presents
     /// alike) bumps it once and uses it as the profiler `recordFrame`
@@ -342,6 +349,17 @@ pub const Scene = struct {
     /// touches no stats/profiler/frame_id/retire_epoch.
     build_seq: u64 = 0,
     last_latched_seq: u64 = 0,
+    /// Game-side UI CPU packet sequence (lock-free-publication slice 2, b):
+    /// `stageUiPacket` (game side, sg-free) records live canvas geometry
+    /// into the back slot's `ui_vertices`/`ui_indices` + `ui_packet` header
+    /// and bumps `ui_packet_seq`; `prepareFrame` latches the packet into
+    /// `ui_frame` when `ui_packet_seq != last_latched_ui_seq` and stamps it
+    /// consumed. Independent of `build_seq`: UI-only apps never call
+    /// `buildPreparedFrame`. Plain counters, no atomics (update-vs-prepare
+    /// exclusion); the stage touches no stats/profiler/frame_id/epoch and
+    /// no GPU state at all (CPU list copies + seq bump only).
+    ui_packet_seq: u64 = 0,
+    last_latched_ui_seq: u64 = 0,
     /// Back-slot index the last `buildPreparedFrame` wrote; the latch
     /// asserts it still is the back index (no intervening publish).
     build_slot: usize = 0,
@@ -1540,6 +1558,57 @@ pub const Scene = struct {
     /// uploads at least one texture per call so a lone oversized texture
     /// still makes progress. Tune only with a profiled reason.
     pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
+    /// Game-side UI CPU packet staging (lock-free-publication slice 2, b):
+    /// records the live canvas CPU geometry into the back slot's
+    /// slot-owned packet lists (`ui_vertices`/`ui_indices` + `ui_packet`
+    /// header) for the prepare latch to consume into `ui_frame`.
+    ///
+    /// Runs on the game side (any non-pool thread under update-vs-prepare
+    /// exclusion — same exclusion as `buildPreparedFrame`), sg-free by
+    /// design: CPU list copies into retained slot capacity + one seq bump.
+    /// No GPU upload and no GPU handle mutation on this path — handles,
+    /// pipeline, font, and screen dims resolve at latch time on the context
+    /// thread, exactly like the legacy path. Call AFTER the tick's UI build
+    /// (canvas holds the frame's geometry) and, when `buildPreparedFrame`
+    /// is also used, AFTER it (the build resets the back slot and would
+    /// wipe an earlier packet; the latch then degrades to the legacy canvas
+    /// read, which still holds the content — correct, just an extra copy).
+    /// Staging twice before a latch: newest wins (lists overwritten, single
+    /// header). OOM mid-stage: the packet is marked invalid and the latch
+    /// takes the legacy path (the canvas still holds the content) — never a
+    /// partial packet. Skipping the stage is always legal: with
+    /// `ui_packet_seq == last_latched_ui_seq` the legacy path runs
+    /// bit-identically and the slot lists stay empty.
+    pub fn stageUiPacket(self: *Scene) void {
+        // Deliberately NO gpu_thread assert: game side, sg-free by design.
+        const back = self.draws.backSlot();
+        const canvas = if (self.ui_canvas) |*c| c else {
+            back.ui_vertices.clearRetainingCapacity();
+            back.ui_indices.clearRetainingCapacity();
+            back.ui_packet = .{ .valid = true, .canvas_present = false };
+            self.ui_packet_seq +%= 1;
+            return;
+        };
+        back.ui_vertices.clearRetainingCapacity();
+        back.ui_indices.clearRetainingCapacity();
+        back.ui_vertices.appendSlice(self.allocator, canvas.vertices.items) catch {
+            back.ui_vertices.clearRetainingCapacity();
+            back.ui_indices.clearRetainingCapacity();
+            back.ui_packet = .{ .valid = false };
+            self.ui_packet_seq +%= 1;
+            return;
+        };
+        back.ui_indices.appendSlice(self.allocator, canvas.indices.items) catch {
+            back.ui_vertices.clearRetainingCapacity();
+            back.ui_indices.clearRetainingCapacity();
+            back.ui_packet = .{ .valid = false };
+            self.ui_packet_seq +%= 1;
+            return;
+        };
+        back.ui_packet = .{ .valid = true, .canvas_present = true };
+        self.ui_packet_seq +%= 1;
+    }
+
     /// P6 UI handoff: captures CPU geometry + draw parameters out of the
     /// live canvas into the render-owned frame and uploads at this
     /// prepare/context boundary (phase mutex held, context thread). Runs
@@ -1553,6 +1622,54 @@ pub const Scene = struct {
     /// canvas or camera-less frames fail close to coherent-empty — never a
     /// stale prior overlay, never an unsafe upload/draw.
     fn captureUiFrame(self: *Scene) void {
+        // Slot-owned UI packet first (game-side staging, slice 2 b): when
+        // the game staged a fresh packet, the latch consumes it instead of
+        // reading the live canvas lists. The seq is stamped consumed on ALL
+        // fresh-packet paths — including the fallbacks — so a stale packet
+        // is never re-latched by a later prepare.
+        if (self.ui_packet_seq != self.last_latched_ui_seq) {
+            self.last_latched_ui_seq = self.ui_packet_seq;
+            const back = self.draws.backSlot();
+            if (back.ui_packet.valid) {
+                if (back.ui_packet.canvas_present) {
+                    if (self.ui_canvas) |*canvas| {
+                        self.ui_frame.canvas_present = true;
+                        if (!self.frame_snapshot.has_camera) {
+                            self.ui_frame.clearEmpty();
+                            self.ui_frame.canvas_present = true;
+                            return;
+                        }
+                        const w = if (self.frame_snapshot.screen_w > 0) self.frame_snapshot.screen_w else sapp.width();
+                        const h = if (self.frame_snapshot.screen_h > 0) self.frame_snapshot.screen_h else sapp.height();
+                        self.ui_frame.capturePacket(
+                            self.allocator,
+                            canvas,
+                            back.ui_vertices.items,
+                            back.ui_indices.items,
+                            @floatFromInt(w),
+                            @floatFromInt(h),
+                        );
+                        _ = self.ui_frame.upload(canvas, .{
+                            .allocator = self.allocator,
+                            .retire_queue = &self.gpu_retire,
+                        });
+                        return;
+                    }
+                    // Staged presence but the canvas vanished before the
+                    // latch: fall through to the legacy path, whose
+                    // missing-canvas branch fail-closes identically.
+                } else {
+                    // Staged absence of canvas: same clear as legacy.
+                    self.ui_frame.clearEmpty();
+                    self.ui_frame.canvas_present = false;
+                    return;
+                }
+            }
+            // Fresh seq but invalid packet (stage OOM, or a later
+            // buildPreparedFrame reset wiped the slot — stage UI after the
+            // build when both are used): the legacy canvas path below still
+            // holds the content, so degrade to it instead of clearing.
+        }
         const canvas = if (self.ui_canvas) |*c| c else {
             self.ui_frame.clearEmpty();
             self.ui_frame.canvas_present = false;
@@ -1902,6 +2019,12 @@ pub const Scene = struct {
         // as back scratch). The new publish at the end re-associates
         // frame_id/retire_epoch.
         self.frame_prepared = false;
+        // A successful prepare ends any reuse streak: from here on the
+        // leading flush below drains retire/upload intents again, so the
+        // streak × destroy-rate pileup is bounded by the streak length
+        // (observable via reuseStreak()/pendingRetires(), capped by
+        // GpuRetireQueue.pending_cap).
+        self.reuse_streak = 0;
         // Начало кадра (P3): новый epoch ретенции. flush ниже (внутри
         // flushPendingGpuUploads) уничтожит только завершённые эпохи —
         // запись текущего кадра ждёт его конца. begin заодно закрывает
@@ -1975,6 +2098,13 @@ pub const Scene = struct {
                 self.frame_snapshot = self.packFrameSnapshot(aspect, cur_w, cur_h);
             }
         }
+
+        // UI packet latch BEFORE the queue branches below: the fallback
+        // branch resets the back slot (wiping a staged UI packet), while the
+        // latch path consumes it — so the packet must land in `ui_frame`
+        // first. Order vs debug/instance uploads is irrelevant (disjoint
+        // buffers; the meter sums identically).
+        self.captureUiFrame();
 
         // Debug line upload (GPU): the frame's single updateBuffer, once per
         // prepare no matter how many PIP views render below. Samples follow
@@ -2098,10 +2228,9 @@ pub const Scene = struct {
             });
         }
 
-        self.captureUiFrame();
-
         // P7 publish: one index flip, no list copies. Newest wins — a repeated
         // prepare's back overwrote nothing consumable until this point.
+        // (UI already latched above, before the queue branches.)
         self.draws.publish(back_idx);
         self.frame_prepared = true;
     }
@@ -2464,6 +2593,21 @@ pub const Scene = struct {
         return self.draws.slots[self.draws.front].frame_id != 0;
     }
 
+    /// Current reuse streak: consecutive `renderReuse` presents since the
+    /// last successful prepare (0 right after any prepare). Context thread
+    /// only. Together with `pendingRetires()` this bounds what a skip streak
+    /// can hide: new uploads stay pending, retires stay queued (capped).
+    pub fn reuseStreak(self: *const Scene) u64 {
+        return self.reuse_streak;
+    }
+
+    /// Retire entries currently awaiting the next successful prepare's
+    /// leading flush (queue + overflow spillover). Grows with
+    /// streak × destroy-rate, bounded by `GpuRetireQueue.pending_cap`.
+    pub fn pendingRetires(self: *Scene) usize {
+        return self.gpu_retire.retainedCount();
+    }
+
     /// Non-blocking render-consumer reuse: re-draws the current front slot
     /// without a prepare, for frames where the app skipped the phase-lock
     /// acquire (lock contended) instead of stalling the present.
@@ -2486,17 +2630,20 @@ pub const Scene = struct {
     /// is the `frame_prepared = false` store; no other render step is
     /// prepare-frame-epoch dependent.
     ///
-    /// Skip-streak retention (honest bound): every skipped prepare defers
-    /// flush AND pending-upload completion, so `GpuRetireQueue.pending`
+    /// Skip-streak retention (bounded, observable): every skipped prepare
+    /// defers flush AND pending-upload completion, so `GpuRetireQueue.pending`
     /// grows with skip-streak × destroy-rate until the next successful
-    /// prepare drains it (overflow[8] covers only OOM appends, not streak
-    /// growth). Previously this was bounded by the phase-mutex coupling
-    /// (every frame ran prepare+flush); with reuse the bound is the app's
-    /// contract — do not streak reuse indefinitely — documented, not capped.
-    /// Borrowed handles stay valid throughout the streak (no flush ran), and
-    /// new meshes stay `gpu_pending` (invisible: queue builds skip them until
-    /// a successful prepare completes their uploads) — staleness visible as
-    /// missing objects, never corruption.
+    /// prepare drains it. The growth is CAPPED (`pending_cap`, default 8192 —
+    /// steady state holds a handful; anything past the cap is a counted +
+    /// logged drop, never silent) and OBSERVABLE (`reuseStreak()` counts the
+    /// streak, `pendingRetires()`/`cappedDropCount()` the pileup and drops).
+    /// Previously this was bounded only by the phase-mutex coupling (every
+    /// frame ran prepare+flush); with reuse the bound is the cap plus the
+    /// app's contract — do not streak reuse indefinitely — documented here,
+    /// not wished away. Borrowed handles stay valid throughout the streak
+    /// (no flush ran), and new meshes stay `gpu_pending` (invisible: queue
+    /// builds skip them until a successful prepare completes their uploads)
+    /// — staleness visible as missing objects, never corruption.
     ///
     /// Stats are saved and restored around the inner render because the frame
     /// was already recorded; the upload meter is still drained by the inner
@@ -2511,6 +2658,7 @@ pub const Scene = struct {
         gpu_thread.assertOnContextThread();
         std.debug.assert(!self.frame_prepared);
         std.debug.assert(self.draws.slots[self.draws.front].frame_id != 0);
+        self.reuse_streak += 1;
         const saved_stats = self.stats;
         self.rendering_reuse = true;
         defer self.rendering_reuse = false;

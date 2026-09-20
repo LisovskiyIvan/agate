@@ -4032,3 +4032,234 @@ test "renderReuse records the re-presented frame with the consumed stats" {
     try std.testing.expectEqual(consumed.draw_calls, scene.profiler.frames.items[1].draw_calls);
     try std.testing.expectEqual(consumed.triangles, scene.profiler.frames.items[1].triangles);
 }
+
+// Upload-intent gate (slice 2, c): a reuse streak applies NOTHING — no
+// retire flush, no upload completion, no staged-UI consumption, no frame
+// advance. Only a successful prepare drains intents.
+test "reuse applies no retire flush and no upload application" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    // Publish + consume one frame so reuse has a front to re-present.
+    scene.prepareFrame();
+    scene.render();
+    try std.testing.expect(scene.hasConsumableFrame());
+
+    // One retire intent + one staged UI intent pending.
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("reuse_gate_probe");
+    scene.gpu_retire.retireMesh(alloc, m);
+    try std.testing.expectEqual(@as(usize, 1), scene.pendingRetires());
+    const completed = scene.gpu_retire.lastCompleted();
+    scene.ui_frame.has_capture = true;
+    scene.ui_frame.needs_upload = true;
+
+    scene.renderReuse();
+    // Nothing drained, nothing consumed, nothing advanced.
+    try std.testing.expectEqual(@as(usize, 1), scene.pendingRetires());
+    try std.testing.expectEqual(completed, scene.gpu_retire.lastCompleted());
+    try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expect(scene.ui_frame.needs_upload);
+    try std.testing.expectEqual(@as(u64, 1), scene.reuseStreak());
+
+    scene.renderReuse();
+    try std.testing.expectEqual(@as(usize, 1), scene.pendingRetires());
+    try std.testing.expectEqual(@as(u64, 2), scene.reuseStreak());
+
+    // The next successful prepare ends the streak and flushes the retire.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
+    try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
+}
+
+test "prepare resets the reuse streak, reuse bumps it" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
+    scene.render();
+    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
+    scene.renderReuse();
+    scene.renderReuse();
+    scene.renderReuse();
+    try std.testing.expectEqual(@as(u64, 3), scene.reuseStreak());
+    try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
+}
+
+// Game-side UI CPU packet (slice 2, b): stage records canvas geometry into
+// the back slot (sg-free, zero meter bytes); the latch consumes the staged
+// bytes even when the canvas is mutated afterwards; a second prepare
+// without a new stage falls back to the legacy canvas read.
+test "ui packet stage-latch equals legacy, staged bytes win over later canvas mutation" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    _ = upload_meter.takeAndReset();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    const canvas = &scene.ui_canvas.?;
+    canvas.drawRect(10, 20, 30, 40, Color4.white);
+    canvas.drawText("packet", 0, 0, 16.0, Color4.white);
+    canvas.drawLine(0, 0, 5, 5, 2.0, Color4.white);
+    const staged_verts = canvas.vertices.items.len;
+    const staged_idx = canvas.indices.items.len;
+    try std.testing.expect(staged_verts > 0 and staged_idx > 0);
+
+    // Game-side stage: CPU copies into the back slot, no GPU touched.
+    scene.stageUiPacket();
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq);
+    const back = scene.draws.backSlot();
+    try std.testing.expect(back.ui_packet.valid);
+    try std.testing.expect(back.ui_packet.canvas_present);
+    try std.testing.expectEqual(staged_verts, back.ui_vertices.items.len);
+    try std.testing.expectEqual(staged_idx, back.ui_indices.items.len);
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Mutate the canvas AFTER the stage: the latch must still see staged.
+    canvas.begin();
+    canvas.drawRect(1, 2, 3, 4, Color4.white);
+    try std.testing.expect(canvas.vertices.items.len != staged_verts);
+
+    // Keep a copy of the staged bytes: the fallback prepare below resets
+    // the back slot (the latch must have consumed the packet first).
+    const UIVertex = @import("../ui.zig").UIVertex;
+    const want_verts = try alloc.dupe(UIVertex, back.ui_vertices.items);
+    defer alloc.free(want_verts);
+    const want_idx = try alloc.dupe(u16, back.ui_indices.items);
+    defer alloc.free(want_idx);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    scene.prepareFrame();
+
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expectEqual(staged_verts, scene.ui_frame.vertices.items.len);
+    try std.testing.expectEqual(staged_idx, scene.ui_frame.indices.items.len);
+    try std.testing.expectEqualSlices(UIVertex, want_verts, scene.ui_frame.vertices.items[0..staged_verts]);
+    try std.testing.expectEqualSlices(u16, want_idx, scene.ui_frame.indices.items[0..staged_idx]);
+    try std.testing.expectEqual(@as(f32, 1920.0), scene.ui_frame.screen_w);
+    try std.testing.expectEqual(@as(f32, 1080.0), scene.ui_frame.screen_h);
+    // Headless: staged but not drawable, zero meter bytes.
+    try std.testing.expect(scene.ui_frame.needs_upload);
+    try std.testing.expect(!scene.ui_frame.gpu_ready);
+    try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
+
+    // Second prepare without a new stage: no double-consume — the legacy
+    // canvas read runs and now reflects the MUTATED canvas.
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expectEqual(canvas.vertices.items.len, scene.ui_frame.vertices.items.len);
+    try std.testing.expect(canvas.vertices.items.len != staged_verts);
+}
+
+test "ui packet unused keeps the legacy path bit-identical" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(1.0, 640, 480);
+
+    // No stageUiPacket call: seqs stay zero, the legacy canvas read runs.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 0), scene.ui_packet_seq);
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq);
+    try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
+    try std.testing.expectEqual(@as(f32, 640.0), scene.ui_frame.screen_w);
+}
+
+test "ui packet stage OOM degrades to the legacy canvas read" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+
+    scene.ui_canvas = UICanvas{
+        .allocator = alloc,
+        .font_texture = std.mem.zeroes(Texture),
+    };
+    defer {
+        if (scene.ui_canvas) |*c| {
+            c.vertices.deinit(alloc);
+            c.indices.deinit(alloc);
+        }
+        scene.ui_canvas = null;
+    }
+    scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
+
+    // Refuse the slot copy: the packet is marked invalid (never partial),
+    // but the seq still advances so the latch degrades exactly once.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const real_alloc = scene.allocator;
+    scene.allocator = failing.allocator();
+    scene.stageUiPacket();
+    scene.allocator = real_alloc;
+    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq);
+    try std.testing.expect(!scene.draws.backSlot().ui_packet.valid);
+
+    // The latch falls back to the legacy canvas read (content intact there):
+    // the frame still captures, and the seq is stamped consumed (no retry).
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq);
+    try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
+}

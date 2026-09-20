@@ -3,8 +3,10 @@
 //! (with their skin/shader side stores), outline items+skins, and prepared
 //! shadow items+skins+bin ranges. Scope is mesh draws only (trail meshes
 //! ride these same queues — Trail.update stages CPU-side and the prepare
-//! flush uploads before the queue build bakes the values): UI stays outside
-//! (P6 single-owned ui_frame), and particles, physics-debug lines, and sky
+//! flush uploads before the queue build bakes the values), plus the
+//! game-side UI CPU packet staging (`ui_vertices`/`ui_indices` + `ui_packet`
+//! header, CPU geometry only — the committed P6 `UiFrame` itself stays
+//! single-owned outside the slots); particles, physics-debug lines, and sky
 //! carry their own prepared frames/payloads — never these slots.
 //!
 //! Ownership / lifecycle block:
@@ -44,9 +46,11 @@ const std = @import("std");
 const render_queue = @import("render_queue.zig");
 const snapshot_mod = @import("snapshot.zig");
 const retire_mod = @import("gpu_retire.zig");
+const ui_frame_mod = @import("ui_frame.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 const mesh_mod = @import("../mesh.zig");
+const ui_mod = @import("../ui.zig");
 
 pub const RenderQueues = render_queue.RenderQueues;
 pub const SkinStorage = render_queue.SkinStorage;
@@ -84,6 +88,16 @@ pub const FrameDrawSlot = struct {
     /// the latch/patch allocate nothing. Record `buffer` copies are borrowed
     /// read handles (never destroyed/retired through the record).
     staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
+    /// Slot-owned UI CPU packet (lock-free-publication slice 2, b): the
+    /// game side (`Scene.stageUiPacket`) records live canvas CPU geometry
+    /// into these back-slot lists and stamps `ui_packet`; the prepare latch
+    /// consumes them into `Scene.ui_frame` instead of reading the live
+    /// canvas lists. Plain CPU data (UIVertex/u16 — no GPU handles); reset
+    /// retains capacity and clears the header, so the latch/patch allocate
+    /// nothing and a stale packet can never resurface.
+    ui_vertices: std.ArrayListUnmanaged(ui_mod.UIVertex) = .empty,
+    ui_indices: std.ArrayListUnmanaged(u16) = .empty,
+    ui_packet: ui_frame_mod.UiPacketState = .{},
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -99,6 +113,9 @@ pub const FrameDrawSlot = struct {
         self.outline_skins.clearRetainingCapacity();
         self.shadow.reset();
         self.staged_instances.clearRetainingCapacity();
+        self.ui_vertices.clearRetainingCapacity();
+        self.ui_indices.clearRetainingCapacity();
+        self.ui_packet = .{};
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -110,6 +127,8 @@ pub const FrameDrawSlot = struct {
         self.outline_skins.deinit(allocator);
         self.shadow.deinit(allocator);
         self.staged_instances.deinit(allocator);
+        self.ui_vertices.deinit(allocator);
+        self.ui_indices.deinit(allocator);
     }
 };
 

@@ -103,6 +103,23 @@ pub const UploadResult = enum {
     failed_coherent_empty,
 };
 
+/// Slot-owned UI CPU packet header (lock-free-publication slice 2, b):
+/// the game side (`Scene.stageUiPacket`, sg-free) records live canvas CPU
+/// geometry into the back `FrameDrawSlot` lists (`ui_vertices`/`ui_indices`)
+/// and stamps this header; the prepare latch consumes the packet into
+/// `UiFrame` instead of reading the live canvas lists. Plain CPU data only —
+/// geometry + presence. Handles/pipeline/font/screen dims resolve at latch
+/// time on the context thread, exactly like the legacy path, so the staged
+/// packet never carries GPU state and the game path never uploads or mutates
+/// a GPU handle.
+pub const UiPacketState = struct {
+    /// A stage published a packet (geometry or staged absence) for the latch.
+    valid: bool = false,
+    /// The canvas existed at stage time. Staged absence (false) latches to
+    /// the same clear as the legacy missing-canvas path.
+    canvas_present: bool = false,
+};
+
 /// Context for the GPU half of capture. Mirrors P5's staging context: the
 /// allocator funds the retire enqueue, the queue may be null for standalone
 /// low-level callers (tests, one-off tooling) with the caller obligation
@@ -189,6 +206,28 @@ pub const UiFrame = struct {
         self.upload_seq = 0;
     }
 
+    /// Same-sokol-frame window decision, shared by `capture` (live canvas)
+    /// and `capturePacket` (slot-owned packet): FIRST-COMMITTED-WINS with
+    /// the committed-upload identity check. `preserve_committed` leaves the
+    /// whole frame untouched (early return, no allocation); `fail_closed`
+    /// has already cleared to coherent-empty (early return); `proceed` runs
+    /// the content guards + reserve + copy of the caller.
+    const WindowDecision = enum { preserve_committed, fail_closed, proceed };
+
+    fn decideWindow(self: *Self, canvas: *const UICanvas) WindowDecision {
+        // Whole-frame coherence first: nothing allocated, nothing touched
+        // unless our own committed upload still owns the canvas buffers.
+        if (canvas.isUploadOpen()) {
+            const own_committed = self.gpu_ready and self.upload_seq != 0 and
+                self.upload_seq == canvas.ui_upload_seq and
+                self.vertex_buffer.id == canvas.vertex_buffer.id and
+                self.index_buffer.id == canvas.index_buffer.id;
+            if (!own_committed) self.clearEmpty();
+            return if (own_committed) .preserve_committed else .fail_closed;
+        }
+        return .proceed;
+    }
+
     /// Captures CPU geometry + draw parameters out of the live canvas.
     /// FIRST-COMMITTED-WINS: when the upload window is open (a committed
     /// upload already spent this sokol frame's single update), the recapture
@@ -208,15 +247,9 @@ pub const UiFrame = struct {
     /// partial half). May query read-only SDK frame metadata via
     /// `isUploadOpen` (no GPU writes, headless-safe); otherwise no `sg.*`.
     pub fn capture(self: *Self, allocator: std.mem.Allocator, canvas: *const UICanvas, screen_w: f32, screen_h: f32) void {
-        // Whole-frame coherence first: nothing allocated, nothing touched
-        // unless our own committed upload still owns the canvas buffers.
-        if (canvas.isUploadOpen()) {
-            const own_committed = self.gpu_ready and self.upload_seq != 0 and
-                self.upload_seq == canvas.ui_upload_seq and
-                self.vertex_buffer.id == canvas.vertex_buffer.id and
-                self.index_buffer.id == canvas.index_buffer.id;
-            if (!own_committed) self.clearEmpty();
-            return;
+        switch (self.decideWindow(canvas)) {
+            .preserve_committed, .fail_closed => return,
+            .proceed => {},
         }
         if (canvas.vertices.items.len == 0 or canvas.indices.items.len == 0) {
             self.clearEmpty();
@@ -226,11 +259,67 @@ pub const UiFrame = struct {
             self.clearEmpty();
             return;
         }
-        const vert_count = UICanvas.clampedVertCount(canvas.vertices.items.len);
-        const index_count = canvas.indices.items.len;
+        self.captureSlices(
+            allocator,
+            canvas,
+            canvas.vertices.items,
+            canvas.indices.items,
+            screen_w,
+            screen_h,
+        );
+    }
+
+    /// Captures out of a slot-owned game-side packet instead of the live
+    /// canvas lists (lock-free-publication slice 2, b): the geometry comes
+    /// from `verts`/`indices` (staged by `Scene.stageUiPacket`), everything
+    /// else — window policy, guards, packet handles, upload identity — reads
+    /// the live canvas exactly like `capture`. The canvas lists themselves
+    /// are never touched here, so a game-side mutation of the canvas between
+    /// stage and latch cannot leak into this frame (staged bytes win) and a
+    /// canvas cleared after the stage still latches the staged content.
+    pub fn capturePacket(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        canvas: *const UICanvas,
+        verts: []const UIVertex,
+        indices: []const u16,
+        screen_w: f32,
+        screen_h: f32,
+    ) void {
+        switch (self.decideWindow(canvas)) {
+            .preserve_committed, .fail_closed => return,
+            .proceed => {},
+        }
+        if (verts.len == 0 or indices.len == 0) {
+            self.clearEmpty();
+            return;
+        }
+        if (screen_w <= 0.0 or screen_h <= 0.0) {
+            self.clearEmpty();
+            return;
+        }
+        self.captureSlices(allocator, canvas, verts, indices, screen_w, screen_h);
+    }
+
+    /// Shared content path of `capture`/`capturePacket`: reserves BOTH lists
+    /// before publishing either (OOM → coherent empty, never a partial
+    /// half), then copies + publishes the packet (clamped counts, dims,
+    /// borrowed canvas handles). Window + empty/dims guards ran in the
+    /// caller.
+    fn captureSlices(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        canvas: *const UICanvas,
+        verts: []const UIVertex,
+        indices: []const u16,
+        screen_w: f32,
+        screen_h: f32,
+    ) void {
+        const vert_count = UICanvas.clampedVertCount(verts.len);
+        const index_count = indices.len;
         // Reserve both BEFORE publish: either both land or the frame is
         // coherent-empty (no old-index/new-vertex mix on OOM).
-        self.vertices.ensureTotalCapacity(allocator, canvas.vertices.items.len) catch {
+        self.vertices.ensureTotalCapacity(allocator, verts.len) catch {
             self.clearEmpty();
             return;
         };
@@ -240,11 +329,11 @@ pub const UiFrame = struct {
         };
         self.vertices.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
-        self.vertices.appendSlice(allocator, canvas.vertices.items) catch {
+        self.vertices.appendSlice(allocator, verts) catch {
             self.clearEmpty();
             return;
         };
-        self.indices.appendSlice(allocator, canvas.indices.items) catch {
+        self.indices.appendSlice(allocator, indices) catch {
             self.clearEmpty();
             return;
         };
@@ -750,4 +839,61 @@ test "P6: legacy canvas render is a safe headless no-op and honors the window" {
     // Never armed (fresh canvas): the window is closed by construction.
     canvas.ui_upload_armed = false;
     try t.expect(!canvas.isUploadOpen());
+}
+
+test "slice2b: capturePacket matches capture and ignores later canvas mutation" {
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+    canvas.pipeline = .{ .id = 7 };
+    canvas.font_texture.view = .{ .id = 11 };
+    canvas.font_texture.sampler = .{ .id = 13 };
+    canvas.vertex_buffer = .{ .id = 21 };
+    canvas.index_buffer = .{ .id = 23 };
+
+    canvas.drawRect(10, 20, 30, 40, Color4.white);
+    canvas.drawText("pkt", 0, 0, 16.0, Color4.white);
+
+    // Reference: legacy capture straight from the live lists.
+    var legacy = UiFrame{};
+    defer legacy.deinit(t.allocator);
+    legacy.capture(t.allocator, &canvas, 800.0, 600.0);
+    try t.expect(legacy.has_capture);
+
+    // Packet capture from staged copies of the same bytes: identical frame.
+    const staged_v = try t.allocator.dupe(UIVertex, canvas.vertices.items);
+    defer t.allocator.free(staged_v);
+    const staged_i = try t.allocator.dupe(u16, canvas.indices.items);
+    defer t.allocator.free(staged_i);
+    var packet = UiFrame{};
+    defer packet.deinit(t.allocator);
+    packet.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0);
+    try t.expect(packet.has_capture);
+    try t.expectEqualSlices(UIVertex, legacy.vertices.items, packet.vertices.items);
+    try t.expectEqualSlices(u16, legacy.indices.items, packet.indices.items);
+    try t.expectEqual(legacy.vert_count, packet.vert_count);
+    try t.expectEqual(legacy.index_count, packet.index_count);
+    try t.expectEqual(legacy.screen_w, packet.screen_w);
+    try t.expectEqual(legacy.pipeline.id, packet.pipeline.id);
+    try t.expectEqual(legacy.font_view.id, packet.font_view.id);
+    try t.expectEqual(legacy.vertex_buffer.id, packet.vertex_buffer.id);
+
+    // Mutate the canvas past recognition: a packet capture from the STAGED
+    // bytes still yields the staged frame (staged wins, nothing live leaks).
+    canvas.begin();
+    canvas.drawRect(1, 2, 3, 4, Color4.white);
+    var late = UiFrame{};
+    defer late.deinit(t.allocator);
+    late.capturePacket(t.allocator, &canvas, staged_v, staged_i, 800.0, 600.0);
+    try t.expect(late.has_capture);
+    try t.expectEqualSlices(UIVertex, legacy.vertices.items, late.vertices.items);
+    try t.expectEqualSlices(u16, legacy.indices.items, late.indices.items);
+
+    // Guards mirror capture: empty slices and bad dims fail closed.
+    var empty = UiFrame{};
+    defer empty.deinit(t.allocator);
+    empty.capturePacket(t.allocator, &canvas, &.{}, &.{}, 800.0, 600.0);
+    try t.expect(!empty.has_capture);
+    empty.capturePacket(t.allocator, &canvas, staged_v, staged_i, 0.0, 600.0);
+    try t.expect(!empty.has_capture);
 }
