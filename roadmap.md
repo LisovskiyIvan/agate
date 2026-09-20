@@ -24,13 +24,13 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; latch live-touch-free (slot records + `commitPublishedRecords`, UI packet handles); concurrent-build primitive landed (`tryClaimBuildSlot`/`BuildClaim`, `releaseHandoff` без flip); lock-free остаток — sandbox adoption (claim/publish) + app-side ordering (atomics, canvas quiesce), затем снятие phase-mutex | 🟡 |
+| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; latch live-touch-free (slot records + `commitPublishedRecords`, UI packet handles); concurrent-build primitive landed (`tryClaimBuildSlot`/`BuildClaim`, `releaseHandoff` без flip); atomic handoff edge done (seq words + `build_slot` — `std.atomic.Value`, release/acquire edge); lock-free остаток — только sandbox adoption (claim/publish за флагом → default; prepareFrame back resolution — locked claim; canvas quiesce; freeze-then-latch), затем снятие phase-mutex | 🟡 |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
 | Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP | 🟡 |
-| Свет | Hemispheric + до 4 Directional (солнце с CSM + до 3 shadowless fill) + до 4 Point + до 2 Spot + до 2 RectArea (closest-point approximation, без теней) | 🟡 |
+| Свет | Hemispheric + до 4 Directional (солнце с CSM + до 3 shadowless fill) + до 4 Point + до 2 Spot + до 2 RectArea (closest-point approximation, без теней) + clustered до 64 point (tile-based forward+, без теней в v1, 2D columns задокументированы) | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) + тени PointLight (до 2, 2D-атлас 1536×512, 4-tap PCF, OFF по умолчанию) | ✅ |
 | Reflection probes | До 4 зондов, on-demand capture (128px RGBA8-куб + 8 мипов, 6 face-проходов); PBR×3 заменяет IBL-источник, Standard ambient — из coarsest mip; nearest enabled+captured в радиусе, без блендинга | ✅ |
 | Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
@@ -62,7 +62,7 @@
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
-| Frame graph, clustered lighting, volumetric, Gaussian splatting | — | ❌ |
+| Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
 | Тесты/бенчмарки | 662 unit-теста (+9), встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
@@ -491,6 +491,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * `HemisphericLight` (небо + ground color) — всегда одна.
 * `DirectionalLight` — `Scene.createDirectionalLight` (солнце: направление, цвет, интенсивность, 4-каскадный CSM) + до 3 shadowless fill через `Scene.addDirectionalLight` (всего до 4, `is_enabled`), hemi остаётся ambient.
 * До 4 `PointLight` с range/интенсивностью и до 2 `SpotLight` (inner/outer cone) — per-pixel затухание, выбор значимых источников в камере за 1 проход.
+* Clustered point lights до 64 (`Scene.addClusteredPointLight`, cap 64 с `error.TooManyClusteredLights`, values-only, session-local): tile-based forward+ (64×64 px window-grid tiles per view на context-потоке из staged snapshot; PIP независим; лаг 1 кадр), SSBO-блоки 12/13/14 во всех пяти forward-шейдерах (пустой pool — бит-идентичный legacy-путь), без теней в v1, 2D-column over-inclusion задокументирован (near/far игнорируются), без per-tile cap (worst-case ~0.5 МБ при 4K/64 — metered, unthrottled); forward-шейдеры glsl430 ради SSBO (Metal/D3D legs без изменений, Linux-GL требует 4.3+).
 * До 2 `RectAreaLight` (`Scene.addAreaLight`, half-extent `right`/`up`, cap 2 с `error.TooManyAreaLights`) — документированная closest-point-on-rect аппроксимация (НЕ LTC: жёстче края у больших/близких rect, без rect-shape specular анизотропии, БЕЗ теней в v1); API-only, session-local.
 * Тени: 4-каскадный CSM (атлас 2048², 4 × 1024²), 16-выборок Poisson PCF / переменная полутень PCSS, depth bias + normal bias, мягкость, fade дальнего каскада.
 * Перспективные тени SpotLight: depth-атлас 1024×512 (до 2 прожекторов), 4-tap PCF-фильтрация.
@@ -606,7 +607,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Возможность Babylon.js | В Agate есть | Чего не хватает |
 |---|---|---|
 | Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP) | Камера-ригов, touch/pinch, инерции |
-| Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + до 4 directional (1 солнце с CSM + до 3 shadowless fill) + 4 point + 2 spot (выбор лучших по камере) + до 2 rect area (closest-point approximation, без теней, API-only) | Кластерного освещения (сотни источников) |
+| Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + до 4 directional (1 солнце с CSM + до 3 shadowless fill) + 4 point + 2 spot (выбор лучших по камере) + до 2 rect area (closest-point approximation, без теней, API-only) + clustered до 64 point (tile-based forward+, без теней в v1) | Кластерного освещения сверх 64 / с тенями |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
@@ -632,7 +633,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 **Свет и тени**
 * Тени от point-светов сверх лимита (3+), PCSS/contact hardening для точечных источников, ESM, blur-exponential; тени rect area-светов (rect area без теней в v1).
-* Динамический IBL, кластерное освещение (сотни источников), объёмный свет/атмосфера (rect area до 2 с closest-point approximation и reflection probes до 4 с on-demand capture уже реализованы, см. ✅).
+* Динамический IBL, объёмный свет/атмосфера (rect area до 2 с closest-point approximation, clustered до 64 без теней в v1 и reflection probes до 4 с on-demand capture уже реализованы, см. ✅).
 
 **Материалы и текстуры**
 * OpenPBR, текстуры clearcoat/sheen, anisotropic, transmission, subsurface.
