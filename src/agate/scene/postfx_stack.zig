@@ -54,8 +54,25 @@ pub const PostFXStack = struct {
     outline_width_px: f32 = 2.0,
 
     // Previous frame view_proj matrix for camera motion blur reprojection
+    // (and the TAA history reprojection, which reuses this exact plumbing:
+    // renderChain stores the jittered current VP here every composite, so
+    // prev is always the previous frame's jittered matrix).
     prev_view_proj: Mat4 = Mat4.identity,
     has_prev_view_proj: bool = false,
+
+    // TAA resolve state. History storage lives in PostProcessPass; this is
+    // the frame counter (ping-pong slots via taaReadIndex/taaWriteIndex, so
+    // skipped/reused snapshot ids can never alias read/write), the validity
+    // latch, and the explicit-reset request. Reset triggers (see
+    // postprocess.zig header docs): resize, taaReset(), taa_camera_cut,
+    // first frame, off->on toggle. MSAA forces TAA off (no depth resolve).
+    taa_frame: u64 = 0,
+    taa_has_history: bool = false,
+    taa_enabled_prev: bool = false,
+    taa_explicit_reset: bool = false,
+
+    // One-shot TAA policy warning (MSAA active => TAA suppressed).
+    warn_taa_msaa: msaa.WarnOnce = .{},
 
     pub fn init() PostFXStack {
         return .{
@@ -81,6 +98,15 @@ pub const PostFXStack = struct {
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
+    }
+
+    /// Explicit TAA history reset for the next composite. Context thread
+    /// only (it destroys the history targets via PostProcessPass.taaReset).
+    /// Update-thread camera cuts use PostProcessOptions.taa_camera_cut
+    /// (one frame, snapshot-carried) instead.
+    pub fn taaReset(self: *PostFXStack) void {
+        self.taa_explicit_reset = true;
+        self.postprocess_pass.taaReset();
     }
 
     /// Begins PASS 2 (the main scene pass) either into the offscreen target
@@ -227,6 +253,22 @@ pub const PostFXStack = struct {
             post.fog_enabled = false;
             post.fxaa_enabled = false;
         }
+        // TAA needs the 1x depth texture for its reprojection velocity; with
+        // an MSAA main target depth is write-only (no resolve in sokol), so
+        // TAA is forced off for the frame like the other depth effects.
+        if (msaa_active and post.taa_enabled) {
+            _ = self.warn_taa_msaa.warn(
+                "msaa: TAA disabled this session: MSAA x{} main target has no depth resolve",
+                .{params.main_samples},
+            );
+            post.taa_enabled = false;
+        }
+        const taa_active = params.post.enabled and post.taa_enabled;
+        if (!taa_active) {
+            self.taa_has_history = false;
+            self.taa_enabled_prev = false;
+            self.taa_explicit_reset = false;
+        }
 
         // ==============================================
         // PASS 2.5: SCREEN-SPACE AMBIENT OCCLUSION (SSAO)
@@ -273,6 +315,38 @@ pub const PostFXStack = struct {
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
         // ==============================================
         if (params.post.enabled) {
+            const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
+            const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
+
+            // TAA resolve inputs. ensureTaaHistory (re)creates the ping-pong
+            // pair; any recreation, first frame, off->on toggle, camera-cut
+            // flag, or explicit taaReset() invalidates history for the frame
+            // (the shader then returns current without sampling history).
+            // The read slot follows the internal frame counter, never the
+            // snapshot id, so reused/skipped frames cannot alias read/write.
+            var taa_history_view = self.postprocess_pass.offscreen_resolve_tex_view;
+            var taa_history_valid = false;
+            var taa_capture = false;
+            if (taa_active) {
+                const recreated = self.postprocess_pass.ensureTaaHistory(cur_w, cur_h);
+                self.postprocess_pass.taa_read = postprocess.taaReadIndex(self.taa_frame);
+                const reset = postprocess.taaShouldReset(.{
+                    .first_frame = !self.taa_has_history,
+                    .toggled_on = !self.taa_enabled_prev,
+                    .resized = recreated,
+                    .camera_cut = post.taa_camera_cut,
+                    .explicit_reset = self.taa_explicit_reset,
+                });
+                if (self.postprocess_pass.taaReadView().id != 0) {
+                    taa_history_view = self.postprocess_pass.taaReadView();
+                }
+                taa_capture = self.postprocess_pass.taaWriteAttView().id != 0;
+                taa_history_valid = !reset and taa_capture and taa_history_view.id != 0;
+                // Degenerate sizes fail ensure: nothing to capture, frame
+                // composites with history invalid (retried next frame).
+                if (!taa_capture) taa_history_valid = false;
+            }
+
             var swap_action = sg.PassAction{};
             swap_action.colors[0] = .{
                 .load_action = .DONTCARE,
@@ -281,9 +355,6 @@ pub const PostFXStack = struct {
                 .action = swap_action,
                 .swapchain = sglue.swapchain(),
             });
-
-            const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
-            const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
 
             self.postprocess_pass.render(
                 post,
@@ -301,6 +372,9 @@ pub const PostFXStack = struct {
                 params.sun_color,
                 params.camera.getNear(),
                 params.camera.getFar(),
+                taa_history_view,
+                taa_history_valid,
+                false,
             );
             self.prev_view_proj = params.view_proj;
             self.has_prev_view_proj = true;
@@ -317,6 +391,55 @@ pub const PostFXStack = struct {
             }
 
             sg.endPass();
+
+            // TAA history capture, after the swapchain pass closed (and after
+            // UI, so HUD pixels never feed the history): re-draw the same
+            // composite into the write slot with capture-only set, which
+            // stores exactly the post-TAA early-LDR color the main draw fed
+            // into the DoF/grade chain. The disabled path never reaches here
+            // (taa_active false), so off stays a single pass.
+            if (taa_active and taa_capture) {
+                var cap_action = sg.PassAction{};
+                cap_action.colors[0] = .{
+                    .load_action = .DONTCARE,
+                };
+                var cap_pass = sg.Pass{ .action = cap_action };
+                cap_pass.attachments.colors[0] = self.postprocess_pass.taaWriteAttView();
+                sg.beginPass(cap_pass);
+                self.postprocess_pass.render(
+                    post,
+                    ssao_view,
+                    ssao.enabled,
+                    ssao.debug_mode,
+                    ssao.intensity,
+                    cur_w,
+                    cur_h,
+                    params.view_proj,
+                    inv_view_proj,
+                    prev_vp,
+                    params.eye,
+                    params.sun_dir,
+                    params.sun_color,
+                    params.camera.getNear(),
+                    params.camera.getFar(),
+                    taa_history_view,
+                    taa_history_valid,
+                    true,
+                );
+                sg.endPass();
+                self.taa_frame += 1;
+                self.taa_has_history = true;
+                params.stats.post_draw_calls += 1;
+                params.stats.draw_calls += 1;
+                params.stats.triangles += 2;
+            }
+            if (taa_active) {
+                // Uncaptured frames (degenerate size) stay invalid but latch
+                // the toggle so the next healthy frame does not reset-loop.
+                if (!taa_capture) self.taa_has_history = false;
+                self.taa_enabled_prev = true;
+                self.taa_explicit_reset = false;
+            }
         }
     }
 };

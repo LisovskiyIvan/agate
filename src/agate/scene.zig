@@ -2270,6 +2270,22 @@ pub const Scene = struct {
             );
         }
 
+        // TAA sub-pixel jitter (context thread, render-owned): the snapshot
+        // view_proj stays UNJITTERED (prepare built queues/culling from it,
+        // i.e. the conservative unjittered frustum); the jittered matrix
+        // below drives the main-pass draws and the postfx reprojection for
+        // this frame so depth/color/history line up. The index is the
+        // snapshot frame_id, so a reused frame repeats its jitter instead of
+        // advancing history against identical content. Forced off under MSAA
+        // (no depth resolve for the velocity term; PostFXStack forces the
+        // composite side off the same way).
+        const taa_on = snap.post_process.enabled and snap.post_process.taa_enabled and samples == 1;
+        var taa_view_proj = snap.primary_cam.view_proj;
+        if (taa_on) {
+            const jpx = postprocess.taaJitter(snap.frame_id, snap.post_process.taa_jitter_scale);
+            taa_view_proj = postprocess.applyTaaJitterToViewProj(snap.primary_cam.view_proj, jpx, cur_w, cur_h);
+        }
+
         // 1. Directional Light Cascaded Shadow View-Projections
         const cascades = snap.cascades;
         const light_pack = snap.light_pack;
@@ -2345,7 +2361,11 @@ pub const Scene = struct {
             const primary_rect = primary_snap.viewport.toPixelRect(cur_w, cur_h);
             sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
             sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
-            self.renderSceneView(primary_snap, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
+            // Only the TAA view (primary) is jittered; secondary views keep
+            // their snapshot matrices.
+            var primary_jittered = primary_snap;
+            if (taa_on) primary_jittered.view_proj = taa_view_proj;
+            self.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
 
             for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
                 if (i == active_idx or !entry.enabled) continue;
@@ -2369,7 +2389,9 @@ pub const Scene = struct {
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
-            self.renderSceneView(snap.primary_cam, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
+            var primary_jittered = snap.primary_cam;
+            if (taa_on) primary_jittered.view_proj = taa_view_proj;
+            self.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
 
             if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
                 sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -2406,7 +2428,9 @@ pub const Scene = struct {
             .ssao = snap.ssao,
             .camera = snap.primary_cam.camera,
             .aspect = snap.primary_cam.aspect,
-            .view_proj = snap.primary_cam.view_proj,
+            // Jittered when TAA is on (same matrix the color pass drew
+            // with); otherwise exactly the snapshot matrix as before.
+            .view_proj = taa_view_proj,
             .eye = snap.primary_cam.eye,
             .sun_dir = snap.sun_dir,
             .sun_color = snap.sun_color,

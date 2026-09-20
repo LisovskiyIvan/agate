@@ -46,6 +46,8 @@ layout(binding = 0) uniform fs_params {
     mat4 inv_view_proj; // inverse view-projection matrix
     mat4 prev_view_proj; // previous frame view-projection matrix
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: unused
+    vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
+    vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -54,6 +56,7 @@ layout(binding = 1) uniform texture2D ssao_tex;
 layout(binding = 2) uniform texture2D depth_tex;
 layout(binding = 3) uniform texture2D bloom_tex;
 layout(binding = 4) uniform texture2D lut_tex;
+layout(binding = 5) uniform texture2D history_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -350,6 +353,60 @@ float sampleLumaFast(vec2 uv) {
     return luma_hdr / (luma_hdr + 1.0);
 }
 
+// Temporal Anti-Aliasing neighborhood: 3x3 box (min/max/average) over the
+// tonemapped-LDR center + 8 fast-LDR taps (the same neighbor approximation
+// FXAA and sharpen use). Mirrors taaNeighborhoodBounds/taaNeighborhoodAvg
+// in postprocess.zig.
+void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, out vec3 avg) {
+    vec2 texel = resolution.zw;
+    box_min = center;
+    box_max = center;
+    vec3 sum = center;
+    vec3 t;
+    t = sampleSceneFastLDR(uv + vec2(-texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(0.0, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(-texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(-texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(0.0, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleSceneFastLDR(uv + vec2(texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    avg = sum / 9.0;
+}
+
+// Temporal Anti-Aliasing resolve on the tonemapped LDR image. Velocity comes
+// from depth reprojection with the (jittered) current/prev view-projection —
+// exactly the applyMotionBlur math — and the history sample is bilinear
+// (smp). Mirrors taaResolvePixel in postprocess.zig (bounds + clamp + blend
+// + sharpen). Disabled (or no valid history yet) returns `current` before
+// any history/depth sampling, so the off path stays bit-identical.
+vec3 applyTAA(vec3 current, vec2 uv) {
+    if (taa_params.x < 0.5) return current;
+    if (taa_state.x < 0.5) return current;
+    float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    if (raw_depth >= 0.9999) return current;
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec4 prev_clip = prev_view_proj * vec4(world_pos, 1.0);
+    if (prev_clip.w <= 0.0001) return current;
+    vec2 prev_ndc = prev_clip.xy / prev_clip.w;
+    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
+    vec3 hist = texture(sampler2D(history_tex, smp), prev_uv).rgb;
+    vec3 box_min;
+    vec3 box_max;
+    vec3 avg;
+    taaNeighborhood(uv, current, box_min, box_max, avg);
+    float clamp_strength = clamp(taa_params.z, 0.0, 1.0);
+    vec3 hist_clamped = mix(hist, clamp(hist, box_min, box_max), clamp_strength);
+    float blend = clamp(taa_params.y, 0.0, 1.0);
+    vec3 outc = mix(current, hist_clamped, blend);
+    float sharp = clamp(taa_params.w, 0.0, 1.0);
+    if (sharp > 0.0001) {
+        outc = clamp(outc + (current - avg) * sharp, box_min, box_max);
+    }
+    return outc;
+}
+
 // FXAA 3.11 Quality Anti-Aliasing
 #define FXAA_EDGE_THRESHOLD_MIN 0.0312
 #define FXAA_EDGE_THRESHOLD     0.125
@@ -574,6 +631,18 @@ void main() {
         color = applyFXAA(uv, resolution.zw);
     } else {
         color = sampleSceneLDR(uv);
+    }
+
+    // Temporal Anti-Aliasing (tonemapped-LDR resolve against the reprojected
+    // history; same depth + current/prev VP velocity math as motion blur).
+    // Disabled (or no valid history yet) returns `color` before any
+    // history/depth sampling, so the off path is bit-identical to pre-TAA.
+    color = applyTAA(color, uv);
+    // History capture draws re-enter with taa_state.y = 1 and store exactly
+    // this post-TAA color for the next frame (PostFXStack.renderChain).
+    if (taa_state.y > 0.5) {
+        frag_color = vec4(clamp(color, 0.0, 1.0), 1.0);
+        return;
     }
 
     // Depth of Field (gather blur on the tonemapped image)
