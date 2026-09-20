@@ -141,17 +141,22 @@
 //! deadlock). The phase mutex between app update/build and prepare/render
 //! is STILL HELD by the apps — this slice changes no app-facing flow
 //! defaults and removes no mutex. App-side adoption checklist (NEXT wave,
-//! not this one):
+//! not this one — wave 30 closed the seq-words item, the rest is app-side
+//! flow):
+//! - DONE (wave 30): the four handoff seq words (`build_seq`/
+//!   `last_latched_seq`, `ui_packet_seq`/`last_latched_ui_seq`) plus
+//!   `build_slot` are `std.atomic.Value` on `Scene` — release on
+//!   publish/stage, acquire on latch/claim-consume, monotonic for the
+//!   single-producer reserve and the context-side latch stamps (see the
+//!   field docs in scene.zig). Sequential behavior is bit-identical and the
+//!   wave-30 handoff-edge test proves the release/acquire pairing across
+//!   threads. The mutex still guards the payload the words order; what
+//!   REMAINS before it can go:
 //! - stop calling bare `buildPreparedFrame`/`stageUiPacket` across threads:
 //!   use `Scene.tryClaimBuildSlot` + `BuildClaim.build`/`stageUi` +
 //!   `publish`/`cancel` on the game thread; never touch `backIndex`/
 //!   `backSlot`/`publish`/raw `slots[i]` writes concurrently (those stay
 //!   single-threaded-only).
-//! - the four handoff seq words (`build_seq`/`last_latched_seq`,
-//!   `ui_packet_seq`/`last_latched_ui_seq`) plus `build_slot` are still
-//!   plain u64/usize under phase exclusion: game||prepare overlap needs
-//!   them atomic (release/acquire) or a handoff-edge lock before the mutex
-//!   can go.
 //! - `prepareFrame`'s back resolution (`backIndex`/`backSlot`, unlocked)
 //!   must become a locked claim so it never targets the game-held slot;
 //!   until then a stage during prepare must use the claim API (targets the
