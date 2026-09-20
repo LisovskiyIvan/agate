@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 19.09.2026).
+> Дата: 10.09.2026 (обновлено 20.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -24,7 +24,7 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты | ✅ |
+| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; lock-free публикация слотов частична (остались consumer pin/lease + снятие phase-mutex) | 🟡 |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
@@ -36,7 +36,7 @@
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
 | OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color; без текстур) | 🟡 |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
-| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
+| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off) | 🟡 |
 | DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA — только offscreen main target | 🟡 |
@@ -504,7 +504,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 ### Текстуры, небо, окружение
 
-* 2D-текстуры: декод PNG/JPEG/… через stb_image, RGBA8, настройки wrap/min/mag, полная CPU-цепочка мипмапов (box-filter), процедурные checkerboard и particle-dot.
+* 2D-текстуры: декод PNG/JPEG/… через stb_image, RGBA8, настройки wrap/min/mag, полная CPU-цепочка мипмапов (box-filter), процедурные checkerboard и particle-dot. OpenEXR scanline (HALF/FLOAT; NONE/RLE/ZIPS/ZIP; строгий API `Texture.fromExrFile/fromExrMemory` → RGBA16F, без silent fallback).
 * CubeTexture: 6 граней, дефолтная 1×1, процедурный skybox-градиент, развёртка equirectangular-панорамы в куб, загрузка граней из файлов.
 * Асинхронный декод картинок glTF на worker-потоках с fallback на синхронный путь и дедупликацией в очереди загрузок.
 
@@ -604,7 +604,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
-| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | EXR, KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/reflection probe текстуры |
+| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, EXR scanline HALF/FLOAT (NONE/RLE/ZIPS/ZIP, strict API `Texture.fromExrFile/fromExrMemory`), equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/reflection probe текстуры |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | glow/highlight; MSAA только offscreen main target (нет depth-resolve) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | GPU-морфов, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps | GPU-симуляции, коллизий с физикой |
@@ -631,7 +631,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 **Материалы и текстуры**
 * OpenPBR, текстуры clearcoat/sheen, anisotropic, transmission, subsurface.
 * NodeMaterial/ShaderMaterial (кастомные шейдеры без пересборки движка), библиотека материалов.
-* EXR, рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡).
+* Рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, reflection/refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡).
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
