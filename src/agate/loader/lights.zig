@@ -21,9 +21,10 @@ const FreeCamera = @import("../camera.zig").FreeCamera;
 //   light_eye = center + dir * dist), so a glTF directional light maps to the
 //   NEGATED travel direction. SpotLight.direction is the beam travel direction
 //   (shader uses dot(-L, s_dir)), so it maps to -Z unnegated.
-// - The engine owns at most one directional light (createDirectionalLight
-//   replaces the previous one) and has a single ?Camera active_camera slot,
-//   hence the "first wins" rules below.
+// - The engine owns up to 4 directional lights (createDirectionalLight for
+//   the shadow-casting primary, addDirectionalLight for 3 shadowless fills)
+//   and has a single ?Camera active_camera slot, hence the "first wins"
+//   rules below (directional: first four win).
 
 pub const default_point_range: f32 = 10.0; // mirrors PointLightOptions.range
 pub const default_spot_range: f32 = 15.0; // mirrors SpotLightOptions.range
@@ -151,13 +152,15 @@ fn cameraObjectName(cam: *const c.cgltf_camera) ?[]const u8 {
 }
 
 /// Imports KHR_lights_punctual lights attached to glTF nodes:
-/// directional -> Scene.createDirectionalLight (first wins, see below),
+/// directional -> Scene.createDirectionalLight for the first, then
+/// Scene.addDirectionalLight fills (up to 4 suns total, extras skipped),
 /// point -> Scene.createPointLight, spot -> Scene.createSpotLight.
 /// Names are duped into the scene allocator (glTF strings die with cgltf_free).
 ///
-/// Single-directional limit: the engine holds one scene sun; if the scene
-/// already has a directional light, or after the first glTF directional is
-/// imported, further directional lights are skipped (their duped names freed).
+/// Multi-directional limit: the engine holds 1 primary sun + 3 fills; if the
+/// scene already has a directional light it becomes the primary only when
+/// the slot is free, further glTF directionals become fills, and lights
+/// past the fourth are skipped (their duped names freed).
 pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) !void {
     if (gltf.nodes_count == 0) return;
     var have_directional = scene.lights.directional != null;
@@ -178,23 +181,34 @@ pub fn loadLights(scene: *Scene, gltf: *const c.cgltf_data, parent_world: Mat4) 
 
         switch (light.type) {
             c.cgltf_light_type_directional => {
-                // Engine keeps a single sun: keep the first, skip the rest.
-                if (have_directional) {
-                    scene.allocator.free(owned_name);
-                    continue;
-                }
+                // Engine keeps up to 4 suns: the first becomes the
+                // shadow-casting primary, the next three shadowless fills;
+                // further lights are skipped (duped names freed).
                 // Engine direction points TOWARD the sun: negate the beam.
                 const to_sun = forwardFromWorld(world).scale(-1.0);
-                const dl = scene.createDirectionalLight(owned_name, .{
-                    .direction = to_sun,
-                    .diffuse = lightColor(light),
-                    .intensity = lightIntensity(light),
-                }) catch |err| {
-                    scene.allocator.free(owned_name);
-                    return err;
-                };
-                dl.owns_name = true;
-                have_directional = true;
+                if (!have_directional) {
+                    const dl = scene.createDirectionalLight(owned_name, .{
+                        .direction = to_sun,
+                        .diffuse = lightColor(light),
+                        .intensity = lightIntensity(light),
+                    }) catch |err| {
+                        scene.allocator.free(owned_name);
+                        return err;
+                    };
+                    dl.owns_name = true;
+                    have_directional = true;
+                } else {
+                    const fill = scene.addDirectionalLight(owned_name, .{
+                        .direction = to_sun,
+                        .diffuse = lightColor(light),
+                        .intensity = lightIntensity(light),
+                    }) catch |err| {
+                        scene.allocator.free(owned_name);
+                        if (err == error.TooManyDirectionalLights) continue;
+                        return err;
+                    };
+                    fill.owns_name = true;
+                }
             },
             c.cgltf_light_type_point => {
                 const pl = scene.createPointLight(owned_name, .{

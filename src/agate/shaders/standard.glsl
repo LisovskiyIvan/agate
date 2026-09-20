@@ -136,6 +136,12 @@ layout(binding = 1) uniform fs_params {
     // zero cost when no point light casts shadows.
     mat4 point_view_proj[12];
     vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: unused
+    // APPENDED LAST (multi-directional): up to 4 suns; slot 0 mirrors the
+    // primary (light_dir/light_color, the only shadow caster), slots 1..3
+    // are shadowless fills. Unused/disabled slots are zeroed (intensity 0
+    // skips in the fill loop below).
+    vec4 directional_dir[4];
+    vec4 directional_color_int[4]; // rgb: color, a: intensity
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -452,6 +458,18 @@ void main() {
     vec3 debug_tint = vec3(0.0);
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 diffuse = light_color.rgb * (NdotL * light_color.a) * (1.0 - shadow);
+
+    // Extra directional fills (slots 1..3, no shadows): zero intensity
+    // (disabled/unused) skips, so a single sun renders bit-identically.
+    for (int i = 1; i < 4; i++) {
+        vec3 d_dir = directional_dir[i].xyz;
+        vec3 d_col = directional_color_int[i].rgb;
+        float d_int = directional_color_int[i].w;
+        if (d_int <= 0.0) continue;
+        float d_NdotL = max(dot(N, d_dir), 0.0);
+        if (d_NdotL <= 0.0) continue;
+        diffuse += d_col * (d_NdotL * d_int);
+    }
 
     // Point Lights
     int num_points = int(light_counts.x);

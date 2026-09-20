@@ -35,6 +35,13 @@ pub const DirectionalLightOptions = struct {
     intensity: f32 = 1.0,
 };
 
+/// Maximum simultaneous directional lights (Babylon.js parity): index 0 is
+/// the shadow-casting sun (CSM unchanged), indices 1..3 are shadowless
+/// fills. See LightRig.addDirectionalLight for the creation cap.
+pub const max_directional_lights: usize = 4;
+/// Fills beyond the primary sun (slots 1..3).
+pub const max_fill_directionals: usize = max_directional_lights - 1;
+
 pub const DirectionalLight = struct {
     name: []const u8 = "DirectionalLight",
     /// True when `name` was heap-allocated by the glTF loader; the scene frees
@@ -43,6 +50,9 @@ pub const DirectionalLight = struct {
     direction: Vec3 = Vec3.new(0.5, 1.0, 0.5),
     diffuse: Color3 = Color3.white,
     intensity: f32 = 1.0,
+    /// Disabled lights pack as zeroed slots (no contribution) and the sun
+    /// resolvers below treat them as absent (hemispheric fallback).
+    is_enabled: bool = true,
 
     pub fn init(name: []const u8, options: DirectionalLightOptions) DirectionalLight {
         return .{
@@ -190,22 +200,23 @@ pub const SpotLight = struct {
     }
 };
 
-// Active sun resolvers: a scene DirectionalLight overrides the legacy
-// hemispheric sun when present, otherwise hemispheric values are kept.
+// Active sun resolvers: an enabled scene DirectionalLight overrides the
+// legacy hemispheric sun when present, otherwise hemispheric values are
+// kept. A disabled directional counts as absent (same fallback).
 pub fn resolveSunDirection(directional: ?*const DirectionalLight, hemi: HemisphericLight) Vec3 {
     if (directional) |d| {
-        if (d.direction.lengthSq() > 1e-12) return d.direction.normalize();
+        if (d.is_enabled and d.direction.lengthSq() > 1e-12) return d.direction.normalize();
     }
     return hemi.direction.normalize();
 }
 
 pub fn resolveSunColor(directional: ?*const DirectionalLight, hemi: HemisphericLight) Color3 {
-    if (directional) |d| return d.diffuse;
+    if (directional) |d| if (d.is_enabled) return d.diffuse;
     return hemi.diffuse;
 }
 
 pub fn resolveSunIntensity(directional: ?*const DirectionalLight, hemi: HemisphericLight) f32 {
-    if (directional) |d| return d.intensity;
+    if (directional) |d| if (d.is_enabled) return d.intensity;
     return hemi.intensity;
 }
 
@@ -255,6 +266,30 @@ test "resolveSunDirection with zero-length direction is safe" {
     try std.testing.expect(std.math.isFinite(dir.y));
     try std.testing.expect(std.math.isFinite(dir.z));
     try std.testing.expectApproxEqAbs(dir.y, 1.0, 1e-6);
+}
+
+test "multi-directional cap is four (one sun plus three fills)" {
+    try std.testing.expectEqual(@as(usize, 4), max_directional_lights);
+    try std.testing.expectEqual(@as(usize, 3), max_fill_directionals);
+}
+
+test "disabled directional falls back to hemispheric sun" {
+    const hemi = HemisphericLight.init("hemi", .{
+        .direction = Vec3.new(0.0, 1.0, 0.0),
+        .diffuse = Color3.new(0.5, 0.25, 0.125),
+        .intensity = 0.75,
+    });
+    var sun = DirectionalLight.init("sun", .{
+        .direction = Vec3.new(0.0, -1.0, 0.0),
+        .diffuse = Color3.new(1.0, 0.5, 0.25),
+        .intensity = 2.0,
+    });
+    sun.is_enabled = false;
+    const dir = resolveSunDirection(&sun, hemi);
+    try std.testing.expectApproxEqAbs(dir.y, 1.0, 1e-6);
+    const color = resolveSunColor(&sun, hemi);
+    try std.testing.expectApproxEqAbs(color.r, 0.5, 1e-6);
+    try std.testing.expectApproxEqAbs(resolveSunIntensity(&sun, hemi), 0.75, 1e-6);
 }
 
 test "SpotLight.getShadowViewProj transforms points in front of spotlight" {

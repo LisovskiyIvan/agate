@@ -164,6 +164,12 @@ layout(binding = 1) uniform fs_params {
     // zero cost when no point light casts shadows.
     mat4 point_view_proj[12];
     vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: unused
+    // APPENDED LAST (multi-directional): up to 4 suns; slot 0 mirrors the
+    // primary (light_dir/light_color, the only shadow caster), slots 1..3
+    // are shadowless fills. Unused/disabled slots are zeroed (intensity 0
+    // skips in the fill loop below).
+    vec4 directional_dir[4];
+    vec4 directional_color_int[4]; // rgb: color, a: intensity
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -638,6 +644,30 @@ void main() {
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 radiance = light_color.rgb * light_color.a;
     vec3 Lo = (kD * albedo / PI + specular * sun_atten + sun_additive) * radiance * NdotL * (1.0 - shadow);
+
+    // Extra directional fills (slots 1..3, no shadows): the same
+    // Cook-Torrance lobe as the sun (coat + sheen included), no shadow
+    // term. Zero intensity (disabled/unused) skips, so a single sun
+    // shades bit-identically.
+    for (int i = 1; i < 4; i++) {
+        vec3 d_dir = directional_dir[i].xyz;
+        vec3 d_col = directional_color_int[i].rgb;
+        float d_int = directional_color_int[i].w;
+        if (d_int <= 0.0) continue;
+        float d_NdotL = max(dot(N, d_dir), 0.0);
+        if (d_NdotL <= 0.0) continue;
+        vec3 d_H = normalize(V + d_dir);
+        float d_NDF = distributionGGX(N, d_H, roughness);
+        float d_G = geometrySmith(N, V, d_dir, roughness);
+        vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
+        vec3 d_spec = (d_NDF * d_G * d_F) / (4.0 * NdotV * d_NdotL + 0.0001);
+        vec3 d_kD = (vec3(1.0) - d_F) * (1.0 - metallic);
+        vec3 d_rad = d_col * d_int;
+        vec3 d_atten;
+        vec3 d_additive;
+        coatSheenLight(N, V, d_dir, d_H, NdotV, d_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, d_atten, d_additive);
+        Lo += (d_kD * albedo / PI + d_spec * d_atten + d_additive) * d_rad * d_NdotL;
+    }
 
     // 2. Point Lights (up to 4)
     int num_points = int(light_counts.x);

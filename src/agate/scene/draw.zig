@@ -194,6 +194,8 @@ pub fn drawRegularItem(
             .spot_shadow_params = f.spot_shadow_params,
             .point_view_proj = f.point_view_proj,
             .point_shadow_params = f.point_shadow_params,
+            .directional_dir = f.directional_dir,
+            .directional_color_int = f.directional_color_int,
         };
         if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -248,6 +250,8 @@ pub fn drawRegularItem(
             .spot_shadow_params = f.spot_shadow_params,
             .point_view_proj = f.point_view_proj,
             .point_shadow_params = f.point_shadow_params,
+            .directional_dir = f.directional_dir,
+            .directional_color_int = f.directional_color_int,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -368,6 +372,8 @@ fn drawShaderMaterialItem(
                 .spot_shadow_params = f.spot_shadow_params,
                 .point_view_proj = f.point_view_proj,
                 .point_shadow_params = f.point_shadow_params,
+                .directional_dir = f.directional_dir,
+                .directional_color_int = f.directional_color_int,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
@@ -412,6 +418,8 @@ fn drawShaderMaterialItem(
                 .spot_shadow_params = f.spot_shadow_params,
                 .point_view_proj = f.point_view_proj,
                 .point_shadow_params = f.point_shadow_params,
+                .directional_dir = f.directional_dir,
+                .directional_color_int = f.directional_color_int,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         }
@@ -633,6 +641,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .spot_shadow_params = f.spot_shadow_params,
             .point_view_proj = f.point_view_proj,
             .point_shadow_params = f.point_shadow_params,
+            .directional_dir = f.directional_dir,
+            .directional_color_int = f.directional_color_int,
             .alpha_cutoff = rec.alpha_cutoff,
             .normal_scale = rec.normal_scale,
             .uv_matrix = rec.uv_matrices,
@@ -687,6 +697,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .spot_shadow_params = f.spot_shadow_params,
             .point_view_proj = f.point_view_proj,
             .point_shadow_params = f.point_shadow_params,
+            .directional_dir = f.directional_dir,
+            .directional_color_int = f.directional_color_int,
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }
@@ -715,6 +727,8 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "clearcoat_color")) @compileError("FsParams missing clearcoat_color");
             if (!@hasField(P, "sheen_factors")) @compileError("FsParams missing sheen_factors");
             if (!@hasField(P, "sheen_color")) @compileError("FsParams missing sheen_color");
+            if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
+            if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
         }
     }
     // Standard family: one diffuse slot.
@@ -722,6 +736,8 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
         for ([_]type{ shd.FsParams, inst_shd.FsParams }) |P| {
             if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
+            if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
+            if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
         }
     }
 }

@@ -16,15 +16,22 @@ const SpotLightOptions = lights.SpotLightOptions;
 const light_selection = @import("light_selection.zig");
 const passes = @import("../passes/mod.zig");
 
-/// Owns every light of the scene: the legacy hemispheric sun, the optional
-/// directional sun, and the point/spot collections. Also packs the
-/// shader-visible subset per frame (top-k selection + uniform arrays), so
-/// light data has exactly one home and Scene never touches light pointers.
+/// Owns every light of the scene: the legacy hemispheric sun, the primary
+/// directional sun plus up to 3 shadowless directional fills (4 suns total,
+/// see lights.max_directional_lights), and the point/spot collections. Also
+/// packs the shader-visible subset per frame (top-k selection + uniform
+/// arrays), so light data has exactly one home and Scene never touches
+/// light pointers.
 pub const LightRig = struct {
     // Legacy hemispheric sun: always present, also drives the ambient term.
     hemi: HemisphericLight = .{},
-    // Optional scene sun. Null keeps the legacy hemispheric sun exactly.
+    // Primary scene sun (uniform slot 0, the only shadow caster). Null keeps
+    // the legacy hemispheric sun exactly.
     directional: ?*DirectionalLight = null,
+    // Shadowless directional fills (uniform slots 1..3, creation order).
+    // Capped at lights.max_fill_directionals; extras are session-local
+    // (save/load persists only the primary sun).
+    extra_directionals: std.ArrayListUnmanaged(*DirectionalLight) = .empty,
     point_lights: std.ArrayListUnmanaged(*PointLight) = .empty,
     spot_lights: std.ArrayListUnmanaged(*SpotLight) = .empty,
 
@@ -63,8 +70,9 @@ pub const LightRig = struct {
         return sl;
     }
 
-    /// Creates (or replaces) the single scene sun. Replacing destroys the
-    /// previous light so at most one directional light is owned at a time.
+    /// Creates (or replaces) the primary scene sun (uniform slot 0, the
+    /// only shadow caster). Replacing destroys the previous primary; fills
+    /// added via addDirectionalLight are untouched.
     pub fn createDirectionalLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         if (self.directional) |old| {
             if (old.owns_name) allocator.free(old.name);
@@ -75,6 +83,36 @@ pub const LightRig = struct {
         dl.* = DirectionalLight.init(name, options);
         self.directional = dl;
         return dl;
+    }
+
+    /// Appends a shadowless directional fill (uniform slots 1..3, creation
+    /// order). Returns error.TooManyDirectionalLights once the rig holds 4
+    /// suns total (1 primary + 3 fills) — hard error, never silent clamp or
+    /// replacement, so callers notice the cap. Fills are session-local:
+    /// save/load persists only the primary sun.
+    pub fn addDirectionalLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
+        if (self.extra_directionals.items.len >= lights.max_fill_directionals) return error.TooManyDirectionalLights;
+        const dl = try allocator.create(DirectionalLight);
+        dl.* = DirectionalLight.init(name, options);
+        try self.extra_directionals.append(allocator, dl);
+        return dl;
+    }
+
+    /// Total directional lights owned (primary + fills), at most
+    /// lights.max_directional_lights.
+    pub fn directionalCount(self: *const LightRig) usize {
+        var n: usize = self.extra_directionals.items.len;
+        if (self.directional != null) n += 1;
+        return n;
+    }
+
+    /// Uniform-slot view: index 0 is the primary sun (null when absent),
+    /// indices 1..3 are the fills in creation order. Null past the end.
+    pub fn directionalAt(self: *const LightRig, index: usize) ?*DirectionalLight {
+        if (index == 0) return self.directional;
+        const fill = index - 1;
+        if (fill < self.extra_directionals.items.len) return self.extra_directionals.items[fill];
+        return null;
     }
 
     // Sun resolution helpers (directional override, hemispheric fallback).
@@ -109,6 +147,12 @@ pub const LightRig = struct {
         }
         self.spot_lights.deinit(allocator);
 
+        for (self.extra_directionals.items) |dl| {
+            if (dl.owns_name) allocator.free(dl.name);
+            allocator.destroy(dl);
+        }
+        self.extra_directionals.deinit(allocator);
+
         if (self.directional) |dl| {
             if (dl.owns_name) allocator.free(dl.name);
             allocator.destroy(dl);
@@ -131,6 +175,14 @@ pub const LightRig = struct {
     /// legacy inline render() code.
     pub const FramePack = struct {
         counts: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
+        // Up to 4 directional suns (see lights.max_directional_lights):
+        // slot 0 mirrors the primary sun (the only shadow caster; zeroed
+        // when absent or disabled), slots 1..3 hold the fills in creation
+        // order (disabled/unused slots zeroed, so the shader skip on
+        // intensity <= 0 costs nothing). Directions are normalized here so
+        // the fragment shaders can use them raw.
+        directional_dir: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+        directional_color_int: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
         point_pos_range: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
         point_color_int: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
         spot_pos_range: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
@@ -152,6 +204,30 @@ pub const LightRig = struct {
         point_shadows: [12]passes.PointShadowRenderInfo = [_]passes.PointShadowRenderInfo{.{}} ** 12,
         num_point_shadows: usize = 0,
     };
+
+    /// Packs the directional suns for the frame uniforms: slot 0 mirrors
+    /// the primary sun (zeroed when absent or disabled), slots 1..3 hold
+    /// the fills in creation order (disabled fills stay zeroed, as do
+    /// unused slots). No hysteresis or significance selection: fills are
+    /// few and order-stable by construction, and the primary slot must
+    /// never swap (it feeds the CSM shadow term).
+    fn packDirectionals(self: *const LightRig, pack: *FramePack) void {
+        if (self.directional) |dl| {
+            if (dl.is_enabled) {
+                const dir = if (dl.direction.lengthSq() > 1e-12) dl.direction.normalize() else Vec3.zero;
+                pack.directional_dir[0] = .{ dir.x, dir.y, dir.z, 0.0 };
+                pack.directional_color_int[0] = .{ dl.diffuse.r, dl.diffuse.g, dl.diffuse.b, dl.intensity };
+            }
+        }
+        for (self.extra_directionals.items, 0..) |dl, k| {
+            if (k >= lights.max_fill_directionals) break; // defensive: insert path caps
+            if (!dl.is_enabled) continue; // stays zeroed
+            const slot = k + 1;
+            const dir = if (dl.direction.lengthSq() > 1e-12) dl.direction.normalize() else Vec3.zero;
+            pack.directional_dir[slot] = .{ dir.x, dir.y, dir.z, 0.0 };
+            pack.directional_color_int[slot] = .{ dl.diffuse.r, dl.diffuse.g, dl.diffuse.b, dl.intensity };
+        }
+    }
 
     /// Picks up to point_shadow_slots shadow casters among the packed point
     /// lights (pack order; ties resolve to the earlier pack index) by raw
@@ -208,6 +284,8 @@ pub const LightRig = struct {
     pub fn packFrame(self: *LightRig, eye: Vec3, shadows_enabled: bool, dt: f32) FramePack {
         var pack = FramePack{
             .counts = .{ 0.0, 0.0, 0.0, 0.0 },
+            .directional_dir = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+            .directional_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
             .point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
             .point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
             .spot_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
@@ -223,6 +301,9 @@ pub const LightRig = struct {
             .point_shadows = undefined,
             .num_point_shadows = 0,
         };
+        // Directional suns ride both pack paths verbatim (no hysteresis):
+        // slot 0 is the primary, slots 1..3 the fills.
+        self.packDirectionals(&pack);
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With
@@ -331,7 +412,7 @@ pub const LightRig = struct {
     }
 };
 
-test "createDirectionalLight replaces and owns at most one sun" {
+test "createDirectionalLight replaces the primary sun" {
     const allocator = std.testing.allocator;
     var rig = LightRig.init("hemi", .{});
     defer rig.deinit(allocator);
@@ -350,6 +431,144 @@ test "createDirectionalLight replaces and owns at most one sun" {
     try std.testing.expectEqual(want_dir.x, sun_dir.x);
     try std.testing.expectEqual(want_dir.y, sun_dir.y);
     try std.testing.expectEqual(want_dir.z, sun_dir.z);
+}
+
+test "single directional packs slot 0 with the rest zeroed (legacy-neutral)" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    // No suns at all: all slots zeroed, sun falls back to hemispheric.
+    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    for (0..4) |i| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_dir[i]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_color_int[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rig.directionalCount());
+    try std.testing.expect(rig.directionalAt(0) == null);
+
+    // Exactly one light (the default): slot 0 mirrors the primary with a
+    // normalized direction, slots 1..3 stay zeroed — the shader fill loop
+    // (1..3, skip on intensity <= 0) then adds nothing bit-identically.
+    const sun = try rig.createDirectionalLight(allocator, "sun", .{
+        .direction = Vec3.new(0.0, -2.0, 0.0),
+        .diffuse = Color3.new(1.0, 0.5, 0.25),
+        .intensity = 2.0,
+    });
+    _ = sun;
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual([4]f32{ 0.0, -1.0, 0.0, 0.0 }, pack.directional_dir[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 2.0 }, pack.directional_color_int[0]);
+    for (1..4) |i| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_dir[i]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_color_int[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rig.directionalCount());
+}
+
+test "fills pack in creation order, disabled entries zeroed" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    _ = try rig.createDirectionalLight(allocator, "sun", .{
+        .direction = Vec3.new(0.0, -1.0, 0.0),
+        .intensity = 1.0,
+    });
+    const fill_a = try rig.addDirectionalLight(allocator, "fill-a", .{
+        .direction = Vec3.new(2.0, 0.0, 0.0),
+        .diffuse = Color3.new(0.0, 1.0, 0.0),
+        .intensity = 0.5,
+    });
+    const fill_b = try rig.addDirectionalLight(allocator, "fill-b", .{
+        .direction = Vec3.new(0.0, 0.0, 3.0),
+        .diffuse = Color3.new(0.0, 0.0, 1.0),
+        .intensity = 0.25,
+    });
+    fill_b.is_enabled = false;
+    try std.testing.expectEqual(@as(usize, 3), rig.directionalCount());
+    try std.testing.expect(rig.directionalAt(1) == fill_a);
+    try std.testing.expect(rig.directionalAt(2) == fill_b);
+    try std.testing.expect(rig.directionalAt(3) == null);
+
+    const pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    // Slot 0 is the primary, slot 1 the enabled fill (normalized).
+    try std.testing.expectEqual([4]f32{ 0.0, -1.0, 0.0, 0.0 }, pack.directional_dir[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.5 }, pack.directional_color_int[1]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, pack.directional_dir[1]);
+    // Disabled fill zeroed, unused slot zeroed.
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_dir[2]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_color_int[2]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_dir[3]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_color_int[3]);
+}
+
+test "addDirectionalLight caps at three fills with a hard error" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    _ = try rig.createDirectionalLight(allocator, "sun", .{});
+    _ = try rig.addDirectionalLight(allocator, "f1", .{});
+    _ = try rig.addDirectionalLight(allocator, "f2", .{});
+    _ = try rig.addDirectionalLight(allocator, "f3", .{});
+    try std.testing.expectEqual(@as(usize, 4), rig.directionalCount());
+    // Beyond 4 total: hard error, never silent clamp or replacement.
+    try std.testing.expectError(error.TooManyDirectionalLights, rig.addDirectionalLight(allocator, "f4", .{}));
+    try std.testing.expectEqual(@as(usize, 4), rig.directionalCount());
+}
+
+test "primary replacement keeps fills and sun resolution ignores fills" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    _ = try rig.createDirectionalLight(allocator, "sun1", .{
+        .direction = Vec3.new(0.0, -1.0, 0.0),
+        .diffuse = Color3.new(1.0, 0.0, 0.0),
+        .intensity = 1.0,
+    });
+    const fill = try rig.addDirectionalLight(allocator, "fill", .{
+        .direction = Vec3.new(1.0, 0.0, 0.0),
+        .diffuse = Color3.new(0.0, 1.0, 0.0),
+        .intensity = 5.0,
+    });
+    const sun2 = try rig.createDirectionalLight(allocator, "sun2", .{
+        .direction = Vec3.new(0.0, 0.0, -1.0),
+        .diffuse = Color3.new(0.0, 0.0, 1.0),
+        .intensity = 2.0,
+    });
+    // Replacement swaps only slot 0; the fill pointer survives.
+    try std.testing.expect(rig.directional == sun2);
+    try std.testing.expect(rig.directionalAt(1) == fill);
+    try std.testing.expectEqual(@as(usize, 2), rig.directionalCount());
+    // Significance/ordering for the primary is unchanged: fills never win
+    // the sun, no matter how intense.
+    const dir = rig.sunDirection();
+    try std.testing.expectApproxEqAbs(dir.z, -1.0, 1e-6);
+    const col = rig.sunColor();
+    try std.testing.expectApproxEqAbs(col.b, 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(rig.sunIntensity(), 2.0, 1e-6);
+}
+
+test "disabled primary zeroes slot 0 and falls back to hemispheric sun" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{ .direction = Vec3.new(0.0, 1.0, 0.0) });
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    const sun = try rig.createDirectionalLight(allocator, "sun", .{
+        .direction = Vec3.new(0.0, -1.0, 0.0),
+        .intensity = 3.0,
+    });
+    sun.is_enabled = false;
+    const pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_dir[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.directional_color_int[0]);
+    const dir = rig.sunDirection();
+    try std.testing.expectApproxEqAbs(dir.y, 1.0, 1e-6);
 }
 
 test "packFrame packs selected point and spot lights into uniform arrays" {

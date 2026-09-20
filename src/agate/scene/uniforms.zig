@@ -12,6 +12,12 @@ pub const FrameContext = struct {
     sun_dir: Vec3,
     sun_color: Color3,
     sun_intensity: f32,
+    // Up to 4 directional suns (slot 0 = primary shadow caster, slots 1..3
+    // shadowless fills; unused/disabled slots zeroed). Mirrors
+    // LightRig.FramePack; kept as explicit arrays (not folded into the sun
+    // lanes) so the legacy sun fields stay bit-identical single-light inputs.
+    directional_dir: [4][4]f32,
+    directional_color_int: [4][4]f32,
     cascades: [4]Mat4,
     light_counts: [4]f32,
     point_pos_range: [4][4]f32,
@@ -52,6 +58,12 @@ pub const FrameUniforms = struct {
     spot_shadow_params: [2][4]f32,
     point_view_proj: [12]Mat4,
     point_shadow_params: [4][4]f32,
+    // APPENDED LAST (multi-directional): 4 suns, slot 0 mirrors the primary
+    // (light_dir/light_color above, the only shadow caster), slots 1..3 are
+    // shadowless fills. A single sun leaves slots 1..3 zeroed and the
+    // shader fill loop adds nothing.
+    directional_dir: [4][4]f32,
+    directional_color_int: [4][4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -120,6 +132,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .spot_shadow_params = ctx.spot_shadow_params,
         .point_view_proj = ctx.point_view_proj,
         .point_shadow_params = ctx.point_shadow_params,
+        .directional_dir = ctx.directional_dir,
+        .directional_color_int = ctx.directional_color_int,
     };
 }
 
@@ -132,6 +146,50 @@ pub fn alphaCutoffFor(mat: ?Material) f32 {
     const m = mat orelse return 0.0;
     if (!m.isCutout()) return 0.0;
     return m.alphaCutoff();
+}
+
+test "buildFrameUniforms passes directional lanes through, legacy lanes intact" {
+    const std = @import("std");
+    const shadow = ShadowState{
+        .ground_color = Color3.new(0.2, 0.25, 0.3),
+        .enable_shadows = true,
+        .mesh_receive_shadows = true,
+        .bias = 0.0012,
+        .intensity = 0.75,
+        .normal_bias = 0.02,
+        .softness = 1.5,
+        .debug_cascades = false,
+        .splits = .{ 10.0, 26.0, 65.0, 150.0 },
+    };
+    // Single-light default: slot 0 mirrors the sun, slots 1..3 zeroed.
+    const ctx = FrameContext{
+        .view_proj = Mat4.identity,
+        .eye = Vec3.new(1.0, 2.0, 3.0),
+        .sun_dir = Vec3.new(0.5, 1.0, 0.3),
+        .sun_color = Color3.new(1.0, 0.9, 0.8),
+        .sun_intensity = 2.0,
+        .directional_dir = .{ .{ 0.5, 1.0, 0.3, 0.0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .directional_color_int = .{ .{ 1.0, 0.9, 0.8, 2.0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .cascades = [_]Mat4{Mat4.identity} ** 4,
+        .light_counts = .{ 0.0, 0.0, 0.0, 0.0 },
+        .point_pos_range = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+        .point_color_int = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+        .spot_pos_range = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .spot_dir_inner = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .spot_color_outer = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .spot_intensity = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .spot_view_proj = [_]Mat4{Mat4.identity} ** 2,
+        .spot_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
+        .point_shadow_params = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+    };
+    const f = buildFrameUniforms(shadow, &ctx);
+    // Legacy lanes keep their exact legacy values...
+    try std.testing.expectEqual([4]f32{ 0.5, 1.0, 0.3, 2048.0 }, f.light_dir);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.9, 0.8, 2.0 }, f.light_color);
+    // ...and the directional lanes ride through verbatim.
+    try std.testing.expectEqual(ctx.directional_dir, f.directional_dir);
+    try std.testing.expectEqual(ctx.directional_color_int, f.directional_color_int);
 }
 
 test "alphaCutoffFor gates the cutoff on cutout mode" {
