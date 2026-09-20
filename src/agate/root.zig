@@ -57,6 +57,12 @@ pub const SpotLightOptions = lights.SpotLightOptions;
 pub const resolveSunDirection = lights.resolveSunDirection;
 pub const resolveSunColor = lights.resolveSunColor;
 pub const resolveSunIntensity = lights.resolveSunIntensity;
+pub const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
+pub const ClusteredPointLight = lights.ClusteredPointLight;
+pub const max_clustered_lights = lights.max_clustered_lights;
+pub const AreaLightOptions = lights.AreaLightOptions;
+pub const AreaLight = lights.AreaLight;
+pub const max_area_lights = lights.max_area_lights;
 
 pub const material = @import("material.zig");
 pub const StandardMaterial = material.StandardMaterial;
@@ -91,6 +97,22 @@ pub const exr = @import("exr.zig");
 /// the UI-facing TtfFont handle. UI text switches via
 /// UICanvas.setFontTtf; see ttf.zig for the supported/rejected matrix.
 pub const ttf = @import("ttf.zig");
+/// UI-facing TrueType font handle (same declaration as ui.TtfFont;
+/// install on a canvas with UICanvas.setFontTtf).
+pub const TtfFont = ttf.TtfFont;
+pub const TtfError = ttf.TtfError;
+pub const GlyphInfo = ttf.GlyphInfo;
+/// KTX2 decode companions: Texture.decodeImageMemory routes KTX2 payloads
+/// here automatically; these names cover standalone use.
+pub const Ktx2DecodeError = ktx2.DecodeError;
+pub const Ktx2DecodeOptions = ktx2.DecodeOptions;
+pub const RawBlockTexture = ktx2.RawBlockTexture;
+/// DDS decode companions (Texture.fromDdsMemory wraps decodeBlock2D).
+pub const DdsDecodeError = dds.DecodeError;
+pub const DdsDecodeOptions = dds.DecodeOptions;
+/// OpenEXR decode companions (Texture.decodeHDRMemory wraps decode).
+pub const ExrDecodeError = exr.DecodeError;
+pub const ExrDecoded = exr.Decoded;
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;
@@ -173,6 +195,14 @@ pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
 pub const SceneStats = scene.SceneStats;
 pub const RenderMeshItem = scene.RenderMeshItem;
+pub const ReflectionProbe = scene.ReflectionProbe;
+pub const ReflectionProbeOptions = scene.ReflectionProbeOptions;
+pub const Ui3dPanel = scene.Ui3dPanel;
+pub const Ui3dPanelOptions = scene.Ui3dPanelOptions;
+pub const Ui3dFaceMode = scene.Ui3dFaceMode;
+pub const Ui3dPickHit = scene.Ui3dPickHit;
+pub const SceneFrameSnapshot = scene.SceneFrameSnapshot;
+pub const CameraSnapshot = scene.CameraSnapshot;
 
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
@@ -180,6 +210,7 @@ pub const SceneLoader = loader.SceneLoader;
 pub const postprocess = @import("postprocess.zig");
 pub const PostProcessOptions = postprocess.PostProcessOptions;
 pub const TonemappingType = postprocess.TonemappingType;
+pub const LutFormat = postprocess.LutFormat;
 
 pub const ssao = @import("ssao.zig");
 pub const SSAOOptions = ssao.SSAOOptions;
@@ -194,6 +225,14 @@ pub const ParticleBlendMode = particles.ParticleBlendMode;
 pub const Particle = particles.Particle;
 pub const ParticleInstanceData = particles.ParticleInstanceData;
 pub const SimulationMode = particles.SimulationMode;
+pub const UpdateError = particles.UpdateError;
+pub const ComputeModeError = particles.ComputeModeError;
+pub const ComputeParticleState = particles.ComputeParticleState;
+pub const SubEmitter = particles.SubEmitter;
+pub const SubEmitterTrigger = particles.SubEmitterTrigger;
+pub const FlowSpace = particles.FlowSpace;
+pub const FlowWrap = particles.FlowWrap;
+pub const GpuParticleSlot = particles.GpuParticleSlot;
 
 /// Compute-pass support (see compute.zig for the backend matrix).
 pub const compute = @import("compute.zig");
@@ -250,6 +289,9 @@ pub const UITheme = ui.UITheme;
 pub const UIGradient = ui.UIGradient;
 pub const UIShadow = ui.UIShadow;
 pub const LayoutStack = ui.LayoutStack;
+pub const layoutAlignOffset = ui.layoutAlignOffset;
+pub const gridExtentSize = ui.gridExtentSize;
+pub const gridExtentOffset = ui.gridExtentOffset;
 pub const LayoutGridSpec = ui.LayoutGridSpec;
 pub const LayoutFlowOptions = ui.LayoutFlowOptions;
 pub const LayoutGridOptions = ui.LayoutGridOptions;
@@ -468,4 +510,45 @@ pub const sokol = @import("sokol");
 
 test {
     _ = @import("tests.zig");
+}
+
+// Every root re-export added for recent Scene APIs: reference each symbol
+// so future removals/renames break loudly here instead of downstream.
+test "root re-exports cover recent Scene APIs" {
+    _ = ClusteredPointLightOptions;
+    _ = ClusteredPointLight;
+    _ = max_clustered_lights;
+    _ = AreaLightOptions;
+    _ = AreaLight;
+    _ = max_area_lights;
+    _ = ReflectionProbe;
+    _ = ReflectionProbeOptions;
+    _ = Ui3dPanel;
+    _ = Ui3dPanelOptions;
+    _ = Ui3dFaceMode;
+    _ = Ui3dPickHit;
+    _ = SceneFrameSnapshot;
+    _ = CameraSnapshot;
+    _ = UpdateError;
+    _ = ComputeModeError;
+    _ = ComputeParticleState;
+    _ = SubEmitter;
+    _ = SubEmitterTrigger;
+    _ = FlowSpace;
+    _ = FlowWrap;
+    _ = GpuParticleSlot;
+    _ = TtfFont;
+    _ = TtfError;
+    _ = GlyphInfo;
+    _ = Ktx2DecodeError;
+    _ = Ktx2DecodeOptions;
+    _ = RawBlockTexture;
+    _ = DdsDecodeError;
+    _ = DdsDecodeOptions;
+    _ = ExrDecodeError;
+    _ = ExrDecoded;
+    _ = LutFormat;
+    _ = layoutAlignOffset;
+    _ = gridExtentSize;
+    _ = gridExtentOffset;
 }
