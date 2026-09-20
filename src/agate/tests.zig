@@ -124,6 +124,10 @@ test {
     _ = @import("scene/project_cache.zig");
     _ = @import("scene/projection.zig");
     _ = @import("scene/render_queue.zig");
+    _ = @import("scene/render_queue/build.zig");
+    _ = @import("scene/render_queue/cull.zig");
+    _ = @import("scene/render_queue/instances.zig");
+    _ = @import("scene/render_queue/items.zig");
     _ = @import("scene/shadow_pcss.zig");
     _ = @import("scene/shadow_system.zig");
     _ = @import("scene/sky_layer.zig");
