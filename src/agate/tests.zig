@@ -176,6 +176,7 @@ test {
     _ = @import("serialization_fuzz.zig");
     _ = @import("shader_material.zig");
     _ = @import("shader_material/merge.zig");
+    _ = @import("softbody.zig");
     _ = @import("ssao.zig");
     _ = @import("testing.zig");
     _ = @import("texture.zig");

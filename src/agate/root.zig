@@ -447,6 +447,15 @@ pub const HiZBuffer = visibility.HiZBuffer;
 pub const SoftwareRasterizer = visibility.SoftwareRasterizer;
 pub const OcclusionCuller = visibility.OcclusionCuller;
 
+/// PBD cloth soft bodies (wave 29, v1): solver + mesh coupling + scene layer.
+pub const softbody = @import("softbody.zig");
+pub const SoftBody = softbody.SoftBody;
+pub const SoftBodyLayer = softbody.SoftBodyLayer;
+pub const SoftBodyError = softbody.SoftBodyError;
+pub const Cloth = softbody.Cloth;
+pub const ClothOptions = softbody.ClothOptions;
+pub const SphereCollider = softbody.SphereCollider;
+
 pub const profiler = @import("profiler.zig");
 pub const Profiler = profiler.Profiler;
 pub const FrameRecord = profiler.FrameRecord;

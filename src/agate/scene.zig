@@ -105,6 +105,12 @@ const scene_decals = @import("scene/decal_layer.zig");
 const scene_trails = @import("scene/trail_layer.zig");
 const scene_nav = @import("scene/nav_layer.zig");
 const scene_physics = @import("scene/physics_layer.zig");
+const softbody_mod = @import("softbody.zig");
+pub const SoftBody = softbody_mod.SoftBody;
+pub const SoftBodyLayer = softbody_mod.SoftBodyLayer;
+pub const Cloth = softbody_mod.Cloth;
+pub const ClothOptions = softbody_mod.ClothOptions;
+pub const SphereCollider = softbody_mod.SphereCollider;
 const scene_project = @import("scene/project_cache.zig");
 const scene_retire = @import("scene/gpu_retire.zig");
 const scene_ui_frame = @import("scene/ui_frame.zig");
@@ -275,6 +281,10 @@ pub const Scene = struct {
     nav: scene_nav.NavLayer = .{},
     // Physics world + debug wireframe overlay.
     physics: scene_physics.PhysicsIntegration = .{},
+    // PBD cloth bodies + their deformable meshes (wave 29, v1). Empty by
+    // default: every hook early-outs over an empty list, so update and
+    // rendering stay bit-identical with no soft bodies.
+    softbodies: SoftBodyLayer = .{},
     // Per-frame draw queues + instance staging.
     // P7 triple buffer: three retained owning slots encompassing PRIMARY +
     // ALL PIP view queues, outline items+skins, and prepared shadow
@@ -757,6 +767,74 @@ pub const Scene = struct {
         return self.lights.areaLightCount();
     }
 
+    // ---- Soft bodies / PBD cloth (wave 29, v1). ----
+    //
+    // A bounded, additive, OFF-by-default feature: with zero soft bodies
+    // `updateSoftBodies` and the flush loop iterate an empty list, so update
+    // and rendering stay bit-identical to today.
+    //
+    // `addSoftBodyCloth` creates a PBD cloth solver plus the textured
+    // double-sided standard-material mesh it deforms every scene update
+    // (game side, inside `Scene.update`'s sequential ordering). Per-frame
+    // vertex uploads follow the sanctioned dynamic-upload discipline from
+    // the morph audit (game stages CPU vertices + sets the pending flag,
+    // the context-thread flush issues the single `sg.updateBuffer` +
+    // meter record — the TrailMesh pattern, not the morph fields). Removal
+    // always retires the mesh through the epoch retire queue, so it is safe
+    // from the game thread under update||render overlap.
+    //
+    // Solver state is session-local (like particle systems and trail nodes);
+    // serialization never writes it. See softbody.zig for the solver
+    // parameters, the exact strain-limiting statement and the non-goals.
+    //
+    // Capacity: at most `softbody.max_bodies` (4); past the cap is a hard
+    // `error.TooManySoftBodies`.
+
+    /// Creates a cloth + its deformable mesh; returns the live body (index
+    /// order == creation order). Hard-errors past the cap or on invalid
+    /// options. Headless/off-context safe (GPU buffers defer to the first
+    /// context-thread flush).
+    pub fn addSoftBodyCloth(self: *Scene, name: []const u8, options: ClothOptions) softbody_mod.SoftBodyError!*SoftBody {
+        return self.softbodies.create(self, name, options);
+    }
+
+    /// Removes body `index`: unlinks + frees the solver side and retires its
+    /// mesh through the epoch queue (context thread completes the teardown
+    /// at the next flush). Order-preserving: higher indices shift down.
+    /// Out-of-range indices are a hard `error.UnknownSoftBody`.
+    pub fn removeSoftBodyCloth(self: *Scene, index: usize) softbody_mod.SoftBodyError!void {
+        const mesh = try self.softbodies.extractAt(self.allocator, index);
+        _ = self.removeMesh(mesh);
+        self.gpu_retire.retireMesh(self.allocator, mesh);
+    }
+
+    /// Live body state (solver fields, pins, wind, colliders are freely
+    /// mutable game-side under update-vs-prepare exclusion). Null when out
+    /// of range.
+    pub fn getSoftBody(self: *Scene, index: usize) ?*SoftBody {
+        return self.softbodies.get(index);
+    }
+
+    /// Live body state by mesh name. Null when no body matches.
+    pub fn getSoftBodyByName(self: *Scene, name: []const u8) ?*SoftBody {
+        for (self.softbodies.bodies.items) |b| {
+            if (std.mem.eql(u8, b.mesh.name, name)) return b;
+        }
+        return null;
+    }
+
+    /// Number of owned cloth bodies (at most softbody.max_bodies).
+    pub fn softBodyCount(self: *const Scene) usize {
+        return self.softbodies.count();
+    }
+
+    /// Advances every enabled cloth and stages its vertex upload (game side,
+    /// no sg.*). Called from `Scene.update`; apps that need their own time
+    /// base may also drive it explicitly like `updateTrails`.
+    pub fn updateSoftBodies(self: *Scene, dt: f32) void {
+        self.softbodies.update(dt);
+    }
+
     // ---- Content registries: materials & meshes. ----
 
     pub fn createStandardMaterial(self: *Scene, name: []const u8) !*StandardMaterial {
@@ -837,6 +915,9 @@ pub const Scene = struct {
         // before its storage is freed. Runs before the sync/deferred branch
         // below so both paths are covered. Never cascade-destroys: orphaned
         // meshes stay alive under their own transform.
+        // Soft bodies: drop the cloth body bound to this mesh, if any (frees
+        // the solver side only; the mesh itself proceeds below as usual).
+        self.softbodies.removeForMesh(self.allocator, mesh);
         // Physics: drop the rigid body bound to this mesh, if any.
         if (self.physics.getWorld()) |pw| {
             if (pw.findBody(mesh)) |body| pw.removeBody(body);
@@ -2996,7 +3077,8 @@ pub const Scene = struct {
 
     /// Stage 3, slice 2: the game-side update entry point. Everything the
     /// simulation advances per frame, in one call, in the canonical order
-    /// (camera -> lights -> physics -> animations -> particles -> decals);
+    /// (camera -> lights -> physics -> animations -> soft bodies ->
+    /// particles -> decals);
     /// render() then consumes the published frame values (light_pack,
     /// staged slot snapshot, prepared draws/UI/debug/sky/particles) without
     /// simulating anything itself.
@@ -3028,6 +3110,7 @@ pub const Scene = struct {
         self.updateLights(dt);
         self.updatePhysics(dt);
         self.updateAnimations(dt);
+        self.updateSoftBodies(dt);
         try self.updateParticles(dt);
         self.updateDecals(dt);
 
@@ -3038,9 +3121,9 @@ pub const Scene = struct {
     }
 
     /// Stage 3: uploads the GPU buffers that the update phase staged
-    /// (particle instances, trail geometry). Called at render start so
-    /// every sg.* touch stays on the context thread; the update phase is
-    /// free of sg.* calls.
+    /// (particle instances, soft-body cloth vertices, trail geometry).
+    /// Called at render start so every sg.* touch stays on the context
+    /// thread; the update phase is free of sg.* calls.
     pub fn flushPendingGpuUploads(self: *Scene) void {
         gpu_thread.assertOnContextThread();
         // Deferred off-context destroys first: unlinking already happened in
@@ -3053,6 +3136,7 @@ pub const Scene = struct {
         // pending check adds no traversal, just one branch per mesh.
         for (self.meshes.items) |m| m.finishGpuUpload(self.allocator);
         for (self.particles.systems.items) |ps| ps.flushGpuUploads();
+        for (self.softbodies.bodies.items) |b| b.flushGpuUploads();
         for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
         for (self.greased_lines.items) |gl| gl.flushGpuUploads();
         for (self.meshes.items) |m| m.flushGpuUploads();
@@ -3496,6 +3580,11 @@ pub const Scene = struct {
         // teardown does not remove them individually (per-mesh destroyMesh
         // does). Destroying the world first closes that dangling window.
         self.physics.deinit(self.allocator);
+
+        // Soft bodies before meshes: the layer frees solver + staging CPU
+        // memory only; meshes/materials below (or already retired) own the
+        // GPU side. Bodies must not outlive this call with mesh pointers.
+        self.softbodies.deinit(self.allocator);
 
         scene_content.deinitMeshes(self.allocator, &self.meshes);
         scene_content.deinitMaterials(self.allocator, &self.materials);
