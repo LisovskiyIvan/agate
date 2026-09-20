@@ -26,6 +26,7 @@ const morph_gpu = @import("../mesh/morph_gpu.zig");
 const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("uniforms.zig");
 const probe_layer = @import("probe_layer.zig");
+const clustered_layer = @import("clustered_lights.zig");
 const forward_pipelines = @import("forward_pipelines.zig");
 const ForwardPipelines = forward_pipelines.ForwardPipelines;
 const shader_material = @import("../shader_material.zig");
@@ -63,6 +64,13 @@ pub const Environment = struct {
     // instanced batches skip probes in v1 (no single object position) and
     // always take the legacy path.
     probes: []const probe_layer.ProbeFrameEntry = &.{},
+    // Clustered forward lights (wave 30): render-owned tile cache borrow
+    // (Scene.clustered, rebuilt per view from the staged snapshot). Null
+    // binds zero views (legacy path; only defensive — both render paths
+    // thread the cache). The bound triple is the real storage views when
+    // a GPU upload landed, else the shared dummy; the count/live uniform
+    // in FrameContext gates the shader loop either way.
+    clustered: ?*const clustered_layer.ClusteredGpuCache = null,
     // Shadow map views/samplers from the CSM/spot atlas.
     shadow_pass: *const passes.ShadowPass,
     // Scene-level fragment uniform inputs; mesh.receive_shadows is patched
@@ -148,6 +156,10 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
         bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
 
+        // Clustered tile storage (wave 30): real views when live, dummy
+        // otherwise (always valid binds; the uniform gates the loop).
+        bindClusteredViews(&bind, pbr_shd, env);
+
         sg.applyBindings(bind);
 
         const vs_params = pbr_shd.VsParams{
@@ -213,6 +225,8 @@ pub fn drawRegularItem(
             .area_right = f.area_right,
             .area_up = f.area_up,
             .area_color = f.area_color,
+            .clustered_params = f.clustered_params,
+            .clustered_viewport = f.clustered_viewport,
         };
         if (skel_bones != null) {
             sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -237,6 +251,9 @@ pub fn drawRegularItem(
         const prb_std = probeForDraw(env, item.model);
         bind.views[shd.VIEW_probe_tex] = prb_std.view;
         bind.samplers[shd.SMP_probe_smp] = prb_std.sampler;
+
+        // Clustered tile storage (wave 30): see the PBR branch above.
+        bindClusteredViews(&bind, shd, env);
 
         sg.applyBindings(bind);
 
@@ -279,6 +296,8 @@ pub fn drawRegularItem(
             .area_right = f.area_right,
             .area_up = f.area_up,
             .area_color = f.area_color,
+            .clustered_params = f.clustered_params,
+            .clustered_viewport = f.clustered_viewport,
         };
         sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
     }
@@ -365,6 +384,8 @@ fn drawShaderMaterialItem(
             const prb_hook = probeForDraw(env, item.model);
             bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
             bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
+            // Clustered tile storage (wave 30): see the regular PBR branch.
+            bindClusteredViews(&bind, pbr_shd, env);
             sg.applyBindings(bind);
 
             const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
@@ -413,6 +434,8 @@ fn drawShaderMaterialItem(
                 .area_right = f.area_right,
                 .area_up = f.area_up,
                 .area_color = f.area_color,
+                .clustered_params = f.clustered_params,
+                .clustered_viewport = f.clustered_viewport,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         } else {
@@ -430,6 +453,8 @@ fn drawShaderMaterialItem(
             const prb_hook_std = probeForDraw(env, item.model);
             bind.views[shd.VIEW_probe_tex] = prb_hook_std.view;
             bind.samplers[shd.SMP_probe_smp] = prb_hook_std.sampler;
+            // Clustered tile storage (wave 30): see the regular PBR branch.
+            bindClusteredViews(&bind, shd, env);
             sg.applyBindings(bind);
 
             const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
@@ -468,6 +493,8 @@ fn drawShaderMaterialItem(
                 .area_right = f.area_right,
                 .area_up = f.area_up,
                 .area_color = f.area_color,
+                .clustered_params = f.clustered_params,
+                .clustered_viewport = f.clustered_viewport,
             };
             sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
         }
@@ -528,6 +555,19 @@ fn probeForDraw(env: *const Environment, model: Mat4) struct {
         .view = env.default_cube.view,
         .sampler = env.default_cube.sampler,
     };
+}
+
+// Binds the clustered tile storage views for one draw: the real views when
+// the cache's GPU side mirrors the staged tiles, else the shared dummy
+// (declared SSBO slots stay valid; the count/live uniform gates the shader
+// loop). The module's VIEW_* consts come from its own generated shader
+// module (identical 12/13/14 slots in all five forward shaders). Pure (no
+// GPU calls).
+fn bindClusteredViews(bind: *sg.Bindings, comptime module: anytype, env: *const Environment) void {
+    const v: clustered_layer.ClusterBindingViews = if (env.clustered) |c| c.bindingViews() else .{};
+    bind.views[module.VIEW_ssbo_cluster_lights] = v.lights;
+    bind.views[module.VIEW_ssbo_cluster_tiles] = v.tiles;
+    bind.views[module.VIEW_ssbo_cluster_indices] = v.indices;
 }
 
 fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) *const uniforms.FrameUniforms {
@@ -688,6 +728,9 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
         bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
 
+        // Clustered tile storage (wave 30): see the regular PBR branch.
+        bindClusteredViews(&bind, inst_pbr_shd, env);
+
         sg.applyBindings(bind);
 
         const inst_vs = inst_pbr_shd.VsParams{
@@ -727,6 +770,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .area_right = f.area_right,
             .area_up = f.area_up,
             .area_color = f.area_color,
+            .clustered_params = f.clustered_params,
+            .clustered_viewport = f.clustered_viewport,
             .alpha_cutoff = rec.alpha_cutoff,
             .normal_scale = rec.normal_scale,
             .uv_matrix = rec.uv_matrices,
@@ -752,6 +797,9 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         // Reflection probes skip instanced batches in v1: legacy path.
         bind.views[inst_shd.VIEW_probe_tex] = env.default_cube.view;
         bind.samplers[inst_shd.SMP_probe_smp] = env.default_cube.sampler;
+
+        // Clustered tile storage (wave 30): see the regular PBR branch.
+        bindClusteredViews(&bind, inst_shd, env);
 
         sg.applyBindings(bind);
 
@@ -792,6 +840,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .area_right = f.area_right,
             .area_up = f.area_up,
             .area_color = f.area_color,
+            .clustered_params = f.clustered_params,
+            .clustered_viewport = f.clustered_viewport,
         };
         sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
     }
@@ -827,6 +877,8 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
             if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
             if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
+            if (!@hasField(P, "clustered_params")) @compileError("FsParams missing clustered_params");
+            if (!@hasField(P, "clustered_viewport")) @compileError("FsParams missing clustered_viewport");
         }
     }
     // Standard family: one diffuse slot.
@@ -841,7 +893,21 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
             if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
             if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
+            if (!@hasField(P, "clustered_params")) @compileError("FsParams missing clustered_params");
+            if (!@hasField(P, "clustered_viewport")) @compileError("FsParams missing clustered_viewport");
         }
+    }
+    // All five forward modules expose the clustered storage-view slots
+    // (identical 12/13/14 in every shader; the draw binds through these).
+    comptime {
+        for ([_]type{ shd, pbr_shd, skinned_pbr_shd, inst_shd, inst_pbr_shd }) |M| {
+            if (!@hasDecl(M, "VIEW_ssbo_cluster_lights")) @compileError("shader module missing VIEW_ssbo_cluster_lights");
+            if (!@hasDecl(M, "VIEW_ssbo_cluster_tiles")) @compileError("shader module missing VIEW_ssbo_cluster_tiles");
+            if (!@hasDecl(M, "VIEW_ssbo_cluster_indices")) @compileError("shader module missing VIEW_ssbo_cluster_indices");
+        }
+        if (shd.VIEW_ssbo_cluster_lights != 12) @compileError("clustered light slot moved");
+        if (pbr_shd.VIEW_ssbo_cluster_tiles != 13) @compileError("clustered tile slot moved");
+        if (inst_shd.VIEW_ssbo_cluster_indices != 14) @compileError("clustered index slot moved");
     }
 }
 
@@ -864,6 +930,22 @@ test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_center_int"), @offsetOf(inst_pbr_shd.FsParams, "area_center_int"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(skinned_pbr_shd.FsParams, "area_color"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(inst_pbr_shd.FsParams, "area_color"));
+    // The clustered lanes are the new tail, at the same offsets in all
+    // three (the draw fills one struct value for every slot).
+    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "clustered_params") > @offsetOf(pbr_shd.FsParams, "area_color"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_params"), @offsetOf(skinned_pbr_shd.FsParams, "clustered_params"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_params"), @offsetOf(inst_pbr_shd.FsParams, "clustered_params"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(skinned_pbr_shd.FsParams, "clustered_viewport"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(inst_pbr_shd.FsParams, "clustered_viewport"));
+}
+
+test "standard FsParams clustered tail matches the instanced twin" {
+    // The regular standard struct value uploads to the instanced UB slot
+    // never (unlike the PBR triple), but the appended lanes must still land
+    // last in both so the draw fills them from the same FrameUniforms.
+    try std.testing.expect(@offsetOf(shd.FsParams, "clustered_params") > @offsetOf(shd.FsParams, "area_color"));
+    try std.testing.expectEqual(@offsetOf(shd.FsParams, "clustered_params"), @offsetOf(inst_shd.FsParams, "clustered_params"));
+    try std.testing.expectEqual(@offsetOf(shd.FsParams, "clustered_viewport"), @offsetOf(inst_shd.FsParams, "clustered_viewport"));
 }
 
 test "probeForDraw resolves the winning probe or the legacy fallback" {

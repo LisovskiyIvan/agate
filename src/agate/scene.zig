@@ -88,6 +88,9 @@ const gpu_thread = @import("gpu_thread.zig");
 const upload_meter = @import("gpu_upload_meter.zig");
 pub const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const scene_lights = @import("scene/light_rig.zig");
+const scene_clustered = @import("scene/clustered_lights.zig");
+pub const ClusteredPointLight = lights.ClusteredPointLight;
+pub const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
 const scene_shadow = @import("scene/shadow_system.zig");
 const scene_sky = @import("scene/sky_layer.zig");
 const scene_probes = @import("scene/probe_layer.zig");
@@ -238,6 +241,11 @@ pub const Scene = struct {
     // PBR/standard ambient terms. Empty by default: with no enabled probe
     // every draw takes today's ambient/skybox path bit-identically.
     probes: scene_probes.ProbeLayer = .{},
+    // Clustered forward point lights (wave 30, v1): render-owned tile
+    // scratch + storage buffers for the EXTRA pool beyond the legacy
+    // lanes. Empty by default: with no clustered light staged every draw
+    // takes the exact legacy path (zeroed lanes, count uniform 0).
+    clustered: scene_clustered.ClusteredGpuCache = .{},
     // 3D GUI panels (wave 28, v1): on-demand world-space UI quads. Empty
     // by default: with no panels every capture/draw hook early-outs with
     // zero sg.* calls, so rendering stays bit-identical.
@@ -785,6 +793,68 @@ pub const Scene = struct {
     /// Number of owned area lights (at most lights.max_area_lights).
     pub fn areaLightCount(self: *const Scene) usize {
         return self.lights.areaLightCount();
+    }
+
+    // ---- Clustered forward point lights (wave 30, v1). ----
+    //
+    // A bounded, additive, OFF-by-default pool of EXTRA point lights beyond
+    // the legacy 4-slot top-k lanes: with zero clustered lights every
+    // appended pack lane is zeroed, the tile build writes empty headers,
+    // and all five forward shaders skip the clustered loop, rendering
+    // bit-identically to today.
+    //
+    // Staging (1-frame lag, probe-pack pattern): add/remove/moves mutate
+    // game-side values under update-vs-prepare exclusion; `updateLights`
+    // stages them into the light handoff, `packFrameSnapshot` freezes the
+    // staged copy, and the context thread rebuilds the 2D screen tiles
+    // from that frozen copy during render — so a move is visible on the
+    // NEXT presented frame, never the current one. Removing a light also
+    // retires the live tile storage buffers through the epoch retire queue
+    // (safe under update||render overlap: the context thread destroys at
+    // the next flush); the next context rebuild recreates exact-fit
+    // buffers.
+    //
+    // Explicit non-goals in v1: shadows for clustered lights (unshadowed,
+    // document accordingly), depth-aware tiles (2D full-depth columns with
+    // documented over-inclusion), hysteresis/fades, glTF import, and
+    // persistence (session-local like directional fills and area lights:
+    // save/load never writes the pool, load never clears live lights).
+    //
+    // Capacity: at most `lights.max_clustered_lights` (64); past the cap
+    // is a hard `error.TooManyClusteredLights`.
+
+    /// Appends a clustered forward point light at `position`; returns its
+    /// index (pack order follows creation order). Hard-errors past the cap.
+    /// Also retires any live tile storage buffers (uniform discipline, so
+    /// stale GPU can never serve the next frame).
+    pub fn addClusteredPointLight(self: *Scene, position: Vec3, options: ClusteredPointLightOptions) error{TooManyClusteredLights}!usize {
+        const idx = try self.lights.addClusteredPointLight(position, options);
+        self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+        return idx;
+    }
+
+    /// Removes clustered light `index`, retiring its tile storage buffers
+    /// through the epoch retire queue (safe under update||render overlap).
+    /// Order-preserving: higher indices shift down. Out-of-range indices
+    /// are a no-op (and never retire).
+    pub fn removeClusteredPointLight(self: *Scene, index: usize) void {
+        if (index >= self.lights.clusteredPointLightCount()) return;
+        self.lights.removeClusteredPointLight(index);
+        self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    }
+
+    /// Live clustered-light state (position/color/intensity/radius/enabled
+    /// are freely mutable game-side under update-vs-prepare exclusion;
+    /// edits stage through updateLights and appear next frame). Null when
+    /// out of range.
+    pub fn getClusteredPointLight(self: *Scene, index: usize) ?*ClusteredPointLight {
+        return self.lights.getClusteredPointLight(index);
+    }
+
+    /// Number of owned clustered lights (at most
+    /// lights.max_clustered_lights).
+    pub fn clusteredPointLightCount(self: *const Scene) usize {
+        return self.lights.clusteredPointLightCount();
     }
 
     // ---- Soft bodies / PBD cloth (wave 29, v1). ----
@@ -1671,6 +1741,55 @@ pub const Scene = struct {
         const view_proj = cam_snap.view_proj;
         const eye = cam_snap.eye;
 
+        // Clustered forward lights (wave 30): rebuild the 2D screen tiles
+        // for THIS view from the staged snapshot (context thread; never
+        // live light state) and upload the storage buffers (metered). The
+        // grid lives on window pixels with this view's rect mapping NDC;
+        // every view (PIP included) rebuilds from its own staged camera, so
+        // no view inherits another view's tile lists. Empty pool (or a
+        // failed rebuild/upload) leaves the descriptor zeroed and binds the
+        // dummy, so every draw takes the exact legacy path. Probe captures
+        // (renderProbeFace below) skip this and upload zeroed lanes
+        // (legacy lanes only in v1, documented).
+        const cl_count = snap.light_pack.clustered_count;
+        var cl_params: [4]f32 = .{ 0, 0, 0, 0 };
+        var cl_viewport: [4]f32 = .{ 0, 0, 64, 0 };
+        if (cl_count > 0) {
+            const rect = cam_snap.viewport.toPixelRect(snap.screen_w, snap.screen_h);
+            const view_rect = scene_clustered.ViewRect{ .x = rect.x, .y = rect.y, .w = rect.width, .h = rect.height };
+            var rebuilt_ok = true;
+            self.clustered.rebuildCpu(
+                self.allocator,
+                &snap.light_pack.clustered_pos_range,
+                &snap.light_pack.clustered_color_int,
+                cl_count,
+                view_proj,
+                snap.screen_w,
+                snap.screen_h,
+                view_rect,
+            ) catch {
+                rebuilt_ok = false;
+            };
+            if (rebuilt_ok and self.clustered.upload(self.allocator, &self.gpu_retire)) {
+                cl_params = .{
+                    @floatFromInt(self.clustered.tiles_x),
+                    @floatFromInt(self.clustered.tiles_y),
+                    @floatFromInt(cl_count),
+                    if (self.clustered.gpu_live) 1.0 else 0.0,
+                };
+                cl_viewport = .{
+                    @floatFromInt(snap.screen_w),
+                    @floatFromInt(snap.screen_h),
+                    @floatFromInt(scene_clustered.tile_size_px),
+                    0.0,
+                };
+            } else {
+                self.clustered.ensureDummyViews();
+            }
+        } else {
+            self.clustered.ensureDummyViews();
+        }
+
         var frame_ctx = FrameContext{
             .view_proj = view_proj,
             .eye = eye,
@@ -1695,6 +1814,8 @@ pub const Scene = struct {
             .area_right = snap.light_pack.area_right,
             .area_up = snap.light_pack.area_up,
             .area_color = snap.light_pack.area_color,
+            .clustered_params = cl_params,
+            .clustered_viewport = cl_viewport,
         };
 
         var shadow_state_with = env.shadow_uniforms;
@@ -1900,6 +2021,7 @@ pub const Scene = struct {
             .probes = &.{},
             .shadow_pass = &self.shadows.pass,
             .shadow_uniforms = snap.shadow_uniforms,
+            .clustered = &self.clustered,
         };
 
         var frame_ctx = FrameContext{
@@ -1926,6 +2048,11 @@ pub const Scene = struct {
             .area_right = snap.light_pack.area_right,
             .area_up = snap.light_pack.area_up,
             .area_color = snap.light_pack.area_color,
+            // Probe captures render the legacy lanes only (documented v1
+            // scope): zeroed descriptor gates the clustered loop off, and
+            // the env cache below binds the dummy views.
+            .clustered_params = .{ 0, 0, 0, 0 },
+            .clustered_viewport = .{ 0, 0, 64, 0 },
         };
 
         var shadow_state_with = env.shadow_uniforms;
@@ -3384,6 +3511,7 @@ pub const Scene = struct {
             .probes = snap.probe_pack.entries[0..snap.probe_pack.count],
             .shadow_pass = &self.shadows.pass,
             .shadow_uniforms = snap.shadow_uniforms,
+            .clustered = &self.clustered,
         };
 
         if (snap.enable_multi_camera and snap.camera_count > 0) {
@@ -3650,6 +3778,7 @@ pub const Scene = struct {
         self.shadows.deinit();
         self.sky.deinit();
         self.probes.deinit();
+        self.clustered.deinit(self.allocator);
         self.gui3d.deinit(self.allocator);
 
         self.forward.deinit();

@@ -134,6 +134,7 @@ test {
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");
     _ = @import("scene/cascades.zig");
+    _ = @import("scene/clustered_lights.zig");
     _ = @import("scene/content.zig");
     _ = @import("scene/decal_layer.zig");
     _ = @import("scene/draw.zig");

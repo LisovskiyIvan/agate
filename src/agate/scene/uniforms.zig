@@ -37,6 +37,15 @@ pub const FrameContext = struct {
     area_right: [2][4]f32,
     area_up: [2][4]f32,
     area_color: [2][4]f32,
+    // Clustered forward point lights (wave 30, v1): tile-grid descriptor
+    // mirroring the staged FramePack pool (the light data itself rides
+    // storage buffers, never uniforms). Zeroed with an empty pool, so the
+    // shader tile loop is gated off bit-identically.
+    //   clustered_params:   x tiles_x, y tiles_y, z staged light count,
+    //                       w gpu-live (1 = real storage views bound).
+    //   clustered_viewport: x screen_w px, y screen_h px, z tile_size px, w 0.
+    clustered_params: [4]f32,
+    clustered_viewport: [4]f32,
     uniforms_with_shadows: ?*const FrameUniforms = null,
     uniforms_without_shadows: ?*const FrameUniforms = null,
 };
@@ -87,6 +96,13 @@ pub const FrameUniforms = struct {
     area_right: [2][4]f32,
     area_up: [2][4]f32,
     area_color: [2][4]f32,
+    // APPENDED LAST (clustered forward lights, wave 30): tile-grid
+    // descriptor for the storage-buffer tile walk (light data itself is
+    // never a uniform). Zeroed with an empty pool (and w = 0 until a live
+    // GPU upload lands), so the shader gates the loop off bit-identically.
+    // Appended last so no existing offset shifts.
+    clustered_params: [4]f32,
+    clustered_viewport: [4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -162,6 +178,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .area_right = ctx.area_right,
         .area_up = ctx.area_up,
         .area_color = ctx.area_color,
+        .clustered_params = ctx.clustered_params,
+        .clustered_viewport = ctx.clustered_viewport,
     };
 }
 
@@ -214,6 +232,8 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
         .area_right = .{ .{ 2.0, 0.0, 0.0, 0.0 }, .{ 0, 0, 0, 0 } },
         .area_up = .{ .{ 0.0, 0.5, 0.0, 0.0 }, .{ 0, 0, 0, 0 } },
         .area_color = .{ .{ 1.0, 0.5, 0.25, 0.0 }, .{ 0, 0, 0, 0 } },
+        .clustered_params = .{ 10.0, 6.0, 3.0, 1.0 },
+        .clustered_viewport = .{ 640.0, 384.0, 64.0, 0.0 },
     };
     const f = buildFrameUniforms(shadow, &ctx);
     // Legacy lanes keep their exact legacy values...
@@ -227,6 +247,9 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
     try std.testing.expectEqual(ctx.area_right, f.area_right);
     try std.testing.expectEqual(ctx.area_up, f.area_up);
     try std.testing.expectEqual(ctx.area_color, f.area_color);
+    // ...and the clustered tile descriptor rides through verbatim.
+    try std.testing.expectEqual(ctx.clustered_params, f.clustered_params);
+    try std.testing.expectEqual(ctx.clustered_viewport, f.clustered_viewport);
     // The shared per-view uniforms always carry a neutral probe lane (the
     // draw overwrites it per draw from the probe selection, or leaves it —
     // so the no-probe path is bit-identical to before this wave).
@@ -242,6 +265,18 @@ test "FrameUniforms appends area lanes last (existing offsets unmoved)" {
     try std.testing.expect(@offsetOf(FrameUniforms, "area_up") > @offsetOf(FrameUniforms, "area_right"));
     try std.testing.expect(@offsetOf(FrameUniforms, "area_color") > @offsetOf(FrameUniforms, "area_up"));
     try std.testing.expect(@offsetOf(FrameUniforms, "directional_dir") < @offsetOf(FrameUniforms, "probe_params"));
+}
+
+test "FrameUniforms appends clustered lanes after the area lanes (offsets unmoved)" {
+    const std = @import("std");
+    // The clustered tile descriptor is the new tail: everything before it
+    // (area lanes included) keeps its offset, so the empty pool uploads
+    // bit-identical values on every pre-existing lane.
+    try std.testing.expect(@offsetOf(FrameUniforms, "clustered_params") > @offsetOf(FrameUniforms, "area_color"));
+    try std.testing.expect(@offsetOf(FrameUniforms, "clustered_viewport") > @offsetOf(FrameUniforms, "clustered_params"));
+    // FrameContext carries the same appended tail for the shared packing.
+    try std.testing.expect(@offsetOf(FrameContext, "clustered_params") > @offsetOf(FrameContext, "area_color"));
+    try std.testing.expect(@offsetOf(FrameContext, "clustered_viewport") > @offsetOf(FrameContext, "clustered_params"));
 }
 
 test "alphaCutoffFor gates the cutoff on cutout mode" {

@@ -15,6 +15,8 @@ const SpotLight = lights.SpotLight;
 const SpotLightOptions = lights.SpotLightOptions;
 const AreaLight = lights.AreaLight;
 const AreaLightOptions = lights.AreaLightOptions;
+const ClusteredPointLight = lights.ClusteredPointLight;
+const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
 const light_selection = @import("light_selection.zig");
 const passes = @import("../passes/mod.zig");
 
@@ -41,6 +43,13 @@ pub const LightRig = struct {
     /// save/load never persists them. No shadows, no hysteresis, no
     /// significance selection — every owned light packs verbatim.
     area_lights: std.ArrayListUnmanaged(*AreaLight) = .empty,
+    /// Clustered forward point lights (wave 30, v1): value array, at most
+    /// lights.max_clustered_lights, session-local like area lights. No
+    /// shadows, no hysteresis, no significance selection — every ENABLED
+    /// light packs verbatim into FramePack and the 2D tile build culls
+    /// per tile (see scene/clustered_lights.zig).
+    clustered: [lights.max_clustered_lights]ClusteredPointLight = [_]ClusteredPointLight{.{}} ** lights.max_clustered_lights,
+    clustered_count: usize = 0,
 
     // Slot hysteresis (see light_selection.Hysteresis): without it two lights
     // trading the 4th/2nd slot pop every frame. `hysteresis_enabled = false`
@@ -162,6 +171,48 @@ pub const LightRig = struct {
         return self.area_lights.items.len;
     }
 
+    /// Appends a clustered forward point light (EXTRA pool beyond the
+    /// legacy 4-slot top-k lanes); returns its index. Pack order follows
+    /// creation order. Returns error.TooManyClusteredLights past
+    /// lights.max_clustered_lights — hard error, never silent clamp or
+    /// replacement, so callers notice the cap. No shadows in v1
+    /// (unshadowed by design). Session-local: save/load never persists
+    /// the pool.
+    pub fn addClusteredPointLight(self: *LightRig, position: Vec3, options: ClusteredPointLightOptions) error{TooManyClusteredLights}!usize {
+        if (self.clustered_count >= lights.max_clustered_lights) return error.TooManyClusteredLights;
+        const idx = self.clustered_count;
+        self.clustered[idx] = ClusteredPointLight.init(position, options);
+        self.clustered_count += 1;
+        return idx;
+    }
+
+    /// Removes clustered light `index`, order-preserving (higher indices
+    /// shift down, so callers must not cache indices across removals).
+    /// Out-of-range indices are a no-op (same contract as
+    /// Scene.removeCamera). Value array: no heap to free; GPU buffers
+    /// retire via the Scene-level cache (see Scene.removeClusteredPointLight).
+    pub fn removeClusteredPointLight(self: *LightRig, index: usize) void {
+        if (index >= self.clustered_count) return;
+        for (index..self.clustered_count - 1) |k| self.clustered[k] = self.clustered[k + 1];
+        self.clustered[self.clustered_count - 1] = .{};
+        self.clustered_count -= 1;
+    }
+
+    /// Live clustered-light state (position/color/intensity/radius/enabled
+    /// are freely mutable game-side under update-vs-prepare exclusion;
+    /// moves take effect in the next staged snapshot, see
+    /// Scene.removeClusteredPointLight docs). Null when out of range.
+    pub fn getClusteredPointLight(self: *LightRig, index: usize) ?*ClusteredPointLight {
+        if (index >= self.clustered_count) return null;
+        return &self.clustered[index];
+    }
+
+    /// Number of owned clustered lights (at most
+    /// lights.max_clustered_lights).
+    pub fn clusteredPointLightCount(self: *const LightRig) usize {
+        return self.clustered_count;
+    }
+
     // Sun resolution helpers (directional override, hemispheric fallback).
     pub fn sunDirection(self: *const LightRig) Vec3 {
         return lights.resolveSunDirection(self.directional, self.hemi);
@@ -266,6 +317,18 @@ pub const LightRig = struct {
         area_right: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         area_up: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         area_color: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        // APPENDED LAST (clustered forward point lights, wave 30): up to
+        // lights.max_clustered_lights EXTRA lights in creation order,
+        // enabled only (disabled/degenerate lanes stay zeroed, so the tile
+        // build skips them and the shader range-gates them exactly like a
+        // zero-range legacy lane). xyz + radius in clustered_pos_range,
+        // rgb + intensity in clustered_color_int, staged count in
+        // clustered_count (usize: snapshot-side plain data, not a shader
+        // lane). Appended last so every existing lane stays bit-identical;
+        // empty pool zeroes everything (exact legacy path).
+        clustered_pos_range: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
+        clustered_color_int: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
+        clustered_count: usize = 0,
     };
 
     /// Packs the directional suns for the frame uniforms: slot 0 mirrors
@@ -307,6 +370,24 @@ pub const LightRig = struct {
             pack.area_up[i] = .{ al.up.x, al.up.y, al.up.z, 0.0 };
             pack.area_color[i] = .{ al.color.r, al.color.g, al.color.b, 0.0 };
         }
+    }
+
+    /// Stages the clustered forward pool for the tile build: creation-order
+    /// lanes (position + radius, color + intensity), disabled lanes zeroed
+    /// (the tile build and the shader range-gate skip them, so the packed
+    /// index always equals the creation index). No hysteresis, no
+    /// selection, nothing frame-dependent (dt ignored): tiling culls per
+    /// tile, and fades would need a look-dev pass. `pack.clustered_count`
+    /// stages the owned count (<= lights.max_clustered_lights); lanes past
+    /// it stay zeroed (exact legacy path when empty).
+    fn packClusteredLights(self: *const LightRig, pack: *FramePack) void {
+        for (self.clustered[0..self.clustered_count], 0..) |*cl, i| {
+            if (i >= lights.max_clustered_lights) break; // defensive
+            if (!cl.is_enabled) continue; // stays zeroed
+            pack.clustered_pos_range[i] = .{ cl.position.x, cl.position.y, cl.position.z, cl.radius };
+            pack.clustered_color_int[i] = .{ cl.color.r, cl.color.g, cl.color.b, cl.intensity };
+        }
+        pack.clustered_count = self.clustered_count;
     }
 
     /// Picks up to point_shadow_slots shadow casters among the packed point
@@ -384,8 +465,11 @@ pub const LightRig = struct {
         // Directional suns ride both pack paths verbatim (no hysteresis):
         // slot 0 is the primary, slots 1..3 the fills. Area lights ride
         // both paths verbatim too (no selection, nothing frame-dependent).
+        // Clustered lights ride both paths verbatim as well (creation-order
+        // lanes; the tile build culls per tile, see packClusteredLights).
         self.packDirectionals(&pack);
         self.packAreaLights(&pack);
+        self.packClusteredLights(&pack);
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With
@@ -923,4 +1007,114 @@ test "packFrame gates point shadows on enabled lights and global shadows" {
     pack = rig.packFrame(eye, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 6), pack.num_point_shadows);
     try std.testing.expectEqual(@as(f32, 1.0), pack.point_shadow_params[0][0]);
+}
+
+test "addClusteredPointLight caps at 64 with a hard error" {
+    var rig = LightRig.init("hemi", .{});
+    // Value array: no allocator traffic, but deinit stays idempotent.
+    const allocator = std.testing.allocator;
+    defer rig.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), rig.clusteredPointLightCount());
+    try std.testing.expect(rig.getClusteredPointLight(0) == null);
+
+    var i: usize = 0;
+    while (i < lights.max_clustered_lights) : (i += 1) {
+        const idx = try rig.addClusteredPointLight(Vec3.new(@floatFromInt(i), 0, 0), .{});
+        try std.testing.expectEqual(i, idx);
+    }
+    try std.testing.expectEqual(lights.max_clustered_lights, rig.clusteredPointLightCount());
+    // Beyond the cap: hard error, never silent clamp or replacement.
+    try std.testing.expectError(error.TooManyClusteredLights, rig.addClusteredPointLight(Vec3.zero, .{}));
+    try std.testing.expectEqual(lights.max_clustered_lights, rig.clusteredPointLightCount());
+}
+
+test "clustered lights pack creation-order lanes, disabled entries zeroed" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    // Empty pool: zero count, all lanes zeroed (the tile build writes empty
+    // headers and the shader takes the exact legacy path).
+    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
+    for (0..lights.max_clustered_lights) |k| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_color_int[k]);
+    }
+
+    const idx0 = try rig.addClusteredPointLight(Vec3.new(1.0, 2.0, 3.0), .{
+        .color = Color3.new(1.0, 0.5, 0.25),
+        .intensity = 3.0,
+        .radius = 7.0,
+    });
+    const idx1 = try rig.addClusteredPointLight(Vec3.new(-1.0, 0.0, 0.0), .{ .intensity = 0.5 });
+    try std.testing.expectEqual(@as(usize, 0), idx0);
+    try std.testing.expectEqual(@as(usize, 1), idx1);
+    try std.testing.expect(rig.getClusteredPointLight(0).?.position.x == 1.0);
+    try std.testing.expect(rig.getClusteredPointLight(2) == null);
+
+    // Packed index == creation index (stable identity for tile lists).
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 3.0 }, pack.clustered_color_int[0]);
+    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_pos_range[1]);
+
+    // Disable: lane zeroes out (tile build + shader skip it), count still
+    // stages the owned lanes.
+    rig.getClusteredPointLight(0).?.is_enabled = false;
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_color_int[0]);
+    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_pos_range[1]);
+    rig.getClusteredPointLight(0).?.is_enabled = true;
+
+    // Legacy lanes are untouched by the clustered pool (append-last: the
+    // legacy top-k selection never sees these lights).
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.counts);
+}
+
+test "removeClusteredPointLight destroys order-preserving, out-of-range is a no-op" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    _ = try rig.addClusteredPointLight(Vec3.new(1, 0, 0), .{});
+    _ = try rig.addClusteredPointLight(Vec3.new(2, 0, 0), .{});
+    _ = try rig.addClusteredPointLight(Vec3.new(3, 0, 0), .{});
+    rig.removeClusteredPointLight(9); // no-op
+    try std.testing.expectEqual(@as(usize, 3), rig.clusteredPointLightCount());
+    rig.removeClusteredPointLight(0);
+    try std.testing.expectEqual(@as(usize, 2), rig.clusteredPointLightCount());
+    // Order-preserving: the tail shifted down (index 0 now holds x=2).
+    try std.testing.expectEqual(@as(f32, 2.0), rig.getClusteredPointLight(0).?.position.x);
+    try std.testing.expectEqual(@as(f32, 3.0), rig.getClusteredPointLight(1).?.position.x);
+    rig.removeClusteredPointLight(1);
+    rig.removeClusteredPointLight(0);
+    try std.testing.expectEqual(@as(usize, 0), rig.clusteredPointLightCount());
+    try std.testing.expect(rig.getClusteredPointLight(0) == null);
+    // Empty again: pack returns to the zeroed legacy-neutral state.
+    const pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[0]);
+}
+
+test "clustered packing is frame-independent (no fade, no selection)" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    // Hysteresis ON here on purpose: clustered lanes must still pack
+    // verbatim on the very first frame (no enter-fade) and identically for
+    // any dt — tiling culls per tile instead of fading slots.
+    _ = try rig.addClusteredPointLight(Vec3.new(0.0, 3.0, 0.0), .{ .intensity = 2.0 });
+    const eye = Vec3.new(10.0, 0.0, 0.0);
+    const p0 = rig.packFrame(eye, true, 0.016);
+    const p1 = rig.packFrame(eye, true, 0.5);
+    try std.testing.expectEqual(@as(usize, 1), p0.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0.0, 3.0, 0.0, 10.0 }, p0.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 2.0 }, p0.clustered_color_int[0]);
+    try std.testing.expectEqual(p0.clustered_pos_range, p1.clustered_pos_range);
+    try std.testing.expectEqual(p0.clustered_color_int, p1.clustered_color_int);
 }
