@@ -199,6 +199,121 @@ test "area lights: Scene API, cap, enable, snapshot round-trip" {
     try std.testing.expectEqualStrings("rim", scene.getAreaLight(0).?.name);
 }
 
+test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
+    const alloc = std.testing.allocator;
+    const cluster_lights = @import("../lights.zig");
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+
+    // Empty scene: zero count, null get, zeroed staged lanes (zero lights
+    // render bit-identically to today).
+    try std.testing.expectEqual(@as(usize, 0), scene.clusteredPointLightCount());
+    try std.testing.expect(scene.getClusteredPointLight(0) == null);
+    scene.updateLights(0.016);
+    var pack: scene_lights.LightRig.FramePack = undefined;
+    try std.testing.expect(scene.light_handoff.takeLatest(&pack));
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_color_int[0]);
+
+    const idx0 = try scene.addClusteredPointLight(Vec3.new(1.0, 2.0, 3.0), .{
+        .color = Color3.new(1.0, 0.0, 0.0),
+        .intensity = 2.0,
+        .radius = 7.0,
+    });
+    const idx1 = try scene.addClusteredPointLight(Vec3.zero, .{});
+    try std.testing.expectEqual(@as(usize, 0), idx0);
+    try std.testing.expectEqual(@as(usize, 1), idx1);
+    try std.testing.expectEqual(@as(usize, 2), scene.clusteredPointLightCount());
+    try std.testing.expect(scene.getClusteredPointLight(0).?.position.x == 1.0);
+    try std.testing.expect(scene.getClusteredPointLight(2) == null);
+
+    // Disable: lane zeroes out on the next staged pack; re-enable restores.
+    scene.getClusteredPointLight(0).?.is_enabled = false;
+    scene.updateLights(0.016);
+    _ = scene.light_handoff.takeLatest(&pack);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_pos_range[0]);
+    scene.getClusteredPointLight(0).?.is_enabled = true;
+
+    // Update path carries the lanes into the frame snapshot (needs a
+    // camera: packFrameSnapshot early-outs without one).
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.updateLights(0.016);
+    var snap = scene.packFrameSnapshot(1.0, 640, 480);
+    try std.testing.expect(snap.has_camera);
+    try std.testing.expectEqual(@as(usize, 2), snap.light_pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 2.0 }, snap.light_pack.clustered_color_int[0]);
+
+    // Update ordering: a move stages through updateLights, so the snapshot
+    // WITHOUT an update still shows the old position (documented 1-frame
+    // lag), and the snapshot AFTER the update shows the new one.
+    scene.getClusteredPointLight(0).?.position = Vec3.new(9.0, 9.0, 9.0);
+    snap = scene.packFrameSnapshot(1.0, 640, 480);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
+    scene.updateLights(0.016);
+    snap = scene.packFrameSnapshot(1.0, 640, 480);
+    try std.testing.expectEqual([4]f32{ 9.0, 9.0, 9.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
+
+    // Hard cap: past 64 lights the add errors and the count is unchanged.
+    var k: usize = 2;
+    while (k < cluster_lights.max_clustered_lights) : (k += 1) {
+        _ = try scene.addClusteredPointLight(Vec3.zero, .{});
+    }
+    try std.testing.expectEqual(cluster_lights.max_clustered_lights, scene.clusteredPointLightCount());
+    try std.testing.expectError(error.TooManyClusteredLights, scene.addClusteredPointLight(Vec3.zero, .{}));
+    try std.testing.expectEqual(cluster_lights.max_clustered_lights, scene.clusteredPointLightCount());
+
+    // Removal is order-preserving; out-of-range is a no-op (and never
+    // retires — see the retire test below).
+    scene.removeClusteredPointLight(7_000);
+    try std.testing.expectEqual(cluster_lights.max_clustered_lights, scene.clusteredPointLightCount());
+    scene.removeClusteredPointLight(0);
+    try std.testing.expectEqual(cluster_lights.max_clustered_lights - 1, scene.clusteredPointLightCount());
+
+    // Session-local (like directional fills and area lights): the
+    // serialization SceneState carries no clustered field, so save/load
+    // never persists the pool.
+    try std.testing.expect(!@hasField(@import("../serialization.zig").SceneState, "clustered_lights"));
+    try std.testing.expect(!@hasField(@import("../serialization.zig").SceneState, "clustered"));
+}
+
+test "clustered removal retires live tile buffers; out-of-range never retires" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    // The retire queue only owns the pending list here (fake buffer ids,
+    // never through sg.*): free the list directly instead of draining.
+    defer scene.gpu_retire.pending.deinit(alloc);
+
+    _ = try scene.addClusteredPointLight(Vec3.zero, .{});
+    _ = try scene.addClusteredPointLight(Vec3.zero, .{});
+    // Simulate a previously uploaded generation (headless: borrowed ids,
+    // never created or destroyed through sg here).
+    scene.clustered.light_buffer = .{ .id = 41 };
+    scene.clustered.header_buffer = .{ .id = 42 };
+    scene.clustered.index_buffer = .{ .id = 43 };
+    scene.clustered.gpu_live = true;
+
+    // Out-of-range removal is a no-op: count unchanged, nothing retired.
+    scene.removeClusteredPointLight(9);
+    try std.testing.expectEqual(@as(usize, 2), scene.clusteredPointLightCount());
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+
+    // Real removal retires all three live tile buffers (epoch-stamped
+    // appends, no sg.*) and zeroes the handles for the next rebuild.
+    scene.removeClusteredPointLight(0);
+    try std.testing.expectEqual(@as(usize, 1), scene.clusteredPointLightCount());
+    try std.testing.expectEqual(@as(usize, 3), scene.gpu_retire.retainedCount());
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.light_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.header_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.index_buffer.id);
+    try std.testing.expect(!scene.clustered.gpu_live);
+}
+
 test "saturated frame mailbox keeps the newest snapshot" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);

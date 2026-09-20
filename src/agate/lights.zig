@@ -137,6 +137,49 @@ pub const PointLight = struct {
     }
 };
 
+/// Maximum EXTRA point lights in the clustered forward pool (wave 30, v1).
+/// These ride OUTSIDE the legacy 4-slot top-k lanes (LightRig.point_slots):
+/// every owned clustered light packs verbatim into LightRig.FramePack and
+/// the 2D screen-tile build culls them per tile. See
+/// LightRig.addClusteredPointLight for the creation cap and
+/// scene/clustered_lights.zig for the tiling design. No shadows in v1
+/// (unshadowed by design, documented there).
+pub const max_clustered_lights: usize = 64;
+
+pub const ClusteredPointLightOptions = struct {
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    /// Influence radius in world units (<= 0 packs as absent: the tile
+    /// build skips the light and the shader range-gates it like a legacy
+    /// lane with zero range).
+    radius: f32 = 10.0,
+    enabled: bool = true,
+};
+
+/// One extra forward point light for the clustered pool. Value type (no
+/// name, no heap, no shadows in v1): LightRig owns a fixed array of these
+/// plus a count, Scene exposes index-based add/remove/get/count, and the
+/// GPU tile build reads the staged FramePack copy (1-frame lag).
+pub const ClusteredPointLight = struct {
+    position: Vec3 = Vec3.zero,
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    radius: f32 = 10.0,
+    /// Disabled lights pack as zeroed lanes (no contribution), mirroring
+    /// the directional-fill contract.
+    is_enabled: bool = true,
+
+    pub fn init(position: Vec3, options: ClusteredPointLightOptions) ClusteredPointLight {
+        return .{
+            .position = position,
+            .color = options.color,
+            .intensity = options.intensity,
+            .radius = options.radius,
+            .is_enabled = options.enabled,
+        };
+    }
+};
+
 pub const AreaLightOptions = struct {
     center: Vec3 = Vec3.zero,
     /// Local +X half-extent vector: direction AND half-width encoded in one
@@ -392,6 +435,21 @@ test "PointLight shadows are off by default" {
 
 test "area light cap is two" {
     try std.testing.expectEqual(@as(usize, 2), max_area_lights);
+}
+
+test "clustered pool cap is 64, defaults match the legacy point lane" {
+    try std.testing.expectEqual(@as(usize, 64), max_clustered_lights);
+    const l = ClusteredPointLight.init(Vec3.new(1, 2, 3), .{});
+    try std.testing.expectEqual(Vec3.new(1, 2, 3), l.position);
+    try std.testing.expectEqual(Color3.white, l.color);
+    try std.testing.expectEqual(@as(f32, 1.0), l.intensity);
+    try std.testing.expectEqual(@as(f32, 10.0), l.radius);
+    try std.testing.expect(l.is_enabled);
+    // Options map verbatim (enabled -> is_enabled, engine convention).
+    const off = ClusteredPointLight.init(Vec3.zero, .{ .enabled = false, .intensity = 2.5, .radius = 3.0 });
+    try std.testing.expect(!off.is_enabled);
+    try std.testing.expectEqual(@as(f32, 2.5), off.intensity);
+    try std.testing.expectEqual(@as(f32, 3.0), off.radius);
 }
 
 test "AreaLight normal and area follow the right/up half-extents" {

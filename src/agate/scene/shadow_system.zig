@@ -153,6 +153,9 @@ test "frameUniforms packs shared lighting state verbatim" {
         .area_right = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
         .area_up = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
         .area_color = [_][4]f32{.{ 0, 0, 0, 0 }} ** 2,
+        // Zero clustered lights: zeroed descriptor, tile loop gated off.
+        .clustered_params = .{ 0, 0, 0, 0 },
+        .clustered_viewport = .{ 0, 0, 64, 0 },
     };
 
     var state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
@@ -183,6 +186,10 @@ test "frameUniforms packs shared lighting state verbatim" {
     try std.testing.expectEqual(ctx.area_right, f.area_right);
     try std.testing.expectEqual(ctx.area_up, f.area_up);
     try std.testing.expectEqual(ctx.area_color, f.area_color);
+    // Clustered descriptor rides through verbatim too; zeroed (the default
+    // above) keeps the shader tile loop gated off bit-identically.
+    try std.testing.expectEqual(ctx.clustered_params, f.clustered_params);
+    try std.testing.expectEqual(ctx.clustered_viewport, f.clustered_viewport);
 
     // Disabled shadows (globally or per-mesh) zero the bias/intensity lanes
     // but keep normal bias and softness, exactly like the legacy literals.

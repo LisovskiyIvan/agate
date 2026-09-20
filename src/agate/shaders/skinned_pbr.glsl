@@ -188,6 +188,15 @@ layout(binding = 2) uniform fs_params {
     vec4 area_right[2];
     vec4 area_up[2];
     vec4 area_color[2];
+    // APPENDED LAST (clustered forward lights, wave 30, v1): tile-grid
+    // descriptor for the storage-buffer tile walk below (the light data
+    // itself is never a uniform). clustered_params = (tiles_x, tiles_y,
+    // staged light count, gpu-live 0/1); clustered_viewport = (screen_w,
+    // screen_h, tile_size px, unused). Zeroed with an empty pool (and w =
+    // 0 until a live GPU upload lands), so the loop gates off
+    // bit-identically. Appended last so no offset shifts.
+    vec4 clustered_params;
+    vec4 clustered_viewport;
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -220,6 +229,34 @@ layout(binding = 3) uniform sampler depth_smp;
 // the shader only samples it when probe_params.x > 0.5.
 layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 6) uniform sampler probe_smp;
+// Clustered forward lights (wave 30, v1): storage buffers for the tile
+// walk. Bindings 12..14 are free view slots in the shared pool of every
+// forward shader (this family uses fs 0..8, 10, 11 and vs 9 for morph).
+// Layouts mirror scene/clustered_lights.zig (ClusterLightGpu = 2x vec4,
+// ClusterTileGpu = uvec2, indices = u32); every buffer block holds exactly
+// one flexible array of a struct (sokol-shdc requirement). The draw always
+// binds something valid here (real tile buffers when a GPU upload landed,
+// the shared 16-byte dummy otherwise); the loop below only reads them when
+// clustered_params gates it on.
+struct ClusterLight {
+    vec4 pos_range; // xyz: position, w: radius
+    vec4 color_int; // rgb: color, a: intensity
+};
+layout(std430, binding = 12) readonly buffer ssbo_cluster_lights {
+    ClusterLight cluster_lights[];
+};
+struct ClusterTile {
+    uvec2 head; // x: index-list offset, y: light count
+};
+layout(std430, binding = 13) readonly buffer ssbo_cluster_tiles {
+    ClusterTile cluster_tiles[];
+};
+struct ClusterIndex {
+    uint light;
+};
+layout(std430, binding = 14) readonly buffer ssbo_cluster_indices {
+    ClusterIndex cluster_indices[];
+};
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -818,6 +855,59 @@ void main() {
         vec3 a_additive;
         coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, a_atten, a_additive);
         Lo += (a_kD * albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
+    }
+
+    // Clustered forward point lights (up to 64, no shadows): pixel -> tile
+    // -> tile light indices -> the same Cook-Torrance lobe as the legacy
+    // lanes above (coat + sheen included, no shadow term). Gated on a live
+    // tile grid (tiles_x/y > 0), a non-empty staged pool (count > 0) and a
+    // landed GPU upload (w > 0.5); otherwise skipped entirely, so the empty
+    // pool shades bit-identically. Tile id follows the CPU build
+    // (scene/clustered_lights.zig tileNdcRect, bottom-left origin); Metal
+    // and D3D run window-y down, hence the !SOKOL_GLSL flip. The tile
+    // lookup is byte-identical in all five forward shaders (only the lobe
+    // tail mirrors the host shader); sokol-shdc has no include mechanism,
+    // so the duplication is deliberate and documented.
+    if (clustered_params.x > 0.5 && clustered_params.y > 0.5 && clustered_params.z > 0.5 && clustered_params.w > 0.5) {
+        vec2 c_px = gl_FragCoord.xy;
+        #if !SOKOL_GLSL
+            c_px.y = clustered_viewport.y - c_px.y;
+        #endif
+        int c_tx = clamp(int(c_px.x / clustered_viewport.z), 0, int(clustered_params.x) - 1);
+        int c_ty = clamp(int(c_px.y / clustered_viewport.z), 0, int(clustered_params.y) - 1);
+        uvec2 c_head = cluster_tiles[uint(c_ty) * uint(clustered_params.x) + uint(c_tx)].head;
+        for (uint c_k = 0u; c_k < c_head.y; c_k++) {
+            uint c_li = cluster_indices[c_head.x + c_k].light;
+            vec3 c_pos = cluster_lights[c_li].pos_range.xyz;
+            float c_range = cluster_lights[c_li].pos_range.w;
+            vec3 c_col = cluster_lights[c_li].color_int.rgb;
+            float c_int = cluster_lights[c_li].color_int.w;
+
+            vec3 c_to_light = c_pos - v_world_pos;
+            float c_dist = length(c_to_light);
+            if (c_dist >= c_range || c_dist < 0.0001) continue;
+
+            vec3 c_L = c_to_light / c_dist;
+            vec3 c_H = normalize(V + c_L);
+
+            float c_d_norm = c_dist / c_range;
+            float c_factor = clamp(1.0 - c_d_norm * c_d_norm * c_d_norm * c_d_norm, 0.0, 1.0);
+            float c_att = (c_factor * c_factor) / (c_dist * c_dist + 1.0);
+
+            float c_NdotL = max(dot(N, c_L), 0.0);
+            if (c_NdotL > 0.0) {
+                float c_NDF = distributionGGX(N, c_H, roughness);
+                float c_G = geometrySmith(N, V, c_L, roughness);
+                vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
+                vec3 c_spec = (c_NDF * c_G * c_F) / (4.0 * NdotV * c_NdotL + 0.0001);
+                vec3 c_kD = (vec3(1.0) - c_F) * (1.0 - metallic);
+                vec3 c_rad = c_col * (c_int * c_att);
+                vec3 c_atten;
+                vec3 c_additive;
+                coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, c_atten, c_additive);
+                Lo += (c_kD * albedo / PI + c_spec * c_atten + c_additive) * c_rad * c_NdotL;
+            }
+        }
     }
 
     // Ambient Occlusion
