@@ -82,6 +82,11 @@ pub const ktx2 = @import("ktx2.zig");
 /// Texture.decodeImageMemory; standalone uploads via
 /// Texture.fromDdsMemory/fromDdsFile (glTF cannot reference .dds).
 pub const dds = @import("dds.zig");
+/// OpenEXR scanline reader: HALF/FLOAT channels (NONE/RLE/ZIPS/ZIP),
+/// decoded to half-float RGBA for the HDR upload path. Routed automatically
+/// by Texture.decodeHDRMemory (magic sniff); standalone uploads via
+/// Texture.fromExrMemory/fromExrFile.
+pub const exr = @import("exr.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;

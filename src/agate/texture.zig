@@ -4,6 +4,7 @@ const sg = sokol.gfx;
 const c = @import("c.zig").c;
 const ktx2 = @import("ktx2.zig");
 const dds = @import("dds.zig");
+const exr = @import("exr.zig");
 
 /// Shared RGBA8 box-filter downsample of one mip level. Dims floor at 1,
 /// source coords clamp at edges (handles NPOT). Fast path for the exact
@@ -885,11 +886,18 @@ pub const Texture = struct {
         return .{ .width = width, .height = height, .pixels = pixels };
     }
 
-    /// Decodes an image to half-float RGBA via stbi_loadf: Radiance .hdr
-    /// natively, LDR formats (PNG/JPEG/...) upconverted to float.
-    /// Thread-safe; pair with `fromRawHdr`. Foreign or corrupt
-    /// data yields error.ImageDecodeFailed, empty sizes error.InvalidDimensions.
+    /// Decodes an image to half-float RGBA: OpenEXR (magic sniff) via the
+    /// engine's scanline reader, Radiance .hdr (and LDR formats upconverted
+    /// to float) via stbi_loadf. Thread-safe; pair with `fromRawHdr`.
+    /// Foreign or corrupt data yields error.ImageDecodeFailed, empty sizes
+    /// error.InvalidDimensions. EXR validation errors surface as their own
+    /// failures (never a silent stb fallback).
     pub fn decodeHDRMemory(allocator: std.mem.Allocator, bytes: []const u8) !RawHdrTexture {
+        if (exr.sniff(bytes)) {
+            const dec = try exr.decode(allocator, bytes);
+            // Same layout (RGBA half-float bits); adopt without copying.
+            return .{ .width = dec.width, .height = dec.height, .pixels = dec.pixels };
+        }
         if (bytes.len == 0) return error.ImageDecodeFailed;
         if (bytes.len > std.math.maxInt(c_int)) return error.ImageTooLarge;
 
@@ -945,23 +953,22 @@ pub const Texture = struct {
     }
 
     /// File variant of `decodeHDRMemory`. Thread-safe; pair with `fromRawHdr`.
+    /// Buffered read so EXR files take the same sniff-routed reader as
+    /// in-memory payloads (stb decodes the same bytes from memory).
     pub fn decodeHDRFile(allocator: std.mem.Allocator, file_path: []const u8) !RawHdrTexture {
-        const path_z = try allocator.dupeZ(u8, file_path);
-        defer allocator.free(path_z);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        // Missing/unreadable files keep the historical ImageDecodeFailed
+        // (same observable contract as the old stbi_loadf path).
+        const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch return error.ImageDecodeFailed;
+        defer file.close(io);
 
-        var w: c_int = 0;
-        var h: c_int = 0;
-        var channels_in_file: c_int = 0;
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
 
-        const data = c.stbi_loadf(path_z.ptr, &w, &h, &channels_in_file, 4);
-        if (data == null) return error.ImageDecodeFailed;
-        defer c.stbi_image_free(data);
-        if (w <= 0 or h <= 0) return error.InvalidDimensions;
-
-        const width: u32 = @intCast(w);
-        const height: u32 = @intCast(h);
-        const channel_count = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ImageTooLarge, 4) catch return error.ImageTooLarge;
-        return buildRawHdr(allocator, width, height, data[0..channel_count]);
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return decodeHDRMemory(allocator, bytes);
     }
 
     /// Thin GPU uploader for RGBA half-float data. Main thread only.
@@ -1024,6 +1031,37 @@ pub const Texture = struct {
         var raw = try decodeHDRFile(allocator, file_path);
         defer raw.deinit(allocator);
         return fromRawHdr(&raw, options);
+    }
+
+    /// Decodes an OpenEXR file from memory and uploads an RGBA16F texture.
+    /// Main thread only (GPU upload); use exr.decode + fromRawHdr to split
+    /// worker-thread decode from main-thread upload. EXR is linear, so the
+    /// upload path marks the texture HDR (no sRGB decode on sample).
+    pub fn fromExrMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
+        var dec = try exr.decode(allocator, bytes);
+        defer dec.deinit(allocator);
+        var raw = RawHdrTexture{ .width = dec.width, .height = dec.height, .pixels = dec.pixels };
+        dec.pixels = &.{};
+        defer raw.deinit(allocator);
+        return fromRawHdr(&raw, options);
+    }
+
+    /// Loads an OpenEXR file and uploads an RGBA16F texture.
+    /// Main thread only (GPU upload); use decodeHDRFile + fromRawHdr to
+    /// split worker-thread decode from main-thread upload. Strict: foreign
+    /// data fails with the EXR reader's own error (NotExr, ...).
+    pub fn fromExrFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
+
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return fromExrMemory(allocator, bytes, options);
     }
 
     pub fn deinit(self: *Texture) void {
