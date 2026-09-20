@@ -11,6 +11,10 @@ const Color4 = math.Color4;
 
 const Texture = @import("texture.zig").Texture;
 const ui_shd = @import("ui_shader");
+const ttf_mod = @import("ttf.zig");
+
+/// TrueType font handle for the UI text path (see ttf.zig).
+pub const TtfFont = ttf_mod.TtfFont;
 
 // Style system modules (phase 2): shared value types, CSS-subset theme
 // parsing, and the pure transition math. The public type names below are
@@ -64,6 +68,18 @@ pub const UICanvas = struct {
     index_buffer: sg.Buffer = .{},
     pipeline: sg.Pipeline = .{},
     font_texture: Texture,
+
+    /// Optional TrueType font override (borrowed; the caller owns the
+    /// `TtfFont` lifetime and must keep both it and its sfnt bytes alive
+    /// while set). When non-null, every drawText* call emits mode-3
+    /// coverage quads from the TTF atlas and canvas-aware measurement
+    /// uses TTF advances; null (default) keeps the bitmap/SDF font
+    /// bit-identical. Switch with setFontTtf/clearFontTtf.
+    ttf_font: ?*const TtfFont = null,
+    /// GPU upload of the TTF atlas, created by setFontTtf when a sokol
+    /// context is live (headless/tests keep CPU-only state and still
+    /// emit TTF vertices). Destroyed by clearFontTtf/deinit.
+    ttf_texture: ?Texture = null,
 
     capacity_vertices: usize = 32768,
     capacity_indices: usize = 49152,
@@ -194,6 +210,7 @@ pub const UICanvas = struct {
         if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
         if (self.index_buffer.id != 0) sg.destroyBuffer(self.index_buffer);
         if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
+        if (self.ttf_texture) |*t| t.deinit();
         self.font_texture.deinit();
     }
 
@@ -392,8 +409,8 @@ pub const UICanvas = struct {
     /// Single-line field: panel, text, and a 2px cursor bar at the cursor
     /// byte offset when focused. No blink timer (static line) and no
     /// clipping: overlong text overflows the frame, the caller may shorten
-    /// or scroll it. The cursor x reuses measureText so it matches the
-    /// drawText advances exactly, byte for byte.
+    /// or scroll it. The cursor x reuses canvas-aware measurement so it
+    /// matches the drawText advances exactly, byte for byte.
     /// (See ui/widgets.zig.)
     pub fn drawTextInput(self: *UICanvas, rect: [4]f32, state: *const TextInputState, focused: bool, font_size: f32) void {
         ui_widgets.drawTextInput(self, rect, state, focused, font_size);
@@ -401,6 +418,75 @@ pub const UICanvas = struct {
 
     /// Returns the pixel dimensions of a text string (see ui/text.zig).
     pub fn measureText(text: []const u8, font_size: f32) Vec2 {
+        return ui_text.measureText(text, font_size);
+    }
+
+    /// Switches text drawing to a TrueType font (`null` restores the
+    /// bitmap/SDF default). The font is borrowed, not copied: the caller
+    /// owns the `TtfFont` (and its sfnt bytes) until clearFontTtf/deinit.
+    /// Parse failures surface at `TtfFont.init`, never here — an installed
+    /// font always draws. With a live sokol context the atlas uploads to
+    /// a GPU texture immediately (context thread only, like every other
+    /// Texture upload); headless, only the CPU-side switch happens and the
+    /// upload is skipped (vertices still emit TTF UVs, so tests can
+    /// assert geometry without a GPU).
+    pub fn setFontTtf(self: *UICanvas, font: ?*const TtfFont) void {
+        if (self.ttf_texture) |*t| {
+            t.deinit();
+            self.ttf_texture = null;
+        }
+        self.ttf_font = font;
+        if (font) |f| {
+            if (sg.isvalid()) {
+                self.ttf_texture = Texture.initRaw(ttf_mod.atlas_size, ttf_mod.atlas_size, f.atlas_pixels, .{
+                    .min_filter = .LINEAR,
+                    .mag_filter = .LINEAR,
+                    .wrap_u = .CLAMP_TO_EDGE,
+                    .wrap_v = .CLAMP_TO_EDGE,
+                    .mipmaps = false,
+                });
+            }
+        }
+    }
+
+    /// Restores the bitmap/SDF font (see setFontTtf).
+    pub fn clearFontTtf(self: *UICanvas) void {
+        self.setFontTtf(null);
+    }
+
+    /// True when a TrueType font is installed.
+    pub fn hasTtfFont(self: *const UICanvas) bool {
+        return self.ttf_font != null;
+    }
+
+    /// Font view the draw binds: the TTF atlas upload when a font is set
+    /// and uploaded, else the bitmap/SDF atlas. Shared by the legacy
+    /// render and the P6 frame capture so both bind the same font.
+    pub fn activeFontView(self: *const UICanvas) sg.View {
+        if (self.ttf_font != null) {
+            if (self.ttf_texture) |*t| {
+                if (t.view.id != 0) return t.view;
+            }
+        }
+        return self.font_texture.view;
+    }
+
+    /// Sampler matching `activeFontView`.
+    pub fn activeFontSampler(self: *const UICanvas) sg.Sampler {
+        if (self.ttf_font != null) {
+            if (self.ttf_texture) |*t| {
+                if (t.sampler.id != 0) return t.sampler;
+            }
+        }
+        return self.font_texture.sampler;
+    }
+
+    /// Canvas-aware measurement: TTF advances when a font is set (so UI
+    /// layout matches the drawn TTF glyphs), the legacy monospace math
+    /// otherwise. Static `measureText` keeps the legacy contract for
+    /// callers that never install a font.
+    pub fn measureTextCurrent(self: *const UICanvas, text: []const u8, font_size: f32) Vec2 {
+        if (self.ttf_font) |f| return ui_text.measureTextTtf(f, text, font_size);
         return ui_text.measureText(text, font_size);
     }
 
@@ -964,8 +1050,8 @@ pub const UICanvas = struct {
             self.pipeline,
             self.vertex_buffer,
             self.index_buffer,
-            self.font_texture.view,
-            self.font_texture.sampler,
+            self.activeFontView(),
+            self.activeFontSampler(),
             screen_w,
             screen_h,
             self.indices.items.len,
@@ -2510,3 +2596,50 @@ test "LayoutStack immediate mode widgets emit geometry and handle input" {
 
 // Note: the "batchUploadBytes keeps the u16 vertex cap in usize arithmetic"
 // test moved to ui/draw.zig with the helper (same name, same assertions).
+
+test "setFontTtf switches text drawing and measurement, clear restores legacy" {
+    const t = std.testing;
+    const file = try ttf_mod.buildFixture(t.allocator, .{});
+    defer t.allocator.free(file);
+    var font = try TtfFont.init(t.allocator, file, 20.0, &.{ 'A', 'B', 'C' });
+    defer font.deinit();
+
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+    try t.expect(!canvas.hasTtfFont());
+
+    // Legacy baseline: "AB" at 20px -> 2 monospace quads, mode 1.
+    canvas.drawText("AB", 0, 0, 20.0, Color4.white);
+    try t.expectEqual(@as(usize, 8), canvas.vertices.items.len);
+    try t.expectApproxEqAbs(@as(f32, 1.0), canvas.vertices.items[0].mode_params[0], 1e-6);
+    const legacy_w = canvas.measureTextCurrent("AB", 20.0).x;
+    try t.expectApproxEqAbs(@as(f32, 20.0), legacy_w, 1e-5);
+    canvas.begin();
+
+    // Install the TTF font (headless: no GPU upload, CPU switch only).
+    canvas.setFontTtf(&font);
+    try t.expect(canvas.hasTtfFont());
+    try t.expect(canvas.ttf_texture == null);
+    canvas.drawText("AB", 0, 0, 20.0, Color4.white);
+    try t.expectEqual(@as(usize, 8), canvas.vertices.items.len);
+    try t.expectApproxEqAbs(ui_text.ttf_text_mode, canvas.vertices.items[0].mode_params[0], 1e-6);
+    // TTF advances (14 + 13 - 1.6 kern) differ from the 20px legacy width.
+    const ttf_w = canvas.measureTextCurrent("AB", 20.0).x;
+    try t.expectApproxEqAbs(@as(f32, 14.0 + 11.4), ttf_w, 1e-4);
+    try t.expect(ttf_w != legacy_w);
+    // Second draw is stable (same quad count, same first vertex).
+    const first = canvas.vertices.items[0];
+    canvas.begin();
+    canvas.drawText("AB", 0, 0, 20.0, Color4.white);
+    try t.expectEqual(@as(usize, 8), canvas.vertices.items.len);
+    try t.expectApproxEqAbs(first.position[0], canvas.vertices.items[0].position[0], 0.0);
+    try t.expectApproxEqAbs(first.uv[0], canvas.vertices.items[0].uv[0], 0.0);
+
+    // Clear: legacy path returns bit-identical (mode 1, monospace advance).
+    canvas.clearFontTtf();
+    try t.expect(!canvas.hasTtfFont());
+    canvas.begin();
+    canvas.drawText("AB", 0, 0, 20.0, Color4.white);
+    try t.expectApproxEqAbs(@as(f32, 1.0), canvas.vertices.items[0].mode_params[0], 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 10.0), canvas.vertices.items[4].position[0], 1e-6);
+}

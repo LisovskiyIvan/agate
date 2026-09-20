@@ -174,6 +174,7 @@ test {
     _ = @import("texture/core.zig");
     _ = @import("texture/cube.zig");
     _ = @import("texture/mip.zig");
+    _ = @import("ttf.zig");
     _ = @import("ui.zig");
     _ = @import("ui/css_parser.zig");
     _ = @import("ui/css_parser_fuzz.zig");

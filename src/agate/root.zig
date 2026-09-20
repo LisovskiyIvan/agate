@@ -87,6 +87,10 @@ pub const dds = @import("dds.zig");
 /// by Texture.decodeHDRMemory (magic sniff); standalone uploads via
 /// Texture.fromExrMemory/fromExrFile.
 pub const exr = @import("exr.zig");
+/// TrueType (glyf-based) font parser, rasterizer and CPU glyph atlas plus
+/// the UI-facing TtfFont handle. UI text switches via
+/// UICanvas.setFontTtf; see ttf.zig for the supported/rejected matrix.
+pub const ttf = @import("ttf.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;

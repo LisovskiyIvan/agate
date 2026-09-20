@@ -342,8 +342,8 @@ pub const UiFrame = struct {
         self.screen_w = screen_w;
         self.screen_h = screen_h;
         self.pipeline = canvas.pipeline;
-        self.font_view = canvas.font_texture.view;
-        self.font_sampler = canvas.font_texture.sampler;
+        self.font_view = canvas.activeFontView();
+        self.font_sampler = canvas.activeFontSampler();
         self.vertex_buffer = canvas.vertex_buffer;
         self.index_buffer = canvas.index_buffer;
         self.has_capture = true;
@@ -896,4 +896,51 @@ test "slice2b: capturePacket matches capture and ignores later canvas mutation" 
     try t.expect(!empty.has_capture);
     empty.capturePacket(t.allocator, &canvas, staged_v, staged_i, 0.0, 600.0);
     try t.expect(!empty.has_capture);
+}
+
+test "P6: capture binds the TTF atlas view when a font is set" {
+    const t = std.testing;
+    const ttf_mod = @import("../ttf.zig");
+    const file = try ttf_mod.buildFixture(t.allocator, .{});
+    defer t.allocator.free(file);
+    var font = try ttf_mod.TtfFont.init(t.allocator, file, 20.0, &.{'A'});
+    defer font.deinit();
+
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+    canvas.font_texture.view = .{ .id = 11 };
+    canvas.font_texture.sampler = .{ .id = 13 };
+    canvas.drawText("A", 0, 0, 16.0, Color4.white);
+
+    // No font: legacy atlas view.
+    var legacy = UiFrame{};
+    defer legacy.deinit(t.allocator);
+    legacy.capture(t.allocator, &canvas, 800.0, 600.0);
+    try t.expect(legacy.has_capture);
+    try t.expectEqual(@as(u32, 11), legacy.font_view.id);
+
+    // Font set with an uploaded atlas: capture takes the TTF view.
+    canvas.ttf_font = &font;
+    var uploaded = std.mem.zeroes(TestTexture);
+    uploaded.view = .{ .id = 42 };
+    uploaded.sampler = .{ .id = 43 };
+    canvas.ttf_texture = uploaded;
+    var frame = UiFrame{};
+    defer frame.deinit(t.allocator);
+    frame.capture(t.allocator, &canvas, 800.0, 600.0);
+    try t.expect(frame.has_capture);
+    try t.expectEqual(@as(u32, 42), frame.font_view.id);
+    try t.expectEqual(@as(u32, 43), frame.font_sampler.id);
+
+    // Font set but headless (no upload): falls back to the legacy view,
+    // vertices still carry the TTF coverage mode.
+    canvas.ttf_texture = null;
+    canvas.begin();
+    canvas.drawText("A", 0, 0, 16.0, Color4.white);
+    try t.expectApproxEqAbs(@as(f32, 3.0), canvas.vertices.items[0].mode_params[0], 1e-6);
+    var headless = UiFrame{};
+    defer headless.deinit(t.allocator);
+    headless.capture(t.allocator, &canvas, 800.0, 600.0);
+    try t.expect(headless.has_capture);
+    try t.expectEqual(@as(u32, 11), headless.font_view.id);
 }

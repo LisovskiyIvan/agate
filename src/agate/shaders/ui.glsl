@@ -60,7 +60,7 @@ void main() {
         float edge = sdfEdge(v_params.z);
         float alpha = smoothstep(edge - w, edge + w, dist);
         frag_color = vec4(v_color.rgb, v_color.a * alpha);
-    } else {
+    } else if (v_params.x < 2.5) {
         // Mode 2: SDF text with dark outline / drop shadow
         float dist = texture(sampler2D(font_tex, smp), v_uv).r;
         float w = sdfWidth(dist);
@@ -71,6 +71,13 @@ void main() {
         vec3 outline_col = vec3(0.02, 0.03, 0.05);
         vec3 col = mix(outline_col, v_color.rgb, text_alpha);
         frag_color = vec4(col, max(text_alpha, outline_alpha * 0.85) * v_color.a);
+    } else {
+        // Mode 3: TrueType coverage text. The TTF atlas stores white RGB +
+        // rasterized coverage in alpha (see ttf.zig); the quad UVs address
+        // the glyph cell, so the sample is the glyph mask verbatim — no
+        // SDF edge reconstruction. Modes 0-2 are untouched above.
+        float a = texture(sampler2D(font_tex, smp), v_uv).a;
+        frag_color = vec4(v_color.rgb, v_color.a * a);
     }
 }
 @end
