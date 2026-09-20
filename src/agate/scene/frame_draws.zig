@@ -46,6 +46,7 @@ const snapshot_mod = @import("snapshot.zig");
 const retire_mod = @import("gpu_retire.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
+const mesh_mod = @import("../mesh.zig");
 
 pub const RenderQueues = render_queue.RenderQueues;
 pub const SkinStorage = render_queue.SkinStorage;
@@ -63,15 +64,26 @@ pub const Epoch = retire_mod.Epoch;
 // (mesh-list index at build time). Game-built (`.build_view`) payloads hold
 // provisional `instance_buffer`/`visible_instance_count` (plus shadow
 // `world_aabb`/`max_dim`, outline `world_center`) until the latch
-// `patchInstanceRefs` finalizes them from the post-latch `instance_render`
-// (fail-closed zero on uid mismatch or stale publish); fallback
-// (`.published`) payloads are final at build time.
+// `patchInstanceRefs` finalizes them from the slot-owned `staged_instances`
+// records (fail-closed zero on record-missing/uid mismatch or stale publish);
+// fallback (`.published`) payloads are final at build time.
+pub const StagedInstanceRecord = mesh_mod.StagedInstanceRecord;
+
 pub const FrameDrawSlot = struct {
     primary: RenderQueues = .{},
     views: [snapshot_mod.MAX_CAMERAS]RenderQueues = [_]RenderQueues{.{}} ** snapshot_mod.MAX_CAMERAS,
     outline_items: std.ArrayListUnmanaged(OutlineDrawItem) = .empty,
     outline_skins: SkinStorage = .empty,
     shadow: PreparedShadowDraws = .{},
+    /// Slot-owned staged instance records (lock-free-publication slice 1):
+    /// one per instance-bearing mesh with a fresh preview, frozen by
+    /// `Scene.buildPreparedFrame` (`freezeStagedRecords`) and consumed by
+    /// the prepare latch (`stageInstancesLatch` + `patchInstanceRefs`)
+    /// instead of live `Mesh.instance_preview` reads. Appended in mesh-list
+    /// order (strictly increasing `mesh_index`); reset retains capacity, so
+    /// the latch/patch allocate nothing. Record `buffer` copies are borrowed
+    /// read handles (never destroyed/retired through the record).
+    staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -86,6 +98,7 @@ pub const FrameDrawSlot = struct {
         self.outline_items.clearRetainingCapacity();
         self.outline_skins.clearRetainingCapacity();
         self.shadow.reset();
+        self.staged_instances.clearRetainingCapacity();
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -96,6 +109,7 @@ pub const FrameDrawSlot = struct {
         self.outline_items.deinit(allocator);
         self.outline_skins.deinit(allocator);
         self.shadow.deinit(allocator);
+        self.staged_instances.deinit(allocator);
     }
 };
 

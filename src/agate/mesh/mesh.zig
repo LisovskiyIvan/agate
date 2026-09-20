@@ -107,6 +107,66 @@ pub const InstancePreviewState = struct {
 /// via `QueueBuildParams.instance_source` / `FrameCullContext.instance_source`
 /// — never a bare cache_key for instance data.
 pub const InstanceSource = enum { published, build_view };
+
+/// Slot-owned staged instance record (lock-free-publication slice 1): the
+/// per-mesh frozen input the prepare latch consumes INSTEAD of the live
+/// `instance_preview` (plus the prior `instance_render` the latch used to
+/// re-read). Written once by `Scene.buildPreparedFrame` (via
+/// `freezeStagedRecords`, only for meshes with a fresh preview) into the
+/// back `FrameDrawSlot.staged_instances`; consumed once by
+/// `stageInstancesLatch`, which mirrors the post-latch state back into the
+/// record so `patchInstanceRefs` finalizes payloads from the record alone.
+///
+/// Ordering: appended in mesh-list order, so `mesh_index` is strictly
+/// increasing — the patch looks records up by index with an early exit, no
+/// allocation. The array reuses capacity across frames (reset retains it):
+/// no allocation in the latch/patch.
+///
+/// The `buffer` copy inside a record is a BORROWED read handle for the
+/// patch: it is never destroyed or retired through the record (lifetime
+/// stays with `instance_render` under the P3 epochs).
+pub const StagedInstanceRecord = struct {
+    /// Owning mesh at build time (write-back target + aliveness guard).
+    /// Never dereferenced before the guard (`meshes[mesh_index] == mesh`
+    /// and uid) passes: a destroyed mesh is unlinked from the list first,
+    /// so the guard fails on the pointer compare without touching freed
+    /// memory; the uid check defends against address reuse.
+    mesh: *Mesh,
+    /// Stable render uid at build time (matches `mesh.uid`).
+    uid: u64,
+    /// Mesh-list index at build time (patch identity + guard position).
+    mesh_index: u32,
+    /// Scratch segment `[scratch_lo, scratch_lo + count)` into the slot's
+    /// `primary.instance_matrices`.
+    scratch_lo: usize,
+    /// Visible instance count staged by the build (slice length at build).
+    count: u32,
+    /// Combined world AABB of the staged visibles (invalid when none).
+    bounds: BoundingBox,
+    /// Wyhash of the staged matrix bytes: the `cpu.hash` input of the GPU
+    /// upload dedup gate (compare-only, never the "last uploaded" state).
+    hash: u64,
+    /// Last-uploaded matrix-bytes hash at build time (prior
+    /// `instance_render.hash`): the `st.hash` seed of the dedup gate. Kept
+    /// separate from `hash` above — seeding the gate with the staged hash
+    /// would compare it against itself and skip every same-count upload.
+    uploaded_hash: u64,
+    /// Mesh position at build time: outline `world_center` fallback when
+    /// the staged bounds are invalid (frozen; the patch performs no live
+    /// reads, so this replaces the old live `mesh.position` fallback).
+    mesh_position: Vec3,
+    /// Prior resolved state frozen at build (what `instance_build_view`
+    /// carries for the queue build): GPU buffer, capacity, last upload
+    /// count, last publish frame. The latch seeds the GPU half from these
+    /// (never from live `instance_render`) and overwrites them with the
+    /// post-latch state on success; on guard/skip failure they are zeroed
+    /// fail-closed (`staged_frame = maxInt`, null buffer, count 0) so the
+    /// patch zeroes the payload entries.
+    buffer: sg.Buffer = .{},
+    capacity: usize = 0,
+    uploaded_count: usize = 0,
+    staged_frame: u64 = std.math.maxInt(u64),
+};
 /// Mesh-module uid counter for `Mesh.ensureUid` (stage-2 increment A).
 /// Chosen over `Scene.next_mesh_uid`: queue/shadow/outline/instance-staging
 /// builders have no Scene handle, so a Scene counter would require threading
@@ -202,9 +262,13 @@ pub const Mesh = struct {
     /// bounds, null buffer). Regular (non-instanced) meshes have no preview
     /// and stay zero — their queue/shadow/outline paths ignore the instanced
     /// fields (regular draws use index_count/model, not count/buffer).
-    /// Ownership: game-side write (build), context-side read (build_view
-    /// resolvers) + latch patch; plain fields, phase ownership like
-    /// `instance_render`. Never read by the fallback (`.published`).
+    /// Ownership: game-side write (build), context-side read by the
+    /// `.build_view` queue/shadow/outline resolvers at build time; plain
+    /// fields, phase ownership like
+    /// `instance_render`. The prepare latch and `patchInstanceRefs` no longer
+    /// read this (they consume the slot-owned `staged_instances` records) —
+    /// it stays because the game-side queue build resolves through it.
+    /// Never read by the fallback (`.published`).
     instance_build_view: InstanceRenderState = .{},
     // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
     cached_matrix: Mat4 = Mat4.identity,

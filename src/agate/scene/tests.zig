@@ -2008,7 +2008,72 @@ test "stage1: instances cleared between build and latch take the regular path" {
     try std.testing.expectEqual(@as(usize, 0), draws.primary.items.items.len);
 }
 
-test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
+test "stage1: latch consumes slot records when live previews are cleared" {
+    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 3;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Build freezes the slot-owned records; wiping the live previews after
+    // that must not matter — the latch reads records + scratch only.
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(usize, 1), scene.draws.backSlot().staged_instances.items.len);
+    parent.instance_preview = .{};
+    try std.testing.expectEqual(@as(u64, 0), parent.instance_preview.build_seq);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
+    try std.testing.expect(parent.instance_render.bounds.isValid());
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
+    try std.testing.expectEqual(@as(u32, 3), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(parent.instance_render.buffer.id, draws.primary.opaque_instanced.items[0].instance_buffer.id);
+    // Post-latch state mirrors into the slot record (the patch source).
+    try std.testing.expectEqual(@as(usize, 1), draws.staged_instances.items.len);
+    try std.testing.expectEqual(scene.frame_id, draws.staged_instances.items[0].staged_frame);
+    try std.testing.expectEqual(@as(u32, 3), draws.staged_instances.items[0].count);
+}
+
+test "stage1: mesh reorder + post-build add fail-closes at latch, recovers next" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
@@ -2084,24 +2149,45 @@ test "stage1: mesh reorder + post-build add keeps surviving slices exact" {
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    // B's slice [3,5) is exact: bounds match its own preview (A's segment
-    // would give min.x near 0, B's gives 49).
-    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
-    try std.testing.expectEqual(mesh_b.instance_preview.bounds, mesh_b.instance_render.bounds);
-    try std.testing.expectApproxEqAbs(@as(f32, 49.0), mesh_b.instance_render.bounds.min.x, 1e-4);
+    // Slot-owned latch: B's record (mesh_index 1) now points at C and A's
+    // record (mesh_index 0) points at B — both guards fail-closed, so neither
+    // publishes (previous never-staged state stands). C (never built) has no
+    // record and is skipped too.
+    try std.testing.expectEqual(@as(u32, 0), mesh_b.instance_render.count);
+    try std.testing.expectEqual(std.math.maxInt(u64), mesh_b.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u32, 0), mesh_a.instance_render.count);
+    try std.testing.expectEqual(std.math.maxInt(u64), mesh_a.instance_render.staged_frame);
+    const latched_records = scene.preparedDraws().staged_instances.items;
+    try std.testing.expectEqual(@as(usize, 2), latched_records.len);
+    for (latched_records) |rec| {
+        try std.testing.expectEqual(std.math.maxInt(u64), rec.staged_frame);
+    }
     // C (never built) is skipped: no publish, no queue batch.
     try std.testing.expectEqual(@as(u64, 0), mesh_c.instance_preview.build_seq);
     try std.testing.expectEqual(@as(u32, 0), mesh_c.instance_render.count);
     try std.testing.expectEqual(std.math.maxInt(u64), mesh_c.instance_render.staged_frame);
     // Stage-2B: the mesh list MUST NOT be mutated between build and latch
     // (swapRemove + append here); queues froze at build (A+B) and both
-    // entries fail-close by uid (A's slot now holds B, B's slot now holds C)
-    // — no OOB, no UAF, both invisible. instance_render above stays exact;
-    // the next funded build+latch republishes the live list.
+    // entries fail-close (A's slot now holds B, B's slot now holds C)
+    // — no OOB, no UAF, both invisible. The next funded build+latch
+    // republishes the live list (see the recovery round below).
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
     for (draws.primary.opaque_instanced.items) |b| {
         try std.testing.expectEqual(@as(u32, 0), b.visible_instance_count);
+    }
+
+    // Recovery: a funded build + latch publishes the live list (B + C).
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), mesh_c.instance_render.count);
+    try std.testing.expectEqual(scene.frame_id, mesh_b.instance_render.staged_frame);
+    const draws_r = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 2), draws_r.primary.opaque_instanced.items.len);
+    for (draws_r.primary.opaque_instanced.items) |b| {
+        try std.testing.expectEqual(@as(u32, 2), b.visible_instance_count);
     }
 }
 
@@ -2412,20 +2498,32 @@ test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
     // Provisional handle is the old one.
     try std.testing.expectEqual(@as(u32, 100), parent.instance_build_view.buffer.id);
 
-    // Simulate growth between build and latch: swap in the new handle (as
-    // stageInstancesGpu would after creating it headless-safe: the latch
-    // keeps the swapped handle since sg is invalid and publishes count).
+    // Simulate growth between build and latch AT THE SLOT LEVEL (as
+    // stageInstancesGpuState would resolve it with a live sg context: the
+    // latch seeds from the record's prior state, never from live
+    // instance_render, so a live swap would be invisible — the headless
+    // stand-in mutates the record's prior buffer/capacity instead).
     // The old-handle retire is deferred until AFTER prepare (into the open
     // latch epoch) so the prepare-leading flush never destroys a fake
     // headless id — mirroring the real growth order (new first, old retired
     // into the current epoch, VALID until a later complete+flush).
-    const old_buf = parent.instance_render.buffer;
-    parent.instance_render.buffer = .{ .id = 200 };
-    parent.instance_render.capacity = 4;
+    try std.testing.expectEqual(@as(usize, 1), scene.draws.backSlot().staged_instances.items.len);
+    const old_buf = scene.draws.backSlot().staged_instances.items[0].buffer;
+    try std.testing.expectEqual(@as(u32, 100), old_buf.id);
+    scene.draws.backSlot().staged_instances.items[0].buffer = .{ .id = 200 };
+    scene.draws.backSlot().staged_instances.items[0].capacity = 4;
+    scene.draws.backSlot().staged_instances.items[0].uploaded_count = 4;
+    scene.draws.backSlot().staged_instances.items[0].uploaded_hash =
+        scene.draws.backSlot().staged_instances.items[0].hash;
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     const draws = scene.preparedDraws();
+    // The record mirror carries the grown handle into instance_render and
+    // every payload ref.
+    try std.testing.expectEqual(@as(u32, 200), parent.instance_render.buffer.id);
+    try std.testing.expectEqual(@as(u32, 200), scene.preparedDraws().staged_instances.items[0].buffer.id);
+    try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().staged_instances.items[0].staged_frame);
     // All payload refs carry the NEW buffer id and count.
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
@@ -2513,10 +2611,18 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
     try scene.outline_meshes.append(alloc, &mesh_b);
 
     scene.buildPreparedFrame();
-    // Simulate an OOM/failing-allocator skip of B at latch: stale its preview
-    // so stageInstancesLatch skips it (previous complete state stands, patch
-    // must zero its provisional entries — no partial mix).
-    mesh_b.instance_preview.build_seq = 0;
+    // Simulate an OOM-skipped segment at latch: drop B's staged record so
+    // the latch has nothing to consume for it (previous complete state
+    // stands, patch must zero its provisional entries — no partial mix).
+    {
+        const recs = &scene.draws.backSlot().staged_instances;
+        var i: usize = 0;
+        while (i < recs.items.len) : (i += 1) {
+            if (recs.items[i].mesh == &mesh_b) break;
+        }
+        try std.testing.expect(i < recs.items.len);
+        _ = recs.orderedRemove(i);
+    }
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
@@ -3272,12 +3378,21 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
 
     scene.buildPreparedFrame();
     try std.testing.expectEqual(@as(u32, 2), parent.instance_preview.count);
-    // Stale the preview so the latch skips (as after an OOM/GPU failure):
-    // the transparent batch patch-zeroes but its transparent_order entry
-    // stays (stale). The draw skips count==0 batches, so the stale order
-    // entry is harmless — slot-state only here (renderSceneView needs a live
-    // camera + sg context, impractical headless; documented).
-    parent.instance_preview.build_seq = 0;
+    // Drop the staged record so the latch skips (as after an OOM/GPU
+    // failure): the transparent batch patch-zeroes but its
+    // transparent_order entry stays (stale). The draw skips count==0
+    // batches, so the stale order entry is harmless — slot-state only here
+    // (renderSceneView needs a live camera + sg context, impractical
+    // headless; documented).
+    {
+        const recs = &scene.draws.backSlot().staged_instances;
+        var i: usize = 0;
+        while (i < recs.items.len) : (i += 1) {
+            if (recs.items[i].mesh == &parent) break;
+        }
+        try std.testing.expect(i < recs.items.len);
+        _ = recs.orderedRemove(i);
+    }
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();

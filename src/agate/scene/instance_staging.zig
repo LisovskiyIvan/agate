@@ -16,12 +16,22 @@
 //!   handling, hash+count dedup gate), then publishes `instance_render`
 //!   (bounds/count/`staged_frame`) only after the GPU half succeeded (or was
 //!   skipped: no context, empty set).
-//! - Latch (`stageInstancesLatch`, context side): consumes fresh previews +
-//!   scratch for one `prepareFrame`; meshes whose preview is stale for this
-//!   build (OOM-skipped, created after the build, upload finished after the
+//! - Latch (`stageInstancesLatch`, context side): consumes the slot-owned
+//!   `staged_instances` records of one `prepareFrame` (frozen by
+//!   `freezeStagedRecords` during `buildPreparedFrame`) + the slot scratch.
+//!   Each record carries its mesh pointer/uid/index, scratch segment, and the
+//!   prior resolved state, so the latch performs NO live
+//!   `instance_preview` reads: an O(1) aliveness/identity guard
+//!   (`meshes[record.mesh_index] == record.mesh` and uid) runs before the
+//!   guarded `instance_render` write-back (fail-closed zeroing of the record
+//!   mirror on mismatch — same contract as the old preview check). Meshes
+//!   with no record for this build (OOM-skipped segment, created after the
 //!   build) are skipped — their previous complete `instance_render` stands,
 //!   coherent, with no partial publish. The next funded build recomputes
-//!   them and the next latch consumes them.
+//!   them and the next latch consumes them. A mesh-list mutation between
+//!   build and latch (reorder/destroy) trips the guard and fail-closes.
+//!   Slices are bounds-checked so a contract violation (scratch reset
+//!   between build and latch) can never slice out of bounds.
 //! - Fallback (`stageInstances` / `stageInstancedMesh`, unchanged
 //!   behavior): the inline CPU+GPU path `prepareFrame` runs when no fresh
 //!   build exists, so apps that never call `buildPreparedFrame` behave
@@ -41,6 +51,8 @@ const BoundingBox = math.BoundingBox;
 const Mesh = @import("../mesh.zig").Mesh;
 const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const InstancePreviewState = @import("../mesh.zig").InstancePreviewState;
+const InstanceRenderState = @import("../mesh.zig").InstanceRenderState;
+const StagedInstanceRecord = @import("../mesh.zig").StagedInstanceRecord;
 const material_mod = @import("../material.zig");
 const Material = material_mod.Material;
 const jobs = @import("../jobs.zig");
@@ -326,16 +338,24 @@ pub const GpuStageContext = struct {
     /// already requires the context thread. A null queue is NOT a guarantee
     /// about snapshots; it is the caller taking responsibility for them.
     retire_queue: ?*gpu_retire.GpuRetireQueue = null,
-    /// Scene `build_seq` being latched (`stageInstancesLatch` skips meshes
-    /// whose preview predates it). 0 = inline fallback (no preview check).
-    build_seq: u64 = 0,
 };
 
 pub fn stageInstancesGpu(gctx: GpuStageContext, mesh: *Mesh, matrices: []const Mat4, cpu: CpuStageResult) void {
     // Deferred-creation meshes have no vertex/index buffers yet; staging
     // instance data for them would produce a draw against invalid handles.
     if (mesh.gpu_pending) return;
-    const st = &mesh.instance_render;
+    stageInstancesGpuState(gctx, &mesh.instance_render, matrices, cpu);
+}
+
+/// Mesh-agnostic GPU core: buffer create/update/dedup/growth/retire for the
+/// CPU-staged `matrices` (FAILED/VALID handling, hash+count dedup gate —
+/// identical to the historical inline path), then publishes into `st`
+/// (bounds/count/`staged_frame`) only after the GPU half succeeded (or was
+/// skipped: no context, empty set). Never reads live instance TRS — only
+/// the staged slice plus the CPU result. The latch seeds `st` from the
+/// slot-owned record (never from live `instance_render`) and mirrors the
+/// result back; the inline fallback passes `&mesh.instance_render` directly.
+pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, matrices: []const Mat4, cpu: CpuStageResult) void {
     if (st.staged_frame == gctx.frame_id) return;
 
     const active_count = matrices.len;
@@ -450,29 +470,129 @@ pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq:
     }
 }
 
-/// GPU latch over every instance-bearing mesh (stage 1, context side):
-/// consumes the fresh previews + scratch of build `gctx.build_seq` (one
-/// `stageInstancesGpu` per mesh, reading its `[scratch_lo,
-/// scratch_lo + count)` slice). Meshes with a stale preview for this build
-/// (OOM-skipped, created after the build, upload finished after the build)
-/// or an out-of-range slice are skipped — previous complete state stands,
-/// no partial publish. Slices are bounds-checked so a contract violation
-/// (scratch reset between build and latch) can never slice out of bounds.
-pub fn stageInstancesLatch(gctx: GpuStageContext, meshes: []const *Mesh, scratch: *const std.ArrayListUnmanaged(Mat4)) void {
-    for (meshes) |mesh| {
+/// Freeze the slot-owned staged records for one build (stage 1, game side):
+/// for every instance-bearing mesh with a fresh preview (`build_seq` from
+/// the `stageInstancesCpu` pass just above), appends a `StagedInstanceRecord`
+/// carrying the mesh pointer/uid/index, the scratch segment, and the prior
+/// resolved state from `instance_render`. Same skip set as the CPU pass
+/// (LOD children, GPU-pending, no instances, stale preview) plus OOM: a
+/// record whose append fails is skipped like an OOM-skipped segment (the
+/// latch has no record for it, the previous complete `instance_render`
+/// stands, and the patch zeroes its provisional payload entries — coherent,
+/// no partial publish). Appends in mesh-list order (strictly increasing
+/// `mesh_index`); the caller reset the array first (two builds before a
+/// latch: the second reset clears the first, newest wins).
+pub fn freezeStagedRecords(
+    allocator: std.mem.Allocator,
+    records: *std.ArrayListUnmanaged(StagedInstanceRecord),
+    meshes: []const *Mesh,
+    build_seq: u64,
+) void {
+    for (meshes, 0..) |mesh, i| {
         _ = mesh.ensureUid();
         if (mesh.is_lod_child) continue;
         if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len == 0) continue;
         const pv = mesh.instance_preview;
-        if (pv.build_seq != gctx.build_seq) continue;
-        const count: usize = pv.count;
-        const end = pv.scratch_lo + count;
-        if (pv.scratch_lo > scratch.items.len or end > scratch.items.len) continue;
-        stageInstancesGpu(gctx, mesh, scratch.items[pv.scratch_lo..end], .{
+        if (pv.build_seq != build_seq) continue;
+        records.append(allocator, .{
+            .mesh = mesh,
+            .uid = mesh.uid,
+            .mesh_index = @intCast(i),
+            .scratch_lo = pv.scratch_lo,
+            .count = pv.count,
             .bounds = pv.bounds,
             .hash = pv.hash,
+            .uploaded_hash = mesh.instance_render.hash,
+            .mesh_position = mesh.position,
+            .buffer = mesh.instance_render.buffer,
+            .capacity = mesh.instance_render.capacity,
+            .uploaded_count = mesh.instance_render.uploaded_count,
+            .staged_frame = mesh.instance_render.staged_frame,
+        }) catch continue;
+    }
+}
+
+/// Zero the mirrored (post-latch) half of a record fail-closed: null buffer,
+/// count 0, `staged_frame` back to never-staged, so `patchInstanceRefs`
+/// zeroes every payload entry resolving to this record. The frozen input
+/// half (scratch range/bounds/hash) is left intact for debuggability.
+fn failRecord(rec: *StagedInstanceRecord) void {
+    rec.buffer = .{};
+    rec.capacity = 0;
+    rec.count = 0;
+    rec.uploaded_count = 0;
+    rec.uploaded_hash = 0;
+    rec.staged_frame = std.math.maxInt(u64);
+}
+
+/// GPU latch over the slot-owned staged records (stage 1, context side):
+/// one `stageInstancesGpuState` per record, reading its `[scratch_lo,
+/// scratch_lo + count)` slice from the slot scratch and seeding the GPU
+/// half from the record's PRIOR state (never from live `instance_preview`
+/// or live `instance_render`). The final state lands in BOTH
+/// `mesh.instance_render` (guarded write-back — the remaining live coupling,
+/// next slice's problem) and the record mirror (so the patch is
+/// self-contained).
+///
+/// Per record, in order:
+/// - O(1) aliveness/identity guard: `mesh_index` in range,
+///   `meshes[mesh_index] == record.mesh`, `uid` match. Evaluated without
+///   dereferencing `record.mesh` first, so a destroyed (unlinked, possibly
+///   freed) mesh fail-closes on the pointer compare — no UAF. On mismatch:
+///   fail-closed zeroing, previous complete `instance_render` stands.
+/// - Today's skip conditions (LOD child, GPU-pending, emptied between build
+///   and latch): fail-closed zeroing, previous state stands.
+/// - Bounds-checked slice (truncated-scratch contract violation): skip with
+///   fail-closed zeroing, previous state stands — never an OOB slice.
+/// Meshes with no record for this build (OOM-skipped, created after the
+/// build) never reach the latch: previous complete state stands.
+pub fn stageInstancesLatch(
+    gctx: GpuStageContext,
+    records: []StagedInstanceRecord,
+    meshes: []const *Mesh,
+    scratch: *const std.ArrayListUnmanaged(Mat4),
+) void {
+    for (records) |*rec| {
+        const idx: usize = rec.mesh_index;
+        if (idx >= meshes.len or meshes[idx] != rec.mesh or meshes[idx].uid != rec.uid) {
+            failRecord(rec);
+            continue;
+        }
+        const mesh = rec.mesh;
+        if (mesh.is_lod_child or mesh.gpu_pending or mesh.instances.items.len == 0) {
+            failRecord(rec);
+            continue;
+        }
+        const count: usize = rec.count;
+        const end = rec.scratch_lo + count;
+        if (rec.scratch_lo > scratch.items.len or end > scratch.items.len) {
+            failRecord(rec);
+            continue;
+        }
+        var st = InstanceRenderState{
+            .buffer = rec.buffer,
+            .capacity = rec.capacity,
+            .count = rec.count,
+            .bounds = rec.bounds,
+            .hash = rec.uploaded_hash,
+            .uploaded_count = rec.uploaded_count,
+            .staged_frame = rec.staged_frame,
+        };
+        stageInstancesGpuState(gctx, &st, scratch.items[rec.scratch_lo..end], .{
+            .bounds = rec.bounds,
+            .hash = rec.hash,
         });
+        mesh.instance_render = st;
+        rec.buffer = st.buffer;
+        rec.capacity = st.capacity;
+        rec.count = st.count;
+        rec.bounds = st.bounds;
+        // rec.hash stays the frozen staged-matrix hash (dedup compare input,
+        // never mirrored); the post-latch uploaded hash lands below.
+        rec.uploaded_hash = st.hash;
+        rec.uploaded_count = st.uploaded_count;
+        rec.staged_frame = st.staged_frame;
     }
 }
 
@@ -655,7 +775,7 @@ test "stage1: CPU+GPU halves equal the inline path (serial and parallel)" {
     }
 }
 
-test "stage1: concatenated scratch + latch consume fresh previews, skip stale" {
+test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     const ally = std.testing.allocator;
     const eye = Vec3.zero;
 
@@ -681,23 +801,176 @@ test "stage1: concatenated scratch + latch consume fresh previews, skip stale" {
     try std.testing.expectEqual(@as(usize, 4), fb.mesh.instance_preview.scratch_lo);
     try std.testing.expectEqual(@as(u64, 7), fb.mesh.instance_preview.build_seq);
 
-    stageInstancesLatch(.{ .allocator = ally, .frame_id = 21, .build_seq = 7 }, &meshes, &scratch);
+    // Records freeze one per fresh preview, in mesh order.
+    var records: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty;
+    defer records.deinit(ally);
+    freezeStagedRecords(ally, &records, &meshes, 7);
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+    try std.testing.expectEqual(@as(u32, 0), records.items[0].mesh_index);
+    try std.testing.expectEqual(@as(u32, 1), records.items[1].mesh_index);
+    try std.testing.expectEqual(fa.mesh.uid, records.items[0].uid);
+    try std.testing.expectEqual(@as(usize, 4), records.items[1].scratch_lo);
+
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 21 }, records.items, &meshes, &scratch);
     try std.testing.expectEqual(@as(u32, 4), fa.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u32, 4), fb.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 21), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(fa.mesh.instance_preview.bounds, fa.mesh.instance_render.bounds);
     try std.testing.expectEqual(fb.mesh.instance_preview.bounds, fb.mesh.instance_render.bounds);
+    // Post-latch state mirrors into the records (the patch is self-contained).
+    try std.testing.expectEqual(@as(u64, 21), records.items[0].staged_frame);
+    try std.testing.expectEqual(@as(u64, 21), records.items[1].staged_frame);
+    try std.testing.expectEqual(@as(u32, 4), records.items[1].count);
 
-    // Stale preview for this build (OOM-skipped / post-build mesh): the
-    // latch skips it — previous complete state stands, no partial publish.
+    // No record for this build (OOM-skipped / post-build mesh): the latch
+    // skips it — previous complete state stands, no partial publish.
     const keep_bounds = fb.mesh.instance_render.bounds;
-    fb.mesh.instance_preview.build_seq = 6;
+    _ = records.pop(); // drop B's record: same as a segment that never froze
     fb.mesh.position = Vec3.new(50, 0, 0);
-    stageInstancesLatch(.{ .allocator = ally, .frame_id = 22, .build_seq = 7 }, &meshes, &scratch);
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 22 }, records.items, &meshes, &scratch);
     try std.testing.expectEqual(@as(u64, 22), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 21), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(keep_bounds, fb.mesh.instance_render.bounds);
     try std.testing.expectEqual(@as(u32, 4), fb.mesh.instance_render.count);
+}
+
+test "stage1: latch ignores cleared live previews, consumes records only" {
+    const ally = std.testing.allocator;
+    const eye = Vec3.zero;
+
+    var src_a = splitSrcMesh();
+    var fa = try StageSplitFixture.init(ally, &src_a, 3, 0);
+    defer fa.deinit(ally);
+    var src_b = splitSrcMesh();
+    var fb = try StageSplitFixture.init(ally, &src_b, 2, 0);
+    defer fb.deinit(ally);
+    const meshes = [_]*Mesh{ &fa.mesh, &fb.mesh };
+
+    var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = eye }, &meshes, 9);
+    var records: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty;
+    defer records.deinit(ally);
+    freezeStagedRecords(ally, &records, &meshes, 9);
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+
+    // Live previews wiped between build and latch (the old latch would skip
+    // both meshes): records still carry everything the latch needs.
+    fa.mesh.instance_preview = .{};
+    fb.mesh.instance_preview = .{};
+
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 33 }, records.items, &meshes, &scratch);
+    try std.testing.expectEqual(@as(u32, 3), fa.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 33), fa.mesh.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u64, 33), fb.mesh.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u64, 33), records.items[0].staged_frame);
+    try std.testing.expect(fa.mesh.instance_render.bounds.isValid());
+    // A live instance TRS mutation after the build still cannot leak in: the
+    // slice was frozen at build time.
+    try std.testing.expectEqual(records.items[0].bounds, fa.mesh.instance_render.bounds);
+}
+
+test "stage1: latch guard fail-closes on reorder/destroy without UAF" {
+    const ally = std.testing.allocator;
+    const eye = Vec3.zero;
+
+    var src_a = splitSrcMesh();
+    var fa = try StageSplitFixture.init(ally, &src_a, 2, 0);
+    defer fa.deinit(ally);
+    var src_b = splitSrcMesh();
+    var fb = try StageSplitFixture.init(ally, &src_b, 2, 0);
+    defer fb.deinit(ally);
+    const built = [_]*Mesh{ &fa.mesh, &fb.mesh };
+
+    var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = eye }, &built, 5);
+    var records: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty;
+    defer records.deinit(ally);
+    freezeStagedRecords(ally, &records, &built, 5);
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+
+    // Reorder: B now sits at index 0 (A's record points at B), A is gone.
+    // Destroy: index 1 is out of range for B's record. Neither guard may
+    // dereference the displaced record mesh.
+    const reordered = [_]*Mesh{&fb.mesh};
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 44 }, records.items, &reordered, &scratch);
+    // A's record (index 0, mesh A): pointer mismatch → fail-closed zeroing.
+    try std.testing.expectEqual(std.math.maxInt(u64), records.items[0].staged_frame);
+    try std.testing.expectEqual(@as(u32, 0), records.items[0].buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), records.items[0].count);
+    // B's record (index 1): out of range → fail-closed zeroing.
+    try std.testing.expectEqual(std.math.maxInt(u64), records.items[1].staged_frame);
+    // Neither mesh published: previous (never-staged) state stands.
+    try std.testing.expectEqual(std.math.maxInt(u64), fa.mesh.instance_render.staged_frame);
+    try std.testing.expectEqual(std.math.maxInt(u64), fb.mesh.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u32, 0), fa.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 0), fb.mesh.instance_render.count);
+}
+
+test "stage1: truncated scratch skips the record, previous stands" {
+    const ally = std.testing.allocator;
+    const eye = Vec3.zero;
+
+    var src = splitSrcMesh();
+    var f = try StageSplitFixture.init(ally, &src, 3, 0);
+    defer f.deinit(ally);
+    const meshes = [_]*Mesh{&f.mesh};
+
+    var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = eye }, &meshes, 3);
+    var records: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty;
+    defer records.deinit(ally);
+    freezeStagedRecords(ally, &records, &meshes, 3);
+
+    // Prime a previous complete publish, then truncate the scratch (contract
+    // violation the latch must survive): the out-of-range slice is skipped
+    // with fail-closed zeroing, never an OOB slice.
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 50 }, records.items, &meshes, &scratch);
+    try std.testing.expectEqual(@as(u32, 3), f.mesh.instance_render.count);
+    const primed = f.mesh.instance_render.bounds;
+    scratch.clearRetainingCapacity();
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 51 }, records.items, &meshes, &scratch);
+    try std.testing.expectEqual(@as(u32, 3), f.mesh.instance_render.count);
+    try std.testing.expectEqual(primed, f.mesh.instance_render.bounds);
+    try std.testing.expectEqual(@as(u64, 50), f.mesh.instance_render.staged_frame);
+    try std.testing.expectEqual(std.math.maxInt(u64), records.items[0].staged_frame);
+}
+
+test "stage1: two record freezes, newest wins" {
+    const ally = std.testing.allocator;
+    const eye = Vec3.zero;
+
+    var src = splitSrcMesh();
+    var f = try StageSplitFixture.init(ally, &src, 2, 0);
+    defer f.deinit(ally);
+    const meshes = [_]*Mesh{&f.mesh};
+
+    var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch.deinit(ally);
+    var records: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty;
+    defer records.deinit(ally);
+
+    // First build.
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = eye }, &meshes, 1);
+    freezeStagedRecords(ally, &records, &meshes, 1);
+    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    const first_bounds = records.items[0].bounds;
+
+    // Second build before any latch (slot reset first: newest wins).
+    f.mem[1].position = Vec3.new(40, 0, 0);
+    scratch.clearRetainingCapacity();
+    records.clearRetainingCapacity();
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = eye }, &meshes, 2);
+    freezeStagedRecords(ally, &records, &meshes, 2);
+    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    try std.testing.expect(records.items[0].bounds.max.x > first_bounds.max.x + 10.0);
+
+    stageInstancesLatch(.{ .allocator = ally, .frame_id = 60 }, records.items, &meshes, &scratch);
+    try std.testing.expectEqual(records.items[0].bounds, f.mesh.instance_render.bounds);
+    try std.testing.expect(records.items[0].bounds.max.x > first_bounds.max.x + 10.0);
 }
 
 test "stage1: segment OOM truncates scratch and advances nothing" {

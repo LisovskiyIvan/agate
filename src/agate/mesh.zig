@@ -22,6 +22,7 @@ pub const Mesh = mesh_impl.Mesh;
 pub const InstanceRenderState = mesh_impl.InstanceRenderState;
 pub const InstancePreviewState = mesh_impl.InstancePreviewState;
 pub const InstanceSource = mesh_impl.InstanceSource;
+pub const StagedInstanceRecord = mesh_impl.StagedInstanceRecord;
 pub const uploadGeometry = mesh_impl.uploadGeometry;
 
 /// GPU morph blending: delta-texture packing plus the pure Zig mirror of

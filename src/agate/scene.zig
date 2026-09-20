@@ -46,6 +46,7 @@ const PointLightOptions = lights.PointLightOptions;
 const SpotLight = lights.SpotLight;
 const SpotLightOptions = lights.SpotLightOptions;
 const Mesh = @import("mesh.zig").Mesh;
+const StagedInstanceRecord = @import("mesh.zig").StagedInstanceRecord;
 const decal_mod = @import("mesh/decal.zig");
 const DecalManager = decal_mod.DecalManager;
 const trail_mod = @import("mesh/trail.zig");
@@ -324,13 +325,16 @@ pub const Scene = struct {
 
     /// Stage 1 producer-build handoff (game/update phase → prepare latch):
     /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages instance
-    /// matrices into the back-slot scratch + per-mesh previews and captures
+    /// matrices into the back-slot scratch + per-mesh previews, freezes the
+    /// slot-owned staged records, and captures
     /// the particle/physics CPU build frames, then bumps `build_seq`.
     /// `prepareFrame` (context side) consumes the build when `build_seq !=
-    /// last_latched_seq` (GPU halves + latch copies, no CPU restaging) and
+    /// last_latched_seq` (GPU halves over the slot records + latch copies,
+    /// no CPU restaging, no live preview reads) and
     /// otherwise runs the historical inline path — so behavior stays correct
     /// when `buildPreparedFrame` is never called. Two builds before a latch:
-    /// newest wins (single preview store recomputed, scratch overwritten).
+    /// newest wins (single preview store recomputed, scratch overwritten,
+    /// record array reset and refilled).
     /// A missed build never resurfaces a stale frame: every prepare (latch
     /// or fallback) publishes a fresh slot; render reuses the last published
     /// front only when prepare itself is not called (unchanged).
@@ -1598,151 +1602,141 @@ pub const Scene = struct {
     }
 
     /// Latch patch finalizing game-built provisional handles (stage-2
-    /// increment B, context side, allocation-free linear pass): after
-    /// `stageInstancesLatch` publishes `instance_render`, every instanced
-    /// payload entry built with `.build_view` is re-resolved by identity
-    /// (`source_mesh` index + `source_uid` validation) against the post-latch
-    /// live mesh list.
+    /// increment B, context side, allocation-free): after
+    /// `stageInstancesLatch` publishes, every instanced payload entry built
+    /// with `.build_view` is re-resolved by identity (`source_mesh` index +
+    /// `source_uid` validation) against the SLOT-OWNED staged records — never
+    /// against the live mesh list.
     ///
     /// Payload identity invariant: `source_uid` is the stable `Mesh.uid`,
     /// `source_mesh` the mesh-list index at build time. Provisional vs
     /// finalized: at build time `instance_buffer`/`visible_instance_count`
     /// (plus shadow `world_aabb`/`max_dim`, outline `world_center`) came from
     /// the provisional `instance_build_view` (frozen count/bounds + old
-    /// handle); here they are finalized from the post-latch `instance_render`.
+    /// handle); here they are finalized from the post-latch RECORD mirror
+    /// (which the latch copied from its guarded `instance_render`
+    /// write-back, so the values are identical to reading live state —
+    /// without the race).
+    ///
+    /// Records are appended in mesh-list order (strictly increasing
+    /// `mesh_index`), so the lookup below is a linear scan with early exit.
+    /// A mesh-list mutation between build and latch can therefore NOT slip
+    /// a stale entry through: the latch guard already fail-closed the
+    /// affected records (`staged_frame != frame_id`), and the patch zeroes
+    /// them here. The live mesh list is validated at latch time, not patch
+    /// time — the patch performs zero live reads (outline stale fallbacks
+    /// use the record-frozen `mesh_position`, not live `mesh.position`).
     ///
     /// Per entry (only `is_instanced` shadow/outline items and all instanced
     /// batches; regular items have no provisional handle and are skipped):
-    /// - resolve `idx = source_mesh`; if `idx >= meshes.len` → fail-closed
-    ///   zero (mesh list shrank; no OOB, no UAF).
-    /// - `mesh = meshes[idx]`; if `mesh.uid != source_uid` → fail-closed zero
-    ///   (swapRemove/reorder changed the list; validated, not merely assumed —
-    ///   the mesh list MUST NOT be mutated between build and latch, and a
-    ///   violation degrades to invisible instead of corrupt).
-    /// - `st = mesh.instance_render`; if `st.staged_frame == frame_id`
-    ///   (published this latch) copy `buffer`/`count` (+ shadow `world_aabb`
-    ///   from `st.bounds` with `max_dim` recomputed from extents exactly as
-    ///   `prepareInto` did, outline `world_center` from `st.bounds` center or
-    ///   `mesh.position` when invalid); else (skipped/stale/FAILED) zero:
-    ///   `instance_buffer={}`, `visible_instance_count=0`, shadow aabb
-    ///   invalid + `max_dim=0`. Outline zero-center rule: OOB index (no mesh
-    ///   to read) → `Vec3.zero`; uid-mismatch or stale publish (mesh known) →
-    ///   `mesh.position` (chosen over keeping the build value so a stale entry
-    ///   never points at a freed/foreign center; documented here).
+    /// - find the record with `mesh_index == source_mesh`; missing (mesh
+    ///   list shrank, or the mesh never froze a record) → fail-closed zero.
+    ///   Outline center falls back to `Vec3.zero` (no record to read).
+    /// - `record.uid != source_uid` (reorder changed the list) →
+    ///   fail-closed zero; outline center falls back to the record-frozen
+    ///   `mesh_position` (the mesh is known via the record).
+    /// - `record.staged_frame != frame_id` (latch skipped/failed this
+    ///   record) → fail-closed zero with the same outline fallback.
+    /// - else copy `buffer`/`count` (+ shadow `world_aabb` from
+    ///   `record.bounds` with `max_dim` recomputed from extents exactly as
+    ///   `prepareInto` did, outline `world_center` from `record.bounds`
+    ///   center or the frozen `mesh_position` when invalid).
     /// - Transparent order entries referencing zeroed batches need no distance
     ///   change: the draw skips `count==0` batches, so order is harmless.
     /// - Culling/inclusion stay frozen at build time (bounds/model/distance
     ///   are NOT repatched): a live TRS mutation between build and latch
     ///   never alters this frame's sets, only the next build sees it.
+    fn findStagedRecord(records: []const StagedInstanceRecord, idx: usize) ?*const StagedInstanceRecord {
+        for (records) |*rec| {
+            const ri: usize = rec.mesh_index;
+            if (ri == idx) return rec;
+            if (ri > idx) break;
+        }
+        return null;
+    }
+
     fn patchInstanceRefs(self: *Scene, back: *FrameDrawSlot) void {
-        const meshes = self.meshes.items;
-        const fid = self.frame_id;
+        _ = self;
+        const records = back.staged_instances.items;
+        const fid = back.frame_id;
         // Queue batches: primary + all views, opaque + transparent.
         const queue_lists = [_]*std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch){
             &back.primary.opaque_instanced, &back.primary.transparent_instanced,
         };
-        for (queue_lists) |list| self.patchBatchList(list, meshes, fid);
+        for (queue_lists) |list| patchBatchList(list, records, fid);
         for (&back.views) |*q| {
-            self.patchBatchList(&q.opaque_instanced, meshes, fid);
-            self.patchBatchList(&q.transparent_instanced, meshes, fid);
+            patchBatchList(&q.opaque_instanced, records, fid);
+            patchBatchList(&q.transparent_instanced, records, fid);
         }
         // Shadow items (instanced only).
         for (back.shadow.items.items) |*it| {
             if (!it.is_instanced) continue;
-            const idx: usize = it.source_mesh;
-            if (idx >= meshes.len) {
+            const rec = findStagedRecord(records, it.source_mesh) orelse {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_aabb = BoundingBox.zero;
+                it.max_dim = 0;
+                continue;
+            };
+            if (rec.uid != it.source_uid or rec.staged_frame != fid) {
                 it.instance_buffer = .{};
                 it.visible_instance_count = 0;
                 it.world_aabb = BoundingBox.zero;
                 it.max_dim = 0;
                 continue;
             }
-            const mesh = meshes[idx];
-            if (mesh.uid != it.source_uid) {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_aabb = BoundingBox.zero;
-                it.max_dim = 0;
-                continue;
-            }
-            const st = mesh.instance_render;
-            if (st.staged_frame == fid) {
-                it.instance_buffer = st.buffer;
-                it.visible_instance_count = st.count;
-                it.world_aabb = st.bounds;
-                const ext = st.bounds.extents();
-                it.max_dim = @max(ext.x, @max(ext.y, ext.z));
-            } else {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_aabb = BoundingBox.zero;
-                it.max_dim = 0;
-            }
+            it.instance_buffer = rec.buffer;
+            it.visible_instance_count = rec.count;
+            it.world_aabb = rec.bounds;
+            const ext = rec.bounds.extents();
+            it.max_dim = @max(ext.x, @max(ext.y, ext.z));
         }
         // Outline items (instanced only).
         for (back.outline_items.items) |*it| {
             if (!it.is_instanced) continue;
-            const idx: usize = it.source_mesh;
-            if (idx >= meshes.len) {
+            const rec = findStagedRecord(records, it.source_mesh) orelse {
                 it.instance_buffer = .{};
                 it.visible_instance_count = 0;
                 it.world_center = Vec3.zero;
                 continue;
-            }
-            const mesh = meshes[idx];
-            if (mesh.uid != it.source_uid) {
+            };
+            if (rec.uid != it.source_uid or rec.staged_frame != fid) {
                 it.instance_buffer = .{};
                 it.visible_instance_count = 0;
-                it.world_center = mesh.position;
+                it.world_center = rec.mesh_position;
                 continue;
             }
-            const st = mesh.instance_render;
-            if (st.staged_frame == fid) {
-                it.instance_buffer = st.buffer;
-                it.visible_instance_count = st.count;
-                it.world_center = if (st.bounds.isValid()) st.bounds.center() else mesh.position;
-            } else {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_center = mesh.position;
-            }
+            it.instance_buffer = rec.buffer;
+            it.visible_instance_count = rec.count;
+            it.world_center = if (rec.bounds.isValid()) rec.bounds.center() else rec.mesh_position;
         }
     }
 
     fn patchBatchList(
-        self: *Scene,
         list: *std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch),
-        meshes: []const *Mesh,
+        records: []const StagedInstanceRecord,
         fid: u64,
     ) void {
-        _ = self;
         for (list.items) |*b| {
-            const idx: usize = b.source_mesh;
-            if (idx >= meshes.len) {
+            const rec = findStagedRecord(records, b.source_mesh) orelse {
+                b.instance_buffer = .{};
+                b.visible_instance_count = 0;
+                continue;
+            };
+            if (rec.uid != b.source_uid or rec.staged_frame != fid) {
                 b.instance_buffer = .{};
                 b.visible_instance_count = 0;
                 continue;
             }
-            const mesh = meshes[idx];
-            if (mesh.uid != b.source_uid) {
-                b.instance_buffer = .{};
-                b.visible_instance_count = 0;
-                continue;
-            }
-            const st = mesh.instance_render;
-            if (st.staged_frame == fid) {
-                b.instance_buffer = st.buffer;
-                b.visible_instance_count = st.count;
-            } else {
-                b.instance_buffer = .{};
-                b.visible_instance_count = 0;
-            }
+            b.instance_buffer = rec.buffer;
+            b.visible_instance_count = rec.count;
         }
     }
 
     /// Stage-2 increment B producer build (game/update phase, CPU-only,
     /// sg-free): stages the CPU halves the prepare latch will consume —
-    /// instance matrices into the back-slot scratch + per-mesh previews, the
+    /// instance matrices into the back-slot scratch + per-mesh previews +
+    /// the slot-owned staged records, the
     /// particle build frame, the physics debug build capture — then freezes
     /// the provisional `instance_build_view` per mesh and builds the full
     /// queue/shadow/outline payload into the back slot via the shared
@@ -1783,6 +1777,7 @@ pub const Scene = struct {
     /// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
     /// no `self.stats`, no profiler. Mutates under game-phase ownership only:
     /// back-slot queues/shadow/outline + scratch, previews/build_views,
+    /// staged records,
     /// particle/physics build frames, `build_snapshot` (refreshed), shadow
     /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
     /// with the build key), and `build_stats`.
@@ -1846,6 +1841,10 @@ pub const Scene = struct {
                 m.instance_build_view = .{};
             }
         }
+        // Freeze the slot-owned staged records for the prepare latch below
+        // (same fresh-preview set as the build-view freeze above). The latch
+        // and `patchInstanceRefs` consume these — never live previews.
+        scene_instance_staging.freezeStagedRecords(self.allocator, &back.staged_instances, self.meshes.items, seq);
         self.particles.buildCapture(self.allocator, seq);
         self.physics.buildDebug(self.allocator, seq);
         // Game-side queue/shadow/outline build (sg-free: instances_prepared).
@@ -1990,17 +1989,25 @@ pub const Scene = struct {
         const back = &self.draws.slots[back_idx];
         if (have_build) {
             // Stage-2 latch: the game-side build already reset this back
-            // slot, staged the instance scratch + previews + build_views, and
+            // slot, staged the instance scratch + previews + staged records +
+            // build_views, and
             // built the queue/shadow/outline payload with `.build_view`
             // (provisional handles). Reset-before-consume would erase the
             // build, and rebuilding would unfreeze the sets — so do NOT call
             // buildQueuesInto here. Only stamp the prepare-owned frame/epoch,
-            // run the GPU halves over the previews + scratch, finalize the
+            // run the GPU halves over the slot records + scratch, finalize the
             // provisional handles with patchInstanceRefs, then merge the
-            // deferred build_stats. Stale previews (OOM-skipped, post-build
-            // meshes) keep their previous complete `instance_render` and
+            // deferred build_stats. Meshes with no record (OOM-skipped,
+            // post-build meshes) keep their previous complete
+            // `instance_render` and
             // patch to invisible — no partial publish. Mesh-list mutation
-            // between build and latch fail-closes by uid (see patch docs).
+            // between build and latch fail-closes by guard at latch time and
+            // by record lookup at patch time (see patch docs).
+            //
+            // Remaining live coupling (next slice): the update-vs-prepare
+            // mutex still guards the whole handoff, and the latch still
+            // writes back `mesh.instance_render` (mirrored into the record so
+            // the patch itself is self-contained).
             std.debug.assert(self.build_slot == back_idx);
             back.frame_id = self.frame_id;
             back.retire_epoch = self.retire_epoch;
@@ -2010,14 +2017,16 @@ pub const Scene = struct {
                 // run before the shadow snapshot historically). Same retire
                 // queue and eye source shape (the eye itself was consumed at
                 // build time for the transparent sort; only the guard reads
-                // the snapshot here).
+                // the snapshot here). The latch consumes the slot-owned
+                // staged records frozen by buildPreparedFrame — no live
+                // preview reads; a mesh-list mutation between build and latch
+                // trips the per-record guard and fail-closes.
                 if (self.frame_snapshot.has_camera) {
                     scene_instance_staging.stageInstancesLatch(.{
                         .allocator = self.allocator,
                         .frame_id = self.frame_id,
                         .retire_queue = &self.gpu_retire,
-                        .build_seq = self.build_seq,
-                    }, self.meshes.items, &back.primary.instance_matrices);
+                    }, back.staged_instances.items, self.meshes.items, &back.primary.instance_matrices);
                 }
             }
             self.patchInstanceRefs(back);
