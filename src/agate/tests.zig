@@ -32,6 +32,13 @@ test {
     _ = @import("audio/tests.zig");
     _ = @import("c.zig");
     _ = @import("camera.zig");
+    _ = @import("camera/arc_rotate.zig");
+    _ = @import("camera/fly.zig");
+    _ = @import("camera/follow.zig");
+    _ = @import("camera/free.zig");
+    _ = @import("camera/target.zig");
+    _ = @import("camera/union.zig");
+    _ = @import("camera/viewport.zig");
     _ = @import("compute.zig");
     _ = @import("dds.zig");
     _ = @import("export/obj.zig");
