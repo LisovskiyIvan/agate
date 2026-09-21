@@ -53,8 +53,9 @@ var game_thread: ?std.Thread = null;
 var particles: *z.ParticleSystem = undefined;
 var msaa_samples: i32 = 1;
 
-fn parseArgs(args: std.process.Args) void {
-    var it = std.process.Args.Iterator.init(args);
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) void {
+    var it = std.process.Args.Iterator.initAllocator(args, allocator) catch return;
+    defer it.deinit();
     _ = it.next(); // program name
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--frames")) {
@@ -278,9 +279,7 @@ fn gameLoop() void {
 
         // Pace the simulation thread (~1 kHz): leaves cores free and
         // keeps dt magnitudes sane for the demo's float32 state.
-        const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&ts, &rem);
+        z.jobs.sleepNs(1_000_000);
     }
 }
 
@@ -388,7 +387,7 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
 }
 
 pub fn main(minimal: std.process.Init.Minimal) void {
-    parseArgs(minimal.args);
+    parseArgs(gpa.allocator(), minimal.args);
     sapp.run(.{
         .init_cb = init,
         .frame_cb = frame,

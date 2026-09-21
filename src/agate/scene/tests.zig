@@ -2170,7 +2170,7 @@ test "stage1: particle build on worker + latch on main freezes the frame" {
     };
     const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
     t.join();
-    try std.testing.expectEqual(@as(u64, 1), scene.particles.build_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.particles.build_seq.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), scene.particles.build_frame.items.len);
     try std.testing.expectEqual(@as(usize, 0), scene.particles.frame.items.len);
 
@@ -2287,7 +2287,7 @@ test "stage1: physics build on worker + latch on main freezes the capture" {
     };
     const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
     t.join();
-    try std.testing.expectEqual(@as(u64, 1), scene.physics.build_seq);
+    try std.testing.expectEqual(@as(u64, 1), scene.physics.build_seq.load(.acquire));
     try std.testing.expect(scene.physics.build_visible);
     try std.testing.expectEqual(@as(usize, 12), scene.physics.build_lines.items.len);
     try std.testing.expect(!scene.physics.prepared_visible);

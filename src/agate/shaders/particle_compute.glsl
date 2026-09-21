@@ -60,7 +60,7 @@ struct CSpawn {
     vec4 d;
     vec4 e;
 };
-layout(std430, binding = 1) buffer cs_spawn {
+layout(std430, binding = 1) readonly buffer cs_spawn {
     CSpawn spawns[];
 };
 

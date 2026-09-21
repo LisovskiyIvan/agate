@@ -22,9 +22,47 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// pthread mutex + condvar pair guarding the wake protocol. All parking
+const windows = std.os.windows;
+
+// Windows API externs (kernel32) for thread synchronization
+const win_sync = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *windows.SRWLOCK) callconv(.winapi) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *windows.SRWLOCK) callconv(.winapi) void;
+    extern "kernel32" fn TryAcquireSRWLockExclusive(SRWLock: *windows.SRWLOCK) callconv(.winapi) windows.BOOLEAN;
+    extern "kernel32" fn SleepConditionVariableSRW(ConditionVariable: *windows.CONDITION_VARIABLE, SRWLock: *windows.SRWLOCK, dwMilliseconds: windows.DWORD, Flags: windows.ULONG) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn WakeAllConditionVariable(ConditionVariable: *windows.CONDITION_VARIABLE) callconv(.winapi) void;
+    extern "kernel32" fn Sleep(dwMilliseconds: windows.DWORD) callconv(.winapi) void;
+    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *windows.LARGE_INTEGER) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *windows.LARGE_INTEGER) callconv(.winapi) windows.BOOL;
+} else struct {};
+
+const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// Mutex + condvar pair guarding the wake protocol. All parking
 /// workers share one lot; the producer broadcasts on it.
-const ParkingLot = struct {
+/// Uses native SRWLock / ConditionVariable on Windows, pthread on POSIX.
+const ParkingLot = if (builtin.os.tag == .windows) struct {
+    srw: windows.SRWLOCK = .{},
+    cond: windows.CONDITION_VARIABLE = .{},
+
+    fn lock(self: *ParkingLot) void {
+        win_sync.AcquireSRWLockExclusive(&self.srw);
+    }
+
+    fn unlock(self: *ParkingLot) void {
+        win_sync.ReleaseSRWLockExclusive(&self.srw);
+    }
+
+    fn sleep(self: *ParkingLot) void {
+        _ = win_sync.SleepConditionVariableSRW(&self.cond, &self.srw, INFINITE, 0);
+    }
+
+    fn broadcast(self: *ParkingLot) void {
+        win_sync.WakeAllConditionVariable(&self.cond);
+    }
+
+    fn deinit(_: *ParkingLot) void {}
+} else struct {
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
 
@@ -48,6 +86,11 @@ const ParkingLot = struct {
     /// check and its sleep.
     fn broadcast(self: *ParkingLot) void {
         _ = std.c.pthread_cond_broadcast(&self.cond);
+    }
+
+    fn deinit(self: *ParkingLot) void {
+        _ = std.c.pthread_mutex_destroy(&self.mutex);
+        _ = std.c.pthread_cond_destroy(&self.cond);
     }
 };
 
@@ -97,9 +140,8 @@ pub const Pool = struct {
             .dispatch_mutex = .{},
         };
         errdefer {
-            _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
-            _ = std.c.pthread_cond_destroy(&self.lot.cond);
-            _ = std.c.pthread_mutex_destroy(&self.dispatch_mutex.mutex);
+            self.lot.deinit();
+            self.dispatch_mutex.deinit();
         }
         const effective: usize = if (builtin.single_threaded) 0 else worker_count;
         if (effective == 0) return self;
@@ -138,9 +180,8 @@ pub const Pool = struct {
         const a = self.allocator;
         if (self.workers.len > 0) a.free(self.workers);
         if (self.mailbox.len > 0) a.free(self.mailbox);
-        _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
-        _ = std.c.pthread_cond_destroy(&self.lot.cond);
-        _ = std.c.pthread_mutex_destroy(&self.dispatch_mutex.mutex);
+        self.lot.deinit();
+        self.dispatch_mutex.deinit();
         a.destroy(self);
     }
 
@@ -257,12 +298,47 @@ pub fn parallelFor(
     pool.?.forkJoin(C, ctx, run, len);
 }
 
-/// Blocking mutex (pthread) for coarse phase ownership: the threaded game
+/// Blocking mutex for coarse phase ownership: the threaded game
 /// loop holds it during Scene.update, the sapp thread during render, so
 /// the two phases never overlap. Small critical sections only — this is
 /// ownership, not a data-race bandage. Condition-variable parking lives
 /// in ParkingLot (TaskRunner); this type is the bare lock.
-pub const Mutex = struct {
+/// Uses native SRWLock on Windows, pthread_mutex on POSIX.
+pub const Mutex = if (builtin.os.tag == .windows) struct {
+    srw: windows.SRWLOCK = .{},
+
+    pub fn lock(self: *Mutex) void {
+        win_sync.AcquireSRWLockExclusive(&self.srw);
+    }
+
+    pub fn tryLock(self: *Mutex) bool {
+        return win_sync.TryAcquireSRWLockExclusive(&self.srw) != .FALSE;
+    }
+
+    pub fn tryLockWithin(self: *Mutex, timeout_ns: u64) bool {
+        if (self.tryLock()) return true;
+        if (timeout_ns == 0) return false;
+        const start = monoNs();
+        var slept: u64 = 0;
+        while (true) {
+            const now = monoNs();
+            const clock_elapsed: u64 = if (now >= start) now - start else 0;
+            const elapsed: u64 = @max(clock_elapsed, slept);
+            if (elapsed >= timeout_ns) return false;
+            const remaining = timeout_ns - elapsed;
+            const step: u64 = @min(remaining, 50_000); // 50us park
+            sleepNs(step);
+            slept += step;
+            if (self.tryLock()) return true;
+        }
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        win_sync.ReleaseSRWLockExclusive(&self.srw);
+    }
+
+    pub fn deinit(_: *Mutex) void {}
+} else struct {
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub fn lock(self: *Mutex) void {
@@ -307,28 +383,46 @@ pub const Mutex = struct {
     pub fn unlock(self: *Mutex) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
+
+    pub fn deinit(self: *Mutex) void {
+        _ = std.c.pthread_mutex_destroy(&self.mutex);
+    }
 };
 
-/// Monotonic nanoseconds via `clock_gettime(CLOCK.MONOTONIC)` — the same
-/// source `std.time.Timer` wraps (removed in Zig 0.16, so jobs.zig calls
-/// libc directly). Returns 0 if the call ever fails; callers pair it with
-/// sleep accounting so a clock stall can never hang the wait.
+/// Monotonic nanoseconds: QPC on Windows, clock_gettime(CLOCK.MONOTONIC) on POSIX.
 fn monoNs() u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: i64 = @intCast(ts.sec);
-    const nsec: i64 = @intCast(ts.nsec);
-    if (sec <= 0) return @intCast(@max(nsec, @as(i64, 0)));
-    return @as(u64, @intCast(sec)) * 1_000_000_000 + @as(u64, @intCast(nsec));
+    if (builtin.os.tag == .windows) {
+        var count: windows.LARGE_INTEGER = undefined;
+        var freq: windows.LARGE_INTEGER = undefined;
+        if (win_sync.QueryPerformanceCounter(&count) == .FALSE) return 0;
+        if (win_sync.QueryPerformanceFrequency(&freq) == .FALSE) return 0;
+        const c: u64 = @bitCast(count);
+        const f: u64 = @bitCast(freq);
+        if (f == 0) return 0;
+        const c_u128: u128 = c;
+        const res = (c_u128 * 1_000_000_000) / f;
+        return @intCast(@min(res, std.math.maxInt(u64)));
+    } else {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        const sec: i64 = @intCast(ts.sec);
+        const nsec: i64 = @intCast(ts.nsec);
+        if (sec <= 0) return @intCast(@max(nsec, @as(i64, 0)));
+        return @as(u64, @intCast(sec)) * 1_000_000_000 + @as(u64, @intCast(nsec));
+    }
 }
 
-/// Parks the caller for `ns` nanoseconds via `nanosleep`.
-fn sleepNs(ns: u64) void {
-    const ts = std.c.timespec{
-        .sec = @intCast(ns / 1_000_000_000),
-        .nsec = @intCast(ns % 1_000_000_000),
-    };
-    _ = std.c.nanosleep(&ts, null);
+/// Parks the caller for `ns` nanoseconds: Sleep on Windows, nanosleep on POSIX.
+pub fn sleepNs(ns: u64) void {
+    if (builtin.os.tag == .windows) {
+        win_sync.Sleep(@intCast(if (ns == 0) 0 else @max(1, ns / 1_000_000)));
+    } else {
+        const ts = std.c.timespec{
+            .sec = @intCast(ns / 1_000_000_000),
+            .nsec = @intCast(ns % 1_000_000_000),
+        };
+        _ = std.c.nanosleep(&ts, null);
+    }
 }
 
 /// Fire-and-forget background tasks on dedicated threads — the asset
@@ -364,8 +458,7 @@ pub const TaskRunner = struct {
             .threads = &.{},
         };
         errdefer {
-            _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
-            _ = std.c.pthread_cond_destroy(&self.lot.cond);
+            self.lot.deinit();
         }
         const effective: usize = if (builtin.single_threaded) 0 else thread_count;
         if (effective == 0) return self;
@@ -398,8 +491,7 @@ pub const TaskRunner = struct {
         self.queue.deinit(self.allocator);
         const a = self.allocator;
         if (self.threads.len > 0) a.free(self.threads);
-        _ = std.c.pthread_mutex_destroy(&self.lot.mutex);
-        _ = std.c.pthread_cond_destroy(&self.lot.cond);
+        self.lot.deinit();
         a.destroy(self);
     }
 

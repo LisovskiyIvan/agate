@@ -145,6 +145,7 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
         bind.views[pbr_shd.VIEW_morph_tex] = morph_view;

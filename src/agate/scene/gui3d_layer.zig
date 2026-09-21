@@ -546,6 +546,11 @@ pub const Gui3dLayer = struct {
         return true;
     }
 
+    fn defaultColorFormat() sg.PixelFormat {
+        const env_def = sg.queryDesc().environment.defaults;
+        return if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+    }
+
     fn createUiPipeline(self: *Gui3dLayer) bool {
         // Same descriptor as the screen-UI canvas pipeline (UICanvas.init):
         // the RT capture reuses the identical pixel→NDC mapping with the
@@ -553,11 +558,16 @@ pub const Gui3dLayer = struct {
         var desc = sg.PipelineDesc{
             .shader = sg.makeShader(ui_shd.uiShaderDesc(sg.queryBackend())),
             .index_type = .UINT16,
-            .depth = .{ .compare = .ALWAYS, .write_enabled = false },
+            .depth = .{
+                .pixel_format = .NONE,
+                .compare = .ALWAYS,
+                .write_enabled = false,
+            },
             .cull_mode = .NONE,
         };
         if (desc.shader.id == 0) return false;
         errdefer sg.destroyShader(desc.shader);
+        desc.colors[0].pixel_format = defaultColorFormat();
         desc.colors[0].blend = .{
             .enabled = true,
             .src_factor_rgb = .SRC_ALPHA,
@@ -621,7 +631,7 @@ pub const Gui3dLayer = struct {
             .usage = .{ .color_attachment = true },
             .width = w,
             .height = h,
-            .pixel_format = .RGBA8,
+            .pixel_format = defaultColorFormat(),
             .sample_count = 1,
         });
         if (img.id == 0) return false;

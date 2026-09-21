@@ -52,7 +52,7 @@ pub const PhysicsIntegration = struct {
     /// Snapshotted visibility for the build frame.
     build_visible: bool = false,
     /// Scene `build_seq` stamped by the last `buildDebug` (0 = never).
-    build_seq: u64 = 0,
+    build_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Last `build_seq` consumed by `latchDebug`.
     latched_seq: u64 = 0,
     // Lazily created on first use; renders physics debug wireframes in 3D.
@@ -119,8 +119,8 @@ pub const PhysicsIntegration = struct {
     /// — the empty IS the new state — so the latch publishes it instead of
     /// a stale prior frame.
     pub fn buildDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator, seq: u64) void {
-        self.build_seq = seq;
         captureInto(self, allocator, &self.build_lines, &self.build_visible);
+        self.build_seq.store(seq, .release);
     }
 
     /// Context-side latch (stage 1): when a fresh build exists (`build_seq`
@@ -130,11 +130,12 @@ pub const PhysicsIntegration = struct {
     /// historical live capture, so a latch without a fresh build stays
     /// coherent. Draws keep reading the prepared capture only.
     pub fn latchDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
-        if (self.build_seq == self.latched_seq) {
+        const fresh_seq = self.build_seq.load(.acquire);
+        if (fresh_seq == self.latched_seq) {
             self.captureDebug(allocator);
             return;
         }
-        self.latched_seq = self.build_seq;
+        self.latched_seq = fresh_seq;
         self.prepared_lines.ensureTotalCapacity(allocator, self.build_lines.items.len) catch {
             self.prepared_lines.clearRetainingCapacity();
             self.prepared_visible = false;
@@ -284,7 +285,7 @@ test "physics buildDebug+latchDebug isolates live mutations" {
     // Game-side build: fills the build capture, stamps the seq, leaves the
     // render-owned capture untouched.
     integ.buildDebug(t.allocator, 9);
-    try t.expectEqual(@as(u64, 9), integ.build_seq);
+    try t.expectEqual(@as(u64, 9), integ.build_seq.load(.acquire));
     try t.expect(integ.build_visible);
     try t.expectEqual(@as(usize, 12), integ.build_lines.items.len);
     try t.expect(!integ.prepared_visible);

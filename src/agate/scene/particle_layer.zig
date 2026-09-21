@@ -88,7 +88,7 @@ pub const ParticleLayer = struct {
     /// values only, same shape as `frame`; freed in deinit.
     build_frame: std.ArrayListUnmanaged(ParticleDraw) = .empty,
     /// `Scene.build_seq` stamped by the last `buildCapture` (0 = never).
-    build_seq: u64 = 0,
+    build_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Last `build_seq` consumed by `latchFrame`.
     latched_seq: u64 = 0,
 
@@ -158,8 +158,8 @@ pub const ParticleLayer = struct {
     /// still advances — the empty IS the new state — so the latch publishes
     /// it instead of a stale prior frame.
     pub fn buildCapture(self: *ParticleLayer, allocator: std.mem.Allocator, seq: u64) void {
-        self.build_seq = seq;
         captureInto(self.systems.items, allocator, &self.build_frame);
+        self.build_seq.store(seq, .release);
     }
 
     /// Context-side latch (stage 1): when a fresh build exists (`build_seq`
@@ -169,11 +169,12 @@ pub const ParticleLayer = struct {
     /// fresh build stays coherent. `renderPrepared` keeps reading `frame`
     /// only — never `build_frame`, never live systems.
     pub fn latchFrame(self: *ParticleLayer, allocator: std.mem.Allocator) void {
-        if (self.build_seq == self.latched_seq) {
+        const fresh_seq = self.build_seq.load(.acquire);
+        if (fresh_seq == self.latched_seq) {
             self.captureFrame(allocator);
             return;
         }
-        self.latched_seq = self.build_seq;
+        self.latched_seq = fresh_seq;
         self.frame.ensureTotalCapacity(allocator, self.build_frame.items.len) catch {
             self.clearFrame();
             return;
@@ -529,7 +530,7 @@ test "particle buildCapture+latchFrame isolates live mutations" {
     // Game-side build: fills the build frame, stamps the seq, leaves the
     // render-owned frame untouched.
     layer.buildCapture(t.allocator, 9);
-    try t.expectEqual(@as(u64, 9), layer.build_seq);
+    try t.expectEqual(@as(u64, 9), layer.build_seq.load(.acquire));
     try t.expectEqual(@as(usize, 1), layer.build_frame.items.len);
     try t.expectEqual(@as(usize, 0), layer.frame.items.len);
 

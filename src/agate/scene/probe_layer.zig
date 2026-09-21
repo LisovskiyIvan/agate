@@ -275,6 +275,9 @@ pub const ProbeLayer = struct {
     blit_sampler: sg.Sampler = .{},
     blit_vb: sg.Buffer = .{},
     blit_ib: sg.Buffer = .{},
+    scratch_cube: sg.Image = .{},
+    scratch_tex_view: sg.View = .{},
+    scratch_mip_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips,
 
     /// Adds a probe; returns its index. Past `max_probes` this is a hard
     /// error (never a silent clamp or replacement), mirroring
@@ -388,6 +391,11 @@ pub const ProbeLayer = struct {
         return true;
     }
 
+    fn defaultColorFormat() sg.PixelFormat {
+        const env_def = sg.queryDesc().environment.defaults;
+        return if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+    }
+
     fn createTarget(gpu: *ProbeGpu) bool {
         const img = sg.makeImage(.{
             .type = .CUBE,
@@ -396,7 +404,7 @@ pub const ProbeLayer = struct {
             .height = face_resolution,
             .num_slices = 6,
             .num_mipmaps = @intCast(max_mips),
-            .pixel_format = .RGBA8,
+            .pixel_format = defaultColorFormat(),
             .sample_count = 1,
         });
         if (img.id == 0) return false;
@@ -510,18 +518,63 @@ pub const ProbeLayer = struct {
             .cull_mode = .NONE,
             .sample_count = 1,
         };
-        desc.colors[0].pixel_format = .RGBA8;
+        desc.colors[0].pixel_format = defaultColorFormat();
         desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
         desc.layout.attrs[blit_shd.ATTR_probe_mip_position] = .{ .format = .FLOAT2, .offset = 0 };
         desc.layout.attrs[blit_shd.ATTR_probe_mip_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
         const pip = sg.makePipeline(desc);
         if (pip.id == 0) return false;
+        errdefer sg.destroyPipeline(pip);
+
+        const scratch_cube = sg.makeImage(.{
+            .type = .CUBE,
+            .usage = .{ .color_attachment = true },
+            .width = face_resolution,
+            .height = face_resolution,
+            .num_slices = 6,
+            .num_mipmaps = @intCast(max_mips),
+            .pixel_format = defaultColorFormat(),
+            .sample_count = 1,
+        });
+        if (scratch_cube.id == 0) return false;
+        errdefer sg.destroyImage(scratch_cube);
+
+        const scratch_tex_view = sg.makeView(.{ .texture = .{ .image = scratch_cube } });
+        if (scratch_tex_view.id == 0) return false;
+        errdefer sg.destroyView(scratch_tex_view);
+
+        var scratch_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips;
+        errdefer {
+            for (&scratch_face_views) |*mip| {
+                for (mip) |*v| {
+                    if (v.id != 0) {
+                        sg.destroyView(v.*);
+                        v.* = .{};
+                    }
+                }
+            }
+        }
+        for (0..max_mips) |m| {
+            for (0..6) |f| {
+                scratch_face_views[m][f] = sg.makeView(.{
+                    .color_attachment = .{
+                        .image = scratch_cube,
+                        .mip_level = @intCast(m),
+                        .slice = @intCast(f),
+                    },
+                });
+                if (scratch_face_views[m][f].id == 0) return false;
+            }
+        }
 
         self.blit_vb = vb;
         self.blit_ib = ib;
         self.blit_sampler = smp;
         self.blit_shader = shd;
         self.blit_pipeline = pip;
+        self.scratch_cube = scratch_cube;
+        self.scratch_tex_view = scratch_tex_view;
+        self.scratch_mip_face_views = scratch_face_views;
         return true;
     }
 
@@ -537,6 +590,13 @@ pub const ProbeLayer = struct {
         if (self.blit_sampler.id != 0) sg.destroySampler(self.blit_sampler);
         if (self.blit_vb.id != 0) sg.destroyBuffer(self.blit_vb);
         if (self.blit_ib.id != 0) sg.destroyBuffer(self.blit_ib);
+        if (self.scratch_tex_view.id != 0) sg.destroyView(self.scratch_tex_view);
+        for (&self.scratch_mip_face_views) |*mip| {
+            for (mip) |*v| {
+                if (v.id != 0) sg.destroyView(v.*);
+            }
+        }
+        if (self.scratch_cube.id != 0) sg.destroyImage(self.scratch_cube);
         self.* = .{};
     }
 };

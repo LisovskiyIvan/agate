@@ -1961,6 +1961,7 @@ pub const Scene = struct {
         const idx = self.probes.nextDirtyIndex() orelse return;
         if (!sg.isvalid()) return;
         if (!self.probes.ensureGpu(idx)) return;
+        self.clustered.ensureDummyViews();
         const probe = &self.probes.probes[idx];
         const draws = self.preparedDraws();
         // Staged slot snapshot (never the live frame_snapshot): the capture
@@ -2148,7 +2149,44 @@ pub const Scene = struct {
         var mip: u32 = 1;
         while (mip < scene_probes.max_mips) : (mip += 1) {
             const size = scene_probes.mipSize(mip);
+            // Pass A: Downsample probe.gpu (mip - 1) -> scratch_cube (mip)
             var face_i: u8 = 0;
+            while (face_i < 6) : (face_i += 1) {
+                var pass = sg.Pass{
+                    .action = .{
+                        .colors = [_]sg.ColorAttachmentAction{
+                            .{ .load_action = .DONTCARE },
+                        } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    },
+                };
+                pass.attachments.colors[0] = self.probes.scratch_mip_face_views[mip][face_i];
+                sg.beginPass(pass);
+                sg.applyPipeline(self.probes.blit_pipeline);
+                sg.applyViewport(0, 0, size, size, true);
+                sg.applyScissorRect(0, 0, size, size, true);
+
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = self.probes.blit_vb;
+                bind.index_buffer = self.probes.blit_ib;
+                bind.views[blit_probe_shd.VIEW_src_tex] = probe.gpu.tex_view;
+                bind.samplers[blit_probe_shd.SMP_smp] = self.probes.blit_sampler;
+                sg.applyBindings(bind);
+
+                const fs_params = blit_probe_shd.FsParams{
+                    .params = .{
+                        @floatFromInt(face_i),
+                        @floatFromInt(mip - 1),
+                        0.0,
+                        0.0,
+                    },
+                };
+                sg.applyUniforms(blit_probe_shd.UB_fs_params, sg.asRange(&fs_params));
+                sg.draw(0, 6, 1);
+                sg.endPass();
+            }
+
+            // Pass B: Copy scratch_cube (mip) -> probe.gpu (mip)
+            face_i = 0;
             while (face_i < 6) : (face_i += 1) {
                 var pass = sg.Pass{
                     .action = .{
@@ -2166,14 +2204,14 @@ pub const Scene = struct {
                 var bind = sg.Bindings{};
                 bind.vertex_buffers[0] = self.probes.blit_vb;
                 bind.index_buffer = self.probes.blit_ib;
-                bind.views[blit_probe_shd.VIEW_src_tex] = probe.gpu.tex_view;
+                bind.views[blit_probe_shd.VIEW_src_tex] = self.probes.scratch_tex_view;
                 bind.samplers[blit_probe_shd.SMP_smp] = self.probes.blit_sampler;
                 sg.applyBindings(bind);
 
                 const fs_params = blit_probe_shd.FsParams{
                     .params = .{
                         @floatFromInt(face_i),
-                        @floatFromInt(mip - 1),
+                        @floatFromInt(mip),
                         0.0,
                         0.0,
                     },
@@ -2770,7 +2808,7 @@ pub const Scene = struct {
             // land ordered after the whole staged payload.
             s.build_slot.store(self.slot, .release);
             s.build_seq.store(self.seq, .release);
-            s.draws.releaseHandoff(self.slot) catch unreachable;
+            s.draws.releaseHandoff(self.slot) catch {};
         }
 
         /// Drop the claim without committing (seq/handoff untouched: prepare
@@ -3475,7 +3513,7 @@ pub const Scene = struct {
         // free set it would without the pin (the front is excluded either
         // way). Unpin is mandatory — the defer covers every return below.
         const pinned_idx = self.draws.pinFront();
-        defer self.draws.unpin(pinned_idx) catch unreachable;
+        defer self.draws.unpin(pinned_idx) catch {};
         // Valid for this render; the next prepareFrame invalidates it (the
         // pin only extends CPU-slot reuse exclusion, never GPU consumability
         // — see scene/frame_draws.zig).

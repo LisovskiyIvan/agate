@@ -209,7 +209,7 @@ pub fn ensureComputeGpu(self: anytype) void {
         defer self.allocator.free(zeros);
         @memset(zeros, 0);
         self.compute_state_buffer = sg.makeBuffer(.{
-            .usage = .{ .storage_buffer = true, .dynamic_update = true },
+            .usage = .{ .storage_buffer = true },
             .data = sg.Range{ .ptr = zeros.ptr, .size = zeros.len },
         });
     }
@@ -221,7 +221,7 @@ pub fn ensureComputeGpu(self: anytype) void {
     }
     if (self.compute_draw_buffer.id == 0) {
         self.compute_draw_buffer = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .storage_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .storage_buffer = true },
             .size = cap * @sizeOf(ParticleInstanceData),
         });
     }
