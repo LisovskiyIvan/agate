@@ -192,6 +192,7 @@ test {
     _ = @import("shader_material/merge.zig");
     _ = @import("softbody.zig");
     _ = @import("ssao.zig");
+    _ = @import("tags.zig");
     _ = @import("testing.zig");
     _ = @import("texture.zig");
     _ = @import("texture/color.zig");

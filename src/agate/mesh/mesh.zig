@@ -28,6 +28,7 @@ const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const morph_gpu = @import("morph_gpu.zig");
 const tangents = @import("tangents.zig");
+const TagSet = @import("../tags.zig").TagSet;
 
 /// Render-side published instance state (P5 «parallel update/render»):
 /// the single ownership point for per-mesh instancing data consumed by the
@@ -284,6 +285,9 @@ pub const Mesh = struct {
 
     // Decal
     is_decal: bool = false,
+
+    // Object Tagging (TagSet)
+    tags: TagSet = .{},
 
     /// Deferred GPU upload: true while the vertex/index buffers still need
     /// creating on the context thread (see uploadGeometry). `pending_vertices`
@@ -855,9 +859,30 @@ pub const Mesh = struct {
             allocator.free(self.pending_vertices);
             self.pending_vertices = &.{};
         }
+        self.tags.deinit(allocator);
         if (self.owns_name and self.name.len > 0) {
             allocator.free(self.name);
         }
+    }
+
+    pub fn addTag(self: *Mesh, allocator: std.mem.Allocator, tag_str: []const u8) !bool {
+        return self.tags.add(allocator, tag_str);
+    }
+
+    pub fn addTags(self: *Mesh, allocator: std.mem.Allocator, tags_str: []const u8) !usize {
+        return self.tags.addMultiple(allocator, tags_str);
+    }
+
+    pub fn removeTag(self: *Mesh, allocator: std.mem.Allocator, tag_str: []const u8) bool {
+        return self.tags.remove(allocator, tag_str);
+    }
+
+    pub fn hasTag(self: *const Mesh, tag_str: []const u8) bool {
+        return self.tags.has(tag_str);
+    }
+
+    pub fn matchesTagQuery(self: *const Mesh, query_str: []const u8) bool {
+        return self.tags.matchesQuery(query_str);
     }
 };
 
@@ -1064,3 +1089,19 @@ test "stage-2A: instanceRenderSource returns instance_render" {
     try std.testing.expectEqual(@as(u32, 9), bv_src.count);
     try std.testing.expectEqual(&m.instance_build_view, bv_src);
 }
+
+test "Mesh tags operations and query" {
+    const alloc = std.testing.allocator;
+    var m: Mesh = .{ .name = "orc", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
+    defer m.deinit(alloc);
+
+    _ = try m.addTags(alloc, "enemy, orc, melee");
+    try std.testing.expect(m.hasTag("enemy"));
+    try std.testing.expect(m.hasTag("ORC"));
+    try std.testing.expect(!m.hasTag("boss"));
+
+    try std.testing.expect(m.matchesTagQuery("enemy && (orc || goblin)"));
+    try std.testing.expect(!m.matchesTagQuery("enemy && boss"));
+    try std.testing.expect(m.matchesTagQuery("!boss && melee"));
+}
+

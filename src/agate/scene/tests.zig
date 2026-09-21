@@ -6,6 +6,7 @@ const Mat4 = math.Mat4;
 const Color3 = math.Color3;
 const Color4 = math.Color4;
 const BoundingBox = math.BoundingBox;
+const Ray = math.Ray;
 const camera_mod = @import("../camera.zig");
 const Camera = camera_mod.Camera;
 const Mesh = @import("../mesh.zig").Mesh;
@@ -6297,3 +6298,94 @@ test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stal
     try std.testing.expectEqual(@as(u32, 0), scene.stats.occluders_count);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.occluder_triangles);
 }
+
+test "Scene tag queries and tag-filtered raycasting" {
+    const alloc = std.testing.allocator;
+    var scene: Scene = undefined;
+    scene.allocator = alloc;
+    scene.meshes = .empty;
+    scene.frame_id = 0;
+    defer scene.meshes.deinit(alloc);
+
+    var m1 = Mesh{
+        .name = "orc_grunt",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 5),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, 4), Vec3.new(1, 1, 6)),
+    };
+    defer m1.deinit(alloc);
+    _ = try m1.addTags(alloc, "enemy, orc, melee");
+    try scene.meshes.append(alloc, &m1);
+
+    var m2 = Mesh{
+        .name = "orc_boss",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(10, 0, 5),
+        .local_bounding_box = BoundingBox.init(Vec3.new(9, -1, 4), Vec3.new(11, 1, 6)),
+    };
+    defer m2.deinit(alloc);
+    _ = try m2.addTags(alloc, "enemy, orc, boss, elite");
+    try scene.meshes.append(alloc, &m2);
+
+    var m3 = Mesh{
+        .name = "player_hero",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, -5),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -6), Vec3.new(1, 1, -4)),
+    };
+    defer m3.deinit(alloc);
+    _ = try m3.addTags(alloc, "player, hero");
+    try scene.meshes.append(alloc, &m3);
+
+    // Test getMeshByName
+    try std.testing.expectEqual(&m1, scene.getMeshByName("orc_grunt"));
+    try std.testing.expectEqual(&m2, scene.getMeshByName("orc_boss"));
+    try std.testing.expect(scene.getMeshByName("nonexistent") == null);
+
+    // Test countMeshesByTag
+    try std.testing.expectEqual(@as(usize, 2), scene.countMeshesByTag("enemy"));
+    try std.testing.expectEqual(@as(usize, 1), scene.countMeshesByTag("boss"));
+    try std.testing.expectEqual(@as(usize, 1), scene.countMeshesByTag("player"));
+    try std.testing.expectEqual(@as(usize, 0), scene.countMeshesByTag("dragon"));
+
+    // Test getMeshesByTag
+    var enemies = try scene.getMeshesByTag(alloc, "enemy");
+    defer enemies.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), enemies.items.len);
+
+    // Test getMeshesByQuery
+    var boss_enemies = try scene.getMeshesByQuery(alloc, "enemy && boss");
+    defer boss_enemies.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boss_enemies.items.len);
+    try std.testing.expectEqual(&m2, boss_enemies.items[0]);
+
+    var non_boss = try scene.getMeshesByQuery(alloc, "enemy && !boss");
+    defer non_boss.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), non_boss.items.len);
+    try std.testing.expectEqual(&m1, non_boss.items[0]);
+
+    // Test findFirstMesh
+    try std.testing.expectEqual(&m2, scene.findFirstMeshByTag("boss"));
+    try std.testing.expectEqual(&m3, scene.findFirstMeshByQuery("hero"));
+
+    // Test pickWithRayTag: ray looking along +Z at (0, 0, 5) hits m1
+    const ray = Ray.new(Vec3.new(0, 0, 0), Vec3.new(0, 0, 1));
+    const hit_any_enemy = scene.pickWithRayTag(ray, "enemy");
+    try std.testing.expect(hit_any_enemy.hit);
+    try std.testing.expectEqual(&m1, hit_any_enemy.picked_mesh.?);
+
+    // Query for boss along the same ray should NOT hit m1 because m1 lacks "boss" tag
+    const hit_boss = scene.pickWithRayTag(ray, "boss");
+    try std.testing.expect(!hit_boss.hit);
+
+    // Query for hero along the same ray should NOT hit
+    const hit_hero = scene.pickWithRayTag(ray, "player");
+    try std.testing.expect(!hit_hero.hit);
+}
+

@@ -17,6 +17,7 @@ const Color3 = math.Color3;
 const Color4 = math.Color4;
 const BoundingBox = math.BoundingBox;
 const Ray = math.Ray;
+const RayHit = math.RayHit;
 
 const physics = @import("physics.zig");
 const PhysicsWorld = physics.PhysicsWorld;
@@ -70,6 +71,9 @@ const CubeTexture = @import("texture.zig").CubeTexture;
 const SkyboxOptions = @import("texture.zig").SkyboxOptions;
 const visibility = @import("visibility/mod.zig");
 const serialization = @import("serialization.zig");
+const tags_mod = @import("tags.zig");
+pub const TagSet = tags_mod.TagSet;
+pub const TagQuery = tags_mod.TagQuery;
 
 // Scene subsystems. Each owns its state (and GPU resources) plus the logic
 // that belongs to it; Scene is the owner/orchestrator facade. Subsystems
@@ -1089,6 +1093,76 @@ pub const Scene = struct {
         self.allocator.destroy(mesh);
     }
 
+    // ---- Mesh search, tags & queries ----
+
+    pub fn getMeshByName(self: *Scene, name: []const u8) ?*Mesh {
+        for (self.meshes.items) |m| {
+            if (std.mem.eql(u8, m.name, name)) return m;
+        }
+        return null;
+    }
+
+    /// Returns a list of all scene meshes that have the specified tag (case-insensitive).
+    pub fn getMeshesByTag(self: *Scene, allocator: std.mem.Allocator, tag_str: []const u8) !std.ArrayListUnmanaged(*Mesh) {
+        var list = std.ArrayListUnmanaged(*Mesh).empty;
+        errdefer list.deinit(allocator);
+        for (self.meshes.items) |m| {
+            if (m.hasTag(tag_str)) {
+                try list.append(allocator, m);
+            }
+        }
+        return list;
+    }
+
+    /// Returns a list of all scene meshes matching the given boolean tag query expression (e.g. "enemy & (boss | elite)").
+    pub fn getMeshesByQuery(self: *Scene, allocator: std.mem.Allocator, query_str: []const u8) !std.ArrayListUnmanaged(*Mesh) {
+        var list = std.ArrayListUnmanaged(*Mesh).empty;
+        errdefer list.deinit(allocator);
+        var q = try TagQuery.parse(allocator, query_str);
+        defer q.deinit();
+
+        for (self.meshes.items) |m| {
+            if (m.tags.matches(&q)) {
+                try list.append(allocator, m);
+            }
+        }
+        return list;
+    }
+
+    /// Counts how many scene meshes have the specified tag.
+    pub fn countMeshesByTag(self: *Scene, tag_str: []const u8) usize {
+        var n: usize = 0;
+        for (self.meshes.items) |m| {
+            if (m.hasTag(tag_str)) n += 1;
+        }
+        return n;
+    }
+
+    /// Counts how many scene meshes match the given boolean tag query expression.
+    pub fn countMeshesByQuery(self: *Scene, query_str: []const u8) usize {
+        var n: usize = 0;
+        for (self.meshes.items) |m| {
+            if (m.matchesTagQuery(query_str)) n += 1;
+        }
+        return n;
+    }
+
+    /// Finds the first scene mesh with the specified tag, or null if none found.
+    pub fn findFirstMeshByTag(self: *Scene, tag_str: []const u8) ?*Mesh {
+        for (self.meshes.items) |m| {
+            if (m.hasTag(tag_str)) return m;
+        }
+        return null;
+    }
+
+    /// Finds the first scene mesh matching the boolean tag query expression, or null if none found.
+    pub fn findFirstMeshByQuery(self: *Scene, query_str: []const u8) ?*Mesh {
+        for (self.meshes.items) |m| {
+            if (m.matchesTagQuery(query_str)) return m;
+        }
+        return null;
+    }
+
     // ---- Decals / particles / trails / CSG / nav. ----
 
     pub fn getOrCreateDecalManager(self: *Scene, max_decals: usize) *DecalManager {
@@ -1381,6 +1455,37 @@ pub const Scene = struct {
     pub fn pickWithRay(self: *Scene, r: Ray) PickingInfo {
         return scene_picking.pickWithRay(self.meshes.items, self.physics.getWorld(), r);
     }
+
+    /// Raycasts into the scene and returns the closest hit mesh that matches the tag query.
+    pub fn pickWithRayTag(self: *Scene, r: Ray, query_str: []const u8) PickingInfo {
+        var closest_dist: f32 = std.math.inf(f32);
+        var best_hit: ?RayHit = null;
+        var best_mesh: ?*Mesh = null;
+
+        for (self.meshes.items) |mesh| {
+            if (!mesh.matchesTagQuery(query_str)) continue;
+            if (mesh.is_lod_child or mesh.is_decal or mesh.gpu_pending) continue;
+
+            const box = if (mesh.cached_frame == self.frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
+            if (r.intersectsAABBNormal(box)) |hit| {
+                if (hit.distance < closest_dist) {
+                    closest_dist = hit.distance;
+                    best_hit = hit;
+                    best_mesh = mesh;
+                }
+            }
+        }
+
+        return .{
+            .hit = best_mesh != null,
+            .distance = if (best_mesh != null) closest_dist else 0.0,
+            .picked_mesh = best_mesh,
+            .picked_point = if (best_hit) |h| h.point else Vec3.zero,
+            .picked_normal = if (best_hit) |h| h.normal else Vec3.up,
+            .picked_instance = null,
+        };
+    }
+
 
     /// Raycast adapter matching audio.RaycastFn for audio occlusion queries.
     pub fn audioRaycastAdapter(origin: Vec3, direction: Vec3, max_distance: f32, user_data: ?*anyopaque) bool {

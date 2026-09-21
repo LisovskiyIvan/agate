@@ -209,6 +209,11 @@ pub const Ui3dPickHit = scene.Ui3dPickHit;
 pub const SceneFrameSnapshot = scene.SceneFrameSnapshot;
 pub const CameraSnapshot = scene.CameraSnapshot;
 
+pub const tags = @import("tags.zig");
+pub const TagSet = tags.TagSet;
+pub const TagQuery = tags.TagQuery;
+
+
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
 
@@ -585,4 +590,6 @@ test "root re-exports cover recent Scene APIs" {
     _ = CameraRigMode;
     _ = StereoConvergenceMode;
     _ = CameraRigSlot;
+    _ = TagSet;
+    _ = TagQuery;
 }

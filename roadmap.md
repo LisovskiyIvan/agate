@@ -58,7 +58,7 @@
 | Layout-контейнеры, Flex/Grid UI | LayoutStack: HStack, VStack, Flexbox, CSS Grid (fr/px/%), 9-point Anchors, Docking (top/bottom/left/right/fill), Spacers, Spans | ✅ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb, звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling), OGG/MP3/WAV потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы и кроссфейдинг музыки | ✅ |
 | mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) | ✅ |
-| Пикинг | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh) | ✅ |
+| Пикинг и теги объектов | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh), теги объектов (TagSet) и булевы смарт-фильтры (TagQuery: and/or/not/parentheses), Scene.pickWithRayTag | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
@@ -462,8 +462,9 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Встроенный профилировщик (`profiler.zig`): точный замер фаз кадра (Update, Prepare, Shadow, Main, PostFX), автоматическая эвристическая диагностика боттлнеков с подсказками, экспорт в интерактивный HTML (SVG-таймлайн), Markdown и Chrome Trace Event JSON (`chrome://tracing`).
 * Мониторинг памяти (`MemorySnapshot`): раздельный учёт памяти геометрии на CPU, общих аллокаций рантайма и видеопамяти VRAM для GPU-буферов и текстур.
 * Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
+* Система тегов объектов и булевых смарт-фильтров (`tags.zig`): `TagSet` (множество строковых тегов с регистронезависимым поиском, дедупликацией и разбором списков через разделители), `TagQuery` (парсер и AST-оценщик булевых выражений: `&`/`&&`/`and`, `|`/`||`/`or`, `!`/`not`, круглые скобки, неявный AND), нативная интеграция в `Mesh` (`tags`, `addTag`, `addTags`, `removeTag`, `hasTag`, `matchesTagQuery`) и `Scene` (`getMeshesByTag`, `getMeshesByQuery`, `countMeshesByTag`, `countMeshesByQuery`, `findFirstMeshByTag`, `findFirstMeshByQuery`, `pickWithRayTag`).
 * Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
-* 621 unit-тест в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
+* 1078 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
