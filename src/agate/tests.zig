@@ -168,6 +168,7 @@ test {
     _ = @import("scene/stats.zig");
     _ = @import("scene/tests.zig");
     _ = @import("scene/trail_layer.zig");
+    _ = @import("scene/ui_capture.zig");
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
     _ = @import("scene/viewport_clear.zig");
