@@ -44,6 +44,11 @@ pub const TargetCameraOptions = camera.TargetCameraOptions;
 pub const FlyCamera = camera.FlyCamera;
 pub const FlyCameraOptions = camera.FlyCameraOptions;
 pub const CameraEntry = @import("scene.zig").CameraEntry;
+pub const CameraRig = camera.CameraRig;
+pub const CameraRigMode = camera.CameraRigMode;
+pub const StereoConvergenceMode = camera.StereoConvergenceMode;
+pub const CameraRigSlot = camera.CameraRigSlot;
+pub const MAX_RIG_SLOTS = camera.MAX_RIG_SLOTS;
 
 pub const lights = @import("lights.zig");
 pub const HemisphericLightOptions = lights.HemisphericLightOptions;
@@ -576,4 +581,8 @@ test "root re-exports cover recent Scene APIs" {
     _ = Crowd;
     _ = CrowdAgent;
     _ = CrowdAgentParams;
+    _ = CameraRig;
+    _ = CameraRigMode;
+    _ = StereoConvergenceMode;
+    _ = CameraRigSlot;
 }

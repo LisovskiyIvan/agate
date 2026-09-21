@@ -29,7 +29,7 @@
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
 | Инстансинг | InstancedMesh + GPU-пайплайны (Standard + Cook-Torrance PBR + IBL + Shadows) | ✅ |
-| Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP, инерция/сглаживание ввода (ArcRotate/Free/Fly) | ✅ |
+| Камеры | ArcRotate + Free + Fly + Follow + Target, union Camera, мультикамера/PIP, камера-риги (CameraRig: dual, quad, CAD, stereoscopic VR 3D), инерция/сглаживание ввода | ✅ |
 | Свет | Hemispheric + до 4 Directional (солнце с CSM + до 3 shadowless fill) + до 4 Point + до 2 Spot + до 2 RectArea (closest-point approximation, без теней) + clustered до 64 point (tile-based forward+, без теней в v1, 2D columns задокументированы) | 🟡 |
 | Тени | 4-каскадный CSM для солнца + перспективные тени SpotLight (до 2 прожекторов, 4-tap PCF) + тени PointLight (до 2, 2D-атлас 1536×512, 4-tap PCF, OFF по умолчанию) | ✅ |
 | Reflection probes | До 4 зондов, on-demand capture (128px RGBA8-куб + 8 мипов, 6 face-проходов); PBR×3 заменяет IBL-источник, Standard ambient — из coarsest mip; nearest enabled+captured в радиусе, без блендинга | ✅ |
@@ -485,6 +485,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * `FollowCamera` — следование за мешем или точкой с радиусом, высотой, смещением угла и сглаживанием.
 * `Camera` — union-абстракция (arc_rotate/free/follow/target/fly), `Scene.updateCamera(dt)`; проходы и пикинг работают с любым типом.
 * Мультикамера / PIP (Picture-in-Picture) с раздельными viewport'ами.
+* `CameraRig` — система камера-ригов и пресетов мультикамер (`CameraRigMode`: `single`, `dual_horizontal`, `dual_vertical`, `quad_view`, `setupCadQuadView` с 4 ортогональными/перспективными проекциями, `pip`, `stereoscopic_side_by_side`, `stereoscopic_over_under` с настраиваемым IPD 64мм и convergence `parallel`/`toe_in`, `custom` с локальными смещениями `local_offset` и `look_at_target`, синхронизация с `Scene` через `applyToScene`/`syncToScene`).
 
 ### Свет и тени
 
@@ -606,7 +607,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 | Возможность Babylon.js | В Agate есть | Чего не хватает |
 |---|---|---|
-| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP), инерция/сглаживание вращения/зума (ArcRotate, Free, Fly) | Камера-ригов, touch/pinch |
+| Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports, риги) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP), инерция/сглаживание вращения/зума (ArcRotate, Free, Fly), камера-риги (CameraRig) с пресетами (dual, quad, CAD, PIP, stereoscopic 3D VR) | touch/pinch, геймпад |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + до 4 directional (1 солнце с CSM + до 3 shadowless fill) + 4 point + 2 spot (выбор лучших по камере) + до 2 rect area (closest-point approximation, без теней, API-only) + clustered до 64 point (tile-based forward+, без теней в v1) | Кластерного освещения сверх 64 / с тенями |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
@@ -628,7 +629,6 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 ## ❌ Чего нет (потенциальный бэклог, не веб-специфика)
 
 **Камеры и ввод**
-* Камера-риги, мультикамеры и viewports (инерция и сглаживание ввода для ArcRotate, Free, Fly, Target, Follow реализованы).
 * Тач-управление, геймпад, виртуальные джойстики; встроенное управление персонажем (кроме physics character controller).
 
 **Свет и тени**

@@ -38,6 +38,7 @@ test {
     _ = @import("camera/fly.zig");
     _ = @import("camera/follow.zig");
     _ = @import("camera/free.zig");
+    _ = @import("camera/rig.zig");
     _ = @import("camera/target.zig");
     _ = @import("camera/union.zig");
     _ = @import("camera/viewport.zig");

@@ -165,6 +165,103 @@ pub const Camera = union(enum) {
             inline else => |*c| c.viewport = vp,
         }
     }
+
+    pub fn getRight(self: Camera) Vec3 {
+        return switch (self) {
+            .fly => |c| c.getRight(),
+            inline else => {
+                const v = self.getViewMatrix();
+                const r = Vec3.new(v.m[0], v.m[4], v.m[8]);
+                const len = r.length();
+                return if (len > 0.0001) r.scale(1.0 / len) else Vec3.right;
+            },
+        };
+    }
+
+    pub fn getUp(self: Camera) Vec3 {
+        return switch (self) {
+            .fly => |c| c.getUp(),
+            inline else => {
+                const v = self.getViewMatrix();
+                const u = Vec3.new(v.m[1], v.m[5], v.m[9]);
+                const len = u.length();
+                return if (len > 0.0001) u.scale(1.0 / len) else Vec3.up;
+            },
+        };
+    }
+
+    pub fn setPosition(self: *Camera, pos: Vec3) void {
+        switch (self.*) {
+            .target => |*c| {
+                c.position = pos;
+                c.desired_position = null;
+            },
+            .free => |*c| {
+                c.position = pos;
+            },
+            .fly => |*c| {
+                c.position = pos;
+            },
+            .follow => |*c| {
+                c.position = pos;
+            },
+            .arc_rotate => |*c| {
+                const diff = pos.sub(c.target);
+                c.radius = diff.length();
+                if (c.radius > 0.0001) {
+                    c.beta = std.math.acos(std.math.clamp(diff.y / c.radius, -1.0, 1.0));
+                    c.alpha = std.math.atan2(diff.z, diff.x);
+                }
+            },
+        }
+    }
+
+    pub fn setLookAt(self: *Camera, pos: Vec3, target: Vec3, up: ?Vec3) void {
+        switch (self.*) {
+            .target => |*c| {
+                c.position = pos;
+                c.target = target;
+                if (up) |u| c.up = u;
+                c.clearGoals();
+            },
+            .free => |*c| {
+                c.position = pos;
+                const fwd = target.sub(pos);
+                if (fwd.length() > 0.0001) {
+                    const norm = fwd.normalize();
+                    const pitch = std.math.asin(std.math.clamp(norm.y, -1.0, 1.0)) * 180.0 / std.math.pi;
+                    const yaw = std.math.atan2(-norm.x, -norm.z) * 180.0 / std.math.pi;
+                    c.rotation.x = pitch;
+                    c.rotation.y = yaw;
+                }
+            },
+            .fly => |*c| {
+                c.position = pos;
+                const fwd = target.sub(pos);
+                if (fwd.length() > 0.0001) {
+                    const norm = fwd.normalize();
+                    const pitch = std.math.asin(std.math.clamp(norm.y, -1.0, 1.0)) * 180.0 / std.math.pi;
+                    const yaw = std.math.atan2(-norm.x, -norm.z) * 180.0 / std.math.pi;
+                    c.rotation.x = pitch;
+                    c.rotation.y = yaw;
+                    c.rotation.z = 0.0;
+                }
+            },
+            .arc_rotate => |*c| {
+                c.target = target;
+                const diff = pos.sub(target);
+                c.radius = diff.length();
+                if (c.radius > 0.0001) {
+                    c.beta = std.math.acos(std.math.clamp(diff.y / c.radius, -1.0, 1.0));
+                    c.alpha = std.math.atan2(diff.z, diff.x);
+                }
+            },
+            .follow => |*c| {
+                c.position = pos;
+                c.target_position = target;
+            },
+        }
+    }
 };
 
 test "Camera union dispatches getPosition" {
@@ -248,3 +345,39 @@ test "Camera union dispatches update to arc_rotate with inertia" {
     const pos1 = cam.getPosition();
     try std.testing.expect(pos0.x != pos1.x or pos0.z != pos1.z);
 }
+
+test "Camera union getRight and getUp" {
+    const free: Camera = .{ .free = FreeCamera.init("free", .{ .position = Vec3.new(0, 0, 5), .rotation = Vec3.zero }) };
+    const r = free.getRight();
+    const u = free.getUp();
+    const f = free.getForward();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), r.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), r.z, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), u.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), u.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), u.z, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), f.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), f.y, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), f.z, 1e-4);
+}
+
+test "Camera union setPosition and setLookAt" {
+    var target_cam: Camera = .{ .target = TargetCamera.init("target", .{
+        .position = Vec3.new(0, 0, 10),
+        .target = Vec3.zero,
+        .smoothing = 0.0,
+    }) };
+    target_cam.setPosition(Vec3.new(1, 2, 3));
+    const p = target_cam.getPosition();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), p.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), p.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), p.z, 1e-5);
+
+    target_cam.setLookAt(Vec3.new(0, 0, 5), Vec3.new(0, 0, 0), Vec3.up);
+    const fwd = target_cam.getForward();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), fwd.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), fwd.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), fwd.z, 1e-5);
+}
+
