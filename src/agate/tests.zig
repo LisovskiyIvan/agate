@@ -85,6 +85,7 @@ test {
     _ = @import("mesh/trail.zig");
     _ = @import("mesh/types.zig");
     _ = @import("mesh/vat.zig");
+    _ = @import("observable.zig");
     _ = @import("particles.zig");
     _ = @import("particles/compute_mode.zig");
     _ = @import("particles/cpu.zig");

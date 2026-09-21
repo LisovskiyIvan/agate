@@ -676,7 +676,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 **Прочее**
 * Crowd simulation (RVO2/ORCA 2D локальное избегание столкновений толпы) уже реализована (см. ✅).
 * Сеть/multiplayer, репликация, WebSocket/WebRTC.
-* Behaviors/Actions/Observables как API-слой, теги объектов, smart filters, flow graph.
+* Behaviors/Actions как API-слой, flow graph (Observables/EventBus, теги объектов и smart filters уже реализованы, см. ✅).
 * Локализация.
 
 ---
