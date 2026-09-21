@@ -87,6 +87,7 @@ test {
     _ = @import("mesh/vat.zig");
     _ = @import("observable.zig");
     _ = @import("particles.zig");
+    _ = @import("particles/collisions.zig");
     _ = @import("particles/compute_mode.zig");
     _ = @import("particles/cpu.zig");
     _ = @import("particles/flow.zig");

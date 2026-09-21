@@ -14,6 +14,8 @@
 //! - `cpu.zig` — `updateCpu` (three-phase integrate/compact/fill).
 //! - `gpu.zig` — `updateGpu` (+ slot-ring staging).
 //! - `flow.zig` — `setFlowMap`/`clearFlowMap`/`sampleFlow`.
+//! - `collisions.zig` — CPU-only collisions (`CollisionMode`,
+//!   `ParticleSphereCollider`, setters, pure contact resolvers).
 //! - `subemitters.zig` — on-death child-spawn pass.
 //! - `compute_mode.zig` — `.compute` staging/flush/dispatch/retire.
 //!
@@ -43,6 +45,7 @@ const sampling = @import("sampling.zig");
 const cpu = @import("cpu.zig");
 const gpu = @import("gpu.zig");
 const flow = @import("flow.zig");
+const collisions = @import("collisions.zig");
 const compute_mode = @import("compute_mode.zig");
 
 const Vec2 = math.Vec2;
@@ -60,6 +63,10 @@ const GpuParticleSlot = types.GpuParticleSlot;
 const Particle = types.Particle;
 const ParticleInstanceData = types.ParticleInstanceData;
 const max_sub_emitters = types.max_sub_emitters;
+const CollisionMode = collisions.CollisionMode;
+const CollisionError = collisions.CollisionError;
+const ParticleSphereCollider = collisions.ParticleSphereCollider;
+const max_sphere_colliders = collisions.max_sphere_colliders;
 
 /// Sub-emitter trigger point. Only `.on_death` exists today (Babylon.js
 /// parity target): a parent particle spawns children in another system on the
@@ -311,6 +318,32 @@ pub const ParticleSystem = struct {
     /// updateCpu tick counter feeding the per-death hash. Reset by reset().
     sub_tick: u64 = 0,
 
+    // --- Particle collisions (CPU-only: static spheres + ground plane) ---
+    // Off by default: with `collision_mode == .none` updateCpu never
+    // snapshots collision state (one cached null branch per particle) and
+    // follows the legacy path bit-for-bit (see collisions.zig). Inline
+    // fixed storage: addSphereCollider never allocates, per-frame or
+    // otherwise. Colliders are interpreted in stored simulation coordinates
+    // (world units when local_space == false, emitter-local units when
+    // true — same rule as the flow field). A `.kill` death compacts away
+    // like any age death (may fire sub-emitters; the slot is recycled by
+    // normal emission, so a respawn inside a collider dies on contact
+    // again).
+    collision_mode: CollisionMode = .none,
+    collision_spheres: [max_sphere_colliders]ParticleSphereCollider = undefined,
+    collision_sphere_count: usize = 0,
+    /// Normal-speed scale on bounce, clamped to [0, 1] at use (0 = dead
+    /// stop, 1 = perfectly elastic). Direct field write, like gravity.
+    collision_restitution: f32 = 0.5,
+    /// Tangential-velocity fraction KEPT on bounce, clamped to [0, 1] at
+    /// use (1 = slick, 0 = full tangential stop — the softbody convention).
+    /// Direct field write, like gravity.
+    collision_friction: f32 = 1.0,
+    /// Ground plane height (particles collide at y == height), or null for
+    /// no plane. Prefer setGroundPlane/clearGroundPlane (they validate and
+    /// gate non-CPU modes); a direct write skips both.
+    collision_ground: ?f32 = null,
+
     prng: std.Random.DefaultPrng,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, capacity: usize) !*ParticleSystem {
@@ -495,6 +528,35 @@ pub const ParticleSystem = struct {
     /// Flow acceleration at `pos` (see flow.zig).
     pub fn sampleFlow(self: *const ParticleSystem, pos: Vec3) Vec3 {
         return flow.sampleFlow(self, pos);
+    }
+
+    /// Adds a static sphere collider (see collisions.zig). Fixed inline
+    /// storage; explicit errors, never a silent downgrade.
+    pub fn addSphereCollider(self: *ParticleSystem, collider: ParticleSphereCollider) CollisionError!void {
+        return collisions.addSphereCollider(self, collider);
+    }
+
+    /// Disarms all collision geometry (spheres + ground plane); response
+    /// knobs kept. Never fails (see collisions.zig).
+    pub fn clearColliders(self: *ParticleSystem) void {
+        collisions.clearColliders(self);
+    }
+
+    /// Selects the collision response (see collisions.zig). Enabling on a
+    /// non-CPU system is an explicit error; `.none` always succeeds.
+    pub fn setCollisionMode(self: *ParticleSystem, mode: CollisionMode) CollisionError!void {
+        return collisions.setCollisionMode(self, mode);
+    }
+
+    /// Arms the ground plane at `height` (see collisions.zig). Validates
+    /// before mutating; non-CPU systems get an explicit error.
+    pub fn setGroundPlane(self: *ParticleSystem, height: f32) CollisionError!void {
+        return collisions.setGroundPlane(self, height);
+    }
+
+    /// Disarms the ground plane (spheres kept). Never fails.
+    pub fn clearGroundPlane(self: *ParticleSystem) void {
+        collisions.clearGroundPlane(self);
     }
 
     pub fn burst(self: *ParticleSystem, count: usize) void {

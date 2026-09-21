@@ -22,6 +22,7 @@ const pc_shd = @import("particle_compute_shader");
 const types = @import("types.zig");
 const sampling = @import("sampling.zig");
 const flow = @import("flow.zig");
+const collisions = @import("collisions.zig");
 
 const Vec3 = math.Vec3;
 const GpuParticleSlot = types.GpuParticleSlot;
@@ -36,6 +37,7 @@ const ComputeModeError = types.ComputeModeError;
 const sampleSpawn = sampling.sampleSpawn;
 const rotationToRadians = sampling.rotationToRadians;
 const activeFlowCtx = flow.activeFlowCtx;
+const activeCollisionCtx = collisions.activeCollisionCtx;
 const SpawnSample = sampling.SpawnSample;
 const ParticleInstanceData = types.ParticleInstanceData;
 const Color4 = math.Color4;
@@ -144,13 +146,15 @@ pub fn emitComputeSlot(self: anytype) void {
 /// dt for the dispatch, and stages spawn slots — O(emitted), never
 /// O(particles). The integration itself happens in the compute pass
 /// (shaders/particle_compute.glsl). Explicit support contract: CPU-only
-/// feature combinations (`local_space`, armed flow field) and a
+/// feature combinations (`local_space`, armed flow field, armed collisions)
+/// and a
 /// known-unsupported backend return errors, never a silent CPU downgrade.
 /// A `.compute` parent never records deaths (they happen GPU-side), so it
 /// never fires sub-emitters — the `.gpu` rule (matrix note (4)) applies.
 pub fn updateCompute(self: anytype, dt: f32) UpdateError!void {
     if (self.local_space) return error.LocalSpaceNeedsCpu;
     if (activeFlowCtx(self) != null) return error.FlowMapNeedsCpu;
+    if (activeCollisionCtx(self) != null) return error.CollisionNeedsCpu;
     if (!computeAvailable(self)) return error.ComputeUnsupported;
     if (self.capacity == 0) return error.InvalidCapacity;
     if (!provisionComputeStaging(self)) return error.OutOfMemory;
