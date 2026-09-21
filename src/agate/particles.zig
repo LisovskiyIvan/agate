@@ -24,6 +24,9 @@
 //!   upload). Imports `sampling` + `flow`.
 //! - `particles/flow.zig` — flow-field texture arming and CPU sampling.
 //!   Imports `types` only.
+//! - `particles/collisions.zig` — CPU-only particle-vs-geometry collisions
+//!   (static sphere colliders + ground plane, `.kill`/`.bounce` response).
+//!   Imports `types` only.
 //! - `particles/subemitters.zig` — on-death child-spawn pass (`emitChild`,
 //!   `fireSubEmitters`). Imports `sampling` + `gpu` + `compute_mode`.
 //! - `particles/compute_mode.zig` — the stateful `.compute` path (staging,
@@ -49,6 +52,7 @@ const types = @import("particles/types.zig");
 const sampling = @import("particles/sampling.zig");
 const system = @import("particles/system.zig");
 const flow = @import("particles/flow.zig");
+const collisions = @import("particles/collisions.zig");
 
 // Shared vocabulary (lives in particles/types.zig).
 pub const ParticleBlendMode = types.ParticleBlendMode;
@@ -88,3 +92,9 @@ pub const ParticleSystem = system.ParticleSystem;
 // Flow-field sampling (lives in particles/flow.zig).
 pub const flowUvForPosition = flow.flowUvForPosition;
 pub const sampleFlowPixels = flow.sampleFlowPixels;
+
+// CPU-only collisions (live in particles/collisions.zig).
+pub const CollisionMode = collisions.CollisionMode;
+pub const CollisionError = collisions.CollisionError;
+pub const ParticleSphereCollider = collisions.ParticleSphereCollider;
+pub const max_sphere_colliders = collisions.max_sphere_colliders;

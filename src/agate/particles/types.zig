@@ -65,7 +65,8 @@ pub const FlowWrap = enum {
 /// | flow-field texture (`flow_map`)        | yes       | error.FlowMapNeedsCpu (5)    |
 /// | sub-emitters (on-death spawn)        | yes       | parent never fires (4)       |
 /// | local_space (moving emitter frame)   | yes       | error.LocalSpaceNeedsCpu (2) |
-/// | collisions, noise, arbitrary forces  | (3)       | error (3)                    |
+/// | collisions (spheres + ground plane)  | yes (6)   | error.CollisionNeedsCpu (6)  |
+/// | noise, arbitrary forces              | (3)       | error (3)                    |
 ///
 /// (1) `drag` is GPU-only by design: the CPU path integrates semi-implicit
 ///     Euler per frame while the GPU path uses the exact exponential form;
@@ -73,11 +74,10 @@ pub const FlowWrap = enum {
 ///     from being silently mixed in one system.
 /// (2) local_space needs the per-particle emitter-transform history; only the
 ///     CPU path can express it.
-/// (3) Not implemented on any path today; features that need per-particle
-///     historical state beyond the live record (collisions, force fields)
-///     must stay CPU-only until the state layout grows. If such a flag is
-///     ever added it must reject `.gpu` in update() with an error — never
-///     downgrade.
+/// (3) Not implemented on any path today (noise, arbitrary force fields).
+///     Particle collisions (static spheres + ground plane, see
+///     `collisions.zig`) ARE implemented on the CPU path and reject `.gpu`
+///     with error.CollisionNeedsCpu when armed — never a silent downgrade.
 /// (4) Deaths happen in the vertex shader, unobservable on CPU, so a `.gpu`
 ///     parent never fires its sub-emitters (silently not firing is correct
 ///     here: erroring would break the steady-state emission the ring was
@@ -88,6 +88,14 @@ pub const FlowWrap = enum {
 ///     (strength != 0 with a valid CPU copy) rejects `.gpu` with
 ///     error.FlowMapNeedsCpu — never a silent downgrade. An unset/empty/
 ///     zero-strength field costs nothing on either path and never errors.
+/// (6) Static sphere colliders (fixed cap 8, `addSphereCollider`) plus an
+///     optional ground plane (`setGroundPlane`), with `.kill`/`.bounce`
+///     response (`setCollisionMode`, restitution + friction knobs).
+///     Default `.none` is bit-identical to the pre-collision path;
+///     armed collisions reject `.gpu`/`.compute` with
+///     error.CollisionNeedsCpu — never a silent downgrade. Colliders live
+///     in stored simulation coordinates (world, or emitter-local when
+///     local_space).
 ///
 /// Integration semantics differ by construction: `.cpu` advances with the
 /// frame dt (semi-implicit Euler), `.gpu` evaluates the exact closed form
@@ -130,7 +138,8 @@ pub const FlowWrap = enum {
 /// | flow-field texture (`flow_map`)      | error.FlowMapNeedsCpu (same rule as .gpu)                     |
 /// | sub-emitters (on-death spawn)        | parent never fires (deaths are GPU-side, unobservable)        |
 /// | local_space (moving emitter frame)   | error.LocalSpaceNeedsCpu (same rule as .gpu)                  |
-/// | collisions, noise, sorting           | not implemented (slots carry no neighbor state)               |
+/// | collisions (+ noise, sorting)        | error.CollisionNeedsCpu when armed (CPU-only);                |
+/// |                                      | noise/sorting not implemented                                 |
 ///
 /// Space recycling: a wrapping CPU cursor overwrites the oldest slot (ring
 /// semantics, same as `.gpu`). Consequence: no per-particle death events are
@@ -177,6 +186,10 @@ pub const UpdateError = error{
     /// An armed flow-field texture needs CPU sampling; the GPU paths have no
     /// flow-texture binding (see the feature matrix note (5)).
     FlowMapNeedsCpu,
+    /// Armed particle collisions (a non-`.none` mode with sphere/ground
+    /// geometry) need the CPU integrator; the GPU paths carry no collider
+    /// state (see the feature matrix note (6)).
+    CollisionNeedsCpu,
     /// First-frame GPU slot allocation failed; the GPU ring cannot run.
     OutOfMemory,
     /// `.compute` selected on a backend without compute support (latched by

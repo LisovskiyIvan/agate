@@ -213,7 +213,6 @@ pub const tags = @import("tags.zig");
 pub const TagSet = tags.TagSet;
 pub const TagQuery = tags.TagQuery;
 
-
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
 
@@ -242,6 +241,9 @@ pub const SubEmitter = particles.SubEmitter;
 pub const SubEmitterTrigger = particles.SubEmitterTrigger;
 pub const FlowSpace = particles.FlowSpace;
 pub const FlowWrap = particles.FlowWrap;
+pub const CollisionMode = particles.CollisionMode;
+pub const CollisionError = particles.CollisionError;
+pub const ParticleSphereCollider = particles.ParticleSphereCollider;
 pub const GpuParticleSlot = particles.GpuParticleSlot;
 
 /// Compute-pass support (see compute.zig for the backend matrix).
@@ -562,6 +564,9 @@ test "root re-exports cover recent Scene APIs" {
     _ = SubEmitterTrigger;
     _ = FlowSpace;
     _ = FlowWrap;
+    _ = CollisionMode;
+    _ = CollisionError;
+    _ = ParticleSphereCollider;
     _ = GpuParticleSlot;
     _ = TtfFont;
     _ = TtfError;

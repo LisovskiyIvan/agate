@@ -16,6 +16,7 @@ const upload_meter = @import("../gpu_upload_meter.zig");
 const types = @import("types.zig");
 const sampling = @import("sampling.zig");
 const flow = @import("flow.zig");
+const collisions = @import("collisions.zig");
 
 const Vec3 = math.Vec3;
 const Color4 = math.Color4;
@@ -28,6 +29,7 @@ const UpdateError = types.UpdateError;
 const sampleSpawn = sampling.sampleSpawn;
 const rotationToRadians = sampling.rotationToRadians;
 const activeFlowCtx = flow.activeFlowCtx;
+const activeCollisionCtx = collisions.activeCollisionCtx;
 const SpawnSample = sampling.SpawnSample;
 
 /// Writes the next ring slot for the GPU path. The ring overwrites the
@@ -86,11 +88,13 @@ pub fn provisionGpuSlots(self: anytype) bool {
 /// GPU-path frame step: advances the epoch clock and appends spawn slots
 /// to the ring — O(emitted), never O(particles). The simulation itself
 /// happens in the vertex shader (shaders/particle.glsl, program
-/// particle_gpu). Explicit support contract: `local_space` and slot
-/// allocation failure return errors, never a silent CPU downgrade.
+/// particle_gpu). Explicit support contract: `local_space`, an armed flow
+/// field, armed collisions, and slot allocation failure return errors,
+/// never a silent CPU downgrade.
 pub fn updateGpu(self: anytype, dt: f32) UpdateError!void {
     if (self.local_space) return error.LocalSpaceNeedsCpu;
     if (activeFlowCtx(self) != null) return error.FlowMapNeedsCpu;
+    if (activeCollisionCtx(self) != null) return error.CollisionNeedsCpu;
     if (!provisionGpuSlots(self)) return error.OutOfMemory;
     self.clock_seconds += dt;
     if (self.is_emitting and self.emit_rate > 0.0) {

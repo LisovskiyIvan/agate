@@ -15,6 +15,7 @@ const jobs = @import("../jobs.zig");
 
 const types = @import("types.zig");
 const flow = @import("flow.zig");
+const collisions = @import("collisions.zig");
 const sampling = @import("sampling.zig");
 const subemitters = @import("subemitters.zig");
 
@@ -29,6 +30,8 @@ const max_sub_emitter_spawns_per_tick = types.max_sub_emitter_spawns_per_tick;
 const flowUvForPosition = flow.flowUvForPosition;
 const sampleFlowPixels = flow.sampleFlowPixels;
 const activeFlowCtx = flow.activeFlowCtx;
+const activeCollisionCtx = collisions.activeCollisionCtx;
+const collideParticle = collisions.collideParticle;
 const fireSubEmitters = subemitters.fireSubEmitters;
 const normalizeAngleDeg = sampling.normalizeAngleDeg;
 const rotationToRadians = sampling.rotationToRadians;
@@ -67,7 +70,7 @@ pub fn updateCpu(self: anytype, dt: f32) void {
     // Phase A: integrate. Each worker owns its index range exclusively.
     // The flow snapshot is taken once per tick (read-only thereafter).
     const PhaseA = Phase(@TypeOf(self));
-    var ictx = PhaseA.IntegrateCtx{ .ps = self, .grav_dt = grav_dt, .dt = dt, .flow = activeFlowCtx(self) };
+    var ictx = PhaseA.IntegrateCtx{ .ps = self, .grav_dt = grav_dt, .dt = dt, .flow = activeFlowCtx(self), .coll = activeCollisionCtx(self) };
     jobs.parallelFor(pool, PhaseA.IntegrateCtx, &ictx, PhaseA.integrateRange, self.active_count);
 
     // Phase B: compact. Same swap-with-last recycling as the legacy
@@ -136,6 +139,12 @@ fn Phase(comptime System: type) type {
             /// instruction stream bit-for-bit (one predictable branch per slot, no
             /// extra FP ops, no memory traffic).
             flow: ?FlowCtx = null,
+            /// Null when collisions are disarmed (mode `.none`, or no
+            /// geometry): same bit-for-bit legacy discipline as `flow`
+            /// above (one cached branch per slot). Armed: one sphere loop
+            /// (cap 8) + one ground check per live particle; `.kill` marks
+            /// the slot dead (compacts away like an age death downstream).
+            coll: ?collisions.CollisionCtx = null,
         };
 
         pub fn integrateRange(ctx: *IntegrateCtx, start: usize, end: usize) void {
@@ -160,6 +169,22 @@ fn Phase(comptime System: type) type {
                     p.velocity = p.velocity.add(push.scale(f.strength * ctx.dt));
                 }
                 p.position = p.position.add(p.velocity.scale(ctx.dt));
+                // Collisions (CPU-only; see collisions.zig): resolved against
+                // the post-move position in stored simulation coordinates.
+                // Skipped entirely when disarmed. `.kill` marks the slot dead
+                // (the serial compaction below recycles it like an age death,
+                // including sub-emitter death events); `.bounce` corrects the
+                // position/velocity in place. Pure per slot: no PRNG, no
+                // cross-slot state, hence worker-count invariant.
+                if (ctx.coll) |c| {
+                    const r = collideParticle(p.position, p.velocity, c);
+                    if (r.killed) {
+                        ps.alive_scratch[i] = 0;
+                        continue;
+                    }
+                    p.position = r.pos;
+                    p.velocity = r.vel;
+                }
                 p.rotation = normalizeAngleDeg(p.rotation + p.angular_velocity * ctx.dt);
             }
         }
