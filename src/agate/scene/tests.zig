@@ -6709,4 +6709,3 @@ test "Scene tag queries and tag-filtered raycasting" {
     const hit_hero = scene.pickWithRayTag(ray, "player");
     try std.testing.expect(!hit_hero.hit);
 }
-

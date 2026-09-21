@@ -380,4 +380,3 @@ test "Camera union setPosition and setLookAt" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), fwd.y, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), fwd.z, 1e-5);
 }
-

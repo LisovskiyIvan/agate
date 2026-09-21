@@ -1104,4 +1104,3 @@ test "Mesh tags operations and query" {
     try std.testing.expect(!m.matchesTagQuery("enemy && boss"));
     try std.testing.expect(m.matchesTagQuery("!boss && melee"));
 }
-

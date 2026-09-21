@@ -464,7 +464,7 @@ pub fn writeGlbAlloc(
     // 3. Chunk 1: BIN (8 bytes header + payload)
     const bin_start = 20 + json_chunk_len;
     std.mem.writeInt(u32, out[bin_start..][0..4], bin_chunk_len, .little);
-    std.mem.writeInt(u32, out[bin_start + 4..][0..4], CHUNK_TYPE_BIN, .little);
+    std.mem.writeInt(u32, out[bin_start + 4 ..][0..4], CHUNK_TYPE_BIN, .little);
     @memcpy(out[bin_start + 8 .. bin_start + 8 + bin_chunk_len], bin_data.items);
 
     return out;

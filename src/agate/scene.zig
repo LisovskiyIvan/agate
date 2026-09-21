@@ -1489,7 +1489,6 @@ pub const Scene = struct {
         };
     }
 
-
     /// Raycast adapter matching audio.RaycastFn for audio occlusion queries.
     pub fn audioRaycastAdapter(origin: Vec3, direction: Vec3, max_distance: f32, user_data: ?*anyopaque) bool {
         const self: *Scene = @ptrCast(@alignCast(user_data orelse return false));

@@ -70,4 +70,3 @@ pub const CameraRigMode = rig_mod.CameraRigMode;
 pub const StereoConvergenceMode = rig_mod.StereoConvergenceMode;
 pub const CameraRigSlot = rig_mod.CameraRigSlot;
 pub const CameraRig = rig_mod.CameraRig;
-
