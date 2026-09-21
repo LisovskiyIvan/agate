@@ -141,6 +141,16 @@ pub const WarnOnce = struct {
     }
 };
 
+/// True when the swapchain color AND depth formats both support MSAA at
+/// runtime (the main target mirrors them; see postprocess_pass.resize).
+/// sg.queryPixelformat is the sokol-provided backend gate.
+pub fn mainTargetFormatsMsaaCapable() bool {
+    const env_def = sg.queryDesc().environment.defaults;
+    const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+    const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
+    return sg.queryPixelformat(color_fmt).msaa and sg.queryPixelformat(depth_fmt).msaa;
+}
+
 // --- GPU-free contract tests (visual AA quality cannot be unit-tested; it
 // is verified with the agate smoke run: `agate --frames 120 --msaa 4`). ---
 

@@ -34,9 +34,6 @@ const Skeleton = @import("animation/skeleton.zig").Skeleton;
 const camera_mod = @import("camera.zig");
 const Camera = camera_mod.Camera;
 const Viewport = camera_mod.Viewport;
-const debug_shd = @import("debug_shader");
-const blit_probe_shd = @import("probe_mip_shader");
-const debug_pass = @import("passes/debug_pass.zig");
 const outline_pass = @import("passes/outline_pass.zig");
 const lights = @import("lights.zig");
 const HemisphericLight = lights.HemisphericLight;
@@ -132,6 +129,7 @@ const scene_uniforms = @import("scene/uniforms.zig");
 const FrameContext = scene_uniforms.FrameContext;
 const scene_draw = @import("scene/draw.zig");
 const scene_msaa = @import("scene/msaa.zig");
+const scene_viewport_clear = @import("scene/viewport_clear.zig");
 pub const scene_snapshot = @import("scene/snapshot.zig");
 pub const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
 pub const CameraSnapshot = scene_snapshot.CameraSnapshot;
@@ -200,10 +198,7 @@ pub const Scene = struct {
     cameras: std.ArrayListUnmanaged(CameraEntry) = .empty,
     active_camera_index: ?usize = null,
     enable_multi_camera: bool = false,
-    clear_pipeline: sg.Pipeline = .{},
-    clear_pipeline_msaa: sg.Pipeline = .{},
-    clear_shader: sg.Shader = .{},
-    clear_vb: sg.Buffer = .{},
+    viewport_clear: scene_viewport_clear.ViewportClearPass = .{},
 
     active_camera: ?Camera = null,
     active_camera_owned_name: ?[]const u8 = null,
@@ -1465,18 +1460,6 @@ pub const Scene = struct {
         }
     }
 
-    // ---- Rendering. ----
-
-    /// True when the swapchain color AND depth formats both support MSAA at
-    /// runtime (the main target mirrors them; see postprocess_pass.resize).
-    /// sg.queryPixelformat is the sokol-provided backend gate.
-    fn mainTargetFormatsMsaaCapable() bool {
-        const env_def = sg.queryDesc().environment.defaults;
-        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
-        const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
-        return sg.queryPixelformat(color_fmt).msaa and sg.queryPixelformat(depth_fmt).msaa;
-    }
-
     /// Forward pipeline set matching the MSAA main-target shape; created
     /// lazily (and recreated on count changes) on the first MSAA frame. The
     /// returned pointer aliases Scene state.
@@ -1490,79 +1473,6 @@ pub const Scene = struct {
             }
         }
         return &self.forward_msaa.?;
-    }
-
-    fn ensureClearResources(self: *Scene, samples: i32) void {
-        if (self.clear_vb.id == 0) {
-            self.clear_vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = 16 * 6 * @sizeOf(debug_pass.Vertex),
-            });
-        }
-        if (self.clear_shader.id == 0) {
-            self.clear_shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
-        }
-        const target_pip = if (samples > 1) &self.clear_pipeline_msaa else &self.clear_pipeline;
-        if (target_pip.id == 0) {
-            var pip_desc = sg.PipelineDesc{
-                .shader = self.clear_shader,
-                .index_type = .NONE,
-                .primitive_type = .TRIANGLES,
-                .depth = .{
-                    .compare = .ALWAYS,
-                    .write_enabled = true,
-                },
-                .cull_mode = .NONE,
-                .sample_count = samples,
-            };
-            pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(debug_pass.Vertex) };
-            pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
-                .format = .FLOAT3,
-                .offset = @offsetOf(debug_pass.Vertex, "position"),
-            };
-            pip_desc.layout.attrs[debug_shd.ATTR_debug_color0] = .{
-                .format = .FLOAT4,
-                .offset = @offsetOf(debug_pass.Vertex, "color"),
-            };
-            target_pip.* = sg.makePipeline(pip_desc);
-            if (sg.queryPipelineState(target_pip.*) != .VALID) {
-                std.debug.print("[CLEAR PIPELINE FAILED]: shader_state={}, pip_state={}\n", .{
-                    sg.queryShaderState(self.clear_shader),
-                    sg.queryPipelineState(target_pip.*),
-                });
-            }
-        }
-    }
-
-    fn clearCurrentViewport(self: *Scene, color: Color4, samples: i32) void {
-        self.ensureClearResources(samples);
-        const pip = if (samples > 1) self.clear_pipeline_msaa else self.clear_pipeline;
-        if (pip.id == 0 or self.clear_vb.id == 0 or sg.queryPipelineState(pip) != .VALID) return;
-
-        const clear_verts = [_]debug_pass.Vertex{
-            .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-            .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-            .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-            .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-            .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-            .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
-        };
-        const offset = sg.appendBuffer(self.clear_vb, sg.asRange(&clear_verts));
-        if (offset < 0) return;
-        // Учёт динамики: 6 вершин clear-квада через appendBuffer (байты те же — стрим в GPU-буфер).
-        upload_meter.record(clear_verts.len * @sizeOf(debug_pass.Vertex));
-
-        sg.applyPipeline(pip);
-        var bind = sg.Bindings{};
-        bind.vertex_buffers[0] = self.clear_vb;
-        bind.vertex_buffer_offsets[0] = offset;
-        sg.applyBindings(bind);
-
-        const vs_params = debug_shd.VsParams{
-            .mvp = Mat4.identity,
-        };
-        sg.applyUniforms(debug_shd.UB_vs_params, sg.asRange(&vs_params));
-        sg.draw(0, 6, 1);
     }
 
     /// Shared queue/shadow/outline build parameters (stage-2 increment B):
@@ -2968,7 +2878,7 @@ pub const Scene = struct {
         if (sg.isvalid()) {
             const upload_samples = scene_msaa.effectiveSampleCount(staged.msaa_sample_count, .{
                 .post_enabled = staged.post_process.enabled,
-                .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
+                .formats_msaa_capable = scene_msaa.mainTargetFormatsMsaaCapable(),
                 .backend = sg.queryBackend(),
             });
             self.physics.uploadDebug(self.allocator, upload_samples);
@@ -3319,7 +3229,7 @@ pub const Scene = struct {
         // (scene/msaa.zig holds the policy and the backend matrix).
         const samples = scene_msaa.effectiveSampleCount(snap.msaa_sample_count, .{
             .post_enabled = snap.post_process.enabled,
-            .formats_msaa_capable = mainTargetFormatsMsaaCapable(),
+            .formats_msaa_capable = scene_msaa.mainTargetFormatsMsaaCapable(),
             .backend = sg.queryBackend(),
         });
         if (snap.post_process.enabled and snap.msaa_sample_count > 1 and samples == 1) {
@@ -3461,7 +3371,7 @@ pub const Scene = struct {
 
                 if (entry.clear_viewport) {
                     const clr = entry.clear_color orelse snap.clear_color;
-                    self.clearCurrentViewport(clr, samples);
+                    self.viewport_clear.clear(clr, samples);
                 }
 
                 self.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
@@ -3660,10 +3570,7 @@ pub const Scene = struct {
             }
         }
         self.cameras.deinit(self.allocator);
-        if (self.clear_vb.id != 0) sg.destroyBuffer(self.clear_vb);
-        if (self.clear_pipeline.id != 0) sg.destroyPipeline(self.clear_pipeline);
-        if (self.clear_pipeline_msaa.id != 0) sg.destroyPipeline(self.clear_pipeline_msaa);
-        if (self.clear_shader.id != 0) sg.destroyShader(self.clear_shader);
+        self.viewport_clear.deinit();
 
         if (self.active_camera_owned_name) |n| {
             self.allocator.free(n);

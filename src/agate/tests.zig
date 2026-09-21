@@ -170,6 +170,7 @@ test {
     _ = @import("scene/trail_layer.zig");
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
+    _ = @import("scene/viewport_clear.zig");
     _ = @import("serialization.zig");
     _ = @import("serialization/format.zig");
     _ = @import("serialization/props.zig");
