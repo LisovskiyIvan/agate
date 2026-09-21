@@ -21,6 +21,7 @@ test {
     _ = @import("animation/sampler.zig");
     _ = @import("animation/skeleton.zig");
     _ = @import("animation/tests.zig");
+    _ = @import("asset_manager.zig");
     _ = @import("assets.zig");
     _ = @import("audio.zig");
     _ = @import("audio/clip.zig");

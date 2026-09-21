@@ -27,6 +27,11 @@ pub fn markContextThread() void {
     context_thread_id = std.Thread.getCurrentId();
 }
 
+/// Test helper to reset context thread state between test cases.
+pub fn resetContextThreadForTest() void {
+    context_thread_id = null;
+}
+
 /// True when called on the marked graphics thread, or when no thread has
 /// been marked (unit tests, tools, single-threaded mode).
 pub fn isOnContextThread() bool {
@@ -48,8 +53,10 @@ pub fn assertOnContextThread() void {
 // --- tests (P1: инвариант владения sg-ресурсами) ---
 
 test "без маркера любой поток считается контекстным (синхронный fallback)" {
-    // NOTE: идёт первым в файле: маркер глобален на процесс, до mark-теста
-    // ниже состояние обязано быть немаркированным.
+    const saved = context_thread_id;
+    defer context_thread_id = saved;
+    context_thread_id = null;
+
     try std.testing.expect(isOnContextThread());
     const Probe = struct {
         fn run(out: *bool) void {
@@ -63,6 +70,9 @@ test "без маркера любой поток считается конте�
 }
 
 test "маркированный поток: владелец проходит, чужой отклоняется" {
+    const saved = context_thread_id;
+    defer context_thread_id = saved;
+
     // Маркер ставит вызывающий (main init до спавна игровых потоков);
     // дальше isOnContextThread — чистая функция сравнения id, без гонок.
     markContextThread();

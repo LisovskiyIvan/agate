@@ -479,6 +479,15 @@ pub const writeStlBinaryAlloc = export_stl.writeStlBinaryAlloc;
 pub const writeGlbAlloc = export_glb.writeGlbAlloc;
 pub const writeGlbMeshAlloc = export_glb.writeGlbMeshAlloc;
 
+pub const assets = @import("assets.zig");
+pub const AsyncTexturePipeline = assets.AsyncTexturePipeline;
+pub const asset_manager = @import("asset_manager.zig");
+pub const AssetManager = asset_manager.AssetManager;
+pub const AssetTask = asset_manager.AssetTask;
+pub const AssetCache = asset_manager.AssetCache;
+pub const TaskState = asset_manager.TaskState;
+pub const TaskType = asset_manager.TaskType;
+
 pub const ai = @import("ai.zig");
 pub const NavNode = ai.NavNode;
 pub const NavMesh = ai.NavMesh;
@@ -558,4 +567,7 @@ test "root re-exports cover recent Scene APIs" {
     _ = GlbExportOptions;
     _ = writeGlbAlloc;
     _ = writeGlbMeshAlloc;
+    _ = AssetManager;
+    _ = AssetTask;
+    _ = AssetCache;
 }

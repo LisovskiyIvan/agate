@@ -46,7 +46,13 @@ const sg = sokol.gfx;
 const jobs = @import("jobs.zig");
 const gpu_thread = @import("gpu_thread.zig");
 const Texture = @import("texture.zig").Texture;
-const ktx2 = @import("ktx2.zig");
+pub const ktx2 = @import("ktx2.zig");
+pub const asset_manager = @import("asset_manager.zig");
+pub const AssetManager = asset_manager.AssetManager;
+pub const AssetTask = asset_manager.AssetTask;
+pub const AssetCache = asset_manager.AssetCache;
+pub const TaskState = asset_manager.TaskState;
+pub const TaskType = asset_manager.TaskType;
 
 pub const TextureState = enum(u8) {
     /// Worker is reading/decoding the file.
