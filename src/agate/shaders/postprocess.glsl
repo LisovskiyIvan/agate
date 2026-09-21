@@ -38,6 +38,8 @@ layout(binding = 0) uniform fs_params {
     vec4 params5; // x: sharpen_amount (0=off), y: grain_intensity (0=off), z: temperature [-1,1], w: tint [-1,1]
     vec4 dof_params; // x: dof_enabled (1/0), y: focus_distance, z: focus_range, w: max_blur_px
     vec4 bloom_pyramid; // x: pyramid_enabled (1/0), y: mips, z/w: unused
+    vec4 glow_params; // x: glow_enabled (1/0), y: intensity, z/w: unused
+    vec4 glow_tint; // xyz: glow color multiplier, w: unused
     vec4 grade_shadows; // xyz: shadows lift [-1,1], w: unused
     vec4 grade_midtones; // xyz: midtones lift [-1,1], w: unused
     vec4 grade_highlights; // xyz: highlights lift [-1,1], w: unused
@@ -57,6 +59,7 @@ layout(binding = 2) uniform texture2D depth_tex;
 layout(binding = 3) uniform texture2D bloom_tex;
 layout(binding = 4) uniform texture2D lut_tex;
 layout(binding = 5) uniform texture2D history_tex;
+layout(binding = 6) uniform texture2D glow_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -704,6 +707,17 @@ void main() {
 
         vec3 bloom_scaled = bloom * params1.z;
         color += bloom_scaled;
+    }
+
+    // Glow layer v1 (global halo, independent of bloom): threshold-extracted
+    // + separable-blurred glow_tex added with intensity * tint. Disabled (or
+    // intensity ~0) returns before sampling, so the off path is bit-identical
+    // to pre-glow. Composites AFTER bloom so either toggle leaves the other's
+    // contribution unchanged; before the grading chain so the halo grades
+    // with the same LDR the bloom halo uses.
+    if (glow_params.x > 0.5 && glow_params.y > 0.001) {
+        vec3 glow = texture(sampler2D(glow_tex, smp), uv).rgb;
+        color += glow * (glow_params.y * glow_tint.xyz);
     }
 
     // Contrast

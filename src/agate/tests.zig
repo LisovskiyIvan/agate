@@ -98,6 +98,7 @@ test {
     _ = @import("particles/types.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");
+    _ = @import("passes/glow_pass.zig");
     _ = @import("passes/mod.zig");
     _ = @import("passes/outline_pass.zig");
     _ = @import("passes/particle_pass.zig");

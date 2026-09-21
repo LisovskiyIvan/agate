@@ -37,6 +37,7 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
             .postprocess_pass = undefined,
             .ssao_pass = undefined,
             .bloom_pass = undefined,
+            .glow_pass = undefined,
             .outline_pass = undefined,
         },
         .forward = .{},

@@ -12,6 +12,7 @@ pub const SkyboxPass = @import("skybox_pass.zig").SkyboxPass;
 pub const ParticlePass = @import("particle_pass.zig").ParticlePass;
 pub const PostProcessPass = @import("postprocess_pass.zig").PostProcessPass;
 pub const BloomPass = @import("bloom_pass.zig").BloomPass;
+pub const GlowPass = @import("glow_pass.zig").GlowPass;
 pub const OutlinePass = @import("outline_pass.zig").OutlinePass;
 pub const OutlineDrawItem = @import("outline_pass.zig").OutlineDrawItem;
 // P4: makeOutlineDrawItem/OutlinePass.renderItems/OutlineDrawItem несут

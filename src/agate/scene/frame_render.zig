@@ -264,7 +264,7 @@ pub fn render(scene: anytype) void {
     scene.stats.main_ms = msSince(t_main);
 
     // ==============================================
-    // PASS 2.5 (SSAO) + 2.75 (bloom) + 3 (composite & UI overlay)
+    // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 3 (composite & UI overlay)
     // ==============================================
     const t_post = sokol.time.now();
     scene.postfx.renderChain(.{

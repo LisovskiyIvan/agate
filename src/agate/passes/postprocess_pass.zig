@@ -33,6 +33,11 @@ pub const PostProcessPass = struct {
     // back to the legacy single-shader bloom and this binds the scene view
     // as a harmless placeholder.
     bloom_tex_view: sg.View = .{},
+    // Optional GlowPass result (global halo, half resolution). Set via
+    // setGlowTexture(); empty by default, in which case the shader skips the
+    // glow block and this binds the scene view as a harmless placeholder
+    // (bit-identical composite).
+    glow_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -350,6 +355,13 @@ pub const PostProcessPass = struct {
             self.bloom_tex_view
         else
             self.offscreen_resolve_tex_view;
+        // Glow halo when the parent fed a GlowPass result; otherwise a valid
+        // placeholder the shader never samples (glow_params.x = 0 gates the
+        // glow block off, so the off path is bit-identical to pre-glow).
+        post_bind.views[post_shd.VIEW_glow_tex] = if (self.glow_tex_view.id != 0)
+            self.glow_tex_view
+        else
+            self.offscreen_resolve_tex_view;
         // LUT when the config carries a live binding; otherwise the resolved
         // scene view as a valid placeholder the shader never samples
         // (lut_params.x = 0 gates the LUT branch off).
@@ -461,6 +473,11 @@ pub const PostProcessPass = struct {
                 0.0,
                 0.0,
             },
+            // (enabled 1/0, intensity, 0, 0); zeros when glow is off, which
+            // keeps the composite identical to the pre-glow path.
+            .glow_params = postprocess.glowParams(config),
+            // (tint rgb, 0); zeros when glow is off (unread while disabled).
+            .glow_tint = postprocess.glowTintParams(config),
             .grade_shadows = .{
                 config.grade_shadows[0],
                 config.grade_shadows[1],
@@ -506,6 +523,13 @@ pub const PostProcessPass = struct {
     // and return to the legacy single-shader bloom path.
     pub fn setBloomTexture(self: *PostProcessPass, view: sg.View) void {
         self.bloom_tex_view = view;
+    }
+
+    // Feed the GlowPass halo result into the composite. Call every frame
+    // before render() once the parent owns a GlowPass; pass .{} to detach
+    // and return to the no-glow composite path (bit-identical to pre-glow).
+    pub fn setGlowTexture(self: *PostProcessPass, view: sg.View) void {
+        self.glow_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

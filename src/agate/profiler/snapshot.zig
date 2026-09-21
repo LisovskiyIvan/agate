@@ -16,6 +16,7 @@ const texture_mod = @import("../texture.zig");
 const probe_layer = @import("../scene/probe_layer.zig");
 const gui3d_layer = @import("../scene/gui3d_layer.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
+const glow_pass_mod = @import("../passes/glow_pass.zig");
 
 const Scene = scene_mod.Scene;
 const Texture = texture_mod.Texture;
@@ -281,6 +282,25 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 .format = .RGBA8,
                 .samples = 1,
                 .gpu_bytes = ssao_bytes,
+            });
+        }
+
+        // Glow layer targets (extract + H/V ping-pong, half res): pass-owned
+        // like the bloom pyramid (pure byte math via GlowPass.targetBytes, no
+        // GPU calls; a sized-out pass contributes nothing). The bloom pyramid
+        // itself has no census entry (predates the census); glow registers
+        // from day one.
+        const glow = &scene.postfx.glow_pass;
+        if (glow.base_width > 0 and glow.base_height > 0) {
+            const glow_bytes = glow_pass_mod.GlowPass.targetBytes(glow.base_width, glow.base_height, glow_pass_mod.GlowPass.glowBytesPerPixel());
+            snap.render_targets_vram_bytes += glow_bytes;
+            try rt_list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, "Glow Targets (Extract + Blur Ping-Pong)"),
+                .width = @intCast(glow.base_width),
+                .height = @intCast(glow.base_height),
+                .format = .RGBA8,
+                .samples = 1,
+                .gpu_bytes = glow_bytes,
             });
         }
 

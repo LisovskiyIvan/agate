@@ -522,8 +522,8 @@ pub const Scene = struct {
     // ---- Offscreen targets & post-processing config. ----
 
     /// Window-resize hook: resizes every viewport-sized offscreen target
-    /// (postprocess, bloom, SSAO, outline). The per-frame post chain resizes
-    /// postprocess/bloom lazily, but SSAO has no other resize path — call
+    /// (postprocess, bloom, glow, SSAO, outline). The per-frame post chain resizes
+    /// postprocess/bloom/glow lazily, but SSAO has no other resize path — call
     /// this when the window size changes and post-processing/SSAO is in use.
     ///
     /// Render-owned targets: CONTEXT THREAD ONLY (asserted), never a worker
