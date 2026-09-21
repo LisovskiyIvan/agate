@@ -141,6 +141,7 @@ test {
     _ = @import("scene/forward_pipelines.zig");
     _ = @import("scene/frame_build.zig");
     _ = @import("scene/frame_draws.zig");
+    _ = @import("scene/frame_prepare.zig");
     _ = @import("scene/frame_render.zig");
     _ = @import("scene/gpu_retire.zig");
     _ = @import("scene/gui3d_layer.zig");
