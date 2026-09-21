@@ -22,6 +22,7 @@ pub const FreeCameraOptions = struct {
     far: f32 = 100.0,
     speed: f32 = 6.0,
     angular_sensitivity: f32 = 0.25,
+    inertia: f32 = 0.0, // Damping factor (0.0 = instant, e.g. 0.85 = smooth damping)
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 };
@@ -35,6 +36,9 @@ pub const FreeCamera = struct {
     far: f32 = 100.0,
     speed: f32 = 6.0,
     angular_sensitivity: f32 = 0.25, // Degrees per pixel
+    inertia: f32 = 0.0,
+    inertial_rotation_x: f32 = 0.0,
+    inertial_rotation_y: f32 = 0.0,
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 
@@ -59,6 +63,7 @@ pub const FreeCamera = struct {
             .far = options.far,
             .speed = options.speed,
             .angular_sensitivity = options.angular_sensitivity,
+            .inertia = options.inertia,
             .culling_mask = options.culling_mask,
             .viewport = options.viewport,
         };
@@ -97,9 +102,14 @@ pub const FreeCamera = struct {
                     self.last_mouse_x = ev.*.mouse_x;
                     self.last_mouse_y = ev.*.mouse_y;
 
-                    self.rotation.y -= dx * self.angular_sensitivity;
-                    self.rotation.x -= dy * self.angular_sensitivity;
-                    self.rotation.x = std.math.clamp(self.rotation.x, -89.0, 89.0);
+                    if (self.inertia <= 0.0) {
+                        self.rotation.y -= dx * self.angular_sensitivity;
+                        self.rotation.x -= dy * self.angular_sensitivity;
+                        self.rotation.x = std.math.clamp(self.rotation.x, -89.0, 89.0);
+                    } else {
+                        self.inertial_rotation_y += dx * self.angular_sensitivity;
+                        self.inertial_rotation_x += dy * self.angular_sensitivity;
+                    }
                 }
             },
             .KEY_DOWN => self.setMoveFlag(ev.*.key_code, true),
@@ -109,6 +119,20 @@ pub const FreeCamera = struct {
     }
 
     pub fn update(self: *FreeCamera, dt: f32) void {
+        if (self.inertia > 0.0) {
+            self.rotation.y -= self.inertial_rotation_y;
+            self.rotation.x -= self.inertial_rotation_x;
+            self.rotation.x = std.math.clamp(self.rotation.x, -89.0, 89.0);
+
+            const clamped_inertia = std.math.clamp(self.inertia, 0.0, 0.999);
+            const decay = std.math.pow(f32, clamped_inertia, dt * 60.0);
+            self.inertial_rotation_x *= decay;
+            self.inertial_rotation_y *= decay;
+
+            if (@abs(self.inertial_rotation_x) < 0.0001) self.inertial_rotation_x = 0.0;
+            if (@abs(self.inertial_rotation_y) < 0.0001) self.inertial_rotation_y = 0.0;
+        }
+
         const yaw_rad = self.rotation.y * std.math.pi / 180.0;
         const fwd = Vec3.new(-@sin(yaw_rad), 0.0, -@cos(yaw_rad));
         const right = fwd.cross(Vec3.up).normalize();
@@ -217,4 +241,32 @@ test "FreeCamera moves forward relative to yaw" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), strafe.position.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), strafe.position.y, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -6.0), strafe.position.z, 1e-4);
+}
+
+test "FreeCamera inertia enables smooth rotation damping" {
+    var cam = FreeCamera.init("free", .{ .inertia = 0.85 });
+    var down_ev = sokol.app.Event{
+        .type = .MOUSE_DOWN,
+        .mouse_button = .LEFT,
+        .mouse_x = 200.0,
+        .mouse_y = 200.0,
+    };
+    cam.handleEvent(&down_ev);
+
+    var move_ev = sokol.app.Event{
+        .type = .MOUSE_MOVE,
+        .mouse_x = 220.0,
+        .mouse_y = 210.0,
+    };
+    cam.handleEvent(&move_ev);
+
+    try std.testing.expectEqual(@as(f32, 0.0), cam.rotation.x);
+    try std.testing.expectEqual(@as(f32, 0.0), cam.rotation.y);
+    try std.testing.expect(cam.inertial_rotation_y != 0.0);
+
+    cam.update(1.0 / 60.0);
+    try std.testing.expect(cam.rotation.y != 0.0);
+    const rot1 = cam.rotation.y;
+    cam.update(1.0 / 60.0);
+    try std.testing.expect(cam.rotation.y < rot1);
 }

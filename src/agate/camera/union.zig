@@ -94,7 +94,7 @@ pub const Camera = union(enum) {
 
     pub fn update(self: *Camera, dt: f32) void {
         switch (self.*) {
-            .arc_rotate => {},
+            .arc_rotate => |*c| c.update(dt),
             .free => |*c| c.update(dt),
             .follow => |*c| c.update(dt),
             .target => |*c| c.update(dt),
@@ -224,4 +224,27 @@ test "Camera mask and viewport dispatch" {
     cam.setViewport(.{ .x = 0.1, .y = 0.2, .width = 0.3, .height = 0.4 });
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), cam.getViewport().x, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), cam.getViewport().width, 1e-5);
+}
+
+test "Camera union dispatches update to arc_rotate with inertia" {
+    var cam: Camera = .{ .arc_rotate = ArcRotateCamera.init("orbit", .{ .inertia = 0.9 }) };
+    var down_ev = sokol.app.Event{
+        .type = .MOUSE_DOWN,
+        .mouse_button = .LEFT,
+        .mouse_x = 50.0,
+        .mouse_y = 50.0,
+    };
+    cam.handleEvent(&down_ev);
+
+    var move_ev = sokol.app.Event{
+        .type = .MOUSE_MOVE,
+        .mouse_x = 70.0,
+        .mouse_y = 60.0,
+    };
+    cam.handleEvent(&move_ev);
+
+    const pos0 = cam.getPosition();
+    cam.update(1.0 / 60.0);
+    const pos1 = cam.getPosition();
+    try std.testing.expect(pos0.x != pos1.x or pos0.z != pos1.z);
 }
