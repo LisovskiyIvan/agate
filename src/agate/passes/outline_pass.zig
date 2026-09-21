@@ -443,10 +443,17 @@ pub const OutlinePass = struct {
                 (if (is_u32) self.pipeline_u32 else self.pipeline_u16);
             if (pip.id == 0) continue;
 
+            if (item.vertex_buffer.id == 0) continue;
+            if (sg.isvalid()) {
+                if (sg.queryBufferState(item.vertex_buffer) != .VALID) continue;
+                if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) continue;
+            }
+
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = item.vertex_buffer;
             if (instanced) {
                 if (item.instance_buffer.id == 0 or item.visible_instance_count == 0) continue;
+                if (sg.isvalid() and sg.queryBufferState(item.instance_buffer) != .VALID) continue;
                 bind.vertex_buffers[1] = item.instance_buffer;
             }
             if (is_cutout and item.cutout_view != null and item.cutout_sampler != null) {

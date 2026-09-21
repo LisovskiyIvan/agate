@@ -40,10 +40,15 @@ fn pipelineFor(self: anytype, bucket: types.Bucket) u32 {
 // 0.12/0.35/0.75 policy as regular items.
 fn shadowItemCulled(item: anytype, frustum: math.Frustum, cascade_idx: ?usize) bool {
     if (!item.is_visible) return true;
-    if (!frustum.intersectsAABB(item.world_aabb)) return true;
     if (item.is_instanced) {
         if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) return true;
     }
+    if (sg.isvalid()) {
+        if (item.vertex_buffer.id != 0 and sg.queryBufferState(item.vertex_buffer) != .VALID) return true;
+        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return true;
+        if (item.is_instanced and item.instance_buffer.id != 0 and sg.queryBufferState(item.instance_buffer) != .VALID) return true;
+    }
+    if (!frustum.intersectsAABB(item.world_aabb)) return true;
     if (cascade_idx) |c_idx| {
         if (c_idx == 1 and item.max_dim < 0.12) return true;
         if (c_idx == 2 and item.max_dim < 0.35) return true;
@@ -77,6 +82,7 @@ pub fn renderBuckets(
             if (item.gpu_pending) continue;
             if (shadowItemCulled(item, frustum, cascade_idx)) continue;
             if (item.is_instanced) {
+                if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) continue;
                 if (pip_id != last_pipeline_id.*) {
                     sg.applyPipeline(.{ .id = pip_id });
                     last_pipeline_id.* = pip_id;

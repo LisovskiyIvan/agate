@@ -2655,17 +2655,27 @@ pub const Scene = struct {
         _ = self;
         const records = back.staged_instances.items;
         const fid = back.frame_id;
+        const is_gpu = sg.isvalid();
         // Queue batches: primary + all views, opaque + transparent.
         const queue_lists = [_]*std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch){
             &back.primary.opaque_instanced, &back.primary.transparent_instanced,
         };
-        for (queue_lists) |list| patchBatchList(list, records, fid);
+        for (queue_lists) |list| patchBatchList(list, records, fid, is_gpu);
         for (&back.views) |*q| {
-            patchBatchList(&q.opaque_instanced, records, fid);
-            patchBatchList(&q.transparent_instanced, records, fid);
+            patchBatchList(&q.opaque_instanced, records, fid, is_gpu);
+            patchBatchList(&q.transparent_instanced, records, fid, is_gpu);
         }
-        // Shadow items (instanced only).
+        // Shadow items.
         for (back.shadow.items.items) |*it| {
+            if (is_gpu and (it.vertex_buffer.id == 0 or sg.queryBufferState(it.vertex_buffer) != .VALID)) {
+                it.is_visible = false;
+                it.gpu_pending = true;
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_aabb = BoundingBox.zero;
+                it.max_dim = 0;
+                continue;
+            }
             if (!it.is_instanced) continue;
             const rec = findStagedRecord(records, it.source_mesh) orelse {
                 it.instance_buffer = .{};
@@ -2689,6 +2699,12 @@ pub const Scene = struct {
         }
         // Outline items (instanced only).
         for (back.outline_items.items) |*it| {
+            if (is_gpu and (it.vertex_buffer.id == 0 or sg.queryBufferState(it.vertex_buffer) != .VALID)) {
+                it.instance_buffer = .{};
+                it.visible_instance_count = 0;
+                it.world_center = Vec3.zero;
+                continue;
+            }
             if (!it.is_instanced) continue;
             const rec = findStagedRecord(records, it.source_mesh) orelse {
                 it.instance_buffer = .{};
@@ -2712,8 +2728,14 @@ pub const Scene = struct {
         list: *std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch),
         records: []const StagedInstanceRecord,
         fid: u64,
+        is_gpu: bool,
     ) void {
         for (list.items) |*b| {
+            if (is_gpu and (b.vertex_buffer.id == 0 or sg.queryBufferState(b.vertex_buffer) != .VALID)) {
+                b.instance_buffer = .{};
+                b.visible_instance_count = 0;
+                continue;
+            }
             const rec = findStagedRecord(records, b.source_mesh) orelse {
                 b.instance_buffer = .{};
                 b.visible_instance_count = 0;

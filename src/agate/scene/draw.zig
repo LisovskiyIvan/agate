@@ -97,6 +97,12 @@ pub fn drawRegularItem(
     shaders: []const material_mod.ShaderDrawSnapshot,
     coats: []const material_mod.CoatParams,
 ) void {
+    if (item.index_count == 0) return;
+    if (sg.isvalid()) {
+        if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) return;
+        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return;
+    }
+
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
     const rec = item.draw_record;
@@ -446,6 +452,7 @@ fn drawShaderMaterialItem(
             bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
             bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
             bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+            bind.views[shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
             bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
             bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
             bind.views[shd.VIEW_morph_tex] = morph_view;
@@ -683,6 +690,11 @@ pub fn instancedDrawFlags(material: ?Material, is_decal: bool) struct { transpar
 // meshes share the already-blended dynamic vertex buffer.
 pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, ctx: *const FrameContext, current_pipeline_id: *u32, coats: []const material_mod.CoatParams) void {
     if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return;
+    if (sg.isvalid()) {
+        if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) return;
+        if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) return;
+        if (sg.queryBufferState(batch.instance_buffer) != .VALID) return;
+    }
 
     const is_pbr = batch.is_pbr;
     const is_u32 = batch.index_type == .UINT32;
