@@ -1889,94 +1889,7 @@ pub const Scene = struct {
     /// Packs the current camera, light, shadow, and environment state into an immutable
     /// frame snapshot that can be published to the render thread.
     pub fn packFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) scene_snapshot.SceneFrameSnapshot {
-        const w = if (cur_w > 0) cur_w else sapp.width();
-        const h = if (cur_h > 0) cur_h else sapp.height();
-        const eff_aspect = if (aspect > 0.0) aspect else (if (h > 0) @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(h)) else 1.0);
-
-        var snap = scene_snapshot.SceneFrameSnapshot{
-            .frame_id = self.frame_id,
-            .aspect = eff_aspect,
-            .screen_w = w,
-            .screen_h = h,
-        };
-
-        const primary_cam_opt = self.active_camera orelse (if (self.cameras.items.len > 0) self.cameras.items[0].camera else null);
-        if (primary_cam_opt == null) {
-            snap.has_camera = false;
-            return snap;
-        }
-        snap.has_camera = true;
-
-        snap.enable_multi_camera = self.enable_multi_camera;
-        snap.active_camera_idx = self.active_camera_index orelse 0;
-        snap.camera_count = @min(self.cameras.items.len, scene_snapshot.MAX_CAMERAS);
-
-        for (0..snap.camera_count) |i| {
-            const entry = self.cameras.items[i];
-            const cam_rect = entry.viewport.toPixelRect(w, h);
-            const cam_aspect = cam_rect.aspect();
-            snap.cameras[i] = scene_snapshot.CameraSnapshot{
-                .camera = entry.camera,
-                .view_proj = entry.camera.getViewProjection(cam_aspect),
-                .eye = entry.camera.getPosition(),
-                .viewport = entry.viewport,
-                .culling_mask = entry.culling_mask,
-                .clear_viewport = entry.clear_viewport,
-                .clear_color = entry.clear_color,
-                .aspect = cam_aspect,
-                .enabled = entry.enabled,
-            };
-        }
-
-        if (snap.enable_multi_camera and snap.camera_count > 0 and snap.active_camera_idx < snap.camera_count) {
-            snap.primary_cam = snap.cameras[snap.active_camera_idx];
-        } else {
-            const vp = primary_cam_opt.?.getViewport();
-            const rect = vp.toPixelRect(w, h);
-            const cam_aspect = rect.aspect();
-            snap.primary_cam = scene_snapshot.CameraSnapshot{
-                .camera = primary_cam_opt.?,
-                .view_proj = primary_cam_opt.?.getViewProjection(cam_aspect),
-                .eye = primary_cam_opt.?.getPosition(),
-                .viewport = vp,
-                .culling_mask = primary_cam_opt.?.getCullingMask(),
-                .aspect = cam_aspect,
-            };
-        }
-
-        snap.sun_dir = self.lights.sunDirection();
-        snap.sun_color = self.lights.sunColor();
-        snap.sun_intensity = self.lights.sunIntensity();
-        snap.cascades = self.shadows.computeCascades(snap.primary_cam.camera, snap.primary_cam.aspect, snap.sun_dir);
-
-        var lp = self.light_pack;
-        _ = self.light_handoff.takeLatest(&lp);
-        self.light_pack = lp;
-        snap.light_pack = lp;
-
-        snap.shadows_enabled = self.shadows.enabled;
-        snap.shadow_uniforms = self.shadows.uniformState(self.lights.hemi.ground_color);
-        snap.sky_texture = self.sky.texture;
-        snap.sky_enabled = self.sky.enabled;
-        snap.sky_exposure = self.sky.exposure;
-        snap.ibl_intensity = self.sky.ibl_intensity;
-        // Reflection-probe state for the draw's per-object selection (plain
-        // data + borrowed cube view/sampler values, never live layer refs).
-        snap.probe_pack = self.probes.packFrame();
-        // Render-owned default copies (plain GPU-handle values): the draw
-        // binds these, never the live Scene.default_*_texture fields.
-        snap.default_white = self.default_white_texture;
-        snap.default_normal = self.default_normal_texture;
-        snap.default_cube = self.default_cube_texture;
-        snap.clear_color = self.clear_color;
-        snap.msaa_sample_count = self.msaa_sample_count;
-        snap.post_process = self.post_process;
-        snap.ssao = self.ssao;
-        snap.outline_enabled = self.postfx.outline_enabled;
-        snap.outline_color = self.postfx.outline_color;
-        snap.outline_width_px = self.postfx.outline_width_px;
-
-        return snap;
+        return scene_snapshot.packFrameSnapshot(self, aspect, cur_w, cur_h);
     }
 
     /// Publishes a complete frame snapshot through the lock-free mailbox.
@@ -1984,32 +1897,8 @@ pub const Scene = struct {
     /// published), stale published slots are drained first so the NEWEST
     /// snapshot wins — otherwise prepareFrame's takeLatest would resurface
     /// an older published frame over the newer fallback.
-    ///
-    /// Render-ownership: the saturated fallback NEVER writes the consumed
-    /// snapshot directly. Render reads the front slot's STAGED snapshot
-    /// (`FrameDrawSlot.snapshot`) concurrently with update (update||render
-    /// overlap), so a producer-side overwrite would race the draw; the
-    /// last-unclaimable tick is DROPPED instead (newest published frame
-    /// stays, this one is skipped). Producer (update) vs consumer (prepare)
-    /// stay excluded under phase_mutex, which is what makes
-    /// releasePublished safe here.
     pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
-        const snap = self.packFrameSnapshot(aspect, cur_w, cur_h);
-        if (self.frame_handoff.claim()) |i| {
-            self.frame_handoff.slot(i).* = snap;
-            self.frame_handoff.publish(i);
-        } else {
-            // Saturated: drop stale published frames (consumer is excluded
-            // by phase ownership here) and publish the newest.
-            self.frame_handoff.releasePublished();
-            if (self.frame_handoff.claim()) |i| {
-                self.frame_handoff.slot(i).* = snap;
-                self.frame_handoff.publish(i);
-            }
-            // Still unclaimable (a slot is held in WRITING state): DROP.
-            // Never fall back to `self.frame_snapshot = snap` — the
-            // consumed snapshot belongs to the in-flight render.
-        }
+        scene_snapshot.publishFrameSnapshot(self, aspect, cur_w, cur_h);
     }
 
     /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.

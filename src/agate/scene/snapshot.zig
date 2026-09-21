@@ -1,4 +1,6 @@
 const std = @import("std");
+const sokol = @import("sokol");
+const sapp = sokol.app;
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
@@ -138,6 +140,132 @@ pub const SceneFrameSnapshot = struct {
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
     outline_width_px: f32 = 2.0,
 };
+
+/// Packs the current camera, light, shadow, and environment state of `scene` into an immutable
+/// frame snapshot that can be published to the render thread.
+pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) SceneFrameSnapshot {
+    const w = if (cur_w > 0) cur_w else sapp.width();
+    const h = if (cur_h > 0) cur_h else sapp.height();
+    const eff_aspect = if (aspect > 0.0) aspect else (if (h > 0) @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(h)) else 1.0);
+
+    var snap = SceneFrameSnapshot{
+        .frame_id = scene.frame_id,
+        .aspect = eff_aspect,
+        .screen_w = w,
+        .screen_h = h,
+    };
+
+    const primary_cam_opt = scene.active_camera orelse (if (scene.cameras.items.len > 0) scene.cameras.items[0].camera else null);
+    if (primary_cam_opt == null) {
+        snap.has_camera = false;
+        return snap;
+    }
+    snap.has_camera = true;
+
+    snap.enable_multi_camera = scene.enable_multi_camera;
+    snap.active_camera_idx = scene.active_camera_index orelse 0;
+    snap.camera_count = @min(scene.cameras.items.len, MAX_CAMERAS);
+
+    for (0..snap.camera_count) |i| {
+        const entry = scene.cameras.items[i];
+        const cam_rect = entry.viewport.toPixelRect(w, h);
+        const cam_aspect = cam_rect.aspect();
+        snap.cameras[i] = CameraSnapshot{
+            .camera = entry.camera,
+            .view_proj = entry.camera.getViewProjection(cam_aspect),
+            .eye = entry.camera.getPosition(),
+            .viewport = entry.viewport,
+            .culling_mask = entry.culling_mask,
+            .clear_viewport = entry.clear_viewport,
+            .clear_color = entry.clear_color,
+            .aspect = cam_aspect,
+            .enabled = entry.enabled,
+        };
+    }
+
+    if (snap.enable_multi_camera and snap.camera_count > 0 and snap.active_camera_idx < snap.camera_count) {
+        snap.primary_cam = snap.cameras[snap.active_camera_idx];
+    } else {
+        const vp = primary_cam_opt.?.getViewport();
+        const rect = vp.toPixelRect(w, h);
+        const cam_aspect = rect.aspect();
+        snap.primary_cam = CameraSnapshot{
+            .camera = primary_cam_opt.?,
+            .view_proj = primary_cam_opt.?.getViewProjection(cam_aspect),
+            .eye = primary_cam_opt.?.getPosition(),
+            .viewport = vp,
+            .culling_mask = primary_cam_opt.?.getCullingMask(),
+            .aspect = cam_aspect,
+        };
+    }
+
+    snap.sun_dir = scene.lights.sunDirection();
+    snap.sun_color = scene.lights.sunColor();
+    snap.sun_intensity = scene.lights.sunIntensity();
+    snap.cascades = scene.shadows.computeCascades(snap.primary_cam.camera, snap.primary_cam.aspect, snap.sun_dir);
+
+    var lp = scene.light_pack;
+    _ = scene.light_handoff.takeLatest(&lp);
+    scene.light_pack = lp;
+    snap.light_pack = lp;
+
+    snap.shadows_enabled = scene.shadows.enabled;
+    snap.shadow_uniforms = scene.shadows.uniformState(scene.lights.hemi.ground_color);
+    snap.sky_texture = scene.sky.texture;
+    snap.sky_enabled = scene.sky.enabled;
+    snap.sky_exposure = scene.sky.exposure;
+    snap.ibl_intensity = scene.sky.ibl_intensity;
+    // Reflection-probe state for the draw's per-object selection (plain
+    // data + borrowed cube view/sampler values, never live layer refs).
+    snap.probe_pack = scene.probes.packFrame();
+    // Render-owned default copies (plain GPU-handle values): the draw
+    // binds these, never the live Scene.default_*_texture fields.
+    snap.default_white = scene.default_white_texture;
+    snap.default_normal = scene.default_normal_texture;
+    snap.default_cube = scene.default_cube_texture;
+    snap.clear_color = scene.clear_color;
+    snap.msaa_sample_count = scene.msaa_sample_count;
+    snap.post_process = scene.post_process;
+    snap.ssao = scene.ssao;
+    snap.outline_enabled = scene.postfx.outline_enabled;
+    snap.outline_color = scene.postfx.outline_color;
+    snap.outline_width_px = scene.postfx.outline_width_px;
+
+    return snap;
+}
+
+/// Publishes a complete frame snapshot through the lock-free mailbox.
+/// When the mailbox is saturated (consumer lagging, both slots
+/// published), stale published slots are drained first so the NEWEST
+/// snapshot wins — otherwise prepareFrame's takeLatest would resurface
+/// an older published frame over the newer fallback.
+///
+/// Render-ownership: the saturated fallback NEVER writes the consumed
+/// snapshot directly. Render reads the front slot's STAGED snapshot
+/// (`FrameDrawSlot.snapshot`) concurrently with update (update||render
+/// overlap), so a producer-side overwrite would race the draw; the
+/// last-unclaimable tick is DROPPED instead (newest published frame
+/// stays, this one is skipped). Producer (update) vs consumer (prepare)
+/// stay excluded under phase_mutex, which is what makes
+/// releasePublished safe here.
+pub fn publishFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) void {
+    const snap = packFrameSnapshot(scene, aspect, cur_w, cur_h);
+    if (scene.frame_handoff.claim()) |i| {
+        scene.frame_handoff.slot(i).* = snap;
+        scene.frame_handoff.publish(i);
+    } else {
+        // Saturated: drop stale published frames (consumer is excluded
+        // by phase ownership here) and publish the newest.
+        scene.frame_handoff.releasePublished();
+        if (scene.frame_handoff.claim()) |i| {
+            scene.frame_handoff.slot(i).* = snap;
+            scene.frame_handoff.publish(i);
+        }
+        // Still unclaimable (a slot is held in WRITING state): DROP.
+        // Never fall back to `self.frame_snapshot = snap` — the
+        // consumed snapshot belongs to the in-flight render.
+    }
+}
 
 test "SceneFrameSnapshot default initialization" {
     const snap = SceneFrameSnapshot{};
