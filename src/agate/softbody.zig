@@ -567,33 +567,13 @@ pub const SoftBodyLayer = struct {
         const owned_name = allocator.dupe(u8, name) catch return error.OutOfMemory;
         errdefer allocator.free(owned_name);
 
-        const deferred = !gpu_thread.isOnContextThread() or !sg.isvalid();
-        var vb: sg.Buffer = .{};
-        var ib: sg.Buffer = .{};
-        if (!deferred) {
-            vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = n * @sizeOf(Vertex),
-            });
-            // Always u32 (see flushGpuUploads): one index path, no narrowing.
-            ib = sg.makeBuffer(.{ .usage = .{ .index_buffer = true }, .data = sg.asRange(indices) });
-            if (vb.id == 0 or ib.id == 0) {
-                if (vb.id != 0) sg.destroyBuffer(vb);
-                if (ib.id != 0) sg.destroyBuffer(ib);
-                return error.OutOfMemory;
-            }
-            // Seed the live dynamic buffer with the rest pose so frame 1
-            // cannot draw uninitialized memory.
-            sg.updateBuffer(vb, sg.asRange(vertices));
-        }
-
         const mesh = allocator.create(Mesh) catch return error.OutOfMemory;
         errdefer allocator.destroy(mesh);
         mesh.* = .{
             .name = owned_name,
             .owns_name = true,
-            .vertex_buffer = vb,
-            .index_buffer = ib,
+            .vertex_buffer = .{},
+            .index_buffer = .{},
             .vertex_count = @intCast(n),
             .index_count = @intCast(indices.len),
             .index_type = .UINT32,
@@ -624,7 +604,8 @@ pub const SoftBodyLayer = struct {
             .material = mat,
             .vertices = vertices,
             .indices = indices,
-            .buffers_pending = deferred,
+            .buffers_pending = true,
+            .upload_pending = false,
         };
         self.bodies.append(allocator, body) catch {
             allocator.destroy(body);
