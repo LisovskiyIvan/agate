@@ -134,6 +134,7 @@ const scene_viewport_clear = @import("scene/viewport_clear.zig");
 const scene_view_render = @import("scene/view_render.zig");
 const scene_queue_builder = @import("scene/queue_builder.zig");
 const scene_frame_render = @import("scene/frame_render.zig");
+const scene_patch_instances = @import("scene/patch_instance_refs.zig");
 pub const QueueBuildParams = scene_queue_builder.QueueBuildParams;
 pub const scene_snapshot = @import("scene/snapshot.zig");
 pub const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
@@ -1749,113 +1750,9 @@ pub const Scene = struct {
     /// - Culling/inclusion stay frozen at build time (bounds/model/distance
     ///   are NOT repatched): a live TRS mutation between build and latch
     ///   never alters this frame's sets, only the next build sees it.
-    fn findStagedRecord(records: []const StagedInstanceRecord, idx: usize) ?*const StagedInstanceRecord {
-        for (records) |*rec| {
-            const ri: usize = rec.mesh_index;
-            if (ri == idx) return rec;
-            if (ri > idx) break;
-        }
-        return null;
-    }
-
     fn patchInstanceRefs(self: *Scene, back: *FrameDrawSlot) void {
         _ = self;
-        const records = back.staged_instances.items;
-        const fid = back.frame_id;
-        const is_gpu = sg.isvalid();
-        // Queue batches: primary + all views, opaque + transparent.
-        const queue_lists = [_]*std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch){
-            &back.primary.opaque_instanced, &back.primary.transparent_instanced,
-        };
-        for (queue_lists) |list| patchBatchList(list, records, fid, is_gpu);
-        for (&back.views) |*q| {
-            patchBatchList(&q.opaque_instanced, records, fid, is_gpu);
-            patchBatchList(&q.transparent_instanced, records, fid, is_gpu);
-        }
-        // Shadow items.
-        for (back.shadow.items.items) |*it| {
-            if (is_gpu and (it.vertex_buffer.id == 0 or sg.queryBufferState(it.vertex_buffer) != .VALID)) {
-                it.is_visible = false;
-                it.gpu_pending = true;
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_aabb = BoundingBox.zero;
-                it.max_dim = 0;
-                continue;
-            }
-            if (!it.is_instanced) continue;
-            const rec = findStagedRecord(records, it.source_mesh) orelse {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_aabb = BoundingBox.zero;
-                it.max_dim = 0;
-                continue;
-            };
-            if (rec.uid != it.source_uid or rec.staged_frame != fid) {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_aabb = BoundingBox.zero;
-                it.max_dim = 0;
-                continue;
-            }
-            it.instance_buffer = rec.buffer;
-            it.visible_instance_count = rec.count;
-            it.world_aabb = rec.bounds;
-            const ext = rec.bounds.extents();
-            it.max_dim = @max(ext.x, @max(ext.y, ext.z));
-        }
-        // Outline items (instanced only).
-        for (back.outline_items.items) |*it| {
-            if (is_gpu and (it.vertex_buffer.id == 0 or sg.queryBufferState(it.vertex_buffer) != .VALID)) {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_center = Vec3.zero;
-                continue;
-            }
-            if (!it.is_instanced) continue;
-            const rec = findStagedRecord(records, it.source_mesh) orelse {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_center = Vec3.zero;
-                continue;
-            };
-            if (rec.uid != it.source_uid or rec.staged_frame != fid) {
-                it.instance_buffer = .{};
-                it.visible_instance_count = 0;
-                it.world_center = rec.mesh_position;
-                continue;
-            }
-            it.instance_buffer = rec.buffer;
-            it.visible_instance_count = rec.count;
-            it.world_center = if (rec.bounds.isValid()) rec.bounds.center() else rec.mesh_position;
-        }
-    }
-
-    fn patchBatchList(
-        list: *std.ArrayListUnmanaged(scene_render_queue.RenderInstancedBatch),
-        records: []const StagedInstanceRecord,
-        fid: u64,
-        is_gpu: bool,
-    ) void {
-        for (list.items) |*b| {
-            if (is_gpu and (b.vertex_buffer.id == 0 or sg.queryBufferState(b.vertex_buffer) != .VALID)) {
-                b.instance_buffer = .{};
-                b.visible_instance_count = 0;
-                continue;
-            }
-            const rec = findStagedRecord(records, b.source_mesh) orelse {
-                b.instance_buffer = .{};
-                b.visible_instance_count = 0;
-                continue;
-            };
-            if (rec.uid != b.source_uid or rec.staged_frame != fid) {
-                b.instance_buffer = .{};
-                b.visible_instance_count = 0;
-                continue;
-            }
-            b.instance_buffer = rec.buffer;
-            b.visible_instance_count = rec.count;
-        }
+        scene_patch_instances.patchInstanceRefs(back);
     }
 
     /// Concurrent-build claim (wave 29, game side): reserve a free draw slot

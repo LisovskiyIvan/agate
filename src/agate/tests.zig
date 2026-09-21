@@ -149,6 +149,7 @@ test {
     _ = @import("scene/msaa.zig");
     _ = @import("scene/nav_layer.zig");
     _ = @import("scene/particle_layer.zig");
+    _ = @import("scene/patch_instance_refs.zig");
     _ = @import("scene/physics_layer.zig");
     _ = @import("scene/picking.zig");
     _ = @import("scene/pipelines.zig");
