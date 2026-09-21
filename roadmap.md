@@ -673,7 +673,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Realtime ray tracing/Gaussian splatting (в Babylon 9 тоже отдельные подсистемы).
 
 **Прочее**
-* Crowd simulation (RVO2/ORCA локальное избегание столкновений толпы).
+* Crowd simulation (RVO2/ORCA 2D локальное избегание столкновений толпы) уже реализована (см. ✅).
 * Сеть/multiplayer, репликация, WebSocket/WebRTC.
 * Behaviors/Actions/Observables как API-слой, теги объектов, smart filters, flow graph.
 * Локализация.

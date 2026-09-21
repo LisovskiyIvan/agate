@@ -8,6 +8,7 @@ test {
     _ = @import("math");
     _ = @import("ai.zig");
     _ = @import("ai/agent.zig");
+    _ = @import("ai/crowd.zig");
     _ = @import("ai/funnel.zig");
     _ = @import("ai/navmesh.zig");
     _ = @import("ai/pathfinding.zig");

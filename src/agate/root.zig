@@ -496,6 +496,9 @@ pub const triArea2D = ai.triArea2D;
 pub const stringPull = ai.stringPull;
 pub const Pathfinding = ai.Pathfinding;
 pub const NavAgent = ai.NavAgent;
+pub const Crowd = ai.Crowd;
+pub const CrowdAgent = ai.CrowdAgent;
+pub const CrowdAgentParams = ai.CrowdAgentParams;
 
 pub const visibility = @import("visibility/mod.zig");
 pub const HiZBuffer = visibility.HiZBuffer;
@@ -570,4 +573,7 @@ test "root re-exports cover recent Scene APIs" {
     _ = AssetManager;
     _ = AssetTask;
     _ = AssetCache;
+    _ = Crowd;
+    _ = CrowdAgent;
+    _ = CrowdAgentParams;
 }
