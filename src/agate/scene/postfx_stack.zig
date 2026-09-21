@@ -24,8 +24,8 @@ const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
 
 /// Screen-space post-processing stack: the offscreen main-pass target, the
-/// fullscreen composite pass, SSAO, the bloom mip pyramid, and the
-/// inverse-hull outline settings. Scene feeds the per-frame configs
+/// fullscreen composite pass, SSAO, the bloom mip pyramid, the glow layer,
+/// and the inverse-hull outline settings. Scene feeds the per-frame configs
 /// (post_process / ssao stay public Scene config fields) through
 /// ChainParams; everything GPU-owned lives here. The list of highlighted
 /// meshes stays on Scene (content registry, mock-constructed in tests).
@@ -33,6 +33,7 @@ pub const PostFXStack = struct {
     postprocess_pass: passes.PostProcessPass,
     ssao_pass: passes.SSAOPass,
     bloom_pass: passes.BloomPass,
+    glow_pass: passes.GlowPass,
     outline_pass: passes.OutlinePass,
 
     // MSAA twin of the outline pass (its pipelines must match the main
@@ -79,6 +80,7 @@ pub const PostFXStack = struct {
             .postprocess_pass = passes.PostProcessPass.init(),
             .ssao_pass = passes.SSAOPass.init(),
             .bloom_pass = passes.BloomPass.init(),
+            .glow_pass = passes.GlowPass.init(),
             .outline_pass = passes.OutlinePass.init(),
         };
     }
@@ -87,6 +89,7 @@ pub const PostFXStack = struct {
         self.postprocess_pass.deinit();
         self.ssao_pass.deinit();
         self.bloom_pass.deinit();
+        self.glow_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
@@ -97,6 +100,7 @@ pub const PostFXStack = struct {
         self.postprocess_pass.resize(width, height, self.main_samples);
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
+        self.glow_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -121,6 +125,7 @@ pub const PostFXStack = struct {
             self.main_samples = samples;
             self.postprocess_pass.resize(width, height, samples);
             self.bloom_pass.resize(width, height);
+            self.glow_pass.resize(width, height);
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
@@ -228,10 +233,11 @@ pub const PostFXStack = struct {
         ui: ?*const UiFrame = null,
     };
 
-    /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 3 (fullscreen
-    /// composite and UI overlay onto the swapchain). The composite pass
-    /// itself only runs when post-processing is enabled — SSAO/bloom then
-    /// just refresh their inputs (legacy behavior kept verbatim).
+    /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 2.8 (glow layer) +
+    /// PASS 3 (fullscreen composite and UI overlay onto the swapchain). The
+    /// composite pass itself only runs when post-processing is enabled —
+    /// SSAO/bloom/glow then just refresh their inputs (legacy behavior kept
+    /// verbatim).
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         // Depth-consuming effects are incompatible with the MSAA main
         // target (no depth resolve in sokol — see scene/msaa.zig); degrade
@@ -296,7 +302,7 @@ pub const PostFXStack = struct {
         // Multi-pass glow; when disabled the composite shader keeps its legacy
         // in-shader bloom and this binds the resolved scene view placeholder.
         var bloom_view = self.postprocess_pass.offscreen_resolve_tex_view;
-        if (params.post.enabled and post.bloom_enabled and post.bloom_pyramid) {
+        if (postprocess.bloomPyramidActive(params.post.enabled, post)) {
             bloom_view = self.bloom_pass.render(
                 self.postprocess_pass.offscreen_resolve_tex_view,
                 post.bloom_threshold,
@@ -310,6 +316,33 @@ pub const PostFXStack = struct {
             params.stats.draw_calls += bloom_draws;
         }
         self.postprocess_pass.setBloomTexture(bloom_view);
+
+        // ==============================================
+        // PASS 2.8: GLOW LAYER v1 (optional global halo)
+        // ==============================================
+        // Threshold extract + separable H/V blur (GLOW_PASS_DRAWS draws);
+        // when disabled the composite shader skips the glow block and this
+        // binds the resolved scene view placeholder (bit-identical). Runs
+        // AFTER the bloom pyramid and composites after bloom's block, so
+        // either toggle leaves the other's output unchanged. Samples the
+        // resolved scene color (no depth), hence no MSAA suppression. Like
+        // bloom it is uniform-only (no sg.updateBuffer, no upload-meter
+        // records) and resize-idempotent, so renderReuse replays replay it
+        // upload-free.
+        var glow_view = self.postprocess_pass.offscreen_resolve_tex_view;
+        if (postprocess.glowActive(params.post.enabled, post)) {
+            glow_view = self.glow_pass.render(
+                self.postprocess_pass.offscreen_resolve_tex_view,
+                post.glow_threshold,
+                post.glow_radius,
+                cur_w,
+                cur_h,
+            );
+            params.stats.post_draw_calls += postprocess.GLOW_PASS_DRAWS;
+            params.stats.draw_calls += postprocess.GLOW_PASS_DRAWS;
+            params.stats.triangles += 2 * postprocess.GLOW_PASS_DRAWS;
+        }
+        self.postprocess_pass.setGlowTexture(glow_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
