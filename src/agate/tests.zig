@@ -168,6 +168,10 @@ test {
     _ = @import("scene/queue_builder.zig");
     _ = @import("scene/render_queue.zig");
     _ = @import("scene/render_queue/build.zig");
+    _ = @import("scene/render_queue/build/equivalence.zig");
+    _ = @import("scene/render_queue/build/frame.zig");
+    _ = @import("scene/render_queue/build/parallel.zig");
+    _ = @import("scene/render_queue/build/snapshots.zig");
     _ = @import("scene/render_queue/cull.zig");
     _ = @import("scene/render_queue/instances.zig");
     _ = @import("scene/render_queue/items.zig");
