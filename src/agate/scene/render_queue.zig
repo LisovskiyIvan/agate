@@ -11,8 +11,11 @@
 //!   plain-mesh cull, material-record build, queue append. Imports `items`.
 //! - `render_queue/instances.zig` — instanced submit/staging glue.
 //!   Imports `items` + `cull`.
-//! - `render_queue/build.zig` — `buildFrameQueues` plus the parallel cull
-//!   pass and merge tail. Imports `items` + `cull` + `instances`.
+//! - `render_queue/build.zig` — facade over `build/` (`frame`:
+//!   `buildFrameQueues` entry + dispatch; `parallel`: chunked cull pass and
+//!   merge tail; `equivalence` + `snapshots`: integration tests). Imports
+//!   `items` + `cull` + `instances` (+ one-directional `frame` → `parallel`
+//!   edge).
 //!
 //! Everything that was public before the split is re-exported here
 //! unchanged; consumers (`scene.zig`, `scene/*`, `passes/*`, `root.zig`)
