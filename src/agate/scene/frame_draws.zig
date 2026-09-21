@@ -123,12 +123,15 @@
 //! goes): the frame snapshot, the staged instance records (+ their latched
 //! outcomes), the UI packet lists + header + handles, the staged build stats
 //! (`FrameDrawSlot.build_stats`, frozen by the game build and merged by the
-//! prepare latch — the last shared word besides pure flow now lives in the
-//! slot payload), and the prepare-gated GPU uploads (P3 epochs + upload
-//! meter). Removing the phase mutex means moving the remaining live reads
-//! above under the same freeze-then-latch shape (or an equivalent mailbox)
-//! — the pin/lease here only covers the variable-length draw payload plus
-//! the staged snapshot, deliberately nothing else.
+//! prepare latch), the frozen particle capture (`particle_draws`) and the
+//! frozen physics-debug capture (`physics_lines`/`physics_visible`) — both
+//! frozen by the game build and consumed by the prepare latch instead of
+//! the shared staging stores — and the prepare-gated GPU uploads (P3 epochs
+//! + upload meter). Removing the phase mutex means moving the remaining
+//! live reads above under the same freeze-then-latch shape (or an
+//! equivalent mailbox) — the pin/lease here covers the variable-length
+//! draw payload plus the staged snapshot, stats, and particle/physics
+//! captures, deliberately nothing else.
 //!
 //! Wave 29 (concurrent-build ENGINE primitive — proof, not adoption): the
 //! game side can now `claimBack` a slot, fill it (`Scene.BuildClaim.build`
@@ -173,24 +176,28 @@
 //!   as before (now via the locked `tryPublish`); a missed slot degrades to
 //!   a counted skip, never a wedge. What REMAINS for adoption is app-side
 //!   flow (the first bullet) + canvas quiesce + freeze-then-latch:
-//! - DONE (wave 31 second slice): `build_stats` is a slot payload — the
-//!   game side accumulates into the live `Scene.build_stats` accumulator
-//!   and the build freezes a plain copy into the claimed slot's
-//!   `build_stats` (staged-wins over post-build accumulation, same
-//!   precedent as the snapshot; `reset` zeroes it so stale stats never
-//!   resurface after slot reuse); `prepareFrame` merges the claimed
-//!   slot's copy into `stats` instead of reading the shared field. This
-//!   was the LAST shared word (besides pure flow) depending on the phase
-//!   mutex. What REMAINS for adoption is app-side flow (the first
-//!   bullet) + canvas quiesce + freeze-then-latch only:
+//! - DONE (wave 32): particle/physics freeze-then-latch — the
+//!   particle capture and the physics-debug capture are slot payloads
+//!   (`FrameDrawSlot.particle_draws`, `physics_lines`/`physics_visible`,
+//!   lock-free-publication slices 4/5): the game build freezes a plain
+//!   copy into the claimed slot right after the shared build capture
+//!   and the prepare latch consumes the SLOT copy, never the shared
+//!   `build_frame`/`build_lines` staging stores — so a game-thread
+//!   producer build colliding with the context-thread consumer latch
+//!   can no longer deliver a torn record for one frame. The shared
+//!   stores stay (direct layer tests + tooling compat) but the adopted
+//!   path never reads them. Staged-wins on OOM (fail-closes to
+//!   coherent-empty, same precedent as the snapshot/stats slices).
+//!   What REMAINS for adoption is app-side flow (the first bullet) +
+//!   canvas quiesce + the remaining live touches below:
 //! - epochs stay context-owned (`begin`/`complete`/`flush` only in
 //!   prepare/render): the build path must never gain epoch calls (tested).
-//! - remaining live touches (meshes/canvas/cameras/lights/particles +
-//!   physics build frames, `packFrameSnapshot` live reads, the inline
-//!   fallback paths, `frame_handoff` producer/consumer exclusion) move
-//!   under freeze-then-latch before the mutex can go; `ui_canvas`
-//!   mutation must additionally quiesce before prepare (the latch reads
-//!   upload identity from the live canvas even on the staged path).
+//! - remaining live touches (meshes/canvas/cameras/lights, the
+//!   `packFrameSnapshot` live reads, the inline fallback paths, the
+//!   `frame_handoff` producer/consumer exclusion) move under
+//!   freeze-then-latch before the mutex can go; `ui_canvas` mutation
+//!   must additionally quiesce before prepare (the latch reads upload
+//!   identity from the live canvas even on the staged path).
 
 const std = @import("std");
 const render_queue = @import("render_queue.zig");
@@ -199,6 +206,8 @@ const stats_mod = @import("stats.zig");
 const retire_mod = @import("gpu_retire.zig");
 const ui_frame_mod = @import("ui_frame.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
+const particle_pass = @import("../passes/particle_pass.zig");
+const physics_types = @import("../physics/types.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 const mesh_mod = @import("../mesh.zig");
 const ui_mod = @import("../ui.zig");
@@ -311,6 +320,31 @@ pub const FrameDrawSlot = struct {
     /// context-owned timing/upload fields); `reset` zeroes it so a
     /// reused slot can never resurface a prior frame's stats.
     build_stats: stats_mod.SceneStats = .{},
+    /// Slot-owned frozen particle capture (wave 32, freeze-then-latch
+    /// slice 4): the game-side build (`Scene.buildIntoClaimedSlot`,
+    /// via `ParticleLayer.stageIntoSlot`) freezes the just-captured
+    /// build frame here by value right after `buildCapture`; the
+    /// prepare latch (`ParticleLayer.latchSlotFrame`) consumes THIS
+    /// copy into the render-owned frame instead of the shared
+    /// `build_frame` — so a game-thread build colliding with the
+    /// context-side latch cannot deliver a torn record. Plain values
+    /// only (borrowed handle ids, never destroyed/retired through the
+    /// slot); `reset` clears the list (retaining capacity) so a reused
+    /// slot can never resurface a prior frame's draws. Staged-wins on
+    /// OOM (fail-closes to coherent-empty, same as the build frame).
+    particle_draws: std.ArrayListUnmanaged(particle_pass.ParticlePass.ParticleDraw) = .empty,
+    /// Slot-owned frozen physics debug capture (wave 32,
+    /// freeze-then-latch slice 5): the game-side build (via
+    /// `PhysicsIntegration.stageIntoSlot`) freezes the just-captured
+    /// build lines + visibility here right after `buildDebug`; the
+    /// prepare latch (`PhysicsIntegration.latchSlotDebug`) consumes
+    /// THESE into the render-owned capture instead of the shared
+    /// `build_lines`/`build_visible`. Same plain-value, staged-wins,
+    /// coherent-empty-on-OOM contract as `particle_draws` above.
+    physics_lines: std.ArrayListUnmanaged(physics_types.DebugLine) = .empty,
+    /// Frozen visibility for the slot's physics debug capture (see
+    /// `physics_lines`); `reset` clears it alongside the list.
+    physics_visible: bool = false,
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -331,6 +365,9 @@ pub const FrameDrawSlot = struct {
         self.ui_packet = .{};
         self.snapshot = .{};
         self.build_stats = .{};
+        self.particle_draws.clearRetainingCapacity();
+        self.physics_lines.clearRetainingCapacity();
+        self.physics_visible = false;
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -344,6 +381,8 @@ pub const FrameDrawSlot = struct {
         self.staged_instances.deinit(allocator);
         self.ui_vertices.deinit(allocator);
         self.ui_indices.deinit(allocator);
+        self.particle_draws.deinit(allocator);
+        self.physics_lines.deinit(allocator);
     }
 
     /// Retained CPU bytes held by this slot (retained capacities × element
@@ -363,6 +402,8 @@ pub const FrameDrawSlot = struct {
         b += listBytes(self.staged_instances);
         b += listBytes(self.ui_vertices);
         b += listBytes(self.ui_indices);
+        b += listBytes(self.particle_draws);
+        b += listBytes(self.physics_lines);
         return b;
     }
 };

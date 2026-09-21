@@ -5569,6 +5569,327 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
     try std.testing.expect(scene.build_slot.load(.monotonic) < scene.draws.slots.len);
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
+
+// ---- Wave 32: particle/physics freeze-then-latch (slot payload). ----
+
+// CPU-only particle system for scene-level freeze/latch tests: built with
+// the shared headless helper (no sg.* anywhere — the init defers buffer
+// creation off-context, and here construction itself is plain CPU allocs),
+// appended to the layer list by pointer. Teardown is manual (free + list
+// deinit): `ParticleLayer.deinit` would run `ps.deinit()` (sg destroys for
+// the canary ids below), so scene tests that stage canary handle ids must
+// not call it.
+fn wave32PushTestSystem(scene: *Scene, capacity: usize) !*ParticleSystem {
+    const psys_mod = @import("../particles/system.zig");
+    const ps = try scene.allocator.create(ParticleSystem);
+    errdefer scene.allocator.destroy(ps);
+    ps.* = try psys_mod.makeTestSystem(scene.allocator, capacity);
+    errdefer psys_mod.freeTestSystem(ps);
+    try scene.particles.systems.append(scene.allocator, ps);
+    return ps;
+}
+
+fn wave32FreeTestSystems(scene: *Scene) void {
+    const psys_mod = @import("../particles/system.zig");
+    for (scene.particles.systems.items) |ps| {
+        psys_mod.freeTestSystem(ps);
+        scene.allocator.destroy(ps);
+    }
+    scene.particles.systems.deinit(scene.allocator);
+    scene.particles.frame.deinit(scene.allocator);
+    scene.particles.build_frame.deinit(scene.allocator);
+}
+
+test "wave32: adopted build freezes particle+physics into the slot; prepare latches the slot copy" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+    defer scene.meshes.deinit(alloc);
+    defer wave32FreeTestSystems(&scene);
+
+    const ps = try wave32PushTestSystem(&scene, 4);
+    ps.active_count = 2;
+    ps.instance_buffer = .{ .id = 11 };
+
+    // Standalone body mesh (not registered: the build stages zero scene
+    // meshes while the debug capture still observes the world).
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("box");
+    defer alloc.destroy(m);
+    _ = try scene.createRigidBody(m, .box, 1.0);
+    scene.physics.show_debug = true;
+    defer scene.physics.deinit(alloc);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    const slot = scene.build_slot.load(.monotonic);
+    const frozen = scene.draws.slotAtConst(slot);
+    // The claimed slot froze both captures by value.
+    try std.testing.expectEqual(@as(usize, 1), frozen.particle_draws.items.len);
+    try std.testing.expectEqual(@as(usize, 2), frozen.particle_draws.items[0].active_count);
+    try std.testing.expectEqual(@as(u32, 11), frozen.particle_draws.items[0].instance_buffer.id);
+    try std.testing.expect(frozen.physics_visible);
+    try std.testing.expectEqual(@as(usize, 12), frozen.physics_lines.items.len);
+    const x0 = frozen.physics_lines.items[0].a.x;
+
+    // Mutate every live field past recognition AFTER the build: the frozen
+    // slot copies (and the shared build frames) stay at build time.
+    ps.active_count = 1;
+    ps.instance_buffer = .{ .id = 99 };
+    m.position = Vec3.new(5, 0, 0);
+    scene.physics.show_debug = false;
+    try std.testing.expectEqual(@as(usize, 2), frozen.particle_draws.items[0].active_count);
+    try std.testing.expectEqual(@as(u32, 11), frozen.particle_draws.items[0].instance_buffer.id);
+    try std.testing.expect(frozen.physics_visible);
+    try std.testing.expectApproxEqAbs(x0, frozen.physics_lines.items[0].a.x, 1e-4);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(slot, scene.draws.front);
+
+    // The latch published the frozen generation: identical to the shared
+    // build frames (sequential bit-identical), immune to the live mutation.
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
+    try std.testing.expectEqual(@as(usize, 2), scene.particles.frame.items[0].active_count);
+    try std.testing.expectEqual(@as(u32, 11), scene.particles.frame.items[0].instance_buffer.id);
+    try std.testing.expectEqual(scene.particles.build_frame.items[0].active_count, scene.particles.frame.items[0].active_count);
+    try std.testing.expectEqual(
+        scene.particles.build_frame.items[0].instance_buffer.id,
+        scene.particles.frame.items[0].instance_buffer.id,
+    );
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+    try std.testing.expectApproxEqAbs(x0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
+    // Both layer generations were consumed (a later fallback runs live).
+    try std.testing.expectEqual(scene.particles.build_seq.load(.acquire), scene.particles.latched_seq);
+    try std.testing.expectEqual(scene.physics.build_seq.load(.acquire), scene.physics.latched_seq);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave32: fallback (no build) still captures particles+physics live" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+    defer scene.meshes.deinit(alloc);
+    defer wave32FreeTestSystems(&scene);
+
+    const ps = try wave32PushTestSystem(&scene, 4);
+    ps.active_count = 2;
+    ps.instance_buffer = .{ .id = 11 };
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("box");
+    defer alloc.destroy(m);
+    _ = try scene.createRigidBody(m, .box, 1.0);
+    scene.physics.show_debug = true;
+    defer scene.physics.deinit(alloc);
+
+    // No build: prepare runs the historical inline captures unchanged.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
+    try std.testing.expectEqual(@as(usize, 2), scene.particles.frame.items[0].active_count);
+    try std.testing.expect(scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
+    // The slots staged nothing: a skipped path never resurfaces a prior frame.
+    const front = scene.draws.slotAtConst(scene.draws.front);
+    try std.testing.expectEqual(@as(usize, 0), front.particle_draws.items.len);
+    try std.testing.expectEqual(@as(usize, 0), front.physics_lines.items.len);
+    try std.testing.expect(!front.physics_visible);
+}
+
+// Concurrent stress: a producer thread runs the adopted claim flow
+// (claim -> build, freezing particle/physics into the claimed slot ->
+// publish) while the test thread runs the prepare-side slot latch
+// (stable-pair claim -> validate the FROZEN payload -> latchSlot ->
+// publish). The per-generation canary: particle `active_count`/`instance_
+// buffer.id` encode the generation parity/value, physics visibility encodes
+// the same parity — any torn cross-generation mix (the wave-32 hazard on
+// the old shared stores) fails the coherence check deterministically:
+// consecutive generations always differ in parity. Latest-wins drops are
+// legal (a moved-on handoff is skipped, counted) but latched generations
+// are strictly increasing with the exact tail; an uncongested rotation
+// never starves the producer (zero claimBack skips).
+test "wave32: concurrent claim/build/publish vs slot-latch — no torn records, exact tail" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+    defer scene.meshes.deinit(alloc);
+    defer wave32FreeTestSystems(&scene);
+
+    const ps = try wave32PushTestSystem(&scene, 4);
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("box");
+    defer alloc.destroy(m);
+    _ = try scene.createRigidBody(m, .box, 1.0);
+    defer scene.physics.deinit(alloc);
+
+    const total_gens: u64 = 5000;
+
+    const Ctx = struct {
+        scene: *Scene,
+        sys: *ParticleSystem,
+        total: u64,
+        skipped: u64 = 0,
+        /// `claimSlot` refusals (`SlotBusy` — the handoff slot is mid-build):
+        /// each one bumps `saturation_skips` exactly once, counted here.
+        busy_misses: u64 = 0,
+        /// Stable-pair races (a newer publish landed between our handoff
+        /// load and our claim): counted latest-wins drops that bump NO
+        /// global counter (`cancelClaim` is silent by design).
+        moved_on: u64 = 0,
+        latched: u64 = 0,
+        max_seen: u64 = 0,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        /// The no-torn-record assertion, applied to the frozen slot payload
+        /// BEFORE the latch consumes it and to the latched copies after:
+        /// every field of the generation decodes to the same `gen`.
+        fn checkCoherent(draw_count: usize, draw_id: u32, n_lines: usize, visible: bool, gen: u64) void {
+            // Particle canary: count (gen%2)+1, id gen.
+            if (draw_count != @as(usize, @intCast((gen % 2) + 1))) unreachable;
+            if (draw_id != @as(u32, @intCast(gen))) unreachable;
+            // Physics canary: visible on even gens, 12 box lines or empty.
+            if (visible != (gen % 2 == 0)) unreachable;
+            if (n_lines != (if (visible) @as(usize, 12) else @as(usize, 0))) unreachable;
+            // Cross-payload pairing: count==1 exactly on visible gens.
+            if ((draw_count == 1) != visible) unreachable;
+        }
+    };
+
+    const Producer = struct {
+        fn run(c: *Ctx) void {
+            var gen: u64 = 1;
+            while (gen <= c.total) {
+                // Encode the generation into live state (producer-only
+                // writes; the consumer never reads live state, only slots).
+                c.sys.active_count = @as(usize, @intCast((gen % 2) + 1));
+                c.sys.instance_buffer = .{ .id = @as(u32, @intCast(gen)) };
+                c.scene.physics.show_debug = (gen % 2 == 0);
+                var claim = while (c.scene.tryClaimBuildSlot()) |cl| break cl else {
+                    c.skipped += 1;
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                claim.build();
+                claim.publish();
+                gen += 1;
+            }
+            c.done.store(true, .release);
+        }
+    };
+
+    var ctx = Ctx{ .scene = &scene, .sys = ps, .total = total_gens };
+    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
+
+    // Consumer = the prepare-side slot latch (test thread): only consume
+    // when the handoff pair is stable across our claim — a moved-on
+    // generation is a counted latest-wins miss, never a stale latch. The
+    // consumed slot is released with `cancelClaim`, never published: the
+    // front flip stays context-owned under exclusion in the real flow, and
+    // the game-side build core reads the plain `front` word (commit over
+    // the front slot) — flipping it here would race that read outside the
+    // lease. The handoff edge under test (claim/build/publish vs
+    // claimSlot/validate/latch) is fully exercised without the flip.
+    while (!ctx.done.load(.acquire) or scene.last_latched_seq.load(.monotonic) != total_gens) {
+        const b = scene.build_seq.load(.acquire);
+        if (b == 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        if (b == scene.last_latched_seq.load(.monotonic)) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        if (b < ctx.max_seen) unreachable; // stale read after publish
+        const s = scene.build_slot.load(.acquire);
+        scene.draws.claimSlot(s) catch {
+            ctx.busy_misses += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        };
+        if (scene.build_seq.load(.acquire) != b or scene.build_slot.load(.acquire) != s) {
+            scene.draws.cancelClaim(s) catch {};
+            ctx.moved_on += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        // The claim is held and the pair is stable: no producer can be
+        // writing this slot — validate the FROZEN record before consuming.
+        const back = scene.draws.slotAt(s);
+        if (back.particle_draws.items.len != 1) unreachable;
+        const frozen_draw = back.particle_draws.items[0];
+        Ctx.checkCoherent(
+            frozen_draw.active_count,
+            frozen_draw.instance_buffer.id,
+            back.physics_lines.items.len,
+            back.physics_visible,
+            b,
+        );
+        scene.particles.latchSlotFrame(alloc, back.particle_draws.items);
+        scene.physics.latchSlotDebug(alloc, back.physics_lines.items, back.physics_visible);
+        // The latched copies carry the same generation, whole.
+        const got = scene.particles.frame.items;
+        if (got.len != 1) unreachable;
+        Ctx.checkCoherent(
+            got[0].active_count,
+            got[0].instance_buffer.id,
+            scene.physics.prepared_lines.items.len,
+            scene.physics.prepared_visible,
+            b,
+        );
+        // Release the consumed slot back to the rotation (never publish:
+        // the front flip stays context-owned — see the loop comment). The
+        // release cannot fail: the claim is ours and unpinned by
+        // construction (no pins are used in this test).
+        scene.draws.cancelClaim(s) catch unreachable;
+        scene.last_latched_seq.store(b, .monotonic);
+        ctx.max_seen = b;
+        ctx.latched += 1;
+    }
+    prod.join();
+
+    // Contract accounting: the producer never starved (3 slots always leave
+    // a free one with at most one consumer claim held), every global
+    // saturation count is exactly one of our counted paths (producer
+    // null-claims plus consumer SlotBusy refusals — the silent moved-on
+    // drops bump nothing by design), generations only moved forward, and
+    // the tail generation landed whole.
+    try std.testing.expectEqual(@as(u64, 0), ctx.skipped);
+    try std.testing.expectEqual(ctx.skipped + ctx.busy_misses, scene.draws.saturation_skips);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.pin_denials);
+    try std.testing.expect(ctx.latched > 0);
+    try std.testing.expectEqual(total_gens, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(total_gens, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(total_gens, ctx.max_seen);
+    // Tail payload is exactly the last generation (never a stale mix).
+    try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
+    const tail_id: u32 = @intCast(total_gens);
+    try std.testing.expectEqual(tail_id, scene.particles.frame.items[0].instance_buffer.id);
+    const tail_count: usize = @intCast((total_gens % 2) + 1);
+    try std.testing.expectEqual(tail_count, scene.particles.frame.items[0].active_count);
+    try std.testing.expectEqual(total_gens % 2 == 0, scene.physics.prepared_visible);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
 // discipline, retire-on-remove. Headless: no sg.* below (buffers stay
 // deferred without a context; the main test thread is context-marked by the
 // earlier gpu_thread tests, so the flush paths take their real branches).

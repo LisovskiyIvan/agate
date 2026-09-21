@@ -116,11 +116,13 @@ pub fn prepareFrame(scene: anytype) void {
     // Reads live systems for the LAST time this frame; the draw below
     // sees only the capture. Stage 1: when the game side built a fresh
     // frame (`have_build`, latched at the top under the lease claim),
-    // latch the build instead of restaging from live systems; otherwise
-    // the historical inline capture (apps without `buildPreparedFrame`
-    // are unchanged).
+    // consume the slot-frozen capture (`latchSlotFrame` reads the claimed
+    // slot's `particle_draws`, never the shared `build_frame` — wave 32
+    // freeze-then-latch, so a colliding game-thread build cannot tear
+    // the record); otherwise the historical inline capture (apps without
+    // `buildPreparedFrame` are unchanged).
     if (have_build) {
-        scene.particles.latchFrame(scene.allocator);
+        scene.particles.latchSlotFrame(scene.allocator, back.particle_draws.items);
     } else {
         scene.particles.captureFrame(scene.allocator);
     }
@@ -128,9 +130,12 @@ pub fn prepareFrame(scene: anytype) void {
     // Physics debug wireframe capture (CPU): world.appendDebugLines runs
     // HERE in prepare — never inside render. The draw below reads only
     // the capture (prepared_visible/prepared_lines). Same stage 1 shape
-    // as particles: latch a fresh build, else capture inline.
+    // as particles: consume the slot-frozen capture on a fresh build
+    // (`latchSlotDebug` reads the claimed slot's `physics_lines`/
+    // `physics_visible`, never the shared staging store), else capture
+    // inline.
     if (have_build) {
-        scene.physics.latchDebug(scene.allocator);
+        scene.physics.latchSlotDebug(scene.allocator, back.physics_lines.items, back.physics_visible);
     } else {
         scene.physics.captureDebug(scene.allocator);
     }

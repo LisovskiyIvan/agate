@@ -26,6 +26,13 @@
 //!   state) plus snapshot-count stats. Never reads `systems`, never
 //!   `build_frame`, never the live texture pointer — only the borrowed view
 //!   id in the record.
+//! - Wave 32 freeze-then-latch (adopted concurrent-build path): the game
+//!   build additionally freezes the capture into the claimed draw slot
+//!   (`stageIntoSlot`) and the prepare latch consumes the slot copy
+//!   (`latchSlotFrame`) — never the shared `build_frame` — so a
+//!   game-thread build colliding with the context-side latch cannot tear
+//!   the record. The shared store below stays for the sequential flow
+//!   (bit-identical) and direct/tooling use.
 //! - GPU handles in the frame are BORROWED: instance/gpu-slot buffers and
 //!   texture views stay owned by their ParticleSystem (via this layer's
 //!   `systems` list). The owner must live until context teardown; replacing
@@ -168,6 +175,14 @@ pub const ParticleLayer = struct {
     /// Otherwise runs the historical live capture, so a latch without a
     /// fresh build stays coherent. `renderPrepared` keeps reading `frame`
     /// only — never `build_frame`, never live systems.
+    ///
+    /// Sequential/fallback path only since wave 32: the adopted
+    /// concurrent-build path freezes into the claimed draw slot
+    /// (`stageIntoSlot`) and latches from it (`latchSlotFrame`), so the
+    /// prepare latch there never reads the shared `build_frame` — a
+    /// game-thread build colliding with the context-side latch cannot
+    /// tear the record. This shared-store latch stays for apps on the
+    /// sequential flow (bit-identical) and for direct/tooling use.
     pub fn latchFrame(self: *ParticleLayer, allocator: std.mem.Allocator) void {
         const fresh_seq = self.build_seq.load(.acquire);
         if (fresh_seq == self.latched_seq) {
@@ -183,6 +198,42 @@ pub const ParticleLayer = struct {
         for (self.build_frame.items) |draw| {
             self.frame.appendAssumeCapacity(draw);
         }
+    }
+
+    /// Freeze-then-latch slot stage (wave 32, adopted concurrent-build
+    /// path): copies the just-captured `build_frame` into the claimed
+    /// slot's `particle_draws`. Runs producer-side inside
+    /// `Scene.buildIntoClaimedSlot` right after `buildCapture`; the frozen
+    /// copy rides the publish release edge (`build_slot`/`build_seq`) to
+    /// the prepare latch, which consumes it via `latchSlotFrame` — never
+    /// the shared `build_frame`. Staged-wins on OOM (fail-closes the slot
+    /// copy to coherent-empty, mirroring `captureInto`); the shared
+    /// `build_frame` keeps its own existing semantics for direct use.
+    pub fn stageIntoSlot(self: *ParticleLayer, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(ParticleDraw)) void {
+        out.ensureTotalCapacity(allocator, self.build_frame.items.len) catch {
+            out.clearRetainingCapacity();
+            return;
+        };
+        out.clearRetainingCapacity();
+        out.appendSliceAssumeCapacity(self.build_frame.items);
+    }
+
+    /// Context-side slot latch (wave 32, adopted concurrent-build path):
+    /// copies the claimed slot's frozen `draws` into `frame`
+    /// (reserve-once, OOM coherent-empty) and consumes the pending build
+    /// generation (`latched_seq` catches up to `build_seq`, acquire-loaded
+    /// — so a later fallback latch runs the live capture, never a stale
+    /// build). Reads only the slot payload + the seq word: never the
+    /// shared `build_frame`, never live systems.
+    pub fn latchSlotFrame(self: *ParticleLayer, allocator: std.mem.Allocator, draws: []const ParticleDraw) void {
+        const fresh_seq = self.build_seq.load(.acquire);
+        self.latched_seq = fresh_seq;
+        self.frame.ensureTotalCapacity(allocator, draws.len) catch {
+            self.clearFrame();
+            return;
+        };
+        self.frame.clearRetainingCapacity();
+        self.frame.appendSliceAssumeCapacity(draws);
     }
 
     /// Shared capture body: one plain `ParticleDraw` per live system with
@@ -610,4 +661,83 @@ test "particle buildCapture OOM fail-closes the build frame, latch publishes emp
     layer.latchFrame(t.allocator);
     try t.expectEqual(@as(usize, 1), layer.frame.items.len);
     try t.expectEqual(@as(usize, 2), layer.frame.items[0].active_count);
+}
+
+test "particle stageIntoSlot+latchSlotFrame freezes the build generation" {
+    const t = std.testing;
+    var layer: ParticleLayer = .{ .pass = undefined };
+    defer layer.systems.deinit(t.allocator);
+    defer layer.frame.deinit(t.allocator);
+    defer layer.build_frame.deinit(t.allocator);
+
+    var ps = try makeLayerTestSystem(t.allocator, 4);
+    defer freeLayerTestSystem(&ps);
+    ps.active_count = 3;
+    try layer.systems.append(t.allocator, &ps);
+
+    // Game-side build + slot freeze (wave 32 adopted path).
+    layer.buildCapture(t.allocator, 9);
+    var slot_draws: std.ArrayListUnmanaged(ParticleDraw) = .empty;
+    defer slot_draws.deinit(t.allocator);
+    layer.stageIntoSlot(t.allocator, &slot_draws);
+    try t.expectEqual(@as(usize, 1), slot_draws.items.len);
+    try t.expectEqual(@as(usize, 3), slot_draws.items[0].active_count);
+    try t.expectEqual(@as(u32, 11), slot_draws.items[0].instance_buffer.id);
+
+    // Live + shared-store mutation after the freeze: the slot copy is immune.
+    ps.active_count = 1;
+    ps.instance_buffer = .{ .id = 99 };
+    layer.build_frame.items[0].active_count = 1;
+    try t.expectEqual(@as(usize, 3), slot_draws.items[0].active_count);
+    try t.expectEqual(@as(u32, 11), slot_draws.items[0].instance_buffer.id);
+
+    // Slot latch publishes the frozen generation (never the shared store)
+    // and consumes the pending layer generation.
+    layer.latchSlotFrame(t.allocator, slot_draws.items);
+    try t.expectEqual(@as(u64, 9), layer.latched_seq);
+    try t.expectEqual(@as(usize, 1), layer.frame.items.len);
+    try t.expectEqual(@as(usize, 3), layer.frame.items[0].active_count);
+    try t.expectEqual(@as(u32, 11), layer.frame.items[0].instance_buffer.id);
+
+    // With the generation consumed, a shared-store latch falls back to the
+    // live capture — the frame tracks live state, never a stale build.
+    layer.latchFrame(t.allocator);
+    try t.expectEqual(@as(usize, 1), layer.frame.items[0].active_count);
+}
+
+test "particle stageIntoSlot newest wins; OOM fail-closes, slot latch publishes empty" {
+    const t = std.testing;
+    var layer: ParticleLayer = .{ .pass = undefined };
+    defer layer.systems.deinit(t.allocator);
+    defer layer.frame.deinit(t.allocator);
+    defer layer.build_frame.deinit(t.allocator);
+
+    var ps = try makeLayerTestSystem(t.allocator, 4);
+    defer freeLayerTestSystem(&ps);
+    ps.active_count = 2;
+    try layer.systems.append(t.allocator, &ps);
+
+    // Two builds before the freeze: newest wins (single store recomputed).
+    layer.buildCapture(t.allocator, 1);
+    ps.active_count = 3;
+    layer.buildCapture(t.allocator, 2);
+    var slot_draws: std.ArrayListUnmanaged(ParticleDraw) = .empty;
+    defer slot_draws.deinit(t.allocator);
+    layer.stageIntoSlot(t.allocator, &slot_draws);
+    try t.expectEqual(@as(usize, 3), slot_draws.items[0].active_count);
+
+    // Unfunded freeze fail-closes the slot copy to coherent-empty
+    // (staged-wins: the latch below publishes the empty, never a mix).
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    slot_draws.clearAndFree(t.allocator);
+    layer.stageIntoSlot(failing.allocator(), &slot_draws);
+    try t.expectEqual(@as(usize, 0), slot_draws.items.len);
+    layer.latchSlotFrame(t.allocator, slot_draws.items);
+    try t.expectEqual(@as(usize, 0), layer.frame.items.len);
+
+    // Recovery: a funded freeze+latch publishes the full frame again.
+    layer.stageIntoSlot(t.allocator, &slot_draws);
+    layer.latchSlotFrame(t.allocator, slot_draws.items);
+    try t.expectEqual(@as(usize, 1), layer.frame.items.len);
+    try t.expectEqual(@as(usize, 3), layer.frame.items[0].active_count);
 }
