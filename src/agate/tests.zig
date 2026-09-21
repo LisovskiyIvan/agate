@@ -156,6 +156,7 @@ test {
     _ = @import("scene/probe_render.zig");
     _ = @import("scene/project_cache.zig");
     _ = @import("scene/projection.zig");
+    _ = @import("scene/queue_builder.zig");
     _ = @import("scene/render_queue.zig");
     _ = @import("scene/render_queue/build.zig");
     _ = @import("scene/render_queue/cull.zig");
