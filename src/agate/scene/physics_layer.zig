@@ -33,6 +33,14 @@ const SceneStats = stats_mod.SceneStats;
 /// into the render-owned `prepared_lines`/`prepared_visible` when the seq is
 /// newer, else runs the historical live capture. Plain fields, no atomics;
 /// GPU handles stay borrowed under the P3 epochs.
+///
+/// Wave 32 freeze-then-latch (adopted concurrent-build path): the game
+/// build additionally freezes the capture into the claimed draw slot
+/// (`stageIntoSlot`) and the prepare latch consumes the slot copy
+/// (`latchSlotDebug`) — never the shared staging store — so a game-thread
+/// build colliding with the context-side latch cannot tear the record.
+/// The shared store stays for the sequential flow (bit-identical) and
+/// direct/tooling use.
 pub const PhysicsIntegration = struct {
     world: ?PhysicsWorld = null,
     // Toggles the physics debug wireframe rendering in the main pass.
@@ -129,6 +137,15 @@ pub const PhysicsIntegration = struct {
     /// OOM coherent-empty) and advances `latched_seq`. Otherwise runs the
     /// historical live capture, so a latch without a fresh build stays
     /// coherent. Draws keep reading the prepared capture only.
+    ///
+    /// Sequential/fallback path only since wave 32: the adopted
+    /// concurrent-build path freezes into the claimed draw slot
+    /// (`stageIntoSlot`) and latches from it (`latchSlotDebug`), so the
+    /// prepare latch there never reads the shared
+    /// `build_lines`/`build_visible` — a game-thread build colliding with
+    /// the context-side latch cannot tear the record. This shared-store
+    /// latch stays for apps on the sequential flow (bit-identical) and
+    /// for direct/tooling use.
     pub fn latchDebug(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
         const fresh_seq = self.build_seq.load(.acquire);
         if (fresh_seq == self.latched_seq) {
@@ -146,6 +163,58 @@ pub const PhysicsIntegration = struct {
             self.prepared_lines.appendAssumeCapacity(line);
         }
         self.prepared_visible = self.build_visible;
+    }
+
+    /// Freeze-then-latch slot stage (wave 32, adopted concurrent-build
+    /// path): copies the just-captured `build_lines`/`build_visible` into
+    /// the claimed slot's `physics_lines`/`physics_visible`. Runs
+    /// producer-side inside `Scene.buildIntoClaimedSlot` right after
+    /// `buildDebug`; the frozen copy rides the publish release edge
+    /// (`build_slot`/`build_seq`) to the prepare latch, which consumes it
+    /// via `latchSlotDebug` — never the shared staging store.
+    /// Staged-wins on OOM (fail-closes the slot copy to coherent-empty +
+    /// invisible, mirroring `captureInto`); the shared build capture keeps
+    /// its own existing semantics for direct use.
+    pub fn stageIntoSlot(
+        self: *PhysicsIntegration,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(physics.DebugLine),
+        visible: *bool,
+    ) void {
+        out.ensureTotalCapacity(allocator, self.build_lines.items.len) catch {
+            out.clearRetainingCapacity();
+            visible.* = false;
+            return;
+        };
+        out.clearRetainingCapacity();
+        out.appendSliceAssumeCapacity(self.build_lines.items);
+        visible.* = self.build_visible;
+    }
+
+    /// Context-side slot latch (wave 32, adopted concurrent-build path):
+    /// copies the claimed slot's frozen `lines`/`visible` into the
+    /// render-owned `prepared_lines`/`prepared_visible` (reserve-once, OOM
+    /// coherent-empty) and consumes the pending build generation
+    /// (`latched_seq` catches up to `build_seq`, acquire-loaded — so a
+    /// later fallback latch runs the live capture, never a stale build).
+    /// Reads only the slot payload + the seq word: never the shared
+    /// `build_lines`/`build_visible`, never the live world.
+    pub fn latchSlotDebug(
+        self: *PhysicsIntegration,
+        allocator: std.mem.Allocator,
+        lines: []const physics.DebugLine,
+        visible: bool,
+    ) void {
+        const fresh_seq = self.build_seq.load(.acquire);
+        self.latched_seq = fresh_seq;
+        self.prepared_lines.ensureTotalCapacity(allocator, lines.len) catch {
+            self.prepared_lines.clearRetainingCapacity();
+            self.prepared_visible = false;
+            return;
+        };
+        self.prepared_lines.clearRetainingCapacity();
+        self.prepared_lines.appendSliceAssumeCapacity(lines);
+        self.prepared_visible = visible;
     }
 
     /// Shared capture body: snapshots `world.appendDebugLines` into `out`
@@ -359,4 +428,82 @@ test "physics buildDebug OOM fail-closes, latch publishes empty, then recovers" 
     integ.latchDebug(t.allocator);
     try t.expect(integ.prepared_visible);
     try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+}
+
+test "physics stageIntoSlot+latchSlotDebug freezes the build generation" {
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    // Game-side build + slot freeze (wave 32 adopted path).
+    integ.buildDebug(t.allocator, 9);
+    var slot_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty;
+    defer slot_lines.deinit(t.allocator);
+    var slot_visible = false;
+    integ.stageIntoSlot(t.allocator, &slot_lines, &slot_visible);
+    try t.expect(slot_visible);
+    try t.expectEqual(@as(usize, 12), slot_lines.items.len);
+    const x0 = slot_lines.items[0].a.x;
+
+    // Live + shared-store mutation after the freeze: the slot copy is immune.
+    fx.mesh.position = Vec3.new(5, 0, 0);
+    integ.show_debug = false;
+    integ.build_lines.items[0].a.x += 100.0;
+    integ.build_visible = false;
+    try t.expect(slot_visible);
+    try t.expectApproxEqAbs(x0, slot_lines.items[0].a.x, 1e-4);
+
+    // Slot latch publishes the frozen generation (never the shared store)
+    // and consumes the pending layer generation.
+    integ.latchSlotDebug(t.allocator, slot_lines.items, slot_visible);
+    try t.expectEqual(@as(u64, 9), integ.latched_seq);
+    try t.expect(integ.prepared_visible);
+    try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+    try t.expectApproxEqAbs(x0, integ.prepared_lines.items[0].a.x, 1e-4);
+
+    // With the generation consumed, a shared-store latch falls back to the
+    // live capture — hidden now, so coherent-empty, never a stale build.
+    integ.latchDebug(t.allocator);
+    try t.expect(!integ.prepared_visible);
+    try t.expectEqual(@as(usize, 0), integ.prepared_lines.items.len);
+}
+
+test "physics stageIntoSlot newest wins; OOM fail-closes, slot latch publishes empty" {
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    // Two builds before the freeze: newest wins (single store recomputed).
+    integ.buildDebug(t.allocator, 1);
+    const x0 = integ.build_lines.items[0].a.x;
+    fx.mesh.position = Vec3.new(5, 0, 0);
+    integ.buildDebug(t.allocator, 2);
+    var slot_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty;
+    defer slot_lines.deinit(t.allocator);
+    var slot_visible = false;
+    integ.stageIntoSlot(t.allocator, &slot_lines, &slot_visible);
+    try t.expect(slot_visible);
+    try t.expectApproxEqAbs(x0 + 5.0, slot_lines.items[0].a.x, 1e-4);
+
+    // Unfunded freeze fail-closes the slot copy to coherent-empty +
+    // invisible (staged-wins: the latch below publishes the empty).
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    slot_lines.clearAndFree(t.allocator);
+    integ.stageIntoSlot(failing.allocator(), &slot_lines, &slot_visible);
+    try t.expect(!slot_visible);
+    try t.expectEqual(@as(usize, 0), slot_lines.items.len);
+    integ.latchSlotDebug(t.allocator, slot_lines.items, slot_visible);
+    try t.expect(!integ.prepared_visible);
+    try t.expectEqual(@as(usize, 0), integ.prepared_lines.items.len);
+
+    // Recovery: a funded freeze+latch publishes the full capture again.
+    integ.stageIntoSlot(t.allocator, &slot_lines, &slot_visible);
+    integ.latchSlotDebug(t.allocator, slot_lines.items, slot_visible);
+    try t.expect(integ.prepared_visible);
+    try t.expectEqual(@as(usize, 12), integ.prepared_lines.items.len);
+    try t.expectApproxEqAbs(x0 + 5.0, integ.prepared_lines.items[0].a.x, 1e-4);
 }

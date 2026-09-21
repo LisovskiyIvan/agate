@@ -86,6 +86,20 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     scene_instance_staging.freezeStagedRecords(scene.allocator, &back.staged_instances, scene.meshes.items, seq);
     scene.particles.buildCapture(scene.allocator, seq);
     scene.physics.buildDebug(scene.allocator, seq);
+    // Wave 32 freeze-then-latch (lock-free-publication slices 4/5): freeze
+    // the just-captured particle/physics build frames into the claimed
+    // slot by value. The prepare latch consumes THESE copies
+    // (`latchSlotFrame`/`latchSlotDebug`) — never the shared
+    // `build_frame`/`build_lines` staging stores — so a game-thread build
+    // colliding with the context-side latch cannot deliver a torn record
+    // for one frame. Rides the same publish release edge as the rest of
+    // the staged payload (`build_slot` then `build_seq` in
+    // `BuildClaim.publish`); staged-wins on OOM (fail-closes to
+    // coherent-empty, same precedent as the snapshot/stats slices above).
+    // The shared stores keep their existing semantics (sequential flow
+    // bit-identical, direct layer tests/tooling unaffected).
+    scene.particles.stageIntoSlot(scene.allocator, &back.particle_draws);
+    scene.physics.stageIntoSlot(scene.allocator, &back.physics_lines, &back.physics_visible);
     // Game-side queue/shadow/outline build (sg-free: instances_prepared).
     // The shared builder resets each view queue (including primary's
     // instance_matrices scratch) — but that scratch holds the CPU-staged

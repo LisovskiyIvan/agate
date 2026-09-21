@@ -402,8 +402,11 @@ pub const Scene = struct {
     /// `instance_render` write-back, ordered after publish, never concurrent
     /// with the context), then stages instance
     /// matrices into the back-slot scratch + per-mesh previews, freezes the
-    /// slot-owned staged records, and captures
-    /// the particle/physics CPU build frames, then bumps `build_seq`.
+    /// slot-owned staged records, captures
+    /// the particle/physics CPU build frames and freezes them into the
+    /// claimed slot (`particle_draws`, `physics_lines`/`physics_visible` —
+    /// wave 32 freeze-then-latch, so the latch never reads the shared
+    /// staging stores), then bumps `build_seq`.
     /// `prepareFrame` (context side) consumes the build when `build_seq !=
     /// last_latched_seq` (GPU halves over the slot records + latch copies,
     /// no CPU restaging, no live mesh reads or writes — outcomes land in
@@ -417,8 +420,8 @@ pub const Scene = struct {
     /// front only when prepare itself is not called (unchanged).
     /// Handoff edge (wave 30, atomic): `build_seq` is release-stored by the
     /// producer (`BuildClaim.publish`) only after the whole build payload is
-    /// staged (slot queues/records/snapshot, particle/physics build frames,
-    /// `build_slot`), and acquire-loaded by the context latch (`prepareFrame`
+    /// staged (slot queues/records/snapshot/stats, frozen particle/physics
+    /// slot captures, `build_slot`), and acquire-loaded by the context latch (`prepareFrame`
     /// freshness check + `last_latched_seq` stamp) — the release/acquire pair
     /// orders the payload before the generation the latch consumes. The claim
     /// reserve (`tryClaimBuildSlot`) monotonic-loads the committed generation
@@ -1883,13 +1886,15 @@ pub const Scene = struct {
     /// Threading: the claim holder owns the claimed slot's payload
     /// exclusively (producer writes, no lock needed); the lease mutex pairs
     /// those writes with the consumer's post-pin reads. Everything ELSE the
-    /// build touches (live meshes/canvas, `build_snapshot`, particle/
-    /// physics build frames and their layer seqs, per-mesh previews) is still
-    /// phase-excluded today — the handoff seq words themselves are atomic
-    /// since wave 30 (release/acquire, see the field docs), but the payload
-    /// they order is not — see the adoption checklist in
-    /// scene/frame_draws.zig. The claim API alone does not remove the phase
-    /// mutex.
+    /// build touches (live meshes/canvas, `build_snapshot`, per-mesh
+    /// previews, the particle/physics shared build frames and their layer
+    /// seqs) is still phase-excluded today — the handoff seq words
+    /// themselves are atomic since wave 30 (release/acquire, see the field
+    /// docs), and since wave 32 the particle/physics payload the latch
+    /// consumes rides the slot too (frozen copies, never the shared
+    /// stores) — but the remaining live reads are not — see the adoption
+    /// checklist in scene/frame_draws.zig. The claim API alone does not
+    /// remove the phase mutex.
     pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
         const slot = self.draws.claimBack() orelse return null;
         // Single-producer reserve: monotonic load suffices, the publish
@@ -1970,6 +1975,11 @@ pub const Scene = struct {
     /// queue/shadow/outline payload into the back slot via the shared
     /// `buildQueuesInto` (with `.build_view` + build-unique cache key +
     /// `&build_stats`), and bumps `build_seq`.
+    ///
+    /// The particle build frame and the physics debug build capture staged
+    /// above are additionally frozen into the claimed slot by value; the
+    /// prepare latch consumes the slot copies (`latchSlotFrame`/
+    /// `latchSlotDebug`), never the shared stores.
     ///
     /// Call AFTER the sim mutations of the tick (update boundary), BEFORE
     /// the context `prepareFrame`; sequential with update, excluded vs
