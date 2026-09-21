@@ -41,6 +41,7 @@ test {
     _ = @import("camera/viewport.zig");
     _ = @import("compute.zig");
     _ = @import("dds.zig");
+    _ = @import("export/glb.zig");
     _ = @import("export/obj.zig");
     _ = @import("export/stl.zig");
     _ = @import("exr.zig");

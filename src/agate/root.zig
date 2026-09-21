@@ -467,13 +467,17 @@ pub const appendPlyToScene = ply_loader.appendToScene;
 
 pub const export_obj = @import("export/obj.zig");
 pub const export_stl = @import("export/stl.zig");
+pub const export_glb = @import("export/glb.zig");
 pub const ObjExportOptions = export_obj.ObjExportOptions;
 pub const StlExportOptions = export_stl.StlExportOptions;
+pub const GlbExportOptions = export_glb.GlbExportOptions;
 pub const writeObjAlloc = export_obj.writeObjAlloc;
 pub const writeMtlAlloc = export_obj.writeMtlAlloc;
 pub const writeStlAlloc = export_stl.writeStlAlloc;
 pub const writeStlAsciiAlloc = export_stl.writeStlAsciiAlloc;
 pub const writeStlBinaryAlloc = export_stl.writeStlBinaryAlloc;
+pub const writeGlbAlloc = export_glb.writeGlbAlloc;
+pub const writeGlbMeshAlloc = export_glb.writeGlbMeshAlloc;
 
 pub const ai = @import("ai.zig");
 pub const NavNode = ai.NavNode;
@@ -551,4 +555,7 @@ test "root re-exports cover recent Scene APIs" {
     _ = layoutAlignOffset;
     _ = gridExtentSize;
     _ = gridExtentOffset;
+    _ = GlbExportOptions;
+    _ = writeGlbAlloc;
+    _ = writeGlbMeshAlloc;
 }
