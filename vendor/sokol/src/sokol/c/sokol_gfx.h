@@ -5523,6 +5523,15 @@ SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_i
 SOKOL_GFX_API_DECL void sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z);
 SOKOL_GFX_API_DECL void sg_end_pass(void);
 SOKOL_GFX_API_DECL void sg_commit(void);
+// AGATE GPU TIMINGS (vendored patch, see vendor/sokol/README.agate.md):
+// frame-level GPU execution time for the Metal backend, off by default.
+// sg_agate_set_gpu_timing_enabled(true) retains each committed command
+// buffer; sg_agate_query_gpu_frame_ms() returns the last COMPLETED frame's
+// (GPUEndTime-GPUStartTime) in ms, or -1 when unavailable/not ready yet.
+// Non-Metal backends always return -1. Trace hooks (SOKOL_TRACE_HOOKS) are
+// unrelated: they are CPU-side begin/end callbacks, not GPU timestamps.
+SOKOL_GFX_API_DECL void sg_agate_set_gpu_timing_enabled(bool enabled);
+SOKOL_GFX_API_DECL float sg_agate_query_gpu_frame_ms(void);
 
 // resource update functions (wip new resource update api)
 SOKOL_GFX_API_DECL void sg_write_buffer_transient(const sg_write_buffer_desc* desc);
@@ -17210,6 +17219,31 @@ _SOKOL_PRIVATE void _sg_mtl_end_pass(const _sg_attachments_ptrs_t* atts) {
     }
 }
 
+// AGATE GPU TIMINGS (vendored patch, see vendor/sokol/README.agate.md):
+// file-static state for the frame-level Metal GPU timer. Written on the
+// context thread only (commit hook + query poll), so no atomics: the Metal
+// runtime publishes GPUStartTime/GPUEndTime once the buffer completes.
+#if defined(SOKOL_METAL)
+static bool _sg_agate_gpu_timing_enabled = false;
+static id<MTLCommandBuffer> _sg_agate_gpu_cb = nil;
+static float _sg_agate_gpu_last_ms = -1.0f;
+// Refresh the last-completed cache from buf once it has finished on GPU.
+// Called for the previous frame's buffer at replace time (a full frame
+// after its commit, so it has normally completed) and opportunistically
+// for the current buffer on query.
+_SOKOL_PRIVATE void _sg_agate_gpu_sample(id<MTLCommandBuffer> buf) {
+    if ((nil != buf) && ([buf status] == MTLCommandBufferStatusCompleted)) {
+        const CFTimeInterval start = [buf GPUStartTime];
+        const CFTimeInterval end = [buf GPUEndTime];
+        if ((end > start) && ((end - start) < 10.0)) {
+            _sg_agate_gpu_last_ms = (float)((end - start) * 1000.0);
+        }
+    }
+}
+#else
+static bool _sg_agate_gpu_timing_enabled = false;
+#endif
+// ---------------------------------------------------------------------------
 _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
     SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
@@ -17217,6 +17251,20 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     // commit the frame's command buffer
     if (_sg.mtl.cmd_buffer) {
         [_sg.mtl.cmd_buffer commit];
+    }
+    // AGATE GPU TIMINGS (vendored patch): while enabled, hold the committed
+    // buffer one extra frame so sg_agate_query_gpu_frame_ms() can serve it.
+    // Context thread only; the in-flight semaphore handshake is untouched.
+    // The previous completed buffer is sampled first (it committed a full
+    // frame ago, so it has normally finished on GPU); at most one extra
+    // buffer is ever retained.
+    if (_sg_agate_gpu_timing_enabled && _sg.mtl.cmd_buffer) {
+        _sg_agate_gpu_sample(_sg_agate_gpu_cb);
+        if (nil != _sg_agate_gpu_cb) {
+            [_sg_agate_gpu_cb release];
+        }
+        [_sg.mtl.cmd_buffer retain];
+        _sg_agate_gpu_cb = _sg.mtl.cmd_buffer;
     }
 
     // garbage-collect resources pending for release
@@ -27495,6 +27543,33 @@ SOKOL_API_IMPL void sg_commit(void) {
     _SG_TRACE_NOARGS(commit);
     _sg.frame_index++;
 }
+// AGATE GPU TIMINGS (vendored patch, see vendor/sokol/README.agate.md) ---
+SOKOL_API_IMPL void sg_agate_set_gpu_timing_enabled(bool enabled) {
+    _sg_agate_gpu_timing_enabled = enabled;
+    #if defined(SOKOL_METAL)
+        if (!enabled) {
+            if (nil != _sg_agate_gpu_cb) {
+                [_sg_agate_gpu_cb release];
+                _sg_agate_gpu_cb = nil;
+            }
+            _sg_agate_gpu_last_ms = -1.0f;
+        }
+    #endif
+}
+SOKOL_API_IMPL float sg_agate_query_gpu_frame_ms(void) {
+    #if defined(SOKOL_METAL)
+        if (!_sg_agate_gpu_timing_enabled || (nil == _sg_agate_gpu_cb)) {
+            return -1.0f;
+        }
+        _sg_agate_gpu_sample(_sg_agate_gpu_cb);
+        // Last-completed semantics: the value lags one frame behind the
+        // CPU submit (async GPU execution). -1 until the first completion.
+        return _sg_agate_gpu_last_ms;
+    #else
+        return -1.0f;
+    #endif
+}
+// ---------------------------------------------------------------------------
 
 SOKOL_API_IMPL void sg_reset_state_cache(void) {
     SOKOL_ASSERT(_sg.valid);

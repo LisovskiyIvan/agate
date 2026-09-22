@@ -87,14 +87,62 @@ mkdir -p vendor/sokol
 tar -xzf "$CACHE/p/$HASH.tar.gz" -C vendor/sokol --strip-components=1
 cp /tmp/README.agate.md vendor/sokol/README.agate.md
 
-# 3. Re-apply the patch (idempotent) and confirm it took.
+# 3. Re-apply the patches (both idempotent) and confirm they took.
 python3 tools/patch_sokol_handle_abi.py
 python3 tools/patch_sokol_handle_abi.py --check
+python3 tools/patch_sokol_gpu_timings.py
+python3 tools/patch_sokol_gpu_timings.py --check
 
 # 4. Record the new upstream commit and package hash at the top of
 #    this file, then verify the build.
 zig build test
 ```
+
+## GPU timings patch (frame-level, Metal-only)
+
+Upstream sokol-gfx has **no GPU-timestamp mechanism**: `sg_query_*`
+covers features/limits/resources, and `SOKOL_TRACE_HOOKS` installs
+CPU-side begin/end callbacks (a `TRACE_HOOKS_NOT_ENABLED` warning means
+someone called `sg_install_trace_hooks()` without `-DSOKOL_TRACE_HOOKS`;
+those hooks never yield GPU time — do not confuse the two). Per-pass
+GPU attribution would require deep surgery, so v1 measures ONE timer
+per frame on Metal and leaves GL4.1/per-pass for a follow-up wave.
+
+Applied by `tools/patch_sokol_gpu_timings.py` (idempotent, `--check`
+supported; 4 anchored insertions in `src/sokol/c/sokol_gfx.h`, a C
+source file that is NOT machine-generated):
+
+- public declarations after `sg_commit`:
+  `sg_agate_set_gpu_timing_enabled(bool)` (default OFF) and
+  `sg_agate_query_gpu_frame_ms()` (measured ms, or -1);
+- file-static state (`_sg_agate_gpu_timing_enabled`,
+  retained `id<MTLCommandBuffer> _sg_agate_gpu_cb`, last-completed
+  cache) ahead of `_sg_mtl_commit`;
+- retain hook in `_sg_mtl_commit`: while enabled, the committed
+  command buffer is retained one extra frame (the previous one is
+  sampled, then released, so at most one extra buffer is ever alive);
+- implementations after `sg_commit`: the query samples the retained
+  buffer via `_sg_agate_gpu_sample` and returns the last-completed
+  cache (`status` read; on `MTLCommandBufferStatusCompleted` the cache
+  refreshes from `(GPUEndTime-GPUStartTime)*1000`, 10 s sanity clamp).
+  Sampling the previous buffer at replace time — a full frame after
+  its commit — is what makes the value converge (a just-committed
+  buffer still reports Committed, not Completed).
+  Non-Metal backends (GL/D3D11/dummy/...) always return -1.
+
+Semantics: last-completed (the value lags one CPU submit behind),
+context thread only (no atomics: commit hook and query poll run on the
+same thread; the Metal runtime publishes the timestamps on completion).
+Disabling releases the retained buffer and resets the cache. The
+`sg_shutdown` path is untouched: disable timings before shutdown to
+release the held buffer (process exit reclaims it otherwise).
+
+Agate side (`src/agate/gpu_timing.zig`, default OFF): `setEnabled` /
+`AGATE_GPU_TIMINGS=1` opt-in, fail-closed `pollFrameMs()` called from
+`scene/frame_render.zig` right after `sg.commit()`; the value flows
+through `SceneStats.gpu_frame_ms` → `FrameRecord.gpu_frame_ms` →
+session `avg/max_gpu_frame_ms` → gated HTML/MD/Chrome-trace output
+(`gpu_frame_ms`, `GPU Frame (measured)`, `cat "gpu"`).
 
 ## Upstream
 

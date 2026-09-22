@@ -26,6 +26,8 @@ pub fn summarize(self: anytype) SessionSummary {
     var sum_shadow: f64 = 0;
     var sum_main: f64 = 0;
     var sum_post: f64 = 0;
+    var sum_gpu: f64 = 0;
+    var max_gpu: f32 = 0;
 
     var sum_draw_calls: u64 = 0;
     var max_draw_calls: u32 = 0;
@@ -79,6 +81,8 @@ pub fn summarize(self: anytype) SessionSummary {
         sum_shadow += frame.shadow_ms;
         sum_main += frame.main_ms;
         sum_post += frame.post_ms;
+        sum_gpu += frame.gpu_frame_ms;
+        max_gpu = @max(max_gpu, frame.gpu_frame_ms);
 
         sum_draw_calls += frame.draw_calls;
         max_draw_calls = @max(max_draw_calls, frame.draw_calls);
@@ -180,6 +184,8 @@ pub fn summarize(self: anytype) SessionSummary {
         .avg_shadow_ms = @floatCast(sum_shadow / nf),
         .avg_main_ms = @floatCast(sum_main / nf),
         .avg_post_ms = @floatCast(sum_post / nf),
+        .avg_gpu_frame_ms = @floatCast(sum_gpu / nf),
+        .max_gpu_frame_ms = max_gpu,
         .avg_draw_calls = @intCast(sum_draw_calls / n),
         .max_draw_calls = max_draw_calls,
         .avg_triangles = @intCast(sum_triangles / n),
@@ -264,6 +270,45 @@ test "Profiler start, recordFrame, and summarize" {
         ally.free(findings);
     }
     try std.testing.expect(findings.len > 0);
+}
+
+test "Profiler summarize tracks measured GPU frame time" {
+    const Profiler = @import("core.zig").Profiler;
+    const sokol = @import("sokol");
+    const SceneStats = @import("../scene/stats.zig").SceneStats;
+    sokol.time.setup();
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+
+    prof.start();
+    var stats: SceneStats = .{
+        .update_ms = 1.0,
+        .prepare_ms = 0.5,
+        .shadow_ms = 1.0,
+        .main_ms = 6.0,
+        .post_ms = 1.0,
+        .draw_calls = 10,
+        .triangles = 1000,
+        .pipeline_switches = 1,
+    };
+    // Disabled path: zeros flow through without touching CPU-submit stats.
+    prof.recordFrame(0, &stats);
+    stats.gpu_frame_ms = 2.0;
+    prof.recordFrame(1, &stats);
+    stats.gpu_frame_ms = 4.0;
+    prof.recordFrame(2, &stats);
+    prof.stop();
+
+    try std.testing.expectEqual(@as(f32, 0), prof.frames.items[0].gpu_frame_ms);
+    try std.testing.expectEqual(@as(f32, 2.0), prof.frames.items[1].gpu_frame_ms);
+    try std.testing.expectEqual(@as(f32, 4.0), prof.frames.items[2].gpu_frame_ms);
+
+    const summary = prof.summarize();
+    try std.testing.expectEqual(@as(f32, 2.0), summary.avg_gpu_frame_ms);
+    try std.testing.expectEqual(@as(f32, 4.0), summary.max_gpu_frame_ms);
+    // CPU-submit stats are untouched by the GPU field.
+    try std.testing.expectEqual(@as(f32, 9.5), summary.avg_frame_ms);
 }
 
 test "Profiler summarize uses frame intervals for pacing" {

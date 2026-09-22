@@ -77,6 +77,12 @@ pub const SceneStats = struct {
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
     post_ms: f32 = 0,
+    /// Last COMPLETED GPU frame time in ms (gpu_timing.pollFrameMs, set in
+    /// render right after sg.commit; Metal-only via the vendored sokol
+    /// patch, 0 when disabled/headless/unsupported). Lags one frame behind
+    /// the CPU submit (async GPU execution). Context-owned like the phase
+    /// timings above: written by render, never merged from game-side builds.
+    gpu_frame_ms: f32 = 0,
 
     /// Deferred merge of a game-side queue build (stage-2 increment B): adds
     /// the counter fields `buildFrameQueues` produces into the context-owned
