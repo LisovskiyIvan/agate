@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 20.09.2026).
+> Дата: 10.09.2026 (обновлено 22.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -64,7 +64,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1131 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 1133 unit-теста, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
