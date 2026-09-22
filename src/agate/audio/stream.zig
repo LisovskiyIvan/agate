@@ -12,7 +12,7 @@
 const std = @import("std");
 const decode = @import("decode.zig");
 const clip_mod = @import("clip.zig");
-const BusId = @import("../audio.zig").BusId;
+const BusId = @import("types.zig").BusId;
 
 pub const StreamFormat = enum {
     auto,

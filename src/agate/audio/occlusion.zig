@@ -1,6 +1,7 @@
 const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
+const BusId = @import("types.zig").BusId;
 
 /// Configuration for audio occlusion (acoustical obstruction of sound by geometry).
 pub const AudioOcclusionConfig = struct {
@@ -107,12 +108,12 @@ pub const AudioOcclusionTracker = struct {
 pub const AudioEmitter = struct {
     position: Vec3 = Vec3.zero,
     velocity: Vec3 = Vec3.zero,
-    bus: ?@import("../audio.zig").BusId = null,
+    bus: ?BusId = null,
     occlusion_config: AudioOcclusionConfig = .{},
     tracker: AudioOcclusionTracker = .{},
     active: bool = true,
 
-    pub fn init(position: Vec3, bus: ?@import("../audio.zig").BusId) AudioEmitter {
+    pub fn init(position: Vec3, bus: ?BusId) AudioEmitter {
         return .{
             .position = position,
             .bus = bus,
