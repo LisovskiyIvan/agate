@@ -296,6 +296,8 @@ pub fn render(scene: anytype) void {
         .sun_color = snap.sun_color,
         .default_white_view = snap.default_white.view,
         .main_samples = samples,
+        // PASS 1.7 depth-prepass gate (snapshot-carried Scene flag).
+        .msaa_depth_prepass = snap.msaa_depth_prepass,
         // P7 staged highlight items from the pinned front slot (never live
         // Scene fields): the render below dereferences no mesh.
         .highlight_items = draws.highlight_items.items,

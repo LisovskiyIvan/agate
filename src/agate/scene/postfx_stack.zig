@@ -238,6 +238,11 @@ pub const PostFXStack = struct {
         stats: *SceneStats,
         // Main-target sample count; see scene/msaa.zig for the clamp policy.
         main_samples: i32 = 1,
+        // PASS 1.7 depth-prepass gate (Scene.msaa_depth_prepass,
+        // snapshot-carried): when active the post chain reads the 1x
+        // prepass depth texture under MSAA instead of suppressing the
+        // depth effects. Default off (legacy suppression).
+        msaa_depth_prepass: bool = false,
         // Staged per-mesh highlight items (render-owned snapshots from the
         // frame slot — never live Scene fields — passed through by
         // frame_render from the pinned front slot, same P7 shape as the

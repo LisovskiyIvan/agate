@@ -121,6 +121,31 @@ pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bo
     return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled);
 }
 
+/// Single-sample depth-prepass gate (MSAA depth-resolve design v1).
+///
+/// sokol has no depth resolve on any backend (see module docs), so an MSAA
+/// main target cannot feed a depth texture to the post chain by itself.
+/// When `gate` (Scene.msaa_depth_prepass) is on, the renderer draws the
+/// opaque primary-view geometry a second time with depth-only pipelines
+/// into a 1x depth texture (PASS 1.7, before the main pass); the post chain
+/// then reads that texture instead of the write-only MSAA depth.
+///
+/// Pure so the toggle matrix stays unit-testable without a GPU. The gate
+/// applies only on top of an MSAA main target: with samples <= 1 the 1x
+/// main depth texture already exists and no prepass is needed; with post
+/// off there is no post chain to feed.
+pub fn depthPrepassActive(post_enabled: bool, gate: bool, main_samples: i32) bool {
+    return post_enabled and gate and main_samples > 1;
+}
+
+/// True when the MSAA depth-effect suppression applies this frame: MSAA is
+/// active but no 1x depth is available (prepass gate off). With the prepass
+/// on, SSAO/SSR/DoF/Fog/MotionBlur read the prepass texture and run
+/// normally; TAA stays suppressed regardless (non-goal v1: TAA under MSAA).
+pub fn suppressDepthEffects(main_samples: i32, gate: bool) bool {
+    return main_samples > 1 and !gate;
+}
+
 /// True when a resolve attachment must exist for the main color target.
 pub fn needsResolveAttachment(sample_count: i32) bool {
     return sample_count > 1;
@@ -210,4 +235,27 @@ test "WarnOnce fires exactly once" {
     var w = WarnOnce{};
     try testing.expect(w.warn("msaa: {}", .{1}));
     try testing.expect(!w.warn("msaa: {}", .{2}));
+}
+
+test "depthPrepassActive needs post, gate, and MSAA samples" {
+    try testing.expect(depthPrepassActive(true, true, 4));
+    try testing.expect(depthPrepassActive(true, true, 2));
+    // Gate off (default): never runs — the off path stays bit-identical.
+    try testing.expect(!depthPrepassActive(true, false, 4));
+    // Post off: no post chain to feed.
+    try testing.expect(!depthPrepassActive(false, true, 4));
+    // 1x target: the main depth texture already exists, no prepass needed.
+    try testing.expect(!depthPrepassActive(true, true, 1));
+    try testing.expect(!depthPrepassActive(true, true, 0));
+}
+
+test "suppressDepthEffects lifts only under the prepass gate" {
+    // 1x: nothing is ever suppressed.
+    try testing.expect(!suppressDepthEffects(1, false));
+    try testing.expect(!suppressDepthEffects(1, true));
+    // MSAA without the gate: suppression applies (legacy behavior).
+    try testing.expect(suppressDepthEffects(4, false));
+    try testing.expect(suppressDepthEffects(2, false));
+    // MSAA with the gate: the prepass feeds depth, suppression lifts.
+    try testing.expect(!suppressDepthEffects(4, true));
 }
