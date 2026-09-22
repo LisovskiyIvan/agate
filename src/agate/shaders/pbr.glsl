@@ -150,8 +150,9 @@ layout(binding = 1) uniform fs_params {
     vec4 uv_matrix[5]; // per slot: rotation*scale rows [m00, m01, m10, m11]
     vec4 uv_offset[5]; // per slot: xy offset, zw unused
     vec4 channel_selectors; // x occlusion, y roughness, z metallic (lane index), w unused
-    // APPENDED LAST (clearcoat/sheen): scalar/color-only coat + fabric lobes
-    // (Babylon parity, no textures this wave). Intensity 0 disables the lobe:
+    // APPENDED LAST (clearcoat/sheen): coat + fabric lobes (scalar/color
+    // plus optional R-mask / rgb-tint maps in pbr-layers v1, bindings 15/16).
+    // Intensity 0 disables the lobe:
     // every added shader term scales by its intensity and the base-specular
     // attenuation becomes exactly (1 - 0), so disabled materials render
     // bit-identically to before. Appended last so no existing offset shifts.
@@ -194,6 +195,15 @@ layout(binding = 1) uniform fs_params {
     // bit-identically. Appended last so no offset shifts.
     vec4 clustered_params;
     vec4 clustered_viewport;
+    // APPENDED LAST (pbr-layers v1): anisotropy / transmission / SSS.
+    // All zeroed when unused: every new term gates on its factor (0 = off),
+    // so legacy materials shade bit-identically. Appended last so no
+    // existing offset shifts.
+    vec4 anisotropy_factors; // x: intensity (0 = isotropic/off), y: tangent-plane rotation (rad), z/w: unused
+    vec4 transmission_factors; // x: factor (0 = off), y/z/w: unused
+    vec4 transmission_color; // rgb: throughput tint (white = untinted), w: unused
+    vec4 sss_factors; // x: strength (0 = off), y/z/w: unused
+    vec4 sss_color; // rgb: scatter tint (white = untinted), w: unused
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -226,6 +236,14 @@ layout(binding = 3) uniform sampler depth_smp;
 // the shader only samples it when probe_params.x > 0.5.
 layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 6) uniform sampler probe_smp;
+// PBR layers v1: coat/fabric masks sampled through data_smp (each texture
+// keeps its own filter/wrap, like the other data slots — no new sampler).
+// Unset slots bind the default white texture: mask 1 / tint 1 = identity,
+// so the scalar path stays bit-identical. Bindings 15/16 are free view
+// slots in the shared pool (fs uses 0..8, 10, 11; vs uses 9 for morph;
+// 12..14 are storage buffers, a separate array).
+layout(binding = 15) uniform texture2D clearcoat_tex;
+layout(binding = 16) uniform texture2D sheen_tex;
 // Clustered forward lights (wave 30, v1): storage buffers for the tile
 // walk. Bindings 12..14 are free view slots in the shared pool of every
 // forward shader (this family uses fs 0..8, 10, 11 and vs 9 for morph).
@@ -634,13 +652,31 @@ float sheenVisibilityNeubelt(float NoV, float NoL) {
     return clamp(1.0 / (4.0 * (NoL + NoV - NoL * NoV)), 0.0, 1.0);
 }
 
+// Anisotropy v1 (Heitz-style GGX): stretches the base-lobe NDF along the
+// tangent frame; intensity 0 early-returns to the legacy isotropic NDF
+// (bit-identical), geometry G stays isotropic and IBL stays isotropic
+// (v1 scope, documented). CPU mirror: material.anisotropyAxes.
+float anisoNDF(vec3 N, vec3 T, vec3 B, vec3 H, float roughness) {
+    float aniso = clamp(anisotropy_factors.x, 0.0, 1.0);
+    if (aniso <= 0.0) return distributionGGX(N, H, roughness);
+    float rough2 = roughness * roughness;
+    float aspect = sqrt(max(1.0 - 0.9 * aniso, 0.01));
+    float ax = max(rough2 / aspect, 0.001);
+    float ay = max(rough2 * aspect, 0.001);
+    float TH = dot(T, H);
+    float BH = dot(B, H);
+    float NH = max(dot(N, H), 0.0);
+    float denom = (TH * TH) / (ax * ax) + (BH * BH) / (ay * ay) + NH * NH;
+    return 1.0 / max(PI * ax * ay * denom * denom, 0.0000001);
+}
+
 // Combined coat + sheen add-on for one punctual light. The caller multiplies
 // `additive` by radiance * NdotL * shadow and scales its own BASE specular
 // by `base_atten` (diffuse/kD untouched). Safe at NdotL = 0: the 0.0001
 // guard matches the base lobe and the caller zeroes the contribution.
 void coatSheenLight(vec3 N, vec3 V, vec3 L, vec3 H, float NdotV, float NdotL,
     float cc_rough, float cc_intensity, vec3 cc_F0,
-    float sheen_rough, float sheen_intensity,
+    float sheen_rough, float sheen_intensity, vec3 sheen_tint,
     out vec3 base_atten, out vec3 additive) {
     float cc_NDF = distributionGGX(N, H, cc_rough);
     float cc_G = geometrySmith(N, V, L, cc_rough);
@@ -649,7 +685,7 @@ void coatSheenLight(vec3 N, vec3 V, vec3 L, vec3 H, float NdotV, float NdotL,
     vec3 cc_spec = (cc_NDF * cc_G * cc_F) / (4.0 * NdotV * NdotL + 0.0001);
     float sheenD = sheenDistributionCharlie(sheen_rough, max(dot(N, H), 0.0));
     float sheenV = sheenVisibilityNeubelt(NdotV, NdotL);
-    vec3 sheen_term = sheen_color.rgb * (sheenD * sheenV) * sheen_intensity;
+    vec3 sheen_term = sheen_tint * (sheenD * sheenV) * sheen_intensity;
     additive = cc_spec + sheen_term;
 }
 
@@ -719,12 +755,52 @@ void main() {
     float sheen_rough = clamp(sheen_factors.y, 0.07, 1.0);
     float sheen_intensity = clamp(sheen_factors.x, 0.0, 1.0);
 
+    // PBR layers v1: coat/fabric masks sampled with the ALBEDO uv transform
+    // (no per-slot coat transform yet — v1 scope). White fallback = 1, so
+    // unset slots keep the scalar path exact; the branch only skips the
+    // fetch when the lobe is off (mask * 0 == 0 either way).
+    vec2 coat_uv = uvApply(uv_matrix[0], uv_offset[0], v_uv);
+    float cc_mask = 1.0;
+    if (cc_intensity > 0.0) {
+        cc_mask = texture(sampler2D(clearcoat_tex, data_smp), coat_uv).r;
+    }
+    cc_intensity *= cc_mask;
+    vec3 sheen_tint = sheen_color.rgb;
+    if (sheen_intensity > 0.0) {
+        sheen_tint *= texture(sampler2D(sheen_tex, data_smp), coat_uv).rgb;
+    }
+
+    // Anisotropy v1 frame: the existing TBN varyings (vertex tangent
+    // attribute, Gram-Schmidt orthogonalized in vs) — NO new attribute.
+    // Meshes without authored tangents carry the loader/builder fallback
+    // (+X, see loader/mesh_spawn.zig): documented approximation.
+    vec3 aniso_T = normalize(v_tangent);
+    vec3 aniso_B = normalize(v_bitangent);
+    float aniso_rot = anisotropy_factors.y;
+    if (clamp(anisotropy_factors.x, 0.0, 1.0) > 0.0 && aniso_rot != 0.0) {
+        float aniso_cr = cos(aniso_rot);
+        float aniso_sr = sin(aniso_rot);
+        vec3 aniso_rT = aniso_T * aniso_cr + aniso_B * aniso_sr;
+        aniso_B = aniso_B * aniso_cr - aniso_T * aniso_sr;
+        aniso_T = aniso_rT;
+    }
+
+    // Transmission v1: thin-slab approx (no refraction target — non-goal).
+    // Diffuse throughput scales by (1 - factor) AFTER F0 so metals keep
+    // their F0; the additive back-light term lands in the post-Lo block.
+    // factor 0 skips: legacy albedo bit-identical.
+    float transm_factor = clamp(transmission_factors.x, 0.0, 1.0);
+    if (transm_factor > 0.0) {
+        albedo *= (1.0 - transm_factor);
+    }
+    float sss_strength = clamp(sss_factors.x, 0.0, 1.0);
+
     // 1. Primary Directional Light (with shadow mapping)
     vec3 L = light_dir.xyz;
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
 
-    float NDF = distributionGGX(N, H, roughness);
+    float NDF = anisoNDF(N, aniso_T, aniso_B, H, roughness);
     float G = geometrySmith(N, V, L, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
@@ -735,7 +811,7 @@ void main() {
     // only — diffuse passes through unattenuated).
     vec3 sun_atten;
     vec3 sun_additive;
-    coatSheenLight(N, V, L, H, NdotV, NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sun_atten, sun_additive);
+    coatSheenLight(N, V, L, H, NdotV, NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, sun_atten, sun_additive);
 
     vec3 debug_tint = vec3(0.0);
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
@@ -754,7 +830,7 @@ void main() {
         float d_NdotL = max(dot(N, d_dir), 0.0);
         if (d_NdotL <= 0.0) continue;
         vec3 d_H = normalize(V + d_dir);
-        float d_NDF = distributionGGX(N, d_H, roughness);
+        float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, roughness);
         float d_G = geometrySmith(N, V, d_dir, roughness);
         vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
         vec3 d_spec = (d_NDF * d_G * d_F) / (4.0 * NdotV * d_NdotL + 0.0001);
@@ -762,7 +838,7 @@ void main() {
         vec3 d_rad = d_col * d_int;
         vec3 d_atten;
         vec3 d_additive;
-        coatSheenLight(N, V, d_dir, d_H, NdotV, d_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, d_atten, d_additive);
+        coatSheenLight(N, V, d_dir, d_H, NdotV, d_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, d_atten, d_additive);
         Lo += (d_kD * albedo / PI + d_spec * d_atten + d_additive) * d_rad * d_NdotL;
     }
 
@@ -789,7 +865,7 @@ void main() {
 
         float p_NdotL = max(dot(N, p_L), 0.0);
         if (p_NdotL > 0.0) {
-            float p_NDF = distributionGGX(N, p_H, roughness);
+            float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, roughness);
             float p_G = geometrySmith(N, V, p_L, roughness);
             vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
@@ -798,7 +874,7 @@ void main() {
             vec3 p_rad = p_col * (p_int * att);
             vec3 p_atten;
             vec3 p_additive;
-            coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, p_atten, p_additive);
+            coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, p_atten, p_additive);
 
             float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
             Lo += (p_kD * albedo / PI + p_spec * p_atten + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
@@ -839,7 +915,7 @@ void main() {
 
         float s_NdotL = max(dot(N, s_L), 0.0);
         if (s_NdotL > 0.0) {
-            float s_NDF = distributionGGX(N, s_H, roughness);
+            float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, roughness);
             float s_G = geometrySmith(N, V, s_L, roughness);
             vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
@@ -848,7 +924,7 @@ void main() {
             vec3 s_rad = s_col * (s_int * total_att);
             vec3 s_atten;
             vec3 s_additive;
-            coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, s_atten, s_additive);
+            coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, s_atten, s_additive);
 
             float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
             Lo += (s_kD * albedo / PI + s_spec * s_atten + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
@@ -865,7 +941,7 @@ void main() {
         float a_factor = areaLightFactor(v_world_pos, N, i, a_L, a_NdotL);
         if (a_factor <= 0.0) continue;
         vec3 a_H = normalize(V + a_L);
-        float a_NDF = distributionGGX(N, a_H, roughness);
+        float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, roughness);
         float a_G = geometrySmith(N, V, a_L, roughness);
         vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
         vec3 a_spec = (a_NDF * a_G * a_F) / (4.0 * NdotV * a_NdotL + 0.0001);
@@ -873,7 +949,7 @@ void main() {
         vec3 a_rad = area_color[i].rgb * a_factor;
         vec3 a_atten;
         vec3 a_additive;
-        coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, a_atten, a_additive);
+        coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, a_atten, a_additive);
         Lo += (a_kD * albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
     }
 
@@ -916,7 +992,7 @@ void main() {
 
             float c_NdotL = max(dot(N, c_L), 0.0);
             if (c_NdotL > 0.0) {
-                float c_NDF = distributionGGX(N, c_H, roughness);
+                float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, roughness);
                 float c_G = geometrySmith(N, V, c_L, roughness);
                 vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
                 vec3 c_spec = (c_NDF * c_G * c_F) / (4.0 * NdotV * c_NdotL + 0.0001);
@@ -924,10 +1000,27 @@ void main() {
                 vec3 c_rad = c_col * (c_int * c_att);
                 vec3 c_atten;
                 vec3 c_additive;
-                coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, c_atten, c_additive);
+                coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, c_atten, c_additive);
                 Lo += (c_kD * albedo / PI + c_spec * c_atten + c_additive) * c_rad * c_NdotL;
             }
         }
+    }
+
+    // Transmission v1 + SSS v1 post terms (sun + ambient driven; point /
+    // spot / area / clustered punctuals do NOT contribute — v1 scope).
+    // Both gate on a uniform branch: 0 adds exactly nothing bit-identical.
+    if (transm_factor > 0.0) {
+        float transm_back = clamp(dot(-N, L) * 0.5 + 0.5, 0.0, 1.0);
+        vec3 transm_irr = light_color.rgb * light_color.a * transm_back + ambient_color.rgb * ambient_color.a * 0.5;
+        Lo += transmission_color.rgb * transm_factor * albedo * transm_irr;
+    }
+    if (sss_strength > 0.0) {
+        // Wrap mirror: material.wrapNdotL (unit-tested on CPU).
+        float sss_wrap = sss_strength * 0.5;
+        float wrap_nl = clamp((dot(N, L) + sss_wrap) / (1.0 + sss_wrap), 0.0, 1.0);
+        float back_scatter = pow(clamp(dot(V, -L), 0.0, 1.0), 2.0);
+        vec3 sss_irr = light_color.rgb * light_color.a * (wrap_nl * 0.6 + back_scatter * 0.4) + ambient_color.rgb * ambient_color.a * 0.25;
+        Lo += sss_color.rgb * sss_strength * albedo * sss_irr;
     }
 
     // Ambient Occlusion
@@ -984,7 +1077,7 @@ void main() {
         vec3 kD_ibl = (vec3(1.0) - F_ibl) * (1.0 - metallic);
         vec3 diffuse_ibl = kD_ibl * irradiance * albedo;
         float sheen_grazing = pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
-        vec3 sheen_ibl = sheen_color.rgb * sheen_intensity * irradiance * sheen_grazing;
+        vec3 sheen_ibl = sheen_tint * sheen_intensity * irradiance * sheen_grazing;
 
         ibl = (diffuse_ibl + specular_ibl) * (ibl_intensity * ao) + sheen_ibl * (ibl_intensity * ao);
     }
