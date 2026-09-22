@@ -79,6 +79,11 @@ pub const Entry = struct {
     /// UB slot of the material's fs-stage sm_user_params block, when the
     /// snippet declares params.
     user_ub: ?u32 = null,
+    /// Declared byte size of the fs user uniform block. The draw uploads
+    /// exactly this many leading bytes of the packed storage (sokol
+    /// validates the upload size against the shader's declared block).
+    /// Hook blocks always declare the full 8x vec4 (128).
+    user_bytes: u16 = 128,
     /// UB slot of the vs-stage sm_user_params_vs block (only when a snippet
     /// uses params inside @hook(vertex)); receives the same 128 bytes.
     vs_user_ub: ?u32 = null,
@@ -113,6 +118,7 @@ const static_table: [static_len]Entry = blk: {
             .vs_ub = e.vs_ub,
             .fs_ub = e.fs_ub,
             .user_ub = e.user_ub,
+            .user_bytes = 128,
             .vs_user_ub = e.vs_user_ub,
             .params = convParams(e.params),
             .make_shader = e.make_shader,
@@ -139,10 +145,47 @@ fn convParams(comptime raw: []const registry.Param) []const Param {
 /// Hard cap for runtime registrations (no allocator, fixed slots).
 pub const max_runtime_entries = 16;
 
+/// V1 budget for EXTERNAL (runtime-registered) user uniforms: at most 2x
+/// vec4 (8 f32 words) of the shared 8x vec4 user uniform storage. The
+/// external path has no merge tool to pack a declarative table, so the
+/// window is deliberately small: registerRuntime rejects params that do
+/// not fit with error.UniformLimitExceeded (explicit, never a silent
+/// clamp). Static hook materials keep the full 8-vec4 merge contract
+/// (merge.user_slot_count) — unchanged.
+pub const max_external_uniform_vec4: u32 = 2;
+/// F32 word budget matching max_external_uniform_vec4.
+pub const max_external_uniform_words: u8 = max_external_uniform_vec4 * 4;
+
 var runtime_table: [max_runtime_entries]Entry = undefined;
 var runtime_len: usize = 0;
 
 /// Descriptor for a runtime-registered shader material.
+///
+/// EXTERNAL-SHADER CONTRACT (ShaderMaterial v1, engine_template = false):
+/// the custom .glsl is written in sokol-shdc format and compiled OFFLINE
+/// with the engine slang set (glsl430:metal_macos:hlsl5) through agate's
+/// public build API (build.zig compileUserShader) — no runtime
+/// cross-compilation, no engine source edits. The draw path renders with
+/// the STANDARD rigid vertex layout (position FLOAT3, normal FLOAT3,
+/// color0 FLOAT4, texcoord0 UV FLOAT2, in that attribute order — declare
+/// the same prefix in the custom @vs), the standard-opaque base state
+/// (depth LESS_EQUAL + write, BACK cull, CCW; blend/cull-off twins follow
+/// the material's alpha_mode/double_sided like Standard), and this bind
+/// contract:
+///   - UB `vs_ub` (default 0) carries {mat4 mvp, mat4 model} — the custom
+///     @vs must declare `layout(binding = 0) uniform vs_params` with two
+///     mat4 members in that order.
+///   - the material texture lands on view slot 0 (+ sampler slot 0), the
+///     optional second texture (ShaderMaterial.texture1) on view/sampler
+///     slot 1. sokol tolerates slots the shader does not declare.
+///   - `user_ub` (when set) receives the packed user uniform bytes
+///     (uniformBytes: full 128-byte storage; the shader reads its own
+///     window — v1 budget is max_external_uniform_vec4).
+/// Only rigid geometry: skinned meshes skip drawing (documented non-goal,
+/// like hook v1); instanced meshes draw through the regular queue without
+/// per-instance data (non-goal). No sg calls happen without a context:
+/// make_shader runs lazily on first use from the render thread; an
+/// invalid shader (id 0) makes the draw path skip the mesh.
 pub const RuntimeDesc = struct {
     /// Unique registration name; the key is Wyhash(name).
     name: []const u8,
@@ -156,9 +199,17 @@ pub const RuntimeDesc = struct {
     /// Runtime sources usually set false: the draw path then binds only
     /// vertex/index buffers and the material texture at view slot 0.
     engine_template: bool = false,
-    /// UB slot that receives the 128-byte user uniform block (when the
-    /// custom shader declares one).
+    /// UB slot that receives the user uniform bytes (when the custom
+    /// shader declares a user block; see user_bytes).
     user_ub: ?u32 = null,
+    /// Declared byte size of the custom shader's fs user uniform block
+    /// (default = the full v1 window, 2x vec4). The draw uploads exactly
+    /// this many leading bytes of the packed storage, so it must equal
+    /// the block size in the .glsl (sokol rejects size mismatches).
+    /// Must be a nonzero multiple of 16 within the v1 budget
+    /// (max_external_uniform_vec4); params must fit inside
+    /// user_bytes/4 words. Violations are error.UniformLimitExceeded.
+    user_bytes: u16 = max_external_uniform_vec4 * 16,
     params: []const Param = &.{},
 };
 
@@ -168,10 +219,24 @@ pub const RuntimeDesc = struct {
 /// the render's pipeline-cache lookup. Register during setup / on the
 /// context thread between submissions — never from the update side or a
 /// jobs worker while render is in flight.
-pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName }!u32 {
+///
+/// Every declared param must fit the v1 external window
+/// (offset + comps <= max_external_uniform_words); overflow is a hard
+/// error.UniformLimitExceeded, never a silent clamp or truncation.
+pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName, UniformLimitExceeded }!u32 {
     gpu_thread.assertOnContextThread();
     if (runtime_len >= max_runtime_entries) return error.RegistryFull;
     if (indexForName(desc.name) != null) return error.DuplicateName;
+    // Wire size: nonzero vec4 multiple inside the v1 budget. The draw
+    // uploads exactly user_bytes, so anything else fails sokol validation
+    // at draw time — reject it here instead, with a name.
+    if (desc.user_bytes == 0 or desc.user_bytes % 16 != 0 or desc.user_bytes > max_external_uniform_vec4 * 16)
+        return error.UniformLimitExceeded;
+    const words: u16 = desc.user_bytes / 4;
+    for (desc.params) |p| {
+        if (p.comps != 1 and p.comps != 4) return error.UniformLimitExceeded;
+        if (@as(u16, p.offset) + p.comps > words) return error.UniformLimitExceeded;
+    }
     const index: u32 = @intCast(static_len + runtime_len);
     runtime_table[runtime_len] = .{
         .name = desc.name,
@@ -181,6 +246,7 @@ pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName }!u
         .vs_ub = vs_params_ub,
         .fs_ub = fs_params_ub,
         .user_ub = desc.user_ub,
+        .user_bytes = desc.user_bytes,
         .vs_user_ub = null,
         .params = desc.params,
         .make_shader = desc.make_shader,
@@ -349,6 +415,52 @@ test "runtime registration appends entries with deterministic keys" {
 
     // Duplicate names are rejected.
     try std.testing.expectError(error.DuplicateName, registerRuntime(.{ .name = "test_runtime_mat", .make_shader = dummy.makeShader }));
+}
+
+test "external uniform window: boundary offsets register, overflow is a hard error" {
+    const dummy = struct {
+        fn makeShader(_: sg.Backend) sg.Shader {
+            return .{};
+        }
+    };
+    // Boundary: two floats in slot 0 plus a vec4 filling slot 1 — exactly
+    // the 2-vec4 v1 window (words 0..7).
+    const fitting = [_]Param{
+        .{ .name = "u_time", .offset = 0, .comps = 1 },
+        .{ .name = "u_intensity", .offset = 1, .comps = 1 },
+        .{ .name = "u_tint", .offset = 4, .comps = 4 },
+    };
+    const idx = try registerRuntime(.{ .name = "test_ext_fit", .make_shader = dummy.makeShader, .user_ub = 1, .params = &fitting });
+    defer runtime_len -= 1;
+    try std.testing.expectEqual(@as(usize, 3), entry(idx).?.params.len);
+
+    // Overflow: a float in word 8 (first word past the window).
+    const past_end = [_]Param{.{ .name = "u_nope", .offset = 8, .comps = 1 }};
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_past", .make_shader = dummy.makeShader, .params = &past_end }));
+    // Straddling vec4 (words 5..8) and unknown component counts are
+    // rejected too — never silently clamped or truncated.
+    const straddle = [_]Param{.{ .name = "u_straddle", .offset = 5, .comps = 4 }};
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_straddle", .make_shader = dummy.makeShader, .params = &straddle }));
+    const bad_comps = [_]Param{.{ .name = "u_vec2", .offset = 0, .comps = 2 }};
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_comps", .make_shader = dummy.makeShader, .params = &bad_comps }));
+    // Rejected registrations leave no entry behind.
+    try std.testing.expect(indexForName("test_ext_past") == null);
+    try std.testing.expect(indexForName("test_ext_straddle") == null);
+    try std.testing.expect(indexForName("test_ext_comps") == null);
+
+    // Wire size: zero, non-vec4-multiple, and over-budget blocks are
+    // rejected (the draw uploads exactly user_bytes — a mismatch would
+    // trip sokol validation at draw time instead).
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_zero", .make_shader = dummy.makeShader, .user_bytes = 0 }));
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_20", .make_shader = dummy.makeShader, .user_bytes = 20 }));
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_48", .make_shader = dummy.makeShader, .user_bytes = 48 }));
+    // A 1-vec4 window registers, but the slot-1 vec4 no longer fits it.
+    const narrow = [_]Param{.{ .name = "u_a", .offset = 0, .comps = 1 }};
+    const narrow_idx = try registerRuntime(.{ .name = "test_ext_narrow", .make_shader = dummy.makeShader, .user_bytes = 16, .params = &narrow });
+    defer runtime_len -= 1;
+    try std.testing.expectEqual(@as(u16, 16), entry(narrow_idx).?.user_bytes);
+    try std.testing.expectError(error.UniformLimitExceeded, registerRuntime(.{ .name = "test_ext_narrow2", .make_shader = dummy.makeShader, .user_bytes = 16, .params = &fitting }));
+    try std.testing.expectEqual(@as(u16, 32), entry(idx).?.user_bytes);
 }
 
 test "defaultUniformStorage applies declared defaults" {

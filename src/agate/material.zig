@@ -315,6 +315,12 @@ pub const ShaderMaterial = struct {
     /// Bound to the material's primary texture slot (diffuse_tex /
     /// albedo_tex for engine templates; view slot 0 for runtime sources).
     texture: ?Texture = null,
+    /// Optional second texture for runtime-registered sources
+    /// (engine_template = false): bound to view/sampler slot 1 (the
+    /// primary occupies slot 0). Ignored by engine-template materials,
+    /// whose texture contract is fixed by the template. Null falls back
+    /// to the default white texture at snapshot build time.
+    texture1: ?Texture = null,
 
     /// Packed user uniform block (8x vec4). Initialized from the declared
     /// param defaults when the registration is resolved (initForShader);
@@ -644,6 +650,47 @@ test "ShaderMaterial.setUniform packs through the registration table" {
     try std.testing.expectError(error.UnknownParam, sm.setUniform("u_nope", .{ .scalar = 1 }));
 }
 
+test "buildShaderSnapshot freezes handles, uniforms and the second texture" {
+    // Headless: handles are plain ids, no sg calls involved.
+    const white = Texture{ .image = .{ .id = 10 }, .view = .{ .id = 11 }, .sampler = .{ .id = 12 }, .width = 4, .height = 4 };
+    var sm = ShaderMaterial.initForShader("ramp_wave", "fx") orelse return error.TestUnexpectedResult;
+    sm.texture = .{ .image = .{ .id = 1 }, .view = .{ .id = 2 }, .sampler = .{ .id = 3 }, .width = 4, .height = 4 };
+    sm.texture1 = .{ .image = .{ .id = 4 }, .view = .{ .id = 5 }, .sampler = .{ .id = 6 }, .width = 4, .height = 4 };
+    try sm.setUniform("u_wave_speed", .{ .scalar = 7.0 });
+    sm.tint_color = Color3.new(0.5, 0.25, 0.125);
+    sm.alpha = 0.75;
+    sm.double_sided = true;
+
+    const m: Material = .{ .shader_material = &sm };
+    const snap = buildShaderSnapshot(m, &white) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(sm.entry_index, snap.entry_index);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.125, 0.75 }, &snap.tint);
+    try std.testing.expectEqual(@as(u32, 2), snap.tex_view.id);
+    try std.testing.expectEqual(@as(u32, 3), snap.tex_sampler.id);
+    try std.testing.expectEqual(@as(u32, 5), snap.tex1_view.id);
+    try std.testing.expectEqual(@as(u32, 6), snap.tex1_sampler.id);
+    const speed = shader_material.findParam(shader_material.entry(sm.entry_index).?.params, "u_wave_speed").?;
+    try std.testing.expectEqual(@as(f32, 7.0), snap.uniforms[speed.offset / 4][speed.offset % 4]);
+    try std.testing.expect(snap.double_sided);
+
+    // Live mutation after the snapshot leaves the frozen copy untouched
+    // (staging discipline: the draw path must never see this write).
+    sm.texture1.?.view.id = 50;
+    sm.uniforms[speed.offset / 4][speed.offset % 4] = 1.0;
+    try std.testing.expectEqual(@as(u32, 5), snap.tex1_view.id);
+    try std.testing.expectEqual(@as(f32, 7.0), snap.uniforms[speed.offset / 4][speed.offset % 4]);
+
+    // Null textures fall back to the default (white) handles.
+    var bare = ShaderMaterial.initForShader("ramp_wave", "bare") orelse return error.TestUnexpectedResult;
+    const bare_mat: Material = .{ .shader_material = &bare };
+    const bare_snap = buildShaderSnapshot(bare_mat, &white) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 11), bare_snap.tex_view.id);
+    try std.testing.expectEqual(@as(u32, 11), bare_snap.tex1_view.id);
+
+    // Non-shader materials and null build no snapshot.
+    try std.testing.expect(buildShaderSnapshot(null, &white) == null);
+}
+
 test "UvTransform packs the KHR_texture_transform matrix rows" {
     const ident = UvTransform.identity;
     try std.testing.expect(ident.isIdentity());
@@ -781,6 +828,10 @@ pub const ShaderDrawSnapshot = struct {
     tint: [4]f32 = .{ 1, 1, 1, 1 },
     tex_view: sg.View = .{},
     tex_sampler: sg.Sampler = .{},
+    /// Frozen second-texture handles (runtime sources only; the draw path
+    /// binds them to view/sampler slot 1).
+    tex1_view: sg.View = .{},
+    tex1_sampler: sg.Sampler = .{},
     uniforms: shader_material.UniformStorage = .{.{ 0, 0, 0, 0 }} ** shader_material.merge.user_slot_count,
     /// Собственный double_sided материала (без decal-форсинга item: раньше draw
     /// читал sm.double_sided напрямую, поведение сохранено точь-в-точь).
@@ -794,11 +845,14 @@ pub fn buildShaderSnapshot(mat: ?Material, default_white: *const Texture) ?Shade
     if (m != .shader_material) return null;
     const sm = m.shader_material;
     const tex = sm.texture orelse default_white.*;
+    const tex1 = sm.texture1 orelse default_white.*;
     return .{
         .entry_index = sm.entry_index,
         .tint = sm.getTintColor4(),
         .tex_view = tex.view,
         .tex_sampler = tex.sampler,
+        .tex1_view = tex1.view,
+        .tex1_sampler = tex1.sampler,
         .uniforms = sm.uniforms,
         .double_sided = sm.double_sided,
     };
