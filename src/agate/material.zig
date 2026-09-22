@@ -137,8 +137,14 @@ pub const StandardMaterial = struct {
 /// A dielectric coat (car paint, lacquered wood) over the base PBR layer:
 /// separate GGX specular lobe with its own roughness, F0 = 0.04 tinted by
 /// `color`, and an energy-conserving (1 - F_cc) attenuation of the BASE
-/// specular (direct + IBL). No textures this wave (no clearcoat map/roughness
-/// map/normal map) and no second normal layer — the coat reuses the base N.
+/// specular (direct + IBL). No clearcoat roughness/normal maps and no
+/// second normal layer — the coat reuses the base N.
+///
+/// `mask_texture` (v1, optional): R lane multiplies `intensity` (white
+/// fallback = identity, so null renders exactly like a 1.0 mask).
+/// Sampled with the ALBEDO uv transform (no per-slot coat transform yet).
+/// The mask modulates — it never enables: `intensity == 0` keeps the lobe
+/// off even with a texture bound (null side-table entry, legacy path).
 ///
 /// Gating: `intensity == 0` (the default) disables the lobe. Every shader
 /// term is multiplied by the intensity and the base attenuation becomes
@@ -151,12 +157,18 @@ pub const Clearcoat = struct {
     intensity: f32 = 0.0,
     roughness: f32 = 0.03,
     color: Color3 = Color3.white,
+    mask_texture: ?Texture = null,
 };
 
 /// Scalar-only sheen layer (Babylon parity, OpenPBR-adjacent subset).
 /// A view-dependent fabric/fuzz lobe (Charlie distribution + Neubelt
 /// visibility, Karis-style grazing response), additive over the base layer.
-/// No textures this wave (no sheen color/roughness maps).
+///
+/// `color_texture` (v1, optional): rgb multiplies `color` (white fallback
+/// = identity, so null renders exactly like a 1.0 tint). Sampled with the
+/// ALBEDO uv transform (no per-slot sheen transform yet). The map
+/// modulates — it never enables: `intensity == 0` keeps the lobe off even
+/// with a texture bound (null side-table entry, legacy path).
 ///
 /// Gating: `intensity == 0` (the default) disables the lobe — every shader
 /// term is multiplied by the intensity, so disabled materials render
@@ -167,38 +179,128 @@ pub const Sheen = struct {
     color: Color3 = Color3.white,
     intensity: f32 = 0.0,
     roughness: f32 = 0.5,
+    color_texture: ?Texture = null,
 };
 
-/// Render-owned, GPU-ready clearcoat + sheen factors (scalar/color only).
-/// Lives in the render-queue side table (RenderQueues.coat_storage, resolved
-/// by index at draw time like skin_storage), NOT in MaterialDrawRecord: 64 B
-/// of per-draw factors would bust the P4 size guard on RenderMeshItem, so
-/// only draws with an enabled lobe occupy a slot. Every other draw resolves
-/// to `neutral` at draw time and shades bit-identically to before.
+/// Anisotropic specular v1 (GGX-Heitz-style stretch of the base-lobe NDF
+/// along the mesh tangent frame). NOT full OpenPBR anisotropy (no
+/// per-light anisotropic roughness maps, isotropic geometry G, isotropic
+/// IBL): the specular highlight elongates along T/B with `intensity`.
+/// The frame is the EXISTING vertex tangent attribute (Gram-Schmidt
+/// orthogonalized in the vertex shader) steered in the tangent plane by
+/// `rotation` — no new vertex attribute. Meshes without authored tangents
+/// (glTF default +X, see loader/mesh_spawn.zig) get a uniform fallback
+/// direction: documented approximation, not an error.
+///
+/// Gating: `intensity == 0` (the default) = isotropic: the shader
+/// early-returns to the legacy GGX NDF, bit-identical to before.
+pub const Anisotropy = struct {
+    intensity: f32 = 0.0,
+    /// Tangent-plane steering angle in radians (0 = mesh tangents as-is).
+    rotation: f32 = 0.0,
+};
+
+/// Cheap transmission v1 (NOT refraction: no refraction target, no IOR,
+/// no thickness — porting a full refraction pass is an explicit non-goal).
+/// Thin-slab approximation that keeps the mesh in its current queue
+/// (alpha/queue untouched: real see-through glass still uses
+/// alpha_mode.blend): the diffuse albedo scales by (1 - factor) AFTER F0
+/// (metals keep their F0) and an additive sun+ambient back-light term
+/// tinted by `color` fakes throughput. Punctual point/spot/area/clustered
+/// lights do NOT contribute to the transmitted term (v1 scope).
+///
+/// Gating: `factor == 0` (the default) = off: the albedo scale is skipped
+/// and the additive term branches off, bit-identical to before.
+pub const Transmission = struct {
+    factor: f32 = 0.0,
+    color: Color3 = Color3.white,
+};
+
+/// Cheap subsurface scattering v1 (NOT a BSSRDF / random-walk SSS:
+/// physical SSS is an explicit non-goal). Wrap-diffuse + back-scatter glow
+/// driven by the sun + ambient, tinted by `color` and the albedo, added
+/// over the base layer. Punctual point/spot/area/clustered lights do NOT
+/// contribute (v1 scope).
+///
+/// Gating: `strength == 0` (the default) = off: the additive term branches
+/// off, bit-identical to before.
+pub const Subsurface = struct {
+    strength: f32 = 0.0,
+    color: Color3 = Color3.white,
+};
+
+/// Render-owned, GPU-ready clearcoat + sheen factors plus the v1 PBR layer
+/// pack (anisotropy / transmission / subsurface). Lives in the render-queue
+/// side table (RenderQueues.coat_storage, resolved by index at draw time
+/// like skin_storage), NOT in MaterialDrawRecord: per-draw factors would
+/// bust the P4 size guard on RenderMeshItem, so only draws with an enabled
+/// layer occupy a slot. Every other draw resolves to `neutral` at draw time
+/// and shades bit-identically to before.
+///
+/// Coat/sheen TEXTURES are not here: texture views stage into
+/// MaterialDrawRecord (a handful of view ids, like every other map) while
+/// this table carries the scalar/color pack. A bound texture never enables
+/// a lobe on its own — the scalar gate below decides.
 pub const CoatParams = struct {
     clearcoat_factors: [4]f32 = .{ 0, 0.03, 0, 0 }, // x: intensity, y: roughness
     clearcoat_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb tint, w unused
     sheen_factors: [4]f32 = .{ 0, 0.5, 0, 0 }, // x: intensity, y: roughness
     sheen_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb tint, w unused
+    // APPENDED LAST (pbr-layers v1): the first four lanes keep their
+    // offsets; disabled (all zero) uploads bit-identical shading.
+    anisotropy_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: intensity (0 = isotropic), y: rotation rad
+    transmission_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: factor (0 = off)
+    transmission_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb throughput tint, w unused
+    sss_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: strength (0 = off)
+    sss_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb scatter tint, w unused
 
     pub const neutral: CoatParams = .{};
 };
 
 /// Builds the side-table snapshot for a material: non-null only for PBR
-/// materials with an enabled coat/fabric lobe (either intensity > 0).
-/// Materials without these features (including every non-PBR material) yield
-/// null and draw from CoatParams.neutral. Pure function (no GPU calls).
+/// materials with an enabled layer (any intensity/factor/strength > 0).
+/// Materials without these features (including every non-PBR material)
+/// yield null and draw from CoatParams.neutral. Bound coat/sheen textures
+/// alone do NOT opt in (a zero intensity multiplies the mask to zero, so
+/// the legacy path stays exact and cheaper). Pure function (no GPU calls).
 pub fn coatParamsFor(mat: ?Material) ?CoatParams {
     const m = mat orelse return null;
     if (m != .pbr) return null;
     const p = m.pbr;
-    if (p.clearcoat.intensity <= 0 and p.sheen.intensity <= 0) return null;
+    if (p.clearcoat.intensity <= 0 and p.sheen.intensity <= 0 and
+        p.anisotropy.intensity <= 0 and p.transmission.factor <= 0 and
+        p.subsurface.strength <= 0) return null;
     return .{
         .clearcoat_factors = .{ p.clearcoat.intensity, p.clearcoat.roughness, 0, 0 },
         .clearcoat_color = .{ p.clearcoat.color.r, p.clearcoat.color.g, p.clearcoat.color.b, 1.0 },
         .sheen_factors = .{ p.sheen.intensity, p.sheen.roughness, 0, 0 },
         .sheen_color = .{ p.sheen.color.r, p.sheen.color.g, p.sheen.color.b, 1.0 },
+        .anisotropy_factors = .{ p.anisotropy.intensity, p.anisotropy.rotation, 0, 0 },
+        .transmission_factors = .{ p.transmission.factor, 0, 0, 0 },
+        .transmission_color = .{ p.transmission.color.r, p.transmission.color.g, p.transmission.color.b, 1.0 },
+        .sss_factors = .{ p.subsurface.strength, 0, 0, 0 },
+        .sss_color = .{ p.subsurface.color.r, p.subsurface.color.g, p.subsurface.color.b, 1.0 },
     };
+}
+
+/// CPU mirror of the shader's anisotropy axis computation (Heitz-style):
+/// (ax, ay) roughnesses along T/B. intensity <= 0 returns the isotropic
+/// pair (roughness^2, roughness^2); the shader then skips the stretch and
+/// evaluates the legacy GGX NDF instead. Unit-tested below.
+pub fn anisotropyAxes(roughness: f32, intensity: f32) [2]f32 {
+    const r2 = roughness * roughness;
+    if (intensity <= 0.0) return .{ r2, r2 };
+    const clamped = @min(@max(intensity, 0.0), 1.0);
+    const aspect = @sqrt(@max(1.0 - 0.9 * clamped, 0.01));
+    return .{ @max(r2 / aspect, 0.001), @max(r2 * aspect, 0.001) };
+}
+
+/// CPU mirror of the SSS wrap term: wraps NdotL toward 1 as strength
+/// grows (strength <= 0 returns the input unchanged). Unit-tested below.
+pub fn wrapNdotL(ndotl: f32, strength: f32) f32 {
+    if (strength <= 0.0) return ndotl;
+    const wrap = strength * 0.5;
+    return @min(@max((ndotl + wrap) / (1.0 + wrap), 0.0), 1.0);
 }
 
 pub const PBRMaterial = struct {
@@ -251,11 +353,20 @@ pub const PBRMaterial = struct {
     environment_intensity: f32 = 1.0,
 
     /// Clearcoat coat layer (default OFF: intensity 0 = lobe disabled,
-    /// neutral tint/roughness). Scalar/color only — no textures this wave.
+    /// neutral tint/roughness). Optional R-mask texture (null = scalar).
     clearcoat: Clearcoat = .{},
     /// Sheen fabric lobe (default OFF: intensity 0 = lobe disabled,
-    /// neutral tint/roughness). Scalar/color only — no textures this wave.
+    /// neutral tint/roughness). Optional rgb tint texture (null = scalar).
     sheen: Sheen = .{},
+    /// Anisotropic specular stretch (default OFF: intensity 0 = isotropic,
+    /// legacy GGX path bit-identical).
+    anisotropy: Anisotropy = .{},
+    /// Thin-slab transmission approx (default OFF: factor 0 = opaque,
+    /// legacy path bit-identical). No refraction target (non-goal).
+    transmission: Transmission = .{},
+    /// Wrap/back-scatter SSS approx (default OFF: strength 0 = no term,
+    /// legacy path bit-identical). Not a BSSRDF (non-goal).
+    subsurface: Subsurface = .{},
 
     pub fn init(name: []const u8) PBRMaterial {
         return .{
@@ -767,6 +878,131 @@ test "CoatParams snapshot is present when enabled, neutral when disabled" {
     try std.testing.expect(coatParamsFor(.{ .pbr = &half }) != null);
 }
 
+test "PBR layers v1 defaults are disabled and neutral" {
+    const mat = PBRMaterial.init("m");
+    // Scalars: every new layer defaults to off.
+    try std.testing.expectEqual(@as(f32, 0.0), mat.anisotropy.intensity);
+    try std.testing.expectEqual(@as(f32, 0.0), mat.anisotropy.rotation);
+    try std.testing.expectEqual(@as(f32, 0.0), mat.transmission.factor);
+    try std.testing.expectEqual(Color3.white, mat.transmission.color);
+    try std.testing.expectEqual(@as(f32, 0.0), mat.subsurface.strength);
+    try std.testing.expectEqual(Color3.white, mat.subsurface.color);
+    // Textures: null slots keep the scalar path (white-fallback staging).
+    try std.testing.expect(mat.clearcoat.mask_texture == null);
+    try std.testing.expect(mat.sheen.color_texture == null);
+    // The extended neutral snapshot stays all-zero on factors.
+    const n = CoatParams.neutral;
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.anisotropy_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.transmission_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.transmission_color);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.sss_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.sss_color);
+}
+
+test "coatParamsFor gates on any layer, textures alone stay null" {
+    // Default material: null (legacy path, no side-table slot).
+    var off = PBRMaterial.init("off");
+    try std.testing.expect(coatParamsFor(.{ .pbr = &off }) == null);
+
+    // A bound mask/tint texture with zero intensity does NOT opt in: the
+    // mask multiplies a zero intensity, so null stays bit-identical.
+    const tex = Texture{ .image = .{}, .view = .{ .id = 9 }, .sampler = .{ .id = 10 }, .width = 4, .height = 4 };
+    off.clearcoat.mask_texture = tex;
+    off.sheen.color_texture = tex;
+    try std.testing.expect(coatParamsFor(.{ .pbr = &off }) == null);
+    off.clearcoat.mask_texture = null;
+    off.sheen.color_texture = null;
+
+    // Each new layer alone opts in (negative values stay off).
+    var aniso = PBRMaterial.init("aniso");
+    aniso.anisotropy = .{ .intensity = 0.6, .rotation = 0.5 };
+    try std.testing.expect(coatParamsFor(.{ .pbr = &aniso }) != null);
+    var transm = PBRMaterial.init("transm");
+    transm.transmission = .{ .factor = 0.4, .color = Color3.new(0.8, 0.9, 1.0) };
+    try std.testing.expect(coatParamsFor(.{ .pbr = &transm }) != null);
+    var sss = PBRMaterial.init("sss");
+    sss.subsurface = .{ .strength = 0.7, .color = Color3.new(1.0, 0.4, 0.3) };
+    try std.testing.expect(coatParamsFor(.{ .pbr = &sss }) != null);
+    var neg = PBRMaterial.init("neg");
+    neg.anisotropy.intensity = -1.0;
+    neg.transmission.factor = -0.5;
+    neg.subsurface.strength = -2.0;
+    try std.testing.expect(coatParamsFor(.{ .pbr = &neg }) == null);
+}
+
+test "coatParamsFor packs anisotropy/transmission/sss verbatim" {
+    var mat = PBRMaterial.init("m");
+    mat.anisotropy = .{ .intensity = 0.6, .rotation = 1.25 };
+    mat.transmission = .{ .factor = 0.4, .color = Color3.new(0.8, 0.9, 1.0) };
+    mat.subsurface = .{ .strength = 0.7, .color = Color3.new(1.0, 0.4, 0.3) };
+    const cp = coatParamsFor(.{ .pbr = &mat }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 1.25, 0, 0 }, &cp.anisotropy_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.4, 0, 0, 0 }, &cp.transmission_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.8, 0.9, 1.0, 1 }, &cp.transmission_color);
+    try std.testing.expectEqualSlices(f32, &.{ 0.7, 0, 0, 0 }, &cp.sss_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.4, 0.3, 1 }, &cp.sss_color);
+    // Legacy lanes keep packing alongside the new ones.
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0.03, 0, 0 }, &cp.clearcoat_factors);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0.5, 0, 0 }, &cp.sheen_factors);
+}
+
+test "anisotropyAxes mirrors the shader formula" {
+    // intensity <= 0: isotropic pair (shader early-returns to legacy GGX).
+    try std.testing.expectEqual([2]f32{ 0.25, 0.25 }, anisotropyAxes(0.5, 0.0));
+    try std.testing.expectEqual([2]f32{ 0.25, 0.25 }, anisotropyAxes(0.5, -1.0));
+    // intensity 1, roughness 1: aspect = sqrt(0.1).
+    const full = anisotropyAxes(1.0, 1.0);
+    const aspect: f32 = @sqrt(0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0) / aspect, full[0], 1e-6);
+    try std.testing.expectApproxEqAbs(aspect, full[1], 1e-6);
+    // Stretch grows monotonically; ax >= ay always; clamp floors hold.
+    const mid = anisotropyAxes(0.5, 0.5);
+    try std.testing.expect(mid[0] >= mid[1]);
+    try std.testing.expect(mid[0] * mid[1] > 0.0);
+    const tiny = anisotropyAxes(0.001, 1.0);
+    try std.testing.expect(tiny[0] >= 0.001 and tiny[1] >= 0.001);
+    // Over-range intensity clamps to the full-stretch pair.
+    const over = anisotropyAxes(0.5, 5.0);
+    const exact = anisotropyAxes(0.5, 1.0);
+    try std.testing.expectEqual(exact, over);
+}
+
+test "wrapNdotL keeps the legacy value when off" {
+    try std.testing.expectEqual(@as(f32, 0.3), wrapNdotL(0.3, 0.0));
+    try std.testing.expectEqual(@as(f32, -0.2), wrapNdotL(-0.2, -1.0));
+    // strength 1: (ndotl + 0.5) / 1.5.
+    try std.testing.expectApproxEqAbs(@as(f32, (0.25 + 0.5) / 1.5), wrapNdotL(0.25, 1.0), 1e-6);
+    // Grazing-back fragments wrap toward light instead of staying black.
+    try std.testing.expect(wrapNdotL(-0.25, 1.0) > 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25 / 1.5), wrapNdotL(-0.25, 1.0), 1e-6);
+    // Fully lit stays fully lit.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), wrapNdotL(1.0, 0.8), 1e-6);
+}
+
+test "MaterialDrawRecord stages coat texture views with white fallback" {
+    var pbr_mat = PBRMaterial.init("test_pbr");
+    const def_std = StandardMaterial.init("def");
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    // Null slots stage the white fallback (identity sampling).
+    const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(u32, 42), rec.clearcoat_view.id);
+    try std.testing.expectEqual(@as(u32, 42), rec.sheen_view.id);
+
+    // Bound slots stage verbatim; later live mutation leaves the record
+    // frozen (staging discipline: the draw never sees the live write).
+    pbr_mat.clearcoat.mask_texture = .{ .image = .{}, .view = .{ .id = 51 }, .sampler = .{ .id = 52 }, .width = 4, .height = 4 };
+    pbr_mat.sheen.color_texture = .{ .image = .{}, .view = .{ .id = 61 }, .sampler = .{ .id = 62 }, .width = 4, .height = 4 };
+    const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
+    try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
+    pbr_mat.clearcoat.mask_texture.?.view.id = 99;
+    pbr_mat.sheen.color_texture.?.view.id = 99;
+    try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
+    try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
+}
+
 test "PBRMaterial slot defaults reproduce the glTF conventions" {
     const mat = PBRMaterial.init("m");
     // Channels: glTF fixed conventions (AO=R, roughness=G, metallic=B).
@@ -796,6 +1032,11 @@ pub const MaterialDrawRecord = struct {
     mr_view: sg.View = .{},
     emissive_view: sg.View = .{},
     occlusion_view: sg.View = .{},
+    /// PBR layer masks (v1): clearcoat R-mask + sheen rgb-tint, staged like
+    /// every other map (white fallback = identity when unset). Sampled
+    /// through the shared data_smp, so no extra sampler lane is needed.
+    clearcoat_view: sg.View = .{},
+    sheen_view: sg.View = .{},
     data_sampler: sg.Sampler = .{},
     env_view: ?sg.View = null,
     env_sampler: ?sg.Sampler = null,
@@ -876,6 +1117,8 @@ pub fn buildDrawRecord(
                 const mr_tex = p.metallic_roughness_texture orelse default_white.*;
                 const emissive_tex = p.emissive_texture orelse default_white.*;
                 const occlusion_tex = p.occlusion_texture orelse default_white.*;
+                const clearcoat_tex = p.clearcoat.mask_texture orelse default_white.*;
+                const sheen_tex = p.sheen.color_texture orelse default_white.*;
 
                 rec.albedo_view = albedo_tex.view;
                 rec.albedo_sampler = albedo_tex.sampler;
@@ -883,6 +1126,8 @@ pub fn buildDrawRecord(
                 rec.mr_view = mr_tex.view;
                 rec.emissive_view = emissive_tex.view;
                 rec.occlusion_view = occlusion_tex.view;
+                rec.clearcoat_view = clearcoat_tex.view;
+                rec.sheen_view = sheen_tex.view;
 
                 const data_tex = p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex;
                 rec.data_sampler = data_tex.sampler;

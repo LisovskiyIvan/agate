@@ -55,10 +55,11 @@ pub const RenderMeshItem = struct {
     /// Индекс ShaderDrawSnapshot в RenderQueues.shader_storage (null = не hook).
     /// Draw-путь hook-материалов читает только этот снимок.
     shader_index: ?u32 = null,
-    /// Индекс CoatParams в RenderQueues.coat_storage (null = lobe выключен).
-    /// Только PBR-draws с включённым clearcoat/sheen занимают слот; все
-    /// остальные рисуют из CoatParams.neutral. 8-байтовый индекс вместо
-    /// 64-байтовых факторов держит размер item в P4-лимите.
+    /// Индекс CoatParams в RenderQueues.coat_storage (null = слои выключены).
+    /// Только PBR-draws с включённым слоем (clearcoat/sheen/anisotropy/
+    /// transmission/subsurface) занимают слот; все остальные рисуют из
+    /// CoatParams.neutral. 8-байтовый индекс вместо факторов держит размер
+    /// item в P4-лимите.
     coat_index: ?u32 = null,
     /// Per-mesh morph uniforms (weights and delta dimensions)
     morph_uniforms: morph_gpu.VsUniforms = .{
@@ -114,8 +115,8 @@ pub const RenderInstancedBatch = struct {
 pub const SkinStorage = std.ArrayListUnmanaged([MAX_BONES]Mat4);
 /// Render-owned снимки hook-материалов: один на shader-draw кадра.
 pub const ShaderStorage = std.ArrayListUnmanaged(material_mod.ShaderDrawSnapshot);
-/// Render-owned снимки clearcoat/sheen-факторов: один на coat-draw кадра
-/// (только PBR с включённым lobe; остальные draws хранят coat_index = null
+/// Render-owned снимки слоёв PBR (clearcoat/sheen/anisotropy/transmission/
+/// subsurface): один на layer-draw кадра (только PBR с включённым слоем; остальные draws хранят coat_index = null
 /// и рисуют из CoatParams.neutral — пустое хранилище ничего не стоит).
 pub const CoatStorage = std.ArrayListUnmanaged(material_mod.CoatParams);
 

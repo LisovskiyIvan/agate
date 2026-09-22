@@ -139,6 +139,10 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
         bind.views[pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
         bind.views[pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+        // PBR layers v1: coat/fabric masks (white fallback staged in the
+        // record when unset); sampled through data_smp, no extra sampler.
+        bind.views[pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
+        bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
         bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
 
@@ -210,6 +214,11 @@ pub fn drawRegularItem(
             .clearcoat_color = coat.clearcoat_color,
             .sheen_factors = coat.sheen_factors,
             .sheen_color = coat.sheen_color,
+            .anisotropy_factors = coat.anisotropy_factors,
+            .transmission_factors = coat.transmission_factors,
+            .transmission_color = coat.transmission_color,
+            .sss_factors = coat.sss_factors,
+            .sss_color = coat.sss_color,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -370,6 +379,10 @@ fn drawShaderMaterialItem(
             bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
             bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
             bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
+            // Hook materials carry no coat/fabric maps: white keeps the
+            // mask slots valid (identity sampling).
+            bind.views[pbr_shd.VIEW_clearcoat_tex] = env.default_white.view;
+            bind.views[pbr_shd.VIEW_sheen_tex] = env.default_white.view;
             bind.samplers[pbr_shd.SMP_smp] = snap.tex_sampler;
             // Hook materials have no per-slot data textures; the flat normal
             // default's sampler keeps the data_smp contract satisfied.
@@ -419,6 +432,11 @@ fn drawShaderMaterialItem(
                 .clearcoat_color = material_mod.CoatParams.neutral.clearcoat_color,
                 .sheen_factors = material_mod.CoatParams.neutral.sheen_factors,
                 .sheen_color = material_mod.CoatParams.neutral.sheen_color,
+                .anisotropy_factors = material_mod.CoatParams.neutral.anisotropy_factors,
+                .transmission_factors = material_mod.CoatParams.neutral.transmission_factors,
+                .transmission_color = material_mod.CoatParams.neutral.transmission_color,
+                .sss_factors = material_mod.CoatParams.neutral.sss_factors,
+                .sss_color = material_mod.CoatParams.neutral.sss_color,
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -728,6 +746,9 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
         bind.views[inst_pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
         bind.views[inst_pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+        // PBR layers v1: see the regular PBR branch above.
+        bind.views[inst_pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
+        bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
         bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
 
@@ -802,6 +823,11 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .clearcoat_color = coat.clearcoat_color,
             .sheen_factors = coat.sheen_factors,
             .sheen_color = coat.sheen_color,
+            .anisotropy_factors = coat.anisotropy_factors,
+            .transmission_factors = coat.transmission_factors,
+            .transmission_color = coat.transmission_color,
+            .sss_factors = coat.sss_factors,
+            .sss_color = coat.sss_color,
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {
@@ -891,6 +917,11 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "clearcoat_color")) @compileError("FsParams missing clearcoat_color");
             if (!@hasField(P, "sheen_factors")) @compileError("FsParams missing sheen_factors");
             if (!@hasField(P, "sheen_color")) @compileError("FsParams missing sheen_color");
+            if (!@hasField(P, "anisotropy_factors")) @compileError("FsParams missing anisotropy_factors");
+            if (!@hasField(P, "transmission_factors")) @compileError("FsParams missing transmission_factors");
+            if (!@hasField(P, "transmission_color")) @compileError("FsParams missing transmission_color");
+            if (!@hasField(P, "sss_factors")) @compileError("FsParams missing sss_factors");
+            if (!@hasField(P, "sss_color")) @compileError("FsParams missing sss_color");
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
             if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
@@ -958,6 +989,31 @@ test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_params"), @offsetOf(inst_pbr_shd.FsParams, "clustered_params"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(skinned_pbr_shd.FsParams, "clustered_viewport"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(inst_pbr_shd.FsParams, "clustered_viewport"));
+    // The pbr-layers v1 lanes are the newest tail, appended after the
+    // clustered lanes at the same offsets in all three (same one-struct
+    // contract; pre-existing lanes never shift).
+    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "anisotropy_factors") > @offsetOf(pbr_shd.FsParams, "clustered_viewport"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "anisotropy_factors"), @offsetOf(skinned_pbr_shd.FsParams, "anisotropy_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "anisotropy_factors"), @offsetOf(inst_pbr_shd.FsParams, "anisotropy_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "transmission_factors"), @offsetOf(skinned_pbr_shd.FsParams, "transmission_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "transmission_color"), @offsetOf(inst_pbr_shd.FsParams, "transmission_color"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_factors"), @offsetOf(skinned_pbr_shd.FsParams, "sss_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_color"), @offsetOf(inst_pbr_shd.FsParams, "sss_color"));
+}
+
+test "pbr layer mask texture slots are pinned across the triple" {
+    // The draw binds coat/fabric masks through these generated slots;
+    // pinning them keeps the .glsl binding numbers and the draw in sync.
+    comptime {
+        for ([_]type{ pbr_shd, skinned_pbr_shd, inst_pbr_shd }) |M| {
+            if (!@hasDecl(M, "VIEW_clearcoat_tex")) @compileError("shader module missing VIEW_clearcoat_tex");
+            if (!@hasDecl(M, "VIEW_sheen_tex")) @compileError("shader module missing VIEW_sheen_tex");
+        }
+        if (pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
+        if (pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
+        if (skinned_pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
+        if (inst_pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
+    }
 }
 
 test "standard FsParams clustered tail matches the instanced twin" {
@@ -1023,6 +1079,10 @@ test "resolveCoat falls back to neutral when the lobe is off" {
     const neutral = resolveCoat(&.{}, null);
     try std.testing.expectEqual(@as(f32, 0.0), neutral.clearcoat_factors[0]);
     try std.testing.expectEqual(@as(f32, 0.0), neutral.sheen_factors[0]);
+    // PBR layers v1: new factors neutral too (off = legacy path).
+    try std.testing.expectEqual(@as(f32, 0.0), neutral.anisotropy_factors[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), neutral.transmission_factors[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), neutral.sss_factors[0]);
     try std.testing.expectEqual(CoatParams.neutral, neutral);
 
     // Stale index (unreachable via builders): neutral as well.
