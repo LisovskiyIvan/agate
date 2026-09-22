@@ -16,36 +16,43 @@ fn msSince(t0: u64) f32 {
 /// Mesh-vanish diagnostic probe (symptom: ALL meshes disappear from the
 /// main view while particles and the skybox keep rendering).
 ///
-/// Condition: every mesh draw queue of the consumed front slot is empty
-/// (primary + all retained view queues) while live scene meshes that could
-/// draw still exist (`is_visible`, not a LOD child). On mismatch logs ONE
-/// rate-limited line (first hit, then at most once per 600 frames) plus a
-/// recovery line when mesh items return, so a live repro captures both the
-/// cause fingerprint and what un-stuck it.
+/// Logs ONE rate-limited line (first hit, then ≤ once per 600 frames)
+/// when the PRIMARY view's opaque draw queues are empty — leftover
+/// transparent items or busy secondary views no longer mask a partial
+/// vanish (the 2026-09-22 live repro stayed silent under the old
+/// "every queue of every view empty" condition). Also logs:
+/// - ARMED once per process: liveness proof that this path executed in
+///   the very run (closes the "probe never ran" hypothesis);
+/// - RECOVERED when the queues refill (what un-stuck it).
 ///
-/// Evidence mapping per line (see the ranked candidates in the report):
-/// - live visible/mask_pass/pending_gpu: distinguishes "scene really
-///   empty" (silent, no log) from mask-cull (mask_pass == 0) and deferred
-///   gpu_pending pileup (pending_gpu == visible).
-/// - build stats total/rendered/culled/occluded + occluders/tris: the
-///   slot-staged counters the prepare latch merged. total == 0 with live
-///   meshes means the build saw nothing (mask skips and gpu_pending skips
-///   bump NO counter); culled == total points at frustum/LOD; occluded > 0
-///   at the occlusion culler; rendered > 0 with empty queues means items
-///   were dropped AFTER the count (queue/storage OOM in append paths).
-/// - cam mask/enabled/vp: culling_mask vs layer_mask mismatch and
-///   non-finite view_proj (NaN/Inf frustum-culls everything).
-/// - reuse/streak: renderReuse replaying a stale empty front.
+/// Evidence mapping per line:
+/// - live(total/visible/mask_pass/pending_gpu): total=0 → meshes removed
+///   from the scene outright; total>0 + visible=0 → mass is_visible-hide
+///   (the old probe returned SILENT on visible==0 — that gap is closed);
+///   mask_pass=0 → mask cull; pending_gpu=visible → deferred GPU upload
+///   pileup.
+/// - prim + queues sums: primary-only emptiness vs all-view totals →
+///   partial vanish vs full.
+/// - build stats total/rendered/culled/occluded + occluders/tris:
+///   rendered>0 with empty queues → items dropped AFTER the count
+///   (append OOM) or draws issued but not rasterized (screen black with
+///   healthy counters); culled==total → frustum/LOD (vp=NaN/Inf poisons
+///   the planes); occluded>0 → occlusion culler (user A/B 2026-09-22:
+///   SHIFT+O OFF did NOT restore meshes — ruled out as THE cause; a line
+///   would re-confirm).
+/// - cam mask/enabled/vp + reuse/streak: culling_mask desync,
+///   non-finite view_proj, stale reuse-replay.
 ///
-/// Cost when healthy: four integer length loads per queue (primary + 8
-/// retained views); the live-mesh census loop and all formatting run only
-/// when every queue is already empty. No allocations, no panics, no state
-/// changes beyond the probe's own cursor/flag. Camera-less frames return
-/// before this point, so offscreen/hidden harness fixtures stay silent
-/// unless they stage visible meshes against empty queues (log-only then).
+/// Cost when healthy: ~8 integer length loads (primary lens + sums over 8
+/// retained view queues) + one flag check; the census loop and all
+/// formatting run only when the empty predicate is already true. No
+/// allocations, no panics, no state changes beyond the probe's own
+/// cursor/flags. Camera-less frames return before this point.
 fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
-    var n_opaque: usize = draws.primary.items.items.len;
-    var n_opaque_inst: usize = draws.primary.opaque_instanced.items.len;
+    const p_opaque: usize = draws.primary.items.items.len;
+    const p_opaque_inst: usize = draws.primary.opaque_instanced.items.len;
+    var n_opaque: usize = p_opaque;
+    var n_opaque_inst: usize = p_opaque_inst;
     var n_trans: usize = draws.primary.transparent.items.len;
     var n_trans_inst: usize = draws.primary.transparent_instanced.items.len;
     for (0..draws.views.len) |i| {
@@ -55,8 +62,19 @@ fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
         n_trans += q.transparent.items.len;
         n_trans_inst += q.transparent_instanced.items.len;
     }
-    const all_empty = n_opaque == 0 and n_opaque_inst == 0 and n_trans == 0 and n_trans_inst == 0;
-    if (!all_empty) {
+    if (!scene.mesh_vanish_armed) {
+        scene.mesh_vanish_armed = true;
+        std.log.warn(
+            "[mesh-vanish-probe] ARMED frame={} prim(opaque={} opaque_inst={}) sums(opaque={} opaque_inst={} trans={} trans_inst={})",
+            .{ snap.frame_id, p_opaque, p_opaque_inst, n_opaque, n_opaque_inst, n_trans, n_trans_inst },
+        );
+    }
+    // Vanish predicate: the PRIMARY view's opaque queues are empty (the
+    // user-visible symptom is meshes-gone with skybox/particles/UI alive;
+    // leftover transparent items or busy secondary views must not mask a
+    // partial vanish). Healthy frames stop here (~8 loads + flag check).
+    const vanished = p_opaque == 0 and p_opaque_inst == 0;
+    if (!vanished) {
         if (scene.mesh_vanish_active) {
             scene.mesh_vanish_active = false;
             std.log.warn(
@@ -66,8 +84,10 @@ fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
         }
         return;
     }
-    // All mesh queues empty: census the live meshes that could draw. Runs
-    // only on the empty path, never on healthy frames.
+    // Empty primary opaque queues: census the live meshes. This branch
+    // ALWAYS logs now — `visible=0` with `total>0` IS the mass
+    // is_visible-hide fingerprint (the old probe returned silent there),
+    // `total=0` means meshes were removed from the scene outright.
     const pmask = snap.primary_cam.culling_mask;
     var visible: usize = 0;
     var mask_pass: usize = 0;
@@ -81,7 +101,6 @@ fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
         }
         if ((m.layer_mask & pmask) != 0) mask_pass += 1;
     }
-    if (visible == 0) return;
     scene.mesh_vanish_active = true;
     // Rate limit: first hit + at most once per 600 frames (wrapping-safe).
     if (scene.mesh_vanish_last_log_frame != 0 and snap.frame_id -% scene.mesh_vanish_last_log_frame < 600) return;
@@ -100,12 +119,15 @@ fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
     else
         snap.primary_cam.enabled;
     std.log.warn(
-        "[mesh-vanish-probe] VANISH frame={} live(visible={} mask_pass={} pending_gpu={}) queues(opaque={} opaque_inst={} trans={} trans_inst={}) build(total={} rendered={} culled={} occluded={} occluders={} occ_tris={}) cam(idx={}/{} multi={} mask=0x{x} enabled={} vp={s}) reuse={} streak={}",
+        "[mesh-vanish-probe] VANISH frame={} live(total={} visible={} mask_pass={} pending_gpu={}) prim(opaque={} opaque_inst={}) queues(opaque={} opaque_inst={} trans={} trans_inst={}) build(total={} rendered={} culled={} occluded={} occluders={} occ_tris={}) cam(idx={}/{} multi={} mask=0x{x} enabled={} vp={s}) reuse={} streak={}",
         .{
             snap.frame_id,
+            scene.meshes.items.len,
             visible,
             mask_pass,
             pending_gpu,
+            p_opaque,
+            p_opaque_inst,
             n_opaque,
             n_opaque_inst,
             n_trans,

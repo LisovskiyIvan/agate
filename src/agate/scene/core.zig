@@ -348,6 +348,7 @@ pub const Scene = struct {
     // valid; the probe never panics, never fails, never allocates.
     mesh_vanish_last_log_frame: u64 = 0,
     mesh_vanish_active: bool = false,
+    mesh_vanish_armed: bool = false,
 
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
