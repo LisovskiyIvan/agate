@@ -1,0 +1,681 @@
+// machine generated, do not edit
+
+//
+// sokol_shape.h -- create simple primitive shapes for sokol_gfx.h
+//
+// Project URL: https://github.com/floooh/sokol
+//
+// Do this:
+//     #define SOKOL_IMPL or
+//     #define SOKOL_SHAPE_IMPL
+// before you include this file in *one* C or C++ file to create the
+// implementation.
+//
+// Include the following headers before including sokol_shape.h:
+//
+//     sokol_gfx.h
+//
+// ...optionally provide the following macros to override defaults:
+//
+// SOKOL_ASSERT(c)     - your own assert macro (default: assert(c))
+// SOKOL_SHAPE_API_DECL- public function declaration prefix (default: extern)
+// SOKOL_API_DECL      - same as SOKOL_SHAPE_API_DECL
+// SOKOL_API_IMPL      - public function implementation prefix (default: -)
+//
+// If sokol_shape.h is compiled as a DLL, define the following before
+// including the declaration or implementation:
+//
+// SOKOL_DLL
+//
+// On Windows, SOKOL_DLL will define SOKOL_SHAPE_API_DECL as __declspec(dllexport)
+// or __declspec(dllimport) as needed.
+//
+// FEATURE OVERVIEW
+// ================
+// sokol_shape.h creates vertices and indices for simple shapes and
+// builds structs which can be plugged into sokol-gfx resource
+// creation functions:
+//
+// The following shape types are supported:
+//
+//     - plane
+//     - cube
+//     - sphere (with poles, not geodesic)
+//     - cylinder
+//     - torus (donut)
+//
+// Generated vertex components have the following format (all components
+// except position are optional):
+//
+// - position: SG_VERTEXFORMAT_FLOAT3
+// - normal: SG_VERTEXFORMAT_BYTE4N
+// - texcoord: SG_VERTEXFORMAT_USHORT2N
+// - color: SG_VERTEXFORMAT_UBYTE4N
+//
+// Indices are generally 16-bits wide (SG_INDEXTYPE_UINT16) and the indices
+// are written as triangle-lists (SG_PRIMITIVETYPE_TRIANGLES).
+//
+// EXAMPLES:
+// =========
+//
+// Create multiple shapes into the same vertex- and index-buffer and
+// render with separate draw calls:
+//
+// https://github.com/floooh/sokol-samples/blob/master/sapp/shapes-sapp.c
+//
+// Same as the above, but pre-transform shapes and merge them into a single
+// shape that's rendered with a single draw call.
+//
+// https://github.com/floooh/sokol-samples/blob/master/sapp/shapes-transform-sapp.c
+//
+// STEP-BY-STEP:
+// =============
+//
+// Setup an sshape_state_t struct with pointers to memory buffers where
+// generated vertices and indices will be written to:
+//
+// ```c
+// uint8_t vertices[512 * SSHAPE_MAX_VERTEX_SIZE];
+// uint16_t indices[4096];
+//
+// sshape_state_t state = {
+//     .vertices = { .buffer = SSHAPE_RANGE(vertices) },
+//     .indices = { .buffer = SSHAPE_RANGE(indices) }
+// };
+// ```
+// This generates all vertex components. Optionally you can disable
+// vertex components to be generates:
+//
+// ```c
+// sshape_state_t state = {
+//     .disable {
+//         .normals = false,
+//         .texcoords = false,
+//         .colors = false,
+//     },
+//     .vertices = { .buffer = SSHAPE_RANGE(vertices) },
+//     .indices = { .buffer = SSHAPE_RANGE(indices) }
+// };
+// ```
+//
+// Compute the per-vertex size in bytes via (note that the arguments
+// have inverted meaning from `sshape_state_t.disabled`, here you define
+// what components are enabled:
+//
+// ```c
+// size_t vertex_size = sshape_vertex_size(&(sshape_optional_components_t){
+//     .normals = true,
+//     .texcoords = true,
+//     .colors = true,
+// });
+// ```
+// This returns a value between SSHAPE_MIN_VERTEX_SIZE (12) and
+// SSHAPE_MAX_VERTEX_SIZE (24).
+//
+// To find out how big the vertex and index memory buffers must be (in case you want
+// to allocate dynamically) call the following functions. For `vertex_size`
+// pass in the result of the `sshape_vertex_size` function:
+// ```c
+// sshape_sizes_t sshape_plane_sizes(uint32_t tiles, size_t vertex_size);
+// sshape_sizes_t sshape_box_sizes(uint32_t tiles, size_t vertex_size);
+// sshape_sizes_t sshape_sphere_sizes(uint32_t slices, uint32_t stacks, size_t vertex_size);
+// sshape_sizes_t sshape_cylinder_sizes(uint32_t slices, uint32_t stacks, size_t vertex_size);
+// sshape_sizes_t sshape_torus_sizes(uint32_t sides, uint32_t rings, size_t vertex_size);
+// ```
+//
+// The returned sshape_sizes_t struct contains vertex- and index-counts
+// as well as the equivalent buffer sizes in bytes. For instance:
+//
+// ```c
+// const vtx_size = sshape_vertex_size(&(sshape_optional_components){0});
+// sshape_sizes_t sizes = sshape_sphere_sizes(36, 12, vtx_size);
+// uint32_t num_vertices = sizes.vertices.num;
+// uint32_t num_indices = sizes.indices.num;
+// uint32_t vertex_buffer_size = sizes.vertices.size;
+// uint32_t index_buffer_size = sizes.indices.size;
+// ```
+//
+// With the sshape_state_t struct that was setup earlier, call any
+// of the shape-builder functions:
+//
+// ```c
+// void sshape_build_plane(sshape_state_t* state, const sshape_plane_t* params);
+// void sshape_build_box(sshape_state_t* state, const sshape_box_t* params);
+// void sshape_build_sphere(sshape_state_t* state, const sshape_sphere_t* params);
+// void sshape_build_cylinder(sshape_state_t* state, const sshape_cylinder_t* params);
+// void sshape_build_torus(sshape_state_t* state, const sshape_torus_t* params);
+// ```
+//
+// Note that the `state` arg is a non-const pointer, this indicates
+// that the `sshape_state_t` struct will be mutated.
+//
+// The second argument is a struct which holds creation parameters.
+//
+// For instance to build a sphere with radius 2, 36 "cake slices" and 12 stacks:
+//
+// ```c
+// sshape_state_t state = ...;
+// sshape_build_sphere(&state, &(sshape_sphere_t){
+//     .radius = 2.0f,
+//     .slices = 36,
+//     .stacks = 12,
+// });
+// ```
+//
+// If the provided buffers are big enough to hold all generated vertices and
+// indices, the "valid" field in the result will be true:
+//
+// ```c
+// assert(state.valid);
+// ```
+//
+// The shape creation parameters have "useful defaults", refer to the
+// actual C struct declarations below to look up those defaults.
+//
+// You can also provide additional creation parameters, like a common vertex
+// color, a debug-helper to randomize colors, tell the shape builder function
+// to merge the new shape with the previous shape into the same draw-element-range,
+// or a 4x4 transform matrix to move, rotate and scale the generated vertices:
+//
+// ```c
+// sshape_state_t state = ...;
+// sshape_build_sphere(&state, &(sshape_sphere_t){
+//     .radius = 2.0f,
+//     .slices = 36,
+//     .stacks = 12,
+//     // merge with previous shape into a single element-range
+//     .merge = true,
+//     // set vertex color to red+opaque
+//     .color = sshape_color_4f(1.0f, 0.0f, 0.0f, 1.0f),
+//     // set position to y = 2.0
+//     .transform = {
+//         .m = {
+//             { 1.0f, 0.0f, 0.0f, 0.0f },
+//             { 0.0f, 1.0f, 0.0f, 0.0f },
+//             { 0.0f, 0.0f, 1.0f, 0.0f },
+//             { 0.0f, 2.0f, 0.0f, 1.0f },
+//         }
+//     }
+// });
+// assert(state.valid);
+// ```
+//
+// The following helper functions can be used to build a packed
+// color value or to convert from external matrix types:
+//
+// ```c
+// uint32_t sshape_color_4f(float r, float g, float b, float a);
+// uint32_t sshape_color_3f(float r, float g, float b);
+// uint32_t sshape_color_4b(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+// uint32_t sshape_color_3b(uint8_t r, uint8_t g, uint8_t b);
+// sshape_mat4_t sshape_mat4(const float m[16]);
+// sshape_mat4_t sshape_mat4_transpose(const float m[16]);
+// ```
+//
+// After the shape builder function has been called, the following functions
+// are used to extract the build result for plugging into sokol_gfx.h:
+//
+// ```c
+// sshape_element_range_t sshape_element_range(const sshape_state_t* state);
+// sg_buffer_desc sshape_vertex_buffer_desc(const sshape_state_t* state);
+// sg_buffer_desc sshape_index_buffer_desc(const sshape_state_t* state);
+// sg_vertex_buffer_layout_state sshape_vertex_buffer_layout_state(const sshape_state_t* state);
+// sg_vertex_attr_state sshape_position_vertex_attr_state(const sshape_state_t* state);
+// sg_vertex_attr_state sshape_normal_vertex_attr_state(consts sshape_state_t* state);
+// sg_vertex_attr_state sshape_texcoord_vertex_attr_state(const sshape_state_t* state);
+// sg_vertex_attr_state sshape_color_vertex_attr_state(const sshape_state_t* state);
+// ```
+//
+// The sshape_element_range_t struct contains the base-index and number of
+// indices which can be plugged into the sg_draw() call:
+//
+// ```c
+// sshape_element_range_t elms = sshape_element_range(&state);
+// ...
+// sg_draw(elms.base_element, elms.num_elements, 1);
+// ```
+//
+// To create sokol-gfx vertex- and index-buffers from the generated
+// shape data:
+//
+// ```c
+// // create sokol-gfx vertex buffer
+// sg_buffer_desc vbuf_desc = sshape_vertex_buffer_desc(&state);
+// sg_buffer vbuf = sg_make_buffer(&vbuf_desc);
+//
+// // create sokol-gfx index buffer
+// sg_buffer_desc ibuf_desc = sshape_index_buffer_desc(&state);
+// sg_buffer ibuf = sg_make_buffer(&ibuf_desc);
+// ```
+//
+// The remaining functions are used to populate the vertex-layout item
+// in sg_pipeline_desc:
+//
+// ```c
+// sg_pipeline pip = sg_make_pipeline(&(sg_pipeline_desc){
+//     .layout = {
+//         .buffers[0] = sshape_vertex_buffer_layout_state(&state),
+//         .attrs = {
+//             [0] = sshape_position_vertex_attr_state(&state),
+//             [1] = sshape_normal_vertex_attr_state(&state),
+//             [2] = sshape_texcoord_vertex_attr_state(&state),
+//             [3] = sshape_color_vertex_attr_state(&state)
+//         }
+//     },
+//     ...
+// });
+// ```
+// Note that you don't have to use all generated vertex attributes in the
+// pipeline's vertex layout, the sg_vertex_buffer_layout_state struct returned
+// by sshape_vertex_buffer_layout_state() contains the correct vertex stride
+// to skip vertex components.
+//
+// WRITING MULTIPLE SHAPES INTO THE SAME BUFFER
+// ============================================
+// You can merge multiple shapes into the same vertex- and
+// index-buffers and either render them as a single shape, or
+// in separate draw calls.
+//
+// To build a single shape made of two cubes which can be rendered
+// in a single draw-call:
+//
+// ```
+// uint8_t vertices[128 * SSHAPE_MAX_VERTEX_SIZE];
+// uint16_t indices[16];
+//
+// sshape_state_t state = {
+//     .vertices.buffer = SSHAPE_RANGE(vertices),
+//     .indices.buffer  = SSHAPE_RANGE(indices)
+// };
+//
+// // first cube at pos x=-2.0 (with default size of 1x1x1)
+// sshape_build_cube(&state, &(sshape_box_t){
+//     .transform = {
+//         .m = {
+//             { 1.0f, 0.0f, 0.0f, 0.0f },
+//             { 0.0f, 1.0f, 0.0f, 0.0f },
+//             { 0.0f, 0.0f, 1.0f, 0.0f },
+//             {-2.0f, 0.0f, 0.0f, 1.0f },
+//         }
+//     }
+// });
+// // ...and append another cube at pos pos=+1.0
+// // NOTE the .merge = true, this tells the shape builder
+// // function to not advance the current shape start offset
+// sshape_build_cube(&state, &(sshape_box_t){
+//     .merge = true,
+//     .transform = {
+//         .m = {
+//             { 1.0f, 0.0f, 0.0f, 0.0f },
+//             { 0.0f, 1.0f, 0.0f, 0.0f },
+//             { 0.0f, 0.0f, 1.0f, 0.0f },
+//             {-2.0f, 0.0f, 0.0f, 1.0f },
+//         }
+//     }
+// });
+// assert(state.valid);
+//
+// // skipping buffer- and pipeline-creation...
+//
+// sshape_element_range_t elms = sshape_element_range(&state);
+// sg_draw(elms.base_element, elms.num_elements, 1);
+// ```
+//
+// To render the two cubes in separate draw-calls, the element-ranges used
+// in the sg_draw() calls must be captured right after calling the
+// builder-functions:
+//
+// ```c
+// uint8_t vertices[128 * SSHAPE_MAX_VERTEX_SIZE];
+// uint16_t indices[16];
+// sshape_state_t state = {
+//     .vertices.buffer = SSHAPE_RANGE(vertices),
+//     .indices.buffer = SSHAPE_RANGE(indices)
+// };
+//
+// // build a red cube...
+// sshape_build_cube(&state, &(sshape_box_t){
+//     .color = sshape_color_3b(255, 0, 0)
+// });
+// sshape_element_range_t red_cube = sshape_element_range(&state);
+//
+// // append a green cube to the same vertex-/index-buffer:
+// sshape_build_cube(&state, &sshape_box_t){
+//     .color = sshape_color_3b(0, 255, 0);
+// });
+// sshape_element_range_t green_cube = sshape_element_range(&state);
+//
+// // skipping buffer- and pipeline-creation...
+//
+// sg_draw(red_cube.base_element, red_cube.num_elements, 1);
+// sg_draw(green_cube.base_element, green_cube.num_elements, 1);
+// ```
+//
+// ...that's about all :)
+//
+// LICENSE
+// =======
+// zlib/libpng license
+//
+// Copyright (c) 2020 Andre Weissflog
+//
+// This software is provided 'as-is', without any express or implied warranty.
+// In no event will the authors be held liable for any damages arising from the
+// use of this software.
+//
+// Permission is granted to anyone to use this software for any purpose,
+// including commercial applications, and to alter it and redistribute it
+// freely, subject to the following restrictions:
+//
+//     1. The origin of this software must not be misrepresented; you must not
+//     claim that you wrote the original software. If you use this software in a
+//     product, an acknowledgment in the product documentation would be
+//     appreciated but is not required.
+//
+//     2. Altered source versions must be plainly marked as such, and must not
+//     be misrepresented as being the original software.
+//
+//     3. This notice may not be removed or altered from any source
+//     distribution.
+
+const builtin = @import("builtin");
+const sg = @import("gfx.zig");
+
+// helper function to convert a C string to a Zig string slice
+fn cStrToZig(c_str: [*c]const u8) [:0]const u8 {
+    return @import("std").mem.span(c_str);
+}
+// helper function to convert "anything" to a Range struct
+pub fn asRange(val: anytype) Range {
+    const type_info = @typeInfo(@TypeOf(val));
+    switch (type_info) {
+        .pointer => |pointer| {
+            switch (pointer.size) {
+                .one => switch (@typeInfo(pointer.child)) {
+                    .array => |array| return .{ .ptr = val, .size = array.len * @sizeOf(array.child) },
+                    else => return .{ .ptr = val, .size = @sizeOf(pointer.child) },
+                },
+                .slice => return .{ .ptr = val.ptr, .size = val.len * @sizeOf(pointer.child) },
+                else => @compileError("FIXME: Pointer type!"),
+            }
+        },
+        .@"struct", .array => {
+            @compileError("Structs and arrays must be passed as pointers to asRange");
+        },
+        else => {
+            @compileError("Cannot convert to Range!");
+        },
+    }
+}
+
+/// sshape_range_t is a pointer-size-pair struct used to pass memory
+/// blobs into sokol-shape. When initialized from a value type
+/// (array or struct), use the SSHAPE_RANGE() macro to build
+/// an sshape_range struct.
+pub const Range = extern struct {
+    ptr: ?*const anyopaque = null,
+    size: usize = 0,
+};
+
+pub const min_vertex_size = 12;
+pub const max_vertex_size = 24;
+
+/// a 4x4 matrix wrapper struct
+pub const Mat4 = extern struct {
+    m: [4][4]f32 = @splat(@splat(0.0)),
+};
+
+/// a struct for configuring optional vertex components
+pub const OptionalComponents = extern struct {
+    normals: bool = false,
+    texcoords: bool = false,
+    colors: bool = false,
+};
+
+/// a range of draw-elements (sg_draw(int base_element, int num_element, ...))
+pub const ElementRange = extern struct {
+    base_element: u32 = 0,
+    num_elements: u32 = 0,
+};
+
+/// number of elements and byte size of build actions
+pub const SizesItem = extern struct {
+    num: u32 = 0,
+    size: u32 = 0,
+};
+
+pub const Sizes = extern struct {
+    vertices: SizesItem = .{},
+    indices: SizesItem = .{},
+};
+
+/// in/out struct to keep track of mesh-build state
+pub const BufferState = extern struct {
+    buffer: Range = .{},
+    data_size: usize = 0,
+    shape_offset: usize = 0,
+};
+
+pub const State = extern struct {
+    valid: bool = false,
+    disable: OptionalComponents = .{},
+    vertices: BufferState = .{},
+    indices: BufferState = .{},
+};
+
+/// creation parameters for the different shape types
+pub const Plane = extern struct {
+    width: f32 = 0.0,
+    depth: f32 = 0.0,
+    tiles: u16 = 0,
+    color: u32 = 0,
+    random_colors: bool = false,
+    merge: bool = false,
+    transform: Mat4 = .{},
+};
+
+pub const Box = extern struct {
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+    depth: f32 = 0.0,
+    tiles: u16 = 0,
+    color: u32 = 0,
+    random_colors: bool = false,
+    merge: bool = false,
+    transform: Mat4 = .{},
+};
+
+pub const Sphere = extern struct {
+    radius: f32 = 0.0,
+    slices: u16 = 0,
+    stacks: u16 = 0,
+    color: u32 = 0,
+    random_colors: bool = false,
+    merge: bool = false,
+    transform: Mat4 = .{},
+};
+
+pub const Cylinder = extern struct {
+    radius: f32 = 0.0,
+    height: f32 = 0.0,
+    slices: u16 = 0,
+    stacks: u16 = 0,
+    color: u32 = 0,
+    random_colors: bool = false,
+    merge: bool = false,
+    transform: Mat4 = .{},
+};
+
+pub const Torus = extern struct {
+    radius: f32 = 0.0,
+    ring_radius: f32 = 0.0,
+    sides: u16 = 0,
+    rings: u16 = 0,
+    color: u32 = 0,
+    random_colors: bool = false,
+    merge: bool = false,
+    transform: Mat4 = .{},
+};
+
+/// shape builder functions
+extern fn sshape_build_plane([*c] State, [*c]const Plane) void;
+
+/// shape builder functions
+pub fn buildPlane(state: *State, params: Plane) void {
+    sshape_build_plane(state, &params);
+}
+
+extern fn sshape_build_box([*c] State, [*c]const Box) void;
+
+pub fn buildBox(state: *State, params: Box) void {
+    sshape_build_box(state, &params);
+}
+
+extern fn sshape_build_sphere([*c] State, [*c]const Sphere) void;
+
+pub fn buildSphere(state: *State, params: Sphere) void {
+    sshape_build_sphere(state, &params);
+}
+
+extern fn sshape_build_cylinder([*c] State, [*c]const Cylinder) void;
+
+pub fn buildCylinder(state: *State, params: Cylinder) void {
+    sshape_build_cylinder(state, &params);
+}
+
+extern fn sshape_build_torus([*c] State, [*c]const Torus) void;
+
+pub fn buildTorus(state: *State, params: Torus) void {
+    sshape_build_torus(state, &params);
+}
+
+/// compute size of vertex given optional components
+extern fn sshape_vertex_size([*c]const OptionalComponents) usize;
+
+/// compute size of vertex given optional components
+pub fn vertexSize(components: OptionalComponents) usize {
+    return sshape_vertex_size(&components);
+}
+
+/// query required vertex- and index-buffer sizes in bytes
+extern fn sshape_plane_sizes(u32, usize) Sizes;
+
+/// query required vertex- and index-buffer sizes in bytes
+pub fn planeSizes(tiles: u32, vertex_size: usize) Sizes {
+    return sshape_plane_sizes(tiles, vertex_size);
+}
+
+extern fn sshape_box_sizes(u32, usize) Sizes;
+
+pub fn boxSizes(tiles: u32, vertex_size: usize) Sizes {
+    return sshape_box_sizes(tiles, vertex_size);
+}
+
+extern fn sshape_sphere_sizes(u32, u32, usize) Sizes;
+
+pub fn sphereSizes(slices: u32, stacks: u32, vertex_size: usize) Sizes {
+    return sshape_sphere_sizes(slices, stacks, vertex_size);
+}
+
+extern fn sshape_cylinder_sizes(u32, u32, usize) Sizes;
+
+pub fn cylinderSizes(slices: u32, stacks: u32, vertex_size: usize) Sizes {
+    return sshape_cylinder_sizes(slices, stacks, vertex_size);
+}
+
+extern fn sshape_torus_sizes(u32, u32, usize) Sizes;
+
+pub fn torusSizes(sides: u32, rings: u32, vertex_size: usize) Sizes {
+    return sshape_torus_sizes(sides, rings, vertex_size);
+}
+
+/// extract sokol-gfx desc structs and primitive ranges from build state
+extern fn sshape_element_range([*c]const State) ElementRange;
+
+/// extract sokol-gfx desc structs and primitive ranges from build state
+pub fn elementRange(state: State) ElementRange {
+    return sshape_element_range(&state);
+}
+
+extern fn sshape_vertex_buffer_desc([*c]const State) sg.BufferDesc;
+
+pub fn vertexBufferDesc(state: State) sg.BufferDesc {
+    return sshape_vertex_buffer_desc(&state);
+}
+
+extern fn sshape_index_buffer_desc([*c]const State) sg.BufferDesc;
+
+pub fn indexBufferDesc(state: State) sg.BufferDesc {
+    return sshape_index_buffer_desc(&state);
+}
+
+extern fn sshape_vertex_buffer_layout_state([*c]const State) sg.VertexBufferLayoutState;
+
+pub fn vertexBufferLayoutState(state: State) sg.VertexBufferLayoutState {
+    return sshape_vertex_buffer_layout_state(&state);
+}
+
+extern fn sshape_position_vertex_attr_state([*c]const State) sg.VertexAttrState;
+
+pub fn positionVertexAttrState(state: State) sg.VertexAttrState {
+    return sshape_position_vertex_attr_state(&state);
+}
+
+extern fn sshape_normal_vertex_attr_state([*c]const State) sg.VertexAttrState;
+
+pub fn normalVertexAttrState(state: State) sg.VertexAttrState {
+    return sshape_normal_vertex_attr_state(&state);
+}
+
+extern fn sshape_texcoord_vertex_attr_state([*c]const State) sg.VertexAttrState;
+
+pub fn texcoordVertexAttrState(state: State) sg.VertexAttrState {
+    return sshape_texcoord_vertex_attr_state(&state);
+}
+
+extern fn sshape_color_vertex_attr_state([*c]const State) sg.VertexAttrState;
+
+pub fn colorVertexAttrState(state: State) sg.VertexAttrState {
+    return sshape_color_vertex_attr_state(&state);
+}
+
+/// helper functions to build packed color value from floats or bytes
+extern fn sshape_color_4f(f32, f32, f32, f32) u32;
+
+/// helper functions to build packed color value from floats or bytes
+pub fn color4f(r: f32, g: f32, b: f32, a: f32) u32 {
+    return sshape_color_4f(r, g, b, a);
+}
+
+extern fn sshape_color_3f(f32, f32, f32) u32;
+
+pub fn color3f(r: f32, g: f32, b: f32) u32 {
+    return sshape_color_3f(r, g, b);
+}
+
+extern fn sshape_color_4b(u8, u8, u8, u8) u32;
+
+pub fn color4b(r: u8, g: u8, b: u8, a: u8) u32 {
+    return sshape_color_4b(r, g, b, a);
+}
+
+extern fn sshape_color_3b(u8, u8, u8) u32;
+
+pub fn color3b(r: u8, g: u8, b: u8) u32 {
+    return sshape_color_3b(r, g, b);
+}
+
+/// adapter function for filling matrix struct from generic float[16] array
+extern fn sshape_mat4([*c]const f32) Mat4;
+
+/// adapter function for filling matrix struct from generic float[16] array
+pub fn mat4(m: *const f32) Mat4 {
+    return sshape_mat4(m);
+}
+
+extern fn sshape_mat4_transpose([*c]const f32) Mat4;
+
+pub fn mat4Transpose(m: *const f32) Mat4 {
+    return sshape_mat4_transpose(m);
+}
+
