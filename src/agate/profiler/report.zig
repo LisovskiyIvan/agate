@@ -15,6 +15,16 @@ const dominantPhase = types.dominantPhase;
 // Callers pass already-computed summary/findings/memory values;
 // Profiler wrapper methods in profiler.zig capture those first.
 
+/// True when at least one frame carries a measured GPU time (> 0).
+/// All GPU-specific report output (HTML/MD/trace) is gated on this so the
+/// disabled path (all zeros) stays byte-identical to the pre-GPU output.
+pub fn hasGpuData(frames: []const FrameRecord) bool {
+    for (frames) |f| {
+        if (f.gpu_frame_ms > 0) return true;
+    }
+    return false;
+}
+
 /// Helper to format byte values (e.g. "12.4 MB").
 pub fn formatBytes(allocator: std.mem.Allocator, bytes: usize) ![]u8 {
     if (bytes < 1024) {
@@ -241,6 +251,7 @@ pub fn generateReportHtml(
     defer allocator.free(vram_total_str);
     const cpu_mesh_str = if (memory_ptr) |m| try formatBytes(allocator, m.total_cpu_mesh_bytes) else try allocator.dupe(u8, "N/A");
     defer allocator.free(cpu_mesh_str);
+    const has_gpu = hasGpuData(frames);
 
     const kpi_html = try std.fmt.allocPrint(allocator,
         \\<div class="kpi-grid">
@@ -295,6 +306,22 @@ pub fn generateReportHtml(
     });
     defer allocator.free(kpi_html);
     try buf.appendSlice(allocator, kpi_html);
+
+    // GPU frame time card (measured on GPU, Metal-only; gated so the
+    // disabled path renders exactly the pre-GPU report).
+    if (has_gpu) {
+        const gpu_html = try std.fmt.allocPrint(allocator,
+            \\<div class="kpi-grid">
+            \\  <div class="kpi-card">
+            \\    <div class="kpi-label">GPU Frame (measured)</div>
+            \\    <div class="kpi-val" style="color: #f472b6;">{d:.2} <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">ms</span></div>
+            \\    <div class="kpi-sub">Max: {d:.2} ms | Metal GPU time, lags 1 frame behind CPU submit</div>
+            \\  </div>
+            \\</div>
+        , .{ summary.avg_gpu_frame_ms, summary.max_gpu_frame_ms });
+        defer allocator.free(gpu_html);
+        try buf.appendSlice(allocator, gpu_html);
+    }
 
     // Section: "Что не так / Автоматическая диагностика"
     try buf.appendSlice(allocator,
@@ -387,8 +414,13 @@ pub fn generateReportHtml(
 
             var cur_y = chart_y_bottom;
 
-            // Group with native tooltip (stacked bars show CPU-submit phases, not GPU time)
-            const tooltip_open = try std.fmt.allocPrint(allocator,
+            // Group with native tooltip (stacked bars show CPU-submit phases, not GPU time).
+            // The GPU line below is the measured Metal frame time (previous
+            // completed frame); emitted only when GPU data exists so the
+            // disabled path stays byte-identical.
+            const tooltip_open = if (has_gpu) try std.fmt.allocPrint(allocator,
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.draw_calls, f.triangles }) else try std.fmt.allocPrint(allocator,
                 \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
             defer allocator.free(tooltip_open);
@@ -450,30 +482,59 @@ pub fn generateReportHtml(
         \\</div>
     );
 
-    // Section: Top Spike Frames Table (ranked by CPU-submit time, not GPU/wall time)
-    try buf.appendSlice(allocator,
-        \\<div class="section-title">
-        \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
-        \\</div>
-        \\<div class="card-table">
-        \\<table>
-        \\  <thead>
-        \\    <tr>
-        \\      <th>Ранг</th>
-        \\      <th>Кадр #</th>
-        \\      <th class="num">Время CPU-submit</th>
-        \\      <th class="num">FPS (wall)</th>
-        \\      <th>Главная причина (CPU-фаза)</th>
-        \\      <th class="num">Draw Calls</th>
-        \\      <th class="num">Треугольники</th>
-        \\      <th class="num">Pipeline Switches</th>
-        \\      <th class="num">Текстуры (КБ)</th>
-        \\      <th class="num">Динамика (КБ)</th>
-        \\    </tr>
-        \\  </thead>
-        \\  <tbody>
-    );
+    // Section: Top Spike Frames Table (ranked by CPU-submit time, not GPU/wall time).
+    // The GPU column is measured Metal time, appended only when GPU data
+    // exists (disabled path keeps the exact pre-GPU table).
+    if (has_gpu) {
+        try buf.appendSlice(allocator,
+            \\<div class="section-title">
+            \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\</div>
+            \\<div class="card-table">
+            \\<table>
+            \\  <thead>
+            \\    <tr>
+            \\      <th>Ранг</th>
+            \\      <th>Кадр #</th>
+            \\      <th class="num">Время CPU-submit</th>
+            \\      <th class="num">GPU (measured)</th>
+            \\      <th class="num">FPS (wall)</th>
+            \\      <th>Главная причина (CPU-фаза)</th>
+            \\      <th class="num">Draw Calls</th>
+            \\      <th class="num">Треугольники</th>
+            \\      <th class="num">Pipeline Switches</th>
+            \\      <th class="num">Текстуры (КБ)</th>
+            \\      <th class="num">Динамика (КБ)</th>
+            \\    </tr>
+            \\  </thead>
+            \\  <tbody>
+        );
+    } else {
+        try buf.appendSlice(allocator,
+            \\<div class="section-title">
+            \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\</div>
+            \\<div class="card-table">
+            \\<table>
+            \\  <thead>
+            \\    <tr>
+            \\      <th>Ранг</th>
+            \\      <th>Кадр #</th>
+            \\      <th class="num">Время CPU-submit</th>
+            \\      <th class="num">FPS (wall)</th>
+            \\      <th>Главная причина (CPU-фаза)</th>
+            \\      <th class="num">Draw Calls</th>
+            \\      <th class="num">Треугольники</th>
+            \\      <th class="num">Pipeline Switches</th>
+            \\      <th class="num">Текстуры (КБ)</th>
+            \\      <th class="num">Динамика (КБ)</th>
+            \\    </tr>
+            \\  </thead>
+            \\  <tbody>
+        );
+    }
 
     // Sort frames by total_frame_ms (CPU-submit sum) descending
     if (frames.len > 0) {
@@ -491,7 +552,36 @@ pub fn generateReportHtml(
             const culprit = dominantPhase(sf);
             const upload_kb: f32 = @as(f32, @floatFromInt(sf.uploaded_bytes)) / 1024.0;
             const update_kb: f32 = @as(f32, @floatFromInt(sf.updated_bytes)) / 1024.0;
-            const row = try std.fmt.allocPrint(allocator,
+            const row = if (has_gpu) try std.fmt.allocPrint(allocator,
+                \\    <tr>
+                \\      <td><strong>#{d}</strong></td>
+                \\      <td>Кадр {d}</td>
+                \\      <td class="num"><span style="color: {s}; font-weight: 700;">{d:.2} мс</span></td>
+                \\      <td class="num">{d:.2} мс</td>
+                \\      <td class="num">{d:.1}</td>
+                \\      <td><span style="color: #fff; font-weight: 600;">{s}</span> <span style="color: var(--text-muted);">({d:.1} мс, {d:.0}%)</span></td>
+                \\      <td class="num">{d}</td>
+                \\      <td class="num">{d}</td>
+                \\      <td class="num">{d}</td>
+                \\      <td class="num">{d:.1}</td>
+                \\      <td class="num">{d:.1}</td>
+                \\    </tr>
+            , .{
+                rank,
+                sf.frame_index,
+                if (sf.total_frame_ms > 33.33) "#ef4444" else if (sf.total_frame_ms > 16.67) "#eab308" else "#22c55e",
+                sf.total_frame_ms,
+                sf.gpu_frame_ms,
+                sf.fps,
+                culprit.name,
+                culprit.ms,
+                culprit.percent,
+                sf.draw_calls,
+                sf.triangles,
+                sf.pipeline_switches,
+                upload_kb,
+                update_kb,
+            }) else try std.fmt.allocPrint(allocator,
                 \\    <tr>
                 \\      <td><strong>#{d}</strong></td>
                 \\      <td>Кадр {d}</td>
@@ -724,6 +814,7 @@ pub fn generateReportMd(
     defer allocator.free(vram_total_str);
     const cpu_mesh_str = if (memory_ptr) |m| try formatBytes(allocator, m.total_cpu_mesh_bytes) else try allocator.dupe(u8, "N/A");
     defer allocator.free(cpu_mesh_str);
+    const has_gpu = hasGpuData(frames);
 
     const overview_table = try std.fmt.allocPrint(allocator,
         \\| Метрика | Значение | Метрика | Значение |
@@ -773,6 +864,20 @@ pub fn generateReportMd(
     defer allocator.free(overview_table);
     try buf.appendSlice(allocator, overview_table);
 
+    // Measured GPU frame time (gated: disabled path keeps the exact
+    // pre-GPU overview above).
+    if (has_gpu) {
+        const gpu_overview = try std.fmt.allocPrint(allocator,
+            \\| **Средний GPU frame (measured, Metal)** | {d:.2} мс | **Макс. GPU frame** | {d:.2} мс |
+            \\
+            \\GPU-время измерено на GPU (последний завершённый кадр, отстаёт на
+            \\1 кадр от CPU-submit); фазы выше — по-прежнему CPU-submit, не GPU.
+            \\
+        , .{ summary.avg_gpu_frame_ms, summary.max_gpu_frame_ms });
+        defer allocator.free(gpu_overview);
+        try buf.appendSlice(allocator, gpu_overview);
+    }
+
     // Section: "Что не так"
     try buf.appendSlice(allocator,
         \\## 2. Что не так / Автоматическая диагностика узких мест
@@ -796,14 +901,25 @@ pub fn generateReportMd(
         try buf.appendSlice(allocator, f_md);
     }
 
-    // Section: Spike Frames (ranked by CPU-submit time, not GPU/wall time)
-    try buf.appendSlice(allocator,
-        \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
-        \\
-        \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
-        \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-        \\
-    );
+    // Section: Spike Frames (ranked by CPU-submit time, not GPU/wall time).
+    // GPU column is measured Metal time, present only with GPU data.
+    if (has_gpu) {
+        try buf.appendSlice(allocator,
+            \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\
+            \\| Ранг | Кадр # | Время CPU-submit (мс) | GPU measured (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
+            \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+            \\
+        );
+    } else {
+        try buf.appendSlice(allocator,
+            \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\
+            \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
+            \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+            \\
+        );
+    }
 
     if (frames.len > 0) {
         const spike_count = @min(10, frames.len);
@@ -820,7 +936,22 @@ pub fn generateReportMd(
             const culprit = dominantPhase(sf);
             const upload_kb: f32 = @as(f32, @floatFromInt(sf.uploaded_bytes)) / 1024.0;
             const update_kb: f32 = @as(f32, @floatFromInt(sf.updated_bytes)) / 1024.0;
-            const row = try std.fmt.allocPrint(allocator,
+            const row = if (has_gpu) try std.fmt.allocPrint(allocator,
+                \\| #{d} | {d} | **{d:.2} мс** | {d:.2} | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
+            , .{
+                rank,
+                sf.frame_index,
+                sf.total_frame_ms,
+                sf.gpu_frame_ms,
+                sf.fps,
+                culprit.name,
+                culprit.ms,
+                culprit.percent,
+                sf.draw_calls,
+                sf.triangles,
+                upload_kb,
+                update_kb,
+            }) else try std.fmt.allocPrint(allocator,
                 \\| #{d} | {d} | **{d:.2} мс** | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
             , .{
                 rank,
@@ -932,6 +1063,10 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
 
+    // GPU events (cat "gpu", tid 2) carry measured Metal frame times only;
+    // the disabled path emits exactly the pre-GPU event stream.
+    const has_gpu = hasGpuData(frames);
+
     try buf.appendSlice(allocator, "{\n  \"traceEvents\": [\n");
 
     for (frames, 0..) |f, i| {
@@ -941,7 +1076,9 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
 
         // Complete event for whole frame. dur covers the CPU-submit span;
         // fps/interval are observed wall-clock pacing.
-        const frame_event = try std.fmt.allocPrint(allocator,
+        const frame_event = if (has_gpu) try std.fmt.allocPrint(allocator,
+            \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "gpu_frame_ms": {d:.3}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
+        , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.gpu_frame_ms, f.draw_calls, f.triangles, f.pipeline_switches }) else try std.fmt.allocPrint(allocator,
             \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
         , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.draw_calls, f.triangles, f.pipeline_switches });
         defer allocator.free(frame_event);
@@ -994,14 +1131,32 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
         try buf.appendSlice(allocator, "\n");
         cur_ts += m_us;
 
-        // PostFX
-        const post_comma = if (is_last_frame) "" else ",";
+        // PostFX. A measured-GPU event may follow on tid 2 (emitted only
+        // for frames with gpu_frame_ms > 0); the comma below accounts for
+        // it so the stream stays valid JSON in every combination.
+        const gpu_emit = has_gpu and f.gpu_frame_ms > 0;
+        const post_comma = if (gpu_emit or !is_last_frame) "," else "";
         const post_ev = try std.fmt.allocPrint(allocator,
             \\    {{"name": "PostFX (CPU submit)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}}{s}
         , .{ cur_ts, post_us, post_comma });
         defer allocator.free(post_ev);
         try buf.appendSlice(allocator, post_ev);
         try buf.appendSlice(allocator, "\n");
+
+        // Measured GPU frame time: separate thread id and "gpu" category so
+        // it can never be mistaken for a CPU-submit slice. ts is the CPU
+        // frame start; the value itself is the last COMPLETED GPU frame
+        // (async execution lags one submit behind).
+        if (gpu_emit) {
+            const gpu_us: u64 = @intFromFloat(f.gpu_frame_ms * 1000.0);
+            const gpu_comma = if (is_last_frame) "" else ",";
+            const gpu_ev = try std.fmt.allocPrint(allocator,
+                \\    {{"name": "GPU Frame (measured)", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 2, "args": {{"gpu_frame_ms": {d:.3}}}}}{s}
+            , .{ ts, gpu_us, f.gpu_frame_ms, gpu_comma });
+            defer allocator.free(gpu_ev);
+            try buf.appendSlice(allocator, gpu_ev);
+            try buf.appendSlice(allocator, "\n");
+        }
     }
 
     try buf.appendSlice(allocator, "  ],\n  \"displayTimeUnit\": \"ms\"\n}\n");
@@ -1112,4 +1267,44 @@ test "Profiler report HTML, MD, and JSON generation" {
     try std.testing.expect(std.mem.indexOf(u8, html, "CPU-submit") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "wall") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "CPU-submit") != null);
+
+    // Disabled GPU path (all zeros): no GPU-named output anywhere — the
+    // reports stay byte-identical to the pre-GPU generators.
+    try std.testing.expect(!hasGpuData(&frames));
+    try std.testing.expect(std.mem.indexOf(u8, html, "gpu_frame_ms") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "GPU Frame (measured)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "gpu_frame_ms") == null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "GPU frame") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "gpu_frame_ms") == null);
+
+    // Enabled path: measured GPU times are exported under explicit GPU
+    // names, never relabeled as CPU-submit phases.
+    var gpu_frames = frames;
+    gpu_frames[0].gpu_frame_ms = 2.5;
+    // Last frame intentionally left at 0: exercises the no-GPU-event tail
+    // (PostFX of the final frame must carry no trailing comma).
+    try std.testing.expect(hasGpuData(&gpu_frames));
+
+    var gpu_summary = summary;
+    gpu_summary.avg_gpu_frame_ms = 1.25;
+    gpu_summary.max_gpu_frame_ms = 2.5;
+
+    const gpu_html = try generateReportHtml(&gpu_frames, gpu_summary, &findings, null, ally);
+    defer ally.free(gpu_html);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU Frame (measured)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU (measured)") != null);
+
+    const gpu_md = try generateReportMd(&gpu_frames, gpu_summary, &findings, null, ally);
+    defer ally.free(gpu_md);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_md, "GPU frame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_md, "gpu_frame_ms") == null); // human prose, no raw field names
+
+    const gpu_json = try generateTraceJson(&gpu_frames, ally);
+    defer ally.free(gpu_json);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"cat\": \"gpu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"name\": \"GPU Frame (measured)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_ms\": 2.500") != null);
+    // CPU slices keep their submit labels; the stream has no trailing comma.
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"Main Pass (CPU submit)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, ",\n  ]") == null);
 }

@@ -539,6 +539,9 @@ pub const SessionSummary = profiler.SessionSummary;
 pub const DiagnosticFinding = profiler.DiagnosticFinding;
 pub const DiagnosticSeverity = profiler.DiagnosticSeverity;
 
+/// GPU frame timings v1 (vendored sokol patch, default off).
+pub const gpu_timing = @import("gpu_timing.zig");
+
 pub const sokol = @import("sokol");
 
 test {

@@ -47,6 +47,7 @@ pub fn recordFrame(self: anytype, frame_id: u64, stats: *const SceneStats) void 
         .shadow_ms = stats.shadow_ms,
         .main_ms = stats.main_ms,
         .post_ms = stats.post_ms,
+        .gpu_frame_ms = stats.gpu_frame_ms,
         .draw_calls = stats.draw_calls,
         .triangles = stats.triangles,
         .pipeline_switches = stats.pipeline_switches,

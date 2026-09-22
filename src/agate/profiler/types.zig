@@ -30,6 +30,12 @@ pub const FrameRecord = struct {
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
     post_ms: f32 = 0,
+    /// Last COMPLETED GPU frame time in ms (measured on GPU via the
+    /// vendored sokol patch, Metal-only; 0 when disabled/headless/
+    /// unsupported). Async execution: lags one frame behind the CPU
+    /// submit. NEVER a CPU-submit value under a GPU name — the CPU
+    /// phases above stay the only submit timings.
+    gpu_frame_ms: f32 = 0,
 
     // Rendering counters
     draw_calls: u32 = 0,
@@ -162,6 +168,10 @@ pub const SessionSummary = struct {
     avg_shadow_ms: f32 = 0,
     avg_main_ms: f32 = 0,
     avg_post_ms: f32 = 0,
+    /// Measured GPU frame time (ms, last-completed semantics, 0 when the
+    /// timer was off). Average/max over all recorded frames.
+    avg_gpu_frame_ms: f32 = 0,
+    max_gpu_frame_ms: f32 = 0,
 
     // Counter stats
     avg_draw_calls: u32 = 0,

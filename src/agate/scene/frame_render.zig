@@ -4,6 +4,7 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const postprocess = @import("../postprocess.zig");
 const gpu_thread = @import("../gpu_thread.zig");
+const gpu_timing = @import("../gpu_timing.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const scene_msaa = @import("msaa.zig");
 const scene_draw = @import("draw.zig");
@@ -298,6 +299,11 @@ pub fn render(scene: anytype) void {
     }, cur_w, cur_h);
 
     sg.commit();
+    // GPU frame timer (v1, default off): last COMPLETED GPU frame duration,
+    // Metal-only. Fail-closed when disabled/headless/unsupported (0) — a
+    // cheap poll, never a GPU stall. Must be read here, right after the
+    // present commit, so the retained command buffer is this frame's.
+    scene.stats.gpu_frame_ms = gpu_timing.pollFrameMs();
     scene.stats.post_ms = msSince(t_post);
 
     // Перенос динамики в кадровую метрику: prepare-фаза (flush, стейджинг,
