@@ -43,6 +43,12 @@ pub const PostFXStack = struct {
     // recreated if the count changes; null keeps the 1x-only memory shape.
     outline_msaa: ?passes.OutlinePass = null,
 
+    // Single-sample depth target for the MSAA depth-prepass (PASS 1.7).
+    // Lazily created on the first active frame
+    // (msaa.depthPrepassActive), destroyed when the gate goes idle;
+    // null keeps the legacy memory shape when the gate is off.
+    msaa_depth: ?passes.MsaaDepthPass = null,
+
     // Effective main-target sample count of the current/last frame. Kept so
     // resizeAll (window resize path outside render()) can keep the target
     // shape stable between frames.
@@ -97,6 +103,7 @@ pub const PostFXStack = struct {
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
+        self.destroyMsaaDepth();
     }
 
     /// Resizes every viewport-sized offscreen target (window resize path).
@@ -112,6 +119,56 @@ pub const PostFXStack = struct {
         self.bloom_pass.resize(width, height);
         self.glow_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
+    }
+
+    /// Frees the prepass target/pipelines (gate-off reclaim path and
+    /// deinit). Null afterwards: the off shape holds no prepass VRAM.
+    pub fn destroyMsaaDepth(self: *PostFXStack) void {
+        if (self.msaa_depth) |*md| md.deinit();
+        self.msaa_depth = null;
+    }
+
+    /// PASS 1.7 entry (context thread): ensures the 1x depth target and
+    /// redraws the opaque primary-view queues into it with depth-only
+    /// pipelines. Fail-closed headless (no sg calls without a context).
+    /// The caller gates on msaa.depthPrepassActive and skips renderReuse
+    /// replays (the persisted texture still matches the replayed
+    /// snapshot; the replay itself stays draw-free).
+    pub fn renderMsaaDepthPrepass(
+        self: *PostFXStack,
+        view_proj: Mat4,
+        queues: *const scene_render_queue.RenderQueues,
+        skins: []const [scene_render_queue.MAX_BONES]Mat4,
+        viewport: Viewport,
+        cur_w: i32,
+        cur_h: i32,
+        stats: *SceneStats,
+    ) void {
+        if (!sg.isvalid()) return;
+        if (self.msaa_depth == null) self.msaa_depth = passes.MsaaDepthPass.init();
+        const md = &self.msaa_depth.?;
+        _ = md.ensure(cur_w, cur_h);
+        const rect = viewport.toPixelRect(cur_w, cur_h);
+        sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
+        sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
+        md.render(view_proj, queues, skins, stats);
+        sg.applyViewport(0, 0, cur_w, cur_h, true);
+        sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+    }
+
+    /// Depth texture view for the post chain (SSAO input + composite
+    /// depth_tex slot). With the prepass active the 1x prepass texture;
+    /// otherwise the legacy main-target view (which under MSAA is the
+    /// resolve-color placeholder — the suppressed branches never sample
+    /// it). The explicit flag (not target-exists) keeps snapshot/gate
+    /// toggles coherent within the frame.
+    pub fn depthSampleView(self: *const PostFXStack, prepass_active: bool) sg.View {
+        if (prepass_active) {
+            if (self.msaa_depth) |*md| {
+                if (md.depthTexView().id != 0) return md.depthTexView();
+            }
+        }
+        return self.postprocess_pass.depthSampleView();
     }
 
     /// Explicit TAA history reset for the next composite. Context thread
@@ -272,11 +329,15 @@ pub const PostFXStack = struct {
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         // Depth-consuming effects are incompatible with the MSAA main
         // target (no depth resolve in sokol — see scene/msaa.zig); degrade
-        // them for the frame on a local copy of the configs.
+        // them for the frame on a local copy of the configs. With the
+        // depth-prepass gate on, the PASS 1.7 1x depth texture feeds them
+        // instead and the suppression lifts (TAA excluded: v1 non-goal,
+        // forced off below regardless of the gate).
         const msaa_active = params.main_samples > 1;
+        const depth_prepass = msaa.depthPrepassActive(params.post.enabled, params.msaa_depth_prepass, params.main_samples);
         var post = params.post;
         var ssao = params.ssao;
-        if (msaa_active) {
+        if (msaa.suppressDepthEffects(params.main_samples, params.msaa_depth_prepass)) {
             if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled)) {
                 _ = self.warn_depth_effects.warn(
                     "msaa: SSAO/SSR/DoF/Fog disabled this session: MSAA x{} main target has no depth resolve",
@@ -316,7 +377,7 @@ pub const PostFXStack = struct {
             self.ssao_pass.render(
                 params.camera,
                 params.aspect,
-                self.postprocess_pass.depthSampleView(),
+                self.depthSampleView(depth_prepass),
                 ssao,
                 cur_w,
                 cur_h,
@@ -479,6 +540,7 @@ pub const PostFXStack = struct {
                 params.sun_color,
                 params.camera.getNear(),
                 params.camera.getFar(),
+                self.depthSampleView(depth_prepass),
                 taa_history_view,
                 taa_history_valid,
                 false,
@@ -529,6 +591,7 @@ pub const PostFXStack = struct {
                     params.sun_color,
                     params.camera.getNear(),
                     params.camera.getFar(),
+                    self.depthSampleView(depth_prepass),
                     taa_history_view,
                     taa_history_valid,
                     true,

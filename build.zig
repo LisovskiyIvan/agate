@@ -311,6 +311,7 @@ pub fn build(b: *Build) !void {
         .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .slang = forward_slang },
         .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .slang = forward_slang },
         .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
+        .{ .name = "msaa_depth_shader", .input = "src/agate/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
         .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },

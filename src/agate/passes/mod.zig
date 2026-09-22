@@ -28,3 +28,5 @@ pub const makeOutlineDrawItem = @import("outline_pass.zig").makeOutlineDrawItem;
 pub const SSAOPass = @import("ssao_pass.zig").SSAOPass;
 pub const outline_pass = @import("outline_pass.zig");
 pub const DebugPass = @import("debug_pass.zig").DebugPass;
+pub const MsaaDepthPass = @import("msaa_depth_pass.zig").MsaaDepthPass;
+pub const msaa_depth_pass = @import("msaa_depth_pass.zig");
