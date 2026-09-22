@@ -43,6 +43,14 @@ pub const UserShaderMaterial = struct {
 
 pub const user_shader_materials = [_]UserShaderMaterial{
     .{ .name = "ramp_wave", .snippet = "examples/shader_materials/ramp_wave.glsl" },
+    // Material library v1 presets (see src/agate/material_library.zig):
+    // procedural Sky/Gradient/Grid/TriPlanar constructors over the same
+    // hook-merge pipeline. Each entry compiles its snippet into the
+    // standard template under glsl430/metal_macos/hlsl5 at build time.
+    .{ .name = "matlib_sky", .snippet = "examples/shader_materials/matlib_sky.glsl" },
+    .{ .name = "matlib_gradient", .snippet = "examples/shader_materials/matlib_gradient.glsl" },
+    .{ .name = "matlib_grid", .snippet = "examples/shader_materials/matlib_grid.glsl" },
+    .{ .name = "matlib_triplanar", .snippet = "examples/shader_materials/matlib_triplanar.glsl" },
 };
 
 // ---------------------------------------------------------------------------
