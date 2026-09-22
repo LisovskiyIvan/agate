@@ -5629,6 +5629,43 @@ test "wave29: cancelled claim commits nothing, rotation unaffected" {
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
 
+test "wave38: concurrent_yield_ns publish keeps handoff semantics, default 0" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    // Default OFF: the phase-locked path never sets the knob.
+    try std.testing.expectEqual(@as(u64, 0), scene.concurrent_yield_ns);
+    // Enabled: claims still succeed and commit exactly one generation
+    // each; the park fires only while a previous build is unconsumed
+    // (backpressure) and holds no lease, so the latch below proceeds.
+    scene.concurrent_yield_ns = 1_000;
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var claim = scene.tryClaimBuildSlot().?;
+    const slot = claim.slot;
+    claim.build();
+    claim.publish();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(slot, scene.build_slot.load(.monotonic));
+    // Second claim while the first build is still unlatched: backpressure
+    // park runs first (tiny: 1µs), the claim itself is unaffected.
+    var claim2 = scene.tryClaimBuildSlot().?;
+    claim2.build();
+    claim2.publish();
+    try std.testing.expectEqual(@as(u64, 2), scene.build_seq.load(.monotonic));
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
+    try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
 test "wave29: build path never begins/completes retire epochs" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
