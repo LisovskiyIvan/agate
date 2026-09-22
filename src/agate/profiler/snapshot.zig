@@ -308,7 +308,10 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         // Highlight layer targets (mask + H/V ping-pong, half res):
         // pass-owned like the glow layer above (pure byte math via
         // HighlightPass.targetBytes — the same three-target shape, no GPU
-        // calls; an unsized pass contributes nothing).
+        // calls; an unsized pass contributes nothing). The targets are
+        // LAZY (allocated on the first active render, never by
+        // resizeAll/beginMainPass), so this gate keeps the census honest:
+        // zero-highlight frames report no highlight VRAM.
         const hl = &scene.postfx.highlight_pass;
         if (hl.base_width > 0 and hl.base_height > 0) {
             const hl_bytes = highlight_pass_mod.HighlightPass.targetBytes(hl.base_width, hl.base_height, glow_pass_mod.GlowPass.glowBytesPerPixel());

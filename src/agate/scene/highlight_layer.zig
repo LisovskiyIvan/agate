@@ -19,6 +19,12 @@
 //!   `postprocess.highlightActive` (post on AND at least one staged item),
 //!   and the composite shader keeps its no-highlight path when the pass
 //!   feeds an empty view.
+//! - Lazy targets: the mask + H/V blur RTs allocate on the first ACTIVE
+//!   `HighlightPass.render` only — `resizeAll`/`beginMainPass` never size
+//!   them, so zero-highlight frames hold no highlight VRAM and the VRAM
+//!   census (gated on the pass base size) honestly reports zero. A resize
+//!   during OFF cannot break the first active frame: `render` resizes to
+//!   the current base size before drawing.
 //! - Render approach (documented choice): mask-RT inner glow. During prepare
 //!   (phase-locked) the world matrices + proxy geometry handles of the
 //!   highlighted meshes are staged into the frame slot; a render pass draws

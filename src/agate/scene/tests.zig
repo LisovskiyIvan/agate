@@ -705,12 +705,25 @@ test "zero highlights is structurally bit-identical (no passes, no state)" {
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
     const postprocess = @import("../postprocess.zig");
     try std.testing.expect(!postprocess.highlightActive(scene.post_process.enabled, scene.preparedDraws().highlight_items.items.len));
+    // Post ON with zero items stays gated off too: renderChain skips the
+    // whole PASS 2.85 block, so no mask/blur draws run and — by the lazy
+    // target discipline (no resize in resizeAll/beginMainPass) — no
+    // highlight RTs allocate (~12 MiB @1080p RGBA16F stays unsized).
+    try std.testing.expect(!postprocess.highlightActive(true, 0));
+    try std.testing.expect(postprocess.highlightActive(true, 1));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.highlightParams(false));
     // Headless fixture owns no highlight GPU state: no mask/blur pass can
-    // run, no targets exist for the census.
+    // run, no targets exist for the census (which gates on base size, so
+    // the unsized pass honestly contributes zero VRAM).
+    // (The OFF-path view discipline — renderChain feeds .{} blurred+mask
+    // views when inactive — is structural in postfx_stack.zig; the
+    // fixture's postprocess_pass stays `undefined` by design, so it is
+    // not dereferenced here.)
     try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_pipeline_u16.id);
     try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.blur_pipeline.id);
     try std.testing.expectEqual(@as(i32, 0), scene.postfx.highlight_pass.base_width);
+    try std.testing.expectEqual(@as(i32, 0), scene.postfx.highlight_pass.base_height);
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_image.id);
 }
 
 test "prepareFrame transfers staged update tick, preserves prepare_ms" {

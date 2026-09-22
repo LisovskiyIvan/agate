@@ -100,12 +100,17 @@ pub const PostFXStack = struct {
     }
 
     /// Resizes every viewport-sized offscreen target (window resize path).
+    /// The highlight mask/blur targets are deliberately EXCLUDED: they
+    /// allocate lazily on the first active HighlightPass.render (gated by
+    /// highlightActive in renderChain), so post-on with zero highlights
+    /// holds no highlight VRAM (~12 MiB @1080p RGBA16F, ~48 MiB @4K).
+    /// A resize during OFF cannot break the first active frame — render()
+    /// resizes to the current base size before drawing.
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
         self.postprocess_pass.resize(width, height, self.main_samples);
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
         self.glow_pass.resize(width, height);
-        self.highlight_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -131,7 +136,9 @@ pub const PostFXStack = struct {
             self.postprocess_pass.resize(width, height, samples);
             self.bloom_pass.resize(width, height);
             self.glow_pass.resize(width, height);
-            self.highlight_pass.resize(width, height);
+            // No highlight_pass.resize here (lazy, see resizeAll): the
+            // first active render() sizes the mask/blur targets itself,
+            // so zero-highlight frames never allocate them.
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
