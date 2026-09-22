@@ -1147,8 +1147,9 @@ pub const Scene = struct {
         samples: i32,
         snap: *const scene_snapshot.SceneFrameSnapshot,
         env: scene_draw.Environment,
+        view_slot: usize,
     ) void {
-        scene_frame.renderSceneView(self, cam_snap, queues, outline_items, outline_skins, samples, snap, env);
+        scene_frame.renderSceneView(self, cam_snap, queues, outline_items, outline_skins, samples, snap, env, view_slot);
     }
 
     /// See `scene/frame_api.zig` (owns the body + docs).

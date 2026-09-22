@@ -71,6 +71,11 @@ pub const Environment = struct {
     // a GPU upload landed, else the shared dummy; the count/live uniform
     // in FrameContext gates the shader loop either way.
     clustered: ?*const clustered_layer.ClusteredGpuCache = null,
+    // Which per-view buffer slot of the clustered cache this draw binds
+    // (0 = primary, 1+ = secondary PIP views). Set per view by
+    // renderSceneView from its own slot; every other construction site
+    // keeps the default (primary). Single-view frames always bind slot 0.
+    clustered_slot: usize = 0,
     // Shadow map views/samplers from the CSM/spot atlas.
     shadow_pass: *const passes.ShadowPass,
     // Scene-level fragment uniform inputs; mesh.receive_shadows is patched
@@ -591,14 +596,14 @@ fn probeForDraw(env: *const Environment, model: Mat4) struct {
     };
 }
 
-// Binds the clustered tile storage views for one draw: the real views when
-// the cache's GPU side mirrors the staged tiles, else the shared dummy
-// (declared SSBO slots stay valid; the count/live uniform gates the shader
-// loop). The module's VIEW_* consts come from its own generated shader
-// module (identical 12/13/14 slots in all five forward shaders). Pure (no
-// GPU calls).
+// Binds the clustered tile storage views for one draw: the real views of
+// this draw's view slot when that slot's GPU side mirrors its view's
+// staged tiles, else the shared dummy (declared SSBO slots stay valid;
+// the count/live uniform gates the shader loop). The module's VIEW_*
+// consts come from its own generated shader module (identical 12/13/14
+// slots in all five forward shaders). Pure (no GPU calls).
 fn bindClusteredViews(bind: *sg.Bindings, comptime module: anytype, env: *const Environment) void {
-    const v: clustered_layer.ClusterBindingViews = if (env.clustered) |c| c.bindingViews() else .{};
+    const v: clustered_layer.ClusterBindingViews = if (env.clustered) |c| c.bindingViewsForSlot(env.clustered_slot) else .{};
     bind.views[module.VIEW_ssbo_cluster_lights] = v.lights;
     bind.views[module.VIEW_ssbo_cluster_tiles] = v.tiles;
     bind.views[module.VIEW_ssbo_cluster_indices] = v.indices;

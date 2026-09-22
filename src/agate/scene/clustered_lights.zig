@@ -42,6 +42,10 @@
 //!   closed (invalid cache binds the shared 16-byte dummy, count uniform 0
 //!   takes the legacy shader path).
 //! - Every `sg.updateBuffer` is paired with `upload_meter.record`.
+//! - One buffer set per rendered view slot (`MAX_VIEW_SLOTS`): each view
+//!   uploads only its own slot exactly once per frame, so no buffer is
+//!   ever updated twice in one frame (sokol allows a single update per
+//!   buffer per frame).
 //! - Buffer replacement (viewport/light-count resize) retires the old
 //!   buffer through `GpuRetireQueue.retireBuffer` (never destroys inline),
 //!   and every light add/remove retires the live buffers first (uniform
@@ -67,6 +71,16 @@ const lights = @import("../lights.zig");
 const compute = @import("../compute.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const gpu_thread = @import("../gpu_thread.zig");
+const snapshot = @import("snapshot.zig");
+
+/// One GPU buffer set per rendered view (slot 0 = primary, slots 1+ =
+/// secondary PIP views, allocated lazily on first use). Sokol allows
+/// exactly one `sg.updateBuffer` per buffer per frame, so multi-view
+/// frames (primary + secondaries in ONE sokol frame) must never share a
+/// buffer set across views: each view rebuilds its own tiles and uploads
+/// only its own slot, giving the structural invariant that every slot's
+/// buffers are updated at most once per frame.
+pub const MAX_VIEW_SLOTS: usize = snapshot.MAX_CAMERAS;
 
 /// Screen tile edge in pixels. Fixed: keeps the tile math, the shader
 /// divisor, and the header sizing on one constant.
@@ -239,40 +253,70 @@ pub const ClusterBindingViews = struct {
     indices: sg.View = .{},
 };
 
-/// Render-owned clustered GPU state: CPU tile scratch plus the three
-/// storage buffers (+ views) the forward shaders read, and a shared 16-byte
-/// dummy bound whenever no real data is live (so declared SSBO slots are
-/// always valid on a live context, even on the legacy path).
-/// All `sg.*` happens on the context thread (`upload`/`deinit`);
-/// `rebuildCpu`/`retireBuffers` are sg-free (any thread, headless-safe).
-pub const ClusteredGpuCache = struct {
-    // CPU scratch (rebuilt per view while any clustered light is staged).
-    cpu_lights: std.ArrayListUnmanaged(ClusterLightGpu) = .empty,
-    cpu_headers: std.ArrayListUnmanaged(ClusterTileGpu) = .empty,
-    cpu_indices: std.ArrayListUnmanaged(u32) = .empty,
-    tiles_x: u32 = 0,
-    tiles_y: u32 = 0,
-    staged_count: usize = 0,
-    // GPU storage (exact-fit; replaced buffers retire, never destroy inline).
+/// One view's GPU buffer set: the three storage buffers (+ views) the
+/// forward shaders read for that view's tiles. Slot 0 is the primary
+/// view; slots 1+ are secondary views, allocated lazily on first use
+/// (single-camera frames touch only slot 0 — no VRAM/behavior change
+/// for the single-view path). Each slot's buffers are updated at most
+/// once per frame because each view uploads its own slot exactly once.
+pub const ClusteredViewSlot = struct {
     light_buffer: sg.Buffer = .{},
     header_buffer: sg.Buffer = .{},
     index_buffer: sg.Buffer = .{},
     light_view: sg.View = .{},
     header_view: sg.View = .{},
     index_view: sg.View = .{},
-    dummy_buffer: sg.Buffer = .{},
-    dummy_view: sg.View = .{},
     light_cap: usize = 0,
     header_cap: usize = 0,
     index_cap: usize = 0,
-    /// True when the GPU buffers mirror the CPU scratch (bind real views).
-    /// False binds the dummy (fail-closed: legacy shader path).
-    gpu_live: bool = false,
+    /// True when this slot's GPU buffers mirror that view's last upload
+    /// (bind real views). False binds the shared dummy (fail-closed:
+    /// legacy shader path) while other slots keep their own state.
+    live: bool = false,
+};
+
+/// Render-owned clustered GPU state: CPU tile scratch plus one storage
+/// buffer set PER VIEW SLOT (+ views) the forward shaders read, and a
+/// shared 16-byte dummy bound whenever no real data is live (so declared
+/// SSBO slots are always valid on a live context, even on the legacy
+/// path).
+/// All `sg.*` happens on the context thread (`upload`/`deinit`);
+/// `rebuildCpu`/`retireBuffers` are sg-free (any thread, headless-safe).
+pub const ClusteredGpuCache = struct {
+    // CPU scratch (rebuilt per view while any clustered light is staged;
+    // shared across views: each view rebuilds then immediately uploads
+    // its own slot before the next view rebuilds).
+    cpu_lights: std.ArrayListUnmanaged(ClusterLightGpu) = .empty,
+    cpu_headers: std.ArrayListUnmanaged(ClusterTileGpu) = .empty,
+    cpu_indices: std.ArrayListUnmanaged(u32) = .empty,
+    tiles_x: u32 = 0,
+    tiles_y: u32 = 0,
+    staged_count: usize = 0,
+    // GPU storage per view slot (exact-fit; replaced buffers retire,
+    // never destroy inline).
+    slots: [MAX_VIEW_SLOTS]ClusteredViewSlot = [_]ClusteredViewSlot{.{}} ** MAX_VIEW_SLOTS,
+    dummy_buffer: sg.Buffer = .{},
+    dummy_view: sg.View = .{},
+
+    /// Clamps an arbitrary view slot to the slot range (defensive: all
+    /// in-tree callers already pass a valid slot; out-of-range input
+    /// addresses the last slot instead of trapping).
+    pub fn clampSlot(view_slot: usize) usize {
+        return @min(view_slot, MAX_VIEW_SLOTS - 1);
+    }
+
+    /// True when `view_slot`'s GPU buffers mirror that view's last upload
+    /// (that view's draws bind the real storage views). Pure (no `sg.*`).
+    pub fn isLive(self: *const ClusteredGpuCache, view_slot: usize) bool {
+        return self.slots[clampSlot(view_slot)].live;
+    }
 
     /// Rebuilds the CPU tile scratch from staged pack data for one view.
-    /// Headless-safe (no `sg.*`); marks the GPU side stale (`gpu_live =
-    /// false`) so the next context `upload` refreshes it. Never fails on
-    /// empty input (zeroed headers, empty indices).
+    /// Headless-safe (no `sg.*`); marks that view's GPU slot stale (its
+    /// `live` goes false) so the next context `upload` for the same slot
+    /// refreshes it — other slots keep their own liveness (their draws
+    /// already ran or are still pending with their own buffers intact).
+    /// Never fails on empty input (zeroed headers, empty indices).
     pub fn rebuildCpu(
         self: *ClusteredGpuCache,
         allocator: std.mem.Allocator,
@@ -284,10 +328,39 @@ pub const ClusteredGpuCache = struct {
         win_h: i32,
         view: ViewRect,
     ) !void {
+        return self.rebuildCpuForSlot(
+            allocator,
+            pos_range,
+            color_int,
+            count,
+            view_proj,
+            win_w,
+            win_h,
+            view,
+            0,
+        );
+    }
+
+    /// Slot-explicit rebuild: same as `rebuildCpu` but clears the liveness
+    /// of `view_slot` (the view being rebuilt). View callers pass their
+    /// own slot so a secondary rebuild never clears the primary's live
+    /// flag (or vice versa).
+    pub fn rebuildCpuForSlot(
+        self: *ClusteredGpuCache,
+        allocator: std.mem.Allocator,
+        pos_range: []const [4]f32,
+        color_int: []const [4]f32,
+        count: usize,
+        view_proj: Mat4,
+        win_w: i32,
+        win_h: i32,
+        view: ViewRect,
+        view_slot: usize,
+    ) !void {
         const grid = tilesForViewport(win_w, win_h);
         self.tiles_x = grid.x;
         self.tiles_y = grid.y;
-        self.gpu_live = false;
+        self.slots[clampSlot(view_slot)].live = false;
         const tiles: usize = @as(usize, grid.x) * @as(usize, grid.y);
         const n = @min(count, pos_range.len, color_int.len, lights.max_clustered_lights);
         self.staged_count = n;
@@ -315,7 +388,6 @@ pub const ClusteredGpuCache = struct {
         }
         const written = buildTileLists(pos_range, color_int, n, view_proj, grid.x, grid.y, view, win_w, win_h, as_pairs, self.cpu_indices.items);
         self.cpu_indices.items.len = written;
-        self.gpu_live = false;
     }
 
     /// Ensures the shared 16-byte dummy buffer + view exist so draws can
@@ -327,94 +399,132 @@ pub const ClusteredGpuCache = struct {
         self.ensureDummy();
     }
 
-    /// Creates/refreshes the GPU buffers from the CPU scratch. Context
-    /// thread only; fails closed headless (`!sg.isvalid()` keeps everything
-    /// staged for a later retry). Replaced buffers retire through
-    /// `retire_queue` (same contract as instance-staging growth). Every
-    /// `sg.updateBuffer` is metered. Returns true when all three views are
-    /// live (dummy included), so the draw can bind unconditionally.
-    pub fn upload(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype) bool {
+    /// Creates/refreshes `view_slot`'s GPU buffers from the CPU scratch
+    /// (which the caller just rebuilt for that view). Context thread only;
+    /// fails closed headless (`!sg.isvalid()` keeps everything staged for
+    /// a later retry). Replaced buffers retire through `retire_queue`
+    /// (same contract as instance-staging growth). Every
+    /// `sg.updateBuffer` is metered. Only this slot's three buffers are
+    /// touched — so each slot is updated at most once per frame (its view
+    /// uploads exactly once) and the sokol one-update-per-buffer rule
+    /// holds under multi-view. Returns true when the dummy is live so the
+    /// draw can bind unconditionally (a sizing failure for THIS slot
+    /// returns false and that view falls back to the dummy/legacy path
+    /// while other slots keep their own state).
+    pub fn upload(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype, view_slot: usize) bool {
         gpu_thread.assertOnContextThread();
         if (!sg.isvalid()) return false;
         self.ensureDummy();
         if (self.dummy_view.id == 0) return false;
-        if (!self.ensureSized(allocator, retire_queue)) return false;
+        const s = clampSlot(view_slot);
+        if (!self.ensureSized(allocator, retire_queue, s)) return false;
+        const slot = &self.slots[s];
 
         if (self.cpu_lights.items.len > 0) {
-            sg.updateBuffer(self.light_buffer, sg.asRange(self.cpu_lights.items));
+            sg.updateBuffer(slot.light_buffer, sg.asRange(self.cpu_lights.items));
             upload_meter.record(self.cpu_lights.items.len * @sizeOf(ClusterLightGpu));
         }
         if (self.cpu_headers.items.len > 0) {
-            sg.updateBuffer(self.header_buffer, sg.asRange(self.cpu_headers.items));
+            sg.updateBuffer(slot.header_buffer, sg.asRange(self.cpu_headers.items));
             upload_meter.record(self.cpu_headers.items.len * @sizeOf(ClusterTileGpu));
         }
         if (self.cpu_indices.items.len > 0) {
-            sg.updateBuffer(self.index_buffer, sg.asRange(self.cpu_indices.items));
+            sg.updateBuffer(slot.index_buffer, sg.asRange(self.cpu_indices.items));
             upload_meter.record(self.cpu_indices.items.len * @sizeOf(u32));
         }
-        self.ensureViews();
-        self.gpu_live = self.light_view.id != 0 and self.header_view.id != 0 and self.index_view.id != 0;
+        self.ensureViews(s);
+        slot.live = slot.light_view.id != 0 and slot.header_view.id != 0 and slot.index_view.id != 0;
         return self.dummy_view.id != 0;
     }
 
-    /// View triple for one draw: the real storage views when the GPU side
-    /// mirrors the CPU scratch, else the shared dummy on all three slots
-    /// (declared SSBO slots stay valid; the count uniform keeps the shader
-    /// on the legacy path). Pure (no `sg.*`).
+    /// View triple for one draw from slot 0 (the primary view): the real
+    /// storage views when that slot mirrors its last upload, else the
+    /// shared dummy on all three slots (declared SSBO slots stay valid;
+    /// the count uniform keeps the shader on the legacy path). Pure (no
+    /// `sg.*`). Multi-view draws use `bindingViewsForSlot` with their own
+    /// slot instead.
     pub fn bindingViews(self: *const ClusteredGpuCache) ClusterBindingViews {
-        if (self.gpu_live) {
-            return .{ .lights = self.light_view, .tiles = self.header_view, .indices = self.index_view };
+        return self.bindingViewsForSlot(0);
+    }
+
+    /// View triple for one draw from `view_slot`: the real storage views
+    /// when THAT slot mirrors its view's last upload, else the shared
+    /// dummy (a failing secondary falls back to legacy while the primary
+    /// keeps clustered). Pure (no `sg.*`).
+    pub fn bindingViewsForSlot(self: *const ClusteredGpuCache, view_slot: usize) ClusterBindingViews {
+        const slot = &self.slots[clampSlot(view_slot)];
+        if (slot.live) {
+            return .{ .lights = slot.light_view, .tiles = slot.header_view, .indices = slot.index_view };
         }
         return .{ .lights = self.dummy_view, .tiles = self.dummy_view, .indices = self.dummy_view };
     }
 
-    /// Retires the three live storage buffers through the epoch retire
-    /// queue (sg-free: only an epoch stamp + append per buffer, like probe
-    /// removal) and zeroes the handles/views. Called on every clustered
-    /// add/remove so stale GPU can never serve a newer frame; the next
-    /// context rebuild recreates exact-fit buffers. Safe on any thread,
-    /// headless-safe (zero ids retire as no-ops inside retireBuffer).
+    /// Retires every allocated slot's three live storage buffers through
+    /// the epoch retire queue (sg-free: only an epoch stamp + append per
+    /// buffer, like probe removal) and zeroes the handles/views/caps plus
+    /// all liveness flags. Called on every clustered add/remove so stale
+    /// GPU can never serve a newer frame; the next context rebuild
+    /// recreates exact-fit buffers per slot on demand. Safe on any
+    /// thread, headless-safe (untouched secondary slots hold zero ids and
+    /// are skipped — only allocated buffers reach the queue).
     pub fn retireBuffers(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype) void {
-        retire_queue.retireBuffer(allocator, self.light_buffer);
-        retire_queue.retireBuffer(allocator, self.header_buffer);
-        retire_queue.retireBuffer(allocator, self.index_buffer);
-        self.light_buffer = .{};
-        self.header_buffer = .{};
-        self.index_buffer = .{};
-        self.light_view = .{};
-        self.header_view = .{};
-        self.index_view = .{};
-        self.light_cap = 0;
-        self.header_cap = 0;
-        self.index_cap = 0;
-        self.gpu_live = false;
+        for (&self.slots) |*slot| {
+            if (slot.light_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.light_buffer);
+            if (slot.header_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.header_buffer);
+            if (slot.index_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.index_buffer);
+            slot.light_buffer = .{};
+            slot.header_buffer = .{};
+            slot.index_buffer = .{};
+            slot.light_view = .{};
+            slot.header_view = .{};
+            slot.index_view = .{};
+            slot.light_cap = 0;
+            slot.header_cap = 0;
+            slot.index_cap = 0;
+            slot.live = false;
+        }
     }
 
-    /// Context-thread teardown: destroys views (guarded: view destroys
-    /// assert a valid context, probe precedent) then buffers, frees CPU
-    /// scratch. Pending retire entries for already-removed buffers drain
-    /// via `GpuRetireQueue.deinit` separately — no double destroy (handles
+    /// Context-thread teardown: destroys every allocated slot's views
+    /// (guarded: view destroys assert a valid context, probe precedent)
+    /// then buffers, plus the shared dummy; frees CPU scratch. Pending
+    /// retire entries for already-removed buffers drain via
+    /// `GpuRetireQueue.deinit` separately — no double destroy (handles
     /// were zeroed at retire time).
     pub fn deinit(self: *ClusteredGpuCache, allocator: std.mem.Allocator) void {
         gpu_thread.assertOnContextThread();
         if (sg.isvalid()) {
-            for ([_]*sg.View{ &self.light_view, &self.header_view, &self.index_view, &self.dummy_view }) |slot| {
-                if (slot.*.id != 0) {
-                    sg.destroyView(slot.*);
-                    slot.* = .{};
+            for (&self.slots) |*slot| {
+                for ([_]*sg.View{ &slot.light_view, &slot.header_view, &slot.index_view }) |v| {
+                    if (v.*.id != 0) {
+                        sg.destroyView(v.*);
+                        v.* = .{};
+                    }
                 }
             }
+            if (self.dummy_view.id != 0) {
+                sg.destroyView(self.dummy_view);
+                self.dummy_view = .{};
+            }
         } else {
-            self.light_view = .{};
-            self.header_view = .{};
-            self.index_view = .{};
+            for (&self.slots) |*slot| {
+                slot.light_view = .{};
+                slot.header_view = .{};
+                slot.index_view = .{};
+            }
             self.dummy_view = .{};
         }
-        for ([_]*sg.Buffer{ &self.light_buffer, &self.header_buffer, &self.index_buffer, &self.dummy_buffer }) |slot| {
-            if (slot.*.id != 0) {
-                sg.destroyBuffer(slot.*);
-                slot.* = .{};
+        for (&self.slots) |*slot| {
+            for ([_]*sg.Buffer{ &slot.light_buffer, &slot.header_buffer, &slot.index_buffer }) |b| {
+                if (b.*.id != 0) {
+                    sg.destroyBuffer(b.*);
+                    b.* = .{};
+                }
             }
+        }
+        if (self.dummy_buffer.id != 0) {
+            sg.destroyBuffer(self.dummy_buffer);
+            self.dummy_buffer = .{};
         }
         self.cpu_lights.deinit(allocator);
         self.cpu_headers.deinit(allocator);
@@ -434,25 +544,30 @@ pub const ClusteredGpuCache = struct {
         }
     }
 
-    fn ensureSized(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype) bool {
+    /// Sizes `view_slot`'s three buffers to the current CPU scratch
+    /// (exact-fit, minimum one element so the views are always bindable).
+    /// Secondary slots allocate lazily here on first use; untouched slots
+    /// hold no buffers. Growth retires the old buffer through the same
+    /// `gpu_retire` queue as before (never destroys inline). Failed
+    /// creation (buffer id 0 / pool exhaustion) fails that slot closed.
+    fn ensureSized(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype, view_slot: usize) bool {
+        const slot = &self.slots[clampSlot(view_slot)];
         const need_lights = @max(self.cpu_lights.items.len, 1);
         const need_headers = @max(self.cpu_headers.items.len, 1);
         const need_indices = @max(self.cpu_indices.items.len, 1);
-        if (!self.ensureBuffer(allocator, retire_queue, &self.light_buffer, &self.light_cap, need_lights * @sizeOf(ClusterLightGpu))) return false;
-        if (!self.ensureBuffer(allocator, retire_queue, &self.header_buffer, &self.header_cap, need_headers * @sizeOf(ClusterTileGpu))) return false;
-        if (!self.ensureBuffer(allocator, retire_queue, &self.index_buffer, &self.index_cap, need_indices * @sizeOf(u32))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.light_buffer, &slot.light_cap, need_lights * @sizeOf(ClusterLightGpu))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.header_buffer, &slot.header_cap, need_headers * @sizeOf(ClusterTileGpu))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.index_buffer, &slot.index_cap, need_indices * @sizeOf(u32))) return false;
         return true;
     }
 
     fn ensureBuffer(
-        self: *ClusteredGpuCache,
         allocator: std.mem.Allocator,
         retire_queue: anytype,
         slot: *sg.Buffer,
         cap: *usize,
         need_bytes: usize,
     ) bool {
-        _ = self;
         if (slot.*.id != 0 and cap.* >= need_bytes) return true;
         if (slot.*.id != 0) {
             retire_queue.retireBuffer(allocator, slot.*);
@@ -468,15 +583,16 @@ pub const ClusteredGpuCache = struct {
         return true;
     }
 
-    fn ensureViews(self: *ClusteredGpuCache) void {
-        if (self.light_view.id == 0 and self.light_buffer.id != 0) {
-            self.light_view = compute.makeStorageView(self.light_buffer, "clustered-lights-view");
+    fn ensureViews(self: *ClusteredGpuCache, view_slot: usize) void {
+        const slot = &self.slots[clampSlot(view_slot)];
+        if (slot.light_view.id == 0 and slot.light_buffer.id != 0) {
+            slot.light_view = compute.makeStorageView(slot.light_buffer, "clustered-lights-view");
         }
-        if (self.header_view.id == 0 and self.header_buffer.id != 0) {
-            self.header_view = compute.makeStorageView(self.header_buffer, "clustered-tiles-view");
+        if (slot.header_view.id == 0 and slot.header_buffer.id != 0) {
+            slot.header_view = compute.makeStorageView(slot.header_buffer, "clustered-tiles-view");
         }
-        if (self.index_view.id == 0 and self.index_buffer.id != 0) {
-            self.index_view = compute.makeStorageView(self.index_buffer, "clustered-indices-view");
+        if (slot.index_view.id == 0 and slot.index_buffer.id != 0) {
+            slot.index_view = compute.makeStorageView(slot.index_buffer, "clustered-indices-view");
         }
     }
 };
@@ -653,8 +769,9 @@ test "rebuildCpu is headless-safe and stages exact-fit scratch" {
     try std.testing.expectEqual(@as(usize, 1), cache.staged_count);
     try std.testing.expectEqual(@as(usize, 1), cache.cpu_lights.items.len);
     try std.testing.expectEqual(@as(usize, 4), cache.cpu_headers.items.len);
-    try std.testing.expect(!cache.gpu_live);
-    // No context headless: upload fails closed, handles stay zero.
+    try std.testing.expect(!cache.isLive(0));
+    // No context headless: upload fails closed for every slot, handles
+    // stay zero.
     const FakeRetire = struct {
         calls: u32 = 0,
         fn retireBuffer(self: *@This(), allocator: std.mem.Allocator, buf: sg.Buffer) void {
@@ -665,8 +782,12 @@ test "rebuildCpu is headless-safe and stages exact-fit scratch" {
     };
     var fake = FakeRetire{};
     try std.testing.expect(!sg.isvalid());
-    try std.testing.expect(!cache.upload(alloc, &fake));
-    try std.testing.expectEqual(@as(u32, 0), cache.light_buffer.id);
+    var s: usize = 0;
+    while (s < MAX_VIEW_SLOTS) : (s += 1) {
+        try std.testing.expect(!cache.upload(alloc, &fake, s));
+        try std.testing.expectEqual(@as(u32, 0), cache.slots[s].light_buffer.id);
+        try std.testing.expect(!cache.isLive(s));
+    }
     // Dummy fallback binds (zero views headless — the draw never runs
     // without a context; the count uniform gates the shader path).
     const views = cache.bindingViews();
@@ -691,25 +812,101 @@ test "retireBuffers moves live buffers into the retire queue and zeroes handles"
             self.calls += 1;
         }
     };
-    var cache = ClusteredGpuCache{
+    var cache = ClusteredGpuCache{};
+    cache.slots[0] = .{
         .light_buffer = .{ .id = 7 },
         .header_buffer = .{ .id = 8 },
         .index_buffer = .{ .id = 9 },
         .light_view = .{ .id = 70 },
-        .gpu_live = true,
+        .live = true,
         .light_cap = 64,
         .header_cap = 32,
         .index_cap = 128,
     };
+    // A second live slot retires too (multi-view frames allocate 1+N).
+    cache.slots[2].index_buffer = .{ .id = 11 };
+    cache.slots[2].live = true;
     var fake = FakeRetire{};
     cache.retireBuffers(alloc, &fake);
-    // All three storage buffers retire (views are context-owned and die
+    // All live storage buffers retire (views are context-owned and die
     // with the buffers' generation; the next upload recreates them).
-    try std.testing.expectEqual(@as(u32, 3), fake.calls);
-    try std.testing.expectEqual(@as(u32, 0), cache.light_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), cache.header_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), cache.index_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), cache.light_view.id);
-    try std.testing.expect(!cache.gpu_live);
-    try std.testing.expectEqual(@as(usize, 0), cache.light_cap);
+    // Untouched slots hold zero ids and are skipped by retireBuffers.
+    try std.testing.expectEqual(@as(u32, 4), fake.calls);
+    try std.testing.expectEqual(@as(u32, 0), cache.slots[0].light_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), cache.slots[0].header_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), cache.slots[0].index_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), cache.slots[0].light_view.id);
+    try std.testing.expect(!cache.isLive(0));
+    try std.testing.expect(!cache.isLive(2));
+    try std.testing.expectEqual(@as(usize, 0), cache.slots[0].light_cap);
+}
+
+test "view slots clamp defensively and cover every camera" {
+    // Slot count tracks the snapshot camera budget: primary (0) plus up
+    // to 7 secondaries fit exactly.
+    try std.testing.expectEqual(snapshot.MAX_CAMERAS, MAX_VIEW_SLOTS);
+    try std.testing.expectEqual(@as(usize, 0), ClusteredGpuCache.clampSlot(0));
+    try std.testing.expectEqual(@as(usize, 3), ClusteredGpuCache.clampSlot(3));
+    try std.testing.expectEqual(MAX_VIEW_SLOTS - 1, ClusteredGpuCache.clampSlot(MAX_VIEW_SLOTS - 1));
+    try std.testing.expectEqual(MAX_VIEW_SLOTS - 1, ClusteredGpuCache.clampSlot(MAX_VIEW_SLOTS));
+    try std.testing.expectEqual(MAX_VIEW_SLOTS - 1, ClusteredGpuCache.clampSlot(std.math.maxInt(usize)));
+
+    // Out-of-range reads never trap: they observe the last slot.
+    var cache = ClusteredGpuCache{};
+    cache.slots[MAX_VIEW_SLOTS - 1].live = true;
+    try std.testing.expect(cache.isLive(std.math.maxInt(usize)));
+    const views = cache.bindingViewsForSlot(std.math.maxInt(usize));
+    // Live but viewless headless: real (zero-id) views, never the dummy
+    // path confusion — liveness and view handles stay consistent.
+    try std.testing.expectEqual(cache.slots[MAX_VIEW_SLOTS - 1].light_view.id, views.lights.id);
+}
+
+test "rebuildCpuForSlot clears only its own slot's liveness" {
+    const alloc = std.testing.allocator;
+    var cache = ClusteredGpuCache{};
+    defer {
+        cache.cpu_lights.deinit(alloc);
+        cache.cpu_headers.deinit(alloc);
+        cache.cpu_indices.deinit(alloc);
+    }
+    const pos = [_][4]f32{.{ 0.75, 0.75, 0.0, 5.0 }};
+    const col = [_][4]f32{.{ 1, 0, 0, 2.0 }};
+    const full = ViewRect{ .x = 0, .y = 0, .w = 128, .h = 128 };
+    // Simulate two uploaded views (headless: liveness flags only, no
+    // sg.*): rebuilding the secondary must not clear the primary.
+    cache.slots[0].live = true;
+    cache.slots[1].live = true;
+    try cache.rebuildCpuForSlot(alloc, &pos, &col, 1, Mat4.identity, 128, 128, full, 1);
+    try std.testing.expect(cache.isLive(0));
+    try std.testing.expect(!cache.isLive(1));
+    // The legacy single-arg rebuild targets the primary slot only.
+    cache.slots[1].live = true;
+    try cache.rebuildCpu(alloc, &pos, &col, 1, Mat4.identity, 128, 128, full);
+    try std.testing.expect(!cache.isLive(0));
+    try std.testing.expect(cache.isLive(1));
+}
+
+test "bindingViewsForSlot falls back to the shared dummy per slot" {
+    var cache = ClusteredGpuCache{};
+    // Fresh cache: every slot binds the (zero, headless) dummy.
+    var s: usize = 0;
+    while (s < MAX_VIEW_SLOTS) : (s += 1) {
+        const v = cache.bindingViewsForSlot(s);
+        try std.testing.expectEqual(@as(u32, 0), v.lights.id);
+        try std.testing.expectEqual(@as(u32, 0), v.tiles.id);
+        try std.testing.expectEqual(@as(u32, 0), v.indices.id);
+    }
+    // A live slot with real views binds them; a dead slot still binds
+    // the dummy — a failing secondary falls back to legacy while the
+    // primary keeps clustered.
+    cache.slots[0].live = true;
+    cache.slots[0].light_view = .{ .id = 21 };
+    cache.slots[0].header_view = .{ .id = 22 };
+    cache.slots[0].index_view = .{ .id = 23 };
+    const primary = cache.bindingViews();
+    try std.testing.expectEqual(@as(u32, 21), primary.lights.id);
+    try std.testing.expectEqual(@as(u32, 22), primary.tiles.id);
+    try std.testing.expectEqual(@as(u32, 23), primary.indices.id);
+    const secondary = cache.bindingViewsForSlot(1);
+    try std.testing.expectEqual(cache.dummy_view.id, secondary.lights.id);
 }

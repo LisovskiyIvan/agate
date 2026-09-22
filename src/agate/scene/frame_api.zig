@@ -104,8 +104,9 @@ pub fn renderSceneView(
     samples: i32,
     snap: *const scene_snapshot.SceneFrameSnapshot,
     env: scene_draw.Environment,
+    view_slot: usize,
 ) void {
-    scene_view_render.renderSceneView(self, cam_snap, queues, outline_items, outline_skins, samples, snap, env);
+    scene_view_render.renderSceneView(self, cam_snap, queues, outline_items, outline_skins, samples, snap, env, view_slot);
 }
 
 /// Runs at most one pending reflection-probe capture (wave 25, v1).
