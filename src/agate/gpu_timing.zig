@@ -8,14 +8,22 @@
 //! `tools/patch_sokol_gpu_timings.py`):
 //!
 //! - `sg_agate_set_gpu_timing_enabled(bool)` — default OFF. While on,
-//!   each committed Metal command buffer is retained one extra frame.
-//! - `sg_agate_query_gpu_frame_ms()` — last COMPLETED frame's
-//!   `(GPUEndTime-GPUStartTime)` in ms, or -1 when unavailable
-//!   (disabled, not ready yet, or a non-Metal backend).
+//!   each committed Metal command buffer is retained one extra frame,
+//!   and each engine phase (shadow/main/post) opens a `GL_TIME_ELAPSED`
+//!   query on GL4.1.
+//! - `sg_agate_query_gpu_frame_ms()` — last COMPLETED frame's GPU time
+//!   in ms (Metal `(GPUEndTime-GPUStartTime)`; GL sum of the
+//!   last-completed per-pass samples), or -1 when unavailable
+//!   (disabled, not ready yet, or an unsupported backend).
+//! - `sg_agate_gpu_pass_begin/end(int)` + `sg_agate_query_gpu_pass_ms`
+//!   — per-pass timers (GL4.1 only; linked no-ops / -1 elsewhere).
 //!
 //! Semantics: the value lags one frame behind the CPU submit (async GPU
-//! execution) and is a single frame-level number — per-pass GPU
-//! attribution is out of scope for v1. Headless/dummy (no sg context)
+//! execution) and is a single frame-level number on Metal — per-pass GPU
+//! attribution is v2: engine-driven `GL_TIME_ELAPSED` pools on GL4.1
+//! (`Pass` below; Metal begin/end are linked no-ops and per-pass queries
+//! are -1 there — the single Metal command buffer spans the whole frame,
+//! see `vendor/sokol/README.agate.md`). Headless/dummy (no sg context)
 //! is fail-closed: every entry point returns 0/false and never calls
 //! into sokol C code outside a valid context.
 //!
@@ -35,6 +43,20 @@ const sg = sokol.gfx;
 
 extern fn sg_agate_set_gpu_timing_enabled(enabled: bool) void;
 extern fn sg_agate_query_gpu_frame_ms() f32;
+extern fn sg_agate_gpu_pass_begin(pass: c_int) void;
+extern fn sg_agate_gpu_pass_end(pass: c_int) void;
+extern fn sg_agate_query_gpu_pass_ms(pass: c_int) f32;
+
+/// Engine render phases with GPU timers. Ids match the sokol patch
+/// (`vendor/sokol/README.agate.md`): 0=shadow, 1=main, 2=post. GL4.1
+/// carries a real `GL_TIME_ELAPSED` pool per phase; Metal compiles the
+/// brackets to linked no-ops (frame timer only — one command buffer per
+/// frame) and every other backend is fail-closed.
+pub const Pass = enum(c_int) {
+    shadow = 0,
+    main = 1,
+    post = 2,
+};
 
 /// Truth values accepted for AGATE_GPU_TIMINGS (exact match, lowercase).
 pub fn parseEnvFlag(value: ?[]const u8) bool {
@@ -79,8 +101,10 @@ pub fn isEnabled() bool {
 
 /// Per-frame hook for the render thread: call once after `sg.commit()`.
 /// Returns the last completed GPU frame time in ms, or 0 when disabled,
-/// headless, not ready yet, or on a backend without support (GL returns
-/// -1 from C today). Never panics, never calls into C without context.
+/// headless, not ready yet, or on a backend without support. On GL the
+/// frame value is the sum of the last-completed per-pass samples (a
+/// lower bound: inter-pass bubbles excluded). Never panics, never calls
+/// into C without context.
 pub fn pollFrameMs() f32 {
     pollEnvOnce();
     if (!enabled.load(.acquire)) {
@@ -90,6 +114,46 @@ pub fn pollFrameMs() f32 {
     if (!sg.isvalid()) return 0;
     syncToC(true);
     const ms = sg_agate_query_gpu_frame_ms();
+    return if (ms >= 0) ms else 0;
+}
+
+/// Opens the GPU timer for phase `pass`. Bracket each engine phase
+/// (`frame_render.zig` shadow/main/post) with begin/end; strictly
+/// sequential, never nested. Fail-closed no-op when disabled or
+/// headless (never calls into C without context); linked no-op on
+/// Metal, so the same call sites serve every backend.
+pub fn beginPass(pass: Pass) void {
+    pollEnvOnce();
+    if (!enabled.load(.acquire)) return;
+    if (!sg.isvalid()) return;
+    syncToC(true);
+    sg_agate_gpu_pass_begin(@intFromEnum(pass));
+}
+
+/// Closes the GPU timer for phase `pass`. Same fail-closed contract as
+/// `beginPass`; an end without begin is ignored by the C side.
+pub fn endPass(pass: Pass) void {
+    pollEnvOnce();
+    if (!enabled.load(.acquire)) return;
+    if (!sg.isvalid()) return;
+    syncToC(true);
+    sg_agate_gpu_pass_end(@intFromEnum(pass));
+}
+
+/// Reads the last COMPLETED sample for phase `pass` in ms (lags behind
+/// the CPU submit like the frame timer), or 0 when disabled, headless,
+/// not ready yet, or unsupported (Metal per-pass is always 0 — the
+/// frame timer is the only Metal GPU number). Never panics, never calls
+/// into C without context.
+pub fn pollPassMs(pass: Pass) f32 {
+    pollEnvOnce();
+    if (!enabled.load(.acquire)) {
+        syncToC(false);
+        return 0;
+    }
+    if (!sg.isvalid()) return 0;
+    syncToC(true);
+    const ms = sg_agate_query_gpu_pass_ms(@intFromEnum(pass));
     return if (ms >= 0) ms else 0;
 }
 
@@ -125,4 +189,38 @@ test "gpu_timing is off by default and fail-closed headless" {
     setEnabled(true);
     try std.testing.expect(isEnabled());
     try std.testing.expectEqual(@as(f32, 0), pollFrameMs());
+}
+
+test "gpu_timing pass ids match the sokol patch contract" {
+    // The C side indexes pools by these ids (0=shadow, 1=main, 2=post);
+    // a renumber here without the matching C change would misattribute.
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(Pass.shadow));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(Pass.main));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(Pass.post));
+}
+
+test "gpu_timing per-pass brackets are fail-closed headless" {
+    const was_enabled = isEnabled();
+    defer setEnabled(was_enabled);
+    try std.testing.expect(!sg.isvalid());
+
+    // Disabled: brackets are pure no-ops, polls read 0.
+    setEnabled(false);
+    beginPass(.shadow);
+    endPass(.shadow);
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.shadow));
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.main));
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.post));
+
+    // Enabled intent but no sg context: still no C call, no panic, 0.
+    setEnabled(true);
+    beginPass(.main);
+    beginPass(.post);
+    endPass(.main);
+    endPass(.post);
+    // Unbalanced end (no begin) must also stay a safe no-op.
+    endPass(.shadow);
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.shadow));
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.main));
+    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.post));
 }

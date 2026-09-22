@@ -48,6 +48,9 @@ pub fn recordFrame(self: anytype, frame_id: u64, stats: *const SceneStats) void 
         .main_ms = stats.main_ms,
         .post_ms = stats.post_ms,
         .gpu_frame_ms = stats.gpu_frame_ms,
+        .gpu_shadow_ms = stats.gpu_shadow_ms,
+        .gpu_main_ms = stats.gpu_main_ms,
+        .gpu_post_ms = stats.gpu_post_ms,
         .draw_calls = stats.draw_calls,
         .triangles = stats.triangles,
         .pipeline_switches = stats.pipeline_switches,
@@ -100,4 +103,47 @@ test "Profiler переносит динамику буферов отдельн
     const summary = prof.summarize();
     try std.testing.expectEqual(@as(usize, 1024), summary.total_uploaded_bytes);
     try std.testing.expectEqual(@as(usize, 2048), summary.total_updated_bytes);
+}
+
+test "Profiler переносит измеренные per-pass GPU-времена" {
+    const Profiler = @import("core.zig").Profiler;
+    sokol.time.setup();
+    const ally = std.testing.allocator;
+    var prof = Profiler.init(ally);
+    defer prof.deinit();
+    prof.start();
+    defer prof.stop();
+
+    // Disabled path: zeros flow through without touching CPU-submit stats.
+    var stats: SceneStats = .{
+        .update_ms = 1.0,
+        .prepare_ms = 0.5,
+        .shadow_ms = 1.0,
+        .main_ms = 6.0,
+        .post_ms = 1.0,
+        .draw_calls = 10,
+        .triangles = 1000,
+        .pipeline_switches = 1,
+    };
+    prof.recordFrame(0, &stats);
+    stats.gpu_shadow_ms = 0.5;
+    stats.gpu_main_ms = 8.0;
+    stats.gpu_post_ms = 1.0;
+    stats.gpu_frame_ms = 9.5;
+    prof.recordFrame(1, &stats);
+
+    try std.testing.expectEqual(@as(f32, 0), prof.frames.items[0].gpu_shadow_ms);
+    try std.testing.expectEqual(@as(f32, 0.5), prof.frames.items[1].gpu_shadow_ms);
+    try std.testing.expectEqual(@as(f32, 8.0), prof.frames.items[1].gpu_main_ms);
+    try std.testing.expectEqual(@as(f32, 1.0), prof.frames.items[1].gpu_post_ms);
+
+    const summary = prof.summarize();
+    try std.testing.expectEqual(@as(f32, 0.25), summary.avg_gpu_shadow_ms);
+    try std.testing.expectEqual(@as(f32, 0.5), summary.max_gpu_shadow_ms);
+    try std.testing.expectEqual(@as(f32, 4.0), summary.avg_gpu_main_ms);
+    try std.testing.expectEqual(@as(f32, 8.0), summary.max_gpu_main_ms);
+    try std.testing.expectEqual(@as(f32, 0.5), summary.avg_gpu_post_ms);
+    try std.testing.expectEqual(@as(f32, 1.0), summary.max_gpu_post_ms);
+    // CPU-submit stats are untouched by the GPU fields.
+    try std.testing.expectEqual(@as(f32, 9.5), summary.avg_frame_ms);
 }

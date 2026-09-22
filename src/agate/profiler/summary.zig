@@ -28,6 +28,12 @@ pub fn summarize(self: anytype) SessionSummary {
     var sum_post: f64 = 0;
     var sum_gpu: f64 = 0;
     var max_gpu: f32 = 0;
+    var sum_gpu_shadow: f64 = 0;
+    var max_gpu_shadow: f32 = 0;
+    var sum_gpu_main: f64 = 0;
+    var max_gpu_main: f32 = 0;
+    var sum_gpu_post: f64 = 0;
+    var max_gpu_post: f32 = 0;
 
     var sum_draw_calls: u64 = 0;
     var max_draw_calls: u32 = 0;
@@ -83,6 +89,12 @@ pub fn summarize(self: anytype) SessionSummary {
         sum_post += frame.post_ms;
         sum_gpu += frame.gpu_frame_ms;
         max_gpu = @max(max_gpu, frame.gpu_frame_ms);
+        sum_gpu_shadow += frame.gpu_shadow_ms;
+        max_gpu_shadow = @max(max_gpu_shadow, frame.gpu_shadow_ms);
+        sum_gpu_main += frame.gpu_main_ms;
+        max_gpu_main = @max(max_gpu_main, frame.gpu_main_ms);
+        sum_gpu_post += frame.gpu_post_ms;
+        max_gpu_post = @max(max_gpu_post, frame.gpu_post_ms);
 
         sum_draw_calls += frame.draw_calls;
         max_draw_calls = @max(max_draw_calls, frame.draw_calls);
@@ -186,6 +198,12 @@ pub fn summarize(self: anytype) SessionSummary {
         .avg_post_ms = @floatCast(sum_post / nf),
         .avg_gpu_frame_ms = @floatCast(sum_gpu / nf),
         .max_gpu_frame_ms = max_gpu,
+        .avg_gpu_shadow_ms = @floatCast(sum_gpu_shadow / nf),
+        .max_gpu_shadow_ms = max_gpu_shadow,
+        .avg_gpu_main_ms = @floatCast(sum_gpu_main / nf),
+        .max_gpu_main_ms = max_gpu_main,
+        .avg_gpu_post_ms = @floatCast(sum_gpu_post / nf),
+        .max_gpu_post_ms = max_gpu_post,
         .avg_draw_calls = @intCast(sum_draw_calls / n),
         .max_draw_calls = max_draw_calls,
         .avg_triangles = @intCast(sum_triangles / n),
