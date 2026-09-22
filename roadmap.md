@@ -64,7 +64,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1133 unit-теста, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 1137 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -625,7 +625,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + TrueType-шрифты + checkbox/slider/dropdown/скролл/text input + 3D world-space панели (до 4, pick+inject, render-on-demand) | Фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
 | Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR | Пользовательских шейдеров без правки движка, нодовых материалов, библиотеки (Sky/Gradient/Grid/TriPlanar/…) |
-| Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
+| Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace) + GPU frame time (Metal, за гейтом), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
 
 ---
 
