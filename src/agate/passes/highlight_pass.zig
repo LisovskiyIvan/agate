@@ -27,10 +27,12 @@ const HighlightOptions = @import("../scene/highlight_layer.zig").HighlightOption
 //     widens the mask into the halo. One blur runs per frame with sigma =
 //     max over the staged items (documented approximation); per-item
 //     color/intensity stay exact (folded into the mask at draw).
-//  3. Composite: the parent feeds the blurred view into the fullscreen
-//     postprocess composite, which adds it after the glow block and before
-//     the grading chain (placeholder + zeroed uniforms when inactive, so
-//     the off path is bit-identical).
+//  3. Composite: the parent feeds the blurred view AND the raw mask view
+//     into the fullscreen postprocess composite, which adds the inner
+//     glow (raw minus blurred, floored at zero, x2 — see
+//     highlightInnerGlow in postprocess.zig) after the glow block and
+//     before the grading chain (placeholder + zeroed uniforms when
+//     inactive, so the off path is bit-identical).
 //
 // Headless behavior mirrors GlowPass exactly: zero handles fail closed
 // (render returns an empty view before any sg.* call), no sg.isvalid gates
@@ -151,10 +153,13 @@ pub fn configureHighlightMaskDesc(desc: *sg.PipelineDesc) void {
 }
 
 /// Result of one highlight frame: the blurred halo view for the composite
-/// (empty when inactive/failed-closed) plus the exact mask-stage draw
-/// accounting for stats. Fail-closed renders return all zeros.
+/// (empty when inactive/failed-closed), the raw unblurred mask view for
+/// the inner-glow minuend (same active/empty discipline — the composite
+/// reads raw minus blurred), plus the exact mask-stage draw accounting
+/// for stats. Fail-closed renders return all zeros.
 pub const HighlightResult = struct {
     view: sg.View = .{},
+    mask_view: sg.View = .{},
     mask_draws: u32 = 0,
     mask_tris: u32 = 0,
 };
@@ -341,7 +346,7 @@ pub const HighlightPass = struct {
     /// gpu-pending, empty, dead handles — outline renderItems precedent,
     /// plus the `queryBufferState` epoch guard when a context is live).
     fn renderMask(self: *HighlightPass, view_proj: Mat4, items: []const HighlightDrawItem) HighlightResult {
-        var out = HighlightResult{ .view = self.mask_tex_view };
+        var out = HighlightResult{ .view = self.mask_tex_view, .mask_view = self.mask_tex_view };
         var pass = sg.Pass{
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
@@ -419,6 +424,7 @@ pub const HighlightPass = struct {
         self.blurStage(self.blur_tex_views[0], 1.0, sigma, texel_w, texel_h, 1);
 
         out.view = self.blur_tex_views[1];
+        out.mask_view = self.mask_tex_view;
         return out;
     }
 
@@ -466,6 +472,7 @@ test "highlight pass fail-closes headless with no state touched" {
     _ = upload_meter.takeAndReset();
     const empty = pass.render(Mat4.identity, &.{}, 1280, 720);
     try std.testing.expectEqual(@as(u32, 0), empty.view.id);
+    try std.testing.expectEqual(@as(u32, 0), empty.mask_view.id);
     try std.testing.expectEqual(@as(u32, 0), empty.mask_draws);
     try std.testing.expectEqual(@as(u32, 0), empty.mask_tris);
     // Empty items, degenerate size, and missing pipelines all fail closed
@@ -473,6 +480,7 @@ test "highlight pass fail-closes headless with no state touched" {
     const item = HighlightDrawItem{ .index_count = 3 };
     const no_pipe = pass.render(Mat4.identity, &[_]HighlightDrawItem{item}, 1280, 720);
     try std.testing.expectEqual(@as(u32, 0), no_pipe.view.id);
+    try std.testing.expectEqual(@as(u32, 0), no_pipe.mask_view.id);
     try std.testing.expectEqual(@as(u32, 0), pass.render(Mat4.identity, &[_]HighlightDrawItem{item}, 0, 720).view.id);
     // Fail-closed render records no GPU uploads (uniform-only past the
     // mask binds: replay in renderReuse stays upload-free).

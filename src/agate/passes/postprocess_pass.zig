@@ -45,6 +45,14 @@ pub const PostProcessPass = struct {
     // the config flag), the highlight gate reads THIS view: the parent feeds
     // the real blurred view when staged items exist and .{} otherwise.
     highlight_tex_view: sg.View = .{},
+    // Optional HighlightPass raw mask (unblurred per-item fills, same
+    // half-res shape as the blurred halo). Set via
+    // setHighlightMaskTexture() alongside setHighlightTexture(); empty by
+    // default, bound to the scene-view placeholder the shader never
+    // samples while the highlight block is gated off. The inner-glow
+    // composite reads raw minus blurred, so both views travel together:
+    // the parent feeds the real pair only when staged items exist.
+    highlight_mask_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -377,6 +385,12 @@ pub const PostProcessPass = struct {
             self.highlight_tex_view
         else
             self.offscreen_resolve_tex_view;
+        // Highlight raw mask (inner-glow minuend) when the parent fed it;
+        // otherwise the same harmless placeholder (unread while gated off).
+        post_bind.views[post_shd.VIEW_highlight_mask_tex] = if (self.highlight_mask_tex_view.id != 0)
+            self.highlight_mask_tex_view
+        else
+            self.offscreen_resolve_tex_view;
         // LUT when the config carries a live binding; otherwise the resolved
         // scene view as a valid placeholder the shader never samples
         // (lut_params.x = 0 gates the LUT branch off).
@@ -559,6 +573,16 @@ pub const PostProcessPass = struct {
     // blurred view only when staged highlight items exist.
     pub fn setHighlightTexture(self: *PostProcessPass, view: sg.View) void {
         self.highlight_tex_view = view;
+    }
+
+    // Feed the HighlightPass raw mask into the composite (inner-glow
+    // minuend: the shader computes raw minus blurred). Call every frame
+    // alongside setHighlightTexture() with the same active/empty
+    // discipline: the real mask view when staged items exist, .{} to
+    // detach. Never read while the highlight block is gated off, so the
+    // off path stays bit-identical.
+    pub fn setHighlightMaskTexture(self: *PostProcessPass, view: sg.View) void {
+        self.highlight_mask_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

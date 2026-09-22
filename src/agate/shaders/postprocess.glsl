@@ -62,6 +62,7 @@ layout(binding = 4) uniform texture2D lut_tex;
 layout(binding = 5) uniform texture2D history_tex;
 layout(binding = 6) uniform texture2D glow_tex;
 layout(binding = 7) uniform texture2D highlight_tex;
+layout(binding = 8) uniform texture2D highlight_mask_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -722,16 +723,28 @@ void main() {
         color += glow * (glow_params.y * glow_tint.xyz);
     }
 
-    // Highlight layer v1 (per-mesh inner glow): blurred per-item mask
-    // (color x intensity folded at draw, frame-max sigma blur) added with
-    // the baked global scale. Disabled returns before sampling, so the off
-    // path is bit-identical to pre-highlight. Composites AFTER glow so
-    // either toggle leaves the other's contribution unchanged; before the
-    // grading chain so per-mesh colors grade with the same LDR the
-    // bloom/glow halos use. Mirrors highlightComposite in postprocess.zig.
+    // Highlight layer v1 (per-mesh inner glow): the raw per-item mask
+    // (color x intensity folded at draw, frame-max sigma blur) minus its
+    // blurred halo, floored at zero per channel and doubled, added with
+    // the baked global scale. Interior pixels have mask ~= blurred, so
+    // they contribute ~0; the silhouette edge (blur ~= half coverage)
+    // restores the full mask color; outside the mesh the raw mask is 0
+    // and the blurred spill clamps to 0 — inner-only glow, no
+    // out-of-mesh halo. The difference form (rather than
+    // mask * (1 - blurred)) is exact under the folded intensity: on a
+    // binary coverage mask both coincide, but only max(mask - blurred, 0)
+    // reaches 0 in the interior for any intensity. Mirrors
+    // highlightInnerGlow/highlightComposite in postprocess.zig (same
+    // per-channel math, same x2 gain). Disabled returns before sampling
+    // EITHER texture, so the off path is bit-identical to pre-highlight.
+    // Composites AFTER glow so either toggle leaves the other's
+    // contribution unchanged; before the grading chain so per-mesh colors
+    // grade with the same LDR the bloom/glow halos use.
     if (highlight_params.x > 0.5) {
-        vec3 halo = texture(sampler2D(highlight_tex, smp), uv).rgb;
-        color += halo * highlight_params.y;
+        vec3 hl_raw = texture(sampler2D(highlight_mask_tex, smp), uv).rgb;
+        vec3 hl_blurred = texture(sampler2D(highlight_tex, smp), uv).rgb;
+        vec3 hl_inner = max(hl_raw - hl_blurred, vec3(0.0)) * 2.0;
+        color += hl_inner * highlight_params.y;
     }
 
     // Contrast

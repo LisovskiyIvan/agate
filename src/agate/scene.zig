@@ -759,7 +759,8 @@ pub const Scene = struct {
     // prepare stage freezes world matrices + proxy geometry handles into
     // the frame slot, a render pass draws them flat-colored into a
     // half-res mask RT, blurs it with the glow-style separable Gaussian,
-    // and the composite adds the halo after the glow block, before the
+    // and the composite adds the inner glow (raw mask minus blurred halo,
+    // floored at zero, x2) after the glow block, before the
     // grading chain. With zero highlights the chain is gated off and
     // rendering stays bit-identical.
     //

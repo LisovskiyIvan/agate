@@ -362,8 +362,12 @@ pub const PostFXStack = struct {
         // Flat-colored mask fills (one per staged item) + separable H/V
         // blur (HIGHLIGHT_BLUR_DRAWS draws); when inactive (post off or
         // zero staged items) the composite shader skips the highlight block
-        // and this binds the empty view (the pass binds the resolved scene
-        // view placeholder for it — bit-identical). Runs AFTER the glow
+        // and this binds the empty views (the pass binds the resolved scene
+        // view placeholder for both — bit-identical). The composite reads
+        // raw mask minus blurred halo (inner-only edge glow, x2 — see
+        // highlightInnerGlow in postprocess.zig), so the raw mask view
+        // travels with the blurred view under the same active/empty
+        // discipline. Runs AFTER the glow
         // stage and composites after glow's block, so either toggle leaves
         // the other's output unchanged. Samples no depth (the mask has no
         // depth attachment), hence no MSAA suppression. Like glow it is
@@ -373,6 +377,7 @@ pub const PostFXStack = struct {
         // primary view only (v1 non-goal: multi-camera highlights follow
         // the primary camera).
         var highlight_view: sg.View = .{};
+        var highlight_mask_view: sg.View = .{};
         if (postprocess.highlightActive(params.post.enabled, params.highlight_items.len)) {
             const hl = self.highlight_pass.render(
                 params.view_proj,
@@ -381,11 +386,13 @@ pub const PostFXStack = struct {
                 cur_h,
             );
             highlight_view = hl.view;
+            highlight_mask_view = hl.mask_view;
             params.stats.post_draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
             params.stats.draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
             params.stats.triangles += hl.mask_tris + 2 * passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
         }
         self.postprocess_pass.setHighlightTexture(highlight_view);
+        self.postprocess_pass.setHighlightMaskTexture(highlight_mask_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
