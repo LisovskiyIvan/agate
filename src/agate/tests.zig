@@ -73,6 +73,12 @@ test {
     _ = @import("mesh.zig");
     _ = @import("mesh/builder.zig");
     _ = @import("mesh/builders.zig");
+    _ = @import("mesh/builders/common.zig");
+    _ = @import("mesh/builders/extrude.zig");
+    _ = @import("mesh/builders/polygon.zig");
+    _ = @import("mesh/builders/revolve.zig");
+    _ = @import("mesh/builders/solids.zig");
+    _ = @import("mesh/builders/sweep.zig");
     _ = @import("mesh/csg.zig");
     _ = @import("mesh/csg_tests.zig");
     _ = @import("mesh/decal.zig");
