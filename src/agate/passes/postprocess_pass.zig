@@ -38,6 +38,13 @@ pub const PostProcessPass = struct {
     // glow block and this binds the scene view as a harmless placeholder
     // (bit-identical composite).
     glow_tex_view: sg.View = .{},
+    // Optional HighlightPass result (per-mesh halo, half resolution). Set
+    // via setHighlightTexture(); empty by default, in which case the shader
+    // skips the highlight block and this binds the scene view as a harmless
+    // placeholder (bit-identical composite). Unlike glow (whose gate reads
+    // the config flag), the highlight gate reads THIS view: the parent feeds
+    // the real blurred view when staged items exist and .{} otherwise.
+    highlight_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -362,6 +369,14 @@ pub const PostProcessPass = struct {
             self.glow_tex_view
         else
             self.offscreen_resolve_tex_view;
+        // Highlight halo when the parent fed a HighlightPass result;
+        // otherwise a valid placeholder the shader never samples
+        // (highlight_params.x = 0 gates the highlight block off, so the
+        // off path is bit-identical to pre-highlight).
+        post_bind.views[post_shd.VIEW_highlight_tex] = if (self.highlight_tex_view.id != 0)
+            self.highlight_tex_view
+        else
+            self.offscreen_resolve_tex_view;
         // LUT when the config carries a live binding; otherwise the resolved
         // scene view as a valid placeholder the shader never samples
         // (lut_params.x = 0 gates the LUT branch off).
@@ -478,6 +493,10 @@ pub const PostProcessPass = struct {
             .glow_params = postprocess.glowParams(config),
             // (tint rgb, 0); zeros when glow is off (unread while disabled).
             .glow_tint = postprocess.glowTintParams(config),
+            // (enabled 1/0, baked global scale 1.0, 0, 0); zeros when the
+            // parent fed no highlight view, which keeps the composite
+            // identical to the pre-highlight path.
+            .highlight_params = postprocess.highlightParams(self.highlight_tex_view.id != 0),
             .grade_shadows = .{
                 config.grade_shadows[0],
                 config.grade_shadows[1],
@@ -530,6 +549,16 @@ pub const PostProcessPass = struct {
     // and return to the no-glow composite path (bit-identical to pre-glow).
     pub fn setGlowTexture(self: *PostProcessPass, view: sg.View) void {
         self.glow_tex_view = view;
+    }
+
+    // Feed the HighlightPass halo result into the composite. Call every
+    // frame before render() once the parent owns a HighlightPass; pass .{}
+    // to detach and return to the no-highlight composite path
+    // (bit-identical to pre-highlight). The composite gate reads this view
+    // (nonzero = active), not a config flag: the parent must pass the real
+    // blurred view only when staged highlight items exist.
+    pub fn setHighlightTexture(self: *PostProcessPass, view: sg.View) void {
+        self.highlight_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

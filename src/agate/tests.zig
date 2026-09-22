@@ -113,6 +113,7 @@ test {
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");
     _ = @import("passes/glow_pass.zig");
+    _ = @import("passes/highlight_pass.zig");
     _ = @import("passes/mod.zig");
     _ = @import("passes/outline_pass.zig");
     _ = @import("passes/particle_pass.zig");
@@ -166,6 +167,7 @@ test {
     _ = @import("scene/frame_render.zig");
     _ = @import("scene/gpu_retire.zig");
     _ = @import("scene/gui3d_layer.zig");
+    _ = @import("scene/highlight_layer.zig");
     _ = @import("scene/instance_staging.zig");
     _ = @import("scene/light_rig.zig");
     _ = @import("scene/light_selection.zig");

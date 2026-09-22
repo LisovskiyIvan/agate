@@ -103,6 +103,10 @@ pub const Ui3dPanel = scene_gui3d.Ui3dPanel;
 pub const Ui3dPanelOptions = scene_gui3d.Ui3dPanelOptions;
 pub const Ui3dFaceMode = scene_gui3d.Ui3dFaceMode;
 pub const Ui3dPickHit = scene_gui3d.Ui3dPickHit;
+const scene_highlight = @import("scene/highlight_layer.zig");
+pub const HighlightLayer = scene_highlight.HighlightLayer;
+pub const HighlightEntry = scene_highlight.HighlightEntry;
+pub const HighlightOptions = scene_highlight.HighlightOptions;
 const scene_postfx = @import("scene/postfx_stack.zig");
 const scene_forward = @import("scene/forward_pipelines.zig");
 const scene_particles = @import("scene/particle_layer.zig");
@@ -339,6 +343,12 @@ pub const Scene = struct {
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
     // The prepared outline items+skins live in the P7 slots (preparedDraws).
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
+    // Per-mesh highlight entries (highlight layer v1, mask-RT inner glow).
+    // Fixed-size layer (no allocation, no deinit — the entries borrow the
+    // mesh pointers; the staged items+handles live in the P7 slots). Empty
+    // by default: with zero highlights the whole mask/blur/composite chain
+    // is gated off and rendering stays bit-identical.
+    highlights: scene_highlight.HighlightLayer = .{},
 
     /// Mailbox for publishing frame-level camera/light/pass state from the
     /// simulation thread. Meshes and materials are still live scene objects,
@@ -741,6 +751,58 @@ pub const Scene = struct {
         return self.gui3d.pick(Ray.new(near_pt, dir));
     }
 
+    // ---- Highlight layer (per-mesh colored inner glow, v1). ----
+    //
+    // Babylon.js HighlightLayer parity: each highlighted mesh carries its
+    // own color/blur/intensity (unlike the single-color inverse-hull
+    // outline). Mask-RT inner glow (see scene/highlight_layer.zig): the
+    // prepare stage freezes world matrices + proxy geometry handles into
+    // the frame slot, a render pass draws them flat-colored into a
+    // half-res mask RT, blurs it with the glow-style separable Gaussian,
+    // and the composite adds the halo after the glow block, before the
+    // grading chain. With zero highlights the chain is gated off and
+    // rendering stays bit-identical.
+    //
+    // Capacity: at most `scene_highlight.max_highlights` (8);
+    // `addHighlightMesh` past the cap is a hard
+    // `error.TooManyHighlights`, invalid options a hard
+    // `error.InvalidHighlightOptions` (never silent clamps — probe/gui3d
+    // precedent).
+    //
+    // Explicit non-goals (v1, see scene/highlight_layer.zig): skinned
+    // meshes (skipped at capture), instanced meshes (template proxy only),
+    // no occlusion-aware highlight (additive, not depth-tested), no
+    // per-instance highlight, primary view only. Transient: entries
+    // reference live meshes and are never serialized (defaults on load).
+
+    /// Highlights `mesh` with `options`; returns its index (id). Headless-safe
+    /// (CPU bookkeeping only; GPU targets are pass-owned and lazy).
+    pub fn addHighlightMesh(self: *Scene, mesh: *Mesh, options: HighlightOptions) error{ TooManyHighlights, InvalidHighlightOptions }!usize {
+        return self.highlights.add(mesh, options);
+    }
+
+    /// Removes highlight `index`. Order-preserving: higher indices shift
+    /// down. Out-of-range indices are a no-op. Entries own no GPU
+    /// resources, so no retire queue is involved (probe/gui3d remove take
+    /// one for their pass-owned targets; highlights have none).
+    pub fn removeHighlightMesh(self: *Scene, index: usize) void {
+        self.highlights.remove(index);
+    }
+
+    /// Drops every highlight (back to the bit-identical no-highlight path).
+    pub fn clearHighlights(self: *Scene) void {
+        self.highlights.clear();
+    }
+
+    /// Live highlight entry state. Null when out of range.
+    pub fn getHighlightMesh(self: *Scene, index: usize) ?*HighlightEntry {
+        return self.highlights.get(index);
+    }
+
+    pub fn highlightCount(self: *const Scene) usize {
+        return self.highlights.highlightCount();
+    }
+
     // ---- Lights. ----
 
     pub fn createHemisphericLight(self: *Scene, name: []const u8, options: lights.HemisphericLightOptions) HemisphericLight {
@@ -1017,6 +1079,12 @@ pub const Scene = struct {
                 break;
             }
         }
+        // Highlights: drop entries bound to the destroyed mesh (same
+        // referent cleanup as outline_meshes above; the entry owns no GPU,
+        // so both the sync and the off-context epoch-retired branches are
+        // covered synchronously here — already-staged items fail closed on
+        // their borrowed handles at draw time).
+        self.highlights.removeForMesh(mesh);
         // Referent cleanup: neutralize every cross-mesh reference to `mesh`
         // before its storage is freed. Runs before the sync/deferred branch
         // below so both paths are covered. Never cascade-destroys: orphaned

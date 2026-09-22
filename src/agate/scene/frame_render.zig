@@ -264,7 +264,7 @@ pub fn render(scene: anytype) void {
     scene.stats.main_ms = msSince(t_main);
 
     // ==============================================
-    // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 3 (composite & UI overlay)
+    // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 2.85 (highlight) + 3 (composite & UI overlay)
     // ==============================================
     const t_post = sokol.time.now();
     scene.postfx.renderChain(.{
@@ -280,6 +280,9 @@ pub fn render(scene: anytype) void {
         .sun_color = snap.sun_color,
         .default_white_view = snap.default_white.view,
         .main_samples = samples,
+        // P7 staged highlight items from the pinned front slot (never live
+        // Scene fields): the render below dereferences no mesh.
+        .highlight_items = draws.highlight_items.items,
         .ui = if (scene.ui_frame.canvas_present) &scene.ui_frame else null,
         .stats = &scene.stats,
     }, cur_w, cur_h);

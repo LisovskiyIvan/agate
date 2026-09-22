@@ -38,6 +38,10 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
             .ssao_pass = undefined,
             .bloom_pass = undefined,
             .glow_pass = undefined,
+            // Zero (not undefined): the highlight layer's bit-identical
+            // default is pinned structurally against this fixture (no
+            // mask/blur pipelines, no targets).
+            .highlight_pass = .{},
             .outline_pass = undefined,
         },
         .forward = .{},

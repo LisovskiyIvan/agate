@@ -40,6 +40,7 @@ layout(binding = 0) uniform fs_params {
     vec4 bloom_pyramid; // x: pyramid_enabled (1/0), y: mips, z/w: unused
     vec4 glow_params; // x: glow_enabled (1/0), y: intensity, z/w: unused
     vec4 glow_tint; // xyz: glow color multiplier, w: unused
+    vec4 highlight_params; // x: highlight_enabled (1/0), y: baked global scale (always 1.0: per-item intensity folds into the mask), z/w: unused
     vec4 grade_shadows; // xyz: shadows lift [-1,1], w: unused
     vec4 grade_midtones; // xyz: midtones lift [-1,1], w: unused
     vec4 grade_highlights; // xyz: highlights lift [-1,1], w: unused
@@ -60,6 +61,7 @@ layout(binding = 3) uniform texture2D bloom_tex;
 layout(binding = 4) uniform texture2D lut_tex;
 layout(binding = 5) uniform texture2D history_tex;
 layout(binding = 6) uniform texture2D glow_tex;
+layout(binding = 7) uniform texture2D highlight_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -718,6 +720,18 @@ void main() {
     if (glow_params.x > 0.5 && glow_params.y > 0.001) {
         vec3 glow = texture(sampler2D(glow_tex, smp), uv).rgb;
         color += glow * (glow_params.y * glow_tint.xyz);
+    }
+
+    // Highlight layer v1 (per-mesh inner glow): blurred per-item mask
+    // (color x intensity folded at draw, frame-max sigma blur) added with
+    // the baked global scale. Disabled returns before sampling, so the off
+    // path is bit-identical to pre-highlight. Composites AFTER glow so
+    // either toggle leaves the other's contribution unchanged; before the
+    // grading chain so per-mesh colors grade with the same LDR the
+    // bloom/glow halos use. Mirrors highlightComposite in postprocess.zig.
+    if (highlight_params.x > 0.5) {
+        vec3 halo = texture(sampler2D(highlight_tex, smp), uv).rgb;
+        color += halo * highlight_params.y;
     }
 
     // Contrast

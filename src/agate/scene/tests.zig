@@ -594,6 +594,125 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().outline_items.items.len);
 }
 
+test "prepareFrame stages highlight snapshots without GPU" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    // Highlight entries borrow live meshes; the fixed-size layer needs no
+    // deinit. The mesh must sit in scene.meshes (OOB referents are skipped
+    // at stage — highlights have no latch patch stage).
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("headless_highlight");
+    m.index_count = 3;
+    m.position = Vec3.new(4, 0, 0);
+    try scene.meshes.append(alloc, m);
+    defer {
+        scene.destroyMesh(m);
+        scene.meshes.deinit(alloc);
+    }
+
+    const id = try scene.addHighlightMesh(m, .{ .color = .{ 1.0, 0.0, 0.0, 1.0 }, .blur = 6.0, .intensity = 0.8 });
+    try std.testing.expectEqual(@as(usize, 0), id);
+    try std.testing.expectEqual(@as(usize, 1), scene.highlightCount());
+
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
+    const staged = scene.preparedDraws().highlight_items.items[0];
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 1.0 }, staged.color);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), staged.blur, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), staged.intensity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), staged.model.m[12], 1e-4);
+    // Rebuild, not accumulate.
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
+    // Clearing works: a hidden mesh rebuilds to empty.
+    m.is_visible = false;
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
+    m.is_visible = true;
+}
+
+test "highlight staged items freeze the model (no live reads at render time)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("frozen_highlight");
+    m.index_count = 3;
+    m.position = Vec3.new(4, 0, 0);
+    try scene.meshes.append(alloc, m);
+    defer {
+        scene.destroyMesh(m);
+        scene.meshes.deinit(alloc);
+    }
+    _ = try scene.addHighlightMesh(m, .{});
+
+    scene.prepareFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
+    // Game-side mutation after prepare cannot tear the published front:
+    // the render consumes this frozen model, never the live mesh.
+    m.position = Vec3.new(9, 0, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
+    // The next prepare picks the new transform up (freshness preserved).
+    scene.prepareFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
+}
+
+test "destroyMesh drops highlight entries and the stage rebuilds empty" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("doomed_highlight");
+    m.index_count = 3;
+    try scene.meshes.append(alloc, m);
+    _ = try scene.addHighlightMesh(m, .{});
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
+
+    // Off-context destroy (headless fixture: no context thread, so the
+    // epoch-retired branch): the entry drops synchronously and the next
+    // stage rebuilds to empty — fail-closed, never a dead draw.
+    scene.destroyMesh(m);
+    try std.testing.expectEqual(@as(usize, 0), scene.highlightCount());
+    try std.testing.expect(scene.getHighlightMesh(0) == null);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
+}
+
+test "zero highlights is structurally bit-identical (no passes, no state)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    // Fresh scene (and every load — highlights are transient, never
+    // serialized): zero entries, zero staged items, gate closed.
+    try std.testing.expectEqual(@as(usize, 0), scene.highlightCount());
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
+    const postprocess = @import("../postprocess.zig");
+    try std.testing.expect(!postprocess.highlightActive(scene.post_process.enabled, scene.preparedDraws().highlight_items.items.len));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.highlightParams(false));
+    // Headless fixture owns no highlight GPU state: no mask/blur pass can
+    // run, no targets exist for the census.
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_pipeline_u16.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.blur_pipeline.id);
+    try std.testing.expectEqual(@as(i32, 0), scene.postfx.highlight_pass.base_width);
+}
+
 test "prepareFrame transfers staged update tick, preserves prepare_ms" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);

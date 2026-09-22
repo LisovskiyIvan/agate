@@ -206,6 +206,7 @@ const stats_mod = @import("stats.zig");
 const retire_mod = @import("gpu_retire.zig");
 const ui_frame_mod = @import("ui_frame.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
+const highlight_pass = @import("../passes/highlight_pass.zig");
 const particle_pass = @import("../passes/particle_pass.zig");
 const physics_types = @import("../physics/types.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
@@ -215,6 +216,7 @@ const ui_mod = @import("../ui.zig");
 pub const RenderQueues = render_queue.RenderQueues;
 pub const SkinStorage = render_queue.SkinStorage;
 pub const OutlineDrawItem = outline_pass.OutlineDrawItem;
+pub const HighlightDrawItem = highlight_pass.HighlightDrawItem;
 pub const PreparedShadowDraws = shadow_pass.ShadowPass.PreparedShadowDraws;
 pub const Epoch = retire_mod.Epoch;
 
@@ -264,6 +266,14 @@ pub const FrameDrawSlot = struct {
     views: [snapshot_mod.MAX_CAMERAS]RenderQueues = [_]RenderQueues{.{}} ** snapshot_mod.MAX_CAMERAS,
     outline_items: std.ArrayListUnmanaged(OutlineDrawItem) = .empty,
     outline_skins: SkinStorage = .empty,
+    /// Staged per-mesh highlight items (highlight layer v1): render-owned
+    /// snapshots (model, handles, frozen options) built by
+    /// `buildQueuesInto` from `Scene.highlights`, consumed by the PASS 2.85
+    /// mask/blur stage in `PostFXStack.renderChain`. No skin store: v1
+    /// stages no skin matrices (skinned meshes are skipped at capture).
+    /// Borrowed GPU handles under the P3 epoch discipline, same as
+    /// outline_items above.
+    highlight_items: std.ArrayListUnmanaged(HighlightDrawItem) = .empty,
     shadow: PreparedShadowDraws = .{},
     /// Slot-owned staged instance records (lock-free-publication slice 1):
     /// one per instance-bearing mesh with a fresh preview, frozen by
@@ -358,6 +368,7 @@ pub const FrameDrawSlot = struct {
         for (&self.views) |*q| q.reset();
         self.outline_items.clearRetainingCapacity();
         self.outline_skins.clearRetainingCapacity();
+        self.highlight_items.clearRetainingCapacity();
         self.shadow.reset();
         self.staged_instances.clearRetainingCapacity();
         self.ui_vertices.clearRetainingCapacity();
@@ -377,6 +388,7 @@ pub const FrameDrawSlot = struct {
         for (&self.views) |*q| q.deinit(allocator);
         self.outline_items.deinit(allocator);
         self.outline_skins.deinit(allocator);
+        self.highlight_items.deinit(allocator);
         self.shadow.deinit(allocator);
         self.staged_instances.deinit(allocator);
         self.ui_vertices.deinit(allocator);
@@ -397,6 +409,7 @@ pub const FrameDrawSlot = struct {
         for (&self.views) |*q| b += queuesBytes(q);
         b += listBytes(self.outline_items);
         b += listBytes(self.outline_skins);
+        b += listBytes(self.highlight_items);
         b += listBytes(self.shadow.items);
         b += listBytes(self.shadow.skins);
         b += listBytes(self.staged_instances);
