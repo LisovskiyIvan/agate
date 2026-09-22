@@ -86,6 +86,11 @@ pub const shader_material = @import("shader_material.zig");
 // material_library.zig docs for the scene-wiring pattern.
 pub const material_library = @import("material_library.zig");
 
+// Typed material graphs that compile to ShaderMaterial hook snippets
+// (graph parameters become runtime uniforms — no engine rebuild). See
+// node_material.zig docs for the bake-once / drive-uniforms pattern.
+pub const node_material = @import("node_material.zig");
+
 pub const texture = @import("texture.zig");
 /// KTX2 container reader: uncompressed LDR subset plus block-compressed
 /// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding. Texture.
