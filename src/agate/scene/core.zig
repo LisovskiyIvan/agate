@@ -458,6 +458,32 @@ pub const Scene = struct {
     /// it after observing a fresh seq and asserts it still is the back index
     /// (no intervening publish).
     build_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Cooperative game-side yield for the concurrent-build path (wave 38,
+    /// contention-yield): nanoseconds the game thread parks inside
+    /// `tryClaimBuildSlot` — but ONLY when the previous build is still
+    /// unconsumed (`build_seq != last_latched_seq`) — when nonzero.
+    /// Default 0 = OFF: the default (phase-locked) path never sets it, so
+    /// it stays behavior-identical (one predictable not-taken branch, no
+    /// syscall, no atomics beyond the existing handoff words). Under
+    /// EXPERIMENTAL `--concurrent-build` the app may set it (startup only,
+    /// before the game thread spawns; game-side read): the game is then
+    /// overproducing (hundreds of builds/s vs 60 latched frames/s), so
+    /// parking before reserving the next slot donates its core to the
+    /// context thread's prepare/render + pool workers instead of burning
+    /// CPU on builds the latch will supersede — the phase mutex used to
+    /// provide this yield implicitly by parking the game on contention
+    /// (§6.38 diagnosis). Backpressure, not a flat tax: when the consumer
+    /// is caught up the claim proceeds immediately (freshness preserved,
+    /// zero added latency); the park also runs BEFORE the lease reserve,
+    /// so no WRITING slot is ever held while parked. Overhead when
+    /// enabled and behind: exactly one nanosleep per skipped-ahead tick;
+    /// when 0 or caught up: a single branch. Plain u64, stays plain:
+    /// written once by the app at startup, read only by the game-side
+    /// claim — never across the handoff edge. Tune only with wall numbers
+    /// (dips / 1% low at fixed prepared=100% + waitC=0), never blindly:
+    /// too small changes nothing, too large slows the sim tick rate
+    /// (ticks/s floor: the latch needs one fresh build per 16.7 ms frame).
+    concurrent_yield_ns: u64 = 0,
     /// Game-owned queue-build stats accumulator (stage-2 increment B,
     /// slot-staged since wave 31 second slice): `buildIntoClaimedSlot`
     /// clears this at build start, the game-side `buildQueuesInto`
@@ -1212,6 +1238,18 @@ pub const Scene = struct {
     /// checklist in scene/frame_draws.zig. The claim API alone does not
     /// remove the phase mutex.
     pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
+        // Contention-yield (wave 38): when enabled AND the previous build
+        // is still unconsumed, park BEFORE reserving — the consumer is
+        // behind, so another build now only adds CPU contention for a
+        // payload the latch will supersede with a newer one. Gated on
+        // nonzero first: the default path (yield 0) executes one not-taken
+        // branch and touches no atomics here. The park holds no lease
+        // (reserve happens after), so prepare's latch can always proceed.
+        if (self.concurrent_yield_ns != 0 and
+            self.build_seq.load(.monotonic) != self.last_latched_seq.load(.monotonic))
+        {
+            jobs.sleepNs(self.concurrent_yield_ns);
+        }
         const slot = self.draws.claimBack() orelse return null;
         // Single-producer reserve: monotonic load suffices, the publish
         // below is the release edge that commits the generation.
