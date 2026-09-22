@@ -242,10 +242,19 @@ pub fn render(scene: anytype) void {
         // their snapshot matrices.
         var primary_jittered = primary_snap;
         if (taa_on) primary_jittered.view_proj = taa_view_proj;
-        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
+        // Primary view always uploads clustered slot 0 (single-view
+        // frames touch only this slot — no VRAM/behavior change there).
+        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env, 0);
 
+        // Secondary views compact into slots 1+ in loop order (the skip
+        // below already compacts enabled non-active views; 1 + up to 7
+        // secondaries fit the 8 camera/slot budget exactly). Each view
+        // uploads only its own slot, so no buffer is updated twice in
+        // this frame (sokol one-update-per-buffer rule).
+        var secondary_ordinal: usize = 0;
         for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
             if (i == active_idx or !entry.enabled) continue;
+            secondary_ordinal += 1;
             const rect = entry.viewport.toPixelRect(cur_w, cur_h);
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
@@ -255,7 +264,7 @@ pub fn render(scene: anytype) void {
                 scene.viewport_clear.clear(clr, samples);
             }
 
-            scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
+            scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env, secondary_ordinal);
         }
         // Restore full viewport
         sg.applyViewport(0, 0, cur_w, cur_h, true);
@@ -268,7 +277,7 @@ pub fn render(scene: anytype) void {
 
         var primary_jittered = snap.primary_cam;
         if (taa_on) primary_jittered.view_proj = taa_view_proj;
-        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env);
+        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env, 0);
 
         if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
             sg.applyViewport(0, 0, cur_w, cur_h, true);

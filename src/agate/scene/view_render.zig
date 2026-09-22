@@ -19,9 +19,19 @@ pub fn renderSceneView(
     samples: i32,
     snap: *const scene_snapshot.SceneFrameSnapshot,
     env: scene_draw.Environment,
+    view_slot: usize,
 ) void {
     const view_proj = cam_snap.view_proj;
     const eye = cam_snap.eye;
+    // This view's clustered buffer slot (0 = primary, 1+ = secondaries):
+    // the view rebuilds the tiles and uploads ONLY its own slot, so no
+    // buffer is updated twice in one frame (sokol one-update rule).
+    const slot = scene_clustered.ClusteredGpuCache.clampSlot(view_slot);
+    // Draws bind this view's slot (real views when its upload landed,
+    // else the shared dummy); the shadow-uniform inputs below are
+    // view-independent, so the copy only affects clustered binding.
+    var view_env = env;
+    view_env.clustered_slot = slot;
 
     // Clustered forward lights (wave 30): rebuild the 2D screen tiles
     // for THIS view from the staged snapshot (context thread; never
@@ -41,10 +51,11 @@ pub fn renderSceneView(
         // real frame built tiles from: keep the existing storage
         // buffers and descriptor instead of rebuilding — a replay must
         // stay upload-free (the reuse fixture asserts zero
-        // updateBuffer calls). If the pool went live without a single
-        // real frame since (pure reuse streak), fall back to the
-        // dummy/legacy path until the next real frame.
-        if (scene.clustered.gpu_live) {
+        // updateBuffer calls). Liveness is per view slot: a view whose
+        // slot never uploaded (pure reuse streak) falls back to the
+        // dummy/legacy path until the next real frame, while other
+        // views keep replaying their own slots.
+        if (scene.clustered.isLive(slot)) {
             cl_params = .{
                 @floatFromInt(scene.clustered.tiles_x),
                 @floatFromInt(scene.clustered.tiles_y),
@@ -64,7 +75,7 @@ pub fn renderSceneView(
         const rect = cam_snap.viewport.toPixelRect(snap.screen_w, snap.screen_h);
         const view_rect = scene_clustered.ViewRect{ .x = rect.x, .y = rect.y, .w = rect.width, .h = rect.height };
         var rebuilt_ok = true;
-        scene.clustered.rebuildCpu(
+        scene.clustered.rebuildCpuForSlot(
             scene.allocator,
             &snap.light_pack.clustered_pos_range,
             &snap.light_pack.clustered_color_int,
@@ -73,15 +84,16 @@ pub fn renderSceneView(
             snap.screen_w,
             snap.screen_h,
             view_rect,
+            slot,
         ) catch {
             rebuilt_ok = false;
         };
-        if (rebuilt_ok and scene.clustered.upload(scene.allocator, &scene.gpu_retire)) {
+        if (rebuilt_ok and scene.clustered.upload(scene.allocator, &scene.gpu_retire, slot)) {
             cl_params = .{
                 @floatFromInt(scene.clustered.tiles_x),
                 @floatFromInt(scene.clustered.tiles_y),
                 @floatFromInt(cl_count),
-                if (scene.clustered.gpu_live) 1.0 else 0.0,
+                if (scene.clustered.isLive(slot)) 1.0 else 0.0,
             };
             cl_viewport = .{
                 @floatFromInt(snap.screen_w),
@@ -139,12 +151,12 @@ pub fn renderSceneView(
 
     // Opaque regular meshes first (front-to-back, early-Z).
     for (queues.items.items) |item| {
-        scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+        scene_draw.drawRegularItem(&view_env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
     }
 
     // Opaque instanced meshes.
     for (queues.opaque_instanced.items) |batch| {
-        scene_draw.drawInstancedBatch(&env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+        scene_draw.drawInstancedBatch(&view_env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
     }
 
     // Transparent pass: regular items and instanced groups interleaved in
@@ -154,12 +166,12 @@ pub fn renderSceneView(
         switch (entry.kind) {
             .regular => {
                 if (entry.index < queues.transparent.items.len) {
-                    scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+                    scene_draw.drawRegularItem(&view_env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
                 }
             },
             .instanced => {
                 if (entry.index < queues.transparent_instanced.items.len) {
-                    scene_draw.drawInstancedBatch(&env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+                    scene_draw.drawInstancedBatch(&view_env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
                 }
             },
         }

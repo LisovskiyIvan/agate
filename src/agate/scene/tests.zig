@@ -293,11 +293,11 @@ test "clustered removal retires live tile buffers; out-of-range never retires" {
     _ = try scene.addClusteredPointLight(Vec3.zero, .{});
     _ = try scene.addClusteredPointLight(Vec3.zero, .{});
     // Simulate a previously uploaded generation (headless: borrowed ids,
-    // never created or destroyed through sg here).
-    scene.clustered.light_buffer = .{ .id = 41 };
-    scene.clustered.header_buffer = .{ .id = 42 };
-    scene.clustered.index_buffer = .{ .id = 43 };
-    scene.clustered.gpu_live = true;
+    // never created or destroyed through sg here). Slot 0 = primary.
+    scene.clustered.slots[0].light_buffer = .{ .id = 41 };
+    scene.clustered.slots[0].header_buffer = .{ .id = 42 };
+    scene.clustered.slots[0].index_buffer = .{ .id = 43 };
+    scene.clustered.slots[0].live = true;
 
     // Out-of-range removal is a no-op: count unchanged, nothing retired.
     scene.removeClusteredPointLight(9);
@@ -309,10 +309,10 @@ test "clustered removal retires live tile buffers; out-of-range never retires" {
     scene.removeClusteredPointLight(0);
     try std.testing.expectEqual(@as(usize, 1), scene.clusteredPointLightCount());
     try std.testing.expectEqual(@as(usize, 3), scene.gpu_retire.retainedCount());
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.light_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.header_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.index_buffer.id);
-    try std.testing.expect(!scene.clustered.gpu_live);
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].light_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].header_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].index_buffer.id);
+    try std.testing.expect(!scene.clustered.isLive(0));
 }
 
 test "saturated frame mailbox keeps the newest snapshot" {
