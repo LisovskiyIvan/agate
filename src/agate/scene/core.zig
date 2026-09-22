@@ -340,6 +340,15 @@ pub const Scene = struct {
     forward_msaa: ?scene_forward.ForwardPipelines = null,
     warn_msaa_format: scene_msaa.WarnOnce = .{},
 
+    // Mesh-vanish probe state (pure diagnostic for the symptom "all meshes
+    // gone from the main view while skybox + particles keep rendering").
+    // Render-owned, context thread only (written by probeMeshVanish in
+    // scene/frame_render.zig): rate-limit cursor + latched active flag for
+    // the recovery line. Defaults keep every existing Scene construction
+    // valid; the probe never panics, never fails, never allocates.
+    mesh_vanish_last_log_frame: u64 = 0,
+    mesh_vanish_active: bool = false,
+
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
     // The prepared outline items+skins live in the P7 slots (preparedDraws).

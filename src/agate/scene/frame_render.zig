@@ -13,6 +13,121 @@ fn msSince(t0: u64) f32 {
     return @floatCast(sokol.time.ms(sokol.time.since(t0)));
 }
 
+/// Mesh-vanish diagnostic probe (symptom: ALL meshes disappear from the
+/// main view while particles and the skybox keep rendering).
+///
+/// Condition: every mesh draw queue of the consumed front slot is empty
+/// (primary + all retained view queues) while live scene meshes that could
+/// draw still exist (`is_visible`, not a LOD child). On mismatch logs ONE
+/// rate-limited line (first hit, then at most once per 600 frames) plus a
+/// recovery line when mesh items return, so a live repro captures both the
+/// cause fingerprint and what un-stuck it.
+///
+/// Evidence mapping per line (see the ranked candidates in the report):
+/// - live visible/mask_pass/pending_gpu: distinguishes "scene really
+///   empty" (silent, no log) from mask-cull (mask_pass == 0) and deferred
+///   gpu_pending pileup (pending_gpu == visible).
+/// - build stats total/rendered/culled/occluded + occluders/tris: the
+///   slot-staged counters the prepare latch merged. total == 0 with live
+///   meshes means the build saw nothing (mask skips and gpu_pending skips
+///   bump NO counter); culled == total points at frustum/LOD; occluded > 0
+///   at the occlusion culler; rendered > 0 with empty queues means items
+///   were dropped AFTER the count (queue/storage OOM in append paths).
+/// - cam mask/enabled/vp: culling_mask vs layer_mask mismatch and
+///   non-finite view_proj (NaN/Inf frustum-culls everything).
+/// - reuse/streak: renderReuse replaying a stale empty front.
+///
+/// Cost when healthy: four integer length loads per queue (primary + 8
+/// retained views); the live-mesh census loop and all formatting run only
+/// when every queue is already empty. No allocations, no panics, no state
+/// changes beyond the probe's own cursor/flag. Camera-less frames return
+/// before this point, so offscreen/hidden harness fixtures stay silent
+/// unless they stage visible meshes against empty queues (log-only then).
+fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
+    var n_opaque: usize = draws.primary.items.items.len;
+    var n_opaque_inst: usize = draws.primary.opaque_instanced.items.len;
+    var n_trans: usize = draws.primary.transparent.items.len;
+    var n_trans_inst: usize = draws.primary.transparent_instanced.items.len;
+    for (0..draws.views.len) |i| {
+        const q = &draws.views[i];
+        n_opaque += q.items.items.len;
+        n_opaque_inst += q.opaque_instanced.items.len;
+        n_trans += q.transparent.items.len;
+        n_trans_inst += q.transparent_instanced.items.len;
+    }
+    const all_empty = n_opaque == 0 and n_opaque_inst == 0 and n_trans == 0 and n_trans_inst == 0;
+    if (!all_empty) {
+        if (scene.mesh_vanish_active) {
+            scene.mesh_vanish_active = false;
+            std.log.warn(
+                "[mesh-vanish-probe] RECOVERED frame={} queues refilled (opaque={} opaque_inst={} trans={} trans_inst={})",
+                .{ snap.frame_id, n_opaque, n_opaque_inst, n_trans, n_trans_inst },
+            );
+        }
+        return;
+    }
+    // All mesh queues empty: census the live meshes that could draw. Runs
+    // only on the empty path, never on healthy frames.
+    const pmask = snap.primary_cam.culling_mask;
+    var visible: usize = 0;
+    var mask_pass: usize = 0;
+    var pending_gpu: usize = 0;
+    for (scene.meshes.items) |m| {
+        if (m.is_lod_child or !m.is_visible) continue;
+        visible += 1;
+        if (m.gpu_pending) {
+            pending_gpu += 1;
+            continue;
+        }
+        if ((m.layer_mask & pmask) != 0) mask_pass += 1;
+    }
+    if (visible == 0) return;
+    scene.mesh_vanish_active = true;
+    // Rate limit: first hit + at most once per 600 frames (wrapping-safe).
+    if (scene.mesh_vanish_last_log_frame != 0 and snap.frame_id -% scene.mesh_vanish_last_log_frame < 600) return;
+    scene.mesh_vanish_last_log_frame = snap.frame_id;
+    var vp_state: []const u8 = "ok";
+    for (snap.primary_cam.view_proj.m) |v| {
+        if (std.math.isNan(v)) {
+            vp_state = "NaN";
+            break;
+        }
+        if (std.math.isInf(v)) vp_state = "Inf";
+    }
+    const multi = snap.enable_multi_camera and snap.camera_count > 0;
+    const cam_enabled = if (multi and snap.active_camera_idx < snap.camera_count)
+        snap.cameras[snap.active_camera_idx].enabled
+    else
+        snap.primary_cam.enabled;
+    std.log.warn(
+        "[mesh-vanish-probe] VANISH frame={} live(visible={} mask_pass={} pending_gpu={}) queues(opaque={} opaque_inst={} trans={} trans_inst={}) build(total={} rendered={} culled={} occluded={} occluders={} occ_tris={}) cam(idx={}/{} multi={} mask=0x{x} enabled={} vp={s}) reuse={} streak={}",
+        .{
+            snap.frame_id,
+            visible,
+            mask_pass,
+            pending_gpu,
+            n_opaque,
+            n_opaque_inst,
+            n_trans,
+            n_trans_inst,
+            scene.stats.total_meshes,
+            scene.stats.rendered_meshes,
+            scene.stats.culled_meshes,
+            scene.stats.occluded_meshes,
+            scene.stats.occluders_count,
+            scene.stats.occluder_triangles,
+            snap.active_camera_idx,
+            snap.camera_count,
+            multi,
+            snap.primary_cam.culling_mask,
+            cam_enabled,
+            vp_state,
+            scene.rendering_reuse,
+            scene.reuse_streak,
+        },
+    );
+}
+
 /// Core scene frame presentation pass.
 pub fn render(scene: anytype) void {
     gpu_thread.assertOnContextThread();
@@ -70,6 +185,10 @@ pub fn render(scene: anytype) void {
         if (sg.isvalid()) sg.commit();
         return;
     }
+
+    // Mesh-vanish probe: log-only, rate-limited (see probeMeshVanish
+    // above). Runs on the consumed front slot before any draw.
+    probeMeshVanish(scene, draws, snap);
 
     const cur_w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
     const cur_h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
