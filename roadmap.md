@@ -40,7 +40,7 @@
 | HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, glow layer (threshold + separable blur + additive, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, cap 8, default off), виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off) | 🟡 |
-| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA — только offscreen main target | 🟡 |
+| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA main target + depth-prepass v1 (`Scene.msaa_depth_prepass`, default off) кормит постэффекты 1x-глубиной | 🟡 |
 | Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот, sub-emitters (on-death, SplitMix), flow maps (`setFlowMap`), коллизии CPU-частиц (сферы cap 8 + ground plane, kill/bounce), stateful compute-режим (см. GPU-симуляция) | 🟡 |
 | GPU-симуляция | Stateful compute-режим частиц (`SimulationMode.compute`, in-place state без ping-pong; гейт `computeAvailable()` + `error.ComputeUnsupported`, без тихого fallback; non-goals: sub-emitter deaths, flow maps, сортировка, коллизии) | ✅ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
@@ -64,7 +64,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1159 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 1170 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -205,7 +205,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 - `gltf_util.readSampler` неверно читал морф-веса: у SCALAR-аксессора на ключ приходится `stride` элементов (по одному на morph target), а код читал один элемент на ключ — таргеты алиасились и вес «дрожал» (0 → ramp → 0). Теперь скалярные элементы читаются поштучно; регрессионный тест `readSampler reads interleaved morph weights per target` в `loader/gltf_util.zig`.
 - В sandbox STEP-ряды `InterpolationTest` поставлены на паузу по умолчанию (ступенчатая интерполяция читается как дрожание кубов; LINEAR/CUBIC играют, STEP остаются в сцене).
 
-Отложено осознанно: MSAA (в этой версии sokol нет depth-resolve, а постобработке нужна depth-текстура — нужен отдельный дизайн), LUT-текстура (сейчас параметрические curves), тени от point/spot, motion blur/TAA.
+Отложено осознанно: MSAA (в этой версии sokol нет depth-resolve — закрыто волной 39: single-sample depth-prepass `Scene.msaa_depth_prepass`, default off, см. таблицу постобработки), LUT-текстура (сейчас параметрические curves), тени от point/spot, motion blur/TAA.
 
 ### Волна 7: модульность, lock-free аудио и оптимизация hot-path (12.09.2026)
 
@@ -616,7 +616,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color + текстуры масок/тинта), anisotropy (GGX-stretch, 0 = legacy), thin-film transmission (без refraction RT), SSS v1 (wrap-diffuse + back-scatter) | OpenPBR, полный refraction (IOR/thickness), физической SSS/BSSRDF, импорт `KHR_materials_clearcoat/sheen` из glTF, анизотропных roughness-карт |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, EXR scanline HALF/FLOAT (NONE/RLE/ZIPS/ZIP, strict API `Texture.fromExrFile/fromExrMemory`), equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/refraction probe текстуры |
-| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, glow layer (global v1: threshold-экстракция + separable blur + аддитивная композиция, независим от bloom, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, цвет/радиус/интенсивность на меш, cap 8 `error.TooManyHighlights`, default off), DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | MSAA только offscreen main target (нет depth-resolve) |
+| Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, glow layer (global v1: threshold-экстракция + separable blur + аддитивная композиция, независим от bloom, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, цвет/радиус/интенсивность на меш, cap 8 `error.TooManyHighlights`, default off), DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), MSAA depth-prepass (PASS 1.7, single-sample depth-only проход, default off) — постглубина (SSAO/SSR/DoF/Fog/MotionBlur) под MSAA, цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | TAA под MSAA (v1 non-goal); без гейта depth-эффекты при MSAA подавлены (prepass v1: 1x-глубина, ±1 пиксель на гранях, primary-only) |
 | Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | GPU-морфов, редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps, коллизии CPU-частиц v1 (сферы cap 8 + ground plane, kill/bounce, `error.CollisionNeedsCpu`), stateful compute-симуляция | Коллизий с мешами / rigid-body coupling, CCD, нодового редактора |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG + GreasedLine + QEM-упрощение мешей (decimation) | CSG2 |
@@ -624,7 +624,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии + PBD cloth v1 (cap 4, session-local) | Импорт коллайдеров из файлов; soft body за пределами PBD cloth v1 |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + TrueType-шрифты + checkbox/slider/dropdown/скролл/text input + 3D world-space панели (до 4, pick+inject, render-on-demand) | Фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
-| Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR + ShaderMaterial (engine-hook + внешний shdc-путь: свой `.glsl` собирается build-API движка без правки его исходников) + библиотека материалов (Sky/Gradient/Grid/TriPlanar hook-пресеты) | NodeMaterial/графа материалов |
+| Материалы (NodeMaterial, ShaderMaterial, библиотека материалов) | Standard + PBR + ShaderMaterial (engine-hook + внешний shdc-путь: свой `.glsl` собирается build-API движка без правки его исходников) + библиотека материалов (Sky/Gradient/Grid/TriPlanar hook-пресеты + sandbox-витрина S25, скрыта по умолчанию) + NodeMaterial v1 (типизированный граф 10 нод → GLSL-codegen через hook-путь, параметры — runtime-уiformы, golden-тесты) | NodeMaterial v2: PBR-output/вершинные хуки, vec4-порты, больше текстурных слотов, сериализация графа, runtime-компиляция незарегистрированного графа; визуальный редактор графа |
 | Инструменты разработчика (Inspector, отладочные оверлеи) | `SceneStats`, встроенный профилировщик фаз кадра (HTML/MD/Chrome Trace) + GPU frame time (Metal) и per-pass тайминги shadow/main/post (GL timer-query, за гейтом), снимки памяти CPU/GPU (MemorySnapshot), debug-режимы SSAO/каскадов, `appendDebugLines` | Интерактивного UI-инспектора сцены (in-game editor), редактирования на лету |
 
 ---
@@ -640,12 +640,12 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 **Материалы и текстуры**
 * OpenPBR, полный refraction (IOR/thickness), физическая SSS/BSSRDF, импорт `KHR_materials_clearcoat/sheen` в glTF-лоадере, анизотропные roughness-карты (текстуры clearcoat/sheen, anisotropy, thin-film transmission и SSS v1 уже сделаны, см. 🟡).
-* NodeMaterial (граф материалов без пересборки движка); библиотека материалов (Sky/Gradient/Grid/TriPlanar) уже сделана, см. 🟡. ShaderMaterial с внешним shdc-путём тоже сделан, см. 🟡 (engine-hook + внешний `.glsl` через build-API).
+* NodeMaterial v2 (визуального редактора графа, PBR-output/вершинных хуков, сериализации и runtime-компиляции незарегистрированного графа); v1 (граф → GLSL через hook-путь, runtime-параметры) уже сделан, см. 🟡. Библиотека материалов и ShaderMaterial с внешним shdc-путём сделаны, см. 🟡 (engine-hook + внешний `.glsl` через build-API).
 * Рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡; reflection probes уже реализованы, см. ✅).
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
-* MSAA/SSAA (MSAA — только offscreen main target), lens flares, snapshot-рендер, SSR/SSAO более высокого качества (glow layer — global v1 — highlight layer — per-mesh inner glow v1, cap 8, без depth/скinned/инстанс-подсветки — и TAA через Halton-jitter + history + clamp, LUT-цветокоррекция через 2D-стрип и Camera Motion Blur уже реализованы).
+* SSAA (суперсэмплинг), lens flares, snapshot-рендер, SSR/SSAO более высокого качества (MSAA с depth-resolve через single-sample depth-prepass, default off, — волна 39; glow layer — global v1 — highlight layer — per-mesh inner glow v1, cap 8, без depth/скinned/инстанс-подсветки — и TAA через Halton-jitter + history + clamp, LUT-цветокоррекция через 2D-стрип и Camera Motion Blur уже реализованы).
 
 **Геометрия**
 * Инстансинг с per-instance материалами (PBR-инстансинг поддержан, per-instance material overrides отсутствуют; GreasedLine и QEM-упрощение мешей с автоматической генерацией LOD уже реализованы).
