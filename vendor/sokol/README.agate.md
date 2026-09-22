@@ -60,14 +60,41 @@ defect but are unused; pass them to the script explicitly if that ever changes.
 
 ## Refreshing from upstream
 
-```sh
-rm -rf vendor/sokol
-zig fetch --save git+https://github.com/floooh/sokol-zig.git#<commit>   # or copy the package
-python3 tools/patch_sokol_handle_abi.py
-```
+`agate` depends on sokol via a **path dependency** (`.sokol = .{ .path =
+"vendor/sokol" }` in `build.zig.zon`), so a refresh must replace the
+*contents* of `vendor/sokol` and leave `build.zig.zon` untouched.
 
-and record the new upstream commit hash here. The script is idempotent, so
-running it twice is safe.
+> Do NOT use `zig fetch --save`: it rewrites `build.zig.zon` to a
+> URL-dependency, destroying the path dependency (and the comment block
+> above it documenting why sokol is vendored). Plain `zig fetch` only
+> populates the global cache and prints the package hash.
+
+```sh
+# 1. Fetch into the global cache and note the printed hash, e.g.
+#    sokol-0.1.0-pb1HKwkTQQA_o-CH0MwmkeZw_5n6EdqNQHWuV45dnW3R.
+#    Tarballs land in <global_cache_dir>/p/ (`zig env` -> .global_cache_dir,
+#    defaults to ~/.cache/zig).
+zig fetch git+https://github.com/floooh/sokol-zig.git#<commit>
+
+# 2. Replace vendor/sokol with the pristine upstream tree. The tarball
+#    wraps everything in one top-level <hash>/ directory, hence
+#    --strip-components=1. Keep this README: it is not part of upstream.
+HASH=<hash-printed-by-zig-fetch>
+CACHE="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}"
+cp vendor/sokol/README.agate.md /tmp/README.agate.md
+rm -rf vendor/sokol
+mkdir -p vendor/sokol
+tar -xzf "$CACHE/p/$HASH.tar.gz" -C vendor/sokol --strip-components=1
+cp /tmp/README.agate.md vendor/sokol/README.agate.md
+
+# 3. Re-apply the patch (idempotent) and confirm it took.
+python3 tools/patch_sokol_handle_abi.py
+python3 tools/patch_sokol_handle_abi.py --check
+
+# 4. Record the new upstream commit and package hash at the top of
+#    this file, then verify the build.
+zig build test
+```
 
 ## Upstream
 
