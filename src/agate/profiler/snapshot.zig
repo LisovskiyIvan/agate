@@ -17,6 +17,7 @@ const probe_layer = @import("../scene/probe_layer.zig");
 const gui3d_layer = @import("../scene/gui3d_layer.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 const glow_pass_mod = @import("../passes/glow_pass.zig");
+const highlight_pass_mod = @import("../passes/highlight_pass.zig");
 
 const Scene = scene_mod.Scene;
 const Texture = texture_mod.Texture;
@@ -301,6 +302,24 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 .format = .RGBA8,
                 .samples = 1,
                 .gpu_bytes = glow_bytes,
+            });
+        }
+
+        // Highlight layer targets (mask + H/V ping-pong, half res):
+        // pass-owned like the glow layer above (pure byte math via
+        // HighlightPass.targetBytes — the same three-target shape, no GPU
+        // calls; an unsized pass contributes nothing).
+        const hl = &scene.postfx.highlight_pass;
+        if (hl.base_width > 0 and hl.base_height > 0) {
+            const hl_bytes = highlight_pass_mod.HighlightPass.targetBytes(hl.base_width, hl.base_height, glow_pass_mod.GlowPass.glowBytesPerPixel());
+            snap.render_targets_vram_bytes += hl_bytes;
+            try rt_list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, "Highlight Targets (Mask + Blur Ping-Pong)"),
+                .width = @intCast(hl.base_width),
+                .height = @intCast(hl.base_height),
+                .format = .RGBA8,
+                .samples = 1,
+                .gpu_bytes = hl_bytes,
             });
         }
 

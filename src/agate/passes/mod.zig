@@ -13,6 +13,11 @@ pub const ParticlePass = @import("particle_pass.zig").ParticlePass;
 pub const PostProcessPass = @import("postprocess_pass.zig").PostProcessPass;
 pub const BloomPass = @import("bloom_pass.zig").BloomPass;
 pub const GlowPass = @import("glow_pass.zig").GlowPass;
+pub const HighlightPass = @import("highlight_pass.zig").HighlightPass;
+pub const HighlightDrawItem = @import("highlight_pass.zig").HighlightDrawItem;
+pub const HighlightResult = @import("highlight_pass.zig").HighlightResult;
+pub const makeHighlightDrawItem = @import("highlight_pass.zig").makeHighlightDrawItem;
+pub const highlight_pass = @import("highlight_pass.zig");
 pub const OutlinePass = @import("outline_pass.zig").OutlinePass;
 pub const OutlineDrawItem = @import("outline_pass.zig").OutlineDrawItem;
 // P4: makeOutlineDrawItem/OutlinePass.renderItems/OutlineDrawItem несут

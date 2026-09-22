@@ -34,6 +34,7 @@ pub const PostFXStack = struct {
     ssao_pass: passes.SSAOPass,
     bloom_pass: passes.BloomPass,
     glow_pass: passes.GlowPass,
+    highlight_pass: passes.HighlightPass,
     outline_pass: passes.OutlinePass,
 
     // MSAA twin of the outline pass (its pipelines must match the main
@@ -81,6 +82,7 @@ pub const PostFXStack = struct {
             .ssao_pass = passes.SSAOPass.init(),
             .bloom_pass = passes.BloomPass.init(),
             .glow_pass = passes.GlowPass.init(),
+            .highlight_pass = passes.HighlightPass.init(),
             .outline_pass = passes.OutlinePass.init(),
         };
     }
@@ -90,6 +92,7 @@ pub const PostFXStack = struct {
         self.ssao_pass.deinit();
         self.bloom_pass.deinit();
         self.glow_pass.deinit();
+        self.highlight_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
@@ -101,6 +104,7 @@ pub const PostFXStack = struct {
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
         self.glow_pass.resize(width, height);
+        self.highlight_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -126,6 +130,7 @@ pub const PostFXStack = struct {
             self.postprocess_pass.resize(width, height, samples);
             self.bloom_pass.resize(width, height);
             self.glow_pass.resize(width, height);
+            self.highlight_pass.resize(width, height);
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
@@ -225,6 +230,12 @@ pub const PostFXStack = struct {
         stats: *SceneStats,
         // Main-target sample count; see scene/msaa.zig for the clamp policy.
         main_samples: i32 = 1,
+        // Staged per-mesh highlight items (render-owned snapshots from the
+        // frame slot — never live Scene fields — passed through by
+        // frame_render from the pinned front slot, same P7 shape as the
+        // outline items-view_render consumes inside the main pass). Empty
+        // by default: zero items gate the whole PASS 2.85 chain off.
+        highlight_items: []const passes.HighlightDrawItem = &.{},
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         // P6: the prepared render-owned frame (upload-free draw), never the
         // live canvas. Intentional low-level break: `?*UICanvas` became
@@ -234,9 +245,10 @@ pub const PostFXStack = struct {
     };
 
     /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 2.8 (glow layer) +
+    /// PASS 2.85 (highlight layer) +
     /// PASS 3 (fullscreen composite and UI overlay onto the swapchain). The
     /// composite pass itself only runs when post-processing is enabled —
-    /// SSAO/bloom/glow then just refresh their inputs (legacy behavior kept
+    /// SSAO/bloom/glow/highlight then just refresh their inputs (legacy behavior kept
     /// verbatim).
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         // Depth-consuming effects are incompatible with the MSAA main
@@ -343,6 +355,37 @@ pub const PostFXStack = struct {
             params.stats.triangles += 2 * postprocess.GLOW_PASS_DRAWS;
         }
         self.postprocess_pass.setGlowTexture(glow_view);
+
+        // ==============================================
+        // PASS 2.85: HIGHLIGHT LAYER v1 (per-mesh inner glow)
+        // ==============================================
+        // Flat-colored mask fills (one per staged item) + separable H/V
+        // blur (HIGHLIGHT_BLUR_DRAWS draws); when inactive (post off or
+        // zero staged items) the composite shader skips the highlight block
+        // and this binds the empty view (the pass binds the resolved scene
+        // view placeholder for it — bit-identical). Runs AFTER the glow
+        // stage and composites after glow's block, so either toggle leaves
+        // the other's output unchanged. Samples no depth (the mask has no
+        // depth attachment), hence no MSAA suppression. Like glow it is
+        // uniform-only past its mask binds (no sg.updateBuffer, no
+        // upload-meter records) and resize-idempotent, so renderReuse
+        // replays replay it upload-free. The mask composites from the
+        // primary view only (v1 non-goal: multi-camera highlights follow
+        // the primary camera).
+        var highlight_view: sg.View = .{};
+        if (postprocess.highlightActive(params.post.enabled, params.highlight_items.len)) {
+            const hl = self.highlight_pass.render(
+                params.view_proj,
+                params.highlight_items,
+                cur_w,
+                cur_h,
+            );
+            highlight_view = hl.view;
+            params.stats.post_draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
+            params.stats.draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
+            params.stats.triangles += hl.mask_tris + 2 * passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
+        }
+        self.postprocess_pass.setHighlightTexture(highlight_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS

@@ -14,6 +14,7 @@ const scene_render_queue = @import("render_queue.zig");
 const RenderQueues = scene_render_queue.RenderQueues;
 const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const outline_pass = @import("../passes/outline_pass.zig");
+const highlight_pass = @import("../passes/highlight_pass.zig");
 const frame_draws = @import("frame_draws.zig");
 const FrameDrawSlot = frame_draws.FrameDrawSlot;
 const jobs = @import("../jobs.zig");
@@ -134,6 +135,33 @@ pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildP
         }
         if (outline_pass.makeOutlineDrawItem(scene.allocator, &back.outline_skins, m, params.cache_key, src_idx, params.instance_source)) |it| {
             back.outline_items.append(scene.allocator, it) catch {};
+        }
+    }
+
+    // Highlight layer v1 capture (same phase-locked prepare point as the
+    // outline loop above, unconditional like it — zero highlights stage
+    // zero items and the whole downstream chain stays bit-identical).
+    // Identity domain matches outline (`source_mesh` = mesh-list index,
+    // OOB sentinel = meshes.len), but — unlike outline — OOB referents
+    // are SKIPPED here: highlights have no latch patch stage
+    // (patch_instance_refs only patches instanced batch refs; highlight
+    // items stage no instance buffers by design), so emitting them would
+    // only feed the mask pass dead handles. destroyMesh drops the entry
+    // synchronously, so OOB is defense-in-depth only. Skinned meshes are
+    // skipped inside makeHighlightDrawItem (no skin matrix staging v1);
+    // instanced meshes stage the template proxy (documented v1 limit).
+    for (scene.highlights.entries[0..scene.highlights.count]) |*e| {
+        if (e.mesh.gpu_pending or !e.mesh.is_visible or e.mesh.index_count == 0) continue;
+        var src_idx: u32 = @intCast(scene.meshes.items.len);
+        for (scene.meshes.items, 0..) |sm, si| {
+            if (sm == e.mesh) {
+                src_idx = @intCast(si);
+                break;
+            }
+        }
+        if (src_idx >= scene.meshes.items.len) continue;
+        if (highlight_pass.makeHighlightDrawItem(e.mesh, e.options, src_idx)) |it| {
+            back.highlight_items.append(scene.allocator, it) catch {};
         }
     }
 

@@ -206,6 +206,9 @@ pub const Ui3dPanel = scene.Ui3dPanel;
 pub const Ui3dPanelOptions = scene.Ui3dPanelOptions;
 pub const Ui3dFaceMode = scene.Ui3dFaceMode;
 pub const Ui3dPickHit = scene.Ui3dPickHit;
+pub const HighlightLayer = scene.HighlightLayer;
+pub const HighlightEntry = scene.HighlightEntry;
+pub const HighlightOptions = scene.HighlightOptions;
 pub const SceneFrameSnapshot = scene.SceneFrameSnapshot;
 pub const CameraSnapshot = scene.CameraSnapshot;
 
@@ -349,8 +352,10 @@ pub const loadThemeFile = ui.loadThemeFile;
 pub const passes = @import("passes/mod.zig");
 pub const DebugPass = passes.DebugPass;
 pub const BloomPass = passes.BloomPass;
+pub const HighlightPass = passes.HighlightPass;
 pub const OutlinePass = passes.OutlinePass;
 pub const outline_pass = passes.outline_pass; // file-level: shouldOutlineMesh etc.
+pub const highlight_pass = passes.highlight_pass; // file-level: makeHighlightDrawItem etc.
 
 pub const animation = struct {
     pub const skeleton = @import("animation/skeleton.zig");
@@ -555,6 +560,11 @@ test "root re-exports cover recent Scene APIs" {
     _ = Ui3dPanelOptions;
     _ = Ui3dFaceMode;
     _ = Ui3dPickHit;
+    _ = HighlightLayer;
+    _ = HighlightEntry;
+    _ = HighlightOptions;
+    _ = HighlightPass;
+    _ = highlight_pass;
     _ = SceneFrameSnapshot;
     _ = CameraSnapshot;
     _ = UpdateError;

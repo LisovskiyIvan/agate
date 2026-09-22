@@ -368,6 +368,53 @@ pub fn glowTintParams(cfg: PostProcessOptions) [4]f32 {
     return .{ c.glow_tint[0], c.glow_tint[1], c.glow_tint[2], 0.0 };
 }
 
+// --- Highlight layer v1 (per-mesh inner glow) ---
+//
+// Composite order (see postprocess.glsl main): ... BLOOM -> GLOW ->
+// HIGHLIGHT -> contrast -> saturation -> curves -> LUT -> vignette ->
+// grain. The highlight halo composites right after the glow block so
+// either toggle leaves the other's contribution bit-identical, and before
+// the grading chain so per-mesh colors grade with the same LDR the
+// bloom/glow halos use.
+//
+// Pass order (see scene/postfx_stack.zig renderChain): PASS 2.5 SSAO, PASS
+// 2.75 bloom pyramid, PASS 2.8 glow (extract + H + V), PASS 2.85 highlight
+// (mask fills + H + V = HIGHLIGHT_BLUR_DRAWS fullscreen draws), PASS 3
+// fullscreen composite. Like glow the highlight pass samples no depth, so
+// the MSAA depth-suppression never applies to it. Like glow it is
+// uniform-only past its mask binds (no sg.updateBuffer, hence no
+// gpu_upload_meter records) and resize-idempotent, so renderReuse replays
+// stay upload-free by construction.
+//
+// Per-item intensity folds into the mask fill color at draw time (exact:
+// the blur kernel is normalized), so the composite carries a single baked
+// global scale of 1.0 below. The frame blur sigma is the max over the
+// staged items (documented v1 approximation in
+// passes/highlight_pass.zig).
+
+// Pass-construction decision (pure; PostFXStack.renderChain gates the GPU
+// passes on this). Zero staged items (or post off) runs zero passes and
+// binds the placeholder (bit-identical composite).
+pub fn highlightActive(post_enabled: bool, highlight_count: usize) bool {
+    return post_enabled and highlight_count > 0;
+}
+
+// Pack the composite highlight_params vec4: (enabled 1/0, baked global
+// scale 1.0, 0, 0). Disabled packs all zeros, which keeps the composite
+// bit-identical to the pre-highlight path (the shader returns before
+// sampling highlight_tex).
+pub fn highlightParams(active: bool) [4]f32 {
+    if (!active) return .{ 0.0, 0.0, 0.0, 0.0 };
+    return .{ 1.0, 1.0, 0.0, 0.0 };
+}
+
+// Additive masked composite. Mirrors the highlight block in
+// postprocess.glsl: the blurred per-item mask (intensity already folded)
+// adds straight onto the scene color.
+pub fn highlightComposite(color: [3]f32, halo: [3]f32) [3]f32 {
+    return .{ color[0] + halo[0], color[1] + halo[1], color[2] + halo[2] };
+}
+
 // True when `size` is a supported LUT cube edge (strip is N*N x N).
 pub fn validLutSize(size: u32) bool {
     return size >= LUT_SIZE_MIN and size <= LUT_SIZE_MAX;
@@ -1620,4 +1667,35 @@ test "glow and bloom pass decisions are independent" {
     // level-0 sizing.
     try std.testing.expectEqual(@as(u32, 3), GLOW_PASS_DRAWS);
     try std.testing.expectEqual(BloomMipSize{ .w = 640, .h = 360 }, bloomMipSize(1280, 720, 0));
+}
+
+test "highlight active gating and params packing" {
+    // Zero highlights (or post off) runs zero passes: the composite keeps
+    // its no-highlight path (bit-identical to pre-highlight).
+    try std.testing.expect(!highlightActive(true, 0));
+    try std.testing.expect(!highlightActive(false, 1));
+    try std.testing.expect(!highlightActive(false, 8));
+    try std.testing.expect(highlightActive(true, 1));
+    try std.testing.expect(highlightActive(true, 8));
+
+    // Disabled packs all zeros (the shader returns before sampling).
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, highlightParams(false));
+    // Enabled packs the baked global scale 1.0: per-item intensity already
+    // folded into the mask at draw time (exact under the normalized blur).
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, highlightParams(true));
+
+    // Independent of glow/bloom: toggling those never changes the
+    // highlight decision (and vice versa).
+    const glow_on = PostProcessOptions{ .glow_enabled = true };
+    try std.testing.expect(!highlightActive(true, 0));
+    try std.testing.expect(glowActive(true, glow_on));
+    try std.testing.expect(highlightActive(true, 3));
+}
+
+test "highlight composite adds the halo" {
+    // Pure add (the blurred per-item mask, intensity already folded).
+    try std.testing.expectEqual([3]f32{ 0.6, 0.7, 0.8 }, highlightComposite(.{ 0.5, 0.5, 0.5 }, .{ 0.1, 0.2, 0.3 }));
+    // Zero halo is identity (what the disabled path computes without
+    // sampling).
+    try std.testing.expectEqual([3]f32{ 0.2, 0.4, 0.6 }, highlightComposite(.{ 0.2, 0.4, 0.6 }, .{ 0.0, 0.0, 0.0 }));
 }
