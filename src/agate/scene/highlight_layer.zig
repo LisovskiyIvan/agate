@@ -19,17 +19,33 @@
 //!   `postprocess.highlightActive` (post on AND at least one staged item),
 //!   and the composite shader keeps its no-highlight path when the pass
 //!   feeds an empty view.
+//! - Lazy targets: the mask + H/V blur RTs allocate on the first ACTIVE
+//!   `HighlightPass.render` only — `resizeAll`/`beginMainPass` never size
+//!   them, so zero-highlight frames hold no highlight VRAM and the VRAM
+//!   census (gated on the pass base size) honestly reports zero. A resize
+//!   during OFF cannot break the first active frame: `render` resizes to
+//!   the current base size before drawing.
 //! - Render approach (documented choice): mask-RT inner glow. During prepare
 //!   (phase-locked) the world matrices + proxy geometry handles of the
 //!   highlighted meshes are staged into the frame slot; a render pass draws
 //!   them flat-colored (per-item color x intensity) into a half-resolution
 //!   mask RT, blurs it with the glow-style separable Gaussian (same
 //!   `glow_blur` shader module and kernel math as `GlowPass`), and the
-//!   fullscreen composite adds the halo after the glow block, before the
-//!   grading chain. The inverse-hull fallback (per-item outline colors) was
-//!   rejected: it cannot produce the soft inner-glow falloff the roadmap
-//!   item asks for, and reusing the outline shader for the flat mask fill
-//!   keeps this pass at zero new GLSL files.
+//!   fullscreen composite adds the inner glow after the glow block, before
+//!   the grading chain. The composite reads the RAW mask minus its blurred
+//!   halo, floored at zero per channel and doubled
+//!   (`highlightInnerGlow` in `postprocess.zig`, mirrored in
+//!   `shaders/postprocess.glsl`): mesh interiors (mask ~= blurred)
+//!   contribute ~0, the silhouette edge (blur ~= half coverage) restores
+//!   the full per-item color, and outside the mesh the raw mask is 0 so
+//!   the blurred spill clamps to 0. The difference form (rather than
+//!   mask x (1 - blurred)) is exact under the folded per-item intensity;
+//!   the visual is deliberately inner-only with NO out-of-mesh halo (the
+//!   halo variant would add max(blurred - mask, 0) instead). The
+//!   inverse-hull fallback (per-item outline colors) was rejected: it
+//!   cannot produce the soft inner-glow falloff the roadmap item asks
+//!   for, and reusing the outline shader for the flat mask fill keeps
+//!   this pass at zero new GLSL files.
 //!
 //! Explicit non-goals (v1):
 //! - Skinned/animated highlighted meshes: no skin matrix staging exists, so
@@ -43,7 +59,9 @@
 //!   geometry (same documented limit as the global glow layer).
 //! - Alpha-cutout cards draw their quad proxy (no alpha test in the mask
 //!   path), so the halo follows the quad, not the leaf silhouette.
-//! - Multi-camera: the mask composites from the primary view only.
+//! - Multi-camera: the mask draws and composites from the primary view
+//!   only, under the primary camera's pixel viewport mapped onto the
+//!   half-res mask target (PIP-aware; secondary views never contribute).
 //! - Blur radius is frame-global (max over the staged items): per-item blur
 //!   values are validated and staged, but one separable blur runs per
 //!   frame, so items with a smaller radius get the frame's widest halo.

@@ -267,6 +267,14 @@ pub fn render(scene: anytype) void {
     // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 2.85 (highlight) + 3 (composite & UI overlay)
     // ==============================================
     const t_post = sokol.time.now();
+    // Highlight mask viewport: the primary view's rect (the same viewport
+    // the main pass drew under above, both single- and multi-camera
+    // paths) — the PASS 2.85 mask maps it onto its half-res target so
+    // PIP/sub-viewports composite aligned. Secondary views never feed it.
+    const highlight_viewport = if (snap.enable_multi_camera and snap.camera_count > 0)
+        (if (snap.active_camera_idx < snap.camera_count) snap.cameras[snap.active_camera_idx].viewport else snap.primary_cam.viewport)
+    else
+        snap.primary_cam.viewport;
     scene.postfx.renderChain(.{
         .post = snap.post_process,
         .ssao = snap.ssao,
@@ -283,6 +291,8 @@ pub fn render(scene: anytype) void {
         // P7 staged highlight items from the pinned front slot (never live
         // Scene fields): the render below dereferences no mesh.
         .highlight_items = draws.highlight_items.items,
+        // Primary view's viewport for the PASS 2.85 mask (computed above).
+        .highlight_viewport = highlight_viewport,
         .ui = if (scene.ui_frame.canvas_present) &scene.ui_frame else null,
         .stats = &scene.stats,
     }, cur_w, cur_h);

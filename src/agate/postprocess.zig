@@ -390,7 +390,11 @@ pub fn glowTintParams(cfg: PostProcessOptions) [4]f32 {
 // the blur kernel is normalized), so the composite carries a single baked
 // global scale of 1.0 below. The frame blur sigma is the max over the
 // staged items (documented v1 approximation in
-// passes/highlight_pass.zig).
+// passes/highlight_pass.zig). The composite is an inner glow, not a flat
+// fill: highlightInnerGlow/highlightComposite mirror the shader block
+// (raw mask minus blurred halo, floored at zero, x2) — see
+// highlightInnerGlow for why the difference form is exact under folded
+// intensity.
 
 // Pass-construction decision (pure; PostFXStack.renderChain gates the GPU
 // passes on this). Zero staged items (or post off) runs zero passes and
@@ -408,11 +412,39 @@ pub fn highlightParams(active: bool) [4]f32 {
     return .{ 1.0, 1.0, 0.0, 0.0 };
 }
 
-// Additive masked composite. Mirrors the highlight block in
-// postprocess.glsl: the blurred per-item mask (intensity already folded)
-// adds straight onto the scene color.
-pub fn highlightComposite(color: [3]f32, halo: [3]f32) [3]f32 {
-    return .{ color[0] + halo[0], color[1] + halo[1], color[2] + halo[2] };
+// Inner-glow edge term. Mirrors the highlight block in postprocess.glsl:
+// per-channel max(mask - blurred, 0) * 2.
+//
+// Why the difference form instead of mask * (1 - blurred) * 2: the raw
+// mask stores premultiplied color x intensity (per-item intensity folds
+// into the fill at draw time, exact under the normalized blur kernel),
+// so mask * (1 - blurred) would leave an intensity-dependent residue in
+// the mesh interior (mask=0.5, blurred=0.5 -> 0.5 instead of 0). On a
+// binary coverage mask both forms coincide (M in {0,1}: M*(1-B) ==
+// max(M-B, 0)); the difference form stays exact for any folded
+// intensity: interior mask ~= blurred -> 0, silhouette edge
+// mask - blurred ~= mask/2 -> x2 restores the full folded color, and
+// outside the mesh mask = 0 clamps the blurred spill to 0 (inner-only
+// glow, no out-of-mesh halo — the halo variant would add
+// max(blurred - mask, 0) instead).
+//
+// Gain 2.0 is exact, not aesthetic: at the silhouette the normalized
+// blur averages ~half coverage, so mask - blurred peaks at ~mask/2 and
+// the x2 restores the peak to the full per-item color x intensity.
+pub fn highlightInnerGlow(mask: [3]f32, blurred: [3]f32) [3]f32 {
+    return .{
+        @max(mask[0] - blurred[0], 0.0) * 2.0,
+        @max(mask[1] - blurred[1], 0.0) * 2.0,
+        @max(mask[2] - blurred[2], 0.0) * 2.0,
+    };
+}
+
+// Additive inner-glow composite. Mirrors the highlight block in
+// postprocess.glsl: the raw per-item mask minus its blurred halo,
+// floored at zero (inner-only) and added straight onto the scene color.
+pub fn highlightComposite(color: [3]f32, mask: [3]f32, blurred: [3]f32) [3]f32 {
+    const inner = highlightInnerGlow(mask, blurred);
+    return .{ color[0] + inner[0], color[1] + inner[1], color[2] + inner[2] };
 }
 
 // True when `size` is a supported LUT cube edge (strip is N*N x N).
@@ -1692,10 +1724,35 @@ test "highlight active gating and params packing" {
     try std.testing.expect(highlightActive(true, 3));
 }
 
-test "highlight composite adds the halo" {
-    // Pure add (the blurred per-item mask, intensity already folded).
-    try std.testing.expectEqual([3]f32{ 0.6, 0.7, 0.8 }, highlightComposite(.{ 0.5, 0.5, 0.5 }, .{ 0.1, 0.2, 0.3 }));
-    // Zero halo is identity (what the disabled path computes without
-    // sampling).
-    try std.testing.expectEqual([3]f32{ 0.2, 0.4, 0.6 }, highlightComposite(.{ 0.2, 0.4, 0.6 }, .{ 0.0, 0.0, 0.0 }));
+test "highlight composite is an inner glow, not a flat fill" {
+    // Mesh interior (mask == blurred, whatever the folded intensity):
+    // zero contribution — this is what the old flat-fill got wrong.
+    try std.testing.expectEqual([3]f32{ 0.5, 0.5, 0.5 }, highlightComposite(.{ 0.5, 0.5, 0.5 }, .{ 0.4, 0.2, 0.8 }, .{ 0.4, 0.2, 0.8 }));
+    // Interior stays dark at full intensity too (intensity-independent).
+    try std.testing.expectEqual([3]f32{ 0.1, 0.1, 0.1 }, highlightComposite(.{ 0.1, 0.1, 0.1 }, .{ 1.0, 1.0, 1.0 }, .{ 1.0, 1.0, 1.0 }));
+    // Silhouette edge (blur ~half coverage): x2 restores the full mask
+    // color on top of the scene color.
+    try std.testing.expectEqual([3]f32{ 0.5 + 0.4, 0.5 + 0.2, 0.5 + 0.8 }, highlightComposite(.{ 0.5, 0.5, 0.5 }, .{ 0.4, 0.2, 0.8 }, .{ 0.2, 0.1, 0.4 }));
+    // Outside the mesh (raw mask 0, blurred spill > 0): clamped to 0 —
+    // inner-only glow, no out-of-mesh halo.
+    try std.testing.expectEqual([3]f32{ 0.2, 0.4, 0.6 }, highlightComposite(.{ 0.2, 0.4, 0.6 }, .{ 0.0, 0.0, 0.0 }, .{ 0.3, 0.1, 0.2 }));
+    // Zero mask + zero blur is identity (what the disabled path computes
+    // without sampling).
+    try std.testing.expectEqual([3]f32{ 0.2, 0.4, 0.6 }, highlightComposite(.{ 0.2, 0.4, 0.6 }, .{ 0.0, 0.0, 0.0 }, .{ 0.0, 0.0, 0.0 }));
+}
+
+test "highlight inner glow edge term" {
+    // Interior: mask == blurred -> exactly zero at any intensity.
+    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 0.0 }, highlightInnerGlow(.{ 0.7, 0.1, 0.0 }, .{ 0.7, 0.1, 0.0 }));
+    // Edge: (mask - blurred) * 2 per channel.
+    const edge = highlightInnerGlow(.{ 0.4, 0.2, 0.8 }, .{ 0.2, 0.1, 0.4 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), edge[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), edge[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), edge[2], 1e-6);
+    // Outside: negative floors per channel, never bleeds across channels.
+    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 0.0 }, highlightInnerGlow(.{ 0.0, 0.0, 0.0 }, .{ 0.3, 0.1, 0.2 }));
+    const mixed = highlightInnerGlow(.{ 0.5, 0.0, 0.25 }, .{ 0.1, 0.4, 0.25 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), mixed[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[2], 1e-6);
 }

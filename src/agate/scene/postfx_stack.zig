@@ -11,6 +11,7 @@ const Color4 = math.Color4;
 
 const Mesh = @import("../mesh.zig").Mesh;
 const Camera = @import("../camera.zig").Camera;
+const Viewport = @import("../camera.zig").Viewport;
 const passes = @import("../passes/mod.zig");
 const scene_render_queue = @import("render_queue.zig");
 const postprocess = @import("../postprocess.zig");
@@ -99,12 +100,17 @@ pub const PostFXStack = struct {
     }
 
     /// Resizes every viewport-sized offscreen target (window resize path).
+    /// The highlight mask/blur targets are deliberately EXCLUDED: they
+    /// allocate lazily on the first active HighlightPass.render (gated by
+    /// highlightActive in renderChain), so post-on with zero highlights
+    /// holds no highlight VRAM (~12 MiB @1080p RGBA16F, ~48 MiB @4K).
+    /// A resize during OFF cannot break the first active frame — render()
+    /// resizes to the current base size before drawing.
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
         self.postprocess_pass.resize(width, height, self.main_samples);
         self.ssao_pass.resize(width, height);
         self.bloom_pass.resize(width, height);
         self.glow_pass.resize(width, height);
-        self.highlight_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -130,7 +136,9 @@ pub const PostFXStack = struct {
             self.postprocess_pass.resize(width, height, samples);
             self.bloom_pass.resize(width, height);
             self.glow_pass.resize(width, height);
-            self.highlight_pass.resize(width, height);
+            // No highlight_pass.resize here (lazy, see resizeAll): the
+            // first active render() sizes the mask/blur targets itself,
+            // so zero-highlight frames never allocate them.
             var offscreen_pass = sg.Pass{
                 .action = main_pass_action,
             };
@@ -236,6 +244,12 @@ pub const PostFXStack = struct {
         // outline items-view_render consumes inside the main pass). Empty
         // by default: zero items gate the whole PASS 2.85 chain off.
         highlight_items: []const passes.HighlightDrawItem = &.{},
+        // Normalized primary-camera viewport for the highlight mask pass
+        // (frame_render forwards the primary view's viewport — the same
+        // rect the main pass draws under — so PIP/sub-viewports stay
+        // aligned; fullscreen by default). Multi-camera stays primary-only
+        // (v1 non-goal); secondary views never feed the mask.
+        highlight_viewport: Viewport = .{},
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         // P6: the prepared render-owned frame (upload-free draw), never the
         // live canvas. Intentional low-level break: `?*UICanvas` became
@@ -362,30 +376,42 @@ pub const PostFXStack = struct {
         // Flat-colored mask fills (one per staged item) + separable H/V
         // blur (HIGHLIGHT_BLUR_DRAWS draws); when inactive (post off or
         // zero staged items) the composite shader skips the highlight block
-        // and this binds the empty view (the pass binds the resolved scene
-        // view placeholder for it — bit-identical). Runs AFTER the glow
+        // and this binds the empty views (the pass binds the resolved scene
+        // view placeholder for both — bit-identical). The composite reads
+        // raw mask minus blurred halo (inner-only edge glow, x2 — see
+        // highlightInnerGlow in postprocess.zig), so the raw mask view
+        // travels with the blurred view under the same active/empty
+        // discipline. Runs AFTER the glow
         // stage and composites after glow's block, so either toggle leaves
         // the other's output unchanged. Samples no depth (the mask has no
         // depth attachment), hence no MSAA suppression. Like glow it is
         // uniform-only past its mask binds (no sg.updateBuffer, no
         // upload-meter records) and resize-idempotent, so renderReuse
-        // replays replay it upload-free. The mask composites from the
-        // primary view only (v1 non-goal: multi-camera highlights follow
-        // the primary camera).
+        // replays replay it upload-free. The mask draws and composites from
+        // the primary view only (v1 non-goal: multi-camera highlights follow
+        // the primary camera's viewport; secondary views never contribute).
         var highlight_view: sg.View = .{};
+        var highlight_mask_view: sg.View = .{};
         if (postprocess.highlightActive(params.post.enabled, params.highlight_items.len)) {
+            // Primary-camera pixel rect (PIP-aware): the mask pass draws
+            // under this viewport/scissor mapped onto its half-res target,
+            // matching where the main pass drew the mesh's scene pixels.
+            const hl_rect = params.highlight_viewport.toPixelRect(cur_w, cur_h);
             const hl = self.highlight_pass.render(
                 params.view_proj,
                 params.highlight_items,
                 cur_w,
                 cur_h,
+                hl_rect,
             );
             highlight_view = hl.view;
+            highlight_mask_view = hl.mask_view;
             params.stats.post_draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
             params.stats.draw_calls += hl.mask_draws + passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
             params.stats.triangles += hl.mask_tris + 2 * passes.highlight_pass.HIGHLIGHT_BLUR_DRAWS;
         }
         self.postprocess_pass.setHighlightTexture(highlight_view);
+        self.postprocess_pass.setHighlightMaskTexture(highlight_mask_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS
