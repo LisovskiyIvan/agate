@@ -53,7 +53,9 @@
 //!   geometry (same documented limit as the global glow layer).
 //! - Alpha-cutout cards draw their quad proxy (no alpha test in the mask
 //!   path), so the halo follows the quad, not the leaf silhouette.
-//! - Multi-camera: the mask composites from the primary view only.
+//! - Multi-camera: the mask draws and composites from the primary view
+//!   only, under the primary camera's pixel viewport mapped onto the
+//!   half-res mask target (PIP-aware; secondary views never contribute).
 //! - Blur radius is frame-global (max over the staged items): per-item blur
 //!   values are validated and staged, but one separable blur runs per
 //!   frame, so items with a smaller radius get the frame's widest halo.

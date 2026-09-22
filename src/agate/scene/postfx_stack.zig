@@ -11,6 +11,7 @@ const Color4 = math.Color4;
 
 const Mesh = @import("../mesh.zig").Mesh;
 const Camera = @import("../camera.zig").Camera;
+const Viewport = @import("../camera.zig").Viewport;
 const passes = @import("../passes/mod.zig");
 const scene_render_queue = @import("render_queue.zig");
 const postprocess = @import("../postprocess.zig");
@@ -236,6 +237,12 @@ pub const PostFXStack = struct {
         // outline items-view_render consumes inside the main pass). Empty
         // by default: zero items gate the whole PASS 2.85 chain off.
         highlight_items: []const passes.HighlightDrawItem = &.{},
+        // Normalized primary-camera viewport for the highlight mask pass
+        // (frame_render forwards the primary view's viewport — the same
+        // rect the main pass draws under — so PIP/sub-viewports stay
+        // aligned; fullscreen by default). Multi-camera stays primary-only
+        // (v1 non-goal); secondary views never feed the mask.
+        highlight_viewport: Viewport = .{},
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         // P6: the prepared render-owned frame (upload-free draw), never the
         // live canvas. Intentional low-level break: `?*UICanvas` became
@@ -373,17 +380,22 @@ pub const PostFXStack = struct {
         // depth attachment), hence no MSAA suppression. Like glow it is
         // uniform-only past its mask binds (no sg.updateBuffer, no
         // upload-meter records) and resize-idempotent, so renderReuse
-        // replays replay it upload-free. The mask composites from the
-        // primary view only (v1 non-goal: multi-camera highlights follow
-        // the primary camera).
+        // replays replay it upload-free. The mask draws and composites from
+        // the primary view only (v1 non-goal: multi-camera highlights follow
+        // the primary camera's viewport; secondary views never contribute).
         var highlight_view: sg.View = .{};
         var highlight_mask_view: sg.View = .{};
         if (postprocess.highlightActive(params.post.enabled, params.highlight_items.len)) {
+            // Primary-camera pixel rect (PIP-aware): the mask pass draws
+            // under this viewport/scissor mapped onto its half-res target,
+            // matching where the main pass drew the mesh's scene pixels.
+            const hl_rect = params.highlight_viewport.toPixelRect(cur_w, cur_h);
             const hl = self.highlight_pass.render(
                 params.view_proj,
                 params.highlight_items,
                 cur_w,
                 cur_h,
+                hl_rect,
             );
             highlight_view = hl.view;
             highlight_mask_view = hl.mask_view;
