@@ -81,6 +81,11 @@ pub const ShaderMaterial = material.ShaderMaterial;
 // shader_material.zig docs for the registration/uniform model.
 pub const shader_material = @import("shader_material.zig");
 
+// Named material presets (Sky/Gradient/Grid/TriPlanar) as reusable
+// ShaderMaterial constructors over the hook registrations above. See
+// material_library.zig docs for the scene-wiring pattern.
+pub const material_library = @import("material_library.zig");
+
 pub const texture = @import("texture.zig");
 /// KTX2 container reader: uncompressed LDR subset plus block-compressed
 /// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding. Texture.

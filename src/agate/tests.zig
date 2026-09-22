@@ -79,6 +79,7 @@ test {
     _ = @import("loader/stl.zig");
     _ = @import("loader/stl_fuzz.zig");
     _ = @import("material.zig");
+    _ = @import("material_library.zig");
     _ = @import("mesh.zig");
     _ = @import("mesh/builder.zig");
     _ = @import("mesh/builders.zig");
