@@ -35,7 +35,7 @@
 | Reflection probes | До 4 зондов, on-demand capture (128px RGBA8-куб + 8 мипов, 6 face-проходов); PBR×3 заменяет IBL-источник, Standard ambient — из coarsest mip; nearest enabled+captured в радиусе, без блендинга | ✅ |
 | Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
-| OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color; без текстур) | 🟡 |
+| OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color + маски/тинт-текстуры), anisotropy v1, thin-film transmission v1 (без refraction RT), SSS v1 (wrap+back-scatter); без OpenPBR | 🟡 |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
 | HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
@@ -64,7 +64,7 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1139 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 1146 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
 | Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
@@ -613,7 +613,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Камеры (Universal/Free/Follow/Target/Fly/VR, мультикамера, viewports, риги) | ArcRotate + Free + Fly + Follow + Target + union Camera, мультикамера/viewport'ы (PIP), инерция/сглаживание вращения/зума (ArcRotate, Free, Fly), камера-риги (CameraRig) с пресетами (dual, quad, CAD, PIP, stereoscopic 3D VR) | touch/pinch, геймпад |
 | Свет (Directional, RectArea, тысячи источников, clustered) | 1 hemi (ambient) + до 4 directional (1 солнце с CSM + до 3 shadowless fill) + 4 point + 2 spot (выбор лучших по камере) + до 2 rect area (closest-point approximation, без теней, API-only) + clustered до 64 point (tile-based forward+, без теней в v1) | Кластерного освещения сверх 64 / с тенями |
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
-| PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color, без текстур) | Расширенных слоёв PBR (текстуры clearcoat/sheen, anisotropy, transmission, SSS), OpenPBR |
+| PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color + текстуры масок/тинта), anisotropy (GGX-stretch, 0 = legacy), thin-film transmission (без refraction RT), SSS v1 (wrap-diffuse + back-scatter) | OpenPBR, полный refraction (IOR/thickness), физической SSS/BSSRDF, импорт `KHR_materials_clearcoat/sheen` из glTF, анизотропных roughness-карт |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
 | Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, EXR scanline HALF/FLOAT (NONE/RLE/ZIPS/ZIP, strict API `Texture.fromExrFile/fromExrMemory`), equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/refraction probe текстуры |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, glow layer (global v1: threshold-экстракция + separable blur + аддитивная композиция, независим от bloom, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, цвет/радиус/интенсивность на меш, cap 8 `error.TooManyHighlights`, default off), DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | MSAA только offscreen main target (нет depth-resolve) |
@@ -639,7 +639,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Динамический IBL, объёмный свет/атмосфера (rect area до 2 с closest-point approximation, clustered до 64 без теней в v1 и reflection probes до 4 с on-demand capture уже реализованы, см. ✅).
 
 **Материалы и текстуры**
-* OpenPBR, текстуры clearcoat/sheen, anisotropic, transmission, subsurface.
+* OpenPBR, полный refraction (IOR/thickness), физическая SSS/BSSRDF, импорт `KHR_materials_clearcoat/sheen` в glTF-лоадере, анизотропные roughness-карты (текстуры clearcoat/sheen, anisotropy, thin-film transmission и SSS v1 уже сделаны, см. 🟡).
 * NodeMaterial (граф материалов без пересборки движка) и библиотека материалов; ShaderMaterial с внешним shdc-путём уже сделан, см. 🟡 (engine-hook + внешний `.glsl` через build-API).
 * Рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡; reflection probes уже реализованы, см. ✅).
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
