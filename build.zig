@@ -46,6 +46,98 @@ pub const user_shader_materials = [_]UserShaderMaterial{
 };
 
 // ---------------------------------------------------------------------------
+// Public: user-owned shader compilation (ShaderMaterial v1 external path).
+//
+// A downstream project compiles its OWN .glsl (sokol-shdc format, like
+// src/agate/shaders/*.glsl) without editing any agate source, from its own
+// build.zig:
+//
+//   const agate_build = @import("agate"); // agate's build.zig, like sokol's
+//   const dep_agate = b.dependency("agate", .{ .target = target, .optimize = optimize });
+//   const my_shader = try agate_build.compileUserShader(b, dep_agate, .{
+//       .name = "my_shader",
+//       .input = "shaders/my.glsl", // downstream build-root relative
+//       .target = target,
+//       .optimize = optimize,
+//   });
+//   exe.root_module.addImport("my_shader", my_shader);
+//
+// At startup the downstream registers the compiled shader for the CURRENT
+// backend and points a material at it (single-context-thread contract, see
+// shader_material.registerRuntime):
+//
+//   const my_mod = @import("my_shader");
+//   const Entry = struct {
+//       fn makeShader(backend: sg.Backend) sg.Shader {
+//           return sg.makeShader(my_mod.myShaderDesc(backend));
+//       }
+//   };
+//   _ = try z.shader_material.registerRuntime(.{
+//       .name = "my_effect",
+//       .make_shader = Entry.makeShader,
+//       .engine_template = false,
+//       .user_ub = my_mod.UB_my_user_block,
+//       .params = &my_params, // f32 offsets into the user uniform storage
+//   });
+//   const mat = scene.createShaderMaterial("fx", "my_effect") orelse unreachable;
+//   mesh.material = .{ .shader_material = mat };
+//
+// sokol/shdc resolve THROUGH dep_agate.builder, so the downstream shares
+// agate's single sokol module instance (no second vendor/sokol dependency,
+// no duplicate sg state). Pass the same target/optimize you used for the
+// agate dependency itself. The generated module unconditionally
+// `@import("math")`, wired here to agate's math facade.
+// ---------------------------------------------------------------------------
+
+/// Backend codegen shared by the engine forward shaders and user shaders
+/// (glsl430 carries the template SSBO syntax; metal_macos/hlsl5 cover the
+/// remaining desktop backends).
+pub const engine_shader_slang = sokol.shdc.Slang{
+    .glsl430 = true,
+    .metal_macos = true,
+    .hlsl5 = true,
+};
+
+pub const UserShaderSpec = struct {
+    /// Zig module name for the generated shader (also the @import name).
+    name: []const u8,
+    /// Downstream build-root-relative path to the .glsl (sokol-shdc format:
+    /// @vs/@fs/@program blocks, see src/agate/shaders/standard.glsl).
+    input: []const u8,
+    /// Generated file name; default "<name>.zig".
+    output: ?[]const u8 = null,
+    /// Slang set; default engine_shader_slang. shdc compiles every leg in
+    /// one invocation, so a broken Metal/HLSL leg fails the build here —
+    /// never silently at runtime on another OS.
+    slang: ?sokol.shdc.Slang = null,
+    /// Must match the target/optimize of the downstream's agate dependency
+    /// (used to resolve agate's sokol/shdc instances for this build).
+    target: Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+};
+
+pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShaderSpec) !*Build.Module {
+    if (spec.name.len == 0 or spec.input.len == 0) return error.UserShaderBadSpec;
+    const dep_sokol = dep_agate.builder.dependency("sokol", .{
+        .target = spec.target,
+        .optimize = spec.optimize,
+    });
+    const mod_sokol = dep_sokol.module("sokol");
+    const dep_shdc = dep_sokol.builder.dependency("shdc", .{});
+    const shader_mod = try sokol.shdc.createModule(b, spec.name, mod_sokol, .{
+        .shdc_dep = dep_shdc,
+        .input = spec.input,
+        .output = spec.output orelse b.fmt("{s}.zig", .{spec.name}),
+        .slang = spec.slang orelse engine_shader_slang,
+    });
+    const mod_math = b.createModule(.{
+        .root_source_file = dep_agate.path("src/agate/math.zig"),
+    });
+    shader_mod.addImport("math", mod_math);
+    return shader_mod;
+}
+
+// ---------------------------------------------------------------------------
 // Test aggregation, dir-based.
 //
 // src/agate/tests.zig is GENERATED from the src/agate tree, so a newly added

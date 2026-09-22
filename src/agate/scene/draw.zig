@@ -512,20 +512,28 @@ fn drawShaderMaterialItem(
         // shader does not declare; shaders that declare nothing get white).
         // Contract: UB 0 carries {mat4 mvp, mat4 model} like every forward
         // shader (runtime sources must declare it, see registerRuntime docs).
-        // Текстура view slot 0 — из снимка.
+        // Текстура view slot 0 — из снимка; вторая (texture1) — view slot
+        // 1 (+ сэмплеры). Шейдеры, не объявляющие слот, получают белый
+        // дефолт снимка без валидационных ошибок.
         bind.views[0] = snap.tex_view;
         bind.samplers[0] = snap.tex_sampler;
+        bind.views[1] = snap.tex1_view;
+        bind.samplers[1] = snap.tex1_sampler;
         sg.applyBindings(bind);
 
         const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
         sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
     }
 
-    // User uniform block (declarative param table -> packed 128 bytes);
+    // User uniform block (declarative param table -> packed storage);
     // materials with vertex-stage params carry the same payload on the
-    // fs-stage and vs-stage blocks.
+    // fs-stage and vs-stage blocks. The upload is exactly the entry's
+    // declared wire size (user_bytes): hook blocks always span the full
+    // 128 bytes, external shaders declare their own window (v1: <= 2x
+    // vec4) — sokol validates the size, so a short slice is required.
     if (entry.user_ub) |ub| {
-        sg.applyUniforms(ub, sg.asRange(&snap.uniforms));
+        const bytes = shader_material.uniformBytes(&snap.uniforms);
+        sg.applyUniforms(ub, sg.asRange(bytes[0..@min(entry.user_bytes, bytes.len)]));
     }
     if (entry.vs_user_ub) |ub| {
         sg.applyUniforms(ub, sg.asRange(&snap.uniforms));
