@@ -318,6 +318,22 @@ pub const Scene = struct {
     // pipeline/target twins on the next MSAA frame.
     msaa_sample_count: i32 = 1,
 
+    // MSAA depth-prepass gate (default OFF): when true AND the effective
+    // main-target sample count is > 1, opaque primary-view geometry is
+    // drawn a second time with depth-only pipelines into a 1x depth
+    // texture (PASS 1.7, before the main pass), so the depth-consuming
+    // post effects (SSAO/SSR/DoF/Fog/MotionBlur) keep running under MSAA
+    // instead of being suppressed. Off path is bit-identical (no extra
+    // pass, no extra VRAM, suppression as before). TAA stays suppressed
+    // under MSAA regardless (v1 non-goal). Known approximations, see
+    // passes/msaa_depth_pass.zig: 1x depth vs MSAA color can differ by a
+    // pixel at geometric edges; cutout renders opaque and GPU morphs
+    // contribute base positions (shadow-map precedent); hook-material,
+    // transparent, decal, particle and secondary-view geometry is skipped
+    // (primary view only, v1 non-goal). Set before the first render();
+    // toggling later allocates/frees the 1x target on the next frame.
+    msaa_depth_prepass: bool = false,
+
     // Forward pipeline twin built for the effective MSAA sample count
     // (sokol requires pipeline.sample_count to match every main-target
     // attachment). Null until the first MSAA frame.

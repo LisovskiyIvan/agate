@@ -347,6 +347,13 @@ pub const PostProcessPass = struct {
         sun_color: Color3,
         near_z: f32,
         far_z: f32,
+        // Scene-depth texture sampled by the SSR/fog/motion-blur/DoF/TAA
+        // blocks (BIND depth_tex). The caller resolves it (PostFXStack
+        // depthSampleView): the 1x main depth, the PASS 1.7 prepass depth
+        // under MSAA + gate, or the resolve-color placeholder while the
+        // depth branches are flag-gated off (the binding only has to
+        // exist for sokol's apply-bindings validation).
+        depth_view: sg.View,
         // TAA resolve inputs: history texture sampled reprojected (bilinear
         // smp) plus the validity latch. Empty view + false keeps the
         // disabled/first-frame path (the shader early-outs before sampling).
@@ -363,7 +370,7 @@ pub const PostProcessPass = struct {
         post_bind.index_buffer = self.postprocess_quad_ib;
         post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
         post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
-        post_bind.views[post_shd.VIEW_depth_tex] = self.depthSampleView();
+        post_bind.views[post_shd.VIEW_depth_tex] = depth_view;
         // Pyramid glow when the parent fed a BloomPass result; otherwise a
         // valid placeholder the shader never samples (pyramid flag off).
         post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)

@@ -154,6 +154,33 @@ pub fn render(scene: anytype) void {
     }
 
     // ==============================================
+    // PASS 1.7: MSAA DEPTH PREPASS (gated, default off)
+    // ==============================================
+    // Single-sample depth for the post chain under MSAA (sokol has no
+    // depth resolve — see scene/msaa.zig): redraws the opaque
+    // primary-view queues with depth-only pipelines into a 1x depth
+    // texture BEFORE the main pass. Skipped on renderReuse replays (the
+    // persisted texture still matches the replayed snapshot); the gate
+    // going idle frees the target so the off shape holds no prepass
+    // VRAM. Cost is attributed to the main phase below.
+    const t_main = sokol.time.now();
+    gpu_timing.beginPass(.main);
+    const depth_prepass = scene_msaa.depthPrepassActive(snap.post_process.enabled, snap.msaa_depth_prepass, samples);
+    if (depth_prepass and !scene.rendering_reuse) {
+        scene.postfx.renderMsaaDepthPrepass(
+            snap.primary_cam.view_proj,
+            &draws.primary,
+            draws.primary.skin_storage.items,
+            snap.primary_cam.viewport,
+            cur_w,
+            cur_h,
+            &scene.stats,
+        );
+    } else if (!depth_prepass) {
+        scene.postfx.destroyMsaaDepth();
+    }
+
+    // ==============================================
     // PASS 2: MAIN SCENE RENDER PASS
     // ==============================================
     var main_pass_action = sg.PassAction{};
@@ -173,8 +200,8 @@ pub fn render(scene: anytype) void {
     };
 
     // Offscreen target when post-processing is on, swapchain otherwise.
-    const t_main = sokol.time.now();
-    gpu_timing.beginPass(.main);
+    // (The .main GPU-timer bracket opened above at PASS 1.7, so the
+    // prepass cost attributes to the main phase.)
     scene.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
 
     // Render-owned draw environment: every fallback below is a snapshot
@@ -296,6 +323,8 @@ pub fn render(scene: anytype) void {
         .sun_color = snap.sun_color,
         .default_white_view = snap.default_white.view,
         .main_samples = samples,
+        // PASS 1.7 depth-prepass gate (snapshot-carried Scene flag).
+        .msaa_depth_prepass = snap.msaa_depth_prepass,
         // P7 staged highlight items from the pinned front slot (never live
         // Scene fields): the render below dereferences no mesh.
         .highlight_items = draws.highlight_items.items,
