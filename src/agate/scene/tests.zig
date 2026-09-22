@@ -2119,6 +2119,76 @@ test "stage1: fallback after latch is not clobbered by the later commit" {
     try std.testing.expectEqual(@as(u64, 3), parent.instance_render.staged_frame);
 }
 
+test "stage1: commit resolves the latest latched front through the lease" {
+    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var src = Mesh{
+        .name = "s1_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    const n: usize = 3;
+    const mem = try alloc.alloc(InstancedMesh, n);
+    defer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    defer alloc.free(ptrs);
+    stage1FillInstances(&src, mem, ptrs, 0);
+    var parent = Mesh{
+        .name = "s1_parent",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+    try scene.meshes.append(alloc, &parent);
+
+    // Generation 1: build + latch (count 3). Live untouched by the latch.
+    scene.buildPreparedFrame();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
+    const front_f1 = scene.draws.frontIndex();
+    try std.testing.expectEqual(@as(u64, 1), scene.draws.slots[front_f1].frame_id);
+
+    // Generation 2: hide one instance, build (commits the F1 mirror), latch.
+    mem[0].is_visible = false;
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 1), parent.instance_render.staged_frame);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    scene.prepareFrame();
+    const front_f2 = scene.draws.frontIndex();
+    try std.testing.expectEqual(@as(u64, 2), scene.draws.slots[front_f2].frame_id);
+
+    // Generation 3: hide another, build — the commit must apply the LATEST
+    // latched front (F2, count 2), never a superseded slot's mirror.
+    mem[1].is_visible = false;
+    scene.buildPreparedFrame();
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
+    // The lease is balanced: the commit takes no pins and the front the
+    // commit resolved is the latest published slot.
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pins_held);
+    try std.testing.expectEqual(front_f2, scene.draws.frontIndex());
+}
+
 test "stage1: serial same-thread build+latch parity" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
@@ -5937,10 +6007,11 @@ test "wave32: concurrent claim/build/publish vs slot-latch — no torn records, 
     // generation is a counted latest-wins miss, never a stale latch. The
     // consumed slot is released with `cancelClaim`, never published: the
     // front flip stays context-owned under exclusion in the real flow, and
-    // the game-side build core reads the plain `front` word (commit over
-    // the front slot) — flipping it here would race that read outside the
-    // lease. The handoff edge under test (claim/build/publish vs
-    // claimSlot/validate/latch) is fully exercised without the flip.
+    // the game-side build core resolves its commit slot through the lease
+    // (`frontIndex`) — flipping it here would still move the commit target
+    // outside the handoff edge under test. The handoff edge under test
+    // (claim/build/publish vs claimSlot/validate/latch) is fully exercised
+    // without the flip.
     while (!ctx.done.load(.acquire) or scene.last_latched_seq.load(.monotonic) != total_gens) {
         const b = scene.build_seq.load(.acquire);
         if (b == 0) {

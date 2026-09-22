@@ -110,7 +110,9 @@
 //!   systems, and live camera/light/sky state (`packFrameSnapshot`), and
 //!   writes live per-mesh previews/build_views — plus the commit itself
 //!   reads the live mesh list (game-side, ordered after publish, never
-//!   concurrent with the context). This is the app-side ordering problem:
+//!   concurrent with the context; the committed SLOT is resolved through
+//!   the lease since the lockfree-closeout slice — no plain `front` word
+//!   read on the game side anymore). This is the app-side ordering problem:
 //!   the game must finish mutating before building, under exclusion.
 //! - the inline fallback paths (no fresh build): context-side `prepareFrame`
 //!   stages instances and captures UI/particles/physics-debug straight from

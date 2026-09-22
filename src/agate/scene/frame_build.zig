@@ -28,9 +28,19 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     // latch stages GPU purely from slot records and mirrors the outcome
     // there; this applies the mirrors to the live meshes under the O(1)
     // identity guard, so the CPU staging + record freeze below observe
-    // the just-published prior state. Reads the FRONT slot (the last
-    // published frame); the claimed-slot reset below never touches it.
-    const front = &scene.draws.slots[scene.draws.front];
+    // the just-published prior state. Resolves the slot through the lease
+    // (`frontIndex`, mutex-guarded): the latest latched generation wins —
+    // a fallback publish in between selects the fallback slot (no records,
+    // commit no-ops instead of regressing to a superseded mirror) — and a
+    // plain `draws.front` read could observe the context `tryPublish` flip
+    // mid-commit. The payload itself is slot-owned (immutable once
+    // published; a concurrent reset only clears lengths, and the guards
+    // below contain any generation mix), so no pin is taken here: the
+    // render path asserts on `pinFront` while presenting, and a game-side
+    // pin could trip it under update||render overlap. The claimed-slot
+    // reset below never touches the committed slot.
+    const front_idx = scene.draws.frontIndex();
+    const front = &scene.draws.slots[front_idx];
     scene_instance_staging.commitPublishedRecords(front.staged_instances.items, scene.meshes.items, front.frame_id);
     const back = &scene.draws.slots[slot];
     back.reset();
