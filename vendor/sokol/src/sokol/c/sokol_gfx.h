@@ -5532,6 +5532,21 @@ SOKOL_GFX_API_DECL void sg_commit(void);
 // unrelated: they are CPU-side begin/end callbacks, not GPU timestamps.
 SOKOL_GFX_API_DECL void sg_agate_set_gpu_timing_enabled(bool enabled);
 SOKOL_GFX_API_DECL float sg_agate_query_gpu_frame_ms(void);
+// AGATE GPU TIMINGS v2 (per-pass timers, see vendor/sokol/README.agate.md):
+// engine-driven phase timers. Pass ids: 0=shadow, 1=main, 2=post.
+// The engine brackets each phase with pass_begin/end; query returns the
+// last COMPLETED sample in ms, or -1 when unavailable (disabled, not
+// ready yet, Metal/unsupported backend, or an invalid pass id).
+SOKOL_GFX_API_DECL void sg_agate_gpu_pass_begin(int pass);
+SOKOL_GFX_API_DECL void sg_agate_gpu_pass_end(int pass);
+SOKOL_GFX_API_DECL float sg_agate_query_gpu_pass_ms(int pass);
+// File-static helpers owned by the v2 GL-state block below (real pool on
+// GLCORE-non-Win32, no-op stubs elsewhere, bottom stubs when the GL
+// region itself is compiled out). Forward-declared here with plain
+// `static` (`_SOKOL_PRIVATE` is only defined further down) so the
+// backend-independent `sg_agate_set_gpu_timing_enabled` below can mirror
+// into the pool on every backend without an implicit declaration.
+static void _sg_agate_gl_apply_enabled(bool enabled);
 
 // resource update functions (wip new resource update api)
 SOKOL_GFX_API_DECL void sg_write_buffer_transient(const sg_write_buffer_desc* desc);
@@ -12797,7 +12812,129 @@ _SOKOL_PRIVATE void _sg_gl_dispatch(int num_groups_x, int num_groups_y, int num_
     #endif
 }
 
+// AGATE GPU TIMINGS v2 (per-pass GL timer queries, see vendor/sokol/README.agate.md):
+// engine-driven GL_TIME_ELAPSED pools, one per pass (0=shadow, 1=main,
+// 2=post). Context thread only (phase brackets + commit drain + query
+// poll all run there), so no atomics. Queries retire with a KEEP-frame
+// lag and are reaped without stalling (GL_QUERY_RESULT_AVAILABLE);
+// the served value is always the last COMPLETED sample, like v1.
+#if defined(SOKOL_GLCORE) && !defined(_WIN32)
+// <GL/gl.h> on Linux stops at GL 1.x: declare the timer-query entry
+// points used below (exported by libGL; macOS <OpenGL/gl3.h> already
+// declares them, so this is Linux/Unix-only).
+#if (defined(__linux__) || defined(__unix__)) && !defined(__APPLE__)
+extern void glGenQueries(GLsizei n, GLuint* ids);
+extern void glDeleteQueries(GLsizei n, const GLuint* ids);
+extern void glBeginQuery(GLenum target, GLuint id);
+extern void glEndQuery(GLenum target);
+extern void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint* params);
+extern void glGetQueryObjectui64v(GLuint id, GLenum pname, uint64_t* params);
+#endif
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
+#define _SG_AGATE_GPU_PASSES (3)
+#define _SG_AGATE_GPU_QUERY_DEPTH (4)
+static bool _sg_agate_gl_enabled = false;
+static GLuint _sg_agate_gl_queries[_SG_AGATE_GPU_PASSES][_SG_AGATE_GPU_QUERY_DEPTH] = { { 0 } };
+static uint8_t _sg_agate_gl_head[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
+static uint8_t _sg_agate_gl_tail[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
+static uint8_t _sg_agate_gl_pending[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
+static int _sg_agate_gl_active = -1;
+static float _sg_agate_gl_last_ms[_SG_AGATE_GPU_PASSES] = { -1.0f, -1.0f, -1.0f };
+// Reap retired queries for pass p, oldest first, never stalling: only
+// AVAILABLE results are read (ns -> ms with a 10 s sanity clamp).
+// Completion for a single target is in order, so the first not-ready
+// query stops the drain.
+_SOKOL_PRIVATE void _sg_agate_gl_reap(int p) {
+    while (_sg_agate_gl_pending[p] > 0) {
+        const GLuint q = _sg_agate_gl_queries[p][_sg_agate_gl_tail[p]];
+        GLuint avail = 0;
+        glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &avail);
+        if (0 == avail) {
+            break;
+        }
+        uint64_t ns = 0;
+        glGetQueryObjectui64v(q, GL_QUERY_RESULT, &ns);
+        const double ms = (double)ns / 1000000.0;
+        if ((ms > 0.0) && (ms < 10000.0)) {
+            _sg_agate_gl_last_ms[p] = (float)ms;
+        }
+        _sg_agate_gl_tail[p] = (uint8_t)((_sg_agate_gl_tail[p] + 1) % _SG_AGATE_GPU_QUERY_DEPTH);
+        _sg_agate_gl_pending[p]--;
+    }
+}
+_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
+    int p;
+    for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
+        _sg_agate_gl_reap(p);
+    }
+}
+// Close any still-open query (normally a no-op: engine phases are
+// strictly sequential, so an open query here means unbalanced calls).
+// The closed query joins the retire queue; the slot advances.
+_SOKOL_PRIVATE void _sg_agate_gl_close_active(void) {
+    if (_sg_agate_gl_active >= 0) {
+        const int ap = _sg_agate_gl_active;
+        glEndQuery(GL_TIME_ELAPSED);
+        _sg_agate_gl_active = -1;
+        _sg_agate_gl_pending[ap]++;
+        _sg_agate_gl_head[ap] = (uint8_t)((_sg_agate_gl_head[ap] + 1) % _SG_AGATE_GPU_QUERY_DEPTH);
+    }
+}
+// (Re)configure the pool on enable/disable. Disable deletes live queries
+// and resets the caches so a later enable starts clean.
+_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
+    _sg_agate_gl_enabled = enabled;
+    if (!enabled) {
+        int p;
+        for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
+            GLuint ids[_SG_AGATE_GPU_QUERY_DEPTH];
+            int n = 0;
+            int i;
+            for (i = 0; i < _SG_AGATE_GPU_QUERY_DEPTH; i++) {
+                if (_sg_agate_gl_queries[p][i] != 0) {
+                    ids[n++] = _sg_agate_gl_queries[p][i];
+                    _sg_agate_gl_queries[p][i] = 0;
+                }
+            }
+            if (n > 0) {
+                glDeleteQueries((GLsizei)n, ids);
+            }
+            _sg_agate_gl_head[p] = 0;
+            _sg_agate_gl_tail[p] = 0;
+            _sg_agate_gl_pending[p] = 0;
+            _sg_agate_gl_last_ms[p] = -1.0f;
+        }
+        _sg_agate_gl_active = -1;
+    }
+}
+#else
+// Non-GL-eligible builds (Metal uses the v1 frame timer; Win32-GL has no
+// timer entry points in the embedded loader; GLES3/D3D11/WGPU/Vulkan/
+// dummy have no support): stubs so the public entry points always link
+// and every query stays fail-closed at -1.
+_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
+    (void)enabled;
+}
+_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
+}
+#endif
+// ---------------------------------------------------------------------------
 _SOKOL_PRIVATE void _sg_gl_commit(void) {
+#if defined(SOKOL_GLCORE) && !defined(_WIN32)
+    // AGATE GPU TIMINGS v2: reap retired timer queries once per frame.
+    // Non-blocking, context thread only; one predictable branch while off.
+    if (_sg_agate_gl_enabled) {
+        _sg_agate_gl_drain_all();
+    }
+#endif
     // "soft" clear bindings (only those that are actually bound)
     _sg_gl_cache_clear_buffer_bindings(false);
     _sg_gl_cache_clear_texture_sampler_bindings(false);
@@ -27545,7 +27682,12 @@ SOKOL_API_IMPL void sg_commit(void) {
 }
 // AGATE GPU TIMINGS (vendored patch, see vendor/sokol/README.agate.md) ---
 SOKOL_API_IMPL void sg_agate_set_gpu_timing_enabled(bool enabled) {
-    _sg_agate_gpu_timing_enabled = enabled;
+    #if defined(SOKOL_METAL)
+        _sg_agate_gpu_timing_enabled = enabled;
+    #endif
+    // AGATE GPU TIMINGS v2: mirror into the GL timer pool (no-op stub
+    // outside GLCORE-non-Win32 builds; disable also deletes live queries).
+    _sg_agate_gl_apply_enabled(enabled);
     #if defined(SOKOL_METAL)
         if (!enabled) {
             if (nil != _sg_agate_gpu_cb) {
@@ -27565,10 +27707,97 @@ SOKOL_API_IMPL float sg_agate_query_gpu_frame_ms(void) {
         // Last-completed semantics: the value lags one frame behind the
         // CPU submit (async GPU execution). -1 until the first completion.
         return _sg_agate_gpu_last_ms;
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        // AGATE GPU TIMINGS v2: GL frame time is the sum of the
+        // last-completed per-pass TIME_ELAPSED values (passes with no
+        // sample yet contribute 0). GPU work is serial, so this is a
+        // lower bound of the true frame span: inter-pass bubbles are
+        // excluded. -1 until the first sample. Drains first so the sum
+        // is as fresh as the last completed query.
+        if (!_sg_agate_gl_enabled) {
+            return -1.0f;
+        }
+        _sg_agate_gl_drain_all();
+        {
+            float sum_ms = 0.0f;
+            bool any = false;
+            int p;
+            for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
+                if (_sg_agate_gl_last_ms[p] >= 0.0f) {
+                    sum_ms += _sg_agate_gl_last_ms[p];
+                    any = true;
+                }
+            }
+            return any ? sum_ms : -1.0f;
+        }
     #else
         return -1.0f;
     #endif
 }
+#if !defined(_SOKOL_ANY_GL)
+// AGATE GPU TIMINGS v2: the GL-state block above lives inside the GL-only
+// region, so on Metal/dummy builds (no `_SOKOL_ANY_GL`) the helpers are
+// defined here instead. Same fail-closed stubs as the in-region `#else`
+// arm (which serves Win32-GL/GLES builds where the region IS compiled).
+_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
+    (void)enabled;
+}
+_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
+}
+#endif
+// AGATE GPU TIMINGS v2 (per-pass entry points, see vendor/sokol/README.agate.md) ---
+SOKOL_API_IMPL void sg_agate_gpu_pass_begin(int pass) {
+    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
+        GLuint q;
+        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
+            return;
+        }
+        _sg_agate_gl_close_active();
+        _sg_agate_gl_reap(pass);
+        if (_sg_agate_gl_pending[pass] >= _SG_AGATE_GPU_QUERY_DEPTH) {
+            // Ring full, oldest still in flight: drop this sample, never stall.
+            return;
+        }
+        q = _sg_agate_gl_queries[pass][_sg_agate_gl_head[pass]];
+        if (0 == q) {
+            glGenQueries(1, &q);
+            if (0 == q) {
+                return;
+            }
+            _sg_agate_gl_queries[pass][_sg_agate_gl_head[pass]] = q;
+        }
+        glBeginQuery(GL_TIME_ELAPSED, q);
+        _sg_agate_gl_active = pass;
+    #else
+        _SOKOL_UNUSED(pass);
+    #endif
+}
+SOKOL_API_IMPL void sg_agate_gpu_pass_end(int pass) {
+    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
+        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
+            return;
+        }
+        if (_sg_agate_gl_active == pass) {
+            _sg_agate_gl_close_active();
+        }
+    #else
+        _SOKOL_UNUSED(pass);
+    #endif
+}
+SOKOL_API_IMPL float sg_agate_query_gpu_pass_ms(int pass) {
+    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
+        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
+            return -1.0f;
+        }
+        _sg_agate_gl_reap(pass);
+        // Last-completed semantics, like the v1 frame timer.
+        return _sg_agate_gl_last_ms[pass];
+    #else
+        _SOKOL_UNUSED(pass);
+        return -1.0f;
+    #endif
+}
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
 SOKOL_API_IMPL void sg_reset_state_cache(void) {

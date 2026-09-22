@@ -144,6 +144,51 @@ through `SceneStats.gpu_frame_ms` → `FrameRecord.gpu_frame_ms` →
 session `avg/max_gpu_frame_ms` → gated HTML/MD/Chrome-trace output
 (`gpu_frame_ms`, `GPU Frame (measured)`, `cat "gpu"`).
 
+### v2: per-pass timers + GL timer-query
+
+`sg_agate_gpu_pass_begin/end(int pass)` (pass ids 0=shadow, 1=main,
+2=post; invalid ids are no-ops) bracket each engine phase from
+`scene/frame_render.zig`, and `sg_agate_query_gpu_pass_ms(int)`
+serves the last COMPLETED sample per pass (or -1). Agate side:
+`gpu_timing.Pass` + `beginPass`/`endPass`/`pollPassMs`, fail-closed
+like the frame poll; `SceneStats.gpu_shadow/main/post_ms` →
+`FrameRecord` → `avg/max_gpu_*_ms` → gated HTML/MD/Chrome-trace output
+(`GPU Shadow/Main/PostFX (measured)`, per-pass `cat "gpu"` events,
+`hasGpuPassData` gate — Metal-only and disabled sessions render
+exactly the pre-per-pass output).
+
+- **Metal: frame-only, by construction.** sokol encodes the whole
+  frame into ONE `MTLCommandBuffer` (created on the first pass in
+  `_sg_mtl_begin_pass`, committed in `_sg_mtl_commit`), so
+  `GPUStartTime/GPUEndTime` can only span the full frame. True
+  per-encoder times would need one command buffer per pass (extra
+  commits + drawable/present and in-flight-semaphore surgery) or
+  `MTLCounterSampleBuffer` timestamp sampling at encoder boundaries
+  (device-capability-gated, resolve + barrier overhead). Both were
+  rejected for v2; per-pass on Metal is a documented follow-up. The
+  pass brackets are linked no-ops there and per-pass queries are -1.
+- **GL4.1 (`SOKOL_GLCORE`, non-Win32): real per-pass timers.** Each
+  pass owns a `GL_TIME_ELAPSED` query pool (depth 4, generated
+  lazily); a per-frame drain in `_sg_gl_commit` and every query reap
+  retired queries oldest-first WITHOUT stalling (only
+  `GL_QUERY_RESULT_AVAILABLE` results are read, ns → ms, 10 s sanity
+  clamp). A full ring whose oldest query is still in flight drops the
+  new sample instead of stalling. Disable deletes live queries and
+  resets the caches. `sg_agate_query_gpu_frame_ms` on GL returns the
+  sum of the last-completed per-pass values: serial GPU execution
+  makes this a LOWER BOUND of the true frame span (inter-pass bubbles
+  excluded), -1 until the first sample. Linux `<GL/gl.h>` stops at GL
+  1.x, so the patch declares the six timer-query entry points itself
+  (exported by libGL; macOS `<OpenGL/gl3.h>` already declares them).
+- **Fail-closed elsewhere:** Win32-GL (the embedded loader has no
+  timer entry points), GLES3 (`GL_TIME_ELAPSED_EXT` differs),
+  D3D11/WGPU/Vulkan/dummy — stubs, every query -1.
+
+Semantics (both timers): last-completed (values lag behind the CPU
+submit), context thread only, never a GPU stall. CPU-submit phase
+times keep their explicit `(CPU submit)` labels everywhere — a
+CPU-submit value under a GPU name is a bug, not a fallback.
+
 ## Upstream
 
 Worth reporting to both:

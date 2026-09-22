@@ -115,12 +115,16 @@ pub fn render(scene: anytype) void {
     // ==============================================
     if (snap.shadows_enabled) {
         const t_shadow = sokol.time.now();
+        // GPU timer bracket (v2, default off): fail-closed no-op while
+        // disabled/headless, linked no-op on Metal (frame timer only).
+        gpu_timing.beginPass(.shadow);
         const shadow_draws = scene.shadows.pass.renderPreparedFrom(
             &draws.shadow,
             cascades,
             light_pack.spot_shadows[0..light_pack.num_spot_shadows],
             light_pack.point_shadows[0..light_pack.num_point_shadows],
         );
+        gpu_timing.endPass(.shadow);
         scene.stats.shadow_draw_calls += shadow_draws;
         scene.stats.draw_calls += shadow_draws;
         scene.stats.shadow_ms = msSince(t_shadow);
@@ -170,6 +174,7 @@ pub fn render(scene: anytype) void {
 
     // Offscreen target when post-processing is on, swapchain otherwise.
     const t_main = sokol.time.now();
+    gpu_timing.beginPass(.main);
     scene.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
 
     // Render-owned draw environment: every fallback below is a snapshot
@@ -262,12 +267,14 @@ pub fn render(scene: anytype) void {
     }
 
     sg.endPass();
+    gpu_timing.endPass(.main);
     scene.stats.main_ms = msSince(t_main);
 
     // ==============================================
     // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 2.85 (highlight) + 3 (composite & UI overlay)
     // ==============================================
     const t_post = sokol.time.now();
+    gpu_timing.beginPass(.post);
     // Highlight mask viewport: the primary view's rect (the same viewport
     // the main pass drew under above, both single- and multi-camera
     // paths) — the PASS 2.85 mask maps it onto its half-res target so
@@ -297,6 +304,7 @@ pub fn render(scene: anytype) void {
         .ui = if (scene.ui_frame.canvas_present) &scene.ui_frame else null,
         .stats = &scene.stats,
     }, cur_w, cur_h);
+    gpu_timing.endPass(.post);
 
     sg.commit();
     // GPU frame timer (v1, default off): last COMPLETED GPU frame duration,
@@ -304,6 +312,13 @@ pub fn render(scene: anytype) void {
     // cheap poll, never a GPU stall. Must be read here, right after the
     // present commit, so the retained command buffer is this frame's.
     scene.stats.gpu_frame_ms = gpu_timing.pollFrameMs();
+    // Per-pass GPU timers (v2, same opt-in): last COMPLETED sample per
+    // phase — real GL_TIME_ELAPSED values on GL4.1, always 0 on Metal
+    // (frame timer above is the only Metal GPU number). A skipped shadow
+    // phase records 0, never a stale sample.
+    scene.stats.gpu_shadow_ms = if (snap.shadows_enabled) gpu_timing.pollPassMs(.shadow) else 0;
+    scene.stats.gpu_main_ms = gpu_timing.pollPassMs(.main);
+    scene.stats.gpu_post_ms = gpu_timing.pollPassMs(.post);
     scene.stats.post_ms = msSince(t_post);
 
     // Перенос динамики в кадровую метрику: prepare-фаза (flush, стейджинг,

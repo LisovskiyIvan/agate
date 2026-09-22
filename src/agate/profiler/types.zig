@@ -31,11 +31,20 @@ pub const FrameRecord = struct {
     main_ms: f32 = 0,
     post_ms: f32 = 0,
     /// Last COMPLETED GPU frame time in ms (measured on GPU via the
-    /// vendored sokol patch, Metal-only; 0 when disabled/headless/
-    /// unsupported). Async execution: lags one frame behind the CPU
-    /// submit. NEVER a CPU-submit value under a GPU name — the CPU
-    /// phases above stay the only submit timings.
+    /// vendored sokol patch, Metal frame timer / GL sum of per-pass
+    /// samples; 0 when disabled/headless/unsupported). Async execution:
+    /// lags one frame behind the CPU submit. NEVER a CPU-submit value
+    /// under a GPU name — the CPU phases above stay the only submit
+    /// timings.
     gpu_frame_ms: f32 = 0,
+    /// Last COMPLETED per-pass GPU times in ms (GL4.1 `GL_TIME_ELAPSED`
+    /// samples via the vendored sokol patch; always 0 on Metal — the
+    /// frame timer is the only Metal GPU number — and 0 when
+    /// disabled/headless/unsupported). Same lag semantics as
+    /// `gpu_frame_ms`; never CPU-submit values under GPU names.
+    gpu_shadow_ms: f32 = 0,
+    gpu_main_ms: f32 = 0,
+    gpu_post_ms: f32 = 0,
 
     // Rendering counters
     draw_calls: u32 = 0,
@@ -172,6 +181,15 @@ pub const SessionSummary = struct {
     /// timer was off). Average/max over all recorded frames.
     avg_gpu_frame_ms: f32 = 0,
     max_gpu_frame_ms: f32 = 0,
+    /// Measured per-pass GPU times (ms, last-completed semantics, 0 when
+    /// off or unsupported — Metal per-pass is always 0). Average/max
+    /// over all recorded frames.
+    avg_gpu_shadow_ms: f32 = 0,
+    max_gpu_shadow_ms: f32 = 0,
+    avg_gpu_main_ms: f32 = 0,
+    max_gpu_main_ms: f32 = 0,
+    avg_gpu_post_ms: f32 = 0,
+    max_gpu_post_ms: f32 = 0,
 
     // Counter stats
     avg_draw_calls: u32 = 0,
