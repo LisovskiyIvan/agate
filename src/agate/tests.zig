@@ -223,6 +223,12 @@ test {
     _ = @import("texture/cube.zig");
     _ = @import("texture/mip.zig");
     _ = @import("ttf.zig");
+    _ = @import("ttf/atlas.zig");
+    _ = @import("ttf/fixture.zig");
+    _ = @import("ttf/font.zig");
+    _ = @import("ttf/outline.zig");
+    _ = @import("ttf/raster.zig");
+    _ = @import("ttf/types.zig");
     _ = @import("ui.zig");
     _ = @import("ui/canvas.zig");
     _ = @import("ui/css_parser.zig");
