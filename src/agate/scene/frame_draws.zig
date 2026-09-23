@@ -466,6 +466,11 @@ pub const FrameDraws = struct {
     /// Producer claims: slots currently being filled between `claimBack`
     /// and `tryPublish`/`cancelClaim`. `pin` refuses these (`SlotBusy`).
     writing: [SLOT_COUNT]bool = .{false} ** SLOT_COUNT,
+    /// Pending handoff slot: the slot published by `releaseHandoff` waiting
+    /// for the prepare latch. `claimBack` avoids this slot when another free
+    /// slot exists, preventing the game thread from reclaiming the in-flight
+    /// handoff and degrading prepare to a skip under high tick rates.
+    handoff: ?usize = null,
     /// Serializes the lease index words (`front`, `pinned`, `writing` and
     /// every counter below): a spinlock (`std.atomic.Mutex` is tryLock-only
     /// in this std, so `lockLease` spins — same shape as assets.zig; the
@@ -491,6 +496,7 @@ pub const FrameDraws = struct {
     /// 3 slots one is always free). `prepareFrame` no longer uses this
     /// (wave 31: locked claim); concurrent callers must use `claimBack`.
     pub fn backIndex(self: *const FrameDraws) usize {
+        if (self.handoff) |h| return h;
         var k: usize = 1;
         while (k < SLOT_COUNT) : (k += 1) {
             const idx = (self.front + k) % SLOT_COUNT;
@@ -525,6 +531,7 @@ pub const FrameDraws = struct {
         std.debug.assert(back_idx == self.backIndex());
         std.debug.assert(!self.pinned[back_idx]);
         self.front = back_idx;
+        if (self.handoff == back_idx) self.handoff = null;
     }
 
     /// Concurrent-producer claim: reserve a free slot for writing. Returns
@@ -532,14 +539,28 @@ pub const FrameDraws = struct {
     /// lagging): the producer SKIPS the frame instead of blocking (the
     /// documented latest-wins saturation behavior) and the skip is counted.
     /// The claim marks the slot WRITING until `tryPublish`/`cancelClaim`.
+    /// Two-pass selection: prefers any slot that is neither pinned, nor
+    /// writing, nor the pending handoff slot awaiting prepare latch.
     pub fn claimBack(self: *FrameDraws) ?usize {
         lockLease(&self.mutex);
         defer self.mutex.unlock();
+        // Pass 1: find a slot that is NOT pinned, NOT writing, and NOT the pending handoff.
         var k: usize = 1;
+        while (k < SLOT_COUNT) : (k += 1) {
+            const idx = (self.front + k) % SLOT_COUNT;
+            if (!self.pinned[idx] and !self.writing[idx] and (self.handoff == null or self.handoff.? != idx)) {
+                self.writing[idx] = true;
+                return idx;
+            }
+        }
+        // Pass 2: if all other non-pinned slots are busy, claim the pending handoff
+        // slot (superseding the unconsumed frame, latest-wins).
+        k = 1;
         while (k < SLOT_COUNT) : (k += 1) {
             const idx = (self.front + k) % SLOT_COUNT;
             if (!self.pinned[idx] and !self.writing[idx]) {
                 self.writing[idx] = true;
+                if (self.handoff == idx) self.handoff = null;
                 return idx;
             }
         }
@@ -572,6 +593,7 @@ pub const FrameDraws = struct {
             return LeaseError.SlotBusy;
         }
         self.writing[idx] = true;
+        if (self.handoff == idx) self.handoff = null;
     }
 
     /// Concurrent-producer publish: hand a claimed slot to the consumer.
@@ -589,6 +611,7 @@ pub const FrameDraws = struct {
         std.debug.assert(back_idx != self.front);
         self.writing[back_idx] = false;
         self.front = back_idx;
+        if (self.handoff == back_idx) self.handoff = null;
     }
 
     /// Game-side handoff release (wave 29 concurrent-build primitive): hand
@@ -611,6 +634,7 @@ pub const FrameDraws = struct {
             return LeaseError.PinnedSlot;
         }
         self.writing[back_idx] = false;
+        self.handoff = back_idx;
     }
 
     /// Release a claim without publishing (producer drops the build, e.g. a
@@ -623,6 +647,7 @@ pub const FrameDraws = struct {
         defer self.mutex.unlock();
         if (!self.writing[back_idx]) return LeaseError.NotClaimed;
         self.writing[back_idx] = false;
+        if (self.handoff == back_idx) self.handoff = null;
     }
 
     /// Consumer pin: hold `idx` for presentation. The slot must be a valid,
@@ -1258,5 +1283,53 @@ test "wave31: claimSlot reserves the handoff slot, refusals are fail-closed and 
     for (0..SLOT_COUNT) |i| {
         try testing.expectError(LeaseError.NotClaimed, draws.cancelClaim(i));
     }
+    draws.deinit(testing.allocator);
+}
+
+test "wave42: handoff slot is protected from claimBack when free slot exists" {
+    var draws = FrameDraws{};
+
+    // Initial state: front is 0.
+    try testing.expectEqual(@as(usize, 0), draws.front);
+    try testing.expectEqual(@as(?usize, null), draws.handoff);
+
+    // Producer claims back: gets slot 1.
+    const slot1 = draws.claimBack().?;
+    try testing.expectEqual(@as(usize, 1), slot1);
+
+    // Producer hands off slot 1 to consumer.
+    try draws.releaseHandoff(slot1);
+    try testing.expectEqual(@as(?usize, 1), draws.handoff);
+
+    // Producer immediately claims next slot BEFORE consumer consumes slot 1:
+    // MUST NOT reclaim slot 1; MUST claim slot 2 instead!
+    const slot2 = draws.claimBack().?;
+    try testing.expectEqual(@as(usize, 2), slot2);
+    try testing.expect(slot2 != slot1);
+
+    // Consumer latches slot 1 while producer is filling slot 2:
+    // Slot 1 is NOT writing (producer is in slot 2), so claimSlot(1) SUCCEEDS without contention!
+    try draws.claimSlot(slot1);
+    try testing.expectEqual(@as(?usize, null), draws.handoff);
+
+    // Consumer publishes slot 1 (front flips to 1).
+    try draws.tryPublish(slot1);
+    try testing.expectEqual(@as(usize, 1), draws.front);
+
+    // Producer hands off slot 2.
+    try draws.releaseHandoff(slot2);
+    try testing.expectEqual(@as(?usize, 2), draws.handoff);
+
+    // Producer claims next slot: front is 1, (1+1)%3 = 2 is handoff, so claimBack avoids 2 and claims 0!
+    const slot0 = draws.claimBack().?;
+    try testing.expectEqual(@as(usize, 0), slot0);
+
+    // Consumer latches slot 2.
+    try draws.claimSlot(slot2);
+    try draws.tryPublish(slot2);
+    try testing.expectEqual(@as(usize, 2), draws.front);
+
+    // Teardown.
+    try draws.cancelClaim(slot0);
     draws.deinit(testing.allocator);
 }

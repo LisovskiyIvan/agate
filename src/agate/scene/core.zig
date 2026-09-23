@@ -1328,13 +1328,13 @@ pub const Scene = struct {
             std.debug.assert(!self.completed);
             self.completed = true;
             const s = self.scene;
-            std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
-            // Release edge: the slot index first, then the generation — the
-            // latch acquire-reads `build_seq` before `build_slot`, so both
-            // land ordered after the whole staged payload.
-            s.build_slot.store(self.slot, .release);
-            s.build_seq.store(self.seq, .release);
+            // Release edge: release the handoff slot first so WRITING is cleared
+            // and handoff is registered before the generation is visible, then
+            // the slot index, then the generation.
             s.draws.releaseHandoff(self.slot) catch {};
+            s.build_slot.store(self.slot, .release);
+            std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
+            s.build_seq.store(self.seq, .release);
         }
 
         /// Drop the claim without committing (seq/handoff untouched: prepare
