@@ -78,15 +78,27 @@ pub const TrailMesh = struct {
 
         // Dynamic vertex & index buffers. Off-context construction (runtime
         // spawn on the game thread) defers creation to flushGpuUploads.
+        // Partial creation (buffer-pool exhaustion mid-init: sg.makeBuffer
+        // returns id 0) falls back to the same deferred path — retrying in
+        // flushGpuUploads next frame — instead of a permanently zero-handle
+        // trail that can never render (observed as "trails missing the
+        // whole session" when init raced the crowd VAT buffer flood).
         const deferred = !gpu_thread.isOnContextThread();
-        const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
+        var vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = max_verts * @sizeOf(Vertex),
         });
-        const ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
+        var ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .index_buffer = true, .dynamic_update = true },
             .size = max_indices * @sizeOf(u16),
         });
+        const partial = !deferred and (vb.id == 0 or ib.id == 0);
+        if (partial) {
+            if (vb.id != 0) sg.destroyBuffer(vb);
+            if (ib.id != 0) sg.destroyBuffer(ib);
+            vb = .{};
+            ib = .{};
+        }
 
         const mesh = try allocator.create(Mesh);
         errdefer allocator.destroy(mesh);
@@ -110,7 +122,7 @@ pub const TrailMesh = struct {
             .vertices = vertices,
             .indices = indices,
             .is_active = options.auto_start,
-            .buffers_pending = deferred,
+            .buffers_pending = deferred or partial,
         };
         return self;
     }
