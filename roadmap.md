@@ -64,8 +64,9 @@
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1173 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
-| Inspector, Playground, NME, редакторы частиц/GUI | — | 🚫 |
+| Тесты/бенчмарки | 1182 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |
+| Web-инспекторы, Playground, NME, браузерные редакторы GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
 | Node.js/NullEngine, серверный headless-рендер | — | 🚫 |
