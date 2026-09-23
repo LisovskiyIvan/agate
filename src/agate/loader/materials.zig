@@ -574,6 +574,17 @@ pub fn loadMaterials(
             }
         }
 
+        // KHR_materials_transmission
+        if (src_mat.has_transmission != 0) {
+            pbr_mat.transmission.factor = src_mat.transmission.transmission_factor;
+        }
+
+        // KHR_materials_ior
+        if (src_mat.has_ior != 0) {
+            pbr_mat.ior = src_mat.ior.ior;
+            pbr_mat.transmission.ior = src_mat.ior.ior;
+        }
+
         // glTF alphaMode/doubleSided mapping (cgltf has no has_alpha_cutoff:
 
         // alpha_cutoff always parses, defaulting to 0.5 when absent).
@@ -685,6 +696,44 @@ test "loadMaterials maps KHR_materials_clearcoat and KHR_materials_sheen (GPU-fr
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), out[1].?.pbr.sheen.color.g, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), out[1].?.pbr.sheen.color.b, 1e-4);
 }
+
+test "loadMaterials maps KHR_materials_transmission and KHR_materials_ior (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var src: [2]c.cgltf_material = .{
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+    };
+    // [0]: transmission active
+    src[0].has_transmission = 1;
+    src[0].transmission.transmission_factor = 0.75;
+
+    // [1]: ior active
+    src[1].has_ior = 1;
+    src[1].ior.ior = 1.33;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [2]?Material = .{ null, null };
+    var img_cache: [0]?Texture = .{};
+    var dec: [0]?Texture.DecodedImage = .{};
+
+    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null);
+
+    try std.testing.expect(out[0].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 0.75), out[0].?.pbr.transmission.factor);
+    try std.testing.expectEqual(@as(f32, 1.5), out[0].?.pbr.ior);
+
+    try std.testing.expect(out[1].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 1.33), out[1].?.pbr.ior);
+    try std.testing.expectEqual(@as(f32, 1.33), out[1].?.pbr.transmission.ior);
+}
+
 
 
 test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {

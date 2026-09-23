@@ -214,6 +214,7 @@ pub const Anisotropy = struct {
 pub const Transmission = struct {
     factor: f32 = 0.0,
     color: Color3 = Color3.white,
+    ior: f32 = 1.5,
 };
 
 /// Cheap subsurface scattering v1 (NOT a BSSRDF / random-walk SSS:
@@ -318,6 +319,7 @@ pub const PBRMaterial = struct {
     /// When true, lighting calculations (direct lights, shadows, SSAO, IBL)
     /// are bypassed: renders pure albedo + emissive.
     unlit: bool = false,
+    ior: f32 = 1.5,
     metallic: f32 = 0.0,
     roughness: f32 = 0.5,
     albedo_texture: ?Texture = null,
