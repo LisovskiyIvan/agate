@@ -278,6 +278,14 @@ pub const RigidBody = struct {
         self.last_vel = self.velocity;
     }
 
+    pub fn setBullet(self: *RigidBody, flag: bool) void {
+        c.b3Body_SetBullet(self.body_id, flag);
+    }
+
+    pub fn isBullet(self: *const RigidBody) bool {
+        return c.b3Body_IsBullet(self.body_id);
+    }
+
     pub fn setMass(self: *RigidBody, mass: f32) void {
         self.mass = mass;
         self.inv_mass = if (mass > 0.0) 1.0 / mass else 0.0;

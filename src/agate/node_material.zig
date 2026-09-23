@@ -88,6 +88,17 @@ pub const Kind = enum {
     mix,
     sin,
     output,
+    cos,
+    clamp,
+    step,
+    smoothstep,
+    pow,
+    dot,
+    length,
+    normalize,
+    fract,
+    fresnel,
+    panner,
 };
 
 /// Max user-param name length (fixed buffer per node, no allocation).
@@ -106,6 +117,7 @@ pub const Error = error{
     BadParamName,
     UnsupportedTextureSlot,
     OutOfMemory,
+    InvalidJson,
 };
 
 /// Options for `Graph.addNode`. Only the fields matching `kind` are read.
@@ -197,6 +209,84 @@ pub const Graph = struct {
         const out_id = try ctx.resolveOutput();
         return ctx.emit(allocator, name, out_id);
     }
+
+    /// Serializes the graph description to JSON text.
+    pub fn serializeJson(self: *const Graph, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.print(allocator, "{{\n  \"nodes\": [\n", .{});
+        for (self.nodes.items, 0..) |n, i| {
+            try out.print(allocator, "    {{\"id\": {d}, \"kind\": \"{s}\"", .{ i, @tagName(n.kind) });
+            if (n.kind == .const_float) {
+                try out.print(allocator, ", \"float\": {d}", .{n.float_val});
+            } else if (n.kind == .const_color) {
+                try out.print(allocator, ", \"color\": [{d}, {d}, {d}]", .{ n.color_val[0], n.color_val[1], n.color_val[2] });
+            } else if (n.kind == .texture_sample) {
+                try out.print(allocator, ", \"tex_slot\": {d}", .{n.tex_slot});
+            }
+            if (n.hasParam()) {
+                try out.print(allocator, ", \"param\": \"{s}\"", .{n.paramName()});
+            }
+            try out.print(allocator, ", \"inputs\": [", .{});
+            var first = true;
+            for (n.inputs) |inp| {
+                if (inp) |src| {
+                    if (!first) try out.print(allocator, ", ", .{});
+                    try out.print(allocator, "{d}", .{src});
+                    first = false;
+                }
+            }
+            try out.print(allocator, "]}}", .{});
+            if (i + 1 < self.nodes.items.len) {
+                try out.print(allocator, ",\n", .{});
+            } else {
+                try out.print(allocator, "\n", .{});
+            }
+        }
+        try out.print(allocator, "  ]\n}}\n", .{});
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Deserializes a graph from JSON text.
+    pub fn deserializeJson(allocator: std.mem.Allocator, json_text: []const u8) !Graph {
+        const NodeEntry = struct {
+            id: ?u32 = null,
+            kind: []const u8,
+            float: ?f32 = null,
+            color: ?[3]f32 = null,
+            tex_slot: ?u8 = null,
+            param: ?[]const u8 = null,
+            inputs: ?[]const u32 = null,
+        };
+        const Schema = struct {
+            nodes: []const NodeEntry,
+        };
+        const parsed = std.json.parseFromSlice(Schema, allocator, json_text, .{ .ignore_unknown_fields = true }) catch return error.InvalidJson;
+        defer parsed.deinit();
+
+        var g = Graph.init(allocator);
+        errdefer g.deinit();
+
+        for (parsed.value.nodes) |ne| {
+            const kind = std.meta.stringToEnum(Kind, ne.kind) orelse return error.InvalidJson;
+            _ = try g.addNode(kind, .{
+                .float = ne.float orelse 0.0,
+                .color = ne.color orelse .{ 1, 1, 1 },
+                .tex_slot = ne.tex_slot orelse 0,
+                .param = ne.param orelse "",
+            });
+        }
+        for (parsed.value.nodes, 0..) |ne, dst| {
+            if (ne.inputs) |inps| {
+                for (inps, 0..) |src, port| {
+                    if (port < 3) {
+                        g.connect(@intCast(dst), @intCast(port), src);
+                    }
+                }
+            }
+        }
+        return g;
+    }
 };
 
 /// Compiled graph: hook snippet text plus the merge-compatible param table.
@@ -264,8 +354,8 @@ const ResolveContext = struct {
         self.marks[id] = .visiting;
         const node = &self.graph.nodes.items[id];
         const t: Type = switch (node.kind) {
-            .const_float, .time, .sin => t: {
-                if (node.kind == .sin) {
+            .const_float, .time, .sin, .cos => t: {
+                if (node.kind == .sin or node.kind == .cos) {
                     const x = try self.input(id, 0);
                     const xt = try self.resolve(x);
                     if (xt != .float) return error.TypeMismatch;
@@ -289,6 +379,83 @@ const ResolveContext = struct {
                 const bt = try self.resolve(b);
                 if (at != bt) return error.TypeMismatch;
                 break :t at;
+            },
+            .pow => t: {
+                const a = try self.input(id, 0);
+                const b = try self.input(id, 1);
+                const at = try self.resolve(a);
+                const bt = try self.resolve(b);
+                if (at != .float or bt != .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .dot => t: {
+                const a = try self.input(id, 0);
+                const b = try self.input(id, 1);
+                const at = try self.resolve(a);
+                const bt = try self.resolve(b);
+                if (at != bt or at == .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .length => t: {
+                const a = try self.input(id, 0);
+                const at = try self.resolve(a);
+                if (at == .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .normalize => t: {
+                const a = try self.input(id, 0);
+                const at = try self.resolve(a);
+                if (at == .float) return error.TypeMismatch;
+                break :t at;
+            },
+            .fract => t: {
+                const a = try self.input(id, 0);
+                const at = try self.resolve(a);
+                break :t at;
+            },
+            .step => t: {
+                const edge = try self.input(id, 0);
+                const x = try self.input(id, 1);
+                const et = try self.resolve(edge);
+                const xt = try self.resolve(x);
+                if (et != xt or et != .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .smoothstep => t: {
+                const e0 = try self.input(id, 0);
+                const e1 = try self.input(id, 1);
+                const x = try self.input(id, 2);
+                const e0t = try self.resolve(e0);
+                const e1t = try self.resolve(e1);
+                const xt = try self.resolve(x);
+                if (e0t != .float or e1t != .float or xt != .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .clamp => t: {
+                const x = try self.input(id, 0);
+                const min_v = try self.input(id, 1);
+                const max_v = try self.input(id, 2);
+                const xt = try self.resolve(x);
+                const mint = try self.resolve(min_v);
+                const maxt = try self.resolve(max_v);
+                if (xt != mint or xt != maxt) return error.TypeMismatch;
+                break :t xt;
+            },
+            .fresnel => t: {
+                const p = try self.input(id, 0);
+                const pt = try self.resolve(p);
+                if (pt != .float) return error.TypeMismatch;
+                break :t .float;
+            },
+            .panner => t: {
+                const uv = try self.input(id, 0);
+                const speed = try self.input(id, 1);
+                const time = try self.input(id, 2);
+                const uvt = try self.resolve(uv);
+                const speedt = try self.resolve(speed);
+                const timet = try self.resolve(time);
+                if (uvt != .vec2 or speedt != .vec2 or timet != .float) return error.TypeMismatch;
+                break :t .vec2;
             },
             .mix => t: {
                 const a = try self.input(id, 0);
@@ -492,6 +659,59 @@ const ResolveContext = struct {
             .sin => {
                 const x = node.inputs[0].?;
                 try printEmit(out, allocator, "float _n{d} = sin(_n{d});\n", .{ id, x });
+            },
+            .cos => {
+                const x = node.inputs[0].?;
+                try printEmit(out, allocator, "float _n{d} = cos(_n{d});\n", .{ id, x });
+            },
+            .pow => {
+                const a = node.inputs[0].?;
+                const b = node.inputs[1].?;
+                try printEmit(out, allocator, "float _n{d} = pow(_n{d}, _n{d});\n", .{ id, a, b });
+            },
+            .dot => {
+                const a = node.inputs[0].?;
+                const b = node.inputs[1].?;
+                try printEmit(out, allocator, "float _n{d} = dot(_n{d}, _n{d});\n", .{ id, a, b });
+            },
+            .length => {
+                const a = node.inputs[0].?;
+                try printEmit(out, allocator, "float _n{d} = length(_n{d});\n", .{ id, a });
+            },
+            .normalize => {
+                const a = node.inputs[0].?;
+                try printEmit(out, allocator, "{s} _n{d} = normalize(_n{d});\n", .{ typeKeyword(t), id, a });
+            },
+            .fract => {
+                const a = node.inputs[0].?;
+                try printEmit(out, allocator, "{s} _n{d} = fract(_n{d});\n", .{ typeKeyword(t), id, a });
+            },
+            .step => {
+                const edge = node.inputs[0].?;
+                const x = node.inputs[1].?;
+                try printEmit(out, allocator, "float _n{d} = step(_n{d}, _n{d});\n", .{ id, edge, x });
+            },
+            .smoothstep => {
+                const e0 = node.inputs[0].?;
+                const e1 = node.inputs[1].?;
+                const x = node.inputs[2].?;
+                try printEmit(out, allocator, "float _n{d} = smoothstep(_n{d}, _n{d}, _n{d});\n", .{ id, e0, e1, x });
+            },
+            .clamp => {
+                const x = node.inputs[0].?;
+                const mn = node.inputs[1].?;
+                const mx = node.inputs[2].?;
+                try printEmit(out, allocator, "{s} _n{d} = clamp(_n{d}, _n{d}, _n{d});\n", .{ typeKeyword(t), id, x, mn, mx });
+            },
+            .fresnel => {
+                const p = node.inputs[0].?;
+                try printEmit(out, allocator, "float _n{d} = pow(1.0 - clamp(dot(N, normalize(eye_pos - v_world_pos)), 0.0, 1.0), _n{d});\n", .{ id, p });
+            },
+            .panner => {
+                const uv = node.inputs[0].?;
+                const speed = node.inputs[1].?;
+                const time = node.inputs[2].?;
+                try printEmit(out, allocator, "vec2 _n{d} = fract(_n{d} + _n{d} * _n{d});\n", .{ id, uv, speed, time });
             },
             .output => unreachable,
         }
@@ -870,4 +1090,60 @@ test "param names are guarded (reserved, duplicate, malformed, slots)" {
         g.connect(out, 0, tx);
         try std.testing.expectError(error.TypeMismatch, g.compile(alloc, "x"));
     }
+}
+
+test "NodeMaterial v2: extended math nodes and JSON serialization round-trip" {
+    const alloc = std.testing.allocator;
+    var g = Graph.init(alloc);
+    defer g.deinit();
+
+    const speed = try g.addNode(.const_float, .{ .float = 0.5, .param = "pan_speed" });
+    const base_col = try g.addNode(.const_color, .{ .color = .{ 0.2, 0.4, 0.9 }, .param = "rim_col" });
+    const pwr = try g.addNode(.const_float, .{ .float = 3.0 });
+    const fr = try g.addNode(.fresnel, .{});
+    g.connect(fr, 0, pwr);
+
+    const cs = try g.addNode(.cos, .{});
+    g.connect(cs, 0, speed);
+
+    const pw = try g.addNode(.pow, .{});
+    g.connect(pw, 0, cs);
+    g.connect(pw, 1, fr);
+
+    const clmp = try g.addNode(.clamp, .{});
+    g.connect(clmp, 0, pw);
+    g.connect(clmp, 1, speed);
+    g.connect(clmp, 2, pwr);
+
+    const mx = try g.addNode(.mix, .{});
+    g.connect(mx, 0, base_col);
+    g.connect(mx, 1, base_col);
+    g.connect(mx, 2, clmp);
+
+    const out = try g.addNode(.output, .{});
+    g.connect(out, 0, mx);
+
+    var compiled = try g.compile(alloc, "v2_test");
+    defer compiled.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, compiled.snippet, "cos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compiled.snippet, "pow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compiled.snippet, "clamp") != null);
+
+    // JSON serialization
+    const json = try g.serializeJson(alloc);
+    defer alloc.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\": \"fresnel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\": \"cos\"") != null);
+
+    // JSON deserialization
+    var g2 = try Graph.deserializeJson(alloc, json);
+    defer g2.deinit();
+
+    try std.testing.expectEqual(g.nodeCount(), g2.nodeCount());
+
+    var compiled2 = try g2.compile(alloc, "v2_test");
+    defer compiled2.deinit(alloc);
+    try std.testing.expectEqualStrings(compiled.snippet, compiled2.snippet);
 }

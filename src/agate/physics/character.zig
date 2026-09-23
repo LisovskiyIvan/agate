@@ -25,10 +25,18 @@ pub const CharacterController = struct {
     is_grounded: bool = false,
     ground_normal: Vec3 = Vec3.up,
 
+    /// Maximum vertical obstacle/step height the controller can climb up.
+    step_height: f32 = 0.35,
+    /// Push impulse strength applied when moving into dynamic rigid bodies.
+    push_strength: f32 = 25.0,
+    /// Whether moving into dynamic bodies applies push forces to them.
+    push_dynamic_bodies: bool = true,
+
     const max_planes = 16;
 
     pub const PlaneCollector = struct {
         planes: []c.b3CollisionPlane,
+        shapes: [max_planes]c.b3ShapeId = undefined,
         count: usize = 0,
     };
 
@@ -76,6 +84,18 @@ pub const CharacterController = struct {
         vx *= self.move_speed;
         vz *= self.move_speed;
 
+        // Push dynamic rigid bodies collided with along the move direction
+        if (self.push_dynamic_bodies and self.push_strength > 0.0 and wl > 0.001) {
+            const pdir = Vec3.new(wish_dir.x / wl, 0.0, wish_dir.z / wl);
+            const imp = pdir.scale(self.push_strength * h);
+            for (collector.shapes[0..collector.count]) |shape_id| {
+                const body_id = c.b3Shape_GetBody(shape_id);
+                if (c.b3Body_GetType(body_id) == c.b3_dynamicBody) {
+                    c.b3Body_ApplyLinearImpulseToCenter(body_id, toB3Vec(imp), true);
+                }
+            }
+        }
+
         var vy = self.velocity.y;
         if (self.is_grounded) {
             if (jump_pressed) {
@@ -89,12 +109,70 @@ pub const CharacterController = struct {
         }
         self.velocity = Vec3.new(vx, vy, vz);
 
-        const target = toB3Vec(Vec3.new(vx * h, vy * h, vz * h));
-        const solved = c.b3SolvePlanes(target, &plane_buf, @intCast(collector.count));
-        self.position = self.position.add(fromB3Vec(solved.delta));
+        // Step climbing: if grounded and moving into a steep wall/step,
+        // test whether lifting by step_height clears the obstacle.
+        var stepped = false;
+        if (self.step_height > 0.0 and self.is_grounded and wl > 0.01) {
+            var blocked_by_step = false;
+            for (plane_buf[0..collector.count]) |cp| {
+                const n = fromB3Vec(cp.plane.normal);
+                if (n.y < self.slope_limit_cos and n.y > -0.5) {
+                    const dot_wish = n.x * wish_dir.x + n.z * wish_dir.z;
+                    if (dot_wish < -0.05) {
+                        blocked_by_step = true;
+                        break;
+                    }
+                }
+            }
+            if (blocked_by_step) {
+                const step_lift = Vec3.new(0.0, self.step_height, 0.0);
+                const step_pos = self.position.add(step_lift);
+                var step_planes: [max_planes]c.b3CollisionPlane = undefined;
+                var step_coll = PlaneCollector{ .planes = &step_planes };
+                c.b3World_CollideMover(world.world_id, toB3Pos(step_pos), &mover, filter, &planeCollectFcn, &step_coll);
 
-        const clipped = c.b3ClipVector(toB3Vec(self.velocity), &plane_buf, @intCast(collector.count));
-        self.velocity = fromB3Vec(clipped);
+                const fwd_target = toB3Vec(Vec3.new(vx * h, 0.0, vz * h));
+                const fwd_solved = c.b3SolvePlanes(fwd_target, &step_planes, @intCast(step_coll.count));
+                const fwd_delta = fromB3Vec(fwd_solved.delta);
+
+                if (fwd_delta.x * fwd_delta.x + fwd_delta.z * fwd_delta.z > 1e-6) {
+                    const top_pos = step_pos.add(fwd_delta);
+                    var down_planes: [max_planes]c.b3CollisionPlane = undefined;
+                    var down_coll = PlaneCollector{ .planes = &down_planes };
+                    c.b3World_CollideMover(world.world_id, toB3Pos(top_pos), &mover, filter, &planeCollectFcn, &down_coll);
+
+                    const down_target = toB3Vec(Vec3.new(0.0, -self.step_height - 0.05, 0.0));
+                    const down_solved = c.b3SolvePlanes(down_target, &down_planes, @intCast(down_coll.count));
+                    const landed_pos = top_pos.add(fromB3Vec(down_solved.delta));
+
+                    var valid_ground = false;
+                    var best_ny: f32 = self.slope_limit_cos;
+                    for (down_planes[0..down_coll.count]) |cp| {
+                        const n = fromB3Vec(cp.plane.normal);
+                        if (n.y > best_ny) {
+                            best_ny = n.y;
+                            self.ground_normal = n;
+                            valid_ground = true;
+                        }
+                    }
+                    if (valid_ground and landed_pos.y >= self.position.y - 0.01) {
+                        self.position = landed_pos;
+                        self.is_grounded = true;
+                        self.velocity = Vec3.new(vx, 0.0, vz);
+                        stepped = true;
+                    }
+                }
+            }
+        }
+
+        if (!stepped) {
+            const target = toB3Vec(Vec3.new(vx * h, vy * h, vz * h));
+            const solved = c.b3SolvePlanes(target, &plane_buf, @intCast(collector.count));
+            self.position = self.position.add(fromB3Vec(solved.delta));
+
+            const clipped = c.b3ClipVector(toB3Vec(self.velocity), &plane_buf, @intCast(collector.count));
+            self.velocity = fromB3Vec(clipped);
+        }
     }
 };
 
@@ -104,7 +182,6 @@ fn planeCollectFcn(
     plane_count: c_int,
     context: ?*anyopaque,
 ) callconv(.c) bool {
-    _ = shape_id;
     const ctx = context orelse return false;
     const collector: *CharacterController.PlaneCollector = @ptrCast(@alignCast(ctx));
     var i: c_int = 0;
@@ -117,6 +194,7 @@ fn planeCollectFcn(
             .push = 0.0,
             .clipVelocity = true,
         };
+        collector.shapes[collector.count] = shape_id;
         collector.count += 1;
     }
     return true;

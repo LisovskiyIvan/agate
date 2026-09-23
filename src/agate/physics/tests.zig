@@ -1957,3 +1957,43 @@ test "PhysicsWorld debug lines reserve once and repeat identically" {
     try std.testing.expectEqual(2 * n, lines.items.len);
     try std.testing.expectEqualSlices(DebugLine, lines.items[0..n], lines.items[n .. 2 * n]);
 }
+
+test "PhysicsWorld continuous collision detection and bullet flags" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    // Default CCD state
+    try std.testing.expect(pw.isContinuousEnabled());
+    pw.enableContinuous(false);
+    try std.testing.expect(!pw.isContinuousEnabled());
+    pw.enableContinuous(true);
+    try std.testing.expect(pw.isContinuousEnabled());
+
+    var m = Mesh{
+        .name = "bullet_mesh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    const b = try pw.createBodyWith(&m, .sphere, 1.0, .{ .is_bullet = true });
+    try std.testing.expect(b.isBullet());
+    b.setBullet(false);
+    try std.testing.expect(!b.isBullet());
+    b.setBullet(true);
+    try std.testing.expect(b.isBullet());
+}
+
+test "CharacterController push dynamic bodies and step climbing options" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var ctrl = @import("character.zig").CharacterController.init(Vec3.new(0.0, 0.0, 0.0), 0.3, 1.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), ctrl.step_height, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), ctrl.push_strength, 1e-4);
+    try std.testing.expect(ctrl.push_dynamic_bodies);
+
+    // Mover advances without error
+    ctrl.move(&pw, Vec3.new(1.0, 0.0, 0.0), false, 1.0 / 60.0);
+    try std.testing.expect(ctrl.position.x > 0.0);
+}

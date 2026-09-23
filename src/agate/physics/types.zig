@@ -68,6 +68,7 @@ pub const BodyOptions = struct {
     enable_sensor_events: bool = false,
     enable_contact_events: bool = false,
     enable_hit_events: bool = false,
+    is_bullet: bool = false,
 };
 
 /// Options for the `PhysicsWorld.add*Shape` compound helpers.

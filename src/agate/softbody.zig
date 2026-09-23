@@ -114,6 +114,9 @@ pub const ClothOptions = struct {
     bend_constraints: bool = false,
     /// Pin the entire top row (y == 0) at creation: the hanging-curtain default.
     pin_top_row: bool = true,
+    /// Maximum strain error (|dist - rest| / rest) before a constraint breaks.
+    /// null = tearing disabled (infinite tensile strength).
+    tear_strain: ?f32 = null,
 
     pub fn validate(self: ClothOptions) SoftBodyError!void {
         if (self.width < 2 or self.width > max_grid) return error.InvalidOptions;
@@ -124,13 +127,17 @@ pub const ClothOptions = struct {
         if (!(self.fixed_dt > 0.0) or self.fixed_dt > 0.2 or !std.math.isFinite(self.fixed_dt)) return error.InvalidOptions;
         if (!(self.damping >= 0.0) or !std.math.isFinite(self.damping)) return error.InvalidOptions;
         if (!(self.friction >= 0.0) or self.friction > 1.0 or !std.math.isFinite(self.friction)) return error.InvalidOptions;
+        if (self.tear_strain) |ts| {
+            if (!(ts > 0.0) or !std.math.isFinite(ts)) return error.InvalidOptions;
+        }
     }
 };
 
-const Constraint = struct {
+pub const Constraint = struct {
     a: u32,
     b: u32,
     rest: f32,
+    active: bool = true,
 };
 
 /// Pure-CPU PBD cloth solver: no scene/mesh/sg imports, deterministic for a
@@ -158,6 +165,8 @@ pub const Cloth = struct {
     accumulator: f32 = 0.0,
     sim_time: f32 = 0.0,
     enabled: bool = true,
+    tear_strain: ?f32 = null,
+    torn_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: ClothOptions) SoftBodyError!Cloth {
         try options.validate();
@@ -232,6 +241,7 @@ pub const Cloth = struct {
             .wind = options.wind,
             .floor_y = options.floor_y,
             .friction = options.friction,
+            .tear_strain = options.tear_strain,
         };
         if (options.pin_top_row) {
             for (0..options.width) |x| self.setPinned(x, 0, true);
@@ -298,6 +308,60 @@ pub const Cloth = struct {
         self.floor_y = floor_y;
     }
 
+    /// Deactivates a specific constraint by index. Returns true if severed.
+    pub fn tearConstraint(self: *Cloth, index: usize) bool {
+        if (index >= self.constraints.len) return false;
+        if (!self.constraints[index].active) return false;
+        self.constraints[index].active = false;
+        self.torn_count += 1;
+        return true;
+    }
+
+    /// Deactivates all constraints connecting to particle (x, y).
+    pub fn tearAt(self: *Cloth, x: usize, y: usize) usize {
+        if (x >= self.width or y >= self.height) return 0;
+        const idx: u32 = @intCast(self.indexOf(x, y));
+        var severed: usize = 0;
+        for (self.constraints) |*c| {
+            if (c.active and (c.a == idx or c.b == idx)) {
+                c.active = false;
+                self.torn_count += 1;
+                severed += 1;
+            }
+        }
+        return severed;
+    }
+
+    /// Cuts a vertical seam down the cloth across column `x`.
+    pub fn tearSeam(self: *Cloth, x: usize) usize {
+        if (x >= self.width) return 0;
+        var severed: usize = 0;
+        const w = self.width;
+        for (0..self.height) |y| {
+            const idx: u32 = @intCast(y * w + x);
+            for (self.constraints) |*c| {
+                if (c.active and (c.a == idx or c.b == idx)) {
+                    const ax = c.a % w;
+                    const bx = c.b % w;
+                    if (ax != bx) {
+                        c.active = false;
+                        self.torn_count += 1;
+                        severed += 1;
+                    }
+                }
+            }
+        }
+        return severed;
+    }
+
+    /// Reactivates all constraints in the cloth.
+    pub fn resetTears(self: *Cloth) void {
+        for (self.constraints) |*c| {
+            c.active = true;
+        }
+        self.torn_count = 0;
+    }
+
     /// Advances the simulation by `dt` seconds through the fixed-step
     /// accumulator. Returns true when at least one fixed step ran (the mesh
     /// coupling uses this as the exactly-once upload flag). Disabled cloths
@@ -350,7 +414,8 @@ pub const Cloth = struct {
     }
 
     fn solveConstraints(self: *Cloth) void {
-        for (self.constraints) |c| {
+        for (self.constraints) |*c| {
+            if (!c.active) continue;
             const wa = self.inv_mass[c.a];
             const wb = self.inv_mass[c.b];
             const w = wa + wb;
@@ -358,6 +423,14 @@ pub const Cloth = struct {
             const delta = self.pos[c.b].sub(self.pos[c.a]);
             const dist = delta.length();
             if (dist == 0.0) continue;
+            const strain = @abs(dist - c.rest) / c.rest;
+            if (self.tear_strain) |limit| {
+                if (strain > limit) {
+                    c.active = false;
+                    self.torn_count += 1;
+                    continue;
+                }
+            }
             const diff = (dist - c.rest) / dist;
             self.pos[c.a] = self.pos[c.a].add(delta.scale(diff * (wa / w)));
             self.pos[c.b] = self.pos[c.b].sub(delta.scale(diff * (wb / w)));
@@ -390,11 +463,12 @@ pub const Cloth = struct {
         }
     }
 
-    /// Maximum relative rest-length violation over all constraints
+    /// Maximum relative rest-length violation over all active constraints
     /// (|dist - rest| / rest). Convergence tests assert this shrinks.
     pub fn maxStrainError(self: *const Cloth) f32 {
         var worst: f32 = 0.0;
         for (self.constraints) |c| {
+            if (!c.active) continue;
             const dist = self.pos[c.a].distance(self.pos[c.b]);
             const err = @abs(dist - c.rest) / c.rest;
             if (err > worst) worst = err;
@@ -909,4 +983,36 @@ test "wind accelerates the sheet downwind vs control" {
         _ = b.step(1.0 / 60.0);
     }
     try t.expect(a.pos[a.indexOf(1, 1)].x > b.pos[b.indexOf(1, 1)].x + 0.05);
+}
+
+test "cloth tearing: tearConstraint, tearSeam, resetTears and auto-tearing" {
+    const t = std.testing;
+    var c = try Cloth.init(t.allocator, .{
+        .width = 4,
+        .height = 4,
+        .spacing = 0.25,
+        .pin_top_row = true,
+        .tear_strain = 0.5,
+    });
+    defer c.deinit();
+
+    try t.expectEqual(@as(usize, 0), c.torn_count);
+    try t.expect(c.tearConstraint(0));
+    try t.expectEqual(@as(usize, 1), c.torn_count);
+    // Already severed
+    try t.expect(!c.tearConstraint(0));
+
+    // Seam cut
+    const cut = c.tearSeam(1);
+    try t.expect(cut > 0);
+    try t.expectEqual(@as(usize, 1 + cut), c.torn_count);
+
+    // Reset restores all
+    c.resetTears();
+    try t.expectEqual(@as(usize, 0), c.torn_count);
+
+    // Simulate with excessive stretch to trigger auto-tearing
+    c.pos[c.indexOf(1, 2)] = Vec3.new(10.0, -10.0, 0.0);
+    _ = c.step(1.0 / 60.0);
+    try t.expect(c.torn_count > 0);
 }

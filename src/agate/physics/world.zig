@@ -123,6 +123,14 @@ pub const PhysicsWorld = struct {
         c.b3DestroyWorld(self.world_id);
     }
 
+    pub fn enableContinuous(self: *PhysicsWorld, flag: bool) void {
+        c.b3World_EnableContinuous(self.world_id, flag);
+    }
+
+    pub fn isContinuousEnabled(self: *const PhysicsWorld) bool {
+        return c.b3World_IsContinuousEnabled(self.world_id);
+    }
+
     pub fn createBody(self: *PhysicsWorld, mesh: *Mesh, collider: ColliderType, mass: f32) !*RigidBody {
         return self.createBodyWith(mesh, collider, mass, .{});
     }
@@ -148,6 +156,10 @@ pub const PhysicsWorld = struct {
         body.last_sensor_events = options.is_sensor or options.enable_sensor_events;
         body.last_contact_events = options.enable_contact_events;
         body.last_hit_events = options.enable_hit_events;
+
+        if (options.is_bullet) {
+            body.setBullet(true);
+        }
 
         body.shape_id = try self.createShapeOnBody(body);
         return body;
