@@ -62,6 +62,8 @@ pub const SpotLightOptions = lights.SpotLightOptions;
 pub const resolveSunDirection = lights.resolveSunDirection;
 pub const resolveSunColor = lights.resolveSunColor;
 pub const resolveSunIntensity = lights.resolveSunIntensity;
+pub const sunDirectionFromAngles = lights.sunDirectionFromAngles;
+pub const colorTemperatureToRgb = lights.colorTemperatureToRgb;
 pub const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
 pub const ClusteredPointLight = lights.ClusteredPointLight;
 pub const max_clustered_lights = lights.max_clustered_lights;
@@ -257,6 +259,10 @@ pub const FlowWrap = particles.FlowWrap;
 pub const CollisionMode = particles.CollisionMode;
 pub const CollisionError = particles.CollisionError;
 pub const ParticleSphereCollider = particles.ParticleSphereCollider;
+pub const ParticleBoxCollider = particles.ParticleBoxCollider;
+pub const ParticlePlaneCollider = particles.ParticlePlaneCollider;
+pub const max_box_colliders = particles.max_box_colliders;
+pub const max_plane_colliders = particles.max_plane_colliders;
 pub const GpuParticleSlot = particles.GpuParticleSlot;
 
 /// Compute-pass support (see compute.zig for the backend matrix).
@@ -569,6 +575,8 @@ test "root re-exports cover recent Scene APIs" {
     _ = AreaLightOptions;
     _ = AreaLight;
     _ = max_area_lights;
+    _ = sunDirectionFromAngles;
+    _ = colorTemperatureToRgb;
     _ = ReflectionProbe;
     _ = ReflectionProbeOptions;
     _ = Ui3dPanel;
@@ -592,6 +600,10 @@ test "root re-exports cover recent Scene APIs" {
     _ = CollisionMode;
     _ = CollisionError;
     _ = ParticleSphereCollider;
+    _ = ParticleBoxCollider;
+    _ = ParticlePlaneCollider;
+    _ = max_box_colliders;
+    _ = max_plane_colliders;
     _ = GpuParticleSlot;
     _ = TtfFont;
     _ = TtfError;

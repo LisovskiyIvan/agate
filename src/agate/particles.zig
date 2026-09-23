@@ -98,3 +98,7 @@ pub const CollisionMode = collisions.CollisionMode;
 pub const CollisionError = collisions.CollisionError;
 pub const ParticleSphereCollider = collisions.ParticleSphereCollider;
 pub const max_sphere_colliders = collisions.max_sphere_colliders;
+pub const ParticleBoxCollider = collisions.ParticleBoxCollider;
+pub const max_box_colliders = collisions.max_box_colliders;
+pub const ParticlePlaneCollider = collisions.ParticlePlaneCollider;
+pub const max_plane_colliders = collisions.max_plane_colliders;

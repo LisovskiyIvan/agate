@@ -47,6 +47,16 @@ pub fn addDirectionalLight(self: anytype, name: []const u8, options: Directional
     return self.lights.addDirectionalLight(self.allocator, name, options);
 }
 
+/// Sets the sun direction from azimuth and elevation angles (radians).
+pub fn setSunAngles(self: anytype, azimuth_rad: f32, elevation_rad: f32) void {
+    self.lights.setSunAngles(azimuth_rad, elevation_rad);
+}
+
+/// Sets the sun color from correlated color temperature in Kelvin (1000K to 12000K).
+pub fn setSunColorTemperature(self: anytype, kelvin: f32) void {
+    self.lights.setSunColorTemperature(kelvin);
+}
+
 // ---- Rect area lights (wave 26, v1). ----
 //
 // A bounded, additive, OFF-by-default feature: with zero area lights

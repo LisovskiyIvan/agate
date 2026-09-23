@@ -67,6 +67,10 @@ const CollisionMode = collisions.CollisionMode;
 const CollisionError = collisions.CollisionError;
 const ParticleSphereCollider = collisions.ParticleSphereCollider;
 const max_sphere_colliders = collisions.max_sphere_colliders;
+const ParticleBoxCollider = collisions.ParticleBoxCollider;
+const max_box_colliders = collisions.max_box_colliders;
+const ParticlePlaneCollider = collisions.ParticlePlaneCollider;
+const max_plane_colliders = collisions.max_plane_colliders;
 
 /// Sub-emitter trigger point. Only `.on_death` exists today (Babylon.js
 /// parity target): a parent particle spawns children in another system on the
@@ -332,6 +336,10 @@ pub const ParticleSystem = struct {
     collision_mode: CollisionMode = .none,
     collision_spheres: [max_sphere_colliders]ParticleSphereCollider = undefined,
     collision_sphere_count: usize = 0,
+    collision_boxes: [max_box_colliders]ParticleBoxCollider = undefined,
+    collision_box_count: usize = 0,
+    collision_planes: [max_plane_colliders]ParticlePlaneCollider = undefined,
+    collision_plane_count: usize = 0,
     /// Normal-speed scale on bounce, clamped to [0, 1] at use (0 = dead
     /// stop, 1 = perfectly elastic). Direct field write, like gravity.
     collision_restitution: f32 = 0.5,
@@ -536,7 +544,37 @@ pub const ParticleSystem = struct {
         return collisions.addSphereCollider(self, collider);
     }
 
-    /// Disarms all collision geometry (spheres + ground plane); response
+    /// Adds a static axis-aligned box collider (see collisions.zig).
+    pub fn addBoxCollider(self: *ParticleSystem, collider: ParticleBoxCollider) CollisionError!void {
+        return collisions.addBoxCollider(self, collider);
+    }
+
+    /// Adds a static oriented plane collider (see collisions.zig).
+    pub fn addPlaneCollider(self: *ParticleSystem, collider: ParticlePlaneCollider) CollisionError!void {
+        return collisions.addPlaneCollider(self, collider);
+    }
+
+    /// Adds a box collider matching the world bounding box of `mesh_obj`.
+    pub fn addMeshAabbCollider(self: *ParticleSystem, mesh_obj: anytype) CollisionError!void {
+        return collisions.addMeshAabbCollider(self, mesh_obj);
+    }
+
+    /// Disarms sphere colliders.
+    pub fn clearSphereColliders(self: *ParticleSystem) void {
+        collisions.clearSphereColliders(self);
+    }
+
+    /// Disarms box colliders.
+    pub fn clearBoxColliders(self: *ParticleSystem) void {
+        collisions.clearBoxColliders(self);
+    }
+
+    /// Disarms plane colliders.
+    pub fn clearPlaneColliders(self: *ParticleSystem) void {
+        collisions.clearPlaneColliders(self);
+    }
+
+    /// Disarms all collision geometry (spheres + boxes + planes + ground plane); response
     /// knobs kept. Never fails (see collisions.zig).
     pub fn clearColliders(self: *ParticleSystem) void {
         collisions.clearColliders(self);
@@ -554,7 +592,7 @@ pub const ParticleSystem = struct {
         return collisions.setGroundPlane(self, height);
     }
 
-    /// Disarms the ground plane (spheres kept). Never fails.
+    /// Disarms the ground plane (other colliders kept). Never fails.
     pub fn clearGroundPlane(self: *ParticleSystem) void {
         collisions.clearGroundPlane(self);
     }

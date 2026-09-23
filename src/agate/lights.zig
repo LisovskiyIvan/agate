@@ -321,6 +321,54 @@ pub fn resolveSunIntensity(directional: ?*const DirectionalLight, hemi: Hemisphe
     return hemi.intensity;
 }
 
+/// Computes a normalized light direction vector from azimuth and elevation angles (radians).
+/// Elevation is measured up from the horizontal XZ plane: 0 = horizon, pi/2 = directly overhead.
+/// Azimuth rotates around +Y: 0 = along +Z, pi/2 = along +X.
+pub fn sunDirectionFromAngles(azimuth_rad: f32, elevation_rad: f32) Vec3 {
+    const cos_elev = @cos(elevation_rad);
+    const sin_elev = @sin(elevation_rad);
+    const dir = Vec3.new(
+        cos_elev * @sin(azimuth_rad),
+        sin_elev,
+        cos_elev * @cos(azimuth_rad),
+    );
+    const len_sq = dir.lengthSq();
+    if (len_sq > 1e-12) return dir.scale(1.0 / @sqrt(len_sq));
+    return Vec3.up;
+}
+
+/// Converts a correlated color temperature in Kelvin (1000K to 12000K) to normalized linear RGB.
+/// Uses the standard Tanner Helland Planckian approximation.
+pub fn colorTemperatureToRgb(kelvin: f32) Color3 {
+    const temp = std.math.clamp(kelvin, 1000.0, 12000.0) / 100.0;
+
+    const r: f32 = if (temp <= 66.0)
+        1.0
+    else blk: {
+        const val = 329.698727446 * std.math.pow(f32, temp - 60.0, -0.1332047592) / 255.0;
+        break :blk std.math.clamp(val, 0.0, 1.0);
+    };
+
+    const g: f32 = if (temp <= 66.0) blk: {
+        const val = (99.4708025861 * @log(temp) - 161.1195681661) / 255.0;
+        break :blk std.math.clamp(val, 0.0, 1.0);
+    } else blk: {
+        const val = 288.1221695283 * std.math.pow(f32, temp - 60.0, -0.0755148492) / 255.0;
+        break :blk std.math.clamp(val, 0.0, 1.0);
+    };
+
+    const b: f32 = if (temp >= 66.0)
+        1.0
+    else if (temp <= 19.0)
+        0.0
+    else blk: {
+        const val = (138.5177312231 * @log(temp - 10.0) - 305.0447927307) / 255.0;
+        break :blk std.math.clamp(val, 0.0, 1.0);
+    };
+
+    return Color3.new(r, g, b);
+}
+
 test "resolveSunDirection falls back to normalized hemi" {
     const hemi = HemisphericLight.init("hemi", .{ .direction = Vec3.new(2.0, 0.0, 0.0) });
     const dir = resolveSunDirection(null, hemi);
@@ -367,6 +415,43 @@ test "resolveSunDirection with zero-length direction is safe" {
     try std.testing.expect(std.math.isFinite(dir.y));
     try std.testing.expect(std.math.isFinite(dir.z));
     try std.testing.expectApproxEqAbs(dir.y, 1.0, 1e-6);
+}
+
+test "sunDirectionFromAngles computes unit vector for zenith and horizon" {
+    // Zenith: elevation = pi/2
+    const zenith = sunDirectionFromAngles(0.0, std.math.pi * 0.5);
+    try std.testing.expectApproxEqAbs(zenith.x, 0.0, 1e-5);
+    try std.testing.expectApproxEqAbs(zenith.y, 1.0, 1e-5);
+    try std.testing.expectApproxEqAbs(zenith.z, 0.0, 1e-5);
+
+    // Horizon +Z: elevation = 0, azimuth = 0
+    const horizon_z = sunDirectionFromAngles(0.0, 0.0);
+    try std.testing.expectApproxEqAbs(horizon_z.x, 0.0, 1e-5);
+    try std.testing.expectApproxEqAbs(horizon_z.y, 0.0, 1e-5);
+    try std.testing.expectApproxEqAbs(horizon_z.z, 1.0, 1e-5);
+
+    // Horizon +X: elevation = 0, azimuth = pi/2
+    const horizon_x = sunDirectionFromAngles(std.math.pi * 0.5, 0.0);
+    try std.testing.expectApproxEqAbs(horizon_x.x, 1.0, 1e-5);
+    try std.testing.expectApproxEqAbs(horizon_x.y, 0.0, 1e-5);
+    try std.testing.expectApproxEqAbs(horizon_x.z, 0.0, 1e-5);
+}
+
+test "colorTemperatureToRgb produces warm for low kelvin and cool for high kelvin" {
+    const warm = colorTemperatureToRgb(2500.0);
+    // Warm: red is 1.0, green ~ 0.62, blue ~ 0.27 (more red than blue)
+    try std.testing.expect(warm.r > warm.g);
+    try std.testing.expect(warm.g > warm.b);
+
+    const neutral = colorTemperatureToRgb(6500.0);
+    // Neutral daylight: balanced channels
+    try std.testing.expectApproxEqAbs(neutral.r, 1.0, 0.05);
+    try std.testing.expect(neutral.g > 0.9);
+    try std.testing.expect(neutral.b > 0.9);
+
+    const cool = colorTemperatureToRgb(10000.0);
+    // Cool sky: blue is 1.0, more blue than red
+    try std.testing.expect(cool.b >= cool.r);
 }
 
 test "multi-directional cap is four (one sun plus three fills)" {

@@ -226,6 +226,28 @@ pub const LightRig = struct {
         return lights.resolveSunIntensity(self.directional, self.hemi);
     }
 
+    /// Sets the sun direction from azimuth and elevation angles (in radians).
+    /// Updates the primary directional light (if created) and the hemispheric
+    /// light direction fallback.
+    pub fn setSunAngles(self: *LightRig, azimuth_rad: f32, elevation_rad: f32) void {
+        const dir = lights.sunDirectionFromAngles(azimuth_rad, elevation_rad);
+        if (self.directional) |dl| {
+            dl.direction = dir;
+        }
+        self.hemi.direction = dir;
+    }
+
+    /// Sets the sun color from correlated color temperature in Kelvin.
+    /// Updates the primary directional light diffuse color and the hemispheric
+    /// diffuse color fallback.
+    pub fn setSunColorTemperature(self: *LightRig, kelvin: f32) void {
+        const col = lights.colorTemperatureToRgb(kelvin);
+        if (self.directional) |dl| {
+            dl.diffuse = col;
+        }
+        self.hemi.diffuse = col;
+    }
+
     /// Frees every owned light. Leaves the collections empty so a deinit
     /// path stays idempotent under testing allocators. Slot hysteresis state
     /// is cleared too — it holds raw light pointers.

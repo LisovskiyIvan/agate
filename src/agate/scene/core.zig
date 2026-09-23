@@ -742,6 +742,16 @@ pub const Scene = struct {
     }
 
     /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn setSunAngles(self: *Scene, azimuth_rad: f32, elevation_rad: f32) void {
+        scene_lights_api.setSunAngles(self, azimuth_rad, elevation_rad);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn setSunColorTemperature(self: *Scene, kelvin: f32) void {
+        scene_lights_api.setSunColorTemperature(self, kelvin);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn addAreaLight(self: *Scene, name: []const u8, options: AreaLightOptions) !*AreaLight {
         return scene_lights_api.addAreaLight(self, name, options);
     }
@@ -1328,13 +1338,8 @@ pub const Scene = struct {
             std.debug.assert(!self.completed);
             self.completed = true;
             const s = self.scene;
-            // Release edge: release the handoff slot first so WRITING is cleared
-            // and handoff is registered before the generation is visible, then
-            // the slot index, then the generation.
-            s.draws.releaseHandoff(self.slot) catch {};
-            s.build_slot.store(self.slot, .release);
             std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
-            s.build_seq.store(self.seq, .release);
+            s.draws.releaseHandoffWithSeq(self.slot, self.seq, &s.build_slot, &s.build_seq) catch {};
         }
 
         /// Drop the claim without committing (seq/handoff untouched: prepare

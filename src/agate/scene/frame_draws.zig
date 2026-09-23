@@ -637,6 +637,31 @@ pub const FrameDraws = struct {
         self.handoff = back_idx;
     }
 
+    /// Atomically releases WRITING and registers handoff while storing the
+    /// atomic build_slot and build_seq under the lease mutex, guaranteeing
+    /// consumers never see a torn pair or a SlotBusy refusal on a freshly
+    /// published frame.
+    pub fn releaseHandoffWithSeq(
+        self: *FrameDraws,
+        back_idx: usize,
+        seq: u64,
+        build_slot: *std.atomic.Value(usize),
+        build_seq: *std.atomic.Value(u64),
+    ) LeaseError!void {
+        if (back_idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.writing[back_idx]) return LeaseError.NotClaimed;
+        if (self.pinned[back_idx]) {
+            self.publish_refusals += 1;
+            return LeaseError.PinnedSlot;
+        }
+        self.writing[back_idx] = false;
+        self.handoff = back_idx;
+        build_slot.store(back_idx, .release);
+        build_seq.store(seq, .release);
+    }
+
     /// Release a claim without publishing (producer drops the build, e.g. a
     /// mid-fill abort). Always legal on a claimed slot; a no-op error
     /// (`NotClaimed`) otherwise. Exists so a dropped build can never wedge
