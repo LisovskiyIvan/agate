@@ -545,41 +545,65 @@ pub const ClusteredGpuCache = struct {
     }
 
     /// Sizes `view_slot`'s three buffers to the current CPU scratch
-    /// (exact-fit, minimum one element so the views are always bindable).
-    /// Secondary slots allocate lazily here on first use; untouched slots
-    /// hold no buffers. Growth retires the old buffer through the same
-    /// `gpu_retire` queue as before (never destroys inline). Failed
-    /// creation (buffer id 0 / pool exhaustion) fails that slot closed.
+    /// (power-of-two growth with a 64 B floor, minimum one element so the
+    /// views are always bindable). Secondary slots allocate lazily here on
+    /// first use; untouched slots hold no buffers. Growth retires the old
+    /// buffer through the same `gpu_retire` queue as before (never destroys
+    /// inline) and drops its storage view so `ensureViews` rebuilds it
+    /// against the new buffer. Failed creation (buffer id 0 / pool
+    /// exhaustion) fails that slot closed.
     fn ensureSized(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype, view_slot: usize) bool {
         const slot = &self.slots[clampSlot(view_slot)];
         const need_lights = @max(self.cpu_lights.items.len, 1);
         const need_headers = @max(self.cpu_headers.items.len, 1);
         const need_indices = @max(self.cpu_indices.items.len, 1);
-        if (!ensureBuffer(allocator, retire_queue, &slot.light_buffer, &slot.light_cap, need_lights * @sizeOf(ClusterLightGpu))) return false;
-        if (!ensureBuffer(allocator, retire_queue, &slot.header_buffer, &slot.header_cap, need_headers * @sizeOf(ClusterTileGpu))) return false;
-        if (!ensureBuffer(allocator, retire_queue, &slot.index_buffer, &slot.index_cap, need_indices * @sizeOf(u32))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.light_buffer, &slot.light_view, &slot.light_cap, need_lights * @sizeOf(ClusterLightGpu))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.header_buffer, &slot.header_view, &slot.header_cap, need_headers * @sizeOf(ClusterTileGpu))) return false;
+        if (!ensureBuffer(allocator, retire_queue, &slot.index_buffer, &slot.index_view, &slot.index_cap, need_indices * @sizeOf(u32))) return false;
         return true;
+    }
+
+    /// Growth size: next power of two with a 64 B floor. A camera sweep
+    /// grows the index scratch as lights sweep across tiles; exact-fit
+    /// sizing made every crossing a retire+create churn event (buffer-pool
+    /// pressure + view churn), pow2 bounds it to a handful per session.
+    fn growBytes(need_bytes: usize) usize {
+        const floor_bytes: usize = 64;
+        if (need_bytes <= floor_bytes) return floor_bytes;
+        return std.math.ceilPowerOfTwo(usize, need_bytes) catch need_bytes;
     }
 
     fn ensureBuffer(
         allocator: std.mem.Allocator,
         retire_queue: anytype,
-        slot: *sg.Buffer,
+        buffer: *sg.Buffer,
+        view: *sg.View,
         cap: *usize,
         need_bytes: usize,
     ) bool {
-        if (slot.*.id != 0 and cap.* >= need_bytes) return true;
-        if (slot.*.id != 0) {
-            retire_queue.retireBuffer(allocator, slot.*);
-            slot.* = .{};
+        if (buffer.*.id != 0 and cap.* >= need_bytes) return true;
+        if (buffer.*.id != 0) {
+            retire_queue.retireBuffer(allocator, buffer.*);
+            buffer.* = .{};
+            // Drop the storage view together with its buffer: once the
+            // retire queue flushes, the stale view is dead at bind time
+            // (VALIDATE_ABND_VIEW_ALIVE) and a non-zero stale view id made
+            // `ensureViews` skip recreation while `slot.live` stayed true —
+            // every clustered draw then failed sg_apply_bindings and drew
+            // nothing (the "clustered ON + rotate camera = empty screen"
+            // bisect; samplers in the same failing bindings were
+            // collateral validation output). ensureViews recreates the
+            // view against the new buffer on the upload below.
+            view.* = .{};
             cap.* = 0;
         }
-        slot.* = sg.makeBuffer(.{
+        const grow = growBytes(need_bytes);
+        buffer.* = sg.makeBuffer(.{
             .usage = .{ .storage_buffer = true, .dynamic_update = true },
-            .size = need_bytes,
+            .size = grow,
         });
-        if (slot.*.id == 0) return false;
-        cap.* = need_bytes;
+        if (buffer.*.id == 0) return false;
+        cap.* = grow;
         return true;
     }
 
@@ -596,6 +620,16 @@ pub const ClusteredGpuCache = struct {
         }
     }
 };
+
+test "growBytes rounds up to pow2 with a 64 B floor" {
+    try std.testing.expectEqual(@as(usize, 64), ClusteredGpuCache.growBytes(0));
+    try std.testing.expectEqual(@as(usize, 64), ClusteredGpuCache.growBytes(1));
+    try std.testing.expectEqual(@as(usize, 64), ClusteredGpuCache.growBytes(64));
+    try std.testing.expectEqual(@as(usize, 128), ClusteredGpuCache.growBytes(65));
+    try std.testing.expectEqual(@as(usize, 256), ClusteredGpuCache.growBytes(200));
+    try std.testing.expectEqual(@as(usize, 4096), ClusteredGpuCache.growBytes(2132));
+    try std.testing.expectEqual(@as(usize, 8192), ClusteredGpuCache.growBytes(6240));
+}
 
 test "tilesForViewport is ceiling division with empty-viewport zero" {
     try std.testing.expectEqual(TileGrid{ .x = 0, .y = 0 }, tilesForViewport(0, 480));
