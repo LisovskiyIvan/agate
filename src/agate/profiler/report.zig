@@ -429,8 +429,9 @@ pub fn generateReportHtml(
         for (frames, 0..) |f, i| {
             const x = chart_x_start + @as(f32, @floatFromInt(i)) * bar_step;
 
-            // Stack from bottom up: update -> prepare -> shadow -> main -> post
+            // Stack from bottom up: update -> physics -> prepare -> shadow -> main -> post
             const h_update = f.update_ms * y_scale;
+            const h_physics = f.physics_ms * y_scale;
             const h_prepare = f.prepare_ms * y_scale;
             const h_shadow = f.shadow_ms * y_scale;
             const h_main = f.main_ms * y_scale;
@@ -444,12 +445,12 @@ pub fn generateReportHtml(
             // disabled path stays byte-identical. Per-pass GPU lines
             // (GL timer queries) append only when per-pass data exists.
             const tooltip_open = if (has_pass) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
-            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.gpu_shadow_ms, f.gpu_main_ms, f.gpu_post_ms, f.draw_calls, f.triangles }) else if (has_gpu) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
-            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.draw_calls, f.triangles }) else try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
-            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.gpu_shadow_ms, f.gpu_main_ms, f.gpu_post_ms, f.draw_calls, f.triangles }) else if (has_gpu) try std.fmt.allocPrint(allocator,
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.draw_calls, f.triangles }) else try std.fmt.allocPrint(allocator,
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+            , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
             defer allocator.free(tooltip_open);
             try buf.appendSlice(allocator, tooltip_open);
 
@@ -457,6 +458,14 @@ pub fn generateReportHtml(
             if (h_update > 0.1) {
                 cur_y -= h_update;
                 const r = try std.fmt.allocPrint(allocator, "<rect x=\"{d:.1}\" y=\"{d:.1}\" width=\"{d:.1}\" height=\"{d:.1}\" fill=\"#3b82f6\" />\n", .{ x, cur_y, bar_w, h_update });
+                defer allocator.free(r);
+                try buf.appendSlice(allocator, r);
+            }
+
+            // Physics rect
+            if (h_physics > 0.1) {
+                cur_y -= h_physics;
+                const r = try std.fmt.allocPrint(allocator, "<rect x=\"{d:.1}\" y=\"{d:.1}\" width=\"{d:.1}\" height=\"{d:.1}\" fill=\"#10b981\" />\n", .{ x, cur_y, bar_w, h_physics });
                 defer allocator.free(r);
                 try buf.appendSlice(allocator, r);
             }
@@ -480,7 +489,7 @@ pub fn generateReportHtml(
             // Main pass rect
             if (h_main > 0.1) {
                 cur_y -= h_main;
-                const r = try std.fmt.allocPrint(allocator, "<rect x=\"{d:.1}\" y=\"{d:.1}\" width=\"{d:.1}\" height=\"{d:.1}\" fill=\"#10b981\" />\n", .{ x, cur_y, bar_w, h_main });
+                const r = try std.fmt.allocPrint(allocator, "<rect x=\"{d:.1}\" y=\"{d:.1}\" width=\"{d:.1}\" height=\"{d:.1}\" fill=\"#6366f1\" />\n", .{ x, cur_y, bar_w, h_main });
                 defer allocator.free(r);
                 try buf.appendSlice(allocator, r);
             }
@@ -501,9 +510,10 @@ pub fn generateReportHtml(
         \\  </svg>
         \\  <div class="chart-legend">
         \\    <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div>Update</div>
+        \\    <div class="legend-item"><div class="legend-dot" style="background: #10b981;"></div>Physics (Box3D)</div>
         \\    <div class="legend-item"><div class="legend-dot" style="background: #06b6d4;"></div>Prepare</div>
         \\    <div class="legend-item"><div class="legend-dot" style="background: #8b5cf6;"></div>Shadow Pass</div>
-        \\    <div class="legend-item"><div class="legend-dot" style="background: #10b981;"></div>Main Pass</div>
+        \\    <div class="legend-item"><div class="legend-dot" style="background: #6366f1;"></div>Main Pass</div>
         \\    <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div>PostFX</div>
         \\  </div>
         \\</div>
@@ -858,6 +868,7 @@ pub fn generateReportMd(
         \\
         \\### Фазы кадра в среднем (CPU-submit, не GPU-время)
         \\- **Update (CPU логика/анимация):** {d:.2} мс
+        \\- **Physics (Box3D симуляция):** {d:.2} мс
         \\- **Prepare (подготовка очередей):** {d:.2} мс
         \\- **Shadow Pass (CPU submit, не GPU):** {d:.2} мс
         \\- **Main Pass (CPU submit, не GPU):** {d:.2} мс
@@ -884,6 +895,7 @@ pub fn generateReportMd(
         vram_total_str,
         cpu_mesh_str,
         summary.avg_update_ms,
+        summary.avg_physics_ms,
         summary.avg_prepare_ms,
         summary.avg_shadow_ms,
         summary.avg_main_ms,
@@ -1137,6 +1149,7 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
         // sg submit calls, never GPU timestamps.
         var cur_ts = ts;
         const u_us: u64 = @intFromFloat(f.update_ms * 1000.0);
+        const phys_us: u64 = @intFromFloat(f.physics_ms * 1000.0);
         const p_us: u64 = @intFromFloat(f.prepare_ms * 1000.0);
         const s_us: u64 = @intFromFloat(f.shadow_ms * 1000.0);
         const m_us: u64 = @intFromFloat(f.main_ms * 1000.0);
@@ -1150,6 +1163,17 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
         try buf.appendSlice(allocator, u_ev);
         try buf.appendSlice(allocator, "\n");
         cur_ts += u_us;
+
+        // Physics
+        if (phys_us > 0) {
+            const phys_ev = try std.fmt.allocPrint(allocator,
+                \\    {{"name": "Physics (Box3D)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}},
+            , .{ cur_ts, phys_us });
+            defer allocator.free(phys_ev);
+            try buf.appendSlice(allocator, phys_ev);
+            try buf.appendSlice(allocator, "\n");
+            cur_ts += phys_us;
+        }
 
         // Prepare
         const p_ev = try std.fmt.allocPrint(allocator,

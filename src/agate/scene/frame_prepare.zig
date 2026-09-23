@@ -85,6 +85,7 @@ pub fn prepareFrame(scene: anytype) void {
     const keep_prepare_ms = scene.stats.prepare_ms;
     scene.stats = .{};
     scene.stats.update_ms = scene.pending_update_ms;
+    scene.stats.physics_ms = scene.pending_physics_ms;
     scene.stats.prepare_ms = keep_prepare_ms;
     // Сброс счётчика динамических обновлений на начало кадра: всё, что
     // запишут flushPendingGpuUploads, стейджинг инстансов и UI/debug

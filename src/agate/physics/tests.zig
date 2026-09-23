@@ -1997,3 +1997,44 @@ test "CharacterController push dynamic bodies and step climbing options" {
     ctrl.move(&pw, Vec3.new(1.0, 0.0, 0.0), false, 1.0 / 60.0);
     try std.testing.expect(ctrl.position.x > 0.0);
 }
+
+test "PhysicsWorld getProfile and getCounters" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m1 = Mesh{
+        .name = "b1",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    var m2 = Mesh{
+        .name = "b2",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 2.0, 0.0),
+    };
+
+    _ = try pw.createBody(&m1, .sphere, 1.0);
+    _ = try pw.createBody(&m2, .box, 0.0); // static ground block
+
+    // Before step, counters reflect created bodies
+    const cnt_before = pw.getCounters();
+    try std.testing.expect(cnt_before.body_count >= 2);
+    try std.testing.expect(cnt_before.shape_count >= 2);
+
+    // Step physics
+    pw.step(1.0 / 60.0);
+
+    const prof = pw.getProfile();
+    // Step time should be non-negative
+    try std.testing.expect(prof.step_ms >= 0.0);
+    try std.testing.expect(prof.collide_ms >= 0.0);
+    try std.testing.expect(prof.solve_ms >= 0.0);
+
+    const cnt_after = pw.getCounters();
+    try std.testing.expect(cnt_after.body_count >= 2);
+}
+

@@ -26,6 +26,7 @@ pub const FrameRecord = struct {
 
     // Phase breakdown (ms)
     update_ms: f32 = 0,
+    physics_ms: f32 = 0,
     prepare_ms: f32 = 0,
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
@@ -173,6 +174,8 @@ pub const SessionSummary = struct {
 
     // Phase averages (ms)
     avg_update_ms: f32 = 0,
+    avg_physics_ms: f32 = 0,
+    max_physics_ms: f32 = 0,
     avg_prepare_ms: f32 = 0,
     avg_shadow_ms: f32 = 0,
     avg_main_ms: f32 = 0,
@@ -257,6 +260,10 @@ pub fn dominantPhase(record: FrameRecord) PhaseCulprit {
     if (record.update_ms > max_ms) {
         max_ms = record.update_ms;
         max_name = "Update";
+    }
+    if (record.physics_ms > max_ms) {
+        max_ms = record.physics_ms;
+        max_name = "Physics / Box3D";
     }
     if (record.prepare_ms > max_ms) {
         max_ms = record.prepare_ms;

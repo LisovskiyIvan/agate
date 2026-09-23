@@ -34,6 +34,8 @@ pub const DebugLine = types.DebugLine;
 
 // The world type itself, moved verbatim to `physics/world.zig`.
 pub const PhysicsWorld = world_mod.PhysicsWorld;
+pub const PhysicsProfile = world_mod.PhysicsProfile;
+pub const PhysicsCounters = world_mod.PhysicsCounters;
 
 const character_mod = @import("physics/character.zig");
 pub const CharacterController = character_mod.CharacterController;

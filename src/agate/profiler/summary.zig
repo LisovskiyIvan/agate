@@ -22,6 +22,8 @@ pub fn summarize(self: anytype) SessionSummary {
 
     var sum_time: f64 = 0;
     var sum_update: f64 = 0;
+    var sum_physics: f64 = 0;
+    var max_physics: f32 = 0;
     var sum_prepare: f64 = 0;
     var sum_shadow: f64 = 0;
     var sum_main: f64 = 0;
@@ -83,6 +85,8 @@ pub fn summarize(self: anytype) SessionSummary {
         }
 
         sum_update += frame.update_ms;
+        sum_physics += frame.physics_ms;
+        max_physics = @max(max_physics, frame.physics_ms);
         sum_prepare += frame.prepare_ms;
         sum_shadow += frame.shadow_ms;
         sum_main += frame.main_ms;
@@ -192,6 +196,8 @@ pub fn summarize(self: anytype) SessionSummary {
         .p95_frame_ms = times[p95_idx],
         .p99_frame_ms = times[p99_idx],
         .avg_update_ms = @floatCast(sum_update / nf),
+        .avg_physics_ms = @floatCast(sum_physics / nf),
+        .max_physics_ms = max_physics,
         .avg_prepare_ms = @floatCast(sum_prepare / nf),
         .avg_shadow_ms = @floatCast(sum_shadow / nf),
         .avg_main_ms = @floatCast(sum_main / nf),

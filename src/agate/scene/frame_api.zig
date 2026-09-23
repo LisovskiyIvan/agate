@@ -51,6 +51,10 @@ pub fn recordUpdateTime(self: anytype, ms: f32) void {
     self.pending_update_ms = ms;
 }
 
+pub fn recordPhysicsTime(self: anytype, ms: f32) void {
+    self.pending_physics_ms = ms;
+}
+
 /// Shared queue/shadow/outline build parameters (stage-2 increment B):
 /// one internal function `buildQueuesInto` fills a `FrameDrawSlot` from
 /// these plus the explicit `snap` cameras (never `Scene.frame_snapshot`

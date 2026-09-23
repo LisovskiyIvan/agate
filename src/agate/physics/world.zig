@@ -65,6 +65,24 @@ const RigidBody = body_mod.RigidBody;
 const Rope = rope_mod.Rope;
 const RopeOptions = rope_mod.RopeOptions;
 
+pub const PhysicsProfile = struct {
+    step_ms: f32 = 0,
+    pairs_ms: f32 = 0,
+    collide_ms: f32 = 0,
+    solve_ms: f32 = 0,
+    bullets_ms: f32 = 0,
+    transforms_ms: f32 = 0,
+    sensors_ms: f32 = 0,
+};
+
+pub const PhysicsCounters = struct {
+    body_count: i32 = 0,
+    shape_count: i32 = 0,
+    contact_count: i32 = 0,
+    joint_count: i32 = 0,
+    island_count: i32 = 0,
+};
+
 pub const PhysicsWorld = struct {
     allocator: std.mem.Allocator,
     gravity: Vec3 = Vec3.new(0.0, -9.81, 0.0),
@@ -129,6 +147,32 @@ pub const PhysicsWorld = struct {
 
     pub fn isContinuousEnabled(self: *const PhysicsWorld) bool {
         return c.b3World_IsContinuousEnabled(self.world_id);
+    }
+
+    /// Queries the detailed performance profile of the most recent physics step from Box3D.
+    pub fn getProfile(self: *const PhysicsWorld) PhysicsProfile {
+        const p = c.b3World_GetProfile(self.world_id);
+        return .{
+            .step_ms = p.step,
+            .pairs_ms = p.pairs,
+            .collide_ms = p.collide,
+            .solve_ms = p.solve,
+            .bullets_ms = p.bullets,
+            .transforms_ms = p.transforms,
+            .sensors_ms = p.sensors,
+        };
+    }
+
+    /// Queries simulation counters and entity counts from Box3D.
+    pub fn getCounters(self: *const PhysicsWorld) PhysicsCounters {
+        const cnt = c.b3World_GetCounters(self.world_id);
+        return .{
+            .body_count = cnt.bodyCount,
+            .shape_count = cnt.shapeCount,
+            .contact_count = cnt.contactCount,
+            .joint_count = cnt.jointCount,
+            .island_count = cnt.islandCount,
+        };
     }
 
     pub fn createBody(self: *PhysicsWorld, mesh: *Mesh, collider: ColliderType, mass: f32) !*RigidBody {

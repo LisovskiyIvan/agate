@@ -149,4 +149,9 @@ pub fn createRigidBodyWith(self: anytype, mesh: *Mesh, collider: ColliderType, m
 
 pub fn updatePhysics(self: anytype, dt: f32) void {
     self.physics.step(dt);
+    if (self.physics.world) |*pw| {
+        self.pending_physics_ms = pw.getProfile().step_ms;
+    } else {
+        self.pending_physics_ms = 0;
+    }
 }

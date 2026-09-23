@@ -224,6 +224,8 @@ pub const Scene = struct {
     /// transfers the last tick into `stats.update_ms`. Separate word from
     /// every stats field, so update||render shares no memory here.
     pending_update_ms: f32 = 0,
+    /// Staged physics-phase timing: written via `recordPhysicsTime` or `updatePhysics`.
+    pending_physics_ms: f32 = 0,
     // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
     frame_id: u64 = 0,
 
@@ -827,6 +829,11 @@ pub const Scene = struct {
     /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn recordUpdateTime(self: *Scene, ms: f32) void {
         scene_frame.recordUpdateTime(self, ms);
+    }
+
+    /// See `scene/frame_api.zig` (owns the body + docs).
+    pub fn recordPhysicsTime(self: *Scene, ms: f32) void {
+        scene_frame.recordPhysicsTime(self, ms);
     }
 
     /// See `scene/registry.zig` (owns the body + docs).

@@ -84,6 +84,13 @@ pub fn analyze(self: anytype, memory: ?*const MemorySnapshot, allocator: std.mem
                     .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} обновление логики заняло {d:.1} мс ({d:.1}% CPU-submit кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
                     .recommendation = try allocator.dupe(u8, "Оптимизируйте анимации, физическую симуляцию или перенесите тяжелые расчеты в фоновый пул jobs.TaskRunner."),
                 });
+            } else if (std.mem.eql(u8, culprit.name, "Physics / Box3D") and culprit.percent > 30.0) {
+                try findings.append(allocator, .{
+                    .severity = .warning,
+                    .title = try allocator.dupe(u8, "Узкое горлышко: Физика (Box3D)"),
+                    .details = try std.fmt.allocPrint(allocator, "В пиковом кадре #{d} физическая симуляция заняла {d:.1} мс ({d:.1}% CPU-submit кадра).", .{ worst_frame.frame_index, culprit.ms, culprit.percent }),
+                    .recommendation = try allocator.dupe(u8, "Уменьшите количество сабстепов PhysicsWorld, включите непрерывное детектирование (CCD) только для скоростных пуль, используйте примитивные коллайдеры вместо сложных мешей."),
+                });
             } else if (std.mem.eql(u8, culprit.name, "PostFX") and culprit.percent > 40.0) {
                 try findings.append(allocator, .{
                     .severity = .warning,

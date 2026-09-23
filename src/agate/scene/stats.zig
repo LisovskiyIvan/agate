@@ -73,6 +73,7 @@ pub const SceneStats = struct {
     updated_bytes_frame: u64 = 0,
     /// Wall-clock phase timings in milliseconds (see header for writers).
     update_ms: f32 = 0,
+    physics_ms: f32 = 0,
     prepare_ms: f32 = 0,
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,

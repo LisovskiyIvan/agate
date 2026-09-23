@@ -43,6 +43,8 @@ pub const Profiler = struct {
     max_frames: usize = 3600, // 60 seconds @ 60 FPS default
     start_time_ticks: u64 = 0,
     last_frame_ticks: u64 = 0,
+    ring_head: usize = 0,
+    wrapped: bool = false,
     last_memory_snapshot: ?MemorySnapshot = null,
 
     pub fn init(allocator: std.mem.Allocator) Profiler {
@@ -78,9 +80,18 @@ pub const Profiler = struct {
         self.last_frame_ticks = self.start_time_ticks;
     }
 
-    /// Stops recording frames.
+    /// Rotates the internal ring buffer in-place so frames are in strict chronological order.
+    pub fn linearize(self: *Profiler) void {
+        if (!self.wrapped or self.ring_head == 0 or self.frames.items.len == 0) return;
+        std.mem.rotate(FrameRecord, self.frames.items, self.ring_head);
+        self.ring_head = 0;
+        self.wrapped = false;
+    }
+
+    /// Stops recording frames and ensures frames are in chronological order.
     pub fn stop(self: *Profiler) void {
         self.is_recording = false;
+        self.linearize();
     }
 
     /// Clears recorded frame history while maintaining configuration.
@@ -88,6 +99,8 @@ pub const Profiler = struct {
         self.frames.clearRetainingCapacity();
         self.start_time_ticks = 0;
         self.last_frame_ticks = 0;
+        self.ring_head = 0;
+        self.wrapped = false;
         if (self.last_memory_snapshot) |*old| old.deinit(self.allocator);
         self.last_memory_snapshot = null;
     }
@@ -111,6 +124,7 @@ pub const Profiler = struct {
     /// Computes statistical summary across all recorded frames
     /// (see summary.zig).
     pub fn summarize(self: *const Profiler) SessionSummary {
+        @constCast(self).linearize();
         return summary_mod.summarize(self);
     }
 
