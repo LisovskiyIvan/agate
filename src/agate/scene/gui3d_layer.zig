@@ -304,21 +304,19 @@ pub const Ui3dPickHit = struct {
     canvas_y: f32,
 };
 
-/// One vertex of the shared unit quad (local XY plane, +/-0.5). UV v = 1 at
-/// the quad top: the UI batch maps canvas-top to NDC-top, and NDC-top lands
-/// in the texture rows sampled at v = 1 (canvas-bottom rows sit at v = 0),
-/// so this orientation displays the canvas upright. GPU-verifiable only
-/// (see the module report); the picking UVs are independent of this choice.
+/// One vertex of the shared unit quad (local XY plane, +/-0.5). UV v = 0 at
+/// the quad top to match canvas space and picking ray intersection (top = v: 0.0,
+/// bottom = v: 1.0), displaying the offscreen canvas upright.
 pub const PanelVertex = struct {
     position: [3]f32,
     uv: [2]f32,
 };
 
 const unit_quad_vertices = [_]PanelVertex{
-    .{ .position = .{ -0.5, 0.5, 0.0 }, .uv = .{ 0.0, 1.0 } },
-    .{ .position = .{ 0.5, 0.5, 0.0 }, .uv = .{ 1.0, 1.0 } },
-    .{ .position = .{ 0.5, -0.5, 0.0 }, .uv = .{ 1.0, 0.0 } },
-    .{ .position = .{ -0.5, -0.5, 0.0 }, .uv = .{ 0.0, 0.0 } },
+    .{ .position = .{ -0.5, 0.5, 0.0 }, .uv = .{ 0.0, 0.0 } },
+    .{ .position = .{ 0.5, 0.5, 0.0 }, .uv = .{ 1.0, 0.0 } },
+    .{ .position = .{ 0.5, -0.5, 0.0 }, .uv = .{ 1.0, 1.0 } },
+    .{ .position = .{ -0.5, -0.5, 0.0 }, .uv = .{ 0.0, 1.0 } },
 };
 const unit_quad_indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
 

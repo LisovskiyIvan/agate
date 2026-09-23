@@ -772,6 +772,7 @@ void main() {
     // Diffuse throughput scales by (1 - factor) AFTER F0 so metals keep
     // their F0; the additive back-light term lands in the post-Lo block.
     // factor 0 skips: legacy albedo bit-identical.
+    vec3 orig_albedo = albedo;
     float transm_factor = clamp(transmission_factors.x, 0.0, 1.0);
     if (transm_factor > 0.0) {
         albedo *= (1.0 - transm_factor);
@@ -860,6 +861,13 @@ void main() {
 
             float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
             Lo += (p_kD * albedo / PI + p_spec * p_atten + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
+        }
+        if (transm_factor > 0.0) {
+            float p_transm_back = max(dot(-N, p_L), 0.0);
+            if (p_transm_back > 0.0) {
+                vec3 p_rad = p_col * (p_int * att);
+                Lo += transmission_color.rgb * transm_factor * orig_albedo / PI * p_rad * p_transm_back;
+            }
         }
     }
 
@@ -992,7 +1000,7 @@ void main() {
     if (transm_factor > 0.0) {
         float transm_back = clamp(dot(-N, L) * 0.5 + 0.5, 0.0, 1.0);
         vec3 transm_irr = light_color.rgb * light_color.a * transm_back + ambient_color.rgb * ambient_color.a * 0.5;
-        Lo += transmission_color.rgb * transm_factor * albedo * transm_irr;
+        Lo += transmission_color.rgb * transm_factor * orig_albedo * transm_irr;
     }
     if (sss_strength > 0.0) {
         // Wrap mirror: material.wrapNdotL (unit-tested on CPU).
