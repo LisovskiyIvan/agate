@@ -172,6 +172,8 @@ pub fn isExtensionSupported(name: []const u8) bool {
         "KHR_lights_punctual",
         "KHR_texture_transform",
         "KHR_materials_unlit",
+        "KHR_materials_clearcoat",
+        "KHR_materials_sheen",
         // KTX2/Basisu textures: the material loader resolves
         // KHR_texture_basisu images (materials.textureImage prefers
         // basisu_image when source is absent) and the KTX2 reader decodes
@@ -192,6 +194,8 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(isExtensionSupported("KHR_lights_punctual"));
     try std.testing.expect(isExtensionSupported("KHR_texture_transform"));
     try std.testing.expect(isExtensionSupported("KHR_materials_unlit"));
+    try std.testing.expect(isExtensionSupported("KHR_materials_clearcoat"));
+    try std.testing.expect(isExtensionSupported("KHR_materials_sheen"));
     // KTX2 images ride on KHR_texture_basisu: required-and-supported
     // files load through the basisu resolve path (see
     // materials.textureImage), so the gate must accept it.
@@ -204,3 +208,4 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(!isExtensionSupported("KHR_texture_basisu_extra"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
 }
+

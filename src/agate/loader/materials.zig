@@ -74,8 +74,12 @@ pub fn colorSlotImageFlags(allocator: std.mem.Allocator, gltf: *c.cgltf_data) ![
             markColorSlotImage(gltf, mat.pbr_metallic_roughness.base_color_texture, flags);
         }
         markColorSlotImage(gltf, mat.emissive_texture, flags);
+        if (mat.has_sheen != 0) {
+            markColorSlotImage(gltf, mat.sheen.sheen_color_texture, flags);
+        }
     }
     return flags;
+
 }
 
 fn markColorSlotImage(gltf: *c.cgltf_data, view: c.cgltf_texture_view, flags: []bool) void {
@@ -535,7 +539,43 @@ pub fn loadMaterials(
             );
         }
 
+        // KHR_materials_clearcoat
+        if (src_mat.has_clearcoat != 0) {
+            const cc = &src_mat.clearcoat;
+            const cc_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &cc.clearcoat_texture, base_dir, false, &pbr_mat.clearcoat.mask_texture, actx);
+            pbr_mat.clearcoat.roughness = cc.clearcoat_roughness_factor;
+            if ((pbr_mat.clearcoat.mask_texture != null or cc_textured) and cc.clearcoat_factor == 0.0) {
+                pbr_mat.clearcoat.intensity = 1.0;
+            } else {
+                pbr_mat.clearcoat.intensity = cc.clearcoat_factor;
+            }
+        }
+
+        // KHR_materials_sheen
+        if (src_mat.has_sheen != 0) {
+            const sh = &src_mat.sheen;
+            pbr_mat.sheen.roughness = sh.sheen_roughness_factor;
+            const sh_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &sh.sheen_color_texture, base_dir, true, &pbr_mat.sheen.color_texture, actx);
+            if ((pbr_mat.sheen.color_texture != null or sh_textured) and
+                sh.sheen_color_factor[0] == 0.0 and
+                sh.sheen_color_factor[1] == 0.0 and
+                sh.sheen_color_factor[2] == 0.0)
+            {
+                pbr_mat.sheen.color = Color3.white;
+                pbr_mat.sheen.intensity = 1.0;
+            } else {
+                pbr_mat.sheen.color = Color3.new(
+                    sh.sheen_color_factor[0],
+                    sh.sheen_color_factor[1],
+                    sh.sheen_color_factor[2],
+                );
+                const has_color = (sh.sheen_color_factor[0] > 0.0 or sh.sheen_color_factor[1] > 0.0 or sh.sheen_color_factor[2] > 0.0);
+                pbr_mat.sheen.intensity = if (has_color or pbr_mat.sheen.color_texture != null or sh_textured) 1.0 else 0.0;
+            }
+        }
+
         // glTF alphaMode/doubleSided mapping (cgltf has no has_alpha_cutoff:
+
         // alpha_cutoff always parses, defaulting to 0.5 when absent).
         if (src_mat.alpha_mode == c.cgltf_alpha_mode_mask) {
             pbr_mat.alpha_mode = .cutout;
@@ -601,6 +641,51 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     try std.testing.expectEqual(@as(f32, 0.5), out[2].?.pbr.alpha_cutoff);
     try std.testing.expect(!out[2].?.pbr.double_sided);
 }
+
+test "loadMaterials maps KHR_materials_clearcoat and KHR_materials_sheen (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var src: [2]c.cgltf_material = .{
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+    };
+    // [0]: clearcoat active
+    src[0].has_clearcoat = 1;
+    src[0].clearcoat.clearcoat_factor = 0.85;
+    src[0].clearcoat.clearcoat_roughness_factor = 0.15;
+
+    // [1]: sheen active
+    src[1].has_sheen = 1;
+    src[1].sheen.sheen_color_factor[0] = 0.9;
+    src[1].sheen.sheen_color_factor[1] = 0.8;
+    src[1].sheen.sheen_color_factor[2] = 0.7;
+    src[1].sheen.sheen_roughness_factor = 0.4;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [2]?Material = .{ null, null };
+    var img_cache: [0]?Texture = .{};
+    var dec: [0]?Texture.DecodedImage = .{};
+
+    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null);
+
+    try std.testing.expect(out[0].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 0.85), out[0].?.pbr.clearcoat.intensity);
+    try std.testing.expectEqual(@as(f32, 0.15), out[0].?.pbr.clearcoat.roughness);
+
+    try std.testing.expect(out[1].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 1.0), out[1].?.pbr.sheen.intensity);
+    try std.testing.expectEqual(@as(f32, 0.4), out[1].?.pbr.sheen.roughness);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), out[1].?.pbr.sheen.color.r, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), out[1].?.pbr.sheen.color.g, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), out[1].?.pbr.sheen.color.b, 1e-4);
+}
+
 
 test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {
     // glTF 2.0 spec enums: 10497 REPEAT, 33071 CLAMP_TO_EDGE, 33648
