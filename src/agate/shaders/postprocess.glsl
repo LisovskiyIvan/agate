@@ -28,7 +28,7 @@ layout(binding = 0) uniform fs_params {
     vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_enabled (1/0), w: vignette_enabled (1/0)
     vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: fxaa_enabled (1/0)
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
-    vec4 camera_params; // x: near_z, y: far_z, z/w: unused
+    vec4 camera_params; // x: near_z, y: far_z, z: ssr_steps, w: unused
     vec4 camera_pos; // xyz: camera world pos, w: unused
     vec4 sun_dir; // xyz: sun direction (normalized), w: unused
     vec4 sun_color; // xyz: sun color, w: unused
@@ -47,8 +47,8 @@ layout(binding = 0) uniform fs_params {
     vec4 lut_params; // x: lut_enabled (1/0), y: lut_strength [0,1], z: lut size N, w: unused
     mat4 view_proj; // camera view-projection matrix
     mat4 inv_view_proj; // inverse view-projection matrix
-    mat4 prev_view_proj; // previous frame view-projection matrix
-    vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: unused
+    mat4 reproj_mat; // combined reprojection matrix (prev_view_proj * inv_view_proj)
+    vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
 };
@@ -97,6 +97,13 @@ vec3 reconstructWorldPos(vec2 uv, float depth) {
     return world.xyz / world.w;
 }
 
+vec2 reprojectClipToPrevUv(vec4 clip) {
+    vec4 prev_clip = reproj_mat * clip;
+    if (prev_clip.w <= 0.0001) return vec2(-1.0);
+    vec2 prev_ndc = prev_clip.xy / prev_clip.w;
+    return vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+}
+
 vec2 projectWorldToUv(vec3 world_pos) {
     vec4 clip = view_proj * vec4(world_pos, 1.0);
     if (clip.w <= 0.0001) return vec2(-1.0);
@@ -142,24 +149,31 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
     float max_dist = ssr_params.w;
     float thickness = ssr_params.z;
-    const int SSR_STEPS = 12;
-    float step_size = max_dist / float(SSR_STEPS);
+    int ssr_steps = int(camera_params.z);
+    if (ssr_steps < 4) ssr_steps = 16;
+    float step_size = max_dist / float(ssr_steps);
 
-    vec3 ray_pos = world_pos + N * 0.08;
+    vec3 ray_start = world_pos + N * 0.08;
+    vec3 ray_dir_step = R * step_size;
 
-    for (int i = 0; i < SSR_STEPS; i++) {
-        ray_pos += R * step_size;
+    vec4 clip_start = view_proj * vec4(ray_start, 1.0);
+    vec4 clip_step = view_proj * vec4(ray_dir_step, 0.0);
 
-        vec3 march_proj = projectWorldToUvDepth(ray_pos);
-        vec2 march_uv = march_proj.xy;
+    for (int i = 1; i <= ssr_steps; i++) {
+        vec4 march_clip = clip_start + clip_step * float(i);
+        if (march_clip.w <= 0.0001) break;
+
+        vec3 ndc = march_clip.xyz / march_clip.w;
+        vec2 march_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
         if (march_uv.x < 0.01 || march_uv.x > 0.99 || march_uv.y < 0.01 || march_uv.y > 0.99) {
             break;
         }
 
         float scene_d = texture(sampler2D(depth_tex, depth_smp), march_uv).r;
         if (scene_d >= 0.9999) continue;
-        if (march_proj.z < scene_d) continue;
+        if (ndc.z < scene_d) continue;
 
+        vec3 ray_pos = ray_start + ray_dir_step * float(i);
         vec3 scene_pos = reconstructWorldPos(march_uv, scene_d);
 
         float ray_cam_dist = length(ray_pos - camera_pos.xyz);
@@ -172,7 +186,7 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
             float edge_dist_y = min(march_uv.y, 1.0 - march_uv.y);
             float edge_fade = clamp(min(edge_dist_x, edge_dist_y) * 10.0, 0.0, 1.0);
 
-            float dist_fade = 1.0 - (float(i) / float(SSR_STEPS));
+            float dist_fade = 1.0 - (float(i - 1) / float(ssr_steps));
             dist_fade *= dist_fade;
 
             float fresnel = 0.04 + 0.96 * pow(1.0 - max(0.0, dot(-V, N)), 5.0);
@@ -229,11 +243,9 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     if (motion_blur_params.x < 0.5) return color;
     if (depth >= 1.0) return color;
 
-    vec3 world_pos = reconstructWorldPos(uv, depth);
-    vec4 prev_clip = prev_view_proj * vec4(world_pos, 1.0);
-    if (prev_clip.w <= 0.0001) return color;
-    vec2 prev_ndc = prev_clip.xy / prev_clip.w;
-    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec2 prev_uv = reprojectClipToPrevUv(clip);
+    if (prev_uv.x < 0.0) return color;
 
     vec2 velocity = (uv - prev_uv) * motion_blur_params.y;
     float max_blur = motion_blur_params.z * resolution.z;
@@ -244,14 +256,16 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     // Sub-pixel threshold: don't blur when movement is sub-pixel (saves full loop on almost-static areas)
     if (speed < resolution.z * 0.75) return color;
 
+    int samples = int(motion_blur_params.w);
+    if (samples < 2) samples = 8;
+
     vec3 acc = color;
-    const int SAMPLES = 5;
-    for (int i = 1; i < SAMPLES; ++i) {
-        float t = float(i) / float(SAMPLES - 1) - 0.5;
+    for (int i = 1; i < samples; ++i) {
+        float t = float(i) / float(samples - 1) - 0.5;
         vec2 sample_uv = clamp(uv + velocity * t, vec2(0.001), vec2(0.999));
         acc += texture(sampler2D(scene_tex, smp), sample_uv).rgb;
     }
-    return acc * (1.0 / float(SAMPLES));
+    return acc * (1.0 / float(samples));
 }
 
 // Sample scene HDR color, apply chromatic aberration, SSAO, SSR, Fog, and Motion Blur
@@ -375,11 +389,9 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     if (taa_state.x < 0.5) return current;
     float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     if (raw_depth >= 0.9999) return current;
-    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
-    vec4 prev_clip = prev_view_proj * vec4(world_pos, 1.0);
-    if (prev_clip.w <= 0.0001) return current;
-    vec2 prev_ndc = prev_clip.xy / prev_clip.w;
-    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
+    vec2 prev_uv = reprojectClipToPrevUv(clip);
     if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
     vec3 hist = texture(sampler2D(history_tex, smp), prev_uv).rgb;
     vec3 box_min;
@@ -553,19 +565,23 @@ vec3 applyDoF(vec3 color, vec2 uv) {
     if (coc < 0.5) return color;
 
     const int DOF_TAPS = 14;
-    const float GOLDEN_ANGLE = 2.3999632;
+    // Precalculated 2D rotator for golden angle (2.3999632 rad):
+    // cos(2.3999632) ~= -0.7373688, sin(2.3999632) ~= 0.6754904
+    const vec2 rot_step = vec2(-0.73736882, 0.67549038);
+    vec2 rot = vec2(1.0, 0.0);
+
     vec2 texel = resolution.zw;
     vec3 acc = color;
     float wsum = 1.0;
     for (int i = 0; i < DOF_TAPS; i++) {
         float fi = float(i);
-        float ang = fi * GOLDEN_ANGLE;
         float rr = (fi + 0.5) / float(DOF_TAPS) * coc;
-        vec2 off = vec2(cos(ang), sin(ang)) * rr * texel;
+        vec2 off = rot * (rr * texel);
         // Fast LDR path reuses the FXAA neighbor approximation (skips
         // SSR/fog re-evaluation on taps).
         acc += sampleSceneFastLDR(uv + off);
         wsum += 1.0;
+        rot = vec2(rot.x * rot_step.x - rot.y * rot_step.y, rot.x * rot_step.y + rot.y * rot_step.x);
     }
     return acc / wsum;
 }

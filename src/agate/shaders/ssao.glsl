@@ -26,6 +26,7 @@ layout(binding = 0) uniform fs_params {
     vec4 kernel_samples[32];
     vec4 params; // x: radius, y: bias, z: intensity, w: power
     vec4 resolution; // xy: resolution, zw: texel size
+    vec4 extra_params; // x: sample_count, yzw: unused
 };
 
 @image_sample_type depth_tex unfilterable_float
@@ -93,11 +94,16 @@ void main() {
     float bias = params.y;
     float occlusion = 0.0;
 
-    for (int i = 0; i < 32; i++) {
+    int sample_count = int(extra_params.x > 0.5 ? extra_params.x : 24.0);
+    sample_count = clamp(sample_count, 4, 32);
+
+    vec4 pos_clip = projection * vec4(pos, 1.0);
+
+    for (int i = 0; i < sample_count; i++) {
         vec3 sample_dir = tbn * kernel_samples[i].xyz;
         vec3 sample_view = pos + sample_dir * radius;
 
-        vec4 sample_clip = projection * vec4(sample_view, 1.0);
+        vec4 sample_clip = pos_clip + projection * vec4(sample_dir * radius, 0.0);
         if (sample_clip.w <= 0.0) continue;
         sample_clip.xyz /= sample_clip.w;
         vec2 sample_uv = sample_clip.xy * 0.5 + 0.5;
@@ -133,8 +139,8 @@ void main() {
         }
     }
 
-    // Normalize with solid angle factor for 32 hemisphere samples
-    float norm_occ = clamp(occlusion / 2.8, 0.0, 1.0);
+    // Normalize with solid angle factor for sample_count hemisphere samples
+    float norm_occ = clamp(occlusion / (float(sample_count) * (2.8 / 32.0)), 0.0, 1.0);
     float ao = clamp(pow(1.0 - norm_occ, params.w), 0.0, 1.0);
 
     frag_color = vec4(ao, ao, ao, 1.0);

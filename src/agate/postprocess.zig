@@ -147,6 +147,7 @@ pub const PostProcessOptions = struct {
     ssr_intensity: f32 = 0.55,
     ssr_max_distance: f32 = 25.0,
     ssr_thickness: f32 = 0.4,
+    ssr_steps: u32 = 16,
 
     // Sharpen (post-tonemap unsharp mask)
     sharpen_enabled: bool = false,
@@ -164,6 +165,7 @@ pub const PostProcessOptions = struct {
     motion_blur_enabled: bool = false,
     motion_blur_intensity: f32 = 0.5,
     motion_blur_max_blur_px: f32 = 32.0,
+    motion_blur_samples: u32 = 8,
 
     // Temporal Anti-Aliasing (sub-pixel Halton jitter + history resolve in
     // postprocess.glsl; history ping-pong in PostProcessPass; jittered VP
@@ -201,6 +203,8 @@ pub const PostProcessOptions = struct {
         out.dof_focus_distance = @max(self.dof_focus_distance, 0.0);
         out.dof_focus_range = @max(self.dof_focus_range, 0.0);
         out.dof_max_blur = @max(self.dof_max_blur, 0.0);
+        out.ssr_steps = std.math.clamp(self.ssr_steps, 4, 64);
+        out.motion_blur_samples = std.math.clamp(self.motion_blur_samples, 2, 32);
         out.motion_blur_intensity = std.math.clamp(self.motion_blur_intensity, 0.0, 3.0);
         out.motion_blur_max_blur_px = std.math.clamp(self.motion_blur_max_blur_px, 1.0, 128.0);
         out.taa_blend = std.math.clamp(self.taa_blend, 0.0, 1.0);
@@ -1756,3 +1760,18 @@ test "highlight inner glow edge term" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[2], 1e-6);
 }
+
+test "ssr and motion blur configurable quality options" {
+    const def = PostProcessOptions{};
+    try std.testing.expectEqual(@as(u32, 16), def.ssr_steps);
+    try std.testing.expectEqual(@as(u32, 8), def.motion_blur_samples);
+
+    var custom = PostProcessOptions{
+        .ssr_steps = 1,
+        .motion_blur_samples = 100,
+    };
+    const c = custom.clamped();
+    try std.testing.expectEqual(@as(u32, 4), c.ssr_steps);
+    try std.testing.expectEqual(@as(u32, 32), c.motion_blur_samples);
+}
+

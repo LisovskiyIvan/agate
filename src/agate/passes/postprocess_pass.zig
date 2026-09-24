@@ -452,7 +452,7 @@ pub const PostProcessPass = struct {
             .camera_params = .{
                 near_z,
                 far_z,
-                0.0,
+                @floatFromInt(config.ssr_steps),
                 0.0,
             },
             .camera_pos = .{
@@ -541,12 +541,12 @@ pub const PostProcessPass = struct {
             .lut_params = postprocess.lutParams(config),
             .view_proj = view_proj,
             .inv_view_proj = inv_view_proj,
-            .prev_view_proj = prev_view_proj,
+            .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
             .motion_blur_params = .{
                 if (config.motion_blur_enabled) 1.0 else 0.0,
                 config.motion_blur_intensity,
                 config.motion_blur_max_blur_px,
-                0.0,
+                @floatFromInt(config.motion_blur_samples),
             },
             // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
             // which keeps the composite identical to the pre-TAA path.

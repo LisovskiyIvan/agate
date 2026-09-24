@@ -309,6 +309,12 @@ pub const SSAOPass = struct {
                 1.0 / @as(f32, @floatFromInt(cur_w)),
                 1.0 / @as(f32, @floatFromInt(cur_h)),
             },
+            .extra_params = .{
+                @floatFromInt(config.sample_count),
+                0.0,
+                0.0,
+                0.0,
+            },
         };
         sg.applyUniforms(ssao_shd.UB_fs_params, sg.asRange(&fs_params));
         sg.draw(0, 6, 1);
