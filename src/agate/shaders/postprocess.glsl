@@ -285,25 +285,33 @@ vec3 sampleSceneRaw(vec2 uv) {
 
     vec3 color = base_color;
 
-    // SSAO Occlusion
+    // Depth-dependent passes: Motion Blur, SSR, SSAO, and Atmospheric Fog
+    float raw_depth = 0.0;
+    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5);
+    if (needs_depth) {
+        raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    }
+
+    // Camera Motion Blur: gathers HDR scene samples along screen velocity
+    if (motion_blur_params.x > 0.5) {
+        color = applyMotionBlur(color, uv, raw_depth);
+    }
+
+    // Screen-Space Reflections (SSR)
+    if (ssr_params.x > 0.5) {
+        color = applySSR(color, uv, raw_depth);
+    }
+
+    // SSAO Occlusion: applied to the resolved scene color so motion blur never washes out or erases AO
     if (params4.x > 0.5) {
         float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
         float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
         color *= ao_factor;
     }
 
-    // Depth-dependent passes: SSR, Atmospheric Fog, and Motion Blur
-    if (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5) {
-        float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
-
-        // Screen-Space Reflections (SSR)
-        color = applySSR(color, uv, raw_depth);
-
-        // Atmospheric Depth & Height Fog
+    // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)
+    if (fog_params.x > 0.5) {
         color = applyAtmosphericFog(color, uv, raw_depth);
-
-        // Camera Motion Blur
-        color = applyMotionBlur(color, uv, raw_depth);
     }
 
     return color;
