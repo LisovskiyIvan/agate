@@ -94,10 +94,11 @@ pub const material_library = @import("material_library.zig");
 pub const node_material = @import("node_material.zig");
 
 pub const texture = @import("texture.zig");
-/// KTX2 container reader: uncompressed LDR subset plus block-compressed
-/// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding. Texture.
-/// decodeMemory/decodeImageMemory route KTX2 payloads here automatically by
-/// magic sniff.
+/// KTX2 container reader: uncompressed LDR subset, block-compressed
+/// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding, and Basis Universal
+/// transcoding (ETC1S/BasisLZ + UASTC LDR 4x4 → BC7/ASTC 4x4/RGBA32).
+/// Texture.decodeMemory/decodeImageMemory route KTX2 payloads here
+/// automatically by magic sniff.
 pub const ktx2 = @import("ktx2.zig");
 /// DDS container reader: block-compressed BC1/BC2/BC3/BC7 subset (legacy
 /// DXT1/DXT3/DXT5 fourCC plus the DX10 header), decoded into the same
@@ -123,6 +124,10 @@ pub const GlyphInfo = ttf.GlyphInfo;
 /// here automatically; these names cover standalone use.
 pub const Ktx2DecodeError = ktx2.DecodeError;
 pub const Ktx2DecodeOptions = ktx2.DecodeOptions;
+pub const Ktx2BasisDecodeOptions = ktx2.BasisDecodeOptions;
+pub const Ktx2BasisInfo = ktx2.BasisInfo;
+pub const Ktx2BasisKind = ktx2.BasisKind;
+pub const Ktx2BasisTarget = ktx2.BasisTarget;
 pub const RawBlockTexture = ktx2.RawBlockTexture;
 /// DDS decode companions (Texture.fromDdsMemory wraps decodeBlock2D).
 pub const DdsDecodeError = dds.DecodeError;

@@ -481,7 +481,45 @@ pub fn build(b: *Build) !void {
         else
             &.{ "-std=c++17", "-O3", "-DNDEBUG", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", no_sancov },
     });
+    // Basis Universal transcoder (Apache-2.0, BinomialLLC/basis_universal,
+    // vendored verbatim under src/agate/c/basisu including the zstd decoder;
+    // see src/agate/c/LICENSES.md). KTX2 ETC1S (BasisLZ) + UASTC LDR 4x4 ->
+    // BC7/ASTC 4x4/RGBA32 at load time (src/agate/c/basis_glue.cpp,
+    // src/agate/ktx2.zig). No -fno-exceptions/-fno-rtti: basisu_containers
+    // pulls in <exception>. -fno-sanitize=alignment: the official transcoder
+    // deliberately reinterprets byte-stream level data as block structs
+    // (uastc_block reads at arbitrary file offsets); that is its shipped
+    // upstream behavior on little-endian targets (x86-64/ARM64 handle the
+    // access, KTX-Software builds it the same way) and only the UBSan
+    // reference-bind check trips. Scoped to these TUs; every other TU keeps
+    // the default sanitizers. Debug keeps -O2: asset transcode dominates
+    // scene startup at -O0 the same way stb_image did (see c_impl.c note).
+    mod_agate.addCSourceFiles(.{
+        .files = &.{
+            "src/agate/c/basisu/transcoder/basisu_transcoder.cpp",
+            "src/agate/c/basis_glue.cpp",
+        },
+        .flags = if (optimize == .Debug)
+            &.{ "-std=c++17", "-O2", "-fno-math-errno", "-fno-sanitize=alignment", no_sancov }
+        else
+            &.{ "-std=c++17", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fomit-frame-pointer", "-fno-sanitize=alignment", no_sancov },
+    });
+    // zstd decoder-only amalgamation backing KTX2 UASTC zstd supercompression
+    // (transcoder.cpp uses ZSTD_decompress/isError/getFrameContentSize).
+    mod_agate.addCSourceFiles(.{
+        .files = &.{
+            "src/agate/c/basisu/zstd/zstddeclib.c",
+        },
+        .flags = if (optimize == .Debug)
+            &.{ "-std=c11", "-O2", "-fno-math-errno", no_sancov }
+        else
+            &.{ "-std=c11", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fomit-frame-pointer", no_sancov },
+    });
     mod_agate.link_libc = true;
+    // libC++ for the Basis Universal transcoder (std::string/mutex/new in
+    // basisu_transcoder + basis_glue's call_once; meshopt above stays
+    // runtime-free and does not need this).
+    mod_agate.link_libcpp = true;
     mod_agate.linkSystemLibrary("m", .{});
 
     const exe = b.addExecutable(.{

@@ -37,10 +37,14 @@ const DecodeJob = struct {
     /// sRGB -> linear conversion before mip generation (color-slot images).
     /// Действует только на .rgba: блочные уровни грузятся как в файле.
     srgb: bool = false,
+    /// Backend-accurate Basis transcode target, snapshotted per load on the
+    /// calling thread (null = desktop-first .bc7 default). Workers never
+    /// touch sg themselves.
+    basis_target: ?ktx2.BasisTarget = null,
     out: ?Texture.DecodedImage = null,
 
     fn run(self: *DecodeJob) void {
-        const opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = self.srgb };
+        const opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = self.srgb, .basis_target = self.basis_target };
         if (self.bytes) |b| {
             self.out = Texture.decodeImageMemory(self.allocator, b, opts) catch null;
         } else if (self.path) |p| {
@@ -110,10 +114,16 @@ pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Te
     const srgb_flags: ?[]bool = colorSlotImageFlags(scene.allocator, gltf) catch null;
     defer if (srgb_flags) |flags| scene.allocator.free(flags);
 
+    // One backend snapshot for every worker: Basis decodes transcode to BC7
+    // on desktop, ASTC where that is all the backend samples, RGBA32 where
+    // nothing compressed samples. Off-context (no sg) leaves null — the
+    // desktop-first .bc7 default applies and fromRawBlock gates explicitly.
+    const basis_target: ?ktx2.BasisTarget = if (sg.isvalid()) ktx2.preferredBasisTarget(Texture.queryBlockSupport()) else null;
+
     var job_count: usize = 0;
     for (0..gltf.images_count) |i| {
         const img = &gltf.images[i];
-        var job = DecodeJob{ .allocator = scene.allocator, .image_index = i };
+        var job = DecodeJob{ .allocator = scene.allocator, .image_index = i, .basis_target = basis_target };
         if (srgb_flags) |flags| job.srgb = flags[i];
 
         if (img.buffer_view) |bv| {
@@ -228,11 +238,21 @@ pub const AsyncTexCtx = struct {
     gltf: *c.cgltf_data,
     base_dir: ?[]const u8,
     queue: *assets.UploadQueue,
+    /// Backend-accurate Basis target, snapshotted at init (same rule as the
+    /// sync parallel decoder: null off-context). Rides decode_opts so the
+    /// queue workers transcode to an uploadable target.
+    basis_target: ?ktx2.BasisTarget = null,
     /// image_index * 2 + srgb -> in-flight request
     seen: std.AutoHashMapUnmanaged(usize, *assets.PendingTexture) = .empty,
 
     pub fn init(scene: *Scene, gltf: *c.cgltf_data, base_dir: ?[]const u8, queue: *assets.UploadQueue) AsyncTexCtx {
-        return .{ .scene = scene, .gltf = gltf, .base_dir = base_dir, .queue = queue };
+        return .{
+            .scene = scene,
+            .gltf = gltf,
+            .base_dir = base_dir,
+            .queue = queue,
+            .basis_target = if (sg.isvalid()) ktx2.preferredBasisTarget(Texture.queryBlockSupport()) else null,
+        };
     }
 
     pub fn deinit(self: *AsyncTexCtx) void {
@@ -259,7 +279,7 @@ pub const AsyncTexCtx = struct {
             applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &tex_options);
         }
         tex_options.srgb_to_linear = srgb;
-        const decode_opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = srgb };
+        const decode_opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = srgb, .basis_target = self.basis_target };
 
         const img = &self.gltf.images[img_idx];
         var pending: ?*assets.PendingTexture = null;
@@ -456,6 +476,9 @@ fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Op
     var dec = Texture.decodeImageMemory(scene.allocator, bytes, .{
         .gen_mipmaps = tex_options.mipmaps,
         .srgb_to_linear = tex_options.srgb_to_linear,
+        // Context thread here (asserted by the caller): snapshot the backend
+        // so Basis payloads transcode to an uploadable target.
+        .basis_target = Texture.basisTargetForCurrentThread(),
     }) catch return null;
     defer dec.deinit(scene.allocator);
     return switch (dec) {
@@ -468,6 +491,7 @@ fn uploadDecodedFile(scene: *Scene, path: []const u8, tex_options: Texture.Optio
     var dec = Texture.decodeImageFile(scene.allocator, path, .{
         .gen_mipmaps = tex_options.mipmaps,
         .srgb_to_linear = tex_options.srgb_to_linear,
+        .basis_target = Texture.basisTargetForCurrentThread(),
     }) catch return null;
     defer dec.deinit(scene.allocator);
     return switch (dec) {

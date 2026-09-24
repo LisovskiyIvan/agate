@@ -1,17 +1,22 @@
 const std = @import("std");
 
+const c = @import("c.zig").c;
 const texture = @import("texture.zig");
 const Texture = texture.Texture;
 const CubeTexture = texture.CubeTexture;
 
 // ---------------------------------------------------------------------------
-// KTX2 container reader — the honest uncompressed subset PLUS a
-// no-transcode block-compressed subset (BC7 / ASTC 4x4).
+// KTX2 container reader — the honest uncompressed subset, a no-transcode
+// block-compressed subset (BC7 / ASTC 4x4), and a REAL Basis Universal
+// transcode subset (ETC1S/BasisLZ + UASTC LDR 4x4 via the official transcoder
+// vendored under src/agate/c/basisu/, Apache-2.0; see LICENSES.md).
 //
 // Supports (KTX2 spec v2.0, all little-endian):
-//   - supercompressionScheme 0 (NONE) only. BasisLZ (1), Zstandard (2) and
-//     ZLIB (3) need a transcoder/inflator dependency (basis_universal /
-//     zstd); see TEXTURE_AUDIT.md "Честно НЕ сделано" — future work.
+//   - supercompressionScheme 0 (NONE) only for the two paths below. BasisLZ
+//     (1) routes to the Basis transcoder; Zstandard (2) and ZLIB (3) route
+//     there too when vkFormat is UNDEFINED (UASTC supercompression — the
+//     vendored zstd decoder handles it). Scheme > 3 errors with
+//     UnsupportedSupercompression.
 //   - 8-bit UNORM/SRGB formats that map onto the engine's RGBA8 LDR upload
 //     path: R8, R8G8, R8G8B8A8, B8G8R8A8, A8B8G8R8_PACK32 (same LE byte
 //     order as R8G8B8A8). Everything else uncompressed (16F/32F, packed
@@ -21,22 +26,38 @@ const CubeTexture = texture.CubeTexture;
 //     BC3_UNORM/SRGB (vk 137/138), BC7_UNORM/SRGB (vk 145/146) and
 //     ASTC_4x4_UNORM/SRGB (vk 157/158), uploaded WITHOUT decoding:
 //     decodeBlock2D returns owned per-level slices for
-//     Texture.fromRawBlock. No BasisLZ/UASTC, no supercompression, no CPU
-//     mip synthesis (a decoder/encoder pair would be a new dependency).
-//     Cube block files are rejected — only 2D. The BC1/BC2/BC3 codes also
-//     serve the DDS reader (dds.zig), which decodes into the same
-//     RawBlockTexture.
+//     Texture.fromRawBlock. No CPU mip synthesis (a decoder/encoder pair
+//     would be a new dependency). Cube block files are rejected — only 2D.
+//     The BC1/BC2/BC3 codes also serve the DDS reader (dds.zig), which
+//     decodes into the same RawBlockTexture.
+//   - Basis (vkFormat UNDEFINED == 0): ETC1S (BasisLZ supercompression) and
+//     UASTC LDR 4x4, transcoded to a caller-chosen target — BC7 (desktop),
+//     ASTC 4x4, or RGBA32 (universal CPU fallback) — with the full
+//     file-authored mip chain, per level, 2D only. sRGB follows the file DFD
+//     for block targets (the sRGB GPU variant, like the no-transcode path)
+//     and the caller's srgb_to_linear decision for RGBA32.
 //   - full file-provided mip chains (level index, largest level first) and
 //     optional chain generation for single-level files (gen_mipmaps, RGBA8
 //     only — block levels upload exactly as authored).
 //   - cube maps (faceCount 6, faces +X,-X,+Y,-Y,+Z,-Z — the engine's order),
 //     RGBA8 only.
 //
-// Deliberately NOT interpreted: the data format descriptor (DFD) and the
-// key/value data are skipped by offset — the numeric vkFormat alone drives
-// the texel interpretation, which is exact for the supported subset. KTX2
-// stores no orientation; glTF/KTX2 assets are top-left like the engine's
-// other LDR loaders, so rows upload unflipped.
+// Deliberately NOT supported (explicit errors, never silent corruption):
+//   - Basis HDR/XUASTC/ASTC-LDR/XUBC7 kinds, ETC1S video (P-frames), Basis
+//     cubes/arrays/3D, levelCount 0/17+ → BasisUnsupported (cubes additionally
+//     hit UnsupportedFaceCount on the 2D-only entry points, matching the
+//     no-transcode path). No ETC2/BC1/BC3/BC5 transcode targets: the engine
+//     has no ETC2 upload path, and BC7 strictly supersedes BC1/BC3 for the
+//     desktop-first backends (server-side re-encode remains the fix for
+//     backends with no compressed target at all — the RGBA32 fallback always
+//     uploads).
+//   - the data format descriptor (DFD) and the key/value data are skipped by
+//     offset on the non-Basis paths — the numeric vkFormat alone drives the
+//     texel interpretation, which is exact for the supported subset. KTX2
+//     stores no orientation; glTF/KTX2 assets are top-left like the engine's
+//     other LDR loaders, so rows upload unflipped. The Basis path lets the
+//     official transcoder parse DFD/KVD itself (notably the sRGB transfer
+//     function).
 //
 // NOTE on "DXGI codes": the KTX2 header carries only vkFormat (offset 12);
 // there is no DXGI field to read. The SRGB block variants (146/158) are the
@@ -67,6 +88,18 @@ pub const DecodeError = error{
     TooManyLevels,
     InvalidLevelData,
     OutOfMemory,
+    /// Payload carries the Basis marker (vkFormat UNDEFINED) but the official
+    /// transcoder rejects the header (foreign/corrupt container).
+    NotBasisKtx2,
+    /// A valid Basis file outside the transcoded subset: HDR/XUASTC/ASTC-LDR
+    /// kinds, ETC1S video, cube/array/3D, levelCount 0/17+. Re-encode the
+    /// asset (ETC1S/UASTC LDR 2D).
+    BasisUnsupported,
+    /// The transcoder accepted the file but a level failed to transcode
+    /// (truncated/corrupt level data).
+    BasisTranscodeFailed,
+    /// Payload exceeds the transcoder's 32-bit size limit.
+    FileTooLarge,
 };
 
 /// The engine-supported vkFormat subset. Values are the Vulkan enum numbers.
@@ -417,6 +450,283 @@ pub fn decodeBlock2D(allocator: std.mem.Allocator, bytes: []const u8) DecodeErro
     }
     return raw;
 }
+
+// ---------------------------------------------------------------------------
+// Basis Universal transcoding (ETC1S/BasisLZ + UASTC LDR 4x4) through the
+// official transcoder (src/agate/c/basis_glue.cpp over the vendored
+// src/agate/c/basisu/). GPU-free and thread-safe: the glue builds a private
+// transcoder per call (global tables init once via call_once) and the caller
+// (here) owns every output buffer, so worker-thread decodes in the asset
+// queue and the glTF parallel decoder need no extra synchronization.
+//
+// Detection: per the KTX2 spec a Basis payload carries vkFormat UNDEFINED
+// (0). isBasisKtx2 is routing-only (like isBlockKtx2); basisInfo validates.
+// Level data for ETC1S reports uncompressedByteLength 0 — the transcoder
+// (not the level index) knows the transcoded size, so expected output sizes
+// come from the level math below and the glue enforces the exact-size
+// contract (any mismatch fails, never truncates).
+// ---------------------------------------------------------------------------
+
+/// Transcode output targets. Integer values match basis_glue.cpp — do not
+/// reorder without updating the glue.
+pub const BasisTarget = enum(i32) {
+    /// Desktop compressed target (BC7_RGBA, 16 B per 4x4 block).
+    bc7 = 0,
+    /// Mobile compressed target (ASTC LDR 4x4 RGBA, 16 B per block).
+    astc = 1,
+    /// Universal CPU fallback (RGBA32 raster, R first, 4 B per pixel).
+    rgba32 = 2,
+};
+
+/// Basis payload kind reported by the transcoder.
+pub const BasisKind = enum { etc1s, uastc };
+
+/// File description from the official transcoder (dims/levels authoritative).
+pub const BasisInfo = struct {
+    width: u32,
+    height: u32,
+    levels: u32,
+    faces: u32,
+    has_alpha: bool,
+    is_srgb: bool,
+    kind: BasisKind,
+};
+
+/// True when `bytes` carry the Basis marker: KTX2 identifier, vkFormat
+/// UNDEFINED (0), supercompression 0..3 (NONE/BasisLZ/Zstd/ZLIB — the
+/// transcoder inflates UASTC supercompression itself). Routing-only:
+/// kind/dims/levels are validated later by basisInfo, so `true` never
+/// implies transcodability.
+pub fn isBasisKtx2(bytes: []const u8) bool {
+    if (!sniff(bytes)) return false;
+    if (bytes.len < header_and_index_size) return false;
+    if (readU32(bytes, 12) != 0) return false;
+    return readU32(bytes, 44) <= 3;
+}
+
+/// Compressed-target preference from live backend caps: BC7 when sampleable
+/// (desktop), else ASTC 4x4 (mobile), else the universal RGBA32 fallback
+/// (always uploads; costs ~4x the VRAM of BC7). Pure and unit-tested. BC1/
+/// BC3/ETC2 are deliberately absent: BC7 supersedes BC1/BC3 on the backends
+/// the engine ships, and there is no ETC2 upload path (see fromRawBlock).
+pub fn preferredBasisTarget(support: Texture.BlockSupport) BasisTarget {
+    if (support.bc7_sample) return .bc7;
+    if (support.astc_sample) return .astc;
+    return .rgba32;
+}
+
+/// Envelope validation shared by the Basis entries: every container check
+/// EXCEPT the payload-kind gate, in parseHeaderFields order, so Basis and
+/// non-Basis paths report identical errors for malformed containers
+/// (notably UnsupportedSupercompression precedes UnsupportedVkFormat, and
+/// the vkFormat gate here requires UNDEFINED instead of a subset member).
+fn parseBasisEnvelope(bytes: []const u8) DecodeError!Header {
+    if (!sniff(bytes)) return error.NotKtx2;
+    if (bytes.len < header_and_index_size) return error.Truncated;
+    if (bytes.len > std.math.maxInt(u32)) return error.FileTooLarge;
+
+    const h = Header{
+        .vk_format = readU32(bytes, 12),
+        .type_size = readU32(bytes, 16),
+        .pixel_width = readU32(bytes, 20),
+        .pixel_height = readU32(bytes, 24),
+        .pixel_depth = readU32(bytes, 28),
+        .layer_count = readU32(bytes, 32),
+        .face_count = readU32(bytes, 36),
+        .level_count = readU32(bytes, 40),
+        .supercompression_scheme = readU32(bytes, 44),
+    };
+
+    if (h.supercompression_scheme > 3) return error.UnsupportedSupercompression;
+    if (h.vk_format != 0) return error.UnsupportedVkFormat;
+    if (h.type_size != 1) return error.UnsupportedTypeSize;
+    if (h.pixel_width == 0 or h.pixel_height == 0) return error.UnsupportedDimensions;
+    if (h.pixel_depth > 1) return error.Unsupported3D;
+    if (h.layer_count > 1) return error.UnsupportedLayers;
+    if (h.face_count != 1) return error.UnsupportedFaceCount;
+    if (h.level_count > 16) return error.TooManyLevels;
+    // levelCount 0 (implicit single level: no encoder writes it, and the
+    // transcoder's level index would be empty) is a valid Basis file outside
+    // the subset — BasisUnsupported, not a container error.
+    if (h.level_count == 0) return error.BasisUnsupported;
+    return h;
+}
+
+/// Inspects a KTX2 Basis payload through the official transcoder. Returns
+/// the file description when the payload is in the transcoded subset;
+/// NotBasisKtx2 when the transcoder rejects the header (foreign/corrupt
+/// container behind the UNDEFINED marker); BasisUnsupported for valid Basis
+/// files outside the subset (grains: kind/cube/video/levelCount 0).
+/// GPU-free and thread-safe.
+pub fn basisInfo(bytes: []const u8) DecodeError!BasisInfo {
+    _ = try parseBasisEnvelope(bytes);
+    var out: c.agate_basis_info = undefined;
+    const rc = c.agate_basis_ktx2_info(bytes.ptr, bytes.len, &out);
+    if (rc == 1) {
+        return .{
+            .width = out.width,
+            .height = out.height,
+            .levels = out.levels,
+            .faces = out.faces,
+            .has_alpha = out.has_alpha != 0,
+            .is_srgb = out.is_srgb != 0,
+            .kind = if (out.kind == 0) .etc1s else .uastc,
+        };
+    }
+    if (rc == 0) return error.NotBasisKtx2;
+    return error.BasisUnsupported;
+}
+
+/// Basis decode switches. `srgb_to_linear: null` = auto from the file DFD
+/// (mirrors DecodeOptions); applies to the RGBA32 target only — block
+/// targets always follow the DFD (sRGB files transcode to the sRGB GPU
+/// variant, exactly like the no-transcode path, so the caller's per-slot
+/// color/data flag has no effect there).
+pub const BasisDecodeOptions = struct {
+    /// Only applies to RGBA32 when the file has a single level: a
+    /// file-provided chain is always transcoded as authored (generating on
+    /// top of it would silently discard authoring data). Block targets
+    /// always transcode the authored chain (no CPU mip synthesis exists).
+    gen_mipmaps: bool = true,
+    srgb_to_linear: ?bool = null,
+};
+
+/// Transcodes a 2D KTX2 Basis file to `target`, level by level
+/// (largest-first, the full authored chain). Returns a DecodedImage directly:
+/// .block for bc7/astc (pair with Texture.fromRawBlock), .rgba for rgba32
+/// (pair with Texture.fromRaw). Owned buffers (the asset queue frees the
+/// source right after decode); free with deinit. GPU-free and thread-safe.
+pub fn decodeBasis2D(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    target: BasisTarget,
+    opts: BasisDecodeOptions,
+) DecodeError!Texture.DecodedImage {
+    const info = try basisInfo(bytes);
+    return switch (target) {
+        .bc7, .astc => .{ .block = try transcodeBlockLevels(allocator, bytes, info, target) },
+        .rgba32 => .{ .rgba = try transcodeRgbaLevels(allocator, bytes, info, opts) },
+    };
+}
+
+/// Block-target levels: exact ceil-grid sizes, sRGB GPU variant for sRGB
+/// files. The glue re-derives the same sizes from the transcoder's own level
+/// description and fails on any mismatch (never truncates).
+fn transcodeBlockLevels(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    info: BasisInfo,
+    target: BasisTarget,
+) DecodeError!RawBlockTexture {
+    const format: BlockFormat = switch (target) {
+        .bc7 => if (info.is_srgb) .bc7_srgb else .bc7_unorm,
+        .astc => if (info.is_srgb) .astc_4x4_srgb else .astc_4x4_unorm,
+        .rgba32 => unreachable,
+    };
+    var raw = RawBlockTexture{
+        .width = info.width,
+        .height = info.height,
+        .num_levels = info.levels,
+        .format = format,
+    };
+    errdefer raw.deinit(allocator);
+    for (0..info.levels) |m| {
+        const dims = levelDims(info.width, info.height, @intCast(m));
+        const n = format.levelByteSize(dims.w, dims.h) orelse return error.InvalidLevelData;
+        const len: usize = std.math.cast(usize, n) orelse return error.InvalidLevelData;
+        const buf = try allocator.alloc(u8, len);
+        const ok = c.agate_basis_ktx2_transcode(
+            bytes.ptr,
+            bytes.len,
+            @intCast(m),
+            0,
+            @intFromEnum(target),
+            buf.ptr,
+            buf.len,
+        );
+        if (!ok) {
+            allocator.free(buf);
+            return error.BasisTranscodeFailed;
+        }
+        raw.levels[m] = buf;
+    }
+    return raw;
+}
+
+/// Converts RGB lanes of an RGBA32 buffer through the shared sRGB LUT
+/// (alpha untouched), matching the KTX2/PNG sRGB path exactly.
+fn convertRgbaSrgbInPlace(buf: []u8) void {
+    var i: usize = 0;
+    while (i < buf.len) : (i += 4) {
+        buf[i + 0] = texture.srgbToLinearU8(buf[i + 0]);
+        buf[i + 1] = texture.srgbToLinearU8(buf[i + 1]);
+        buf[i + 2] = texture.srgbToLinearU8(buf[i + 2]);
+    }
+}
+
+fn transcodeRgbaLevel(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    info: BasisInfo,
+    level: u32,
+) DecodeError![]u8 {
+    const dims = levelDims(info.width, info.height, level);
+    const n = @as(u64, dims.w) * dims.h * 4;
+    const len: usize = std.math.cast(usize, n) orelse return error.InvalidLevelData;
+    const buf = try allocator.alloc(u8, len);
+    const ok = c.agate_basis_ktx2_transcode(
+        bytes.ptr,
+        bytes.len,
+        level,
+        0,
+        @intFromEnum(BasisTarget.rgba32),
+        buf.ptr,
+        buf.len,
+    );
+    if (!ok) {
+        allocator.free(buf);
+        return error.BasisTranscodeFailed;
+    }
+    return buf;
+}
+
+fn transcodeRgbaLevels(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    info: BasisInfo,
+    opts: BasisDecodeOptions,
+) DecodeError!Texture.RawTexture {
+    const srgb = opts.srgb_to_linear orelse info.is_srgb;
+    // Single-level files can feed the engine's chain generator; multi-level
+    // files transcode exactly as authored.
+    if (info.levels == 1 and opts.gen_mipmaps) {
+        const level0 = try transcodeRgbaLevel(allocator, bytes, info, 0);
+        defer allocator.free(level0);
+        if (srgb) convertRgbaSrgbInPlace(level0);
+        // buildRaw validates dimensions against the byte length; a mismatch
+        // here means the transcoder disagrees with its own header.
+        var raw = Texture.buildRaw(allocator, info.width, info.height, level0, true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidLevelData,
+        };
+        raw.is_srgb = srgb;
+        return raw;
+    }
+
+    var raw = Texture.RawTexture{
+        .width = info.width,
+        .height = info.height,
+        .num_levels = info.levels,
+        .is_srgb = srgb,
+    };
+    errdefer raw.deinit(allocator);
+    for (0..info.levels) |m| {
+        const buf = try transcodeRgbaLevel(allocator, bytes, info, @intCast(m));
+        if (srgb) convertRgbaSrgbInPlace(buf);
+        raw.levels[m] = buf;
+    }
+    return raw;
+}
 // `srgb` converts COLOR lanes (never alpha) with the shared golden LUT, so
 // KTX2 color assets match the PNG sRGB path bit for bit.
 // ---------------------------------------------------------------------------
@@ -455,10 +765,10 @@ fn convertTexels(format: Format, src: []const u8, dst: []u8, srgb: bool) void {
         // PNG), alpha forced opaque.
         .r8_unorm, .r8_srgb => {
             for (src, 0..) |v, i| {
-                const c = mapChannel(v, w);
-                dst[i * 4 + 0] = c;
-                dst[i * 4 + 1] = c;
-                dst[i * 4 + 2] = c;
+                const ch = mapChannel(v, w);
+                dst[i * 4 + 0] = ch;
+                dst[i * 4 + 1] = ch;
+                dst[i * 4 + 2] = ch;
                 dst[i * 4 + 3] = 255;
             }
         },
@@ -1170,4 +1480,296 @@ test "Texture.decodeImageMemory routes block payloads without touching the RGBA8
         },
         .block => return error.TestUnexpectedResult,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Basis Universal tests — REAL toktx fixtures (src/agate/ktx2_fixtures/,
+// see README.md there), not fabricated headers. Sizes: 16x16 base, 5-level
+// chains (16..1): RGBA32 level bytes [1024,256,64,16,4], BC7/ASTC block
+// bytes [256,64,16,16,16].
+// ---------------------------------------------------------------------------
+
+const fx_etc1s_rgb_mip = @embedFile("ktx2_fixtures/fx_etc1s_rgb_mip.ktx2");
+const fx_etc1s_rgba_mip = @embedFile("ktx2_fixtures/fx_etc1s_rgba_mip.ktx2");
+const fx_uastc_rgba_mip = @embedFile("ktx2_fixtures/fx_uastc_rgba_mip.ktx2");
+const fx_uastc_rgba_zstd = @embedFile("ktx2_fixtures/fx_uastc_rgba_zstd.ktx2");
+const fx_uastc_rgb_flat = @embedFile("ktx2_fixtures/fx_uastc_rgb_flat.ktx2");
+const fx_uastc_rgb_flat_linear = @embedFile("ktx2_fixtures/fx_uastc_rgb_flat_linear.ktx2");
+const fx_etc1s_rgb_flat_linear = @embedFile("ktx2_fixtures/fx_etc1s_rgb_flat_linear.ktx2");
+const fx_uastc_cube = @embedFile("ktx2_fixtures/fx_uastc_cube.ktx2");
+
+test "isBasisKtx2 routes by the UNDEFINED marker only" {
+    for ([_][]const u8{
+        fx_etc1s_rgb_mip,
+        fx_etc1s_rgba_mip,
+        fx_uastc_rgba_mip,
+        fx_uastc_rgba_zstd,
+        fx_uastc_rgb_flat,
+        fx_uastc_rgb_flat_linear,
+        fx_etc1s_rgb_flat_linear,
+        fx_uastc_cube,
+    }) |fx| try testing.expect(isBasisKtx2(fx));
+
+    // Non-Basis KTX2 (RGBA8/BC7), foreign data, truncated identifier.
+    const allocator = testing.allocator;
+    const rgba_level = [_]u8{0} ** 4;
+    const rgba_ktx = try (TestKtx2{
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgba_level},
+    }).build(allocator);
+    defer allocator.free(rgba_ktx);
+    try testing.expect(!isBasisKtx2(rgba_ktx));
+    try testing.expect(!isBasisKtx2("png data pretending"));
+    try testing.expect(!isBasisKtx2(fx_uastc_rgb_flat[0..8]));
+    // Scheme > 3 is not a Basis payload even behind the UNDEFINED marker.
+    const patched = try allocator.dupe(u8, fx_uastc_rgb_flat);
+    defer allocator.free(patched);
+    std.mem.writeInt(u32, patched[44..48], 4, .little);
+    try testing.expect(!isBasisKtx2(patched));
+}
+
+test "basisInfo reads real ETC1S/UASTC headers" {
+    const etc1s = try basisInfo(fx_etc1s_rgb_mip);
+    try testing.expectEqual(BasisKind.etc1s, etc1s.kind);
+    try testing.expectEqual(@as(u32, 16), etc1s.width);
+    try testing.expectEqual(@as(u32, 16), etc1s.height);
+    try testing.expectEqual(@as(u32, 5), etc1s.levels);
+    try testing.expect(etc1s.is_srgb);
+    try testing.expect(!etc1s.has_alpha);
+
+    const etc1s_alpha = try basisInfo(fx_etc1s_rgba_mip);
+    try testing.expectEqual(BasisKind.etc1s, etc1s_alpha.kind);
+    try testing.expect(etc1s_alpha.has_alpha);
+
+    const uastc = try basisInfo(fx_uastc_rgba_mip);
+    try testing.expectEqual(BasisKind.uastc, uastc.kind);
+    try testing.expectEqual(@as(u32, 5), uastc.levels);
+    try testing.expect(uastc.is_srgb);
+    try testing.expect(uastc.has_alpha);
+
+    const linear = try basisInfo(fx_uastc_rgb_flat_linear);
+    try testing.expect(!linear.is_srgb);
+    try testing.expect(!linear.has_alpha);
+
+    // The 2D-only entries reject the cube before the transcoder runs
+    // (same UnsupportedFaceCount contract as decodeBlock2D).
+    try testing.expectError(error.UnsupportedFaceCount, basisInfo(fx_uastc_cube));
+    try testing.expectError(error.NotKtx2, basisInfo("png data pretending"));
+    try testing.expectError(error.Truncated, basisInfo(fx_uastc_rgb_flat[0..40]));
+    // Header-only prefix: envelope passes, the transcoder init fails.
+    try testing.expectError(error.NotBasisKtx2, basisInfo(fx_uastc_rgb_flat[0..80]));
+}
+
+test "decodeBasis2D transcodes a real ETC1S mip chain to BC7" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_etc1s_rgb_mip, .bc7, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.bc7_srgb, b.format);
+            try testing.expectEqual(@as(u32, 16), b.width);
+            try testing.expectEqual(@as(u32, 5), b.num_levels);
+            const want = [_]usize{ 256, 64, 16, 16, 16 };
+            for (want, 0..) |n, m| try testing.expectEqual(n, b.levels[m].?.len);
+            try testing.expectEqual(@as(usize, 368), b.totalBytes());
+            // Non-degenerate transcode output (gradient in, gradient out).
+            var all_same = true;
+            for (b.levels[0].?[1..]) |byte| {
+                if (byte != b.levels[0].?[0]) {
+                    all_same = false;
+                    break;
+                }
+            }
+            try testing.expect(!all_same);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
+test "decodeBasis2D transcodes a real UASTC mip chain to BC7" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_uastc_rgba_mip, .bc7, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.bc7_srgb, b.format);
+            try testing.expectEqual(@as(u32, 5), b.num_levels);
+            const want = [_]usize{ 256, 64, 16, 16, 16 };
+            for (want, 0..) |n, m| try testing.expectEqual(n, b.levels[m].?.len);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
+test "decodeBasis2D transcodes zstd-supercompressed UASTC (vendored zstd)" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_uastc_rgba_zstd, .bc7, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.bc7_srgb, b.format);
+            try testing.expectEqual(@as(u32, 1), b.num_levels);
+            try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
+test "decodeBasis2D selects UNORM variants for linear-transfer files" {
+    const allocator = testing.allocator;
+    var bc7 = try decodeBasis2D(allocator, fx_etc1s_rgb_flat_linear, .bc7, .{});
+    defer bc7.deinit(allocator);
+    switch (bc7) {
+        .block => |b| try testing.expectEqual(BlockFormat.bc7_unorm, b.format),
+        .rgba => return error.TestUnexpectedResult,
+    }
+    var astc = try decodeBasis2D(allocator, fx_uastc_rgb_flat_linear, .astc, .{});
+    defer astc.deinit(allocator);
+    switch (astc) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.astc_4x4_unorm, b.format);
+            try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+    // sRGB flat picks the sRGB ASTC variant with identical block math.
+    var astc_srgb = try decodeBasis2D(allocator, fx_uastc_rgb_flat, .astc, .{});
+    defer astc_srgb.deinit(allocator);
+    switch (astc_srgb) {
+        .block => |b| try testing.expectEqual(BlockFormat.astc_4x4_srgb, b.format),
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
+test "decodeBasis2D RGBA32 fallback keeps sizes, alpha and sRGB behavior" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_uastc_rgba_mip, .rgba32, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .rgba => |r| {
+            try testing.expectEqual(@as(u32, 5), r.num_levels);
+            try testing.expect(r.is_srgb); // auto from the sRGB DFD
+            const want = [_]usize{ 1024, 256, 64, 16, 4 };
+            for (want, 0..) |n, m| try testing.expectEqual(n, r.levels[m].?.len);
+            // Gradient alpha survives the round trip (not all opaque).
+            var opaque_count: usize = 0;
+            var i: usize = 3;
+            while (i < r.levels[0].?.len) : (i += 4) {
+                if (r.levels[0].?[i] == 255) opaque_count += 1;
+            }
+            try testing.expect(opaque_count < 256);
+        },
+        .block => return error.TestUnexpectedResult,
+    }
+
+    // Opaque ETC1S decodes to fully opaque alpha.
+    var opaque_img = try decodeBasis2D(allocator, fx_etc1s_rgb_mip, .rgba32, .{ .srgb_to_linear = false });
+    defer opaque_img.deinit(allocator);
+    switch (opaque_img) {
+        .rgba => |r| {
+            try testing.expect(!r.is_srgb); // explicit override wins over DFD
+            var i: usize = 3;
+            while (i < r.levels[0].?.len) : (i += 4) {
+                try testing.expectEqual(@as(u8, 255), r.levels[0].?[i]);
+            }
+        },
+        .block => return error.TestUnexpectedResult,
+    }
+
+    // Single-level RGBA32 honors gen_mipmaps like every other RGBA8 path.
+    var chained = try decodeBasis2D(allocator, fx_uastc_rgb_flat, .rgba32, .{});
+    defer chained.deinit(allocator);
+    switch (chained) {
+        .rgba => |r| try testing.expectEqual(Texture.mipLevelCount(16, 16), r.num_levels),
+        .block => return error.TestUnexpectedResult,
+    }
+    var flat = try decodeBasis2D(allocator, fx_uastc_rgb_flat, .rgba32, .{ .gen_mipmaps = false });
+    defer flat.deinit(allocator);
+    switch (flat) {
+        .rgba => |r| try testing.expectEqual(@as(u32, 1), r.num_levels),
+        .block => return error.TestUnexpectedResult,
+    }
+}
+
+test "preferredBasisTarget ladders BC7, ASTC, then the RGBA32 fallback" {
+    const bc7: Texture.BlockSupport = .{ .bc7_sample = true };
+    try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(bc7));
+    const astc: Texture.BlockSupport = .{ .astc_sample = true };
+    try testing.expectEqual(BasisTarget.astc, preferredBasisTarget(astc));
+    const both: Texture.BlockSupport = .{ .bc7_sample = true, .astc_sample = true };
+    try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(both));
+    try testing.expectEqual(BasisTarget.rgba32, preferredBasisTarget(.{}));
+    // Sample-without-filter still counts (upload forces NEAREST there).
+    const no_filter: Texture.BlockSupport = .{ .bc7_sample = true };
+    try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(no_filter));
+}
+
+test "decodeBasis2D rejects malformed and out-of-subset containers" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.NotKtx2, decodeBasis2D(allocator, "png data", .bc7, .{}));
+    try testing.expectError(error.Truncated, decodeBasis2D(allocator, fx_uastc_rgb_flat[0..40], .bc7, .{}));
+    try testing.expectError(error.UnsupportedFaceCount, decodeBasis2D(allocator, fx_uastc_cube, .bc7, .{}));
+
+    // Non-Basis KTX2 on the Basis entry: unsupported vkFormat.
+    const rgba_level = [_]u8{0} ** 4;
+    const rgba_ktx = try (TestKtx2{
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgba_level},
+    }).build(allocator);
+    defer allocator.free(rgba_ktx);
+    try testing.expectError(error.UnsupportedVkFormat, decodeBasis2D(allocator, rgba_ktx, .bc7, .{}));
+
+    // Scheme 4 behind the UNDEFINED marker: supercompression first.
+    const sc4 = try allocator.dupe(u8, fx_uastc_rgb_flat);
+    defer allocator.free(sc4);
+    std.mem.writeInt(u32, sc4[44..48], 4, .little);
+    try testing.expectError(error.UnsupportedSupercompression, decodeBasis2D(allocator, sc4, .bc7, .{}));
+
+    // levelCount 0 (implicit single level, no encoder writes it): the
+    // transcoder has no level index to work with — explicit BasisUnsupported.
+    const lc0 = try allocator.dupe(u8, fx_uastc_rgb_flat);
+    defer allocator.free(lc0);
+    std.mem.writeInt(u32, lc0[40..44], 0, .little);
+    try testing.expectError(error.BasisUnsupported, decodeBasis2D(allocator, lc0, .bc7, .{}));
+
+    // Truncated payloads fail at init (the transcoder validates level bounds
+    // up front): explicit NotBasisKtx2, never silent.
+    try testing.expectError(error.NotBasisKtx2, decodeBasis2D(allocator, fx_uastc_rgb_flat[0 .. fx_uastc_rgb_flat.len - 8], .bc7, .{}));
+    try testing.expectError(error.NotBasisKtx2, decodeBasis2D(allocator, fx_etc1s_rgb_flat_linear[0 .. fx_etc1s_rgb_flat_linear.len - 4], .bc7, .{}));
+    // Corrupt slice CONTENT (valid bounds, garbage bytes): init passes, the
+    // level transcode fails. fx_etc1s_rgb_flat_linear carries its 8-byte
+    // slice at file offset 448.
+    const corrupt = try allocator.dupe(u8, fx_etc1s_rgb_flat_linear);
+    defer allocator.free(corrupt);
+    corrupt[450] ^= 0xFF;
+    corrupt[453] ^= 0xFF;
+    try testing.expectError(error.BasisTranscodeFailed, decodeBasis2D(allocator, corrupt, .bc7, .{}));
+}
+
+test "Texture.decodeImageMemory routes real Basis files by target" {
+    const allocator = testing.allocator;
+    var block_img = try Texture.decodeImageMemory(allocator, fx_uastc_rgba_mip, .{});
+    defer block_img.deinit(allocator);
+    switch (block_img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.bc7_srgb, b.format);
+            try testing.expectEqual(@as(u32, 5), b.num_levels);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+
+    var rgba_img = try Texture.decodeImageMemory(allocator, fx_uastc_rgba_mip, .{ .basis_target = .rgba32 });
+    defer rgba_img.deinit(allocator);
+    switch (rgba_img) {
+        .rgba => |r| try testing.expectEqual(@as(u32, 5), r.num_levels),
+        .block => return error.TestUnexpectedResult,
+    }
+}
+
+test "Texture.decodeMemory rejects Basis with its own reason" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.BasisRequiresBlockDecode, Texture.decodeMemory(allocator, fx_uastc_rgb_flat, .{}));
+    try testing.expectError(error.Truncated, Texture.decodeMemory(allocator, fx_uastc_rgb_flat[0..40], .{}));
 }

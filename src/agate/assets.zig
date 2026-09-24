@@ -899,3 +899,34 @@ test "byte budgeting paces ready slots across calls without an sg context" {
 
     try testing.expectEqual(@as(usize, 0), queue.collectReady(batch[0..1]));
 }
+
+test "requestMemory routes real Basis payloads to the block path off-thread" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    // Real toktx UASTC fixture (see src/agate/ktx2_fixtures/README.md): the
+    // worker transcodes to the default .bc7 target without touching sg.
+    const fx = @embedFile("ktx2_fixtures/fx_uastc_rgba_mip.ktx2");
+    const owned = try a.dupe(u8, fx);
+    const p = try queue.requestMemory(owned, .{}, .{});
+    try testing.expect(waitForState(p, &.{.ready}));
+    try testing.expect(p.memory == null); // input freed before publish
+    try testing.expect(p.block_raw != null);
+    try testing.expectEqual(ktx2.BlockFormat.bc7_srgb, p.block_raw.?.format);
+    try testing.expectEqual(@as(u32, 16), p.block_raw.?.width);
+    try testing.expectEqual(@as(u32, 5), p.block_raw.?.num_levels);
+    try testing.expectEqual(@as(usize, 256 + 64 + 16 + 16 + 16), p.block_raw.?.totalBytes());
+    // The RGBA8 side stays empty for transcoded files (no double decode).
+    try testing.expectEqual(@as(u32, 0), p.raw.num_levels);
+    // No sg context in tests: the .ready transcode is torn down by queue
+    // deinit (which must free block_raw without leaking).
+
+    // The RGBA32 fallback target decodes to the .rgba side instead.
+    const owned2 = try a.dupe(u8, fx);
+    const q = try queue.requestMemory(owned2, .{}, .{ .basis_target = .rgba32 });
+    try testing.expect(waitForState(q, &.{.ready}));
+    try testing.expect(q.block_raw == null);
+    try testing.expectEqual(@as(u32, 5), q.raw.num_levels);
+    try testing.expectEqual(@as(usize, 1024), q.raw.levels[0].?.len);
+}

@@ -266,6 +266,13 @@ pub const Texture = struct {
     pub const DecodeOptions = struct {
         gen_mipmaps: bool = true,
         srgb_to_linear: bool = false,
+        /// Transcode target for KTX2 Basis payloads (ETC1S/UASTC); ignored
+        /// by every other format. Null = desktop-first .bc7 default (the
+        /// fromRawBlock backend gate still rejects unsupported backends
+        /// explicitly). Loaders snapshot per load via
+        /// basisTargetForCurrentThread() so worker decodes already carry the
+        /// backend-accurate target.
+        basis_target: ?ktx2.BasisTarget = null,
     };
 
     // -----------------------------------------------------------------------
@@ -431,12 +438,22 @@ pub const Texture = struct {
     /// touching the GPU. Thread-safe; pair with `fromRaw`. KTX2 payloads
     /// (magic sniff) route to the ktx2 reader: only its uncompressed LDR
     /// subset decodes here — cube KTX2 files are rejected with
-    /// error.UnsupportedFaceCount (use ktx2.decodeCube instead). DDS
+    /// error.UnsupportedFaceCount (use ktx2.decodeCube instead), and Basis
+    /// payloads (ETC1S/UASTC) fail with error.BasisRequiresBlockDecode after
+    /// reporting the file's own validation reason for malformed files (use
+    /// decodeImageMemory or fromBasisMemory instead). DDS
     /// payloads are block-compressed and have no RGBA8 form: they fail
     /// here (malformed files with their own validation error, valid ones
     /// with DdsRequiresBlockDecode) — use decodeImageMemory or
     /// fromDdsMemory instead.
     pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
+        if (ktx2.isBasisKtx2(bytes)) {
+            // Report the file's own validation error when malformed (init or
+            // subset gate), so a corrupt Basis file never degrades into a
+            // generic stb failure; a valid one names the correct API instead.
+            _ = try ktx2.basisInfo(bytes);
+            return error.BasisRequiresBlockDecode;
+        }
         if (dds.sniff(bytes)) {
             // Report the file's own validation error when malformed, so a
             // corrupt DDS never degrades into a generic stb failure; a
@@ -532,15 +549,25 @@ pub const Texture = struct {
 
     /// decodeMemory plus block routing: KTX2 BC/ASTC and DDS BC payloads
     /// decode to .block (owned slices, mip chain as authored, no
-    /// synthesis); everything else behaves exactly like decodeMemory
-    /// (.rgba). Thread-safe; pair with fromRaw/fromRawBlock. A block file
-    /// that fails validation (supercompression, truncated levels, ...)
-    /// surfaces the reader error — never a silent RGBA8 fallback.
+    /// synthesis); KTX2 Basis payloads (ETC1S/UASTC) transcode to
+    /// opts.basis_target (null = desktop-first .bc7) — .block for bc7/astc,
+    /// .rgba for the rgba32 fallback; everything else behaves exactly like
+    /// decodeMemory (.rgba). Thread-safe; pair with fromRaw/fromRawBlock. A
+    /// Basis file that fails validation surfaces the reader error — never a
+    /// silent RGBA8 fallback.
     /// decode_opts are RGBA8-only, except srgb_to_linear, which doubles as
     /// the DDS legacy sRGB decision (DX10/KTX2 files carry their own tag):
     /// gen_mipmaps has no effect on .block (chain and sRGB-ness ride in
-    /// the authored levels and the GPU format).
+    /// the authored levels and the GPU format). For Basis, srgb_to_linear is
+    /// the explicit RGBA32-path decision (block targets follow the file DFD).
     pub fn decodeImageMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !DecodedImage {
+        if (ktx2.isBasisKtx2(bytes)) {
+            const t = opts.basis_target orelse .bc7;
+            return try ktx2.decodeBasis2D(allocator, bytes, t, .{
+                .gen_mipmaps = opts.gen_mipmaps,
+                .srgb_to_linear = opts.srgb_to_linear,
+            });
+        }
         if (ktx2.isBlockKtx2(bytes)) {
             return .{ .block = try ktx2.decodeBlock2D(allocator, bytes) };
         }
@@ -701,6 +728,65 @@ pub const Texture = struct {
         });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
+    }
+
+    /// Resolves a null Basis target against the live backend (BC7 when
+    /// sampleable, else ASTC 4x4, else the universal RGBA32 fallback). Without
+    /// an sg context (worker threads, CLI tools) returns null: decode entries
+    /// then use the desktop-first .bc7 default and the fromRawBlock backend
+    /// gate reports unsupported backends explicitly. Snapshot per load on the
+    /// context thread when the accurate answer matters (the glTF loader does).
+    pub fn basisTargetForCurrentThread() ?ktx2.BasisTarget {
+        if (!sg.isvalid()) return null;
+        return ktx2.preferredBasisTarget(queryBlockSupport());
+    }
+
+    /// Decodes a KTX2 Basis file (ETC1S/UASTC, 2D) from memory and uploads
+    /// it: block targets via fromRawBlock, the RGBA32 fallback via fromRaw.
+    /// Main thread only (GPU upload); use ktx2.decodeBasis2D + fromRawBlock/
+    /// fromRaw to split worker-thread transcode from main-thread upload. A
+    /// null target snapshots the live backend (BC7 → ASTC → RGBA32); an
+    /// explicit target forces it (unit tests, re-encode previews).
+    /// options.srgb_to_linear is the RGBA-path decision (the block targets
+    /// follow the file DFD, like every other .block upload).
+    pub fn fromBasisMemory(
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        options: Options,
+        target: ?ktx2.BasisTarget,
+    ) !Texture {
+        const t = target orelse basisTargetForCurrentThread() orelse .bc7;
+        var dec = try ktx2.decodeBasis2D(allocator, bytes, t, .{
+            .gen_mipmaps = options.mipmaps,
+            .srgb_to_linear = options.srgb_to_linear,
+        });
+        defer dec.deinit(allocator);
+        return switch (dec) {
+            .rgba => |*raw| fromRaw(raw, options),
+            .block => |*blk| try fromRawBlock(blk, options),
+        };
+    }
+
+    /// File variant of `fromBasisMemory`. Main thread only (GPU upload); the
+    /// buffered read matches decodeFile so the async UploadQueue
+    /// (decodeImageFile → decodeImageMemory) sees identical bytes.
+    pub fn fromBasisFile(
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        options: Options,
+        target: ?ktx2.BasisTarget,
+    ) !Texture {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
+
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return fromBasisMemory(allocator, bytes, options, target);
     }
 
     /// Decodes a block-compressed DDS file (BC1/BC2/BC3/BC7, mip chain as
