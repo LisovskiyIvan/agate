@@ -287,15 +287,11 @@ pub fn stageSegmentCpu(
         }
         scratch.items.len = lo + total_visible;
     } else {
+        try scratch.ensureUnusedCapacity(allocator, mesh.instances.items.len);
         for (mesh.instances.items) |inst| {
             if (!inst.is_visible) continue;
             const world = instanceWorldMatrix(inst);
-            // OOM: stage nothing for this mesh — truncate the partial
-            // segment (earlier meshes' segments intact) and propagate.
-            scratch.append(allocator, world) catch {
-                scratch.items.len = lo;
-                return error.OutOfMemory;
-            };
+            scratch.appendAssumeCapacity(world);
             const box = instanceWorldAABB(inst, world);
             if (combined_aabb.isValid()) {
                 combined_aabb = combined_aabb.merge(box);
@@ -395,7 +391,8 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
             // .size only (no initial .data) and get at most ONE
             // sg.updateBuffer per buffer per sokol frame; the fresh buffer
             // takes this frame's single update, the retired one takes none.
-            const new_cap = @max(active_count, st.capacity * 2);
+            const min_cap: usize = 16;
+            const new_cap = std.math.ceilPowerOfTwo(usize, @max(active_count, @max(st.capacity * 2, min_cap))) catch @max(active_count, st.capacity * 2);
             const new_buf = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
                 .size = new_cap * @sizeOf(Mat4),
@@ -504,6 +501,7 @@ pub fn freezeStagedRecords(
     meshes: []const *Mesh,
     build_seq: u64,
 ) void {
+    records.ensureTotalCapacity(allocator, records.items.len + meshes.len) catch {};
     for (meshes, 0..) |mesh, i| {
         _ = mesh.ensureUid();
         if (mesh.is_lod_child) continue;

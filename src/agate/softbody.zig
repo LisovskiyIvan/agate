@@ -56,6 +56,7 @@ const computeNormals = @import("mesh.zig").computeNormals;
 const StandardMaterial = @import("material.zig").StandardMaterial;
 const gpu_thread = @import("gpu_thread.zig");
 const upload_meter = @import("gpu_upload_meter.zig");
+const jobs = @import("jobs.zig");
 
 /// Maximum cloth grid resolution per axis (particle counts, not quads).
 /// 64x64 = 4096 particles, the `u16` index fast path still applies.
@@ -167,6 +168,7 @@ pub const Cloth = struct {
     enabled: bool = true,
     tear_strain: ?f32 = null,
     torn_count: usize = 0,
+    thread_pool: ?*jobs.Pool = null,
 
     pub fn init(allocator: std.mem.Allocator, options: ClothOptions) SoftBodyError!Cloth {
         try options.validate();
@@ -401,16 +403,40 @@ pub const Cloth = struct {
         self.sim_time += h;
     }
 
+    const IntegrateCtx = struct {
+        cloth: *Cloth,
+        accel_hh: Vec3,
+        damp: f32,
+
+        fn run(ctx: *IntegrateCtx, start: usize, end: usize) void {
+            const pos = ctx.cloth.pos[start..end];
+            const prev = ctx.cloth.prev[start..end];
+            const inv_mass = ctx.cloth.inv_mass[start..end];
+            const damp = ctx.damp;
+            const accel_hh = ctx.accel_hh;
+            for (pos, prev, inv_mass) |*p, *pr, w| {
+                if (w == 0.0) continue;
+                const vel = p.*.sub(pr.*).scale(damp);
+                pr.* = p.*;
+                p.* = p.*.add(vel).add(accel_hh);
+            }
+        }
+    };
+
     fn integrate(self: *Cloth, h: f32) void {
         const accel = self.gravity.add(self.wind);
         const damp = @max(0.0, 1.0 - self.damping * h);
         const hh = h * h;
-        for (self.pos, self.prev, self.inv_mass) |*p, *pr, w| {
-            if (w == 0.0) continue;
-            const vel = p.*.sub(pr.*).scale(damp);
-            pr.* = p.*;
-            p.* = p.*.add(vel).add(accel.scale(hh));
+        const accel_hh = accel.scale(hh);
+        var ctx = IntegrateCtx{ .cloth = self, .accel_hh = accel_hh, .damp = damp };
+        const pool = self.thread_pool orelse jobs.global;
+        if (pool) |p| {
+            if (self.pos.len >= 256 and p.workerCount() > 0) {
+                p.forkJoin(IntegrateCtx, &ctx, IntegrateCtx.run, self.pos.len);
+                return;
+            }
         }
+        ctx.run(0, self.pos.len);
     }
 
     fn solveConstraints(self: *Cloth) void {
@@ -437,30 +463,53 @@ pub const Cloth = struct {
         }
     }
 
-    fn collide(self: *Cloth) void {
-        for (self.pos, self.prev, self.inv_mass) |*p, *pr, w| {
-            if (w == 0.0) continue;
-            for (self.spheres[0..self.sphere_count]) |s| {
-                const delta = p.*.sub(s.center);
-                const dist = delta.length();
-                if (dist < s.radius) {
-                    const n = if (dist > 1e-9) delta.scale(1.0 / dist) else Vec3.new(0.0, 1.0, 0.0);
-                    p.* = s.center.add(n.scale(s.radius));
-                    // Coulomb-ish friction: the inward normal velocity dies,
-                    // `friction` fraction of the tangential velocity survives.
-                    const vel = p.*.sub(pr.*);
-                    const vt = vel.sub(n.scale(vel.dot(n)));
-                    pr.* = p.*.sub(vt.scale(self.friction));
+    const CollideCtx = struct {
+        cloth: *Cloth,
+
+        fn run(ctx: *CollideCtx, start: usize, end: usize) void {
+            const c_ptr = ctx.cloth;
+            const pos = c_ptr.pos[start..end];
+            const prev = c_ptr.prev[start..end];
+            const inv_mass = c_ptr.inv_mass[start..end];
+            const spheres = c_ptr.spheres[0..c_ptr.sphere_count];
+            const floor_y = c_ptr.floor_y;
+            const friction = c_ptr.friction;
+
+            for (pos, prev, inv_mass) |*p, *pr, w| {
+                if (w == 0.0) continue;
+                for (spheres) |s| {
+                    const delta = p.*.sub(s.center);
+                    const dist = delta.length();
+                    if (dist < s.radius) {
+                        const n = if (dist > 1e-9) delta.scale(1.0 / dist) else Vec3.new(0.0, 1.0, 0.0);
+                        p.* = s.center.add(n.scale(s.radius));
+                        const vel = p.*.sub(pr.*);
+                        const vt = vel.sub(n.scale(vel.dot(n)));
+                        pr.* = p.*.sub(vt.scale(friction));
+                    }
                 }
-            }
-            if (self.floor_y) |fy| {
-                if (p.y < fy) {
-                    p.y = fy;
-                    const vel = p.*.sub(pr.*);
-                    pr.* = Vec3.new(p.x - vel.x * self.friction, p.y, p.z - vel.z * self.friction);
+                if (floor_y) |fy| {
+                    if (p.y < fy) {
+                        p.y = fy;
+                        const vel = p.*.sub(pr.*);
+                        pr.* = Vec3.new(p.x - vel.x * friction, p.y, p.z - vel.z * friction);
+                    }
                 }
             }
         }
+    };
+
+    fn collide(self: *Cloth) void {
+        if (self.sphere_count == 0 and self.floor_y == null) return;
+        var ctx = CollideCtx{ .cloth = self };
+        const pool = self.thread_pool orelse jobs.global;
+        if (pool) |p| {
+            if (self.pos.len >= 256 and p.workerCount() > 0) {
+                p.forkJoin(CollideCtx, &ctx, CollideCtx.run, self.pos.len);
+                return;
+            }
+        }
+        ctx.run(0, self.pos.len);
     }
 
     /// Maximum relative rest-length violation over all active constraints
@@ -509,16 +558,14 @@ pub const SoftBody = struct {
     /// Rebuilds staging vertices from solver positions and recomputes
     /// normals + bounds. Game side only (no sg.*).
     pub fn writeVertices(self: *SoftBody) void {
-        for (self.vertices, self.cloth.pos) |*v, p| {
-            v.position = p.toArray();
-        }
-        computeNormals(self.vertices, self.indices, null);
         var min_pt = Vec3.new(std.math.inf(f32), std.math.inf(f32), std.math.inf(f32));
         var max_pt = Vec3.new(-std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32));
-        for (self.cloth.pos) |p| {
+        for (self.vertices, self.cloth.pos) |*v, p| {
+            v.position = p.toArray();
             min_pt = Vec3.new(@min(min_pt.x, p.x), @min(min_pt.y, p.y), @min(min_pt.z, p.z));
             max_pt = Vec3.new(@max(max_pt.x, p.x), @max(max_pt.y, p.y), @max(max_pt.z, p.z));
         }
+        computeNormals(self.vertices, self.indices, null);
         self.mesh.local_bounding_box = BoundingBox.init(min_pt, max_pt);
         self.mesh.cached_aabb = self.mesh.local_bounding_box;
     }
@@ -564,6 +611,7 @@ pub const SoftBody = struct {
 /// `anytype` (TrailLayer pattern) so this module never imports scene.zig.
 pub const SoftBodyLayer = struct {
     bodies: std.ArrayListUnmanaged(*SoftBody) = .empty,
+    thread_pool: ?*jobs.Pool = null,
 
     pub fn deinit(self: *SoftBodyLayer, allocator: std.mem.Allocator) void {
         for (self.bodies.items) |b| {
@@ -681,6 +729,7 @@ pub const SoftBodyLayer = struct {
             .buffers_pending = true,
             .upload_pending = false,
         };
+        body.cloth.thread_pool = self.thread_pool orelse jobs.global;
         self.bodies.append(allocator, body) catch {
             allocator.destroy(body);
             return error.OutOfMemory;
