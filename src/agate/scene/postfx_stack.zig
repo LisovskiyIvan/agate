@@ -523,7 +523,7 @@ pub const PostFXStack = struct {
         // upload-meter records) and resize-idempotent (lazy targets, no
         // resize in resizeAll/beginMainPass), so renderReuse replays
         // replay it upload-free. Primary view only (v1 non-goal).
-        var shaft_view = self.postprocess_pass.offscreen_resolve_tex_view;
+        var shaft_view: sg.View = .{};
         if (postprocess.shaftActive(params.post.enabled, post, params.shadows_enabled)) {
             const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
             shaft_view = self.volumetric_pass.render(.{
@@ -540,13 +540,14 @@ pub const PostFXStack = struct {
                 .base_w = cur_w,
                 .base_h = cur_h,
             });
-            // An empty shadow atlas view fail-closes inside the pass
-            // (returns .{}); fall back to the placeholder so the
-            // composite gate — not a dead handle — decides the pixels.
-            if (shaft_view.id == 0) shaft_view = self.postprocess_pass.offscreen_resolve_tex_view;
-            params.stats.post_draw_calls += postprocess.SHAFT_PASS_DRAWS;
-            params.stats.draw_calls += postprocess.SHAFT_PASS_DRAWS;
-            params.stats.triangles += 2 * postprocess.SHAFT_PASS_DRAWS;
+            // Keep .{} when the pass fail-closes. PostProcessPass binds a
+            // valid scene placeholder but zeros shaft_params unless this is
+            // a real shaft result, so it cannot add the scene to itself.
+            if (shaft_view.id != 0) {
+                params.stats.post_draw_calls += postprocess.SHAFT_PASS_DRAWS;
+                params.stats.draw_calls += postprocess.SHAFT_PASS_DRAWS;
+                params.stats.triangles += 2 * postprocess.SHAFT_PASS_DRAWS;
+            }
         }
         self.postprocess_pass.setShaftTexture(shaft_view);
 

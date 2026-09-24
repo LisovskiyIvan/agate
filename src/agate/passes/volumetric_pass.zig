@@ -24,9 +24,9 @@ const Color3 = math.Color3;
 //  2. Blur: bilateral H then V over the shaft radiance with the scene
 //     depth as the edge gate, so shafts never bleed across silhouettes.
 //  3. Composite: the parent feeds the blurred view into the fullscreen
-//     postprocess composite, which adds it with shaft intensity
-//     (placeholder + zeroed uniforms when inactive, so the off path is
-//     bit-identical).
+//     postprocess shader, which adds the radiance to linear scene color
+//     before exposure/tone mapping (placeholder + zeroed uniforms when
+//     inactive, so the off path is bit-identical).
 //
 // Typical parent (scene/postfx_stack.zig) usage, after the highlight
 // stage and before the fullscreen postprocess pass:

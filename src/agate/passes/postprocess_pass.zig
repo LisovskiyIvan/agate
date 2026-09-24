@@ -533,7 +533,7 @@ pub const PostProcessPass = struct {
             .highlight_params = postprocess.highlightParams(self.highlight_tex_view.id != 0),
             // (enabled 1/0, intensity, 0, 0); zeros when the shaft is off,
             // which keeps the composite identical to the pre-shaft path.
-            .shaft_params = postprocess.shaftParams(config),
+            .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
             .grade_shadows = .{
                 config.grade_shadows[0],
                 config.grade_shadows[1],

@@ -270,6 +270,15 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     return acc * (1.0 / float(samples));
 }
 
+// Add the raymarched shaft radiance before exposure and tone mapping. This
+// keeps the shaft contribution in the same linear HDR domain as scene color.
+vec3 addShaftRadiance(vec3 color, vec2 uv) {
+    if (shaft_params.x > 0.5 && shaft_params.y > 0.001) {
+        color += texture(sampler2D(shaft_tex, smp), uv).rgb * shaft_params.y;
+    }
+    return color;
+}
+
 // Sample scene HDR color, apply chromatic aberration, SSAO, SSR, Fog, and Motion Blur
 vec3 sampleSceneRaw(vec2 uv) {
     vec3 base_color;
@@ -321,7 +330,7 @@ vec3 sampleSceneRaw(vec2 uv) {
 
 // Sample tonemapped LDR color for perceptual FXAA edge detection
 vec3 sampleSceneLDR(vec2 uv) {
-    vec3 color = sampleSceneRaw(uv);
+    vec3 color = addShaftRadiance(sampleSceneRaw(uv), uv);
     color *= params1.x; // Exposure
 
     float tonemap_mode = params3.x;
@@ -349,7 +358,7 @@ float grainHash(vec2 p) {
 // Single texture fetch from scene_tex with exposure + Reinhard/ACES tonemap.
 // Skips redundant SSAO fetches, SSR, fog, and chromatic aberration dispersion.
 vec3 sampleSceneFastLDR(vec2 uv) {
-    vec3 color = texture(sampler2D(scene_tex, smp), uv).rgb * params1.x; // Exposure
+    vec3 color = addShaftRadiance(texture(sampler2D(scene_tex, smp), uv).rgb, uv) * params1.x; // Exposure
     float tonemap_mode = params3.x;
     if (tonemap_mode > 1.5) {
         color = Reinhard(color);
@@ -362,7 +371,7 @@ vec3 sampleSceneFastLDR(vec2 uv) {
 // Fast luma approximation for FXAA edge detection and tangent walking:
 // skips re-running tonemapping polynomials on every neighbor tap.
 float sampleLumaFast(vec2 uv) {
-    vec3 c = texture(sampler2D(scene_tex, smp), uv).rgb;
+    vec3 c = addShaftRadiance(texture(sampler2D(scene_tex, smp), uv).rgb, uv);
     float luma_hdr = dot(c, vec3(0.299, 0.587, 0.114)) * params1.x;
     return luma_hdr / (luma_hdr + 1.0);
 }
@@ -755,18 +764,6 @@ void main() {
         vec3 hl_blurred = texture(sampler2D(highlight_tex, smp), uv).rgb;
         vec3 hl_inner = max(hl_raw - hl_blurred, vec3(0.0)) * 2.0;
         color += hl_inner * highlight_params.y;
-    }
-
-    // Volumetric light shafts v1 (sun CSM-backed raymarch, low-res +
-    // bilateral blur): the blurred shaft radiance added with intensity.
-    // Disabled returns before sampling, so the off path is bit-identical
-    // to pre-shaft. Composites AFTER highlight so either toggle leaves
-    // the other's contribution unchanged; before the grading chain so
-    // shafts grade with the same LDR the other halos use. Mirrors
-    // shaftParams in postprocess.zig (same (enabled, intensity) pack).
-    if (shaft_params.x > 0.5 && shaft_params.y > 0.001) {
-        vec3 shaft = texture(sampler2D(shaft_tex, smp), uv).rgb;
-        color += shaft * shaft_params.y;
     }
 
     // Contrast

@@ -742,7 +742,7 @@ test "shaft defaults are off with zero GPU state (bit-identical)" {
     try std.testing.expect(!postprocess.shaftActive(true, scene.post_process, true));
     try std.testing.expect(!postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, false));
     try std.testing.expect(postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, true));
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.shaftParams(scene.post_process));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.shaftParams(scene.post_process, false));
     // Headless fixture owns no shaft GPU state: no raymarch/blur pass
     // can run, no targets exist for the census (which gates on base
     // size, so the unsized pass honestly contributes zero VRAM).

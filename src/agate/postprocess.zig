@@ -1815,12 +1815,11 @@ test "ssr and motion blur configurable quality options" {
 
 // --- Volumetric light shafts v1 (sun CSM-backed) ---
 //
-// Composite order (see postprocess.glsl main): ... BLOOM -> GLOW ->
-// HIGHLIGHT -> SHAFT -> contrast -> saturation -> curves -> LUT ->
-// vignette -> grain. The shaft radiance composites right after the
-// highlight block so either toggle leaves the other's contribution
-// bit-identical, and before the grading chain so shafts grade with the
-// same LDR the bloom/glow halos use.
+// Composite order (see postprocess.glsl): shaft radiance is added to the
+// linear scene color after sampleSceneRaw's depth effects and before
+// exposure/tone mapping. FXAA/TAA/DoF and the later LDR chain (including
+// bloom, glow and highlight) then consume that result. The zeroed shaft
+// gate keeps the disabled path bit-identical.
 //
 // Pass order (see scene/postfx_stack.zig renderChain): PASS 2.5 SSAO,
 // PASS 2.75 bloom pyramid, PASS 2.8 glow, PASS 2.85 highlight, PASS 2.9
@@ -1838,9 +1837,9 @@ test "ssr and motion blur configurable quality options" {
 //
 // v1 non-goals (documented, not silent): no PCF in the march (one raw
 // tap per step — the bilateral blur eats the aliasing), no height-fog
-// coupling (shafts add on top of the fogged image), pre-tonemap HDR
-// injection (v1 composites into the same post-tonemap LDR chain the
-// glow/highlight halos use), secondary-camera views (primary only).
+// coupling (shafts add on top of the fogged image), secondary-camera
+// views (primary only). The shaft target uses RGBA16F where renderable and
+// retains the existing RGBA8 fallback for backends without float color RTs.
 
 /// Raymarch target resolution: half or quarter of the base size.
 pub const ShaftResolution = enum(u8) {
@@ -1888,10 +1887,11 @@ pub fn shaftActive(post_enabled: bool, cfg: PostProcessOptions, shadows_enabled:
 }
 
 // Pack the composite shaft_params vec4: (enabled 1/0, intensity, 0, 0).
-// Disabled packs all zeros, which keeps the composite bit-identical to
-// the pre-shaft path (the shader returns before sampling shaft_tex).
-pub fn shaftParams(cfg: PostProcessOptions) [4]f32 {
-    if (!cfg.shaft_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+// No valid raymarch result (including shadows-off/fail-closed) or a disabled
+// config packs zeros; the scene-texture binding used as a placeholder must
+// never be mistaken for shaft radiance.
+pub fn shaftParams(cfg: PostProcessOptions, result_available: bool) [4]f32 {
+    if (!cfg.shaft_enabled or !result_available) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
     return .{ 1.0, c.shaft_intensity, 0.0, 0.0 };
 }
@@ -1974,11 +1974,17 @@ test "shaft defaults are off and bit-identical" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg.shaft_blur_sigma, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.02), cfg.shaft_edge_sigma, 1e-6);
     // Off packs zeros: the composite never samples the shaft texture.
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, shaftParams(cfg));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, shaftParams(cfg, true));
     try std.testing.expect(!shaftActive(true, cfg, true));
     try std.testing.expect(!shaftActive(false, PostProcessOptions{ .shaft_enabled = true }, true));
     try std.testing.expect(!shaftActive(true, PostProcessOptions{ .shaft_enabled = true }, false));
     try std.testing.expect(shaftActive(true, PostProcessOptions{ .shaft_enabled = true }, true));
+    // A configured effect without a successful CSM-backed result must not
+    // sample the scene-view placeholder as if it were shaft radiance.
+    try std.testing.expectEqual(
+        [4]f32{ 0.0, 0.0, 0.0, 0.0 },
+        shaftParams(PostProcessOptions{ .shaft_enabled = true }, false),
+    );
 }
 
 test "shaft config clamped sanitizes ranges" {
@@ -2005,7 +2011,7 @@ test "shaft config clamped sanitizes ranges" {
     try std.testing.expectApproxEqAbs(-SHAFT_ANISOTROPY_MAX, cfg.clamped().shaft_anisotropy, 1e-6);
     // Enabled packs the clamped intensity.
     const on = PostProcessOptions{ .shaft_enabled = true, .shaft_intensity = 2.5 };
-    try std.testing.expectEqual([4]f32{ 1.0, 2.5, 0.0, 0.0 }, shaftParams(on));
+    try std.testing.expectEqual([4]f32{ 1.0, 2.5, 0.0, 0.0 }, shaftParams(on, true));
 }
 
 test "shaft validation rejects non-finite and out-of-range" {
