@@ -213,6 +213,8 @@ pub fn buildLibSokol(b: *Build, options: LibSokolOptions) !*Build.Step.Compile {
     }
     if (!isOptimizeModeDebug(options.optimize)) {
         try cflags.appendBounded("-DNDEBUG");
+        try cflags.appendBounded("-O3");
+        try cflags.appendBounded("-fno-math-errno");
     }
     switch (backend) {
         .d3d11 => try cflags.appendBounded("-DSOKOL_D3D11"),

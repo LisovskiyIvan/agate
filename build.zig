@@ -390,18 +390,21 @@ pub fn build(b: *Build) !void {
             // contribute no coverage feedback. User cflags land after zig's.
             if (optimize == .Debug) {
                 break :blk if (neon)
-                    &.{ "-std=c99", "-O2", "-DSTBI_NEON", no_sancov }
+                    &.{ "-std=c99", "-O2", "-DSTBI_NEON", "-fno-math-errno", no_sancov }
                 else
-                    &.{ "-std=c99", "-O2", no_sancov };
+                    &.{ "-std=c99", "-O2", "-fno-math-errno", no_sancov };
             }
             break :blk if (neon)
-                &.{ "-std=c99", "-DSTBI_NEON", no_sancov }
+                &.{ "-std=c99", "-O3", "-DSTBI_NEON", "-fno-math-errno", "-fno-trapping-math", no_sancov }
             else
-                &.{ "-std=c99", no_sancov };
+                &.{ "-std=c99", "-O3", "-fno-math-errno", "-fno-trapping-math", no_sancov };
         },
     });
     // Box3D v0.1.0, vendored C17 sources (MIT). Public headers under
     // src/agate/c/box3d/include, internal headers resolve inside src/.
+    // In Debug: -O2 prevents physics from bottlenecking frame time at -O0.
+    // In Release: -O3, -fno-math-errno and -fno-trapping-math enable hardware
+    // sqrt/rsqrt instructions and loop vectorization across collision and solver loops.
     mod_agate.addCSourceFiles(.{
         .files = &.{
             "src/agate/c/box3d/src/aabb.c",
@@ -455,7 +458,10 @@ pub fn build(b: *Build) !void {
             "src/agate/c/box3d/src/wheel_joint.c",
             "src/agate/c/box3d/src/world_snapshot.c",
         },
-        .flags = &.{ "-std=c17", no_sancov },
+        .flags = if (optimize == .Debug)
+            &.{ "-std=c17", "-O2", "-fno-math-errno", no_sancov }
+        else
+            &.{ "-std=c17", "-O3", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", no_sancov },
     });
     // meshoptimizer v1.2 (MIT), decoder-only subset vendored under
     // src/agate/c/meshopt. Compiled as C++: the decoder sources are
@@ -467,7 +473,10 @@ pub fn build(b: *Build) !void {
             "src/agate/c/meshopt/vertexcodec.cpp",
             "src/agate/c/meshopt/vertexfilter.cpp",
         },
-        .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", no_sancov },
+        .flags = if (optimize == .Debug)
+            &.{ "-std=c++17", "-O2", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", no_sancov }
+        else
+            &.{ "-std=c++17", "-O3", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", no_sancov },
     });
     mod_agate.link_libc = true;
     mod_agate.linkSystemLibrary("m", .{});
