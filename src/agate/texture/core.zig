@@ -122,7 +122,7 @@ pub const Texture = struct {
 
     /// Exact level bytes for one mip level: block-grid math for the
     /// compressed formats fromRawBlock uploads (4x4 blocks, 8 B each for
-    /// BC1, 16 B each for BC2/BC3/BC7/ASTC 4x4), w*h*bpp otherwise. `bpp`
+    /// BC1, 16 B each for BC2/BC3/BC7/ETC2 RGBA8/ASTC 4x4), w*h*bpp otherwise. `bpp`
     /// is the pixelFormatBytes of the format.
     fn gpuLevelBytes(format: sg.PixelFormat, w: u32, h: u32, bpp: usize) usize {
         switch (format) {
@@ -136,7 +136,7 @@ pub const Texture = struct {
                 const bh = (@as(usize, h) + 3) / 4;
                 return bw * bh * 16;
             },
-            .BC7_RGBA, .BC7_SRGBA, .ASTC_4x4_RGBA, .ASTC_4x4_SRGBA => {
+            .BC7_RGBA, .BC7_SRGBA, .ETC2_RGBA8, .ETC2_SRGB8A8, .ASTC_4x4_RGBA, .ASTC_4x4_SRGBA => {
                 const bw = (@as(usize, w) + 3) / 4;
                 const bh = (@as(usize, h) + 3) / 4;
                 return bw * bh * 16;
@@ -276,7 +276,7 @@ pub const Texture = struct {
     };
 
     // -----------------------------------------------------------------------
-    // Block-compressed textures (KTX2 BC1/BC2/BC3/BC7 / ASTC 4x4 and DDS
+    // Block-compressed textures (KTX2 BC1/BC2/BC3/BC7 / ETC2 RGBA8 / ASTC 4x4 and DDS
     // BC1/BC2/BC3/BC7, never decoded).
     //
     // Backend gate: compressed formats are uploaded only when
@@ -313,6 +313,8 @@ pub const Texture = struct {
         bc3_filter: bool = false,
         bc7_sample: bool = false,
         bc7_filter: bool = false,
+        etc2_sample: bool = false,
+        etc2_filter: bool = false,
         astc_sample: bool = false,
         astc_filter: bool = false,
 
@@ -322,12 +324,13 @@ pub const Texture = struct {
                 .BC1_RGBA => self.bc1_sample,
                 .BC2_RGBA, .BC3_RGBA, .BC3_SRGBA => self.bc3_sample,
                 .BC7_RGBA, .BC7_SRGBA => self.bc7_sample,
+                .ETC2_RGBA8, .ETC2_SRGB8A8 => self.etc2_sample,
                 .ASTC_4x4_RGBA, .ASTC_4x4_SRGBA => self.astc_sample,
                 else => false,
             };
         }
 
-        /// Preference order BC7 → BC3 → BC1 → ASTC 4x4 (UNORM
+        /// Preference order BC7 → BC3 → BC1 → ASTC 4x4 → ETC2 RGBA8 (UNORM
         /// representatives). Pure. Feeds the unsupported-format log hint so
         /// authors learn which encoding the current backend prefers.
         pub fn preferred(self: BlockSupport) ?sg.PixelFormat {
@@ -335,6 +338,7 @@ pub const Texture = struct {
             if (self.bc3_sample) return .BC3_RGBA;
             if (self.bc1_sample) return .BC1_RGBA;
             if (self.astc_sample) return .ASTC_4x4_RGBA;
+            if (self.etc2_sample) return .ETC2_RGBA8;
             return null;
         }
     };
@@ -352,6 +356,8 @@ pub const Texture = struct {
             .bc3_srgb => .BC3_SRGBA,
             .bc7_unorm => .BC7_RGBA,
             .bc7_srgb => .BC7_SRGBA,
+            .etc2_rgba8_unorm => .ETC2_RGBA8,
+            .etc2_rgba8_srgb => .ETC2_SRGB8A8,
             .astc_4x4_unorm => .ASTC_4x4_RGBA,
             .astc_4x4_srgb => .ASTC_4x4_SRGBA,
         };
@@ -364,6 +370,7 @@ pub const Texture = struct {
         const bc1 = sg.queryPixelformat(.BC1_RGBA);
         const bc3 = sg.queryPixelformat(.BC3_RGBA);
         const bc7 = sg.queryPixelformat(.BC7_RGBA);
+        const etc2 = sg.queryPixelformat(.ETC2_RGBA8);
         const astc = sg.queryPixelformat(.ASTC_4x4_RGBA);
         return .{
             .bc1_sample = bc1.sample,
@@ -372,6 +379,8 @@ pub const Texture = struct {
             .bc3_filter = bc3.filter,
             .bc7_sample = bc7.sample,
             .bc7_filter = bc7.filter,
+            .etc2_sample = etc2.sample,
+            .etc2_filter = etc2.filter,
             .astc_sample = astc.sample,
             .astc_filter = astc.filter,
         };
@@ -731,7 +740,7 @@ pub const Texture = struct {
     }
 
     /// Resolves a null Basis target against the live backend (BC7 when
-    /// sampleable, else ASTC 4x4, else the universal RGBA32 fallback). Without
+    /// sampleable, else ASTC 4x4, then ETC2 RGBA8, else universal RGBA32). Without
     /// an sg context (worker threads, CLI tools) returns null: decode entries
     /// then use the desktop-first .bc7 default and the fromRawBlock backend
     /// gate reports unsupported backends explicitly. Snapshot per load on the
@@ -745,7 +754,7 @@ pub const Texture = struct {
     /// it: block targets via fromRawBlock, the RGBA32 fallback via fromRaw.
     /// Main thread only (GPU upload); use ktx2.decodeBasis2D + fromRawBlock/
     /// fromRaw to split worker-thread transcode from main-thread upload. A
-    /// null target snapshots the live backend (BC7 → ASTC → RGBA32); an
+    /// null target snapshots the live backend (BC7 → ASTC → ETC2 → RGBA32); an
     /// explicit target forces it (unit tests, re-encode previews).
     /// options.srgb_to_linear is the RGBA-path decision (the block targets
     /// follow the file DFD, like every other .block upload).
@@ -1162,16 +1171,20 @@ test "sgPixelFormatForBlock maps UNORM/SRGB variants exactly" {
     try std.testing.expectEqual(sg.PixelFormat.BC3_SRGBA, Texture.sgPixelFormatForBlock(.bc3_srgb));
     try std.testing.expectEqual(sg.PixelFormat.BC7_RGBA, Texture.sgPixelFormatForBlock(.bc7_unorm));
     try std.testing.expectEqual(sg.PixelFormat.BC7_SRGBA, Texture.sgPixelFormatForBlock(.bc7_srgb));
+    try std.testing.expectEqual(sg.PixelFormat.ETC2_RGBA8, Texture.sgPixelFormatForBlock(.etc2_rgba8_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.ETC2_SRGB8A8, Texture.sgPixelFormatForBlock(.etc2_rgba8_srgb));
     try std.testing.expectEqual(sg.PixelFormat.ASTC_4x4_RGBA, Texture.sgPixelFormatForBlock(.astc_4x4_unorm));
     try std.testing.expectEqual(sg.PixelFormat.ASTC_4x4_SRGBA, Texture.sgPixelFormatForBlock(.astc_4x4_srgb));
 }
 
-test "BlockSupport gates exact variants and prefers BC7 over ASTC" {
-    const full: Texture.BlockSupport = .{ .bc7_sample = true, .bc7_filter = true, .astc_sample = true, .astc_filter = true };
+test "BlockSupport gates exact variants and prefers BC7 over ASTC and ETC2" {
+    const full: Texture.BlockSupport = .{ .bc7_sample = true, .bc7_filter = true, .etc2_sample = true, .etc2_filter = true, .astc_sample = true, .astc_filter = true };
     try std.testing.expect(full.supportsFormat(.BC7_RGBA));
     try std.testing.expect(full.supportsFormat(.BC7_SRGBA));
     try std.testing.expect(full.supportsFormat(.ASTC_4x4_RGBA));
     try std.testing.expect(full.supportsFormat(.ASTC_4x4_SRGBA));
+    try std.testing.expect(full.supportsFormat(.ETC2_RGBA8));
+    try std.testing.expect(full.supportsFormat(.ETC2_SRGB8A8));
     try std.testing.expect(!full.supportsFormat(.RGBA8));
     try std.testing.expect(!full.supportsFormat(.BC3_RGBA));
     // Preference order BC7 -> ASTC 4x4.
@@ -1183,6 +1196,11 @@ test "BlockSupport gates exact variants and prefers BC7 over ASTC" {
     try std.testing.expect(astc_only.supportsFormat(.ASTC_4x4_RGBA));
     try std.testing.expectEqual(sg.PixelFormat.ASTC_4x4_RGBA, astc_only.preferred().?);
 
+    const etc2_only: Texture.BlockSupport = .{ .etc2_sample = true, .etc2_filter = true };
+    try std.testing.expect(!etc2_only.supportsFormat(.ASTC_4x4_RGBA));
+    try std.testing.expect(etc2_only.supportsFormat(.ETC2_SRGB8A8));
+    try std.testing.expectEqual(sg.PixelFormat.ETC2_RGBA8, etc2_only.preferred().?);
+
     // Sample-without-filter still gates as supported (upload forces
     // NEAREST); SRGB and UNORM share the family bit.
     const bc7_no_filter: Texture.BlockSupport = .{ .bc7_sample = true };
@@ -1192,6 +1210,7 @@ test "BlockSupport gates exact variants and prefers BC7 over ASTC" {
     const none: Texture.BlockSupport = .{};
     try std.testing.expect(none.preferred() == null);
     try std.testing.expect(!none.supportsFormat(.BC7_RGBA));
+    try std.testing.expect(!none.supportsFormat(.ETC2_RGBA8));
 }
 
 test "BlockSupport gates the BC1/BC2/BC3 families for the DDS path" {

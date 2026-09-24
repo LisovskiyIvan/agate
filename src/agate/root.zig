@@ -95,8 +95,8 @@ pub const node_material = @import("node_material.zig");
 
 pub const texture = @import("texture.zig");
 /// KTX2 container reader: uncompressed LDR subset, block-compressed
-/// BC1/BC2/BC3/BC7 / ASTC 4x4 upload-without-transcoding, and Basis Universal
-/// transcoding (ETC1S/BasisLZ + UASTC LDR 4x4 → BC7/ASTC 4x4/RGBA32).
+/// BC1/BC2/BC3/BC7 / ETC2 RGBA8 / ASTC 4x4 upload-without-transcoding, and Basis
+/// Universal transcoding (ETC1S/BasisLZ + UASTC LDR 4x4 → BC7/ASTC/ETC2/RGBA32).
 /// Texture.decodeMemory/decodeImageMemory route KTX2 payloads here
 /// automatically by magic sniff.
 pub const ktx2 = @import("ktx2.zig");

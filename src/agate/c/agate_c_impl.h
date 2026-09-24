@@ -44,8 +44,8 @@ int agate_basis_ktx2_info(const uint8_t* data, size_t size, agate_basis_info* ou
 
 /* Transcodes one (level, face) of a KTX2 Basis file inspected by
    agate_basis_ktx2_info. `target`: 0 = BC7 RGBA, 1 = ASTC LDR 4x4 RGBA,
-   2 = RGBA32 raster. `out` must be EXACTLY the level size (blocks*16 for
-   block targets, orig_w*orig_h*4 for RGBA32); any mismatch fails. */
+   2 = RGBA32 raster, 3 = ETC2 RGBA8. `out` must be EXACTLY the level size
+   (blocks*16 for block targets, orig_w*orig_h*4 for RGBA32); mismatch fails. */
 bool agate_basis_ktx2_transcode(const uint8_t* data, size_t size,
     uint32_t level, uint32_t face, int32_t target,
     uint8_t* out, size_t out_len);

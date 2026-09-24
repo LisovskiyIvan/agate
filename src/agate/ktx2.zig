@@ -7,7 +7,7 @@ const CubeTexture = texture.CubeTexture;
 
 // ---------------------------------------------------------------------------
 // KTX2 container reader — the honest uncompressed subset, a no-transcode
-// block-compressed subset (BC7 / ASTC 4x4), and a REAL Basis Universal
+// block-compressed subset (BC7 / ASTC 4x4 / ETC2 RGBA8), and a REAL Basis Universal
 // transcode subset (ETC1S/BasisLZ + UASTC LDR 4x4 via the official transcoder
 // vendored under src/agate/c/basisu/, Apache-2.0; see LICENSES.md).
 //
@@ -20,11 +20,11 @@ const CubeTexture = texture.CubeTexture;
 //   - 8-bit UNORM/SRGB formats that map onto the engine's RGBA8 LDR upload
 //     path: R8, R8G8, R8G8B8A8, B8G8R8A8, A8B8G8R8_PACK32 (same LE byte
 //     order as R8G8B8A8). Everything else uncompressed (16F/32F, packed
-//     16-bit, BC4-BC6, ETC/EAC, other ASTC footprints) errors with
+//     16-bit, BC4-BC6, ETC1/EAC, other ASTC footprints) errors with
 //     UnsupportedVkFormat.
 //   - block-compressed BC1_UNORM (vk 133), BC2_UNORM (135),
 //     BC3_UNORM/SRGB (vk 137/138), BC7_UNORM/SRGB (vk 145/146) and
-//     ASTC_4x4_UNORM/SRGB (vk 157/158), uploaded WITHOUT decoding:
+//     ASTC_4x4_UNORM/SRGB (vk 157/158), ETC2_RGBA8_UNORM/SRGB (vk 151/152), uploaded WITHOUT decoding:
 //     decodeBlock2D returns owned per-level slices for
 //     Texture.fromRawBlock. No CPU mip synthesis (a decoder/encoder pair
 //     would be a new dependency). Cube block files are rejected — only 2D.
@@ -32,7 +32,7 @@ const CubeTexture = texture.CubeTexture;
 //     decodes into the same RawBlockTexture.
 //   - Basis (vkFormat UNDEFINED == 0): ETC1S (BasisLZ supercompression) and
 //     UASTC LDR 4x4, transcoded to a caller-chosen target — BC7 (desktop),
-//     ASTC 4x4, or RGBA32 (universal CPU fallback) — with the full
+//     ASTC 4x4, ETC2 RGBA8, or RGBA32 (universal CPU fallback) — with the full
 //     file-authored mip chain, per level, 2D only. sRGB follows the file DFD
 //     for block targets (the sRGB GPU variant, like the no-transcode path)
 //     and the caller's srgb_to_linear decision for RGBA32.
@@ -46,11 +46,10 @@ const CubeTexture = texture.CubeTexture;
 //   - Basis HDR/XUASTC/ASTC-LDR/XUBC7 kinds, ETC1S video (P-frames), Basis
 //     cubes/arrays/3D, levelCount 0/17+ → BasisUnsupported (cubes additionally
 //     hit UnsupportedFaceCount on the 2D-only entry points, matching the
-//     no-transcode path). No ETC2/BC1/BC3/BC5 transcode targets: the engine
-//     has no ETC2 upload path, and BC7 strictly supersedes BC1/BC3 for the
-//     desktop-first backends (server-side re-encode remains the fix for
-//     backends with no compressed target at all — the RGBA32 fallback always
-//     uploads).
+//     no-transcode path). BC1/BC3/BC5 transcode targets remain omitted because
+//     BC7 supersedes BC1/BC3 on the desktop-first backends; ETC2 RGBA8 is kept
+//     as a mobile compressed fallback when ASTC is unavailable. The RGBA32
+//     fallback always uploads on backends with no compressed target.
 //   - the data format descriptor (DFD) and the key/value data are skipped by
 //     offset on the non-Basis paths — the numeric vkFormat alone drives the
 //     texel interpretation, which is exact for the supported subset. KTX2
@@ -60,8 +59,8 @@ const CubeTexture = texture.CubeTexture;
 //     function).
 //
 // NOTE on "DXGI codes": the KTX2 header carries only vkFormat (offset 12);
-// there is no DXGI field to read. The SRGB block variants (146/158) are the
-// counterparts of DXGI_BC7_UNORM_SRGB / DXGI ASTC sRGB encodings.
+// there is no DXGI field to read. The SRGB block variants (146/152/158) are
+// the BC7, ETC2 RGBA8, and ASTC sRGB encodings.
 // ---------------------------------------------------------------------------
 
 /// The 12-byte KTX2 identifier: «KTX 20» + CR LF ^Z LF.
@@ -148,6 +147,7 @@ pub fn formatFromVk(vk_format: u32) ?Format {
 ///   135 = VK_FORMAT_BC2_UNORM_BLOCK (DXT3, 4x4, 16 B/block),
 ///   137/138 = VK_FORMAT_BC3_UNORM_BLOCK / _SRGB_BLOCK (DXT5, 4x4, 16 B/block),
 ///   145/146 = VK_FORMAT_BC7_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
+///   151/152 = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
 ///   157/158 = VK_FORMAT_ASTC_4x4_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block).
 /// BC1/BC2 have no sRGB GPU variant in this sokol checkout (only BC3_SRGBA
 /// and BC7_SRGBA exist), so their _SRGB Vulkan/DXGI counterparts upload as
@@ -160,6 +160,8 @@ pub const BlockFormat = enum(u32) {
     bc3_srgb = 138,
     bc7_unorm = 145,
     bc7_srgb = 146,
+    etc2_rgba8_unorm = 151,
+    etc2_rgba8_srgb = 152,
     astc_4x4_unorm = 157,
     astc_4x4_srgb = 158,
 
@@ -183,7 +185,7 @@ pub const BlockFormat = enum(u32) {
     /// without a decoder.
     pub fn isSrgb(self: BlockFormat) bool {
         return switch (self) {
-            .bc3_srgb, .bc7_srgb, .astc_4x4_srgb => true,
+            .bc3_srgb, .bc7_srgb, .etc2_rgba8_srgb, .astc_4x4_srgb => true,
             else => false,
         };
     }
@@ -476,6 +478,8 @@ pub const BasisTarget = enum(i32) {
     astc = 1,
     /// Universal CPU fallback (RGBA32 raster, R first, 4 B per pixel).
     rgba32 = 2,
+    /// Mobile compressed fallback (ETC2 RGBA8, 16 B per 4x4 block).
+    etc2_rgba = 3,
 };
 
 /// Basis payload kind reported by the transcoder.
@@ -505,13 +509,12 @@ pub fn isBasisKtx2(bytes: []const u8) bool {
 }
 
 /// Compressed-target preference from live backend caps: BC7 when sampleable
-/// (desktop), else ASTC 4x4 (mobile), else the universal RGBA32 fallback
-/// (always uploads; costs ~4x the VRAM of BC7). Pure and unit-tested. BC1/
-/// BC3/ETC2 are deliberately absent: BC7 supersedes BC1/BC3 on the backends
-/// the engine ships, and there is no ETC2 upload path (see fromRawBlock).
+/// (desktop), else ASTC 4x4, then ETC2 RGBA8 (widely available on GLES 3
+/// devices), else the universal RGBA32 fallback. Pure and unit-tested.
 pub fn preferredBasisTarget(support: Texture.BlockSupport) BasisTarget {
     if (support.bc7_sample) return .bc7;
     if (support.astc_sample) return .astc;
+    if (support.etc2_sample) return .etc2_rgba;
     return .rgba32;
 }
 
@@ -604,7 +607,7 @@ pub fn decodeBasis2D(
 ) DecodeError!Texture.DecodedImage {
     const info = try basisInfo(bytes);
     return switch (target) {
-        .bc7, .astc => .{ .block = try transcodeBlockLevels(allocator, bytes, info, target) },
+        .bc7, .astc, .etc2_rgba => .{ .block = try transcodeBlockLevels(allocator, bytes, info, target) },
         .rgba32 => .{ .rgba = try transcodeRgbaLevels(allocator, bytes, info, opts) },
     };
 }
@@ -621,6 +624,7 @@ fn transcodeBlockLevels(
     const format: BlockFormat = switch (target) {
         .bc7 => if (info.is_srgb) .bc7_srgb else .bc7_unorm,
         .astc => if (info.is_srgb) .astc_4x4_srgb else .astc_4x4_unorm,
+        .etc2_rgba => if (info.is_srgb) .etc2_rgba8_srgb else .etc2_rgba8_unorm,
         .rgba32 => unreachable,
     };
     var raw = RawBlockTexture{
@@ -1240,13 +1244,15 @@ test "Texture.decodeMemory routes KTX2 payloads by magic sniff" {
     try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, raw.levels[0].?[0..4].*);
 }
 
-test "blockFormatFromVk covers exactly the BC and ASTC 4x4 subsets" {
+test "blockFormatFromVk covers the BC, ETC2 RGBA8, and ASTC 4x4 subsets" {
     try testing.expectEqual(BlockFormat.bc1_unorm, blockFormatFromVk(133).?);
     try testing.expectEqual(BlockFormat.bc2_unorm, blockFormatFromVk(135).?);
     try testing.expectEqual(BlockFormat.bc3_unorm, blockFormatFromVk(137).?);
     try testing.expectEqual(BlockFormat.bc3_srgb, blockFormatFromVk(138).?);
     try testing.expectEqual(BlockFormat.bc7_unorm, blockFormatFromVk(145).?);
     try testing.expectEqual(BlockFormat.bc7_srgb, blockFormatFromVk(146).?);
+    try testing.expectEqual(BlockFormat.etc2_rgba8_unorm, blockFormatFromVk(151).?);
+    try testing.expectEqual(BlockFormat.etc2_rgba8_srgb, blockFormatFromVk(152).?);
     try testing.expectEqual(BlockFormat.astc_4x4_unorm, blockFormatFromVk(157).?);
     try testing.expectEqual(BlockFormat.astc_4x4_srgb, blockFormatFromVk(158).?);
     try testing.expect(blockFormatFromVk(0) == null); // UNDEFINED
@@ -1261,12 +1267,15 @@ test "blockFormatFromVk covers exactly the BC and ASTC 4x4 subsets" {
     try testing.expect(BlockFormat.bc3_srgb.isSrgb() == true);
     try testing.expect(BlockFormat.bc7_unorm.isSrgb() == false);
     try testing.expect(BlockFormat.bc7_srgb.isSrgb() == true);
+    try testing.expect(BlockFormat.etc2_rgba8_unorm.isSrgb() == false);
+    try testing.expect(BlockFormat.etc2_rgba8_srgb.isSrgb() == true);
     try testing.expect(BlockFormat.astc_4x4_unorm.isSrgb() == false);
     try testing.expect(BlockFormat.astc_4x4_srgb.isSrgb() == true);
     try testing.expect(BlockFormat.bc1_unorm.blockByteSize() == 8);
     try testing.expect(BlockFormat.bc2_unorm.blockByteSize() == 16);
     try testing.expect(BlockFormat.bc3_unorm.blockByteSize() == 16);
     try testing.expect(BlockFormat.bc7_unorm.blockByteSize() == 16);
+    try testing.expect(BlockFormat.etc2_rgba8_unorm.blockByteSize() == 16);
     try testing.expect(BlockFormat.astc_4x4_unorm.blockByteSize() == 16);
 }
 
@@ -1485,7 +1494,7 @@ test "Texture.decodeImageMemory routes block payloads without touching the RGBA8
 // ---------------------------------------------------------------------------
 // Basis Universal tests — REAL toktx fixtures (src/agate/ktx2_fixtures/,
 // see README.md there), not fabricated headers. Sizes: 16x16 base, 5-level
-// chains (16..1): RGBA32 level bytes [1024,256,64,16,4], BC7/ASTC block
+// chains (16..1): RGBA32 level bytes [1024,256,64,16,4], BC7/ASTC/ETC2 block
 // bytes [256,64,16,16,16].
 // ---------------------------------------------------------------------------
 
@@ -1602,6 +1611,34 @@ test "decodeBasis2D transcodes a real UASTC mip chain to BC7" {
     }
 }
 
+test "decodeBasis2D transcodes a real ETC1S mip chain to ETC2 RGBA8" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_etc1s_rgba_mip, .etc2_rgba, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.etc2_rgba8_srgb, b.format);
+            try testing.expectEqual(@as(u32, 5), b.num_levels);
+            const want = [_]usize{ 256, 64, 16, 16, 16 };
+            for (want, 0..) |n, m| try testing.expectEqual(n, b.levels[m].?.len);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
+test "decodeBasis2D transcodes a real UASTC image to ETC2 RGBA8" {
+    const allocator = testing.allocator;
+    var img = try decodeBasis2D(allocator, fx_uastc_rgba_mip, .etc2_rgba, .{});
+    defer img.deinit(allocator);
+    switch (img) {
+        .block => |b| {
+            try testing.expectEqual(BlockFormat.etc2_rgba8_srgb, b.format);
+            try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
+        },
+        .rgba => return error.TestUnexpectedResult,
+    }
+}
+
 test "decodeBasis2D transcodes zstd-supercompressed UASTC (vendored zstd)" {
     const allocator = testing.allocator;
     var img = try decodeBasis2D(allocator, fx_uastc_rgba_zstd, .bc7, .{});
@@ -1692,13 +1729,19 @@ test "decodeBasis2D RGBA32 fallback keeps sizes, alpha and sRGB behavior" {
     }
 }
 
-test "preferredBasisTarget ladders BC7, ASTC, then the RGBA32 fallback" {
+test "preferredBasisTarget ladders BC7, ASTC, ETC2, then RGBA32" {
     const bc7: Texture.BlockSupport = .{ .bc7_sample = true };
     try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(bc7));
     const astc: Texture.BlockSupport = .{ .astc_sample = true };
     try testing.expectEqual(BasisTarget.astc, preferredBasisTarget(astc));
+    const etc2: Texture.BlockSupport = .{ .etc2_sample = true };
+    try testing.expectEqual(BasisTarget.etc2_rgba, preferredBasisTarget(etc2));
+    const mobile: Texture.BlockSupport = .{ .astc_sample = true, .etc2_sample = true };
+    try testing.expectEqual(BasisTarget.astc, preferredBasisTarget(mobile));
     const both: Texture.BlockSupport = .{ .bc7_sample = true, .astc_sample = true };
     try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(both));
+    const bc7_etc2: Texture.BlockSupport = .{ .bc7_sample = true, .etc2_sample = true };
+    try testing.expectEqual(BasisTarget.bc7, preferredBasisTarget(bc7_etc2));
     try testing.expectEqual(BasisTarget.rgba32, preferredBasisTarget(.{}));
     // Sample-without-filter still counts (upload forces NEAREST there).
     const no_filter: Texture.BlockSupport = .{ .bc7_sample = true };

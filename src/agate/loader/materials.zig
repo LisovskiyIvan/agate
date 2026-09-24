@@ -83,7 +83,6 @@ pub fn colorSlotImageFlags(allocator: std.mem.Allocator, gltf: *c.cgltf_data) ![
         }
     }
     return flags;
-
 }
 
 fn markColorSlotImage(gltf: *c.cgltf_data, view: c.cgltf_texture_view, flags: []bool) void {
@@ -115,8 +114,8 @@ pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Te
     defer if (srgb_flags) |flags| scene.allocator.free(flags);
 
     // One backend snapshot for every worker: Basis decodes transcode to BC7
-    // on desktop, ASTC where that is all the backend samples, RGBA32 where
-    // nothing compressed samples. Off-context (no sg) leaves null — the
+    // on desktop, ASTC when supported, ETC2 when ASTC is unavailable, and
+    // RGBA32 where no compressed target samples. Off-context (no sg) leaves null — the
     // desktop-first .bc7 default applies and fromRawBlock gates explicitly.
     const basis_target: ?ktx2.BasisTarget = if (sg.isvalid()) ktx2.preferredBasisTarget(Texture.queryBlockSupport()) else null;
 
@@ -757,8 +756,6 @@ test "loadMaterials maps KHR_materials_transmission and KHR_materials_ior (GPU-f
     try std.testing.expectEqual(@as(f32, 1.33), out[1].?.pbr.ior);
     try std.testing.expectEqual(@as(f32, 1.33), out[1].?.pbr.transmission.ior);
 }
-
-
 
 test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {
     // glTF 2.0 spec enums: 10497 REPEAT, 33071 CLAMP_TO_EDGE, 33648

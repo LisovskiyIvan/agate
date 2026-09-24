@@ -113,6 +113,10 @@ bool agate_basis_ktx2_transcode(const uint8_t* data, size_t size,
         fmt = basist::transcoder_texture_format::cTFRGBA32;
         block_or_pixel_bytes = 4;
         break;
+    case 3: // ETC2 RGBA8, 16 B per 4x4 block
+        fmt = basist::transcoder_texture_format::cTFETC2_RGBA;
+        block_or_pixel_bytes = 16;
+        break;
     default:
         return false;
     }
