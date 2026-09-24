@@ -219,13 +219,13 @@ pub const Scene = struct {
     /// `pending_update_ms` + `recordUpdateTime` and is transferred by
     /// prepareFrame.
     stats: SceneStats = .{},
-    /// Staged update-phase timing: the game side writes ONLY this field via
-    /// `recordUpdateTime` (under update-vs-prepare exclusion); prepareFrame
-    /// transfers the last tick into `stats.update_ms`. Separate word from
-    /// every stats field, so update||render shares no memory here.
-    pending_update_ms: f32 = 0,
-    /// Staged physics-phase timing: written via `recordPhysicsTime` or `updatePhysics`.
-    pending_physics_ms: f32 = 0,
+    /// Latest update timing crosses the producer/prepare boundary atomically.
+    /// Prepare may finish a slot-owned frame while the producer starts the
+    /// next tick, so a plain float here would race even though stats itself
+    /// remains context-owned.
+    pending_update_ms: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
+    /// Latest physics timing, published with the same single-writer rule.
+    pending_physics_ms: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
     // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
     frame_id: u64 = 0,
 
@@ -392,6 +392,14 @@ pub const Scene = struct {
     build_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
     /// Flag indicating whether prepareFrame() has already run for this frame.
     frame_prepared: bool = false,
+    /// Context-only linear-use guard for the split prepare token. A begin
+    /// claims a slot and must be paired with exactly one finish or cancel.
+    prepare_claim_generation: u64 = 0,
+    prepare_claim_active: bool = false,
+    prepare_claim_slot: usize = 0,
+    prepare_claim_seq: u64 = 0,
+    prepare_claim_have_build: bool = false,
+    prepare_claim_has_handoff: bool = false,
     /// Reuse guard owned by `renderReuse` on the context thread (set around
     /// the inner `render()` call, never observed concurrently): tells render
     /// to skip the `prepareFrame` fallback and the profiler `recordFrame`
@@ -512,19 +520,6 @@ pub const Scene = struct {
     /// too small changes nothing, too large slows the sim tick rate
     /// (ticks/s floor: the latch needs one fresh build per 16.7 ms frame).
     concurrent_yield_ns: u64 = 0,
-    /// Game-owned queue-build stats accumulator (stage-2 increment B,
-    /// slot-staged since wave 31 second slice): `buildIntoClaimedSlot`
-    /// clears this at build start, the game-side `buildQueuesInto`
-    /// accumulates the queue counters here (never `self.stats`, which stays
-    /// context-owned), and the build freezes a plain copy into the claimed
-    /// slot's `build_stats` (staged-wins over any post-build accumulation,
-    /// same precedent as the snapshot). The prepare latch merges the SLOT
-    /// copy into `self.stats` via `SceneStats.mergeFrom` (after the latch's
-    /// own reset) and zeroes both copies. The live field itself never
-    /// crosses the handoff edge — a concurrent game-side accumulation
-    /// cannot race the context-side merge.
-    build_stats: SceneStats = .{},
-
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
     /// P6 render-owned UI frame: prepareFrame captures CPU geometry + draw
@@ -1310,6 +1305,7 @@ pub const Scene = struct {
         slot: usize,
         seq: u64,
         completed: bool = false,
+        did_build: bool = false,
 
         /// Run the shared build core into the claimed slot (commit of the
         /// last published latch outcomes, CPU staging, record freeze, queue/
@@ -1317,6 +1313,7 @@ pub const Scene = struct {
         /// wins); the generation is only committed by `publish()`.
         pub fn build(self: *BuildClaim) void {
             self.scene.buildIntoClaimedSlot(self.slot, self.seq);
+            self.did_build = true;
         }
 
         /// Stage the live canvas CPU packet into the CLAIMED slot (concurrent
@@ -1339,7 +1336,17 @@ pub const Scene = struct {
             self.completed = true;
             const s = self.scene;
             std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
-            s.draws.releaseHandoffWithSeq(self.slot, self.seq, &s.build_slot, &s.build_seq) catch {};
+            // UI-only claims are supported, so stamp every published slot
+            // here as well as the full build core. Prepare consumes this
+            // exact generation after newer producer claims may publish.
+            const slot = s.draws.slotAt(self.slot);
+            slot.build_seq = self.seq;
+            slot.has_scene_build = self.did_build;
+            s.draws.releaseHandoffWithSeq(self.slot, self.seq, &s.build_slot, &s.build_seq) catch {
+                // A failed publish must not strand the producer lease. The
+                // generation remains uncommitted and prepare sees no handoff.
+                s.draws.cancelClaim(self.slot) catch {};
+            };
         }
 
         /// Drop the claim without committing (seq/handoff untouched: prepare
@@ -1368,6 +1375,22 @@ pub const Scene = struct {
     /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn prepareFrame(self: *Scene) void {
         scene_frame.prepareFrame(self);
+    }
+
+    /// Split context prepare at the caller's producer/live-state lock
+    /// boundary. See `scene/frame_api.zig` for the ownership contract.
+    pub const PrepareClaim = scene_frame.PrepareClaim;
+
+    pub fn beginStagedPrepare(self: *Scene) ?PrepareClaim {
+        return scene_frame.beginStagedPrepare(self);
+    }
+
+    pub fn finishStagedPrepare(self: *Scene, claim: PrepareClaim) void {
+        scene_frame.finishStagedPrepare(self, claim);
+    }
+
+    pub fn cancelStagedPrepare(self: *Scene, claim: PrepareClaim) void {
+        scene_frame.cancelStagedPrepare(self, claim);
     }
 
     /// See `scene/lights_api.zig` (owns the body + docs).

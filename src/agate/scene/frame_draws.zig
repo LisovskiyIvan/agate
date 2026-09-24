@@ -76,8 +76,10 @@
 //!   `unpin`-without-`pin` is an error, never a no-op.
 //! - Threading split (explicit, no silent gap): the lease INDEX words
 //!   (`front`, `pinned`, `writing`, counters) are serialized by the internal
-//!   mutex in `claimBack` / `claimSlot` / `tryPublish` / `cancelClaim` /
-//!   `pin` / `pinFront` / `unpin` / `frontIndex` / `isPinned` / `pinsHeld`.
+//!   mutex in `claimBack` / `claimSlot` / `claimLatestHandoff` /
+//!   `cancelHandoffClaim` / `tryPublish` / `cancelClaim` / `pin` /
+//!   `pinFront` / `pinFrontReader` / `unpin` / `unpinReader` / `frontIndex` /
+//!   `isPinned` / `isReadPinned` / `pinsHeld`.
 //!   The legacy trio (`backIndex` / `backSlot` / `publish`) plus direct
 //!   `slots[i]` payload access are SINGLE-THREADED ONLY (the sequential
 //!   legacy `stageUiPacket` path and the wave-26 rotation tests):
@@ -246,6 +248,12 @@ pub const LeaseError = error{
     NotClaimed,
 };
 
+pub const HandoffClaim = struct {
+    slot: usize,
+    seq: u64,
+    has_scene_build: bool,
+};
+
 /// One coherent prepared frame: the prepared mesh draw lists (view queues,
 // outline, shadow) the render phase consumes. Built whole into a BACK
 // slot, then published by index flip; render touches it only through const
@@ -321,17 +329,20 @@ pub const FrameDrawSlot = struct {
     /// `cpuBytes` deliberately excludes it (fixed scalar, like
     /// `frame_id`/`retire_epoch` — the census counts retained list capacity).
     snapshot: snapshot_mod.SceneFrameSnapshot = .{},
-    /// Slot-owned staged build stats (wave 31 second slice,
-    /// lock-free-publication slice 3): the game-side queue build
-    /// accumulates into the live `Scene.build_stats` accumulator and
-    /// `Scene.buildIntoClaimedSlot` freezes a plain copy here at build
-    /// time; the prepare latch merges THIS copy into `Scene.stats`
-    /// instead of reading the shared field — so a concurrent game-side
-    /// accumulation cannot race the context-side merge. Plain struct
-    /// copy (counter fields only — `mergeFrom` never touches the
-    /// context-owned timing/upload fields); `reset` zeroes it so a
-    /// reused slot can never resurface a prior frame's stats.
+    /// Slot-owned build counters. The producer writes directly into this
+    /// claimed slot while building; prepare merges the same immutable copy
+    /// after the publish edge. No shared producer-side accumulator crosses
+    /// the handoff. `reset` zeroes this field so a reused slot cannot
+    /// resurface stale counters.
     build_stats: stats_mod.SceneStats = .{},
+    /// Producer generation that built this slot. Prepare latches this exact
+    /// generation even if a newer build publishes while the slot-only latch
+    /// is finishing.
+    build_seq: u64 = 0,
+    /// True only when the producer built the 3D/frame payload, not a
+    /// UI-packet-only claim. Staged-only prepare must not consume stale 3D
+    /// data as if it belonged to a UI-only handoff.
+    has_scene_build: bool = false,
     /// Slot-owned frozen particle capture (wave 32, freeze-then-latch
     /// slice 4): the game-side build (`Scene.buildIntoClaimedSlot`,
     /// via `ParticleLayer.stageIntoSlot`) freezes the just-captured
@@ -378,6 +389,8 @@ pub const FrameDrawSlot = struct {
         self.ui_packet = .{};
         self.snapshot = .{};
         self.build_stats = .{};
+        self.build_seq = 0;
+        self.has_scene_build = false;
         self.particle_draws.clearRetainingCapacity();
         self.physics_lines.clearRetainingCapacity();
         self.physics_visible = false;
@@ -463,6 +476,10 @@ pub const FrameDraws = struct {
     /// Consumer pins: pinned slots are never build targets and never publish
     /// targets. Set only via `pin`/`pinFront`, cleared only via `unpin`.
     pinned: [SLOT_COUNT]bool = .{false} ** SLOT_COUNT,
+    /// Shared read leases used by producer commit while the context may also
+    /// be presenting the current front. Multiple readers are safe; every
+    /// writer/rotation path treats a nonzero count as pinned.
+    read_pins: [SLOT_COUNT]usize = .{0} ** SLOT_COUNT,
     /// Producer claims: slots currently being filled between `claimBack`
     /// and `tryPublish`/`cancelClaim`. `pin` refuses these (`SlotBusy`).
     writing: [SLOT_COUNT]bool = .{false} ** SLOT_COUNT,
@@ -500,7 +517,7 @@ pub const FrameDraws = struct {
         var k: usize = 1;
         while (k < SLOT_COUNT) : (k += 1) {
             const idx = (self.front + k) % SLOT_COUNT;
-            if (!self.pinned[idx] and !self.writing[idx]) return idx;
+            if (!self.pinned[idx] and self.read_pins[idx] == 0 and !self.writing[idx]) return idx;
         }
         unreachable; // sequential path holds no pins/claims: a slot is free
     }
@@ -529,7 +546,7 @@ pub const FrameDraws = struct {
     /// locked `tryPublish` instead).
     pub fn publish(self: *FrameDraws, back_idx: usize) void {
         std.debug.assert(back_idx == self.backIndex());
-        std.debug.assert(!self.pinned[back_idx]);
+        std.debug.assert(!self.pinned[back_idx] and self.read_pins[back_idx] == 0);
         self.front = back_idx;
         if (self.handoff == back_idx) self.handoff = null;
     }
@@ -548,7 +565,7 @@ pub const FrameDraws = struct {
         var k: usize = 1;
         while (k < SLOT_COUNT) : (k += 1) {
             const idx = (self.front + k) % SLOT_COUNT;
-            if (!self.pinned[idx] and !self.writing[idx] and (self.handoff == null or self.handoff.? != idx)) {
+            if (!self.pinned[idx] and self.read_pins[idx] == 0 and !self.writing[idx] and (self.handoff == null or self.handoff.? != idx)) {
                 self.writing[idx] = true;
                 return idx;
             }
@@ -558,7 +575,7 @@ pub const FrameDraws = struct {
         k = 1;
         while (k < SLOT_COUNT) : (k += 1) {
             const idx = (self.front + k) % SLOT_COUNT;
-            if (!self.pinned[idx] and !self.writing[idx]) {
+            if (!self.pinned[idx] and self.read_pins[idx] == 0 and !self.writing[idx]) {
                 self.writing[idx] = true;
                 if (self.handoff == idx) self.handoff = null;
                 return idx;
@@ -584,7 +601,7 @@ pub const FrameDraws = struct {
         if (idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
         lockLease(&self.mutex);
         defer self.mutex.unlock();
-        if (self.pinned[idx]) {
+        if (self.pinned[idx] or self.read_pins[idx] != 0) {
             self.publish_refusals += 1;
             return LeaseError.PinnedSlot;
         }
@@ -596,6 +613,60 @@ pub const FrameDraws = struct {
         if (self.handoff == idx) self.handoff = null;
     }
 
+    /// Atomically reads the producer's published `(build_slot, build_seq)`
+    /// pair and claims that exact handoff under the same lease mutex used by
+    /// `releaseHandoffWithSeq`. This prevents the consumer from pairing an
+    /// old sequence with a newer slot when the producer publishes between
+    /// separate atomic loads. `null` means no generation is pending; lease
+    /// failures are counted and returned.
+    pub fn claimLatestHandoff(
+        self: *FrameDraws,
+        build_slot: *const std.atomic.Value(usize),
+        build_seq: *const std.atomic.Value(u64),
+        last_latched_seq: u64,
+        require_scene_build: bool,
+    ) LeaseError!?HandoffClaim {
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+
+        const seq = build_seq.load(.monotonic);
+        if (seq == last_latched_seq) return null;
+        const idx = build_slot.load(.monotonic);
+        if (idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
+        // Lease words FIRST, payload second: every payload writer holds
+        // `writing` (or the publish mutex edge that clears it) under this
+        // same mutex, so once we observe an unclaimed, unpinned slot here
+        // the payload reads below are race-free. `claimBack` pass 2 may
+        // supersede this very handoff slot (reset + rebuild under its own
+        // claim) — that window is exactly `writing == true` for us.
+        if (self.pinned[idx] or self.read_pins[idx] != 0) {
+            self.publish_refusals += 1;
+            return LeaseError.PinnedSlot;
+        }
+        if (self.writing[idx]) {
+            self.saturation_skips += 1;
+            return LeaseError.SlotBusy;
+        }
+        // Pair validation: publication stamped the slot under this same
+        // mutex, so the slot stamp is the authoritative marker that this
+        // exact (slot, seq) pair is still the pending handoff. The `handoff`
+        // field itself is NOT checked here: claimSlot/cancelClaim legitimately
+        // clear it as a reservation marker (e.g. a contention holder probing
+        // the slot), and the pending build must stay claimable after that
+        // reservation is released. A stamp mismatch means the slot was
+        // reclaimed and reset between publish and this claim — fail closed
+        // as a counted skip rather than consuming the wrong payload.
+        if (self.slots[idx].build_seq != seq) {
+            self.saturation_skips += 1;
+            return LeaseError.SlotBusy;
+        }
+        const has_scene_build = self.slots[idx].has_scene_build;
+        if (require_scene_build and !has_scene_build) return null;
+        self.writing[idx] = true;
+        self.handoff = null;
+        return HandoffClaim{ .slot = idx, .seq = seq, .has_scene_build = has_scene_build };
+    }
+
     /// Concurrent-producer publish: hand a claimed slot to the consumer.
     /// Refuses (with counting, state unchanged) a pinned target or a slot
     /// that was never claimed. Clears WRITING and flips `front` on success.
@@ -604,7 +675,7 @@ pub const FrameDraws = struct {
         lockLease(&self.mutex);
         defer self.mutex.unlock();
         if (!self.writing[back_idx]) return LeaseError.NotClaimed;
-        if (self.pinned[back_idx]) {
+        if (self.pinned[back_idx] or self.read_pins[back_idx] != 0) {
             self.publish_refusals += 1;
             return LeaseError.PinnedSlot;
         }
@@ -629,7 +700,7 @@ pub const FrameDraws = struct {
         lockLease(&self.mutex);
         defer self.mutex.unlock();
         if (!self.writing[back_idx]) return LeaseError.NotClaimed;
-        if (self.pinned[back_idx]) {
+        if (self.pinned[back_idx] or self.read_pins[back_idx] != 0) {
             self.publish_refusals += 1;
             return LeaseError.PinnedSlot;
         }
@@ -652,7 +723,7 @@ pub const FrameDraws = struct {
         lockLease(&self.mutex);
         defer self.mutex.unlock();
         if (!self.writing[back_idx]) return LeaseError.NotClaimed;
-        if (self.pinned[back_idx]) {
+        if (self.pinned[back_idx] or self.read_pins[back_idx] != 0) {
             self.publish_refusals += 1;
             return LeaseError.PinnedSlot;
         }
@@ -675,6 +746,26 @@ pub const FrameDraws = struct {
         if (self.handoff == back_idx) self.handoff = null;
     }
 
+    /// Releases a prepare-held handoff claim after cancellation. Restore it
+    /// only if no newer producer generation replaced the published pair
+    /// while prepare was in flight; newest-wins remains intact otherwise.
+    pub fn cancelHandoffClaim(
+        self: *FrameDraws,
+        back_idx: usize,
+        seq: u64,
+        build_slot: *const std.atomic.Value(usize),
+        build_seq: *const std.atomic.Value(u64),
+    ) LeaseError!void {
+        if (back_idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.writing[back_idx]) return LeaseError.NotClaimed;
+        self.writing[back_idx] = false;
+        if (build_seq.load(.monotonic) == seq and build_slot.load(.monotonic) == back_idx) {
+            self.handoff = back_idx;
+        }
+    }
+
     /// Consumer pin: hold `idx` for presentation. The slot must be a valid,
     /// unpinned, unclaimed slot; a pinned slot stays readable across any
     /// number of later publishes until `unpin`. Double-pin and pinning a
@@ -683,7 +774,7 @@ pub const FrameDraws = struct {
         if (idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
         lockLease(&self.mutex);
         defer self.mutex.unlock();
-        if (self.pinned[idx]) {
+        if (self.pinned[idx] or self.read_pins[idx] != 0) {
             self.pin_denials += 1;
             return LeaseError.AlreadyPinned;
         }
@@ -712,6 +803,21 @@ pub const FrameDraws = struct {
         return idx;
     }
 
+    /// Shared read lease on the current front. Unlike the presentation pin,
+    /// this may coexist with another reader (including render) because the
+    /// slot is immutable while published. It prevents the slot from being
+    /// reclaimed if a concurrent prepare advances `front` during the read.
+    pub fn pinFrontReader(self: *FrameDraws) usize {
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        const idx = self.front;
+        std.debug.assert(!self.writing[idx]);
+        self.read_pins[idx] += 1;
+        self.pins_held += 1;
+        self.total_pins += 1;
+        return idx;
+    }
+
     /// Consumer unpin: release a held slot back to the rotation. MANDATORY
     /// after every successful `pin`/`pinFront`; unpinning a slot that is not
     /// pinned is an error (counted), never a no-op.
@@ -724,6 +830,18 @@ pub const FrameDraws = struct {
             return LeaseError.NotPinned;
         }
         self.pinned[idx] = false;
+        self.pins_held -= 1;
+    }
+
+    pub fn unpinReader(self: *FrameDraws, idx: usize) LeaseError!void {
+        if (idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.read_pins[idx] == 0) {
+            self.unpin_denials += 1;
+            return LeaseError.NotPinned;
+        }
+        self.read_pins[idx] -= 1;
         self.pins_held -= 1;
     }
 
@@ -740,6 +858,13 @@ pub const FrameDraws = struct {
         lockLease(&self.mutex);
         defer self.mutex.unlock();
         return self.pinned[idx];
+    }
+
+    pub fn isReadPinned(self: *FrameDraws, idx: usize) bool {
+        if (idx >= SLOT_COUNT) return false;
+        lockLease(&self.mutex);
+        defer self.mutex.unlock();
+        return self.read_pins[idx] != 0;
     }
 
     pub fn pinsHeld(self: *FrameDraws) usize {
@@ -822,6 +947,65 @@ test "wave26: claimBack skips the front and pinned slots, publish flips" {
     try testing.expectEqual(@as(u64, 7), draws.slotAtConst(f).frame_id);
     try draws.unpin(f);
     try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
+}
+
+test "wave39: shared front reader coexists with render pin and blocks slot reuse" {
+    var draws = FrameDraws{};
+    const front = draws.pinFrontReader();
+    try testing.expectEqual(draws.front, front);
+    try testing.expect(draws.isReadPinned(front));
+    try testing.expect(!draws.isPinned(front));
+
+    // Rendering is a second immutable reader of the same published slot.
+    try testing.expectEqual(front, draws.pinFront());
+    try testing.expect(draws.isPinned(front));
+
+    // The producer/context may advance the front, but neither lease allows
+    // the old slot to be reclaimed while commit/render still reads it.
+    const next = draws.claimBack().?;
+    draws.slotAt(next).frame_id = 1;
+    try draws.tryPublish(next);
+    const third = draws.claimBack().?;
+    draws.slotAt(third).frame_id = 2;
+    try draws.tryPublish(third);
+    try testing.expect(draws.front != front);
+    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(front));
+
+    try draws.unpin(front);
+    try testing.expect(!draws.isPinned(front));
+    try testing.expect(draws.isReadPinned(front));
+    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(front));
+    try draws.unpinReader(front);
+    try testing.expect(!draws.isReadPinned(front));
+    try draws.claimSlot(front);
+    try draws.cancelClaim(front);
+    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
+}
+
+test "wave39: handoff slot and generation are claimed as one counted pair" {
+    var draws = FrameDraws{};
+    var build_slot = std.atomic.Value(usize).init(0);
+    var build_seq = std.atomic.Value(u64).init(0);
+
+    const slot = draws.claimBack().?;
+    draws.slotAt(slot).build_seq = 7;
+    draws.slotAt(slot).has_scene_build = true;
+    try draws.releaseHandoffWithSeq(slot, 7, &build_slot, &build_seq);
+    const claimed = (try draws.claimLatestHandoff(&build_slot, &build_seq, 0, true)).?;
+    try testing.expectEqual(slot, claimed.slot);
+    try testing.expectEqual(@as(u64, 7), claimed.seq);
+    try testing.expect(claimed.has_scene_build);
+    try draws.tryPublish(claimed.slot);
+    try testing.expect((try draws.claimLatestHandoff(&build_slot, &build_seq, 7, true)) == null);
+
+    const stale_slot = draws.claimBack().?;
+    draws.slotAt(stale_slot).build_seq = 8;
+    try draws.releaseHandoffWithSeq(stale_slot, 9, &build_slot, &build_seq);
+    try testing.expectError(LeaseError.SlotBusy, draws.claimLatestHandoff(&build_slot, &build_seq, 7, false));
+    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
+    // The fail-closed mismatch did not consume or wedge the handoff.
+    try draws.claimSlot(stale_slot);
+    try draws.cancelClaim(stale_slot);
 }
 
 test "wave26: pin/unpin contract — double pin, unpin without pin, counters" {

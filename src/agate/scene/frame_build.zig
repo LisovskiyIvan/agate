@@ -22,28 +22,21 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     // a spawned worker. Everything below is sg-free (the commit, the CPU
     // staging half, the plain captures, the CPU queue/shadow/outline
     // build with instances_prepared=true); any sg.* here would be a bug.
-    scene.build_stats = .{};
-    // Commit the last published latch outcomes FIRST (game side, ordered
-    // after publish, never concurrent with the context): the prepare
-    // latch stages GPU purely from slot records and mirrors the outcome
-    // there; this applies the mirrors to the live meshes under the O(1)
-    // identity guard, so the CPU staging + record freeze below observe
-    // the just-published prior state. Resolves the slot through the lease
-    // (`frontIndex`, mutex-guarded): the latest latched generation wins —
-    // a fallback publish in between selects the fallback slot (no records,
-    // commit no-ops instead of regressing to a superseded mirror) — and a
-    // plain `draws.front` read could observe the context `tryPublish` flip
-    // mid-commit. The payload itself is slot-owned (immutable once
-    // published; a concurrent reset only clears lengths, and the guards
-    // below contain any generation mix), so no pin is taken here: the
-    // render path asserts on `pinFront` while presenting, and a game-side
-    // pin could trip it under update||render overlap. The claimed-slot
-    // reset below never touches the committed slot.
-    const front_idx = scene.draws.frontIndex();
-    const front = &scene.draws.slots[front_idx];
-    scene_instance_staging.commitPublishedRecords(front.staged_instances.items, scene.meshes.items, front.frame_id);
+    // Commit the last published latch outcomes FIRST. Resolve and hold a
+    // shared read lease on the exact front: render may already be pinning it,
+    // and prepare may advance front while this producer build continues.
+    // The read lease prevents either case from reclaiming/resetting the slot
+    // while its records are copied into the live meshes.
+    {
+        const front_idx = scene.draws.pinFrontReader();
+        defer scene.draws.unpinReader(front_idx) catch {};
+        const front = &scene.draws.slots[front_idx];
+        scene_instance_staging.commitPublishedRecords(front.staged_instances.items, scene.meshes.items, front.frame_id);
+    }
     const back = &scene.draws.slots[slot];
     back.reset();
+    back.build_seq = seq;
+    back.has_scene_build = true;
     // Producer snapshot FIRST (update-vs-prepare excluded): consume the
     // newest published tick into the producer-owned build_snapshot. When
     // nothing new was published, ALWAYS pack fresh live state — never
@@ -125,7 +118,7 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
         scene.buildQueuesInto(back, .{
             .snap = &scene.build_snapshot,
             .cache_key = build_key,
-            .stats = &scene.build_stats,
+            .stats = &back.build_stats,
             .eye = eye,
             .sky_texture = sky_tex,
             .ibl_intensity = ibl_int,
@@ -137,11 +130,4 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
         // and restore the staged scratch.
         back.primary.instance_matrices = saved_scratch;
     }
-    // Freeze the accumulated build stats into the claim slot by value
-    // (plain copy — the prepare latch merges THIS copy, never the live
-    // accumulator, so a post-build game-side accumulation cannot race
-    // the context-side merge; staged wins, same precedent as the slot
-    // snapshot above). Rides the same publish release edge as the rest
-    // of the staged payload.
-    back.build_stats = scene.build_stats;
 }

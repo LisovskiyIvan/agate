@@ -48,11 +48,11 @@ const CubeTexture = @import("../texture.zig").CubeTexture;
 /// `scene.stats.*` writes from the update thread are forbidden (stats is
 /// context-owned; render reads it concurrently with update).
 pub fn recordUpdateTime(self: anytype, ms: f32) void {
-    self.pending_update_ms = ms;
+    self.pending_update_ms.store(ms, .release);
 }
 
 pub fn recordPhysicsTime(self: anytype, ms: f32) void {
-    self.pending_physics_ms = ms;
+    self.pending_physics_ms.store(ms, .release);
 }
 
 /// Shared queue/shadow/outline build parameters (stage-2 increment B):
@@ -65,7 +65,7 @@ pub fn recordPhysicsTime(self: anytype, ms: f32) void {
 /// `.published` (today's exact behavior). The game-side build passes
 /// `&build_snapshot` with the build-unique key `(build_seq | (1<<63))`
 /// (high bit set: cannot collide with any context `frame_id`, which
-/// counts up from 0), `&self.build_stats`, the frozen snapshot eye,
+/// counts up from 0), the claimed slot's `&back.build_stats`, the frozen snapshot eye,
 /// the exact snapshot sky/ibl, `true`, and `.build_view`
 /// (provisional buffer/count until the latch patch).
 /// Payload identity invariant: every instanced batch / shadow item /
@@ -75,10 +75,9 @@ pub fn recordPhysicsTime(self: anytype, ms: f32) void {
 /// `eye` is currently informational (views sort by their own snapshot
 /// eye; the build passes the live eye for future transparent-sort use
 /// and for the instance CPU staging eye, which is threaded separately).
-/// `stats` stays a direct pointer: the game-side build passes
-/// `&self.build_stats` (the live accumulator, frozen into the claim
-/// slot at build end and merged from there by the latch), the fallback
-/// passes `&self.stats` directly.
+/// `stats` stays a direct pointer: the game-side build passes the claimed
+/// slot's counter accumulator, while the serialized fallback passes
+/// `&self.stats` directly.
 // internal, used by scene tests
 pub fn prepareViewQueues(
     self: anytype,
@@ -314,8 +313,8 @@ pub fn patchInstanceRefs(self: anytype, back: *FrameDrawSlot) void {
 /// particle build frame, the physics debug build capture — then freezes
 /// the provisional `instance_build_view` per mesh and builds the full
 /// queue/shadow/outline payload into the back slot via the shared
-/// `buildQueuesInto` (with `.build_view` + build-unique cache key +
-/// `&build_stats`), and bumps `build_seq`.
+/// `buildQueuesInto` (with `.build_view` + build-unique cache key + the
+/// claimed slot's `build_stats`), and bumps `build_seq`.
 ///
 /// The particle build frame and the physics debug build capture staged
 /// above are additionally frozen into the claimed slot by value; the
@@ -352,10 +351,8 @@ pub fn patchInstanceRefs(self: anytype, back: *FrameDrawSlot) void {
 /// `frame_snapshot` (the latch consumes the staged slot copy, staged
 /// wins over a post-build `build_snapshot` mutation).
 /// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
-/// cannot collide with any context `frame_id`). Stats accumulate into
-/// the game-owned `build_stats` accumulator (cleared at build start)
-/// and freeze into the claim slot's staged `build_stats` copy at build
-/// end; the latch merges the slot copy.
+/// cannot collide with any context `frame_id`). Queue stats accumulate
+/// directly into the claimed slot and the latch merges that slot copy.
 ///
 /// Touches NOTHING else: no sg.*, no GpuRetire begin/complete/flush (view
 /// builds run with `instances_prepared=true`, never retrying staging),
@@ -364,11 +361,10 @@ pub fn patchInstanceRefs(self: anytype, back: *FrameDrawSlot) void {
 /// live mesh `instance_render` (commit of the last published latch
 /// outcomes, guarded — see above), back-slot queues/shadow/outline +
 /// scratch, previews/build_views,
-/// staged records, the staged slot `snapshot`, the staged slot
-/// `build_stats` copy,
+/// staged records, the staged slot `snapshot` and `build_stats`,
 /// particle/physics build frames, `build_snapshot` (refreshed), shadow
 /// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
-/// with the build key), and the live `build_stats` accumulator.
+/// with the build key).
 ///
 /// App contract: no latch is possible while a build runs (update-vs-
 /// prepare exclusion), and the mesh list MUST NOT be mutated between a
@@ -405,6 +401,39 @@ pub fn buildIntoClaimedSlot(self: anytype, slot: usize, seq: u64) void {
 
 pub fn prepareFrame(self: anytype) void {
     scene_frame_prepare.prepareFrame(self);
+}
+
+pub const PrepareClaim = scene_frame_prepare.PrepareClaim;
+
+/// Begins concurrent preparation while the caller excludes producer-side
+/// live-scene mutation (game thread held out of simulate/build for the
+/// duration of THIS call). Returns null when no fresh producer frame is
+/// ready; unlike `prepareFrame`, this never enters the live-read fallback.
+///
+/// Token contract: every successful begin MUST be paired with exactly one
+/// `finishStagedPrepare` or `cancelStagedPrepare` on the same thread, on
+/// every path including errors — a dropped claim wedges all future begins
+/// (they return null until the process resets). A `render` between begin
+/// and finish sees `frame_prepared == false` and drops the present, so
+/// keep the pair adjacent around the unlock window. Only the context
+/// thread may call any of the three.
+pub fn beginStagedPrepare(self: anytype) ?PrepareClaim {
+    return scene_frame_prepare.beginPrepare(self, false);
+}
+
+/// Completes a claim from `beginStagedPrepare`. The producer lock may be
+/// released before this call: a staged claim consumes only slot-owned and
+/// context-owned state. Consumes the token (one-shot; a second call asserts).
+pub fn finishStagedPrepare(self: anytype, claim: PrepareClaim) void {
+    scene_frame_prepare.finishPrepare(self, claim);
+}
+
+/// Releases a claim from `beginStagedPrepare` without publishing: drops the
+/// slot lease (restoring the handoff when no newer producer generation
+/// superseded it) and closes the begin-side retire epoch. Consumes the
+/// token (one-shot; a second call asserts).
+pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
+    scene_frame_prepare.cancelPrepare(self, claim);
 }
 
 /// Stage 3, slice 2: the game-side update entry point. Everything the

@@ -797,7 +797,7 @@ test "recordUpdateTime stages without touching stats (update||render disjoint)" 
     // Update-сторона (game thread): только staged поле, stats не тронуты —
     // render может читать stats конкурентно.
     scene.recordUpdateTime(7.5);
-    try std.testing.expectEqual(@as(f32, 7.5), scene.pending_update_ms);
+    try std.testing.expectEqual(@as(f32, 7.5), scene.pending_update_ms.load(.monotonic));
     try std.testing.expectEqual(@as(f32, 0.0), scene.stats.update_ms);
 
     // Последний тик wins до prepare; prepare переносит его в stats.
@@ -1794,7 +1794,7 @@ test "worker churn after prepare cannot mutate consumed snapshot/timings" {
     try std.testing.expect(scene.frame_snapshot.sky_enabled);
     try std.testing.expectEqual(snap_clear_r, scene.frame_snapshot.clear_color.r);
     try std.testing.expectEqual(@as(f32, 3.0), scene.stats.update_ms);
-    try std.testing.expectEqual(@as(f32, 99.0), scene.pending_update_ms);
+    try std.testing.expectEqual(@as(f32, 99.0), scene.pending_update_ms.load(.monotonic));
 
     // Next prepare picks up the newest live state (newest wins).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -6762,13 +6762,9 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
 
 // ---- Wave 31 (second slice): build_stats as a slot payload. ----
 //
-// The game-side queue build accumulates into the live `Scene.build_stats`
-// accumulator; the build freezes a plain copy into the claimed slot's
-// `build_stats` (staged-wins over post-build accumulation, same precedent
-// as the slot snapshot); `prepareFrame` merges the SLOT copy into `stats`
-// instead of reading the shared field. Sequential behavior is bit-identical
-// (the stage-2B equivalence tests below the wave-29 block prove the merged
-// values unchanged); these tests pin the staging points.
+// The game-side queue build writes its counters directly into the claimed
+// slot; `prepareFrame` merges that exact slot payload into context stats.
+// There is no producer-shared stats accumulator for prepare to race.
 
 test "wave31b: build stages slot build_stats; post-build accumulation never leaks into the merge" {
     const alloc = std.testing.allocator;
@@ -6801,23 +6797,13 @@ test "wave31b: build stages slot build_stats; post-build accumulation never leak
     var claim = scene.tryClaimBuildSlot().?;
     claim.build();
 
-    // Staging point: the claimed slot freezes exactly what the build
-    // accumulated (whole-struct equality, plain copy).
+    // Staging point: queue counters land directly in the claimed slot.
     const slot = claim.slot;
-    try std.testing.expectEqual(scene.build_stats, scene.draws.slots[slot].build_stats);
-    // The fixture is meaningful: the queue build counted the mesh.
+    // The fixture is meaningful: the queue build counted the mesh and the
+    // slot generation identifies the exact producer build.
     const staged = scene.draws.slots[slot].build_stats;
     try std.testing.expect(staged.total_meshes > 0);
-
-    // Post-build game-side accumulation AFTER the freeze: staged wins, so
-    // none of this may reach the prepared frame's merge — including the
-    // assign-merge fields (occluders_* use `=`, not `+=`).
-    scene.build_stats.total_meshes += 1000;
-    scene.build_stats.rendered_meshes += 1000;
-    scene.build_stats.culled_meshes += 1000;
-    scene.build_stats.occluded_meshes += 1000;
-    scene.build_stats.occluders_count = 12345;
-    scene.build_stats.occluder_triangles = 67890;
+    try std.testing.expectEqual(claim.seq, scene.draws.slots[slot].build_seq);
     claim.publish();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -6831,8 +6817,7 @@ test "wave31b: build stages slot build_stats; post-build accumulation never leak
     try std.testing.expectEqual(staged.occluded_meshes, scene.stats.occluded_meshes);
     try std.testing.expectEqual(staged.occluders_count, scene.stats.occluders_count);
     try std.testing.expectEqual(staged.occluder_triangles, scene.stats.occluder_triangles);
-    // Both copies are cleared for the next tick (same reset semantics).
-    try std.testing.expectEqual(SceneStats{}, scene.build_stats);
+    // The consumed slot's counters are cleared after merge.
     try std.testing.expectEqual(SceneStats{}, scene.draws.slots[scene.draws.front].build_stats);
 }
 
@@ -6889,6 +6874,227 @@ test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stal
     try std.testing.expectEqual(@as(u32, 0), scene.stats.occluded_meshes);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.occluders_count);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.occluder_triangles);
+}
+
+test "wave39: split prepare consumes its claimed generation, not a newer publication" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var first = scene.tryClaimBuildSlot().?;
+    first.build();
+    first.stageUi();
+    first.publish();
+
+    // Begin claims generation 1 and performs the live-touching prelude. The
+    // next producer build is then allowed to publish before generation 1's
+    // finish, exactly matching the sandbox unlock boundary.
+    const first_prepare = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(first.seq, first_prepare.build_seq);
+    try std.testing.expect(scene.prepare_claim_active);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 1024, 768);
+    var second = scene.tryClaimBuildSlot().?;
+    second.build();
+    second.stageUi();
+    second.publish();
+    try std.testing.expect(second.seq > first.seq);
+
+    scene.finishStagedPrepare(first_prepare);
+    try std.testing.expectEqual(first.seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(second.seq, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(first.slot, scene.draws.front);
+    try std.testing.expect(!scene.prepare_claim_active);
+
+    const second_prepare = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(second.seq, second_prepare.build_seq);
+    scene.finishStagedPrepare(second_prepare);
+    try std.testing.expectEqual(second.seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(second.slot, scene.draws.front);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+    try std.testing.expect(!scene.prepare_claim_active);
+}
+
+test "wave39: cancelled split prepare releases its slot and closes its epoch" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var build = scene.tryClaimBuildSlot().?;
+    build.build();
+    build.stageUi();
+    build.publish();
+
+    const claim = scene.beginStagedPrepare().?;
+    scene.cancelStagedPrepare(claim);
+    try std.testing.expect(!scene.prepare_claim_active);
+    try std.testing.expect(!scene.draws.writing[claim.back_idx]);
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+    try std.testing.expectEqual(scene.gpu_retire.current(), scene.gpu_retire.lastCompleted());
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_seq.load(.monotonic));
+}
+
+test "wave39: staged-only prepare leaves UI-only handoff for serialized fallback" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    var ui_only = scene.tryClaimBuildSlot().?;
+    ui_only.stageUi();
+    ui_only.publish();
+    const ui_seq = scene.build_seq.load(.monotonic);
+    try std.testing.expect(scene.beginStagedPrepare() == null);
+    try std.testing.expectEqual(ui_seq, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_seq.load(.monotonic));
+    try std.testing.expect(scene.draws.handoff != null);
+
+    // A full producer build supersedes the UI-only handoff; staged-only
+    // prepare then consumes the fresh 3D payload and exact generation.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var full = scene.tryClaimBuildSlot().?;
+    full.build();
+    full.stageUi();
+    full.publish();
+    const claim = scene.beginStagedPrepare().?;
+    try std.testing.expect(claim.have_build);
+    try std.testing.expect(claim.build_seq > ui_seq);
+    scene.finishStagedPrepare(claim);
+    try std.testing.expectEqual(full.seq, scene.last_latched_seq.load(.monotonic));
+}
+
+test "wave39: serialized fallback consumes a lone UI-only handoff; staged stays null" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    var ui_only = scene.tryClaimBuildSlot().?;
+    ui_only.stageUi();
+    ui_only.publish();
+    const ui_seq = scene.build_seq.load(.monotonic);
+    const pkt_seq = scene.ui_packet_seq.load(.monotonic);
+
+    // The serialized legacy path consumes the UI-only handoff through the
+    // fallback branch (fresh snapshot pack + inline queue build) and stamps
+    // the exact generation after publication.
+    scene.prepareFrame();
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(ui_seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(pkt_seq, scene.last_latched_ui_seq.load(.monotonic));
+
+    // Nothing pending: staged-only prepare stays null, no live fallback.
+    try std.testing.expect(scene.beginStagedPrepare() == null);
+    try std.testing.expectEqual(ui_seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave39: cancel restores the handoff; a newer publish keeps newest-wins" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var build = scene.tryClaimBuildSlot().?;
+    build.build();
+    build.stageUi();
+    build.publish();
+
+    const claim = scene.beginStagedPrepare().?;
+    scene.cancelStagedPrepare(claim);
+
+    // The handoff was restored unchanged: re-begin resolves the SAME
+    // generation and can be consumed to completion.
+    try std.testing.expect(scene.draws.handoff != null);
+    const retry = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(claim.build_seq, retry.build_seq);
+    try std.testing.expectEqual(claim.back_idx, retry.back_idx);
+    scene.finishStagedPrepare(retry);
+    try std.testing.expectEqual(build.seq, scene.last_latched_seq.load(.monotonic));
+
+    // Newest-wins negative: cancel AFTER a newer publish must not restore
+    // the stale handoff over the newer pending pair. Begin claims the mid
+    // build's handoff, the producer then publishes a third build on the
+    // remaining slot, and the cancel observes the changed pair.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var mid = scene.tryClaimBuildSlot().?;
+    mid.build();
+    mid.stageUi();
+    mid.publish();
+    const mid_claim = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(mid.seq, mid_claim.build_seq);
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var newer = scene.tryClaimBuildSlot().?;
+    try std.testing.expect(newer.slot != mid_claim.back_idx);
+    newer.build();
+    newer.publish();
+    const newer_seq = scene.build_seq.load(.monotonic);
+
+    scene.cancelStagedPrepare(mid_claim);
+    const resumed = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(newer_seq, resumed.build_seq);
+    scene.finishStagedPrepare(resumed);
+    try std.testing.expectEqual(newer_seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
+}
+
+test "wave39: pinned handoff refuses the staged begin, counted, stamp untouched" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var build = scene.tryClaimBuildSlot().?;
+    build.build();
+    build.stageUi();
+    build.publish();
+    const seq = scene.build_seq.load(.monotonic);
+
+    try scene.draws.pin(scene.build_slot.load(.monotonic));
+    const ref0 = scene.draws.publish_refusals;
+    try std.testing.expect(scene.beginStagedPrepare() == null);
+    try std.testing.expectEqual(ref0 + 1, scene.draws.publish_refusals);
+    try std.testing.expectEqual(seq, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_seq.load(.monotonic));
+
+    // Unpin restores: the same generation latches exactly once.
+    try scene.draws.unpin(scene.build_slot.load(.monotonic));
+    const claim = scene.beginStagedPrepare().?;
+    try std.testing.expectEqual(seq, claim.build_seq);
+    scene.finishStagedPrepare(claim);
+    try std.testing.expectEqual(seq, scene.last_latched_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
 
 test "Scene tag queries and tag-filtered raycasting" {

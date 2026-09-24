@@ -9,10 +9,24 @@ const scene_msaa = @import("msaa.zig");
 const scene_instance_staging = @import("instance_staging.zig");
 const SceneFrameSnapshot = @import("snapshot.zig").SceneFrameSnapshot;
 
-/// Prepares the scene frame on the context thread.
-/// Orchestrates upload draining, snapshot latching, instance staging,
-/// debug wireframe uploads, queue building, and triple-buffer publication.
-pub fn prepareFrame(scene: anytype) void {
+/// A claimed producer frame split at the update-vs-prepare ownership
+/// boundary. `beginPrepare` performs all operations that can touch live
+/// producer state; after it returns, `finishPrepare` consumes only this
+/// claimed slot and context-owned state.
+pub const PrepareClaim = struct {
+    token_id: u64,
+    back_idx: usize,
+    build_seq: u64,
+    have_build: bool,
+    has_handoff: bool,
+};
+
+/// Begins preparation on the context thread. The caller must exclude the
+/// producer from live-scene mutation for this call. `allow_fallback` is for
+/// sequential/legacy callers only: the inline path captures live state and
+/// must stay inside the same exclusion window. Concurrent callers pass false;
+/// if there is no new producer frame this is a no-op, never a live read.
+pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
     // Владение фазой: prepare выполняется на context-потоке
     // ПОСЛЕДОВАТЕЛЬНО с render (один поток, next prepare NEVER
     // concurrent with render); update-поток в это время ИСКЛЮЧЁН
@@ -22,14 +36,17 @@ pub fn prepareFrame(scene: anytype) void {
     // построение очередей + CPU-capture (debug/particles/UI) и их GPU
     // upload. Draw-фаза ниже читает только render-owned снимки.
     gpu_thread.assertOnContextThread();
+    if (scene.prepare_claim_active) return null;
     // Wave-31 lease claim (concurrent-build prerequisite): prepare
     // resolves AND holds its working slot through the lease protocol for
     // the duration of the whole prepare. Fallback (no fresh build)
     // claims any free slot (`claimBack` — sequentially exactly the old
     // `backIndex`); the latch path claims the handoff slot the game
-    // published (`claimSlot(build_slot)` — sequentially exactly the old
-    // `build_slot == backIndex` assert, now fail-closed instead of
-    // debug-only). While the claim is held a concurrent game
+    // published (`claimLatestHandoff` — the `(build_slot, build_seq)` pair
+    // plus the slot stamp are read under one lease-mutex critical section,
+    // so a publish landing between separate loads can never pair an old
+    // generation with a newer slot; UI-only handoffs are left pending when
+    // `allow_fallback == false`). While the claim is held a concurrent game
     // `tryClaimBuildSlot` skips this slot (or saturates, counted) and
     // `pin` refuses it (`SlotBusy`, counted): no concurrent
     // `BuildClaim.publish`/`stageUi` can target the slot prepare is
@@ -43,19 +60,25 @@ pub fn prepareFrame(scene: anytype) void {
     // still the freshest prepared); with nothing pending it stays false,
     // so `render`'s fallback drops the present instead of mislabeling a
     // stale front. On the latch path the build stays fresh
-    // (`last_latched_seq` unstamped) for the next prepare.
-    // Acquire: pairs with the publish release-store, so the staged build
-    // payload is visible on the latch path below.
-    const have_build = scene.build_seq.load(.acquire) != scene.last_latched_seq.load(.monotonic);
-    const back_idx: usize = if (have_build) blk: {
-        const wanted = scene.build_slot.load(.acquire);
-        scene.draws.claimSlot(wanted) catch {
-            return;
-        };
-        break :blk wanted;
-    } else blk: {
+    // (`last_latched_seq` unstamped until the finish publishes) for the
+    // next prepare.
+    // Visibility: publication and this claim meet under the lease mutex
+    // (releaseHandoffWithSeq vs claimLatestHandoff), so the staged build
+    // payload is visible on the latch path below without a separate
+    // acquire edge on the seq words.
+    const handoff = scene.draws.claimLatestHandoff(
+        &scene.build_slot,
+        &scene.build_seq,
+        scene.last_latched_seq.load(.monotonic),
+        !allow_fallback,
+    ) catch return null;
+    const has_handoff = handoff != null;
+    const have_build = if (handoff) |h| h.has_scene_build else false;
+    if (!has_handoff and !allow_fallback) return null;
+    const build_seq: u64 = if (handoff) |h| h.seq else 0;
+    const back_idx: usize = if (handoff) |h| h.slot else blk: {
         break :blk scene.draws.claimBack() orelse {
-            return;
+            return null;
         };
     };
     const back = scene.draws.slotAt(back_idx);
@@ -84,8 +107,8 @@ pub fn prepareFrame(scene: anytype) void {
     // update-потока нет — stats читает render конкурентно с update.
     const keep_prepare_ms = scene.stats.prepare_ms;
     scene.stats = .{};
-    scene.stats.update_ms = scene.pending_update_ms;
-    scene.stats.physics_ms = scene.pending_physics_ms;
+    scene.stats.update_ms = scene.pending_update_ms.load(.acquire);
+    scene.stats.physics_ms = scene.pending_physics_ms.load(.acquire);
     scene.stats.prepare_ms = keep_prepare_ms;
     // Сброс счётчика динамических обновлений на начало кадра: всё, что
     // запишут flushPendingGpuUploads, стейджинг инстансов и UI/debug
@@ -157,10 +180,11 @@ pub fn prepareFrame(scene: anytype) void {
     // only on the publish at the end, so the claim stays stable across
     // the latch, and the staged UI packet lives in this same slot.)
     if (have_build) {
-        // The handoff slot is already held via `claimSlot(build_slot)`:
+        // The handoff slot is already held via `claimLatestHandoff`:
         // no intervening publish could have moved `front` (only prepare
-        // flips it, and the latch has not run yet), and no concurrent
-        // claim could have taken it (claims skip WRITING slots).
+        // flips it, and the latch has not run yet; a second prepare is
+        // token-blocked), and no concurrent claim could have taken it
+        // (claims skip WRITING slots).
         scene.frame_snapshot = back.snapshot;
     } else {
         var snap = scene.frame_snapshot;
@@ -187,11 +211,46 @@ pub fn prepareFrame(scene: anytype) void {
     // buffers; the meter sums identically).
     scene.captureUiFrame(staged, back);
 
+    std.debug.assert(!scene.prepare_claim_active);
+    scene.prepare_claim_generation +%= 1;
+    if (scene.prepare_claim_generation == 0) scene.prepare_claim_generation = 1;
+    scene.prepare_claim_active = true;
+    scene.prepare_claim_slot = back_idx;
+    scene.prepare_claim_seq = build_seq;
+    scene.prepare_claim_have_build = have_build;
+    scene.prepare_claim_has_handoff = has_handoff;
+    return .{
+        .token_id = scene.prepare_claim_generation,
+        .back_idx = back_idx,
+        .build_seq = build_seq,
+        .have_build = have_build,
+        .has_handoff = has_handoff,
+    };
+}
+
+/// Finishes preparation using the exact slot claimed by `beginPrepare`.
+/// The caller may release producer/live-state exclusion before this function
+/// only when `claim.have_build` is true. A fallback claim reads live meshes
+/// and must remain serialized for the whole call.
+pub fn finishPrepare(scene: anytype, claim: PrepareClaim) void {
+    gpu_thread.assertOnContextThread();
+    if (!matchesPrepareClaim(scene, claim)) {
+        std.debug.assert(false);
+        return;
+    }
+    // Consume the one-shot token before any side effects: a duplicate finish
+    // cannot re-run uploads/merges or double-publish the claimed slot.
+    scene.prepare_claim_active = false;
+    const back_idx = claim.back_idx;
+    const build_seq = claim.build_seq;
+    const have_build = claim.have_build;
+    const back = scene.draws.slotAt(back_idx);
+
     // Debug line upload (GPU): the frame's single updateBuffer, once per
-    // prepare no matter how many PIP views render below. Samples follow
-    // the same MSAA policy as render (same snapshot inputs, same
-    // result). Headless the whole upload is skipped (the CPU capture
-    // above already ran for tests) — no sg.* without a context.
+    // prepare no matter how many PIP views render below. This consumes the
+    // render-owned capture created in beginPrepare (or the serialized legacy
+    // capture) and does not read producer-owned physics state.
+    const staged: *const SceneFrameSnapshot = if (have_build) &back.snapshot else &scene.frame_snapshot;
     if (sg.isvalid()) {
         const upload_samples = scene_msaa.effectiveSampleCount(staged.msaa_sample_count, .{
             .post_enabled = staged.post_process.enabled,
@@ -234,10 +293,10 @@ pub fn prepareFrame(scene: anytype) void {
         // finalized from the mirrors): the game-side commit at the next
         // build applies the mirrors to the live meshes. The staged slot
         // snapshot above is already frozen (wave 27) — the latch reads
-        // it, never the live `build_snapshot`/`frame_snapshot` — and
-        // the staged slot build_stats below likewise (wave 31 second
-        // slice): the latch merges the slot copy, never the live
-        // `build_stats` accumulator.
+        // it, never the live `build_snapshot`/`frame_snapshot`. Queue
+        // stats have no shared accumulator at all (wave 39): the producer
+        // wrote this slot's `build_stats` directly and the merge below
+        // folds that immutable copy into context-owned `stats`.
         back.frame_id = scene.frame_id;
         back.retire_epoch = scene.retire_epoch;
         if (is_gpu_init) {
@@ -259,20 +318,10 @@ pub fn prepareFrame(scene: anytype) void {
             }
         }
         scene.patchInstanceRefs(back);
-        // Deferred stats merge (stage-2B, slot-staged since wave 31
-        // second slice): the game-side queue build accumulated into the
-        // live `build_stats` accumulator and froze a copy into this
-        // slot; fold the SLOT copy's queue counters into the
-        // context-owned self.stats (already reset above, so upload
-        // tallies/prepare_ms/update_ms are preserved) and clear both
-        // copies for the next tick. Sourcing the merge from the slot —
-        // never the shared field — is what lets a concurrent game-side
-        // accumulation race nothing here.
+        // Deferred stats merge: fold this immutable slot's queue counters
+        // into context-owned stats and clear the consumed slot for reuse.
         scene.stats.mergeFrom(&back.build_stats);
         back.build_stats = .{};
-        scene.build_stats = .{};
-        // Context-side stamp only (the producer never touches this word).
-        scene.last_latched_seq.store(scene.build_seq.load(.monotonic), .monotonic);
     } else {
         // Inline fallback (no fresh build): reset first — every list
         // plus the staged snapshot, so a skipped path can never resurface
@@ -340,8 +389,57 @@ pub fn prepareFrame(scene: anytype) void {
     // to a counted skip — the refusal itself is counted inside
     // `tryPublish`).
     scene.draws.tryPublish(back_idx) catch {
-        scene.draws.cancelClaim(back_idx) catch {};
+        if (claim.has_handoff) {
+            scene.draws.cancelHandoffClaim(back_idx, build_seq, &scene.build_slot, &scene.build_seq) catch {};
+        } else {
+            scene.draws.cancelClaim(back_idx) catch {};
+        }
+        // No render will consume this frame: close the epoch begun in
+        // beginPrepare here (same pairing as cancelPrepare), not just via
+        // the next begin's auto-close.
+        scene.gpu_retire.complete(scene.retire_epoch);
         return;
     };
+    if (claim.has_handoff) {
+        // Consume the exact handoff only after successful publication. A
+        // newer producer generation may already be pending and must remain
+        // visible to the next begin.
+        scene.last_latched_seq.store(build_seq, .monotonic);
+    }
     scene.frame_prepared = true;
+}
+
+/// Cancels an in-progress split prepare and releases its slot lease. The
+/// begin-side retire epoch is completed because no render will consume it.
+pub fn cancelPrepare(scene: anytype, claim: PrepareClaim) void {
+    gpu_thread.assertOnContextThread();
+    if (!matchesPrepareClaim(scene, claim)) {
+        std.debug.assert(false);
+        return;
+    }
+    scene.prepare_claim_active = false;
+    if (claim.has_handoff) {
+        scene.draws.cancelHandoffClaim(claim.back_idx, claim.build_seq, &scene.build_slot, &scene.build_seq) catch {};
+    } else {
+        scene.draws.cancelClaim(claim.back_idx) catch {};
+    }
+    scene.frame_prepared = false;
+    scene.gpu_retire.complete(scene.retire_epoch);
+}
+
+fn matchesPrepareClaim(scene: anytype, claim: PrepareClaim) bool {
+    return scene.prepare_claim_active and
+        scene.prepare_claim_generation == claim.token_id and
+        scene.prepare_claim_slot == claim.back_idx and
+        scene.prepare_claim_seq == claim.build_seq and
+        scene.prepare_claim_have_build == claim.have_build and
+        scene.prepare_claim_has_handoff == claim.has_handoff;
+}
+
+/// Serialized compatibility entry point. Applications that overlap producer
+/// updates with context preparation should use `beginPrepare(..., false)`,
+/// release their producer lock, then call `finishPrepare`.
+pub fn prepareFrame(scene: anytype) void {
+    const claim = beginPrepare(scene, true) orelse return;
+    finishPrepare(scene, claim);
 }
