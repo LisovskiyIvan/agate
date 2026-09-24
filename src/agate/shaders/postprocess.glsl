@@ -142,7 +142,7 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
     float max_dist = ssr_params.w;
     float thickness = ssr_params.z;
-    const int SSR_STEPS = 16;
+    const int SSR_STEPS = 12;
     float step_size = max_dist / float(SSR_STEPS);
 
     vec3 ray_pos = world_pos + N * 0.08;
@@ -241,15 +241,17 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     if (speed > max_blur) {
         velocity = velocity * (max_blur / speed);
     }
-    if (speed < 0.0002) return color;
+    // Sub-pixel threshold: don't blur when movement is sub-pixel (saves full loop on almost-static areas)
+    if (speed < resolution.z * 0.75) return color;
 
     vec3 acc = color;
-    for (int i = 1; i < 8; ++i) {
-        float t = float(i) / 7.0 - 0.5;
+    const int SAMPLES = 5;
+    for (int i = 1; i < SAMPLES; ++i) {
+        float t = float(i) / float(SAMPLES - 1) - 0.5;
         vec2 sample_uv = clamp(uv + velocity * t, vec2(0.001), vec2(0.999));
         acc += texture(sampler2D(scene_tex, smp), sample_uv).rgb;
     }
-    return acc * 0.125;
+    return acc * (1.0 / float(SAMPLES));
 }
 
 // Sample scene HDR color, apply chromatic aberration, SSAO, SSR, Fog, and Motion Blur
@@ -277,16 +279,18 @@ vec3 sampleSceneRaw(vec2 uv) {
     }
 
     // Depth-dependent passes: SSR, Atmospheric Fog, and Motion Blur
-    float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    if (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5) {
+        float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
 
-    // Screen-Space Reflections (SSR)
-    color = applySSR(color, uv, raw_depth);
+        // Screen-Space Reflections (SSR)
+        color = applySSR(color, uv, raw_depth);
 
-    // Atmospheric Depth & Height Fog
-    color = applyAtmosphericFog(color, uv, raw_depth);
+        // Atmospheric Depth & Height Fog
+        color = applyAtmosphericFog(color, uv, raw_depth);
 
-    // Camera Motion Blur
-    color = applyMotionBlur(color, uv, raw_depth);
+        // Camera Motion Blur
+        color = applyMotionBlur(color, uv, raw_depth);
+    }
 
     return color;
 }
@@ -317,31 +321,11 @@ float grainHash(vec2 p) {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-// Fast LDR sample for FXAA edge detection and tangent searching
-// Includes scene_tex, chromatic aberration, and SSAO (from pre-rendered ssao_tex)
-// Skips heavy raymarching SSR and atmospheric fog on neighbor taps
+// Fast LDR sample for neighbor filtering (Sharpen, DoF, TAA neighborhood):
+// Single texture fetch from scene_tex with exposure + Reinhard/ACES tonemap.
+// Skips redundant SSAO fetches, SSR, fog, and chromatic aberration dispersion.
 vec3 sampleSceneFastLDR(vec2 uv) {
-    vec3 color;
-    float ca = params3.y;
-    if (ca > 0.00001) {
-        vec2 dist_from_center = uv - 0.5;
-        vec2 ca_offset = dist_from_center * ca;
-        float r = texture(sampler2D(scene_tex, smp), uv + ca_offset).r;
-        float g = texture(sampler2D(scene_tex, smp), uv).g;
-        float b = texture(sampler2D(scene_tex, smp), uv - ca_offset).b;
-        color = vec3(r, g, b);
-    } else {
-        color = texture(sampler2D(scene_tex, smp), uv).rgb;
-    }
-
-    // SSAO Occlusion (fast texture fetch from pre-rendered pass)
-    if (params4.x > 0.5) {
-        float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
-        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
-        color *= ao_factor;
-    }
-
-    color *= params1.x; // Exposure
+    vec3 color = texture(sampler2D(scene_tex, smp), uv).rgb * params1.x; // Exposure
     float tonemap_mode = params3.x;
     if (tonemap_mode > 1.5) {
         color = Reinhard(color);
