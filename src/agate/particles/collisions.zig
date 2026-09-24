@@ -299,9 +299,11 @@ pub fn resolveSphereContact(
     friction: f32,
 ) ContactResult {
     const delta = pos.sub(center);
-    const dist = delta.length();
-    if (dist >= radius) return .{ .pos = pos, .vel = vel, .killed = false };
+    const dist_sq = delta.lengthSq();
+    const rad_sq = radius * radius;
+    if (dist_sq >= rad_sq) return .{ .pos = pos, .vel = vel, .killed = false };
     if (mode == .kill) return .{ .pos = pos, .vel = vel, .killed = true };
+    const dist = @sqrt(dist_sq);
     const n = if (dist > 1e-9) delta.scale(1.0 / dist) else Vec3.new(0.0, 1.0, 0.0);
     const pushed = center.add(n.scale(radius));
     const vn = vel.dot(n);
@@ -386,7 +388,7 @@ pub fn resolvePlaneContact(
 ) ContactResult {
     const n_sq = normal.lengthSq();
     if (n_sq <= 1e-12 or !std.math.isFinite(n_sq)) return .{ .pos = pos, .vel = vel, .killed = false };
-    const n = normal.scale(1.0 / @sqrt(n_sq));
+    const n = if (@abs(n_sq - 1.0) < 1e-5) normal else normal.scale(1.0 / @sqrt(n_sq));
     const dist = pos.sub(point).dot(n);
     if (dist >= 0.0) return .{ .pos = pos, .vel = vel, .killed = false };
     if (mode == .kill) return .{ .pos = pos, .vel = vel, .killed = true };

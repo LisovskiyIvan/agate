@@ -124,6 +124,7 @@ pub const TrailMesh = struct {
             .is_active = options.auto_start,
             .buffers_pending = deferred or partial,
         };
+        self.nodes.ensureTotalCapacity(allocator, max_nodes) catch {};
         return self;
     }
 
@@ -164,8 +165,9 @@ pub const TrailMesh = struct {
         if (self.target) |tgt| {
             const world_mat = tgt.getWorldMatrix();
             const cur_pos = world_mat.transformPoint(self.target_offset);
-            const dist = if (self.last_position) |lp| cur_pos.distance(lp) else (self.options.min_distance + 1.0);
-            if (dist >= self.options.min_distance) {
+            const min_dist_sq = self.options.min_distance * self.options.min_distance;
+            const dist_sq = if (self.last_position) |lp| cur_pos.distanceSq(lp) else (min_dist_sq + 1.0);
+            if (dist_sq >= min_dist_sq) {
                 self.addNode(cur_pos) catch {};
             }
         }

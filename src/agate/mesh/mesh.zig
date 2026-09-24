@@ -418,11 +418,27 @@ pub const Mesh = struct {
         return active;
     }
 
+    /// Selects the appropriate active LOD mesh for a given squared distance from camera,
+    /// avoiding floating-point sqrt in hot culling passes.
+    pub fn getLODSq(self: *const Mesh, distance_sq: f32) ?*Mesh {
+        if (self.lod_levels.items.len == 0) return @constCast(self);
+        var active: ?*Mesh = @constCast(self);
+        for (self.lod_levels.items) |lvl| {
+            const thresh_sq = lvl.distance * lvl.distance;
+            if (distance_sq >= thresh_sq) {
+                active = lvl.mesh;
+            } else {
+                break;
+            }
+        }
+        return active;
+    }
+
     /// Selects the active LOD mesh based on camera distance to this mesh's center.
     pub fn getLODForCamera(self: *const Mesh, camera_pos: Vec3) ?*Mesh {
         const center = if (self.cached_aabb.isValid()) self.cached_aabb.center() else self.position;
-        const dist = center.distance(camera_pos);
-        return self.getLOD(dist);
+        const dist_sq = center.distanceSq(camera_pos);
+        return self.getLODSq(dist_sq);
     }
 
     pub fn getWorldMatrix(self: Mesh) Mat4 {

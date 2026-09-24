@@ -400,6 +400,7 @@ pub fn buildDecalData(
 
         // Triangulate clipped convex polygon into fan
         const base_idx: u32 = @intCast(out_vertices.items.len);
+        try out_vertices.ensureUnusedCapacity(allocator, count_a);
         for (buf_a[0..count_a]) |v| {
             const uv_x = std.math.clamp(v.local_pos.x + 0.5, 0.0, 1.0);
             const uv_y = std.math.clamp(1.0 - (v.local_pos.y + 0.5), 0.0, 1.0);
@@ -420,7 +421,7 @@ pub fn buildDecalData(
                     target_mesh.cpu_skin[idx2],
                 );
 
-                try out_vertices.append(allocator, .{
+                out_vertices.appendAssumeCapacity(.{
                     .position = .{ pos_biased.x, pos_biased.y, pos_biased.z },
                     .normal = .{ bind_norm.x, bind_norm.y, bind_norm.z },
                     .color = .{ 1.0, 1.0, 1.0, 1.0 },
@@ -435,7 +436,7 @@ pub fn buildDecalData(
                 const local_p = inv_target_mat.transformPoint(pos);
                 const local_n = inv_target_mat.transformDirection(v.normal).normalize();
 
-                try out_vertices.append(allocator, .{
+                out_vertices.appendAssumeCapacity(.{
                     .position = .{ local_p.x, local_p.y, local_p.z },
                     .normal = .{ local_n.x, local_n.y, local_n.z },
                     .color = .{ 1.0, 1.0, 1.0, 1.0 },
@@ -447,7 +448,7 @@ pub fn buildDecalData(
             } else {
                 // Static world-space decal
                 const pos = v.world_pos.add(v.normal.scale(options.depth_bias));
-                try out_vertices.append(allocator, .{
+                out_vertices.appendAssumeCapacity(.{
                     .position = .{ pos.x, pos.y, pos.z },
                     .normal = .{ v.normal.x, v.normal.y, v.normal.z },
                     .color = .{ 1.0, 1.0, 1.0, 1.0 },
@@ -459,11 +460,15 @@ pub fn buildDecalData(
             }
         }
 
-        var j: u32 = 1;
-        while (j + 1 < count_a) : (j += 1) {
-            try out_indices.append(allocator, base_idx);
-            try out_indices.append(allocator, base_idx + j);
-            try out_indices.append(allocator, base_idx + j + 1);
+        if (count_a >= 3) {
+            const tri_count = count_a - 2;
+            try out_indices.ensureUnusedCapacity(allocator, tri_count * 3);
+            var j: u32 = 1;
+            while (j + 1 < count_a) : (j += 1) {
+                out_indices.appendAssumeCapacity(base_idx);
+                out_indices.appendAssumeCapacity(base_idx + j);
+                out_indices.appendAssumeCapacity(base_idx + j + 1);
+            }
         }
     }
 
@@ -589,8 +594,9 @@ pub const DecalProjector = struct {
 
             const base_idx: u32 = @intCast(combined_verts.items.len);
             try combined_verts.appendSlice(allocator, data.vertices);
+            try combined_indices.ensureUnusedCapacity(allocator, data.indices.len);
             for (data.indices) |idx| {
-                try combined_indices.append(allocator, base_idx + idx);
+                combined_indices.appendAssumeCapacity(base_idx + idx);
             }
         }
 
@@ -680,11 +686,13 @@ pub const DecalManager = struct {
     instances: std.ArrayListUnmanaged(DecalInstance) = .empty,
 
     pub fn init(scene: *Scene, max_decals: usize) DecalManager {
-        return .{
+        var self = DecalManager{
             .allocator = scene.allocator,
             .scene = scene,
             .max_decals = max_decals,
         };
+        self.instances.ensureTotalCapacity(scene.allocator, max_decals) catch {};
+        return self;
     }
 
     pub fn deinit(self: *DecalManager) void {

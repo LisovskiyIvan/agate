@@ -234,8 +234,9 @@ pub fn cullNonInstancedMesh(
     const model = worldMatrixCached(ctx.cache_key, mesh);
     var render_mesh = mesh;
     if (mesh.lod_levels.items.len > 0) {
-        const dist = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center().distance(eye) else mesh.position.distance(eye);
-        const active_lod = mesh.getLOD(dist);
+        const center = if (mesh.cached_aabb.isValid()) mesh.cached_aabb.center() else mesh.position;
+        const dist_sq = center.distanceSq(eye);
+        const active_lod = mesh.getLODSq(dist_sq);
         if (active_lod) |lod| {
             render_mesh = lod;
         } else {
