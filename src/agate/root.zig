@@ -230,6 +230,7 @@ pub const TagQuery = tags.TagQuery;
 
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
+pub const c = @import("c.zig").c;
 
 pub const postprocess = @import("postprocess.zig");
 pub const PostProcessOptions = postprocess.PostProcessOptions;
