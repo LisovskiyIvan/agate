@@ -126,9 +126,9 @@ pub fn shadowLodActive(has_shadow_lod: bool, cascade_idx: ?usize) bool {
     return has_shadow_lod and c >= SHADOW_LOD_FIRST_CASCADE;
 }
 
-/// Resolves the coarsest genuinely-simplified LOD child usable as a shadow
-/// stand-in for `mesh`, or null when no safe stand-in exists — the caller
-/// must then fail safe to the high-poly mesh. Rejects:
+/// Resolves the genuinely-simplified LOD child with the fewest indices that
+/// is usable as a shadow stand-in for `mesh`, or null when no safe stand-in
+/// exists — the caller must then fail safe to the high-poly mesh. Rejects:
 /// - skinned sources (LOD children carry no skeleton, and the skinned
 ///   shadow pipeline needs bone matrices);
 /// - morph sources (the LOD child would freeze the unmorphed shape);
@@ -137,7 +137,8 @@ pub fn shadowLodActive(has_shadow_lod: bool, cascade_idx: ?usize) bool {
 ///   (`index_count >= source`), so a misconfigured LOD never silently
 ///   replaces the mesh with itself or a heavier copy;
 /// - index-type mismatches (the bucket pipeline is picked from the source);
-/// - children still awaiting GPU upload (`gpu_pending`, dead handles).
+/// - children still awaiting GPU upload or without live handle ids
+///   (`gpu_pending`, zero vertex/index buffers).
 ///
 /// The returned geometry is expected to come from the QEM simplifier
 /// (`mesh/simplify.zig`: `simplifyGeometry`/`generateLODLevels`). The
@@ -151,13 +152,12 @@ pub fn shadowLodMesh(mesh: *const Mesh) ?*const Mesh {
     var coarsest: ?*const Mesh = null;
     for (mesh.lod_levels.items) |lvl| {
         const lm = lvl.mesh orelse continue;
-        coarsest = lm;
+        if (@intFromPtr(lm) == @intFromPtr(mesh)) continue;
+        if (lm.gpu_pending or lm.vertex_buffer.id == 0 or lm.index_buffer.id == 0 or lm.index_count == 0) continue;
+        if (lm.index_type != mesh.index_type or lm.index_count >= mesh.index_count) continue;
+        if (coarsest == null or lm.index_count < coarsest.?.index_count) coarsest = lm;
     }
     const lod = coarsest orelse return null;
-    if (@intFromPtr(lod) == @intFromPtr(mesh)) return null;
-    if (lod.gpu_pending) return null;
-    if (lod.index_type != mesh.index_type) return null;
-    if (lod.index_count >= mesh.index_count) return null;
     return lod;
 }
 
@@ -264,14 +264,14 @@ test "shadowLodMesh picks the coarsest decimated child" {
     defer src.lod_levels.deinit(ally);
     var mid = Mesh{
         .name = "lod_mid",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
+        .vertex_buffer = .{ .id = 11 },
+        .index_buffer = .{ .id = 12 },
         .index_count = 150,
     };
     var coarse = Mesh{
         .name = "lod_coarse",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
+        .vertex_buffer = .{ .id = 13 },
+        .index_buffer = .{ .id = 14 },
         .index_count = 60,
     };
     try src.addLODLevel(ally, 20.0, &mid);
@@ -279,23 +279,26 @@ test "shadowLodMesh picks the coarsest decimated child" {
     const picked = shadowLodMesh(&src) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(&coarse), @intFromPtr(picked));
 
-    // A heavier-or-equal "LOD" is not a simplification: fall back.
+    // A heavier-or-equal "LOD" is ignored in favor of another valid child.
     coarse.index_count = 300;
-    try std.testing.expect(shadowLodMesh(&src) == null);
+    try std.testing.expectEqual(@intFromPtr(&mid), @intFromPtr(shadowLodMesh(&src).?));
     coarse.index_count = 60;
 
-    // A pending (not yet uploaded) child has dead handles: fall back until
-    // the upload finishes and a fresh prepare snapshots it.
+    // A pending (not yet uploaded) child is ignored; keep a valid fallback.
     coarse.gpu_pending = true;
-    try std.testing.expect(shadowLodMesh(&src) == null);
+    try std.testing.expectEqual(@intFromPtr(&mid), @intFromPtr(shadowLodMesh(&src).?));
     coarse.gpu_pending = false;
 
     // Index-type mismatch would draw garbage through the source bucket
-    // pipeline: fall back.
+    // pipeline, so keep the valid mid child instead.
     coarse.index_type = .UINT32;
-    try std.testing.expect(shadowLodMesh(&src) == null);
+    try std.testing.expectEqual(@intFromPtr(&mid), @intFromPtr(shadowLodMesh(&src).?));
     coarse.index_type = .UINT16;
     try std.testing.expect(shadowLodMesh(&src) != null);
+
+    // Missing GPU handles are not usable stand-ins.
+    coarse.index_buffer = .{};
+    try std.testing.expectEqual(@intFromPtr(&mid), @intFromPtr(shadowLodMesh(&src).?));
 
     // A morph source would freeze the unmorphed shape in the stand-in:
     // fall back to high-poly.

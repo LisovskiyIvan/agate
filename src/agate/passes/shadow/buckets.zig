@@ -47,9 +47,15 @@ fn shadowItemCulled(item: anytype, frustum: math.Frustum, cascade_idx: ?usize) b
     if (item.is_instanced) {
         if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) return true;
     }
+    const use_lod = types.shadowLodActive(item.has_shadow_lod, cascade_idx);
+    const geo_vb = if (use_lod) item.lod_vertex_buffer else item.vertex_buffer;
+    const geo_ib = if (use_lod) item.lod_index_buffer else item.index_buffer;
     if (sg.isvalid()) {
-        if (item.vertex_buffer.id != 0 and sg.queryBufferState(item.vertex_buffer) != .VALID) return true;
-        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return true;
+        // Validate the geometry actually selected for this cascade. The
+        // snapshotted LOD child may have been retired after prepare; checking
+        // only the source mesh handles would miss that case.
+        if (geo_vb.id == 0 or sg.queryBufferState(geo_vb) != .VALID) return true;
+        if (geo_ib.id == 0 or sg.queryBufferState(geo_ib) != .VALID) return true;
         if (item.is_instanced and item.instance_buffer.id != 0 and sg.queryBufferState(item.instance_buffer) != .VALID) return true;
     }
     if (!frustum.intersectsAABB(item.world_aabb)) return true;
