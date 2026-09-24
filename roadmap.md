@@ -2,7 +2,7 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 22.09.2026).
+> Дата: 10.09.2026 (обновлено 24.09.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
@@ -36,11 +36,11 @@
 | Материал Standard | Diffuse-цвет/текстура + Unlit-режим | ✅ |
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
 | OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color + маски/тинт-текстуры), anisotropy v1, thin-film transmission v1 (без refraction RT), SSS v1 (wrap+back-scatter); без OpenPBR | 🟡 |
-| Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image, RGBA8/RGBA16F, CPU-мипмапы | 🟡 |
-| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | 🟡 |
+| Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image (NEON SIMD, 357 Mpix/s), RGBA8/RGBA16F, CPU-мипмапы | ✅ |
+| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | ✅ |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
-| Постобработка | ACES/Reinhard, bloom, glow layer (threshold + separable blur + additive, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, cap 8, default off), виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off) | 🟡 |
-| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA main target + depth-prepass v1 (`Scene.msaa_depth_prepass`, default off) кормит постэффекты 1x-глубиной | 🟡 |
+| Постобработка | ACES/Reinhard, bloom, glow layer (threshold + separable blur + additive, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, cap 8, default off), виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off); оптимизации математики (комплексный ротатор золотого сечения для SSAO, pre-projection матрицы, раздельное наложение Motion Blur и SSAO без вымывания окклюзии) | ✅ |
+| DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA main target + depth-prepass v1 (`Scene.msaa_depth_prepass`, default off) кормит постэффекты 1x-глубиной; интерактивные переключатели шагов/сэмплов в HUD | ✅ |
 | Частицы | CPU-симуляция + GPU-инстансы, additive/alpha, local space, спрайт-листы, поворот, sub-emitters (on-death, SplitMix), flow maps (`setFlowMap`), коллизии CPU-частиц (сферы cap 8 + ground plane, kill/bounce), stateful compute-режим (см. GPU-симуляция) | 🟡 |
 | GPU-симуляция | Stateful compute-режим частиц (`SimulationMode.compute`, in-place state без ping-pong; гейт `computeAvailable()` + `error.ComputeUnsupported`, без тихого fallback; non-goals: sub-emitter deaths, flow maps, сортировка, коллизии) | ✅ |
 | Анимация | Скелетная (до 64 костей, GPU skinning, блендинг/crossfade) + node-анимации glTF TRS + easing | 🟡 |
@@ -49,22 +49,22 @@
 | LOD & Декали | Mesh.addLODLevel / getLOD / getLODForCamera + Sutherland-Hodgman Decal Projector | ✅ |
 | CSG (Конструктивная блочная геометрия) | BSP-дерево (splitPolygon, invert, clipTo), Union, Subtract, Intersect, MeshBuilder/Scene интеграция | ✅ |
 | Упрощение мешей (Mesh simplification) & Greased Lines | Garland-Heckbert QEM edge-collapse + автоматическая генерация LOD-уровней; GreasedLine: ribbon/billboard толстые 3D-линии, miter joints, multi-path, per-vertex width/color, UV/dashed modes | ✅ |
-| glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали | 🟡 |
-| Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (LDR + BC7-батч через `sandbox/tools/convert_ktx2.sh`) в glTF-загрузке, `KHR_texture_basisu` в whitelist `extensionsRequired` | 🟡 |
-| Физика | Box3D: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы | ✅ |
+| glTF/GLB | PBR, сэмплеры, скины, анимации, морфы, свет/камеры (KHR_lights_punctual), квантование (KHR_mesh_quantization), авто-нормали, прямой zero-copy парсер `cgltf` (0.01-0.03 мс на модель 4 МБ) | ✅ |
+| Draco/meshopt, KTX2-транскодинг (Basis), экспорт | KTX2-контейнер (LDR + BC7-батч через `sandbox/tools/convert_ktx2.sh`) в glTF-загрузке, `EXT_meshopt_compression` (распаковка через `meshoptimizer` < 0.001 мс), `KHR_texture_basisu` в whitelist `extensionsRequired` | ✅ |
+| Физика | Box3D v0.1.0: коллайдеры, compound, суставы, character, rope, события, запросы AABB/сфера/точка, ragdoll/vehicle-хелперы; компиляция `-O3 -DNDEBUG -fno-math-errno` (тик 0.5-1.0 мс, ~1000-1900 Hz); капитальный ремонт физики автомобиля (топология осей, свободный накат, сглаживание руля) | ✅ |
 | Soft body | PBD cloth v1 (Verlet 2–64, Jacobi constraints, pinned, sphere/floor коллайдеры, cap 4; non-goals: self-collision, tearing, fluids, box3d coupling, GPU sim, cloth-cloth, persistence) | ✅ |
 | Debug-рендер физики | генерация линий коллайдеров (`appendDebugLines`) + 3D-пасс линий (depth-tested) | ✅ |
 | UI | Экранный canvas, SDF-текст + TrueType (glyf-парсер, cmap 4/12, композитные глифы, kern fmt0, scanline-растеризатор, атлас), кнопки/панели, checkbox, slider, dropdown, скролл, text input, CSS-темы, анимации переходов + 3D world-space панели (до 4, pick+inject, render-on-demand) | ✅ |
 | Layout-контейнеры, Flex/Grid UI | LayoutStack: HStack, VStack, Flexbox, CSS Grid (fr/px/%), 9-point Anchors, Docking (top/bottom/left/right/fill), Spacers, Spans | ✅ |
 | Аудио | Процедурный синтез + WAV-файлы, 24 голоса, динамический реестр шин, DAG-иерархия, затухание (linear/inv/exp), Doppler, DSP-фильтры (biquad IIR), стерео-реверберация Freeverb, звуковая окклюзия геометрией/физикой (multi-tap raycast, LPF muffling), OGG/MP3/WAV потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы и кроссфейдинг музыки | ✅ |
-| mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией) | ✅ |
+| mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией); бенчмарки скорости: dr_mp3 45 MB/s, stb_vorbis 22.5 MB/s | ✅ |
 | Пикинг и теги объектов | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh), теги объектов (TagSet) и булевы смарт-фильтры (TagQuery: and/or/not/parentheses), Scene.pickWithRayTag | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1182 unit-тестов, встроенный профилировщик (HTML/JSON trace), `zig build test`, `zig build fmt`, `sandbox --bench` | ✅ |
+| Тесты/бенчмарки | 1193 unit-тестов (100% pass), Agate Performance Benchmark Suite (7 бенчмарков: Mat4 SIMD, Frustum Cull 4-wide, Transforms Pool, Full Pipeline, Audio decoders, 3D glTF/meshopt, Image decoders; `sandbox --bench`) | ✅ |
 | In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |
 | Web-инспекторы, Playground, NME, браузерные редакторы GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
@@ -465,7 +465,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
 * Система тегов объектов и булевых смарт-фильтров (`tags.zig`): `TagSet` (множество строковых тегов с регистронезависимым поиском, дедупликацией и разбором списков через разделители), `TagQuery` (парсер и AST-оценщик булевых выражений: `&`/`&&`/`and`, `|`/`||`/`or`, `!`/`not`, круглые скобки, неявный AND), нативная интеграция в `Mesh` (`tags`, `addTag`, `addTags`, `removeTag`, `hasTag`, `matchesTagQuery`) и `Scene` (`getMeshesByTag`, `getMeshesByQuery`, `countMeshesByTag`, `countMeshesByQuery`, `findFirstMeshByTag`, `findFirstMeshByQuery`, `pickWithRayTag`).
 * Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
-* 1078 unit-тестов в библиотеке, отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
+* 1193 unit-тестов в библиотеке (100% pass), отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
