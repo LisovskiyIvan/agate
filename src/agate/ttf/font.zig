@@ -305,11 +305,12 @@ fn parseCmap(cmap: []const u8) TtfError!CmapPair {
         const fmt16 = try readU16At(cmap, off);
         if (fmt16 == 4 and f4 == null) {
             if (off + 16 > cmap.len) return error.BadCmap;
+            const length = try readU16At(cmap, off + 2);
             const seg_count = @as(usize, try readU16At(cmap, off + 6)) / 2;
             if (seg_count == 0 or seg_count > 4096) return error.BadCmap;
             const need = 16 + seg_count * 8;
-            if (off + need > cmap.len) return error.BadCmap;
-            const sub = cmap[off..][0..need];
+            if (length < need or off + length > cmap.len) return error.BadCmap;
+            const sub = cmap[off..][0..length];
             // The spec requires the final segment to end at 0xFFFF.
             if (try readU16At(sub, 14 + (seg_count - 1) * 2) != 0xFFFF) return error.BadCmap;
             f4 = sub;

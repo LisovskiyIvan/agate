@@ -196,6 +196,17 @@ test "cmap format 4 maps ASCII, unknown maps to .notdef" {
     try testing.expectEqual(@as(u16, 0), try font.glyphIndex(0x4E2D));
 }
 
+test "cmap format 4 with idRangeOffset and glyphIdArray" {
+    const file = try buildFixture(testing.allocator, .{ .cmap = .fmt4_range_offset });
+    defer testing.allocator.free(file);
+    const font = try Font.parse(file);
+    try testing.expect(font.cmap_fmt4 != null);
+    try testing.expectEqual(@as(u16, 1), try font.glyphIndex('A'));
+    try testing.expectEqual(@as(u16, 2), try font.glyphIndex('B'));
+    try testing.expectEqual(@as(u16, 3), try font.glyphIndex('C'));
+    try testing.expectEqual(@as(u16, 0), try font.glyphIndex('Z'));
+}
+
 test "cmap format 12 maps BMP and supplementary codepoints" {
     const file = try buildFixture(testing.allocator, .{ .cmap = .fmt12 });
     defer testing.allocator.free(file);

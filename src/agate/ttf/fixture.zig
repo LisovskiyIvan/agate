@@ -18,7 +18,7 @@ const tag_kern: u32 = types.tag_kern;
 const tag_fvar: u32 = types.tag_fvar;
 const tag_cff: u32 = types.tag_cff;
 
-pub const FixtureCmap = enum { fmt4, fmt12, both, unsupported };
+pub const FixtureCmap = enum { fmt4, fmt4_range_offset, fmt12, both, unsupported };
 pub const FixtureComposite = enum { normal, self_cyclic, pair_cyclic, deep };
 pub const FixtureLoca = enum { ok, out_of_range };
 
@@ -333,7 +333,7 @@ pub fn buildFixture(allocator: std.mem.Allocator, opts: FixtureOptions) ![]u8 {
     {
         var o: std.Io.Writer.Allocating = .init(tmp);
         const w = &o.writer;
-        const want4 = opts.cmap == .fmt4 or opts.cmap == .both;
+        const want4 = opts.cmap == .fmt4 or opts.cmap == .fmt4_range_offset or opts.cmap == .both;
         const want12 = opts.cmap == .fmt12 or opts.cmap == .both;
         const n_sub: u16 = if (opts.cmap == .unsupported) 1 else (if (want4 and want12) 2 else 1);
         try fixtureWriteU16(w, 0);
@@ -367,11 +367,12 @@ pub fn buildFixture(allocator: std.mem.Allocator, opts: FixtureOptions) ![]u8 {
         var sub_off: [2]u32 = undefined;
         if (want4) {
             sub_off[0] = @intCast(o.written().len);
-            // Format 4: one segment A..C + terminator. idDelta maps
-            // 0x41->1: delta = (1 - 0x41) mod 65536 = 65472.
+            // Format 4: one segment A..C + terminator.
             const seg_count: u16 = 2;
+            const has_ro = (opts.cmap == .fmt4_range_offset);
+            const extra_len: u16 = if (has_ro) 6 else 0;
             try fixtureWriteU16(w, 4);
-            try fixtureWriteU16(w, 16 + seg_count * 8);
+            try fixtureWriteU16(w, 16 + seg_count * 8 + extra_len);
             try fixtureWriteU16(w, 0);
             try fixtureWriteU16(w, seg_count * 2);
             try fixtureWriteU16(w, 4); // searchRange 2*2^1
@@ -382,10 +383,20 @@ pub fn buildFixture(allocator: std.mem.Allocator, opts: FixtureOptions) ![]u8 {
             try fixtureWriteU16(w, 0); // reservedPad
             try fixtureWriteU16(w, 0x41);
             try fixtureWriteU16(w, 0xFFFF);
-            try fixtureWriteU16(w, 65472); // (1-0x41) idDelta
-            try fixtureWriteU16(w, 1);
-            try fixtureWriteU16(w, 0);
-            try fixtureWriteU16(w, 0);
+            if (has_ro) {
+                try fixtureWriteU16(w, 0);
+                try fixtureWriteU16(w, 1);
+                try fixtureWriteU16(w, 4);
+                try fixtureWriteU16(w, 0);
+                try fixtureWriteU16(w, 1);
+                try fixtureWriteU16(w, 2);
+                try fixtureWriteU16(w, 3);
+            } else {
+                try fixtureWriteU16(w, 65472); // (1-0x41) idDelta
+                try fixtureWriteU16(w, 1);
+                try fixtureWriteU16(w, 0);
+                try fixtureWriteU16(w, 0);
+            }
         }
         if (want12) {
             sub_off[if (want4) 1 else 0] = @intCast(o.written().len);
