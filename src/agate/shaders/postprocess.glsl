@@ -51,6 +51,7 @@ layout(binding = 0) uniform fs_params {
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
+    vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -63,6 +64,7 @@ layout(binding = 5) uniform texture2D history_tex;
 layout(binding = 6) uniform texture2D glow_tex;
 layout(binding = 7) uniform texture2D highlight_tex;
 layout(binding = 8) uniform texture2D highlight_mask_tex;
+layout(binding = 9) uniform texture2D shaft_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -753,6 +755,18 @@ void main() {
         vec3 hl_blurred = texture(sampler2D(highlight_tex, smp), uv).rgb;
         vec3 hl_inner = max(hl_raw - hl_blurred, vec3(0.0)) * 2.0;
         color += hl_inner * highlight_params.y;
+    }
+
+    // Volumetric light shafts v1 (sun CSM-backed raymarch, low-res +
+    // bilateral blur): the blurred shaft radiance added with intensity.
+    // Disabled returns before sampling, so the off path is bit-identical
+    // to pre-shaft. Composites AFTER highlight so either toggle leaves
+    // the other's contribution unchanged; before the grading chain so
+    // shafts grade with the same LDR the other halos use. Mirrors
+    // shaftParams in postprocess.zig (same (enabled, intensity) pack).
+    if (shaft_params.x > 0.5 && shaft_params.y > 0.001) {
+        vec3 shaft = texture(sampler2D(shaft_tex, smp), uv).rgb;
+        color += shaft * shaft_params.y;
     }
 
     // Contrast

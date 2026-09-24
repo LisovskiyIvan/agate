@@ -18,6 +18,7 @@ const gui3d_layer = @import("../scene/gui3d_layer.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 const glow_pass_mod = @import("../passes/glow_pass.zig");
 const highlight_pass_mod = @import("../passes/highlight_pass.zig");
+const volumetric_pass_mod = @import("../passes/volumetric_pass.zig");
 
 const Scene = scene_mod.Scene;
 const Texture = texture_mod.Texture;
@@ -323,6 +324,27 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 .format = .RGBA8,
                 .samples = 1,
                 .gpu_bytes = hl_bytes,
+            });
+        }
+
+        // Volumetric shaft targets (raymarch + bilateral H/V ping-pong,
+        // half/quarter res): pass-owned like the layers above (pure byte
+        // math via VolumetricPass.targetBytes, no GPU calls; an unsized
+        // pass contributes nothing). The targets are LAZY (allocated on
+        // the first active render, never by resizeAll/beginMainPass), so
+        // this gate keeps the census honest: shaft-off frames report no
+        // shaft VRAM.
+        const shaft = &scene.postfx.volumetric_pass;
+        if (shaft.base_width > 0 and shaft.base_height > 0) {
+            const shaft_bytes = volumetric_pass_mod.VolumetricPass.targetBytes(shaft.base_width, shaft.base_height, volumetric_pass_mod.VolumetricPass.shaftBytesPerPixel(), shaft.resolution);
+            snap.render_targets_vram_bytes += shaft_bytes;
+            try rt_list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, "Volumetric Shaft Targets (Raymarch + Blur Ping-Pong)"),
+                .width = @intCast(shaft.base_width),
+                .height = @intCast(shaft.base_height),
+                .format = .RGBA8,
+                .samples = 1,
+                .gpu_bytes = shaft_bytes,
             });
         }
 

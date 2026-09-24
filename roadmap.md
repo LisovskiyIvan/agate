@@ -62,7 +62,7 @@
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
-| Frame graph, volumetric, Gaussian splatting | — | ❌ |
+| Frame graph, volumetric, Gaussian splatting | Volumetric light shafts v1 (sun-CSM raymarch, half/quarter res, HG phase, bilateral blur, additive composite, default off; engine-only, no sandbox UI) | 🟡 |
 | Large world rendering, geospatial | — | ❌ |
 | Тесты/бенчмарки | 1193 unit-тестов (100% pass), Agate Performance Benchmark Suite (7 бенчмарков: Mat4 SIMD, Frustum Cull 4-wide, Transforms Pool, Full Pipeline, Audio decoders, 3D glTF/meshopt, Image decoders; `sandbox --bench`) | ✅ |
 | In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |

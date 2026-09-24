@@ -13,6 +13,7 @@ pub const ParticlePass = @import("particle_pass.zig").ParticlePass;
 pub const PostProcessPass = @import("postprocess_pass.zig").PostProcessPass;
 pub const BloomPass = @import("bloom_pass.zig").BloomPass;
 pub const GlowPass = @import("glow_pass.zig").GlowPass;
+pub const VolumetricPass = @import("volumetric_pass.zig").VolumetricPass;
 pub const HighlightPass = @import("highlight_pass.zig").HighlightPass;
 pub const HighlightDrawItem = @import("highlight_pass.zig").HighlightDrawItem;
 pub const HighlightResult = @import("highlight_pass.zig").HighlightResult;

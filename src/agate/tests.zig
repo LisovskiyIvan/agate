@@ -133,6 +133,7 @@ test {
     _ = @import("passes/shadow_pass.zig");
     _ = @import("passes/skybox_pass.zig");
     _ = @import("passes/ssao_pass.zig");
+    _ = @import("passes/volumetric_pass.zig");
     _ = @import("physics.zig");
     _ = @import("physics/body.zig");
     _ = @import("physics/character.zig");

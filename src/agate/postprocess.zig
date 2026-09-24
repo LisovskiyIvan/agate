@@ -187,6 +187,37 @@ pub const PostProcessOptions = struct {
     // Snapshot-carried, so the update thread sets it safely for one frame.
     taa_camera_cut: bool = false,
 
+    // Volumetric light shafts v1 (sun CSM-backed raymarch, low-res).
+    // Screen-space raymarch from the camera through each low-res pixel to
+    // the scene depth surface, sampling the SUN's CSM atlas at every step
+    // (single raw-depth tap per step, no PCF in v1) and accumulating
+    // single-scatter with a Henyey-Greenstein phase term and Beer-Lambert
+    // transmittance; bilateral (depth-aware) H/V blur; additive composite
+    // after the highlight block. Default OFF: zero passes run, the
+    // composite branch is skipped, and rendering stays bit-identical.
+    // Requires live CSM data (gated on shadows_enabled at the call site,
+    // see shaftActive): without a rendered CSM atlas there is nothing
+    // real to march against, and v1 refuses to fake it.
+    shaft_enabled: bool = false,
+    // Additive composite scale; >= 0.
+    shaft_intensity: f32 = 1.0,
+    // Raymarch steps per pixel; clamped to [4, 32] (the shader loop bound).
+    shaft_steps: u32 = 12,
+    // Extinction/scattering coefficient per meter; >= 0.
+    shaft_density: f32 = 0.05,
+    // Henyey-Greenstein anisotropy in [-0.9, 0.9]; > 0 forward scattering
+    // (bright shafts looking toward the sun), 0 isotropic.
+    shaft_anisotropy: f32 = 0.4,
+    // Raymarch span cap in meters; >= 0 (sky pixels march the full span).
+    shaft_max_distance: f32 = 60.0,
+    // Raymarch/blur target resolution (half or quarter of the base size).
+    shaft_resolution: ShaftResolution = .quarter,
+    // Bilateral blur spatial sigma in shaft-target texels; >= 0.
+    shaft_blur_sigma: f32 = 2.0,
+    // Bilateral blur depth gate in raw-depth units; >= 0 (0 = no depth
+    // weighting, plain Gaussian).
+    shaft_edge_sigma: f32 = 0.02,
+
     // Return a copy with out-of-range values pulled into valid ranges.
     // Never fails; safe to apply on load or before uploading uniforms.
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
@@ -211,6 +242,13 @@ pub const PostProcessOptions = struct {
         out.taa_jitter_scale = std.math.clamp(self.taa_jitter_scale, 0.0, 4.0);
         out.taa_sharpness = std.math.clamp(self.taa_sharpness, 0.0, 1.0);
         out.taa_clamp_strength = std.math.clamp(self.taa_clamp_strength, 0.0, 1.0);
+        out.shaft_intensity = @max(self.shaft_intensity, 0.0);
+        out.shaft_steps = std.math.clamp(self.shaft_steps, SHAFT_STEPS_MIN, SHAFT_STEPS_MAX);
+        out.shaft_density = @max(self.shaft_density, 0.0);
+        out.shaft_anisotropy = std.math.clamp(self.shaft_anisotropy, -SHAFT_ANISOTROPY_MAX, SHAFT_ANISOTROPY_MAX);
+        out.shaft_max_distance = @max(self.shaft_max_distance, 0.0);
+        out.shaft_blur_sigma = @max(self.shaft_blur_sigma, 0.0);
+        out.shaft_edge_sigma = @max(self.shaft_edge_sigma, 0.0);
         out.grade_shadows = clampGrade(self.grade_shadows);
         out.grade_midtones = clampGrade(self.grade_midtones);
         out.grade_highlights = clampGrade(self.grade_highlights);
@@ -1775,3 +1813,285 @@ test "ssr and motion blur configurable quality options" {
     try std.testing.expectEqual(@as(u32, 32), c.motion_blur_samples);
 }
 
+// --- Volumetric light shafts v1 (sun CSM-backed) ---
+//
+// Composite order (see postprocess.glsl main): ... BLOOM -> GLOW ->
+// HIGHLIGHT -> SHAFT -> contrast -> saturation -> curves -> LUT ->
+// vignette -> grain. The shaft radiance composites right after the
+// highlight block so either toggle leaves the other's contribution
+// bit-identical, and before the grading chain so shafts grade with the
+// same LDR the bloom/glow halos use.
+//
+// Pass order (see scene/postfx_stack.zig renderChain): PASS 2.5 SSAO,
+// PASS 2.75 bloom pyramid, PASS 2.8 glow, PASS 2.85 highlight, PASS 2.9
+// shaft (raymarch + bilateral H + V = SHAFT_PASS_DRAWS draws), PASS 3
+// fullscreen composite. The raymarch samples the scene depth (so the
+// MSAA depth-suppression gates it exactly like SSR/DoF/Fog/TAA) and the
+// sun CSM atlas (so it additionally requires shadows_enabled — without
+// a rendered CSM atlas v1 runs zero passes rather than marching
+// against stale data). Past its input binds the pass is uniform-only
+// (no sg.updateBuffer, hence no gpu_upload_meter records) and
+// resize-idempotent, so renderReuse replays stay upload-free by
+// construction. Like the highlight targets, the shaft RTs allocate
+// lazily on the first active render, so post-on with the shaft off
+// holds no shaft VRAM.
+//
+// v1 non-goals (documented, not silent): no PCF in the march (one raw
+// tap per step — the bilateral blur eats the aliasing), no height-fog
+// coupling (shafts add on top of the fogged image), pre-tonemap HDR
+// injection (v1 composites into the same post-tonemap LDR chain the
+// glow/highlight halos use), secondary-camera views (primary only).
+
+/// Raymarch target resolution: half or quarter of the base size.
+pub const ShaftResolution = enum(u8) {
+    half = 0,
+    quarter = 1,
+};
+
+/// Raymarch step clamp range (the shader loop bound is SHAFT_MARCH_MAX).
+pub const SHAFT_STEPS_MIN: u32 = 4;
+pub const SHAFT_STEPS_MAX: u32 = 32;
+/// Hard loop bound mirrored by the raymarch shader (steps break out early).
+pub const SHAFT_MARCH_MAX: u32 = 32;
+/// Fullscreen draws one shaft frame issues: raymarch + bilateral H + V.
+pub const SHAFT_PASS_DRAWS: u32 = 3;
+/// Anisotropy clamp (|g| < 1 keeps the HG denominator nonzero).
+pub const SHAFT_ANISOTROPY_MAX: f32 = 0.9;
+/// Bilateral blur taps per axis (mirrors volumetric_blur.glsl, same 9-tap
+/// shape as the glow blur so the kernel sum helper stays shared).
+pub const SHAFT_BLUR_TAPS: u32 = 9;
+pub const SHAFT_BLUR_HALF_TAPS: i32 = 4;
+
+pub const ShaftTargetSize = struct {
+    w: i32,
+    h: i32,
+};
+
+// Shaft target size for a base framebuffer: half is bloomMipSize level 0,
+// quarter halves once more, clamped to 1x1. Mirrors VolumetricPass.resize.
+pub fn shaftTargetSize(base_w: i32, base_h: i32, res: ShaftResolution) ShaftTargetSize {
+    const half = bloomMipSize(base_w, base_h, 0);
+    switch (res) {
+        .half => return .{ .w = half.w, .h = half.h },
+        .quarter => return .{
+            .w = @max(1, @divTrunc(half.w, 2)),
+            .h = @max(1, @divTrunc(half.h, 2)),
+        },
+    }
+}
+
+// Pass-construction decision (pure; PostFXStack.renderChain gates PASS 2.9
+// on this). Post off, shaft off, or no rendered CSM atlas (shadows off)
+// runs zero passes and binds the placeholder (bit-identical composite).
+pub fn shaftActive(post_enabled: bool, cfg: PostProcessOptions, shadows_enabled: bool) bool {
+    return post_enabled and cfg.shaft_enabled and shadows_enabled;
+}
+
+// Pack the composite shaft_params vec4: (enabled 1/0, intensity, 0, 0).
+// Disabled packs all zeros, which keeps the composite bit-identical to
+// the pre-shaft path (the shader returns before sampling shaft_tex).
+pub fn shaftParams(cfg: PostProcessOptions) [4]f32 {
+    if (!cfg.shaft_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    const c = cfg.clamped();
+    return .{ 1.0, c.shaft_intensity, 0.0, 0.0 };
+}
+
+// Strict range check for the shaft knobs. Finite out-of-range values are
+// the clamped() domain (bloom/glow precedent: silent sanitize on load);
+// non-finite values (NaN/Inf) can never sanitize meaningfully, so they
+// are a hard InvalidShaftOptions error here instead of a silent clamp.
+pub fn validateShaft(cfg: PostProcessOptions) !void {
+    if (!std.math.isFinite(cfg.shaft_intensity)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shaft_density)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shaft_anisotropy)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shaft_max_distance)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shaft_blur_sigma)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shaft_edge_sigma)) return error.InvalidShaftOptions;
+    if (cfg.shaft_intensity < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shaft_density < 0.0) return error.InvalidShaftOptions;
+    if (@abs(cfg.shaft_anisotropy) > SHAFT_ANISOTROPY_MAX) return error.InvalidShaftOptions;
+    if (cfg.shaft_max_distance < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shaft_blur_sigma < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shaft_edge_sigma < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shaft_steps < SHAFT_STEPS_MIN or cfg.shaft_steps > SHAFT_MARCH_MAX) return error.InvalidShaftOptions;
+}
+
+// Henyey-Greenstein phase term for cos_theta = dot(view_ray, sun_dir)
+// (both toward the scene: view ray from the camera, sun dir toward the
+// sun) and anisotropy g. Mirrors hgPhase in volumetric_raymarch.glsl so
+// CPU tests pin the exact shader formula.
+pub fn hgPhase(cos_theta: f32, g: f32) f32 {
+    const gg = g * g;
+    const denom = 1.0 + gg - 2.0 * g * cos_theta;
+    return (1.0 - gg) / (4.0 * std.math.pi * denom * @sqrt(@max(denom, 1e-6)));
+}
+
+// CSM cascade index for a camera-distance sample. Mirrors
+// calculateShadow in the forward shaders (and shaftCascade in
+// volumetric_raymarch.glsl): distance-ordered splits, cascade 3 past
+// split 2, so the march taps the same tile the surface shader uses.
+pub fn shaftCascadeIndex(view_dist: f32, splits: [4]f32) usize {
+    if (view_dist < splits[0]) return 0;
+    if (view_dist < splits[1]) return 1;
+    if (view_dist < splits[2]) return 2;
+    return 3;
+}
+
+// One bilateral blur tap weight: spatial Gaussian (offset in shaft texels,
+// sigma floored at 0.5 exactly like the shader) times a raw-depth gate
+// (edge_sigma <= 0 disables the gate: plain Gaussian). Mirrors
+// volumetric_blur.glsl; both sides divide by the kernel sum.
+pub fn shaftBilateralWeight(offset: f32, sigma_spatial: f32, depth_diff: f32, sigma_depth: f32) f32 {
+    const s = @max(sigma_spatial, 0.5);
+    const t = offset / s;
+    const spatial = @exp(-0.5 * t * t);
+    if (sigma_depth <= 0.0) return spatial;
+    const d = depth_diff / sigma_depth;
+    return spatial * @exp(-0.5 * d * d);
+}
+
+// Kernel normalization both blur stages apply: sum of
+// shaftBilateralWeight over the taps at zero depth difference (the
+// center-pixel normalization; per-tap depth gates only shrink weights).
+pub fn shaftKernelSum(sigma_spatial: f32) f32 {
+    var sum: f32 = 0.0;
+    var i: i32 = -SHAFT_BLUR_HALF_TAPS;
+    while (i <= SHAFT_BLUR_HALF_TAPS) : (i += 1) {
+        sum += shaftBilateralWeight(@floatFromInt(i), sigma_spatial, 0.0, 0.0);
+    }
+    return sum;
+}
+
+test "shaft defaults are off and bit-identical" {
+    const cfg = PostProcessOptions{};
+    try std.testing.expect(!cfg.shaft_enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.shaft_intensity, 1e-6);
+    try std.testing.expectEqual(@as(u32, 12), cfg.shaft_steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), cfg.shaft_density, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.shaft_anisotropy, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 60.0), cfg.shaft_max_distance, 1e-6);
+    try std.testing.expectEqual(ShaftResolution.quarter, cfg.shaft_resolution);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg.shaft_blur_sigma, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02), cfg.shaft_edge_sigma, 1e-6);
+    // Off packs zeros: the composite never samples the shaft texture.
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, shaftParams(cfg));
+    try std.testing.expect(!shaftActive(true, cfg, true));
+    try std.testing.expect(!shaftActive(false, PostProcessOptions{ .shaft_enabled = true }, true));
+    try std.testing.expect(!shaftActive(true, PostProcessOptions{ .shaft_enabled = true }, false));
+    try std.testing.expect(shaftActive(true, PostProcessOptions{ .shaft_enabled = true }, true));
+}
+
+test "shaft config clamped sanitizes ranges" {
+    var cfg = PostProcessOptions{
+        .shaft_intensity = -1.0,
+        .shaft_steps = 100,
+        .shaft_density = -0.5,
+        .shaft_anisotropy = 2.0,
+        .shaft_max_distance = -10.0,
+        .shaft_blur_sigma = -3.0,
+        .shaft_edge_sigma = -0.1,
+    };
+    const out = cfg.clamped();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_intensity, 1e-6);
+    try std.testing.expectEqual(SHAFT_STEPS_MAX, out.shaft_steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_density, 1e-6);
+    try std.testing.expectApproxEqAbs(SHAFT_ANISOTROPY_MAX, out.shaft_anisotropy, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_max_distance, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_blur_sigma, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_edge_sigma, 1e-6);
+    cfg.shaft_steps = 0;
+    try std.testing.expectEqual(SHAFT_STEPS_MIN, cfg.clamped().shaft_steps);
+    cfg.shaft_anisotropy = -2.0;
+    try std.testing.expectApproxEqAbs(-SHAFT_ANISOTROPY_MAX, cfg.clamped().shaft_anisotropy, 1e-6);
+    // Enabled packs the clamped intensity.
+    const on = PostProcessOptions{ .shaft_enabled = true, .shaft_intensity = 2.5 };
+    try std.testing.expectEqual([4]f32{ 1.0, 2.5, 0.0, 0.0 }, shaftParams(on));
+}
+
+test "shaft validation rejects non-finite and out-of-range" {
+    const ok = PostProcessOptions{ .shaft_enabled = true };
+    try validateShaft(ok);
+    var bad = ok;
+    bad.shaft_intensity = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shaft_anisotropy = 1.0;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shaft_steps = 3;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shaft_steps = 33;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shaft_density = -1.0;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shaft_edge_sigma = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+}
+
+test "hg phase golden values" {
+    // Isotropic (g = 0): uniform 1/(4π) whatever the angle.
+    const iso = 1.0 / (4.0 * std.math.pi);
+    try std.testing.expectApproxEqAbs(iso, hgPhase(1.0, 0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(iso, hgPhase(-1.0, 0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(iso, hgPhase(0.0, 0.0), 1e-6);
+    // Forward scattering peaks looking toward the sun.
+    const fwd = hgPhase(1.0, 0.4);
+    try std.testing.expect(fwd > hgPhase(0.0, 0.4));
+    try std.testing.expect(hgPhase(0.0, 0.4) > hgPhase(-1.0, 0.4));
+    // Negative g mirrors: back-scatter peak.
+    try std.testing.expectApproxEqAbs(fwd, hgPhase(-1.0, -0.4), 1e-5);
+    // Spot value: g = 0.4 straight into the sun: (1-0.16)/(4π·0.36^1.5).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3095), fwd, 1e-3);
+    // Always finite and positive inside the clamp range.
+    var g: f32 = -0.9;
+    while (g <= 0.9) : (g += 0.1) {
+        const p = hgPhase(0.7, g);
+        try std.testing.expect(std.math.isFinite(p) and p > 0.0);
+    }
+}
+
+test "shaft cascade index mirrors the forward splits" {
+    const splits = [4]f32{ 10.0, 26.0, 65.0, 150.0 };
+    try std.testing.expectEqual(@as(usize, 0), shaftCascadeIndex(5.0, splits));
+    try std.testing.expectEqual(@as(usize, 0), shaftCascadeIndex(9.99, splits));
+    try std.testing.expectEqual(@as(usize, 1), shaftCascadeIndex(10.0, splits));
+    try std.testing.expectEqual(@as(usize, 1), shaftCascadeIndex(25.99, splits));
+    try std.testing.expectEqual(@as(usize, 2), shaftCascadeIndex(26.0, splits));
+    try std.testing.expectEqual(@as(usize, 3), shaftCascadeIndex(65.0, splits));
+    try std.testing.expectEqual(@as(usize, 3), shaftCascadeIndex(1000.0, splits));
+}
+
+test "shaft target sizes halve and quarter" {
+    try std.testing.expectEqual(ShaftTargetSize{ .w = 640, .h = 360 }, shaftTargetSize(1280, 720, .half));
+    try std.testing.expectEqual(ShaftTargetSize{ .w = 320, .h = 180 }, shaftTargetSize(1280, 720, .quarter));
+    // Quarter of half-res level 0, never below 1x1.
+    try std.testing.expectEqual(ShaftTargetSize{ .w = 1, .h = 1 }, shaftTargetSize(3, 3, .quarter));
+    const q = shaftTargetSize(1920, 1080, .quarter);
+    try std.testing.expect(q.w >= 1 and q.h >= 1);
+    // Doubling both dims quadruples the census area either way.
+    const h1 = shaftTargetSize(640, 360, .half);
+    const h2 = shaftTargetSize(1280, 720, .half);
+    try std.testing.expectEqual(h1.w * 2, h2.w);
+    try std.testing.expectEqual(h1.h * 2, h2.h);
+}
+
+test "shaft bilateral weights gate on depth edges" {
+    // Center tap with no depth step is exactly 1.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), shaftBilateralWeight(0.0, 2.0, 0.0, 0.02), 1e-6);
+    // Spatial falloff matches the glow Gaussian at zero depth difference.
+    try std.testing.expectApproxEqAbs(glowGaussianWeight(2.0, 2.0), shaftBilateralWeight(2.0, 2.0, 0.0, 0.02), 1e-6);
+    // A depth step far beyond the edge sigma kills the tap.
+    try std.testing.expect(shaftBilateralWeight(0.0, 2.0, 1.0, 0.02) < 1e-6);
+    // Zero edge sigma disables the gate: plain Gaussian everywhere.
+    try std.testing.expectApproxEqAbs(glowGaussianWeight(1.0, 2.0), shaftBilateralWeight(1.0, 2.0, 1.0, 0.0), 1e-6);
+    // Kernel is normalized the same way (center normalization).
+    var sum: f32 = 0.0;
+    var i: i32 = -SHAFT_BLUR_HALF_TAPS;
+    while (i <= SHAFT_BLUR_HALF_TAPS) : (i += 1) {
+        sum += glowGaussianWeight(@floatFromInt(i), 2.0);
+    }
+    try std.testing.expectApproxEqAbs(sum, shaftKernelSum(2.0), 1e-6);
+}

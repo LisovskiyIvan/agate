@@ -480,6 +480,15 @@ pub fn render(scene: anytype) void {
         .highlight_items = draws.highlight_items.items,
         // Primary view's viewport for the PASS 2.85 mask (computed above).
         .highlight_viewport = highlight_viewport,
+        // PASS 2.9 volumetric shafts: live CSM atlas view (context thread
+        // owns it this frame — PASS 1 rendered into it above) plus the
+        // snapshot's cascades/splits/bias and the shadows gate. The pass
+        // fail-closes on an empty view, so pre-init/headless stays safe.
+        .shaft_shadow_view = scene.shadows.pass.texture_view,
+        .shaft_cascades = snap.cascades,
+        .shaft_splits = snap.shadow_uniforms.splits,
+        .shaft_shadow_bias = snap.shadow_uniforms.bias,
+        .shadows_enabled = snap.shadows_enabled,
         .ui = if (scene.ui_frame.canvas_present) &scene.ui_frame else null,
         .stats = &scene.stats,
     }, cur_w, cur_h);

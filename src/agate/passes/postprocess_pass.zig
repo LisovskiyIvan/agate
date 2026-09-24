@@ -53,6 +53,11 @@ pub const PostProcessPass = struct {
     // composite reads raw minus blurred, so both views travel together:
     // the parent feeds the real pair only when staged items exist.
     highlight_mask_tex_view: sg.View = .{},
+    // Optional VolumetricPass result (sun-CSM shaft radiance, half/quarter
+    // res). Set via setShaftTexture(); empty by default, in which case the
+    // shader skips the shaft block and this binds the scene view as a
+    // harmless placeholder (bit-identical composite).
+    shaft_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -398,6 +403,14 @@ pub const PostProcessPass = struct {
             self.highlight_mask_tex_view
         else
             self.offscreen_resolve_tex_view;
+        // Shaft radiance when the parent fed a VolumetricPass result;
+        // otherwise a valid placeholder the shader never samples
+        // (shaft_params.x = 0 gates the shaft block off, so the off path
+        // is bit-identical to pre-shaft).
+        post_bind.views[post_shd.VIEW_shaft_tex] = if (self.shaft_tex_view.id != 0)
+            self.shaft_tex_view
+        else
+            self.offscreen_resolve_tex_view;
         // LUT when the config carries a live binding; otherwise the resolved
         // scene view as a valid placeholder the shader never samples
         // (lut_params.x = 0 gates the LUT branch off).
@@ -518,6 +531,9 @@ pub const PostProcessPass = struct {
             // parent fed no highlight view, which keeps the composite
             // identical to the pre-highlight path.
             .highlight_params = postprocess.highlightParams(self.highlight_tex_view.id != 0),
+            // (enabled 1/0, intensity, 0, 0); zeros when the shaft is off,
+            // which keeps the composite identical to the pre-shaft path.
+            .shaft_params = postprocess.shaftParams(config),
             .grade_shadows = .{
                 config.grade_shadows[0],
                 config.grade_shadows[1],
@@ -590,6 +606,14 @@ pub const PostProcessPass = struct {
     // off path stays bit-identical.
     pub fn setHighlightMaskTexture(self: *PostProcessPass, view: sg.View) void {
         self.highlight_mask_tex_view = view;
+    }
+
+    // Feed the VolumetricPass shaft result into the composite. Call every
+    // frame before render() once the parent owns a VolumetricPass; pass
+    // .{} to detach and return to the no-shaft composite path
+    // (bit-identical to pre-shaft).
+    pub fn setShaftTexture(self: *PostProcessPass, view: sg.View) void {
+        self.shaft_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

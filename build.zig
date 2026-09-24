@@ -332,6 +332,8 @@ pub fn build(b: *Build) !void {
         .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig" },
         .{ .name = "glow_extract_shader", .input = "src/agate/shaders/glow_extract.glsl", .output = "glow_extract_shader.zig" },
         .{ .name = "glow_blur_shader", .input = "src/agate/shaders/glow_blur.glsl", .output = "glow_blur_shader.zig" },
+        .{ .name = "volumetric_raymarch_shader", .input = "src/agate/shaders/volumetric_raymarch.glsl", .output = "volumetric_raymarch_shader.zig" },
+        .{ .name = "volumetric_blur_shader", .input = "src/agate/shaders/volumetric_blur.glsl", .output = "volumetric_blur_shader.zig" },
         .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
         .{ .name = "probe_mip_shader", .input = "src/agate/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
         .{ .name = "ui3d_panel_shader", .input = "src/agate/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },

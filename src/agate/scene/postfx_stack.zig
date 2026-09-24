@@ -36,6 +36,7 @@ pub const PostFXStack = struct {
     bloom_pass: passes.BloomPass,
     glow_pass: passes.GlowPass,
     highlight_pass: passes.HighlightPass,
+    volumetric_pass: passes.VolumetricPass = .{},
     outline_pass: passes.OutlinePass,
 
     // MSAA twin of the outline pass (its pipelines must match the main
@@ -90,6 +91,7 @@ pub const PostFXStack = struct {
             .bloom_pass = passes.BloomPass.init(),
             .glow_pass = passes.GlowPass.init(),
             .highlight_pass = passes.HighlightPass.init(),
+            .volumetric_pass = passes.VolumetricPass.init(),
             .outline_pass = passes.OutlinePass.init(),
         };
     }
@@ -100,6 +102,7 @@ pub const PostFXStack = struct {
         self.bloom_pass.deinit();
         self.glow_pass.deinit();
         self.highlight_pass.deinit();
+        self.volumetric_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
@@ -107,10 +110,12 @@ pub const PostFXStack = struct {
     }
 
     /// Resizes every viewport-sized offscreen target (window resize path).
-    /// The highlight mask/blur targets are deliberately EXCLUDED: they
-    /// allocate lazily on the first active HighlightPass.render (gated by
-    /// highlightActive in renderChain), so post-on with zero highlights
-    /// holds no highlight VRAM (~12 MiB @1080p RGBA16F, ~48 MiB @4K).
+    /// The highlight mask/blur targets and the volumetric shaft targets
+    /// are deliberately EXCLUDED: they allocate lazily on the first
+    /// active render (gated by highlightActive/shaftActive in
+    /// renderChain), so post-on with zero highlights and the shaft off
+    /// holds no highlight/shaft VRAM (~12 MiB @1080p RGBA16F, ~48 MiB
+    /// @4K for highlights; quarter-res shafts ~3 MiB @1080p RGBA16F).
     /// A resize during OFF cannot break the first active frame — render()
     /// resizes to the current base size before drawing.
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
@@ -312,6 +317,26 @@ pub const PostFXStack = struct {
         // aligned; fullscreen by default). Multi-camera stays primary-only
         // (v1 non-goal); secondary views never feed the mask.
         highlight_viewport: Viewport = .{},
+        // Sun CSM atlas texture view sampled once per raymarch step by
+        // the volumetric shaft pass (PASS 2.9). Render-owned snapshot of
+        // scene.shadows.pass.texture_view taken by frame_render on the
+        // context thread; empty (.{} id 0) headless or before the first
+        // shadow render — VolumetricPass.render fail-closes on it.
+        shaft_shadow_view: sg.View = .{},
+        // Sun CSM cascade matrices + split distances for the shaft
+        // raymarch (frame snapshot copies of snap.cascades and
+        // snap.shadow_uniforms.splits); identity/zero until packed.
+        shaft_cascades: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
+        shaft_splits: [4]f32 = .{ 0, 0, 0, 0 },
+        // Forward shadow depth bias feeding the shaft receiver bias
+        // (snapshot copy of snap.shadow_uniforms.bias; the pass floors
+        // it at a sub-texel epsilon).
+        shaft_shadow_bias: f32 = 0.0,
+        // Whether PASS 1 rendered the CSM atlas this frame (snapshot copy
+        // of snap.shadows_enabled). The shaft pass requires live CSM
+        // data: without it shaftActive stays closed and zero shaft
+        // passes run rather than marching against stale data.
+        shadows_enabled: bool = false,
         // Optional 2D overlay drawn on top of the post-processed swapchain.
         // P6: the prepared render-owned frame (upload-free draw), never the
         // live canvas. Intentional low-level break: `?*UICanvas` became
@@ -321,10 +346,10 @@ pub const PostFXStack = struct {
     };
 
     /// PASS 2.5 (SSAO) + PASS 2.75 (bloom pyramid) + PASS 2.8 (glow layer) +
-    /// PASS 2.85 (highlight layer) +
+    /// PASS 2.85 (highlight layer) + PASS 2.9 (volumetric shafts) +
     /// PASS 3 (fullscreen composite and UI overlay onto the swapchain). The
     /// composite pass itself only runs when post-processing is enabled —
-    /// SSAO/bloom/glow/highlight then just refresh their inputs (legacy behavior kept
+    /// SSAO/bloom/glow/highlight/shaft then just refresh their inputs (legacy behavior kept
     /// verbatim).
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         // Depth-consuming effects are incompatible with the MSAA main
@@ -338,9 +363,9 @@ pub const PostFXStack = struct {
         var post = params.post;
         var ssao = params.ssao;
         if (msaa.suppressDepthEffects(params.main_samples, params.msaa_depth_prepass)) {
-            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled)) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled) or post.shaft_enabled) {
                 _ = self.warn_depth_effects.warn(
-                    "msaa: SSAO/SSR/DoF/Fog disabled this session: MSAA x{} main target has no depth resolve",
+                    "msaa: SSAO/SSR/DoF/Fog/Shaft disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},
                 );
             }
@@ -350,6 +375,7 @@ pub const PostFXStack = struct {
             post.dof_enabled = false;
             post.fog_enabled = false;
             post.fxaa_enabled = false;
+            post.shaft_enabled = false;
         }
         // TAA needs the 1x depth texture for its reprojection velocity; with
         // an MSAA main target depth is write-only (no resolve in sokol), so
@@ -478,6 +504,51 @@ pub const PostFXStack = struct {
         }
         self.postprocess_pass.setHighlightTexture(highlight_view);
         self.postprocess_pass.setHighlightMaskTexture(highlight_mask_view);
+
+        // ==============================================
+        // PASS 2.9: VOLUMETRIC LIGHT SHAFTS v1 (sun CSM raymarch)
+        // ==============================================
+        // Low-res raymarch against the scene depth + the sun CSM atlas
+        // (single raw tap per step, HG phase, Beer-Lambert) + bilateral
+        // H/V blur (SHAFT_PASS_DRAWS draws); when inactive (post off,
+        // shaft off, shadows off, or MSAA-suppressed above) the composite
+        // shader skips the shaft block and this binds the resolved scene
+        // view placeholder (bit-identical). Runs AFTER the highlight
+        // stage and composites after highlight's block, so either toggle
+        // leaves the other's output unchanged. Samples the post depth
+        // texture (hence the MSAA suppression above, lifted by the PASS
+        // 1.7 prepass like SSR/DoF/Fog) plus the CSM atlas view carried
+        // in ChainParams (never a live pass pointer). Like glow it is
+        // uniform-only past its input binds (no sg.updateBuffer, no
+        // upload-meter records) and resize-idempotent (lazy targets, no
+        // resize in resizeAll/beginMainPass), so renderReuse replays
+        // replay it upload-free. Primary view only (v1 non-goal).
+        var shaft_view = self.postprocess_pass.offscreen_resolve_tex_view;
+        if (postprocess.shaftActive(params.post.enabled, post, params.shadows_enabled)) {
+            const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
+            shaft_view = self.volumetric_pass.render(.{
+                .depth_view = self.depthSampleView(depth_prepass),
+                .shadow_view = params.shaft_shadow_view,
+                .inv_view_proj = inv_view_proj,
+                .camera_pos = params.eye,
+                .sun_dir = params.sun_dir,
+                .sun_color = params.sun_color,
+                .splits = params.shaft_splits,
+                .cascades = params.shaft_cascades,
+                .shadow_bias = params.shaft_shadow_bias,
+                .config = post,
+                .base_w = cur_w,
+                .base_h = cur_h,
+            });
+            // An empty shadow atlas view fail-closes inside the pass
+            // (returns .{}); fall back to the placeholder so the
+            // composite gate — not a dead handle — decides the pixels.
+            if (shaft_view.id == 0) shaft_view = self.postprocess_pass.offscreen_resolve_tex_view;
+            params.stats.post_draw_calls += postprocess.SHAFT_PASS_DRAWS;
+            params.stats.draw_calls += postprocess.SHAFT_PASS_DRAWS;
+            params.stats.triangles += 2 * postprocess.SHAFT_PASS_DRAWS;
+        }
+        self.postprocess_pass.setShaftTexture(shaft_view);
 
         // ==============================================
         // PASS 3: FULLSCREEN POST-PROCESSING PASS

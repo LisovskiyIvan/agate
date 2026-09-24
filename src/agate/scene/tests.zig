@@ -726,6 +726,37 @@ test "zero highlights is structurally bit-identical (no passes, no state)" {
     try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_image.id);
 }
 
+test "shaft defaults are off with zero GPU state (bit-identical)" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    // Fresh scene (and every load — shafts are transient, never
+    // serialized): disabled by default, and the gate needs post + shaft
+    // + live CSM data, so the default fixture keeps PASS 2.9 closed.
+    const postprocess = @import("../postprocess.zig");
+    try std.testing.expect(!scene.post_process.shaft_enabled);
+    try std.testing.expect(!postprocess.shaftActive(scene.post_process.enabled, scene.post_process, true));
+    try std.testing.expect(!postprocess.shaftActive(true, scene.post_process, true));
+    try std.testing.expect(!postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, false));
+    try std.testing.expect(postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, true));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.shaftParams(scene.post_process));
+    // Headless fixture owns no shaft GPU state: no raymarch/blur pass
+    // can run, no targets exist for the census (which gates on base
+    // size, so the unsized pass honestly contributes zero VRAM).
+    // (The OFF-path view discipline — renderChain feeds the resolved
+    // scene placeholder when inactive — is structural in
+    // postfx_stack.zig; the fixture's postprocess_pass stays `undefined`
+    // by design, so it is not dereferenced here.)
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.raymarch_pipeline.id);
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.blur_pipeline.id);
+    try std.testing.expectEqual(@as(i32, 0), scene.postfx.volumetric_pass.base_width);
+    try std.testing.expectEqual(@as(i32, 0), scene.postfx.volumetric_pass.base_height);
+    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.raymarch_image.id);
+}
+
 test "prepareFrame transfers staged update tick, preserves prepare_ms" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
