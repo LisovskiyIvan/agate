@@ -876,7 +876,12 @@ test "armed collision scenario pins a golden hash" {
     // Pinned regression values (seed 42 emission + collisions; regenerate
     // deliberately if the integrator changes — see the .none parity test,
     // which proves the default path is untouched by this feature).
-    try std.testing.expectEqual(@as(u64, 15457552461678759088), std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ps.particles[0..ps.active_count])));
+    // In ReleaseFast, LLVM fuses multiply-add into hardware FMA instructions.
+    const want_hash: u64 = switch (@import("builtin").mode) {
+        .ReleaseFast => 7238270927919988946,
+        else => 15457552461678759088,
+    };
+    try std.testing.expectEqual(want_hash, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ps.particles[0..ps.active_count])));
     // 30 frames x 0.5 emissions/frame, lifetimes >= 1 s: nothing dies.
     try std.testing.expectEqual(@as(usize, 15), ps.active_count);
 }
