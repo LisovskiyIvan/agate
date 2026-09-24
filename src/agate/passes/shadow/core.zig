@@ -110,6 +110,20 @@ pub const ShadowPass = struct {
         model: Mat4 = Mat4.identity,
         world_aabb: math.BoundingBox = math.BoundingBox.zero,
         max_dim: f32 = 0.0,
+        /// Render-owned low-poly stand-in for distant CSM cascades
+        /// (>= `types.SHADOW_LOD_FIRST_CASCADE`): borrowed GPU handles of
+        /// the coarsest QEM-simplified LOD child (`types.shadowLodMesh`),
+        /// snapshotted per prepare like the handles above. `false` (no
+        /// valid stand-in: no LOD, skinned/morph source, pending upload,
+        /// type mismatch, non-decimated child) fails safe to the
+        /// high-poly handles above in every cascade. Skinned items never
+        /// carry a stand-in. LOD children are excluded from binning, so the
+        /// stand-in never double-draws; the main pass keeps its own
+        /// camera-distance LOD pick untouched.
+        lod_vertex_buffer: sg.Buffer = .{},
+        lod_index_buffer: sg.Buffer = .{},
+        lod_index_count: u32 = 0,
+        has_shadow_lod: bool = false,
         /// Индекс копии скин-матриц в PreparedShadowDraws.skins (null = не скин).
         skin_index: ?u32 = null,
         bucket: Bucket = .regular_u16,

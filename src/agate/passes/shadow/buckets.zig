@@ -4,7 +4,11 @@
 //! `renderBuckets` is the shared draw core behind the CSM/spot/point paths
 //! (`csm.zig`, `spot.zig`, `point.zig`): it walks the prepared bins in
 //! `bucket_order`, skips culled/`gpu_pending` items and packs the
-//! per-item/per-bucket uniforms. Takes the pass and the prepared payload as
+//! per-item/per-bucket uniforms. Per cascade it applies two distant-cascade
+//! optimizations from `types.zig`: size culling of small AABBs
+//! (`CASCADE_MIN_DIM`, near cascade and spot/point paths exempt) and the
+//! low-poly shadow LOD stand-in (`shadowLodActive`, distant CSM cascades
+//! only). Takes the pass and the prepared payload as
 //! `anytype` so this module never imports `core.zig` or the facade back
 //! (same discipline as `particles/*`, `profiler/*`).
 //!
@@ -49,11 +53,10 @@ fn shadowItemCulled(item: anytype, frustum: math.Frustum, cascade_idx: ?usize) b
         if (item.is_instanced and item.instance_buffer.id != 0 and sg.queryBufferState(item.instance_buffer) != .VALID) return true;
     }
     if (!frustum.intersectsAABB(item.world_aabb)) return true;
-    if (cascade_idx) |c_idx| {
-        if (c_idx == 1 and item.max_dim < 0.12) return true;
-        if (c_idx == 2 and item.max_dim < 0.35) return true;
-        if (c_idx == 3 and item.max_dim < 0.75) return true;
-    }
+    // Cascade-aware size culling: distant CSM cascades drop sub-texel
+    // casters (named `types.CASCADE_MIN_DIM` policy; cascade 0 and the
+    // spot/point paths never cull by size).
+    if (types.cascadeSizeCulled(cascade_idx, item.max_dim)) return true;
     return false;
 }
 
@@ -81,6 +84,14 @@ pub fn renderBuckets(
         for (bucket_items) |item| {
             if (item.gpu_pending) continue;
             if (shadowItemCulled(item, frustum, cascade_idx)) continue;
+            // Distant CSM cascades draw the snapshotted QEM stand-in when
+            // one exists; near cascades and spot/point paths stay full-res.
+            // Skinned items never carry a stand-in (see prepareInto), so the
+            // bone-uniform path below always matches full-res geometry.
+            const use_lod = types.shadowLodActive(item.has_shadow_lod, cascade_idx);
+            const geo_vb = if (use_lod) item.lod_vertex_buffer else item.vertex_buffer;
+            const geo_ib = if (use_lod) item.lod_index_buffer else item.index_buffer;
+            const geo_ic = if (use_lod) item.lod_index_count else item.index_count;
             if (item.is_instanced) {
                 if (item.visible_instance_count == 0 or item.instance_buffer.id == 0) continue;
                 if (pip_id != last_pipeline_id.*) {
@@ -91,9 +102,9 @@ pub fn renderBuckets(
                 }
 
                 var bind = sg.Bindings{};
-                bind.vertex_buffers[0] = item.vertex_buffer;
+                bind.vertex_buffers[0] = geo_vb;
                 bind.vertex_buffers[1] = item.instance_buffer;
-                bind.index_buffer = item.index_buffer;
+                bind.index_buffer = geo_ib;
                 sg.applyBindings(bind);
                 last_vb_id = 0;
                 last_ib_id = 0;
@@ -102,7 +113,7 @@ pub fn renderBuckets(
                     .light_view_proj = light_view_proj,
                 };
                 sg.applyUniforms(shadow_shd.UB_vs_inst_params, sg.asRange(&inst_vs));
-                sg.draw(0, item.index_count, item.visible_instance_count);
+                sg.draw(0, geo_ic, item.visible_instance_count);
                 draw_calls.* += 1;
             } else {
                 if (pip_id != last_pipeline_id.*) {
@@ -112,13 +123,13 @@ pub fn renderBuckets(
                     last_ib_id = 0;
                 }
 
-                if (item.vertex_buffer.id != last_vb_id or item.index_buffer.id != last_ib_id) {
+                if (geo_vb.id != last_vb_id or geo_ib.id != last_ib_id) {
                     var bind = sg.Bindings{};
-                    bind.vertex_buffers[0] = item.vertex_buffer;
-                    bind.index_buffer = item.index_buffer;
+                    bind.vertex_buffers[0] = geo_vb;
+                    bind.index_buffer = geo_ib;
                     sg.applyBindings(bind);
-                    last_vb_id = item.vertex_buffer.id;
-                    last_ib_id = item.index_buffer.id;
+                    last_vb_id = geo_vb.id;
+                    last_ib_id = geo_ib.id;
                 }
 
                 const shadow_vs = shadow_shd.VsParams{
@@ -136,7 +147,7 @@ pub fn renderBuckets(
                     sg.applyUniforms(shadow_shd.UB_vs_skin, sg.asRange(&vs_skin));
                 }
 
-                sg.draw(0, item.index_count, 1);
+                sg.draw(0, geo_ic, 1);
                 draw_calls.* += 1;
             }
         }
@@ -221,6 +232,35 @@ test "shadow item culling applies far-cascade max_dim policy to all items" {
     };
     try std.testing.expect(shadowItemCulled(inst, frustum, 3));
     try std.testing.expect(!shadowItemCulled(inst, frustum, 0));
+}
+
+test "shadow item culling honors named cascade size thresholds exactly" {
+    const ShadowPass = @import("core.zig").ShadowPass;
+    const frustum = math.Frustum.fromViewProjection(Mat4.identity);
+    const inside_aabb = math.BoundingBox.init(
+        math.Vec3.new(-0.5, -0.5, 0.2),
+        math.Vec3.new(0.5, 0.5, 0.8),
+    );
+
+    // Cascade 0 never culls by size, however small the caster.
+    const tiny = ShadowPass.ShadowDrawItem{ .world_aabb = inside_aabb, .max_dim = 0.001 };
+    try std.testing.expect(!shadowItemCulled(tiny, frustum, 0));
+    // Spot/point paths (null cascade) never cull by size either.
+    try std.testing.expect(!shadowItemCulled(tiny, frustum, null));
+
+    // Exact policy boundaries (strict less-than, mirrors types.CASCADE_MIN_DIM).
+    const cases = [_]struct { c: usize, dim: f32, culled: bool }{
+        .{ .c = 1, .dim = 0.11, .culled = true },
+        .{ .c = 1, .dim = 0.12, .culled = false },
+        .{ .c = 2, .dim = 0.34, .culled = true },
+        .{ .c = 2, .dim = 0.35, .culled = false },
+        .{ .c = 3, .dim = 0.74, .culled = true },
+        .{ .c = 3, .dim = 0.75, .culled = false },
+    };
+    for (cases) |tc| {
+        const item = ShadowPass.ShadowDrawItem{ .world_aabb = inside_aabb, .max_dim = tc.dim };
+        try std.testing.expectEqual(tc.culled, shadowItemCulled(item, frustum, tc.c));
+    }
 }
 
 test "shadow item culling skips invisible items" {

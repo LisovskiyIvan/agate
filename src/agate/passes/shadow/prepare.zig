@@ -95,6 +95,10 @@ pub fn prepareInto(
         const ext = aabb_w.extents();
         const max_dim = @max(ext.x, @max(ext.y, ext.z));
 
+        // Distant-cascade shadow LOD stand-in (render-owned snapshot of the
+        // coarsest QEM-simplified child; null = fail safe to high-poly).
+        const shadow_lod = types.shadowLodMesh(mesh);
+
         out.items.items[idx] = .{
             .vertex_buffer = mesh.vertex_buffer,
             .index_buffer = mesh.index_buffer,
@@ -111,6 +115,10 @@ pub fn prepareInto(
             .is_visible = mesh.is_visible,
             .source_uid = mesh.uid,
             .source_mesh = self.binned_source.items[idx],
+            .lod_vertex_buffer = if (shadow_lod) |lm| lm.vertex_buffer else .{},
+            .lod_index_buffer = if (shadow_lod) |lm| lm.index_buffer else .{},
+            .lod_index_count = if (shadow_lod) |lm| lm.index_count else 0,
+            .has_shadow_lod = shadow_lod != null,
         };
     }
 
@@ -733,4 +741,161 @@ test "stage-2A: shadow items carry source uid and list index" {
         if (it.source_mesh == 2) try std.testing.expectEqual(b.uid, it.source_uid);
     }
     try std.testing.expect(a.uid != 0 and b.uid != 0 and a.uid != b.uid);
+}
+
+// ---- Shadow LOD: QEM stand-in snapshot + high-poly fallback. ----
+
+// The stand-in must be genuinely simplified geometry: QEM-decimate a
+// subdivided plane, use the decimated counts for the LOD child, and prove
+// the snapshot carries the smaller geometry (never an alias of the source).
+test "shadow LOD: prepare snapshots the QEM-simplified stand-in" {
+    const core = @import("core.zig");
+    const ally = std.testing.allocator;
+
+    var plane_data = try mesh_mod.builders.buildPlaneData(ally, .{
+        .width = 4.0,
+        .height = 4.0,
+        .subdivisions_x = 4,
+        .subdivisions_y = 4,
+    });
+    defer plane_data.deinit(ally);
+    const full_tris = plane_data.indices.len / 3;
+    try std.testing.expect(full_tris > 4);
+
+    var lod_geom = try mesh_mod.simplifyGeometry(ally, &plane_data, .{
+        .target_ratio = 0.25,
+        .preserve_border = true,
+    });
+    defer lod_geom.deinit(ally);
+    const lod_tris = lod_geom.indices.len / 3;
+    // Genuine decimation proof: strictly fewer triangles, valid indices.
+    try std.testing.expect(lod_tris < full_tris);
+    for (lod_geom.indices) |idx| try std.testing.expect(idx < lod_geom.vertices.len);
+
+    const full_count: u32 = @intCast(plane_data.indices.len);
+    const lod_count: u32 = @intCast(lod_geom.indices.len);
+    var src = Mesh{
+        .name = "shadow_lod_src",
+        .vertex_buffer = .{ .id = 21 },
+        .index_buffer = .{ .id = 22 },
+        .index_count = full_count,
+        .local_bounding_box = plane_data.bounds,
+    };
+    defer src.lod_levels.deinit(ally);
+    var lod_child = Mesh{
+        .name = "shadow_lod_child",
+        .vertex_buffer = .{ .id = 23 },
+        .index_buffer = .{ .id = 24 },
+        .index_count = lod_count,
+        .local_bounding_box = lod_geom.bounds,
+    };
+    try src.addLODLevel(ally, 40.0, &lod_child);
+
+    var pass = core.testShadowPass(ally);
+    defer pass.binned_meshes.deinit(ally);
+    defer pass.binned_source.deinit(ally);
+    defer pass.prepared.deinit(ally);
+    const meshes = [_]*Mesh{&src};
+    _ = pass.prepare(&meshes, 77, .published, null);
+    try std.testing.expectEqual(@as(usize, 1), pass.prepared.items.items.len);
+    const it = pass.prepared.items.items[0];
+    // High-poly snapshot intact (near cascades + spot/point draw this).
+    try std.testing.expectEqual(full_count, it.index_count);
+    try std.testing.expectEqual(@as(u32, 21), it.vertex_buffer.id);
+    // Stand-in snapshot carries the QEM-decimated geometry.
+    try std.testing.expect(it.has_shadow_lod);
+    try std.testing.expectEqual(lod_count, it.lod_index_count);
+    try std.testing.expect(it.lod_index_count < it.index_count);
+    try std.testing.expectEqual(@as(u32, 23), it.lod_vertex_buffer.id);
+    try std.testing.expectEqual(@as(u32, 24), it.lod_index_buffer.id);
+}
+
+// Fallback matrix: no LOD, skinned source, and instanced coverage. A mesh
+// without levels snapshots no stand-in; a skinned source never does (LOD
+// children carry no skeleton); an instanced parent snapshots the stand-in
+// like a regular mesh (the instance batch reuses it in far cascades).
+test "shadow LOD: prepare falls back to high-poly without a valid stand-in" {
+    const core = @import("core.zig");
+    const ally = std.testing.allocator;
+    const unit_box = math.BoundingBox.init(math.Vec3.new(-0.5, -0.5, -0.5), math.Vec3.new(0.5, 0.5, 0.5));
+
+    var plain = Mesh{
+        .name = "shadow_lod_plain",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 300,
+        .local_bounding_box = unit_box,
+    };
+    var skinned_child = Mesh{
+        .name = "shadow_lod_skinned_child",
+        .vertex_buffer = .{ .id = 31 },
+        .index_buffer = .{ .id = 32 },
+        .index_count = 60,
+        .local_bounding_box = unit_box,
+    };
+    const skel = try SkeletonForP4.init(ally, 1);
+    defer skel.deinit();
+    skel.update();
+    var skinned = Mesh{
+        .name = "shadow_lod_skinned",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 300,
+        .local_bounding_box = unit_box,
+        .skeleton = skel,
+    };
+    defer skinned.lod_levels.deinit(ally);
+    try skinned.addLODLevel(ally, 40.0, &skinned_child);
+
+    var inst_child = Mesh{
+        .name = "shadow_lod_inst_child",
+        .vertex_buffer = .{ .id = 41 },
+        .index_buffer = .{ .id = 42 },
+        .index_count = 90,
+        .local_bounding_box = unit_box,
+    };
+    var inst_src = Mesh{
+        .name = "shadow_lod_inst_src",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 6,
+        .local_bounding_box = unit_box,
+    };
+    var inst = InstancedMeshForP5{ .name = "s0", .source_mesh = &inst_src };
+    var ptrs = [_]*InstancedMeshForP5{&inst};
+    var inst_parent = Mesh{
+        .name = "shadow_lod_inst_parent",
+        .vertex_buffer = .{ .id = 43 },
+        .index_buffer = .{ .id = 44 },
+        .index_count = 300,
+        .local_bounding_box = unit_box,
+        .instances = .{ .items = &ptrs, .capacity = 1 },
+    };
+    defer inst_parent.lod_levels.deinit(ally);
+    try inst_parent.addLODLevel(ally, 40.0, &inst_child);
+
+    const meshes = [_]*Mesh{ &plain, &skinned, &inst_parent };
+    var pass = core.testShadowPass(ally);
+    defer pass.binned_meshes.deinit(ally);
+    defer pass.binned_source.deinit(ally);
+    defer pass.prepared.deinit(ally);
+    _ = pass.prepare(&meshes, 78, .published, null);
+    try std.testing.expectEqual(@as(usize, 3), pass.prepared.items.items.len);
+
+    for (pass.prepared.items.items) |it| {
+        if (it.source_mesh == 0) {
+            try std.testing.expect(!it.has_shadow_lod);
+            try std.testing.expectEqual(@as(u32, 0), it.lod_index_count);
+        } else if (it.source_mesh == 1) {
+            try std.testing.expect(!it.has_shadow_lod);
+            try std.testing.expectEqual(@as(u32, 0), it.lod_index_count);
+            try std.testing.expectEqual(@as(u32, 300), it.index_count);
+        } else {
+            try std.testing.expectEqual(@as(u32, 2), it.source_mesh);
+            try std.testing.expect(it.is_instanced);
+            try std.testing.expect(it.has_shadow_lod);
+            try std.testing.expectEqual(@as(u32, 90), it.lod_index_count);
+            try std.testing.expectEqual(@as(u32, 41), it.lod_vertex_buffer.id);
+        }
+    }
 }
