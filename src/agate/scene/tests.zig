@@ -7503,13 +7503,30 @@ test "slice6: staged prepare consumes frozen trail packet despite live mutation"
 
     const claim = scene.beginStagedPrepare().?;
     try std.testing.expect(claim.have_build);
-    // Begin consumes the packet headless: publishes frozen scalars, clears
-    // the live dirty flag, never reads the mutated live staging arrays.
-    try std.testing.expectEqual(@as(u32, 6), tm.mesh.index_count);
+    // Begin flushes headless: the packet records undelivered WITHOUT
+    // touching live state (phase 2 ownership — no flag clears, no scalar
+    // publishes, no handle installs on the context path). The frozen
+    // bytes stay intact despite the live mutation above.
+    try std.testing.expect(!slot.trail_uploads.items[0].delivered);
+    try std.testing.expectEqual(@as(u32, 0), tm.mesh.index_count);
     try std.testing.expect(!tm.gpu_dirty);
     try std.testing.expectEqual([3]f32{ 1, 2, 3 }, slot.trail_verts.items[0].position);
     scene.finishStagedPrepare(claim);
     try std.testing.expect(scene.frame_prepared);
+
+    // Next build commits the undelivered outcome game-side: the flags
+    // re-arm for retry (headless never lands), scalars stay unpublished.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var build2 = scene.tryClaimBuildSlot().?;
+    // Simulate the live-context delivery of the frozen generation for the
+    // commit below: a real flush would have set this after uploading the
+    // frozen bytes (headless-safe part of the test is the commit path).
+    slot.trail_uploads.items[0].delivered = true;
+    build2.build();
+    // The frozen scalars published (commit path): index count + bounds
+    // from the packet, never the mutated live pending values.
     try std.testing.expectEqual(@as(u32, 6), tm.mesh.index_count);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), tm.mesh.local_bounding_box.min.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), tm.mesh.local_bounding_box.max.x, 1e-6);
+    build2.publish();
 }

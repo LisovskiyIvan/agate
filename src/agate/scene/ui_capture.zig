@@ -114,8 +114,17 @@ pub fn captureUiFrame(scene: anytype, snap: *const SceneFrameSnapshot, back: *Fr
                     return;
                 }
                 // Staged presence but the canvas vanished before the
-                // latch: fall through to the legacy path, whose
-                // missing-canvas branch fail-closes identically.
+                // latch: under the phase mutex the legacy path below
+                // fail-closes identically; lock-free (no producer
+                // exclusion) it must not read the live canvas lists, so
+                // fail closed to coherent-empty instead — the next funded
+                // build re-stages.
+                if (scene.lock_free_prepare) {
+                    scene.ui_frame.clearEmpty();
+                    scene.ui_frame.canvas_present = false;
+                    return;
+                }
+                // Fall through to the legacy path (mutex-held only).
             } else {
                 // Staged absence of canvas: same clear as legacy.
                 scene.ui_frame.clearEmpty();
@@ -125,8 +134,16 @@ pub fn captureUiFrame(scene: anytype, snap: *const SceneFrameSnapshot, back: *Fr
         }
         // Fresh seq but invalid packet (stage OOM, or a later
         // buildPreparedFrame reset wiped the slot — stage UI after the
-        // build when both are used): the legacy canvas path below still
-        // holds the content, so degrade to it instead of clearing.
+        // build when both are used): under the phase mutex the legacy
+        // canvas path below still holds the content, so degrade to it
+        // instead of clearing. Lock-free the live canvas lists cannot be
+        // read — fail closed to coherent-empty; the next funded build
+        // re-stages (the canvas still holds the content producer-side).
+        if (scene.lock_free_prepare) {
+            scene.ui_frame.clearEmpty();
+            scene.ui_frame.canvas_present = true;
+            return;
+        }
     }
     const canvas = if (scene.ui_canvas) |*c| c else {
         scene.ui_frame.clearEmpty();

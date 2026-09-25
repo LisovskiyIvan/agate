@@ -19,6 +19,13 @@ pub const PrepareClaim = struct {
     build_seq: u64,
     have_build: bool,
     has_handoff: bool,
+    /// Frozen host bytes staged by the producer (`BuildClaim.stageHostBytes`
+    /// into the claimed slot's `host_bytes`): the context reads this copy
+    /// instead of live host state (phase 2 lock-free prepare). Valid from
+    /// `beginPrepare` until the paired `finishPrepare`/`cancelPrepare`
+    /// releases the slot claim — never beyond. Empty when the producer
+    /// staged nothing (saturation skip, UI-only ticks without staging).
+    host_bytes: []const u8 = &.{},
 };
 
 /// Begins preparation on the context thread. The caller must exclude the
@@ -234,6 +241,7 @@ pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
         .build_seq = build_seq,
         .have_build = have_build,
         .has_handoff = has_handoff,
+        .host_bytes = back.host_bytes.items,
     };
 }
 

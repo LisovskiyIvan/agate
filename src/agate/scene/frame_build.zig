@@ -33,6 +33,19 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
         defer scene.draws.unpinReader(front_idx) catch {};
         const front = &scene.draws.slots[front_idx];
         scene_instance_staging.commitPublishedRecords(front.staged_instances.items, scene.meshes.items, front.frame_id);
+        // Phase 2 lock-free publication: apply the staged-upload outcomes
+        // published by the last latch (handle installs, scalar publishes,
+        // pending-array frees, compute ring advance) or re-arm the flags
+        // of undelivered packets for this build to re-freeze. Once per
+        // published frame: a repeat build without an intervening latch
+        // skips, so outcomes are never double-applied. The front is
+        // read-leased above, so a concurrent prepare cannot reset it
+        // mid-commit; concurrent READS (render) of other slot fields are
+        // safe (same immutable-published-slot rule as the record commit).
+        if (front.frame_id != 0 and front.frame_id != scene.last_upload_commit_frame) {
+            scene_upload_packets.commitSlotResults(scene, front);
+            scene.last_upload_commit_frame = front.frame_id;
+        }
     }
     const back = &scene.draws.slots[slot];
     back.reset();

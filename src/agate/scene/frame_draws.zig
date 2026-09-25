@@ -289,6 +289,12 @@ pub const MorphUpload = struct {
     buffer_id: u32 = 0,
     count: u32 = 0,
     data_lo: usize = 0,
+    /// Lock-free publication outcome (phase 2, context-written): the staged
+    /// flush sets true once the frozen bytes landed in `buffer_id` (or the
+    /// packet was empty). The producer cleared `morph_upload_needed` at
+    /// stage time; a false outcome means the game-side commit must re-arm
+    /// it for retry. Never written by the producer after staging.
+    delivered: bool = false,
 };
 pub const ParticleCpuUpload = struct {
     token: usize = 0,
@@ -296,6 +302,17 @@ pub const ParticleCpuUpload = struct {
     buffer_id: u32 = 0,
     count: u32 = 0,
     data_lo: usize = 0,
+    /// Frozen allocation capacity (immutable after system init): deferred
+    /// creation sizes the buffer from this, never the live field.
+    capacity: usize = 0,
+    /// Deferred-creation outcome (context-written): the created buffer, or
+    /// zero when no creation was needed/possible. Installed by the
+    /// game-side commit (which retires a replaced non-zero handle, though
+    /// in practice the live id is always zero here — only the context
+    /// creates, and both paths run on the same thread).
+    created_buffer_id: u32 = 0,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    delivered: bool = false,
 };
 pub const ParticleGpuUpload = struct {
     token: usize = 0,
@@ -303,6 +320,12 @@ pub const ParticleGpuUpload = struct {
     buffer_id: u32 = 0,
     count: u32 = 0,
     data_lo: usize = 0,
+    /// Frozen allocation capacity (see ParticleCpuUpload).
+    capacity: usize = 0,
+    /// Deferred-creation outcome (context-written, see ParticleCpuUpload).
+    created_buffer_id: u32 = 0,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    delivered: bool = false,
 };
 pub const ParticleComputeUpload = struct {
     token: usize = 0,
@@ -323,6 +346,46 @@ pub const ParticleComputeUpload = struct {
     sheet_loops: f32 = 1.0,
     data_lo: usize = 0,
     data_count: usize = 0,
+    /// Frozen allocation capacity (immutable after init): creation and the
+    /// dispatch addr field use this, never the live field.
+    capacity: usize = 0,
+    /// Frozen GPU object ids (staged alongside the bytes): the direct
+    /// staged upload/dispatch addresses these without touching live
+    /// handles. Zero means "not yet created".
+    state_buffer_id: u32 = 0,
+    draw_buffer_id: u32 = 0,
+    state_view_id: u32 = 0,
+    spawn_view_id: u32 = 0,
+    draw_view_id: u32 = 0,
+    shader_id: u32 = 0,
+    pipeline_id: u32 = 0,
+    /// Deferred-creation outcomes (context-written): created GPU objects,
+    /// zero when no creation was needed. Installed by the game-side
+    /// commit (replaced non-zero live handles retire through the queue —
+    /// defensive only: in practice the live ids are zero whenever these
+    /// are set, because only the context creates).
+    created_state_buffer_id: u32 = 0,
+    created_spawn_buffer_id: u32 = 0,
+    created_draw_buffer_id: u32 = 0,
+    created_state_view_id: u32 = 0,
+    created_spawn_view_id: u32 = 0,
+    created_draw_view_id: u32 = 0,
+    created_shader_id: u32 = 0,
+    created_pipeline_id: u32 = 0,
+    /// Consumed window (context-written): how many staged records and how
+    /// much dt the dispatch consumed. The game-side commit advances the
+    /// live ring by exactly this (guarded by a stage_base match, so a
+    /// post-freeze eviction skips the advance instead of corrupting it)
+    /// and subtracts the dt clamped at zero.
+    consumed_staged: usize = 0,
+    consumed_dt: f32 = 0.0,
+    /// Backend without compute support latched context-side
+    /// (context-written): the game-side commit publishes it into
+    /// `compute_known_unsupported` and drops the pending flags, mirroring
+    /// the legacy helper — never a silent fallback, never a retry spin.
+    unsupported: bool = false,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    delivered: bool = false,
 };
 pub const TrailUpload = struct {
     token: usize = 0,
@@ -336,6 +399,17 @@ pub const TrailUpload = struct {
     min_pt: [3]f32 = .{ 0, 0, 0 },
     max_pt: [3]f32 = .{ 0, 0, 0 },
     buffers_pending: bool = false,
+    /// Frozen allocation lengths (fixed at trail init): deferred creation
+    /// sizes the buffers from these, never the live slices.
+    vert_cap: usize = 0,
+    index_cap: usize = 0,
+    /// Deferred-creation outcomes (context-written, see ParticleCpuUpload).
+    created_vertex_buffer_id: u32 = 0,
+    created_index_buffer_id: u32 = 0,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    /// The frozen index_count/bounds are published by the game-side
+    /// commit; the render path reads only the baked queue payload.
+    delivered: bool = false,
 };
 pub const SoftUpload = struct {
     token: usize = 0,
@@ -348,6 +422,14 @@ pub const SoftUpload = struct {
     min_pt: [3]f32 = .{ 0, 0, 0 },
     max_pt: [3]f32 = .{ 0, 0, 0 },
     buffers_pending: bool = false,
+    /// Frozen vertex allocation length (fixed grid at body creation):
+    /// deferred creation sizes the vertex buffer from this.
+    vert_cap: usize = 0,
+    /// Deferred-creation outcomes (context-written, see ParticleCpuUpload).
+    created_vertex_buffer_id: u32 = 0,
+    created_index_buffer_id: u32 = 0,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    delivered: bool = false,
 };
 pub const GreasedUpload = struct {
     token: usize = 0,
@@ -359,6 +441,18 @@ pub const GreasedUpload = struct {
     vert_lo: usize = 0,
     index_lo: usize = 0,
     full_upload: bool = false,
+    /// Frozen allocation lengths: deferred creation sizes the buffers
+    /// from these, never the live slices.
+    vert_cap: usize = 0,
+    index_cap: usize = 0,
+    /// Deferred-creation outcomes (context-written, see ParticleCpuUpload).
+    created_vertex_buffer_id: u32 = 0,
+    created_index_buffer_id: u32 = 0,
+    /// Full-index-upload delivery (context-written, same protocol as
+    /// TrailUpload.full_delivered).
+    full_delivered: bool = false,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    delivered: bool = false,
 };
 pub const PendingMeshUpload = struct {
     token: usize = 0,
@@ -370,6 +464,14 @@ pub const PendingMeshUpload = struct {
     index_lo: usize = 0,
     index_type_is_u16: bool = true,
     dynamic_update: bool = false,
+    /// Deferred-creation outcomes (context-written, see ParticleCpuUpload).
+    created_vertex_buffer_id: u32 = 0,
+    created_index_buffer_id: u32 = 0,
+    /// Lock-free publication outcome (context-written, see MorphUpload).
+    /// The game-side commit installs the handles, publishes
+    /// `vertex_count` (when live is zero), re-arms `morph_upload_needed`
+    /// for dynamic updates, and frees the consumed live pending arrays.
+    delivered: bool = false,
 };
 
 pub const FrameDrawSlot = struct {
@@ -494,6 +596,15 @@ pub const FrameDrawSlot = struct {
     pending_uploads: std.ArrayListUnmanaged(PendingMeshUpload) = .empty,
     pending_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
     pending_indices: std.ArrayListUnmanaged(u32) = .empty,
+    /// Slot-owned frozen host bytes (lock-free prepare host pipe): the
+    /// producer (`BuildClaim.stageHostBytes`) copies small host-owned
+    /// payloads here (picked-name bytes, memory-summary tallies) while it
+    /// holds the claim; the context (`PrepareClaim.host_bytes`) reads the
+    /// frozen copy instead of live host state. Plain bytes — the app owns
+    /// the encoding. `reset` clears (retaining capacity) so a reused slot
+    /// can never resurface a prior frame; `deinit` frees; `cpuBytes`
+    /// counts the retained capacity.
+    host_bytes: std.ArrayListUnmanaged(u8) = .empty,
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -540,6 +651,7 @@ pub const FrameDrawSlot = struct {
         self.pending_uploads.clearRetainingCapacity();
         self.pending_verts.clearRetainingCapacity();
         self.pending_indices.clearRetainingCapacity();
+        self.host_bytes.clearRetainingCapacity();
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -576,6 +688,7 @@ pub const FrameDrawSlot = struct {
         self.pending_uploads.deinit(allocator);
         self.pending_verts.deinit(allocator);
         self.pending_indices.deinit(allocator);
+        self.host_bytes.deinit(allocator);
     }
 
     /// Retained CPU bytes held by this slot (retained capacities × element
@@ -618,6 +731,7 @@ pub const FrameDrawSlot = struct {
         b += listBytes(self.pending_uploads);
         b += listBytes(self.pending_verts);
         b += listBytes(self.pending_indices);
+        b += listBytes(self.host_bytes);
         return b;
     }
 };

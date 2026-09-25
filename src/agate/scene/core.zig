@@ -146,6 +146,7 @@ const scene_sim = @import("sim_api.zig");
 const scene_query = @import("query_api.zig");
 const scene_frame = @import("frame_api.zig");
 const scene_profile = @import("profile_api.zig");
+const scene_upload_packets = @import("upload_packets.zig");
 const mesh_mod = @import("../mesh.zig");
 
 pub const CameraEntry = scene_cameras.CameraEntry;
@@ -531,6 +532,26 @@ pub const Scene = struct {
     /// too small changes nothing, too large slows the sim tick rate
     /// (ticks/s floor: the latch needs one fresh build per 16.7 ms frame).
     concurrent_yield_ns: u64 = 0,
+    /// Lock-free staged prepare (phase 2, default ON): `Runtime.beginPrepare*`
+    /// sets this from its `producer_exclusion` knob on every begin
+    /// (`setProducerExclusion(true)` clears it again). It gates the last
+    /// live-list fallbacks on the fresh-build path (`captureUiFrame` degrades
+    /// an invalid staged UI packet to coherent-empty instead of re-reading
+    /// the live canvas lists); the upload-packet flush/commit needs no flag
+    /// (it never touches live state either way). Plain bool, written on the
+    /// context thread, read only there.
+    lock_free_prepare: bool = false,
+    /// Last published frame whose staged-upload outcomes were committed
+    /// (`commitSlotResults` at the next build). Game side only (written
+    /// by the build core, never across the handoff edge): a repeat build
+    /// without an intervening latch observes the same `front.frame_id`
+    /// and skips the commit, so outcomes are never double-applied.
+    last_upload_commit_frame: u64 = 0,
+    /// Dropped `stageHostBytes` payloads (OOM fail-closed clears). Game
+    /// side only (written by the producer claim, read by the host/tests —
+    /// never across the handoff edge). Expected to stay zero: the encode
+    /// is fixed-size into retained slot capacity.
+    host_bytes_oob_drops: u64 = 0,
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
     /// P6 render-owned UI frame: prepareFrame captures CPU geometry + draw
@@ -1347,6 +1368,30 @@ pub const Scene = struct {
             self.scene.stageUiPacketInto(self.slot);
         }
 
+        /// Copy small host-owned bytes into the CLAIMED slot's frozen host
+        /// area (`FrameDrawSlot.host_bytes`), for the context to read via
+        /// `PrepareClaim.host_bytes` instead of live host state (phase 2
+        /// lock-free prepare: picked-name bytes, memory-summary tallies).
+        /// Slot-owned copy (the claim owns the slot); fail-closed on OOM
+        /// (the area is cleared, so the context sees absent bytes rather
+        /// than a half-written payload). Call AFTER `build()` like
+        /// `stageUi` (the build resets the slot) and BEFORE `publish()`.
+        /// sg-free, game side. Repeatable (newest wins).
+        pub fn stageHostBytes(self: *BuildClaim, bytes: []const u8) void {
+            const slot = self.scene.draws.slotAt(self.slot);
+            slot.host_bytes.clearRetainingCapacity();
+            slot.host_bytes.appendSlice(self.scene.allocator, bytes) catch {
+                slot.host_bytes.clearRetainingCapacity();
+                // Observable fail-closed: the encode is fixed-size (≤128B
+                // in practice) into retained slot capacity, so OOM here is
+                // practically impossible after the first success — but a
+                // silent clear would hide it forever. Game-side plain
+                // counter (same discipline as last_upload_commit_frame:
+                // written only by the producer, never across the handoff).
+                self.scene.host_bytes_oob_drops +%= 1;
+            };
+        }
+
         /// Hand the built slot to prepare: commit the reserved generation
         /// (`build_seq`, `build_slot`) and release WRITING (payload kept —
         /// prepare consumes it and flips `front` itself at latch time).
@@ -1373,12 +1418,17 @@ pub const Scene = struct {
         /// Drop the claim without committing (seq/handoff untouched: prepare
         /// sees no fresh build and runs its fallback; provisional previews
         /// stamped with the uncommitted seq are overwritten by the next
-        /// build and never latched). The slot is reset by the next claim.
-        /// Safe to call on an unconsumed claim; double-terminal is a bug
-        /// (debug-asserted).
+        /// build and never latched). Staged-upload flags frozen into the
+        /// dropped slot are re-armed on their live owners
+        /// (token/index/uid-validated), so a cancelled claim consumes no
+        /// upload — the next funded build re-freezes from the intact live
+        /// arrays. The slot payload itself is ignored by prepare and reset
+        /// by the next claim. Safe to call on an unconsumed claim;
+        /// double-terminal is a bug (debug-asserted).
         pub fn cancel(self: *BuildClaim) void {
             std.debug.assert(!self.completed);
             self.completed = true;
+            scene_upload_packets.restageDroppedSlot(self.scene, &self.scene.draws.slots[self.slot]);
             self.scene.draws.cancelClaim(self.slot) catch {};
         }
     };

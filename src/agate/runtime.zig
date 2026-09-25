@@ -14,33 +14,45 @@
 //!
 //! This module owns that ordering. Two levels:
 //! - Simple (`update` + `renderFrame`): the whole frame for normal apps —
-//!   the agate demo runs on these two calls. Acquisition is bounded;
-//!   live-state reads remain inside producer exclusion.
-//! - Advanced (`gameLock`/`gameUnlock`, `produceBuild`, `beginExcluded*`,
+//!   the agate demo runs on these two calls. The staged begin is lock-free
+//!   by default (see below).
+//! - Advanced (`gameLock`/`gameUnlock`, `produceBuild`, `beginPrepare*`,
 //!   `finishPrepare`/`cancelPrepare`, `reuseIfConsumable`, `prepareSerial`,
 //!   direct `mutex` access): the same primitives for instrumented hosts
 //!   (Sandbox interleaves phase metrics, test hooks, and UI snapshot
 //!   transfer). It is NOT a generic backend, ECS, event bus, or plugin
 //!   system.
 //!
-//! Ownership contract (static, same as the engine handoff):
-//! - The game side holds `mutex` across its whole tick (`simulate` +
-//!   `produceBuild`). It may overlap `finishStagedPrepare` and `render`.
-//! - The context side holds `mutex` across `beginExcluded*` ONLY (plus any
-//!   host live-state reads the caller runs inside the `beginExcludedWith`
-//!   callback: picked-name copies, memory-snapshot serve, profiler toggles,
-//!   deferred report saves). `finish`, `cancel`, and `render` run unlocked.
-//! - Context-side acquisition is ALWAYS bounded (`lock_wait_ns`, default 0
-//!   = pure non-blocking try): a busy mutex yields `busy` (or a
+//! Default ownership contract (lock-free staged prepare):
+//! - The staged begin (`beginPrepare*`, `renderFrame`) takes NO phase mutex.
+//!   It is safe unlocked because a fresh producer build froze every upload
+//!   payload into the slot (`stageUploads` + `stageUi` + `stageHostBytes`)
+//!   and every live dirty flag/scalar is consumed by the game-side commit
+//!   (`commitSlotResults`) instead of by the context.
+//! - The game side keeps `gameLock` semantics for its own producers
+//!   (`update` takes it only when the exclusion is enabled; `simulate` +
+//!   `produceBuild` still serialize producers — a single producer remains
+//!   mandatory).
+//! - `setProducerExclusion(true)` restores the previous contract (Sandbox
+//!   `--prepare-exclusion`, a diagnostic/rollback switch): the context then
+//!   holds `mutex` across `beginPrepare*` (plus any host live-state reads in
+//!   the `beginPrepareWith` callback), which is required when the lock-free
+//!   contract cannot be guaranteed (unfrozen payloads, live host reads).
+//!   Context-side acquisition is bounded there (`lock_wait_ns`, default 0 =
+//!   pure non-blocking try): a busy mutex yields `busy` (or a
 //!   `tryRunLocked` skip). Scheduling and GPU work can still delay a present.
-//!   `prepareSerial` is the deliberate
-//!   exception — the legacy/single path blocks by contract (uncontended
-//!   single-threaded, or the opt-out `--no-concurrent-build` diagnostic).
 //! - `prepareSerial` (the `--no-concurrent-build` / `--no-threads` path)
-//!   holds `mutex` across the FULL `prepareFrame`: its live-read fallback
-//!   must stay inside the exclusion window, and only render overlaps.
+//!   always holds `mutex` across the FULL `prepareFrame`: its live-read
+//!   fallback must stay inside the exclusion window, and only render
+//!   overlaps. The legacy/serial diagnostics always lock regardless of the
+//!   knob.
 //! - Only the context thread calls `begin`/`finish`/`cancel`/`prepareSerial`
 //!   (the engine asserts this); only one game producer calls `produceBuild`.
+//!
+//! Not lock-free by design (documented, unchanged): registry add/remove
+//! during an in-flight latch (coherent via commit guards, still an app
+//! contract violation), profiler control/report file IO (bounded mutex
+//! window only when a request is pending), and the serial/legacy paths.
 //!
 //! Host-owned responsibilities (NOT here): sokol window setup/shutdown, the
 //! `simulate` body itself, the UI snapshot transfer policy, render calls and
@@ -52,7 +64,7 @@ const std = @import("std");
 const jobs = @import("jobs.zig");
 const Scene = @import("scene.zig").Scene;
 
-/// Result of a `beginExcluded*` call: the staged claim (null when no fresh
+/// Result of a `beginPrepare*` call: the staged claim (null when no fresh
 /// producer frame is ready — never a live-read fallback), whether the
 /// phase mutex could not be acquired within the budget (`busy`, distinct
 /// from "no fresh build": no begin was attempted, reuse/skip exactly like
@@ -119,6 +131,27 @@ pub const Runtime = struct {
     /// publish it here; the staged path then honors it instead of
     /// stalling the present.
     lock_wait_ns: u64 = 0,
+    /// Producer phase exclusion around the staged begin. DEFAULT FALSE:
+    /// `beginPrepare*` and `renderFrame` take no phase mutex, which is safe
+    /// because a fresh producer build froze every upload payload into the
+    /// slot and the game-side commit consumes the live flags/scalars (see
+    /// the module header). `setProducerExclusion(true)` restores the mutex
+    /// (required when the lock-free contract cannot be guaranteed):
+    ///   * every fresh build froze all upload payloads into the slot
+    ///     (`stageUploads` + `stageUi`, outcomes committed game-side);
+    ///   * `Scene.lock_free_prepare` is set (live-list fallbacks gated) —
+    ///     `beginPrepare*` drives it from this knob;
+    ///   * host live-state reads moved into `BuildClaim.stageHostBytes`
+    ///     (frozen) or proven context-owned (UI stats snapshot);
+    ///   * no registry add/remove races the in-flight latch (the commit
+    ///     guards keep a violation coherent, never corrupt — but the app
+    ///     contract still forbids it).
+    /// The game side keeps `gameLock` semantics for its own state either
+    /// way (simulate + produce still serialize producers; a single
+    /// producer remains mandatory). The legacy/serial paths
+    /// (`prepareSerial`, `--no-concurrent-build` hosts) always take the
+    /// mutex regardless of this knob.
+    producer_exclusion: bool = false,
 
     pub fn init() Runtime {
         return .{
@@ -130,9 +163,18 @@ pub const Runtime = struct {
         };
     }
 
+    /// Switch the staged begin between lock-free (false, default) and the
+    /// producer-exclusion window (true, diagnostic/rollback). Affects
+    /// `beginPrepare*`/`renderFrame` on the next call; serial/legacy paths
+    /// always lock. Context thread (or pre-spawn init) only.
+    pub fn setProducerExclusion(self: *Runtime, excluded: bool) void {
+        self.producer_exclusion = excluded;
+    }
+
     /// Publish the context-side acquisition budget (e.g. from
-    /// `--lock-wait-us`). Takes effect on the next `beginExcluded*` /
-    /// `renderFrame`. Context thread (or pre-spawn init) only.
+    /// `--lock-wait-us`). Only meaningful with `setProducerExclusion(true)`;
+    /// takes effect on the next `beginPrepare*` / `renderFrame`. Context
+    /// thread (or pre-spawn init) only.
     pub fn setLockWaitNs(self: *Runtime, ns: u64) void {
         self.lock_wait_ns = ns;
     }
@@ -181,8 +223,10 @@ pub const Runtime = struct {
     // -- game-side exclusion (game thread) --
 
     /// Hold across the whole producer tick (`simulate` + `produceBuild`).
-    /// Pairs with the context's `beginExcluded*`: while held, no begin runs;
-    /// `finish`/`render` overlap freely. Advanced hosts only — the simple
+    /// Pairs with the context's `beginPrepare*` when the producer exclusion
+    /// is enabled: while held, no begin runs; `finish`/`render` overlap
+    /// freely. In the default lock-free mode the game side may keep using it
+    /// to serialize its own producers. Advanced hosts only — the simple
     /// path uses `update`.
     pub fn gameLock(self: *Runtime) void {
         self.mutex.lock();
@@ -201,6 +245,15 @@ pub const Runtime = struct {
     /// staged-only handoffs never satisfy a staged begin (the serialized
     /// fallback consumes them instead).
     pub fn produceBuild(self: *Runtime, scene: *Scene) bool {
+        return self.produceBuildWithHostBytes(scene, null);
+    }
+
+    /// Same as `produceBuild`, plus freezing `host_bytes` (when non-null)
+    /// into the claimed slot between `stageUi` and `publish` — the
+    /// producer-side half of the lock-free host pipe (`PrepareClaim.
+    /// host_bytes`). Must run before `publish` (which releases the slot);
+    /// staging after publish would race the context latch.
+    pub fn produceBuildWithHostBytes(self: *Runtime, scene: *Scene, host_bytes: ?[]const u8) bool {
         const slot_claim = scene.tryClaimBuildSlot() orelse {
             self.metrics.producer_skips += 1;
             return false;
@@ -208,6 +261,7 @@ pub const Runtime = struct {
         var claim = slot_claim;
         claim.build();
         claim.stageUi();
+        if (host_bytes) |bytes| claim.stageHostBytes(bytes);
         claim.publish();
         self.metrics.producer_builds += 1;
         return true;
@@ -215,14 +269,18 @@ pub const Runtime = struct {
 
     // -- simple path (normal apps: the agate demo runs on these two) --
 
-    /// Simplest game-side tick: hold the phase mutex, run `tick(ctx)` (the
-    /// simulate body WITHOUT the build), then the producer one-liner.
-    /// Returns whether a build published. Single-threaded hosts call this
-    /// inline (the mutex is uncontended; the lock still documents producer
-    /// ownership for the same code path).
+    /// Simplest game-side tick: run `tick(ctx)` (the simulate body WITHOUT
+    /// the build), then the producer one-liner. Holds the phase mutex only
+    /// when `setProducerExclusion(true)` is in effect (the lock-free default
+    /// needs no exclusion window). Returns whether a build published.
+    /// Single-threaded hosts call this inline.
     pub fn update(self: *Runtime, scene: *Scene, ctx: anytype, comptime tick: fn (@TypeOf(ctx)) void) bool {
-        self.gameLock();
-        defer self.gameUnlock();
+        if (self.producer_exclusion) {
+            self.gameLock();
+            defer self.gameUnlock();
+            tick(ctx);
+            return self.produceBuild(scene);
+        }
         tick(ctx);
         return self.produceBuild(scene);
     }
@@ -236,7 +294,7 @@ pub const Runtime = struct {
     /// inside prepare.
     pub fn renderFrame(self: *Runtime, scene: *Scene) FrameResult {
         const t0 = jobs.monoNs();
-        const begun = self.beginExcluded(scene);
+        const begun = self.beginPrepare(scene);
         if (begun.claim) |c| {
             self.finishPrepare(scene, c);
             const elapsed_ns = jobs.monoNs() -% t0;
@@ -273,13 +331,29 @@ pub const Runtime = struct {
         return true;
     }
 
-    /// Staged begin with the smallest safe exclusion boundary: bounded
-    /// acquire, run NOTHING else, begin, unlock. `finishPrepare` + `render`
-    /// stay unlocked by the caller. Null + `busy == false` means no fresh
-    /// producer frame — never a live read; the caller reuses the last front
-    /// or skips the present. Null + `busy == true` means the mutex stayed
-    /// held past the budget: same reuse/skip, counted as contention.
-    pub fn beginExcluded(self: *Runtime, scene: *Scene) BeginResult {
+    /// Staged begin. DEFAULT (lock-free): no mutex is taken; the fresh-build
+    /// contract (frozen slot payloads + game-side commit) makes the begin
+    /// safe unlocked, and `Scene.lock_free_prepare` is set so the UI
+    /// live-list fallbacks fail closed. With `setProducerExclusion(true)`:
+    /// bounded acquire, begin, unlock (the smallest exclusion window).
+    /// `finishPrepare` + `render` stay unlocked by the caller.
+    /// Null + `busy == false` means no fresh producer frame — never a live
+    /// read; the caller reuses the last front or skips the present. Null +
+    /// `busy == true` means the mutex stayed held past the budget: same
+    /// reuse/skip, counted as contention (exclusion mode only).
+    pub fn beginPrepare(self: *Runtime, scene: *Scene) BeginResult {
+        scene.lock_free_prepare = !self.producer_exclusion;
+        if (!self.producer_exclusion) {
+            const t1 = jobs.monoNs();
+            const claim = scene.beginStagedPrepare();
+            const t2 = jobs.monoNs();
+            if (claim != null) {
+                self.metrics.begins += 1;
+            } else {
+                self.metrics.begin_empty += 1;
+            }
+            return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
+        }
         const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
@@ -297,16 +371,32 @@ pub const Runtime = struct {
         return .{ .claim = claim, .busy = false, .wait_ns = acq.wait_ns, .held_ns = t2 -% t1 };
     }
 
-    /// Same as `beginExcluded`, but runs the host's live-state reads
-    /// (`work`: picked-name copies, memory-snapshot serve, profiler toggle
-    /// consume, deferred report save) inside the SAME exclusion window as
-    /// the begin, so no torn read can slip between a snapshot copy and the
-    /// begin that consumes it.
-    pub fn beginExcludedWith(
+    /// Same as `beginPrepare`, but runs the host's pre-begin work (`work`)
+    /// in the same window. DEFAULT (lock-free): `work` runs unlocked and
+    /// must only read frozen bytes / context-owned state / atomics — move
+    /// every live game-state read into the producer's `stageHostBytes`
+    /// instead. With `setProducerExclusion(true)`: `work` (picked-name
+    /// copies, memory-snapshot serve, profiler toggles, deferred report
+    /// saves) runs inside the SAME exclusion window as the begin, so no torn
+    /// read can slip between a snapshot copy and the begin that consumes it.
+    pub fn beginPrepareWith(
         self: *Runtime,
         scene: *Scene,
         comptime work: fn () void,
     ) BeginResult {
+        scene.lock_free_prepare = !self.producer_exclusion;
+        if (!self.producer_exclusion) {
+            const t1 = jobs.monoNs();
+            work();
+            const claim = scene.beginStagedPrepare();
+            const t2 = jobs.monoNs();
+            if (claim != null) {
+                self.metrics.begins += 1;
+            } else {
+                self.metrics.begin_empty += 1;
+            }
+            return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
+        }
         const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
@@ -409,7 +499,7 @@ test "runtime: produceBuild publishes one build; begin/finish consume it" {
 
     // No fresh build: staged begin stays null (not busy — uncontended),
     // never a live fallback.
-    const empty = rt.beginExcluded(&scene);
+    const empty = rt.beginPrepare(&scene);
     try testing.expect(empty.claim == null);
     try testing.expect(!empty.busy);
     try testing.expectEqual(@as(u64, 1), rt.metrics.begin_empty);
@@ -420,7 +510,7 @@ test "runtime: produceBuild publishes one build; begin/finish consume it" {
     try testing.expect(rt.produceBuild(&scene));
     try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds);
 
-    const begun = rt.beginExcluded(&scene);
+    const begun = rt.beginPrepare(&scene);
     try testing.expect(!begun.busy);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
     try testing.expect(claim.have_build);
@@ -440,7 +530,7 @@ fn beginWindowProbeWork() void {
     begin_window_probe.ran = true;
 }
 
-test "runtime: beginExcludedWith runs locked work in the begin window" {
+test "runtime: beginPrepareWith runs the pre-begin work in the same window" {
     const alloc = testing.allocator;
     gpu_thread.markContextThread();
     var scene = testSceneOwned(alloc);
@@ -451,7 +541,7 @@ test "runtime: beginExcludedWith runs locked work in the begin window" {
     begin_window_probe.ran = false;
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
-    const begun = rt.beginExcludedWith(&scene, beginWindowProbeWork);
+    const begun = rt.beginPrepareWith(&scene, beginWindowProbeWork);
     try testing.expect(begin_window_probe.ran);
     try testing.expect(!begun.busy);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
@@ -459,7 +549,12 @@ test "runtime: beginExcludedWith runs locked work in the begin window" {
     try testing.expect(scene.hasConsumableFrame());
 }
 
-test "runtime: bounded acquisition reports busy instead of stalling" {
+test "runtime: lock-free is the default; setProducerExclusion restores the guarded window" {
+    // Default: staged begins run WITHOUT taking the phase mutex — even when
+    // the game side holds it — and report zero acquisition wait, with
+    // Scene.lock_free_prepare set so the UI fallbacks fail closed.
+    // setProducerExclusion(true) restores the exclusion: a held mutex
+    // reports busy instead.
     const alloc = testing.allocator;
     gpu_thread.markContextThread();
     var scene = testSceneOwned(alloc);
@@ -467,10 +562,87 @@ test "runtime: bounded acquisition reports busy instead of stalling" {
     var rt = Runtime.init();
     defer rt.deinit();
 
+    try testing.expect(!rt.producer_exclusion);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+
+    // Game side holds its lock across the whole tick; the unlocked begin
+    // must still succeed (it would report busy under the exclusion).
+    rt.gameLock();
+    const unlocked = rt.beginPrepare(&scene);
+    rt.gameUnlock();
+    try testing.expect(!unlocked.busy);
+    try testing.expectEqual(@as(u64, 0), unlocked.wait_ns);
+    try testing.expect(scene.lock_free_prepare);
+    const claim = unlocked.claim orelse return error.TestUnexpectedResult;
+    try testing.expect(claim.have_build);
+    // The frozen host pipe rides the claim (empty: produceBuild stages no
+    // host bytes) and finish consumes the staged build unlocked.
+    try testing.expectEqual(@as(usize, 0), claim.host_bytes.len);
+    rt.finishPrepare(&scene, claim);
+    try testing.expect(scene.hasConsumableFrame());
+
+    // Exclusion restored: the same held mutex now reports busy, and the
+    // UI live-list fallbacks are re-enabled for that window.
+    rt.setProducerExclusion(true);
+    rt.mutex.lock();
+    const guarded = rt.beginPrepare(&scene);
+    rt.mutex.unlock();
+    try testing.expect(guarded.claim == null);
+    try testing.expect(guarded.busy);
+    try testing.expect(!scene.lock_free_prepare);
+    // Back to the lock-free default: the next begin drives the scene gate
+    // again (the flag follows the begin, not the setter).
+    rt.setProducerExclusion(false);
+    try testing.expect(!rt.producer_exclusion);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const unlocked_again = rt.beginPrepare(&scene);
+    try testing.expect(scene.lock_free_prepare);
+    rt.finishPrepare(&scene, unlocked_again.claim orelse return error.TestUnexpectedResult);
+}
+
+test "runtime: produceBuildWithHostBytes freezes the host pipe for the claim" {
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    const payload = [_]u8{ 3, 'f', 'o', 'o' };
+    try testing.expect(rt.produceBuildWithHostBytes(&scene, &payload));
+    try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds);
+
+    const begun = rt.beginPrepare(&scene);
+    const claim = begun.claim orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 4), claim.host_bytes.len);
+    try testing.expectEqualSlices(u8, &payload, claim.host_bytes);
+    rt.finishPrepare(&scene, claim);
+
+    // Null host bytes: the claim carries an empty pipe, same as
+    // produceBuild.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const begun2 = rt.beginPrepare(&scene);
+    const claim2 = begun2.claim orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), claim2.host_bytes.len);
+    rt.finishPrepare(&scene, claim2);
+}
+test "runtime: bounded acquisition reports busy instead of stalling" {
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+    rt.setProducerExclusion(true); // this test exercises the exclusion path
+
     // Self-held mutex: even the owner cannot re-acquire (non-recursive),
     // so the bounded begin reports busy without blocking.
     rt.mutex.lock();
-    const self_busy = rt.beginExcluded(&scene);
+    const self_busy = rt.beginPrepare(&scene);
     rt.mutex.unlock();
     try testing.expect(self_busy.claim == null);
     try testing.expect(self_busy.busy);
@@ -502,7 +674,7 @@ test "runtime: bounded acquisition reports busy instead of stalling" {
     try testing.expect(holder.holding.load(.acquire));
 
     rt.setLockWaitNs(2_000_000);
-    const contended = rt.beginExcluded(&scene);
+    const contended = rt.beginPrepare(&scene);
     holder.release.store(true, .release);
     try testing.expect(contended.claim == null);
     try testing.expect(contended.busy);
@@ -514,7 +686,7 @@ test "runtime: bounded acquisition reports busy instead of stalling" {
     rt.setLockWaitNs(0);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
-    const free = rt.beginExcluded(&scene);
+    const free = rt.beginPrepare(&scene);
     try testing.expect(!free.busy);
     rt.finishPrepare(&scene, free.claim orelse return error.TestUnexpectedResult);
 }
@@ -556,14 +728,14 @@ test "runtime: cancel releases the claim; begin works again" {
     try testing.expect(rt.produceBuild(&scene));
     const seq = scene.build_seq.load(.monotonic);
 
-    const begun = rt.beginExcluded(&scene);
+    const begun = rt.beginPrepare(&scene);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
     rt.cancelPrepare(&scene, claim);
     try testing.expectEqual(@as(u64, 1), rt.metrics.cancels);
     try testing.expect(!scene.prepare_claim_active);
 
     // The handoff was restored: re-begin resolves the same generation.
-    const retry = rt.beginExcluded(&scene);
+    const retry = rt.beginPrepare(&scene);
     const claim2 = retry.claim orelse return error.TestUnexpectedResult;
     try testing.expectEqual(seq, claim2.build_seq);
     rt.finishPrepare(&scene, claim2);
@@ -583,7 +755,7 @@ test "runtime: reuseIfConsumable skips before the first prepare, reuses after" {
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
-    const begun = rt.beginExcluded(&scene);
+    const begun = rt.beginPrepare(&scene);
     rt.finishPrepare(&scene, begun.claim orelse return error.TestUnexpectedResult);
     // Consume the prepared frame (headless: no camera, so the inner render
     // early-outs after epoch completion — sg never touched), then the
@@ -620,19 +792,21 @@ test "runtime: simple update/renderFrame presents without manual locking" {
     try testing.expect(scene.stats.prepare_ms >= 0);
 }
 
-test "runtime: begin window excludes the producer; finish does not" {
+test "runtime: exclusion-mode begin window excludes the producer; finish does not" {
     // Deterministic exclusion proof by handshake (no timing assumptions):
-    // while the begin callback holds the phase mutex, a controlled worker
-    // attempt MUST fail; after the callback the worker is admitted; and
-    // `finishPrepare` returns while the worker holds the mutex (it never
-    // blocks on producer exclusion). Removing the exclusion (unlocked
-    // callback) flips the worker's attempt to success and fails this test.
+    // with `setProducerExclusion(true)` and the begin callback holding the
+    // phase mutex, a controlled worker attempt MUST fail; after the callback
+    // the worker is admitted; and `finishPrepare` returns while the worker
+    // holds the mutex (it never blocks on producer exclusion). Removing the
+    // exclusion (unlocked callback) flips the worker's attempt to success
+    // and fails this test.
     const alloc = testing.allocator;
     gpu_thread.markContextThread();
     var scene = testSceneOwned(alloc);
     defer deinitTestScene(&scene);
     var rt = Runtime.init();
     defer rt.deinit();
+    rt.setProducerExclusion(true);
 
     const Harness = struct {
         rt: *Runtime,
@@ -700,7 +874,7 @@ test "runtime: begin window excludes the producer; finish does not" {
     }
     try testing.expect(harness.ready.load(.acquire));
 
-    const begun = rt.beginExcludedWith(&scene, exclusionWindowWork);
+    const begun = rt.beginPrepareWith(&scene, exclusionWindowWork);
     exclusion_harness_slot = null;
     const claim = begun.claim orelse return error.TestUnexpectedResult;
     try testing.expect(!begun.busy);
@@ -804,7 +978,7 @@ test "runtime: producer ticks under gameLock overlap finish safely" {
     var spins: u32 = 0;
     while (spins < 200_000) : (spins += 1) {
         if (worker.done.load(.acquire)) break;
-        const begun = rt.beginExcluded(&scene);
+        const begun = rt.beginPrepare(&scene);
         if (begun.claim) |claim| {
             try testing.expect(claim.have_build);
             rt.finishPrepare(&scene, claim);
@@ -820,7 +994,7 @@ test "runtime: producer ticks under gameLock overlap finish safely" {
     // Final drain after the join (uncontended: busies here would be a bug).
     var drains: u32 = 0;
     while (drains < 64) : (drains += 1) {
-        const begun = rt.beginExcluded(&scene);
+        const begun = rt.beginPrepare(&scene);
         if (begun.claim) |claim| {
             try testing.expect(!begun.busy);
             rt.finishPrepare(&scene, claim);

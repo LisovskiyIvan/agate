@@ -24,7 +24,7 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, async-ассеты; 3-слотовые prepared-фреймы, consumer pin/lease и slot-owned snapshots. Simulation может перекрываться с `finishStagedPrepare` и render; `beginStagedPrepare` требует исключения producer, пока GPU uploads читают живые staging-массивы. При недоступности фазы context повторяет готовый кадр. Lease-протокол использует внутренний mutex: это не «100% lock-free». Полностью независимый prepare требует переноса динамических upload bytes в slot-owned packets | 🟡 |
+| Потоки и владение GPU | game/render threads, affinity-маркер, async-ассеты; 3-слотовые prepared-фреймы, consumer pin/lease и slot-owned snapshots. Simulation перекрывается с `finishStagedPrepare` и render; по умолчанию staged begin идёт БЕЗ producer-exclusion: producer замораживает динамические upload-данные в slot-пакеты, живые флаги/скаляры потребляет game-side commit, хост-чтения едут в `stageHostBytes`. `--prepare-exclusion` возвращает mutex-режим для диагностики/отката; serial/legacy пути и сохранение профиля остаются под mutex. Lease-протокол использует внутренний mutex — это не «100% lock-free» | ✅ |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |

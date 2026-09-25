@@ -172,31 +172,41 @@ defer rt.deinit(); // joins the worker before Scene.deinit
 fn gameTick(ctx: *Tick) void { /* simulate only; no build here */ }
 fn gameLoop() void {
     while (rt.shouldRun()) {
-        _ = rt.update(&scene, &tick, gameTick); // simulate + build, under exclusion
+        _ = rt.update(&scene, &tick, gameTick); // simulate + build (lock-free by default)
     }
 }
 ```
 
-- Simple path (the agate demo): `update(scene, ctx, tick)` holds the
-  exclusion, runs `tick`, then `claim -> build -> stageUi -> publish`.
-  `renderFrame(scene)` returns `prepared`, `reused`, `skipped` (nothing
-  consumable yet), or `busy` (acquisition budget exceeded; a consumable
+- Simple path (the agate demo): `update(scene, ctx, tick)` runs `tick`,
+  then `claim -> build -> stageUi -> publish`. `renderFrame(scene)`
+  returns `prepared`, `reused`, `skipped` (nothing consumable yet), or
+  `busy` (exclusion mode only: acquisition budget exceeded; a consumable
   front is still re-presented). The first frames skip until the first
   build is ready.
+- Lock-free by default: `beginPrepare`/`renderFrame` take no phase mutex.
+  Safety comes from the fresh-build contract — the producer froze every
+  upload payload into the slot (`stageUploads`/`stageUi`), the game-side
+  commit consumes the live flags/scalars, and host live-state reads travel
+  frozen in `BuildClaim.stageHostBytes` (read back as
+  `PrepareClaim.host_bytes`). `setProducerExclusion(true)` restores the
+  previous mutex window (`beginPrepareWith` then runs host live-state reads
+  inside it; bounded by `setLockWaitNs`).
 - Advanced path (instrumented hosts, e.g. Sandbox): `gameLock`/
-  `gameUnlock`, `produceBuild`, `beginExcludedWith` (runs host live-state
-  reads inside the same exclusion window as the begin), `finishPrepare`,
-  `cancelPrepare`, `reuseIfConsumable`, `prepareSerial`, and
-  `tryRunLocked` (never blocks; false means the caller keeps its previous
-  snapshot/title). `finishPrepare` must be called unlocked and only for
-  claims with `have_build` (asserted).
-- Exclusion contract: producer mutations are excluded from `begin` only.
-  `finishPrepare` and `render`/`renderReuse` are context-owned and
-  overlap the next producer tick. A successful begin must pair with
-  exactly one `finishPrepare` or `cancelPrepare`.
-- Context-side acquisition is bounded by `setLockWaitNs` (0 = pure
-  non-blocking try; scheduling and GPU work can still delay a present).
-  The game side blocks: a tick is never dropped.
+  `gameUnlock`, `produceBuild`/`produceBuildWithHostBytes`,
+  `beginPrepare`/`beginPrepareWith`, `finishPrepare`, `cancelPrepare`,
+  `reuseIfConsumable`, `prepareSerial`, and `tryRunLocked` (never blocks;
+  false means the caller keeps its previous snapshot/title).
+  `finishPrepare` must be called unlocked and only for claims with
+  `have_build` (asserted).
+- Claim contract: a successful begin must pair with exactly one
+  `finishPrepare` or `cancelPrepare`. `finishPrepare` and
+  `render`/`renderReuse` are context-owned and overlap the next producer
+  tick.
+- Still mutex-dependent by design: `prepareSerial` (the
+  `--no-concurrent-build`/`--no-threads` diagnostics), profiler control and
+  report file IO (bounded window only when a request is pending), and
+  registry add/remove while a latch is in flight (an app-contract
+  violation, kept coherent by the commit guards).
 - Worker lifecycle: `spawnWorker(entry)` starts the game loop,
   `shouldRun()` gates it, `quiesce()` is idempotent, and `Runtime.deinit`
   quiesces then tears down the mutex. `spawnWorker` must not be called
