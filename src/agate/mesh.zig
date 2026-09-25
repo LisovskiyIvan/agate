@@ -6,10 +6,7 @@ pub const CullingStrategy = types.CullingStrategy;
 pub const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 pub const MorphTarget = types.MorphTarget;
 pub const MorphMode = types.MorphMode;
-pub const InstancedMesh = types.InstancedMesh;
-pub const BoneAttachment = types.BoneAttachment;
 pub const GeometryData = types.GeometryData;
-pub const LODLevel = types.LODLevel;
 pub const SkinJointWeight = types.SkinJointWeight;
 
 pub const tangents = @import("mesh/tangents.zig");
@@ -24,6 +21,11 @@ pub const InstancePreviewState = mesh_impl.InstancePreviewState;
 pub const InstanceSource = mesh_impl.InstanceSource;
 pub const StagedInstanceRecord = mesh_impl.StagedInstanceRecord;
 pub const uploadGeometry = mesh_impl.uploadGeometry;
+// Mesh-referencing instance vocabulary (lives in mesh/mesh.zig with the
+// Mesh owner; see the note there).
+pub const InstancedMesh = mesh_impl.InstancedMesh;
+pub const BoneAttachment = mesh_impl.BoneAttachment;
+pub const LODLevel = mesh_impl.LODLevel;
 
 /// GPU morph blending: delta-texture packing plus the pure Zig mirror of
 /// the vertex-shader blend (opt-in via Mesh.morph_mode == .gpu).

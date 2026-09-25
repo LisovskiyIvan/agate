@@ -13,10 +13,7 @@ const CullingStrategy = types.CullingStrategy;
 const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 const MorphTarget = types.MorphTarget;
 const MorphMode = types.MorphMode;
-const InstancedMesh = types.InstancedMesh;
-const BoneAttachment = types.BoneAttachment;
 const GeometryData = types.GeometryData;
-const LODLevel = types.LODLevel;
 const SkinJointWeight = types.SkinJointWeight;
 
 const Material = @import("../material.zig").Material;
@@ -171,6 +168,78 @@ pub const StagedInstanceRecord = struct {
     uploaded_count: usize = 0,
     staged_frame: u64 = std.math.maxInt(u64),
 };
+/// Mesh-referencing instance vocabulary (moved verbatim from `types.zig`):
+/// `LODLevel`, `InstancedMesh`, and `BoneAttachment` all hold `*Mesh`, so
+/// they live here with the `Mesh` owner instead of in the pure-data
+/// `types.zig` leaf. That keeps `types.zig` import-free of the `Mesh` owner
+/// (it previously reached back through the `mesh.zig` facade, a leaf ->
+/// facade edge the repo convention forbids) and leaves the `mesh.zig`
+/// facade re-exports unchanged.
+pub const LODLevel = struct {
+    distance: f32,
+    mesh: ?*Mesh,
+};
+
+pub const InstancedMesh = struct {
+    name: []const u8,
+    position: Vec3 = Vec3.zero,
+    rotation: Vec3 = Vec3.zero, // Euler angles in degrees
+    scaling: Vec3 = Vec3.one,
+    is_visible: bool = true,
+    cast_shadows: bool = true,
+    receive_shadows: bool = true,
+    culling_strategy: CullingStrategy = .frustum,
+    layer_mask: u32 = 0xFFFFFFFF,
+    source_mesh: *Mesh,
+
+    cached_world_matrix: Mat4 = Mat4.identity,
+    cached_bounding_box: BoundingBox = BoundingBox.zero,
+    last_position: Vec3 = Vec3.new(std.math.nan(f32), 0, 0),
+    last_rotation: Vec3 = Vec3.zero,
+    last_scaling: Vec3 = Vec3.zero,
+    dirty: bool = true,
+
+    pub fn markDirty(self: *InstancedMesh) void {
+        self.dirty = true;
+    }
+
+    pub fn computeWorldMatrix(self: InstancedMesh) Mat4 {
+        const trs = Mat4.fromRotationTranslationScale(self.position, self.rotation, self.scaling);
+        return Mat4.mul(trs, self.source_mesh.base_matrix);
+    }
+
+    pub fn updateCachedTransforms(self: *InstancedMesh) void {
+        const moved = self.dirty or
+            !self.position.eql(self.last_position) or
+            !self.rotation.eql(self.last_rotation) or
+            !self.scaling.eql(self.last_scaling);
+        if (moved) {
+            self.cached_world_matrix = self.computeWorldMatrix();
+            self.cached_bounding_box = self.source_mesh.local_bounding_box.transform(self.cached_world_matrix);
+            self.last_position = self.position;
+            self.last_rotation = self.rotation;
+            self.last_scaling = self.scaling;
+            self.dirty = false;
+        }
+    }
+
+    pub fn getWorldMatrix(self: *InstancedMesh) Mat4 {
+        self.updateCachedTransforms();
+        return self.cached_world_matrix;
+    }
+
+    pub fn getWorldBoundingBox(self: *InstancedMesh) BoundingBox {
+        self.updateCachedTransforms();
+        return self.cached_bounding_box;
+    }
+};
+
+pub const BoneAttachment = struct {
+    host_mesh: *Mesh,
+    bone_index: usize,
+    offset_matrix: Mat4 = Mat4.identity,
+};
+
 /// Mesh-module uid counter for `Mesh.ensureUid` (stage-2 increment A).
 /// Chosen over `Scene.next_mesh_uid`: queue/shadow/outline/instance-staging
 /// builders have no Scene handle, so a Scene counter would require threading

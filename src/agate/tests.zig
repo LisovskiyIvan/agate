@@ -66,6 +66,14 @@ test {
     _ = @import("ktx2.zig");
     _ = @import("ktx2_tests.zig");
     _ = @import("lights.zig");
+    _ = @import("lights/area.zig");
+    _ = @import("lights/clustered.zig");
+    _ = @import("lights/directional.zig");
+    _ = @import("lights/hemispheric.zig");
+    _ = @import("lights/point.zig");
+    _ = @import("lights/spot.zig");
+    _ = @import("lights/sun.zig");
+    _ = @import("lights/tests.zig");
     _ = @import("loader/animations.zig");
     _ = @import("loader/gltf_util.zig");
     _ = @import("loader/lights.zig");
