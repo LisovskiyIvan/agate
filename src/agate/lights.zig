@@ -454,9 +454,21 @@ test "colorTemperatureToRgb produces warm for low kelvin and cool for high kelvi
     try std.testing.expect(cool.b >= cool.r);
 }
 
-test "multi-directional cap is four (one sun plus three fills)" {
+test "directional light limits and array capacity" {
     try std.testing.expectEqual(@as(usize, 4), max_directional_lights);
     try std.testing.expectEqual(@as(usize, 3), max_fill_directionals);
+
+    var lights_arr: [max_directional_lights]DirectionalLight = undefined;
+    for (&lights_arr, 0..) |*l, i| {
+        l.* = DirectionalLight.init("dir", .{
+            .direction = Vec3.new(0, -1, @floatFromInt(i)),
+            .intensity = 1.0 + @as(f32, @floatFromInt(i)),
+        });
+    }
+    for (lights_arr, 0..) |l, i| {
+        try std.testing.expect(l.is_enabled);
+        try std.testing.expectApproxEqAbs(1.0 + @as(f32, @floatFromInt(i)), l.intensity, 1e-5);
+    }
 }
 
 test "disabled directional falls back to hemispheric sun" {
@@ -518,8 +530,19 @@ test "PointLight shadows are off by default" {
     try std.testing.expect(!bare.cast_shadows);
 }
 
-test "area light cap is two" {
+test "area light capacity and array bounds" {
     try std.testing.expectEqual(@as(usize, 2), max_area_lights);
+    var area_arr: [max_area_lights]AreaLight = undefined;
+    for (&area_arr, 0..) |*al, i| {
+        al.* = AreaLight.init("area", .{
+            .center = Vec3.new(@floatFromInt(i), 0, 0),
+            .intensity = 2.0,
+        });
+    }
+    for (area_arr, 0..) |al, i| {
+        try std.testing.expectEqual(Vec3.new(@floatFromInt(i), 0, 0), al.center);
+        try std.testing.expectEqual(@as(f32, 2.0), al.intensity);
+    }
 }
 
 test "clustered pool cap is 64, defaults match the legacy point lane" {

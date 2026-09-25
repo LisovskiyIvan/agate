@@ -32,4 +32,3 @@ test "ssao options default and clamping" {
     const low = (SSAOOptions{ .sample_count = 1 }).clamped();
     try std.testing.expectEqual(@as(u32, 4), low.sample_count);
 }
-

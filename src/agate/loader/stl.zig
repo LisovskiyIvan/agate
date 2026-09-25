@@ -411,6 +411,11 @@ test "stl zero facet normal is computed from geometry" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), data.normals[2], 1e-5);
 }
 
-test "stl appendToScene links (type check)" {
-    _ = appendToScene;
+test "stl rejects invalid binary header and zero facets" {
+    const alloc = std.testing.allocator;
+    const short_buf = [_]u8{0} ** 50;
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, &short_buf));
+
+    const empty_buf = [_]u8{0} ** 84;
+    try std.testing.expectError(error.NoGeometry, parse(alloc, &empty_buf));
 }

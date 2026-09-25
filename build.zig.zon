@@ -45,6 +45,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "API.md",
         "src",
         // Path dependency: the patched sokol bindings travel with the package.
         "vendor",

@@ -24,7 +24,7 @@
 | Направление (аналог в Babylon.js) | Agate | Статус |
 |---|---|---|
 | Ядро: сцена, граф, трансформы, математика | Scene, Mesh, SIMD-математика | ✅ |
-| Потоки и владение GPU | game/render threads, affinity-маркер, неблокирующий render без разыменования мешей, async-ассеты; 3-слотовая ротация prepared-фреймов + consumer pin/lease + slot-owned snapshot; latch live-touch-free (slot records + `commitPublishedRecords`, UI packet handles); concurrent-build primitive landed (`tryClaimBuildSlot`/`BuildClaim`, `releaseHandoff` без flip); atomic handoff edge done (seq words + `build_slot` — `std.atomic.Value`, release/acquire edge); prepareFrame locked-claim + `build_stats` через слот payload; lock-free ADOPTED behind experimental `--concurrent-build` (default OFF; sandbox claim/publish landed, default bit-identical); остаток — burn-in затем default flip + freeze-then-latch, затем снятие phase-mutex | 🟡 |
+| Потоки и владение GPU | game/render threads, affinity-маркер, async-ассеты; 3-слотовые prepared-фреймы, consumer pin/lease и slot-owned snapshots. Simulation может перекрываться с `finishStagedPrepare` и render; `beginStagedPrepare` требует исключения producer, пока GPU uploads читают живые staging-массивы. При недоступности фазы context повторяет готовый кадр. Lease-протокол использует внутренний mutex: это не «100% lock-free». Полностью независимый prepare требует переноса динамических upload bytes в slot-owned packets | 🟡 |
 | Рендер | Forward, 8 пайплайнов, opaque/blend/cutout, per-instance OIT-сортировка, сортировка по пайплайну/текстуре/дистанции | ✅ |
 | Frustum culling | AABB + SIMD 4-wide | ✅ |
 | Occlusion culling | CPU Hierarchical Z-Buffer (Hi-Z), 9-уровневая пирамида, O(1) AABB-тест, 0 GPU stall/pop-in | ✅ |
@@ -62,9 +62,9 @@
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
 | Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
 | Сеть/multiplayer | — | ❌ |
-| Frame graph, volumetric, Gaussian splatting | Volumetric light shafts v1 (sun-CSM raymarch, half/quarter res, HG phase, bilateral blur, additive composite, default off; engine-only, no sandbox UI) | 🟡 |
+| Frame graph, volumetric, Gaussian splatting | Volumetric light shafts v1 (sun-CSM raymarch, half/quarter res, HG phase, bilateral blur, additive composite, default off; Sandbox UI controls: toggle, resolution, steps, anisotropy, intensity slider, hotkey Shift+G, regression S26) | ✅ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | 1193 unit-тестов (100% pass), Agate Performance Benchmark Suite (7 бенчмарков: Mat4 SIMD, Frustum Cull 4-wide, Transforms Pool, Full Pipeline, Audio decoders, 3D glTF/meshopt, Image decoders; `sandbox --bench`) | ✅ |
+| Тесты/бенчмарки | `zig build test` в Agate и Sandbox; отдельный Sandbox `zig build test-gpu` с реальным контекстом: P5/P6/P7, update/render в трёх режимах, save/load round trip и stress. GPU-гейты последовательные, логи и saves изолированы во временных каталогах. Agate Performance Benchmark Suite (`sandbox --bench`); успешный smoke-прогон не является замером ускорения | ✅ |
 | In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |
 | Web-инспекторы, Playground, NME, браузерные редакторы GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |

@@ -191,7 +191,17 @@ pub const Mesh = struct {
     /// read (builders ensure before forkJoin); the counter itself is plain
     /// (phase ownership, like `instance_render`).
     uid: u64 = 0,
+    /// Human-readable label, resolved by `Scene.getMeshByName`.
+    /// Borrowed or Scene-allocator-owned (see `owns_name`): never freed or
+    /// reassigned directly — rename only via `Scene.renameMesh`, which takes
+    /// an owned copy with copy-before-free (alias-safe) and atomic OOM
+    /// semantics. `Mesh.deinit` frees the slice iff `owns_name`.
     name: []const u8,
+    /// Whether `name` was allocated from the Scene allocator and is freed
+    /// in `Mesh.deinit` (iff set and `name.len > 0`). Plain boolean, not a
+    /// privacy mechanism (Zig struct fields have no access modifiers):
+    /// loaders/builders set it when adopting a duped name; borrowed names
+    /// (literals, `uploadGeometry` inputs) leave it false.
     owns_name: bool = false,
     position: Vec3 = Vec3.zero,
     rotation: Vec3 = Vec3.zero, // Euler angles in degrees

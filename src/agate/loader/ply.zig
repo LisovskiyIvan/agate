@@ -1189,6 +1189,9 @@ test "ply zero faces returns InvalidPly without double free" {
     try std.testing.expectError(error.InvalidPly, parse(alloc, text));
 }
 
-test "ply appendToScene links (type check)" {
-    _ = appendToScene;
+test "ply rejects invalid magic or truncated header" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidPly, parse(alloc, "not a ply file at all"));
+    try std.testing.expectError(error.TruncatedPly, parse(alloc, "ply\n"));
+    try std.testing.expectError(error.TruncatedPly, parse(alloc, "ply\nformat ascii 1.0\n"));
 }

@@ -982,4 +982,3 @@ test "box and plane kill mode eliminates contacting particle" {
     ps.updateCpu(0.8); // reaches 1.8, inside box
     try std.testing.expectEqual(@as(usize, 0), ps.active_count);
 }
-

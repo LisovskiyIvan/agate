@@ -43,6 +43,91 @@ const submitInstancedMesh = instances.submitInstancedMesh;
 const frame = @import("frame.zig");
 const buildFrameQueues = frame.buildFrameQueues;
 
+test "material alpha modes route regular and instanced draws with frozen cutoffs" {
+    const ally = std.testing.allocator;
+    var standard = StandardMaterial.init("standard");
+    var pbr = material_mod.PBRMaterial.init("pbr");
+    var shader = material_mod.ShaderMaterial.init("shader");
+    const materials = [_]Material{
+        .{ .standard = &standard },
+        .{ .pbr = &pbr },
+        .{ .shader_material = &shader },
+    };
+
+    // Exercise the queue builder, not just Material.isTransparent(). This
+    // is CPU routing/snapshot proof, not a claim about shader output pixels.
+    for (materials) |mat| {
+        for ([_]material_mod.AlphaMode{ .@"opaque", .cutout, .blend }) |mode| {
+            switch (mat) {
+                inline else => |m| {
+                    m.alpha_mode = mode;
+                    m.alpha_cutoff = 0.37;
+                },
+            }
+            var regular = Mesh{
+                .name = "regular",
+                .vertex_buffer = .{},
+                .index_buffer = .{},
+                .index_count = 3,
+                .material = mat,
+                .culling_strategy = .always_render,
+                .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+            };
+            var instance = InstancedMesh{ .name = "copy", .source_mesh = &regular };
+            var instance_ptrs = [_]*InstancedMesh{&instance};
+            var batched = Mesh{
+                .name = "batched",
+                .vertex_buffer = .{},
+                .index_buffer = .{},
+                .index_count = 3,
+                .material = mat,
+                .instances = .{ .items = &instance_ptrs, .capacity = 1 },
+            };
+            const meshes = [_]*Mesh{ &regular, &batched };
+            var queues = RenderQueues{};
+            defer queues.deinit(ally);
+            var stats = SceneStats{};
+            var culler = visibility.OcclusionCuller.init();
+            buildFrameQueues(.{
+                .allocator = ally,
+                .meshes = &meshes,
+                .cache_key = 1,
+                .view_proj = Mat4.identity,
+                .eye = Vec3.zero,
+                .cull_frustum = false,
+                .cull_occlusion = false,
+                .occlusion_culler = &culler,
+                .stats = &stats,
+                .queues = &queues,
+                .default_white_id = 1,
+            });
+
+            const blend = mode == .blend;
+            try std.testing.expectEqual(@as(usize, if (blend) 0 else 1), queues.items.items.len);
+            try std.testing.expectEqual(@as(usize, if (blend) 1 else 0), queues.transparent.items.len);
+            try std.testing.expectEqual(@as(usize, if (blend) 0 else 1), queues.opaque_instanced.items.len);
+            try std.testing.expectEqual(@as(usize, if (blend) 1 else 0), queues.transparent_instanced.items.len);
+            try std.testing.expectEqual(@as(usize, if (blend) 2 else 0), queues.transparent_order.items.len);
+
+            // Source mutation must not change the records already queued.
+            switch (mat) {
+                inline else => |m| {
+                    m.alpha_mode = if (blend) .@"opaque" else .blend;
+                    m.alpha_cutoff = 0.91;
+                },
+            }
+            const item = if (blend) queues.transparent.items[0] else queues.items.items[0];
+            const batch = if (blend) queues.transparent_instanced.items[0] else queues.opaque_instanced.items[0];
+            const cutoff: f32 = if (mode == .cutout) 0.37 else 0;
+            try std.testing.expectEqual(@as(u32, 0), item.mesh_index);
+            try std.testing.expectEqual(@as(u32, 1), batch.source_mesh);
+            try std.testing.expectEqual(cutoff, item.draw_record.alpha_cutoff);
+            try std.testing.expectEqual(cutoff, batch.draw_record.alpha_cutoff);
+            try std.testing.expectEqual(blend, batch.transparent);
+        }
+    }
+}
+
 // Очереди не хранят живых указателей: скриншот пережил мутацию TRS/
 // материала и две публикации скелета, перезаписавшие исходный слот.
 test "P4: queued snapshot survives source mutation and skeleton republication" {

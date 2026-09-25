@@ -408,6 +408,29 @@ test "obj empty is NoGeometry" {
     try std.testing.expectError(error.NoGeometry, parse(alloc, "# only a comment\n\n"));
 }
 
-test "obj appendToScene links (type check)" {
-    _ = appendToScene;
+test "obj rejects invalid and out-of-bounds face indices" {
+    const alloc = std.testing.allocator;
+    const zero_idx =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\f 0 1 2
+    ;
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, zero_idx));
+
+    const out_of_bounds =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\f 1 2 999
+    ;
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, out_of_bounds));
+
+    const negative_out_of_bounds =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\f -99 1 2
+    ;
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, negative_out_of_bounds));
 }

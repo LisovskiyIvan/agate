@@ -241,11 +241,25 @@ pub const postprocess = @import("postprocess.zig");
 pub const PostProcessOptions = postprocess.PostProcessOptions;
 pub const TonemappingType = postprocess.TonemappingType;
 pub const LutFormat = postprocess.LutFormat;
+pub const ShaftResolution = postprocess.ShaftResolution;
 
 pub const ssao = @import("ssao.zig");
 pub const SSAOOptions = ssao.SSAOOptions;
 
 pub const jobs = @import("jobs.zig");
+/// Thin engine-owned frame lifecycle facade (update-vs-begin phase mutex,
+/// worker start/stop, producer claim->build->stageUi->publish one-liner,
+/// staged begin/finish/cancel with the smallest safe exclusion boundary,
+/// serial legacy prepare, reuse fallback, truthful counters). Threaded
+/// apps (agate demo, sandbox) compose their frame loop from this instead
+/// of reproducing the ordering by hand.
+pub const runtime = @import("runtime.zig");
+pub const Runtime = runtime.Runtime;
+pub const RuntimeMetrics = runtime.Metrics;
+pub const RuntimeBeginResult = runtime.BeginResult;
+pub const RuntimeFrameResult = runtime.FrameResult;
+pub const handoff = @import("handoff.zig");
+pub const Handoff = handoff.Handoff;
 /// Graphics-context thread marker: apps call `markContextThread()` in their
 /// init callback so engine paths can detect off-context GPU touches.
 pub const gpu_thread = @import("gpu_thread.zig");
@@ -640,4 +654,14 @@ test "root re-exports cover recent Scene APIs" {
     _ = CameraRigSlot;
     _ = TagSet;
     _ = TagQuery;
+    _ = Handoff;
+}
+
+test "root re-exports cover the runtime frame facade" {
+    _ = Runtime;
+    _ = RuntimeMetrics;
+    _ = RuntimeBeginResult;
+    _ = RuntimeFrameResult;
+    _ = runtime.BeginResult;
+    _ = runtime.FrameResult;
 }

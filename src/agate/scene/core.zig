@@ -171,6 +171,17 @@ fn msSince(t0: u64) f32 {
 /// The `light_pack` consumed-copy fallback in `updateLights` stays
 /// game-owned under update-vs-prepare exclusion (render reads only the
 /// snapshot copy) — no atomic mailbox needed there.
+///
+/// Resource-lifetime contract (see `scene/registry.zig` + `agate/API.md`):
+/// meshes/materials/trails are Scene-owned and die through the matching
+/// `destroy*` (mesh GPU buffers retire by epoch off-context and flush at
+/// the next render start; `deinit` drains everything). Mesh `name` slices
+/// are borrowed (`owns_name == false`) or Scene-allocator-owned
+/// (`owns_name == true`, freed in `Mesh.deinit`) — plain fields, no
+/// language-level privacy; rename only via `renameMesh`. Particle systems
+/// are Scene-owned until `deinit` (context-thread only): no per-system
+/// destroy exists, because `ParticleSystem.deinit` issues `sg.destroy*`
+/// inline and prepared frames borrow its handle ids.
 pub const Scene = struct {
     allocator: std.mem.Allocator,
 
@@ -854,6 +865,16 @@ pub const Scene = struct {
     /// See `scene/registry.zig` (owns the body + docs).
     pub fn destroyMesh(self: *Scene, mesh: *Mesh) void {
         scene_registry.destroyMesh(self, mesh);
+    }
+
+    /// See `scene/registry.zig` (owns the body + docs).
+    pub fn renameMesh(self: *Scene, mesh: *Mesh, new_name: []const u8) !void {
+        return scene_registry.renameMesh(self, mesh, new_name);
+    }
+
+    /// See `scene/registry.zig` (owns the body + docs).
+    pub fn destroyTrailMesh(self: *Scene, trail: *TrailMesh) void {
+        scene_registry.destroyTrailMesh(self, trail);
     }
 
     /// See `scene/registry.zig` (owns the body + docs).

@@ -37,19 +37,21 @@ const stats_interval: u32 = 120;
 var stats_tick: u32 = 0;
 /// Actual update||render split. The game thread owns simulation
 /// (Scene.update + input consumption + recordUpdateTime staging), the sapp
-/// (context) thread owns prepare + render. Phase ownership (phase_mutex)
-/// covers update-vs-prepare ONLY: frame() unlocks right after prepare so the
-/// next update overlaps render. This is sound because render reads ONLY
-/// render-owned captures (prepared draws/UI/debug/sky/particle frames +
-/// frame_snapshot + borrowed GPU handles under P3 epochs) — see Scene docs.
+/// (context) thread owns prepare + render. Choreography lives in the
+/// engine-owned `z.Runtime` facade (see runtime.zig): the game side holds
+/// the phase mutex across its whole tick (`simulate` + producer build),
+/// the context side holds it across the staged begin ONLY, then releases
+/// before finish + render so the next update overlaps the draw. This is
+/// sound because `finishStagedPrepare` consumes only the claimed slot plus
+/// context-owned state and render reads ONLY render-owned captures
+/// (prepared draws/UI/debug/sky/particle frames + frame_snapshot +
+/// borrowed GPU handles under P3 epochs) — see Scene docs.
 /// sg.* calls only happen on the sapp thread; the update phase is free of
 /// them. The Scene allocator is thread-safe (GPA .thread_safe = true):
 /// prepare/render lazy caches and jobs workers allocate from it.
 var threaded: bool = true;
-var phase_mutex: z.jobs.Mutex = .{};
-var game_running = std.atomic.Value(bool).init(false);
+var runtime: z.Runtime = z.Runtime.init();
 var quit_requested = std.atomic.Value(bool).init(false);
-var game_thread: ?std.Thread = null;
 var particles: *z.ParticleSystem = undefined;
 var msaa_samples: i32 = 1;
 
@@ -185,19 +187,13 @@ export fn init() callconv(.c) void {
     // Stage 3: spawn the game thread — simulation moves there; the sapp
     // thread keeps windowing + render. Spawn failure degrades to
     // single-threaded (frame() runs simulate inline).
-    if (threaded) {
-        game_running.store(true, .release);
-        game_thread = std.Thread.spawn(.{}, gameLoop, .{}) catch |err| blk: {
-            game_running.store(false, .release);
-            std.debug.print("game thread spawn failed ({s}); running single-threaded\n", .{@errorName(err)});
-            break :blk null;
-        };
-        if (game_thread == null) threaded = false;
-    }
-
     if (profile_mode) {
         scene.startProfiling();
         std.log.info("Profiling started via --profile CLI flag", .{});
+    }
+
+    if (threaded) {
+        if (!runtime.spawnWorker(gameLoop)) threaded = false;
     }
 }
 
@@ -226,7 +222,8 @@ fn pushInput(ev: AppEvent) void {
 }
 
 /// One simulation step on the game side: input consumption + Scene.update
-/// + demo state. Callers own phase ownership (the mutex when threaded).
+/// + demo state. Callers hold the runtime phase mutex (game side) across
+/// the whole tick — see gameLoop / the single-threaded frame path.
 fn simulate(dt_sec: f32) void {
     // Game-side input consumption: events were produced on the sapp
     // thread (ring), applied here where the simulation state lives.
@@ -254,28 +251,37 @@ fn simulate(dt_sec: f32) void {
             if (particle_mode) |m| @tagName(m) else "off",
         });
     };
-    // Stage 1 producer build at the update boundary (CPU-only, sg-free):
-    // stages instance matrices + particle/physics captures for the prepare
-    // latch. prepareFrame consumes the build when fresh, else stages inline.
-    scene.buildPreparedFrame();
+    // Producer build at the update boundary (CPU-only, sg-free): the
+    // engine facade stages instance matrices + particle/physics captures
+    // for the prepare latch via Runtime.update (claim -> build -> stageUi
+    // -> publish, right after this body). Kept out of here so the simple
+    // path owns the ordering in one place.
     // Stage the update tick WITHOUT touching stats (context-owned; render
     // may read it concurrently): prepareFrame transfers it next frame.
     scene.recordUpdateTime(msSince(t_update));
 }
 
+/// Simple-path tick body for Runtime.update: simulation WITHOUT the build
+/// (the facade appends produceBuild under the same game-side hold).
+fn gameTick(ctx: *TickCtx) void {
+    simulate(ctx.dt_sec);
+}
+
+const TickCtx = struct {
+    dt_sec: f32,
+};
+
 fn gameLoop() void {
     var last = sokol.time.now();
-    while (game_running.load(.acquire)) {
+    while (runtime.shouldRun()) {
         const now = sokol.time.now();
         const dt_sec: f32 = @floatCast(sokol.time.ms(now -% last) / 1000.0);
         last = now;
 
-        // Update-vs-prepare exclusion only: simulate() may overlap the
-        // context thread's render (it touches live sim state + stages
-        // pending_update_ms, never stats/Profiler/prepared payloads).
-        phase_mutex.lock();
-        if (game_running.load(.acquire)) simulate(dt_sec);
-        phase_mutex.unlock();
+        // Simple-path producer tick: simulate + build under game-side
+        // exclusion, overlapping the context's finish + render.
+        var tick = TickCtx{ .dt_sec = dt_sec };
+        _ = runtime.update(&scene, &tick, gameTick);
 
         // Pace the simulation thread (~1 kHz): leaves cores free and
         // keeps dt magnitudes sane for the demo's float32 state.
@@ -287,29 +293,19 @@ export fn frame() callconv(.c) void {
     if (quit_requested.load(.acquire)) sapp.quit();
 
     if (threaded) {
-        // Actual update||render: phase ownership covers prepare ONLY.
-        // Unlock BEFORE render so the game thread's next update overlaps
-        // the draw — render reads only render-owned captures (see Scene).
-        // Next prepare NEVER runs concurrently with render (same thread,
-        // sequential frames). prepare_ms is written here on the context
-        // thread, same as render — no cross-thread stats write.
-        phase_mutex.lock();
-        const t_prepare = sokol.time.now();
-        scene.prepareFrame();
-        scene.stats.prepare_ms = msSince(t_prepare);
-        phase_mutex.unlock();
-        scene.render();
+        // Simple-path context frame: bounded begin, then finish + render,
+        // reuse, or skip. Live reads stay under exclusion and mutex
+        // acquisition is bounded. prepare_ms is written inside renderFrame on the
+        // context thread (begin + finish minus acquisition wait), same as
+        // render — no cross-thread stats write.
+        _ = runtime.renderFrame(&scene);
 
         if (show_stats) printFrameStats();
     } else {
-        simulate(@floatCast(sapp.frameDuration()));
-        // Explicit prepare (render would do it internally): same total work,
-        // but the prepare phase gets its own timing attribution. Assigned
-        // before render so recordFrame at the end of render sees it.
-        const t_prepare = sokol.time.now();
-        scene.prepareFrame();
-        scene.stats.prepare_ms = msSince(t_prepare);
-        scene.render();
+        // Single-threaded: same two calls inline (mutex uncontended).
+        var tick = TickCtx{ .dt_sec = @floatCast(sapp.frameDuration()) };
+        _ = runtime.update(&scene, &tick, gameTick);
+        _ = runtime.renderFrame(&scene);
         if (show_stats) printFrameStats();
     }
 
@@ -320,12 +316,9 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
-    // Stage 3: stop the game thread before any state it touches dies.
-    if (game_thread) |t| {
-        game_running.store(false, .release);
-        t.join();
-        game_thread = null;
-    }
+    // Stop the game thread before any state it touches dies (idempotent
+    // with any earlier quiesce; exactly one join total).
+    runtime.deinit();
     if (z.jobs.global) |pool| {
         pool.deinit();
         z.jobs.global = null;
@@ -365,8 +358,8 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
                 // update side (profiler reports + memory capture read live
                 // state); the Profiler itself is context-owned and workers
                 // never touch it.
-                phase_mutex.lock();
-                defer phase_mutex.unlock();
+                runtime.mutex.lock();
+                defer runtime.mutex.unlock();
                 if (scene.isProfiling()) {
                     scene.stopProfiling();
                     scene.saveProfileReports("profile") catch |err| {

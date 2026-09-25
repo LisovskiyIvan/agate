@@ -126,3 +126,11 @@ pub const profiler_mod = @import("profiler.zig");
 pub const Profiler = profiler_mod.Profiler;
 pub const FrameRecord = profiler_mod.FrameRecord;
 pub const MemorySnapshot = profiler_mod.MemorySnapshot;
+
+// Test-only seam exposure: the P5 live-GPU gate arms
+// `instance_staging.testArmGrowthFailOnce()` to exercise the real makeBuffer
+// .FAILED staging branch, then reads `testLastInjectedFailId()` to prove the
+// failed handle itself was destroyed. Same module instance the frame leaves
+// use (file-path dedup); one not-taken branch when unarmed, no behavior
+// change otherwise.
+pub const instance_staging = @import("scene/instance_staging.zig");

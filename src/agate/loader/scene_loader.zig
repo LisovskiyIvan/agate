@@ -212,4 +212,3 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(!isExtensionSupported("KHR_texture_basisu_extra"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
 }
-

@@ -564,6 +564,16 @@ pub fn build(b: *Build) !void {
     const test_step = b.step("test", "Run library tests (fails while src/agate/tests.zig is stale; run `zig build update-tests`)");
     test_step.dependOn(&run_lib_tests.step);
 
+    const math_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agate/math.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_math_tests = b.addRunArtifact(math_tests);
+    test_step.dependOn(&run_math_tests.step);
+
     const fmt = b.addFmt(.{ .paths = &.{"src"}, .check = true });
     b.step("fmt", "Check formatting with zig fmt").dependOn(&fmt.step);
 }

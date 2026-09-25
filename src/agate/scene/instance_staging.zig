@@ -148,6 +148,36 @@ const ParallelInstanceStage = struct {
     }
 };
 
+/// Test-only growth-failure injection (P5 5d): armed via
+/// testArmGrowthFailOnce(), the next growth allocation synthesizes a nonzero
+/// FAILED buffer (allocBuffer + failBuffer) instead of calling sg.makeBuffer,
+/// driving the REAL `.FAILED` handling below (destroy the failed slot, keep
+/// the previous complete published state, retire nothing). State is private:
+/// the only writers/readers are the two context-thread-only accessors below,
+/// never a freely mutable production switch. A zero id at consume time (dry
+/// pool) falls through to the real makeBuffer so the failure mode stays
+/// pool-exhaustion (covered by P5 5a), never a vacuous injection.
+var test_inject_growth_fail_once: bool = false;
+/// Exact buffer id the last armed injection failed (0 = none consumed yet).
+/// Lets the test assert the failed handle itself reached INVALID, not just
+/// that the pool has room.
+var test_last_injected_fail_id: u32 = 0;
+
+/// Arms one injected growth failure. Context thread only (asserted): the
+/// staging GPU half never runs anywhere else.
+pub fn testArmGrowthFailOnce() void {
+    gpu_thread.assertOnContextThread();
+    test_last_injected_fail_id = 0;
+    test_inject_growth_fail_once = true;
+}
+
+/// Exact id the last armed injection failed, or 0 when no injection has been
+/// consumed. Context thread only (asserted).
+pub fn testLastInjectedFailId() u32 {
+    gpu_thread.assertOnContextThread();
+    return test_last_injected_fail_id;
+}
+
 /// Minimal per-frame input for instance staging, extracted from
 /// FrameCullContext (see render_queue.zig). Scene.prepareFrame pre-stages
 /// through this before the shadow pass so ShadowPass.prepare snapshots the
@@ -393,10 +423,29 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
             // takes this frame's single update, the retired one takes none.
             const min_cap: usize = 16;
             const new_cap = std.math.ceilPowerOfTwo(usize, @max(active_count, @max(st.capacity * 2, min_cap))) catch @max(active_count, st.capacity * 2);
-            const new_buf = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = new_cap * @sizeOf(Mat4),
-            });
+            // Test-only injection (P5 5d): synthesize a nonzero FAILED
+            // buffer instead of the real makeBuffer, so the validity check
+            // below exercises its `.FAILED` arm on the real path. The flag
+            // auto-resets; a dry pool (id 0) falls through to the real call
+            // so the mode stays pool-exhaustion, never vacuous.
+            var injected_fail = false;
+            var new_buf: sg.Buffer = undefined;
+            if (test_inject_growth_fail_once) {
+                test_inject_growth_fail_once = false;
+                const fb = sg.allocBuffer();
+                if (fb.id != 0) {
+                    sg.failBuffer(fb);
+                    test_last_injected_fail_id = fb.id;
+                    new_buf = fb;
+                    injected_fail = true;
+                }
+            }
+            if (!injected_fail) {
+                new_buf = sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                    .size = new_cap * @sizeOf(Mat4),
+                });
+            }
             // A failed makeBuffer may still hand out a nonzero id in
             // FAILED resource state (id == 0 means pool exhaustion only),
             // so validity is checked via queryBufferState, not the id.

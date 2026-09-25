@@ -1,8 +1,8 @@
 //! Scene content-registry API: material/mesh create/destroy, mesh search
 //! by name/tag/query. Split out of `scene.zig` (facade). `destroyMesh`
 //! keeps its cross-layer referent cleanup (outline/highlights/soft
-//! bodies/physics/hierarchy/LOD/animation/decals) plus the epoch-retire
-//! off-context branch.
+//! bodies/physics/hierarchy/LOD/animation/decals/trail targets) plus the
+//! epoch-retire off-context branch.
 //!
 /// Anti-cycle rule (same as `audio/*`, `profiler/*`): every function takes
 /// the scene as `anytype` (a `*Scene` from `core.zig` in practice) and this
@@ -17,8 +17,29 @@ const PBRMaterial = @import("../material.zig").PBRMaterial;
 const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const TagQuery = @import("../tags.zig").TagQuery;
 const gpu_thread = @import("../gpu_thread.zig");
+const trail_mod = @import("../mesh/trail.zig");
+const TrailMesh = trail_mod.TrailMesh;
 
 // ---- Content registries: materials & meshes. ----
+//
+// Ownership summary (see agate/API.md for the user-facing version):
+// - Meshes/materials are Scene-owned: creation appends to a registry list,
+//   destruction unlinks + frees through the matching destroy below.
+// - Mesh GPU buffers die on the context thread only: `destroyMesh` destroys
+//   inline on-context, otherwise unlinks now and retires into `gpu_retire`
+//   for the next render-start flush (or `deinit`, which drains everything).
+// - Mesh names are plain `[]const u8` slices with an `owns_name` flag (Zig
+//   has no field privacy; the flag is convention, not enforcement):
+//   borrowed (`owns_name == false`, e.g. string literals or builder inputs)
+//   or Scene-allocator-owned (`owns_name == true`, freed in `Mesh.deinit`).
+//   Mutate names only through `renameMesh` below.
+// - Particle systems are Scene-owned until `deinit` (context-thread only):
+//   there is deliberately NO `destroyParticleSystem` — `ParticleSystem.deinit`
+//   issues `sg.destroy*` inline (buffers, compute views/pipelines, owned
+//   textures), which is illegal off-context, and the retire queue has no
+//   particle entry kind. Removing one mid-life would also need to scrub
+//   sub-emitter back-references and the prepared/build frames that borrow
+//   its handle ids by value. Create systems sparingly and reuse them.
 
 pub fn createStandardMaterial(self: anytype, name: []const u8) !*StandardMaterial {
     const mat = try self.allocator.create(StandardMaterial);
@@ -157,6 +178,14 @@ pub fn destroyMesh(self: anytype, mesh: *Mesh) void {
             }
         }
     }
+    // Trails: clear follow targets bound to the destroyed mesh so
+    // followers never read retired/freed storage in `TrailMesh.update`.
+    // Runs before the sync/deferred branch below so both paths are covered
+    // (same placement as the highlight scrub above); `destroyTrailMesh`
+    // relies on this instead of scrubbing itself.
+    for (self.trails.meshes.items) |other| {
+        if (other.target == mesh) other.target = null;
+    }
     // Decal expiration calls this from Scene.update on the game thread,
     // where sg.destroyBuffer is illegal: unlink now, destroy the GPU
     // resources at the next render-start flush on the context thread
@@ -167,6 +196,54 @@ pub fn destroyMesh(self: anytype, mesh: *Mesh) void {
     }
     mesh.deinit(self.allocator);
     self.allocator.destroy(mesh);
+}
+
+/// Renames a Scene-owned mesh, taking ownership of an internal copy of
+/// `new_name` (the caller's slice is borrowed, never retained).
+///
+/// Semantics:
+/// - The copy is allocated BEFORE the old name is freed, so an aliased
+///   input (`renameMesh(m, m.name)`, or a subslice of it) is safe: the new
+///   copy lands first, then the old allocation drops.
+/// - Failure is atomic: on `OutOfMemory` the mesh keeps its old name and
+///   `owns_name` flag untouched.
+/// - After success `mesh.owns_name` is always true (even for an empty
+///   name, which holds no allocation and frees nothing in `Mesh.deinit`).
+/// - The mesh keeps its registry slot: only the name changes, so a
+///   subsequent `getMeshByName` resolves the new name and no longer the old
+///   one (unless another mesh still carries it).
+/// - Game-thread safe (pure CPU: one dupe + one free, no `sg.*`). Callers
+///   must pass a mesh owned by this scene; membership is not re-checked.
+pub fn renameMesh(self: anytype, mesh: *Mesh, new_name: []const u8) !void {
+    const owned = try self.allocator.dupe(u8, new_name);
+    if (mesh.owns_name and mesh.name.len > 0) {
+        self.allocator.free(mesh.name);
+    }
+    mesh.name = owned;
+    mesh.owns_name = true;
+}
+
+/// Destroys a Scene-owned trail: unlinks it from the trail layer, destroys
+/// its linked scene mesh through `destroyMesh` (same epoch-retire contract:
+/// inline on the context thread, unlinked + retired off-context for the
+/// next render-start flush; `destroyMesh` also clears other trails targeting
+/// that mesh), then frees the trail's CPU staging (`TrailMesh.deinit` is
+/// CPU-only: nodes, vertex/index mirrors) and the struct itself.
+///
+/// Game-thread safe via the `destroyMesh` retire path. Callers must pass a
+/// trail owned by this scene; membership is not re-checked beyond the
+/// unlink scan.
+pub fn destroyTrailMesh(self: anytype, trail: *TrailMesh) void {
+    for (self.trails.meshes.items, 0..) |t, i| {
+        if (t == trail) {
+            _ = self.trails.meshes.swapRemove(i);
+            break;
+        }
+    }
+    const mesh = trail.mesh;
+    destroyMesh(self, mesh);
+    trail.deinit();
+    self.allocator.destroy(trail);
 }
 
 // ---- Mesh search, tags & queries ----

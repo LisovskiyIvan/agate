@@ -5,7 +5,10 @@
 //!   - TextFileTask: loads UTF-8 text files (JSON, configs, shaders)
 //!   - BinaryFileTask: loads raw binary data (buffers, audio data, packets)
 //!   - TextureTask: loads 2D textures (integrated with Texture decode / GPU upload)
-//!   - MeshTask: loads 3D models (.glb, .gltf, .obj, .stl, .ply) into a Scene or memory
+//!   - MeshTask: loads 3D models (.glb, .gltf, .obj, .stl, .ply) into a Scene
+//!     (scene != null, via SceneLoader/appendToScene). Scene-less mesh tasks
+//!     retain owned CPU `GeometryData` in `task.mesh_result` (OBJ/STL/PLY;
+//!     GLB/GLTF without a scene is `error.MeshRequiresScene`).
 //!   - CustomTask: user-defined arbitrary loading routine
 //! - AssetCache:
 //!   - In-memory cache by path/URL to prevent duplicate disk reads and duplicate allocations
@@ -14,23 +17,51 @@
 //!   - Total, completed, failed, and remaining task counts
 //!   - Normalized progress in [0.0 .. 1.0]
 //!   - Task states: .pending, .running, .completed, .failed
-//! - Execution Models:
-//!   - Synchronous batch loading (`loadSync`)
-//!   - Cooperative stepped frame-budgeted loading (`loadStep`)
+//! - Execution Models: synchronous `loadSync` / stepped `loadStep` (task-count
+//!   budget only — NOT a wall-time frame budget; each task runs I/O +
+//!   parse/decode/upload inline). Context-thread rule: texture/mesh GPU
+//!   uploads require the sg-context thread (`error.TextureRequiresContextThread`
+//!   otherwise). A manager has one caller at a time: it is not internally
+//!   synchronized. Text/binary work can run on a worker; custom tasks must
+//!   obey their own thread contract. True async is the
+//!   existing `assets.UploadQueue` (worker decode, context drain) — note its
+//!   `.async_textures` option offloads texture decode, not mesh geometry;
+//!   GPU uploads still run on the context thread.
+//!   No second worker pipeline lives here (see `AssetManager` docs).
 //! - Event Callbacks:
 //!   - `onTaskSuccess`, `onTaskError`, `onProgress`, `onFinish`
+//!
+//! Ownership + lifetime:
+//! - `AssetTask.name`/`path` are BORROWED: the caller must keep them alive
+//!   until `reset`/`resetAll`/`deinit`. The manager never dupes or frees them.
+//! - `text_result`/`binary_result` are OWNED by the task (`owned_*`) when
+//!   `use_cache == false`, else BORROWED from the cache (freed by
+//!   `cache.clear`/`deinit`, never by `reset`).
+//! - `texture_result` is OWNED by the task (`owned_texture`) only when
+//!   `use_cache == false`; cached hits AND newly-cached uploads are owned by
+//!   the cache (task holds a borrowed alias — `reset` must NOT deinit it).
+//! - `mesh_result` (scene-less mesh tasks) is OWNED CPU `GeometryData`
+//!   (freed by `reset`, or moved out via `takeMeshGeometry` and freed with
+//!   the manager's allocator). Reset/cache teardown of GPU textures is
+//!   context-thread only, after prepared frames stop borrowing their handles.
 
 const std = @import("std");
 
 const Scene = @import("scene.zig").Scene;
 const Mesh = @import("mesh.zig").Mesh;
+const GeometryData = @import("mesh.zig").GeometryData;
+const Vertex = @import("mesh.zig").Vertex;
+const computeTangents = @import("mesh.zig").computeTangents;
 const Texture = @import("texture.zig").Texture;
 const SceneLoader = @import("loader/scene_loader.zig").SceneLoader;
 const obj_loader = @import("loader/obj.zig");
 const stl_loader = @import("loader/stl.zig");
 const ply_loader = @import("loader/ply.zig");
+const gpu_thread = @import("gpu_thread.zig");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const math = @import("math");
+const BoundingBox = math.BoundingBox;
 
 pub const TaskState = enum(u8) {
     pending,
@@ -48,7 +79,9 @@ pub const TaskType = enum(u8) {
 };
 
 pub const AssetTask = struct {
+    /// BORROWED: caller keeps alive until manager reset/deinit.
     name: []const u8,
+    /// BORROWED: caller keeps alive until manager reset/deinit.
     path: []const u8 = "",
     task_type: TaskType,
     state: TaskState = .pending,
@@ -56,10 +89,25 @@ pub const AssetTask = struct {
     use_cache: bool = true,
 
     // Results
+    /// OWNED iff owned_text (use_cache == false); else borrowed from cache.
     text_result: ?[]const u8 = null,
+    /// OWNED iff owned_binary (use_cache == false); else borrowed from cache.
     binary_result: ?[]const u8 = null,
+    /// OWNED iff owned_texture (use_cache == false AND upload succeeded);
+    /// cached hits and newly-cached uploads are borrowed from the cache.
     texture_result: ?Texture = null,
+    /// Meshes spawned into scene (scene != null), or 1 with owned CPU
+    /// geometry in `mesh_result` (scene-less OBJ/STL/PLY). Zero until
+    /// success; never 1 on failure.
     mesh_count: usize = 0,
+    /// Validated CPU vertex/index totals for mesh tasks (scene loads sum the
+    /// spawned meshes; scene-less loads count `mesh_result`).
+    mesh_vertex_count: usize = 0,
+    mesh_index_count: usize = 0,
+    /// Scene-less mesh result: OWNED CPU geometry (`owned_mesh`), freed by
+    /// `reset` or moved out via `takeMeshGeometry`. Null for scene loads
+    /// (meshes live in the Scene) and until success.
+    mesh_result: ?GeometryData = null,
 
     // Task-specific context
     scene: ?*Scene = null,
@@ -70,7 +118,22 @@ pub const AssetTask = struct {
     // Internal ownership tracking
     owned_text: bool = false,
     owned_binary: bool = false,
+    owned_texture: bool = false,
+    owned_mesh: bool = false,
     from_cache: bool = false,
+
+    /// Moves the scene-less mesh geometry out; the task no longer owns it
+    /// (subsequent `reset` won't free it). Returns null when there is none.
+    pub fn takeMeshGeometry(self: *AssetTask) ?GeometryData {
+        if (!self.owned_mesh) return null;
+        const g = self.mesh_result orelse return null;
+        self.mesh_result = null;
+        self.owned_mesh = false;
+        self.mesh_count = 0;
+        self.mesh_vertex_count = 0;
+        self.mesh_index_count = 0;
+        return g;
+    }
 
     pub fn isSuccess(self: *const AssetTask) bool {
         return self.state == .completed;
@@ -137,7 +200,16 @@ pub const AssetCache = struct {
         errdefer self.allocator.free(key_dupe);
         const text_dupe = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(text_dupe);
-        try self.text_map.put(self.allocator, key_dupe, text_dupe);
+        const gop = try self.text_map.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            // Overwrite: keep the original key, free the dupe + old value.
+            self.allocator.free(key_dupe);
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = text_dupe;
+            return gop.value_ptr.*;
+        }
+        gop.key_ptr.* = key_dupe;
+        gop.value_ptr.* = text_dupe;
         return text_dupe;
     }
 
@@ -154,7 +226,15 @@ pub const AssetCache = struct {
         errdefer self.allocator.free(key_dupe);
         const data_dupe = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(data_dupe);
-        try self.binary_map.put(self.allocator, key_dupe, data_dupe);
+        const gop = try self.binary_map.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(key_dupe);
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = data_dupe;
+            return gop.value_ptr.*;
+        }
+        gop.key_ptr.* = key_dupe;
+        gop.value_ptr.* = data_dupe;
         return data_dupe;
     }
 
@@ -169,13 +249,41 @@ pub const AssetCache = struct {
     pub fn putTexture(self: *AssetCache, key: []const u8, texture: Texture) !void {
         const key_dupe = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_dupe);
-        try self.texture_map.put(self.allocator, key_dupe, texture);
+        const gop = try self.texture_map.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            // Self-put of the identical GPU handles (e.g. re-caching the
+            // borrowed alias) is a no-op: deinit would destroy the live
+            // texture out from under the inserted alias.
+            if (textureHandlesEqual(gop.value_ptr.*, texture)) {
+                self.allocator.free(key_dupe);
+                return;
+            }
+            // Overwrite: keep the original key, destroy the old GPU texture.
+            // Transfer semantics: `texture` ownership moves to the cache;
+            // never pass a borrowed cache alias with different handles.
+            self.allocator.free(key_dupe);
+            gop.value_ptr.deinit();
+            gop.value_ptr.* = texture;
+            return;
+        }
+        gop.key_ptr.* = key_dupe;
+        gop.value_ptr.* = texture;
     }
 
     pub fn count(self: *const AssetCache) usize {
         return self.text_map.count() + self.binary_map.count() + self.texture_map.count();
     }
 };
+
+/// Pure GPU-handle identity for textures (no sg calls): image/view/sampler
+/// ids plus dimensions. Used to make `putTexture` self-put safe.
+pub fn textureHandlesEqual(a: Texture, b: Texture) bool {
+    return a.image.id == b.image.id and
+        a.view.id == b.view.id and
+        a.sampler.id == b.sampler.id and
+        a.width == b.width and
+        a.height == b.height;
+}
 
 fn readFileBytesAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -190,16 +298,75 @@ fn readFileBytesAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return buf;
 }
 
+/// Sums vertex/index totals over meshes spawned into a scene.
+fn sumSpawned(spawned: []*Mesh) struct { verts: usize, idx: usize } {
+    var v: usize = 0;
+    var idx: usize = 0;
+    for (spawned) |m| {
+        v += m.vertex_count;
+        idx += m.index_count;
+    }
+    return .{ .verts = v, .idx = idx };
+}
+
+/// Builds owned CPU `GeometryData` from parsed loader output (positions /
+/// normals / uvs / indices, white color; PLY passes its own colors). Bounds
+/// + tangents mirror the `appendToScene` upload path; no GPU calls.
+fn buildCpuGeometry(
+    allocator: std.mem.Allocator,
+    positions: []const f32,
+    normals: []const f32,
+    uvs: []const f32,
+    colors: ?[]const f32,
+    indices: []const u32,
+) !GeometryData {
+    const n = positions.len / 3;
+    const vertices = try allocator.alloc(Vertex, n);
+    errdefer allocator.free(vertices);
+    for (0..n) |i| {
+        vertices[i] = .{
+            .position = .{ positions[3 * i], positions[3 * i + 1], positions[3 * i + 2] },
+            .normal = .{ normals[3 * i], normals[3 * i + 1], normals[3 * i + 2] },
+            .color = if (colors) |c| .{ c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3] } else .{ 1, 1, 1, 1 },
+            .uv = .{ uvs[2 * i], uvs[2 * i + 1] },
+        };
+    }
+    var min_p = math.Vec3.new(vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]);
+    var max_p = min_p;
+    for (vertices) |vert| {
+        min_p.x = @min(min_p.x, vert.position[0]);
+        min_p.y = @min(min_p.y, vert.position[1]);
+        min_p.z = @min(min_p.z, vert.position[2]);
+        max_p.x = @max(max_p.x, vert.position[0]);
+        max_p.y = @max(max_p.y, vert.position[1]);
+        max_p.z = @max(max_p.z, vert.position[2]);
+    }
+    const owned_idx = try allocator.dupe(u32, indices);
+    errdefer allocator.free(owned_idx);
+    computeTangents(vertices, owned_idx, null);
+    return .{
+        .vertices = vertices,
+        .indices = owned_idx,
+        .bounds = BoundingBox.init(min_p, max_p),
+    };
+}
+
 pub const TaskSuccessFn = *const fn (manager: *AssetManager, task: *AssetTask) void;
 pub const TaskErrorFn = *const fn (manager: *AssetManager, task: *AssetTask, err: anyerror) void;
 pub const ProgressFn = *const fn (manager: *AssetManager, remaining: usize, total: usize, task: *AssetTask) void;
 pub const FinishFn = *const fn (manager: *AssetManager) void;
 
-/// Central asset loading manager orchestrating multiple asset tasks with
-/// progress tracking, automatic caching, and step-budgeted execution.
+/// Central asset loading manager: synchronous batch loading with progress,
+/// caching, and stable task pointers. See module docs for the execution /
+/// context-thread contract (sync only; `UploadQueue` is the async route).
 pub const AssetManager = struct {
     allocator: std.mem.Allocator,
-    tasks: std.ArrayListUnmanaged(AssetTask) = .empty,
+    /// Individually allocated tasks: returned `*AssetTask` pointers stay
+    /// stable across later `add*` calls (the pointer array may reallocate,
+    /// the task allocations do not move). Callbacks may safely enqueue new
+    /// tasks and keep using the current task pointer. Callbacks must NOT
+    /// call `reset`/`resetAll`/`deinit` (that would free the running task).
+    tasks: std.ArrayListUnmanaged(*AssetTask) = .empty,
     cache: AssetCache,
 
     completed_count: usize = 0,
@@ -226,14 +393,22 @@ pub const AssetManager = struct {
     }
 
     /// Clears task queue and frees task-owned data, keeping the cache intact.
+    /// Borrowed cache aliases (text/binary/texture) are NOT freed/deinited.
     pub fn reset(self: *AssetManager) void {
-        for (self.tasks.items) |*task| {
+        for (self.tasks.items) |task| {
             if (task.owned_text and task.text_result != null) {
                 self.allocator.free(task.text_result.?);
             }
             if (task.owned_binary and task.binary_result != null) {
                 self.allocator.free(task.binary_result.?);
             }
+            if (task.owned_texture and task.texture_result != null) {
+                task.texture_result.?.deinit();
+            }
+            if (task.owned_mesh and task.mesh_result != null) {
+                task.mesh_result.?.deinit(self.allocator);
+            }
+            self.allocator.destroy(task);
         }
         self.tasks.deinit(self.allocator);
         self.tasks = .empty;
@@ -249,41 +424,53 @@ pub const AssetManager = struct {
     }
 
     pub fn addTextFileTask(self: *AssetManager, name: []const u8, path: []const u8) !*AssetTask {
-        try self.tasks.append(self.allocator, .{
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
             .name = name,
             .path = path,
             .task_type = .text,
-        });
-        return &self.tasks.items[self.tasks.items.len - 1];
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
     }
 
     pub fn addBinaryFileTask(self: *AssetManager, name: []const u8, path: []const u8) !*AssetTask {
-        try self.tasks.append(self.allocator, .{
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
             .name = name,
             .path = path,
             .task_type = .binary,
-        });
-        return &self.tasks.items[self.tasks.items.len - 1];
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
     }
 
     pub fn addTextureTask(self: *AssetManager, name: []const u8, path: []const u8, options: Texture.Options) !*AssetTask {
-        try self.tasks.append(self.allocator, .{
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
             .name = name,
             .path = path,
             .task_type = .texture,
             .texture_options = options,
-        });
-        return &self.tasks.items[self.tasks.items.len - 1];
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
     }
 
     pub fn addMeshTask(self: *AssetManager, name: []const u8, path: []const u8, scene: ?*Scene) !*AssetTask {
-        try self.tasks.append(self.allocator, .{
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
             .name = name,
             .path = path,
             .task_type = .mesh,
             .scene = scene,
-        });
-        return &self.tasks.items[self.tasks.items.len - 1];
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
     }
 
     pub fn addCustomTask(
@@ -292,17 +479,20 @@ pub const AssetManager = struct {
         run_fn: *const fn (*AssetTask, std.mem.Allocator) anyerror!void,
         user_ctx: ?*anyopaque,
     ) !*AssetTask {
-        try self.tasks.append(self.allocator, .{
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
             .name = name,
             .task_type = .custom,
             .custom_run = run_fn,
             .user_ctx = user_ctx,
-        });
-        return &self.tasks.items[self.tasks.items.len - 1];
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
     }
 
     pub fn getTaskByName(self: *AssetManager, name: []const u8) ?*AssetTask {
-        for (self.tasks.items) |*t| {
+        for (self.tasks.items) |t| {
             if (std.mem.eql(u8, t.name, name)) return t;
         }
         return null;
@@ -342,6 +532,7 @@ pub const AssetManager = struct {
                     return;
                 }
                 const bytes = try readFileBytesAlloc(self.allocator, task.path);
+                errdefer self.allocator.free(bytes);
                 if (task.use_cache) {
                     task.text_result = try self.cache.putText(task.path, bytes);
                     self.allocator.free(bytes);
@@ -358,6 +549,7 @@ pub const AssetManager = struct {
                     return;
                 }
                 const bytes = try readFileBytesAlloc(self.allocator, task.path);
+                errdefer self.allocator.free(bytes);
                 if (task.use_cache) {
                     task.binary_result = try self.cache.putBinary(task.path, bytes);
                     self.allocator.free(bytes);
@@ -371,52 +563,103 @@ pub const AssetManager = struct {
                 if (task.use_cache and self.cache.hasTexture(task.path)) {
                     task.texture_result = self.cache.getTexture(task.path);
                     task.from_cache = true;
+                    task.owned_texture = false;
                     return;
                 }
                 if (sg.isvalid()) {
-                    const tex = try Texture.fromFile(self.allocator, task.path, task.texture_options);
-                    task.texture_result = tex;
+                    // Live GPU upload: context thread only. Worker threads
+                    // must use UploadQueue (decode off-thread, drain here).
+                    if (!gpu_thread.isOnContextThread()) return error.TextureRequiresContextThread;
+                    var tex = try Texture.fromFile(self.allocator, task.path, task.texture_options);
+                    errdefer tex.deinit();
                     if (task.use_cache) {
+                        // Cache takes GPU ownership; the task keeps a borrowed alias.
                         try self.cache.putTexture(task.path, tex);
+                        task.texture_result = tex;
+                        task.owned_texture = false;
+                        task.from_cache = false;
+                    } else {
+                        task.texture_result = tex;
+                        task.owned_texture = true;
                     }
                 } else {
-                    // Headless CPU decode check
+                    // Headless CPU decode check (no GPU upload possible):
+                    // validates the file decodes, leaves texture_result null.
                     var raw = try Texture.decodeImageFile(self.allocator, task.path, .{});
                     raw.deinit(self.allocator);
                     task.texture_result = null;
+                    task.owned_texture = false;
                 }
             },
             .mesh => {
+                const is_glb = std.mem.endsWith(u8, task.path, ".glb") or std.mem.endsWith(u8, task.path, ".gltf");
+                const is_obj = std.mem.endsWith(u8, task.path, ".obj");
+                const is_stl = std.mem.endsWith(u8, task.path, ".stl");
+                const is_ply = std.mem.endsWith(u8, task.path, ".ply");
                 if (task.scene) |sc| {
-                    if (std.mem.endsWith(u8, task.path, ".glb") or std.mem.endsWith(u8, task.path, ".gltf")) {
+                    if (is_glb) {
                         const spawned = try SceneLoader.appendGlb(sc, task.path);
+                        defer sc.allocator.free(spawned);
+                        const totals = sumSpawned(spawned);
                         task.mesh_count = spawned.len;
-                    } else if (std.mem.endsWith(u8, task.path, ".obj")) {
+                        task.mesh_vertex_count = totals.verts;
+                        task.mesh_index_count = totals.idx;
+                    } else if (is_obj or is_stl or is_ply) {
                         const bytes = try readFileBytesAlloc(self.allocator, task.path);
                         defer self.allocator.free(bytes);
-                        var data = try obj_loader.parse(self.allocator, bytes);
-                        defer data.deinit(self.allocator);
-                        task.mesh_count = 1;
-                    } else if (std.mem.endsWith(u8, task.path, ".stl")) {
-                        const bytes = try readFileBytesAlloc(self.allocator, task.path);
-                        defer self.allocator.free(bytes);
-                        var data = try stl_loader.parse(self.allocator, bytes);
-                        defer data.deinit(self.allocator);
-                        task.mesh_count = 1;
-                    } else if (std.mem.endsWith(u8, task.path, ".ply")) {
-                        const bytes = try readFileBytesAlloc(self.allocator, task.path);
-                        defer self.allocator.free(bytes);
-                        var data = try ply_loader.parse(self.allocator, bytes);
-                        defer data.deinit(self.allocator);
-                        task.mesh_count = 1;
+                        const spawned = if (is_obj)
+                            try obj_loader.appendToScene(sc, self.allocator, task.name, bytes)
+                        else if (is_stl)
+                            try stl_loader.appendToScene(sc, self.allocator, task.name, bytes)
+                        else
+                            try ply_loader.appendToScene(sc, self.allocator, task.name, bytes);
+                        defer self.allocator.free(spawned);
+                        const totals = sumSpawned(spawned);
+                        task.mesh_count = spawned.len;
+                        task.mesh_vertex_count = totals.verts;
+                        task.mesh_index_count = totals.idx;
                     } else {
                         return error.UnsupportedMeshFormat;
                     }
                 } else {
-                    // Cache or read raw mesh file
+                    // Scene-less: retain owned CPU geometry (OBJ/STL/PLY).
+                    // GLB/GLTF has no CPU-only path — explicit error.
+                    if (is_glb) return error.MeshRequiresScene;
                     const bytes = try readFileBytesAlloc(self.allocator, task.path);
                     defer self.allocator.free(bytes);
+                    var geom: GeometryData = undefined;
+                    if (is_obj) {
+                        var data = try obj_loader.parse(self.allocator, bytes);
+                        defer data.deinit(self.allocator);
+                        geom = try buildCpuGeometry(self.allocator, data.positions, data.normals, data.uvs, null, data.indices);
+                    } else if (is_stl) {
+                        var data = try stl_loader.parse(self.allocator, bytes);
+                        defer data.deinit(self.allocator);
+                        const n = data.vertex_count;
+                        const uvs = try self.allocator.alloc(f32, n * 2);
+                        defer self.allocator.free(uvs);
+                        @memset(uvs, 0);
+                        geom = try buildCpuGeometry(self.allocator, data.positions, data.normals, uvs, null, data.indices);
+                    } else if (is_ply) {
+                        var data = try ply_loader.parse(self.allocator, bytes);
+                        defer data.deinit(self.allocator);
+                        geom = try buildCpuGeometry(
+                            self.allocator,
+                            data.positions,
+                            data.normals,
+                            data.uvs,
+                            if (data.has_colors) data.colors else null,
+                            data.indices,
+                        );
+                    } else {
+                        return error.UnsupportedMeshFormat;
+                    }
+                    errdefer geom.deinit(self.allocator);
+                    task.mesh_result = geom;
+                    task.owned_mesh = true;
                     task.mesh_count = 1;
+                    task.mesh_vertex_count = geom.vertices.len;
+                    task.mesh_index_count = geom.indices.len;
                 }
             },
             .custom => {
@@ -427,11 +670,16 @@ pub const AssetManager = struct {
         }
     }
 
-    /// Runs up to `max_tasks` pending tasks. Returns `true` if all tasks are completed.
+    /// Runs up to `max_tasks` pending tasks (sync; see module docs).
+    /// Callbacks may enqueue via `add*` (pointers stable); they must not
+    /// call `reset`/`resetAll`/`deinit`.
     pub fn loadStep(self: *AssetManager, max_tasks: usize) bool {
         var executed: usize = 0;
         while (self.current_index < self.tasks.items.len and executed < max_tasks) {
-            const task = &self.tasks.items[self.current_index];
+            // Re-read the pointer per iteration: callbacks may append (which
+            // may reallocate the pointer array) — the task allocations
+            // themselves stay stable.
+            const task = self.tasks.items[self.current_index];
             self.current_index += 1;
 
             if (task.state != .pending) continue;
@@ -612,4 +860,229 @@ test "AssetManager custom task, error reporting, and callbacks" {
     try testing.expectEqual(@as(usize, 1), ctx.error_count);
     try testing.expectEqual(@as(usize, 2), ctx.progress_calls);
     try testing.expect(ctx.finished);
+}
+
+test "AssetManager task pointers stay stable across growth and callbacks" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_path = "test_stable_first.txt";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "stable", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const first = try mgr.addTextFileTask("first_task", tmp_path);
+    _ = try mgr.addCustomTask("filler", struct {
+        fn run(_: *AssetTask, _: std.mem.Allocator) !void {}
+    }.run, null);
+
+    const Ctx = struct {
+        first_ptr: ?*AssetTask = null,
+        saw_success: bool = false,
+        progress_calls: usize = 0,
+        progress_saw_first: bool = false,
+        progress_first_state_ok: bool = false,
+    };
+    var ctx = Ctx{ .first_ptr = first };
+    mgr.user_data = &ctx;
+    mgr.onTaskSuccess = struct {
+        fn cb(m: *AssetManager, task: *AssetTask) void {
+            const c: *Ctx = @ptrCast(@alignCast(m.user_data.?));
+            if (task == c.first_ptr) {
+                c.saw_success = true;
+                // Force pointer-array reallocation inside the callback: the
+                // running task allocation must not move.
+                var i: usize = 0;
+                while (i < 64) : (i += 1) {
+                    _ = m.addCustomTask("enqueued", struct {
+                        fn run(_: *AssetTask, _: std.mem.Allocator) !void {}
+                    }.run, null) catch return;
+                }
+            }
+        }
+    }.cb;
+    mgr.onProgress = struct {
+        fn cb(m: *AssetManager, _: usize, _: usize, task: *AssetTask) void {
+            const c: *Ctx = @ptrCast(@alignCast(m.user_data.?));
+            c.progress_calls += 1;
+            // Identity + state must survive the in-callback growth above;
+            // stored to ctx so the check can't be optimized away.
+            if (task == c.first_ptr) {
+                c.progress_saw_first = true;
+                c.progress_first_state_ok = task.isSuccess() and
+                    std.mem.eql(u8, task.name, "first_task");
+            }
+        }
+    }.cb;
+
+    mgr.loadSync();
+    try testing.expect(ctx.saw_success);
+    try testing.expect(ctx.progress_saw_first);
+    try testing.expect(ctx.progress_first_state_ok);
+    // 2 initial + 64 enqueued, each fires onProgress exactly once.
+    try testing.expectEqual(@as(usize, 66), ctx.progress_calls);
+    try testing.expect(mgr.isDone());
+    try testing.expect(!mgr.hasErrors());
+    try testing.expect(mgr.getTaskByName("first_task") == first);
+    try testing.expect(first.isSuccess());
+}
+
+test "AssetManager mesh scene-less retains geometry, scene load spawns + cleanup" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const obj_path = "test_mesh_task.obj";
+    const obj_text =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\f 1 2 3
+    ;
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, obj_text, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+
+    // Scene-less: retains owned CPU geometry with real vertices/indices.
+    {
+        var mgr = AssetManager.init(allocator);
+        defer mgr.deinit();
+        _ = try mgr.addMeshTask("tri_noscene", obj_path, null);
+        mgr.loadSync();
+        const t = mgr.getTaskByName("tri_noscene").?;
+        try testing.expect(t.isSuccess());
+        try testing.expectEqual(@as(usize, 1), t.mesh_count);
+        try testing.expect(t.owned_mesh);
+        const g = t.mesh_result.?;
+        try testing.expectEqual(@as(usize, 3), g.vertices.len);
+        try testing.expectEqual(@as(usize, 3), g.indices.len);
+        try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, g.indices);
+        try testing.expectEqual(@as(f32, 1), g.vertices[1].position[0]);
+        try testing.expectEqual(@as(usize, 3), t.mesh_vertex_count);
+        try testing.expectEqual(@as(usize, 3), t.mesh_index_count);
+        // take moves ownership out; reset must not double-free.
+        var taken = t.takeMeshGeometry().?;
+        defer taken.deinit(allocator);
+        try testing.expect(!t.owned_mesh);
+        try testing.expect(t.mesh_result == null);
+    }
+
+    // Scene load: real entity appears with matching counts; cleanup frees it.
+    {
+        var mgr = AssetManager.init(allocator);
+        defer mgr.deinit();
+        const testScene = @import("testing.zig").testScene;
+        var scene = testScene(allocator);
+        // testScene leaves GPU passes undefined; only allocator/meshes are
+        // touched by the deferred upload path (no sg context in tests).
+        defer {
+            for (scene.meshes.items) |m| {
+                m.deinit(allocator);
+                allocator.destroy(m);
+            }
+            scene.meshes.deinit(allocator);
+            scene.profiler.deinit();
+        }
+        _ = try mgr.addMeshTask("tri_scene", obj_path, &scene);
+        mgr.loadSync();
+        const t = mgr.getTaskByName("tri_scene").?;
+        try testing.expect(t.isSuccess());
+        try testing.expectEqual(@as(usize, 1), t.mesh_count);
+        try testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+        try testing.expectEqual(t.mesh_vertex_count, @as(usize, scene.meshes.items[0].vertex_count));
+        try testing.expectEqual(t.mesh_index_count, @as(usize, scene.meshes.items[0].index_count));
+        try testing.expectEqual(@as(usize, 3), t.mesh_vertex_count);
+        try testing.expectEqual(@as(usize, 3), t.mesh_index_count);
+    }
+}
+
+test "AssetManager mesh failures are explicit, never fake success" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const bad_obj_path = "test_mesh_bad.obj";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, bad_obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "this is not a mesh {{{ }}}", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, bad_obj_path) catch {};
+
+    const unsupported_path = "test_mesh_task.xyz";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, unsupported_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "junk", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, unsupported_path) catch {};
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.addMeshTask("missing_file", "no_such_mesh_file.obj", null);
+    _ = try mgr.addMeshTask("bad_obj", bad_obj_path, null);
+    _ = try mgr.addMeshTask("unsupported_ext", unsupported_path, null);
+    _ = try mgr.addMeshTask("glb_needs_scene", "whatever.glb", null);
+
+    mgr.loadSync();
+
+    try testing.expectEqual(@as(usize, 0), mgr.completed_count);
+    try testing.expectEqual(@as(usize, 4), mgr.failed_count);
+    for ([_][]const u8{ "missing_file", "bad_obj", "unsupported_ext", "glb_needs_scene" }) |name| {
+        const t = mgr.getTaskByName(name).?;
+        try testing.expect(t.isFailed());
+        try testing.expect(!t.isSuccess());
+        try testing.expect(t.error_result != null);
+        try testing.expectEqual(@as(usize, 0), t.mesh_count);
+        try testing.expectEqual(@as(usize, 0), t.mesh_vertex_count);
+        try testing.expectEqual(@as(usize, 0), t.mesh_index_count);
+        try testing.expect(t.mesh_result == null);
+        try testing.expect(!t.owned_mesh);
+    }
+    try testing.expect(mgr.getTaskByName("glb_needs_scene").?.error_result.? == error.MeshRequiresScene);
+    try testing.expect(mgr.getTaskByName("unsupported_ext").?.error_result.? == error.UnsupportedMeshFormat);
+}
+
+test "AssetCache overwrite replaces value without leaking keys" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var cache = AssetCache.init(allocator);
+    defer cache.deinit();
+
+    _ = try cache.putText("k", "first");
+    _ = try cache.putText("k", "second");
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expectEqualStrings("second", cache.getText("k").?);
+
+    _ = try cache.putBinary("b", "123");
+    _ = try cache.putBinary("b", "4567");
+    try testing.expectEqualStrings("4567", cache.getBinary("b").?);
+}
+
+test "textureHandlesEqual compares GPU identity without touching sg" {
+    const testing = std.testing;
+    var a = std.mem.zeroes(Texture);
+    var b = std.mem.zeroes(Texture);
+    a.width = 4;
+    a.height = 4;
+    b.width = 4;
+    b.height = 4;
+    try testing.expect(textureHandlesEqual(a, b));
+    b.height = 8;
+    try testing.expect(!textureHandlesEqual(a, b));
+    b.height = 4;
+    b.image.id += 1;
+    try testing.expect(!textureHandlesEqual(a, b));
 }

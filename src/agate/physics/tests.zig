@@ -2037,4 +2037,3 @@ test "PhysicsWorld getProfile and getCounters" {
     const cnt_after = pw.getCounters();
     try std.testing.expect(cnt_after.body_count >= 2);
 }
-

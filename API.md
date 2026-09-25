@@ -1,0 +1,215 @@
+# Agate public API — Scene ownership guide
+
+Scene creation, resource ownership, named-object lookup, and thread boundaries.
+
+## Scene creation
+
+```zig
+// Run after sokol.gfx.setup, on the marked graphics-context thread.
+var scene: agate.Scene = undefined;
+scene.initInto(allocator);
+defer scene.deinit();
+```
+
+- Alternatively, use `var scene = agate.Scene.init(allocator)`; do not
+  initialize the same Scene twice. Keep its address stable once content
+  holds references to it.
+- The allocator MUST be thread-safe when using workers (e.g. GPA with `.thread_safe = true`):
+  prepare/render lazy caches and jobs workers allocate from it.
+- `deinit` is context-thread only and drains everything: the retire queue
+  (including uncompleted epochs), physics, meshes, materials, trails,
+  particles, passes, and the async upload/file-I/O runners (joined first,
+  so in-flight decodes finish before their target materials are freed).
+
+## Resources and lifetimes
+
+### Meshes
+
+- Create: `MeshBuilder.*` constructors, `uploadGeometry`, CSG/simplify
+  builders, glTF/OBJ/PLY/STL loaders. All append to `scene.meshes`.
+- Destroy: `scene.destroyMesh(mesh)`.
+  - Unlinks from `scene.meshes` plus every cross-mesh referent first:
+    outline list, highlights, soft bodies, physics bodies, parent/child
+    and bone-attachment links, LOD bands, morph-target bindings,
+    decal-manager instances.
+  - GPU teardown is context-thread only. On the context thread the
+    buffers are destroyed inline; off-context the mesh is unlinked now
+    and retired into `gpu_retire` (epoch-stamped, no `sg.*`, no frees).
+    The next render-start flush (`flushPendingGpuUploads`, inside
+    `prepareFrame`) destroys due entries after their epoch completes;
+    `deinit` destroys everything, including uncompleted epochs.
+  - Never call `sg.destroy*` on a mesh yourself; never `destroy` the
+    struct directly — always go through `destroyMesh`.
+  - Context-thread destruction must not invalidate a still-pending
+    prepared frame. Game-side destruction under the update exclusion
+    uses epoch retirement instead of freeing in-flight GPU handles.
+- Off-context creation is CPU-only and deferred: with no context thread
+  (or no valid `sg` context) the mesh keeps CPU mirrors plus
+  `pending_vertices` (`gpu_pending = true`) and `finishGpuUpload` builds
+  the buffers on the next context-thread flush. `Mesh.deinit` frees the
+  retained copies either way, so a mesh that dies pending never leaks.
+
+### Mesh names (`name` / `owns_name`)
+
+- The name is a plain `[]const u8`; `owns_name` records whether it was
+  allocated from the Scene allocator (`Mesh.deinit` frees it iff set and
+  non-empty). Zig struct fields have no access modifiers — the flag is a
+  documented convention, not enforcement.
+- Borrowed (`owns_name == false`): string literals and builder/loader
+  inputs held by the caller. Owned (`owns_name == true`): adopted dupes
+  (loaders dupe; callers adopting a heap name, e.g. an `allocPrint`ed
+  segment name passed to a builder, set the flag).
+- Rename only via `scene.renameMesh(mesh, new_name) !void`:
+  - `new_name` is borrowed; the Scene keeps an internal copy.
+  - Copy-before-free: aliased input (`renameMesh(m, m.name)`, or a
+    subslice) is safe.
+  - Atomic on OOM: the old name and flag are untouched.
+  - Always owned after success; `getMeshByName` resolves the new name.
+
+### Materials
+
+- Create: `scene.createStandardMaterial(name)`,
+  `scene.createPBRMaterial(name)`, `scene.createShaderMaterial(name,
+  shader_name)` (null on an unknown shader or allocation failure).
+- Destroy: `scene.destroyPBRMaterial(mat)` unlinks and frees the CPU
+  material immediately with no GPU retire — prepared draw records carry
+  GPU handle values, never CPU material references, and materials own no
+  GPU objects needing deferred teardown.
+  Detach live mesh references first and let pending asynchronous uploads
+  targeting the material finish before destroying it.
+- Standard/shader materials remain Scene-owned until `Scene.deinit`;
+  there is no individual destroy API for them.
+- Texture handles assigned to materials are borrowed. Keep their owner
+  alive through every prepared frame that can reference them; a copied
+  handle is not a retained resource. Async texture uploads use the queue
+  drained in `beginPrepare`, not during draw submission.
+
+### Particle systems
+
+- Create: `scene.createParticleSystem(name, capacity)` (off-context
+  creation defers GPU buffers to the context-side flush). Step: `scene.updateParticles(dt)`
+  (CPU staging only; GPU-path errors surface as `UpdateError`, never a
+  silent CPU downgrade).
+- Scene-owned until `deinit` (context-thread only, like any direct
+  `ps.deinit()`): there is deliberately NO `destroyParticleSystem`.
+  `ParticleSystem.deinit` issues `sg.destroy*` inline (instance/slot and
+  compute buffers, compute views/pipeline/shader, owned textures), which
+  is illegal off-context, and the retire queue has no particle entry
+  kind; mid-life removal would also have to scrub sub-emitter
+  back-references and the prepared/build frames that borrow its handle
+  ids. Create systems sparingly and reuse them (`start`/`stop`/`reset`).
+
+### Trails
+
+- Create: `scene.createTrailMesh(name, options)` (off-context defers
+  buffer creation to the render-side flush). Step:
+  `scene.updateTrails(dt)` (CPU staging only).
+- Destroy: `scene.destroyTrailMesh(trail)` — unlinks the trail, destroys
+  the linked scene mesh through `destroyMesh` (same epoch-retire
+  contract), clears other trails targeting that mesh, then frees the
+  trail's CPU staging and the struct. `TrailMesh.deinit` itself is
+  CPU-only and never touches the linked mesh.
+
+## Named-object lookup
+
+- `scene.getMeshByName(name)` — first mesh with an equal name, else null.
+- Tag/query search: `getMeshesByTag` / `getMeshesByQuery` (owned result
+  lists), `countMeshesByTag` / `countMeshesByQuery`, `findFirstMeshByTag`
+  / `findFirstMeshByQuery`. Mesh tags: `addTag(s)` / `removeTag` /
+  `hasTag` / `matchesTagQuery`.
+
+## AssetManager
+
+`add*Task` returns a stable pointer until `reset`/`deinit`, including when
+callbacks enqueue more tasks. Names and paths are borrowed for that lifetime;
+callbacks may enqueue, but must not reset or destroy their manager.
+
+- Mesh tasks with a Scene append real meshes. Scene-less OBJ/STL/PLY tasks
+  retain CPU `GeometryData` in `task.mesh_result`. `takeMeshGeometry()`
+  transfers it to the caller, who frees it with the manager's allocator.
+  Scene-less GLB/GLTF tasks fail with `MeshRequiresScene`.
+- Text/binary/texture results are borrowed from the cache when caching is
+  enabled; otherwise the task owns them until reset. Cache replacement or
+  clearing invalidates borrowed results. Do not clear textures while a
+  prepared frame still uses their GPU handles.
+- `loadStep(max_tasks)` is synchronous and limits **task count**, not elapsed
+  time. Do not treat it as a frame-time budget. Use the existing `UploadQueue`
+  or the loader's `.async_textures` option for off-thread texture decoding;
+  upload still happens on the graphics context. These do not offload mesh parsing.
+- A manager is single-caller, not internally synchronized. GPU texture
+  creation and destruction require the context thread. Headless texture tasks
+  validate decoding only and return no GPU texture.
+
+## Thread ownership
+
+- Game (update) thread, under update-vs-prepare exclusion: mutate live
+  meshes/materials/transforms/tags, create content (deferred paths above),
+  `destroyMesh`/`destroyTrailMesh`/`renameMesh` (pure CPU plus the retire
+  path), step decals/particles/trails/physics/animations, publish frame
+  snapshots and prepared builds.
+- Context thread (prepare + render, sequential): `prepareFrame`,
+  `render`/`renderReuse`, flushes, all `sg.*` creation/destruction,
+  `Scene.deinit`, `resizeOffscreen`. Workers and the update side never
+  touch the frame snapshot, render passes, or render-owned caches.
+- Rule of thumb: if it touches `sg.*`, it runs on the context thread or
+  through `gpu_retire`. `gpu_thread.isOnContextThread()` is the branch;
+  with no marked thread (unit tests, tools) every thread counts as the
+  context thread. Update-side code never writes `scene.stats` directly —
+  timings cross via `recordUpdateTime`/`recordPhysicsTime` and are
+  transferred by `prepareFrame`.
+
+## Runtime facade (threaded frame lifecycle)
+
+`agate.Runtime` owns the update-vs-prepare choreography so apps do not
+reproduce the claim/build/stage/publish and begin/finish/render ordering
+by hand. The host still owns the window, sokol setup, its `simulate`
+body, render instrumentation, and save/quit policy.
+
+```zig
+var rt = agate.Runtime.init();
+defer rt.deinit(); // joins the worker before Scene.deinit
+
+fn gameTick(ctx: *Tick) void { /* simulate only; no build here */ }
+fn gameLoop() void {
+    while (rt.shouldRun()) {
+        _ = rt.update(&scene, &tick, gameTick); // simulate + build, under exclusion
+    }
+}
+```
+
+- Simple path (the agate demo): `update(scene, ctx, tick)` holds the
+  exclusion, runs `tick`, then `claim -> build -> stageUi -> publish`.
+  `renderFrame(scene)` returns `prepared`, `reused`, `skipped` (nothing
+  consumable yet), or `busy` (acquisition budget exceeded; a consumable
+  front is still re-presented). The first frames skip until the first
+  build is ready.
+- Advanced path (instrumented hosts, e.g. Sandbox): `gameLock`/
+  `gameUnlock`, `produceBuild`, `beginExcludedWith` (runs host live-state
+  reads inside the same exclusion window as the begin), `finishPrepare`,
+  `cancelPrepare`, `reuseIfConsumable`, `prepareSerial`, and
+  `tryRunLocked` (never blocks; false means the caller keeps its previous
+  snapshot/title). `finishPrepare` must be called unlocked and only for
+  claims with `have_build` (asserted).
+- Exclusion contract: producer mutations are excluded from `begin` only.
+  `finishPrepare` and `render`/`renderReuse` are context-owned and
+  overlap the next producer tick. A successful begin must pair with
+  exactly one `finishPrepare` or `cancelPrepare`.
+- Context-side acquisition is bounded by `setLockWaitNs` (0 = pure
+  non-blocking try; scheduling and GPU work can still delay a present).
+  The game side blocks: a tick is never dropped.
+- Worker lifecycle: `spawnWorker(entry)` starts the game loop,
+  `shouldRun()` gates it, `quiesce()` is idempotent, and `Runtime.deinit`
+  quiesces then tears down the mutex. `spawnWorker` must not be called
+  twice.
+- `RuntimeMetrics` counts what each call did (`producer_builds`,
+  `producer_skips`, `begins`, `begin_empty`, `begin_busy`, `finishes`,
+  `cancels`, `reuses`, `skipped_presents`, `serial_prepares`). Hosts that
+  keep bespoke legacy branches bump the counter for the event they
+  perform, so totals stay truthful.
+- The `--no-concurrent-build`/`--no-threads` diagnostics use
+  `prepareSerial`: the full live-reading `prepareFrame` under the
+  exclusion, released before render.
+
+The contracts above still describe the `Scene` itself: what the game
+thread may do, what the context thread owns, and when destruction
+actually happens (retire flush vs `Scene.deinit`).

@@ -7186,3 +7186,238 @@ test "Scene tag queries and tag-filtered raycasting" {
     const hit_hero = scene.pickWithRayTag(ray, "player");
     try std.testing.expect(!hit_hero.hit);
 }
+
+test "renameMesh adopts an owned copy and repeated renames leak nothing" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("helmet_borrowed");
+    try scene.meshes.append(alloc, m);
+
+    // Borrowed -> owned: the literal is copied, the flag flips, lookup
+    // follows the new name and drops the old one.
+    try scene.renameMesh(m, "Damaged Helmet (PBR)");
+    try std.testing.expect(m.owns_name);
+    try std.testing.expectEqualStrings("Damaged Helmet (PBR)", m.name);
+    try std.testing.expect(scene.getMeshByName("Damaged Helmet (PBR)") == m);
+    try std.testing.expect(scene.getMeshByName("helmet_borrowed") == null);
+
+    // Owned -> owned: the previous allocation is freed (the testing
+    // allocator fails the test on leak) and lookup follows again.
+    try scene.renameMesh(m, "Fox Character");
+    try std.testing.expect(m.owns_name);
+    try std.testing.expectEqualStrings("Fox Character", m.name);
+    try std.testing.expect(scene.getMeshByName("Fox Character") == m);
+    try std.testing.expect(scene.getMeshByName("Damaged Helmet (PBR)") == null);
+
+    scene.destroyMesh(m);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "renameMesh with aliased input preserves content" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("alias_borrowed");
+    try scene.meshes.append(alloc, m);
+    try scene.renameMesh(m, "alias_me");
+    try std.testing.expect(m.owns_name);
+
+    // Whole-slice alias: copy-before-free keeps the content alive.
+    try scene.renameMesh(m, m.name);
+    try std.testing.expect(m.owns_name);
+    try std.testing.expectEqualStrings("alias_me", m.name);
+    try std.testing.expect(scene.getMeshByName("alias_me") == m);
+
+    // Subslice alias into the owned allocation: same guarantee.
+    try scene.renameMesh(m, m.name[0..5]);
+    try std.testing.expect(m.owns_name);
+    try std.testing.expectEqualStrings("alias", m.name);
+    try std.testing.expect(scene.getMeshByName("alias") == m);
+    try std.testing.expect(scene.getMeshByName("alias_me") == null);
+
+    scene.destroyMesh(m);
+}
+
+test "renameMesh OOM keeps the old name and flag" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("old_name");
+    try scene.meshes.append(alloc, m);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const saved = scene.allocator;
+    scene.allocator = failing.allocator();
+    const res = scene.renameMesh(m, "new_name");
+    scene.allocator = saved;
+    try std.testing.expectError(error.OutOfMemory, res);
+    // Atomic failure: old slice and flag untouched, lookup unchanged.
+    try std.testing.expect(!m.owns_name);
+    try std.testing.expectEqualStrings("old_name", m.name);
+    try std.testing.expect(scene.getMeshByName("old_name") == m);
+    try std.testing.expect(scene.getMeshByName("new_name") == null);
+
+    scene.destroyMesh(m);
+}
+
+test "destroyTrailMesh unlinks the layer and mesh and clears followers" {
+    const alloc = std.testing.allocator;
+    const TrailMesh = @import("../mesh/trail.zig").TrailMesh;
+    const Vertex = @import("../mesh/types.zig").Vertex;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.trails.deinit(alloc);
+    // Failure-safe: the deferred list deinitializers free only backing
+    // storage (`trails.deinit` frees remaining trail structs, but
+    // `meshes.deinit` does not free mesh structs), so a mid-test `try`
+    // failure would leak the still-linked meshes without this drain.
+    // Retired entries stay owned by `gpu_retire` and are untouched here.
+    errdefer {
+        for (scene.meshes.items) |m| {
+            m.deinit(alloc);
+            alloc.destroy(m);
+        }
+    }
+
+    const mesh_a = try alloc.create(Mesh);
+    mesh_a.* = @import("../testing.zig").testMesh("trail_a_mesh");
+    try scene.meshes.append(alloc, mesh_a);
+    const ta = try alloc.create(TrailMesh);
+    ta.* = .{
+        .allocator = alloc,
+        .scene = &scene,
+        .mesh = mesh_a,
+        .options = .{},
+        .vertices = try alloc.alloc(Vertex, 4),
+        .indices = try alloc.alloc(u16, 6),
+    };
+    try scene.trails.meshes.append(alloc, ta);
+
+    const mesh_b = try alloc.create(Mesh);
+    mesh_b.* = @import("../testing.zig").testMesh("trail_b_mesh");
+    try scene.meshes.append(alloc, mesh_b);
+    const tb = try alloc.create(TrailMesh);
+    tb.* = .{
+        .allocator = alloc,
+        .scene = &scene,
+        .mesh = mesh_b,
+        .options = .{},
+        .vertices = try alloc.alloc(Vertex, 4),
+        .indices = try alloc.alloc(u16, 6),
+    };
+    tb.target = mesh_a;
+    try scene.trails.meshes.append(alloc, tb);
+
+    scene.destroyTrailMesh(ta);
+    try std.testing.expectEqual(@as(usize, 1), scene.trails.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+    try std.testing.expect(scene.getMeshByName("trail_a_mesh") == null);
+    try std.testing.expect(scene.getMeshByName("trail_b_mesh") == mesh_b);
+    // The follower no longer points at the freed mesh.
+    try std.testing.expect(tb.target == null);
+
+    scene.destroyTrailMesh(tb);
+    try std.testing.expectEqual(@as(usize, 0), scene.trails.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "destroyMesh off-context clears trail targets; destroyTrailMesh retires" {
+    const alloc = std.testing.allocator;
+    const TrailMesh = @import("../mesh/trail.zig").TrailMesh;
+    const Vertex = @import("../mesh/types.zig").Vertex;
+    // Same convention as the off-context destroyMesh test above: the main
+    // thread is the context owner, workers are game-thread stand-ins.
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.trails.deinit(alloc);
+    // Failure-safe (see the test above): retired entries stay owned by
+    // `gpu_retire`; remaining trail structs go through `trails.deinit`.
+    errdefer {
+        for (scene.meshes.items) |m| {
+            m.deinit(alloc);
+            alloc.destroy(m);
+        }
+    }
+
+    // Follow target + follower trail (manual structs, no GPU handles, so
+    // neither the retire nor the flush below touches sg.*).
+    const target = try alloc.create(Mesh);
+    target.* = @import("../testing.zig").testMesh("offctx_target");
+    try scene.meshes.append(alloc, target);
+    const follower_mesh = try alloc.create(Mesh);
+    follower_mesh.* = @import("../testing.zig").testMesh("offctx_follower_mesh");
+    try scene.meshes.append(alloc, follower_mesh);
+    const follower = try alloc.create(TrailMesh);
+    follower.* = .{
+        .allocator = alloc,
+        .scene = &scene,
+        .mesh = follower_mesh,
+        .options = .{},
+        .vertices = try alloc.alloc(Vertex, 4),
+        .indices = try alloc.alloc(u16, 6),
+    };
+    follower.target = target;
+    try scene.trails.meshes.append(alloc, follower);
+
+    // Ordinary destroyMesh from a worker: unlinks + retires the target and
+    // clears the follower — no dangling `target` past the retire.
+    const DestroyJob = struct {
+        scene: *Scene,
+        mesh: *Mesh,
+        fn run(j: @This()) void {
+            j.scene.destroyMesh(j.mesh);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, DestroyJob.run, .{DestroyJob{ .scene = &scene, .mesh = target }});
+    t.join();
+    try std.testing.expect(follower.target == null);
+    try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+
+    // Epoch completes on the context thread: the retired target is freed.
+    scene.gpu_retire.complete(scene.gpu_retire.current());
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+
+    // destroyTrailMesh from a worker: the trail unlinks + frees inline
+    // (CPU-only) while its mesh retires for the next flush.
+    const TrailJob = struct {
+        scene: *Scene,
+        trail: *TrailMesh,
+        fn run(j: @This()) void {
+            j.scene.destroyTrailMesh(j.trail);
+        }
+    };
+    const t2 = try std.Thread.spawn(.{}, TrailJob.run, .{TrailJob{ .scene = &scene, .trail = follower }});
+    t2.join();
+    try std.testing.expectEqual(@as(usize, 0), scene.trails.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
+
+    scene.gpu_retire.complete(scene.gpu_retire.current());
+    scene.flushPendingGpuUploads();
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+}
