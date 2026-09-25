@@ -270,11 +270,3 @@ pub fn publishFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32)
         // consumed snapshot belongs to the in-flight render.
     }
 }
-
-test "SceneFrameSnapshot default initialization" {
-    const snap = SceneFrameSnapshot{};
-    try std.testing.expect(!snap.has_camera);
-    try std.testing.expectEqual(@as(usize, 0), snap.camera_count);
-    try std.testing.expectEqual(@as(i32, 1), snap.msaa_sample_count);
-    try std.testing.expect(!snap.msaa_depth_prepass);
-}

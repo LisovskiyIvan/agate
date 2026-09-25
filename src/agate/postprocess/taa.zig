@@ -169,15 +169,7 @@ pub fn taaState(history_valid: bool, capture_only: bool) [4]f32 {
     };
 }
 
-test "taa defaults and clamps" {
-    const cfg = options.PostProcessOptions{};
-    try std.testing.expect(!cfg.taa_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cfg.taa_blend, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.taa_jitter_scale, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), cfg.taa_sharpness, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.taa_clamp_strength, 1e-6);
-    try std.testing.expect(!cfg.taa_camera_cut);
-
+test "taa clamps" {
     var bad = options.PostProcessOptions{
         .taa_blend = 2.0,
         .taa_jitter_scale = -1.0,

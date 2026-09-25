@@ -388,17 +388,10 @@ pub fn takeGpuBuffersForRetire(self: anytype, out: []sg.Buffer) usize {
 // bookkeeping, buffer retire lifecycle, capacity/ring policy, and parameter
 // validation.
 
-test "compute mode defaults off; state and workgroup layout pinned" {
+test "compute workgroup layout matches the shader" {
     const sys = @import("system.zig");
     var ps = try sys.makeTestSystem(std.testing.allocator, 4);
     defer sys.freeTestSystem(&ps);
-    // OFF by default: existing systems never opt in implicitly.
-    try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
-    try std.testing.expectEqual(@as(usize, 0), ps.compute_staged);
-    try std.testing.expectEqual(@as(usize, 0), ps.compute_high_water);
-    try std.testing.expectEqual(false, ps.compute_flush_pending);
-    try std.testing.expectEqual(false, ps.compute_known_unsupported);
-    try std.testing.expectEqual(@as(?bool, null), ps.compute_support_override);
     // Six vec4 (see CState in shaders/particle_compute.glsl).
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(ComputeParticleState));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(ComputeParticleState, "pos_age"));

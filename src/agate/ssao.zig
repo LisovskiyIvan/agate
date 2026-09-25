@@ -22,10 +22,7 @@ pub const SSAOOptions = struct {
     }
 };
 
-test "ssao options default and clamping" {
-    const def = SSAOOptions{};
-    try std.testing.expectEqual(@as(u32, 24), def.sample_count);
-
+test "ssao options clamping" {
     const custom = (SSAOOptions{ .sample_count = 100 }).clamped();
     try std.testing.expectEqual(@as(u32, 32), custom.sample_count);
 

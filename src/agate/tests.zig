@@ -24,6 +24,7 @@ test {
     _ = @import("animation/tests.zig");
     _ = @import("asset_manager.zig");
     _ = @import("assets.zig");
+    _ = @import("assets_tests.zig");
     _ = @import("audio.zig");
     _ = @import("audio/buses.zig");
     _ = @import("audio/clip.zig");
@@ -85,6 +86,7 @@ test {
     _ = @import("loader/obj_fuzz.zig");
     _ = @import("loader/ply.zig");
     _ = @import("loader/ply_fuzz.zig");
+    _ = @import("loader/ply_tests.zig");
     _ = @import("loader/scene_loader.zig");
     _ = @import("loader/skins.zig");
     _ = @import("loader/stl.zig");
@@ -124,6 +126,7 @@ test {
     _ = @import("observable_tests.zig");
     _ = @import("particles.zig");
     _ = @import("particles/collisions.zig");
+    _ = @import("particles/collisions_tests.zig");
     _ = @import("particles/compute_mode.zig");
     _ = @import("particles/cpu.zig");
     _ = @import("particles/flow.zig");
@@ -210,7 +213,9 @@ test {
     _ = @import("scene/instance_staging.zig");
     _ = @import("scene/lifecycle.zig");
     _ = @import("scene/light_rig.zig");
+    _ = @import("scene/light_rig_tests.zig");
     _ = @import("scene/light_selection.zig");
+    _ = @import("scene/light_selection_tests.zig");
     _ = @import("scene/lights_api.zig");
     _ = @import("scene/msaa.zig");
     _ = @import("scene/nav_layer.zig");
@@ -218,6 +223,7 @@ test {
     _ = @import("scene/patch_instance_refs.zig");
     _ = @import("scene/physics_layer.zig");
     _ = @import("scene/picking.zig");
+    _ = @import("scene/picking_tests.zig");
     _ = @import("scene/pipelines.zig");
     _ = @import("scene/postfx_stack.zig");
     _ = @import("scene/probe_layer.zig");
@@ -257,6 +263,7 @@ test {
     _ = @import("serialization/reader.zig");
     _ = @import("serialization/writer.zig");
     _ = @import("serialization_fuzz.zig");
+    _ = @import("serialization_tests.zig");
     _ = @import("shader_material.zig");
     _ = @import("shader_material/expand_main.zig");
     _ = @import("shader_material/include.zig");
@@ -268,6 +275,7 @@ test {
     _ = @import("texture.zig");
     _ = @import("texture/color.zig");
     _ = @import("texture/core.zig");
+    _ = @import("texture/core_tests.zig");
     _ = @import("texture/cube.zig");
     _ = @import("texture/mip.zig");
     _ = @import("ttf.zig");
@@ -277,6 +285,7 @@ test {
     _ = @import("ttf/outline.zig");
     _ = @import("ttf/raster.zig");
     _ = @import("ttf/types.zig");
+    _ = @import("ttf_tests.zig");
     _ = @import("ui.zig");
     _ = @import("ui/canvas.zig");
     _ = @import("ui/css_parser.zig");

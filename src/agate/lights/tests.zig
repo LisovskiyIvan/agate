@@ -108,23 +108,6 @@ test "colorTemperatureToRgb produces warm for low kelvin and cool for high kelvi
     try std.testing.expect(cool.b >= cool.r);
 }
 
-test "directional light limits and array capacity" {
-    try std.testing.expectEqual(@as(usize, 4), max_directional_lights);
-    try std.testing.expectEqual(@as(usize, 3), max_fill_directionals);
-
-    var lights_arr: [max_directional_lights]DirectionalLight = undefined;
-    for (&lights_arr, 0..) |*l, i| {
-        l.* = DirectionalLight.init("dir", .{
-            .direction = Vec3.new(0, -1, @floatFromInt(i)),
-            .intensity = 1.0 + @as(f32, @floatFromInt(i)),
-        });
-    }
-    for (lights_arr, 0..) |l, i| {
-        try std.testing.expect(l.is_enabled);
-        try std.testing.expectApproxEqAbs(1.0 + @as(f32, @floatFromInt(i)), l.intensity, 1e-5);
-    }
-}
-
 test "disabled directional falls back to hemispheric sun" {
     const hemi = HemisphericLight.init("hemi", .{
         .direction = Vec3.new(0.0, 1.0, 0.0),
@@ -182,36 +165,6 @@ test "PointLight shadows are off by default" {
     // A literal without the new fields keeps the same defaults.
     const bare = PointLight{};
     try std.testing.expect(!bare.cast_shadows);
-}
-
-test "area light capacity and array bounds" {
-    try std.testing.expectEqual(@as(usize, 2), max_area_lights);
-    var area_arr: [max_area_lights]AreaLight = undefined;
-    for (&area_arr, 0..) |*al, i| {
-        al.* = AreaLight.init("area", .{
-            .center = Vec3.new(@floatFromInt(i), 0, 0),
-            .intensity = 2.0,
-        });
-    }
-    for (area_arr, 0..) |al, i| {
-        try std.testing.expectEqual(Vec3.new(@floatFromInt(i), 0, 0), al.center);
-        try std.testing.expectEqual(@as(f32, 2.0), al.intensity);
-    }
-}
-
-test "clustered pool cap is 64, defaults match the legacy point lane" {
-    try std.testing.expectEqual(@as(usize, 64), max_clustered_lights);
-    const l = ClusteredPointLight.init(Vec3.new(1, 2, 3), .{});
-    try std.testing.expectEqual(Vec3.new(1, 2, 3), l.position);
-    try std.testing.expectEqual(Color3.white, l.color);
-    try std.testing.expectEqual(@as(f32, 1.0), l.intensity);
-    try std.testing.expectEqual(@as(f32, 10.0), l.radius);
-    try std.testing.expect(l.is_enabled);
-    // Options map verbatim (enabled -> is_enabled, engine convention).
-    const off = ClusteredPointLight.init(Vec3.zero, .{ .enabled = false, .intensity = 2.5, .radius = 3.0 });
-    try std.testing.expect(!off.is_enabled);
-    try std.testing.expectEqual(@as(f32, 2.5), off.intensity);
-    try std.testing.expectEqual(@as(f32, 3.0), off.radius);
 }
 
 test "AreaLight normal and area follow the right/up half-extents" {

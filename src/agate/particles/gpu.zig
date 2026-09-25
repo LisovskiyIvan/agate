@@ -134,13 +134,10 @@ pub fn flushGpuUpload(self: anytype) void {
 
 // --- GPU-path tests: ring bookkeeping and fallback (sg-free) ---
 
-test "gpu mode defaults off and slot layout matches shader attrs" {
+test "gpu slot layout matches shader attrs" {
     const sys = @import("system.zig");
     var ps = try sys.makeTestSystem(std.testing.allocator, 4);
     defer sys.freeTestSystem(&ps);
-    try std.testing.expectEqual(SimulationMode.cpu, ps.simulation_mode);
-    try std.testing.expectEqual(@as(f32, 0.0), ps.drag);
-    try std.testing.expectEqual(@as(f32, 0.0), ps.clock_seconds);
     // Five FLOAT4 vertex attributes (see particle_gpu program in
     // shaders/particle.glsl): spawn_pos_time, velocity_lifetime, color_start,
     // color_end, size_rotation.

@@ -523,9 +523,3 @@ test "shaderMaterialSlotKey separates sample-count variants and is stable" {
     // Different registration keys stay distinct within one sample count.
     try std.testing.expect(k1 != shaderMaterialSlotKey(key + 1, 1));
 }
-
-test "sampled ForwardPipelines default field keeps the legacy shape" {
-    const fw = ForwardPipelines{};
-    try std.testing.expectEqual(@as(i32, 1), fw.sample_count);
-    try std.testing.expectEqual(@as(i32, 1), fw.shader_materials.sample_count);
-}

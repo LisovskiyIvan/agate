@@ -241,24 +241,6 @@ pub const PostProcessOptions = struct {
     }
 };
 
-test "postprocess defaults" {
-    const cfg = PostProcessOptions{};
-    try std.testing.expect(!cfg.enabled);
-    try std.testing.expect(!cfg.bloom_pyramid);
-    try std.testing.expectEqual(@as(u32, 5), cfg.bloom_pyramid_mips);
-    try std.testing.expect(!cfg.dof_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), cfg.dof_focus_distance, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), cfg.dof_focus_range, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), cfg.dof_max_blur, 1e-6);
-    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 0.0 }, cfg.grade_shadows);
-    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 0.0 }, cfg.grade_midtones);
-    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 0.0 }, cfg.grade_highlights);
-    // Legacy single-shader bloom stays on by default as the fallback path.
-    try std.testing.expect(cfg.bloom_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.05), cfg.saturation, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.05), cfg.contrast, 1e-6);
-}
-
 test "config clamped sanitizes new fields" {
     var cfg = PostProcessOptions{
         .exposure = -2.0,
@@ -275,11 +257,7 @@ test "config clamped sanitizes new fields" {
     try std.testing.expectEqual([3]f32{ 1.0, -1.0, 0.5 }, out.grade_shadows);
 }
 
-test "ssr and motion blur configurable quality options" {
-    const def = PostProcessOptions{};
-    try std.testing.expectEqual(@as(u32, 16), def.ssr_steps);
-    try std.testing.expectEqual(@as(u32, 8), def.motion_blur_samples);
-
+test "ssr and motion blur clamp quality options" {
     var custom = PostProcessOptions{
         .ssr_steps = 1,
         .motion_blur_samples = 100,

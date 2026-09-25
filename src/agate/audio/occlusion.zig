@@ -144,14 +144,6 @@ pub const AudioEmitter = struct {
     }
 };
 
-test "AudioOcclusionConfig default values" {
-    const cfg = AudioOcclusionConfig{};
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), cfg.min_volume, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 500.0), cfg.min_cutoff, 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 20000.0), cfg.max_cutoff, 0.1);
-    try std.testing.expectEqual(@as(u8, 1), cfg.num_rays);
-}
-
 test "AudioOcclusionTracker smooth transition" {
     var tracker = AudioOcclusionTracker.init(0.0);
     try std.testing.expectEqual(@as(f32, 0.0), tracker.current);

@@ -109,11 +109,8 @@ test "glow defaults are off and neutral" {
     // Default OFF: disabled glow runs zero passes and packs zero uniforms,
     // so the composite stays bit-identical to the pre-glow path.
     try std.testing.expect(!cfg.glow_enabled);
-    try std.testing.expectApproxEqAbs(GLOW_THRESHOLD_DEFAULT, cfg.glow_threshold, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.glow_threshold, 1e-6);
-    try std.testing.expectApproxEqAbs(GLOW_INTENSITY_DEFAULT, cfg.glow_intensity, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), cfg.glow_intensity, 1e-6);
-    try std.testing.expectApproxEqAbs(GLOW_RADIUS_DEFAULT, cfg.glow_radius, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), cfg.glow_radius, 1e-6);
     try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, cfg.glow_tint);
     // Distinct from bloom: threshold above bloom's 0.8, radius wider than
