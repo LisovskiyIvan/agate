@@ -287,6 +287,10 @@ pub fn build(b: *Build) !void {
         /// на рантайме всё равно гейтится sg.queryFeatures().compute, см.
         /// src/agate/compute.zig).
         slang: ?sokol.shdc.Slang = null,
+        /// Шейдер содержит `// @include` директивы: перед shdc запускается
+        /// препроход expand_shader_includes (см. createShaderWithIncludes).
+        /// Остальные идут напрямую через sokol.shdc.createModule.
+        includes: bool = false,
     };
     const default_slang = sokol.shdc.Slang{
         .glsl410 = true, // Linux (GL)
@@ -305,15 +309,24 @@ pub fn build(b: *Build) !void {
         .hlsl5 = true,
     };
     const shader_specs = [_]ShaderSpec{
-        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig", .slang = forward_slang },
-        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .slang = forward_slang },
-        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .slang = forward_slang },
-        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .slang = forward_slang },
-        .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .slang = forward_slang },
+        // Increment 2 of the shader-include refactor: the five forward
+        // shaders share cluster structs, the shadow/PCF block,
+        // areaLightFactor and uvApply (common/*.glsl); the three PBR
+        // variants additionally share the BRDF math + channelSelect.
+        // Deliberately NOT shared: fs_params blocks (layout parity +
+        // differing probe semantics) and morph/skin vertex variants.
+        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig", .slang = forward_slang, .includes = true },
+        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .slang = forward_slang, .includes = true },
+        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .slang = forward_slang, .includes = true },
+        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .slang = forward_slang, .includes = true },
+        .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .slang = forward_slang, .includes = true },
         .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
         .{ .name = "msaa_depth_shader", .input = "src/agate/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
         .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
-        .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig" },
+        // Increment 1 of the shader-include refactor: these nine share the
+        // fullscreen @vs body (src/agate/shaders/common/fullscreen_vs.glsl).
+        // probe_mip.glsl is deliberately excluded (no Y-flip line).
+        .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig", .includes = true },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
         // Stateful compute particles (wave 25): compute slang set (410 has
         // no compute); runtime availability still gates on
@@ -325,31 +338,52 @@ pub fn build(b: *Build) !void {
             .slang = .{ .glsl430 = true, .metal_macos = true, .hlsl5 = true },
         },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
-        .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig" },
-        .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig" },
+        .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
+        .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig", .includes = true },
         .{ .name = "debug_shader", .input = "src/agate/shaders/debug.glsl", .output = "debug_shader.zig" },
-        .{ .name = "bloom_down_shader", .input = "src/agate/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig" },
-        .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig" },
-        .{ .name = "glow_extract_shader", .input = "src/agate/shaders/glow_extract.glsl", .output = "glow_extract_shader.zig" },
-        .{ .name = "glow_blur_shader", .input = "src/agate/shaders/glow_blur.glsl", .output = "glow_blur_shader.zig" },
-        .{ .name = "volumetric_raymarch_shader", .input = "src/agate/shaders/volumetric_raymarch.glsl", .output = "volumetric_raymarch_shader.zig" },
-        .{ .name = "volumetric_blur_shader", .input = "src/agate/shaders/volumetric_blur.glsl", .output = "volumetric_blur_shader.zig" },
+        .{ .name = "bloom_down_shader", .input = "src/agate/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
+        .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },
+        .{ .name = "glow_extract_shader", .input = "src/agate/shaders/glow_extract.glsl", .output = "glow_extract_shader.zig", .includes = true },
+        .{ .name = "glow_blur_shader", .input = "src/agate/shaders/glow_blur.glsl", .output = "glow_blur_shader.zig", .includes = true },
+        .{ .name = "volumetric_raymarch_shader", .input = "src/agate/shaders/volumetric_raymarch.glsl", .output = "volumetric_raymarch_shader.zig", .includes = true },
+        .{ .name = "volumetric_blur_shader", .input = "src/agate/shaders/volumetric_blur.glsl", .output = "volumetric_blur_shader.zig", .includes = true },
         .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
         .{ .name = "probe_mip_shader", .input = "src/agate/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
         .{ .name = "ui3d_panel_shader", .input = "src/agate/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});
+    // Host prepass for `// @include` directives (see
+    // src/agate/shader_material/include.zig): sokol-shdc cannot resolve
+    // includes itself, so they are expanded textually before shdc runs.
+    const expand_tool = b.addExecutable(.{
+        .name = "expand_shader_includes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agate/shader_material/expand_main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
     var shader_modules: [shader_specs.len]*Build.Module = undefined;
     for (shader_specs, 0..) |spec, i| {
-        const shader_mod = try sokol.shdc.createModule(b, spec.name, mod_sokol, .{
-            .shdc_dep = dep_shdc,
-            .input = spec.input,
-            .output = spec.output,
-            .slang = spec.slang orelse default_slang,
-        });
-        shader_mod.addImport("math", mod_math);
-        shader_modules[i] = shader_mod;
+        if (spec.includes) {
+            shader_modules[i] = try createShaderWithIncludes(b, expand_tool, mod_sokol, dep_shdc, .{
+                .name = spec.name,
+                .input = spec.input,
+                .output = spec.output,
+                .slang = spec.slang orelse default_slang,
+            });
+            shader_modules[i].addImport("math", mod_math);
+        } else {
+            const shader_mod = try sokol.shdc.createModule(b, spec.name, mod_sokol, .{
+                .shdc_dep = dep_shdc,
+                .input = spec.input,
+                .output = spec.output,
+                .slang = spec.slang orelse default_slang,
+            });
+            shader_mod.addImport("math", mod_math);
+            shader_modules[i] = shader_mod;
+        }
     }
 
     // Shader materials: hook-merge each user snippet into its base template,
@@ -358,7 +392,7 @@ pub fn build(b: *Build) !void {
     // runtime resolves registrations from. sokol.shdc.createModule only
     // accepts build-root paths, so the shdc invocation is replicated here
     // with a LazyPath input (the merge step's output).
-    const mod_registry = try createShaderMaterialRegistry(b, mod_sokol, mod_math, dep_shdc);
+    const mod_registry = try createShaderMaterialRegistry(b, mod_sokol, mod_math, dep_shdc, expand_tool);
 
     // Главный модуль библиотеки agate
     var agate_imports: [3 + shader_specs.len]Build.Module.Import = undefined;
@@ -578,6 +612,68 @@ pub fn build(b: *Build) !void {
     b.step("fmt", "Check formatting with zig fmt").dependOn(&fmt.step);
 }
 
+// ---------------------------------------------------------------------------
+// Shader include prepass: `// @include` expansion + sokol-shdc.
+//
+// Shaders whose spec sets `.includes = true` go through the host
+// expand_shader_includes tool first; the expanded LazyPath then feeds a
+// MANUAL shdc invocation that replicates sokol.shdc.createModule's argv
+// exactly for the given slang set (verified against the vendored
+// sokol-tools-bin build.zig: `-l <slang> -f sokol_zig --no-log-cmdline
+// --input X --output Y`; no defines/module/reflection/bytecode/dump/
+// genver/ifdef/tmpdir — all default-off like the wrapper). createModule
+// only accepts build-root path inputs, hence the manual replication (same
+// reason as in createShaderMaterialRegistry below).
+// ---------------------------------------------------------------------------
+const IncludeShaderSpec = struct {
+    name: []const u8,
+    input: []const u8,
+    output: []const u8,
+    slang: sokol.shdc.Slang,
+};
+
+/// Slang set to shdc `-l` string. Copy of the vendored wrapper's
+/// slangToString (field order = declaration order of sokol.shdc.Slang).
+fn includeSlangToString(b: *Build, slang: sokol.shdc.Slang) []const u8 {
+    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+    inline for (comptime std.meta.fieldNames(sokol.shdc.Slang)) |field| {
+        if (@field(slang, field)) parts.append(b.allocator, field) catch @panic("OOM");
+    }
+    return std.mem.join(b.allocator, ":", parts.items) catch @panic("OOM");
+}
+
+fn createShaderWithIncludes(
+    b: *Build,
+    expand_tool: *Build.Step.Compile,
+    mod_sokol: *Build.Module,
+    dep_shdc: *Build.Dependency,
+    spec: IncludeShaderSpec,
+) !*Build.Module {
+    // 1. Expand `// @include` directives (root = engine shaders dir, so
+    // `common/*.glsl` resolve; the directory arg tracks every file under
+    // it for rebuilds).
+    const run_expand = b.addRunArtifact(expand_tool);
+    run_expand.addArg("--root");
+    run_expand.addDirectoryArg(b.path("src/agate/shaders"));
+    run_expand.addArg("--input");
+    run_expand.addFileArg(b.path(spec.input));
+    run_expand.addArg("--output");
+    const expanded_glsl = run_expand.addOutputFileArg(b.fmt("expanded_{s}.glsl", .{spec.name}));
+
+    // 2. sokol-shdc on the expanded GLSL (argv mirrors createModule).
+    const shdc_exe = dep_shdc.path(try sokol.shdc.getShdcSubPath());
+    const run_shdc = b.addSystemCommand(&.{shdc_exe.getPath(b)});
+    run_shdc.addArgs(&.{ "-l", includeSlangToString(b, spec.slang), "-f", "sokol_zig", "--no-log-cmdline" });
+    run_shdc.addArg("--input");
+    run_shdc.addFileArg(expanded_glsl);
+    run_shdc.addArg("--output");
+    const shader_zig = run_shdc.addOutputFileArg(spec.output);
+
+    const shader_mod = b.addModule(spec.name, .{ .root_source_file = shader_zig });
+    shader_mod.addImport("sokol", mod_sokol);
+    return shader_mod;
+}
+
 // Hook-level shader material pipeline: merge tool -> sokol-shdc -> generated
 // registry module. Returns the `shader_material_registry` module (always
 // exists; `entries` is empty when user_shader_materials is empty).
@@ -586,6 +682,7 @@ fn createShaderMaterialRegistry(
     mod_sokol: *Build.Module,
     mod_math: *Build.Module,
     dep_shdc: *Build.Dependency,
+    expand_tool: *Build.Step.Compile,
 ) !*Build.Module {
     // Host tool that performs the hook merge (see shader_material/merge.zig).
     const merge_tool = b.addExecutable(.{
@@ -666,18 +763,28 @@ fn createShaderMaterialRegistry(
         run_merge.addArg("--out-params");
         const params_zig = run_merge.addOutputFileArg(b.fmt("shader_mat_{s}_params.zig", .{mat.name}));
 
-        // 2. sokol-shdc on the merged GLSL — same slangs as the engine
-        // forward shader table (glsl430 / metal_macos / hlsl5: hook
-        // materials inherit the clustered storage blocks from the
-        // templates, and SSBO syntax needs GLSL 4.30+). sokol.shdc's
-        // createModule only accepts build-root paths, so the invocation is
-        // replicated here to feed it the merge step's LazyPath output.
+        // 2. Expand `// @include` directives in the merged GLSL (base
+        // templates share common/*.glsl chunks; merge passes directives
+        // through untouched) and run sokol-shdc on the result — same
+        // slangs as the engine forward shader table (glsl430 /
+        // metal_macos / hlsl5: hook materials inherit the clustered
+        // storage blocks from the templates, and SSBO syntax needs GLSL
+        // 4.30+). sokol.shdc's createModule only accepts build-root
+        // paths, so the invocation is replicated here to feed it the
+        // merge+expand steps' LazyPath outputs.
         // argv[0] = the sokol-shdc binary (resolved eagerly like
         // sokol.shdc does for zig 0.16).
+        const run_expand = b.addRunArtifact(expand_tool);
+        run_expand.addArg("--root");
+        run_expand.addDirectoryArg(b.path("src/agate/shaders"));
+        run_expand.addArg("--input");
+        run_expand.addFileArg(merged_glsl);
+        run_expand.addArg("--output");
+        const expanded_glsl = run_expand.addOutputFileArg(b.fmt("shader_mat_{s}_expanded.glsl", .{mat.name}));
         const run_shdc = b.addSystemCommand(&.{shdc_exe.getPath(b)});
         run_shdc.addArgs(&.{ "-l", "glsl430:metal_macos:hlsl5", "-f", "sokol_zig" });
         run_shdc.addArg("--input");
-        run_shdc.addFileArg(merged_glsl);
+        run_shdc.addFileArg(expanded_glsl);
         run_shdc.addArg("--output");
         const shader_zig = run_shdc.addOutputFileArg(b.fmt("shader_mat_{s}_shader.zig", .{mat.name}));
 

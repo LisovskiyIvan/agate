@@ -258,6 +258,8 @@ test {
     _ = @import("serialization/writer.zig");
     _ = @import("serialization_fuzz.zig");
     _ = @import("shader_material.zig");
+    _ = @import("shader_material/expand_main.zig");
+    _ = @import("shader_material/include.zig");
     _ = @import("shader_material/merge.zig");
     _ = @import("softbody.zig");
     _ = @import("ssao.zig");
