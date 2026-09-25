@@ -7421,3 +7421,95 @@ test "destroyMesh off-context clears trail targets; destroyTrailMesh retires" {
     scene.flushPendingGpuUploads();
     try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
 }
+
+test "slice6: staged prepare consumes frozen trail packet despite live mutation" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.profiler.deinit();
+    defer scene.trails.deinit(alloc);
+    defer {
+        for (scene.meshes.items) |m| {
+            m.deinit(alloc);
+            alloc.destroy(m);
+        }
+        scene.meshes.deinit(alloc);
+    }
+
+    const TrailMesh = @import("../mesh/trail.zig").TrailMesh;
+    const Vertex = @import("../mesh/types.zig").Vertex;
+    // Manual fixture (no TrailMesh.init: it issues sg.* when a previous
+    // test already marked this thread as the context thread).
+    const mesh_ptr = try alloc.create(Mesh);
+    mesh_ptr.* = .{ .name = "pkt_trail", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    errdefer alloc.destroy(mesh_ptr);
+    try scene.meshes.append(alloc, mesh_ptr);
+    const verts = try alloc.alloc(Vertex, 4);
+    errdefer alloc.free(verts);
+    for (verts) |*v| v.* = std.mem.zeroes(Vertex);
+    const idx = try alloc.alloc(u16, 6);
+    errdefer alloc.free(idx);
+    const tm = try alloc.create(TrailMesh);
+    errdefer alloc.destroy(tm);
+    tm.* = .{
+        .allocator = alloc,
+        .scene = &scene,
+        .mesh = mesh_ptr,
+        .options = .{},
+        .vertices = verts,
+        .indices = idx,
+        .gpu_dirty = true,
+        .buffers_pending = false,
+        .pending_vertex_count = 2,
+        .pending_index_count = 6,
+        .pending_min_pt = Vec3.new(1, 2, 3),
+        .pending_max_pt = Vec3.new(4, 5, 6),
+    };
+    errdefer tm.deinit();
+    try scene.trails.meshes.append(alloc, tm);
+    // Stage two verts + one quad (6 indices) as the frozen generation.
+    tm.vertices[0].position = .{ 1, 2, 3 };
+    tm.vertices[1].position = .{ 4, 5, 6 };
+    tm.indices[0] = 0;
+    tm.indices[1] = 1;
+    tm.indices[2] = 0;
+    tm.indices[3] = 1;
+    tm.indices[4] = 0;
+    tm.indices[5] = 1;
+    tm.pending_vertex_count = 2;
+    tm.pending_index_count = 6;
+    tm.pending_min_pt = Vec3.new(1, 2, 3);
+    tm.pending_max_pt = Vec3.new(4, 5, 6);
+    tm.gpu_dirty = true;
+
+    // Context-thread work starts here (creation above stayed deferred while
+    // off-context, so no sg.* ran headless).
+    gpu_thread.markContextThread();
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var build = scene.tryClaimBuildSlot().?;
+    build.build();
+    build.publish();
+    const slot = &scene.draws.slots[build.slot];
+    try std.testing.expectEqual(@as(usize, 1), slot.trail_uploads.items.len);
+    try std.testing.expectEqual(@as(usize, 2), slot.trail_uploads.items[0].vert_count);
+
+    // Live mutation after the freeze: different counts, verts, bounds.
+    tm.pending_vertex_count = 1;
+    tm.pending_index_count = 0;
+    tm.vertices[0].position = .{ 99, 99, 99 };
+    tm.pending_min_pt = Vec3.new(99, 99, 99);
+    tm.pending_max_pt = Vec3.new(100, 100, 100);
+
+    const claim = scene.beginStagedPrepare().?;
+    try std.testing.expect(claim.have_build);
+    // Begin consumes the packet headless: publishes frozen scalars, clears
+    // the live dirty flag, never reads the mutated live staging arrays.
+    try std.testing.expectEqual(@as(u32, 6), tm.mesh.index_count);
+    try std.testing.expect(!tm.gpu_dirty);
+    try std.testing.expectEqual([3]f32{ 1, 2, 3 }, slot.trail_verts.items[0].position);
+    scene.finishStagedPrepare(claim);
+    try std.testing.expect(scene.frame_prepared);
+    try std.testing.expectEqual(@as(u32, 6), tm.mesh.index_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), tm.mesh.local_bounding_box.min.x, 1e-6);
+}

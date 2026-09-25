@@ -794,9 +794,10 @@ test "saveFileAsync and loadFileAsync round-trip with TaskRunner" {
     defer runner.deinit();
 
     const original = try makeFullState(alloc);
-    const test_path = "test_async_scene.bin";
-    const io = std.Io.Threaded.global_single_threaded.io();
-    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/test_async_scene.bin", .{tmp.sub_path});
+    defer alloc.free(test_path);
 
     const save_task = try saveFileAsync(alloc, runner, original, test_path);
     defer save_task.deinit();

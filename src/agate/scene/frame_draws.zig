@@ -212,6 +212,7 @@ const ui_frame_mod = @import("ui_frame.zig");
 const outline_pass = @import("../passes/outline_pass.zig");
 const highlight_pass = @import("../passes/highlight_pass.zig");
 const particle_pass = @import("../passes/particle_pass.zig");
+const particle_types = @import("../particles/types.zig");
 const physics_types = @import("../physics/types.zig");
 const shadow_pass = @import("../passes/shadow_pass.zig");
 const mesh_mod = @import("../mesh.zig");
@@ -270,6 +271,106 @@ pub const HandoffClaim = struct {
 // records (fail-closed zero on record-missing/uid mismatch or stale publish);
 // fallback (`.published`) payloads are final at build time.
 pub const StagedInstanceRecord = mesh_mod.StagedInstanceRecord;
+
+/// Slot-owned dynamic-upload packets (producer freeze-then-latch slice 6):
+/// every per-frame GPU staging payload the prepare flush uploads is frozen
+/// here by value on the producer side (`buildIntoClaimedSlot` via
+/// `upload_packets.stageUploads`) and consumed by the staged prepare
+/// (`upload_packets.flushSlotUploads`) instead of any live mutable array.
+/// All descriptors are plain integers (tokens/ids/counts/offsets); the byte
+/// payloads live in the sibling flattened lists below. Buffer ids are
+/// borrowed values under the P3 epoch discipline (never destroyed/retired
+/// through the packet). `reset` clears lengths retaining capacity; `deinit`
+/// frees; `cpuBytes` counts retained capacities.
+pub const MorphUpload = struct {
+    token: usize = 0,
+    uid: u64 = 0,
+    mesh_index: u32 = 0,
+    buffer_id: u32 = 0,
+    count: u32 = 0,
+    data_lo: usize = 0,
+};
+pub const ParticleCpuUpload = struct {
+    token: usize = 0,
+    sys_index: u32 = 0,
+    buffer_id: u32 = 0,
+    count: u32 = 0,
+    data_lo: usize = 0,
+};
+pub const ParticleGpuUpload = struct {
+    token: usize = 0,
+    sys_index: u32 = 0,
+    buffer_id: u32 = 0,
+    count: u32 = 0,
+    data_lo: usize = 0,
+};
+pub const ParticleComputeUpload = struct {
+    token: usize = 0,
+    sys_index: u32 = 0,
+    spawn_buffer_id: u32 = 0,
+    staged: usize = 0,
+    stage_base: usize = 0,
+    cursor: usize = 0,
+    high_water: usize = 0,
+    dt_accum: f32 = 0.0,
+    flush_pending: bool = false,
+    state_clear_pending: bool = false,
+    buffers_pending: bool = false,
+    gravity: [3]f32 = .{ 0, 0, 0 },
+    drag: f32 = 0.0,
+    sheet_cols: u32 = 1,
+    sheet_rows: u32 = 1,
+    sheet_loops: f32 = 1.0,
+    data_lo: usize = 0,
+    data_count: usize = 0,
+};
+pub const TrailUpload = struct {
+    token: usize = 0,
+    trail_index: u32 = 0,
+    vertex_buffer_id: u32 = 0,
+    index_buffer_id: u32 = 0,
+    vert_count: usize = 0,
+    index_count: usize = 0,
+    vert_lo: usize = 0,
+    index_lo: usize = 0,
+    min_pt: [3]f32 = .{ 0, 0, 0 },
+    max_pt: [3]f32 = .{ 0, 0, 0 },
+    buffers_pending: bool = false,
+};
+pub const SoftUpload = struct {
+    token: usize = 0,
+    body_index: u32 = 0,
+    vertex_buffer_id: u32 = 0,
+    vert_count: usize = 0,
+    data_lo: usize = 0,
+    index_lo: usize = 0,
+    index_count: usize = 0,
+    min_pt: [3]f32 = .{ 0, 0, 0 },
+    max_pt: [3]f32 = .{ 0, 0, 0 },
+    buffers_pending: bool = false,
+};
+pub const GreasedUpload = struct {
+    token: usize = 0,
+    line_index: u32 = 0,
+    vertex_buffer_id: u32 = 0,
+    index_buffer_id: u32 = 0,
+    vert_count: usize = 0,
+    index_count: usize = 0,
+    vert_lo: usize = 0,
+    index_lo: usize = 0,
+    full_upload: bool = false,
+};
+pub const PendingMeshUpload = struct {
+    token: usize = 0,
+    uid: u64 = 0,
+    mesh_index: u32 = 0,
+    vert_count: usize = 0,
+    index_count: usize = 0,
+    vert_lo: usize = 0,
+    index_lo: usize = 0,
+    index_type_is_u16: bool = true,
+    dynamic_update: bool = false,
+};
 
 pub const FrameDrawSlot = struct {
     primary: RenderQueues = .{},
@@ -368,6 +469,31 @@ pub const FrameDrawSlot = struct {
     /// Frozen visibility for the slot's physics debug capture (see
     /// `physics_lines`); `reset` clears it alongside the list.
     physics_visible: bool = false,
+    /// Slot-owned dynamic-upload packets (slice 6, see the packet structs
+    /// above): frozen producer-side by `upload_packets.stageUploads`,
+    /// consumed context-side by `upload_packets.flushSlotUploads` on the
+    /// fresh-build path. Descriptors + flattened byte stores; reset retains
+    /// capacity, deinit frees, cpuBytes counts capacities.
+    morph_uploads: std.ArrayListUnmanaged(MorphUpload) = .empty,
+    morph_data: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
+    p_cpu_uploads: std.ArrayListUnmanaged(ParticleCpuUpload) = .empty,
+    p_cpu_data: std.ArrayListUnmanaged(particle_types.ParticleInstanceData) = .empty,
+    p_gpu_uploads: std.ArrayListUnmanaged(ParticleGpuUpload) = .empty,
+    p_gpu_data: std.ArrayListUnmanaged(particle_types.GpuParticleSlot) = .empty,
+    p_compute_uploads: std.ArrayListUnmanaged(ParticleComputeUpload) = .empty,
+    p_compute_data: std.ArrayListUnmanaged(particle_types.GpuParticleSlot) = .empty,
+    trail_uploads: std.ArrayListUnmanaged(TrailUpload) = .empty,
+    trail_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
+    trail_indices: std.ArrayListUnmanaged(u16) = .empty,
+    soft_uploads: std.ArrayListUnmanaged(SoftUpload) = .empty,
+    soft_data: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
+    soft_indices: std.ArrayListUnmanaged(u32) = .empty,
+    greased_uploads: std.ArrayListUnmanaged(GreasedUpload) = .empty,
+    greased_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
+    greased_indices: std.ArrayListUnmanaged(u32) = .empty,
+    pending_uploads: std.ArrayListUnmanaged(PendingMeshUpload) = .empty,
+    pending_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
+    pending_indices: std.ArrayListUnmanaged(u32) = .empty,
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
     /// GpuRetire epoch opened by the prepareFrame that built this slot.
@@ -394,6 +520,26 @@ pub const FrameDrawSlot = struct {
         self.particle_draws.clearRetainingCapacity();
         self.physics_lines.clearRetainingCapacity();
         self.physics_visible = false;
+        self.morph_uploads.clearRetainingCapacity();
+        self.morph_data.clearRetainingCapacity();
+        self.p_cpu_uploads.clearRetainingCapacity();
+        self.p_cpu_data.clearRetainingCapacity();
+        self.p_gpu_uploads.clearRetainingCapacity();
+        self.p_gpu_data.clearRetainingCapacity();
+        self.p_compute_uploads.clearRetainingCapacity();
+        self.p_compute_data.clearRetainingCapacity();
+        self.trail_uploads.clearRetainingCapacity();
+        self.trail_verts.clearRetainingCapacity();
+        self.trail_indices.clearRetainingCapacity();
+        self.soft_uploads.clearRetainingCapacity();
+        self.soft_data.clearRetainingCapacity();
+        self.soft_indices.clearRetainingCapacity();
+        self.greased_uploads.clearRetainingCapacity();
+        self.greased_verts.clearRetainingCapacity();
+        self.greased_indices.clearRetainingCapacity();
+        self.pending_uploads.clearRetainingCapacity();
+        self.pending_verts.clearRetainingCapacity();
+        self.pending_indices.clearRetainingCapacity();
         self.frame_id = 0;
         self.retire_epoch = 0;
     }
@@ -410,6 +556,26 @@ pub const FrameDrawSlot = struct {
         self.ui_indices.deinit(allocator);
         self.particle_draws.deinit(allocator);
         self.physics_lines.deinit(allocator);
+        self.morph_uploads.deinit(allocator);
+        self.morph_data.deinit(allocator);
+        self.p_cpu_uploads.deinit(allocator);
+        self.p_cpu_data.deinit(allocator);
+        self.p_gpu_uploads.deinit(allocator);
+        self.p_gpu_data.deinit(allocator);
+        self.p_compute_uploads.deinit(allocator);
+        self.p_compute_data.deinit(allocator);
+        self.trail_uploads.deinit(allocator);
+        self.trail_verts.deinit(allocator);
+        self.trail_indices.deinit(allocator);
+        self.soft_uploads.deinit(allocator);
+        self.soft_data.deinit(allocator);
+        self.soft_indices.deinit(allocator);
+        self.greased_uploads.deinit(allocator);
+        self.greased_verts.deinit(allocator);
+        self.greased_indices.deinit(allocator);
+        self.pending_uploads.deinit(allocator);
+        self.pending_verts.deinit(allocator);
+        self.pending_indices.deinit(allocator);
     }
 
     /// Retained CPU bytes held by this slot (retained capacities × element
@@ -432,6 +598,26 @@ pub const FrameDrawSlot = struct {
         b += listBytes(self.ui_indices);
         b += listBytes(self.particle_draws);
         b += listBytes(self.physics_lines);
+        b += listBytes(self.morph_uploads);
+        b += listBytes(self.morph_data);
+        b += listBytes(self.p_cpu_uploads);
+        b += listBytes(self.p_cpu_data);
+        b += listBytes(self.p_gpu_uploads);
+        b += listBytes(self.p_gpu_data);
+        b += listBytes(self.p_compute_uploads);
+        b += listBytes(self.p_compute_data);
+        b += listBytes(self.trail_uploads);
+        b += listBytes(self.trail_verts);
+        b += listBytes(self.trail_indices);
+        b += listBytes(self.soft_uploads);
+        b += listBytes(self.soft_data);
+        b += listBytes(self.soft_indices);
+        b += listBytes(self.greased_uploads);
+        b += listBytes(self.greased_verts);
+        b += listBytes(self.greased_indices);
+        b += listBytes(self.pending_uploads);
+        b += listBytes(self.pending_verts);
+        b += listBytes(self.pending_indices);
         return b;
     }
 };

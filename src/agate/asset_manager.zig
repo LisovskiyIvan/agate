@@ -27,7 +27,20 @@
 //!   existing `assets.UploadQueue` (worker decode, context drain) — note its
 //!   `.async_textures` option offloads texture decode, not mesh geometry;
 //!   GPU uploads still run on the context thread.
-//!   No second worker pipeline lives here (see `AssetManager` docs).
+//! - Opt-in async mesh parsing (`addMeshTaskAsync` + `enableMeshAsync`):
+//!   OBJ/STL/PLY file read + parse + CPU geometry build run on a
+//!   `jobs.TaskRunner` worker; `loadStep`/`loadSync` (caller/context thread)
+//!   drain completions without blocking (`loadStep`) and only there append
+//!   to the Scene (`uploadGeometry` + morph-base retain, mirroring
+//!   `appendToScene`) or publish owned `mesh_result`. No second worker
+//!   pipeline: the existing `jobs.TaskRunner` is reused (UploadQueue stays
+//!   the texture route). GLB/GLTF stay sync-only (`addMeshTaskAsync`
+//!   rejects them with `error.UnsupportedMeshFormat`): cgltf parsing plus
+//!   material/texture/sg work is not worker-safe. GPU upload still happens
+//!   on the context thread — async only moves I/O + parse off it.
+//!   `loadStep` polls async completions non-blockingly; `max_tasks` bounds
+//!   submits AND completions drained per call. `loadSync` blocks until every
+//!   async worker result is drained. See `AssetManager` docs.
 //! - Event Callbacks:
 //!   - `onTaskSuccess`, `onTaskError`, `onProgress`, `onFinish`
 //!
@@ -44,6 +57,18 @@
 //!   (freed by `reset`, or moved out via `takeMeshGeometry` and freed with
 //!   the manager's allocator). Reset/cache teardown of GPU textures is
 //!   context-thread only, after prepared frames stop borrowing their handles.
+//! - Async mesh tasks (`is_async`): `name`/`path` stay BORROWED with the same
+//!   lifetime rule. The worker never touches the `AssetTask` or the `Scene`:
+//!   it owns a heap `AsyncMeshJob` (borrowed `path` bytes, manager
+//!   allocator) and publishes owned CPU `GeometryData` into the job. The
+//!   caller thread moves that geometry into `mesh_result` (scene-less) or
+//!   into the Scene (upload + retain, freeing the worker copy) during
+//!   `loadStep`/`loadSync` drain. Unclaimed worker geometry is freed by
+//!   `reset`/`deinit` after joining the worker (release/acquire handshake
+//!   on `done`). The manager allocator must be thread-safe for the async
+//!   path (worker allocates/parses on it). Thread rule: worker = file read
+//!   + parse only (no `sg.*`, no Scene, no callbacks); caller = Scene
+//!   append + callbacks + GPU upload (context thread, still required).
 
 const std = @import("std");
 
@@ -52,12 +77,14 @@ const Mesh = @import("mesh.zig").Mesh;
 const GeometryData = @import("mesh.zig").GeometryData;
 const Vertex = @import("mesh.zig").Vertex;
 const computeTangents = @import("mesh.zig").computeTangents;
+const uploadGeometry = @import("mesh.zig").uploadGeometry;
 const Texture = @import("texture.zig").Texture;
 const SceneLoader = @import("loader/scene_loader.zig").SceneLoader;
 const obj_loader = @import("loader/obj.zig");
 const stl_loader = @import("loader/stl.zig");
 const ply_loader = @import("loader/ply.zig");
 const gpu_thread = @import("gpu_thread.zig");
+const jobs = @import("jobs.zig");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const math = @import("math");
@@ -114,6 +141,20 @@ pub const AssetTask = struct {
     texture_options: Texture.Options = .{},
     custom_run: ?*const fn (*AssetTask, std.mem.Allocator) anyerror!void = null,
     user_ctx: ?*anyopaque = null,
+
+    // Opt-in async mesh parsing (see `addMeshTaskAsync`). False for every
+    // other task type. Async tasks run file read + parse on a
+    // `jobs.TaskRunner` worker and finalize on the caller thread.
+    is_async: bool = false,
+    /// In-flight worker handoff (non-null while `.running` async). Owned by
+    /// the manager: freed on drain (`loadStep`/`loadSync`) or, unclaimed, by
+    /// `reset`/`deinit` after the worker handshake. Never touched by the
+    /// worker's task-state path (the worker only writes the job).
+    async_job: ?*AsyncMeshJob = null,
+    /// Worker thread id that parsed this task (copied on drain; null until
+    /// the first successful or failed drain). Test observable proving the
+    /// parse left the calling thread.
+    async_worker_id: ?std.Thread.Id = null,
 
     // Internal ownership tracking
     owned_text: bool = false,
@@ -351,14 +392,114 @@ fn buildCpuGeometry(
     };
 }
 
+/// Worker-safe mesh kinds for the async path: pure CPU parse with no Scene,
+/// no `sg.*`, no cache. GLB/GLTF are excluded (cgltf + materials/textures +
+/// sg work is not worker-safe) and stay sync-only.
+const AsyncMeshKind = enum { obj, stl, ply };
+
+fn asyncKindForPath(path: []const u8) ?AsyncMeshKind {
+    if (std.mem.endsWith(u8, path, ".obj")) return .obj;
+    if (std.mem.endsWith(u8, path, ".stl")) return .stl;
+    if (std.mem.endsWith(u8, path, ".ply")) return .ply;
+    return null;
+}
+
+/// Parses raw file bytes into owned CPU geometry (worker side). Mirrors the
+/// sync scene-less branch exactly (same loaders, same `buildCpuGeometry`
+/// inputs) so async and sync scene-less results are identical. No Scene, no
+/// `sg.*`, no cache — allocator must be thread-safe.
+fn parseMeshBytesToGeometry(allocator: std.mem.Allocator, kind: AsyncMeshKind, bytes: []const u8) !GeometryData {
+    switch (kind) {
+        .obj => {
+            var data = try obj_loader.parse(allocator, bytes);
+            defer data.deinit(allocator);
+            return buildCpuGeometry(allocator, data.positions, data.normals, data.uvs, null, data.indices);
+        },
+        .stl => {
+            var data = try stl_loader.parse(allocator, bytes);
+            defer data.deinit(allocator);
+            const n = data.vertex_count;
+            const uvs = try allocator.alloc(f32, n * 2);
+            defer allocator.free(uvs);
+            @memset(uvs, 0);
+            return buildCpuGeometry(allocator, data.positions, data.normals, uvs, null, data.indices);
+        },
+        .ply => {
+            var data = try ply_loader.parse(allocator, bytes);
+            defer data.deinit(allocator);
+            return buildCpuGeometry(
+                allocator,
+                data.positions,
+                data.normals,
+                data.uvs,
+                if (data.has_colors) data.colors else null,
+                data.indices,
+            );
+        },
+    }
+}
+
+/// Test-only hold gate: while true, async workers spin after publishing
+/// `started`/`worker_id` and before parsing. Lets a test observe `.running`
+/// deterministically, then release. Never set with a zero-thread (inline)
+/// runner — the posting thread would spin on its own gate.
+pub var async_test_hold: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Heap handoff between the `TaskRunner` worker and the caller thread. The
+/// worker writes `worker_id`, then `started` (release), then parses into
+/// `result`/`err`, then `done` (release). The caller reads `result`/`err`
+/// only after `done == true` (acquire). The worker never touches the
+/// `AssetTask` or the `Scene`; `path` bytes are borrowed from the caller
+/// (same lifetime rule as `AssetTask.path`).
+const AsyncMeshJob = struct {
+    kind: AsyncMeshKind,
+    /// BORROWED path bytes (caller keeps alive until reset/deinit).
+    path: []const u8,
+    allocator: std.mem.Allocator,
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    worker_id: ?std.Thread.Id = null,
+    result: ?GeometryData = null,
+    err: ?anyerror = null,
+};
+
+/// `jobs.TaskRunner` entry: file read + parse + CPU geometry build. No
+/// `sg.*`, no Scene mutation, no callbacks, no task-state writes.
+fn asyncMeshRun(ctx: *anyopaque) void {
+    const job: *AsyncMeshJob = @ptrCast(@alignCast(ctx));
+    job.worker_id = std.Thread.getCurrentId();
+    job.started.store(true, .release);
+    while (async_test_hold.load(.acquire)) jobs.sleepNs(50_000);
+    const bytes = readFileBytesAlloc(job.allocator, job.path) catch |e| {
+        job.err = e;
+        job.done.store(true, .release);
+        return;
+    };
+    defer job.allocator.free(bytes);
+    const geom = parseMeshBytesToGeometry(job.allocator, job.kind, bytes) catch |e| {
+        job.err = e;
+        job.done.store(true, .release);
+        return;
+    };
+    job.result = geom;
+    job.done.store(true, .release);
+}
+
 pub const TaskSuccessFn = *const fn (manager: *AssetManager, task: *AssetTask) void;
 pub const TaskErrorFn = *const fn (manager: *AssetManager, task: *AssetTask, err: anyerror) void;
 pub const ProgressFn = *const fn (manager: *AssetManager, remaining: usize, total: usize, task: *AssetTask) void;
 pub const FinishFn = *const fn (manager: *AssetManager) void;
 
 /// Central asset loading manager: synchronous batch loading with progress,
-/// caching, and stable task pointers. See module docs for the execution /
-/// context-thread contract (sync only; `UploadQueue` is the async route).
+/// caching, and stable task pointers, plus an opt-in async mesh path.
+/// See module docs for the execution / context-thread contract.
+/// (`UploadQueue` stays the texture async route; async mesh reuses the
+/// existing `jobs.TaskRunner` — no second worker pipeline.)
+///
+/// Threading: one caller at a time on `loadStep`/`loadSync`/`reset`/
+/// `deinit` (not internally synchronized). Async workers only touch their
+/// `AsyncMeshJob` (never the task, Scene, `sg.*`, or callbacks); the caller
+/// thread owns every task-state transition, Scene append, and callback.
 pub const AssetManager = struct {
     allocator: std.mem.Allocator,
     /// Individually allocated tasks: returned `*AssetTask` pointers stay
@@ -368,6 +509,11 @@ pub const AssetManager = struct {
     /// call `reset`/`resetAll`/`deinit` (that would free the running task).
     tasks: std.ArrayListUnmanaged(*AssetTask) = .empty,
     cache: AssetCache,
+    /// Lazily created worker pool for `addMeshTaskAsync` tasks (owned iff
+    /// `async_owned`). Kept across `reset` for reuse; joined in `deinit`
+    /// (and `disableMeshAsync`). Null until first async use.
+    async_runner: ?*jobs.TaskRunner = null,
+    async_owned: bool = false,
 
     completed_count: usize = 0,
     failed_count: usize = 0,
@@ -390,12 +536,27 @@ pub const AssetManager = struct {
     pub fn deinit(self: *AssetManager) void {
         self.reset();
         self.cache.deinit();
+        if (self.async_runner) |runner| {
+            if (self.async_owned) runner.deinit();
+            self.async_runner = null;
+            self.async_owned = false;
+        }
     }
 
     /// Clears task queue and frees task-owned data, keeping the cache intact.
     /// Borrowed cache aliases (text/binary/texture) are NOT freed/deinited.
+    /// Async safety: in-flight worker jobs are joined (spin on `done` with a
+    /// short park — workers only parse, so they always finish) and their
+    /// unclaimed geometry freed; the runner itself is kept for reuse
+    /// (joined in `deinit`/`disableMeshAsync`). Caller thread only.
     pub fn reset(self: *AssetManager) void {
         for (self.tasks.items) |task| {
+            if (task.async_job) |job| {
+                while (!job.done.load(.acquire)) jobs.sleepNs(50_000);
+                if (job.result) |*g| g.deinit(self.allocator);
+                self.allocator.destroy(job);
+                task.async_job = null;
+            }
             if (task.owned_text and task.text_result != null) {
                 self.allocator.free(task.text_result.?);
             }
@@ -471,6 +632,164 @@ pub const AssetManager = struct {
         };
         try self.tasks.append(self.allocator, task);
         return task;
+    }
+
+    /// Opt-in async mesh task: OBJ/STL/PLY file read + parse + CPU geometry
+    /// build run on a `jobs.TaskRunner` worker; Scene append (or owned
+    /// `mesh_result` publish) happens on the caller thread during
+    /// `loadStep`/`loadSync` drain. GLB/GLTF and unknown extensions are
+    /// rejected here with `error.UnsupportedMeshFormat` — they stay
+    /// sync-only via `addMeshTask` (cgltf + materials/textures + `sg.*`
+    /// work is not worker-safe). The runner is created lazily (1 worker)
+    /// when the first async task submits; call `enableMeshAsync` first to
+    /// pick the thread count. Nothing runs until `loadStep`/`loadSync`
+    /// (same as sync tasks). Requires a thread-safe manager allocator.
+    pub fn addMeshTaskAsync(self: *AssetManager, name: []const u8, path: []const u8, scene: ?*Scene) !*AssetTask {
+        if (asyncKindForPath(path) == null) return error.UnsupportedMeshFormat;
+        const task = try self.allocator.create(AssetTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .name = name,
+            .path = path,
+            .task_type = .mesh,
+            .scene = scene,
+            .is_async = true,
+        };
+        try self.tasks.append(self.allocator, task);
+        return task;
+    }
+
+    /// Creates the async worker pool explicitly (idempotent). Without this,
+    /// the first async submit lazily creates 1 worker. `thread_count == 0`
+    /// creates an inline runner (tasks run on the posting thread — still
+    /// correct, no parallelism). Caller thread only.
+    pub fn enableMeshAsync(self: *AssetManager, thread_count: usize) !void {
+        if (self.async_runner != null) return;
+        self.async_runner = try jobs.TaskRunner.init(self.allocator, thread_count);
+        self.async_owned = true;
+    }
+
+    /// Joins the async workers and drops the pool; queued/in-flight jobs
+    /// run to completion inside `TaskRunner.deinit` (their results stay
+    /// parked in their jobs for a later `loadStep` drain or `reset` free).
+    /// New async submits lazily recreate the pool. Caller thread only.
+    pub fn disableMeshAsync(self: *AssetManager) void {
+        if (self.async_runner) |runner| {
+            if (self.async_owned) runner.deinit();
+            self.async_runner = null;
+            self.async_owned = false;
+        }
+    }
+
+    fn ensureAsyncRunner(self: *AssetManager) !void {
+        if (self.async_runner != null) return;
+        try self.enableMeshAsync(1);
+    }
+
+    /// Posts a pending async mesh task to the runner (caller thread).
+    /// Sets `.running`; completion (or failure) is published later by
+    /// `drainAsyncMesh` on the caller thread. Never touches the Scene.
+    fn submitAsyncMesh(self: *AssetManager, task: *AssetTask) anyerror!void {
+        const kind = asyncKindForPath(task.path) orelse return error.UnsupportedMeshFormat;
+        try self.ensureAsyncRunner();
+        const job = try self.allocator.create(AsyncMeshJob);
+        job.* = .{
+            .kind = kind,
+            .path = task.path,
+            .allocator = self.allocator,
+        };
+        task.async_job = job;
+        task.state = .running;
+        self.async_runner.?.post(@ptrCast(job), asyncMeshRun);
+    }
+
+    /// Finalizes one worker-finished async task on the caller thread:
+    /// publishes `mesh_result` (scene-less) or appends to the Scene via
+    /// `uploadGeometry` + name dupe + morph-base retain (mirroring
+    /// `appendToScene`; the worker copy is then freed). Failures set
+    /// `error_result` exactly like the sync path. Frees the job.
+    /// Precondition: `job.done.load(.acquire) == true`.
+    fn drainAsyncMesh(self: *AssetManager, task: *AssetTask, job: *AsyncMeshJob) void {
+        task.async_worker_id = job.worker_id;
+        if (job.err) |e| {
+            task.state = .failed;
+            task.error_result = e;
+            self.failed_count += 1;
+            self.allocator.destroy(job);
+            task.async_job = null;
+            if (self.onTaskError) |cb| cb(self, task, e);
+            if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+            return;
+        }
+        var geom = job.result orelse {
+            task.state = .failed;
+            task.error_result = error.AsyncMeshMissingResult;
+            self.failed_count += 1;
+            self.allocator.destroy(job);
+            task.async_job = null;
+            if (self.onTaskError) |cb| cb(self, task, error.AsyncMeshMissingResult);
+            if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+            return;
+        };
+        if (task.scene) |sc| {
+            const owned_name = sc.allocator.dupe(u8, task.name) catch |e| {
+                geom.deinit(self.allocator);
+                task.state = .failed;
+                task.error_result = e;
+                self.failed_count += 1;
+                self.allocator.destroy(job);
+                task.async_job = null;
+                if (self.onTaskError) |cb| cb(self, task, e);
+                if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+                return;
+            };
+            errdefer sc.allocator.free(owned_name);
+            const mesh_obj = uploadGeometry(sc, owned_name, geom) catch |e| {
+                geom.deinit(self.allocator);
+                task.state = .failed;
+                task.error_result = e;
+                self.failed_count += 1;
+                self.allocator.destroy(job);
+                task.async_job = null;
+                if (self.onTaskError) |cb| cb(self, task, e);
+                if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+                return;
+            };
+            mesh_obj.owns_name = true;
+            mesh_obj.retainMorphBase(sc.allocator, geom.vertices) catch |e| {
+                geom.deinit(self.allocator);
+                task.state = .failed;
+                task.error_result = e;
+                self.failed_count += 1;
+                self.allocator.destroy(job);
+                task.async_job = null;
+                if (self.onTaskError) |cb| cb(self, task, e);
+                if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+                return;
+            };
+            task.mesh_count = 1;
+            task.mesh_vertex_count = geom.vertices.len;
+            task.mesh_index_count = geom.indices.len;
+            geom.deinit(self.allocator);
+            task.state = .completed;
+            self.completed_count += 1;
+            self.allocator.destroy(job);
+            task.async_job = null;
+            if (self.onTaskSuccess) |cb| cb(self, task);
+            if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+        } else {
+            task.mesh_result = geom;
+            task.owned_mesh = true;
+            task.mesh_count = 1;
+            task.mesh_vertex_count = geom.vertices.len;
+            task.mesh_index_count = geom.indices.len;
+            task.state = .completed;
+            self.completed_count += 1;
+            self.allocator.destroy(job);
+            task.async_job = null;
+            if (self.onTaskSuccess) |cb| cb(self, task);
+            if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+        }
     }
 
     pub fn addCustomTask(
@@ -670,11 +989,33 @@ pub const AssetManager = struct {
         }
     }
 
-    /// Runs up to `max_tasks` pending tasks (sync; see module docs).
-    /// Callbacks may enqueue via `add*` (pointers stable); they must not
-    /// call `reset`/`resetAll`/`deinit`.
+    /// Runs up to `max_tasks` tasks (sync inline + async submit/drain; see
+    /// module docs). Polls async completions NON-BLOCKINGLY first (each
+    /// drained completion consumes 1 of `max_tasks`), then runs/submits
+    /// pending tasks in order (sync tasks execute inline; async mesh tasks
+    /// post to the runner and go `.running` without firing progress yet —
+    /// progress/success/error for async tasks fire on the later drain, on
+    /// the caller thread). A task never reports success before its result
+    /// is available. Callbacks may enqueue via `add*` (pointers stable);
+    /// they must not call `reset`/`resetAll`/`deinit`.
     pub fn loadStep(self: *AssetManager, max_tasks: usize) bool {
         var executed: usize = 0;
+        // Phase 1: drain worker-finished async tasks (non-blocking poll).
+        // Scan the whole list: submitted tasks sit behind `current_index`.
+        if (executed < max_tasks) {
+            var i: usize = 0;
+            while (i < self.tasks.items.len and executed < max_tasks) {
+                // Re-read per iteration: drain fires callbacks that may
+                // append (pointer array may reallocate; tasks stay stable).
+                const task = self.tasks.items[i];
+                i += 1;
+                const job = task.async_job orelse continue;
+                if (task.state != .running) continue;
+                if (!job.done.load(.acquire)) continue;
+                self.drainAsyncMesh(task, job);
+                executed += 1;
+            }
+        }
         while (self.current_index < self.tasks.items.len and executed < max_tasks) {
             // Re-read the pointer per iteration: callbacks may append (which
             // may reallocate the pointer array) — the task allocations
@@ -683,6 +1024,21 @@ pub const AssetManager = struct {
             self.current_index += 1;
 
             if (task.state != .pending) continue;
+
+            if (task.is_async and task.task_type == .mesh) {
+                if (self.submitAsyncMesh(task)) {
+                    // Submitted: `.running`, no callback yet (fires on drain).
+                    executed += 1;
+                } else |err| {
+                    task.state = .failed;
+                    task.error_result = err;
+                    self.failed_count += 1;
+                    if (self.onTaskError) |cb| cb(self, task, err);
+                    executed += 1;
+                    if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+                }
+                continue;
+            }
 
             task.state = .running;
             if (self.executeTask(task)) {
@@ -709,9 +1065,16 @@ pub const AssetManager = struct {
         return done;
     }
 
-    /// Loads all tasks synchronously to completion.
+    /// Loads all tasks to completion. Sync tasks run inline; async mesh
+    /// tasks BLOCK here until every worker result is drained (short parks
+    /// between non-blocking polls — never a hot spin). Caller/context
+    /// thread: Scene appends and GPU uploads still happen here.
     pub fn loadSync(self: *AssetManager) void {
-        _ = self.loadStep(std.math.maxInt(usize));
+        while (true) {
+            const done = self.loadStep(std.math.maxInt(usize));
+            if (done) return;
+            jobs.sleepNs(1_000_000);
+        }
     }
 };
 
@@ -722,17 +1085,23 @@ test "AssetManager text and binary loading with cache and progress" {
     var mgr = AssetManager.init(allocator);
     defer mgr.deinit();
 
-    // Create scratch files for test
+    // Scratch files live in an isolated per-run directory (unique,
+    // auto-cleaned): fixed CWD-relative names would collide with a
+    // concurrent `zig build test` run of the same suite.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_txt_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_asset_file.txt", .{tmp.sub_path});
+    defer allocator.free(test_txt_path);
+    const test_bin_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_asset_file.bin", .{tmp.sub_path});
+    defer allocator.free(test_bin_path);
+
     const io = std.Io.Threaded.global_single_threaded.io();
-    const test_txt_path = "test_asset_file.txt";
-    const test_bin_path = "test_asset_file.bin";
 
     {
         const f = try std.Io.Dir.cwd().createFile(io, test_txt_path, .{});
         defer f.close(io);
         _ = try f.writePositionalAll(io, "Hello AssetManager", 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, test_txt_path) catch {};
 
     {
         const f = try std.Io.Dir.cwd().createFile(io, test_bin_path, .{});
@@ -740,7 +1109,6 @@ test "AssetManager text and binary loading with cache and progress" {
         const raw_bin = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x42 };
         _ = try f.writePositionalAll(io, &raw_bin, 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, test_bin_path) catch {};
 
     _ = try mgr.addTextFileTask("text_sample", test_txt_path);
     _ = try mgr.addBinaryFileTask("bin_sample", test_bin_path);
@@ -870,13 +1238,15 @@ test "AssetManager task pointers stay stable across growth and callbacks" {
     defer mgr.deinit();
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    const tmp_path = "test_stable_first.txt";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_stable_first.txt", .{tmp.sub_path});
+    defer allocator.free(tmp_path);
     {
         const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
         defer f.close(io);
         _ = try f.writePositionalAll(io, "stable", 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     const first = try mgr.addTextFileTask("first_task", tmp_path);
     _ = try mgr.addCustomTask("filler", struct {
@@ -939,7 +1309,10 @@ test "AssetManager mesh scene-less retains geometry, scene load spawns + cleanup
     const allocator = testing.allocator;
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    const obj_path = "test_mesh_task.obj";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const obj_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_mesh_task.obj", .{tmp.sub_path});
+    defer allocator.free(obj_path);
     const obj_text =
         \\v 0 0 0
         \\v 1 0 0
@@ -951,7 +1324,6 @@ test "AssetManager mesh scene-less retains geometry, scene load spawns + cleanup
         defer f.close(io);
         _ = try f.writePositionalAll(io, obj_text, 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
 
     // Scene-less: retains owned CPU geometry with real vertices/indices.
     {
@@ -1010,22 +1382,24 @@ test "AssetManager mesh failures are explicit, never fake success" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const bad_obj_path = "test_mesh_bad.obj";
+    const bad_obj_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_mesh_bad.obj", .{tmp.sub_path});
+    defer allocator.free(bad_obj_path);
     {
         const f = try std.Io.Dir.cwd().createFile(io, bad_obj_path, .{});
         defer f.close(io);
         _ = try f.writePositionalAll(io, "this is not a mesh {{{ }}}", 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, bad_obj_path) catch {};
 
-    const unsupported_path = "test_mesh_task.xyz";
+    const unsupported_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/test_mesh_task.xyz", .{tmp.sub_path});
+    defer allocator.free(unsupported_path);
     {
         const f = try std.Io.Dir.cwd().createFile(io, unsupported_path, .{});
         defer f.close(io);
         _ = try f.writePositionalAll(io, "junk", 0);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, unsupported_path) catch {};
 
     var mgr = AssetManager.init(allocator);
     defer mgr.deinit();
@@ -1085,4 +1459,120 @@ test "textureHandlesEqual compares GPU identity without touching sg" {
     b.height = 4;
     b.image.id += 1;
     try testing.expect(!textureHandlesEqual(a, b));
+}
+
+test "AssetManager async mesh parses on a worker thread (gated handshake)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const obj_path = "test_async_mesh.obj";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.enableMeshAsync(1);
+
+    const caller_id = std.Thread.getCurrentId();
+    async_test_hold.store(true, .release);
+    defer async_test_hold.store(false, .release);
+    const t = try mgr.addMeshTaskAsync("tri_async", obj_path, null);
+    try testing.expect(t.is_async);
+    try testing.expectEqual(TaskState.pending, t.state);
+
+    // Submit only: must go `.running` without completing (worker is gated).
+    const done_submit = mgr.loadStep(1);
+    try testing.expect(!done_submit);
+    try testing.expectEqual(TaskState.running, t.state);
+    try testing.expect(!t.isSuccess());
+    try testing.expect(t.mesh_result == null);
+
+    // Handshake: wait (bounded) for the worker to start and block in the
+    // gate — proves the parse left the calling thread, with no timing luck.
+    const job = t.async_job.?;
+    var spins: usize = 0;
+    while (!job.started.load(.acquire)) : (spins += 1) {
+        if (spins > 100_000) return error.AsyncWorkerNeverStarted;
+        jobs.sleepNs(50_000);
+    }
+    try testing.expect(job.worker_id.? != caller_id);
+    // Still running while the worker is blocked: no fake success.
+    try testing.expectEqual(TaskState.running, t.state);
+    try testing.expect(!t.isSuccess());
+
+    async_test_hold.store(false, .release);
+    mgr.loadSync();
+
+    try testing.expect(t.isSuccess());
+    try testing.expectEqual(@as(usize, 1), t.mesh_count);
+    try testing.expect(t.owned_mesh);
+    try testing.expectEqual(@as(usize, 3), t.mesh_result.?.vertices.len);
+    try testing.expectEqual(@as(usize, 3), t.mesh_result.?.indices.len);
+    try testing.expectEqual(@as(usize, 3), t.mesh_vertex_count);
+    try testing.expectEqual(@as(usize, 3), t.mesh_index_count);
+    try testing.expect(t.async_worker_id.? != caller_id);
+    try testing.expectEqual(@as(usize, 1), mgr.completed_count);
+    try testing.expectEqual(@as(usize, 0), mgr.failed_count);
+    try testing.expect(mgr.isDone());
+}
+
+test "AssetManager async mesh scene load + failures drain on caller" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const obj_path = "test_async_scene.obj";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.enableMeshAsync(1);
+
+    const testScene = @import("testing.zig").testScene;
+    var scene = testScene(allocator);
+    defer {
+        for (scene.meshes.items) |m| {
+            m.deinit(allocator);
+            allocator.destroy(m);
+        }
+        scene.meshes.deinit(allocator);
+        scene.profiler.deinit();
+    }
+
+    const t = try mgr.addMeshTaskAsync("tri_scene_async", obj_path, &scene);
+    const bad = try mgr.addMeshTaskAsync("missing_async", "no_such_async_file.obj", null);
+    // GLB stays sync-only: rejected at submit time, explicitly.
+    try testing.expectError(error.UnsupportedMeshFormat, mgr.addMeshTaskAsync("glb_async", "x.glb", &scene));
+
+    mgr.loadSync();
+
+    try testing.expect(t.isSuccess());
+    try testing.expectEqual(@as(usize, 1), t.mesh_count);
+    try testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+    try testing.expectEqual(t.mesh_vertex_count, @as(usize, scene.meshes.items[0].vertex_count));
+    try testing.expectEqual(t.mesh_index_count, @as(usize, scene.meshes.items[0].index_count));
+    try testing.expect(t.mesh_result == null);
+    try testing.expect(!t.owned_mesh);
+
+    try testing.expect(bad.isFailed());
+    try testing.expect(bad.error_result != null);
+    try testing.expectEqual(@as(usize, 0), bad.mesh_count);
+    try testing.expect(bad.mesh_result == null);
+    try testing.expect(!bad.owned_mesh);
+    try testing.expectEqual(@as(usize, 1), mgr.completed_count);
+    try testing.expectEqual(@as(usize, 1), mgr.failed_count);
+
+    // Reset frees everything (including any unclaimed worker payload path)
+    // with a clean testing allocator; runner survives for reuse.
+    mgr.reset();
+    try testing.expectEqual(@as(usize, 0), mgr.totalCount());
+    try testing.expect(mgr.async_runner != null);
 }

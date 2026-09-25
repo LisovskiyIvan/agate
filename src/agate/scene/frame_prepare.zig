@@ -132,7 +132,16 @@ pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
     // render(); a standalone flushPendingGpuUploads (quiesced-context
     // completion) has no following render and must commit itself.
     scene.flush_in_prepare = true;
-    scene.flushPendingGpuUploads();
+    if (have_build) {
+        // Slice 6 staged path: upload exclusively from the slot-owned
+        // packets frozen by the producer build — never the live mutable
+        // staging arrays (morph staging, particle instances/slots, trail /
+        // softbody / greased verts, pending-mesh geometry). The fallback
+        // below stays live-read by contract (serialized, no fresh build).
+        @import("upload_packets.zig").flushSlotUploads(scene, back);
+    } else {
+        scene.flushPendingGpuUploads();
+    }
     scene.flush_in_prepare = false;
 
     // Particle prepared frame: capture the retained plain frame here,

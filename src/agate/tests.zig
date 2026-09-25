@@ -240,6 +240,7 @@ test {
     _ = @import("scene/ui_capture.zig");
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
+    _ = @import("scene/upload_packets.zig");
     _ = @import("scene/view_render.zig");
     _ = @import("scene/viewport_clear.zig");
     _ = @import("serialization.zig");

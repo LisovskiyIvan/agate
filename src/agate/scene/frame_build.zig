@@ -5,6 +5,7 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const jobs = @import("../jobs.zig");
 const scene_instance_staging = @import("instance_staging.zig");
+const scene_upload_packets = @import("upload_packets.zig");
 
 /// Shared build core behind `buildPreparedFrame` and `BuildClaim.build`:
 /// the exact historical build body targeted at the claimed `slot` under
@@ -103,6 +104,14 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     // bit-identical, direct layer tests/tooling unaffected).
     scene.particles.stageIntoSlot(scene.allocator, &back.particle_draws);
     scene.physics.stageIntoSlot(scene.allocator, &back.physics_lines, &back.physics_visible);
+    // Slice 6 freeze-then-latch (dynamic-upload packets): freeze every
+    // per-frame GPU staging payload into the claimed slot by value. The
+    // staged prepare (`flushSlotUploads`) uploads THESE copies, so no live
+    // staging bytes drive the upload and a producer mutation between build
+    // and latch cannot tear it (see the module header for the two narrow
+    // under-exclusion exceptions). sg-free (plain copies + handle stamps,
+    // same staged-wins/OOM-skip contract as the slices above).
+    scene_upload_packets.stageUploads(scene, back);
     // Game-side queue/shadow/outline build (sg-free: instances_prepared).
     // The shared builder resets each view queue (including primary's
     // instance_matrices scratch) — but that scratch holds the CPU-staged

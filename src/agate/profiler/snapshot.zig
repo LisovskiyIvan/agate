@@ -463,21 +463,28 @@ test "Profiler memory snapshot and file saving" {
     try std.testing.expectEqual(@as(usize, 1), snap.meshes.len);
     try std.testing.expectEqualStrings("TestCube", snap.meshes[0].name);
 
-    // Test saving reports to temporary path
-    const tmp_base = ".zig-cache/test_profile_out";
+    // Test saving reports into an isolated per-run directory (unique,
+    // auto-cleaned): never the shared build-cache root, so a concurrent
+    // `zig build` or a stale leftover cannot collide with this test.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_base = try std.fmt.allocPrint(ally, ".zig-cache/tmp/{s}/test_profile_out", .{tmp.sub_path});
+    defer ally.free(tmp_base);
     try prof.saveReports(&scene, tmp_base);
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    // Verify files were created
-    const h_file = try std.Io.Dir.cwd().openFile(io, tmp_base ++ ".html", .{});
+    // Verify files were created (cleanup is owned by tmp.cleanup above,
+    // so no explicit deletes: the tree vanishes even on failure).
+    const h_path = try std.fmt.allocPrint(ally, "{s}.html", .{tmp_base});
+    defer ally.free(h_path);
+    const m_path = try std.fmt.allocPrint(ally, "{s}.md", .{tmp_base});
+    defer ally.free(m_path);
+    const j_path = try std.fmt.allocPrint(ally, "{s}.json", .{tmp_base});
+    defer ally.free(j_path);
+    const h_file = try std.Io.Dir.cwd().openFile(io, h_path, .{});
     h_file.close(io);
-    const m_file = try std.Io.Dir.cwd().openFile(io, tmp_base ++ ".md", .{});
+    const m_file = try std.Io.Dir.cwd().openFile(io, m_path, .{});
     m_file.close(io);
-    const j_file = try std.Io.Dir.cwd().openFile(io, tmp_base ++ ".json", .{});
+    const j_file = try std.Io.Dir.cwd().openFile(io, j_path, .{});
     j_file.close(io);
-
-    // Clean up temporary files
-    try std.Io.Dir.cwd().deleteFile(io, tmp_base ++ ".html");
-    try std.Io.Dir.cwd().deleteFile(io, tmp_base ++ ".md");
-    try std.Io.Dir.cwd().deleteFile(io, tmp_base ++ ".json");
 }

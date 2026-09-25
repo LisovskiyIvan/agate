@@ -622,18 +622,25 @@ test "AudioClip MP3 and OGG file decodes match the memory decodes exactly" {
     var ogg_mem = try AudioClip.fromOggMemory(alloc, ogg_bytes);
     defer ogg_mem.deinit(alloc);
 
-    if (cwd.writeFile(tio, .{ .sub_path = "agate_mp3_fixture_test.mp3", .data = mp3_bytes })) {
-        defer cwd.deleteFile(tio, "agate_mp3_fixture_test.mp3") catch {};
-        var mp3_file = try AudioClip.fromMp3File(alloc, "agate_mp3_fixture_test.mp3");
+    // Isolated per-run directory: fixed CWD-relative fixture names would
+    // collide with a concurrent run of the same suite.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mp3_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_mp3_fixture_test.mp3", .{tmp.sub_path});
+    defer alloc.free(mp3_path);
+    const ogg_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_ogg_fixture_test.ogg", .{tmp.sub_path});
+    defer alloc.free(ogg_path);
+
+    if (cwd.writeFile(tio, .{ .sub_path = mp3_path, .data = mp3_bytes })) {
+        var mp3_file = try AudioClip.fromMp3File(alloc, mp3_path);
         defer mp3_file.deinit(alloc);
         try std.testing.expectEqual(mp3_mem.frames, mp3_file.frames);
         try std.testing.expectEqual(mp3_mem.sample_rate, mp3_file.sample_rate);
         try std.testing.expectEqualSlices(f32, mp3_mem.samples, mp3_file.samples);
     } else |_| {}
 
-    if (cwd.writeFile(tio, .{ .sub_path = "agate_ogg_fixture_test.ogg", .data = ogg_bytes })) {
-        defer cwd.deleteFile(tio, "agate_ogg_fixture_test.ogg") catch {};
-        var ogg_file = try AudioClip.fromOggFile(alloc, "agate_ogg_fixture_test.ogg");
+    if (cwd.writeFile(tio, .{ .sub_path = ogg_path, .data = ogg_bytes })) {
+        var ogg_file = try AudioClip.fromOggFile(alloc, ogg_path);
         defer ogg_file.deinit(alloc);
         try std.testing.expectEqual(ogg_mem.frames, ogg_file.frames);
         try std.testing.expectEqual(ogg_mem.sample_rate, ogg_file.sample_rate);
@@ -732,16 +739,24 @@ test "AudioClip fromWavFile streams PCM in chunks" {
 
     // Filesystem round-trip when a writable tmp file is available; otherwise
     // the conversions are verified through the memory path above and below.
-    const tmp_name = "agate_audio_stream_test.wav";
+    // Paths live in an isolated per-run directory so concurrent suite runs
+    // never share fixture names.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_name = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_audio_stream_test.wav", .{tmp.sub_path});
+    defer alloc.free(tmp_name);
+    const trunc_name = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_audio_stream_test_trunc.wav", .{tmp.sub_path});
+    defer alloc.free(trunc_name);
+    const bad_name = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_audio_stream_test_bad.wav", .{tmp.sub_path});
+    defer alloc.free(bad_name);
+    const u8name = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/agate_audio_stream_test_u8.wav", .{tmp.sub_path});
+    defer alloc.free(u8name);
     var from_file: ?AudioClip = null;
     if (cwd.writeFile(tio, .{ .sub_path = tmp_name, .data = wav })) {
-        defer cwd.deleteFile(tio, tmp_name) catch {};
         from_file = try AudioClip.fromWavFile(alloc, tmp_name);
 
         // Truncated file must fail like the memory path.
-        const trunc_name = "agate_audio_stream_test_trunc.wav";
         try cwd.writeFile(tio, .{ .sub_path = trunc_name, .data = wav[0 .. wav.len / 2] });
-        defer cwd.deleteFile(tio, trunc_name) catch {};
         try std.testing.expectError(error.InvalidWav, AudioClip.fromWavFile(alloc, trunc_name));
 
         // Unsupported format must fail like the memory path.
@@ -750,18 +765,14 @@ test "AudioClip fromWavFile streams PCM in chunks" {
         @memset(bad_raw, 0);
         const bad_wav = try buildWav(alloc, true, 1, 3, 44100, 16, bad_raw);
         defer alloc.free(bad_wav);
-        const bad_name = "agate_audio_stream_test_bad.wav";
         try cwd.writeFile(tio, .{ .sub_path = bad_name, .data = bad_wav });
-        defer cwd.deleteFile(tio, bad_name) catch {};
         try std.testing.expectError(error.UnsupportedWavFormat, AudioClip.fromWavFile(alloc, bad_name));
 
         // Data-before-fmt chunk order with an odd-size pad byte.
         const u8raw = [_]u8{ 0, 64, 128, 192, 255 };
         const u8wav = try buildWav(alloc, false, 1, 1, 22050, 8, &u8raw);
         defer alloc.free(u8wav);
-        const u8name = "agate_audio_stream_test_u8.wav";
         try cwd.writeFile(tio, .{ .sub_path = u8name, .data = u8wav });
-        defer cwd.deleteFile(tio, u8name) catch {};
         var u8file = try AudioClip.fromWavFile(alloc, u8name);
         defer u8file.deinit(alloc);
         var u8mem = try AudioClip.fromWavMemory(alloc, u8wav);
