@@ -44,10 +44,14 @@
 //! reads them. Payload reads/writes on distinct slots need no further
 //! locking (single producer; see frame_draws.zig).
 //!
-//! Deferred morph-delta textures (`morph_upload_pending`) stay on the
-//! legacy fallback path and are deliberately NOT frozen (rare,
-//! write-once, GPU-mode only): a staged creation draws the base pose for
-//! one frame while the delta upload retries on the next fallback flush.
+//! Deferred morph-delta textures (`morph_upload_pending`, GPU-mode only)
+//! ride the pending-mesh packet: the producer packs the RGBA32F delta
+//! pixels into `pending_delta_data` at stage time (write-once), the context
+//! creates the delta image + view from those frozen bytes alongside the
+//! base buffers, and the commit installs everything atomically — the mesh
+//! leaves `gpu_pending` fully drawable (no base-pose frame). The legacy
+//! `finishGpuUpload` still owns meshes that never went through a staged
+//! build (no-build fallback path).
 //!
 //! The legacy `flushPendingGpuUploads` stays for the no-build fallback
 //! (serialized by contract) and is never called on the fresh-build path.
@@ -78,6 +82,7 @@ const sg = sokol.gfx;
 const math = @import("math");
 const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
+const morph_gpu = @import("../mesh/morph_gpu.zig");
 
 /// Producer freeze (game side, sg-free). Copies every dirty staging payload
 /// into `slot`; never touches sg.*, never clears live flags, never reads the
@@ -372,11 +377,33 @@ fn stagePendingMeshes(scene: anytype, slot: anytype, allocator: std.mem.Allocato
         // legacy finish attempts creation whenever gpu_pending is set, so
         // the staged flush must observe the same owner instead of skipping
         // it silently.
+        //
+        // GPU-morph meshes additionally freeze their packed RGBA32F delta
+        // pixels (producer-side pack, sg-free) so the context creates the
+        // delta image + view from frozen bytes alongside the buffers —
+        // write-once (the flag is consumed at stage time below), so the
+        // per-frame path stays a pure weights uniform with no base-pose
+        // frame. Any freeze failure below keeps BOTH flags for the next
+        // build (same OOM contract as every other owner).
+        const want_delta = m.morph_upload_pending and m.morph_mode == .gpu and m.morph_targets.len > 0;
+        var delta_pixels: []f32 = &.{};
+        var delta_size: morph_gpu.TextureSize = .{ .width = 0, .height = 0 };
+        if (want_delta) {
+            delta_size = morph_gpu.textureSizeFor(m.morph_base.len);
+            delta_pixels = morph_gpu.packDeltas(allocator, m.morph_targets, m.morph_base.len, delta_size) catch continue;
+        }
+        defer if (delta_pixels.len > 0) allocator.free(delta_pixels);
         const v_lo = slot.pending_verts.items.len;
         if (m.pending_vertices.len > 0) slot.pending_verts.appendSlice(allocator, m.pending_vertices) catch continue;
         const i_lo = slot.pending_indices.items.len;
         if (m.cpu_indices.len > 0) slot.pending_indices.appendSlice(allocator, m.cpu_indices) catch {
             slot.pending_verts.items.len = v_lo;
+            continue;
+        };
+        const d_lo = slot.pending_delta_data.items.len;
+        if (delta_pixels.len > 0) slot.pending_delta_data.appendSlice(allocator, delta_pixels) catch {
+            slot.pending_verts.items.len = v_lo;
+            slot.pending_indices.items.len = i_lo;
             continue;
         };
         slot.pending_uploads.append(allocator, .{
@@ -389,17 +416,27 @@ fn stagePendingMeshes(scene: anytype, slot: anytype, allocator: std.mem.Allocato
             .index_lo = i_lo,
             .index_type_is_u16 = m.index_type == .UINT16,
             .dynamic_update = m.pending_dynamic_update,
+            .morph_delta_pending = want_delta,
+            .delta_lo = d_lo,
+            .delta_count = delta_pixels.len,
+            .delta_width = delta_size.width,
+            .delta_height = delta_size.height,
         }) catch {
             slot.pending_verts.items.len = v_lo;
             slot.pending_indices.items.len = i_lo;
+            slot.pending_delta_data.items.len = d_lo;
             continue;
         };
         // Consumed at stage time (see stageMorphs): the deferred creation
         // will not be attempted again until the commit re-arms it on an
         // undelivered outcome. `pending_dynamic_update` stays live until
         // the commit (which clears it on delivery), so a failed creation
-        // still knows to re-arm `morph_upload_needed`.
+        // still knows to re-arm `morph_upload_needed`. `morph_upload_pending`
+        // is consumed here for the same reason (the delta bytes above are
+        // the frozen request); the commit re-arms it when the delta
+        // texture does not land.
         m.gpu_pending = false;
+        if (want_delta) m.morph_upload_pending = false;
     }
 }
 
@@ -479,6 +516,8 @@ fn resetOutcomes(slot: anytype) void {
         up.delivered = false;
         up.created_vertex_buffer_id = 0;
         up.created_index_buffer_id = 0;
+        up.created_delta_image_id = 0;
+        up.created_delta_view_id = 0;
     }
 }
 
@@ -493,13 +532,14 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
         if (v_end > slot.pending_verts.items.len or i_end > slot.pending_indices.items.len) continue;
         const verts = slot.pending_verts.items[up.vert_lo..v_end];
         const idx32 = slot.pending_indices.items[up.index_lo..i_end];
+        var vbuf: sg.Buffer = .{};
+        var ibuf: sg.Buffer = .{};
         if (up.dynamic_update) {
-            const vbuf = sg.makeBuffer(.{
+            vbuf = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
                 .size = verts.len * @sizeOf(@TypeOf(verts[0])),
             });
             if (vbuf.id == 0) continue;
-            var ibuf: sg.Buffer = .{};
             if (up.index_type_is_u16) {
                 const tmp = scene.allocator.alloc(u16, idx32.len) catch {
                     sg.destroyBuffer(vbuf);
@@ -518,9 +558,8 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             up.created_vertex_buffer_id = vbuf.id;
             up.created_index_buffer_id = ibuf.id;
         } else {
-            const vbuf = sg.makeBuffer(.{ .data = sg.asRange(verts) });
+            vbuf = sg.makeBuffer(.{ .data = sg.asRange(verts) });
             if (vbuf.id == 0) continue;
-            var ibuf: sg.Buffer = .{};
             if (up.index_type_is_u16) {
                 const tmp = scene.allocator.alloc(u16, idx32.len) catch {
                     sg.destroyBuffer(vbuf);
@@ -542,6 +581,43 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
         // Delivered: the commit publishes vertex_count (when live is zero),
         // re-arms morph_upload_needed for dynamic updates, clears
         // pending_dynamic_update, and frees the consumed live arrays.
+        // GPU-morph meshes additionally land their delta texture here, from
+        // the frozen packed bytes (never live morph_targets): any failure
+        // tears the fresh buffers back down inline (context thread, legal)
+        // and records undelivered, so the commit re-arms both flags and the
+        // next build retries the whole finish atomically — the mesh stays
+        // skipped by the queue meanwhile (no base-pose frame, no panic).
+        if (up.morph_delta_pending) {
+            const d_end = up.delta_lo + up.delta_count;
+            const want: usize = @as(usize, up.delta_width) * up.delta_height * 4;
+            if (d_end > slot.pending_delta_data.items.len or up.delta_count != want or want == 0) {
+                sg.destroyBuffer(vbuf);
+                sg.destroyBuffer(ibuf);
+                continue;
+            }
+            var img_desc = sg.ImageDesc{
+                .width = @intCast(up.delta_width),
+                .height = @intCast(up.delta_height),
+                .pixel_format = .RGBA32F,
+            };
+            img_desc.data.mip_levels[0] = sg.asRange(slot.pending_delta_data.items[up.delta_lo..d_end]);
+            const img = sg.makeImage(img_desc);
+            if (img.id == 0) {
+                sg.destroyBuffer(vbuf);
+                sg.destroyBuffer(ibuf);
+                continue;
+            }
+            const view = sg.makeView(.{ .texture = .{ .image = img } });
+            if (view.id == 0) {
+                sg.destroyImage(img);
+                sg.destroyBuffer(vbuf);
+                sg.destroyBuffer(ibuf);
+                continue;
+            }
+            up.created_delta_image_id = img.id;
+            up.created_delta_view_id = view.id;
+            upload_meter.record(up.delta_count * @sizeOf(f32));
+        }
         up.delivered = true;
     }
 }
@@ -1056,6 +1132,7 @@ pub fn restageDroppedSlot(scene: anytype, slot: anytype) void {
     for (slot.pending_uploads.items) |up| {
         const m = commitMeshAt(scene, up.mesh_index, up.token, up.uid) orelse continue;
         m.gpu_pending = true;
+        if (up.morph_delta_pending) m.morph_upload_pending = true;
     }
 }
 
@@ -1498,10 +1575,19 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
+            // Images/views cannot travel through the buffer retire queue
+            // (same defensive-only precedent as installComputeCreated):
+            // the owner is gone, so these (if any) leak — log loudly.
+            if (up.created_delta_image_id != 0 or up.created_delta_view_id != 0) {
+                std.log.err("upload_packets: orphaned morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
+            }
+            up.created_delta_image_id = 0;
+            up.created_delta_view_id = 0;
             continue;
         };
         if (!up.delivered) {
             m.gpu_pending = true;
+            if (up.morph_delta_pending) m.morph_upload_pending = true;
             continue;
         }
         if (up.created_vertex_buffer_id == 0 or up.created_index_buffer_id == 0) {
@@ -1512,7 +1598,10 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
+            up.created_delta_image_id = 0;
+            up.created_delta_view_id = 0;
             m.gpu_pending = true;
+            if (up.morph_delta_pending) m.morph_upload_pending = true;
             continue;
         }
         if (m.vertex_buffer.id != 0 or m.index_buffer.id != 0) {
@@ -1520,7 +1609,25 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
+            up.created_delta_image_id = 0;
+            up.created_delta_view_id = 0;
             m.gpu_pending = true;
+            if (up.morph_delta_pending) m.morph_upload_pending = true;
+            continue;
+        }
+        // Delta texture without handles (should not happen: the flush only
+        // delivers a delta request with a valid image + view): retire the
+        // buffers and re-arm both flags instead of installing a mesh the
+        // queue would panic on (vsUniforms requires the delta view).
+        if (up.morph_delta_pending and (up.created_delta_image_id == 0 or up.created_delta_view_id == 0)) {
+            retireCreated(scene, up.created_vertex_buffer_id);
+            retireCreated(scene, up.created_index_buffer_id);
+            up.created_vertex_buffer_id = 0;
+            up.created_index_buffer_id = 0;
+            up.created_delta_image_id = 0;
+            up.created_delta_view_id = 0;
+            m.gpu_pending = true;
+            m.morph_upload_pending = true;
             continue;
         }
         m.vertex_buffer = .{ .id = up.created_vertex_buffer_id };
@@ -1528,10 +1635,32 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
         up.created_vertex_buffer_id = 0;
         up.created_index_buffer_id = 0;
         if (m.vertex_count == 0 and up.vert_count > 0) m.vertex_count = @intCast(up.vert_count);
-        // Deferred GPU-morph delta textures stay on the legacy fallback
-        // path (see the module header): the base creation above draws the
-        // base pose for one frame. `morph_upload_pending` is untouched
-        // here — the fallback finish owns it.
+        // Staged GPU-morph delta texture (see the module header): installed
+        // atomically with the base buffers above, so the mesh leaves
+        // gpu_pending fully drawable — no base-pose frame, no missing-view
+        // panic. The legacy fallback finish still owns meshes that never
+        // went through a staged build.
+        if (up.morph_delta_pending) {
+            if (m.morph_delta_image.id != 0 or m.morph_delta_view.id != 0) {
+                // Defensive only (in practice only the context creates, so
+                // the live ids are zero here): the live delta texture
+                // already exists, so the mesh is complete — drop the
+                // created pair loudly (no image/view retire queue, same
+                // precedent as installComputeCreated) and finish normally.
+                std.log.err("upload_packets: duplicate morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
+                up.created_delta_image_id = 0;
+                up.created_delta_view_id = 0;
+                m.morph_upload_pending = false;
+            } else {
+                m.morph_delta_image = .{ .id = up.created_delta_image_id };
+                m.morph_delta_view = .{ .id = up.created_delta_view_id };
+                up.created_delta_image_id = 0;
+                up.created_delta_view_id = 0;
+                m.morph_tex_width = up.delta_width;
+                m.morph_tex_height = up.delta_height;
+                m.morph_upload_pending = false;
+            }
+        }
         if (up.dynamic_update) m.morph_upload_needed = true;
         m.pending_dynamic_update = false;
         // The retained CPU mirrors (cpu_positions/cpu_indices) stay — the
@@ -2521,4 +2650,164 @@ test "upload packets: lock-free stress — mutating producer vs unlocked staged 
     try t.expect(mesh.morph_upload_needed);
     try t.expect(ps.instance_dirty);
     try t.expectEqual(@as(usize, 1), slot.morph_uploads.items.len);
+}
+
+test "upload packets: pending gpu-morph freeze packs delta bytes, survives live mutation" {
+    // Write-once GPU-morph creation on the staged path: the producer packs
+    // the RGBA32F delta strip (sg-free) and freezes bytes + dims into the
+    // pending packet, consuming BOTH flags at stage time. Live mutation
+    // after the freeze must not reach the packet.
+    const t = std.testing;
+    const mesh_types = @import("../mesh/types.zig");
+    const mesh_mod = @import("../mesh/mesh.zig");
+    const frame_draws = @import("frame_draws.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var pos = [_][3]f32{ .{ 0.5, 0, 0 }, .{ 0, 0.25, 0 } };
+    var nrm = [_][3]f32{ .{ 0, 0.1, 0 }, .{ 0, 0, 0.2 } };
+    var targets = [_]mesh_types.MorphTarget{.{
+        .position_deltas = &pos,
+        .normal_deltas = &nrm,
+    }};
+    var base = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
+    var pverts = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
+    var cidx = [_]u32{ 0, 1, 2 };
+    var weights = [_]f32{0} ** 1;
+    var mesh = mesh_mod.Mesh{
+        .name = "gpu_morph",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .gpu_pending = true,
+        .pending_vertices = &pverts,
+        .cpu_indices = &cidx,
+        .morph_targets = &targets,
+        .morph_weights = &weights,
+        .morph_base = &base,
+        .morph_mode = .gpu,
+        .morph_upload_pending = true,
+    };
+    _ = mesh.ensureUid();
+    var meshes = [_]*mesh_mod.Mesh{&mesh};
+    const SysType = @import("../particles/system.zig").ParticleSystem;
+    var no_systems: []*SysType = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = meshes[0..], .capacity = 1 },
+        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+    };
+    stageUploads(&fake_scene, &slot);
+    try t.expectEqual(@as(usize, 1), slot.pending_uploads.items.len);
+    const up = slot.pending_uploads.items[0];
+    try t.expect(up.morph_delta_pending);
+    const size = morph_gpu.textureSizeFor(2);
+    try t.expectEqual(size.width, up.delta_width);
+    try t.expectEqual(size.height, up.delta_height);
+    try t.expectEqual(@as(usize, size.width) * size.height * 4, up.delta_count);
+    // Texel layout mirror (texelIndex * 4 f32): vertex 0 / target 0 /
+    // position -> f32 0..3, normal -> 4..7, tangent (absent) -> zeros.
+    const px = slot.pending_delta_data.items[up.delta_lo..][0..12];
+    try t.expectEqual(pos[0], [3]f32{ px[0], px[1], px[2] });
+    try t.expectEqual(@as(f32, 0), px[3]);
+    try t.expectEqual(nrm[0], [3]f32{ px[4], px[5], px[6] });
+    try t.expectEqual([4]f32{ 0, 0, 0, 0 }, [4]f32{ px[8], px[9], px[10], px[11] });
+    // Vertex 1 / target 0 / position texel (1 * 24 + 0) * 4 = f32 96.
+    const v1 = slot.pending_delta_data.items[up.delta_lo..][96..100];
+    try t.expectEqual(pos[1], [3]f32{ v1[0], v1[1], v1[2] });
+    // Both flags consumed at stage time (phase 2 ownership transfer).
+    try t.expect(!mesh.gpu_pending);
+    try t.expect(!mesh.morph_upload_pending);
+
+    // Live mutation after the freeze must not reach the packet.
+    pos[0] = .{ 99, 99, 99 };
+    nrm[1] = .{ 99, 99, 99 };
+    const px2 = slot.pending_delta_data.items[up.delta_lo..][0..12];
+    try t.expectEqual([3]f32{ 0.5, 0, 0 }, [3]f32{ px2[0], px2[1], px2[2] });
+}
+
+test "upload packets: pending delta undelivered re-arms both flags, bytes intact" {
+    // Headless staged cycle: nothing can deliver, so the game-side commit
+    // must re-arm gpu_pending AND morph_upload_pending for retry with the
+    // frozen bytes intact — and a cancelled claim must re-arm both too.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const mesh_types = @import("../mesh/types.zig");
+    const mesh_mod = @import("../mesh/mesh.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var pos = [_][3]f32{ .{ 0.5, 0, 0 }, .{ 0, 0.25, 0 } };
+    var targets = [_]mesh_types.MorphTarget{.{
+        .position_deltas = &pos,
+    }};
+    var base = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
+    var pverts = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
+    var cidx = [_]u32{ 0, 1, 2 };
+    var mesh = mesh_mod.Mesh{
+        .name = "gpu_morph_retry",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .gpu_pending = true,
+        .pending_vertices = &pverts,
+        .cpu_indices = &cidx,
+        .morph_targets = &targets,
+        .morph_base = &base,
+        .morph_mode = .gpu,
+        .morph_upload_pending = true,
+    };
+    _ = mesh.ensureUid();
+    var meshes = [_]*mesh_mod.Mesh{&mesh};
+    const SysType = @import("../particles/system.zig").ParticleSystem;
+    var no_systems: []*SysType = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer retire.deinit(t.allocator);
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = meshes[0..], .capacity = 1 },
+        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+        .gpu_retire = &retire,
+        .flush_in_prepare = true,
+    };
+    stageUploads(&fake_scene, &slot);
+    try t.expectEqual(@as(usize, 1), slot.pending_uploads.items.len);
+    try t.expect(slot.pending_uploads.items[0].morph_delta_pending);
+    try t.expect(!mesh.gpu_pending);
+    try t.expect(!mesh.morph_upload_pending);
+
+    // Headless flush: no context, nothing delivered, no live writes.
+    flushSlotUploads(&fake_scene, &slot);
+    try t.expect(!slot.pending_uploads.items[0].delivered);
+    try t.expect(!mesh.gpu_pending);
+    try t.expect(!mesh.morph_upload_pending);
+
+    // Game-side commit re-arms both flags; frozen bytes stay intact.
+    commitSlotResults(&fake_scene, &slot);
+    try t.expect(mesh.gpu_pending);
+    try t.expect(mesh.morph_upload_pending);
+    const up = slot.pending_uploads.items[0];
+    const px = slot.pending_delta_data.items[up.delta_lo..][0..3];
+    try t.expectEqual(pos[0], [3]f32{ px[0], px[1], px[2] });
+
+    // A cancelled claim re-arms both flags as well (inverse of stage).
+    mesh.gpu_pending = false;
+    mesh.morph_upload_pending = false;
+    restageDroppedSlot(&fake_scene, &slot);
+    try t.expect(mesh.gpu_pending);
+    try t.expect(mesh.morph_upload_pending);
 }

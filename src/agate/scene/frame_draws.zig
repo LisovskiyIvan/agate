@@ -464,6 +464,25 @@ pub const PendingMeshUpload = struct {
     index_lo: usize = 0,
     index_type_is_u16: bool = true,
     dynamic_update: bool = false,
+    /// Frozen GPU-morph delta request (write-once, GPU-mode only): the mesh
+    /// carried `morph_upload_pending` at stage time, so the producer packed
+    /// its RGBA32F delta pixels into `pending_delta_data` below (frozen
+    /// dims + f32 range). The context creates the delta image + view from
+    /// those frozen bytes alongside the vertex/index buffers, and the
+    /// game-side commit installs everything atomically — the per-frame CPU
+    /// blend stays gone on the GPU path with no base-pose frame. False for
+    /// every non-morph and CPU-morph mesh (no bytes frozen, legacy paths
+    /// untouched).
+    morph_delta_pending: bool = false,
+    delta_lo: usize = 0,
+    delta_count: usize = 0,
+    delta_width: u32 = 0,
+    delta_height: u32 = 0,
+    /// Deferred-creation outcomes for the delta texture (context-written,
+    /// see ParticleCpuUpload): installed by the game-side commit over zero
+    /// live handles together with the buffers above.
+    created_delta_image_id: u32 = 0,
+    created_delta_view_id: u32 = 0,
     /// Deferred-creation outcomes (context-written, see ParticleCpuUpload).
     created_vertex_buffer_id: u32 = 0,
     created_index_buffer_id: u32 = 0,
@@ -596,6 +615,11 @@ pub const FrameDrawSlot = struct {
     pending_uploads: std.ArrayListUnmanaged(PendingMeshUpload) = .empty,
     pending_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
     pending_indices: std.ArrayListUnmanaged(u32) = .empty,
+    /// Frozen GPU-morph delta pixels (slice 6, PendingMeshUpload delta
+    /// fields): packed RGBA32F texels (4 f32 per texel, see
+    /// mesh/morph_gpu.zig) for pending GPU-morph meshes only. Same
+    /// freeze-then-latch contract as every other byte store here.
+    pending_delta_data: std.ArrayListUnmanaged(f32) = .empty,
     /// Slot-owned frozen host bytes (lock-free prepare host pipe): the
     /// producer (`BuildClaim.stageHostBytes`) copies small host-owned
     /// payloads here (picked-name bytes, memory-summary tallies) while it
@@ -651,6 +675,7 @@ pub const FrameDrawSlot = struct {
         self.pending_uploads.clearRetainingCapacity();
         self.pending_verts.clearRetainingCapacity();
         self.pending_indices.clearRetainingCapacity();
+        self.pending_delta_data.clearRetainingCapacity();
         self.host_bytes.clearRetainingCapacity();
         self.frame_id = 0;
         self.retire_epoch = 0;
@@ -688,6 +713,7 @@ pub const FrameDrawSlot = struct {
         self.pending_uploads.deinit(allocator);
         self.pending_verts.deinit(allocator);
         self.pending_indices.deinit(allocator);
+        self.pending_delta_data.deinit(allocator);
         self.host_bytes.deinit(allocator);
     }
 
@@ -731,6 +757,7 @@ pub const FrameDrawSlot = struct {
         b += listBytes(self.pending_uploads);
         b += listBytes(self.pending_verts);
         b += listBytes(self.pending_indices);
+        b += listBytes(self.pending_delta_data);
         b += listBytes(self.host_bytes);
         return b;
     }

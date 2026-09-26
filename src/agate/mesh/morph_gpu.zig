@@ -186,6 +186,18 @@ pub fn vsUniforms(mesh: *const Mesh) VsUniforms {
     };
 }
 
+/// Backend capability gate for GPU morph blending (compute-style explicit
+/// check, no silent fallback): true only with a live sg context whose
+/// backend reports RGBA32F sample support. The morph shaders sample the
+/// delta strip with NEAREST through an `unfilterable_float` /
+/// `nonfiltering` pair (the ozz-skin precedent in sokol's docs), so only
+/// the sample bit gates — filtering is never required. Headless (unit
+/// tests, id == 0) reports false.
+pub fn supported() bool {
+    if (!sg.isvalid()) return false;
+    return sg.queryPixelformat(.RGBA32F).sample;
+}
+
 /// Packs the mesh's morph targets into an RGBA32F image and stores the
 /// resulting view on the mesh (replacing any previous delta texture).
 /// Requires RGBA32F support; failure propagates loudly (no silent CPU
@@ -229,4 +241,10 @@ fn destroyDeltaResources(mesh: *Mesh) void {
     mesh.morph_delta_view = .{};
     mesh.morph_tex_width = 0;
     mesh.morph_tex_height = 0;
+}
+
+test "supported reports false without an sg context" {
+    // Headless unit-test environment has no sokol context: the capability
+    // gate must fail closed (never claim RGBA32F support it cannot verify).
+    try std.testing.expect(!supported());
 }
