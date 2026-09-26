@@ -1114,3 +1114,198 @@ test "Truncated bone tracks fall back to bind pose in skeleton blending" {
     try std.testing.expectApproxEqAbs(q1.z, skel.bones[0].local_rotation.z, 1e-6);
     try std.testing.expectApproxEqAbs(q1.w, skel.bones[0].local_rotation.w, 1e-6);
 }
+
+// One track's heap buffers (times + outputs); frees times when outputs fails.
+fn invAllocTrack(allocator: std.mem.Allocator, n_out: usize) !struct { t: []f32, o: []f32 } {
+    const t = try allocator.alloc(f32, 2);
+    errdefer allocator.free(t);
+    const o = try allocator.alloc(f32, n_out);
+    return .{ .t = t, .o = o };
+}
+
+// One bone clip driving every bone (translation + rotation, 2 linear keys).
+// Buffers are per-channel heap so AnimationGroup.deinit owns them.
+fn invMakeBoneClip(allocator: std.mem.Allocator, skel: *Skeleton, seed: f32, weight: f32, additive: bool) !*AnimationGroup {
+    const n_bones = skel.bones.len;
+    const channels = try allocator.alloc(AnimationChannel, n_bones * 2);
+    var filled: usize = 0;
+    errdefer {
+        for (channels[0..filled]) |ch| {
+            allocator.free(ch.sampler.timestamps);
+            allocator.free(ch.sampler.outputs);
+        }
+        allocator.free(channels);
+    }
+    for (0..n_bones) |b| {
+        const fb: f32 = @floatFromInt(b);
+        const tr = try invAllocTrack(allocator, 6);
+        tr.t[0] = 0.0;
+        tr.t[1] = 1.0;
+        tr.o[0] = fb + seed;
+        tr.o[1] = seed;
+        tr.o[2] = fb * seed;
+        tr.o[3] = fb + seed + 1.0;
+        tr.o[4] = seed + 1.0;
+        tr.o[5] = fb * seed + 1.0;
+        const rr = try invAllocTrack(allocator, 8);
+        rr.t[0] = 0.0;
+        rr.t[1] = 1.0;
+        const q = Quat.fromEulerDeg(Vec3.new(seed * 10.0 + fb * 5.0, seed * 3.0, 0.0));
+        rr.o[0] = 0.0;
+        rr.o[1] = 0.0;
+        rr.o[2] = 0.0;
+        rr.o[3] = 1.0;
+        rr.o[4] = q.x;
+        rr.o[5] = q.y;
+        rr.o[6] = q.z;
+        rr.o[7] = q.w;
+        channels[b * 2 + 0] = .{ .bone_index = b, .target_path = .translation, .sampler = .{ .timestamps = tr.t, .outputs = tr.o, .interpolation = .linear } };
+        channels[b * 2 + 1] = .{ .bone_index = b, .target_path = .rotation, .sampler = .{ .timestamps = rr.t, .outputs = rr.o, .interpolation = .linear } };
+        filled += 2;
+    }
+    const ag = try AnimationGroup.init(allocator, "inv_clip", channels, 1.0);
+    ag.skeleton = skel;
+    ag.play(true);
+    ag.setWeight(weight);
+    ag.setAdditive(additive);
+    return ag;
+}
+
+const InvRig = struct {
+    skels: []*Skeleton,
+    groups: std.ArrayListUnmanaged(*AnimationGroup),
+    nodes: [8]TestNode,
+
+    fn deinit(r: *InvRig, allocator: std.mem.Allocator) void {
+        for (r.groups.items) |ag| ag.deinit();
+        r.groups.deinit(allocator);
+        for (r.skels) |sk| sk.deinit();
+        allocator.free(r.skels);
+    }
+};
+
+// 8 skeletons x 4 bones covering every eval path: fast path (0,1),
+// two-clip blend (2,3), base + additive (4), fast path WITH node channels
+// (5: serial-exclusion path), blend WITH node channels (6), inactive (7).
+//
+// `out` must stay at a stable address for the rig's lifetime: node targets
+// hold raw pointers into out.nodes (same discipline as Mesh bindings).
+fn invBuildRig(allocator: std.mem.Allocator, out: *InvRig) !void {
+    out.* = InvRig{
+        .skels = try allocator.alloc(*Skeleton, 8),
+        .groups = .empty,
+        .nodes = [_]TestNode{.{}} ** 8,
+    };
+    errdefer allocator.free(out.skels);
+    var built_skel: usize = 0;
+    errdefer {
+        for (out.groups.items) |ag| ag.deinit();
+        out.groups.deinit(allocator);
+        for (out.skels[0..built_skel]) |sk| sk.deinit();
+    }
+    for (0..8) |s| {
+        const skel = try Skeleton.init(allocator, 4);
+        out.skels[s] = skel;
+        built_skel += 1;
+        for (0..4) |b| {
+            const fb: f32 = @floatFromInt(b);
+            skel.bones[b].bind_position = Vec3.new(fb, @as(f32, @floatFromInt(s)), 0);
+            skel.bones[b].bind_rotation = Quat.identity;
+            skel.bones[b].bind_scale = Vec3.one;
+            if (b > 0) skel.bones[b].parent_index = b - 1;
+        }
+        skel.resetToBindPose();
+        const fs: f32 = @floatFromInt(s);
+        switch (s) {
+            0, 1 => {
+                try out.groups.append(allocator, try invMakeBoneClip(allocator, skel, fs, 1.0, false));
+            },
+            2, 3 => {
+                try out.groups.append(allocator, try invMakeBoneClip(allocator, skel, fs, 0.5, false));
+                try out.groups.append(allocator, try invMakeBoneClip(allocator, skel, fs + 10.0, 0.5, false));
+            },
+            4 => {
+                try out.groups.append(allocator, try invMakeBoneClip(allocator, skel, fs, 0.6, false));
+                try out.groups.append(allocator, try invMakeBoneClip(allocator, skel, fs + 20.0, 0.4, true));
+            },
+            5 => {
+                const ag = try invMakeBoneClip(allocator, skel, fs, 1.0, false);
+                try out.groups.append(allocator, ag);
+                const target = try ag.bindNodeTarget(&out.nodes[s].position, &out.nodes[s].rotation, &out.nodes[s].scaling, false);
+                const tr = try invAllocTrack(allocator, 6);
+                tr.t[0] = 0.0;
+                tr.t[1] = 1.0;
+                tr.o[0] = 0.0;
+                tr.o[1] = 0.0;
+                tr.o[2] = 0.0;
+                tr.o[3] = 5.0;
+                tr.o[4] = 0.0;
+                tr.o[5] = 0.0;
+                try ag.addNodeChannel(.{ .target = target, .target_path = .translation, .sampler = .{ .timestamps = tr.t, .outputs = tr.o, .interpolation = .linear } });
+            },
+            6 => {
+                const ag_a = try invMakeBoneClip(allocator, skel, fs, 0.5, false);
+                try out.groups.append(allocator, ag_a);
+                const ag_b = try invMakeBoneClip(allocator, skel, fs + 30.0, 0.5, false);
+                try out.groups.append(allocator, ag_b);
+                const target = try ag_b.bindNodeTarget(&out.nodes[s].position, &out.nodes[s].rotation, &out.nodes[s].scaling, false);
+                const tr = try invAllocTrack(allocator, 6);
+                tr.t[0] = 0.0;
+                tr.t[1] = 1.0;
+                tr.o[0] = 0.0;
+                tr.o[1] = 0.0;
+                tr.o[2] = 0.0;
+                tr.o[3] = 0.0;
+                tr.o[4] = 7.0;
+                tr.o[5] = 0.0;
+                try ag_b.addNodeChannel(.{ .target = target, .target_path = .translation, .sampler = .{ .timestamps = tr.t, .outputs = tr.o, .interpolation = .linear } });
+            },
+            else => {},
+        }
+    }
+}
+
+test "updateAnimations serial vs pool is bit-identical (node writers stay serial)" {
+    const jobs = @import("../jobs.zig");
+    const runtime = @import("../scene/animation_runtime.zig");
+    const allocator = std.testing.allocator;
+
+    // The rig (8 skeletons) must clear the parallel threshold.
+    try std.testing.expect(runtime.min_skeletons_for_workers <= 8);
+
+    var serial: InvRig = undefined;
+    try invBuildRig(allocator, &serial);
+    defer serial.deinit(allocator);
+    var parallel: InvRig = undefined;
+    try invBuildRig(allocator, &parallel);
+    defer parallel.deinit(allocator);
+
+    const pool = try jobs.Pool.init(allocator, 2);
+    defer pool.deinit();
+
+    // Identical tick sequences from identical start states; the only
+    // difference is the execution path (null global = inline, pool = forkJoin).
+    for (0..3) |_| runtime.updateAnimations(serial.groups.items, serial.skels, &.{}, 1.0 / 60.0);
+    jobs.global = pool;
+    defer jobs.global = null;
+    for (0..3) |_| runtime.updateAnimations(parallel.groups.items, parallel.skels, &.{}, 1.0 / 60.0);
+
+    for (serial.skels, parallel.skels, 0..) |sk_s, sk_p, i| {
+        for (sk_s.bones, sk_p.bones) |b_s, b_p| {
+            try std.testing.expectEqual(b_s.local_position, b_p.local_position);
+            try std.testing.expectEqual(b_s.local_rotation, b_p.local_rotation);
+            try std.testing.expectEqual(b_s.local_scale, b_p.local_scale);
+            try std.testing.expectEqual(b_s.model_matrix, b_p.model_matrix);
+        }
+        for (sk_s.skin_matrices, sk_p.skin_matrices) |m_s, m_p| {
+            try std.testing.expectEqual(m_s, m_p);
+        }
+        try std.testing.expectEqual(sk_s.render_slot.load(.monotonic), sk_p.render_slot.load(.monotonic));
+        // Node targets bound by the exclusion-path skeletons (5, 6) must
+        // match too: update() wrote them serially on both paths, and the
+        // parallel path correctly skipped the duplicate re-apply.
+        try std.testing.expectEqual(serial.nodes[i].position, parallel.nodes[i].position);
+        try std.testing.expectEqual(serial.nodes[i].rotation, parallel.nodes[i].rotation);
+        try std.testing.expectEqual(serial.nodes[i].scaling, parallel.nodes[i].scaling);
+    }
+}

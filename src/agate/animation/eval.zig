@@ -6,11 +6,36 @@ const Skeleton = @import("skeleton.zig").Skeleton;
 const AnimationGroup = @import("group.zig").AnimationGroup;
 
 pub fn evaluateSkeleton(skel: *Skeleton, active_base: []const *AnimationGroup, active_additive: []const *AnimationGroup) void {
+    evaluateSkeletonInner(skel, active_base, active_additive, false);
+}
+
+/// Parallel-safe evaluation: bit-identical bone results to
+/// evaluateSkeleton, but never touches node/morph targets. The serial
+/// update() pass already applied every playing group's node tracks at the
+/// same current_time/weight, so the fast-path node re-apply inside
+/// applyAtTime would only rewrite identical values — skipping it keeps mesh
+/// state identical while removing the one cross-skeleton shared write
+/// (two groups can bind the same mesh transform, where "last group wins"
+/// ordering would otherwise become schedule-dependent).
+///
+/// Precondition: no concurrent update() on the same groups (times/weights
+/// are read but never written here). Skeletons whose active groups own
+/// node channels must use evaluateSkeleton on the serial path instead —
+/// see scene/animation_runtime.zig.
+pub fn evaluateSkeletonPoseOnly(skel: *Skeleton, active_base: []const *AnimationGroup, active_additive: []const *AnimationGroup) void {
+    evaluateSkeletonInner(skel, active_base, active_additive, true);
+}
+
+fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, active_additive: []const *AnimationGroup, comptime pose_only: bool) void {
     if (active_base.len == 0 and active_additive.len == 0) return;
 
     // Fast path: exactly 1 active base clip with full weight and no additive layers
     if (active_base.len == 1 and active_additive.len == 0 and active_base[0].weight >= 0.999) {
-        active_base[0].applyAtTime(active_base[0].current_time);
+        if (pose_only) {
+            active_base[0].applySkeletonAtTime(active_base[0].current_time);
+        } else {
+            active_base[0].applyAtTime(active_base[0].current_time);
+        }
         return;
     }
 

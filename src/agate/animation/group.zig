@@ -530,6 +530,15 @@ pub const AnimationGroup = struct {
     }
 
     pub fn applyAtTime(self: *AnimationGroup, time: f32) void {
+        self.applySkeletonAtTime(time);
+        self.applyNodesAtTime(time);
+    }
+
+    /// Skeleton-pose half of applyAtTime: writes bone local TRS from the
+    /// group's skeleton channels and recomputes model/skin matrices. Never
+    /// touches node/morph targets, so calls for distinct skeletons are
+    /// index-disjoint (see evaluateSkeletonPoseOnly in eval.zig).
+    pub fn applySkeletonAtTime(self: *AnimationGroup, time: f32) void {
         if (self.skeleton) |skel| {
             for (self.channels) |ch| {
                 if (ch.bone_index >= skel.bones.len) continue;
@@ -547,8 +556,6 @@ pub const AnimationGroup = struct {
 
             skel.update();
         }
-
-        self.applyNodesAtTime(time);
     }
 
     /// Node counterpart of sampleBoneAtTime: samples every channel driving
