@@ -28,6 +28,7 @@
 //! block-scoped import that exists only in test builds.
 const core = @import("profiler/core.zig");
 const types = @import("profiler/types.zig");
+const report_queue = @import("profiler/report_queue.zig");
 
 // Profiler type (lives in profiler/core.zig).
 pub const Profiler = core.Profiler;
@@ -44,3 +45,9 @@ pub const DiagnosticSeverity = types.DiagnosticSeverity;
 pub const DiagnosticFinding = types.DiagnosticFinding;
 pub const PhaseCulprit = types.PhaseCulprit;
 pub const dominantPhase = types.dominantPhase;
+
+// Async report file writes over `Scene.io_runner` (see report_queue.zig):
+// the enqueue-only half of the lock-free profiler window.
+pub const ReportWriteTask = report_queue.ReportWriteTask;
+pub const ReportFiles = core.Profiler.ReportFiles;
+pub const ReportBundle = core.Profiler.ReportBundle;

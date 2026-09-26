@@ -26,6 +26,8 @@ const recording = @import("recording.zig");
 const snapshot = @import("snapshot.zig");
 const summary_mod = @import("summary.zig");
 const diagnostics = @import("diagnostics.zig");
+const report_queue = @import("report_queue.zig");
+const jobs = @import("../jobs.zig");
 const stats_mod = @import("../scene/stats.zig");
 const scene_mod = @import("../scene.zig");
 
@@ -204,23 +206,121 @@ pub const Profiler = struct {
     }
 
     /// Saves all reports (HTML, Markdown, and Chrome Trace JSON) to `<base_path>.html`,
-    /// `<base_path>.md`, and `<base_path>.json`.
+    /// `<base_path>.md`, and `<base_path>.json`. Synchronous: the caller
+    /// holds whatever exclusion the capture needs (or none, when the
+    /// registries are quiesced); file IO happens inline before return.
     pub fn saveReports(self: *const Profiler, scene: ?*const Scene, base_path: []const u8) !void {
         if (scene) |sc| {
             var mut_prof = @constCast(self);
             _ = try mut_prof.captureMemorySnapshot(sc);
         }
+        var bundle = try self.generateReportsAlloc(self.allocator);
+        defer bundle.deinit(self.allocator);
+        const io = std.Io.Threaded.global_single_threaded.io();
         const html_path = try std.fmt.allocPrint(self.allocator, "{s}.html", .{base_path});
         defer self.allocator.free(html_path);
-        try self.saveReportHtml(null, html_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = html_path, .data = bundle.html });
 
         const md_path = try std.fmt.allocPrint(self.allocator, "{s}.md", .{base_path});
         defer self.allocator.free(md_path);
-        try self.saveReportMd(null, md_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = md_path, .data = bundle.md });
 
         const json_path = try std.fmt.allocPrint(self.allocator, "{s}.json", .{base_path});
         defer self.allocator.free(json_path);
-        try self.saveTraceJson(json_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = bundle.json });
+    }
+
+    /// Owned encoded reports (HTML + Markdown + Chrome-trace JSON).
+    /// Produced by `generateReportsAlloc`; each field moves into its
+    /// `ReportWriteTask` on the async path, or is written + freed inline on
+    /// the sync path above.
+    pub const ReportBundle = struct {
+        html: []u8 = &.{},
+        md: []u8 = &.{},
+        json: []u8 = &.{},
+
+        pub fn deinit(self: *ReportBundle, allocator: std.mem.Allocator) void {
+            if (self.html.len > 0) allocator.free(self.html);
+            if (self.md.len > 0) allocator.free(self.md);
+            if (self.json.len > 0) allocator.free(self.json);
+            self.* = .{};
+        }
+    };
+
+    /// Which report files an async save covers. The F8 full-save selects
+    /// all; the HTML-only / trace-only buttons select one.
+    pub const ReportFiles = struct {
+        html: bool = true,
+        md: bool = true,
+        json: bool = true,
+
+        pub const all: ReportFiles = .{};
+        pub const html_only: ReportFiles = .{ .md = false, .json = false };
+        pub const trace_only: ReportFiles = .{ .html = false, .md = false };
+    };
+
+    /// Encodes all reports over already-frozen state (recorded frames plus
+    /// the last captured memory snapshot). No live-registry reads, no
+    /// capture, no file IO — safe OFF the phase lock: the game thread never
+    /// touches the profiler, and only the context thread mutates it,
+    /// sequentially. The caller captures first (under exclusion when live)
+    /// and enqueues or writes the bundle afterwards.
+    pub fn generateReportsAlloc(self: *const Profiler, allocator: std.mem.Allocator) !ReportBundle {
+        const memory_ptr: ?*const MemorySnapshot = if (self.last_memory_snapshot) |*s| s else null;
+        const summary = self.summarize();
+        const findings = try self.analyze(memory_ptr, allocator);
+        defer {
+            for (findings) |*f| @constCast(f).deinit(allocator);
+            allocator.free(findings);
+        }
+        const html = try report.generateReportHtml(self.frames.items, summary, findings, memory_ptr, allocator);
+        errdefer allocator.free(html);
+        const md = try report.generateReportMd(self.frames.items, summary, findings, memory_ptr, allocator);
+        errdefer allocator.free(md);
+        const json = try report.generateTraceJson(self.frames.items, allocator);
+        errdefer allocator.free(json);
+        return .{ .html = html, .md = md, .json = json };
+    }
+
+    /// Async report save: encodes (see `generateReportsAlloc`) and enqueues
+    /// one `ReportWriteTask` per selected file on `runner` (in practice
+    /// `Scene.io_runner`). Returns after the enqueue — no file IO happens
+    /// before return, so a bounded exclusion window may call this and
+    /// release the mutex immediately. Each `out` slot holds the posted task
+    /// (null when its file was not selected); the caller polls `isDone()`
+    /// and `deinit()`s every non-null slot. On error the not-yet-enqueued
+    /// bytes are freed here; already-posted tasks complete independently
+    /// and stay pollable through the filled `out` slots.
+    pub fn enqueueReportWrites(
+        self: *const Profiler,
+        runner: *jobs.TaskRunner,
+        base_path: []const u8,
+        files: ReportFiles,
+        out: *[3]?*report_queue.ReportWriteTask,
+    ) !void {
+        out.* = .{ null, null, null };
+        const bundle = try self.generateReportsAlloc(self.allocator);
+        // Each bundle field moves into `datas` and then into its task; the
+        // bundle struct itself is never deinited after the move (that would
+        // double-free). The errdefer below frees whatever has not moved yet.
+        var datas = [_][]u8{ bundle.html, bundle.md, bundle.json };
+        errdefer {
+            for (datas) |d| if (d.len > 0) self.allocator.free(d);
+        }
+        const want = [_]bool{ files.html, files.md, files.json };
+        const exts = [_][]const u8{ ".html", ".md", ".json" };
+        for (0..3) |i| {
+            if (!want[i]) {
+                if (datas[i].len > 0) self.allocator.free(datas[i]);
+                datas[i] = &.{};
+                continue;
+            }
+            const path = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base_path, exts[i] });
+            errdefer self.allocator.free(path);
+            out[i] = try report_queue.enqueueReportWrite(self.allocator, runner, path, datas[i]);
+            self.allocator.free(path); // enqueue dupes the path
+            datas[i] = &.{};
+        }
     }
 };
 
@@ -307,4 +407,112 @@ test "Profiler start/stop never moves app clock backward for concurrent readers"
     ctx.stop.store(true, .release);
     reader.join();
     try std.testing.expectEqual(@as(u32, 0), ctx.backward.load(.acquire));
+}
+
+test "profiler async enqueue matches sync output; window hold excludes file IO" {
+    // Equivalence: the async path (capture + encode + enqueue to io_runner)
+    // must produce byte-identical files to the synchronous saveReports.
+    // Measurement (smoke-grade, machine noise applies): the old window held
+    // the mutex across capture + encode + FILE IO; the new window holds it
+    // across capture only (encode is context-owned, IO runs on io_runner).
+    // Both timings print below; the reported gate numbers come from here.
+    const Mesh = @import("../mesh.zig").Mesh;
+    sokol.time.setup();
+    const ally = std.testing.allocator;
+    const testScene = @import("../testing.zig").testScene;
+    var scene = testScene(ally);
+    defer {
+        @import("../scene/content.zig").deinitMeshes(ally, &scene.meshes);
+        scene.profiler.deinit();
+    }
+
+    const m = try ally.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("BenchCube");
+    m.vertex_count = 24;
+    m.index_count = 36;
+    m.index_type = .UINT16;
+    try scene.meshes.append(ally, m);
+
+    scene.profiler.start();
+    var stats = SceneStats{};
+    stats.draw_calls = 128;
+    stats.triangles = 4096;
+    var f: u64 = 0;
+    while (f < 300) : (f += 1) {
+        stats.update_ms = 1.0;
+        stats.prepare_ms = 0.5;
+        stats.main_ms = 2.0;
+        scene.profiler.recordFrame(f, &stats);
+    }
+    scene.profiler.stop();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sync_base = try std.fmt.allocPrint(ally, ".zig-cache/tmp/{s}/rep_sync", .{tmp.sub_path});
+    defer ally.free(sync_base);
+    const async_base = try std.fmt.allocPrint(ally, ".zig-cache/tmp/{s}/rep_async", .{tmp.sub_path});
+    defer ally.free(async_base);
+
+    // BEFORE shape: capture + encode + file IO, all inline (what the old
+    // bounded window held the mutex across).
+    const t_sync0 = jobs.monoNs();
+    try scene.profiler.saveReports(&scene, sync_base);
+    const sync_ns = jobs.monoNs() -% t_sync0;
+
+    // AFTER shape: capture (the only part left under the window) ...
+    const t_cap0 = jobs.monoNs();
+    _ = try scene.profiler.captureMemorySnapshot(&scene);
+    const cap_ns = jobs.monoNs() -% t_cap0;
+    // ... then encode + enqueue with NO lock held and NO file IO inline.
+    const runner = try jobs.TaskRunner.init(ally, 1);
+    defer runner.deinit();
+    var out: [3]?*report_queue.ReportWriteTask = .{ null, null, null };
+    const t_enq0 = jobs.monoNs();
+    try scene.profiler.enqueueReportWrites(runner, async_base, .all, &out);
+    const enq_ns = jobs.monoNs() -% t_enq0;
+    // Caller-side poll + deinit (the showcase/cleanup pattern).
+    const deadline = jobs.monoNs() + 10_000_000_000;
+    var done = false;
+    while (!done) {
+        if (jobs.monoNs() >= deadline) return error.TestUnexpectedResult;
+        done = true;
+        for (out) |slot| {
+            if (slot) |task| {
+                if (!task.isDone()) done = false;
+            }
+        }
+        if (!done) jobs.sleepNs(500_000);
+    }
+    for (out, 0..) |slot, i| {
+        if (slot) |task| {
+            try std.testing.expect(task.isSuccess());
+            out[i] = null;
+            task.deinit();
+        }
+    }
+
+    // Byte-identical files across the two paths.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const exts = [_][]const u8{ ".html", ".md", ".json" };
+    for (exts) |ext| {
+        const ps = try std.fmt.allocPrint(ally, "{s}{s}", .{ sync_base, ext });
+        defer ally.free(ps);
+        const pa = try std.fmt.allocPrint(ally, "{s}{s}", .{ async_base, ext });
+        defer ally.free(pa);
+        const bs = try std.Io.Dir.cwd().readFileAlloc(io, ps, ally, .unlimited);
+        defer ally.free(bs);
+        const ba = try std.Io.Dir.cwd().readFileAlloc(io, pa, ally, .unlimited);
+        defer ally.free(ba);
+        try std.testing.expectEqualSlices(u8, bs, ba);
+    }
+
+    const to_ms = struct {
+        fn ms(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+        }
+    }.ms;
+    std.debug.print(
+        "[profile-window] sync capture+encode+IO: {d:.2}ms | capture-only (new window hold): {d:.2}ms | encode+enqueue off-lock: {d:.2}ms (smoke-grade, includes tmpfs IO)\n",
+        .{ to_ms(sync_ns), to_ms(cap_ns), to_ms(enq_ns) },
+    );
 }

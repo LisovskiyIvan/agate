@@ -186,6 +186,7 @@ test {
     _ = @import("profiler/diagnostics.zig");
     _ = @import("profiler/recording.zig");
     _ = @import("profiler/report.zig");
+    _ = @import("profiler/report_queue.zig");
     _ = @import("profiler/snapshot.zig");
     _ = @import("profiler/summary.zig");
     _ = @import("profiler/types.zig");

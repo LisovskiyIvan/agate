@@ -7,6 +7,8 @@
 /// Cross-leaf helpers consumed here are `pub` in their home module but are
 /// deliberately NOT re-exported by the facade.
 const profiler_types = @import("../profiler/types.zig");
+const report_queue = @import("../profiler/report_queue.zig");
+const jobs = @import("../jobs.zig");
 const MemorySnapshot = profiler_types.MemorySnapshot;
 
 // ---- Profiling & Diagnostics API ----
@@ -65,4 +67,21 @@ pub fn saveProfileTraceJson(self: anytype, path: []const u8) !void {
 /// `<base_path>.md`, and `<base_path>.json`.
 pub fn saveProfileReports(self: anytype, base_path: []const u8) !void {
     try self.profiler.saveReports(self, base_path);
+}
+
+/// Async report save over the scene `io_runner`: encodes and enqueues one
+/// `ReportWriteTask` per selected file, returning after the enqueue with no
+/// file IO before return. The caller captures first when live registries
+/// are involved (under exclusion), polls every non-null `out` slot with
+/// `isDone()`, and `deinit()`s it. `error.NoTaskRunner` when the scene has
+/// no I/O runner (init failure or bare test fixture): fall back to the
+/// synchronous `saveProfileReports` above.
+pub fn saveProfileReportsAsync(
+    self: anytype,
+    base_path: []const u8,
+    files: @import("../profiler/core.zig").Profiler.ReportFiles,
+    out: *[3]?*report_queue.ReportWriteTask,
+) !void {
+    const runner: *jobs.TaskRunner = if (self.io_runner) |r| r else return error.NoTaskRunner;
+    try self.profiler.enqueueReportWrites(runner, base_path, files, out);
 }

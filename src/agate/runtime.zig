@@ -51,8 +51,9 @@
 //!
 //! Not lock-free by design (documented, unchanged): registry add/remove
 //! during an in-flight latch (coherent via commit guards, still an app
-//! contract violation), profiler control/report file IO (bounded mutex
-//! window only when a request is pending), and the serial/legacy paths.
+//! contract violation), profiler control + report capture (bounded mutex
+//! window only when a request is pending; encode + file IO run unlocked on
+//! the scene io_runner), and the serial/legacy paths.
 //!
 //! Host-owned responsibilities (NOT here): sokol window setup/shutdown, the
 //! `simulate` body itself, the UI snapshot transfer policy, render calls and

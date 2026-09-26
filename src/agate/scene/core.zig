@@ -1558,4 +1558,14 @@ pub const Scene = struct {
     pub fn saveProfileReports(self: *Scene, base_path: []const u8) !void {
         return scene_profile.saveProfileReports(self, base_path);
     }
+
+    /// See `scene/profile_api.zig` (owns the body + docs).
+    pub fn saveProfileReportsAsync(
+        self: *Scene,
+        base_path: []const u8,
+        files: profiler_mod.ReportFiles,
+        out: *[3]?*profiler_mod.ReportWriteTask,
+    ) !void {
+        return scene_profile.saveProfileReportsAsync(self, base_path, files, out);
+    }
 };

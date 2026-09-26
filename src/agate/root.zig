@@ -576,6 +576,8 @@ pub const MemorySnapshot = profiler.MemorySnapshot;
 pub const SessionSummary = profiler.SessionSummary;
 pub const DiagnosticFinding = profiler.DiagnosticFinding;
 pub const DiagnosticSeverity = profiler.DiagnosticSeverity;
+pub const ReportWriteTask = profiler.ReportWriteTask;
+pub const ReportFiles = profiler.ReportFiles;
 
 /// GPU frame timings v1 (vendored sokol patch, default off).
 pub const gpu_timing = @import("gpu_timing.zig");
