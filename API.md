@@ -2,6 +2,9 @@
 
 Scene creation, resource ownership, named-object lookup, and thread boundaries.
 
+> Module-by-module documentation (Russian; full API references, threading and
+> ownership notes, examples): **[docs/README.md](./docs/README.md)**.
+
 ## Scene creation
 
 ```zig
