@@ -88,7 +88,7 @@ pub fn transformDirection(self: Mat4, d: Vec3) Vec3 // w=0, без трансл�
 pub fn projectPoint(self: Mat4, p: Vec3, screen_w: f32, screen_h: f32) ?Vec2 // null за камерой (w <= 0.001)
 ```
 
-`fromRotationTranslationScale` — аналитическая сборка `T·Rz·Ry·Rx·S` из замкнутых тригонометрических форм поворотов (без численной декомпозиции; порядок фиксирован и совпадает с `Quat.fromEulerDeg`, паритет закреплён тестом `m_euler ≈ m_quat`). `fromQuatTranslationScale` — та же сборка через нормализованный кватернион со скейлом по колонкам. `perspective` — под клип `[0, 1]` (m[10] = `far/(near−far)`); `projectPoint` маппит NDC в пиксели с top-left `(0,0)`. `invert` — классический adjugate/det. `transformDirection` нормирует результат (нулевой вектор даст ноль через `normalize`-гард).
+`fromRotationTranslationScale` — аналитическая сборка `T·Rz·Ry·Rx·S`: замкнутые формы элементов `Rz·Ry·Rx` из синусов/косинусов (порядок фиксирован и совпадает с `Quat.fromEulerDeg`), скейл по колонкам, трансляция в последний столбец — без матричных умножений (5 `mul` композиции убраны), побитово совпадает со старым путём (порядок произведений/сумм и канонизация `−0 → +0` повторяют `mulSimd`). Мотивация: самая горячая per-entity операция (~78% бенчмарка transform-пайплайна), цель ~2×. Паритет с кватернионным путём закреплён тестом `m_euler ≈ m_quat`, ортонормальность — тестом analytic properties. `fromQuatTranslationScale` — та же сборка через нормализованный кватернион со скейлом по колонкам. `perspective` — под клип `[0, 1]` (m[10] = `far/(near−far)`); `projectPoint` маппит NDC в пиксели с top-left `(0,0)`. `invert` — классический adjugate/det. `transformDirection` нормирует результат (нулевой вектор даст ноль через `normalize`-гард).
 
 ### Кватернионы
 

@@ -151,16 +151,61 @@ pub const Mat4 = extern struct {
         } };
     }
 
+    /// Analytic Euler->matrix build of T * Rz * Ry * Rx * S (degrees, order
+    /// Rz*Ry*Rx — same as Quat.fromEulerDeg). Bit-identical to the old
+    /// composed path (translation/rotationX/Y/Z/scaling + mul); kept so by
+    /// evaluating every sum in the same order the 0/1 entries of the
+    /// elementary rotations force on mulSimd (explicit parens below).
+    ///
+    /// Derivation (row-major 3x3 view; column-major storage m[col*4+row]):
+    ///   Rx = [[1,0,0],[0,cx,-sx],[0,sx,cx]]
+    ///   Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]]
+    ///   Rz = [[cz,-sz,0],[sz,cz,0],[0,0,1]]
+    ///   Ry*Rx = [[cy, sy*sx, sy*cx],
+    ///            [0,  cx,    -sx   ],
+    ///            [-sy, cy*sx, cy*cx]]
+    ///   R = Rz*(Ry*Rx):
+    ///   row0 = cz*row0(RyRx) - sz*row1(RyRx)
+    ///        = [cz*cy, cz*(sy*sx) - sz*cx, cz*(sy*cx) + sz*sx]
+    ///   row1 = sz*row0(RyRx) + cz*row1(RyRx)
+    ///        = [sz*cy, sz*(sy*sx) + cz*cx, sz*(sy*cx) - cz*sx]
+    ///   row2 = [-sy, cy*sx, cy*cx]
+    /// Scale is applied per column (col j *= scale_j), translation sets the
+    /// last column — same as T*(R*S) since T and S are pure diagonal/shift.
+    /// The trailing `+ 0.0` on each entry mirrors the composed path's exact
+    /// zero dot-product terms: they canonicalize -0 to +0, so the analytic
+    /// result matches mulSimd bit-for-bit (x + 0.0 == x for all x but -0).
+    /// Two are needed per rotation/scale entry: one on the rotation element
+    /// (mulSimd's Rz*(Ry*Rx) trailing zeros) and one after column scaling
+    /// (trailing zeros of (R*S)); the translation lanes get one as well
+    /// since T*(R*S) accumulates the pos lane onto exact-zero terms.
     pub fn fromRotationTranslationScale(pos: Vec3, rot_deg: Vec3, scale_v: Vec3) Mat4 {
-        // T * Rz * Ry * Rx * S
-        const t = translation(pos);
-        const rx = rotationX(rot_deg.x);
-        const ry = rotationY(rot_deg.y);
-        const rz = rotationZ(rot_deg.z);
-        const s = scaling(scale_v);
+        const rad_x = rot_deg.x * std.math.pi / 180.0;
+        const cx = std.math.cos(rad_x);
+        const sx = std.math.sin(rad_x);
+        const rad_y = rot_deg.y * std.math.pi / 180.0;
+        const cy = std.math.cos(rad_y);
+        const sy = std.math.sin(rad_y);
+        const rad_z = rot_deg.z * std.math.pi / 180.0;
+        const cz = std.math.cos(rad_z);
+        const sz = std.math.sin(rad_z);
 
-        const rot = mul(rz, mul(ry, rx));
-        return mul(t, mul(rot, s));
+        const r00 = cz * cy + 0.0;
+        const r10 = sz * cy + 0.0;
+        const r20 = -sy + 0.0;
+        const r01 = cz * (sy * sx) - sz * cx + 0.0;
+        const r11 = sz * (sy * sx) + cz * cx + 0.0;
+        const r21 = cy * sx + 0.0;
+        const r02 = cz * (sy * cx) + sz * sx + 0.0;
+        const r12 = sz * (sy * cx) - cz * sx + 0.0;
+        const r22 = cy * cx + 0.0;
+
+        return .{ .m = .{
+            r00 * scale_v.x + 0.0, r10 * scale_v.x + 0.0, r20 * scale_v.x + 0.0, 0.0,
+            r01 * scale_v.y + 0.0, r11 * scale_v.y + 0.0, r21 * scale_v.y + 0.0, 0.0,
+            r02 * scale_v.z + 0.0, r12 * scale_v.z + 0.0, r22 * scale_v.z + 0.0, 0.0,
+            pos.x + 0.0,           pos.y + 0.0,           pos.z + 0.0,           1.0,
+        } };
     }
 
     pub fn fromQuatTranslationScale(pos: Vec3, q_in: Quat, scale_v: Vec3) Mat4 {
@@ -325,6 +370,40 @@ test "Mat4 fromQuatTranslationScale" {
 
     for (0..16) |i| {
         try std.testing.expectApproxEqAbs(m_euler.m[i], m_quat.m[i], 1e-4);
+    }
+}
+
+test "Mat4 fromRotationTranslationScale analytic properties" {
+    // Cheap deterministic spot checks for the analytic TRS build:
+    // translation round-trip, scaled-orthonormal columns (norm == |scale|,
+    // pairwise dots == 0), and unit-scale 3x3 determinant == +1.
+    const rots = [_]Vec3{
+        Vec3.new(0.0, 0.0, 0.0),
+        Vec3.new(30.0, 45.0, 60.0),
+        Vec3.new(-90.0, 15.0, 180.0),
+        Vec3.new(123.0, -67.0, 11.0),
+    };
+    const pos = Vec3.new(12.0, -34.0, 56.0);
+    const scale = Vec3.new(2.0, 0.5, 1.5);
+    for (rots) |rot| {
+        const m = Mat4.fromRotationTranslationScale(pos, rot, scale);
+        try std.testing.expectEqual(pos, m.getTranslation());
+
+        const c0 = Vec3.new(m.m[0], m.m[1], m.m[2]);
+        const c1 = Vec3.new(m.m[4], m.m[5], m.m[6]);
+        const c2 = Vec3.new(m.m[8], m.m[9], m.m[10]);
+        try std.testing.expectApproxEqAbs(@abs(scale.x), c0.length(), 1e-4);
+        try std.testing.expectApproxEqAbs(@abs(scale.y), c1.length(), 1e-4);
+        try std.testing.expectApproxEqAbs(@abs(scale.z), c2.length(), 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), c0.dot(c1), 1e-3);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), c0.dot(c2), 1e-3);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), c1.dot(c2), 1e-3);
+
+        const u = Mat4.fromRotationTranslationScale(Vec3.zero, rot, Vec3.one);
+        const det = u.m[0] * (u.m[5] * u.m[10] - u.m[9] * u.m[6]) -
+            u.m[4] * (u.m[1] * u.m[10] - u.m[9] * u.m[2]) +
+            u.m[8] * (u.m[1] * u.m[6] - u.m[5] * u.m[2]);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), det, 1e-5);
     }
 }
 
