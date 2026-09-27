@@ -43,6 +43,7 @@ const TrailMesh = trail_mod.TrailMesh;
 
 pub fn createStandardMaterial(self: anytype, name: []const u8) !*StandardMaterial {
     const mat = try self.allocator.create(StandardMaterial);
+    errdefer self.allocator.destroy(mat);
     mat.* = StandardMaterial.init(name);
     try self.materials.append(self.allocator, mat);
     return mat;
@@ -50,6 +51,7 @@ pub fn createStandardMaterial(self: anytype, name: []const u8) !*StandardMateria
 
 pub fn createPBRMaterial(self: anytype, name: []const u8) !*PBRMaterial {
     const mat = try self.allocator.create(PBRMaterial);
+    errdefer self.allocator.destroy(mat);
     mat.* = PBRMaterial.init(name);
     try self.pbr_materials.append(self.allocator, mat);
     return mat;

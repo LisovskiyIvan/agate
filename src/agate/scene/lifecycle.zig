@@ -87,6 +87,13 @@ pub fn ensureForwardMsaa(self: anytype, samples: i32) *scene_forward.ForwardPipe
 }
 
 pub fn deinit(self: anytype) void {
+    // Documented pre-condition (API.md: "deinit is context-thread only"):
+    // teardown touches sg.* and joins GPU-bound runners, so it must run on
+    // the marked context thread. Enforced in Debug/ReleaseSafe; unmarked
+    // threads (tests, tools, legacy single-threaded embedders) keep the
+    // gpu_thread compatibility fallback where every thread counts as
+    // context.
+    gpu_thread.assertOnContextThread();
     self.profiler.deinit();
     // In-flight decodes target material fields; join them before any
     // mesh/material teardown can free those fields.
@@ -145,7 +152,10 @@ pub fn deinit(self: anytype) void {
     self.trails.deinit(self.allocator);
     for (self.greased_lines.items) |gl| gl.deinit();
     self.greased_lines.deinit(self.allocator);
-    self.nav.deinit(self.allocator);
+    // sim domain (matches the sim-routed creates in sim_api): nav meshes +
+    // agents, particle systems + their prepared/build frames were all
+    // allocated with sim_allocator, so they must be freed with it here.
+    self.nav.deinit(self.sim_allocator);
 
     self.default_white_texture.deinit();
     self.default_normal_texture.deinit();
@@ -154,7 +164,11 @@ pub fn deinit(self: anytype) void {
     self.shadows.deinit();
     self.sky.deinit();
     self.probes.deinit();
-    self.clustered.deinit(self.allocator);
+    // render domain, CPU scratch only: rebuildCpuForSlot (view_render) grows
+    // cpu_lights/headers/indices with render_allocator and this frees them.
+    // upload/retireBuffers stay core: their allocator funds appends into the
+    // core-owned gpu_retire queue (growth retire + add/remove retire).
+    self.clustered.deinit(self.render_allocator);
     self.gui3d.deinit(self.allocator);
 
     self.forward.deinit();
@@ -166,7 +180,8 @@ pub fn deinit(self: anytype) void {
     self.outline_meshes.deinit(self.allocator);
     self.postfx.deinit();
 
-    self.particles.deinit(self.allocator);
+    // sim domain (matches createParticleSystem in sim_api).
+    self.particles.deinit(self.sim_allocator);
 
     if (self.ui_canvas) |*u| {
         u.deinit();

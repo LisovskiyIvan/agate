@@ -25,6 +25,10 @@ const CubeTexture = @import("texture.zig").CubeTexture;
 pub fn testScene(alloc: std.mem.Allocator) Scene {
     return .{
         .allocator = alloc,
+        // Fixture default: one allocator for everything (mirrors Scene.init).
+        .render_allocator = alloc,
+        .sim_allocator = alloc,
+        .io_allocator = alloc,
         .profiler = @import("profiler.zig").Profiler.init(alloc),
         .default_white_texture = std.mem.zeroes(Texture),
         .default_normal_texture = std.mem.zeroes(Texture),

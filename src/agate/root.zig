@@ -228,6 +228,7 @@ pub const HighlightEntry = scene.HighlightEntry;
 pub const HighlightOptions = scene.HighlightOptions;
 pub const SceneFrameSnapshot = scene.SceneFrameSnapshot;
 pub const CameraSnapshot = scene.CameraSnapshot;
+pub const AllocatorConfig = scene.AllocatorConfig;
 
 pub const tags = @import("tags.zig");
 pub const TagSet = tags.TagSet;
@@ -657,6 +658,7 @@ test "root re-exports cover recent Scene APIs" {
     _ = TagSet;
     _ = TagQuery;
     _ = Handoff;
+    _ = AllocatorConfig;
 }
 
 test "root re-exports cover the runtime frame facade" {

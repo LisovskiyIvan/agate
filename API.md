@@ -24,6 +24,14 @@ defer scene.deinit();
   particles, passes, and the async upload/file-I/O runners (joined first,
   so in-flight decodes finish before their target materials are freed).
 
+## Allocator domains (optional)
+
+Advanced users may split allocation by domain via `AllocatorConfig`
+(`Scene.initWithAllocators` / `Scene.initIntoWithAllocators`); the
+default (`init` / `initInto`) uses one allocator for everything and is
+unchanged. Rules, per-consumer routing, thread-safety and lifetime
+requirements: **[docs/allocators.md](./docs/allocators.md)**.
+
 ## Resources and lifetimes
 
 ### Meshes
@@ -46,6 +54,15 @@ defer scene.deinit();
   - Context-thread destruction must not invalidate a still-pending
     prepared frame. Game-side destruction under the update exclusion
     uses epoch retirement instead of freeing in-flight GPU handles.
+- Off-context removal without free: `scene.removeMesh(mesh)` returns
+  true when the mesh was registered and unlinks it from `scene.meshes`
+  only — no referent scrub, no GPU retire, no frees. Ownership transfers
+  to the caller, who must finish the teardown itself: `mesh.deinit` +
+  allocator destroy on the context thread, or `gpu_retire.retireMesh`
+  off-context for the next render-start flush (as `removeSoftBodyCloth`
+  does). Prefer `destroyMesh` unless deliberately taking over lifetime
+  management (e.g. error rollback after a manual `scene.meshes.append`,
+  as the soft-body creator does).
 - Off-context creation is CPU-only and deferred: with no context thread
   (or no valid `sg` context) the mesh keeps CPU mirrors plus
   `pending_vertices` (`gpu_pending = true`) and `finishGpuUpload` builds
@@ -82,6 +99,12 @@ defer scene.deinit();
   targeting the material finish before destroying it.
 - Standard/shader materials remain Scene-owned until `Scene.deinit`;
   there is no individual destroy API for them.
+- Material names are borrowed: `StandardMaterial.init(name)` /
+  `PBRMaterial.init(name)` (and the `create*Material` wrappers) store
+  the slice as-is — no dupe, no `owns_name` flag, nothing freed at
+  destroy. The name storage must outlive the material (string literals
+  or caller-owned buffers kept alive). Contrast mesh names, which are
+  owned iff `owns_name` and renamed only via `scene.renameMesh`.
 - Texture handles assigned to materials are borrowed. Keep their owner
   alive through every prepared frame that can reference them; a copied
   handle is not a retained resource. Async texture uploads use the queue

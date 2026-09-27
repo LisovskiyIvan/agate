@@ -130,6 +130,15 @@ pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
 
     if (scene.uploads) |*q| {
         scene.frame_uploads = q.drainCountedBudget(upload_budget_per_frame, upload_byte_budget_per_frame);
+        // Serialized legacy path only (no fresh build): the drain above just
+        // published `.uploaded` without touching game-owned material slots
+        // (lock-free ownership split — the drain never writes them even
+        // here); with no producer build coming to commit, apply the patch
+        // inline while still under the fallback's phase exclusion. The
+        // fresh-build path instead commits game-side in
+        // `frame_build.buildIntoClaimedSlot`, concurrent-safe with this
+        // drain via the per-slot targets mutex.
+        if (!have_build) _ = q.commitUploadedTargets();
     } else {
         scene.frame_uploads = .{};
     }
@@ -162,9 +171,11 @@ pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
     // the record); otherwise the historical inline capture (apps without
     // `buildPreparedFrame` are unchanged).
     if (have_build) {
-        scene.particles.latchSlotFrame(scene.allocator, back.particle_draws.items);
+        // sim domain: funds the sim-owned retained `frame` (freed in
+        // ParticleLayer.deinit with sim); the slot `draws` arg is read-only.
+        scene.particles.latchSlotFrame(scene.sim_allocator, back.particle_draws.items);
     } else {
-        scene.particles.captureFrame(scene.allocator);
+        scene.particles.captureFrame(scene.sim_allocator);
     }
 
     // Physics debug wireframe capture (CPU): world.appendDebugLines runs

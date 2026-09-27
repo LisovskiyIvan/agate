@@ -52,6 +52,14 @@ pub const NavAgent = struct {
 
         const path = try Pathfinding.findPath(self.nav_mesh, self.position, target, self.allocator);
         if (path.len == 0) {
+            // Every findPath result is freed exactly once (module
+            // convention, cf. the `defer allocator.free(path)` in
+            // ai/tests.zig). For today's len-0 early-outs this free is a
+            // proven no-op — std alloc(T, 0) returns a comptime sentinel
+            // without reaching the vtable, and free() early-returns on
+            // len 0 — so dropping the slice leaks nothing; the call stays
+            // as a guard if an early-out ever becomes heap-backed.
+            self.allocator.free(path);
             self.arrived = true;
             self.target_pos = null;
             return false;

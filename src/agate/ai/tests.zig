@@ -4,6 +4,7 @@ const Vec3 = math.Vec3;
 const BoundingBox = math.BoundingBox;
 
 const NavMesh = @import("navmesh.zig").NavMesh;
+const NavNode = @import("navmesh.zig").NavNode;
 const funnel = @import("funnel.zig");
 const Portal = funnel.Portal;
 const Pathfinding = @import("pathfinding.zig").Pathfinding;
@@ -338,4 +339,108 @@ test "NavAgent: smooth acceleration, cornering, and arrival" {
     }
     try testing.expect(agent.arrived);
     try testing.expect(agent.position.sub(Vec3.new(10.0, 0.0, 2.0)).length() < 0.25);
+}
+
+/// Test-only counting allocator: forwards everything to the backing
+/// allocator while counting allocs vs frees. Catches leaks the backing
+/// GPA silently ignores — notably zero-length allocations, which is exactly
+/// what `findPath` returns on its empty-result early-outs.
+const CountAlloc = struct {
+    backing: std.mem.Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+
+    fn init(backing: std.mem.Allocator) CountAlloc {
+        return .{ .backing = backing };
+    }
+
+    fn allocator(self: *CountAlloc) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.allocs += 1;
+        return p;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        const res = self.backing.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        // A successful remap conceptually frees the old backing and
+        // allocates the new one: count both sides so the balance holds no
+        // matter which growth path (alloc vs remap) ArrayList takes.
+        self.allocs += 1;
+        self.frees += 1;
+        return res;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+test "NavAgent.setDestination on an empty mesh frees the empty path (no leak)" {
+    const testing = std.testing;
+    // Real caller path: scene/nav_layer.zig createAgent is allocator.create
+    // + NavAgent.init + append, so this drives the exact Scene wiring
+    // (Scene.createNavAgent) with the layer, not just the struct.
+    const NavLayer = @import("../scene/nav_layer.zig").NavLayer;
+    const Crowd = @import("crowd.zig").Crowd;
+    const CrowdAgentParams = @import("crowd.zig").CrowdAgentParams;
+
+    // Empty mesh: findClosestNode finds nothing, so findPath returns its
+    // len-0 early-out on EVERY call. Per std semantics those are comptime
+    // sentinels that never reach the vtable (and free() on len 0 is a
+    // no-op), so the 64 failed queries must leave the counter exactly
+    // balanced; any heap-backed empty dropped without freeing would show up
+    // here as allocs > frees.
+    var counter = CountAlloc.init(testing.allocator);
+    const alloc = counter.allocator();
+
+    // NOT counter-owned: NavMesh.init stores the slice as-is and deinit
+    // frees it, but a len-0 free is a std no-op that would never reach the
+    // counter — routing it through the counter would imbalance the test's
+    // own bookkeeping (alloc counted, free elided).
+    const empty_nodes = try testing.allocator.alloc(NavNode, 0);
+    var nav = NavMesh.init(alloc, empty_nodes, BoundingBox.zero);
+    defer nav.deinit();
+
+    var layer = NavLayer{};
+    const agent = try layer.createAgent(alloc, &nav, Vec3.new(0, 0, 0));
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try testing.expect(!try agent.setDestination(Vec3.new(100, 0, 100)));
+    }
+    try testing.expect(agent.arrived);
+    try testing.expect(agent.target_pos == null);
+    layer.deinit(alloc);
+
+    // Same empty-result ownership in Crowd.setAgentDestination.
+    var crowd = Crowd.init(alloc, &nav);
+    const id = try crowd.addAgent(Vec3.new(0, 0, 0), CrowdAgentParams{});
+    var j: usize = 0;
+    while (j < 64) : (j += 1) {
+        try testing.expect(!try crowd.setAgentDestination(id, Vec3.new(100, 0, 100)));
+    }
+    // Explicit teardown BEFORE the balance check (a defer would run past it).
+    crowd.deinit();
+
+    try testing.expectEqual(counter.allocs, counter.frees);
 }

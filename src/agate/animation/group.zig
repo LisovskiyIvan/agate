@@ -326,6 +326,14 @@ pub const AnimationGroup = struct {
                 if (self.weight <= 0.0001 and self.stop_on_fade_out) {
                     self.is_playing = false;
                     self.current_time = self.from;
+                    // Skeleton channels are blended later in
+                    // scene/animation_runtime (collectActive skips stopped /
+                    // zero-weight groups, eval returns on zero active clips),
+                    // so without this the skeleton would retain its last pose
+                    // while nodes/morphs below restore to rest. Mirror stop().
+                    if (self.skeleton) |skel| {
+                        skel.resetToBindPose();
+                    }
                     // Weight is zero so this restores the rest pose.
                     self.applyNodesAtTime(self.current_time);
                     return;

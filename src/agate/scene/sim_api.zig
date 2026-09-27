@@ -45,7 +45,12 @@ pub fn updateDecals(self: anytype, dt: f32) void {
 }
 
 pub fn createParticleSystem(self: anytype, name: []const u8, capacity: usize) !*ParticleSystem {
-    return self.particles.create(self.allocator, name, capacity);
+    // sim domain: ParticleSystem.init stores this allocator (all internal
+    // arrays + the struct free through it in ps.deinit) and the systems
+    // list itself is appended/freed with it (create here, deinit in
+    // lifecycle). The prepared/build frames use sim too (frame_build /
+    // frame_prepare); only the frozen P7 slot copy stays core (slot-owned).
+    return self.particles.create(self.sim_allocator, name, capacity);
 }
 
 /// Explicit particle stepping: GPU simulation modes either run or return
@@ -93,7 +98,10 @@ pub fn createNavMeshFromTriangles(
     indices: []const u32,
     max_slope_rad: f32,
 ) !*ai_mod.NavMesh {
-    return self.nav.createMeshFromTriangles(self.allocator, positions, indices, max_slope_rad);
+    // sim domain: NavMesh stores this allocator (nodes freed through it in
+    // nm.deinit) and the layer mesh list is appended/freed with it
+    // (deinit in lifecycle).
+    return self.nav.createMeshFromTriangles(self.sim_allocator, positions, indices, max_slope_rad);
 }
 
 pub fn createNavMeshGrid(
@@ -107,11 +115,14 @@ pub fn createNavMeshGrid(
     subdiv_z: usize,
     obstacles: []const BoundingBox,
 ) !*ai_mod.NavMesh {
-    return self.nav.createMeshGrid(self.allocator, min_x, max_x, min_z, max_z, elevation_y, subdiv_x, subdiv_z, obstacles);
+    return self.nav.createMeshGrid(self.sim_allocator, min_x, max_x, min_z, max_z, elevation_y, subdiv_x, subdiv_z, obstacles);
 }
 
 pub fn createNavAgent(self: anytype, nav_mesh: *const ai_mod.NavMesh, start_pos: Vec3) !*ai_mod.NavAgent {
-    return self.nav.createAgent(self.allocator, nav_mesh, start_pos);
+    // sim domain: NavAgent.init stores this allocator (waypoint paths from
+    // setDestination/findPath are freed through it in deinit/stop); the
+    // agent struct + layer list use it too (deinit in lifecycle).
+    return self.nav.createAgent(self.sim_allocator, nav_mesh, start_pos);
 }
 
 pub fn updateNavAgents(self: anytype, dt: f32) void {

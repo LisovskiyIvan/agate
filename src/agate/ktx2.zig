@@ -346,13 +346,18 @@ fn parseLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, 
         const uncompressed_length = readU64(bytes, entry + 16);
 
         const dims = levelDims(header.pixel_width, header.pixel_height, @intCast(m));
-        const expected: u64 = @as(u64, dims.w) * dims.h * format.texelBlockSize() * face_count;
+        const texel_bytes: u64 = format.texelBlockSize();
+        const pixels = std.math.mul(u64, dims.w, dims.h) catch return error.InvalidLevelData;
+        const face_bytes = std.math.mul(u64, pixels, texel_bytes) catch return error.InvalidLevelData;
+        const expected = std.math.mul(u64, face_bytes, @as(u64, face_count)) catch return error.InvalidLevelData;
         if (byte_length != uncompressed_length or uncompressed_length != expected) {
             return error.InvalidLevelData;
         }
         const start: usize = std.math.cast(usize, byte_offset) orelse return error.InvalidLevelData;
         const len: usize = std.math.cast(usize, byte_length) orelse return error.InvalidLevelData;
-        if (start < index_end or @as(u64, start) + byte_length > bytes.len) return error.Truncated;
+        const start_u64: u64 = @as(u64, @intCast(start));
+        const end = std.math.add(u64, start_u64, byte_length) catch return error.Truncated;
+        if (start < index_end or end > bytes.len) return error.Truncated;
         levels[m] = .{ .data = bytes[start .. start + len], .width = dims.w, .height = dims.h };
     }
     return levels;
@@ -420,7 +425,9 @@ fn parseBlockLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Hea
         }
         const start: usize = std.math.cast(usize, byte_offset) orelse return error.InvalidLevelData;
         const len: usize = std.math.cast(usize, byte_length) orelse return error.InvalidLevelData;
-        if (start < index_end or @as(u64, start) + byte_length > bytes.len) return error.Truncated;
+        const start_u64: u64 = @as(u64, @intCast(start));
+        const end = std.math.add(u64, start_u64, byte_length) catch return error.Truncated;
+        if (start < index_end or end > bytes.len) return error.Truncated;
         levels[m] = .{ .data = bytes[start .. start + len], .width = dims.w, .height = dims.h };
     }
     return levels;

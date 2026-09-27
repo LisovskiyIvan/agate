@@ -1309,3 +1309,84 @@ test "updateAnimations serial vs pool is bit-identical (node writers stay serial
         try std.testing.expectEqual(serial.nodes[i].scaling, parallel.nodes[i].scaling);
     }
 }
+
+fn fadeMakeBoneClip(allocator: std.mem.Allocator, name: []const u8, z: f32) !*AnimationGroup {
+    const times = try allocator.alloc(f32, 1);
+    times[0] = 0.0;
+    const outs = try allocator.alloc(f32, 3);
+    outs[0] = 0.0;
+    outs[1] = 0.0;
+    outs[2] = z;
+    const channels = try allocator.alloc(AnimationChannel, 1);
+    channels[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times, .outputs = outs } };
+    return AnimationGroup.init(allocator, name, channels, 1.0);
+}
+
+test "fadeOut completion resets skeleton to bind pose (single clip)" {
+    const runtime = @import("../scene/animation_runtime.zig");
+    const allocator = std.testing.allocator;
+    const skel = try Skeleton.init(allocator, 1);
+    defer skel.deinit();
+    skel.bones[0].bind_position = Vec3.zero;
+    skel.bones[0].bind_rotation = Quat.identity;
+    skel.bones[0].bind_scale = Vec3.one;
+    skel.resetToBindPose();
+
+    const ag = try fadeMakeBoneClip(allocator, "fade Solo", 10.0);
+    defer ag.deinit();
+    ag.skeleton = skel;
+    ag.play(true);
+
+    var groups = [_]*AnimationGroup{ag};
+    var skels = [_]*Skeleton{skel};
+    // Drive one frame so the skeleton leaves bind (fast path writes z=10).
+    runtime.updateAnimations(&groups, &skels, &.{}, 1.0 / 60.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), skel.bones[0].local_position.z, 1e-4);
+
+    // Fade out fully: group stops, skeleton must return to bind like stop().
+    // Without the group.zig reset, collectActive finds zero active clips,
+    // eval returns early, and the z=10 pose sticks.
+    ag.fadeOut(0.5);
+    runtime.updateAnimations(&groups, &skels, &.{}, 0.25);
+    try std.testing.expect(ag.is_playing);
+    runtime.updateAnimations(&groups, &skels, &.{}, 0.25);
+    try std.testing.expect(!ag.is_playing);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), skel.bones[0].local_position.x, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), skel.bones[0].local_position.y, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), skel.bones[0].local_position.z, 1e-5);
+}
+
+test "crossFade source reset does not disturb remaining target" {
+    const runtime = @import("../scene/animation_runtime.zig");
+    const allocator = std.testing.allocator;
+    const skel = try Skeleton.init(allocator, 1);
+    defer skel.deinit();
+    skel.bones[0].bind_position = Vec3.zero;
+    skel.bones[0].bind_rotation = Quat.identity;
+    skel.bones[0].bind_scale = Vec3.one;
+    skel.resetToBindPose();
+
+    const src = try fadeMakeBoneClip(allocator, "fade_src", 10.0);
+    defer src.deinit();
+    src.skeleton = skel;
+    src.play(true);
+    src.setWeight(1.0);
+
+    const dst = try fadeMakeBoneClip(allocator, "fade_dst", 20.0);
+    defer dst.deinit();
+    dst.skeleton = skel;
+
+    var groups = [_]*AnimationGroup{ src, dst };
+    var skels = [_]*Skeleton{skel};
+    src.crossFadeTo(dst, 1.0);
+    runtime.updateAnimations(&groups, &skels, &.{}, 0.5);
+    runtime.updateAnimations(&groups, &skels, &.{}, 0.5);
+
+    // Source stopped at weight 0; target alone drives the skeleton at full
+    // weight. The source's bind reset must not leak into the result.
+    try std.testing.expect(!src.is_playing);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), src.weight, 1e-4);
+    try std.testing.expect(dst.is_playing);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dst.weight, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), skel.bones[0].local_position.z, 1e-4);
+}

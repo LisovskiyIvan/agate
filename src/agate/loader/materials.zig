@@ -232,6 +232,11 @@ pub fn uvTransformFromView(view: anytype) UvTransform {
 /// image+srgb pair (`seen`), even when several materials share it.
 /// Embedded buffer-view bytes are copied at registration time — the cgltf
 /// data dies when appendGlb returns, long before the worker decodes.
+/// Registration runs on the calling (game) thread and is safe against a
+/// concurrent context-side drain: `addTarget` serializes the list, and the
+/// drain never writes the material slots itself — the game-side commit
+/// (`UploadQueue.commitUploadedTargets`, every producer build) patches
+/// them, so the slots stay game-owned end to end.
 pub const AsyncTexCtx = struct {
     scene: *Scene,
     gltf: *c.cgltf_data,

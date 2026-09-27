@@ -954,3 +954,91 @@ test "Texture.decodeMemory rejects Basis with its own reason" {
     try testing.expectError(error.BasisRequiresBlockDecode, Texture.decodeMemory(allocator, fx_uastc_rgb_flat, .{}));
     try testing.expectError(error.Truncated, Texture.decodeMemory(allocator, fx_uastc_rgb_flat[0..40], .{}));
 }
+
+/// Builds a raw 104-byte header+single-level-index container with explicit
+/// level-index fields, for malformed-input overflow cases the TestKtx2
+/// builder cannot express (absurd dims, hostile offsets).
+fn buildRawOverflowCase(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    face_count: u32,
+    byte_offset: u64,
+    byte_length: u64,
+    uncompressed_length: u64,
+) ![]u8 {
+    var buf = try allocator.alloc(u8, header_and_index_size + level_index_entry_size);
+    @memcpy(buf[0..magic.len], &magic);
+    std.mem.writeInt(u32, buf[12..16], 37, .little); // RGBA8_UNORM
+    std.mem.writeInt(u32, buf[16..20], 1, .little); // typeSize
+    std.mem.writeInt(u32, buf[20..24], width, .little);
+    std.mem.writeInt(u32, buf[24..28], height, .little);
+    std.mem.writeInt(u32, buf[28..32], 0, .little); // depth
+    std.mem.writeInt(u32, buf[32..36], 0, .little); // layers
+    std.mem.writeInt(u32, buf[36..40], face_count, .little);
+    std.mem.writeInt(u32, buf[40..44], 1, .little); // levelCount
+    std.mem.writeInt(u32, buf[44..48], 0, .little); // scheme NONE
+    std.mem.writeInt(u32, buf[48..52], 0, .little); // dfd offset
+    std.mem.writeInt(u32, buf[52..56], 0, .little); // dfd length
+    std.mem.writeInt(u32, buf[56..60], 0, .little); // kvd offset
+    std.mem.writeInt(u32, buf[60..64], 0, .little); // kvd length
+    std.mem.writeInt(u64, buf[64..72], 0, .little); // sgd offset
+    std.mem.writeInt(u64, buf[72..80], 0, .little); // sgd length
+    std.mem.writeInt(u64, buf[80..88], byte_offset, .little);
+    std.mem.writeInt(u64, buf[88..96], byte_length, .little);
+    std.mem.writeInt(u64, buf[96..104], uncompressed_length, .little);
+    return buf;
+}
+
+test "decode2D rejects dimension-size multiplication overflow without panicking" {
+    const allocator = testing.allocator;
+    // 3e9 x 3e9 x 4 B: w*h fits u64 (9e18) but x texel size (3.6e19)
+    // exceeds maxInt(u64). Unchecked math wraps/panics; checked math must
+    // report InvalidLevelData.
+    const ktx = try buildRawOverflowCase(allocator, 3_000_000_000, 3_000_000_000, 1, 104, 0, 0);
+    defer allocator.free(ktx);
+    try testing.expectEqual(@as(usize, 104), ktx.len);
+    try testing.expectError(error.InvalidLevelData, decode2D(allocator, ktx, .{}));
+}
+
+test "decode2D rejects level offset+length addition overflow without panicking" {
+    const allocator = testing.allocator;
+    // 1x1 RGBA8 expects exactly 4 bytes; offset=maxInt(u64) makes
+    // start+length overflow u64. Must report Truncated, never panic or wrap
+    // into a small slice.
+    const ktx = try buildRawOverflowCase(
+        allocator,
+        1,
+        1,
+        1,
+        std.math.maxInt(u64),
+        4,
+        4,
+    );
+    defer allocator.free(ktx);
+    const expected = if (@bitSizeOf(usize) < 64) error.InvalidLevelData else error.Truncated;
+    try testing.expectError(expected, decode2D(allocator, ktx, .{}));
+}
+
+test "decodeCube rejects face-count multiplication overflow without panicking" {
+    const allocator = testing.allocator;
+    // 1.5e9 x 1.5e9 x 4 B fits u64 (9e18) but x 6 faces (5.4e19) does not:
+    // the faces factor must be checked too.
+    const ktx = try buildRawOverflowCase(allocator, 1_500_000_000, 1_500_000_000, 6, 104, 0, 0);
+    defer allocator.free(ktx);
+    try testing.expectError(error.InvalidLevelData, decodeCube(allocator, ktx, .{}));
+}
+
+test "decodeBlock2D rejects level offset+length addition overflow without panicking" {
+    const allocator = testing.allocator;
+    // 4x4 BC7 expects exactly one 16-byte block; offset=maxInt(u64) makes
+    // start+length overflow u64. Must never panic or wrap into a small slice.
+    // On 64-bit targets the usize cast succeeds and the checked addition
+    // reports Truncated; on 32-bit targets the cast itself rejects the
+    // offset as InvalidLevelData. Assert the target-specific error.
+    const ktx = try buildRawOverflowCase(allocator, 4, 4, 1, std.math.maxInt(u64), 16, 16);
+    defer allocator.free(ktx);
+    std.mem.writeInt(u32, ktx[12..16], 145, .little); // BC7_UNORM_BLOCK
+    const expected = if (@bitSizeOf(usize) < 64) error.InvalidLevelData else error.Truncated;
+    try testing.expectError(expected, decodeBlock2D(allocator, ktx));
+}

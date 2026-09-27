@@ -75,8 +75,12 @@ pub fn renderSceneView(
         const rect = cam_snap.viewport.toPixelRect(snap.screen_w, snap.screen_h);
         const view_rect = scene_clustered.ViewRect{ .x = rect.x, .y = rect.y, .w = rect.width, .h = rect.height };
         var rebuilt_ok = true;
+        // render domain: funds the render-owned clustered CPU scratch
+        // (cpu_lights/headers/indices, freed in ClusteredGpuCache.deinit
+        // with render). upload below stays core: its allocator funds appends
+        // into the core-owned gpu_retire queue on buffer growth.
         scene.clustered.rebuildCpuForSlot(
-            scene.allocator,
+            scene.render_allocator,
             &snap.light_pack.clustered_pos_range,
             &snap.light_pack.clustered_color_int,
             cl_count,

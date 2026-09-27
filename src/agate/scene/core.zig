@@ -151,6 +151,21 @@ const mesh_mod = @import("../mesh.zig");
 
 pub const CameraEntry = scene_cameras.CameraEntry;
 
+/// Optional per-domain allocator configuration for advanced users.
+///
+/// `core` funds everything unless a domain override is given; a null domain
+/// resolves to `core`, so `init(allocator)` / `initInto(allocator)` behave
+/// exactly as before (one allocator for everything). Domain allocators must
+/// outlive `Scene.deinit`. Thread-safety and routing rules per domain: see
+/// `agate/docs/allocators.md`. `audio`/`physics` are deliberately NOT part
+/// of this config (app-owned modules that already take their own allocator).
+pub const AllocatorConfig = struct {
+    core: std.mem.Allocator,
+    render: ?std.mem.Allocator = null,
+    sim: ?std.mem.Allocator = null,
+    io: ?std.mem.Allocator = null,
+};
+
 /// Milliseconds elapsed since a `sokol.time.now()` tick. Cheap, no
 /// allocation; used for the SceneStats phase timings.
 fn msSince(t0: u64) f32 {
@@ -185,6 +200,14 @@ fn msSince(t0: u64) f32 {
 /// inline and prepared frames borrow its handle ids.
 pub const Scene = struct {
     allocator: std.mem.Allocator,
+    /// Resolved domain allocators (see `AllocatorConfig`): each may equal
+    /// `allocator` (the default: one allocator for everything). Every
+    /// allocation AND every free of a domain object uses that domain's
+    /// allocator; never free across domains. Lifetime/thread-safety rules:
+    /// see `agate/docs/allocators.md`.
+    render_allocator: std.mem.Allocator,
+    sim_allocator: std.mem.Allocator,
+    io_allocator: std.mem.Allocator,
 
     // ---- Content registries (kept flat: external code iterates them). ----
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
@@ -566,8 +589,33 @@ pub const Scene = struct {
     // Frame uniform types shared with the draw path (see scene/uniforms.zig).
 
     pub fn initInto(self: *Scene, allocator: std.mem.Allocator) void {
+        self.initIntoWithAllocators(.{ .core = allocator });
+    }
+
+    /// Assigns the four allocator fields from `cfg` (null domains resolve
+    /// to `core`). Split out from `initIntoWithAllocators` so the
+    /// default-equality rule is unit-testable without a GPU context (the
+    /// full init builds GPU pipelines/shaders); always the first step of
+    /// every init path.
+    pub fn initAllocatorsInto(self: *Scene, cfg: AllocatorConfig) void {
+        self.allocator = cfg.core;
+        self.render_allocator = cfg.render orelse cfg.core;
+        self.sim_allocator = cfg.sim orelse cfg.core;
+        self.io_allocator = cfg.io orelse cfg.core;
+    }
+
+    pub fn initIntoWithAllocators(self: *Scene, cfg: AllocatorConfig) void {
+        self.initAllocatorsInto(cfg);
+        const allocator = cfg.core;
+        const io = self.io_allocator;
         self.* = Scene{
             .allocator = allocator,
+            // Resolved domains, read back: initAllocatorsInto above is the
+            // single source of truth for the null-resolves-to-core rule (the
+            // literal resets every field, so the values must be re-stated).
+            .render_allocator = self.render_allocator,
+            .sim_allocator = self.sim_allocator,
+            .io_allocator = io,
             .profiler = profiler_mod.Profiler.init(allocator),
             .default_white_texture = Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
@@ -578,6 +626,10 @@ pub const Scene = struct {
                 .ground_color = Color3.new(0.2, 0.25, 0.3),
                 .intensity = 1.0,
             }),
+            // Stays on core (NOT render): ShadowPass.prepareInto funds the
+            // core-owned P7 slot payloads (`back.shadow` in queue_builder)
+            // with the pass's stored allocator, so it must equal core —
+            // routing it to render would free slot memory across domains.
             .shadows = scene_shadow.ShadowSystem.init(allocator),
             .sky = scene_sky.SkyboxLayer.init(),
             .postfx = scene_postfx.PostFXStack.init(),
@@ -585,16 +637,30 @@ pub const Scene = struct {
             .particles = scene_particles.ParticleLayer.init(),
         };
         // Async texture decode/uploads (stage 2): failures degrade to a
-        // null queue and all loads take the synchronous path.
-        self.uploads = assets_mod.UploadQueue.init(allocator, 2) catch null;
+        // null queue and all loads take the synchronous path. io domain: the
+        // queue (plus its internal decode TaskRunner) stores this allocator
+        // and frees every slot through it — decode workers allocate here.
+        self.uploads = assets_mod.UploadQueue.init(io, 2) catch null;
         // Dedicated file-I/O runner (1 thread): async save/load must not
-        // share the decode runner, or long file I/O starves decodes.
-        self.io_runner = jobs.TaskRunner.init(allocator, 1) catch null;
+        // share the decode runner, or long file I/O starves decodes. io
+        // domain: struct + thread list + pending queue, joined/freed in
+        // deinit via the stored allocator. (Task BODIES keep their
+        // call-site allocator — core — only runner internals use io.)
+        self.io_runner = jobs.TaskRunner.init(io, 1) catch null;
     }
 
     pub fn init(allocator: std.mem.Allocator) Scene {
         var self: Scene = undefined;
         self.initInto(allocator);
+        return self;
+    }
+
+    /// Same as `init` but with per-domain allocators (see `AllocatorConfig`).
+    /// Null domains resolve to `core`, so passing all-null is identical to
+    /// `init`. Domain allocators must outlive the returned scene's `deinit`.
+    pub fn initWithAllocators(cfg: AllocatorConfig) Scene {
+        var self: Scene = undefined;
+        self.initIntoWithAllocators(cfg);
         return self;
     }
 

@@ -11,6 +11,7 @@ const TextureState = assets.TextureState;
 const PendingTexture = assets.PendingTexture;
 const uploadBudgetExhausted = assets.uploadBudgetExhausted;
 const UploadQueue = assets.UploadQueue;
+const Texture = @import("texture.zig").Texture;
 
 fn waitForState(p: *PendingTexture, comptime states: []const TextureState) bool {
     // Bounded spin: the states under test are reached in microseconds.
@@ -477,4 +478,173 @@ test "requestMemory routes real Basis payloads to the block path off-thread" {
     try testing.expect(q.block_raw == null);
     try testing.expectEqual(@as(u32, 5), q.raw.num_levels);
     try testing.expectEqual(@as(usize, 1024), q.raw.levels[0].?.len);
+}
+
+// Headless stand-in for the context drain's publish half (`finishUpload`
+// minus the sg upload, which needs a GPU context and is therefore NOT
+// covered here): frees the decoded pixels and publishes `.uploaded` with a
+// caller-provided texture, leaving game-owned target slots untouched.
+fn publishHeadless(p: *PendingTexture, tex: Texture) void {
+    p.raw.deinit(testing.allocator);
+    p.texture = tex;
+    p.state.store(.uploaded, .release);
+}
+
+test "drain publishes without touching game slots; game commit patches exactly once" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    const p = try queue.requestFile(path.?, .{}, .{ .gen_mipmaps = true });
+    try testing.expect(waitForState(p, &.{.ready}));
+
+    // A game-thread registration racing the in-flight prepare.
+    var slot: ?Texture = null;
+    p.addTarget(&slot);
+
+    // Headless drain is a no-op: must neither upload nor patch game state.
+    try testing.expectEqual(@as(usize, 0), queue.drain());
+    try testing.expectEqual(TextureState.ready, p.state.load(.acquire));
+    try testing.expect(slot == null);
+
+    // Context publishes (sg upload untestable headless); the slot is still
+    // null — the drain side never writes game-owned memory.
+    publishHeadless(p, std.mem.zeroes(Texture));
+    try testing.expect(slot == null);
+
+    // Game-side commit patches exactly once, then goes quiescent.
+    try testing.expectEqual(@as(usize, 1), queue.commitUploadedTargets());
+    try testing.expect(slot != null);
+    try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
+    try testing.expect(slot != null);
+
+    // Late registration after publication patches inline, dedup preserved.
+    var late: ?Texture = null;
+    p.addTarget(&late);
+    try testing.expect(late != null);
+    try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
+
+    // take()/release() pairing is unchanged (commit leaves take semantics).
+    try testing.expect(p.take() != null);
+    queue.release(p);
+}
+
+test "failed uploads drop game targets and keep slots null" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const garbage = try a.dupe(u8, "this is definitely not a valid image payload!!!");
+    const p = queue.requestMemory(garbage, .{}, .{}) catch |e| {
+        a.free(garbage);
+        return e;
+    };
+    var slot: ?Texture = null;
+    p.addTarget(&slot);
+    try testing.expect(waitForState(p, &.{.failed}));
+
+    // Failed commit drops the target without patching; slot stays null
+    // (default-white), and the slot remains release-ready.
+    try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
+    try testing.expect(slot == null);
+    try testing.expect(p.take() == null);
+    queue.release(p);
+}
+
+const targetAdderCtx = struct {
+    p: *PendingTexture,
+    slots: []?Texture,
+    go: *std.atomic.Value(bool),
+};
+
+fn targetAdder(ctx: *targetAdderCtx) void {
+    while (!ctx.go.load(.acquire)) std.atomic.spinLoopHint();
+    for (ctx.slots) |*slot| ctx.p.addTarget(slot);
+}
+
+const commitRacerCtx = struct {
+    q: *UploadQueue,
+    sum: *std.atomic.Value(usize),
+};
+
+fn commitRacer(ctx: *commitRacerCtx) void {
+    const n = ctx.q.commitUploadedTargets();
+    _ = ctx.sum.fetchAdd(n, .monotonic);
+}
+
+test "concurrent addTarget vs publish/commit loses no target and patches once" {
+    const a = testing.allocator;
+    var queue = try UploadQueue.init(a, 1);
+    defer queue.deinit();
+
+    const path = findFontPng();
+    try testing.expect(path != null);
+
+    const p = try queue.requestFile(path.?, .{}, .{ .gen_mipmaps = true });
+    try testing.expect(waitForState(p, &.{.ready}));
+    // Test-only reclaim: the worker never touches a `.ready` slot again
+    // (module contract), so the test may restage it as in-flight to force
+    // registration/publish interleaving deterministically.
+    p.raw.deinit(a);
+    p.state.store(.decoding, .release);
+
+    // Four game-side registrars (e.g. concurrent GLB loads sharing one
+    // image) racing the context publish below.
+    const threads_n = 4;
+    const per_thread = 16;
+    var all_slots: [threads_n * per_thread]?Texture = [_]?Texture{null} ** (threads_n * per_thread);
+    var go = std.atomic.Value(bool).init(false);
+    var adders: [threads_n]std.Thread = undefined;
+    var actxs: [threads_n]targetAdderCtx = undefined;
+    for (0..threads_n) |i| {
+        actxs[i] = .{
+            .p = p,
+            .slots = all_slots[i * per_thread ..][0..per_thread],
+            .go = &go,
+        };
+        adders[i] = try std.Thread.spawn(.{}, targetAdder, .{&actxs[i]});
+    }
+    go.store(true, .release);
+    // Context-side publish lands mid-registration: early targets ride the
+    // pending list, late ones take the `.uploaded` fast path inline.
+    // Either way each slot is patched exactly once.
+    p.texture = std.mem.zeroes(Texture);
+    p.state.store(.uploaded, .release);
+    for (&adders) |*t| t.join();
+
+    try testing.expectEqual(TextureState.uploaded, p.state.load(.acquire));
+    _ = queue.commitUploadedTargets();
+    for (all_slots) |slot| try testing.expect(slot != null);
+    try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
+
+    // Zero-handle stand-in texture: drop without sg deinit (headless).
+    try testing.expect(p.take() != null);
+    queue.release(p);
+
+    // Wave 2: racing COMMITS on one published slot patch exactly once in
+    // total (swap-empties-the-list under the per-slot mutex).
+    const q2 = try queue.requestFile(path.?, .{}, .{});
+    try testing.expect(waitForState(q2, &.{.ready}));
+    q2.raw.deinit(a);
+    var wave2: [32]?Texture = [_]?Texture{null} ** 32;
+    for (&wave2) |*slot| q2.addTarget(slot);
+    q2.texture = std.mem.zeroes(Texture);
+    q2.state.store(.uploaded, .release);
+
+    var total = std.atomic.Value(usize).init(0);
+    var racers: [4]std.Thread = undefined;
+    var rctxs: [4]commitRacerCtx = undefined;
+    for (0..4) |i| {
+        rctxs[i] = .{ .q = &queue, .sum = &total };
+        racers[i] = try std.Thread.spawn(.{}, commitRacer, .{&rctxs[i]});
+    }
+    for (&racers) |*t| t.join();
+    try testing.expectEqual(@as(usize, 32), total.load(.monotonic));
+    for (wave2) |slot| try testing.expect(slot != null);
+
+    try testing.expect(q2.take() != null);
+    queue.release(q2);
 }

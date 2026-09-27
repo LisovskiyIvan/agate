@@ -3,7 +3,7 @@
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
 > Дата: 10.09.2026 (обновлено 24.09.2026).
-> **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL 4.1 (Linux), Metal (macOS), D3D11/HLSL5 (Windows).
+> **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL (Linux: forward-контуры — GLSL 4.30, нужен контекст 4.3+ из-за кластерных SSBO; остальные — GLSL 4.10), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
 > Agate **не рассчитан на веб**: браузерных и JS-зависимых возможностей Babylon в нём нет и не планируется. Всё остальное, чего пока нет, — потенциальный бэклог, а не приговор.
@@ -469,7 +469,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 ### Рендеринг
 
-* Forward-рендер, шейдеры cross-compile через sokol-shdc (GLSL410/Metal/HLSL5).
+* Forward-рендер, шейдеры cross-compile через sokol-shdc (GLSL410/Metal/HLSL5; пять forward-контуров с кластерными SSBO — GLSL430/Metal/HLSL5, на Linux-GL нужен контекст 4.3+).
 * 8 пайплайнов: Standard, PBR, Instanced, Skinned PBR — каждый под u16/u32 индексы + double-sided твины.
 * Полностью неблокирующий рендеринг: zero-dereference рендер (`Scene.render` исполняется без захвата блокировок симуляции и не разыменовывает указатели `*Mesh`); все GPU-хэндлы, матрицы и дескрипторы материалов упаковываются в фазе `prepareFrame()` в изолированные структуры `RenderMeshItem`, `RenderInstancedBatch`, `ShadowDrawItem`, `OutlineDrawItem`.
 * Сортировка очереди: непрозрачные Standard/PBR группами по текстуре, front-to-back для early-Z; back-to-front для прозрачных мешей.
@@ -616,12 +616,12 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 | Тени (PCF/PCSS/Blur/Contact hardening для всех источников) | CSM для directional, Poisson PCF + PCSS, перспективные тени SpotLight, тени PointLight (до 2, 2D-атлас, 4-tap PCF) | ESM, каскадных настроек per-light |
 | PBR (OpenPBR, clearcoat, sheen, anisotropy, transmission, SSS) | metallic-roughness + IBL, unlit-режим, clearcoat + sheen (scalar/color + текстуры масок/тинта), импорт `KHR_materials_clearcoat/sheen` из glTF, anisotropy (GGX-stretch, 0 = legacy), thin-film transmission (без refraction RT), SSS v1 (wrap-diffuse + back-scatter) | OpenPBR, полный refraction (IOR/thickness), физической SSS/BSSRDF, анизотропных roughness-карт |
 | Прозрачность | Все alpha-режимы (opaque/cutout/blend) + double-sided (cull-off пайплайны), единый back-to-front порядок regular+instanced, per-instance сортировка прозрачных инстансов (OIT) | back-face освещение по геометрическим нормалям, пиксельный WBOIT |
-| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, EXR scanline HALF/FLOAT (NONE/RLE/ZIPS/ZIP, strict API `Texture.fromExrFile/fromExrMemory`), equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы) | KTX2-суперкомпрессии (нужен рантайм-транскодер) и прочие блочные форматы (ETC/ASTC), HDR-16F в KTX2, видеотекстуры, render-target/refraction probe текстуры |
+| Текстуры (EXR/DDS/KTX/Basis, сжатие, видео) | PNG/JPEG RGBA8 + HDR Radiance RGBA16F, EXR scanline HALF/FLOAT (NONE/RLE/ZIPS/ZIP, strict API `Texture.fromExrFile/fromExrMemory`), equirect→cube, мипмапы, wrap/filter/anisotropy, KTX2 LDR (мипы/cube/sRGB) + BC7-батч моделей (`sandbox/tools/convert_ktx2.sh`), DDS BC1/BC2/BC3/BC7 (мипы), runtime-транскодинг Basis (ETC1S/UASTC → BC7/ASTC 4x4/ETC2 RGBA8/RGBA32 через `decodeBasis2D`) | Блочные форматы вне поддерживаемого подмножества (BC4/BC5/BC6, прочие ETC/ASTC-футпринты), HDR-16F в KTX2, видеотекстуры, render-target/refraction probe текстуры |
 | Постобработка (DoF, motion blur, TAA, MSAA, glow/highlight, LUT) | ACES/Reinhard, bloom с мип-пирамидой, glow layer (global v1: threshold-экстракция + separable blur + аддитивная композиция, независим от bloom, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, цвет/радиус/интенсивность на меш, cap 8 `error.TooManyHighlights`, default off), DoF, camera motion blur, TAA (Halton-jitter, history ping-pong, 3×3 neighborhood clamp, default off), MSAA depth-prepass (PASS 1.7, single-sample depth-only проход, default off) — постглубина (SSAO/SSR/DoF/Fog/MotionBlur) под MSAA, цветовые curves, LUT-стрип (2D strip + `setColorGradingLut`/`lut_strength`), outline-слой, виньетка, CA, FXAA, fog, SSR, SSAO, sharpen, grain, white balance | TAA под MSAA (v1 non-goal); без гейта depth-эффекты при MSAA подавлены (prepass v1: 1x-глубина, ±1 пиксель на гранях, primary-only) |
-| Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты, cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | GPU-морфов, редактора |
+| Анимация (retargeting, GPU-морфы) | Скелетная + node-анимации, морф-таргеты (CPU + GPU-режим через delta-текстуру, `morph_mode = .gpu`), cubic-spline (Hermite), события/колбэки, easing, ретаргетинг скелетов (name/index/bone_map) | Редактора |
 | Частицы (GPU-симуляция, sub-emitters, flow maps, spritesheet) | CPU-симуляция + GPU-рендер, спрайт-листы, локальное пространство, sub-emitters, flow maps, коллизии CPU-частиц v1 (сферы cap 8 + ground plane, kill/bounce, `error.CollisionNeedsCpu`), stateful compute-симуляция | Коллизий с мешами / rigid-body coupling, CCD, нодового редактора |
 | Меш-билдеры и геометрия (CSG2, LOD, упрощение, decals, GreasedLine) | 16 примитивов + terrain + LOD + Decals + Polygon + TrailMesh + CSG + GreasedLine + QEM-упрощение мешей (decimation) | CSG2 |
-| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0), KHR_materials_clearcoat/sheen, экспорт GLB (бинарный glTF 2.0) | Draco, KTX2-транскодинг (Basis), multi-UV (texCoord>0) |
+| glTF (Draco/meshopt/KTX2, расширения, экспорт) | GLB/GLTF, EXT_meshopt_compression, KHR_mesh_quantization, автогенерация нормалей, PBR-текстуры (в т.ч. .ktx2), runtime-транскодинг Basis (`decodeBasis2D`: ETC1S/UASTC → BC7/ASTC 4x4/ETC2 RGBA8/RGBA32), скины, анимации, морф-таргеты, KHR_lights_punctual-свет, камеры, KHR_texture_transform (texCoord0), KHR_materials_clearcoat/sheen, экспорт GLB (бинарный glTF 2.0) | Draco, multi-UV (texCoord>0) |
 | Физика (Havok: ragdoll/vehicle/soft body, инспектор) | Box3D + суставы, character, rope, запросы, ragdoll/vehicle-хелперы, debug-линии + PBD cloth v1 (cap 4, session-local) | Импорт коллайдеров из файлов; soft body за пределами PBD cloth v1 |
 | UI/GUI (полный набор контролов, layout, 3D GUI, редактор) | Immediate-mode примитивы + SDF-текст + TrueType-шрифты + checkbox/slider/dropdown/скролл/text input + 3D world-space панели (до 4, pick+inject, render-on-demand) | Фокуса/состояния, редактора |
 | Аудио (файлы, стриминг, шины, эффекты, doppler) | Процедурный синтез + WAV/OGG/MP3, потоковый стриминг с диска/памяти, SPSC lock-free кольцевые буферы, кроссфейд музыки, 24 голоса, динамический DAG шин, spatial/non-spatial, затухание (linear/inv/exp), Doppler, biquad IIR фильтры, Freeverb реверберация, звуковая окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
@@ -643,7 +643,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * OpenPBR, полный refraction (IOR/thickness), физическая SSS/BSSRDF, анизотропные roughness-карты (текстуры clearcoat/sheen, импорт `KHR_materials_clearcoat/sheen` из glTF, anisotropy, thin-film transmission и SSS v1 уже сделаны, см. 🟡).
 
 * NodeMaterial v2 (визуального редактора графа, PBR-output/вершинных хуков, сериализации и runtime-компиляции незарегистрированного графа); v1 (граф → GLSL через hook-путь, runtime-параметры) уже сделан, см. 🟡. Библиотека материалов и ShaderMaterial с внешним shdc-путём сделаны, см. 🟡 (engine-hook + внешний `.glsl` через build-API).
-* Рантайм KTX2-транскодинг суперкомпрессии (BasisLZ/Zstd; нужен basis_universal), ETC/ASTC, HDR-16F в KTX2, видеотекстуры, render-to-texture, refraction probes, кубмапы-зонды (DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡; reflection probes уже реализованы, см. ✅).
+* Блочные форматы вне поддерживаемого KTX2-подмножества (BC4/BC5/BC6, прочие ETC/ASTC-футпринты), HDR-16F в KTX2, видеотекстуры, render-to-texture, refraction probes, кубмапы-зонды (runtime-транскодинг Basis ETC1S/UASTC → BC7/ASTC 4x4/ETC2 RGBA8/RGBA32 через `decodeBasis2D` уже сделан, см. ✅; DDS BC1/BC2/BC3/BC7 и офлайн BC7-батч моделей уже сделаны, см. 🟡; reflection probes уже реализованы, см. ✅).
 * Back-face освещение по геометрическим нормалям (per-instance OIT сортировка прозрачных инстансов уже реализована).
 
 **Постобработка и эффекты**
@@ -670,7 +670,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 **Ассеты и данные**
 * Экспорт glTF (GLB бинарный glTF 2.0) и AssetManager с прогрессом и кэшем уже реализованы (см. ✅).
-* Draco/meshopt, рантайм KTX2-транскодинг (Basis), 3D Tiles (офлайн BC7-конвертация моделей уже покрыта скриптом).
+* Draco, 3D Tiles (`EXT_meshopt_compression`, офлайн BC7-конвертация и runtime-транскодинг Basis уже сделаны, см. ✅).
 
 **Архитектура рендера**
 * Frame graph / node render graph, кастомные rendering pipelines.

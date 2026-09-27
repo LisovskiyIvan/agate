@@ -686,11 +686,16 @@ pub const SoftBodyLayer = struct {
             }
         }
 
+        // Name + mesh: manual cleanup until the mesh is adopted by the
+        // scene registry; afterwards a single rollback errdefer owns the
+        // teardown. No separate owned_name/mesh errdefers: they would
+        // double-free against both the append-failure path below and the
+        // rollback (mesh.deinit frees the name via owns_name).
         const owned_name = allocator.dupe(u8, name) catch return error.OutOfMemory;
-        errdefer allocator.free(owned_name);
-
-        const mesh = allocator.create(Mesh) catch return error.OutOfMemory;
-        errdefer allocator.destroy(mesh);
+        const mesh = allocator.create(Mesh) catch {
+            allocator.free(owned_name);
+            return error.OutOfMemory;
+        };
         mesh.* = .{
             .name = owned_name,
             .owns_name = true,
@@ -704,10 +709,12 @@ pub const SoftBodyLayer = struct {
         };
         mesh.cached_aabb = mesh.local_bounding_box;
         scene.meshes.append(allocator, mesh) catch {
-            mesh.deinit(allocator);
+            allocator.free(owned_name);
             allocator.destroy(mesh);
             return error.OutOfMemory;
         };
+        // Mesh + name now scene-owned; rollback preserves removeMesh
+        // semantics (unlink only, no retire queue: never published).
         errdefer {
             _ = scene.removeMesh(mesh);
             mesh.deinit(allocator);
@@ -715,6 +722,18 @@ pub const SoftBodyLayer = struct {
         }
 
         const mat = scene.createStandardMaterial(owned_name) catch return error.OutOfMemory;
+        // Material name aliases the mesh-owned slice; unlink + free the
+        // struct before the mesh rollback above frees the name. A fresh
+        // material owns no texture, so no texture teardown here.
+        errdefer {
+            for (scene.materials.items, 0..) |m, i| {
+                if (m == mat) {
+                    _ = scene.materials.swapRemove(i);
+                    break;
+                }
+            }
+            allocator.destroy(mat);
+        }
         mat.double_sided = true;
         mesh.material = .{ .standard = mat };
 

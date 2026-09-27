@@ -6308,6 +6308,94 @@ test "softbody destroyMesh drops the bound body (referent cleanup)" {
     try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
 }
 
+test "softbody create OOM rolls back mesh/material/body at every allocation point" {
+    // Deterministic failing-allocator sweep over addSoftBodyCloth: every
+    // induced OutOfMemory must leave all three registries empty (no
+    // registered mesh with a freed name, no dangling material aliasing
+    // it, no half-linked body). Success past the last allocation point
+    // must register exactly one of each with the material name aliasing
+    // the mesh-owned slice. Headless: no sg.* below (buffers stay
+    // deferred). Double-free/leak failures surface via the testing
+    // allocator + the fixture teardown.
+    //
+    // Single dimension (fail_index): list growth goes through
+    // ensureTotalCapacityPrecise, which falls back to alloc+copy when
+    // remap fails, so every growth point is reachable as a raw-alloc
+    // failure; a resize_fail_index sweep could never induce OOM here.
+    const alloc = std.testing.allocator;
+    var saw_induced = false;
+    var saw_success = false;
+    var n: usize = 0;
+    while (n < 64) : (n += 1) {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = n });
+        var scene = @import("../testing.zig").testScene(alloc);
+        scene.allocator = failing.allocator();
+        const res = scene.addSoftBodyCloth("oom_cloth", .{ .width = 4, .height = 4 });
+        scene.allocator = alloc;
+        if (res) |body| {
+            try std.testing.expect(!failing.has_induced_failure);
+            saw_success = true;
+            try std.testing.expectEqual(@as(usize, 1), scene.softBodyCount());
+            try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
+            try std.testing.expectEqual(@as(usize, 1), scene.materials.items.len);
+            // Ownership nuance: the material name aliases the mesh-owned
+            // slice (freed once via Mesh.deinit/owns_name).
+            try std.testing.expect(body.material.name.ptr == body.mesh.name.ptr);
+            try std.testing.expect(body.mesh.owns_name);
+            freeSoftbodyFixture(alloc, &scene);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            saw_induced = true;
+            try std.testing.expectEqual(@as(usize, 0), scene.softBodyCount());
+            try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+            try std.testing.expectEqual(@as(usize, 0), scene.materials.items.len);
+            freeSoftbodyFixture(alloc, &scene);
+        }
+    }
+    try std.testing.expect(saw_induced);
+    try std.testing.expect(saw_success);
+}
+
+test "createPBRMaterial append OOM frees the struct (no leak, registry unchanged)" {
+    // PBRMaterial.init borrows the name, so creation is exactly two
+    // allocations: struct create (#0) then registry-append growth (#1).
+    // Index 1 is the previously-leaking path: without the errdefer the
+    // struct leaks (DebugAllocator flags it) while the list stays empty.
+    const alloc = std.testing.allocator;
+    var saw_induced = false;
+    var saw_success = false;
+    var n: usize = 0;
+    while (n < 4) : (n += 1) {
+        var scene = @import("../testing.zig").testScene(alloc);
+        defer scene.lights.deinit(alloc);
+        defer scene.meshes.deinit(alloc);
+        defer scene.pbr_materials.deinit(alloc);
+        defer scene.gpu_retire.deinit(alloc);
+        defer scene.outline_meshes.deinit(alloc);
+        errdefer {
+            while (scene.pbr_materials.pop()) |m| alloc.destroy(m);
+        }
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = n });
+        scene.allocator = failing.allocator();
+        const res = scene.createPBRMaterial("oom_pbr");
+        scene.allocator = alloc;
+        if (res) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+            saw_success = true;
+            try std.testing.expectEqual(@as(usize, 1), scene.pbr_materials.items.len);
+            alloc.destroy(scene.pbr_materials.pop().?);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            saw_induced = true;
+            try std.testing.expectEqual(@as(usize, 0), scene.pbr_materials.items.len);
+        }
+    }
+    try std.testing.expect(saw_induced);
+    try std.testing.expect(saw_success);
+}
+
 test "softbody disabled body pauses: no step, no upload flag" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
@@ -7529,4 +7617,273 @@ test "slice6: staged prepare consumes frozen trail packet despite live mutation"
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), tm.mesh.local_bounding_box.min.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), tm.mesh.local_bounding_box.max.x, 1e-6);
     build2.publish();
+}
+
+// ---- Allocator domains (`AllocatorConfig`; see agate/docs/allocators.md).
+//
+// Full `Scene.init` is not headless-runnable (GPU pipelines/shaders), so the
+// wiring is proven at three headless-safe levels: the resolution rule
+// through `initAllocatorsInto` (the exact first step every init path
+// executes — `init`/`initInto` delegate to `initIntoWithAllocators`, which
+// starts with it); io routing through the exact `UploadQueue.init` /
+// `TaskRunner.init` expressions `initIntoWithAllocators` uses; sim routing
+// through the real `Scene` methods (`createParticleSystem`,
+// `createNavMeshGrid`, `createNavAgent`, updates, layer capture/deinit)
+// with the fixture's `sim_allocator` swapped for a tracker. Particle work
+// runs on a spawned (non-context) thread so `ParticleSystem.init` takes the
+// deferred-GPU path, exactly like a game-thread spawn.
+
+/// Test-only tracking allocator: wraps a backing allocator, records every
+/// live allocation by pointer, and detects cross-domain frees (a free of a
+/// pointer this domain never allocated) plus leaks (nonempty live set at
+/// test end). All trackers in one test share the same backing, so a foreign
+/// free can still be forwarded to its true owner after being recorded.
+/// Zero-length frees of unknown pointers are ignored (never foreign):
+/// deinits of never-grown lists free an empty/undefined slice, which owns
+/// no bytes by definition.
+const TrackDomain = struct {
+    backing: std.mem.Allocator,
+    live: std.AutoHashMap(usize, usize),
+    allocated_bytes: usize = 0,
+    freed_bytes: usize = 0,
+    foreign_frees: usize = 0,
+    map_drops: usize = 0,
+
+    fn init(backing: std.mem.Allocator) TrackDomain {
+        return .{ .backing = backing, .live = std.AutoHashMap(usize, usize).init(backing) };
+    }
+
+    fn deinit(self: *TrackDomain) void {
+        self.live.deinit();
+    }
+
+    fn allocator(self: *TrackDomain) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn liveCount(self: *const TrackDomain) usize {
+        return self.live.count();
+    }
+
+    fn trackAlloc(self: *TrackDomain, ptr: [*]u8, len: usize) void {
+        self.live.put(@intFromPtr(ptr), len) catch {
+            self.map_drops += 1;
+            return;
+        };
+        self.allocated_bytes += len;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *TrackDomain = @ptrCast(@alignCast(ctx));
+        const p = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.trackAlloc(p, len);
+        return p;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *TrackDomain = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ra)) return false;
+        if (self.live.getPtr(@intFromPtr(memory.ptr))) |slot| {
+            if (new_len > slot.*) self.allocated_bytes += new_len - slot.* else self.freed_bytes += slot.* - new_len;
+            slot.* = new_len;
+        } else if (memory.len > 0) {
+            self.foreign_frees += 1;
+        }
+        return true;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *TrackDomain = @ptrCast(@alignCast(ctx));
+        const res = self.backing.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        if (self.live.fetchRemove(@intFromPtr(memory.ptr))) |kv| {
+            if (new_len > kv.value) self.allocated_bytes += new_len - kv.value else self.freed_bytes += kv.value - new_len;
+            self.live.put(@intFromPtr(res), new_len) catch {
+                self.map_drops += 1;
+            };
+        } else if (memory.len > 0) {
+            self.foreign_frees += 1;
+        }
+        return res;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *TrackDomain = @ptrCast(@alignCast(ctx));
+        if (self.live.fetchRemove(@intFromPtr(memory.ptr))) |kv| {
+            self.freed_bytes += kv.value;
+        } else if (memory.len > 0) {
+            self.foreign_frees += 1;
+        }
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+fn expectSameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) !void {
+    try std.testing.expect(a.ptr == b.ptr);
+    try std.testing.expect(a.vtable == b.vtable);
+}
+
+test "allocator domains: nulls resolve to core, explicit domains stick" {
+    const t = std.testing;
+    // initIntoWithAllocators starts with initAllocatorsInto, and init/initInto
+    // delegate to it — so this resolution IS the default-equality rule all
+    // init paths share (the full init adds GPU objects, untestable headless).
+    var scene: Scene = undefined;
+    scene.initAllocatorsInto(.{ .core = t.allocator });
+    try expectSameAllocator(t.allocator, scene.allocator);
+    try expectSameAllocator(t.allocator, scene.render_allocator);
+    try expectSameAllocator(t.allocator, scene.sim_allocator);
+    try expectSameAllocator(t.allocator, scene.io_allocator);
+
+    var render_mem = TrackDomain.init(t.allocator);
+    defer render_mem.deinit();
+    var sim_mem = TrackDomain.init(t.allocator);
+    defer sim_mem.deinit();
+    var io_mem = TrackDomain.init(t.allocator);
+    defer io_mem.deinit();
+    scene.initAllocatorsInto(.{
+        .core = t.allocator,
+        .render = render_mem.allocator(),
+        .sim = sim_mem.allocator(),
+        .io = io_mem.allocator(),
+    });
+    try expectSameAllocator(t.allocator, scene.allocator);
+    try expectSameAllocator(render_mem.allocator(), scene.render_allocator);
+    try expectSameAllocator(sim_mem.allocator(), scene.sim_allocator);
+    try expectSameAllocator(io_mem.allocator(), scene.io_allocator);
+}
+
+test "allocator domains: io funds UploadQueue and io_runner, frees clean" {
+    const t = std.testing;
+    const assets_mod = @import("../assets.zig");
+    const jobs_mod = @import("../jobs.zig");
+    var io_mem = TrackDomain.init(t.allocator);
+    defer io_mem.deinit();
+    const io = io_mem.allocator();
+
+    // Exact expressions from Scene.initIntoWithAllocators (core.zig).
+    var uploads = try assets_mod.UploadQueue.init(io, 2);
+    var runner = try jobs_mod.TaskRunner.init(io, 1);
+
+    // Worker-side proof: a task allocating + freeing through io on the
+    // runner thread (posted tasks own their context and free it in run).
+    const IoProbe = struct {
+        alloc: std.mem.Allocator,
+        done: *std.atomic.Value(bool),
+        fn run(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const probe = self.alloc.alloc(u8, 64) catch unreachable;
+            @memset(probe, 0xA5);
+            self.alloc.free(probe);
+            self.done.store(true, .release);
+            self.alloc.destroy(self);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const ctx = try io.create(IoProbe);
+    ctx.* = .{ .alloc = io, .done = &done };
+    runner.post(ctx, IoProbe.run);
+    var waited_ns: u64 = 0;
+    while (!done.load(.acquire)) {
+        try t.expect(waited_ns < 5_000_000_000);
+        jobs_mod.sleepNs(1_000_000);
+        waited_ns += 1_000_000;
+    }
+
+    // Exact teardown order of Scene.deinit (uploads first, then io_runner):
+    // both free through the stored io allocator.
+    uploads.deinit();
+    runner.deinit();
+    try t.expectEqual(@as(usize, 0), io_mem.liveCount());
+    try t.expectEqual(@as(usize, 0), io_mem.foreign_frees);
+    try t.expectEqual(@as(usize, 0), io_mem.map_drops);
+    try t.expect(io_mem.allocated_bytes > 0);
+}
+
+test "allocator domains: sim funds particles and nav, frees clean" {
+    const t = std.testing;
+    var sim_mem = TrackDomain.init(t.allocator);
+    defer sim_mem.deinit();
+
+    const SimWork = struct {
+        core: std.mem.Allocator,
+        sim: std.mem.Allocator,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.work() catch |e| {
+                self.err = e;
+            };
+        }
+        fn work(self: *@This()) !void {
+            // Spawned thread = non-context thread, so ParticleSystem.init
+            // defers GPU buffers exactly like a game-thread spawn; no sg.*
+            // fires anywhere below (create/update/capture are CPU-only,
+            // deinit skips zero-id buffers).
+            var scene = @import("../testing.zig").testScene(self.core);
+            defer scene.lights.deinit(self.core);
+            defer scene.cameras.deinit(self.core);
+            scene.sim_allocator = self.sim;
+            scene.render_allocator = self.core;
+            scene.io_allocator = self.core;
+
+            const nm = try scene.createNavMeshGrid(-4, 4, -4, 4, 0, 2, 2, &.{});
+            const ag = try scene.createNavAgent(nm, Vec3.new(0, 0, 0));
+            // Pathfinder runtime alloc (waypoints) through the stored sim
+            // allocator; the open grid connects start to target.
+            try t.expect(try ag.setDestination(Vec3.new(3, 0, 3)));
+            scene.updateNavAgents(0.016);
+
+            const ps = try scene.createParticleSystem("sim_probe", 8);
+            ps.emitOne();
+            try scene.updateParticles(0.016);
+            // Mirrors the frame_prepare wiring (sim-owned retained frame).
+            scene.particles.captureFrame(scene.sim_allocator);
+
+            // Mirrors ParticleLayer.deinit's CPU frees with the lifecycle
+            // wiring (same allocator expressions), minus pass.deinit():
+            // the pass teardown issues unconditional sg.destroy* and is
+            // context-only like the real Scene.deinit, which never runs
+            // headless. ps.deinit itself is sg-free here: every handle is
+            // zero (deferred creation, CPU mode), all destroys id-guarded.
+            for (scene.particles.systems.items) |sys| {
+                sys.deinit();
+                scene.sim_allocator.destroy(sys);
+            }
+            scene.particles.systems.deinit(scene.sim_allocator);
+            scene.particles.frame.deinit(scene.sim_allocator);
+            scene.particles.build_frame.deinit(scene.sim_allocator);
+            scene.nav.deinit(scene.sim_allocator);
+        }
+    };
+    var work = SimWork{ .core = t.allocator, .sim = sim_mem.allocator() };
+    const thread = try std.Thread.spawn(.{}, SimWork.run, .{&work});
+    thread.join();
+    if (work.err) |e| return e;
+    try t.expectEqual(@as(usize, 0), sim_mem.liveCount());
+    try t.expectEqual(@as(usize, 0), sim_mem.foreign_frees);
+    try t.expectEqual(@as(usize, 0), sim_mem.map_drops);
+    try t.expect(sim_mem.allocated_bytes > 0);
+}
+
+test "allocator domains: failing io degrades to null runners" {
+    const t = std.testing;
+    const assets_mod = @import("../assets.zig");
+    const jobs_mod = @import("../jobs.zig");
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    const f = failing.allocator();
+    // Exact expressions from Scene.initIntoWithAllocators (core.zig): both
+    // degrade to null and every load takes its synchronous path.
+    const uploads = assets_mod.UploadQueue.init(f, 2) catch null;
+    try t.expect(uploads == null);
+    const io_runner = jobs_mod.TaskRunner.init(f, 1) catch null;
+    try t.expect(io_runner == null);
+    // Scene.deinit guards both with `if (...)`: the null branches free
+    // nothing and deinit succeeds.
 }

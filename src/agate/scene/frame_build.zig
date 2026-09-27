@@ -46,6 +46,15 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
             scene_upload_packets.commitSlotResults(scene, front);
             scene.last_upload_commit_frame = front.frame_id;
         }
+        // Async-texture target commit (game side, sg-free): patches the
+        // material slots registered by `AsyncTexCtx.register` on uploads the
+        // context drain has published since the last build. Same
+        // context-publishes/game-commits split as the packet commit above —
+        // the drain never writes these game-owned slots itself, so a
+        // game-thread registration racing the in-flight prepare is never
+        // torn. Idempotent (committed slots are skipped via their pending
+        // flag), so every build can call it unconditionally.
+        if (scene.uploads) |*q| _ = q.commitUploadedTargets();
     }
     const back = &scene.draws.slots[slot];
     back.reset();
@@ -101,7 +110,9 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     // (same fresh-preview set as the build-view freeze above). The latch
     // and `patchInstanceRefs` consume these — never live previews.
     scene_instance_staging.freezeStagedRecords(scene.allocator, &back.staged_instances, scene.meshes.items, seq);
-    scene.particles.buildCapture(scene.allocator, seq);
+    // sim domain: funds the sim-owned build_frame (consumed by latchFrame /
+    // latchSlotFrame, freed in ParticleLayer.deinit with sim).
+    scene.particles.buildCapture(scene.sim_allocator, seq);
     scene.physics.buildDebug(scene.allocator, seq);
     // Wave 32 freeze-then-latch (lock-free-publication slices 4/5): freeze
     // the just-captured particle/physics build frames into the claimed
@@ -115,6 +126,9 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
     // coherent-empty, same precedent as the snapshot/stats slices above).
     // The shared stores keep their existing semantics (sequential flow
     // bit-identical, direct layer tests/tooling unaffected).
+    // Stays on core: this allocator funds `out` (`back.particle_draws`), a
+    // core-owned P7 slot list freed in FrameDraws.deinit with core — routing
+    // it to sim would free slot memory across domains.
     scene.particles.stageIntoSlot(scene.allocator, &back.particle_draws);
     scene.physics.stageIntoSlot(scene.allocator, &back.physics_lines, &back.physics_visible);
     // Slice 6 freeze-then-latch (dynamic-upload packets): freeze every

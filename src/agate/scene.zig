@@ -77,6 +77,8 @@ const scene_cameras = @import("scene/cameras.zig");
 
 /// The scene orchestrator (lives in `scene/core.zig`).
 pub const Scene = core.Scene;
+/// Optional per-domain allocator config (lives in `scene/core.zig`).
+pub const AllocatorConfig = core.AllocatorConfig;
 /// Camera list entry (lives in `scene/cameras.zig`).
 pub const CameraEntry = scene_cameras.CameraEntry;
 
@@ -134,3 +136,11 @@ pub const MemorySnapshot = profiler_mod.MemorySnapshot;
 // use (file-path dedup); one not-taken branch when unarmed, no behavior
 // change otherwise.
 pub const instance_staging = @import("scene/instance_staging.zig");
+
+// Test-only seam exposure: the P5 live-GPU gate arms
+// `mesh_deferred.testArmMeshFailOnce()` to exercise the real makeBuffer
+// .FAILED deferred-creation branch in Mesh.finishGpuUpload, then reads
+// `testLastInjectedMeshFailId()` to prove the failed handle itself was
+// destroyed. Same module instance the flush path uses (file-path dedup);
+// one not-taken branch when unarmed, no behavior change otherwise.
+pub const mesh_deferred = @import("mesh/mesh.zig");

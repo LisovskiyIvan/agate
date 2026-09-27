@@ -320,6 +320,11 @@ pub const Crowd = struct {
         if (self.nav_mesh) |nm| {
             const path = try Pathfinding.findPath(nm, agent.position, target, self.allocator);
             if (path.len == 0) {
+                // Same ownership as NavAgent.setDestination: every findPath
+                // result is freed exactly once. A proven no-op for today's
+                // sentinel len-0 early-outs (std never reaches the vtable
+                // for them); kept as a guard for heap-backed empties.
+                self.allocator.free(path);
                 agent.arrived = true;
                 agent.target_pos = null;
                 return false;

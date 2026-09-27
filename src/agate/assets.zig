@@ -9,33 +9,55 @@
 //! Ownership model:
 //!   - `requestFile` allocates a `PendingTexture` and posts the decode.
 //!   - `drainBudget` uploads at most `max` finished decodes per call
-//!     (`drain` is the unbounded wrapper); an optional `target` slot gets
-//!     the live texture pointer patched in — e.g. `&pbr.albedo_texture.?`,
-//!     so draws pick the real texture up on the next frame with no further
-//!     wiring. Leftover `.ready` slots ride to later frames.
-//!   - `take` moves the GPU texture out once uploaded.
+//!     (`drain` is the unbounded wrapper). The context-side drain creates
+//!     the GPU texture and publishes `.uploaded` but patches NO material
+//!     slots (they stay game-owned under the lock-free prepare).
+//!   - `commitUploadedTargets` (game side, every producer build + the
+//!     serialized legacy drain path) patches the `addTarget` slots of newly
+//!     `.uploaded` slots exactly once; an optional `target` slot registered
+//!     after publication patches inline. Leftover `.ready` slots ride to
+//!     later frames.
+//!   - `take` moves the GPU texture out once uploaded (cancelling the
+//!     auto-patch).
 //!   - `release` frees a finished slot (after `take`, or when failed).
 //!
 //! Locking/ownership contract (what `drainCounted` relies on):
 //!   - The queue is serialized by external phase ownership, not by thread
 //!     identity: in the threaded apps the game and render phases never
-//!     overlap (`phase_mutex`), so `requestFile`/`requestMemory` +
-//!     `PendingTexture.addTarget` (posted from either side — the off-context
-//!     GLB loader does it from the game thread) and
+//!     overlap (`phase_mutex`), so `requestFile`/`requestMemory` and
 //!     `drainCounted`/`release`/`deinit` never run concurrently. Posting and
 //!     draining from two threads at once is out of contract for every op
 //!     except the worker's decode.
-//!   - The spinlock therefore only ever contends with list ops from the
-//!     current phase plus the worker's atomic state stores.
+//!   - EXCEPTION (lock-free prepare, default ON): the game thread may call
+//!     `AsyncTexCtx.register` (`getOrRequestFile` + `PendingTexture.addTarget`)
+//!     while the context thread is inside `drainCountedBudget`. Two rules
+//!     keep this safe without serializing rendering:
+//!       * the per-slot `targets_mutex` serializes `addTarget` against the
+//!         game-side target commit (`commitUploadedTargets`), so appends are
+//!         never lost and every target patches exactly once;
+//!       * the context drain NEVER writes game-owned material slots. It only
+//!         creates the GPU texture and publishes `.uploaded`; patching the
+//!         registered `*?Texture` slots is the game side's job
+//!         (`commitUploadedTargets`, every producer build plus the serialized
+//!         legacy drain path). A registration landing after the publish
+//!         observes `.uploaded` and patches its own (game-owned) slot inline.
+//!   - The spinlocks therefore only ever contend with list ops from the
+//!     current phase plus the worker's atomic state stores (queue mutex) or
+//!     with a concurrent game-side register/commit (per-slot targets mutex,
+//!     pointer appends/swaps only — never held across GPU work).
 //!   - The worker touches a slot only while it is `.decoding` and publishes
 //!     `.ready`/`.failed` via the state release store; after that it never
 //!     touches the slot again. So once a slot is collected as `.ready`, the
-//!     unlocked upload phase (fromRaw, raw deinit, target patching, state
-//!     store) races with nothing and needs no re-lock.
+//!     unlocked upload phase (fromRaw, raw deinit, state store) races with
+//!     nothing and needs no re-lock. The game-side commit of an `.uploaded`
+//!     slot races with nothing either: the texture handle is immutable after
+//!     publication and the material slots are game-owned.
 //!   - Slots are freed only by `release` (contract: `.failed`/`.taken` only)
 //!     and `deinit` (runner joined first), both serialized by the same phase
 //!     ownership, so a collected pointer stays alive through the unlocked
-//!     phase.
+//!     phase. A slot passed to `release` must have no concurrent
+//!     `addTarget`/`commitUploadedTargets` in flight (same pairing rule as
+//!     the queue ops above).
 //!
 //! State publication is ordered by the atomic `state` release/acquire pair:
 //! the worker writes results before publishing, consumers read after.
@@ -80,10 +102,25 @@ pub const PendingTexture = struct {
     options: Texture.Options = .{},
     decode_opts: Texture.DecodeOptions = .{},
     /// Material slots to patch on upload (e.g. `&pbr.albedo_texture`).
-    /// Several materials may share one image. Registration happens on the
-    /// posting thread before the next `drain`; both run on the sg thread,
-    /// so no lock is needed here.
+    /// Several materials may share one image. Registration (`addTarget`,
+    /// game side, e.g. the off-context GLB loader) may run concurrently
+    /// with the context-side drain under the lock-free prepare, so every
+    /// list mutation is serialized by `targets_mutex`. The drain itself
+    /// never touches this list or the material slots (see
+    /// `commitUploadedTargets`): the slots stay game-owned end to end.
     targets: std.ArrayListUnmanaged(*?Texture) = .empty,
+    /// Guards `targets` (+ the state check paired with it) across a
+    /// concurrent game-side `addTarget`/`commitUploadedTargets` and the
+    /// `take` cancellation below. Never held across GPU work or across
+    /// the queue mutex (lock order, where both are held, is always
+    /// queue-then-slot).
+    targets_mutex: std.atomic.Mutex = .unlocked,
+    /// Set (release) whenever `addTarget` appends, cleared while holding
+    /// `targets_mutex` when the list is swapped out (commit) or dropped
+    /// (`take`, failed-commit). Lets `commitUploadedTargets` skip
+    /// already-committed slots with a lock-free atomic read instead of
+    /// locking every ever-uploaded slot on every producer build.
+    targets_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator = undefined,
     raw: Texture.RawTexture = .{},
     /// Block-compressed decode (KTX2/DDS BC/ASTC): owned per-level slices for
@@ -92,12 +129,23 @@ pub const PendingTexture = struct {
     block_raw: ?ktx2.RawBlockTexture = null,
     texture: ?Texture = null,
 
+    /// Registers a game-owned material slot for the game-side commit
+    /// (`commitUploadedTargets`). Thread-safe against a concurrent commit:
+    /// when the texture is already published (`.uploaded`) the caller's own
+    /// slot is patched inline (the handle is immutable after publication,
+    /// the slot is game-owned); otherwise the slot joins the pending list
+    /// under `targets_mutex` and the next commit patches it exactly once.
     pub fn addTarget(self: *PendingTexture, slot: *?Texture) void {
+        lockSpin(&self.targets_mutex);
         if (self.state.load(.acquire) == .uploaded and self.texture != null) {
-            slot.* = self.texture;
+            const tex = self.texture.?;
+            self.targets_mutex.unlock();
+            slot.* = tex;
             return;
         }
         self.targets.append(self.allocator, slot) catch {};
+        self.targets_pending.store(true, .release);
+        self.targets_mutex.unlock();
     }
 
     fn decode(self: *PendingTexture) void {
@@ -138,9 +186,21 @@ pub const PendingTexture = struct {
     }
 
     /// Moves the uploaded GPU texture out. Returns null while the load is
-    /// not uploaded yet (or was already taken / failed).
+    /// not uploaded yet (or was already taken / failed). Taking cancels the
+    /// game-side auto-patch: pending targets are dropped under
+    /// `targets_mutex` (a later commit finds an empty list), so the caller
+    /// owns the texture exclusively and no material aliases it.
+    /// Contract: exclusive ownership — do NOT mix `take` with registered
+    /// material targets on the same slot. If `commitUploadedTargets` (or the
+    /// `addTarget` post-publication fast path) already patched targets, the
+    /// taken texture aliases the handles now owned by those materials and
+    /// both sides must not free it; use `take` only on target-free slots.
     pub fn take(self: *PendingTexture) ?Texture {
+        lockSpin(&self.targets_mutex);
+        defer self.targets_mutex.unlock();
         if (self.state.load(.acquire) != .uploaded) return null;
+        self.targets.clearRetainingCapacity();
+        self.targets_pending.store(false, .release);
         self.state.store(.taken, .release);
         const t = self.texture.?;
         self.texture = null;
@@ -212,8 +272,10 @@ pub const UploadQueue = struct {
     }
 
     /// Starts an async load of an image file. The returned slot stays valid
-    /// until `release` (or queue `deinit`); register targets via
-    /// `PendingTexture.addTarget` before the next `drain`.
+    /// until `release` (or queue `deinit`); material slots registered via
+    /// `PendingTexture.addTarget` are patched by the game-side
+    /// `commitUploadedTargets` once the context drain publishes `.uploaded`
+    /// (a registration landing after publication patches inline).
     pub fn requestFile(
         self: *UploadQueue,
         path: []const u8,
@@ -343,15 +405,92 @@ pub const UploadQueue = struct {
 
     /// Shared post-upload bookkeeping for the RGBA8 and block pixel paths
     /// (runs on the sg-context thread, right after the fromRaw/fromRawBlock
-    /// call): patches material targets, publishes .uploaded, tallies the
-    /// per-call count + the exact bytes handed to sg.
+    /// call): publishes `.uploaded` and tallies the per-call count + the
+    /// exact bytes handed to sg. Deliberately patches NO material slots:
+    /// those stay game-owned (lock-free prepare lets the game register new
+    /// targets concurrently with this drain); the game side applies them via
+    /// `commitUploadedTargets`. The pending target list is left intact for
+    /// that commit (freed by `release`/`deinit`).
     fn finishUpload(p: *PendingTexture, bytes: u64, res: *DrainResult) void {
-        for (p.targets.items) |slot| slot.* = p.texture.?;
-        p.targets.deinit(p.allocator);
-        p.targets = .empty;
         p.state.store(.uploaded, .release);
         res.count += 1;
         res.bytes += bytes;
+    }
+
+    /// Game-side commit of context-published uploads: patches every material
+    /// slot registered via `PendingTexture.addTarget` on slots that have
+    /// reached `.uploaded` since the last commit. Failed slots drop their
+    /// targets (slots keep the default-white null). Returns how many slots
+    /// were patched (0 when nothing new published — idempotent, safe to
+    /// call every producer build).
+    ///
+    /// Ownership: call wherever the caller owns the materials — the producer
+    /// build (`frame_build.buildIntoClaimedSlot`, lock-free path) and the
+    /// serialized legacy drain path (`frame_prepare.beginPrepare` fallback,
+    /// still under phase exclusion). Never held across GPU work: pending
+    /// pointers are collected under the queue mutex in chunks, then each
+    /// slot's list is swapped out under its `targets_mutex` and patched
+    /// unlocked. Concurrent commits are safe (the swap empties the list, so
+    /// the second commit is a no-op); concurrent `addTarget` either lands in
+    /// the list before the swap (patched here) or observes `.uploaded` after
+    /// it (patched inline there) — exactly once either way.
+    pub fn commitUploadedTargets(self: *UploadQueue) usize {
+        var patched: usize = 0;
+        var buf: [drain_chunk]*PendingTexture = undefined;
+        // Quiescent loop: a registration racing the scan (flag set after
+        // the collect) is picked up by the next pass. Terminates in
+        // practice — registration and commit are both game-side/serialized,
+        // so no endless concurrent registrar exists; each pass with no
+        // candidates ends the loop.
+        while (true) {
+            lockSpin(&self.mutex);
+            var n: usize = 0;
+            for (self.pending.items) |p| {
+                if (n == buf.len) break;
+                if (!p.targets_pending.load(.acquire)) continue;
+                const s = p.state.load(.acquire);
+                if (s != .uploaded and s != .failed) continue;
+                buf[n] = p;
+                n += 1;
+            }
+            self.mutex.unlock();
+            if (n == 0) break;
+            for (buf[0..n]) |p| patched += commitSlotTargets(p);
+        }
+        return patched;
+    }
+
+    /// Patches (`.uploaded`) or drops (`.failed`) one slot's pending game
+    /// targets. Returns the patched count. Slots in any other state — or
+    /// already committed (flag clear / empty list) / taken (cleared by
+    /// `take`) — are a no-op.
+    fn commitSlotTargets(p: *PendingTexture) usize {
+        if (!p.targets_pending.load(.acquire)) return 0;
+        const s = p.state.load(.acquire);
+        if (s != .uploaded and s != .failed) return 0;
+        lockSpin(&p.targets_mutex);
+        // Re-check under the lock: `take` may have cancelled the list
+        // (state .taken, list cleared) between the load above and now.
+        const s2 = p.state.load(.acquire);
+        if (s2 == .failed or s2 == .taken) {
+            p.targets.clearRetainingCapacity();
+            p.targets_pending.store(false, .release);
+            p.targets_mutex.unlock();
+            return 0;
+        }
+        if (s2 != .uploaded or p.texture == null or p.targets.items.len == 0) {
+            if (p.targets.items.len == 0) p.targets_pending.store(false, .release);
+            p.targets_mutex.unlock();
+            return 0;
+        }
+        const tex = p.texture.?;
+        var owned: std.ArrayListUnmanaged(*?Texture) = .empty;
+        std.mem.swap(std.ArrayListUnmanaged(*?Texture), &owned, &p.targets);
+        p.targets_pending.store(false, .release);
+        p.targets_mutex.unlock();
+        defer owned.deinit(p.allocator);
+        for (owned.items) |slot| slot.* = tex;
+        return owned.items.len;
     }
 
     /// Byte-aware drain: like `drainCounted` but additionally stops once

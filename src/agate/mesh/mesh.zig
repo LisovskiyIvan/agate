@@ -248,6 +248,39 @@ pub const BoneAttachment = struct {
 /// wraps with +% and skips 0, never reuses a live uid (2^64 space).
 var mesh_uid_next: u64 = 1;
 
+/// Test-only deferred-creation failure injection (P5 5e): armed via
+/// testArmMeshFailOnce(), the next finishGpuUpload vertex allocation
+/// synthesizes a nonzero FAILED buffer (allocBuffer + failBuffer) instead of
+/// calling sg.makeBuffer, driving the REAL `.FAILED` handling below (destroy
+/// the failed slot, keep every pending flag for retry). Covers the FIRST
+/// vertex allocation for both the dynamic and the static branches (one shared
+/// site above the branch — whichever is reachable); the index allocation has
+/// no seam (vertex failure returns before any index buffer exists). State is
+/// private: the only writers/readers are the two context-thread-only
+/// accessors below, never a freely mutable production switch. A zero id at
+/// consume time (dry pool) falls through to the real makeBuffer so the
+/// failure mode stays pool-exhaustion, never a vacuous injection.
+var test_inject_mesh_fail_once: bool = false;
+/// Exact buffer id the last armed injection failed (0 = none consumed yet).
+/// Lets the test assert the failed handle itself reached INVALID, not just
+/// that the pool has room.
+var test_last_injected_mesh_fail_id: u32 = 0;
+
+/// Arms one injected deferred-creation failure. Context thread only
+/// (asserted): the finish path never runs anywhere else.
+pub fn testArmMeshFailOnce() void {
+    gpu_thread.assertOnContextThread();
+    test_last_injected_mesh_fail_id = 0;
+    test_inject_mesh_fail_once = true;
+}
+
+/// Exact id the last armed injection failed, or 0 when no injection has been
+/// consumed. Context thread only (asserted).
+pub fn testLastInjectedMeshFailId() u32 {
+    gpu_thread.assertOnContextThread();
+    return test_last_injected_mesh_fail_id;
+}
+
 pub const Mesh = struct {
     id: u64 = 0,
     /// Render identity for queue/shadow/outline payloads (stage-2 increment A,
@@ -788,18 +821,48 @@ pub const Mesh = struct {
         // CPU-morph glTF meshes created off-context need the same empty
         // dynamic vertex buffer the immediate loader path builds (the first
         // frame's applyMorphs fills it); everything else uploads static.
-        const vbuf = if (self.pending_dynamic_update)
-            sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = self.pending_vertices.len * @sizeOf(Vertex),
-            })
-        else
-            sg.makeBuffer(.{
-                .data = sg.asRange(self.pending_vertices),
-            });
-        if (vbuf.id == 0) return;
+        //
+        // Test-only injection (P5 5e): synthesize a nonzero FAILED buffer
+        // instead of the real makeBuffer, so the validity check below
+        // exercises its `.FAILED` arm on the real path. The flag
+        // auto-resets; a dry pool (id 0) falls through to the real call so
+        // the mode stays pool-exhaustion, never vacuous.
+        var injected_fail = false;
+        var vbuf: sg.Buffer = undefined;
+        if (test_inject_mesh_fail_once) {
+            test_inject_mesh_fail_once = false;
+            const fb = sg.allocBuffer();
+            if (fb.id != 0) {
+                sg.failBuffer(fb);
+                test_last_injected_mesh_fail_id = fb.id;
+                vbuf = fb;
+                injected_fail = true;
+            }
+        }
+        if (!injected_fail) {
+            vbuf = if (self.pending_dynamic_update)
+                sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                    .size = self.pending_vertices.len * @sizeOf(Vertex),
+                })
+            else
+                sg.makeBuffer(.{
+                    .data = sg.asRange(self.pending_vertices),
+                });
+        }
+        // A failed makeBuffer may still hand out a nonzero id in FAILED
+        // resource state (id == 0 means pool exhaustion only); draw rejects
+        // FAILED permanently, so accept VALID only and keep every pending
+        // flag for retry. Same contract as instance staging/ui ensure.
+        if (vbuf.id == 0 or sg.queryBufferState(vbuf) != .VALID) {
+            if (vbuf.id != 0) sg.destroyBuffer(vbuf);
+            return;
+        }
         if (self.index_type == .UINT16) {
-            const indices16 = allocator.alloc(u16, self.cpu_indices.len) catch return;
+            const indices16 = allocator.alloc(u16, self.cpu_indices.len) catch {
+                sg.destroyBuffer(vbuf);
+                return;
+            };
             defer allocator.free(indices16);
             for (self.cpu_indices, 0..) |idx, k| {
                 indices16[k] = @intCast(idx);
@@ -808,7 +871,8 @@ pub const Mesh = struct {
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(indices16),
             });
-            if (ibuf.id == 0) {
+            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+                if (ibuf.id != 0) sg.destroyBuffer(ibuf);
                 sg.destroyBuffer(vbuf);
                 return;
             }
@@ -818,7 +882,8 @@ pub const Mesh = struct {
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(self.cpu_indices),
             });
-            if (ibuf.id == 0) {
+            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+                if (ibuf.id != 0) sg.destroyBuffer(ibuf);
                 sg.destroyBuffer(vbuf);
                 return;
             }
@@ -992,9 +1057,11 @@ pub const Mesh = struct {
 // yet", so context-less tests never crash inside makeBuffer.
 //
 // The immediate path fails with error.GpuBufferAllocationFailed when the
-// sokol buffer pool is exhausted (sg.makeBuffer returns id == 0) instead of
-// publishing a mesh with dead handles; nothing is appended and no GPU/CPU
-// state leaks.
+// sokol buffer pool is exhausted (sg.makeBuffer returns id == 0) or hands
+// out a nonzero id in FAILED resource state (accept VALID only, same
+// contract as finishGpuUpload — draw rejects FAILED permanently) instead
+// of publishing a mesh with dead handles; nothing is appended and no
+// GPU/CPU state leaks.
 pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mesh {
     if (!gpu_thread.isOnContextThread() or !sg.isvalid()) {
         const mesh = try scene.allocator.create(Mesh);
@@ -1050,7 +1117,15 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
     const vbuf = sg.makeBuffer(.{
         .data = sg.asRange(data.vertices),
     });
-    if (vbuf.id == 0) return error.GpuBufferAllocationFailed;
+    // A failed makeBuffer may still hand out a nonzero id in FAILED
+    // resource state (id == 0 means pool exhaustion only); draw rejects
+    // FAILED permanently, so accept VALID only. The local is not yet
+    // assigned to the mesh, so the failed slot is destroyed inline here
+    // (the errdefer below cannot see it yet).
+    if (vbuf.id == 0 or sg.queryBufferState(vbuf) != .VALID) {
+        if (vbuf.id != 0) sg.destroyBuffer(vbuf);
+        return error.GpuBufferAllocationFailed;
+    }
     mesh.vertex_buffer = vbuf;
 
     if (index_type == .UINT16) {
@@ -1065,14 +1140,23 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(indices16),
         });
-        if (ibuf.id == 0) return error.GpuBufferAllocationFailed;
+        // Same VALID-only contract as above: the local is not yet
+        // assigned, so destroy the failed slot inline; the already
+        // installed vertex_buffer is reclaimed by the errdefer.
+        if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+            if (ibuf.id != 0) sg.destroyBuffer(ibuf);
+            return error.GpuBufferAllocationFailed;
+        }
         mesh.index_buffer = ibuf;
     } else {
         const ibuf = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(data.indices),
         });
-        if (ibuf.id == 0) return error.GpuBufferAllocationFailed;
+        if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+            if (ibuf.id != 0) sg.destroyBuffer(ibuf);
+            return error.GpuBufferAllocationFailed;
+        }
         mesh.index_buffer = ibuf;
         try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
     }

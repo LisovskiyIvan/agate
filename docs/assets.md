@@ -11,12 +11,13 @@
 ```zig
 const agate = @import("agate");
 
-// Низкоуровнево: async-текстура с дедупликацией, слот патчится сам.
+// Низкоуровнево: async-текстура с дедупликацией, слот патчится game-side коммитом.
 var queue = try agate.assets.UploadQueue.init(allocator, 2);
 defer queue.deinit();
 const slot = try queue.getOrRequestFile("assets/brick.png", .{ .srgb_to_linear = true }, .{});
-slot.addTarget(&mat.albedo_texture); // патч при drain на context-потоке
-// ... в кадре (context): _ = queue.drainCountedBudget(4, byte_budget);
+slot.addTarget(&mat.albedo_texture); // регистрация с game-потока race-safe; патч — в commitUploadedTargets
+// ... в кадре (context): _ = queue.drainCountedBudget(4, byte_budget); // только GPU-аплоад + публикация .uploaded
+// ... на продюсере (game, каждый build): _ = queue.commitUploadedTargets(); // патч слотов материалов
 
 // Высокоуровнево: менеджер с прогрессом.
 var mgr = agate.AssetManager.init(allocator);
@@ -35,8 +36,8 @@ std.debug.print("progress: {d}\n", .{mgr.progress()});
 ```zig
 pub const TextureState = enum(u8) { ... }; // pending → ready → uploaded / failed / taken
 pub const PendingTexture = struct {
-    pub fn addTarget(self: *PendingTexture, slot: *?Texture) void; // слот-получатель патча
-    pub fn take(self: *PendingTexture) ?Texture;                   // забрать владение
+    pub fn addTarget(self: *PendingTexture, slot: *?Texture) void; // слот-получатель патча (race-safe с game-потока)
+    pub fn take(self: *PendingTexture) ?Texture;                   // забрать владение (только слоты без таргетов)
 };
 pub fn uploadBudgetExhausted(uploaded_count: usize, uploaded_bytes: u64, max_bytes: ?u64) bool;
 pub const UploadQueue = struct {
@@ -52,11 +53,12 @@ pub const UploadQueue = struct {
     pub fn drainCountedBudget(self: *UploadQueue, max_count: ?usize, max_bytes: ?u64) DrainResult;
     pub fn drainBudget(self: *UploadQueue, max: usize) usize;
     pub fn drain(self: *UploadQueue) usize;
+    pub fn commitUploadedTargets(self: *UploadQueue) usize; // game-side патч таргетов опубликованных слотов
     pub fn release(self: *UploadQueue, p: *PendingTexture) void;
 };
 ```
 
-Контракт: слот валиден до `release`/`deinit`; таргеты регистрировать до drain. Состояния слота: ожидание декода → `ready` (CPU-буфер готов, ждёт GPU) → `uploaded` (хендл создан, таргеты пропатчены) либо `failed` (ошибка декода — слот мёртв, повторный запрос создаёт новый); `taken` — текстура забрана через `take` и слот больше не участвует в дедупликации. Спинлок покрывает только очередь/сканирование (батч ≤ 64 слотов — константа `drain_chunk`, чанк на стеке, без аллокаций в кадре); GPU-работа и патчи — после отпускания замка. `deinit` сначала гасит runner (join гарантирует завершение записей декодеров), затем освобождает слоты по состояниям (`uploaded` → `Texture.deinit`, `ready` → CPU-буферы). Дедупликация по пути: повторный запрос того же файла переиспользует in-flight или uploaded слот вместо второго декода и аплоада.
+Контракт: слот валиден до `release`/`deinit`; регистрация таргетов через `addTarget` race-safe с game-потока в любой момент (под lock-free prepare конкурентно с context-drain): попавшие до публикации `.uploaded` копятся в списке слота, попавшие после — патчат свой слот сразу (хендл после публикации иммутабелен). Применяет их game-side `commitUploadedTargets` — каждый producer build (`frame_build.buildIntoClaimedSlot`) плюс сериализованный legacy-drain (`frame_prepare.beginPrepare` без fresh build); context-drain только создаёт GPU-текстуру и публикует `.uploaded`, живые слоты материалов не трогает. Состояния слота: ожидание декода → `ready` (CPU-буфер готов, ждёт GPU) → `uploaded` (хендл создан, ждёт game-side коммита таргетов) либо `failed` (ошибка декода — слот мёртв, повторный запрос создаёт новый); `taken` — текстура забрана через `take` и слот больше не участвует в дедупликации. `take` — эксклюзивное владение, не смешивать с зарегистрированными/закоммиченными таргетами (иначе забранный хендл алиасит материалы). Спинлок очереди покрывает только очередь/сканирование (батч ≤ 64 слотов — константа `drain_chunk`, чанк на стеке, без аллокаций в кадре); плюс per-slot мьютекс таргетов (только указатели, никогда через GPU-работу); GPU-работа — после отпускания замков. `deinit` сначала гасит runner (join гарантирует завершение записей декодеров), затем освобождает слоты по состояниям (`uploaded` → `Texture.deinit`, `ready` → CPU-буферы). Дедупликация по пути: повторный запрос того же файла переиспользует in-flight или uploaded слот вместо второго декода и аплоада.
 
 ```zig
 // Несколько материалов на одну текстуру — один декод и аплоад.
@@ -121,7 +123,7 @@ if (mgr.hasErrors()) ui.showError();
 
 ## Потоки и владение
 
-Запросы (`request*/add*Task`) — с любого потока (очередь под спинлоком). Декод — worker-пул (`task_threads` 1–2: один декод монолитен, параллелизм только по изображениям). Drain/финализация (`drain*`, `loadStep` для GPU-части, патч слотов) — только context-поток. Байты `requestMemory` уходят во владение очереди (освобождаются после декода). `PendingTexture` живёт до `release`; забранная через `take` текстура — владение вызывающего (`Texture.deinit` сам). `AssetManager.reset` чистит задачи, `resetAll` — плюс кэш.
+Запросы (`request*/add*Task`) — с любого потока (очередь под спинлоком). `addTarget` — с game-потока, race-safe относительно context-drain (per-slot мьютекс + fast path после публикации). Декод — worker-пул (`task_threads` 1–2: один декод монолитен, параллелизм только по изображениям). Drain/финализация (`drain*`) — только context-поток: GPU-аплоад и публикация `.uploaded`, без записи в слоты материалов. Патч слотов (`commitUploadedTargets`) — game-side (каждый producer build) либо сериализованный legacy-drain; `loadStep` для GPU-части менеджера — context. Байты `requestMemory` уходят во владение очереди (освобождаются после декода). `PendingTexture` живёт до `release`; забранная через `take` текстура — владение вызывающего (`Texture.deinit` сам), только для слотов без таргетов. `AssetManager.reset` чистит задачи, `resetAll` — плюс кэш.
 
 ## Ошибки и краевые случаи
 
