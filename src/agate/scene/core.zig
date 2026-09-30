@@ -432,7 +432,7 @@ pub const Scene = struct {
     prepare_claim_generation: u64 = 0,
     prepare_claim_active: bool = false,
     prepare_claim_slot: usize = 0,
-    prepare_claim_seq: u64 = 0,
+    prepare_claim_seq: usize = 0,
     prepare_claim_have_build: bool = false,
     prepare_claim_has_handoff: bool = false,
     /// Reuse guard owned by `renderReuse` on the context thread (set around
@@ -496,8 +496,8 @@ pub const Scene = struct {
     /// producer never touches it) — atomic so the handoff-edge comparison
     /// itself is race-free once game||prepare overlap. The build touches no
     /// stats/profiler/frame_id/retire_epoch.
-    build_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    last_latched_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    build_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    last_latched_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Game-side UI CPU packet sequence (lock-free-publication slice 2, b):
     /// `stageUiPacket` (game side, sg-free) records live canvas geometry
     /// into the back slot's `ui_vertices`/`ui_indices` + `ui_packet` header
@@ -513,8 +513,8 @@ pub const Scene = struct {
     /// `last_latched_ui_seq` is stamped context-side only (the producer never
     /// touches it). The stage touches no stats/profiler/frame_id/epoch and
     /// no GPU state at all (CPU list copies + seq bump only).
-    ui_packet_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    last_latched_ui_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ui_packet_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    last_latched_ui_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// How many prepares actually consumed a staged packet as the geometry
     /// source (the `capturePacket` path, not the legacy canvas read and not
     /// the staged-absence clear). Observability only: lets an app/fixture
@@ -1411,7 +1411,7 @@ pub const Scene = struct {
     pub const BuildClaim = struct {
         scene: *Scene,
         slot: usize,
-        seq: u64,
+        seq: usize,
         completed: bool = false,
         did_build: bool = false,
 
@@ -1505,7 +1505,7 @@ pub const Scene = struct {
     }
 
     /// See `scene/frame_api.zig` (owns the body + docs).
-    fn buildIntoClaimedSlot(self: *Scene, slot: usize, seq: u64) void {
+    fn buildIntoClaimedSlot(self: *Scene, slot: usize, seq: usize) void {
         scene_frame.buildIntoClaimedSlot(self, slot, seq);
     }
 

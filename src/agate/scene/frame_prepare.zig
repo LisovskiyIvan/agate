@@ -16,7 +16,7 @@ const SceneFrameSnapshot = @import("snapshot.zig").SceneFrameSnapshot;
 pub const PrepareClaim = struct {
     token_id: u64,
     back_idx: usize,
-    build_seq: u64,
+    build_seq: usize,
     have_build: bool,
     has_handoff: bool,
     /// Frozen host bytes staged by the producer (`BuildClaim.stageHostBytes`
@@ -82,7 +82,7 @@ pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim {
     const has_handoff = handoff != null;
     const have_build = if (handoff) |h| h.has_scene_build else false;
     if (!has_handoff and !allow_fallback) return null;
-    const build_seq: u64 = if (handoff) |h| h.seq else 0;
+    const build_seq: usize = if (handoff) |h| h.seq else 0;
     const back_idx: usize = if (handoff) |h| h.slot else blk: {
         break :blk scene.draws.claimBack() orelse {
             return null;

@@ -18,7 +18,7 @@ const scene_upload_packets = @import("upload_packets.zig");
 /// `GpuRetire.begin`/`complete`/`flush` and never passes a `retire_queue`
 /// anywhere — epochs stay context-owned (prepare/render own the
 /// begin/complete pairing); enforced by test.
-pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: u64) void {
+pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
     // Deliberately NO gpu_thread assert: this runs on the game side or
     // a spawned worker. Everything below is sg-free (the commit, the CPU
     // staging half, the plain captures, the CPU queue/shadow/outline

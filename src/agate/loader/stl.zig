@@ -142,8 +142,8 @@ fn readF32LE(bytes: []const u8) f32 {
 fn binaryCount(bytes: []const u8) ?u32 {
     if (bytes.len < 84) return null;
     const count = std.mem.readInt(u32, bytes[80..84], .little);
-    const want: usize = 84 + @as(usize, count) * 50;
-    if (bytes.len == want) return count;
+    const want: u64 = 84 + @as(u64, count) * 50;
+    if (@as(u64, bytes.len) == want) return count;
     return null;
 }
 

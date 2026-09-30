@@ -62,6 +62,7 @@
 //! order cannot drift; hosts keep their policy.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const jobs = @import("jobs.zig");
 const Scene = @import("scene.zig").Scene;
 
@@ -187,6 +188,9 @@ pub const Runtime = struct {
     /// when `shouldRun` goes false). Returns false on spawn failure with
     /// `running` left clear so the host degrades to single-threaded.
     pub fn spawnWorker(self: *Runtime, comptime entry: fn () void) bool {
+        if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) {
+            return false;
+        }
         std.debug.assert(self.thread == null);
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, entry, .{}) catch |err| {

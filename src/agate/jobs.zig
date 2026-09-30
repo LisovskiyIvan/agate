@@ -123,6 +123,7 @@ pub const Pool = struct {
     /// Worker count for pool setup: one thread per core, capped so
     /// pathological many-core machines don't over-park, floor 1.
     pub fn recommendedWorkerCount() usize {
+        if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) return 1;
         const cpus = std.Thread.getCpuCount() catch return 1;
         return @min(@max(cpus -| 1, 1), 8);
     }
@@ -143,12 +144,11 @@ pub const Pool = struct {
             self.lot.deinit();
             self.dispatch_mutex.deinit();
         }
-        const effective: usize = if (builtin.single_threaded) 0 else worker_count;
-        if (effective == 0) return self;
+        if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) return self;
 
-        self.workers = try allocator.alloc(std.Thread, effective);
+        self.workers = try allocator.alloc(std.Thread, worker_count);
         errdefer allocator.free(self.workers);
-        self.mailbox = try allocator.alloc(std.atomic.Value(?*Job), effective);
+        self.mailbox = try allocator.alloc(std.atomic.Value(?*Job), worker_count);
         errdefer allocator.free(self.mailbox);
         for (self.mailbox) |*m| m.* = std.atomic.Value(?*Job).init(null);
 
@@ -160,7 +160,7 @@ pub const Pool = struct {
             self.lot.broadcast();
             for (self.workers[0..spawned]) |t| t.join();
         }
-        for (0..effective) |i| {
+        for (0..worker_count) |i| {
             self.workers[i] = try std.Thread.spawn(.{}, workerMain, .{ self, i });
             spawned += 1;
         }
@@ -469,10 +469,9 @@ pub const TaskRunner = struct {
         errdefer {
             self.lot.deinit();
         }
-        const effective: usize = if (builtin.single_threaded) 0 else thread_count;
-        if (effective == 0) return self;
+        if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) return self;
 
-        self.threads = try allocator.alloc(std.Thread, effective);
+        self.threads = try allocator.alloc(std.Thread, thread_count);
         errdefer allocator.free(self.threads);
         var spawned: usize = 0;
         errdefer {
@@ -482,7 +481,7 @@ pub const TaskRunner = struct {
             self.lot.broadcast();
             for (self.threads[0..spawned]) |t| t.join();
         }
-        for (0..effective) |i| {
+        for (0..thread_count) |i| {
             self.threads[i] = try std.Thread.spawn(.{}, workerMain, .{self});
             spawned += 1;
         }
@@ -566,8 +565,8 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
     comptime std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0); // power of two
     return struct {
         const Self = @This();
-        head: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        tail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         buf: [capacity]T = undefined,
 
         pub fn push(self: *Self, value: T) bool {
@@ -590,7 +589,7 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
 
         /// Items available for the consumer.
         pub fn len(self: *Self) usize {
-            return @intCast(self.head.load(.monotonic) - self.tail.load(.monotonic));
+            return self.head.load(.monotonic) - self.tail.load(.monotonic);
         }
     };
 }

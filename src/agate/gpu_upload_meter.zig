@@ -13,24 +13,26 @@ const std = @import("std");
 // Сброс раз в кадр: Scene.prepareFrame обнуляет счётчик в начале кадра,
 // Scene.render забирает значение в stats.updated_bytes_frame перед
 // Profiler.recordFrame (включая UI/debug-апдейты, идущие уже внутри render).
-var pending_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+const builtin = @import("builtin");
+const MeterInt = if (builtin.cpu.arch.isWasm()) usize else u64;
+var pending_bytes: std.atomic.Value(MeterInt) = std.atomic.Value(MeterInt).init(0);
 
 /// Учитывает очередные `bytes` байт, записанные в GPU-буфер.
 /// Вызывать строго рядом с фактическим sg.updateBuffer/appendBuffer,
 /// внутри того же guard'а (без sokol-контекста эти ветки недостижимы,
 /// счётчик в тестах остаётся нулевым).
 pub fn record(bytes: usize) void {
-    _ = pending_bytes.fetchAdd(@as(u64, @intCast(bytes)), .monotonic);
+    _ = pending_bytes.fetchAdd(@as(MeterInt, @intCast(bytes)), .monotonic);
 }
 
 /// Забирает накопленное значение и обнуляет счётчик (раз в кадр).
 pub fn takeAndReset() u64 {
-    return pending_bytes.swap(0, .acq_rel);
+    return @as(u64, pending_bytes.swap(0, .acq_rel));
 }
 
 /// Текущее значение без сброса (для тестов и отладки).
 pub fn peek() u64 {
-    return pending_bytes.load(.monotonic);
+    return @as(u64, pending_bytes.load(.monotonic));
 }
 
 test "record накапливает, takeAndReset возвращает сумму и обнуляет" {

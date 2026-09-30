@@ -536,7 +536,7 @@ const WavDecoder = struct {
             self.current_frame += actual_frames;
             return actual_frames;
         } else if (self.memory) |mem| {
-            const start = self.data_offset + @as(u64, @intCast(self.current_frame * self.block_align));
+            const start: usize = @intCast(self.data_offset + @as(u64, @intCast(self.current_frame * self.block_align)));
             src_slice = mem[start .. start + bytes_to_read];
             decodeChunk(dst[0 .. frames_to_read * 2], src_slice, self);
             self.current_frame += frames_to_read;

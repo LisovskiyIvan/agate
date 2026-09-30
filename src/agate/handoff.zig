@@ -76,9 +76,10 @@
 
 const std = @import("std");
 
-const STATE_FREE: u64 = 0;
-const STATE_WRITING: u64 = 1;
-const STATE_PUBLISHED: u64 = 2;
+const SeqInt = usize;
+const STATE_FREE: SeqInt = 0;
+const STATE_WRITING: SeqInt = 1;
+const STATE_PUBLISHED: SeqInt = 2;
 
 pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
     comptime std.debug.assert(slot_count >= 2); // double buffer minimum
@@ -92,17 +93,17 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
         /// Global publish counter: sequence numbers must be unique and
         /// monotonic across ALL slots, otherwise takeLatest cannot tell
         /// which published frame is newer.
-        publish_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        meta: [slot_count]std.atomic.Value(u64) = blk: {
-            var m: [slot_count]std.atomic.Value(u64) = undefined;
-            for (&m) |*v| v.* = std.atomic.Value(u64).init(STATE_FREE);
+        publish_seq: std.atomic.Value(SeqInt) = std.atomic.Value(SeqInt).init(0),
+        meta: [slot_count]std.atomic.Value(SeqInt) = blk: {
+            var m: [slot_count]std.atomic.Value(SeqInt) = undefined;
+            for (&m) |*v| v.* = std.atomic.Value(SeqInt).init(STATE_FREE);
             break :blk m;
         },
         /// Newest sequence ever delivered by `takeLatest` (null = nothing
         /// delivered yet). Consumer-side only: written after a validated
         /// copy, read to suppress late-visible stale frames (see header).
         /// Plain field — only the single consumer touches it.
-        floor: ?u64 = null,
+        floor: ?SeqInt = null,
 
         /// Reserves a free slot for writing. Returns null when every slot
         /// is published or being written (consumer lagging) — publishers
@@ -112,7 +113,7 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
             for (0..slot_count) |i| {
                 const m = self.meta[i].load(.monotonic);
                 if (m & 3 != STATE_FREE) continue;
-                if (self.meta[i].cmpxchgWeak(m, (m & ~@as(u64, 3)) | STATE_WRITING, .acquire, .monotonic) == null) {
+                if (self.meta[i].cmpxchgWeak(m, (m & ~@as(SeqInt, 3)) | STATE_WRITING, .acquire, .monotonic) == null) {
                     return i;
                 }
             }
@@ -154,7 +155,7 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
                     // Keep the seq (same as takeLatest): free slots are
                     // reclaimed with the same seq, publish stamps a fresh
                     // global one, so ordering stays monotonic.
-                    _ = self.meta[j].cmpxchgStrong(m, m & ~@as(u64, 3), .release, .monotonic);
+                    _ = self.meta[j].cmpxchgStrong(m, m & ~@as(SeqInt, 3), .release, .monotonic);
                 }
             }
         }
@@ -169,8 +170,8 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
         pub fn takeLatest(self: *Self, out: *T) bool {
             while (true) {
                 var best: ?usize = null;
-                var best_seq: u64 = 0;
-                var best_word: u64 = 0;
+                var best_seq: SeqInt = 0;
+                var best_word: SeqInt = 0;
                 for (0..slot_count) |i| {
                     const m = self.meta[i].load(.acquire);
                     if (m & 3 != STATE_PUBLISHED) continue;
@@ -217,12 +218,12 @@ pub fn Handoff(comptime T: type, comptime slot_count: usize) type {
         /// explicit publisher intent). The CAS is on the exact observed
         /// word, so a slot reclaimed + republished with a newer sequence in
         /// between fails the CAS and survives for the next take.
-        fn releaseScanned(self: *Self, max_seq: u64) void {
+        fn releaseScanned(self: *Self, max_seq: SeqInt) void {
             for (0..slot_count) |j| {
                 const m = self.meta[j].load(.monotonic);
                 if (m & 3 != STATE_PUBLISHED) continue;
                 if ((m >> 2) > max_seq) continue;
-                _ = self.meta[j].cmpxchgStrong(m, m & ~@as(u64, 3), .release, .monotonic);
+                _ = self.meta[j].cmpxchgStrong(m, m & ~@as(SeqInt, 3), .release, .monotonic);
             }
         }
     };

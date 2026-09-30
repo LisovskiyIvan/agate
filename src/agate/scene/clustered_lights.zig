@@ -536,7 +536,7 @@ pub const ClusteredGpuCache = struct {
         if (self.dummy_buffer.id == 0) {
             self.dummy_buffer = sg.makeBuffer(.{
                 .usage = .{ .storage_buffer = true },
-                .size = 16,
+                .size = 64,
             });
         }
         if (self.dummy_buffer.id != 0 and self.dummy_view.id == 0) {

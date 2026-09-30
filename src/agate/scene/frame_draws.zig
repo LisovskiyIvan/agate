@@ -251,7 +251,7 @@ pub const LeaseError = error{
 
 pub const HandoffClaim = struct {
     slot: usize,
-    seq: u64,
+    seq: usize,
     has_scene_build: bool,
 };
 
@@ -560,7 +560,7 @@ pub const FrameDrawSlot = struct {
     /// Producer generation that built this slot. Prepare latches this exact
     /// generation even if a newer build publishes while the slot-only latch
     /// is finishing.
-    build_seq: u64 = 0,
+    build_seq: usize = 0,
     /// True only when the producer built the 3D/frame payload, not a
     /// UI-packet-only claim. Staged-only prepare must not consume stale 3D
     /// data as if it belonged to a UI-only handoff.
@@ -949,8 +949,8 @@ pub const FrameDraws = struct {
     pub fn claimLatestHandoff(
         self: *FrameDraws,
         build_slot: *const std.atomic.Value(usize),
-        build_seq: *const std.atomic.Value(u64),
-        last_latched_seq: u64,
+        build_seq: *const std.atomic.Value(usize),
+        last_latched_seq: usize,
         require_scene_build: bool,
     ) LeaseError!?HandoffClaim {
         lockLease(&self.mutex);
@@ -1042,9 +1042,9 @@ pub const FrameDraws = struct {
     pub fn releaseHandoffWithSeq(
         self: *FrameDraws,
         back_idx: usize,
-        seq: u64,
+        seq: usize,
         build_slot: *std.atomic.Value(usize),
-        build_seq: *std.atomic.Value(u64),
+        build_seq: *std.atomic.Value(usize),
     ) LeaseError!void {
         if (back_idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
         lockLease(&self.mutex);
@@ -1079,9 +1079,9 @@ pub const FrameDraws = struct {
     pub fn cancelHandoffClaim(
         self: *FrameDraws,
         back_idx: usize,
-        seq: u64,
+        seq: usize,
         build_slot: *const std.atomic.Value(usize),
-        build_seq: *const std.atomic.Value(u64),
+        build_seq: *const std.atomic.Value(usize),
     ) LeaseError!void {
         if (back_idx >= SLOT_COUNT) return LeaseError.InvalidSlot;
         lockLease(&self.mutex);
@@ -1312,7 +1312,7 @@ test "wave39: shared front reader coexists with render pin and blocks slot reuse
 test "wave39: handoff slot and generation are claimed as one counted pair" {
     var draws = FrameDraws{};
     var build_slot = std.atomic.Value(usize).init(0);
-    var build_seq = std.atomic.Value(u64).init(0);
+    var build_seq = std.atomic.Value(usize).init(0);
 
     const slot = draws.claimBack().?;
     draws.slotAt(slot).build_seq = 7;
@@ -1320,7 +1320,7 @@ test "wave39: handoff slot and generation are claimed as one counted pair" {
     try draws.releaseHandoffWithSeq(slot, 7, &build_slot, &build_seq);
     const claimed = (try draws.claimLatestHandoff(&build_slot, &build_seq, 0, true)).?;
     try testing.expectEqual(slot, claimed.slot);
-    try testing.expectEqual(@as(u64, 7), claimed.seq);
+    try testing.expectEqual(@as(usize, 7), claimed.seq);
     try testing.expect(claimed.has_scene_build);
     try draws.tryPublish(claimed.slot);
     try testing.expect((try draws.claimLatestHandoff(&build_slot, &build_seq, 7, true)) == null);

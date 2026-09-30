@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 
@@ -150,17 +151,21 @@ pub fn decodeImagesInParallel(scene: *Scene, gltf: *c.cgltf_data, decoded: []?Te
     if (job_count == 0) return;
 
     var queue = DecodeQueue{ .jobs = jobs[0..job_count] };
-    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const cpu_count = if (builtin.single_threaded or builtin.cpu.arch.isWasm()) 1 else std.Thread.getCpuCount() catch 4;
     const max_threads = 8;
     const worker_count = @min(job_count, @min(cpu_count, max_threads));
-    if (worker_count > 1) {
-        var threads: [max_threads]std.Thread = undefined;
-        var spawned: usize = 0;
-        while (spawned < worker_count - 1) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, DecodeQueue.run, .{&queue}) catch break;
+    if (comptime !builtin.single_threaded and !builtin.cpu.arch.isWasm()) {
+        if (worker_count > 1) {
+            var threads: [max_threads]std.Thread = undefined;
+            var spawned: usize = 0;
+            while (spawned < worker_count - 1) : (spawned += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, DecodeQueue.run, .{&queue}) catch break;
+            }
+            queue.run();
+            for (threads[0..spawned]) |t| t.join();
+        } else {
+            queue.run();
         }
-        queue.run();
-        for (threads[0..spawned]) |t| t.join();
     } else {
         queue.run();
     }

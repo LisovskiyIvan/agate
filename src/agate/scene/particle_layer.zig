@@ -95,9 +95,9 @@ pub const ParticleLayer = struct {
     /// values only, same shape as `frame`; freed in deinit.
     build_frame: std.ArrayListUnmanaged(ParticleDraw) = .empty,
     /// `Scene.build_seq` stamped by the last `buildCapture` (0 = never).
-    build_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    build_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Last `build_seq` consumed by `latchFrame`.
-    latched_seq: u64 = 0,
+    latched_seq: usize = 0,
 
     pass: passes.ParticlePass,
 
@@ -164,7 +164,7 @@ pub const ParticleLayer = struct {
     /// `build_frame` to coherent-empty (mirroring `captureFrame`); the seq
     /// still advances — the empty IS the new state — so the latch publishes
     /// it instead of a stale prior frame.
-    pub fn buildCapture(self: *ParticleLayer, allocator: std.mem.Allocator, seq: u64) void {
+    pub fn buildCapture(self: *ParticleLayer, allocator: std.mem.Allocator, seq: usize) void {
         captureInto(self.systems.items, allocator, &self.build_frame);
         self.build_seq.store(seq, .release);
     }
@@ -581,7 +581,7 @@ test "particle buildCapture+latchFrame isolates live mutations" {
     // Game-side build: fills the build frame, stamps the seq, leaves the
     // render-owned frame untouched.
     layer.buildCapture(t.allocator, 9);
-    try t.expectEqual(@as(u64, 9), layer.build_seq.load(.acquire));
+    try t.expectEqual(@as(usize, 9), layer.build_seq.load(.acquire));
     try t.expectEqual(@as(usize, 1), layer.build_frame.items.len);
     try t.expectEqual(@as(usize, 0), layer.frame.items.len);
 

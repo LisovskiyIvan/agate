@@ -1,6 +1,6 @@
 const std = @import("std");
 const Build = std.Build;
-const sokol = @import("sokol");
+pub const sokol = @import("sokol");
 
 // ---------------------------------------------------------------------------
 // User shader materials (hook level).
@@ -104,6 +104,7 @@ pub const engine_shader_slang = sokol.shdc.Slang{
     .glsl430 = true,
     .metal_macos = true,
     .hlsl5 = true,
+    .wgsl = true,
 };
 
 pub const UserShaderSpec = struct {
@@ -125,10 +126,11 @@ pub const UserShaderSpec = struct {
 };
 
 pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShaderSpec) !*Build.Module {
-    if (spec.name.len == 0 or spec.input.len == 0) return error.UserShaderBadSpec;
+    const is_web = spec.target.result.cpu.arch.isWasm();
     const dep_sokol = dep_agate.builder.dependency("sokol", .{
         .target = spec.target,
         .optimize = spec.optimize,
+        .wgpu = is_web,
     });
     const mod_sokol = dep_sokol.module("sokol");
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});
@@ -143,6 +145,11 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
     });
     shader_mod.addImport("math", mod_math);
     return shader_mod;
+}
+
+pub fn getEmsdk(dep_agate: *Build.Dependency) *Build.Dependency {
+    const dep_sokol = dep_agate.builder.dependency("sokol", .{});
+    return dep_sokol.builder.dependency("emsdk", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +257,7 @@ fn excludedFromTestRegistry(path: []const u8) bool {
 /// Clang flags disabling every sanitizer-coverage feature zig enables for C
 /// sources in fuzz mode. See the c_impl.c flag block for the rationale.
 const no_sancov = "-fno-sanitize-coverage=trace-pc-guard,inline-8bit-counters,pc-table,indirect-calls,trace-cmp,trace-div,trace-gep,inline-bool-flag";
+const no_ubsan = "-fno-sanitize=undefined";
 
 pub fn build(b: *Build) !void {
     // Test registry: compute-only at configure time. Never writes to source
@@ -264,9 +272,13 @@ pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const is_web = target.result.cpu.arch.isWasm();
+    const opt_wgpu = b.option(bool, "wgpu", "Force WebGPU (default: true for web)") orelse is_web;
+
     const dep_sokol = b.dependency("sokol", .{
         .target = target,
         .optimize = optimize,
+        .wgpu = opt_wgpu,
     });
     const mod_sokol = dep_sokol.module("sokol");
     const mod_math = b.createModule(.{ .root_source_file = b.path("src/agate/math.zig") });
@@ -296,6 +308,7 @@ pub fn build(b: *Build) !void {
         .glsl410 = true, // Linux (GL)
         .metal_macos = true, // macOS (Metal)
         .hlsl5 = true, // Windows (D3D11)
+        .wgsl = true, // WebGPU
     };
     // Forward shaders with fragment-stage storage buffers (clustered
     // lights, wave 30): SSBO syntax is not valid GLSL 4.10, so these five
@@ -307,6 +320,7 @@ pub fn build(b: *Build) !void {
         .glsl430 = true,
         .metal_macos = true,
         .hlsl5 = true,
+        .wgsl = true, // WebGPU
     };
     const shader_specs = [_]ShaderSpec{
         // Increment 2 of the shader-include refactor: the five forward
@@ -335,7 +349,7 @@ pub fn build(b: *Build) !void {
             .name = "particle_compute_shader",
             .input = "src/agate/shaders/particle_compute.glsl",
             .output = "particle_compute_shader.zig",
-            .slang = .{ .glsl430 = true, .metal_macos = true, .hlsl5 = true },
+            .slang = .{ .glsl430 = true, .metal_macos = true, .hlsl5 = true, .wgsl = true },
         },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
@@ -408,6 +422,14 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
         .imports = &agate_imports,
     });
+    if (is_web) {
+        const dep_emsdk = dep_sokol.builder.dependency("emsdk", .{});
+        mod_agate.addSystemIncludePath(dep_emsdk.path("upstream/emscripten/cache/sysroot/include"));
+        mod_agate.addSystemIncludePath(dep_emsdk.path("upstream/emscripten/cache/sysroot/include/c++/v1"));
+        if (opt_wgpu) {
+            mod_agate.addSystemIncludePath(dep_emsdk.path("upstream/emscripten/cache/ports/emdawnwebgpu/emdawnwebgpu_pkg/webgpu/include"));
+        }
+    }
     mod_agate.addIncludePath(b.path("src/agate/c"));
     mod_agate.addIncludePath(b.path("src/agate/c/box3d/include"));
     mod_agate.addCSourceFile(.{
@@ -426,9 +448,9 @@ pub fn build(b: *Build) !void {
             // contribute no coverage feedback. User cflags land after zig's.
             if (optimize == .Debug) {
                 break :blk if (neon)
-                    &.{ "-std=c99", "-O2", "-DSTBI_NEON", "-fno-math-errno", no_sancov }
+                    &.{ "-std=c99", "-O2", "-DSTBI_NEON", "-fno-math-errno", no_sancov, no_ubsan }
                 else
-                    &.{ "-std=c99", "-O2", "-fno-math-errno", no_sancov };
+                    &.{ "-std=c99", "-O2", "-fno-math-errno", no_sancov, no_ubsan };
             }
             break :blk if (neon)
                 &.{ "-std=c99", "-O3", "-DNDEBUG", "-DSTBI_NEON", "-fno-math-errno", "-fno-trapping-math", "-fomit-frame-pointer", no_sancov }
@@ -495,8 +517,13 @@ pub fn build(b: *Build) !void {
             "src/agate/c/box3d/src/wheel_joint.c",
             "src/agate/c/box3d/src/world_snapshot.c",
         },
-        .flags = if (optimize == .Debug)
-            &.{ "-std=c17", "-O2", "-fno-math-errno", no_sancov }
+        .flags = if (is_web)
+            if (optimize == .Debug)
+                &.{ "-std=c17", "-O2", "-fno-math-errno", "-D_POSIX_C_SOURCE=199309L", no_sancov, no_ubsan }
+            else
+                &.{ "-std=c17", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", "-D_POSIX_C_SOURCE=199309L", no_sancov }
+        else if (optimize == .Debug)
+            &.{ "-std=c17", "-O2", "-fno-math-errno", no_sancov, no_ubsan }
         else
             &.{ "-std=c17", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", no_sancov },
     });
@@ -511,7 +538,7 @@ pub fn build(b: *Build) !void {
             "src/agate/c/meshopt/vertexfilter.cpp",
         },
         .flags = if (optimize == .Debug)
-            &.{ "-std=c++17", "-O2", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", no_sancov }
+            &.{ "-std=c++17", "-O2", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", no_sancov, no_ubsan }
         else
             &.{ "-std=c++17", "-O3", "-DNDEBUG", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", no_sancov },
     });
@@ -534,7 +561,7 @@ pub fn build(b: *Build) !void {
             "src/agate/c/basis_glue.cpp",
         },
         .flags = if (optimize == .Debug)
-            &.{ "-std=c++17", "-O2", "-fno-math-errno", "-fno-sanitize=alignment", no_sancov }
+            &.{ "-std=c++17", "-O2", "-fno-math-errno", "-fno-sanitize=alignment", no_sancov, no_ubsan }
         else
             &.{ "-std=c++17", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fomit-frame-pointer", "-fno-sanitize=alignment", no_sancov },
     });
@@ -545,7 +572,7 @@ pub fn build(b: *Build) !void {
             "src/agate/c/basisu/zstd/zstddeclib.c",
         },
         .flags = if (optimize == .Debug)
-            &.{ "-std=c11", "-O2", "-fno-math-errno", no_sancov }
+            &.{ "-std=c11", "-O2", "-fno-math-errno", no_sancov, no_ubsan }
         else
             &.{ "-std=c11", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fomit-frame-pointer", no_sancov },
     });
@@ -782,7 +809,7 @@ fn createShaderMaterialRegistry(
         run_expand.addArg("--output");
         const expanded_glsl = run_expand.addOutputFileArg(b.fmt("shader_mat_{s}_expanded.glsl", .{mat.name}));
         const run_shdc = b.addSystemCommand(&.{shdc_exe.getPath(b)});
-        run_shdc.addArgs(&.{ "-l", "glsl430:metal_macos:hlsl5", "-f", "sokol_zig" });
+        run_shdc.addArgs(&.{ "-l", "glsl430:metal_macos:hlsl5:wgsl", "-f", "sokol_zig" });
         run_shdc.addArg("--input");
         run_shdc.addFileArg(expanded_glsl);
         run_shdc.addArg("--output");

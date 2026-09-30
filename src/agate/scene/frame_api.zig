@@ -395,7 +395,7 @@ pub fn buildPreparedFrame(self: anytype) void {
 /// `GpuRetire.begin`/`complete`/`flush` and never passes a `retire_queue`
 /// anywhere — epochs stay context-owned (prepare/render own the
 /// begin/complete pairing); enforced by test.
-pub fn buildIntoClaimedSlot(self: anytype, slot: usize, seq: u64) void {
+pub fn buildIntoClaimedSlot(self: anytype, slot: usize, seq: usize) void {
     scene_frame_build.buildIntoClaimedSlot(self, slot, seq);
 }
 

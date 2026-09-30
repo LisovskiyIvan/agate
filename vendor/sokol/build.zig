@@ -395,6 +395,7 @@ pub const EmLinkOptions = struct {
 pub fn emLinkStep(b: *Build, options: EmLinkOptions) !*Build.Step.InstallDir {
     const emcc_path = emTool(b, options.emsdk, "emcc");
     const emcc = addRunFile(b, emcc_path);
+    setupEmToolEnv(b, options.emsdk, emcc);
     emcc.setName("emcc"); // hide emcc path
     if (isOptimizeModeDebug(options.optimize)) {
         emcc.addArgs(&.{ "-g", "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
@@ -468,6 +469,7 @@ pub const EmRunOptions = struct {
 pub fn emRunStep(b: *Build, options: EmRunOptions) *Build.Step.Run {
     const emrun_path = emTool(b, options.emsdk, "emrun");
     const emrun = addRunFile(b, emrun_path);
+    setupEmToolEnv(b, options.emsdk, emrun);
     emrun.addFileArg(b.path(b.fmt("zig-out/web/{s}.html", .{options.name})));
     return emrun;
 }
@@ -483,6 +485,7 @@ pub const EmBuilderOptions = struct {
 pub fn emBuilderStep(b: *Build, options: EmBuilderOptions) *Build.Step.Run {
     const embuilder_path = emTool(b, options.emsdk, "embuilder");
     const embuilder = addRunFile(b, embuilder_path);
+    setupEmToolEnv(b, options.emsdk, embuilder);
     if (options.lto) {
         embuilder.addArg("--lto");
     }
@@ -494,6 +497,21 @@ pub fn emBuilderStep(b: *Build, options: EmBuilderOptions) *Build.Step.Run {
     }
     embuilder.addArgs(&.{ "build", options.port_name });
     return embuilder;
+}
+
+fn setupEmToolEnv(b: *Build, emsdk: *Build.Dependency, run: *Build.Step.Run) void {
+    const emsdk_path = emsdk.path(".").getPath(b);
+    run.setEnvironmentVariable("EMSDK", emsdk_path);
+    if (b.graph.environ_map.get("EMSDK_PYTHON")) |p| {
+        run.setEnvironmentVariable("EMSDK_PYTHON", p);
+    } else {
+        run.setEnvironmentVariable("EMSDK_PYTHON", emsdk.path("python/3.13.3_64bit/bin/python3").getPath(b));
+    }
+    if (b.graph.environ_map.get("EMSDK_NODE")) |n| {
+        run.setEnvironmentVariable("EMSDK_NODE", n);
+    } else {
+        run.setEnvironmentVariable("EMSDK_NODE", emsdk.path("node/22.16.0_64bit/bin/node").getPath(b));
+    }
 }
 
 // helper function to build a LazyPath from the emsdk root and provided path components
@@ -509,10 +527,13 @@ pub fn emTool(b: *Build, emsdk: *Build.Dependency, tool: []const u8) Build.LazyP
 
 fn createEmsdkStep(b: *Build, emsdk: *Build.Dependency) *Build.Step.Run {
     if (builtin.os.tag == .windows) {
-        return addRunFile(b, emSdkLazyPath(b, emsdk, &.{"emsdk.bat"}));
+        const step = addRunFile(b, emSdkLazyPath(b, emsdk, &.{"emsdk.bat"}));
+        setupEmToolEnv(b, emsdk, step);
+        return step;
     } else {
         const step = b.addSystemCommand(&.{"bash"});
         step.addFileArg(emSdkLazyPath(b, emsdk, &.{"emsdk"}));
+        setupEmToolEnv(b, emsdk, step);
         return step;
     }
 }
