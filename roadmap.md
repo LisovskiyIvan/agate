@@ -2,11 +2,11 @@
 
 > Это одновременно карта возможностей и очередь работ: всё из раздела **❌** — кандидаты в реализацию, **🚫** — вне области нативного движка.
 
-> Дата: 10.09.2026 (обновлено 24.09.2026).
+> Дата: 10.09.2026 (обновлено 01.10.2026).
 > **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL (Linux: forward-контуры — GLSL 4.30, нужен контекст 4.3+ из-за кластерных SSBO; остальные — GLSL 4.10), Metal (macOS), D3D11/HLSL5 (Windows).
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
-> Agate **не рассчитан на веб**: браузерных и JS-зависимых возможностей Babylon в нём нет и не планируется. Всё остальное, чего пока нет, — потенциальный бэклог, а не приговор.
+> Agate — **нативный движок без JS-слоя**: браузерных API Babylon (DOM/HTML, JS/TS API, npm, WebXR) в нём нет и не планируется. При этом с 30.09.2026 (`b54861e`) есть **экспериментальный сборочный таргет wasm32-emscripten + WebGPU**: движок, sandbox и бенч собираются под WebGPU (sokol WGPU) и запускаются в браузере — для веб-сравнения с Babylon.js. Это инструмент бенча и демо, а не продуктовая веб-платформа. Всё остальное, чего пока нет, — потенциальный бэклог, а не приговор.
 
 **Легенда**
 
@@ -37,7 +37,7 @@
 | Материал PBR (metallic-roughness) | Albedo/Normal/MR/Emissive/AO + IBL + Unlit-режим | ✅ |
 | OpenPBR, clearcoat, sheen, transmission | PBR clearcoat + sheen (scalar/color + маски/тинт-текстуры), anisotropy v1, thin-film transmission v1 (без refraction RT), SSS v1 (wrap+back-scatter); без OpenPBR | 🟡 |
 | Текстуры 2D | PNG/JPEG + HDR (Radiance) через stb_image (NEON SIMD, 357 Mpix/s), RGBA8/RGBA16F, CPU-мипмапы | ✅ |
-| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC), видеотекстуры | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | ✅ |
+| HDR/EXR/DDS, сжатие (Basis/BC/ETC/ASTC) (видеотекстуры — ❌) | KTX2 LDR (мипы, cube, sRGB) + BC7-батч моделей (DamagedHelmet, Lamp, CesiumMan, Fox), HDR Radiance + EXR scanline (HALF/FLOAT, NONE/RLE/ZIPS/ZIP, strict `Texture.fromExrFile/fromExrMemory`) + DDS BC1/BC2/BC3/BC7 (мипы, `Texture.fromDdsFile/fromDdsMemory`) | ✅ |
 | Cube / Skybox / IBL | CubeTexture, equirect → cube, процедурное небо | ✅ |
 | Постобработка | ACES/Reinhard, bloom, glow layer (threshold + separable blur + additive, default off), highlight layer (per-mesh inner glow: маска-RT + blur + additive, cap 8, default off), виньетка, CA, sharpen, grain, white balance, FXAA, fog, SSR, SSAO, camera motion blur, TAA (default off); оптимизации математики (комплексный ротатор золотого сечения для SSAO, pre-projection матрицы, раздельное наложение Motion Blur и SSAO без вымывания окклюзии) | ✅ |
 | DoF, motion blur, TAA, MSAA, LUT-цветокоррекция | DoF, camera motion blur, TAA (jitter+reprojection+clamp, default off, под MSAA off), цветовые curves и LUT-стрип (2D strip + API) есть; MSAA main target + depth-prepass v1 (`Scene.msaa_depth_prepass`, default off) кормит постэффекты 1x-глубиной; интерактивные переключатели шагов/сэмплов в HUD | ✅ |
@@ -60,14 +60,15 @@
 | mp3/ogg, стриминг, шины, эффекты | OGG Vorbis (`stb_vorbis`), MP3 (`dr_mp3`), WAV стриминг с диска и памяти, SPSC lock-free ring buffer, gapless loop, crossfade, динамические шины (DAG-дерево, biquad low/high/band/notch, Freeverb reverb, окклюзия геометрией); бенчмарки скорости: dr_mp3 45 MB/s, stb_vorbis 22.5 MB/s | ✅ |
 | Пикинг и теги объектов | CPU-луч (AABB/сфера/треугольник), raycast в физике, точный raycast по инстансам (InstancedMesh), теги объектов (TagSet) и булевы смарт-фильтры (TagQuery: and/or/not/parentheses), Scene.pickWithRayTag | ✅ |
 | Сериализация сцены (бинарный AGSC v1-v3: TRS/материалы/свет/камера/post FX/entity IDs/custom properties), экспорт | ✅ |
-| Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent | ✅ |
+| Навигация/crowd/pathfinding | NavMesh (dual-graph, slope filter, grid builder), A* поиск, Funnel (string-pulling), NavAgent, Crowd (RVO2/ORCA-разведение в плоскости XZ, `a2266d5`, документировано в `docs/ai.md`) | ✅ |
 | Сеть/multiplayer | — | ❌ |
 | Frame graph, volumetric, Gaussian splatting | Volumetric light shafts v1 (sun-CSM raymarch, half/quarter res, HG phase, bilateral blur, additive composite, default off; Sandbox UI controls: toggle, resolution, steps, anisotropy, intensity slider, hotkey Shift+G, regression S26) | ✅ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | `zig build test` в Agate и Sandbox; отдельный Sandbox `zig build test-gpu` с реальным контекстом: P5/P6/P7, update/render в трёх режимах, save/load round trip и stress. GPU-гейты последовательные, логи и saves изолированы во временных каталогах. Agate Performance Benchmark Suite (`sandbox --bench`); успешный smoke-прогон не является замером ускорения | ✅ |
+| Тесты/бенчмарки | `zig build test` в Agate — **1327 тестов + 27 в отдельном math-шаге** (100% pass, 01.10.2026) и 29 headless-тестов в Sandbox; отдельный Sandbox `zig build test-gpu` с реальным контекстом: 8 последовательных live-GPU ног (P5/P6/P7, update/render в трёх режимах, save/load round trip и stress). GPU-гейты последовательные, логи и saves изолированы во временных каталогах. Agate Performance Benchmark Suite (`sandbox --bench`); успешный smoke-прогон не является замером ускорения | ✅ |
 | In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |
 | Web-инспекторы, Playground, NME, браузерные редакторы GUI | — | 🚫 |
-| WebGL/WebGPU, DOM/HTML, JS/TS API, npm | — | 🚫 |
+| WebGL/WebGPU, DOM/HTML, JS/TS API, npm | wasm32-emscripten + WebGPU таргет (экспериментальный: сборка движка/sandbox/бенча под WebGPU для веб-сравнения с Babylon.js, `b54861e`) | 🟡 |
+| DOM/HTML, JS/TS API, npm | — | 🚫 |
 | WebXR (VR/AR), WebAudio, Web Workers, CDN | — | 🚫 |
 | Node.js/NullEngine, серверный headless-рендер | — | 🚫 |
 | Babylon Native / React Native (JS-рантайм-мосты) | — | 🚫 |
@@ -206,7 +207,7 @@ Sandbox: PLY-октаэдр в галерее; клавиши `[;]` bloom-пир
 - `gltf_util.readSampler` неверно читал морф-веса: у SCALAR-аксессора на ключ приходится `stride` элементов (по одному на morph target), а код читал один элемент на ключ — таргеты алиасились и вес «дрожал» (0 → ramp → 0). Теперь скалярные элементы читаются поштучно; регрессионный тест `readSampler reads interleaved morph weights per target` в `loader/gltf_util.zig`.
 - В sandbox STEP-ряды `InterpolationTest` поставлены на паузу по умолчанию (ступенчатая интерполяция читается как дрожание кубов; LINEAR/CUBIC играют, STEP остаются в сцене).
 
-Отложено осознанно: MSAA (в этой версии sokol нет depth-resolve — закрыто волной 39: single-sample depth-prepass `Scene.msaa_depth_prepass`, default off, см. таблицу постобработки), LUT-текстура (сейчас параметрические curves), тени от point/spot, motion blur/TAA.
+Отложено осознанно (закрыто, см. таблицы ✅/🟡): MSAA (в этой версии sokol нет depth-resolve — закрыто волной 39: single-sample depth-prepass `Scene.msaa_depth_prepass`, default off), LUT-текстура (закрыто: 2D LUT-стрип + `setColorGradingLut`/`lut_strength`), тени от point/spot (закрыто: point-light shadow atlas `7013db1` и перспективные тени SpotLight), motion blur/TAA (закрыто: Camera Motion Blur и TAA `4388b07`, jitter+reprojection+clamp, default off).
 
 ### Волна 7: модульность, lock-free аудио и оптимизация hot-path (12.09.2026)
 
@@ -449,6 +450,24 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 Проверки: 662/662 unit-тестов, `zig build test` (agate), `zig fmt --check src/` и `zig build` (sandbox) проходят без ошибок.
 
+### Волны 25–52: параллельный кадр, PBR-слои, контейнеры текстур, веб-таргет (21.09–01.10.2026)
+
+Раздел закрывает разрыв журнала: волны 25–31 (17–20.09) восстановлены по git-истории — их фичи уже были занесены в таблицы ✅/🟡 doc-коммитами «wave 32..39» и «wave 50-51», но записей в журнале не имели. Материал — только коммиты этого репозитория за 17.09–01.10.2026.
+
+| Подсистема | Коммиты и содержание |
+|---|---|
+| Многопоточный кадр и владение GPU | epoch-ретрай GPU-хендлов `47e46f7` (P3) → render-owned snapshots P4–P7: `62f86b3` (draw snapshots), `fd21eec` (instance state), `85ba20d` (prepared UI draws), `15ec16f` (double-buffered queues); перекрытие update/render `1116861`; монотонные часы профилировщика `f75f35c`; producer-side build `6dc637f`, `3cd7bed`; 3-слотовая ротация prepared-кадров с consumer pin/lease `78917e0`; concurrent build claim/publish `8cd7756`, atomic handoff edge `c6ba039`, расщепление staged prepare и атомарной передачи фаз `741d83d`; producer-exclusion `66a271e`; lock-free staged prepare по умолчанию `f625e95`; slot-owned upload packets + async mesh parse `b0a4245`; bounded phase-lock `9802746`, reuse-путь неблокирующего потребителя `b345e3c` |
+| Освещение и тени | атлас теней point-светов `7013db1` (`POINT_SHADOW_SLOTS = 2`, 2D-атлас 1536×512, 4-tap PCF, default off); до 4 directional lights `3656b28`; rect area до 2 `fa4c6a4`; clustered до 64 point `28882c7` + per-view buffer sets `d1debe3` (flush-free replay `044ec05`); cascade-aware culling/LOD теней `059b964`, выбор валидного LOD-буфера `e6e1c18`; volumetric light shafts v1 `858ddae`, HDR-гейт radiance `83419f7`; clearcoat+sheen лобы `6625fa7`; PBR-слои (coat/sheen-текстуры, anisotropy, transmission, SSS v1) `30b5d50`; импорт `KHR_materials_clearcoat/sheen` `1f45d5e` и `KHR_materials_transmission/IOR` `36d4cbe` |
+| Материал и постобработка | TAA (Halton-jitter, history, clamp) `4388b07`; color grading LUT API `482bc75`; NodeMaterial v1 `2f2916b`; MSAA depth-prepass `b825f95` + гейт/плумбинг снапшота `b78901d`; ShaderMaterial внешний путь (offline shdc build API) `5765819`; библиотека материалов (Sky/Gradient/Grid/TriPlanar) `2c2d994`; quality-ручки SSR/motion blur/SSAO и оптимизация шейдерной математики `74552a7`, SSAO после motion blur `3fe8ce0`; glow layer `4eb0a6a`; highlight layer `abeb3da` (+ inner-glow/viewport/lazy-RT фиксы `ee6f20a`, `f092db2`, `aa585bb`) |
+| Текстуры и ассеты | реальный транскодинг Basis Universal ETC1S/UASTC → BC7/ASTC/RGBA32 `726ba41` + ETC2-fallback `93b4b32`; DDS BC1/BC2/BC3/BC7 и требование basisu `0dbb815`; EXR scanline `e5326aa`; block-compressed KTX2 в glTF-моделях `b640aec`; AssetManager с прогрессом/кэшем `5d0f1da`; экспорт GLB `41e5a4b` |
+| Анимация, геометрия, частицы | ретаргетинг скелетов `236eac5` + явная bone map `76ecb98`; GPU-морфы через delta-текстуру `3e9545a`; параллельная оценка скелета на пуле `dcd5879`; flow maps `425b8a4`; on-death sub-emitters `462e515`; stateful compute-частицы `cc08ea7`; коллизии частиц v2 (box/plane) и динамический sun-rig `ce22a14`; reflection probes `87e3909`; soft body PBD cloth `795bcc9`; 3D GUI-панели `a7bb3d8`; TrueType-шрифты `1e74432` + TTF cmap fmt4 фикс `9b8bea6`; CameraRig `7f28e02`; инерция/сглаживание камер `f3e8a7e`; теги `c8a092b`; Observable/EventBus `58d9ca0` |
+| Производительность и аудит | аналитический TRS build, бит-идентичный, 5–11× `b97de9a`; allocator domains + async-texture commit + OOM/overflow-hardening `0289cd8`; profiler enqueue-only окно и латченый memory snapshot `f27414e`; аудит-хотфиксы движка (sokol validation, windows cross-build, seqlock race) `2eba4fd`; оптимизация C/C++-флагов вендоров `9000566`, `cfb41f9`; прогон волн 1–60 плана оптимизации — внешний документ `../optimize.md` §6 |
+| Документация и структура | набор из 27 модульных доков `docs/` `e189bb8`; перенос inline-тестов в `*_tests.zig` `1a6ec36`; общие shader include-чанки `7a2d405`; сплиты монолитов: scene `5ad6400`, mesh `7370bf4`, audio `01f7e40`, texture `dd9ec32`, camera `15c5ba4`, particles `3a10c06`, profiler `2ecc2be`, render_queue `e778b51`, shadow `f158c2b`, ui `1ea4486`, serialization `71be4ff`, ttf `a095798`; C-биндинги под `z.c` в `root.zig` `98361d6` |
+| Веб-таргет | `b54861e` — сборочный таргет wasm32-emscripten + WebGPU и 32-битная wasm-совместимость (движок, sandbox и бенч; JS/TS API, DOM, npm, WebXR остаются вне области — см. 🟡 и `docs/architecture.md`) |
+| Хотфиксы 01.10.2026 | `f453011` — VAT: не-финитный dt и вырожденный конфиг плеера клампятся (иначе NaN залипал в `time` и скелет рисовался вырожденным); `16a375e` — top-left origin viewport для CSM и point-теней (каскады 2/3 и слот 1 point-атласа читались из чужой половины атласа на Metal/D3D) |
+
+Проверки на 01.10.2026: `zig build test` — **1327/1327** (64/64 шагов сборки, ~2 с в Debug) + **27/27** в отдельном math-шаге; sandbox — **29** headless-тестов и `zig build test-gpu` — **8** последовательных live-GPU ног.
+
 ---
 
 ## ✅ Что сделано
@@ -465,7 +484,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
 * Система тегов объектов и булевых смарт-фильтров (`tags.zig`): `TagSet` (множество строковых тегов с регистронезависимым поиском, дедупликацией и разбором списков через разделители), `TagQuery` (парсер и AST-оценщик булевых выражений: `&`/`&&`/`and`, `|`/`||`/`or`, `!`/`not`, круглые скобки, неявный AND), нативная интеграция в `Mesh` (`tags`, `addTag`, `addTags`, `removeTag`, `hasTag`, `matchesTagQuery`) и `Scene` (`getMeshesByTag`, `getMeshesByQuery`, `countMeshesByTag`, `countMeshesByQuery`, `findFirstMeshByTag`, `findFirstMeshByQuery`, `pickWithRayTag`).
 * Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
-* 1193 unit-тестов в библиотеке (100% pass), отдельный sandbox с бенчмарками (`zig build test`, `zig build fmt`, флаг `--bench`).
+* **1327 тестов библиотеки + 27 в отдельном math-шаге** (100% pass, актуализировано 01.10.2026; `zig build test` — 64/64 шагов сборки, ~2 с в Debug), sandbox: **29 headless-тестов + 8 live-GPU ног** (`zig build test-gpu`), отдельный sandbox с бенчмарками (`zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
@@ -636,8 +655,8 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Тач-управление, геймпад, виртуальные джойстики; встроенное управление персонажем (кроме physics character controller).
 
 **Свет и тени**
-* Тени от point-светов сверх лимита (3+), PCSS/contact hardening для точечных источников, ESM, blur-exponential; тени rect area-светов (rect area без теней в v1).
-* Динамический IBL, объёмный свет/атмосфера (rect area до 2 с closest-point approximation, clustered до 64 без теней в v1 и reflection probes до 4 с on-demand capture уже реализованы, см. ✅).
+* Тени от point-светов сверх лимита (2; `POINT_SHADOW_SLOTS = 2` в `passes/shadow/types.zig`), PCSS/contact hardening для точечных источников, ESM, blur-exponential; тени rect area-светов (rect area без теней в v1).
+* Динамический IBL, полноценная атмосфера/volumetric fog (volumetric light shafts v1 от sun-CSM уже реализован — `858ddae`, см. ✅; rect area до 2 с closest-point approximation, clustered до 64 без теней в v1 и reflection probes до 4 с on-demand capture — тоже реализованы, см. ✅).
 
 **Материалы и текстуры**
 * OpenPBR, полный refraction (IOR/thickness), физическая SSS/BSSRDF, анизотропные roughness-карты (текстуры clearcoat/sheen, импорт `KHR_materials_clearcoat/sheen` из glTF, anisotropy, thin-film transmission и SSS v1 уже сделаны, см. 🟡).
@@ -685,11 +704,11 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 ---
 
-## 🚫 Что не планируется (Agate — нативный движок, не для веба)
+## 🚫 Что не планируется (Agate — нативный движок, JS-слой и веб-экосистема вне области)
 
 **Платформа и API**
-* WebGL/WebGPU-рендер, HTML-канвас, DOM, CSS-интеграция.
-* JavaScript/TypeScript API, npm-пакеты, ESM/tree-shaking, сборка под браузер, WASM-таргет.
+* WebGL-рендер, HTML-канвас, DOM, CSS-интеграция. (WebGPU-рендер существует только как экспериментальный сборочный таргет wasm32-emscripten, см. 🟡.)
+* JavaScript/TypeScript API, npm-пакеты, ESM/tree-shaking, продуктовая сборка под браузер. (Экспериментальный таргет `wasm32-emscripten` — это сборка самого Zig-движка, а не JS API.)
 * Web Workers, browser storage, CDN, асинхронная загрузка браузерными механизмами.
 
 **Инструменты экосистемы Babylon.js**
