@@ -81,6 +81,21 @@ if (begun.claim) |c| { runtime.finishPrepare(&scene, c); scene.render(); }
 - Тестовый реестр `src/agate/tests.zig` — GENERATED обходом дерева (`zig build update-tests`, затем `zig build test` с CheckFile-гейтом; обычные сборки реестр не переписывают). Fuzz: вендорный раннер `tools/test_runner.zig`, `zig build test --fuzz[=limit]`; C-флаги гасят sancov-инструментацию (`no_sancov`).
 - Демо-бинарник `agate` (`src/main.zig`, `zig build run`): threaded game/context, CLI `--frames/--particles/--msaa/--stats`; headless-smoke `agate --frames 120 --msaa 4` без sokol validation errors.
 
+### Веб-таргет (wasm32-emscripten + WebGPU)
+
+Экспериментальный сборочный таргет (`b54861e`, 30.09.2026): движок, sandbox и бенч собираются под `wasm32-emscripten` и рисуют через WebGPU (бэкенд sokol WGPU). Это инструмент для веб-сравнения с Babylon.js, а не продуктовая веб-платформа.
+
+```sh
+# sandbox/ — сборка в sandbox/zig-out/web/ (sandbox.html/js/wasm/data)
+zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast
+zig build -Dtarget=wasm32-emscripten -Dweb-debug   # оставить Debug (иначе Debug флорится в ReleaseFast)
+```
+
+- `build.zig` (агент): `is_web = target.result.cpu.arch.isWasm()`; `opt_wgpu = -Dwgpu orelse is_web` (строка ~275–276). Зависимость sokol подключается с `.wgpu = is_web` — тот же флаг прокидывается в `compileUserShader` для downstream-шейдеров (`build.zig` ~129–133). Для wasm добавляются system-include-пути emsdk: `upstream/emscripten/cache/sysroot/include`, `.../include/c++/v1` и, при WGPU, `.../cache/ports/emdawnwebgpu/emdawnwebgpu_pkg/webgpu/include` (~425–430); C-флаги Box3D/вендоров зависят от `is_web` (~520). `pub fn getEmsdk(dep_agate)` (~150) отдаёт downstream-сборкам тот же emsdk; при `-Doptimize=Debug` на wasm C-часть собирается `-O2` (нативный Debug оставляет `-O0`).
+- `sandbox/build.zig`: на веб-таргете root-модуль — `src/web_main.zig` вместо `main.zig`, статическая библиотека линкуется через `agate_build.sokol.emLinkStep` (`use_webgpu = true`, `use_webgl2 = false`, `use_emmalloc = true`, `use_filesystem = true`, `shell_file_path = vendor/sokol/src/sokol/web/shell.html`, `--preload-file assets@assets`, `-sSTACK_SIZE=1MB`, `-sINITIAL_MEMORY=128MB`, `-sALLOW_MEMORY_GROWTH=1`); `emRunStep` даёт `zig build run` в браузере. Без `-Dweb-debug` Debug-сборка на wasm флорится в `ReleaseFast` (неоптимизированный был бы с `-O0` + safety-checks + `SAFE_HEAP`, что даёт неприемлемый FPS).
+- Уже работает: WebGPU-бэкенд через sokol WGPU, sandbox и бенч собираются и запускаются в браузере, 32-битная wasm-совместимость.
+- Не входит: JS/TS API, DOM/HTML, npm, WebXR (см. `../roadmap.md`, раздел 🟡/🚫).
+
 ### Тесты и гейты
 
 - `zig build test` — юнит-реестр (все `test`-блоки дерева; math отдельно) + `zig fmt --check` гейт (`zig build fmt`).
