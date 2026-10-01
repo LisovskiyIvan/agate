@@ -762,7 +762,17 @@ void main() {
     // no diffuse lobe: Babylon's `diffuseColor = albedo * (1 - metallic)`,
     // so a full metal takes only the specular path (an earlier revision fed
     // the hemispheric term to metals too, washing them out).
-    vec3 ambient = hemiIrradiance(N) * diffuse_albedo * (1.0 - metallic) * ao;
+    // Ambient occlusion does NOT touch this term. Babylon's hemispheric light
+    // is an analytic light: its diffuse lands in `diffuseBase` and therefore in
+    // `finalDiffuse`, which is occluded only by
+    //     ambientOcclusionForDirectDiffuse = mix(vec3(1), ao,
+    //                                            ambientTextureImpactOnAnalyticalLights)
+    // (`pbrBlockFinalUnlitComponents`) and
+    // `PBRMaterial.DEFAULT_AO_ON_ANALYTICAL_LIGHTS == 0`. The occlusion map
+    // reaches `finalAmbient` (= vAmbientColor * surfaceAlbedo, black by default)
+    // and the IBL irradiance only — both handled above/below. The bench measures
+    // the difference: see PROBE.md §10.
+    vec3 ambient = hemiIrradiance(N) * diffuse_albedo * (1.0 - metallic);
 
     // Hemispheric SPECULAR (Babylon model — see common/hemi.glsl). Babylon's
     // PBR adds a full GGX lobe for a HEMILIGHT, coloured by the light's
