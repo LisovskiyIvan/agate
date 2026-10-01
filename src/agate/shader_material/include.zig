@@ -262,6 +262,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/uv_apply.glsl", .text = @embedFile("../shaders/common/uv_apply.glsl") },
         .{ .name = "shaders/common/pbr_brdf.glsl", .text = @embedFile("../shaders/common/pbr_brdf.glsl") },
         .{ .name = "shaders/common/channel_select.glsl", .text = @embedFile("../shaders/common/channel_select.glsl") },
+        .{ .name = "shaders/common/hemi.glsl", .text = @embedFile("../shaders/common/hemi.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{

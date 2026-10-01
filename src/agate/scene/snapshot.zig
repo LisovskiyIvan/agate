@@ -214,6 +214,11 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
 
     snap.shadows_enabled = scene.shadows.enabled;
     snap.shadow_uniforms = scene.shadows.uniformState(scene.lights.hemi.ground_color);
+    // Hemispheric light model (Babylon): direction/diffuse/intensity are real
+    // shading inputs, not decoration — see shaders/common/hemi.glsl.
+    snap.shadow_uniforms.hemi_dir = scene.lights.hemi.direction;
+    snap.shadow_uniforms.hemi_diffuse = scene.lights.hemi.diffuse;
+    snap.shadow_uniforms.hemi_intensity = scene.lights.hemi.intensity;
     snap.sky_texture = scene.sky.texture;
     snap.sky_enabled = scene.sky.enabled;
     snap.sky_exposure = scene.sky.exposure;

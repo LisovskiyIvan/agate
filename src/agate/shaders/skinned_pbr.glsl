@@ -207,6 +207,12 @@ layout(binding = 2) uniform fs_params {
     vec4 transmission_color; // rgb: throughput tint (white = untinted), w: unused
     vec4 sss_factors; // x: strength (0 = off), y/z/w: unused
     vec4 sss_color; // rgb: scatter tint (white = untinted), w: unused
+    // APPENDED LAST (hemispheric light model): Babylon's HemisphericLight is
+    // a light, not a flat ambient — its irradiance interpolates between
+    // `ambient_color.rgb` (groundColor) and `hemi_diffuse.rgb * w` by
+    // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
+    vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
+    vec4 hemi_diffuse; // rgb: diffuse color, a: unused
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -325,6 +331,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // branches — SPIRV-Cross cannot flatten dynamic component indexing for
 // legacy targets (HLSL5), same constraint as morphWeight.
 // @include "common/channel_select.glsl"
+// @include "common/hemi.glsl"
 
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
@@ -629,7 +636,7 @@ void main() {
     // Both gate on a uniform branch: 0 adds exactly nothing bit-identical.
     if (transm_factor > 0.0) {
         float transm_back = clamp(dot(-N, L) * 0.5 + 0.5, 0.0, 1.0);
-        vec3 transm_irr = light_color.rgb * light_color.a * transm_back + ambient_color.rgb * ambient_color.a * 0.5;
+        vec3 transm_irr = light_color.rgb * light_color.a * transm_back + hemiIrradiance(N) * 0.5;
         Lo += transmission_color.rgb * transm_factor * orig_albedo * transm_irr;
     }
     if (sss_strength > 0.0) {
@@ -637,7 +644,7 @@ void main() {
         float sss_wrap = sss_strength * 0.5;
         float wrap_nl = clamp((dot(N, L) + sss_wrap) / (1.0 + sss_wrap), 0.0, 1.0);
         float back_scatter = pow(clamp(dot(V, -L), 0.0, 1.0), 2.0);
-        vec3 sss_irr = light_color.rgb * light_color.a * (wrap_nl * 0.6 + back_scatter * 0.4) + ambient_color.rgb * ambient_color.a * 0.25;
+        vec3 sss_irr = light_color.rgb * light_color.a * (wrap_nl * 0.6 + back_scatter * 0.4) + hemiIrradiance(N) * 0.25;
         Lo += sss_color.rgb * sss_strength * albedo * sss_irr;
     }
 
@@ -700,7 +707,11 @@ void main() {
         ibl = (diffuse_ibl + specular_ibl) * (ibl_intensity * ao) + sheen_ibl * (ibl_intensity * ao);
     }
 
-    vec3 ambient = ambient_color.rgb * ambient_color.a * albedo * ao;
+    // Hemispheric base (Babylon model — see common/hemi.glsl). Metals have
+    // no diffuse lobe: Babylon's `diffuseColor = albedo * (1 - metallic)`,
+    // so a full metal takes only the specular path (an earlier revision fed
+    // the hemispheric term to metals too, washing them out).
+    vec3 ambient = hemiIrradiance(N) * albedo * (1.0 - metallic) * ao;
 
     vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;

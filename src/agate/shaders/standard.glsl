@@ -166,6 +166,12 @@ layout(binding = 1) uniform fs_params {
     // bit-identically. Appended last so no offset shifts.
     vec4 clustered_params;
     vec4 clustered_viewport;
+    // APPENDED LAST (hemispheric light model): Babylon's HemisphericLight is
+    // a light, not a flat ambient — its irradiance interpolates between
+    // `ambient_color.rgb` (groundColor) and `hemi_diffuse.rgb * w` by
+    // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
+    vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
+    vec4 hemi_diffuse; // rgb: diffuse color, a: unused
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -260,6 +266,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 #define PCSS_BLOCKER_SAMPLES 12
 
 // @include "common/shadow_pcf.glsl"
+// @include "common/hemi.glsl"
 
 void main() {
     vec3 N = normalize(v_normal);
@@ -422,7 +429,8 @@ void main() {
     // is replaced by the probe's coarsest-mip diffuse sample (documented
     // approximation), scaled by the probe intensity. Disabled: legacy path,
     // bit-identical.
-    vec3 ambient = ambient_color.rgb * ambient_color.a;
+    // Hemispheric base (Babylon model — see common/hemi.glsl).
+    vec3 ambient = hemiIrradiance(N);
     if (probe_params.x > 0.5) {
         ambient = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
     }

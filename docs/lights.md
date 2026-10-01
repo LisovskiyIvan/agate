@@ -69,7 +69,21 @@ pub const HemisphericLight = struct {
 };
 ```
 
-Скай/земля эмбиент; также legacy-фолбэк солнца, когда directional отсутствует или выключен.
+Небесно-земляной свет по модели Babylon.js `HemisphericLight`: вклад в
+освещённость интерполируется между `ground_color` (поверхность отвернута от
+света) и `diffuse * intensity` (поверхность смотрит на свет) по
+`0.5 + 0.5 * dot(N, direction)`; итог умножается на альбедо и
+`(1 - metallic)` (у металлов диффуза нет). Реализация —
+`shaders/common/hemi.glsl`, юниформы `hemi_dir_intensity` / `hemi_diffuse`
+(`scene/uniforms.zig`, дописаны в конец `fs_params`, чтобы не сдвинуть
+существующие оффсеты). `ground_color` по-прежнему едет в слоте
+`ambient_color.rgb`. Также legacy-фолбэк солнца, когда directional
+отсутствует или выключен.
+
+Ранее `direction`, `diffuse` и `intensity` игнорировались, а `ground_color`
+работал плоским ambient: любая сцена выходила темнее и синее, чем в
+Babylon.js (на бенче земля давала 0.39 linear вместо 0.60 при тех же двух
+источниках).
 
 ### `DirectionalLight` (`lights/directional.zig`)
 

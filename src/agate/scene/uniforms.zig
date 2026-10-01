@@ -103,6 +103,13 @@ pub const FrameUniforms = struct {
     // Appended last so no existing offset shifts.
     clustered_params: [4]f32,
     clustered_viewport: [4]f32,
+    // APPENDED LAST (hemispheric light model): `ambient_color.rgb` holds the
+    // hemispheric groundColor; these two lanes turn the old flat ambient into
+    // Babylon's `HemisphericLight` irradiance
+    // `mix(groundColor, diffuse * intensity, 0.5 + 0.5 * N·L)` (see
+    // shaders/common/hemi.glsl). Appended last so no existing offset shifts.
+    hemi_dir_intensity: [4]f32,
+    hemi_diffuse: [4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -128,6 +135,14 @@ pub const ShadowState = struct {
     pcss_blocker_radius: f32 = pcss.default_blocker_radius,
     pcss_min_penumbra: f32 = pcss.default_min_penumbra,
     pcss_max_penumbra: f32 = pcss.default_max_penumbra,
+    // Hemispheric light (Babylon model). Defaults mirror HemisphericLight's
+    // own defaults (up, white, ground (0.2,0.2,0.2), intensity 1) so a
+    // ShadowState built without a scene keeps the legacy ambient constant
+    // readable and self-consistent. `ground_color` above is the hemispheric
+    // groundColor — it is the same value the ambient lane always carried.
+    hemi_dir: Vec3 = Vec3.up,
+    hemi_diffuse: Color3 = Color3.white,
+    hemi_intensity: f32 = 1.0,
 };
 
 // Packs the shared fragment uniforms once per draw. Legacy lanes are
@@ -180,6 +195,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .area_color = ctx.area_color,
         .clustered_params = ctx.clustered_params,
         .clustered_viewport = ctx.clustered_viewport,
+        .hemi_dir_intensity = .{ shadow.hemi_dir.x, shadow.hemi_dir.y, shadow.hemi_dir.z, shadow.hemi_intensity },
+        .hemi_diffuse = .{ shadow.hemi_diffuse.r, shadow.hemi_diffuse.g, shadow.hemi_diffuse.b, 0.0 },
     };
 }
 
