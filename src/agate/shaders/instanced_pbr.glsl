@@ -648,6 +648,16 @@ void main() {
     // the hemispheric term to metals too, washing them out).
     vec3 ambient = hemiIrradiance(N) * albedo * (1.0 - metallic) * ao;
 
+    // Hemispheric SPECULAR (Babylon model — see common/hemi.glsl). Babylon's
+    // PBR adds a full GGX lobe for a HEMILIGHT, coloured by the light's
+    // `vLightDiffuse` (not `vLightSpecular`) and Fresnel-weighted by the
+    // material F0. For a metal that lobe is the ONLY hemispheric term left
+    // (the irradiance above is `(1 - metallic)`-gated), which is exactly the
+    // metal-path residual the bench measured. NOT multiplied by `ao`:
+    // Babylon occludes `finalDiffuse` and the IBL irradiance, never its
+    // analytic `finalSpecular`. Evaluated once per fragment, not per light.
+    Lo += hemiSpecular(N, V, NdotV, roughness, F0);
+
     // Emissive
     vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
