@@ -59,7 +59,7 @@ _ = try scene.light_rig.addClusteredPointLight(.{ .x = 0, .y = 2, .z = 0 }, .{
 pub const HemisphericLightOptions = struct {
     direction: Vec3 = Vec3.up,
     diffuse: Color3 = Color3.white,
-    ground_color: Color3 = Color3.new(0.2, 0.2, 0.2),
+    ground_color: Color3 = Color3.black, // как HemisphericLight в Babylon
     intensity: f32 = 1.0,
 };
 pub const HemisphericLight = struct {
@@ -79,6 +79,19 @@ pub const HemisphericLight = struct {
 существующие оффсеты). `ground_color` по-прежнему едет в слоте
 `ambient_color.rgb`. Также legacy-фолбэк солнца, когда directional
 отсутствует или выключен.
+
+Полусферический свет даёт ещё и **спекулярный лепесток** (как в Babylon, где
+`computeSpecularLighting` вызывается и для `HEMILIGHT`, причём цветом служит
+`vLightDiffuse`, а не `vLightSpecular` — поэтому `hemi.specular` у Babylon
+ни на что не влияет). Формула: `L = normalize(direction)`,
+`NdotL = dot(N, L) * 0.5 + 0.5`, `attenuation = 1`, `roughness` материала,
+`D · Vis · F(VdotH, F0)` без множителя `(1 − metallic)`; вклад строго нулевой
+при `intensity = 0`. До этой правки весь полусферический вклад у металла
+гас множителем `(1 − metallic)`, из-за чего металл у agate был темнее
+Babylon на ~9/255 в среднем.
+
+Диффузная часть дополнительно масштабируется ground-цветом на интенсивность
+(`vLightGround = groundColor * intensity`, как в Babylon).
 
 Ранее `direction`, `diffuse` и `intensity` игнорировались, а `ground_color`
 работал плоским ambient: любая сцена выходила темнее и синее, чем в
