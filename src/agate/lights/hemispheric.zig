@@ -1,5 +1,13 @@
 //! Hemispheric light (sky/ground ambient). Leaf of the `lights.zig` facade;
 //! see the facade header for the module map and the anti-cycle rule.
+//!
+//! `ground_color` defaults to BLACK, which is Babylon's
+//! `HemisphericLight` default (babylon.js minified:
+//! `constructor(e,t,i,n){super(e,i,n),this.groundColor=lt(this,r,new Te(0,0,0))}`;
+//! a runtime probe of the reference bundle reads back `[0,0,0]`). A scene
+//! that wants the classic grey bounce authors it explicitly — `Scene.init`
+//! does exactly that (scene/core.zig passes 0.2 / 0.25 / 0.3), so no
+//! existing scene changes appearance when this default moves.
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Color3 = math.Color3;
@@ -7,7 +15,7 @@ const Color3 = math.Color3;
 pub const HemisphericLightOptions = struct {
     direction: Vec3 = Vec3.up,
     diffuse: Color3 = Color3.white,
-    ground_color: Color3 = Color3.new(0.2, 0.2, 0.2),
+    ground_color: Color3 = Color3.black,
     intensity: f32 = 1.0,
 };
 
@@ -15,7 +23,7 @@ pub const HemisphericLight = struct {
     name: []const u8 = "HemisphericLight",
     direction: Vec3 = Vec3.up,
     diffuse: Color3 = Color3.white,
-    ground_color: Color3 = Color3.new(0.2, 0.2, 0.2),
+    ground_color: Color3 = Color3.black,
     intensity: f32 = 1.0,
 
     pub fn init(name: []const u8, options: HemisphericLightOptions) HemisphericLight {

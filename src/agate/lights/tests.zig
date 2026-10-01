@@ -31,6 +31,22 @@ test "resolveSunDirection falls back to normalized hemi" {
     try std.testing.expectApproxEqAbs(dir.z, 0.0, 1e-6);
 }
 
+test "HemisphericLight defaults match Babylon (ground black, white diffuse, up, 1.0)" {
+    // babylon.js: this.groundColor=lt(this,r,new Te(0,0,0)) -- the reference
+    // bundle reads back [0,0,0] through a NullEngine probe; diffuse (1,1,1),
+    // intensity 1, direction (0,1,0). Scene.init authors its own 0.2/0.25/0.3
+    // ambient explicitly, so this default only affects callers who build a
+    // light from `HemisphericLightOptions{}`.
+    const defaults = HemisphericLight.init("hemi", .{});
+    try std.testing.expectEqual(Color3.black, defaults.ground_color);
+    try std.testing.expectEqual(Color3.white, defaults.diffuse);
+    try std.testing.expectEqual(@as(f32, 1.0), defaults.intensity);
+    try std.testing.expectEqual(Vec3.up, defaults.direction);
+    // The options struct carries the same default.
+    const options: lights_mod.HemisphericLightOptions = .{};
+    try std.testing.expectEqual(Color3.black, options.ground_color);
+}
+
 test "resolveSunColor and resolveSunIntensity fall back to hemi" {
     const hemi = HemisphericLight.init("hemi", .{
         .diffuse = Color3.new(0.5, 0.25, 0.125),
