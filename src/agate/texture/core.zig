@@ -41,12 +41,17 @@ pub const Texture = struct {
         mip_filter: sg.Filter = .LINEAR,
         wrap_u: sg.Wrap = .REPEAT,
         wrap_v: sg.Wrap = .REPEAT,
-        /// Max anisotropy 1..16 (sokol sg_sampler_desc.max_anisotropy). sokol
-        /// requires LINEAR min/mag/mip filters for anisotropy > 1 and fails
-        /// sampler validation otherwise, so non-LINEAR combinations clamp
-        /// back to 1 here. sokol has no lod bias; lod range defaults to
-        /// 0..FLT_MAX (not exposed).
-        max_anisotropy: u32 = 1,
+        /// Max anisotropy 1..16 (sokol sg_sampler_desc.max_anisotropy).
+        /// Default 4 = Babylon's `Texture.DEFAULT_ANISOTROPIC_FILTERING_LEVEL`
+        /// (babylon.js: `e.DEFAULT_ANISOTROPIC_FILTERING_LEVEL=4`, assigned to
+        /// every `Texture.anisotropicFilteringLevel`; the glTF loader never
+        /// overrides it, so every texture a glTF file references is sampled
+        /// with 4). sokol requires LINEAR min/mag/mip filters for anisotropy
+        /// > 1 and fails sampler validation otherwise, so non-LINEAR
+        /// combinations clamp back to 1 here (Babylon clamps the same way,
+        /// by sampling mode, in `_setAnisotropicLevel`). sokol has no lod
+        /// bias; lod range defaults to 0..FLT_MAX (not exposed).
+        max_anisotropy: u32 = 4,
         /// Signed distance fields must not be box-downsampled: the mip chain
         /// dilutes thin strokes and the shader edge drifts. Disable for fonts.
         mipmaps: bool = true,
@@ -59,23 +64,36 @@ pub const Texture = struct {
         srgb_to_linear: bool = false,
     };
 
+    /// Mip selection filter actually handed to sokol: the authored filter
+    /// only exists when there IS a mip chain, otherwise NEAREST (a
+    /// single-level texture has no mip to select).
+    fn samplerMipFilter(options: Options, num_mip_levels: u32) sg.Filter {
+        return if (num_mip_levels > 1) options.mip_filter else .NEAREST;
+    }
+
+    /// Effective anisotropy for one sampler after the two clamps: the sokol
+    /// range (1..16) and the LINEAR-filter requirement described on
+    /// Options.max_anisotropy. Pure, so the clamping contract is testable
+    /// without a graphics context.
+    pub fn effectiveAnisotropy(options: Options, num_mip_levels: u32) u32 {
+        const aniso = @min(options.max_anisotropy, 16);
+        if (aniso <= 1) return aniso;
+        if (options.min_filter != .LINEAR or options.mag_filter != .LINEAR or
+            samplerMipFilter(options, num_mip_levels) != .LINEAR) return 1;
+        return aniso;
+    }
+
     /// Shared sampler creation for LDR 2D textures: applies min/mag/wrap,
     /// the mip filter (only meaningful with a chain), and the anisotropy
     /// guard described on Options.max_anisotropy.
     fn makeSamplerFor(options: Options, num_mip_levels: u32) sg.Sampler {
-        const mip_filter: sg.Filter = if (num_mip_levels > 1) options.mip_filter else .NEAREST;
-        var aniso = options.max_anisotropy;
-        if (aniso > 16) aniso = 16;
-        if (aniso > 1 and (options.min_filter != .LINEAR or options.mag_filter != .LINEAR or mip_filter != .LINEAR)) {
-            aniso = 1;
-        }
         return sg.makeSampler(.{
             .min_filter = options.min_filter,
             .mag_filter = options.mag_filter,
-            .mipmap_filter = mip_filter,
+            .mipmap_filter = samplerMipFilter(options, num_mip_levels),
             .wrap_u = options.wrap_u,
             .wrap_v = options.wrap_v,
-            .max_anisotropy = aniso,
+            .max_anisotropy = effectiveAnisotropy(options, num_mip_levels),
         });
     }
 

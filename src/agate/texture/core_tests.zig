@@ -384,3 +384,38 @@ test "createParticleDot validates size without GPU upload" {
         Texture.createParticleDot(allocator, 100000),
     );
 }
+
+test "Options.max_anisotropy defaults to Babylon's 4" {
+    // babylon.js: e.DEFAULT_ANISOTROPIC_FILTERING_LEVEL=4, assigned to
+    // every Texture.anisotropicFilteringLevel; the glTF loader never
+    // overrides it. A default-constructed Options must ask for that, and a
+    // mipmapped LINEAR texture must actually get it (the bench's
+    // DamagedHelmet/Fox path).
+    const defaults: Texture.Options = .{};
+    try std.testing.expectEqual(@as(u32, 4), defaults.max_anisotropy);
+    try std.testing.expectEqual(@as(u32, 4), Texture.effectiveAnisotropy(defaults, 10));
+}
+
+test "effectiveAnisotropy clamps to 1 without LINEAR min/mag/mip" {
+    // sokol requires LINEAR min AND mag AND mipmap for anisotropy > 1
+    // (VALIDATE_SAMPLERDESC_ANISTROPIC_REQUIRES_LINEAR_FILTERING); Babylon
+    // clamps identically in _setAnisotropicLevel.
+    const nearest_min: Texture.Options = .{ .min_filter = .NEAREST, .max_anisotropy = 8 };
+    const nearest_mag: Texture.Options = .{ .mag_filter = .NEAREST, .max_anisotropy = 8 };
+    const nearest_mip: Texture.Options = .{ .mip_filter = .NEAREST, .max_anisotropy = 8 };
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(nearest_min, 10));
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(nearest_mag, 10));
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(nearest_mip, 10));
+
+    // Same options WITH a single level: the sampler mip filter becomes
+    // NEAREST regardless of the authored one, so anisotropy clamps too.
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(.{ .max_anisotropy = 4 }, 1));
+    try std.testing.expectEqual(@as(u32, 4), Texture.effectiveAnisotropy(.{ .max_anisotropy = 4 }, 2));
+
+    // An explicit 1 is the escape hatch back to agate's old sampling.
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(.{ .max_anisotropy = 1 }, 10));
+
+    // sokol's documented range is 1..16.
+    try std.testing.expectEqual(@as(u32, 16), Texture.effectiveAnisotropy(.{ .max_anisotropy = 64 }, 10));
+    try std.testing.expectEqual(@as(u32, 0), Texture.effectiveAnisotropy(.{ .max_anisotropy = 0 }, 10));
+}

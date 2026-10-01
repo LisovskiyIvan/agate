@@ -46,7 +46,7 @@ pub const Options = struct {
     mip_filter: sg.Filter = .LINEAR, // только при наличии цепочки
     wrap_u: sg.Wrap = .REPEAT,
     wrap_v: sg.Wrap = .REPEAT,
-    max_anisotropy: u32 = 1,         // 1..16; требует LINEAR-фильтры, иначе кламп к 1
+    max_anisotropy: u32 = 4,         // 1..16; дефолт = Babylon DEFAULT_ANISOTROPIC_FILTERING_LEVEL
     mipmaps: bool = true,            // false для SDF/шрифтов/LUT
     srgb_to_linear: bool = false,    // true для albedo/emissive; false для data-карт
 };
@@ -57,7 +57,9 @@ pub const DecodeOptions = struct {
 };
 ```
 
-Анизотропия > 1 с не-LINEAR фильтрами молча клампится к 1 (требование валидации sokol). `srgb_to_linear` применяется до генерации мипов — усреднение идёт в линейном пространстве.
+`max_anisotropy = 4` повторяет Babylon (`Texture.DEFAULT_ANISOTROPIC_FILTERING_LEVEL = 4`; glTF-загрузчик Babylon его не переопределяет, так что все текстуры glTF сэмплируются с 4). Ручка на время загрузки — `SceneLoader.LoadOptions.max_anisotropy: ?u32` (null = дефолт движка, 1 = выключить анизотропию).
+
+Анизотропия > 1 с не-LINEAR min/mag/mip фильтрами молча клампится к 1 (`Texture.effectiveAnisotropy` — требование валидации sokol, Babylon клампит так же по sampling mode); одноуровневые текстуры (без мипов) тоже получают 1. `srgb_to_linear` применяется до генерации мипов — усреднение идёт в линейном пространстве.
 
 ### Форматы и точки входа
 

@@ -36,6 +36,16 @@ pub const SceneLoader = struct {
         /// graphics thread forces this mode when the queue exists: sync
         /// texture creation touches sg.* inline and would fail loudly.
         async_textures: bool = false,
+        /// Sampler anisotropy (1..16) for every texture this load creates.
+        /// null keeps the engine default, which is Babylon's
+        /// `Texture.DEFAULT_ANISOTROPIC_FILTERING_LEVEL` = 4 — the value the
+        /// Babylon glTF loader leaves untouched. Pass 1 to opt out of
+        /// anisotropic filtering (matches Babylon at
+        /// `anisotropicFilteringLevel = 1`), or 16 for the maximum.
+        /// The authored glTF sampler still wins on wrap/filter; this only
+        /// replaces the anisotropy, and the LINEAR-filter clamp in
+        /// `Texture.effectiveAnisotropy` still applies.
+        max_anisotropy: ?u32 = null,
     };
 
     /// Parses a glTF scene and spawns its content into `scene`. Both
@@ -118,12 +128,13 @@ pub const SceneLoader = struct {
             materials_mod.AsyncTexCtx.init(scene, gltf, base_dir, &scene.uploads.?)
         else
             null;
+        if (actx) |*a| a.max_anisotropy = load_options.max_anisotropy;
         defer if (actx) |*a| a.deinit();
 
         if (!async_textures) {
             materials_mod.decodeImagesInParallel(scene, gltf, decoded, base_dir);
         }
-        try materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded, if (actx) |*a| a else null);
+        try materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded, if (actx) |*a| a else null, load_options.max_anisotropy);
 
         // 2. Parse skeletons/skins
         const skeletons = try scene.allocator.alloc(?*Skeleton, gltf.skins_count);

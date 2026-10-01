@@ -216,6 +216,24 @@ pub fn applyGltfSampler(wrap_s: c_int, wrap_t: c_int, mag_filter: c_int, min_fil
     }
 }
 
+/// Base `Texture.Options` for one glTF texture: the engine defaults (which
+/// since the anisotropy fix mirror Babylon's — wrap REPEAT, LINEAR
+/// min/mag/mip, `max_anisotropy` = Babylon's
+/// DEFAULT_ANISOTROPIC_FILTERING_LEVEL = 4), then the view's own glTF
+/// sampler on top (a sampler-less texture keeps the defaults, exactly like
+/// Babylon's loader), then the load-wide `max_anisotropy` override, then the
+/// caller's per-slot sRGB decision. Shared by the sync and async texture
+/// paths so both produce identical samplers.
+pub fn textureOptionsFor(tex: [*c]const c.cgltf_texture, srgb: bool, max_anisotropy: ?u32) Texture.Options {
+    var opts: Texture.Options = .{};
+    if (tex.*.sampler) |smp| {
+        applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &opts);
+    }
+    if (max_anisotropy) |a| opts.max_anisotropy = a;
+    opts.srgb_to_linear = srgb;
+    return opts;
+}
+
 /// Extracts the KHR_texture_transform UV map from a glTF texture view
 /// (identity when the extension is absent). Documented limitation: views
 /// with `texCoord` > 0 reference a second UV set the engine does not load
@@ -251,6 +269,10 @@ pub const AsyncTexCtx = struct {
     /// sync parallel decoder: null off-context). Rides decode_opts so the
     /// queue workers transcode to an uploadable target.
     basis_target: ?ktx2.BasisTarget = null,
+    /// Load-wide sampler anisotropy override (SceneLoader.LoadOptions);
+    /// null keeps Texture.Options' default (Babylon's 4). Rides every
+    /// texture this load registers.
+    max_anisotropy: ?u32 = null,
     /// image_index * 2 + srgb -> in-flight request
     seen: std.AutoHashMapUnmanaged(usize, *assets.PendingTexture) = .empty,
 
@@ -283,11 +305,7 @@ pub const AsyncTexCtx = struct {
             return;
         }
 
-        var tex_options: Texture.Options = .{};
-        if (tex.*.sampler) |smp| {
-            applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &tex_options);
-        }
-        tex_options.srgb_to_linear = srgb;
+        const tex_options = textureOptionsFor(tex, srgb, self.max_anisotropy);
         const decode_opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = srgb, .basis_target = self.basis_target };
 
         const img = &self.gltf.images[img_idx];
@@ -333,8 +351,9 @@ pub fn loadTextureSlot(
     srgb_to_linear: bool,
     slot: *?Texture,
     actx: ?*AsyncTexCtx,
+    max_anisotropy: ?u32,
 ) bool {
-    if (loadTextureFromView(scene, gltf, image_cache, decoded, view, base_dir, srgb_to_linear, actx == null)) |t| {
+    if (loadTextureFromView(scene, gltf, image_cache, decoded, view, base_dir, srgb_to_linear, actx == null, max_anisotropy)) |t| {
         slot.* = t;
         return true;
     }
@@ -354,6 +373,7 @@ pub fn loadTextureFromView(
     base_dir: ?[]const u8,
     srgb_to_linear: bool,
     allow_sync_fallback: bool,
+    max_anisotropy: ?u32,
 ) ?Texture {
     if (view == null) return null;
     if (view.*.texture == null) return null;
@@ -374,11 +394,7 @@ pub fn loadTextureFromView(
         }
     }
 
-    var tex_options: Texture.Options = .{};
-    if (tex.*.sampler) |smp| {
-        applyGltfSampler(@intCast(smp.*.wrap_s), @intCast(smp.*.wrap_t), @intCast(smp.*.mag_filter), @intCast(smp.*.min_filter), &tex_options);
-    }
-    tex_options.srgb_to_linear = srgb_to_linear;
+    const tex_options = textureOptionsFor(tex, srgb_to_linear, max_anisotropy);
 
     // Pre-decoded on worker threads: only the GPU upload runs here.
     // .rgba идёт старым путём (декод чужого sRGB-варианта не трогаем);
@@ -517,6 +533,7 @@ pub fn loadMaterials(
     image_cache: []?Texture,
     decoded: []?Texture.DecodedImage,
     actx: ?*AsyncTexCtx,
+    max_anisotropy: ?u32,
 ) !void {
     for (0..gltf.materials_count) |i| {
         const src_mat = &gltf.materials[i];
@@ -540,23 +557,23 @@ pub fn loadMaterials(
 
             // Color slots load sRGB -> linear (glTF: textures are sRGB,
             // factors linear); data slots stay linear.
-            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true, &pbr_mat.albedo_texture, actx);
+            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true, &pbr_mat.albedo_texture, actx, max_anisotropy);
             pbr_mat.albedo_uv_transform = uvTransformFromView(&pbr.base_color_texture);
-            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false, &pbr_mat.metallic_roughness_texture, actx);
+            _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false, &pbr_mat.metallic_roughness_texture, actx, max_anisotropy);
             pbr_mat.metallic_roughness_uv_transform = uvTransformFromView(&pbr.metallic_roughness_texture);
         }
 
-        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false, &pbr_mat.normal_texture, actx);
+        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false, &pbr_mat.normal_texture, actx, max_anisotropy);
         if (src_mat.normal_texture.texture != null) {
             // cgltf defaults texture-view scale to 1.0 (cgltf.h parse).
             pbr_mat.normal_scale = src_mat.normal_texture.scale;
         }
         pbr_mat.normal_uv_transform = uvTransformFromView(&src_mat.normal_texture);
-        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false, &pbr_mat.occlusion_texture, actx);
+        _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false, &pbr_mat.occlusion_texture, actx, max_anisotropy);
         pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
         pbr_mat.occlusion_uv_transform = uvTransformFromView(&src_mat.occlusion_texture);
 
-        const emissive_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true, &pbr_mat.emissive_texture, actx);
+        const emissive_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true, &pbr_mat.emissive_texture, actx, max_anisotropy);
         pbr_mat.emissive_uv_transform = uvTransformFromView(&src_mat.emissive_texture);
         if ((pbr_mat.emissive_texture != null or emissive_textured) and
             src_mat.emissive_factor[0] == 0.0 and
@@ -575,7 +592,7 @@ pub fn loadMaterials(
         // KHR_materials_clearcoat
         if (src_mat.has_clearcoat != 0) {
             const cc = &src_mat.clearcoat;
-            const cc_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &cc.clearcoat_texture, base_dir, false, &pbr_mat.clearcoat.mask_texture, actx);
+            const cc_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &cc.clearcoat_texture, base_dir, false, &pbr_mat.clearcoat.mask_texture, actx, max_anisotropy);
             pbr_mat.clearcoat.roughness = cc.clearcoat_roughness_factor;
             if ((pbr_mat.clearcoat.mask_texture != null or cc_textured) and cc.clearcoat_factor == 0.0) {
                 pbr_mat.clearcoat.intensity = 1.0;
@@ -588,7 +605,7 @@ pub fn loadMaterials(
         if (src_mat.has_sheen != 0) {
             const sh = &src_mat.sheen;
             pbr_mat.sheen.roughness = sh.sheen_roughness_factor;
-            const sh_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &sh.sheen_color_texture, base_dir, true, &pbr_mat.sheen.color_texture, actx);
+            const sh_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &sh.sheen_color_texture, base_dir, true, &pbr_mat.sheen.color_texture, actx, max_anisotropy);
             if ((pbr_mat.sheen.color_texture != null or sh_textured) and
                 sh.sheen_color_factor[0] == 0.0 and
                 sh.sheen_color_factor[1] == 0.0 and
@@ -670,7 +687,7 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     var out: [3]?Material = .{ null, null, null };
     const empty_tex: []?Texture = &.{};
     const empty_dec: []?Texture.DecodedImage = &.{};
-    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_dec, null);
+    try loadMaterials(&scene, &data, null, &out, empty_tex, empty_dec, null, null);
 
     try std.testing.expect(out[0].? == .pbr);
     try std.testing.expect(out[0].?.pbr.alpha_mode == .@"opaque");
@@ -716,7 +733,7 @@ test "loadMaterials maps KHR_materials_clearcoat and KHR_materials_sheen (GPU-fr
     var img_cache: [0]?Texture = .{};
     var dec: [0]?Texture.DecodedImage = .{};
 
-    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null);
+    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null, null);
 
     try std.testing.expect(out[0].? == .pbr);
     try std.testing.expectEqual(@as(f32, 0.85), out[0].?.pbr.clearcoat.intensity);
@@ -756,7 +773,7 @@ test "loadMaterials maps KHR_materials_transmission and KHR_materials_ior (GPU-f
     var img_cache: [0]?Texture = .{};
     var dec: [0]?Texture.DecodedImage = .{};
 
-    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null);
+    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null, null);
 
     try std.testing.expect(out[0].? == .pbr);
     try std.testing.expectEqual(@as(f32, 0.75), out[0].?.pbr.transmission.factor);
@@ -820,6 +837,49 @@ test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {
     try std.testing.expectEqual(sg.Filter.LINEAR, opts.min_filter);
 }
 
+test "textureOptionsFor starts from Babylon's defaults and applies the load override" {
+    // A sampler-less glTF texture keeps the engine defaults: glTF's
+    // REPEAT/LINEAR_MIPMAP_LINEAR plus Babylon's
+    // DEFAULT_ANISOTROPIC_FILTERING_LEVEL = 4, which the Babylon glTF loader
+    // never overrides. The bench's DamagedHelmet/Fox GLBs have no `sampler`
+    // on most textures, so this is the bench's actual path.
+    var no_sampler = std.mem.zeroes(c.cgltf_texture);
+    no_sampler.sampler = null;
+    const by_default = textureOptionsFor(&no_sampler, true, null);
+    try std.testing.expectEqual(@as(u32, 4), by_default.max_anisotropy);
+    try std.testing.expectEqual(sg.Wrap.REPEAT, by_default.wrap_u);
+    try std.testing.expectEqual(sg.Filter.LINEAR, by_default.min_filter);
+    try std.testing.expect(by_default.srgb_to_linear);
+
+    // The load-wide override wins over that default, and 1 restores the
+    // pre-fix sampling (Babylon at anisotropicFilteringLevel = 1).
+    try std.testing.expectEqual(@as(u32, 1), textureOptionsFor(&no_sampler, false, 1).max_anisotropy);
+    try std.testing.expectEqual(@as(u32, 16), textureOptionsFor(&no_sampler, false, 16).max_anisotropy);
+
+    // An authored sampler still wins on wrap/filter (glTF is authoritative
+    // there), while the anisotropy override applies on top: Babylon's own
+    // loader likewise sets wrap/filter from the glTF sampler and leaves
+    // anisotropicFilteringLevel alone.
+    var sampler = c.cgltf_sampler{
+        .mag_filter = 9728, // NEAREST
+        .min_filter = 9984, // NEAREST_MIPMAP_NEAREST
+        .wrap_s = 33071, // CLAMP_TO_EDGE
+        .wrap_t = 33648, // MIRRORED_REPEAT
+    };
+    var textured = std.mem.zeroes(c.cgltf_texture);
+    textured.sampler = &sampler;
+    const authored = textureOptionsFor(&textured, false, null);
+    try std.testing.expectEqual(sg.Wrap.CLAMP_TO_EDGE, authored.wrap_u);
+    try std.testing.expectEqual(sg.Wrap.MIRRORED_REPEAT, authored.wrap_v);
+    try std.testing.expectEqual(sg.Filter.NEAREST, authored.mag_filter);
+    try std.testing.expectEqual(sg.Filter.NEAREST, authored.min_filter);
+    // ... and the sokol LINEAR clamp still applies to the effective value.
+    try std.testing.expectEqual(@as(u32, 1), Texture.effectiveAnisotropy(authored, 10));
+    // The override still lands on an authored-sampler texture (it changes
+    // anisotropy only, never wrap/filter).
+    try std.testing.expectEqual(@as(u32, 8), textureOptionsFor(&textured, false, 8).max_anisotropy);
+}
+
 test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -849,7 +909,7 @@ test "loadMaterials maps normalTexture.scale into normal_scale (GPU-free)" {
     // cleanly returns null without touching the GPU.
     var tex_cache: [2]?Texture = .{ null, null };
     var dec_cache: [1]?Texture.DecodedImage = .{null};
-    try loadMaterials(&scene, &data, null, &out, &tex_cache, &dec_cache, null);
+    try loadMaterials(&scene, &data, null, &out, &tex_cache, &dec_cache, null, null);
 
     try std.testing.expectEqual(@as(f32, 1.0), out[0].?.pbr.normal_scale);
     try std.testing.expectEqual(@as(f32, 0.5), out[1].?.pbr.normal_scale);
@@ -931,7 +991,7 @@ test "loadMaterials maps texture transforms into the PBR slots (GPU-free)" {
     data.materials_count = src.len;
 
     var out: [1]?Material = .{null};
-    try loadMaterials(&scene, &data, null, &out, &.{}, &.{}, null);
+    try loadMaterials(&scene, &data, null, &out, &.{}, &.{}, null, null);
 
     const mat = out[0].?.pbr;
     try std.testing.expectEqual(@as(f32, 0.5), mat.albedo_uv_transform.rotation);
@@ -973,7 +1033,7 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
     } };
 
     // Requesting as linear (srgb_to_linear = false) MUST NOT consume or alias with the sRGB decoded texture
-    const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true);
+    const linear_tex = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true, null);
     // Since it's linear and decoded was sRGB (and no buffer_view/uri exists), linear_tex stays null:
     try std.testing.expect(linear_tex == null);
     try std.testing.expect(decoded[0] != null); // Was NOT consumed!
@@ -997,11 +1057,11 @@ test "loadTextureFromView caches linear and sRGB variants separately without ali
     image_cache[1] = mock_srgb;
 
     // Separate lookups must return their own distinct slot!
-    const query_linear = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true);
+    const query_linear = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, false, true, null);
     try std.testing.expect(query_linear != null);
     try std.testing.expectEqual(@as(u32, 101), query_linear.?.image.id);
 
-    const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true, true);
+    const query_srgb = loadTextureFromView(&scene, &data, &image_cache, &decoded, &view, null, true, true, null);
     try std.testing.expect(query_srgb != null);
     try std.testing.expectEqual(@as(u32, 102), query_srgb.?.image.id);
 }
