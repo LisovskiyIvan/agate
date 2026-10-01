@@ -38,8 +38,8 @@ pub fn renderPoint(
         var point_last_pipeline_id: u32 = 0;
 
         for (point_shadows) |point_info| {
-            sg.applyViewport(point_info.tile_x, point_info.tile_y, types.POINT_SHADOW_RES, types.POINT_SHADOW_RES, false);
-            sg.applyScissorRect(point_info.tile_x, point_info.tile_y, types.POINT_SHADOW_RES, types.POINT_SHADOW_RES, false);
+            sg.applyViewport(point_info.tile_x, point_info.tile_y, types.POINT_SHADOW_RES, types.POINT_SHADOW_RES, true);
+            sg.applyScissorRect(point_info.tile_x, point_info.tile_y, types.POINT_SHADOW_RES, types.POINT_SHADOW_RES, true);
 
             const point_frustum = math.Frustum.fromViewProjection(point_info.view_proj);
             buckets.renderBuckets(self, prepared, point_info.view_proj, point_frustum, null, &point_last_pipeline_id, draw_calls);

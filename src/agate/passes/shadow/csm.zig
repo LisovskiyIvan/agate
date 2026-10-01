@@ -40,8 +40,8 @@ pub fn renderCsm(
         const vx: i32 = if (c_idx % 2 == 1) CASCADE_RES else 0;
         const vy: i32 = if (c_idx >= 2) CASCADE_RES else 0;
 
-        sg.applyViewport(vx, vy, CASCADE_RES, CASCADE_RES, false);
-        sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, false);
+        sg.applyViewport(vx, vy, CASCADE_RES, CASCADE_RES, true);
+        sg.applyScissorRect(vx, vy, CASCADE_RES, CASCADE_RES, true);
 
         const c_frustum = math.Frustum.fromViewProjection(light_view_proj);
         buckets.renderBuckets(self, prepared, light_view_proj, c_frustum, c_idx, &last_pipeline_id, draw_calls);
