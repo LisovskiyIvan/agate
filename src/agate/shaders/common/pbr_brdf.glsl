@@ -1,3 +1,19 @@
+// Babylon's dielectric F0 for the metallic workflow — and the constant its
+// LEGACY energy conservation is built from. `PBRBaseMaterial` uploads
+// `vReflectivityColor.a = ((ior - 1) / (ior + 1))^2` (the exact normal-
+// incidence Fresnel reflectance of the IOR: 0.04 at the glTF default 1.5),
+// and `reflectivityBlock` uses it twice:
+//
+//     dielectricColorF0 = vec3(dielectricF0 * surfaceReflectivityColor)
+//     surfaceAlbedo     = baseColor * (1 - dielectricF0 * surfaceReflectivityColor)
+//                                    * (1 - metallic)      // LEGACY path only
+//
+// `surfaceReflectivityColor` is `metallicReflectanceFactors.rgb`. A glTF
+// material without `KHR_materials_specular` leaves it white and
+// `metallicF0Factor` at 1, so both expressions reduce to this constant; agate
+// does not support that extension, so the value is not a uniform here either.
+const float dielectric_f0 = 0.04;
+
 // Babylon's roughness remap: alphaG = roughness^2 + MINIMUMVARIANCE
 // (`convertRoughnessToAverageSlope`, MINIMUMVARIANCE = 0.0005). The epsilon
 // keeps the slope non-zero at roughness 0 so the visibility division below

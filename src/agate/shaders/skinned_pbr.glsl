@@ -364,8 +364,23 @@ void main() {
     vec3 V = normalize(eye_pos.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 0.0001);
 
-    vec3 F0 = vec3(0.04);
+    vec3 F0 = vec3(dielectric_f0);
     F0 = mix(F0, albedo, metallic);
+
+    // Energy-conserved diffuse albedo (Babylon `reflectivityBlock`). Under the
+    // `LEGACY_SPECULAR_ENERGY_CONSERVATION` define — which PBRBaseMaterial sets
+    // unconditionally — Babylon feeds
+    //     surfaceAlbedo = baseColor * (1 - dielectricF0 * surfaceReflectivityColor)
+    //                              * (1 - metallic)
+    // to EVERY diffuse term (`finalDiffuse = diffuseBase * surfaceAlbedo`,
+    // `finalIrradiance *= surfaceAlbedo`), while the specular keeps the raw
+    // `baseColor` in `F0` above. glTF without KHR_materials_specular (all agate
+    // supports) leaves `surfaceReflectivityColor` white, so the factor is the
+    // constant `1 - dielectric_f0`; the `(1 - metallic)` half is already
+    // applied per site (in `kD`, in the hemispheric term). Metals are
+    // unaffected (their diffuse is gated to zero anyway); dielectrics and the
+    // ground lose the 4%.
+    vec3 diffuse_albedo = albedo * (1.0 - dielectric_f0);
 
     // Clearcoat + sheen factors (scalar/color only, no textures this wave).
     // Intensity 0 disables the lobe while keeping every legacy term exact.
@@ -413,6 +428,8 @@ void main() {
     float transm_factor = clamp(transmission_factors.x, 0.0, 1.0);
     if (transm_factor > 0.0) {
         albedo *= (1.0 - transm_factor);
+        // keep the energy-conserved copy in step (it feeds every diffuse site)
+        diffuse_albedo *= (1.0 - transm_factor);
     }
     float sss_strength = clamp(sss_factors.x, 0.0, 1.0);
 
@@ -437,7 +454,7 @@ void main() {
     vec3 debug_tint = vec3(0.0);
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 radiance = light_color.rgb * light_color.a;
-    vec3 Lo = (kD * albedo / PI + specular * sun_atten + sun_additive) * radiance * NdotL * (1.0 - shadow);
+    vec3 Lo = (kD * diffuse_albedo / PI + specular * sun_atten + sun_additive) * radiance * NdotL * (1.0 - shadow);
 
     // Extra directional fills (slots 1..3, no shadows): the same
     // Cook-Torrance lobe as the sun (coat + sheen included), no shadow
@@ -460,7 +477,7 @@ void main() {
         vec3 d_atten;
         vec3 d_additive;
         coatSheenLight(N, V, d_dir, d_H, NdotV, d_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, d_atten, d_additive);
-        Lo += (d_kD * albedo / PI + d_spec * d_atten + d_additive) * d_rad * d_NdotL;
+        Lo += (d_kD * diffuse_albedo / PI + d_spec * d_atten + d_additive) * d_rad * d_NdotL;
     }
 
     // 2. Point Lights (up to 4)
@@ -497,7 +514,7 @@ void main() {
             coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, p_atten, p_additive);
 
             float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
-            Lo += (p_kD * albedo / PI + p_spec * p_atten + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
+            Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
         }
         if (transm_factor > 0.0) {
             float p_transm_back = max(dot(-N, p_L), 0.0);
@@ -552,7 +569,7 @@ void main() {
             coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, s_atten, s_additive);
 
             float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
-            Lo += (s_kD * albedo / PI + s_spec * s_atten + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
+            Lo += (s_kD * diffuse_albedo / PI + s_spec * s_atten + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
         }
     }
 
@@ -575,7 +592,7 @@ void main() {
         vec3 a_atten;
         vec3 a_additive;
         coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, a_atten, a_additive);
-        Lo += (a_kD * albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
+        Lo += (a_kD * diffuse_albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
     }
 
     // Clustered forward point lights (up to 64, no shadows): pixel -> tile
@@ -626,7 +643,7 @@ void main() {
                 vec3 c_atten;
                 vec3 c_additive;
                 coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, c_atten, c_additive);
-                Lo += (c_kD * albedo / PI + c_spec * c_atten + c_additive) * c_rad * c_NdotL;
+                Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten + c_additive) * c_rad * c_NdotL;
             }
         }
     }
@@ -700,7 +717,7 @@ void main() {
         specular_ibl = specular_ibl * (vec3(1.0) - cc_F_ibl) + cc_spec_ibl;
 
         vec3 kD_ibl = (vec3(1.0) - F_ibl) * (1.0 - metallic);
-        vec3 diffuse_ibl = kD_ibl * irradiance * albedo;
+        vec3 diffuse_ibl = kD_ibl * irradiance * diffuse_albedo;
         float sheen_grazing = pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
         vec3 sheen_ibl = sheen_tint * sheen_intensity * irradiance * sheen_grazing;
 
@@ -711,7 +728,7 @@ void main() {
     // no diffuse lobe: Babylon's `diffuseColor = albedo * (1 - metallic)`,
     // so a full metal takes only the specular path (an earlier revision fed
     // the hemispheric term to metals too, washing them out).
-    vec3 ambient = hemiIrradiance(N) * albedo * (1.0 - metallic) * ao;
+    vec3 ambient = hemiIrradiance(N) * diffuse_albedo * (1.0 - metallic) * ao;
 
     // Hemispheric SPECULAR (Babylon model — see common/hemi.glsl). Babylon's
     // PBR adds a full GGX lobe for a HEMILIGHT, coloured by the light's
