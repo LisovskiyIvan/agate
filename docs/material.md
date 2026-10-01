@@ -225,6 +225,22 @@ pub fn presetForKind(kind: PresetKind) PresetInfo;
 
 Возвращают `null`, если шейдер не зарегистрирован. Опции — plain-структуры (`SkyOptions`, `GradientOptions`, `GridOptions`, `TriPlanarOptions`).
 
+## Модель затенения PBR (паритет с Babylon.js)
+
+Спекуляр считается как в Babylon.js: NDF Trowbridge-Reitz (GGX) от
+`alphaG = roughness² + 0.0005` (`convertRoughnessToAverageSlope`), видимость —
+height-correlated Smith `0.5 / (Gv + Gl)` (`smithVisibility_GGXCorrelated`,
+Heitz 2014), итог `f_spec = D · Vis · F` (множитель `NdotL` применяет
+вызывающий), диффуз — `albedo · (1 − metallic) / π`. Все формулы живут в
+`shaders/common/pbr_brdf.glsl` и используются всеми тремя PBR-контурами
+(`pbr`, `instanced_pbr`, `skinned_pbr`), включая clearcoat-лоб.
+
+Ранее стояло приближение Schlick-GGX с `k = (r+1)²/8` (фит Лазарова, в UE4
+он предназначен для IBL, а не для прямого света) и деление на
+`4·NdotV·NdotL`. На скользящих углах оно давало до 1.8× меньше спекуляра,
+чем модель Babylon, и синий оттенок на диэлектриках; на бенче земля
+сходилась с эталоном только в пределах 10/255, а после перехода — 2-3/255.
+
 ## Потоки и владение
 
 Материалы — plain data без внутренних мьютексов: создавать и мутировать можно на любом потоке до публикации в draw-контур; чтение в кадре — на context-потоке через снапшоты. `Material` хранит указатели — владение за вызывающим (обычно долгоживущие объекты на аллокаторе сцены; освобождение после `destroyMesh`/смены материала). Текстуры внутри материалов — владеющие GPU-хендлы `Texture` (см. `./texture.md`); асинхронная подмена слотов идёт через `UploadQueue`/`PendingTexture.addTarget`.

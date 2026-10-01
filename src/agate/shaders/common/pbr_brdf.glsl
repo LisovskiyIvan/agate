@@ -1,5 +1,13 @@
+// Babylon's roughness remap: alphaG = roughness^2 + MINIMUMVARIANCE
+// (`convertRoughnessToAverageSlope`, MINIMUMVARIANCE = 0.0005). The epsilon
+// keeps the slope non-zero at roughness 0 so the visibility division below
+// stays finite.
+float convertRoughnessToAverageSlope(float roughness) {
+    return roughness * roughness + 0.0005;
+}
+
 float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a = roughness * roughness;
+    float a = convertRoughnessToAverageSlope(roughness);
     float a2 = a * a;
     float NdotH = max(dot(N, H), 0.0);
     float NdotH2 = NdotH * NdotH;
@@ -9,18 +17,22 @@ float distributionGGX(vec3 N, vec3 H, float roughness) {
     return num / max(denom, 0.0000001);
 }
 
-float geometrySchlickGGX(float NdotV, float roughness) {
-    float r = (roughness + 1.0);
-    float k = (r * r) / 8.0;
-    return NdotV / (NdotV * (1.0 - k) + k);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    float NdotV = max(dot(N, V), 0.0);
-    float NdotL = max(dot(N, L), 0.0);
-    float ggx2 = geometrySchlickGGX(NdotV, roughness);
-    float ggx1 = geometrySchlickGGX(NdotL, roughness);
-    return ggx1 * ggx2;
+// Height-correlated Smith masking-shadowing — Babylon's
+// `smithVisibility_GGXCorrelated`. This is the physically-derived model
+// (Heitz 2014) used by Babylon.js, Filament and the glTF sample viewer; it
+// replaces the Schlick-GGX approximation with k = (r+1)^2/8, which is
+// Lazarov's *IBL* fit and over-darkens grazing angles on direct light.
+//
+// The returned visibility already contains the 1/(4*NdotL*NdotV) factor of
+// the Cook-Torrance denominator, so the specular is
+//     f_spec = D * Vis * F        (the caller applies NdotL)
+// matching Babylon's `specTerm = fresnel * distribution * smithVisibility`.
+float smithVisibilityGGXCorrelated(float NdotL, float NdotV, float roughness) {
+    float alphaG = convertRoughnessToAverageSlope(roughness);
+    float a2 = alphaG * alphaG;
+    float ggx_v = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float ggx_l = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    return 0.5 / max(ggx_v + ggx_l, 1e-6);
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
@@ -92,10 +104,10 @@ void coatSheenLight(vec3 N, vec3 V, vec3 L, vec3 H, float NdotV, float NdotL,
     float sheen_rough, float sheen_intensity, vec3 sheen_tint,
     out vec3 base_atten, out vec3 additive) {
     float cc_NDF = distributionGGX(N, H, cc_rough);
-    float cc_G = geometrySmith(N, V, L, cc_rough);
+    float cc_Vis = smithVisibilityGGXCorrelated(NdotL, NdotV, cc_rough);
     vec3 cc_F = fresnelSchlick(clamp(dot(H, V), 0.0, 1.0), cc_F0) * cc_intensity;
     base_atten = vec3(1.0) - cc_F;
-    vec3 cc_spec = (cc_NDF * cc_G * cc_F) / (4.0 * NdotV * NdotL + 0.0001);
+    vec3 cc_spec = cc_NDF * cc_Vis * cc_F;
     float sheenD = sheenDistributionCharlie(sheen_rough, max(dot(N, H), 0.0));
     float sheenV = sheenVisibilityNeubelt(NdotV, NdotL);
     vec3 sheen_term = sheen_tint * (sheenD * sheenV) * sheen_intensity;

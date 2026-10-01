@@ -18,7 +18,7 @@ materials).
 | `cluster.glsl` | 19 | `standard`, `pbr`, `instanced`, `instanced_pbr`, `skinned_pbr` (5) |
 | `shadow_pcf.glsl` | 248 | same 5 (`hash01` → `areaLightFactor`, incl. rect area-light comment) |
 | `uv_apply.glsl` | 3 | same 5 |
-| `pbr_brdf.glsl` | 103 | `pbr`, `instanced_pbr`, `skinned_pbr` (3) |
+| `pbr_brdf.glsl` | 115 | `pbr`, `instanced_pbr`, `skinned_pbr` (3) |
 | `channel_select.glsl` | 6 | same 3 |
 | `hemi.glsl` | 24 | same 5 (`standard`, `pbr`, `instanced`, `instanced_pbr`, `skinned_pbr`) |
 

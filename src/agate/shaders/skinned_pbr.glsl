@@ -422,10 +422,10 @@ void main() {
     float NdotL = max(dot(N, L), 0.0);
 
     float NDF = anisoNDF(N, aniso_T, aniso_B, H, roughness);
-    float G = geometrySmith(N, V, L, roughness);
+    float Vis = smithVisibilityGGXCorrelated(NdotL, NdotV, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
-    vec3 specular = (NDF * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+    vec3 specular = NDF * Vis * F;
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
 
     // Coat + sheen add-on for the sun (base_atten scales the BASE specular
@@ -452,9 +452,9 @@ void main() {
         if (d_NdotL <= 0.0) continue;
         vec3 d_H = normalize(V + d_dir);
         float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, roughness);
-        float d_G = geometrySmith(N, V, d_dir, roughness);
+        float d_Vis = smithVisibilityGGXCorrelated(d_NdotL, NdotV, roughness);
         vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
-        vec3 d_spec = (d_NDF * d_G * d_F) / (4.0 * NdotV * d_NdotL + 0.0001);
+        vec3 d_spec = d_NDF * d_Vis * d_F;
         vec3 d_kD = (vec3(1.0) - d_F) * (1.0 - metallic);
         vec3 d_rad = d_col * d_int;
         vec3 d_atten;
@@ -486,10 +486,10 @@ void main() {
         float p_NdotL = max(dot(N, p_L), 0.0);
         if (p_NdotL > 0.0) {
             float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, roughness);
-            float p_G = geometrySmith(N, V, p_L, roughness);
+            float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, roughness);
             vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
-            vec3 p_spec = (p_NDF * p_G * p_F) / (4.0 * NdotV * p_NdotL + 0.0001);
+            vec3 p_spec = p_NDF * p_Vis * p_F;
             vec3 p_kD = (vec3(1.0) - p_F) * (1.0 - metallic);
             vec3 p_rad = p_col * (p_int * att);
             vec3 p_atten;
@@ -541,10 +541,10 @@ void main() {
         float s_NdotL = max(dot(N, s_L), 0.0);
         if (s_NdotL > 0.0) {
             float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, roughness);
-            float s_G = geometrySmith(N, V, s_L, roughness);
+            float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, roughness);
             vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
-            vec3 s_spec = (s_NDF * s_G * s_F) / (4.0 * NdotV * s_NdotL + 0.0001);
+            vec3 s_spec = s_NDF * s_Vis * s_F;
             vec3 s_kD = (vec3(1.0) - s_F) * (1.0 - metallic);
             vec3 s_rad = s_col * (s_int * total_att);
             vec3 s_atten;
@@ -567,9 +567,9 @@ void main() {
         if (a_factor <= 0.0) continue;
         vec3 a_H = normalize(V + a_L);
         float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, roughness);
-        float a_G = geometrySmith(N, V, a_L, roughness);
+        float a_Vis = smithVisibilityGGXCorrelated(a_NdotL, NdotV, roughness);
         vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
-        vec3 a_spec = (a_NDF * a_G * a_F) / (4.0 * NdotV * a_NdotL + 0.0001);
+        vec3 a_spec = a_NDF * a_Vis * a_F;
         vec3 a_kD = (vec3(1.0) - a_F) * (1.0 - metallic);
         vec3 a_rad = area_color[i].rgb * a_factor;
         vec3 a_atten;
@@ -618,9 +618,9 @@ void main() {
             float c_NdotL = max(dot(N, c_L), 0.0);
             if (c_NdotL > 0.0) {
                 float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, roughness);
-                float c_G = geometrySmith(N, V, c_L, roughness);
+                float c_Vis = smithVisibilityGGXCorrelated(c_NdotL, NdotV, roughness);
                 vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
-                vec3 c_spec = (c_NDF * c_G * c_F) / (4.0 * NdotV * c_NdotL + 0.0001);
+                vec3 c_spec = c_NDF * c_Vis * c_F;
                 vec3 c_kD = (vec3(1.0) - c_F) * (1.0 - metallic);
                 vec3 c_rad = c_col * (c_int * c_att);
                 vec3 c_atten;
