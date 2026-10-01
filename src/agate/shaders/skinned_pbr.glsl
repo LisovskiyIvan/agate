@@ -152,7 +152,9 @@ layout(binding = 2) uniform fs_params {
     // 0 albedo, 1 normal, 2 metallic-roughness, 3 emissive, 4 occlusion.
     vec4 uv_matrix[5]; // per slot: rotation*scale rows [m00, m01, m10, m11]
     vec4 uv_offset[5]; // per slot: xy offset, zw unused
-    vec4 channel_selectors; // x occlusion, y roughness, z metallic (lane index), w unused
+    vec4 channel_selectors; // x occlusion, y roughness, z metallic (lane index),
+                            // w: specular anti-aliasing flag (0/1 — Babylon's
+                            // SPECULARAA; see aaRoughnessFactor)
     // APPENDED LAST (clearcoat/sheen): coat + fabric lobes (scalar/color
     // plus optional R-mask / rgb-tint maps in pbr-layers v1, bindings 15/16).
     // Intensity 0 disables the lobe:
@@ -364,6 +366,17 @@ void main() {
     vec3 V = normalize(eye_pos.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 0.0001);
 
+    // Babylon's specular anti-aliasing (SPECULARAA — see aaRoughnessFactor in
+    // common/pbr_brdf.glsl): `computeSpecularLighting` evaluates its lobes at
+    //    roughness = max(info.roughness, AARoughnessFactors.x)
+    // so the screen-space normal variation can only RAISE the specular
+    // roughness. `aa_rough` is exactly 0 with the material flag off, which
+    // makes `spec_roughness == roughness` and every lobe bit-identical to the
+    // pre-SPECULARAA shading. The IBL block below deliberately keeps the raw
+    // `roughness` (Babylon feeds it its own `alphaG`, not this value).
+    float aa_rough = aaRoughnessFactor(N);
+    float spec_roughness = max(roughness, aa_rough);
+
     vec3 F0 = vec3(dielectric_f0);
     F0 = mix(F0, albedo, metallic);
 
@@ -384,10 +397,14 @@ void main() {
 
     // Clearcoat + sheen factors (scalar/color only, no textures this wave).
     // Intensity 0 disables the lobe while keeping every legacy term exact.
-    float cc_rough = clamp(clearcoat_factors.y, 0.03, 1.0);
+    // Babylon's computeClearCoatLighting / computeSheenLighting apply the
+    // same max(roughness, AARoughnessFactors.x) to the coat / sheen lobe.
+    float cc_rough = max(clamp(clearcoat_factors.y, 0.03, 1.0), aa_rough);
     float cc_intensity = clamp(clearcoat_factors.x, 0.0, 1.0);
     vec3 cc_F0 = clearcoatF0();
-    float sheen_rough = clamp(sheen_factors.y, 0.07, 1.0);
+    // Babylon's computeClearCoatLighting / computeSheenLighting apply the
+    // same max(roughness, AARoughnessFactors.x) to the coat / sheen lobe.
+    float sheen_rough = max(clamp(sheen_factors.y, 0.07, 1.0), aa_rough);
     float sheen_intensity = clamp(sheen_factors.x, 0.0, 1.0);
 
     // PBR layers v1: coat/fabric masks sampled with the ALBEDO uv transform
@@ -438,8 +455,8 @@ void main() {
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
 
-    float NDF = anisoNDF(N, aniso_T, aniso_B, H, roughness);
-    float Vis = smithVisibilityGGXCorrelated(NdotL, NdotV, roughness);
+    float NDF = anisoNDF(N, aniso_T, aniso_B, H, spec_roughness);
+    float Vis = smithVisibilityGGXCorrelated(NdotL, NdotV, spec_roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
     vec3 specular = NDF * Vis * F;
@@ -468,8 +485,8 @@ void main() {
         float d_NdotL = max(dot(N, d_dir), 0.0);
         if (d_NdotL <= 0.0) continue;
         vec3 d_H = normalize(V + d_dir);
-        float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, roughness);
-        float d_Vis = smithVisibilityGGXCorrelated(d_NdotL, NdotV, roughness);
+        float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, spec_roughness);
+        float d_Vis = smithVisibilityGGXCorrelated(d_NdotL, NdotV, spec_roughness);
         vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
         vec3 d_spec = d_NDF * d_Vis * d_F;
         vec3 d_kD = (vec3(1.0) - d_F) * (1.0 - metallic);
@@ -502,8 +519,8 @@ void main() {
 
         float p_NdotL = max(dot(N, p_L), 0.0);
         if (p_NdotL > 0.0) {
-            float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, roughness);
-            float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, roughness);
+            float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, spec_roughness);
+            float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, spec_roughness);
             vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
             vec3 p_spec = p_NDF * p_Vis * p_F;
@@ -557,8 +574,8 @@ void main() {
 
         float s_NdotL = max(dot(N, s_L), 0.0);
         if (s_NdotL > 0.0) {
-            float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, roughness);
-            float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, roughness);
+            float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, spec_roughness);
+            float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, spec_roughness);
             vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
             vec3 s_spec = s_NDF * s_Vis * s_F;
@@ -583,8 +600,8 @@ void main() {
         float a_factor = areaLightFactor(v_world_pos, N, i, a_L, a_NdotL);
         if (a_factor <= 0.0) continue;
         vec3 a_H = normalize(V + a_L);
-        float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, roughness);
-        float a_Vis = smithVisibilityGGXCorrelated(a_NdotL, NdotV, roughness);
+        float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, spec_roughness);
+        float a_Vis = smithVisibilityGGXCorrelated(a_NdotL, NdotV, spec_roughness);
         vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
         vec3 a_spec = a_NDF * a_Vis * a_F;
         vec3 a_kD = (vec3(1.0) - a_F) * (1.0 - metallic);
@@ -634,8 +651,8 @@ void main() {
 
             float c_NdotL = max(dot(N, c_L), 0.0);
             if (c_NdotL > 0.0) {
-                float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, roughness);
-                float c_Vis = smithVisibilityGGXCorrelated(c_NdotL, NdotV, roughness);
+                float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, spec_roughness);
+                float c_Vis = smithVisibilityGGXCorrelated(c_NdotL, NdotV, spec_roughness);
                 vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
                 vec3 c_spec = c_NDF * c_Vis * c_F;
                 vec3 c_kD = (vec3(1.0) - c_F) * (1.0 - metallic);
@@ -738,7 +755,7 @@ void main() {
     // metal-path residual the bench measured. NOT multiplied by `ao`:
     // Babylon occludes `finalDiffuse` and the IBL irradiance, never its
     // analytic `finalSpecular`. Evaluated once per fragment, not per light.
-    Lo += hemiSpecular(N, V, NdotV, roughness, F0);
+    Lo += hemiSpecular(N, V, NdotV, spec_roughness, F0);
 
     vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;

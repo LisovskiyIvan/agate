@@ -39,7 +39,10 @@ pub const MaterialDrawRecord = struct {
     normal_scale: f32 = 1.0,
     alpha_cutoff: f32 = 0.0,
 
-    // UV transforms & channel selectors
+    // UV transforms & channel selectors. channel_selectors.w is the specular
+    // anti-aliasing flag (Babylon's SPECULARAA): 1.0 = evaluate the specular
+    // lobes at max(roughness, AARoughnessFactors.x) — see aaRoughnessFactor in
+    // common/pbr_brdf.glsl. 0.0 keeps the legacy roughness bit-identically.
     uv_matrices: [5][4]f32 = @splat(.{ 1, 0, 0, 1 }),
     uv_offsets: [5][4]f32 = @splat(.{ 0, 0, 0, 0 }),
     channel_selectors: [4]f32 = .{ 0, 1, 2, 0 },
@@ -162,7 +165,7 @@ pub fn buildDrawRecord(
                     p.occlusion_channel.selector(),
                     p.roughness_channel.selector(),
                     p.metallic_channel.selector(),
-                    0,
+                    if (p.specular_anti_aliasing) 1.0 else 0.0,
                 };
             },
             .standard => |s| {

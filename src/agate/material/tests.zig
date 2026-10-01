@@ -472,6 +472,33 @@ test "PBRMaterial slot defaults reproduce the glTF conventions" {
     try std.testing.expect(mat.occlusion_uv_transform.isIdentity());
 }
 
+test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w" {
+    var pbr_mat = PBRMaterial.init("aa_pbr");
+    const def_std = StandardMaterial.init("def");
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    // Hand-built PBRMaterial default = Babylon's own default (SPECULARAA off):
+    // the w lane must stay 0 so the shader takes the legacy roughness path.
+    try std.testing.expect(!pbr_mat.specular_anti_aliasing);
+    const rec_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[3]);
+    // The three lane selectors are untouched by the flag (same uniform).
+    try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), rec_off.channel_selectors[1]);
+    try std.testing.expectEqual(@as(f32, 2.0), rec_off.channel_selectors[2]);
+
+    pbr_mat.specular_anti_aliasing = true;
+    pbr_mat.occlusion_channel = .a;
+    pbr_mat.roughness_channel = .r;
+    pbr_mat.metallic_channel = .a;
+    const rec_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), rec_on.channel_selectors[3]);
+    try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), rec_on.channel_selectors[1]);
+    try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[2]);
+}
+
 test "MaterialDrawRecord builds correctly from PBRMaterial" {
     var pbr_mat = PBRMaterial.init("test_pbr");
     pbr_mat.metallic = 0.8;

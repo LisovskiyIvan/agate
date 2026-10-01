@@ -63,6 +63,21 @@ pub const PBRMaterial = struct {
     environment_texture: ?CubeTexture = null,
     environment_intensity: f32 = 1.0,
 
+    /// Babylon's `enableSpecularAntiAliasing` (`SPECULARAA`): widen the
+    /// specular roughness of every analytic lobe by the screen-space normal
+    /// variation, so a sub-pixel lobe is not point-sampled into aliasing
+    /// (`getAARoughnessFactors` → `max(info.roughness,
+    /// geometricRoughnessFactor)`; see `aaRoughnessFactor` in
+    /// common/pbr_brdf.glsl). Rides the `channel_selectors.w` lane.
+    ///
+    /// Default matches a hand-built Babylon `PBRMaterial` (`false`); the glTF
+    /// loaders force it ON for every material they create — that is what
+    /// `babylonjs.loaders.js`'s `PBRMaterialLoadingAdapter` constructor does
+    /// (`this._material.enableSpecularAntiAliasing = true`), and it is why a
+    /// glTF helmet and a hand-made ground plane in the same Babylon scene
+    /// compile different shaders. `SceneLoader` follows suit below.
+    specular_anti_aliasing: bool = false,
+
     /// Clearcoat coat layer (default OFF: intensity 0 = lobe disabled,
     /// neutral tint/roughness). Optional R-mask texture (null = scalar).
     clearcoat: Clearcoat = .{},

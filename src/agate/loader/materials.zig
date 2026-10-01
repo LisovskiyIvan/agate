@@ -544,6 +544,23 @@ pub fn loadMaterials(
 
         const pbr_mat = try scene.createPBRMaterial(mat_name);
 
+        // glTF material default (Babylon's loading adapters). Babylon turns
+        // specular anti-aliasing ON for every material the loader creates —
+        // `babylonjs.loaders.js`, `PBRMaterialLoadingAdapter` constructor:
+        //     class PBRMaterialLoadingAdapter {
+        //         constructor(material) {
+        //             this._specWorkflow = false;
+        //             this._material = material;
+        //             this._material.enableSpecularAntiAliasing = true;
+        //         }
+        // (byte 372234, reached from `_getOrCreateMaterialAdapter` at byte
+        // 304156 → `_createDefaultMaterial` at byte 338350). A Babylon
+        // PBRMaterial built by hand keeps its own default of `false`, so this
+        // is a LOADER default, not a material one: without it a glTF helmet
+        // and a hand-made ground plane in the same scene would shade
+        // differently in Babylon while shading identically here.
+        pbr_mat.specular_anti_aliasing = true;
+
         if (src_mat.has_pbr_metallic_roughness != 0) {
             const pbr = &src_mat.pbr_metallic_roughness;
             pbr_mat.albedo_color = Color3.new(
@@ -701,7 +718,17 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     try std.testing.expect(out[2].?.pbr.alpha_mode == .blend);
     try std.testing.expectEqual(@as(f32, 0.5), out[2].?.pbr.alpha_cutoff);
     try std.testing.expect(!out[2].?.pbr.double_sided);
+
+    // Every glTF material carries the loader's specular anti-aliasing default
+    // (Babylon's PBRMaterialLoadingAdapter sets it on unconditionally), on all
+    // three alpha modes. A hand-built PBRMaterial keeps its own default off.
+    try std.testing.expect(out[0].?.pbr.specular_anti_aliasing);
+    try std.testing.expect(out[1].?.pbr.specular_anti_aliasing);
+    try std.testing.expect(out[2].?.pbr.specular_anti_aliasing);
+    try std.testing.expect(!PBRMaterial.init("hand_made").specular_anti_aliasing);
 }
+
+const PBRMaterial = @import("../material/pbr.zig").PBRMaterial;
 
 test "loadMaterials maps KHR_materials_clearcoat and KHR_materials_sheen (GPU-free)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
