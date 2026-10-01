@@ -140,6 +140,7 @@ pub const VatData = struct {
     /// Samples the vertex position with sub-frame linear interpolation.
     pub fn samplePositionInterpolated(self: VatData, vertex_idx: usize, frame_time: f32) Vec3 {
         if (self.frame_count == 0 or self.vertex_count == 0) return Vec3.zero;
+        if (!std.math.isFinite(frame_time)) return Vec3.zero;
         const total: f32 = @floatFromInt(self.frame_count);
         const wrapped = @mod(frame_time, total);
         const f0_idx: usize = @intFromFloat(@floor(wrapped));
@@ -163,6 +164,7 @@ pub const VatData = struct {
     /// Samples the vertex normal with sub-frame interpolation and normalization.
     pub fn sampleNormalInterpolated(self: VatData, vertex_idx: usize, frame_time: f32) Vec3 {
         if (self.normals == null or self.frame_count == 0) return Vec3.up;
+        if (!std.math.isFinite(frame_time)) return Vec3.up;
         const total: f32 = @floatFromInt(self.frame_count);
         const wrapped = @mod(frame_time, total);
         const f0_idx: usize = @intFromFloat(@floor(wrapped));
@@ -432,8 +434,20 @@ pub const VatPlayer = struct {
 
     pub fn update(self: *VatPlayer, dt: f32) void {
         self.time += dt * self.speed;
+        // Guard against degenerate VatData (frame_count=0 / fps=0): the
+        // division would yield 0/0=NaN, and `NaN <= 0` is false, so the
+        // early-out below would NOT fire — @mod(time, NaN) would then
+        // poison `time` forever (NaN mesh transforms downstream). Zero or
+        // non-finite config means "nothing to play": clamp to zero.
+        if (self.vat.frame_count == 0 or !(self.vat.fps > 0.0)) {
+            self.time = 0.0;
+            return;
+        }
         const total_duration = @as(f32, @floatFromInt(self.vat.frame_count)) / self.vat.fps;
-        if (total_duration <= 0.0) return;
+        if (!(total_duration > 0.0)) {
+            self.time = 0.0;
+            return;
+        }
 
         if (self.loop) {
             self.time = @mod(self.time, total_duration);
@@ -443,8 +457,9 @@ pub const VatPlayer = struct {
     }
 
     pub fn seek(self: *VatPlayer, time_seconds: f32) void {
+        if (self.vat.frame_count == 0 or !(self.vat.fps > 0.0)) return;
         const total_duration = @as(f32, @floatFromInt(self.vat.frame_count)) / self.vat.fps;
-        if (total_duration <= 0.0) return;
+        if (!(total_duration > 0.0)) return;
         if (self.loop) {
             self.time = @mod(time_seconds, total_duration);
         } else {
