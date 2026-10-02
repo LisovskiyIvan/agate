@@ -239,6 +239,27 @@ pub const Scene = struct {
     active_camera: ?Camera = null,
     active_camera_owned_name: ?[]const u8 = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
+    /// Babylon's output stage for the PBR family: the final shaded value is
+    /// gamma-encoded in the shader (`applyImageProcessing` -> `toGammaSpace`
+    /// = `pow(color, 1/2.2)`) and written to a backbuffer that is NOT sRGB.
+    /// Babylon itself has no switch — every material shader ends that way —
+    /// so this defaults to ON, which is also the convention `clear_color`
+    /// above already follows (the default `(0.12, 0.14, 0.18)` is Babylon's
+    /// `Scene.clearColor`, i.e. a gamma-space value written verbatim).
+    ///
+    /// Set it to `false` for an sRGB backbuffer (`sapp_desc.srgb = true`),
+    /// where the hardware applies the exact piecewise sRGB curve to linear
+    /// shader output; leaving it ON there encodes twice. The two curves are
+    /// not the same function (they differ by ~1% in the midtones and by tens
+    /// of percent in deep shadow), which is why the flag must match the
+    /// backbuffer — see shaders/common/output_gamma.glsl and bench/PROBE.md
+    /// §10.13.
+    ///
+    /// Scope: the PBR shader family (`pbr`, `instanced_pbr`, `skinned_pbr`),
+    /// which is what Babylon's PBR materials cover. The standard-material,
+    /// particle, skybox and UI families still write linear color (they need
+    /// the same lane before this flag can be called engine-wide).
+    output_gamma: bool = true,
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
     /// Babylon's environment-BRDF lookup (256x256, gammaSpace) behind

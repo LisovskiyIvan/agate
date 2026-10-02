@@ -221,6 +221,7 @@ pub fn drawRegularItem(
             .uv_matrix = rec.uv_matrices,
             .uv_offset = rec.uv_offsets,
             .channel_selectors = rec.channel_selectors,
+            .output_params = f.output_params,
             .clearcoat_factors = coat.clearcoat_factors,
             .clearcoat_color = coat.clearcoat_color,
             .sheen_factors = coat.sheen_factors,
@@ -442,6 +443,7 @@ fn drawShaderMaterialItem(
                 .uv_matrix = identityUvMatrices(),
                 .uv_offset = identityUvOffsets(),
                 .channel_selectors = pbrChannelSelectors(null),
+                .output_params = f.output_params,
                 // Hook materials carry no coat/fabric layers: neutral-disabled.
                 .clearcoat_factors = material_mod.CoatParams.neutral.clearcoat_factors,
                 .clearcoat_color = material_mod.CoatParams.neutral.clearcoat_color,
@@ -842,6 +844,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .uv_matrix = rec.uv_matrices,
             .uv_offset = rec.uv_offsets,
             .channel_selectors = rec.channel_selectors,
+            .output_params = f.output_params,
             .clearcoat_factors = coat.clearcoat_factors,
             .clearcoat_color = coat.clearcoat_color,
             .sheen_factors = coat.sheen_factors,
@@ -938,6 +941,7 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
             if (!@hasField(P, "channel_selectors")) @compileError("FsParams missing channel_selectors");
+            if (!@hasField(P, "output_params")) @compileError("FsParams missing output_params");
             if (!@hasField(P, "clearcoat_factors")) @compileError("FsParams missing clearcoat_factors");
             if (!@hasField(P, "clearcoat_color")) @compileError("FsParams missing clearcoat_color");
             if (!@hasField(P, "sheen_factors")) @compileError("FsParams missing sheen_factors");

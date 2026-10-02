@@ -215,6 +215,15 @@ layout(binding = 2) uniform fs_params {
     // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
     vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
     vec4 hemi_diffuse; // rgb: diffuse color, a: unused
+    // APPENDED LAST (Babylon output stage): x = gamma-encode flag (0/1),
+    // y/z/w unused. Babylon always ends its PBR fragment shader with
+    // `applyImageProcessing` -> `toGammaSpace` (pow(color, 1/2.2)) into a
+    // NON-sRGB backbuffer, so the encode is part of the shaded value (before
+    // blending and MSAA resolve); agate's default is linear color + the sRGB
+    // swapchain's exact piecewise-sRGB hardware encode. `Scene.output_gamma`
+    // selects Babylon's curve; see common/output_gamma.glsl. Appended last so
+    // no existing offset shifts.
+    vec4 output_params;
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -277,7 +286,7 @@ in vec2 v_uv;
 
 out vec4 frag_color;
 
-const float PI = 3.14159265359;
+// PI comes from common/pbr_brdf.glsl (single source for the BRDF chunk).
 
 const vec2 POISSON_DISK[16] = vec2[](
     vec2(-0.94201624, -0.39906216),
@@ -336,6 +345,9 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // legacy targets (HLSL5), same constraint as morphWeight.
 // @include "common/channel_select.glsl"
 // @include "common/hemi.glsl"
+// @include "common/hemi_pbr.glsl"
+// @include "common/specular_aa.glsl"
+// @include "common/output_gamma.glsl"
 
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
@@ -349,7 +361,7 @@ void main() {
     if (uv_offset[0].z > 0.5) {
         vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
         vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
-        frag_color = vec4(albedo_rgba.rgb + emissive, albedo_rgba.a);
+        frag_color = babylonOutputColor(albedo_rgba.rgb + emissive, albedo_rgba.a);
         return;
     }
     vec3 albedo = albedo_rgba.rgb;
@@ -789,7 +801,7 @@ void main() {
 
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;
 
-    frag_color = vec4(final_color, albedo_rgba.a);
+    frag_color = babylonOutputColor(final_color, albedo_rgba.a);
 }
 @end
 

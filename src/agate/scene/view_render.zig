@@ -138,6 +138,7 @@ pub fn renderSceneView(
         .area_color = snap.light_pack.area_color,
         .clustered_params = cl_params,
         .clustered_viewport = cl_viewport,
+        .output_params = .{ if (scene.output_gamma) 1.0 else 0.0, 0.0, 0.0, 0.0 },
     };
 
     var shadow_state_with = env.shadow_uniforms;
