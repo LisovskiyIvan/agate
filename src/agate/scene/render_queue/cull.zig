@@ -93,6 +93,8 @@ pub const FrameCullContext = struct {
     default_white: ?*const Texture = null,
     default_normal: ?*const Texture = null,
     default_cube: ?*const CubeTexture = null,
+    /// Babylon's environment-BRDF lookup (coloredEnergyConservationFactor).
+    default_brdf_lut: ?*const Texture = null,
     sky_texture: ?CubeTexture = null,
     ibl_intensity: f32 = 1.0,
     default_morph_view: sg.View = .{},
@@ -195,6 +197,7 @@ pub fn buildMaterialRecord(ctx: FrameCullContext, mat: ?Material) MaterialDrawRe
     const white_tex = ctx.default_white orelse &dummy_tex;
     const norm_tex = ctx.default_normal orelse &dummy_tex;
     const cube_tex = ctx.default_cube orelse &dummy_cube;
+    const brdf_lut = ctx.default_brdf_lut orelse &dummy_tex;
     const def_mat = ctx.default_material orelse &dummy_std;
 
     return material_mod.buildDrawRecord(
@@ -203,6 +206,7 @@ pub fn buildMaterialRecord(ctx: FrameCullContext, mat: ?Material) MaterialDrawRe
         white_tex,
         norm_tex,
         cube_tex,
+        brdf_lut,
         ctx.sky_texture,
         ctx.ibl_intensity,
     );

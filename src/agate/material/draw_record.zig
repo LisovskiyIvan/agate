@@ -31,6 +31,12 @@ pub const MaterialDrawRecord = struct {
     data_sampler: sg.Sampler = .{},
     env_view: ?sg.View = null,
     env_sampler: ?sg.Sampler = null,
+    /// Environment-BRDF lookup for `coloredEnergyConservationFactor`
+    /// (Babylon `BRDFTextureTools.GetEnvironmentBRDFTexture`). Always bound:
+    /// the scene owns a default, so the analytic specular never reads a null
+    /// texture.
+    brdf_lut_view: sg.View = .{},
+    brdf_lut_sampler: sg.Sampler = .{},
 
     // Factors & params
     base_color: [4]f32 = .{ 1, 1, 1, 1 },
@@ -99,10 +105,14 @@ pub fn buildDrawRecord(
     default_white: *const Texture,
     default_normal: *const Texture,
     default_cube: *const CubeTexture,
+    default_brdf_lut: *const Texture,
     sky_texture: ?CubeTexture,
     ibl_intensity: f32,
 ) MaterialDrawRecord {
-    var rec = MaterialDrawRecord{};
+    var rec = MaterialDrawRecord{
+        .brdf_lut_view = default_brdf_lut.view,
+        .brdf_lut_sampler = default_brdf_lut.sampler,
+    };
     if (mat) |m| {
         switch (m) {
             .pbr => |p| {

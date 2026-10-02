@@ -31,6 +31,7 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
         .io_allocator = alloc,
         .profiler = @import("profiler.zig").Profiler.init(alloc),
         .default_white_texture = std.mem.zeroes(Texture),
+        .default_brdf_lut_texture = std.mem.zeroes(Texture),
         .default_normal_texture = std.mem.zeroes(Texture),
         .default_cube_texture = std.mem.zeroes(CubeTexture),
         .lights = .{},

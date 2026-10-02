@@ -241,6 +241,10 @@ pub const Scene = struct {
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
+    /// Babylon's environment-BRDF lookup (256x256, gammaSpace) behind
+    /// `coloredEnergyConservationFactor`; owned by the scene like the other
+    /// builtin fallbacks.
+    default_brdf_lut_texture: Texture,
     default_normal_texture: Texture,
     default_cube_texture: CubeTexture,
 
@@ -618,6 +622,7 @@ pub const Scene = struct {
             .io_allocator = io,
             .profiler = profiler_mod.Profiler.init(allocator),
             .default_white_texture = Texture.createWhite1x1(),
+            .default_brdf_lut_texture = Texture.createBrdfLut(allocator) catch Texture.createWhite1x1(),
             .default_normal_texture = Texture.createFlatNormal1x1(),
             .default_cube_texture = CubeTexture.createDefault1x1(.{ 25, 30, 40, 255 }),
             .lights = scene_lights.LightRig.init("hemi", .{

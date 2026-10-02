@@ -437,7 +437,7 @@ test "MaterialDrawRecord stages coat texture views with white fallback" {
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
     // Null slots stage the white fallback (identity sampling).
-    const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 42), rec.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 42), rec.sheen_view.id);
 
@@ -445,7 +445,7 @@ test "MaterialDrawRecord stages coat texture views with white fallback" {
     // frozen (staging discipline: the draw never sees the live write).
     pbr_mat.clearcoat.mask_texture = .{ .image = .{}, .view = .{ .id = 51 }, .sampler = .{ .id = 52 }, .width = 4, .height = 4 };
     pbr_mat.sheen.color_texture = .{ .image = .{}, .view = .{ .id = 61 }, .sampler = .{ .id = 62 }, .width = 4, .height = 4 };
-    const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
     pbr_mat.clearcoat.mask_texture.?.view.id = 99;
@@ -481,7 +481,7 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     // Hand-built PBRMaterial default = Babylon's own default (SPECULARAA off):
     // the w lane must stay 0 so the shader takes the legacy roughness path.
     try std.testing.expect(!pbr_mat.specular_anti_aliasing);
-    const rec_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[3]);
     // The three lane selectors are untouched by the flag (same uniform).
     try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[0]);
@@ -492,7 +492,7 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     pbr_mat.occlusion_channel = .a;
     pbr_mat.roughness_channel = .r;
     pbr_mat.metallic_channel = .a;
-    const rec_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_on.channel_selectors[3]);
     try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[0]);
     try std.testing.expectEqual(@as(f32, 0.0), rec_on.channel_selectors[1]);
@@ -516,6 +516,7 @@ test "MaterialDrawRecord builds correctly from PBRMaterial" {
         &dummy_tex,
         &dummy_tex,
         &dummy_cube,
+        &dummy_tex,
         null,
         1.5,
     );
@@ -542,10 +543,10 @@ test "Material unlit mode properly routes to DrawRecord" {
     var mat_std = Material{ .standard = &std_mat };
     try std.testing.expect(mat_std.isUnlit());
 
-    const rec_pbr = buildDrawRecord(mat_pbr, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec_pbr = buildDrawRecord(mat_pbr, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_pbr.uv_offsets[0][2]);
 
-    const rec_std = buildDrawRecord(mat_std, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, null, 1.0);
+    const rec_std = buildDrawRecord(mat_std, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_std.standard_uv_offset[2]);
 }
 

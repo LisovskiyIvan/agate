@@ -150,6 +150,10 @@ pub fn drawRegularItem(
         bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
         bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
+        // Babylon env-BRDF lookup: scales the analytic specular sum and the
+        // specular IBL (coloredEnergyConservationFactor).
+        bind.views[pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
+        bind.samplers[pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map
         const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube).view;
@@ -764,6 +768,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
         bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
+        // Babylon env-BRDF lookup: scales the analytic specular sum and the
+        // specular IBL (coloredEnergyConservationFactor).
+        bind.views[inst_pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
+        bind.samplers[inst_pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
 
         // Environment IBL Cubemap & Shadow Depth Map
         const cube_view = rec.env_view orelse (if (env.sky_texture) |s| s.view else env.default_cube.view);

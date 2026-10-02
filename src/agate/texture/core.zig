@@ -621,6 +621,19 @@ pub const Texture = struct {
         return decodeImageMemory(allocator, bytes, opts);
     }
 
+    /// Babylon's `BRDFTextureTools.GetEnvironmentBRDFTexture` (256x256,
+    /// `gammaSpace = true`) embedded byte-identical: the environment-BRDF
+    /// lookup behind `coloredEnergyConservationFactor`. The PNG holds the
+    /// gamma-encoded bytes, so it goes through the LDR sRGB decode path and
+    /// the shader reads linear values. No mip chain: Babylon's lookup texture
+    /// has none either, so the implicit-LOD sample always hits level 0.
+    pub fn createBrdfLut(allocator: std.mem.Allocator) !Texture {
+        const png = @embedFile("brdf_lut.png");
+        var raw = try decodeMemory(allocator, png, .{ .gen_mipmaps = false, .srgb_to_linear = true });
+        defer raw.deinit(allocator);
+        return fromRaw(&raw, .{ .min_filter = .LINEAR, .mag_filter = .LINEAR });
+    }
+
     pub fn createWhite1x1() Texture {
         const white = [_]u8{ 255, 255, 255, 255 };
         return initRaw(1, 1, &white, .{

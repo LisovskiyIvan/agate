@@ -179,3 +179,16 @@ void coatSheenLight(vec3 N, vec3 V, vec3 L, vec3 H, float NdotV, float NdotL,
     vec3 sheen_term = sheen_tint * (sheenD * sheenV) * sheen_intensity;
     additive = cc_spec + sheen_term;
 }
+
+// Babylon `getEnergyConservationFactor` + `getBRDFLookup`
+// (pbrBlockReflectance0/pbrBlockFinalLitComponents, MS_BRDF_ENERGY_CONSERVATION):
+// the environment-BRDF LUT entry scales the whole analytic specular sum as
+// well as the specular IBL, once per fragment.
+//
+// `lookup_g` is the LUT's .y (bias) term sampled at
+// vec2(NdotV, perceptualRoughness). The engine uploads
+// `BRDFTextureTools.GetEnvironmentBRDFTexture` through the LDR sRGB path, so
+// the sample is already the linear value Babylon's gammaSpace texture yields.
+vec3 specEnergyConservation(float lookup_g, vec3 F0) {
+    return vec3(1.0) + F0 * (1.0 / max(lookup_g, 0.0001) - 1.0);
+}

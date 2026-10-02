@@ -61,6 +61,7 @@ pub fn prepareViewQueues(
         .default_white = &scene.default_white_texture,
         .default_normal = &scene.default_normal_texture,
         .default_cube = &scene.default_cube_texture,
+        .default_brdf_lut = &scene.default_brdf_lut_texture,
         .sky_texture = sky_texture,
         .ibl_intensity = ibl_intensity,
         .default_morph_view = scene.forward.default_morph_view,

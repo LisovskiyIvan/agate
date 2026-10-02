@@ -231,6 +231,7 @@ layout(binding = 8) uniform texture2D spot_shadow_tex;
 // Binding 10: vs uses texture 9 (morph), fs uses 0..8 — next free slot in
 // the shared pool. Sampled through the shared shadow_smp compare sampler.
 layout(binding = 10) uniform texture2D point_shadow_tex;
+layout(binding = 17) uniform texture2D brdf_lut_tex; // Babylon env-BRDF lookup (coloredEnergyConservationFactor)
 layout(binding = 0) uniform sampler smp; // color slot: albedo (its own sampler)
 // Data slots (normal / metallic-roughness / occlusion / emissive) sample
 // through data_smp so their textures keep their OWN filter/wrap settings
@@ -247,6 +248,7 @@ layout(binding = 3) uniform sampler depth_smp;
 // the shader only samples it when probe_params.x > 0.5.
 layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 6) uniform sampler probe_smp;
+layout(binding = 7) uniform sampler brdf_lut_smp;
 // PBR layers v1: coat/fabric masks sampled through data_smp (each texture
 // keeps its own filter/wrap, like the other data slots — no new sampler).
 // Unset slots bind the default white texture: mask 1 / tint 1 = identity,
@@ -379,6 +381,13 @@ void main() {
 
     vec3 F0 = vec3(dielectric_f0);
     F0 = mix(F0, albedo, metallic);
+    // Babylon `coloredEnergyConservationFactor` (MS_BRDF_ENERGY_CONSERVATION):
+    // the env-BRDF lookup at vec2(NdotV, perceptualRoughness) scales the whole
+    // analytic specular sum and the specular IBL. Babylon samples the lookup
+    // with the RAW perceptual roughness (before SPECULARAA), and the engine
+    // uploads the LUT linearised, so `.y` is already the linear value.
+    float brdf_lut_g = texture(sampler2D(brdf_lut_tex, brdf_lut_smp), vec2(NdotV, roughness)).y;
+    vec3 spec_ec = specEnergyConservation(brdf_lut_g, F0);
 
     // Energy-conserved diffuse albedo (Babylon `reflectivityBlock`). Under the
     // `LEGACY_SPECULAR_ENERGY_CONSERVATION` define — which PBRBaseMaterial sets
@@ -471,7 +480,7 @@ void main() {
     vec3 debug_tint = vec3(0.0);
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 radiance = light_color.rgb * light_color.a;
-    vec3 Lo = (kD * diffuse_albedo / PI + specular * sun_atten + sun_additive) * radiance * NdotL * (1.0 - shadow);
+    vec3 Lo = (kD * diffuse_albedo / PI + specular * sun_atten * spec_ec + sun_additive) * radiance * NdotL * (1.0 - shadow);
 
     // Extra directional fills (slots 1..3, no shadows): the same
     // Cook-Torrance lobe as the sun (coat + sheen included), no shadow
@@ -494,7 +503,7 @@ void main() {
         vec3 d_atten;
         vec3 d_additive;
         coatSheenLight(N, V, d_dir, d_H, NdotV, d_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, d_atten, d_additive);
-        Lo += (d_kD * diffuse_albedo / PI + d_spec * d_atten + d_additive) * d_rad * d_NdotL;
+        Lo += (d_kD * diffuse_albedo / PI + d_spec * d_atten * spec_ec + d_additive) * d_rad * d_NdotL;
     }
 
     // 2. Point Lights (up to 4)
@@ -531,7 +540,7 @@ void main() {
             coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, p_atten, p_additive);
 
             float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
-            Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
+            Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten * spec_ec + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
         }
         if (transm_factor > 0.0) {
             float p_transm_back = max(dot(-N, p_L), 0.0);
@@ -586,7 +595,7 @@ void main() {
             coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, s_atten, s_additive);
 
             float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
-            Lo += (s_kD * diffuse_albedo / PI + s_spec * s_atten + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
+            Lo += (s_kD * diffuse_albedo / PI + s_spec * s_atten * spec_ec + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
         }
     }
 
@@ -609,7 +618,7 @@ void main() {
         vec3 a_atten;
         vec3 a_additive;
         coatSheenLight(N, V, a_L, a_H, NdotV, a_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, a_atten, a_additive);
-        Lo += (a_kD * diffuse_albedo / PI + a_spec * a_atten + a_additive) * a_rad * a_NdotL;
+        Lo += (a_kD * diffuse_albedo / PI + a_spec * a_atten * spec_ec + a_additive) * a_rad * a_NdotL;
     }
 
     // Clustered forward point lights (up to 64, no shadows): pixel -> tile
@@ -660,7 +669,7 @@ void main() {
                 vec3 c_atten;
                 vec3 c_additive;
                 coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, c_atten, c_additive);
-                Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten + c_additive) * c_rad * c_NdotL;
+                Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten * spec_ec + c_additive) * c_rad * c_NdotL;
             }
         }
     }
@@ -711,7 +720,7 @@ void main() {
 
         vec3 F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
         vec2 brdf = envBRDFApprox(roughness, NdotV);
-        vec3 specular_ibl = prefiltered_spec * (F0 * brdf.x + brdf.y);
+        vec3 specular_ibl = prefiltered_spec * (F0 * brdf.x + brdf.y) * spec_ec;
 
         // Clearcoat IBL: own roughness lobe; its fresnel attenuates the base
         // specular IBL (energy conservation). Sheen IBL: grazing-weighted
@@ -765,7 +774,7 @@ void main() {
     // metal-path residual the bench measured. NOT multiplied by `ao`:
     // Babylon occludes `finalDiffuse` and the IBL irradiance, never its
     // analytic `finalSpecular`. Evaluated once per fragment, not per light.
-    Lo += hemiSpecular(N, V, NdotV, spec_roughness, F0);
+    Lo += (hemiSpecular(N, V, NdotV, spec_roughness, F0) * spec_ec);
 
     vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
