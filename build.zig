@@ -686,6 +686,26 @@ fn createShaderWithIncludes(
     run_expand.addFileArg(b.path(spec.input));
     run_expand.addArg("--output");
     const expanded_glsl = run_expand.addOutputFileArg(b.fmt("expanded_{s}.glsl", .{spec.name}));
+    // The expansion resolves `// @include "common/*.glsl"` by READING those
+    // files at run time, so nothing in the tool's argv tells Zig about them
+    // and a chunk-only edit would silently reuse the cached expansion (the
+    // shader would keep the OLD chunk: observed while splitting
+    // common/pbr_brdf.glsl — `touch` cannot help, the cache is content
+    // addressed, and only editing the including .glsl invalidated it).
+    // Register every chunk as an explicit input of every expansion.
+    {
+        const io = b.graph.io;
+        const chunks = b.path("src/agate/shaders/common").getPath3(b, null);
+        var dir = chunks.root_dir.handle.openDir(io, chunks.subPathOrDot(), .{ .iterate = true }) catch
+            @panic("shader includes: cannot open src/agate/shaders/common");
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch |err| @panic(@errorName(err))) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".glsl")) continue;
+            run_expand.addFileInput(b.path(b.fmt("src/agate/shaders/common/{s}", .{entry.name})));
+        }
+    }
 
     // 2. sokol-shdc on the expanded GLSL (argv mirrors createModule).
     const shdc_exe = dep_shdc.path(try sokol.shdc.getShdcSubPath());
