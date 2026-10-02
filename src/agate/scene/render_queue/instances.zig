@@ -226,10 +226,11 @@ test "parallel instanced staging produces serial-identical instance matrices" {
 
     // Verify bit-identical results, including the published render state
     // (bounds/count/frame — not pointer identity, and never a weaker
-    // count-only check: 300 instances with every 7th hidden stage 257).
+    // count-only check: 300 instances with every 7th hidden stage 257
+    // visible instances, plus the source mesh entry = 258).
     try std.testing.expectEqual(mesh_serial.instance_render.bounds, mesh_parallel.instance_render.bounds);
-    try std.testing.expectEqual(@as(u32, 257), mesh_serial.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 257), mesh_parallel.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 258), mesh_serial.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 258), mesh_parallel.instance_render.count);
     try std.testing.expectEqual(@as(u64, 1), mesh_serial.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 2), mesh_parallel.instance_render.staged_frame);
     try std.testing.expectEqual(queues_s.instance_matrices.items.len, queues_p.instance_matrices.items.len);
@@ -273,7 +274,7 @@ test "stageInstances stages visible count and combined AABB" {
 
     // sg has no context in tests, so the upload half is skipped; the
     // transform/count staging must still run into the published render state.
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expect(parent.instance_render.bounds.isValid());
     // inst0 covers [-1,1], inst1 covers [4,6]: the combined AABB spans both.
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
@@ -413,18 +414,21 @@ test "P5: staging leaves source TRS and game caches untouched" {
         .eye = Vec3.zero,
     }, &meshes);
 
-    // Published state: count 1, staged frame advanced, bounds read through
-    // the source base translation: unit box at (3,4,5)+(10,0,0) = [12,14]x[3,5]x[4,6].
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    // Published state: count 2 (source mesh entry + one instance), staged
+    // frame advanced, bounds read through the source base translation: unit
+    // box at (3,4,5)+(10,0,0) = [12,14]x[3,5]x[4,6].
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 11), parent.instance_render.staged_frame);
     try std.testing.expectApproxEqAbs(@as(f32, 12.0), parent.instance_render.bounds.min.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 14.0), parent.instance_render.bounds.max.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), parent.instance_render.bounds.min.y, 1e-4);
-    // Scratch carries the same world translation (13,4,5).
-    try std.testing.expectEqual(@as(usize, 1), queues.instance_matrices.items.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 13.0), queues.instance_matrices.items[0].m[12], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), queues.instance_matrices.items[0].m[13], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), queues.instance_matrices.items[0].m[14], 1e-4);
+    // Scratch carries the source entry first (its own identity transform),
+    // then the instance's world translation (13,4,5).
+    try std.testing.expectEqual(@as(usize, 2), queues.instance_matrices.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), queues.instance_matrices.items[0].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 13.0), queues.instance_matrices.items[1].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), queues.instance_matrices.items[1].m[13], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), queues.instance_matrices.items[1].m[14], 1e-4);
 
     // Game caches: every sentinel bit-identical, dirty flag untouched.
     try std.testing.expectApproxEqAbs(@as(f32, 999.0), inst.cached_world_matrix.m[12], 1e-6);
@@ -492,7 +496,7 @@ test "P5: staged frame survives a second eye; next frame restages" {
     }, &meshes);
     try std.testing.expectEqual(@as(u64, 21), parent.instance_render.staged_frame);
     try std.testing.expectEqual(first_bounds, parent.instance_render.bounds);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(first_scratch.len, queues.instance_matrices.items.len);
     for (first_scratch, queues.instance_matrices.items) |a, b| {
         try std.testing.expectEqual(a, b);
@@ -555,19 +559,23 @@ test "P5: visible transitions and the empty path stay coherent" {
     }.run;
 
     stage(ally, &queues.instance_matrices, 31, &meshes);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 21.0), parent.instance_render.bounds.max.x, 1e-4);
 
     inst1.is_visible = false;
     stage(ally, &queues.instance_matrices, 32, &meshes);
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 32), parent.instance_render.staged_frame);
     // Only inst0's box remains: a count-only check would miss stale bounds.
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), parent.instance_render.bounds.max.x, 1e-4);
 
     inst0.is_visible = false;
+    // The empty batch needs the source mesh hidden too: Babylon draws the
+    // source mesh at its own transform independently of its instances, so a
+    // visible source keeps the batch non-empty (one matrix).
+    parent.is_visible = false;
     // GPU-side sentinels (no GPU context here, so the upload half is skipped
     // and these must survive untouched): a live GPU probe covers the same
     // preservation against real buffers separately.
@@ -588,8 +596,9 @@ test "P5: visible transitions and the empty path stay coherent" {
 
     inst0.is_visible = true;
     inst1.is_visible = true;
+    parent.is_visible = true;
     stage(ally, &queues.instance_matrices, 34, &meshes);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expect(parent.instance_render.bounds.isValid());
     try std.testing.expectApproxEqAbs(@as(f32, 21.0), parent.instance_render.bounds.max.x, 1e-4);
 }
@@ -627,7 +636,7 @@ test "P5: scratch OOM keeps the previous publish and allows retry" {
         .frame_id = 41,
         .eye = Vec3.zero,
     }, &meshes);
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
 
     // Fresh scratch (no retained capacity) + failing allocator: the first
     // append/resize fails. Mutation is staged for the retry below.
@@ -643,7 +652,7 @@ test "P5: scratch OOM keeps the previous publish and allows retry" {
         .eye = Vec3.zero,
     }, &meshes);
     // Previous complete publish intact, guard not advanced.
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 41), parent.instance_render.staged_frame);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), parent.instance_render.bounds.min.x, 1e-4);
 
@@ -693,7 +702,7 @@ test "P5: CPU-only staging publishes no upload identity" {
         .eye = Vec3.zero,
     };
     instance_staging.stageInstances(ctx, &meshes);
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 51), parent.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 0), parent.instance_render.hash);
     try std.testing.expectEqual(@as(usize, 0), parent.instance_render.uploaded_count);

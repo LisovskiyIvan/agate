@@ -408,7 +408,7 @@ test "transparent regular+instanced groups share one back-to-front order" {
     try std.testing.expectEqual(@as(usize, 1), queues.transparent.items.len);
     try std.testing.expectEqual(@as(usize, 2), queues.transparent_instanced.items.len);
     try std.testing.expectEqual(@as(usize, 3), queues.transparent_order.items.len);
-    try std.testing.expectEqual(@as(u32, 3), stats.rendered_meshes);
+    try std.testing.expectEqual(@as(u32, 5), stats.rendered_meshes);
     // Material snapshot survives the queue: regular item kept the blend
     // record (transparent flag + draw_record), без живых указателей.
     try std.testing.expect(queues.transparent.items[0].transparent);
@@ -494,11 +494,13 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
         .default_white_id = 1,
     });
 
-    try std.testing.expectEqual(@as(usize, 3), queues.instance_matrices.items.len);
-    // Back-to-front: z=30 (farthest), then z=20, then z=10 (nearest)
+    try std.testing.expectEqual(@as(usize, 4), queues.instance_matrices.items.len);
+    // Back-to-front: z=30 (farthest), then z=20, z=10, and the source mesh
+    // entry (its own transform, z=0) sorted in with them as the nearest.
     try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[0].m[14]);
     try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[1].m[14]);
     try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[2].m[14]);
+    try std.testing.expectEqual(@as(f32, 0.0), queues.instance_matrices.items[3].m[14]);
 
     // Opaque instanced mesh preserves original instance creation order
     var opaque_mat = StandardMaterial.init("opaque_mat");
@@ -520,11 +522,13 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
         .default_white_id = 1,
     });
 
-    try std.testing.expectEqual(@as(usize, 3), queues.instance_matrices.items.len);
-    // Original insertion order: z=10, z=30, z=20
-    try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[0].m[14]);
-    try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[1].m[14]);
-    try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[2].m[14]);
+    try std.testing.expectEqual(@as(usize, 4), queues.instance_matrices.items.len);
+    // Original insertion order: the source mesh entry first (own transform,
+    // z=0), then z=10, z=30, z=20.
+    try std.testing.expectEqual(@as(f32, 0.0), queues.instance_matrices.items[0].m[14]);
+    try std.testing.expectEqual(@as(f32, 10.0), queues.instance_matrices.items[1].m[14]);
+    try std.testing.expectEqual(@as(f32, 30.0), queues.instance_matrices.items[2].m[14]);
+    try std.testing.expectEqual(@as(f32, 20.0), queues.instance_matrices.items[3].m[14]);
 }
 
 test "pre-staged instances feed buildFrameQueues batch" {
@@ -576,7 +580,7 @@ test "pre-staged instances feed buildFrameQueues batch" {
     });
 
     try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 2), queues.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 3), queues.opaque_instanced.items[0].visible_instance_count);
     try std.testing.expectEqual(@as(u32, 3), queues.opaque_instanced.items[0].index_count);
 }
 
@@ -609,6 +613,12 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
+        // The source mesh entry is part of the batch (Babylon semantics), so
+        // hide it here: this fixture needs the batch geometry to be exactly
+        // the far instance while the warmed origin cached_aabb stays the
+        // stale sentinel culling must NOT use. Visible instances still draw
+        // with the source hidden.
+        .is_visible = false,
         .local_bounding_box = origin_box,
         .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
     };
@@ -638,7 +648,7 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
         .eye = Vec3.zero,
     }, &meshes);
     try std.testing.expectEqual(@as(u32, 1), far_parent.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 1), near_parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), near_parent.instance_render.count);
     try std.testing.expectApproxEqAbs(@as(f32, 49.5), far_parent.instance_render.bounds.min.x, 1e-4);
 
     const pool = try jobs.Pool.init(ally, 2);
@@ -706,7 +716,7 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
     // not an empty queue, and identical across paths.
     const sb = serial_batch orelse return error.TestUnexpectedResult;
     const pb = parallel_batch orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u32, 1), sb.visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 2), sb.visible_instance_count);
     try std.testing.expectEqual(@as(u32, 77), sb.instance_buffer.id);
     try std.testing.expectEqual(sb.visible_instance_count, pb.visible_instance_count);
     try std.testing.expectEqual(sb.instance_buffer.id, pb.instance_buffer.id);
@@ -718,7 +728,7 @@ test "P5: warmed instance parents cull on staged bounds, serial and parallel" {
     const ps = parallel_stats orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 1), ss.culled_meshes);
     try std.testing.expectEqual(@as(u32, 1), ss.total_meshes);
-    try std.testing.expectEqual(@as(u32, 1), ss.rendered_meshes);
+    try std.testing.expectEqual(@as(u32, 2), ss.rendered_meshes);
     try std.testing.expectEqual(ss.culled_meshes, ps.culled_meshes);
     try std.testing.expectEqual(ss.total_meshes, ps.total_meshes);
     try std.testing.expectEqual(ss.rendered_meshes, ps.rendered_meshes);

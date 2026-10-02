@@ -1903,7 +1903,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
     try std.testing.expectEqual(@as(usize, 1), scene.gpu_retire.retainedCount());
     try std.testing.expectEqual(@as(u64, 1), parent.instance_preview.build_seq);
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_preview.count);
     try std.testing.expectEqual(@as(u64, 1), victim.instance_preview.build_seq);
 
     // Live mutation AFTER the build: the published record mirror must
@@ -1934,10 +1934,10 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     var found_victim: usize = 0;
     for (draws.primary.opaque_instanced.items) |b| {
         if (b.source_uid == parent.uid) {
-            try std.testing.expectEqual(@as(u32, 4), b.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 5), b.visible_instance_count);
             found_parent += 1;
         } else {
-            try std.testing.expectEqual(@as(u32, 2), b.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), b.visible_instance_count);
             found_victim += 1;
         }
     }
@@ -1947,7 +1947,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     // Commit (next game-side build) applies the published mirrors to live:
     // parent lands, the unlinked victim is skipped by the identity guard.
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(preview_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
     // The CPU preview carries the matrix-bytes hash for the GPU dedup gate;
@@ -2067,7 +2067,7 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const mirror = scene.preparedDraws().staged_instances.items[0];
-    try std.testing.expectEqual(@as(u32, 4), mirror.count);
+    try std.testing.expectEqual(@as(u32, 5), mirror.count);
     const latched_bounds = mirror.bounds;
     const latched_hash = mirror.uploaded_hash;
 
@@ -2132,21 +2132,21 @@ test "stage1: fallback after latch is not clobbered by the later commit" {
     // directly — the pending frame-1 mirrors must not leak back in later.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
 
     // Next build commits: the front slot is the fallback's (no records), so
     // this is a no-op — live keeps the frame-2 state, never regresses to
     // the stale frame-1 mirror.
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
 
     // A fresh latch + commit republishes identically.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 3), parent.instance_render.staged_frame);
 }
 
@@ -2201,7 +2201,7 @@ test "stage1: commit resolves the latest latched front through the lease" {
     // Generation 2: hide one instance, build (commits the F1 mirror), latch.
     mem[0].is_visible = false;
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 1), parent.instance_render.staged_frame);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
@@ -2212,7 +2212,7 @@ test "stage1: commit resolves the latest latched front through the lease" {
     // latched front (F2, count 2), never a superseded slot's mirror.
     mem[1].is_visible = false;
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
     // The lease is balanced: the commit takes no pins and the front the
     // commit resolved is the latest published slot.
@@ -2271,7 +2271,7 @@ test "stage1: serial same-thread build+latch parity" {
     // Commit (next game-side build) applies the publish to live.
     scene.buildPreparedFrame();
     try std.testing.expectEqual(parent.instance_preview.count, parent.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 6), parent.instance_render.count);
     try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
     try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
@@ -2326,7 +2326,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     scene.buildPreparedFrame();
     const primed_bounds = parent.instance_render.bounds;
     const primed_hash = parent.instance_render.hash;
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
 
     // Mutate live, then build unfunded: drop ALL scratch capacity so the
     // segment really allocates, and refuse the first alloc. The preview
@@ -2347,7 +2347,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(primed_hash, parent.instance_render.hash);
 
@@ -2582,7 +2582,7 @@ test "stage1: instances cleared between build and latch take the regular path" {
     // Build while instanced: the preview records 3 (the build never
     // publishes — instance_render stays empty until a latch or fallback).
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
 
     // Drop all instances before the latch: stage-2B freezes queues at build
@@ -2600,7 +2600,7 @@ test "stage1: instances cleared between build and latch take the regular path" {
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 3), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
     try std.testing.expectEqual(@as(usize, 0), draws.primary.items.items.len);
 
     // Next build: the commit skips the emptied mesh (live stays empty) and
@@ -2658,7 +2658,7 @@ test "stage1: latch consumes slot records when live previews are cleared" {
     // Build freezes the slot-owned records; wiping the live previews after
     // that must not matter — the latch reads records + scratch only.
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
     try std.testing.expectEqual(@as(usize, 1), scene.draws.backSlot().staged_instances.items.len);
     parent.instance_preview = .{};
     try std.testing.expectEqual(@as(u64, 0), parent.instance_preview.build_seq);
@@ -2674,15 +2674,15 @@ test "stage1: latch consumes slot records when live previews are cleared" {
     try std.testing.expectEqual(std.math.maxInt(u64), parent.instance_render.staged_frame);
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 3), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
     try std.testing.expectEqual(@as(usize, 1), draws.staged_instances.items.len);
     try std.testing.expectEqual(scene.frame_id, draws.staged_instances.items[0].staged_frame);
-    try std.testing.expectEqual(@as(u32, 3), draws.staged_instances.items[0].count);
+    try std.testing.expectEqual(@as(u32, 4), draws.staged_instances.items[0].count);
 
     // Commit (next game-side build) applies the published mirror to live.
     // (The rebuild recomputes the wiped preview from unchanged live TRS.)
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
     try std.testing.expect(parent.instance_render.bounds.isValid());
     try std.testing.expectEqual(draws.staged_instances.items[0].buffer.id, parent.instance_render.buffer.id);
@@ -2735,7 +2735,7 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expect(parent.instance_render.bounds.isValid());
 
     // Distinctive prior values in every preserved field (headless buffers
@@ -2754,7 +2754,7 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
     // real GPU).
     parent.instances.items = ptrs[0..4];
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_preview.count);
     scene.draws.backSlot().primary.instance_matrices.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
@@ -2812,9 +2812,9 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
-    try std.testing.expectEqual(@as(u32, 4), scene.preparedDraws().primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 5), scene.preparedDraws().primary.opaque_instanced.items[0].visible_instance_count);
 }
 
 test "stage1: mesh reorder + post-build add stages through, commit skips, recovers next" {
@@ -2872,7 +2872,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     // Scratch is concatenated [A0 A1 A2 B0 B1]: A.lo=0, B.lo=3.
     scene.buildPreparedFrame();
     try std.testing.expectEqual(@as(usize, 0), mesh_a.instance_preview.scratch_lo);
-    try std.testing.expectEqual(@as(usize, 3), mesh_b.instance_preview.scratch_lo);
+    try std.testing.expectEqual(@as(usize, 4), mesh_b.instance_preview.scratch_lo);
 
     // Reorder (swapRemove unlinks A) and add a fresh mesh C whose preview
     // predates every build (build_seq 0).
@@ -2918,7 +2918,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
     for (draws.primary.opaque_instanced.items) |b| {
-        try std.testing.expect(b.visible_instance_count == 3 or b.visible_instance_count == 2);
+        try std.testing.expect(b.visible_instance_count == 4 or b.visible_instance_count == 3);
     }
     scene.buildPreparedFrame();
     try std.testing.expectEqual(@as(u32, 0), mesh_a.instance_render.count);
@@ -2932,13 +2932,13 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 2), mesh_c.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_c.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, mesh_b.instance_render.staged_frame);
     const draws_r = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws_r.primary.opaque_instanced.items.len);
     for (draws_r.primary.opaque_instanced.items) |b| {
-        try std.testing.expectEqual(@as(u32, 2), b.visible_instance_count);
+        try std.testing.expectEqual(@as(u32, 3), b.visible_instance_count);
     }
 }
 
@@ -2989,7 +2989,7 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     scene.prepareFrame();
     scene.buildPreparedFrame();
     const primed_bounds = parent.instance_render.bounds;
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
 
     // Mutate, rebuild, then truncate the scratch before the latch (a
     // contract violation the latch must survive): the out-of-range slice is
@@ -3001,7 +3001,7 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.prepareFrame();
     try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
 
     // Recovery: a funded build + latch + commit publishes the mutated state.
@@ -3310,22 +3310,22 @@ test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
     try std.testing.expectEqual(@as(u32, 200), scene.preparedDraws().staged_instances.items[0].buffer.id);
     try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().staged_instances.items[0].staged_frame);
     // All payload refs carry the NEW buffer id and count.
-    try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 200), draws.primary.opaque_instanced.items[0].instance_buffer.id);
-    try std.testing.expectEqual(@as(u32, 4), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 5), draws.primary.opaque_instanced.items[0].visible_instance_count);
     var shadow_ok = false;
     for (draws.shadow.items.items) |it| {
         if (it.is_instanced and it.source_uid == parent.uid) {
             try std.testing.expectEqual(@as(u32, 200), it.instance_buffer.id);
-            try std.testing.expectEqual(@as(u32, 4), it.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 5), it.visible_instance_count);
             shadow_ok = true;
         }
     }
     try std.testing.expect(shadow_ok);
     try std.testing.expectEqual(@as(usize, 1), draws.outline_items.items.len);
     try std.testing.expectEqual(@as(u32, 200), draws.outline_items.items[0].instance_buffer.id);
-    try std.testing.expectEqual(@as(u32, 4), draws.outline_items.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 5), draws.outline_items.items[0].visible_instance_count);
     // SIMULATION-ONLY retire tail (headless, fake buffer ids): retire the
     // grown-away old handle AFTER prepare (into the open latch epoch, as real
     // growth would): pre-complete flush keeps it VALID without touching sg.*
@@ -3415,7 +3415,7 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
     try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
     for (draws.primary.opaque_instanced.items) |batch| {
         if (batch.source_uid == mesh_a.uid) {
-            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
         } else if (batch.source_uid == mesh_b.uid) {
             try std.testing.expectEqual(@as(u32, 0), batch.visible_instance_count);
             try std.testing.expectEqual(@as(u32, 0), batch.instance_buffer.id);
@@ -3440,7 +3440,7 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
     scene.prepareFrame();
     const draws2 = scene.preparedDraws();
     for (draws2.primary.opaque_instanced.items) |batch| {
-        try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+        try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
     }
 }
 
@@ -3524,11 +3524,11 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     var b_ok = false;
     for (draws.primary.opaque_instanced.items) |batch| {
         if (batch.source_uid == uid_a) {
-            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
             a_ok = true;
         }
         if (batch.source_uid == uid_b) {
-            try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
             b_ok = true;
         }
     }
@@ -3546,10 +3546,10 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     const draws2 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws2.primary.opaque_instanced.items.len);
     for (draws2.primary.opaque_instanced.items) |batch| {
-        try std.testing.expectEqual(@as(u32, 2), batch.visible_instance_count);
+        try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
     }
-    try std.testing.expectEqual(@as(u32, 2), mesh_a.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_a.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
 
     // Third round: unlink A again before the next build — both records are
     // now displaced (A unlinked, B shifted to index 0), so the commit guard
@@ -3557,9 +3557,9 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     // state stands for both, the stale generation never lands.
     _ = scene.meshes.swapRemove(1); // [B] (A unlinked again)
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 2), mesh_a.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_a.instance_render.count);
     try std.testing.expect(mesh_a.instance_render.staged_frame != scene.frame_id);
-    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
     try std.testing.expect(mesh_b.instance_render.staged_frame != scene.frame_id);
 
     // Recovery: a funded rebuild + latch + commit over the live order passes
@@ -3570,8 +3570,8 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     scene.prepareFrame();
     scene.buildPreparedFrame();
     try std.testing.expectEqual(scene.frame_id, mesh_b.instance_render.staged_frame);
-    try std.testing.expectEqual(@as(u32, 2), mesh_b.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 2), mesh_a.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), mesh_a.instance_render.count);
     try std.testing.expect(mesh_a.instance_render.staged_frame != scene.frame_id);
 }
 
@@ -4058,13 +4058,13 @@ test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
     for (draws.outline_items.items) |it| {
         if (it.source_uid == mesh_b.uid) {
             try std.testing.expectEqual(@as(u32, 1), it.source_mesh);
-            try std.testing.expectEqual(@as(u32, 2), it.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), it.visible_instance_count);
             try std.testing.expectEqual(mesh_b.instance_render.buffer.id, it.instance_buffer.id);
             const expect_c = if (mesh_b.instance_render.bounds.isValid()) mesh_b.instance_render.bounds.center() else mesh_b.position;
             try std.testing.expectEqual(expect_c, it.world_center);
         } else if (it.source_uid == mesh_a.uid) {
             try std.testing.expectEqual(@as(u32, 0), it.source_mesh);
-            try std.testing.expectEqual(@as(u32, 2), it.visible_instance_count);
+            try std.testing.expectEqual(@as(u32, 3), it.visible_instance_count);
             try std.testing.expectEqual(mesh_a.instance_render.buffer.id, it.instance_buffer.id);
             const expect_c = if (mesh_a.instance_render.bounds.isValid()) mesh_a.instance_render.bounds.center() else mesh_a.position;
             try std.testing.expectEqual(expect_c, it.world_center);
@@ -4194,7 +4194,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     try scene.meshes.append(alloc, &parent);
 
     scene.buildPreparedFrame();
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_preview.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
     // Drop the staged record so the latch skips (as after an OOM/GPU
     // failure): the transparent batch patch-zeroes but its
     // transparent_order entry stays (stale). The draw skips count==0
@@ -4292,9 +4292,9 @@ test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
     try std.testing.expect(fb_item.model.m[12] != built_reg_x);
     // Cache retagged with the context frame_id (not the build high-bit key).
     try std.testing.expectEqual(scene.frame_id, regular.cached_frame);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
-    try std.testing.expectEqual(@as(u32, 2), draws.primary.opaque_instanced.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 3), draws.primary.opaque_instanced.items[0].visible_instance_count);
 }
 
 test "snapshot ownership repro: build must not touch consumed frame_snapshot" {
@@ -4588,11 +4588,13 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     // Frozen generation: published eye/sky, not the live mutation.
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
     try std.testing.expectEqual(@as(u32, 77), scene.build_snapshot.sky_texture.?.view.id);
-    // Staging sorted farthest-from-published-eye first (+10 before -10).
+    // Staging sorted farthest-from-published-eye first (+10, then the source
+    // mesh entry at x=0, then -10).
     const scratch = scene.draws.slots[scene.build_slot.load(.monotonic)].primary.instance_matrices.items;
-    try std.testing.expectEqual(@as(usize, 2), scratch.len);
+    try std.testing.expectEqual(@as(usize, 3), scratch.len);
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch[0].m[12], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch[1].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch[1].m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch[2].m[12], 1e-4);
     scene.prepareFrame();
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
     try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
@@ -5235,13 +5237,13 @@ test "wave26: staged records + UI packet latch correctly across all three slots"
         // (the latch mirrors; live meshes are committed by the NEXT build,
         // so live lags the mirror by exactly one frame).
         const mirror = scene.preparedDraws().staged_instances.items[0];
-        try std.testing.expectEqual(@as(u32, 4), mirror.count);
+        try std.testing.expectEqual(@as(u32, 5), mirror.count);
         try std.testing.expectEqual(scene.frame_id, mirror.staged_frame);
         if (frame == 0) {
             try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
             try std.testing.expectEqual(std.math.maxInt(u64), parent.instance_render.staged_frame);
         } else {
-            try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
+            try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
             try std.testing.expectEqual(scene.frame_id - 1, parent.instance_render.staged_frame);
         }
         // UI packet: this frame's staged bytes, not a stale slot's.

@@ -263,6 +263,16 @@ pub fn stageSegmentCpu(
 ) std.mem.Allocator.Error!CpuStageResult {
     std.debug.assert(lo <= scratch.items.len);
     var combined_aabb = BoundingBox.zero;
+    // Babylon semantics (`Mesh._renderWithInstances`): the instanced batch is
+    // the visible instances PLUS one entry for the source mesh's own world
+    // matrix (its instance buffer is sized `(visible + 1) * 16` floats), so a
+    // mesh with instances is still drawn at its own transform unless it is
+    // hidden. `mesh.is_visible` gates only that source entry — visible
+    // instances keep drawing when the source is hidden.
+    const self_visible = mesh.is_visible;
+    const self_count: usize = if (self_visible) 1 else 0;
+    const self_world = if (self_visible) mesh.getWorldMatrix() else Mat4.identity;
+    const self_aabb: ?BoundingBox = if (self_visible) mesh.getWorldBoundingBox() else null;
     const use_parallel = if (thread_pool) |pool|
         pool.workerCount() > 0 and mesh.instances.items.len >= 256
     else
@@ -275,7 +285,8 @@ pub fn stageSegmentCpu(
         // Scratch upper bound first: OOM here stages nothing (scratch
         // unchanged — resize fails before mutating) and a later call may
         // retry.
-        try scratch.resize(allocator, lo + mesh.instances.items.len);
+        try scratch.resize(allocator, lo + self_count + mesh.instances.items.len);
+        if (self_visible) scratch.items[lo] = self_world;
 
         var chunk_aabbs_buf: [64]BoundingBox = undefined;
         var chunk_visible_buf: [64]usize = undefined;
@@ -286,7 +297,7 @@ pub fn stageSegmentCpu(
             .chunk_aabbs = chunk_aabbs_buf[0..chunk_count],
             .chunk_visible_counts = chunk_visible_buf[0..chunk_count],
             .out_matrices = scratch.items,
-            .out_base = lo,
+            .out_base = lo + self_count,
         };
 
         pool.forkJoin(ParallelInstanceStage, &stage, ParallelInstanceStage.runChunks, chunk_count);
@@ -295,10 +306,13 @@ pub fn stageSegmentCpu(
         // down to [lo, lo + total_visible). Destinations never overtake
         // sources (offset_c <= c*span relative to lo: every earlier chunk
         // contributes at most span), so the forward copy is overlap-safe.
-        var total_visible: usize = 0;
+        // The source entry, when present, already occupies [lo, lo + self_count)
+        // and is compacted to the head of the [lo, ...) segment.
+        var total_visible: usize = self_count;
+        if (self_aabb) |box| combined_aabb = box;
         for (0..chunk_count) |c| {
             const count = chunk_visible_buf[c];
-            const src_lo = lo + c * span;
+            const src_lo = lo + self_count + c * span;
             if (count > 0) {
                 std.mem.copyForwards(
                     Mat4,
@@ -317,7 +331,11 @@ pub fn stageSegmentCpu(
         }
         scratch.items.len = lo + total_visible;
     } else {
-        try scratch.ensureUnusedCapacity(allocator, mesh.instances.items.len);
+        try scratch.ensureUnusedCapacity(allocator, self_count + mesh.instances.items.len);
+        if (self_visible) {
+            scratch.appendAssumeCapacity(self_world);
+            combined_aabb = self_aabb.?;
+        }
         for (mesh.instances.items) |inst| {
             if (!inst.is_visible) continue;
             const world = instanceWorldMatrix(inst);
@@ -889,7 +907,7 @@ test "stage1: CPU+GPU halves equal the inline path (serial and parallel)" {
     stageInstancesGpu(.{ .allocator = ally, .frame_id = 11 }, &fb.mesh, scratch_split.items, cpu);
 
     try std.testing.expectEqual(fa.mesh.instance_render.count, fb.mesh.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 257), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 258), fb.mesh.instance_render.count);
     try std.testing.expectEqual(fa.mesh.instance_render.bounds, fb.mesh.instance_render.bounds);
     try std.testing.expectEqual(@as(u64, 11), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(scratch_inline.items.len, scratch_split.items.len);
@@ -916,12 +934,12 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
 
     // Concatenated segments: [0,4) then [4,8); previews carry offsets.
     // (fb hides every 3rd of 6 → 4 visibles, not 6.)
-    try std.testing.expectEqual(@as(usize, 8), scratch.items.len);
-    try std.testing.expectEqual(@as(u32, 4), fa.mesh.instance_preview.count);
+    try std.testing.expectEqual(@as(usize, 10), scratch.items.len);
+    try std.testing.expectEqual(@as(u32, 5), fa.mesh.instance_preview.count);
     try std.testing.expectEqual(@as(usize, 0), fa.mesh.instance_preview.scratch_lo);
     try std.testing.expectEqual(@as(u64, 7), fa.mesh.instance_preview.build_seq);
-    try std.testing.expectEqual(@as(u32, 4), fb.mesh.instance_preview.count);
-    try std.testing.expectEqual(@as(usize, 4), fb.mesh.instance_preview.scratch_lo);
+    try std.testing.expectEqual(@as(u32, 5), fb.mesh.instance_preview.count);
+    try std.testing.expectEqual(@as(usize, 5), fb.mesh.instance_preview.scratch_lo);
     try std.testing.expectEqual(@as(u64, 7), fb.mesh.instance_preview.build_seq);
 
     // Records freeze one per fresh preview, in mesh order.
@@ -932,7 +950,7 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     try std.testing.expectEqual(@as(u32, 0), records.items[0].mesh_index);
     try std.testing.expectEqual(@as(u32, 1), records.items[1].mesh_index);
     try std.testing.expectEqual(fa.mesh.uid, records.items[0].uid);
-    try std.testing.expectEqual(@as(usize, 4), records.items[1].scratch_lo);
+    try std.testing.expectEqual(@as(usize, 5), records.items[1].scratch_lo);
 
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 21 }, records.items, &scratch);
     // The latch mirrors into the records only: live meshes stay exactly as
@@ -941,12 +959,12 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     try std.testing.expectEqual(@as(u32, 0), fa.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 21), records.items[0].staged_frame);
     try std.testing.expectEqual(@as(u64, 21), records.items[1].staged_frame);
-    try std.testing.expectEqual(@as(u32, 4), records.items[1].count);
+    try std.testing.expectEqual(@as(u32, 5), records.items[1].count);
 
     // Commit (next game-side build) applies the published mirrors to live.
     commitPublishedRecords(records.items, &meshes, 21);
-    try std.testing.expectEqual(@as(u32, 4), fa.mesh.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 4), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), fa.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), fb.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 21), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(fa.mesh.instance_preview.bounds, fa.mesh.instance_render.bounds);
     try std.testing.expectEqual(fb.mesh.instance_preview.bounds, fb.mesh.instance_render.bounds);
@@ -961,7 +979,7 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     try std.testing.expectEqual(@as(u64, 22), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 21), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(keep_bounds, fb.mesh.instance_render.bounds);
-    try std.testing.expectEqual(@as(u32, 4), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 5), fb.mesh.instance_render.count);
 }
 
 test "stage1: latch ignores cleared live previews, consumes records only" {
@@ -997,8 +1015,8 @@ test "stage1: latch ignores cleared live previews, consumes records only" {
     try std.testing.expectEqual(std.math.maxInt(u64), fb.mesh.instance_render.staged_frame);
 
     commitPublishedRecords(records.items, &meshes, 33);
-    try std.testing.expectEqual(@as(u32, 3), fa.mesh.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 2), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), fa.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), fb.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 33), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 33), fb.mesh.instance_render.staged_frame);
     try std.testing.expect(fa.mesh.instance_render.bounds.isValid());
@@ -1055,8 +1073,8 @@ test "stage1: latch stages from slot data alone; reorder is caught at commit, ne
     commitPublishedRecords(records.items, &built, 44);
     try std.testing.expectEqual(@as(u64, 44), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 44), fb.mesh.instance_render.staged_frame);
-    try std.testing.expectEqual(@as(u32, 2), fa.mesh.instance_render.count);
-    try std.testing.expectEqual(@as(u32, 2), fb.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), fa.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), fb.mesh.instance_render.count);
 }
 
 test "stage1: latch never touches record.mesh — dangling pointer proof" {
@@ -1082,7 +1100,7 @@ test "stage1: latch never touches record.mesh — dangling pointer proof" {
     records.items[0].uid = 0xbadc0de;
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 45 }, records.items, &scratch);
     try std.testing.expectEqual(@as(u64, 45), records.items[0].staged_frame);
-    try std.testing.expectEqual(@as(u32, 2), records.items[0].count);
+    try std.testing.expectEqual(@as(u32, 3), records.items[0].count);
 
     // The commit only compares the pointer (never dereferences it): the
     // dangling record skips, the live mesh keeps its previous state.
@@ -1114,12 +1132,12 @@ test "stage1: truncated scratch skips the record, previous stands" {
     // the previous complete live state stands.
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 50 }, records.items, &scratch);
     commitPublishedRecords(records.items, &meshes, 50);
-    try std.testing.expectEqual(@as(u32, 3), f.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), f.mesh.instance_render.count);
     const primed = f.mesh.instance_render.bounds;
     scratch.clearRetainingCapacity();
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 51 }, records.items, &scratch);
     commitPublishedRecords(records.items, &meshes, 51);
-    try std.testing.expectEqual(@as(u32, 3), f.mesh.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 4), f.mesh.instance_render.count);
     try std.testing.expectEqual(primed, f.mesh.instance_render.bounds);
     try std.testing.expectEqual(@as(u64, 50), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(std.math.maxInt(u64), records.items[0].staged_frame);
@@ -1297,8 +1315,9 @@ test "stage1: segment OOM truncates scratch and advances nothing" {
     // Recovery: a funded build recomputes the preview.
     stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch, .thread_pool = null, .eye = Vec3.zero }, &meshes, 6);
     try std.testing.expectEqual(@as(u64, 6), f.mesh.instance_preview.build_seq);
-    try std.testing.expectEqual(@as(u32, 4), f.mesh.instance_preview.count);
-    try std.testing.expectEqual(@as(usize, 4), scratch.items.len);
+    // 4 visible instances + the source mesh entry.
+    try std.testing.expectEqual(@as(u32, 5), f.mesh.instance_preview.count);
+    try std.testing.expectEqual(@as(usize, 5), scratch.items.len);
 }
 
 test "stage1: transparent sort is farthest-first under each path's own eye" {
@@ -1333,9 +1352,11 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
     var scratch_build: std.ArrayListUnmanaged(Mat4) = .empty;
     defer scratch_build.deinit(ally);
     stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_build, .thread_pool = null, .eye = eye_live }, &meshes, 1);
-    try std.testing.expectEqual(@as(usize, 2), scratch_build.items.len);
+    try std.testing.expectEqual(@as(usize, 3), scratch_build.items.len);
+    // (+10) farthest, then the source mesh entry (x=0), then (-10).
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch_build.items[0].m[12], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch_build.items[1].m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch_build.items[1].m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch_build.items[2].m[12], 1e-6);
 
     // Inline fallback path with the snapshot eye on the right: farthest
     // (-10) first — the reverse order. Correct for its own eye, divergent
@@ -1350,9 +1371,11 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
         .frame_id = 31,
         .eye = eye_snap,
     }, &mesh);
-    try std.testing.expectEqual(@as(usize, 2), scratch_inline.items.len);
+    try std.testing.expectEqual(@as(usize, 3), scratch_inline.items.len);
+    // Snapshot eye on the right: (-10) farthest, then the source entry, +10.
     try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch_inline.items[0].m[12], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch_inline.items[1].m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch_inline.items[1].m[12], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch_inline.items[2].m[12], 1e-6);
 
     // Farthest-first check per eye (strict distances, no tiebreak needed).
     const d_live_0 = Vec3.new(scratch_build.items[0].m[12], 0, 0).sub(eye_live).lengthSq();

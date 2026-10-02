@@ -112,7 +112,12 @@ pub fn prepareInto(
             .bucket = types.bucketFor(mesh),
             .is_instanced = is_inst,
             .gpu_pending = mesh.gpu_pending or skin_oom,
-            .is_visible = mesh.is_visible,
+            // Instanced batch: drawable iff the staged buffer holds at least
+            // one matrix (visible source mesh and/or visible instances).
+            // Babylon renders the source mesh and its instances independently
+            // of each other's `isVisible`, so the batch must not inherit the
+            // source flag wholesale.
+            .is_visible = if (is_inst) staged.count > 0 else mesh.is_visible,
             .source_uid = mesh.uid,
             .source_mesh = self.binned_source.items[idx],
             .lod_vertex_buffer = if (shadow_lod) |lm| lm.vertex_buffer else .{},
@@ -501,7 +506,7 @@ test "P5: shadow, main batch and outline read identical published state" {
         .frame_id = 61,
         .eye = Vec3.zero,
     }, &meshes);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 61), parent.instance_render.staged_frame);
 
     // Shadow-читатель.
@@ -605,9 +610,9 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .frame_id = 71,
         .eye = primary_eye,
     }, &meshes);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
-    try std.testing.expectEqual(@as(usize, 2), stage_queues.instance_matrices.items.len);
+    try std.testing.expectEqual(@as(usize, 3), stage_queues.instance_matrices.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), stage_queues.instance_matrices.items[0].m[12], 1e-4);
     const old_bounds = parent.instance_render.bounds;
 
@@ -624,7 +629,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .frame_id = 72,
         .eye = primary_eye,
     }, &meshes);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
 
     // Shadow snapshot captures the OLD state (count 2, old bounds).
@@ -635,7 +640,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
     _ = pass.prepare(&meshes, 72, .published, null);
     try std.testing.expectEqual(@as(usize, 1), pass.prepared.items.items.len);
     const shadow_item = pass.prepared.items.items[0];
-    try std.testing.expectEqual(@as(u32, 2), shadow_item.visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 3), shadow_item.visible_instance_count);
     try std.testing.expectEqual(old_bounds, shadow_item.world_aabb);
 
     // Main build with a WORKING allocator: instances_prepared (as Scene
@@ -684,7 +689,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .instances_prepared = true,
     });
     try std.testing.expectEqual(@as(u64, 71), parent.instance_render.staged_frame);
-    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), stage_queues.instance_matrices.items[0].m[12], 1e-4);
 
     // Frame 73: successful pre-stage updates every reader to count 1.
@@ -695,10 +700,10 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .frame_id = 73,
         .eye = primary_eye,
     }, &meshes);
-    try std.testing.expectEqual(@as(u32, 1), parent.instance_render.count);
+    try std.testing.expectEqual(@as(u32, 2), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 73), parent.instance_render.staged_frame);
     _ = pass.prepare(&meshes, 73, .published, null);
-    try std.testing.expectEqual(@as(u32, 1), pass.prepared.items.items[0].visible_instance_count);
+    try std.testing.expectEqual(@as(u32, 2), pass.prepared.items.items[0].visible_instance_count);
     try std.testing.expectEqual(parent.instance_render.bounds, pass.prepared.items.items[0].world_aabb);
 }
 
