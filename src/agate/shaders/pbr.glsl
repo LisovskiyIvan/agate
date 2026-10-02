@@ -482,7 +482,15 @@ void main() {
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
     vec3 specular = NDF * Vis * F;
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    // No (1 - F) Fresnel factor here (nor on the other analytic diffuse
+    // sites below): Babylon's punctual diffuse is `diffuseBase *
+    // surfaceAlbedo` with `diffuseBase` from `computeDiffuseLighting`
+    // (diffuseTerm * attenuation * NdotL * lightColor, no Fresnel) and
+    // `surfaceAlbedo` carrying only the (1 - metallic) gate — verified
+    // against babylon.js 9.28.0. An extra (1 - F) darkened fractional-metal
+    // diffuse by up to ~30% (F0 ~ 0.3 at metallic 0.64); it is invisible at
+    // metallic 0/1, which is why scalar probes never caught it.
+    vec3 kD = vec3(1.0 - metallic);
 
     // Coat + sheen add-on for the sun (base_atten scales the BASE specular
     // only — diffuse passes through unattenuated).
@@ -511,7 +519,7 @@ void main() {
         float d_Vis = smithVisibilityGGXCorrelated(d_NdotL, NdotV, spec_roughness);
         vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
         vec3 d_spec = d_NDF * d_Vis * d_F;
-        vec3 d_kD = (vec3(1.0) - d_F) * (1.0 - metallic);
+        vec3 d_kD = vec3(1.0 - metallic);
         vec3 d_rad = d_col * d_int;
         vec3 d_atten;
         vec3 d_additive;
@@ -547,7 +555,7 @@ void main() {
             vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
             vec3 p_spec = p_NDF * p_Vis * p_F;
-            vec3 p_kD = (vec3(1.0) - p_F) * (1.0 - metallic);
+            vec3 p_kD = vec3(1.0 - metallic);
             vec3 p_rad = p_col * (p_int * att);
             vec3 p_atten;
             vec3 p_additive;
@@ -604,7 +612,7 @@ void main() {
             vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
             vec3 s_spec = s_NDF * s_Vis * s_F;
-            vec3 s_kD = (vec3(1.0) - s_F) * (1.0 - metallic);
+            vec3 s_kD = vec3(1.0 - metallic);
             vec3 s_rad = s_col * (s_int * total_att);
             vec3 s_atten;
             vec3 s_additive;
@@ -629,7 +637,7 @@ void main() {
         float a_Vis = smithVisibilityGGXCorrelated(a_NdotL, NdotV, spec_roughness);
         vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
         vec3 a_spec = a_NDF * a_Vis * a_F;
-        vec3 a_kD = (vec3(1.0) - a_F) * (1.0 - metallic);
+        vec3 a_kD = vec3(1.0 - metallic);
         vec3 a_rad = area_color[i].rgb * a_factor;
         vec3 a_atten;
         vec3 a_additive;
@@ -680,7 +688,7 @@ void main() {
                 float c_Vis = smithVisibilityGGXCorrelated(c_NdotL, NdotV, spec_roughness);
                 vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
                 vec3 c_spec = c_NDF * c_Vis * c_F;
-                vec3 c_kD = (vec3(1.0) - c_F) * (1.0 - metallic);
+                vec3 c_kD = vec3(1.0 - metallic);
                 vec3 c_rad = c_col * (c_int * c_att);
                 vec3 c_atten;
                 vec3 c_additive;
