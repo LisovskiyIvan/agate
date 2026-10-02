@@ -266,6 +266,9 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 #define PCSS_BLOCKER_SAMPLES 12
 
 // @include "common/shadow_pcf.glsl"
+// hemisphere IRRADIANCE only: the specular lobe (common/hemi_pbr.glsl)
+// needs the BRDF chunk and the PBR uniform lanes, neither of which the
+// standard material has.
 // @include "common/hemi.glsl"
 
 void main() {
