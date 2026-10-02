@@ -279,6 +279,7 @@ test {
     _ = @import("texture/core_tests.zig");
     _ = @import("texture/cube.zig");
     _ = @import("texture/mip.zig");
+    _ = @import("texture/mip_tests.zig");
     _ = @import("ttf.zig");
     _ = @import("ttf/atlas.zig");
     _ = @import("ttf/fixture.zig");

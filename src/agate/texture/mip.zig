@@ -123,3 +123,9 @@ test "checkedFaceBytes rejects empty and overflowing sizes" {
     try std.testing.expectError(error.ImageTooLarge, checkedFaceBytes(100000));
     try std.testing.expectEqual(@as(usize, 2 * 2 * 4), try checkedFaceBytes(2));
 }
+
+test {
+    // sRGB/linear mip-contract suites (decode -> convert -> box filter)
+    // live in a sibling file; this file is the test-root import target.
+    _ = @import("mip_tests.zig");
+}
