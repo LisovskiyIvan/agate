@@ -23,9 +23,16 @@
 // takes the `mronly` probe from 8.80% to 1.63% of pixels over |Δ|>8).
 //
 // `Scene.output_gamma` (lane `output_params.x`) selects it for a frame, so an
-// app whose backbuffer IS sRGB can keep the hardware path (flag off). Babylon
-// itself has no such switch — there the encode is unconditional — which is
-// why the flag defaults to ON.
+// app whose backbuffer IS sRGB can keep the hardware path (flag off). For the
+// PBR family Babylon has no such switch — there the encode is unconditional —
+// which is why the flag defaults to ON.
+//
+// SCOPE (measured, see bench/PROBE.md §10.14): PBR only. Babylon's *assembled*
+// StandardMaterial shader never calls `applyImageProcessing` (the helper is
+// compiled in, the call is not: `IMAGEPROCESSING` stays undefined), so a
+// standard material writes linear color and the standard family must NOT use
+// this helper. The `stdmat` bench probe shows the two engines' standard
+// materials agree to 0.8% in linear space exactly when the encode is left out.
 vec4 babylonOutputColor(vec3 rgb, float alpha) {
     rgb = max(rgb, vec3(0.0));
     if (output_params.x > 0.5) {

@@ -255,10 +255,16 @@ pub const Scene = struct {
     /// backbuffer — see shaders/common/output_gamma.glsl and bench/PROBE.md
     /// §10.13.
     ///
-    /// Scope: the PBR shader family (`pbr`, `instanced_pbr`, `skinned_pbr`),
-    /// which is what Babylon's PBR materials cover. The standard-material,
-    /// particle, skybox and UI families still write linear color (they need
-    /// the same lane before this flag can be called engine-wide).
+    /// Scope: the PBR shader family (`pbr`, `instanced_pbr`, `skinned_pbr`) —
+    /// and that scope is MEASURED, not inferred. Babylon's *assembled* WGSL
+    /// for a `StandardMaterial` contains the `applyImageProcessing` helper but
+    /// never calls it (the `IMAGEPROCESSING` define is off for it), so a
+    /// standard material writes LINEAR color to the canvas while a PBR one
+    /// writes `pow(color, 1/2.2)`. The bench probe pair `stdmat` / `stdmatns`
+    /// pins that down: with the ground on a StandardMaterial the two engines'
+    /// linear values agree to 0.8% (0.2646 vs 0.2667) once this flag is NOT
+    /// applied there. Do not extend it to the standard family — see
+    /// bench/PROBE.md §10.14.
     output_gamma: bool = true,
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
