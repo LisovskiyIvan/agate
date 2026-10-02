@@ -108,6 +108,16 @@ layout(binding = 1) uniform fs_params {
     // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
     vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
     vec4 hemi_diffuse; // rgb: diffuse color, a: unused
+    // APPENDED LAST (Babylon standard-material specular): rgb =
+    // `StandardMaterial.specularColor`, w = `specularPower`. Babylon's
+    // standard shader adds, per light,
+    //   pow(max(0, dot(N, normalize(V + L))), max(1, specularPower))
+    //     * <light specular, intensity-scaled>
+    // sums those and multiplies by this rgb; the specular is added to the
+    // shaded result WITHOUT the albedo and is not clamped. See
+    // material/standard.zig and bench/PROBE.md §10.16. Appended last so no
+    // existing offset shifts.
+    vec4 specular_color_power;
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -226,6 +236,19 @@ void main() {
     float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
     vec3 diffuse = light_color.rgb * (NdotL * light_color.a) * (1.0 - shadow);
 
+    // Babylon's standard-material Blinn-Phong specular (see the lane docs).
+    // `V` is the per-pixel view vector, `gloss` the material power (Babylon
+    // clamps the exponent to >= 1). Per light the lobe is
+    // `pow(max(0, dot(N, normalize(V + L))), gloss) * <light specular>`, and
+    // the sun's specular is shadowed exactly like its diffuse. Babylon scales
+    // a light's specular by its intensity; agate has no per-light specular
+    // colour yet, so the intensity-scaled WHITE Babylon defaults to is used
+    // (that is the only value the bench and Babylon's own default produce).
+    vec3 V = normalize(eye_pos.xyz - v_world_pos);
+    float gloss = max(1.0, specular_color_power.w);
+    vec3 sun_H = normalize(V + L);
+    vec3 specular = vec3(pow(max(dot(N, sun_H), 0.0), gloss)) * vec3(light_color.a) * (1.0 - shadow);
+
     // Extra directional fills (slots 1..3, no shadows): zero intensity
     // (disabled/unused) skips, so a single sun renders bit-identically.
     for (int i = 1; i < 4; i++) {
@@ -236,6 +259,9 @@ void main() {
         float d_NdotL = max(dot(N, d_dir), 0.0);
         if (d_NdotL <= 0.0) continue;
         diffuse += d_col * (d_NdotL * d_int);
+        // Same Blinn-Phong lobe as the primary sun (no shadow on fills).
+        vec3 d_H = normalize(V + d_dir);
+        specular += vec3(pow(max(dot(N, d_H), 0.0), gloss)) * vec3(d_int);
     }
 
     // Point Lights
@@ -355,12 +381,25 @@ void main() {
     // probe_params.x > 0.5). Instanced draws always upload zero here, so
     // this stays legacy.
     // Hemispheric base (Babylon model — see common/hemi.glsl).
+    // Hemispheric SPECULAR (Babylon's standard `computeHemisphericLighting`):
+    // the same Blinn-Phong lobe against the light DIRECTION, with no NdotL
+    // wrap and no attenuation — `specular = pow(max(0, dot(N,
+    // normalize(V + L))), max(1, glossiness)) * vLightSpecular.rgb`, and
+    // `vLightSpecular` is the light's specular (white by default) scaled by
+    // its intensity. NOTE: this is the LEGACY standard lobe, different from
+    // the Cook-Torrance hemispheric lobe the PBR family uses
+    // (common/hemi_pbr.glsl).
+    vec3 hemi_H = normalize(V + hemi_dir_intensity.xyz);
+    specular += vec3(pow(max(dot(N, hemi_H), 0.0), gloss)) * vec3(hemi_dir_intensity.w);
+
     vec3 ambient = hemiIrradiance(N);
     if (probe_params.x > 0.5) {
         ambient = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
     }
 
-    vec3 final_rgb = base.rgb * (ambient + diffuse) + debug_tint;
+    // Babylon adds the specular AFTER the albedo multiply and does not clamp
+    // it: `finalDiffuse * baseAmbientColor + finalSpecular`.
+    vec3 final_rgb = base.rgb * (ambient + diffuse) + specular * specular_color_power.rgb + debug_tint;
     frag_color = vec4(final_rgb, base.a);
 }
 @end

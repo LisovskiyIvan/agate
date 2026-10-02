@@ -499,6 +499,24 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[2]);
 }
 
+test "MaterialDrawRecord routes the standard specular color and power (Babylon defaults)" {
+    const def_std = StandardMaterial.init("def");
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    // Babylon's StandardMaterial defaults are specularColor white and
+    // specularPower 64, uploaded verbatim as `vSpecularColor` = (rgb, power):
+    // the lane must carry exactly that for a hand-built material.
+    var std_mat = StandardMaterial.init("spec");
+    const rec_def = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 64.0 }, rec_def.pbr_factors);
+
+    std_mat.specular_color = Color3.new(0.25, 0.5, 0.75);
+    std_mat.specular_power = 8.0;
+    const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual([4]f32{ 0.25, 0.5, 0.75, 8.0 }, rec_set.pbr_factors);
+}
+
 test "MaterialDrawRecord builds correctly from PBRMaterial" {
     var pbr_mat = PBRMaterial.init("test_pbr");
     pbr_mat.metallic = 0.8;

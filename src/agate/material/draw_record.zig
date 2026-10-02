@@ -40,7 +40,15 @@ pub const MaterialDrawRecord = struct {
 
     // Factors & params
     base_color: [4]f32 = .{ 1, 1, 1, 1 },
-    pbr_factors: [4]f32 = .{ 0, 0.5, 1.0, 1.0 }, // metallic, roughness, occlusion_strength, env_intensity
+    // PBR family: metallic, roughness, occlusion_strength, env_intensity.
+    // STANDARD family: (specularColor.rgb, specularPower) — the standard shader
+    // has no metallic/roughness lanes at all, so this vec4 is dead for a
+    // standard draw and carries its Blinn-Phong specular instead (Babylon
+    // uploads the power verbatim as the exponent: `vSpecularColor.a`). Sharing
+    // the lane keeps the per-item record — which `RenderMeshItem` embeds by
+    // value and the P4 size guard watches — exactly as small as before; a draw
+    // is either PBR or standard, never both.
+    pbr_factors: [4]f32 = .{ 0, 0.5, 1.0, 1.0 },
     emissive_color: [4]f32 = .{ 0, 0, 0, 1 },
     normal_scale: f32 = 1.0,
     alpha_cutoff: f32 = 0.0,
@@ -56,6 +64,7 @@ pub const MaterialDrawRecord = struct {
     // Standard material diffuse UV matrix / offset
     standard_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
     standard_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
+
 };
 
 /// Render-owned копия изменяемых CPU-данных hook-материала: draw-путь читает
@@ -183,6 +192,12 @@ pub fn buildDrawRecord(
                 rec.albedo_view = tex.view;
                 rec.albedo_sampler = tex.sampler;
                 rec.base_color = s.getDiffuseColor4();
+                rec.pbr_factors = .{
+                    s.specular_color.r,
+                    s.specular_color.g,
+                    s.specular_color.b,
+                    s.specular_power,
+                };
                 rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
                 rec.standard_uv_matrix = s.diffuse_uv_transform.matrixRows();
                 rec.standard_uv_offset = s.diffuse_uv_transform.offsetPacked();

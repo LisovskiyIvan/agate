@@ -21,6 +21,20 @@ pub const StandardMaterial = struct {
     /// When true, lighting calculations are bypassed: renders pure base color + emissive.
     unlit: bool = false,
     emissive_color: Color3 = Color3.black,
+    /// Babylon's `StandardMaterial.specularColor` (default white) and
+    /// `specularPower` (default 64). Babylon's standard shader adds, per
+    /// light, `pow(max(0, dot(N, normalize(V + L))), max(1, specularPower))`
+    /// times that LIGHT's specular colour (its own `specular`, scaled by the
+    /// light intensity), sums them and multiplies the sum by THIS colour:
+    ///
+    ///     final = clamp(diffuseBase * diffuseColor + emissive + ambient, 0, 1)
+    ///             * albedo + specularBase * specularColor
+    ///
+    /// i.e. the specular is NOT modulated by the albedo and it is not clamped.
+    /// Rides the `specular_color_power` lane (rgb + power); see
+    /// shaders/standard.glsl and bench/PROBE.md §10.16.
+    specular_color: Color3 = Color3.white,
+    specular_power: f32 = 64.0,
     diffuse_texture: ?Texture = null,
     /// KHR_texture_transform-style UV map for the diffuse slot (identity =
     /// unchanged sampling). glTF never produces StandardMaterials, so this

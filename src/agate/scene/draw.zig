@@ -301,6 +301,7 @@ pub fn drawRegularItem(
             .hemi_dir_intensity = f.hemi_dir_intensity,
             .hemi_diffuse = f.hemi_diffuse,
             .diffuse_color = rec.base_color,
+            .specular_color_power = rec.pbr_factors,
             .alpha_cutoff = rec.alpha_cutoff,
             .uv_matrix = rec.standard_uv_matrix,
             .uv_offset = rec.standard_uv_offset,
@@ -512,6 +513,11 @@ fn drawShaderMaterialItem(
                 .hemi_dir_intensity = f.hemi_dir_intensity,
                 .hemi_diffuse = f.hemi_diffuse,
                 .diffuse_color = snap.tint,
+                // Hook / shader materials carry no specular: Babylon's
+                // `ShaderMaterial` has none, and keeping it at zero means the
+                // existing presets (examples/shader_materials/*) keep exactly
+                // the look they had before the Blinn-Phong lobe was ported.
+                .specular_color_power = .{ 0.0, 0.0, 0.0, 64.0 },
                 .alpha_cutoff = alpha_cutoff,
                 // Hook materials have no UV transform: identity.
                 .uv_matrix = material_mod.UvTransform.identity.matrixRows(),
@@ -890,6 +896,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .hemi_dir_intensity = f.hemi_dir_intensity,
             .hemi_diffuse = f.hemi_diffuse,
             .diffuse_color = rec.base_color,
+            .specular_color_power = rec.pbr_factors,
             .alpha_cutoff = rec.alpha_cutoff,
             .uv_matrix = rec.standard_uv_matrix,
             .uv_offset = rec.standard_uv_offset,
@@ -965,6 +972,7 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
     // Standard family: one diffuse slot.
     comptime {
         for ([_]type{ shd.FsParams, inst_shd.FsParams }) |P| {
+            if (!@hasField(P, "specular_color_power")) @compileError("FsParams missing specular_color_power");
             if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
             if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
