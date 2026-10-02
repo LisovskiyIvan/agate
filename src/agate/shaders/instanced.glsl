@@ -266,11 +266,13 @@ void main() {
         float d_int = directional_color_int[i].w;
         if (d_int <= 0.0) continue;
         float d_NdotL = max(dot(N, d_dir), 0.0);
-        if (d_NdotL <= 0.0) continue;
-        diffuse += d_col * (d_NdotL * d_int);
-        // Same Blinn-Phong lobe as the primary sun (no shadow on fills).
+        // Same Blinn-Phong lobe as the primary sun (no shadow on fills), and
+        // like `computeLighting` it is NOT gated on NdotL — hence outside the
+        // diffuse's guard.
         vec3 d_H = normalize(V + d_dir);
         specular += vec3(pow(max(dot(N, d_H), 0.0), gloss)) * vec3(d_int);
+        if (d_NdotL <= 0.0) continue;
+        diffuse += d_col * (d_NdotL * d_int);
     }
 
     // Point Lights
@@ -288,13 +290,27 @@ void main() {
 
         vec3 p_L = p_to_light / dist;
         float p_NdotL = max(dot(N, p_L), 0.0);
-        if (p_NdotL > 0.0) {
-            float d_norm = dist / p_range;
-            float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
-            float att = (factor * factor) / (dist * dist + 1.0);
-            float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
-            diffuse += p_col * (p_NdotL * p_int * att * (1.0 - point_shadow));
-        }
+        // Babylon's STANDARD point falloff — `computeLighting`'s positional
+        // branch in the shipped bundle is a plain linear ramp to zero at
+        // `range`:
+        //     attenuation = max(0, 1 - length(direction)/range)
+        // with no inverse-square and no window. agate used the PBR path's
+        // windowed inverse-square here, which at d = 12 with range 40 is
+        // ~100x dimmer (linear 0.0017 against Babylon's 0.175), so a
+        // standard-material scene lit by point lights was a different picture
+        // entirely — bench/PROBE.md §10.18.
+        float att = max(0.0, 1.0 - dist / p_range);
+        float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
+        float lit = 1.0 - point_shadow;
+        diffuse += p_col * (p_NdotL * p_int * att * lit);
+        // Babylon's standard point SPECULAR: the same Blinn-Phong lobe as the
+        // sun, against this light's direction, times the light's specular
+        // colour (white x intensity, agate has no per-light specular yet) and
+        // the same attenuation. NOTE: `computeLighting` does NOT gate the
+        // specular on NdotL — a light behind the surface still produces a
+        // highlight — so this sits outside the diffuse's NdotL guard.
+        vec3 p_H = normalize(V + p_L);
+        specular += vec3(pow(max(dot(N, p_H), 0.0), gloss)) * vec3(p_int) * att * lit;
     }
 
     // Spot Lights
@@ -376,12 +392,12 @@ void main() {
 
             vec3 c_L = c_to_light / c_dist;
             float c_NdotL = max(dot(N, c_L), 0.0);
-            if (c_NdotL > 0.0) {
-                float c_d_norm = c_dist / c_range;
-                float c_factor = clamp(1.0 - c_d_norm * c_d_norm * c_d_norm * c_d_norm, 0.0, 1.0);
-                float c_att = (c_factor * c_factor) / (c_dist * c_dist + 1.0);
-                diffuse += c_col * (c_NdotL * c_int * c_att);
-            }
+            // Same STANDARD falloff and lobe as the legacy point lanes above:
+            // a clustered light must not shade differently from a legacy one.
+            float c_att = max(0.0, 1.0 - c_dist / c_range);
+            diffuse += c_col * (c_NdotL * c_int * c_att);
+            vec3 c_H = normalize(V + c_L);
+            specular += vec3(pow(max(dot(N, c_H), 0.0), gloss)) * vec3(c_int) * c_att;
         }
     }
 
