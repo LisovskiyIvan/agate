@@ -29,4 +29,6 @@ vec3 tri_tx = texture(sampler2D(diffuse_tex, smp), v_world_pos.yz * u_tri_scale)
 vec3 tri_ty = texture(sampler2D(diffuse_tex, smp), v_world_pos.xz * u_tri_scale).rgb;
 vec3 tri_tz = texture(sampler2D(diffuse_tex, smp), v_world_pos.xy * u_tri_scale).rgb;
 vec3 tri_col = tri_tx * u_tri_x.rgb * tri_w.x + tri_ty * u_tri_y.rgb * tri_w.y + tri_tz * u_tri_z.rgb * tri_w.z;
-base.rgb = tri_col * v_color.rgb * diffuse_color.rgb;
+// `base` is the albedo (texture x vertex colour); the material colour is
+// applied by the lighting, so it is NOT folded in here any more.
+base.rgb = tri_col * v_color.rgb;

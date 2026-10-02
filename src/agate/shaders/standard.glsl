@@ -299,19 +299,31 @@ void main() {
     // KHR_texture_transform: uv' = matrix * uv + offset. Identity uniforms
     // make this a no-op, so materials without the extension sample unchanged.
     vec4 tex_val = texture(sampler2D(diffuse_tex, smp), uvApply(uv_matrix, uv_offset, v_uv));
-    vec4 base = v_color * diffuse_color * tex_val;
+    // `base` is Babylon's `baseColor`: the ALBEDO product (texture x vertex
+    // colour). The material's `diffuseColor` is NOT folded in — Babylon applies
+    // it to the lighting instead, `clamp(diffuseBase*diffuseColor + emissive +
+    // ambient, 0, 1) * baseColor`, which is where its clamp lives (see the
+    // composition at the end of main). The alpha keeps the material alpha so
+    // the cutout test and the blend path are unchanged.
+    vec4 base = vec4(v_color.rgb * tex_val.rgb, v_color.a * diffuse_color.a * tex_val.a);
 
-    // Shader material hook 'albedo': user snippets may modify `base` (rgb
-    // and alpha; the alpha cutoff below sees the modified value). In scope:
-    // base, v_uv, v_world_pos, N, v_color, diffuse_color, eye_pos.
+    // Shader material hook 'albedo': user snippets may modify `base`, which is
+    // the ALBEDO (texture x vertex colour) — NOT multiplied by the material's
+    // `diffuse_color` any more: the lighting applies that itself, the way
+    // Babylon does. A snippet that wants a tint should set `diffuse_color` or
+    // apply it to `base` on purpose. The alpha cutoff below sees any alpha the
+    // snippet wrote. In scope: base, v_uv, v_world_pos, N, v_color,
+    // diffuse_color, eye_pos.
     // @hook(albedo)
     // @endhook
 
     if (base.a < alpha_cutoff) discard;
 
-    // Unlit mode: bypass all lighting and shadows
+    // Unlit mode: bypass all lighting and shadows. The albedo still gets the
+    // material colour (agate's documented unlit look), which the lit path
+    // receives through the lighting instead.
     if (uv_offset.z > 0.5) {
-        frag_color = base;
+        frag_color = vec4(base.rgb * diffuse_color.rgb, base.a);
         return;
     }
 
@@ -524,8 +536,17 @@ void main() {
     // screen is `emissive * (texel * v_color)` — see the lane docs. The
     // composition is otherwise kept in agate's (algebraically identical,
     // unclamped) order so the diffuse path stays bit-exact against Babylon.
-    vec3 emissive = emissive_color.rgb * (tex_val.rgb * v_color.rgb);
-    vec3 final_rgb = base.rgb * (ambient + diffuse) + emissive + specular * specular_color_power.rgb + debug_tint;
+    // Babylon's composition, clamp included: the LIT value (diffuse x material
+    // colour + emissive) is clamped to [0, 1] BEFORE the albedo multiply, so a
+    // saturated surface with a dark texture does not come out brighter than
+    // its albedo. agate multiplied the albedo first and never clamped, which
+    // is a 2x difference on the saturated `stdclamp` probe (bench/PROBE.md
+    // §10.21). The scene-ambient lane Babylon also adds here is not modelled
+    // (agate has no `Scene.ambient_color`; Babylon's default is black).
+    vec3 lit = (ambient + diffuse) * diffuse_color.rgb + emissive_color.rgb;
+    vec3 final_rgb = clamp(lit, 0.0, 1.0) * base.rgb
+                   + specular * specular_color_power.rgb
+                   + debug_tint;
 
     // Shader material hook 'post_lighting': user snippets may modify
     // final_rgb (rim light, color grading, custom emissive glow). In scope:
