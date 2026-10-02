@@ -198,6 +198,15 @@ pub fn buildDrawRecord(
                     s.specular_color.b,
                     s.specular_power,
                 };
+                // Same lane and same meaning as the PBR family's emissive
+                // (Babylon's standard composition adds it too — it just used
+                // to be dropped on the floor for standard draws).
+                rec.emissive_color = .{
+                    s.emissive_color.r,
+                    s.emissive_color.g,
+                    s.emissive_color.b,
+                    1.0,
+                };
                 rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
                 rec.standard_uv_matrix = s.diffuse_uv_transform.matrixRows();
                 rec.standard_uv_offset = s.diffuse_uv_transform.offsetPacked();

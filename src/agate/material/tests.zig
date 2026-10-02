@@ -515,6 +515,13 @@ test "MaterialDrawRecord routes the standard specular color and power (Babylon d
     std_mat.specular_power = 8.0;
     const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual([4]f32{ 0.25, 0.5, 0.75, 8.0 }, rec_set.pbr_factors);
+    // The emissive lane is shared with the PBR family and means the same
+    // thing there; a hand-built StandardMaterial defaults to black, and a set
+    // colour must arrive verbatim (the standard shader used to ignore it).
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 1.0 }, rec_def.emissive_color);
+    std_mat.emissive_color = Color3.new(0.2, 0.1, 0.05);
+    const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual([4]f32{ 0.2, 0.1, 0.05, 1.0 }, rec_emis.emissive_color);
 }
 
 test "MaterialDrawRecord builds correctly from PBRMaterial" {

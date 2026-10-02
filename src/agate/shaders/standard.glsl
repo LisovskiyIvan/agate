@@ -182,6 +182,15 @@ layout(binding = 1) uniform fs_params {
     // material/standard.zig and bench/PROBE.md §10.16. Appended last so no
     // existing offset shifts.
     vec4 specular_color_power;
+    // APPENDED LAST (standard-material emissive): rgb = emissive color, a
+    // unused. Babylon's standard composition adds `emissiveColor` inside the
+    // clamp and the whole clamp result is multiplied by the albedo product
+    // (`baseColor` = texture x vertex color), so the emissive reaches the
+    // screen as `emissive * texel * v_color`; agate has always had the
+    // StandardMaterial field but the shader never read it. See
+    // material/standard.zig and bench/PROBE.md §10.17. Appended last so no
+    // existing offset shifts.
+    vec4 emissive_color;
 };
 
 layout(binding = 0) uniform texture2D diffuse_tex;
@@ -477,7 +486,13 @@ void main() {
 
     // Babylon adds the specular AFTER the albedo multiply and does not clamp
     // it: `finalDiffuse * baseAmbientColor + finalSpecular`.
-    vec3 final_rgb = base.rgb * (ambient + diffuse) + specular * specular_color_power.rgb + debug_tint;
+    // Emissive: Babylon adds `emissiveColor` INSIDE the clamp and then
+    // multiplies the clamped sum by the albedo product, so what reaches the
+    // screen is `emissive * (texel * v_color)` — see the lane docs. The
+    // composition is otherwise kept in agate's (algebraically identical,
+    // unclamped) order so the diffuse path stays bit-exact against Babylon.
+    vec3 emissive = emissive_color.rgb * (tex_val.rgb * v_color.rgb);
+    vec3 final_rgb = base.rgb * (ambient + diffuse) + emissive + specular * specular_color_power.rgb + debug_tint;
 
     // Shader material hook 'post_lighting': user snippets may modify
     // final_rgb (rim light, color grading, custom emissive glow). In scope:

@@ -302,6 +302,7 @@ pub fn drawRegularItem(
             .hemi_diffuse = f.hemi_diffuse,
             .diffuse_color = rec.base_color,
             .specular_color_power = rec.pbr_factors,
+            .emissive_color = rec.emissive_color,
             .alpha_cutoff = rec.alpha_cutoff,
             .uv_matrix = rec.standard_uv_matrix,
             .uv_offset = rec.standard_uv_offset,
@@ -518,6 +519,9 @@ fn drawShaderMaterialItem(
                 // existing presets (examples/shader_materials/*) keep exactly
                 // the look they had before the Blinn-Phong lobe was ported.
                 .specular_color_power = .{ 0.0, 0.0, 0.0, 64.0 },
+                // Hook materials carry no emissive of their own (their look is
+                // the tint + the user's own hooks), so this stays black.
+                .emissive_color = .{ 0.0, 0.0, 0.0, 1.0 },
                 .alpha_cutoff = alpha_cutoff,
                 // Hook materials have no UV transform: identity.
                 .uv_matrix = material_mod.UvTransform.identity.matrixRows(),
@@ -897,6 +901,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .hemi_diffuse = f.hemi_diffuse,
             .diffuse_color = rec.base_color,
             .specular_color_power = rec.pbr_factors,
+            .emissive_color = rec.emissive_color,
             .alpha_cutoff = rec.alpha_cutoff,
             .uv_matrix = rec.standard_uv_matrix,
             .uv_offset = rec.standard_uv_offset,
