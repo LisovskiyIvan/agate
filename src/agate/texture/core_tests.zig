@@ -419,3 +419,15 @@ test "effectiveAnisotropy clamps to 1 without LINEAR min/mag/mip" {
     try std.testing.expectEqual(@as(u32, 16), Texture.effectiveAnisotropy(.{ .max_anisotropy = 64 }, 10));
     try std.testing.expectEqual(@as(u32, 0), Texture.effectiveAnisotropy(.{ .max_anisotropy = 0 }, 10));
 }
+
+test "brdf lut sampler pins CLAMP wrap (REPEAT regression)" {
+    // v = 1.0 is roughness exactly 1.0: under REPEAT a LINEAR sample blends the
+    // LUT's last row with its first, which silently under-reported
+    // coloredEnergyConservationFactor (PROBE.md 10.9). The engine default stays
+    // REPEAT for ordinary textures, so the LUT must pin CLAMP explicitly and
+    // this constant is the only place the sampler is described.
+    try std.testing.expectEqual(sg.Wrap.CLAMP_TO_EDGE, Texture.brdf_lut_options.wrap_u);
+    try std.testing.expectEqual(sg.Wrap.CLAMP_TO_EDGE, Texture.brdf_lut_options.wrap_v);
+    try std.testing.expectEqual(sg.Filter.LINEAR, Texture.brdf_lut_options.min_filter);
+    try std.testing.expectEqual(sg.Filter.LINEAR, Texture.brdf_lut_options.mag_filter);
+}

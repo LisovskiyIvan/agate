@@ -631,17 +631,21 @@ pub const Texture = struct {
         const png = @embedFile("brdf_lut.png");
         var raw = try decodeMemory(allocator, png, .{ .gen_mipmaps = false, .srgb_to_linear = true });
         defer raw.deinit(allocator);
-        // CLAMP, not the engine default REPEAT: Babylon's lookup texture is
-        // sampled with clamp semantics, and at v = 1.0 (roughness exactly 1.0)
-        // REPEAT blends the last row with the first, which under-reported the
-        // factor (measured g ~0.68 instead of ~0.44, PROBE.md 10.9).
-        return fromRaw(&raw, .{
-            .min_filter = .LINEAR,
-            .mag_filter = .LINEAR,
-            .wrap_u = .CLAMP_TO_EDGE,
-            .wrap_v = .CLAMP_TO_EDGE,
-        });
+        return fromRaw(&raw, brdf_lut_options);
     }
+
+    /// Sampler options for `createBrdfLut`. CLAMP, not the engine default
+    /// REPEAT: Babylon's lookup texture is sampled with clamp semantics, and
+    /// at v = 1.0 (roughness exactly 1.0) REPEAT blends the last row with the
+    /// first, which under-reported `coloredEnergyConservationFactor`
+    /// (measured g ~ 0.68 instead of ~ 0.44 — PROBE.md 10.9). Named so a test
+    /// can pin it: the wrap mode is not readable from the `sg.Sampler` handle.
+    pub const brdf_lut_options: Options = .{
+        .min_filter = .LINEAR,
+        .mag_filter = .LINEAR,
+        .wrap_u = .CLAMP_TO_EDGE,
+        .wrap_v = .CLAMP_TO_EDGE,
+    };
 
     pub fn createWhite1x1() Texture {
         const white = [_]u8{ 255, 255, 255, 255 };
