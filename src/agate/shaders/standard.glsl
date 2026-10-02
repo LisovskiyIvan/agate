@@ -293,6 +293,13 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 void main() {
     vec3 N = normalize(v_normal);
 
+    // Babylon's `TWOSIDEDLIGHTING` (defaultPixelShader: `normalW =
+    // gl_FrontFacing ? normalW : -normalW`, right after the bump block): with
+    // back-face culling OFF and the material flag ON, the inside of a
+    // double-sided surface is lit like its outside. The flag rides
+    // `emissive_color.a` (unused by Babylon's vec3 emissive upload).
+    if (emissive_color.a > 0.5 && !gl_FrontFacing) N = -N;
+
     // Alpha test (cutout): cutout materials discard sub-cutoff fragments
     // before any lighting work. Opaque/blend materials upload 0.0, so this
     // never fires for them (alpha is always >= 0.0).

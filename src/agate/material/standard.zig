@@ -18,6 +18,15 @@ pub const StandardMaterial = struct {
     /// When true the mesh renders with face culling disabled (a cull-off
     /// pipeline twin). Both opaque and blend twins exist.
     double_sided: bool = false,
+    /// Babylon's `twoSidedLighting` (default FALSE, like Babylon's own
+    /// `_twoSidedLighting`). Babylon defines `TWOSIDEDLIGHTING` only when the
+    /// material ALSO has back-face culling off, and then flips the shading
+    /// normal on back faces (`normalW = gl_FrontFacing ? normalW : -normalW`,
+    /// after the normal-map perturbation), so the inside of a double-sided
+    /// surface is lit like its outside. agate's `double_sided` only turns
+    /// culling off, so back faces were shaded with a normal pointing away and
+    /// came out black. Rides the `emissive_*.w` lane (unused elsewhere).
+    two_sided_lighting: bool = false,
     /// When true, lighting calculations are bypassed: renders pure base color + emissive.
     unlit: bool = false,
     emissive_color: Color3 = Color3.black,

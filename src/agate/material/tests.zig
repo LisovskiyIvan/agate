@@ -518,10 +518,41 @@ test "MaterialDrawRecord routes the standard specular color and power (Babylon d
     // The emissive lane is shared with the PBR family and means the same
     // thing there; a hand-built StandardMaterial defaults to black, and a set
     // colour must arrive verbatim (the standard shader used to ignore it).
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 1.0 }, rec_def.emissive_color);
+    // Its `w` lane carries the two-sided-lighting flag (0 by default).
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, rec_def.emissive_color);
     std_mat.emissive_color = Color3.new(0.2, 0.1, 0.05);
     const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual([4]f32{ 0.2, 0.1, 0.05, 1.0 }, rec_emis.emissive_color);
+    try std.testing.expectEqual([4]f32{ 0.2, 0.1, 0.05, 0.0 }, rec_emis.emissive_color);
+}
+
+test "MaterialDrawRecord routes two-sided lighting into the emissive w lane" {
+    // Babylon defines TWOSIDEDLIGHTING only for `backFaceCulling == false &&
+    // twoSidedLighting == true` and then flips the shading normal on back
+    // faces. The flag rides the emissive lane's w (unused by the vec3 emissive
+    // upload), and it must reach BOTH families' shaders through the same lane.
+    const def_std = StandardMaterial.init("def");
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    var std_mat = StandardMaterial.init("ts_std");
+    var pbr_mat = PBRMaterial.init("ts_pbr");
+    try std.testing.expect(!std_mat.two_sided_lighting);
+    try std.testing.expect(!pbr_mat.two_sided_lighting);
+
+    const std_off = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 0.0), std_off.emissive_color[3]);
+    const pbr_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 0.0), pbr_off.emissive_color[3]);
+
+    std_mat.two_sided_lighting = true;
+    pbr_mat.two_sided_lighting = true;
+    const std_on = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), std_on.emissive_color[3]);
+    const pbr_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), pbr_on.emissive_color[3]);
+    // The emissive colour itself is untouched by the flag.
+    try std.testing.expectEqual(@as(f32, 0.0), std_on.emissive_color[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), pbr_on.emissive_color[0]);
 }
 
 test "MaterialDrawRecord builds correctly from PBRMaterial" {

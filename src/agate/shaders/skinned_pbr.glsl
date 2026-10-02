@@ -377,6 +377,13 @@ void main() {
     mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
     vec3 N = normalize(TBN * map_n);
 
+    // Babylon's `TWOSIDEDLIGHTING` (pbrBlockNormalFinal): with back-face
+    // culling OFF and the material flag ON, the shading normal is flipped on
+    // back faces so the inside of a double-sided surface is lit like its
+    // outside. The flag rides `emissive_factor.w` (unused by Babylon's own
+    // vec3 emissive upload). Applied AFTER the normal map, like Babylon.
+    if (emissive_factor.w > 0.5 && !gl_FrontFacing) N = -N;
+
     vec3 V = normalize(eye_pos.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 0.0001);
 

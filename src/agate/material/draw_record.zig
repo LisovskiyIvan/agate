@@ -49,6 +49,10 @@ pub const MaterialDrawRecord = struct {
     // value and the P4 size guard watches — exactly as small as before; a draw
     // is either PBR or standard, never both.
     pbr_factors: [4]f32 = .{ 0, 0.5, 1.0, 1.0 },
+    // rgb = emissive colour. w = the two-sided-lighting flag (0/1): Babylon's
+    // `TWOSIDEDLIGHTING` normal flip on back faces. Babylon's own emissive
+    // upload leaves that lane unused (`vEmissiveColor` is a vec3 there), so
+    // sharing it costs nothing.
     emissive_color: [4]f32 = .{ 0, 0, 0, 1 },
     normal_scale: f32 = 1.0,
     alpha_cutoff: f32 = 0.0,
@@ -163,7 +167,12 @@ pub fn buildDrawRecord(
                     p.occlusion_strength,
                     ibl_intensity * p.environment_intensity,
                 };
-                rec.emissive_color = .{ p.emissive_color.r, p.emissive_color.g, p.emissive_color.b, 1.0 };
+                rec.emissive_color = .{
+                    p.emissive_color.r,
+                    p.emissive_color.g,
+                    p.emissive_color.b,
+                    if (p.two_sided_lighting) 1.0 else 0.0,
+                };
                 rec.normal_scale = p.normal_scale;
                 rec.alpha_cutoff = if (p.alpha_mode == .cutout) p.alpha_cutoff else 0.0;
 
@@ -205,7 +214,7 @@ pub fn buildDrawRecord(
                     s.emissive_color.r,
                     s.emissive_color.g,
                     s.emissive_color.b,
-                    1.0,
+                    if (s.two_sided_lighting) 1.0 else 0.0,
                 };
                 rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
                 rec.standard_uv_matrix = s.diffuse_uv_transform.matrixRows();
