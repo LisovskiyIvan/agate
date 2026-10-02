@@ -537,7 +537,7 @@ pub const LightRig = struct {
                 pack.spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
                 pack.spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
                 pack.spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-                pack.spot_intensity[i] = .{ fade_intensity, 0.0, 0.0, 0.0 };
+                pack.spot_intensity[i] = .{ fade_intensity, sl.exponent, 0.0, 0.0 };
 
                 // A fading-out shadow caster keeps its shadow: dropping the
                 // shadow earlier than the light itself would pop twice.
@@ -579,7 +579,7 @@ pub const LightRig = struct {
             pack.spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
             pack.spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
             pack.spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-            pack.spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
+            pack.spot_intensity[i] = .{ sl.intensity, sl.exponent, 0.0, 0.0 };
 
             if (sl.cast_shadows and shadows_enabled and sl.is_enabled) {
                 const svp = sl.getShadowViewProj();

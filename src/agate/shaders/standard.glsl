@@ -408,17 +408,34 @@ void main() {
 
         vec3 s_L = s_to_light / dist;
         float s_NdotL = max(dot(N, s_L), 0.0);
-        if (s_NdotL > 0.0) {
-            float d_norm = dist / s_range;
-            float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
-            float dist_att = (factor * factor) / (dist * dist + 1.0);
-
-            float cos_angle = dot(-s_L, s_dir);
-            float cone_att = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 0.0001), 0.0, 1.0);
-            cone_att *= cone_att;
-
+        // Babylon's STANDARD spot (`computeSpotLighting` in the shipped
+        // bundle): the same LINEAR distance falloff as its point light, then a
+        // hard cone gate at `cos(angle/2)` scaled by `pow(cosAngle, exponent)`
+        // (`getAttenuation`, `exponent` = `SpotLight.exponent`, default 0 = a
+        // hard edge). The cone gates the whole light — outside it Babylon
+        // returns zero — and `innerAngle` plays no part at all in the standard
+        // path (it is a PBR-family parameter there). agate's angles are
+        // half-angles, so `cos_outer` IS Babylon's `cos(angle/2)`.
+        //
+        // agate used to run the PBR model here instead (windowed
+        // inverse-square + a smooth inner/outer cone), which at d = 12 with
+        // range 40 is ~100x dimmer than Babylon's linear ramp — the whole
+        // standard spot picture was black (bench/PROBE.md §10.20).
+        float dist_att = max(0.0, 1.0 - dist / s_range);
+        float cos_angle = dot(-s_L, s_dir);
+        float cone_att = 0.0;
+        if (cos_angle >= cos_outer) {
+            cone_att = max(0.0, pow(max(cos_angle, 0.0), spot_intensity[i].y));
+        }
+        float spot_att = dist_att * cone_att;
+        if (spot_att > 0.0) {
             float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
-            diffuse += s_col * (s_NdotL * s_int * dist_att * cone_att * (1.0 - spot_shadow));
+            float lit = 1.0 - spot_shadow;
+            diffuse += s_col * (s_NdotL * s_int * spot_att * lit);
+            // Same Blinn-Phong lobe as the sun and the point light, and like
+            // `computeBasicSpotLighting` it is NOT gated on NdotL.
+            vec3 s_H = normalize(V + s_L);
+            specular += vec3(pow(max(dot(N, s_H), 0.0), gloss)) * vec3(s_int) * spot_att * lit;
         }
     }
 

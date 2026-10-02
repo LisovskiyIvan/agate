@@ -15,6 +15,15 @@ pub const SpotLightOptions = struct {
     range: f32 = 15.0,
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
+    /// Babylon's `SpotLight.exponent` (default 0) — the sharpening of the
+    /// LEGACY cone its STANDARD material uses:
+    /// `if (cosAngle >= cos(angle/2)) attenuation *= max(0, pow(cosAngle, exponent))`.
+    /// Babylon's standard path ignores `innerAngle` entirely (only `angle` and
+    /// `exponent`), and agate's standard shader follows it: `inner_angle_deg`
+    /// is a PBR-family parameter here. `exponent = 0` (the default) makes the
+    /// cone a hard edge, which is what Babylon renders by default. Rides the
+    /// `spot_intensity.y` lane. See shaders/standard.glsl and PROBE.md §10.20.
+    exponent: f32 = 0.0,
     cast_shadows: bool = false,
     shadow_bias: f32 = 0.002,
     shadow_normal_bias: f32 = 0.005,
@@ -32,6 +41,8 @@ pub const SpotLight = struct {
     range: f32 = 15.0,
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
+    /// See SpotLightOptions.exponent.
+    exponent: f32 = 0.0,
     is_enabled: bool = true,
     cast_shadows: bool = false,
     shadow_bias: f32 = 0.002,
@@ -48,6 +59,7 @@ pub const SpotLight = struct {
             .range = options.range,
             .inner_angle_deg = options.inner_angle_deg,
             .outer_angle_deg = options.outer_angle_deg,
+            .exponent = options.exponent,
             .cast_shadows = options.cast_shadows,
             .shadow_bias = options.shadow_bias,
             .shadow_normal_bias = options.shadow_normal_bias,
