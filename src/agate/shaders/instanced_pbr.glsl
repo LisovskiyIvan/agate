@@ -14,6 +14,7 @@ in vec3 normal;
 in vec4 tangent;
 in vec4 color0;
 in vec2 texcoord0;
+in vec2 texcoord1;
 
 // Per-instance attributes (Buffer 1)
 in vec4 inst_mat0;
@@ -27,6 +28,7 @@ out vec3 v_tangent;
 out vec3 v_bitangent;
 out vec4 v_color;
 out vec2 v_uv;
+out vec2 v_uv1;
 
 void main() {
     mat4 model = mat4(inst_mat0, inst_mat1, inst_mat2, inst_mat3);
@@ -45,6 +47,7 @@ void main() {
     v_bitangent = B;
     v_color = color0;
     v_uv = texcoord0;
+    v_uv1 = texcoord1;
 }
 @end
 
@@ -158,6 +161,13 @@ layout(binding = 1) uniform fs_params {
     // selects Babylon's curve; see common/output_gamma.glsl. Appended last so
     // no existing offset shifts.
     vec4 output_params;
+    vec4 clearcoat_uv_matrix;
+    vec4 clearcoat_uv_offset;
+    vec4 sheen_uv_matrix;
+    vec4 sheen_uv_offset;
+    vec4 refraction_factors;
+    mat4 refraction_view_proj;
+    vec4 refraction_capture;
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -200,6 +210,8 @@ layout(binding = 7) uniform sampler brdf_lut_smp;
 // 12..14 are storage buffers, a separate array).
 layout(binding = 15) uniform texture2D clearcoat_tex;
 layout(binding = 16) uniform texture2D sheen_tex;
+layout(binding = 18) uniform texture2D refraction_tex;
+layout(binding = 8) uniform sampler refraction_smp;
 // Clustered forward lights (wave 30, v1): storage buffers for the tile
 // walk. Bindings 12..14 are free view slots in the shared pool of every
 // forward shader (this family uses fs 0..8, 10, 11, vs no textures).
@@ -217,8 +229,10 @@ in vec3 v_tangent;
 in vec3 v_bitangent;
 in vec4 v_color;
 in vec2 v_uv;
+in vec2 v_uv1;
 
 out vec4 frag_color;
+// @include "common/refraction.glsl"
 
 // PI comes from common/pbr_brdf.glsl (single source for the BRDF chunk).
 
@@ -339,8 +353,8 @@ void main() {
     // analytic specular sum and the specular IBL. Babylon samples the lookup
     // with the RAW perceptual roughness (before SPECULARAA), and the engine
     // uploads the LUT linearised, so `.y` is already the linear value.
-    float brdf_lut_g = texture(sampler2D(brdf_lut_tex, brdf_lut_smp), vec2(NdotV, roughness)).y;
-    vec3 spec_ec = specEnergyConservation(brdf_lut_g, F0);
+    vec2 environment_brdf = texture(sampler2D(brdf_lut_tex, brdf_lut_smp), vec2(NdotV, roughness)).xy;
+    vec3 spec_ec = specEnergyConservation(environment_brdf.y, F0);
 
     // Energy-conserved diffuse albedo (Babylon `reflectivityBlock`). Under the
     // `LEGACY_SPECULAR_ENERGY_CONSERVATION` define — which PBRBaseMaterial sets
@@ -373,7 +387,7 @@ void main() {
     // (no per-slot coat transform yet — v1 scope). White fallback = 1, so
     // unset slots keep the scalar path exact; the branch only skips the
     // fetch when the lobe is off (mask * 0 == 0 either way).
-    vec2 coat_uv = uvApply(uv_matrix[0], uv_offset[0], v_uv);
+    vec2 coat_uv = uvApply(clearcoat_uv_matrix, clearcoat_uv_offset, v_uv);
     float cc_mask = 1.0;
     if (cc_intensity > 0.0) {
         cc_mask = texture(sampler2D(clearcoat_tex, data_smp), coat_uv).r;
@@ -381,7 +395,7 @@ void main() {
     cc_intensity *= cc_mask;
     vec3 sheen_tint = sheen_color.rgb;
     if (sheen_intensity > 0.0) {
-        sheen_tint *= texture(sampler2D(sheen_tex, data_smp), coat_uv).rgb;
+        sheen_tint *= texture(sampler2D(sheen_tex, data_smp), uvApply(sheen_uv_matrix, sheen_uv_offset, v_uv)).rgb;
     }
 
     // Anisotropy v1 frame: the existing TBN varyings (vertex tangent
@@ -405,6 +419,7 @@ void main() {
     // factor 0 skips: legacy albedo bit-identical.
     vec3 orig_albedo = albedo;
     float transm_factor = clamp(transmission_factors.x, 0.0, 1.0);
+    bool refracting = refraction_factors.x > 0.5 && refraction_capture.x > 0.5;
     if (transm_factor > 0.0) {
         albedo *= (1.0 - transm_factor);
         // keep the energy-conserved copy in step (it feeds every diffuse site)
@@ -504,7 +519,7 @@ void main() {
             float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
             Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten * spec_ec + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
         }
-        if (transm_factor > 0.0) {
+        if (transm_factor > 0.0 && !refracting) {
             float p_transm_back = max(dot(-N, p_L), 0.0);
             if (p_transm_back > 0.0) {
                 vec3 p_rad = p_col * (p_int * att);
@@ -641,7 +656,7 @@ void main() {
     // Transmission v1 + SSS v1 post terms (sun + ambient driven; point /
     // spot / area / clustered punctuals do NOT contribute — v1 scope).
     // Both gate on a uniform branch: 0 adds exactly nothing bit-identical.
-    if (transm_factor > 0.0) {
+    if (transm_factor > 0.0 && !refracting) {
         float transm_back = clamp(dot(-N, L) * 0.5 + 0.5, 0.0, 1.0);
         vec3 transm_irr = light_color.rgb * light_color.a * transm_back + hemiIrradiance(N) * 0.5;
         Lo += transmission_color.rgb * transm_factor * orig_albedo * transm_irr;
@@ -679,9 +694,8 @@ void main() {
             irradiance = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
         }
 
-        vec3 F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
-        vec2 brdf = envBRDFApprox(roughness, NdotV);
-        vec3 specular_ibl = prefiltered_spec * (F0 * brdf.x + brdf.y) * spec_ec;
+        vec3 reflectance_ibl = environmentReflectance(F0, environment_brdf);
+        vec3 specular_ibl = prefiltered_spec * reflectance_ibl * spec_ec;
 
         // Clearcoat IBL: own roughness lobe; its fresnel attenuates the base
         // specular IBL (energy conservation). Sheen IBL: grazing-weighted
@@ -698,12 +712,12 @@ void main() {
             } else {
                 cc_prefiltered = textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb;
             }
-            vec2 cc_brdf = envBRDFApprox(cc_rough, NdotV);
-            cc_spec_ibl = cc_prefiltered * (cc_F0 * cc_brdf.x + cc_brdf.y) * cc_intensity;
+            vec2 cc_brdf = texture(sampler2D(brdf_lut_tex, brdf_lut_smp), vec2(NdotV, cc_rough)).xy;
+            cc_spec_ibl = cc_prefiltered * environmentReflectance(cc_F0, cc_brdf) * cc_intensity;
         }
         specular_ibl = specular_ibl * (vec3(1.0) - cc_F_ibl) + cc_spec_ibl;
 
-        vec3 kD_ibl = (vec3(1.0) - F_ibl) * (1.0 - metallic);
+        vec3 kD_ibl = clamp(vec3(1.0) - reflectance_ibl * spec_ec, 0.0, 1.0) * (1.0 - metallic);
         vec3 diffuse_ibl = kD_ibl * irradiance * diffuse_albedo;
         float sheen_grazing = pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
         vec3 sheen_ibl = sheen_tint * sheen_intensity * irradiance * sheen_grazing;
@@ -743,6 +757,7 @@ void main() {
     vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
 
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;
+    if (refracting) final_color += refractedBackground(N, V, roughness) * transm_factor * (1.0 - metallic) * transmission_color.rgb;
 
     frag_color = babylonOutputColor(final_color, albedo_rgba.a);
 }

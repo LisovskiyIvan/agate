@@ -13,6 +13,7 @@ in vec3 position;
 in vec3 normal;
 in vec4 color0;
 in vec2 texcoord0;
+in vec2 texcoord1;
 
 // Per-instance attributes (Buffer 1)
 in vec4 inst_mat0;
@@ -24,6 +25,7 @@ out vec3 v_world_pos;
 out vec3 v_normal;
 out vec4 v_color;
 out vec2 v_uv;
+out vec2 v_uv1;
 
 void main() {
     mat4 model = mat4(inst_mat0, inst_mat1, inst_mat2, inst_mat3);
@@ -33,6 +35,7 @@ void main() {
     v_normal = mat3(model) * normal;
     v_color = color0;
     v_uv = texcoord0;
+    v_uv1 = texcoord1;
 }
 @end
 
@@ -164,6 +167,7 @@ in vec3 v_world_pos;
 in vec3 v_normal;
 in vec4 v_color;
 in vec2 v_uv;
+in vec2 v_uv1;
 
 out vec4 frag_color;
 
@@ -477,4 +481,3 @@ void main() {
 @end
 
 @program instanced vs fs
-

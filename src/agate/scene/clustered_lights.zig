@@ -80,7 +80,11 @@ const snapshot = @import("snapshot.zig");
 /// buffer set across views: each view rebuilds its own tiles and uploads
 /// only its own slot, giving the structural invariant that every slot's
 /// buffers are updated at most once per frame.
-pub const MAX_VIEW_SLOTS: usize = snapshot.MAX_CAMERAS;
+// Captures must not reuse a primary/PIP buffer in the same sokol frame.
+// Both extra slots allocate GPU buffers lazily, just like camera slots.
+pub const REFRACTION_VIEW_SLOT: usize = snapshot.MAX_CAMERAS;
+pub const RTT_VIEW_SLOT: usize = snapshot.MAX_CAMERAS + 1;
+pub const MAX_VIEW_SLOTS: usize = snapshot.MAX_CAMERAS + 2;
 
 /// Screen tile edge in pixels. Fixed: keeps the tile math, the shader
 /// divisor, and the header sizing on one constant.
@@ -876,9 +880,11 @@ test "retireBuffers moves live buffers into the retire queue and zeroes handles"
 }
 
 test "view slots clamp defensively and cover every camera" {
-    // Slot count tracks the snapshot camera budget: primary (0) plus up
-    // to 7 secondaries fit exactly.
-    try std.testing.expectEqual(snapshot.MAX_CAMERAS, MAX_VIEW_SLOTS);
+    // All cameras fit; capture slots are disjoint from them and each other.
+    try std.testing.expectEqual(snapshot.MAX_CAMERAS + 2, MAX_VIEW_SLOTS);
+    try std.testing.expect(REFRACTION_VIEW_SLOT >= snapshot.MAX_CAMERAS);
+    try std.testing.expect(RTT_VIEW_SLOT > REFRACTION_VIEW_SLOT);
+    try std.testing.expect(RTT_VIEW_SLOT < MAX_VIEW_SLOTS);
     try std.testing.expectEqual(@as(usize, 0), ClusteredGpuCache.clampSlot(0));
     try std.testing.expectEqual(@as(usize, 3), ClusteredGpuCache.clampSlot(3));
     try std.testing.expectEqual(MAX_VIEW_SLOTS - 1, ClusteredGpuCache.clampSlot(MAX_VIEW_SLOTS - 1));

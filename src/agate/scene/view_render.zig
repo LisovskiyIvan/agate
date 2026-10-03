@@ -138,7 +138,7 @@ pub fn renderSceneView(
         .area_color = snap.light_pack.area_color,
         .clustered_params = cl_params,
         .clustered_viewport = cl_viewport,
-        .output_params = .{ if (scene.output_gamma) 1.0 else 0.0, 0.0, 0.0, 0.0 },
+        .output_params = .{ if (env.gamma_override orelse scene.output_gamma) 1.0 else 0.0, 0.0, 0.0, 0.0 },
     };
 
     var shadow_state_with = env.shadow_uniforms;
@@ -156,11 +156,13 @@ pub fn renderSceneView(
 
     // Opaque regular meshes first (front-to-back, early-Z).
     for (queues.items.items) |item| {
+        if (env.capture_opaque_only and item.draw_record.refractive) continue;
         scene_draw.drawRegularItem(&view_env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
     }
 
     // Opaque instanced meshes.
     for (queues.opaque_instanced.items) |batch| {
+        if (env.capture_opaque_only and batch.draw_record.refractive) continue;
         scene_draw.drawInstancedBatch(&view_env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
     }
 
@@ -168,6 +170,7 @@ pub fn renderSceneView(
     // one global back-to-front order (each instanced group draws as a
     // single batch at its sorted position; no per-instance sorting).
     for (queues.transparent_order.items) |entry| {
+        if (env.capture_opaque_only) break;
         switch (entry.kind) {
             .regular => {
                 if (entry.index < queues.transparent.items.len) {
@@ -188,11 +191,11 @@ pub fn renderSceneView(
     // count with zero sg.* calls when no panel is drawable, so
     // panel-less frames are bit-identical. Probe face captures never
     // reach this path (renderProbeFace inlines its own draws).
-    scene.gui3d.drawPanels(scene.allocator, view_proj, samples, env.stats);
+    if (!env.capture_opaque_only) scene.gui3d.drawPanels(scene.allocator, view_proj, samples, env.stats);
 
     // Inverse-hull outline for highlighted meshes (P7: published slot
     // payload, never live Scene fields).
-    scene.postfx.renderOutlineItems(
+    if (!env.capture_opaque_only) scene.postfx.renderOutlineItems(
         view_proj,
         eye,
         outline_items,
@@ -207,7 +210,7 @@ pub fn renderSceneView(
     // Physics debug lines: prepared capture only — no live world,
     // no show_debug read at draw time (update may step the world
     // concurrently). One committed upload (prepare), one draw per view.
-    scene.physics.renderDebugPrepared(view_proj, samples, &scene.stats);
+    if (!env.capture_opaque_only) scene.physics.renderDebugPrepared(view_proj, samples, &scene.stats);
 
     // Skybox Pass: captured enabled/texture/exposure only. The cube is
     // the snapshot sky texture orelse the snapshot's render-owned
@@ -224,5 +227,5 @@ pub fn renderSceneView(
 
     // Particle Pass: prepared frame only — no live ParticleSystem reads
     // at draw time (the update side may step systems concurrently).
-    scene.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, &scene.stats);
+    if (!env.capture_opaque_only) scene.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, &scene.stats);
 }

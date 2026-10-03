@@ -46,21 +46,20 @@ pub const Channel = enum(u2) {
 /// uniforms per slot ([m00, m01, m10, m11] rows + offset) so every slot can
 /// carry its own transform without touching the vertex contract.
 ///
-/// Documented limitation: glTF `texCoord` > 0 (a second UV set) is NOT
-/// supported — the transform applies to texcoord0 regardless. Multi-UV
-/// support would need a v_uv2 varying across the five forward shaders
-/// (roadmap).
+/// `tex_coord` selects UV0 (the default) or UV1 before the transform.
+/// Packed in offset.w, preserving the uniform and draw-record layout.
 pub const UvTransform = struct {
     offset: [2]f32 = .{ 0, 0 },
     rotation: f32 = 0,
     scale: [2]f32 = .{ 1, 1 },
+    tex_coord: u1 = 0,
 
     pub const identity: UvTransform = .{};
 
     pub fn isIdentity(self: UvTransform) bool {
         return self.offset[0] == 0 and self.offset[1] == 0 and
             self.rotation == 0 and
-            self.scale[0] == 1 and self.scale[1] == 1;
+            self.scale[0] == 1 and self.scale[1] == 1 and self.tex_coord == 0;
     }
 
     /// The 2x2 rotation*scale matrix rows packed for the shaders' uv_matrix
@@ -79,11 +78,19 @@ pub const UvTransform = struct {
         };
     }
 
-    /// The offset packed for the shaders' uv_offset uniform ([x, y, 0, 0]).
+    /// xy offset, z reserved for unlit, w texture-coordinate selector.
     pub fn offsetPacked(self: UvTransform) [4]f32 {
-        return .{ self.offset[0], self.offset[1], 0, 0 };
+        return .{ self.offset[0], self.offset[1], 0, @floatFromInt(self.tex_coord) };
     }
 };
+
+test "UV1 selection preserves transform matrix and unlit lane" {
+    const uv = UvTransform{ .tex_coord = 1, .offset = .{ 0.25, -0.5 } };
+    try std.testing.expect(!uv.isIdentity());
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &uv.matrixRows());
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, -0.5, 0, 1 }, &uv.offsetPacked());
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &UvTransform.identity.offsetPacked());
+}
 
 /// Scalar-only clearcoat layer (Babylon parity, OpenPBR-adjacent subset).
 /// A dielectric coat (car paint, lacquered wood) over the base PBR layer:
@@ -110,6 +117,8 @@ pub const Clearcoat = struct {
     roughness: f32 = 0.03,
     color: Color3 = Color3.white,
     mask_texture: ?Texture = null,
+    /// Null preserves manual materials' historical albedo UV mapping.
+    uv_transform: ?UvTransform = null,
 };
 
 /// Scalar-only sheen layer (Babylon parity, OpenPBR-adjacent subset).
@@ -132,6 +141,8 @@ pub const Sheen = struct {
     intensity: f32 = 0.0,
     roughness: f32 = 0.5,
     color_texture: ?Texture = null,
+    /// glTF imports supply this map independently from the albedo slot.
+    uv_transform: ?UvTransform = null,
 };
 
 /// Anisotropic specular v1 (GGX-Heitz-style stretch of the base-lobe NDF
@@ -152,8 +163,9 @@ pub const Anisotropy = struct {
     rotation: f32 = 0.0,
 };
 
-/// Cheap transmission v1 (NOT refraction: no refraction target, no IOR,
-/// no thickness — porting a full refraction pass is an explicit non-goal).
+/// Transmission defaults to the legacy thin-slab approximation.
+/// Opt in to screen-space refraction with `refract`: PBR draws bend a
+/// captured opaque background image using Snell's law.
 /// Thin-slab approximation that keeps the mesh in its current queue
 /// (alpha/queue untouched: real see-through glass still uses
 /// alpha_mode.blend): the diffuse albedo scales by (1 - factor) AFTER F0
@@ -167,6 +179,22 @@ pub const Transmission = struct {
     factor: f32 = 0.0,
     color: Color3 = Color3.white,
     ior: f32 = 1.5,
+    refract: bool = false,
+    /// Optical slab thickness in world units (no depth raymarch in v1).
+    thickness: f32 = 0.1,
+
+    pub fn isRefractive(self: Transmission) bool {
+        return self.refract and std.math.isFinite(self.factor) and self.factor > 0;
+    }
+
+    pub fn refractionPacked(self: Transmission) [4]f32 {
+        return .{
+            if (self.isRefractive()) 1 else 0,
+            if (std.math.isFinite(self.thickness)) std.math.clamp(self.thickness, 0, 100) else 0,
+            if (std.math.isFinite(self.ior)) std.math.clamp(self.ior, 1, 3) else 1.5,
+            0,
+        };
+    }
 };
 
 /// Cheap subsurface scattering v1 (NOT a BSSRDF / random-walk SSS:
@@ -206,6 +234,11 @@ pub const CoatParams = struct {
     transmission_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb throughput tint, w unused
     sss_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: strength (0 = off)
     sss_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb scatter tint, w unused
+    clearcoat_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
+    clearcoat_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
+    sheen_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
+    sheen_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
+    refraction_factors: [4]f32 = .{ 0, 0, 1.5, 0 }, // enabled, thickness, IOR
 
     pub const neutral: CoatParams = .{};
 };

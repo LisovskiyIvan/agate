@@ -83,6 +83,7 @@ const math = @import("math");
 const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const morph_gpu = @import("../mesh/morph_gpu.zig");
+const gpu_retire = @import("gpu_retire.zig");
 
 /// Producer freeze (game side, sg-free). Copies every dirty staging payload
 /// into `slot`; never touches sg.*, never clears live flags, never reads the
@@ -1407,75 +1408,112 @@ fn computeWindowMatches(ps: anytype, front: anytype, up: anytype) bool {
 }
 
 /// Installs created compute GPU objects over zero live ids (game-side
-/// commit); retires anything that cannot install. Both the delivered and
-/// the undelivered (partial-progress) paths land here: a failed creation
-/// records its partial handles in the outcome so the retry completes the
-/// rest instead of leaking them.
+/// commit); every handle that cannot install rides ONE coherent bundle
+/// into the epoch retire queue (see GpuRetireQueue.retireComputeBundle) —
+/// thread-safe and sg-free game-side, destroyed context-side at the next
+/// flush. Both the delivered and the undelivered (partial-progress) paths
+/// land here: a failed creation records its partial handles in the outcome
+/// so the retry completes the rest instead of leaking them.
+///
+/// Coherence (no dangling installs): a created view installs only when its
+/// live slot is zero AND its backing buffer is live — i.e. the flush
+/// stamped the view from frozen ids (which always match live: live buffers
+/// only ever transition zero -> set), or from a created buffer that
+/// installs alongside it. A view stamped from a LOSING created buffer
+/// would reference a retired handle, so it loses with that buffer even
+/// when its own live slot is still zero — the same stale-freeze race that
+/// makes the buffer lose. Pipelines likewise install only with a live
+/// shader that is frozen (= live) or a fellow winner.
 fn installComputeCreated(scene: anytype, ps: anytype, up: anytype) void {
-    if (up.created_state_buffer_id != 0) {
+    var lost: gpu_retire.ComputeBundle = .{};
+    // Buffers and the shader install independently over zero live ids;
+    // record which created handles won for the dependent installs below
+    // (the outcome fields are read before they are zeroed).
+    const made_state_buf = up.created_state_buffer_id != 0;
+    var state_buf_wins = false;
+    if (made_state_buf) {
         if (ps.compute_state_buffer.id == 0) {
             ps.compute_state_buffer = .{ .id = up.created_state_buffer_id };
+            state_buf_wins = true;
         } else {
-            retireCreated(scene, up.created_state_buffer_id);
+            lost.state_buffer = .{ .id = up.created_state_buffer_id };
         }
         up.created_state_buffer_id = 0;
     }
-    if (up.created_spawn_buffer_id != 0) {
+    const made_spawn_buf = up.created_spawn_buffer_id != 0;
+    var spawn_buf_wins = false;
+    if (made_spawn_buf) {
         if (ps.compute_spawn_buffer.id == 0) {
             ps.compute_spawn_buffer = .{ .id = up.created_spawn_buffer_id };
+            spawn_buf_wins = true;
         } else {
-            retireCreated(scene, up.created_spawn_buffer_id);
+            lost.spawn_buffer = .{ .id = up.created_spawn_buffer_id };
         }
         up.created_spawn_buffer_id = 0;
     }
-    if (up.created_draw_buffer_id != 0) {
+    const made_draw_buf = up.created_draw_buffer_id != 0;
+    var draw_buf_wins = false;
+    if (made_draw_buf) {
         if (ps.compute_draw_buffer.id == 0) {
             ps.compute_draw_buffer = .{ .id = up.created_draw_buffer_id };
+            draw_buf_wins = true;
         } else {
-            retireCreated(scene, up.created_draw_buffer_id);
+            lost.draw_buffer = .{ .id = up.created_draw_buffer_id };
         }
         up.created_draw_buffer_id = 0;
     }
+    const made_shader = up.created_shader_id != 0;
+    var shader_wins = false;
+    if (made_shader) {
+        if (ps.compute_shader.id == 0) {
+            ps.compute_shader = .{ .id = up.created_shader_id };
+            shader_wins = true;
+        } else {
+            lost.shader = .{ .id = up.created_shader_id };
+        }
+        up.created_shader_id = 0;
+    }
     if (up.created_state_view_id != 0) {
-        if (ps.compute_state_view.id == 0) {
+        if (ps.compute_state_view.id == 0 and ps.compute_state_buffer.id != 0 and
+            (!made_state_buf or state_buf_wins))
+        {
             ps.compute_state_view = .{ .id = up.created_state_view_id };
         } else {
-            retireComputeView(up.created_state_view_id);
+            lost.state_view = .{ .id = up.created_state_view_id };
         }
         up.created_state_view_id = 0;
     }
     if (up.created_spawn_view_id != 0) {
-        if (ps.compute_spawn_view.id == 0) {
+        if (ps.compute_spawn_view.id == 0 and ps.compute_spawn_buffer.id != 0 and
+            (!made_spawn_buf or spawn_buf_wins))
+        {
             ps.compute_spawn_view = .{ .id = up.created_spawn_view_id };
         } else {
-            retireComputeView(up.created_spawn_view_id);
+            lost.spawn_view = .{ .id = up.created_spawn_view_id };
         }
         up.created_spawn_view_id = 0;
     }
     if (up.created_draw_view_id != 0) {
-        if (ps.compute_draw_view.id == 0) {
+        if (ps.compute_draw_view.id == 0 and ps.compute_draw_buffer.id != 0 and
+            (!made_draw_buf or draw_buf_wins))
+        {
             ps.compute_draw_view = .{ .id = up.created_draw_view_id };
         } else {
-            retireComputeView(up.created_draw_view_id);
+            lost.draw_view = .{ .id = up.created_draw_view_id };
         }
         up.created_draw_view_id = 0;
     }
-    if (up.created_shader_id != 0) {
-        if (ps.compute_shader.id == 0) {
-            ps.compute_shader = .{ .id = up.created_shader_id };
-        } else {
-            retireComputeShader(up.created_shader_id);
-        }
-        up.created_shader_id = 0;
-    }
     if (up.created_pipeline_id != 0) {
-        if (ps.compute_pipeline.id == 0) {
+        if (ps.compute_pipeline.id == 0 and ps.compute_shader.id != 0 and
+            (!made_shader or shader_wins))
+        {
             ps.compute_pipeline = .{ .id = up.created_pipeline_id };
         } else {
-            retireComputePipeline(up.created_pipeline_id);
+            lost.pipeline = .{ .id = up.created_pipeline_id };
         }
         up.created_pipeline_id = 0;
     }
+    if (!lost.isEmpty()) scene.gpu_retire.retireComputeBundle(scene.allocator, lost);
     // A fully-created set resolves the pending request (mirrors
     // ensureComputeGpu, which clears the flag once every object exists).
     if (ps.compute_state_buffer.id != 0 and ps.compute_spawn_buffer.id != 0 and
@@ -1487,46 +1525,47 @@ fn installComputeCreated(scene: anytype, ps: anytype, up: anytype) void {
     }
 }
 
-/// Views/pipelines/shaders cannot travel through the buffer retire queue
-/// (tripwire P6: no new queues) and their destroys are context-thread
-/// only. Reaching here means a duplicate creation raced the commit —
-/// defensive only (in practice only the context creates, sequentially on
-/// one thread, so the live id is always zero when a created id exists).
-/// Destroying inline game-side would violate the sg-thread contract, and
-/// leaking is bounded (one handle per race); log loudly instead of going
-/// silent. If this ever fires, the creation protocol needs a rethink.
-fn retireComputeView(id: u32) void {
-    std.log.err("upload_packets: duplicate compute view created (id {}), leaking (see installComputeCreated)", .{id});
-}
-
-fn retireComputeShader(id: u32) void {
-    std.log.err("upload_packets: duplicate compute shader created (id {}), leaking (see installComputeCreated)", .{id});
-}
-
-fn retireComputePipeline(id: u32) void {
-    std.log.err("upload_packets: duplicate compute pipeline created (id {}), leaking (see installComputeCreated)", .{id});
-}
-
 fn retireComputeCreated(scene: anytype, up: anytype) void {
-    retireCreated(scene, up.created_state_buffer_id);
-    retireCreated(scene, up.created_spawn_buffer_id);
-    retireCreated(scene, up.created_draw_buffer_id);
-    // Views/shader/pipeline have no retire path: the owner is gone, so
-    // these handles (if any) leak — log loudly instead of going silent
-    // (same rationale as installComputeCreated).
-    if (up.created_state_view_id != 0) retireComputeView(up.created_state_view_id);
-    if (up.created_spawn_view_id != 0) retireComputeView(up.created_spawn_view_id);
-    if (up.created_draw_view_id != 0) retireComputeView(up.created_draw_view_id);
-    if (up.created_shader_id != 0) retireComputeShader(up.created_shader_id);
-    if (up.created_pipeline_id != 0) retireComputePipeline(up.created_pipeline_id);
-    up.created_state_buffer_id = 0;
-    up.created_spawn_buffer_id = 0;
-    up.created_draw_buffer_id = 0;
-    up.created_state_view_id = 0;
-    up.created_spawn_view_id = 0;
-    up.created_draw_view_id = 0;
-    up.created_shader_id = 0;
-    up.created_pipeline_id = 0;
+    // Owner gone (index/token mismatch): every created handle rides one
+    // coherent bundle into the epoch retire queue — buffers exactly as
+    // before (same queue, same epoch discipline), views/shader/pipeline
+    // now alongside them instead of log-and-leak. Teardown order inside
+    // the bundle is dependency-safe (views before buffers, pipeline
+    // before shader); zero fields are partial outcomes, skipped.
+    var lost: gpu_retire.ComputeBundle = .{};
+    if (up.created_state_buffer_id != 0) {
+        lost.state_buffer = .{ .id = up.created_state_buffer_id };
+        up.created_state_buffer_id = 0;
+    }
+    if (up.created_spawn_buffer_id != 0) {
+        lost.spawn_buffer = .{ .id = up.created_spawn_buffer_id };
+        up.created_spawn_buffer_id = 0;
+    }
+    if (up.created_draw_buffer_id != 0) {
+        lost.draw_buffer = .{ .id = up.created_draw_buffer_id };
+        up.created_draw_buffer_id = 0;
+    }
+    if (up.created_state_view_id != 0) {
+        lost.state_view = .{ .id = up.created_state_view_id };
+        up.created_state_view_id = 0;
+    }
+    if (up.created_spawn_view_id != 0) {
+        lost.spawn_view = .{ .id = up.created_spawn_view_id };
+        up.created_spawn_view_id = 0;
+    }
+    if (up.created_draw_view_id != 0) {
+        lost.draw_view = .{ .id = up.created_draw_view_id };
+        up.created_draw_view_id = 0;
+    }
+    if (up.created_shader_id != 0) {
+        lost.shader = .{ .id = up.created_shader_id };
+        up.created_shader_id = 0;
+    }
+    if (up.created_pipeline_id != 0) {
+        lost.pipeline = .{ .id = up.created_pipeline_id };
+        up.created_pipeline_id = 0;
+    }
+    if (!lost.isEmpty()) scene.gpu_retire.retireComputeBundle(scene.allocator, lost);
 }
 
 fn commitTrails(scene: anytype, front: anytype) void {
@@ -1651,8 +1690,8 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
-            // Images/views cannot travel through the buffer retire queue
-            // (same defensive-only precedent as installComputeCreated):
+            // Images/views cannot travel through the retire queue (its
+            // entries are meshes/buffers/probe/ui3d/compute-bundle kinds):
             // the owner is gone, so these (if any) leak — log loudly.
             if (up.created_delta_image_id != 0 or up.created_delta_view_id != 0) {
                 std.log.err("upload_packets: orphaned morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
@@ -1721,8 +1760,8 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
                 // Defensive only (in practice only the context creates, so
                 // the live ids are zero here): the live delta texture
                 // already exists, so the mesh is complete — drop the
-                // created pair loudly (no image/view retire queue, same
-                // precedent as installComputeCreated) and finish normally.
+                // created pair loudly (no image/view retire entry kind)
+                // and finish normally.
                 std.log.err("upload_packets: duplicate morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
                 up.created_delta_image_id = 0;
                 up.created_delta_view_id = 0;
@@ -2136,6 +2175,276 @@ test "upload packets: token mismatch fail-closes, previous state stands" {
     try t.expect(!ps.instance_dirty);
     try t.expect(!slot.morph_uploads.items[0].delivered);
     try t.expect(!slot.p_cpu_uploads.items[0].delivered);
+}
+
+test "upload packets: duplicate compute creation retires the loser, winner installs" {
+    // Deterministic replay of the stale-freeze race: two in-flight packets
+    // for one system (both frozen while live was zero, both flushed into
+    // full created sets). The first committed outcome installs; the second
+    // finds every live id set, so all eight handles ride ONE coherent
+    // retire bundle — no log-and-leak, no dangling installs.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var ps = try sys_mod.makeComputeSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&ps);
+    ps.compute_buffers_pending = true;
+    var systems = [_]*sys_mod.ParticleSystem{&ps};
+    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
+    // проверенные ниже записи сбрасываются вручную без уничтожения —
+    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
+        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+        .gpu_retire = &retire,
+        .flush_in_prepare = true,
+    };
+    const token = @intFromPtr(&ps);
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = token,
+        .sys_index = 0,
+        .delivered = true,
+        .created_state_buffer_id = 101,
+        .created_spawn_buffer_id = 102,
+        .created_draw_buffer_id = 103,
+        .created_state_view_id = 104,
+        .created_spawn_view_id = 105,
+        .created_draw_view_id = 106,
+        .created_shader_id = 107,
+        .created_pipeline_id = 108,
+    });
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = token,
+        .sys_index = 0,
+        .delivered = true,
+        .created_state_buffer_id = 201,
+        .created_spawn_buffer_id = 202,
+        .created_draw_buffer_id = 203,
+        .created_state_view_id = 204,
+        .created_spawn_view_id = 205,
+        .created_draw_view_id = 206,
+        .created_shader_id = 207,
+        .created_pipeline_id = 208,
+    });
+
+    commitSlotResults(&fake_scene, &slot);
+
+    // Winner installs the full set; the pending request resolves.
+    try t.expectEqual(@as(u32, 101), ps.compute_state_buffer.id);
+    try t.expectEqual(@as(u32, 102), ps.compute_spawn_buffer.id);
+    try t.expectEqual(@as(u32, 103), ps.compute_draw_buffer.id);
+    try t.expectEqual(@as(u32, 104), ps.compute_state_view.id);
+    try t.expectEqual(@as(u32, 105), ps.compute_spawn_view.id);
+    try t.expectEqual(@as(u32, 106), ps.compute_draw_view.id);
+    try t.expectEqual(@as(u32, 107), ps.compute_shader.id);
+    try t.expectEqual(@as(u32, 108), ps.compute_pipeline.id);
+    try t.expect(!ps.compute_buffers_pending);
+    // Loser retires as exactly one coherent bundle (not eight entries,
+    // not a log): buffers, views, shader, pipeline together.
+    try t.expectEqual(@as(usize, 1), retire.retainedCount());
+    try t.expectEqual(retire_mod.Kind.compute, retire.pending.items[0].kind);
+    const lost = retire.pending.items[0].compute;
+    try t.expectEqual(@as(u32, 201), lost.state_buffer.id);
+    try t.expectEqual(@as(u32, 202), lost.spawn_buffer.id);
+    try t.expectEqual(@as(u32, 203), lost.draw_buffer.id);
+    try t.expectEqual(@as(u32, 204), lost.state_view.id);
+    try t.expectEqual(@as(u32, 205), lost.spawn_view.id);
+    try t.expectEqual(@as(u32, 206), lost.draw_view.id);
+    try t.expectEqual(@as(u32, 207), lost.shader.id);
+    try t.expectEqual(@as(u32, 208), lost.pipeline.id);
+    try t.expectEqual(@as(u64, 0), retire.duplicateDropCount());
+    try t.expectEqual(@as(u64, 0), retire.cappedDropCount());
+    // Outcomes consumed: a repeat commit is a no-op (idempotence carve-out).
+    try t.expectEqual(@as(u32, 0), slot.p_compute_uploads.items[0].created_state_buffer_id);
+    try t.expectEqual(@as(u32, 0), slot.p_compute_uploads.items[1].created_pipeline_id);
+    commitSlotResults(&fake_scene, &slot);
+    try t.expectEqual(@as(usize, 1), retire.retainedCount());
+    try t.expectEqual(@as(u32, 101), ps.compute_state_buffer.id);
+}
+
+test "upload packets: stale compute views lose with their buffers, never dangle" {
+    // Partial-race coherence: the first outcome installed buffers only
+    // (partial progress); a stale full set commits second. Its buffers
+    // lose — and its views MUST lose with them even though their live
+    // slots are still zero (they were stamped from the losing buffers and
+    // would otherwise dangle). The independent shader still installs, and
+    // the pipeline follows its winning shader.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var ps = try sys_mod.makeComputeSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&ps);
+    ps.compute_state_buffer = .{ .id = 11 };
+    ps.compute_spawn_buffer = .{ .id = 12 };
+    ps.compute_draw_buffer = .{ .id = 13 };
+    ps.compute_buffers_pending = true;
+    var systems = [_]*sys_mod.ParticleSystem{&ps};
+    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
+    // проверенные ниже записи сбрасываются вручную без уничтожения —
+    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
+        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+        .gpu_retire = &retire,
+        .flush_in_prepare = true,
+    };
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = @intFromPtr(&ps),
+        .sys_index = 0,
+        .delivered = true,
+        .created_state_buffer_id = 21,
+        .created_spawn_buffer_id = 22,
+        .created_draw_buffer_id = 23,
+        .created_state_view_id = 24,
+        .created_spawn_view_id = 25,
+        .created_draw_view_id = 26,
+        .created_shader_id = 27,
+        .created_pipeline_id = 28,
+    });
+
+    commitSlotResults(&fake_scene, &slot);
+
+    // Buffers stay (first set wins); views must NOT install over the zero
+    // live slots — their backing buffers lost.
+    try t.expectEqual(@as(u32, 11), ps.compute_state_buffer.id);
+    try t.expectEqual(@as(u32, 12), ps.compute_spawn_buffer.id);
+    try t.expectEqual(@as(u32, 13), ps.compute_draw_buffer.id);
+    try t.expectEqual(@as(u32, 0), ps.compute_state_view.id);
+    try t.expectEqual(@as(u32, 0), ps.compute_spawn_view.id);
+    try t.expectEqual(@as(u32, 0), ps.compute_draw_view.id);
+    // Shader is dependency-free: installs. Pipeline follows its winner.
+    try t.expectEqual(@as(u32, 27), ps.compute_shader.id);
+    try t.expectEqual(@as(u32, 28), ps.compute_pipeline.id);
+    // The set is incomplete (views missing): the request stays pending.
+    try t.expect(ps.compute_buffers_pending);
+    // Losers retire together: three buffers + three views, no shader or
+    // pipeline in the bundle (those installed).
+    try t.expectEqual(@as(usize, 1), retire.retainedCount());
+    try t.expectEqual(retire_mod.Kind.compute, retire.pending.items[0].kind);
+    const lost = retire.pending.items[0].compute;
+    try t.expectEqual(@as(u32, 21), lost.state_buffer.id);
+    try t.expectEqual(@as(u32, 22), lost.spawn_buffer.id);
+    try t.expectEqual(@as(u32, 23), lost.draw_buffer.id);
+    try t.expectEqual(@as(u32, 24), lost.state_view.id);
+    try t.expectEqual(@as(u32, 25), lost.spawn_view.id);
+    try t.expectEqual(@as(u32, 26), lost.draw_view.id);
+    try t.expectEqual(@as(u32, 0), lost.shader.id);
+    try t.expectEqual(@as(u32, 0), lost.pipeline.id);
+}
+
+test "upload packets: owner-gone compute outcome retires whole, live stands" {
+    // Stale owner (system removed between stage and commit): every created
+    // handle — buffers exactly as before, views/shader/pipeline now too
+    // instead of log-and-leak — rides one bundle; live state is untouched.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var ps = try sys_mod.makeComputeSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&ps);
+    ps.compute_buffers_pending = true;
+    var systems = [_]*sys_mod.ParticleSystem{&ps};
+    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
+    // проверенные ниже записи сбрасываются вручную без уничтожения —
+    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
+        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+        .gpu_retire = &retire,
+        .flush_in_prepare = true,
+    };
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = @intFromPtr(&ps) +% 1, // owner replaced: pointer mismatch
+        .sys_index = 0,
+        .delivered = true,
+        .created_state_buffer_id = 31,
+        .created_spawn_buffer_id = 32,
+        .created_draw_buffer_id = 33,
+        .created_state_view_id = 34,
+        .created_spawn_view_id = 35,
+        .created_draw_view_id = 36,
+        .created_shader_id = 37,
+        .created_pipeline_id = 38,
+    });
+
+    commitSlotResults(&fake_scene, &slot);
+
+    // Nothing installed on the unrelated live owner; flags untouched.
+    try t.expectEqual(@as(u32, 0), ps.compute_state_buffer.id);
+    try t.expectEqual(@as(u32, 0), ps.compute_shader.id);
+    try t.expect(ps.compute_buffers_pending);
+    // All eight handles queued as one bundle.
+    try t.expectEqual(@as(usize, 1), retire.retainedCount());
+    try t.expectEqual(retire_mod.Kind.compute, retire.pending.items[0].kind);
+    const lost = retire.pending.items[0].compute;
+    try t.expectEqual(@as(u32, 31), lost.state_buffer.id);
+    try t.expectEqual(@as(u32, 32), lost.spawn_buffer.id);
+    try t.expectEqual(@as(u32, 33), lost.draw_buffer.id);
+    try t.expectEqual(@as(u32, 34), lost.state_view.id);
+    try t.expectEqual(@as(u32, 35), lost.spawn_view.id);
+    try t.expectEqual(@as(u32, 36), lost.draw_view.id);
+    try t.expectEqual(@as(u32, 37), lost.shader.id);
+    try t.expectEqual(@as(u32, 38), lost.pipeline.id);
+    try t.expectEqual(@as(u32, 0), slot.p_compute_uploads.items[0].created_shader_id);
 }
 
 test "upload packets: lock-free ownership audit — flush writes no live state, commit writes only the documented set" {

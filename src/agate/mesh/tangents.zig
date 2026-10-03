@@ -18,6 +18,7 @@ inline fn accumulateTriangleTangent(
     idx0: usize,
     idx1: usize,
     idx2: usize,
+    tex_coord: u1,
 ) void {
     if (idx0 >= vertices.len or idx1 >= vertices.len or idx2 >= vertices.len) return;
 
@@ -28,10 +29,13 @@ inline fn accumulateTriangleTangent(
     const edge1 = Vec3.new(v1.position[0] - v0.position[0], v1.position[1] - v0.position[1], v1.position[2] - v0.position[2]);
     const edge2 = Vec3.new(v2.position[0] - v0.position[0], v2.position[1] - v0.position[1], v2.position[2] - v0.position[2]);
 
-    const delta_u1 = v1.uv[0] - v0.uv[0];
-    const delta_v1 = v1.uv[1] - v0.uv[1];
-    const delta_u2 = v2.uv[0] - v0.uv[0];
-    const delta_v2 = v2.uv[1] - v0.uv[1];
+    const uv0 = if (tex_coord == 0) v0.uv else v0.uv1;
+    const uv1 = if (tex_coord == 0) v1.uv else v1.uv1;
+    const uv2 = if (tex_coord == 0) v2.uv else v2.uv1;
+    const delta_u1 = uv1[0] - uv0[0];
+    const delta_v1 = uv1[1] - uv0[1];
+    const delta_u2 = uv2[0] - uv0[0];
+    const delta_v2 = uv2[1] - uv0[1];
 
     const det = delta_u1 * delta_v2 - delta_u2 * delta_v1;
     if (@abs(det) > 1e-6) {
@@ -132,6 +136,12 @@ pub fn computeNormals(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]c
 }
 
 pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]const u16) void {
+    computeTangentsForUv(vertices, indices, indices16, 0);
+}
+
+/// Normal-map tangents must be generated from that map's coordinate set.
+/// The old entry point remains UV0-compatible for procedural builders.
+pub fn computeTangentsForUv(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]const u16, tex_coord: u1) void {
     for (vertices) |*v| {
         v.tangent = .{ 0, 0, 0, 1 };
     }
@@ -154,17 +164,17 @@ pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]
     if (indices) |idx| {
         var tri_i: usize = 0;
         while (tri_i + 2 < idx.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, bitangents, idx[tri_i], idx[tri_i + 1], idx[tri_i + 2]);
+            accumulateTriangleTangent(vertices, bitangents, idx[tri_i], idx[tri_i + 1], idx[tri_i + 2], tex_coord);
         }
     } else if (indices16) |idx16| {
         var tri_i: usize = 0;
         while (tri_i + 2 < idx16.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, bitangents, idx16[tri_i], idx16[tri_i + 1], idx16[tri_i + 2]);
+            accumulateTriangleTangent(vertices, bitangents, idx16[tri_i], idx16[tri_i + 1], idx16[tri_i + 2], tex_coord);
         }
     } else {
         var tri_i: usize = 0;
         while (tri_i + 2 < vertices.len) : (tri_i += 3) {
-            accumulateTriangleTangent(vertices, bitangents, tri_i, tri_i + 1, tri_i + 2);
+            accumulateTriangleTangent(vertices, bitangents, tri_i, tri_i + 1, tri_i + 2, tex_coord);
         }
     }
 
@@ -201,6 +211,20 @@ pub fn computeTangents(vertices: []Vertex, indices: ?[]const u32, indices16: ?[]
             v.tangent = .{ 1.0, 0.0, 0.0, 1.0 };
         }
     }
+}
+
+test "computeTangentsForUv uses UV1 without changing the UV0 input" {
+    var vertices = [_]Vertex{
+        .{ .position = .{ 0, 0, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 0, 0 }, .uv1 = .{ 0, 0 } },
+        .{ .position = .{ 1, 0, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 1, 0 }, .uv1 = .{ 0, 1 } },
+        .{ .position = .{ 0, 1, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 0, 1 }, .uv1 = .{ 1, 0 } },
+    };
+    computeTangents(&vertices, null, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), vertices[0].tangent[0], 0.00001);
+    computeTangentsForUv(&vertices, null, null, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), vertices[0].tangent[1], 0.00001);
+    try std.testing.expectEqual(@as(f32, -1), vertices[0].tangent[3]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, &vertices[1].uv);
 }
 
 test "computeTangents right-handed vs mirrored UV handedness" {

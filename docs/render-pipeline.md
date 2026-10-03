@@ -197,6 +197,15 @@ pub const ViewportClearPass = struct {
 
 `drawRegularItem`: ранний выход при `index_count == 0` или невалидных буферах; hook-материалы (`shader_index`) — отдельный путь через `ShaderMaterialCache`; пайплайн — `forRegularItem(item)`, биндинги из item'а, скин — по `skin_index`, слои PBR — по `coat_index`. Каждый вид (`view_slot`: 0 = primary, 1+ = вторичные) перестраивает кластерные тайлы под свой слот (sokol one-update rule) и биндит свой слот (или общий dummy).
 
+После shadow/probe/UI3D capture, до depth-prepass/main, opt-in refraction
+снимает opaque-фон в half-resolution RT. Его clustered-слот (8) не пересекается
+с камерами (0…7) или ручным RTT (9). Capture читает prepared queues под
+consumer pin, исключает transparent/UI/outline/particles и использует linear
+forward output. `renderReuse` сохраняет захват того же `frame_id`, без новых
+uploads; multi-camera использует legacy transmission fallback. Ручной
+`RenderTarget.renderPrimaryView` рисует весь primary view, не вызывает
+рекурсивный refraction capture; см. [render-target.md](./render-target.md).
+
 ### Проекция (`projection.zig`, `project_cache.zig`)
 
 ```zig

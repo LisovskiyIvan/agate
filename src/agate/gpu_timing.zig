@@ -1,29 +1,28 @@
-//! GPU frame timings, v1 (Metal-only) via the vendored sokol patch.
+//! GPU frame timings, v1 (Metal-only) via the agate sokol fork.
 //!
 //! Upstream sokol-gfx has no GPU-timestamp mechanism (trace hooks are
 //! CPU-side begin/end callbacks, not GPU time), so the engine profiler
-//! historically recorded CPU-submit times only. The vendored
-//! `sokol_gfx.h` carries a minimal patch (see
-//! `vendor/sokol/README.agate.md`, "GPU timings patch", applied by
-//! `tools/patch_sokol_gpu_timings.py`):
+//! historically recorded CPU-submit times only. The `engine/sokol` fork
+//! carries a minimal C addition to `sokol_gfx.h`, and the
+//! `engine/sokol-zig` fork exposes it as generated wrappers:
 //!
-//! - `sg_agate_set_gpu_timing_enabled(bool)` — default OFF. While on,
-//!   each committed Metal command buffer is retained one extra frame,
-//!   and each engine phase (shadow/main/post) opens a `GL_TIME_ELAPSED`
-//!   query on GL4.1.
-//! - `sg_agate_query_gpu_frame_ms()` — last COMPLETED frame's GPU time
+//! - `sg.agateSetGpuTimingEnabled(bool)` — default OFF. While on,
+//!   Metal retains each committed command buffer one extra frame;
+//!   on GLCORE-non-Win32 desktop GL each engine phase (shadow/main/post)
+//!   opens a `GL_TIME_ELAPSED` query (other backends: C-level -1).
+//! - `sg.agateQueryGpuFrameMs()` — last COMPLETED frame's GPU time
 //!   in ms (Metal `(GPUEndTime-GPUStartTime)`; GL sum of the
 //!   last-completed per-pass samples), or -1 when unavailable
 //!   (disabled, not ready yet, or an unsupported backend).
-//! - `sg_agate_gpu_pass_begin/end(int)` + `sg_agate_query_gpu_pass_ms`
-//!   — per-pass timers (GL4.1 only; linked no-ops / -1 elsewhere).
+//! - `sg.agateGpuPassBegin/End(int)` + `sg.agateQueryGpuPassMs`
+//!   — per-pass timers (GLCORE-non-Win32 desktop GL only; linked no-ops / C-level -1 elsewhere).
 //!
 //! Semantics: the value lags one frame behind the CPU submit (async GPU
 //! execution) and is a single frame-level number on Metal — per-pass GPU
-//! attribution is v2: engine-driven `GL_TIME_ELAPSED` pools on GL4.1
-//! (`Pass` below; Metal begin/end are linked no-ops and per-pass queries
-//! are -1 there — the single Metal command buffer spans the whole frame,
-//! see `vendor/sokol/README.agate.md`). Headless/dummy (no sg context)
+//! attribution is v2: engine-driven `GL_TIME_ELAPSED` pools on GLCORE-non-Win32
+//! desktop GL (`Pass` below; Metal begin/end are linked no-ops and per-pass
+//! queries are C-level -1 there (0 via `pollPassMs`) — the single Metal
+//! command buffer spans the whole frame, see the fork's C comments). Headless/dummy (no sg context)
 //! is fail-closed: every entry point returns 0/false and never calls
 //! into sokol C code outside a valid context.
 //!
@@ -33,6 +32,8 @@
 //!   context exists), or
 //! - environment: `AGATE_GPU_TIMINGS=1` (also `true`/`on`/`yes`),
 //!   picked up lazily on first use — no sandbox flag plumbing needed.
+//! Disable on the context thread before `sg.shutdown()` to release the
+//! fork's retained command buffer/query pool; shutdown does not do it yet.
 //!
 //! Leaf module: imports std + sokol only, never the profiler or scene,
 //! so `scene/frame_render.zig` can poll it without an import cycle.
@@ -41,17 +42,11 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 
-extern fn sg_agate_set_gpu_timing_enabled(enabled: bool) void;
-extern fn sg_agate_query_gpu_frame_ms() f32;
-extern fn sg_agate_gpu_pass_begin(pass: c_int) void;
-extern fn sg_agate_gpu_pass_end(pass: c_int) void;
-extern fn sg_agate_query_gpu_pass_ms(pass: c_int) f32;
-
-/// Engine render phases with GPU timers. Ids match the sokol patch
-/// (`vendor/sokol/README.agate.md`): 0=shadow, 1=main, 2=post. GL4.1
-/// carries a real `GL_TIME_ELAPSED` pool per phase; Metal compiles the
-/// brackets to linked no-ops (frame timer only — one command buffer per
-/// frame) and every other backend is fail-closed.
+/// Engine render phases with GPU timers. Ids match the sokol fork's C
+/// side (`engine/sokol`): 0=shadow, 1=main, 2=post. GLCORE-non-Win32
+/// desktop GL carries a real `GL_TIME_ELAPSED` pool per phase; Metal
+/// compiles the brackets to linked no-ops (frame timer only — one command
+/// buffer per frame) and every other backend is fail-closed.
 pub const Pass = enum(c_int) {
     shadow = 0,
     main = 1,
@@ -80,13 +75,14 @@ fn pollEnvOnce() void {
 fn syncToC(want: bool) void {
     if (!sg.isvalid()) return;
     if (c_applied.load(.acquire) == want) return;
-    sg_agate_set_gpu_timing_enabled(want);
+    sg.agateSetGpuTimingEnabled(want);
     c_applied.store(want, .release);
 }
 
 /// Enables or disables GPU frame timings. Safe to call with no sg
 /// context (the C flag is applied lazily by `pollFrameMs` once a
-/// context exists); safe to call from any thread.
+/// context exists). With a live context, call only on the context thread:
+/// applying the flag may allocate or release backend timing resources.
 pub fn setEnabled(on: bool) void {
     pollEnvOnce();
     enabled.store(on, .release);
@@ -113,7 +109,7 @@ pub fn pollFrameMs() f32 {
     }
     if (!sg.isvalid()) return 0;
     syncToC(true);
-    const ms = sg_agate_query_gpu_frame_ms();
+    const ms = sg.agateQueryGpuFrameMs();
     return if (ms >= 0) ms else 0;
 }
 
@@ -127,7 +123,7 @@ pub fn beginPass(pass: Pass) void {
     if (!enabled.load(.acquire)) return;
     if (!sg.isvalid()) return;
     syncToC(true);
-    sg_agate_gpu_pass_begin(@intFromEnum(pass));
+    sg.agateGpuPassBegin(@intFromEnum(pass));
 }
 
 /// Closes the GPU timer for phase `pass`. Same fail-closed contract as
@@ -137,7 +133,7 @@ pub fn endPass(pass: Pass) void {
     if (!enabled.load(.acquire)) return;
     if (!sg.isvalid()) return;
     syncToC(true);
-    sg_agate_gpu_pass_end(@intFromEnum(pass));
+    sg.agateGpuPassEnd(@intFromEnum(pass));
 }
 
 /// Reads the last COMPLETED sample for phase `pass` in ms (lags behind
@@ -153,7 +149,7 @@ pub fn pollPassMs(pass: Pass) f32 {
     }
     if (!sg.isvalid()) return 0;
     syncToC(true);
-    const ms = sg_agate_query_gpu_pass_ms(@intFromEnum(pass));
+    const ms = sg.agateQueryGpuPassMs(@intFromEnum(pass));
     return if (ms >= 0) ms else 0;
 }
 

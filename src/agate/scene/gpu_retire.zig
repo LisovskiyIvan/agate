@@ -2,9 +2,11 @@
 //! механизм отложенного уничтожения GPU-ресурсов.
 //!
 //! Ownership-блок:
-//! - ПИШЕТ любой поток через `retireMesh`/`retireBuffer` (сегодня — только
-//!   Scene.destroyMesh вне context-потока и рост instance-буферов в стейджинге;
-//!   в будущем — update-поток, выводящий объекты из эксплуатации). Под
+//! - ПИШЕТ любой поток через `retireMesh`/`retireBuffer`/`retireProbeTarget`/
+//!   `retireUi3dTarget`/`retireComputeBundle` (сегодня — destroy вне
+//!   context-потока, рост instance-буферов в стейджинге, снятие проб/панелей
+//!   и проигравшие compute-наборы game-side коммита; в будущем —
+//!   update-поток, выводящий объекты из эксплуатации). Под
 //!   мьютексом только штамп epoch + append записи, никаких sg.* и никакого
 //!   освобождения памяти.
 //! - ЧИТАЕТ/УНИЧТОЖАЕТ только context-поток: `flush` (начало render-кадра) и
@@ -72,17 +74,64 @@ const overflow_cap: usize = 8;
 /// старый instance-буфер (P5), либо снятый с учёта reflection-проб таргет
 /// (wave 25: куб + его вьюхи/сэмплер + глубина одним значением), либо снятый
 /// 3D-GUI-панель таргет (wave 28: RT + его вьюхи/сэмплер + панельные
-/// UI-буферы одним значением) + кадр ухода в ретенцию.
+/// UI-буферы одним значением), либо проигравший compute-набор (staged
+/// compute-создание: созданные флешем буферы + вьюхи + шейдер + пайплайн,
+/// которые game-side коммит не смог установить — дубликат после гонки
+/// созданий или владелец исчез; уничтожаются одним значением в
+/// dependency-порядке) + кадр ухода в ретенцию.
 const Entry = struct {
     kind: Kind,
     mesh: ?*Mesh = null,
     buffer: sg.Buffer = .{},
     probe: probe_layer.ProbeGpu = .{},
     ui3d: gui3d_layer.Ui3dTarget = .{},
+    compute: ComputeBundle = .{},
     epoch: Epoch,
 };
 
-pub const Kind = enum { mesh, buffer, probe, ui3d };
+pub const Kind = enum { mesh, buffer, probe, ui3d, compute };
+
+/// Проигравший исход staged compute-создания (см. installComputeCreated /
+/// retireComputeCreated в upload_packets.zig): все созданные флешем хендлы,
+/// которые коммит не установил поверх живых id. Едут одной записью, чтобы
+/// порядок уничтожения всегда был dependency-безопасным (вьюхи ссылаются
+/// на буферы, пайплайн — на шейдер), независимо от порядка записей в
+/// очереди. Частичные исходы — норма (упавший make* останавливает флеш
+/// раньше): нулевые поля при уничтожении пропускаются.
+pub const ComputeBundle = struct {
+    state_buffer: sg.Buffer = .{},
+    spawn_buffer: sg.Buffer = .{},
+    draw_buffer: sg.Buffer = .{},
+    state_view: sg.View = .{},
+    spawn_view: sg.View = .{},
+    draw_view: sg.View = .{},
+    shader: sg.Shader = .{},
+    pipeline: sg.Pipeline = .{},
+
+    /// Пустой набор — нечего ретайрить (победа по всем фронтам или
+    /// outcome без созданий): retireComputeBundle — no-op.
+    pub fn isEmpty(self: ComputeBundle) bool {
+        return self.state_buffer.id == 0 and self.spawn_buffer.id == 0 and
+            self.draw_buffer.id == 0 and self.state_view.id == 0 and
+            self.spawn_view.id == 0 and self.draw_view.id == 0 and
+            self.shader.id == 0 and self.pipeline.id == 0;
+    }
+
+    /// Уничтожение одного набора в dependency-порядке: сначала вьюхи (они
+    /// ссылаются на буферы), затем пайплайн (ссылается на шейдер), затем
+    /// шейдер и только потом буферы. Нулевые поля (частичный исход) —
+    /// пропуск. Только context-поток, под локом очереди из drainLocked.
+    pub fn deinit(self: *ComputeBundle) void {
+        if (self.state_view.id != 0) sg.destroyView(self.state_view);
+        if (self.spawn_view.id != 0) sg.destroyView(self.spawn_view);
+        if (self.draw_view.id != 0) sg.destroyView(self.draw_view);
+        if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
+        if (self.shader.id != 0) sg.destroyShader(self.shader);
+        if (self.state_buffer.id != 0) sg.destroyBuffer(self.state_buffer);
+        if (self.spawn_buffer.id != 0) sg.destroyBuffer(self.spawn_buffer);
+        if (self.draw_buffer.id != 0) sg.destroyBuffer(self.draw_buffer);
+    }
+};
 
 /// Спин по образцу assets.UploadQueue: критические секции — bump счётчика или
 /// append одного указателя, вызовы retire редкие.
@@ -280,6 +329,39 @@ pub const GpuRetireQueue = struct {
         };
     }
 
+    /// Уход проигравшего compute-набора в ретенцию (staged compute-путь:
+    /// дубликат после гонки созданий или владелец исчез — коммит в
+    /// upload_packets.zig сам решает, что победило, и сдаёт сюда
+    /// остальное одним значением). Можно звать с любого потока; тот же
+    /// epoch/overflow[8]/log+leak контракт, что у retireMesh, плюс
+    /// dedup/cap выше: под мьютексом только штамп epoch + проверки +
+    /// append, никаких sg.*. Пустой набор — no-op (нечего ретайрить).
+    /// Уничтожение (`ComputeBundle.deinit`: вьюхи, затем пайплайн, шейдер,
+    /// затем буферы) — только context-поток во flush/deinit.
+    pub fn retireComputeBundle(self: *Self, allocator: std.mem.Allocator, bundle: ComputeBundle) void {
+        if (bundle.isEmpty()) return;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = Entry{ .kind = .compute, .compute = bundle, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.err("scene: retire queue cap {d} reached, leaking compute bundle (state buffer id {})", .{ self.pending_cap, bundle.state_buffer.id });
+            return;
+        }
+        self.pending.append(allocator, entry) catch {
+            if (self.overflow_len < self.overflow.len) {
+                self.overflow[self.overflow_len] = entry;
+                self.overflow_len += 1;
+            } else {
+                std.log.err("scene: destroy queues exhausted, leaking compute bundle (state buffer id {})", .{bundle.state_buffer.id});
+            }
+        };
+    }
+
     /// Уничтожение due-записей (`epoch <= lastCompleted()`): Mesh.deinit
     /// (sg.*) + free. Только context-поток. Идемпотентен на пустой очереди.
     /// Держит спинлок и во время sg-teardown: retire редкий и короткий,
@@ -361,7 +443,10 @@ pub const GpuRetireQueue = struct {
     /// Идентичность ретайр-записей: kind совпадает и хендл тот же. Меши —
     /// по указателю (повторный ретайр одного объекта), буферы — по id
     /// (повторный ретайр одного GPU-хендла), проб-таргеты — по id куб-имиджа,
-    /// ui3d-таргеты — по id RT-имиджа (повторный ретайр одного таргета).
+    /// ui3d-таргеты — по id RT-имиджа (повторный ретайр одного таргета),
+    /// compute-наборы — по полному кортежу всех восьми id (один и тот же
+    /// проигравший исход; один и тот же числовой id в РАЗНЫХ полях —
+    /// например буфер 5 против вьюхи 5 — совпадением не считается).
     fn sameHandle(a: Entry, b: Entry) bool {
         if (a.kind != b.kind) return false;
         return switch (a.kind) {
@@ -369,6 +454,7 @@ pub const GpuRetireQueue = struct {
             .buffer => a.buffer.id == b.buffer.id,
             .probe => a.probe.image.id == b.probe.image.id,
             .ui3d => a.ui3d.image.id == b.ui3d.image.id,
+            .compute => std.meta.eql(a.compute, b.compute),
         };
     }
 
@@ -403,6 +489,14 @@ pub const GpuRetireQueue = struct {
                         var target = entry.ui3d;
                         target.deinit();
                     },
+                    // Staged compute-путь: проигравший набор — вьюхи,
+                    // затем пайплайн, шейдер, затем буферы (см.
+                    // ComputeBundle.deinit); частичные исходы несут нули
+                    // в несозданных полях.
+                    .compute => {
+                        var bundle = entry.compute;
+                        bundle.deinit();
+                    },
                 }
             } else {
                 self.pending.items[kept] = entry;
@@ -427,6 +521,10 @@ pub const GpuRetireQueue = struct {
                         .ui3d => {
                             var target = entry.ui3d;
                             target.deinit();
+                        },
+                        .compute => {
+                            var bundle = entry.compute;
+                            bundle.deinit();
                         },
                     }
                     continue;
@@ -771,4 +869,140 @@ test "retireUi3dTarget waits for its epoch and dedups by rt image" {
     q.complete(e);
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+}
+
+test "retireComputeBundle zero is a no-op; full bundle waits for its epoch" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    // Manual teardown throughout (fake ids have no GPU resource behind
+    // them): entries are dropped by hand, never flushed live — the live
+    // destroy proof is the P6 gate (runComputeBundleRetire), which drives
+    // a real bundle through complete + flush to INVALID on-context.
+    defer {
+        q.pending.clearRetainingCapacity();
+        @memset(&q.overflow, null);
+        q.overflow_len = 0;
+        q.pending.deinit(alloc);
+    }
+    const e = q.begin();
+
+    // Empty bundle: nothing to retire, no entry, no counts.
+    q.retireComputeBundle(alloc, .{});
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 0), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+
+    // Full losing outcome (fake ids): exactly one stamped entry.
+    q.retireComputeBundle(alloc, .{
+        .state_buffer = .{ .id = 101 },
+        .spawn_buffer = .{ .id = 102 },
+        .draw_buffer = .{ .id = 103 },
+        .state_view = .{ .id = 104 },
+        .spawn_view = .{ .id = 105 },
+        .draw_view = .{ .id = 106 },
+        .shader = .{ .id = 107 },
+        .pipeline = .{ .id = 108 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    try std.testing.expectEqual(Kind.compute, q.pending.items[0].kind);
+    try std.testing.expectEqual(e, q.pending.items[0].epoch);
+    try std.testing.expectEqual(@as(u32, 104), q.pending.items[0].compute.state_view.id);
+    try std.testing.expectEqual(@as(u32, 108), q.pending.items[0].compute.pipeline.id);
+
+    // Flush before complete: the open-epoch entry waits, sg.* untouched.
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+
+    // Cap probe still admits around it (no drop+log path is exercised:
+    // the test runner fails on any std.log.err, same precedent as the
+    // mesh/buffer cap tests — the boundary is pinned from the admission
+    // side).
+    q.pending_cap = 1;
+    try std.testing.expect(!q.admitsOneMore());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+    q.pending_cap = 8192;
+
+    // Hand-drop the fake-id entry (no GPU resource behind it).
+    q.pending.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+}
+
+test "retireComputeBundle dedups the exact tuple, isolates handle types" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+    defer {
+        q.pending.clearRetainingCapacity();
+        @memset(&q.overflow, null);
+        q.overflow_len = 0;
+        q.pending.deinit(alloc);
+    }
+    _ = q.begin();
+
+    // Same losing outcome retired twice: one entry, one counted duplicate
+    // (a second destroy of the same eight handles would corrupt).
+    const loser = ComputeBundle{
+        .state_buffer = .{ .id = 201 },
+        .spawn_buffer = .{ .id = 202 },
+        .draw_buffer = .{ .id = 203 },
+        .state_view = .{ .id = 204 },
+        .spawn_view = .{ .id = 205 },
+        .draw_view = .{ .id = 206 },
+        .shader = .{ .id = 207 },
+        .pipeline = .{ .id = 208 },
+    };
+    q.retireComputeBundle(alloc, loser);
+    q.retireComputeBundle(alloc, loser);
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+
+    // Same NUMERIC id in different handle fields is NOT a duplicate: a
+    // buffer id and a view id live in different sokol pools.
+    q.retireComputeBundle(alloc, .{ .state_buffer = .{ .id = 300 } });
+    q.retireComputeBundle(alloc, .{ .state_view = .{ .id = 300 } });
+    try std.testing.expectEqual(@as(usize, 3), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+
+    // Different losing outcomes sharing one handle id are different
+    // outcomes (each created handle belongs to exactly one outcome, so a
+    // shared id here means distinct packets, never a double-retire).
+    q.retireComputeBundle(alloc, .{
+        .state_buffer = .{ .id = 300 },
+        .state_view = .{ .id = 301 },
+    });
+    try std.testing.expectEqual(@as(usize, 4), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+}
+
+test "retireComputeBundle OOM parks in overflow[8], dedups across it" {
+    const alloc = std.testing.allocator;
+    var q: GpuRetireQueue = .{};
+    defer {
+        @memset(&q.overflow, null);
+        q.overflow_len = 0;
+        q.pending.deinit(alloc);
+    }
+    _ = q.begin();
+
+    // Every append fails: entries park in the allocation-free overflow
+    // without touching thread-affinity (the overflow-exhausted log+leak
+    // branch is not exercised — same precedent as the buffer OOM test).
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        q.retireComputeBundle(failing.allocator(), .{ .state_buffer = .{ .id = 400 + i } });
+    }
+    try std.testing.expectEqual(@as(usize, 8), q.retainedCount());
+    try std.testing.expectEqual(@as(usize, 8), q.overflow_len);
+    try std.testing.expectEqual(@as(u32, 400), q.overflow[0].?.compute.state_buffer.id);
+    try std.testing.expectEqual(Kind.compute, q.overflow[7].?.kind);
+
+    // The repeat of an overflow-parked bundle hits the overflow half of
+    // the dedup scan instead of appending twice.
+    q.retireComputeBundle(failing.allocator(), .{ .state_buffer = .{ .id = 400 } });
+    try std.testing.expectEqual(@as(usize, 8), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
 }

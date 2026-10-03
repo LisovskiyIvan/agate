@@ -17,9 +17,10 @@ materials).
 | `fullscreen_vs.glsl` | 13 | `bloom_down/up`, `glow_blur/extract`, `ssao`, `ssao_blur`, `volumetric_blur/raymarch`, `postprocess` (9) |
 | `cluster.glsl` | 19 | `standard`, `pbr`, `instanced`, `instanced_pbr`, `skinned_pbr` (5) |
 | `shadow_pcf.glsl` | 248 | same 5 (`hash01` → `areaLightFactor`, incl. rect area-light comment) |
-| `uv_apply.glsl` | 3 | same 5 |
+| `uv_apply.glsl` | 6 | same 5 (UV0/UV1 selection + transform) |
 | `pbr_brdf.glsl` | 115 | `pbr`, `instanced_pbr`, `skinned_pbr` (3) |
 | `channel_select.glsl` | 6 | same 3 |
+| `refraction.glsl` | 25 | same 3 (screen-space refraction) |
 | `hemi.glsl` | 24 | same 5 (`standard`, `pbr`, `instanced`, `instanced_pbr`, `skinned_pbr`) |
 
 Rules: chunk files are pure code spans with NO provenance header (any

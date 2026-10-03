@@ -260,6 +260,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/cluster.glsl", .text = @embedFile("../shaders/common/cluster.glsl") },
         .{ .name = "shaders/common/shadow_pcf.glsl", .text = @embedFile("../shaders/common/shadow_pcf.glsl") },
         .{ .name = "shaders/common/uv_apply.glsl", .text = @embedFile("../shaders/common/uv_apply.glsl") },
+        .{ .name = "shaders/common/refraction.glsl", .text = @embedFile("../shaders/common/refraction.glsl") },
         .{ .name = "shaders/common/pbr_brdf.glsl", .text = @embedFile("../shaders/common/pbr_brdf.glsl") },
         .{ .name = "shaders/common/channel_select.glsl", .text = @embedFile("../shaders/common/channel_select.glsl") },
         .{ .name = "shaders/common/hemi.glsl", .text = @embedFile("../shaders/common/hemi.glsl") },

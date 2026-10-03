@@ -10,6 +10,9 @@ pub const Vertex = extern struct {
     tangent: [4]f32 = .{ 1.0, 0.0, 0.0, 1.0 },
     joints: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
     weights: [4]f32 = .{ 1.0, 0.0, 0.0, 0.0 },
+    /// Second texture-coordinate set. Appended to preserve all existing
+    /// attribute offsets; old builders keep UV0 and zero-initialize UV1.
+    uv1: [2]f32 = .{ 0.0, 0.0 },
 };
 
 pub const SkinJointWeight = extern struct {

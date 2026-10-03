@@ -305,6 +305,20 @@ pub fn render(scene: anytype) void {
     // going idle frees the target so the off shape holds no prepass
     // VRAM. Cost is attributed to the main phase below.
     const t_main = sokol.time.now();
+    var env = scene_draw.Environment{
+        .pipelines = if (samples > 1) scene.ensureForwardMsaa(samples) else &scene.forward,
+        .stats = &scene.stats,
+        .default_white = snap.default_white,
+        .default_normal = snap.default_normal,
+        .default_cube = snap.default_cube,
+        .sky_texture = snap.sky_texture,
+        .ibl_intensity = snap.ibl_intensity,
+        .probes = snap.probe_pack.entries[0..snap.probe_pack.count],
+        .shadow_pass = &scene.shadows.pass,
+        .shadow_uniforms = snap.shadow_uniforms,
+        .clustered = &scene.clustered,
+    };
+    @import("refraction.zig").capture(scene, draws, snap, &env);
     gpu_timing.beginPass(.main);
     const depth_prepass = scene_msaa.depthPrepassActive(snap.post_process.enabled, snap.msaa_depth_prepass, samples);
     if (depth_prepass and !scene.rendering_reuse) {
@@ -344,34 +358,6 @@ pub fn render(scene: anytype) void {
     // (The .main GPU-timer bracket opened above at PASS 1.7, so the
     // prepass cost attributes to the main phase.)
     scene.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
-
-    // Render-owned draw environment: every fallback below is a snapshot
-    // COPY (default textures + sky captured at prepare) — the draw never
-    // dereferences game-mutatable Scene.default_*_texture / sky fields,
-    // so update may run concurrently with this whole pass. (The
-    // default_material pointer is gone: null-material draws were already
-    // baked into draw_record at prepare; the draw never needed it.)
-    const env = scene_draw.Environment{
-        // Pipeline set must match the main target's sample count: the
-        // 1x set for the legacy/swapchain path, the MSAA twin otherwise.
-        // Render-owned lazy caches (forward_msaa, clear_*, sky/debug/
-        // particle/outline MSAA twins, postfx targets, shader-material
-        // cache): touched ONLY on this context thread in prepare/render,
-        // never by update — safe under overlap given the thread-safe
-        // Scene allocator (GPA .thread_safe = true); no prewarm needed
-        // just because the fields live in Scene.
-        .pipelines = if (samples > 1) scene.ensureForwardMsaa(samples) else &scene.forward,
-        .stats = &scene.stats,
-        .default_white = snap.default_white,
-        .default_normal = snap.default_normal,
-        .default_cube = snap.default_cube,
-        .sky_texture = snap.sky_texture,
-        .ibl_intensity = snap.ibl_intensity,
-        .probes = snap.probe_pack.entries[0..snap.probe_pack.count],
-        .shadow_pass = &scene.shadows.pass,
-        .shadow_uniforms = snap.shadow_uniforms,
-        .clustered = &scene.clustered,
-    };
 
     if (snap.enable_multi_camera and snap.camera_count > 0) {
         const active_idx = snap.active_camera_idx;

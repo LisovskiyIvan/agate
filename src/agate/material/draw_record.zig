@@ -16,6 +16,8 @@ const Material = union_mod.Material;
 /// alpha cutoff, and texture handles. Built at queue-build time; the render passes
 /// draw from this record without inspecting mutable material state on the mesh.
 pub const MaterialDrawRecord = struct {
+    /// Frozen opt-in: captures never draw surfaces sampling themselves.
+    refractive: bool = false,
     // Texture views & samplers (or defaults)
     albedo_view: sg.View = .{},
     albedo_sampler: sg.Sampler = .{},
@@ -68,7 +70,6 @@ pub const MaterialDrawRecord = struct {
     // Standard material diffuse UV matrix / offset
     standard_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
     standard_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
-
 };
 
 /// Render-owned копия изменяемых CPU-данных hook-материала: draw-путь читает
@@ -129,6 +130,7 @@ pub fn buildDrawRecord(
     if (mat) |m| {
         switch (m) {
             .pbr => |p| {
+                rec.refractive = p.transmission.isRefractive();
                 const albedo_tex = p.albedo_texture orelse default_white.*;
                 const normal_tex = p.normal_texture orelse default_normal.*;
                 const mr_tex = p.metallic_roughness_texture orelse default_white.*;

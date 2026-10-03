@@ -39,6 +39,8 @@ pub const SceneLoader = struct {
     pub const LoadOptions = struct {
         morph_mode: MorphMode = .cpu,   // бленд морфов: CPU-буфер или GPU дельта-текстура
         async_textures: bool = false,   // декод изображений на UploadQueue-воркерах
+        max_anisotropy: ?u32 = null,    // null сохраняет стандартные настройки
+        timings: ?*LoadTimings = null, // caller-owned, без clock overhead при null
     };
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh; // == appendGlbOptions(..., .{})
     pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh;
@@ -68,7 +70,7 @@ pub fn textureImage(tex) ?[*c]const c.cgltf_image;
 pub fn colorSlotImageFlags(allocator, gltf) ![]bool;
 pub fn decodeImagesInParallel(scene, gltf, decoded, base_dir: ?[]const u8) void; // fork-join предекод
 pub fn applyGltfSampler(wrap_s/wrap_t/mag/min: c_int, opts: *Texture.Options) void;
-pub fn uvTransformFromView(view: anytype) UvTransform; // KHR_texture_transform
+pub fn uvTransformFromView(view: anytype) error{UnsupportedTextureCoordinate}!UvTransform;
 pub const AsyncTexCtx = struct { pub fn init(scene, gltf, base_dir, queue) AsyncTexCtx;
     pub fn deinit(...); pub fn register(self, view, srgb: bool, slot: *?Texture) void; };
 pub fn loadTextureSlot/loadTextureFromView(...) ...;
@@ -133,7 +135,9 @@ pub fn appendToScene(scene, allocator, name, bytes) ![]*Mesh;
 | Битый JSON/GLB, недоступный .bin | `GltfParseFailed` / `GltfLoadBuffersFailed` |
 | Ошибка meshopt-распаковки | `GltfMeshoptDecodeFailed` |
 | Морфов > 8 | Первые 8 загружаются, остальные отбрасываются (документировано) |
-| `texCoord > 0` | Игнорируется (texcoord0, см. `./material.md`) |
+| `texCoord = 1` | Загружается `TEXCOORD_1`; каждый поддерживаемый текстурный слот выбирает UV0/UV1 независимо |
+| `texCoord < 0` / `texCoord > 1` | `UnsupportedTextureCoordinate` (включая override `KHR_texture_transform.texCoord`) |
+| Текстура требует UV1, а у примитива нет `TEXCOORD_1` | `MissingTextureCoordinate`; неверный размер/тип аксессора — `InvalidTextureCoordinate` |
 | Отсутствующие range/углы/камеры | Дефолты `default_*` выше |
 | OBJ > 10M треугольников / STL > 10M фасеток | Ошибка парсинга (anti-OOM) |
 | Пустой STL (0 фасеток) | Импорт сообщает `NoGeometry` |
@@ -145,6 +149,9 @@ pub fn appendToScene(scene, allocator, name, bytes) ![]*Mesh;
 - Async-режим убирает хитч ценой временного `default_white` и pop-in по мере drain (бюджет — см. `./assets.md`).
 - `image_cache` дедуплицирует изображения glTF (×2 слота под sRGB-варианты): одна картинка на albedo+emissive декодируется один раз.
 - CPU-зеркала (`cpu_positions/indices/skin`) удерживаются всегда: цена памяти против физики/декалей/экспорта без повторного парсинга.
+- Опциональные `LoadOptions.timings` дают время по стадиям без логирования; см. [loading-performance.md](./loading-performance.md).
+
+UV0 остаётся умолчанием; `Vertex.uv1` добавлен в конец структуры (старые offsets атрибутов сохранены, stride увеличен на 8 байт). Override `KHR_texture_transform.texCoord` имеет приоритет над `textureInfo.texCoord`. При отсутствии авторских касательных normal map на UV1 получает касательные, рассчитанные по UV1. Поддержаны albedo/normal/MR/emissive/AO и реализованные текстуры clearcoat/sheen; прочие текстуры glTF-расширений по-прежнему вне поддерживаемого подмножества.
 
 ## Смотрите также
 

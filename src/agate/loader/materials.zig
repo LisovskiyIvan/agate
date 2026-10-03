@@ -234,20 +234,51 @@ pub fn textureOptionsFor(tex: [*c]const c.cgltf_texture, srgb: bool, max_anisotr
     return opts;
 }
 
-/// Extracts the KHR_texture_transform UV map from a glTF texture view
-/// (identity when the extension is absent). Documented limitation: views
-/// with `texCoord` > 0 reference a second UV set the engine does not load
-/// (single v_uv varying); the transform still applies to texcoord0.
+/// KHR_texture_transform.texCoord overrides the base view's texCoord.
+/// Unsupported coordinate sets fail the import rather than sampling UV0.
+pub fn textureCoordFromView(view: anytype) error{UnsupportedTextureCoordinate}!u1 {
+    const coord = if (view.*.has_transform != 0 and view.*.transform.has_texcoord != 0)
+        view.*.transform.texcoord
+    else
+        view.*.texcoord;
+    if (coord < 0 or coord > 1) return error.UnsupportedTextureCoordinate;
+    return @intCast(coord);
+}
+
+/// Extracts the UV selector and KHR_texture_transform map. loadMaterials
+/// validates coordinate sets before creating any materials or GPU objects.
 /// `anytype` accepts both normal and C (allowzero) pointers to
 /// cgltf_texture_view (cgltf's own structs carry C-pointer parents).
-pub fn uvTransformFromView(view: anytype) UvTransform {
-    if (view.has_transform == 0) return UvTransform.identity;
-    const t = view.transform;
+pub fn uvTransformFromView(view: anytype) error{UnsupportedTextureCoordinate}!UvTransform {
+    const coord = try textureCoordFromView(view);
+    if (view.*.has_transform == 0) return .{ .tex_coord = coord };
+    const t = view.*.transform;
     return .{
         .offset = .{ t.offset[0], t.offset[1] },
         .rotation = t.rotation,
         .scale = .{ t.scale[0], t.scale[1] },
+        .tex_coord = coord,
     };
+}
+
+pub fn textureViewsForMaterial(mat: anytype) [7][*c]const c.cgltf_texture_view {
+    return .{
+        &mat.*.pbr_metallic_roughness.base_color_texture,
+        &mat.*.pbr_metallic_roughness.metallic_roughness_texture,
+        &mat.*.normal_texture,
+        &mat.*.occlusion_texture,
+        &mat.*.emissive_texture,
+        &mat.*.clearcoat.clearcoat_texture,
+        &mat.*.sheen.sheen_color_texture,
+    };
+}
+
+pub fn validateTextureCoordinates(gltf: *const c.cgltf_data) !void {
+    for (0..gltf.materials_count) |i| {
+        for (textureViewsForMaterial(&gltf.materials[i])) |view| {
+            if (view.*.texture != null) _ = try textureCoordFromView(view);
+        }
+    }
 }
 
 /// Stage 2: schedules background decodes for images the sync path could
@@ -535,6 +566,8 @@ pub fn loadMaterials(
     actx: ?*AsyncTexCtx,
     max_anisotropy: ?u32,
 ) !void {
+    // Validate the entire load before publishing partial material state.
+    try validateTextureCoordinates(gltf);
     for (0..gltf.materials_count) |i| {
         const src_mat = &gltf.materials[i];
         const mat_name = if (src_mat.name != null)
@@ -575,9 +608,9 @@ pub fn loadMaterials(
             // Color slots load sRGB -> linear (glTF: textures are sRGB,
             // factors linear); data slots stay linear.
             _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.base_color_texture, base_dir, true, &pbr_mat.albedo_texture, actx, max_anisotropy);
-            pbr_mat.albedo_uv_transform = uvTransformFromView(&pbr.base_color_texture);
+            pbr_mat.albedo_uv_transform = try uvTransformFromView(&pbr.base_color_texture);
             _ = loadTextureSlot(scene, gltf, image_cache, decoded, &pbr.metallic_roughness_texture, base_dir, false, &pbr_mat.metallic_roughness_texture, actx, max_anisotropy);
-            pbr_mat.metallic_roughness_uv_transform = uvTransformFromView(&pbr.metallic_roughness_texture);
+            pbr_mat.metallic_roughness_uv_transform = try uvTransformFromView(&pbr.metallic_roughness_texture);
         }
 
         _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.normal_texture, base_dir, false, &pbr_mat.normal_texture, actx, max_anisotropy);
@@ -585,13 +618,13 @@ pub fn loadMaterials(
             // cgltf defaults texture-view scale to 1.0 (cgltf.h parse).
             pbr_mat.normal_scale = src_mat.normal_texture.scale;
         }
-        pbr_mat.normal_uv_transform = uvTransformFromView(&src_mat.normal_texture);
+        pbr_mat.normal_uv_transform = try uvTransformFromView(&src_mat.normal_texture);
         _ = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.occlusion_texture, base_dir, false, &pbr_mat.occlusion_texture, actx, max_anisotropy);
         pbr_mat.occlusion_strength = src_mat.occlusion_texture.scale;
-        pbr_mat.occlusion_uv_transform = uvTransformFromView(&src_mat.occlusion_texture);
+        pbr_mat.occlusion_uv_transform = try uvTransformFromView(&src_mat.occlusion_texture);
 
         const emissive_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &src_mat.emissive_texture, base_dir, true, &pbr_mat.emissive_texture, actx, max_anisotropy);
-        pbr_mat.emissive_uv_transform = uvTransformFromView(&src_mat.emissive_texture);
+        pbr_mat.emissive_uv_transform = try uvTransformFromView(&src_mat.emissive_texture);
         if ((pbr_mat.emissive_texture != null or emissive_textured) and
             src_mat.emissive_factor[0] == 0.0 and
             src_mat.emissive_factor[1] == 0.0 and
@@ -610,6 +643,7 @@ pub fn loadMaterials(
         if (src_mat.has_clearcoat != 0) {
             const cc = &src_mat.clearcoat;
             const cc_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &cc.clearcoat_texture, base_dir, false, &pbr_mat.clearcoat.mask_texture, actx, max_anisotropy);
+            pbr_mat.clearcoat.uv_transform = try uvTransformFromView(&cc.clearcoat_texture);
             pbr_mat.clearcoat.roughness = cc.clearcoat_roughness_factor;
             if ((pbr_mat.clearcoat.mask_texture != null or cc_textured) and cc.clearcoat_factor == 0.0) {
                 pbr_mat.clearcoat.intensity = 1.0;
@@ -623,6 +657,7 @@ pub fn loadMaterials(
             const sh = &src_mat.sheen;
             pbr_mat.sheen.roughness = sh.sheen_roughness_factor;
             const sh_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &sh.sheen_color_texture, base_dir, true, &pbr_mat.sheen.color_texture, actx, max_anisotropy);
+            pbr_mat.sheen.uv_transform = try uvTransformFromView(&sh.sheen_color_texture);
             if ((pbr_mat.sheen.color_texture != null or sh_textured) and
                 sh.sheen_color_factor[0] == 0.0 and
                 sh.sheen_color_factor[1] == 0.0 and
@@ -980,15 +1015,32 @@ test "colorSlotImageFlags marks albedo/emissive images, not data slots" {
 test "uvTransformFromView reads KHR_texture_transform, identity when absent" {
     var view: c.cgltf_texture_view = std.mem.zeroes(c.cgltf_texture_view);
     // No extension: identity.
-    try std.testing.expect(uvTransformFromView(&view).isIdentity());
+    try std.testing.expect((try uvTransformFromView(&view)).isIdentity());
 
     // has_transform with offset/rotation/scale maps 1:1.
     view.has_transform = 1;
     view.transform.offset = .{ 0.25, -0.5 };
     view.transform.rotation = 1.5;
     view.transform.scale = .{ 2, 4 };
-    const t = uvTransformFromView(&view);
+    const t = try uvTransformFromView(&view);
     try testingExpected(t);
+}
+
+test "texture coordinate selection honors extension override and rejects unsupported sets" {
+    var view = std.mem.zeroes(c.cgltf_texture_view);
+    view.texcoord = 1;
+    try std.testing.expectEqual(@as(u1, 1), try textureCoordFromView(&view));
+    try std.testing.expectEqual(@as(u1, 1), (try uvTransformFromView(&view)).tex_coord);
+    view.has_transform = 1;
+    view.transform.has_texcoord = 1;
+    view.transform.texcoord = 0;
+    view.transform.scale = .{ 1, 1 };
+    try std.testing.expectEqual(@as(u1, 0), try textureCoordFromView(&view));
+    view.transform.texcoord = 2;
+    try std.testing.expectError(error.UnsupportedTextureCoordinate, textureCoordFromView(&view));
+    try std.testing.expectError(error.UnsupportedTextureCoordinate, uvTransformFromView(&view));
+    view.transform.texcoord = -1;
+    try std.testing.expectError(error.UnsupportedTextureCoordinate, textureCoordFromView(&view));
 }
 
 fn testingExpected(t: UvTransform) !void {

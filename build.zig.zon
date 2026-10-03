@@ -32,14 +32,11 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Vendored instead of fetched: the upstream bindings pass 4-byte
-        // resource handles to `extern fn`s by value, which Zig 0.16 widens to
-        // `i64` and materialises with an out-of-bounds 8-byte load (UB that
-        // ReleaseFast folds into a NULL pipeline id). See vendor/sokol/README.agate.md
-        // and tools/patch_sokol_handle_abi.py.
-        // Upstream: floooh/sokol-zig @fafdd96d1694f72fd3a261e25996d51c8b75f62e
+        // Workspace fork: ../sokol-zig contains the generated bindings and C
+        // sources from ../sokol. Both patches live in the forks, not scripts.
+        // Standalone distribution requires a published, pinned URL dependency.
         .sokol = .{
-            .path = "vendor/sokol",
+            .path = "../sokol-zig",
         },
     },
     .paths = .{
@@ -47,13 +44,10 @@
         "build.zig.zon",
         "API.md",
         "src",
-        // Path dependency: the patched sokol bindings travel with the package.
-        "vendor",
-        // Referenced by build.zig outside src/: vendored test runner (only
-        // needed for `zig build test`) and the user shader snippet dir backing
-        // the growing `user_shader_materials` table. Narrow paths to avoid
-        // shipping unrelated artifacts (e.g. tools/generate_font_sdf.py).
+        // Build inputs outside src/; exclude unrelated tools and assets.
         "tools/test_runner.zig",
+        "tools/bench_texture.zig",
         "examples/shader_materials",
+        "examples/render_target_basic.zig",
     },
 }

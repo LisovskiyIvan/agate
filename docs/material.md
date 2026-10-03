@@ -45,7 +45,7 @@ pub const Material = union(enum) {
     standard: *StandardMaterial,
     pbr: *PBRMaterial,
     shader: *ShaderMaterial,
-    pub fn isTransparent(self: Material) bool; // true только для .blend
+    pub fn isTransparent(self: Material) bool; // .blend или opt-in PBR refraction
     pub fn isCutout(self: Material) bool;      // .cutout: альфа-тест в opaque-очереди
     pub fn isDoubleSided(self: Material) bool;
     pub fn isUnlit(self: Material) bool;
@@ -139,7 +139,7 @@ pub const PBRMaterial = struct {
 | `emissive_texture` × `emissive_color` | Самосвечение | Да | Аддитивно поверх |
 | `environment_texture` | IBL-куб | Да | Интенсивность `environment_intensity` |
 
-`Channel` (`r/g/b/a`) — API для ручных материалов с не-glTF раскладкой ORM; glTF всегда использует фиксированные каналы. `UvTransform` — подмножество `KHR_texture_transform` (`uv' = R(rotation)·(scale·uv) + offset`, радианы, против часовой); второй UV-сет (`texCoord > 0`) не поддерживается — трансформ применяется к texcoord0.
+`Channel` (`r/g/b/a`) — API для ручных материалов с не-glTF раскладкой ORM; glTF всегда использует фиксированные каналы. `UvTransform` — `KHR_texture_transform` (`uv' = R(rotation)·(scale·uv) + offset`, радианы, против часовой). `tex_coord: u1 = 0` выбирает `Vertex.uv` или `Vertex.uv1` **до** трансформа. Выбор независим для каждого слота и работает в rigid/skinned/instanced-контурах. `Clearcoat.uv_transform` и `Sheen.uv_transform`: `null` сохраняет исторический albedo-трансформ ручных материалов; импорт glTF задаёт собственный трансформ каждого слота.
 
 Расширенные слои (все выключены по умолчанию, включение — скаляром, текстура сама по себе слой не включает; выключенный слой шейдит бит-идентично legacy):
 
@@ -148,10 +148,23 @@ pub const PBRMaterial = struct {
 | `Clearcoat{ intensity, roughness, color, mask_texture: ?Texture }` | `intensity == 0` → off | Диэлектрический лак: отдельный GGX-лоб, F0 = 0.04, база гасится на (1 − F_cc) |
 | `Sheen{ color, intensity, roughness, color_texture: ?Texture }` | `intensity == 0` → off | Тканевый fuzz-лоб (Charlie + Neubelt), аддитивно |
 | `Anisotropy{ intensity, rotation }` | `intensity == 0` → изотроп | Растяжение GGX-NDF вдоль касательных; `anisotropyAxes(roughness, intensity)` — CPU-зеркало |
-| `Transmission{ factor, color, ior }` | `factor == 0` → off | Дешёвая тонкослойная аппроксимация БЕЗ рефракции (albedo × (1−factor) + аддитивный back-light); настоящее стекло — через `alpha_mode.blend` |
+| `Transmission{ factor, color, ior, refract, thickness }` | `factor == 0` → off; `refract = false` по умолчанию | Legacy thin-slab; opt-in `refract = true` — screen-space преломление opaque-фона |
 | `Subsurface{ strength, color }` | `strength == 0` → off | Wrap-диффуз + back-scatter от солнца/эмбиента; `wrapNdotL(ndotl, strength)` — CPU-зеркало |
 
 `CoatParams` — render-side GPU-пак слоёв в side-table очереди (не в `MaterialDrawRecord` из-за лимита размера draw-записи); `coatParamsFor(mat)` собирает его из материала.
+
+### Преломление (v1, отключено по умолчанию)
+
+```zig
+const glass = try scene.createPBRMaterial("glass");
+glass.roughness = 0.05;
+glass.transmission = .{ .factor = 1, .refract = true, .ior = 1.5, .thickness = 0.7 };
+mesh.setPBRMaterial(glass);
+```
+
+Материал автоматически попадает в сортируемую blend-очередь с выключенной записью глубины; для цельного стекла оставьте `alpha = 1`, иначе фон смешается второй раз. Сцена после теней/зондов снимает **opaque-фон** в half-resolution color+depth RT, исключая стекло и другие transparent draws. Все три PBR-контура проецируют выход луча из оптической плиты (Snell, IOR), семплируют linear-фон, учитывают Fresnel и 5-tap roughness blur. Только текущие staged-данные; `renderReuse` не переснимает фон. Без opt-in RT не создаётся.
+
+Ограничения: одна камера, без transparent recursion, raymarch по глубине, offscreen-восстановления и refraction probes. При multi-camera или недоступном RT — legacy thin-slab fallback. `thickness` — заданная толщина, не восстановленный объём; не полная модель glTF volume/OpenPBR. glTF transmission остаётся legacy до явного `refract = true`. RT API — [render-target.md](./render-target.md).
 
 ### `ShaderMaterial` (`material/shader_mat.zig`)
 
@@ -235,6 +248,13 @@ Heitz 2014), итог `f_spec = D · Vis · F` (множитель `NdotL` пр�
 `shaders/common/pbr_brdf.glsl` и используются всеми тремя PBR-контурами
 (`pbr`, `instanced_pbr`, `skinned_pbr`), включая clearcoat-лоб.
 
+IBL использует height-correlated BRDF-LUT: `reflectance = mix(lut.r, lut.g, F0)`,
+`spec_ec = 1 + F0 * (1 / max(lut.g, 0.0001) - 1)`. Specular IBL умножается
+на `reflectance * spec_ec`, diffuse IBL — на `clamp(1 - reflectance * spec_ec)`.
+Аналитический Karis scale/bias здесь не смешивается с LUT. Clearcoat выбирает
+LUT по собственной roughness. Fixed-threshold `environment` gate: MAE 0.90,
+|Δ|>8 на 0.01% кадра; это не заявление о полном паритете всех IBL-сцен.
+
 Диффузная часть использует энергосохранённое альбедо
 `diffuse_albedo = albedo * (1 − dielectric_f0)`, `dielectric_f0 = 0.04`
 (`((ior−1)/(ior+1))²` при ior 1.5) — как `surfaceAlbedo` в Babylon под
@@ -260,7 +280,7 @@ Heitz 2014), итог `f_spec = D · Vis · F` (множитель `NdotL` пр�
 | `setUniform` с неизвестным именем/типом | `shader_material.SetUniformError` (имя/тип mismatch) |
 | `initForShader` для незарегистрированного шейдера | `null` |
 | Текстура слоя (clearcoat/sheen) при нулевой интенсивности | Слой выключен, текстура игнорируется (null side-table) |
-| `texCoord > 0` из glTF | Игнорируется, используется texcoord0 (задокументированное ограничение) |
+| `texCoord = 1` из glTF | UV1; наборы > 1 отклоняются, см. `./loader.md` |
 | `normal_scale == 0` | Плоская геометрическая нормаль |
 | `alpha_cutoff` при `opaque/blend` | Загружается 0.0, тест не срабатывает |
 | Анизотропия без авторских касательных | Фолбэк +X (glTF-дефолт), не ошибка |

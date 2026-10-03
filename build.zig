@@ -91,7 +91,7 @@ pub const user_shader_materials = [_]UserShaderMaterial{
 //   mesh.material = .{ .shader_material = mat };
 //
 // sokol/shdc resolve THROUGH dep_agate.builder, so the downstream shares
-// agate's single sokol module instance (no second vendor/sokol dependency,
+// agate's single sokol module instance (no second sokol dependency,
 // no duplicate sg state). Pass the same target/optimize you used for the
 // agate dependency itself. The generated module unconditionally
 // `@import("math")`, wired here to agate's math facade.
@@ -150,6 +150,14 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
 pub fn getEmsdk(dep_agate: *Build.Dependency) *Build.Dependency {
     const dep_sokol = dep_agate.builder.dependency("sokol", .{});
     return dep_sokol.builder.dependency("emsdk", .{});
+}
+
+/// Path to the sokol web shell (downstream wasm link steps). Resolves the
+/// sokol package through agate's dependency graph, so downstream projects
+/// do not need their own sokol dependency.
+pub fn sokolShellPath(dep_agate: *Build.Dependency) Build.LazyPath {
+    const dep_sokol = dep_agate.builder.dependency("sokol", .{});
+    return dep_sokol.path("src/sokol/web/shell.html");
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +608,34 @@ pub fn build(b: *Build) !void {
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the window").dependOn(&run.step);
+    const bench_texture = b.addExecutable(.{
+        .name = "bench-texture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench_texture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "agate", .module = mod_agate }},
+        }),
+    });
+    const run_bench_texture = b.addRunArtifact(bench_texture);
+    if (b.args) |args| run_bench_texture.addArgs(args);
+    b.step("bench-texture", "Measure bit-identical sRGB conversion and mip generation").dependOn(&run_bench_texture.step);
+    const rtt_smoke = b.addExecutable(.{
+        .name = "rtt-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/render_target_basic.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sokol", .module = mod_sokol },
+                .{ .name = "agate", .module = mod_agate },
+            },
+        }),
+    });
+    b.installArtifact(rtt_smoke);
+    const run_rtt = b.addRunArtifact(rtt_smoke);
+    if (b.args) |args| run_rtt.addArgs(args);
+    b.step("example-rtt", "Run render-target and refraction smoke (needs GPU/display)").dependOn(&run_rtt.step);
     const lib_tests = b.addTest(.{
         .root_module = mod_agate,
         // Vendored runner (tools/test_runner.zig): stock 0.16.0 fails to
@@ -645,7 +681,7 @@ pub fn build(b: *Build) !void {
 // Shaders whose spec sets `.includes = true` go through the host
 // expand_shader_includes tool first; the expanded LazyPath then feeds a
 // MANUAL shdc invocation that replicates sokol.shdc.createModule's argv
-// exactly for the given slang set (verified against the vendored
+// exactly for the given slang set (verified against the dependency's
 // sokol-tools-bin build.zig: `-l <slang> -f sokol_zig --no-log-cmdline
 // --input X --output Y`; no defines/module/reflection/bytecode/dump/
 // genver/ifdef/tmpdir — all default-off like the wrapper). createModule
@@ -659,7 +695,7 @@ const IncludeShaderSpec = struct {
     slang: sokol.shdc.Slang,
 };
 
-/// Slang set to shdc `-l` string. Copy of the vendored wrapper's
+/// Slang set to shdc `-l` string. Copy of the dependency wrapper's
 /// slangToString (field order = declaration order of sokol.shdc.Slang).
 fn includeSlangToString(b: *Build, slang: sokol.shdc.Slang) []const u8 {
     var parts: std.ArrayListUnmanaged([]const u8) = .empty;

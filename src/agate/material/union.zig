@@ -134,5 +134,10 @@ pub fn coatParamsFor(mat: ?Material) ?CoatParams {
         .transmission_color = .{ p.transmission.color.r, p.transmission.color.g, p.transmission.color.b, 1.0 },
         .sss_factors = .{ p.subsurface.strength, 0, 0, 0 },
         .sss_color = .{ p.subsurface.color.r, p.subsurface.color.g, p.subsurface.color.b, 1.0 },
+        .clearcoat_uv_matrix = (p.clearcoat.uv_transform orelse p.albedo_uv_transform).matrixRows(),
+        .clearcoat_uv_offset = (p.clearcoat.uv_transform orelse p.albedo_uv_transform).offsetPacked(),
+        .sheen_uv_matrix = (p.sheen.uv_transform orelse p.albedo_uv_transform).matrixRows(),
+        .sheen_uv_offset = (p.sheen.uv_transform orelse p.albedo_uv_transform).offsetPacked(),
+        .refraction_factors = p.transmission.refractionPacked(),
     };
 }

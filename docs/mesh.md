@@ -53,6 +53,7 @@ pub const Vertex = extern struct {
     tangent: [4]f32 = .{ 1, 0, 0, 1 },
     joints: [4]f32 = .{ 0, 0, 0, 0 },
     weights: [4]f32 = .{ 1, 0, 0, 0 },
+    uv1: [2]f32 = .{ 0, 0 },
 };
 pub const CullingStrategy = enum { frustum, occlusion, always_render };
 pub const MAX_MORPH_TARGETS: usize = 8;
@@ -147,6 +148,12 @@ pub fn pickOrthogonal(n: Vec3) Vec3;
 
 Пересчёт по месту, сложность O(V+T). Используются загрузчиками и CSG-выходом.
 
+`mesh.tangents.computeTangentsForUv(..., tex_coord: u1)` выбирает UV0/UV1;
+обычный `computeTangents` остаётся UV0. glTF-загрузчик выбирает набор normal map
+при отсутствии авторских касательных. QEM и CSG копируют оба UV-набора и
+интерполируют их при collapse/split (покрыто тестами). CSG из одних
+`cpu_positions/cpu_indices` не имеет ни UV0, ни UV1 — оба остаются нулевыми.
+
 ### CSG (`csg.zig`)
 
 BSP-булевы операции над твёрдыми телами: `CSG.unionWith/subtract/intersect(other) !CSG`, узлы `CSGNode` (`build/clipTo/clipPolygons/allPolygons/fromPolygons`), полигоны `CSGPolygon` (`init/clone/flip`), плоскости `CSGPlane` (`fromPoints/splitPolygon`, `EPSILON = 1e-5`). Результат публикуется через `MeshBuilder.createCSG(scene, name, &csg_solid)`. Сложность зависит от числа полигонов BSP-дерева; аллокации — на аллокаторе сцены.
@@ -167,6 +174,11 @@ pub fn blendSkinWeights(...) ...;
 ```
 
 Проектор вырезает геометрию целевого меша в боксе проектора (требует `cpu_positions/cpu_indices`). Скиннинг переносится через `blendSkinWeights`.
+
+Декаль создаёт **собственную проекторную UV0**, не копирует текстурные
+координаты поверхности. UV1 остаётся нулевым, как у остальных одноканальных
+процедурных builders; материал декали должен выбирать UV0, если UV1 не
+задан вручную. Это генерация нового mapping, не потеря импортированного UV1.
 
 ### Линии и шлейфы (`greased_line.zig`, `trail.zig`)
 

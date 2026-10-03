@@ -118,7 +118,7 @@ pub const PBRMaterial = struct {
     }
 
     pub fn isTransparent(self: PBRMaterial) bool {
-        return self.alpha_mode == .blend;
+        return self.alpha_mode == .blend or self.transmission.isRefractive();
     }
 
     /// Cutout is NOT transparent: it stays in the opaque queue with depth

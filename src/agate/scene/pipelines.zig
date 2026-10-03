@@ -47,6 +47,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
             desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
             desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            desc.layout.attrs[shd.ATTR_standard_texcoord1] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
         },
         .pbr => {
             desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
@@ -54,6 +55,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[pbr_shd.ATTR_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
             desc.layout.attrs[pbr_shd.ATTR_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
             desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord1] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
             desc.layout.attrs[pbr_shd.ATTR_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
         },
         .instanced => {
@@ -62,6 +64,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
             desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
             desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            desc.layout.attrs[inst_shd.ATTR_instanced_texcoord1] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
 
             desc.layout.buffers[1] = .{
                 .step_func = .PER_INSTANCE,
@@ -80,6 +83,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[inst_pbr_shd.ATTR_instanced_pbr_tangent] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
             desc.layout.attrs[inst_pbr_shd.ATTR_instanced_pbr_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
             desc.layout.attrs[inst_pbr_shd.ATTR_instanced_pbr_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            desc.layout.attrs[inst_pbr_shd.ATTR_instanced_pbr_texcoord1] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
 
             desc.layout.buffers[1] = .{
                 .step_func = .PER_INSTANCE,
@@ -97,6 +101,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
+            desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_texcoord1] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_joints] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "joints") };
             desc.layout.attrs[skinned_pbr_shd.ATTR_skinned_pbr_weights] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "weights") };

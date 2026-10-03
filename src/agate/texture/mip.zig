@@ -45,15 +45,20 @@ pub fn boxDownsampleU8(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w
     while (y < dst_h) : (y += 1) {
         const sy0 = @min(y * 2, src_h - 1);
         const sy1 = @min(y * 2 + 1, src_h - 1);
+        // Hoisted row bases: identical taps/offsets as before, fewer
+        // per-pixel multiplies on the NPOT tail path.
+        const row0: usize = @as(usize, sy0) * @as(usize, src_w) * 4;
+        const row1: usize = @as(usize, sy1) * @as(usize, src_w) * 4;
+        const dst_row: usize = @as(usize, y) * @as(usize, dst_w) * 4;
         var x: u32 = 0;
         while (x < dst_w) : (x += 1) {
             const sx0 = @min(x * 2, src_w - 1);
             const sx1 = @min(x * 2 + 1, src_w - 1);
-            const q00 = (sy0 * src_w + sx0) * 4;
-            const q10 = (sy0 * src_w + sx1) * 4;
-            const q01 = (sy1 * src_w + sx0) * 4;
-            const q11 = (sy1 * src_w + sx1) * 4;
-            const o = (y * dst_w + x) * 4;
+            const q00 = row0 + @as(usize, sx0) * 4;
+            const q10 = row0 + @as(usize, sx1) * 4;
+            const q01 = row1 + @as(usize, sx0) * 4;
+            const q11 = row1 + @as(usize, sx1) * 4;
+            const o = dst_row + @as(usize, x) * 4;
             inline for (0..4) |ch| {
                 const sum: u32 = @as(u32, src[q00 + ch]) + @as(u32, src[q10 + ch]) + @as(u32, src[q01 + ch]) + @as(u32, src[q11 + ch]);
                 dst[o + ch] = @intCast((sum + 2) >> 2);

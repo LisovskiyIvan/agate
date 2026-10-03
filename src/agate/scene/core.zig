@@ -319,6 +319,8 @@ pub const Scene = struct {
     postfx: scene_postfx.PostFXStack,
     // Forward GPU pipeline sets (opaque/blend/double-sided per family).
     forward: scene_forward.ForwardPipelines,
+    /// Context-thread owned; created lazily for opt-in refractive draws.
+    refraction: @import("refraction.zig").RefractionCapture = .{},
     // Particle systems + billboard pass.
     particles: scene_particles.ParticleLayer,
     /// Stage 3, slice 2: light selection + packing (including the

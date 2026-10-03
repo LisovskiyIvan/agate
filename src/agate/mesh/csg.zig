@@ -20,6 +20,7 @@ pub const CSGVertex = struct {
     pos: Vec3,
     normal: Vec3,
     uv: Vec2 = Vec2.new(0.0, 0.0),
+    uv1: Vec2 = Vec2.new(0.0, 0.0),
     color: Color4 = Color4.new(1.0, 1.0, 1.0, 1.0),
 
     pub fn interpolate(self: CSGVertex, other: CSGVertex, t: f32) CSGVertex {
@@ -37,6 +38,10 @@ pub const CSGVertex = struct {
             .uv = Vec2.new(
                 self.uv.x + (other.uv.x - self.uv.x) * clamped_t,
                 self.uv.y + (other.uv.y - self.uv.y) * clamped_t,
+            ),
+            .uv1 = Vec2.new(
+                self.uv1.x + (other.uv1.x - self.uv1.x) * clamped_t,
+                self.uv1.y + (other.uv1.y - self.uv1.y) * clamped_t,
             ),
             .color = Color4.new(
                 self.color.r + (other.color.r - self.color.r) * clamped_t,
@@ -595,18 +600,21 @@ pub const CSG = struct {
                     .pos = p0,
                     .normal = n0,
                     .uv = Vec2.new(v0_src.uv[0], v0_src.uv[1]),
+                    .uv1 = Vec2.new(v0_src.uv1[0], v0_src.uv1[1]),
                     .color = Color4.new(v0_src.color[0], v0_src.color[1], v0_src.color[2], v0_src.color[3]),
                 },
                 .{
                     .pos = p1,
                     .normal = n1,
                     .uv = Vec2.new(v1_src.uv[0], v1_src.uv[1]),
+                    .uv1 = Vec2.new(v1_src.uv1[0], v1_src.uv1[1]),
                     .color = Color4.new(v1_src.color[0], v1_src.color[1], v1_src.color[2], v1_src.color[3]),
                 },
                 .{
                     .pos = p2,
                     .normal = n2,
                     .uv = Vec2.new(v2_src.uv[0], v2_src.uv[1]),
+                    .uv1 = Vec2.new(v2_src.uv1[0], v2_src.uv1[1]),
                     .color = Color4.new(v2_src.color[0], v2_src.color[1], v2_src.color[2], v2_src.color[3]),
                 },
             };
@@ -657,6 +665,8 @@ pub const CSG = struct {
                     .position = p.toArray(),
                     .normal = .{ 0.0, 1.0, 0.0 },
                     .uv = .{ 0.0, 0.0 },
+                    // CPU-position fallback genuinely lacks UVs: keep both sets zeroed.
+                    .uv1 = .{ 0.0, 0.0 },
                     .color = .{ 1.0, 1.0, 1.0, 1.0 },
                 };
             }
@@ -725,6 +735,7 @@ pub const CSG = struct {
                         .position = tv.pos.toArray(),
                         .normal = tv.normal.toArray(),
                         .uv = .{ tv.uv.x, tv.uv.y },
+                        .uv1 = .{ tv.uv1.x, tv.uv1.y },
                         .color = tv.color.toArray(),
                         .tangent = .{ 1.0, 0.0, 0.0, 1.0 },
                     };
@@ -755,3 +766,91 @@ pub const CSG = struct {
         return uploadGeometry(scene, name, data);
     }
 };
+
+test "CSG: interpolate splits uv and uv1 independently" {
+    const a = CSGVertex{
+        .pos = Vec3.new(0, 0, 0),
+        .normal = Vec3.new(0, 0, 1),
+        .uv = Vec2.new(0, 0),
+        .uv1 = Vec2.new(5, 7),
+    };
+    const b = CSGVertex{
+        .pos = Vec3.new(1, 0, 0),
+        .normal = Vec3.new(0, 0, 1),
+        .uv = Vec2.new(1, 1),
+        .uv1 = Vec2.new(15, 17),
+    };
+    const m = a.interpolate(b, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), m.uv.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), m.uv.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), m.uv1.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), m.uv1.y, 1e-6);
+}
+
+test "CSG: multiUV uv1 survives fromGeometryData/toGeometryData roundtrip" {
+    const ally = std.testing.allocator;
+    var quad_verts = [_]Vertex{
+        .{ .position = .{ -1, -1, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 0, 0 }, .uv1 = .{ 5, 7 } },
+        .{ .position = .{ 1, -1, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 1, 0 }, .uv1 = .{ 15, 7 } },
+        .{ .position = .{ 1, 1, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 1, 1 }, .uv1 = .{ 15, 17 } },
+        .{ .position = .{ -1, 1, 0 }, .normal = .{ 0, 0, 1 }, .color = .{ 1, 1, 1, 1 }, .uv = .{ 0, 1 }, .uv1 = .{ 5, 17 } },
+    };
+    var quad_idx = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    const quad = GeometryData{
+        .vertices = &quad_verts,
+        .indices = &quad_idx,
+        .bounds = BoundingBox.init(Vec3.new(-1, -1, 0), Vec3.new(1, 1, 0)),
+    };
+    var csg = try CSG.fromGeometryData(ally, quad, null);
+    defer csg.deinit();
+    var out = try csg.toGeometryData(ally);
+    defer out.deinit(ally);
+
+    try std.testing.expectEqual(@as(usize, 6), out.vertices.len);
+    // Fan triangulation preserves the input triangles exactly; each output
+    // uv1 must match one of the distinct input uv1 corners.
+    const corners = [4][2]f32{ .{ 5, 7 }, .{ 15, 7 }, .{ 15, 17 }, .{ 5, 17 } };
+    for (out.vertices) |v| {
+        var hit = false;
+        for (corners) |c| {
+            if (@abs(v.uv1[0] - c[0]) < 1e-5 and @abs(v.uv1[1] - c[1]) < 1e-5) hit = true;
+        }
+        try std.testing.expect(hit);
+        // Distinct from uv0 (uv in [0,1], uv1 in [5,15]x[7,17]).
+        try std.testing.expect(v.uv1[0] > 1.0 and v.uv1[1] > 1.0);
+    }
+}
+
+test "CSG: multiUV uv1 survives real boolean union" {
+    const ally = std.testing.allocator;
+    var box_a = try builders.buildBoxData(ally, .{ .width = 2.0, .height = 2.0, .depth = 2.0 });
+    defer box_a.deinit(ally);
+    var box_b = try builders.buildBoxData(ally, .{ .width = 2.0, .height = 2.0, .depth = 2.0 });
+    defer box_b.deinit(ally);
+    // Paint distinct channels: uv stays builder-provided, uv1 is offset far away.
+    for (box_a.vertices) |*v| v.uv1 = .{ v.uv[0] * 10.0 + 5.0, v.uv[1] * 10.0 + 7.0 };
+    for (box_b.vertices) |*v| v.uv1 = .{ v.uv[0] * 10.0 + 5.0, v.uv[1] * 10.0 + 7.0 };
+
+    var csg_a = try CSG.fromGeometryData(ally, box_a, null);
+    defer csg_a.deinit();
+    var csg_b = try CSG.fromGeometryData(ally, box_b, Mat4.translation(Vec3.new(1, 0, 0)));
+    defer csg_b.deinit();
+
+    var joined = try csg_a.unionWith(&csg_b);
+    defer joined.deinit();
+    var out = try joined.toGeometryData(ally);
+    defer out.deinit(ally);
+
+    try std.testing.expect(out.vertices.len > 0);
+    // Split planes interpolate new verts: every output uv1 must lie within
+    // the painted input range and keep the 10x+offset split from uv0.
+    var saw_nonzero_uv1 = false;
+    for (out.vertices) |v| {
+        try std.testing.expect(v.uv1[0] >= 5.0 - 1e-3 and v.uv1[0] <= 15.0 + 1e-3);
+        try std.testing.expect(v.uv1[1] >= 7.0 - 1e-3 and v.uv1[1] <= 17.0 + 1e-3);
+        try std.testing.expectApproxEqAbs(10.0 * v.uv[0] + 5.0, v.uv1[0], 1e-3);
+        try std.testing.expectApproxEqAbs(10.0 * v.uv[1] + 7.0, v.uv1[1], 1e-3);
+        if (v.uv1[0] != 0.0 or v.uv1[1] != 0.0) saw_nonzero_uv1 = true;
+    }
+    try std.testing.expect(saw_nonzero_uv1);
+}

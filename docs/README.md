@@ -10,6 +10,7 @@
 | Файл | О чём |
 |---|---|
 | [architecture.md](./architecture.md) | Слои движка, модель потоков (game/context/audio/io_runner), lock-free staged prepare одной страницей, владение GPU-ресурсами, сборка, тесты и гейты, карта модулей |
+| [graphics-roadmap.md](./graphics-roadmap.md) | План качества/перфа: HDR и IBL сначала, предпосылки GI/temporal/indirect, гейты и стоп-условия |
 
 ## Ядро и потоки
 
@@ -26,10 +27,12 @@
 | Файл | О чём |
 |---|---|
 | [mesh.md](./mesh.md) | `Mesh`/`InstancedMesh`/LOD, `GeometryData` + `uploadGeometry`, все построители, CSG, декали, GreasedLine, TrailMesh, морфы (.cpu/.gpu), QEM-упрощение, VAT |
-| [material.md](./material.md) | Standard/PBR (clearcoat/sheen/aniso/thin-film/SSS), unlit, alpha-режимы, shader-материалы, node-материалы (граф), библиотека пресетов |
+| [material.md](./material.md) | Standard/PBR (UV0/UV1, clearcoat/sheen/aniso/transmission/SSS, opt-in refraction), unlit, alpha-режимы, shader-материалы, node-материалы (граф), библиотека пресетов |
 | [lights.md](./lights.md) | 7 типов света, лимиты и тени по типам, sun-резолверы, цветовая температура |
 | [cameras.md](./cameras.md) | 5 камер с инерцией, `Camera`-union, viewport'ы, риги (dual/quad/CAD/stereo VR), PIP |
 | [texture.md](./texture.md) | PNG/JPEG/HDR/EXR/DDS/KTX2+Basis, мипмапы, sRGB, cube-текстуры, capacities |
+| [render-target.md](./render-target.md) | Render-to-texture: color/depth/MSAA resolve, borrowed Texture, resize, GPU smoke |
+| [loading-performance.md](./loading-performance.md) | Опциональные замеры glTF по стадиям, побайтово совместимое ускорение sRGB+mips |
 | [loader.md](./loader.md) | glTF/GLB-конвейер + OBJ/STL/PLY/meshopt, `LoadOptions` (в т.ч. `morph_mode`), async-загрузка |
 | [export.md](./export.md) | Экспорт OBJ+MTL, STL, GLB |
 | [assets.md](./assets.md) | `UploadQueue` (дедупликация, покадровые бюджеты), `AssetManager`, `io_runner` |

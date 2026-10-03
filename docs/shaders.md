@@ -4,7 +4,7 @@
 
 ## Что это
 
-Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппетов в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang», компилирующая каждый шейдер под три бэкенда. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
+Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппетов в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang» для GL, Metal, D3D11 и WebGPU. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
 
 Ключевое ограничение, породившее всю механику: sokol-shdc не поддерживает `#include` (проверено: `#include` падает в glslang, флага `-I` у вендорного бинарника нет). Поэтому sharing — текстовая подстановка `// @include "common/<file>"` хост-утилитой `expand_shader_includes` (см. `shader_material/include.zig`) до запуска shdc.
 
@@ -56,10 +56,10 @@ mesh.material = .{ .shader_material = mat };
 
 | Набор | Леги | Кто |
 |---|---|---|
-| `default_slang` | glsl410 + metal_macos + hlsl5 | большинство шейдеров (Linux GL / macOS Metal / Windows D3D11) |
-| `forward_slang` | glsl430 + metal_macos + hlsl5 | 5 forward-шейдеров (SSBO-кластеры невалидны в GLSL 4.10) |
-| compute-набор | glsl430 + metal_macos + hlsl5 | `particle_compute` (в 410 нет compute) |
-| `engine_shader_slang` | glsl430 + metal_macos + hlsl5 | пользовательские шейдеры через `compileUserShader`, hook-merge |
+| `default_slang` | glsl410 + metal_macos + hlsl5 + wgsl | большинство шейдеров (GL / Metal / D3D11 / WebGPU) |
+| `forward_slang` | glsl430 + metal_macos + hlsl5 + wgsl | 5 forward-шейдеров (SSBO-кластеры невалидны в GLSL 4.10) |
+| compute-набор | glsl430 + metal_macos + hlsl5 + wgsl | `particle_compute` (в 410 нет compute) |
+| `engine_shader_slang` | glsl430 + metal_macos + hlsl5 + wgsl | пользовательские шейдеры через `compileUserShader`, hook-merge |
 
 Таблица (`ShaderSpec`: `name`, `input`, `output`, `slang?`, `includes`):
 
@@ -177,7 +177,7 @@ pub fn uniformBytes(storage: *const UniformStorage) []const u8
 ### compileUserShader (`build.zig`)
 
 ```zig
-pub const engine_shader_slang = sokol.shdc.Slang{ .glsl430 = true, .metal_macos = true, .hlsl5 = true };
+pub const engine_shader_slang = sokol.shdc.Slang{ .glsl430 = true, .metal_macos = true, .hlsl5 = true, .wgsl = true };
 pub const UserShaderSpec = struct {
     name: []const u8, input: []const u8, output: ?[]const u8 = null,
     slang: ?sokol.shdc.Slang = null, // default engine_shader_slang
@@ -186,7 +186,7 @@ pub const UserShaderSpec = struct {
 pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShaderSpec) !*Build.Module
 ```
 
-Внешний путь НЕ идёт через merge/expand (свои инклуды проект организует сам). Резолв sokol/shdc — через `dep_agate.builder`, поэтому downstream делит один инстанс sokol-модуля (без второй зависимости vendor/sokol и дублирования sg-состояния). Пустой `name`/`input` → `error.UserShaderBadSpec`. Ручной argv-эквивалент `createModule` задокументирован рядом (`-l <slang> -f sokol_zig`, genver/ifdef/tmpdir выключены как у враппера).
+Внешний путь НЕ идёт через merge/expand (свои инклуды проект организует сам). Резолв sokol/shdc — через `dep_agate.builder`, поэтому downstream делит один инстанс sokol-модуля (без второй зависимости sokol и дублирования sg-состояния). Пустой `name`/`input` → `error.UserShaderBadSpec`. Ручной argv-эквивалент `createModule` задокументирован рядом (`-l <slang> -f sokol_zig`, genver/ifdef/tmpdir выключены как у враппера).
 
 ### Drift-тесты (`shader_material/include.zig`)
 

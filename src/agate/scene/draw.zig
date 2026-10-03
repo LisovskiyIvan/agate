@@ -81,6 +81,12 @@ pub const Environment = struct {
     // Scene-level fragment uniform inputs; mesh.receive_shadows is patched
     // per draw before building the shader uniforms.
     shadow_uniforms: uniforms.ShadowState,
+    capture_opaque_only: bool = false,
+    gamma_override: ?bool = null,
+    refraction_view: sg.View = .{},
+    refraction_sampler: sg.Sampler = .{},
+    refraction_view_proj: Mat4 = Mat4.identity,
+    refraction_capture: [4]f32 = .{ 0, 1, 1, 0 }, // valid, width, height
 };
 
 // Draws one regular (non-instanced) queue item: pipeline select, bind,
@@ -148,6 +154,8 @@ pub fn drawRegularItem(
         // record when unset); sampled through data_smp, no extra sampler.
         bind.views[pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
         bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+        bind.views[pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
+        bind.samplers[pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
         bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
         // Babylon env-BRDF lookup: scales the analytic specular sum and the
@@ -231,6 +239,13 @@ pub fn drawRegularItem(
             .transmission_color = coat.transmission_color,
             .sss_factors = coat.sss_factors,
             .sss_color = coat.sss_color,
+            .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
+            .clearcoat_uv_offset = coat.clearcoat_uv_offset,
+            .sheen_uv_matrix = coat.sheen_uv_matrix,
+            .sheen_uv_offset = coat.sheen_uv_offset,
+            .refraction_factors = coat.refraction_factors,
+            .refraction_view_proj = env.refraction_view_proj,
+            .refraction_capture = env.refraction_capture,
             .shadow_params = f.shadow_params,
             .shadow_splits = f.shadow_splits,
             .cascade_view_proj = f.cascade_view_proj,
@@ -414,6 +429,8 @@ fn drawShaderMaterialItem(
             bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
             bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
+            bind.views[pbr_shd.VIEW_refraction_tex] = env.default_white.view;
+            bind.samplers[pbr_shd.SMP_refraction_smp] = env.default_white.sampler;
             bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
             // Reflection probe (wave 25): hook materials resolve like
             // regular draws (per-object selection from the model).
@@ -456,6 +473,13 @@ fn drawShaderMaterialItem(
                 .transmission_color = material_mod.CoatParams.neutral.transmission_color,
                 .sss_factors = material_mod.CoatParams.neutral.sss_factors,
                 .sss_color = material_mod.CoatParams.neutral.sss_color,
+                .clearcoat_uv_matrix = material_mod.CoatParams.neutral.clearcoat_uv_matrix,
+                .clearcoat_uv_offset = material_mod.CoatParams.neutral.clearcoat_uv_offset,
+                .sheen_uv_matrix = material_mod.CoatParams.neutral.sheen_uv_matrix,
+                .sheen_uv_offset = material_mod.CoatParams.neutral.sheen_uv_offset,
+                .refraction_factors = material_mod.CoatParams.neutral.refraction_factors,
+                .refraction_view_proj = Mat4.identity,
+                .refraction_capture = .{ 0, 1, 1, 0 },
                 .shadow_params = f.shadow_params,
                 .shadow_splits = f.shadow_splits,
                 .cascade_view_proj = f.cascade_view_proj,
@@ -778,6 +802,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         // PBR layers v1: see the regular PBR branch above.
         bind.views[inst_pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
         bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+        bind.views[inst_pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
+        bind.samplers[inst_pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
         bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
         bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
         // Babylon env-BRDF lookup: scales the analytic specular sum and the
@@ -864,6 +890,13 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
             .transmission_color = coat.transmission_color,
             .sss_factors = coat.sss_factors,
             .sss_color = coat.sss_color,
+            .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
+            .clearcoat_uv_offset = coat.clearcoat_uv_offset,
+            .sheen_uv_matrix = coat.sheen_uv_matrix,
+            .sheen_uv_offset = coat.sheen_uv_offset,
+            .refraction_factors = coat.refraction_factors,
+            .refraction_view_proj = env.refraction_view_proj,
+            .refraction_capture = env.refraction_capture,
         };
         sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
     } else {

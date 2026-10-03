@@ -32,6 +32,7 @@ in vec3 position;
 in vec3 normal;
 in vec4 color0;
 in vec2 texcoord0;
+in vec2 texcoord1;
 
 // Shader material hook 'decls' (vertex stage): the same generated
 // sm_user_params uniform block as the fs-side hook, for snippets that use
@@ -43,6 +44,7 @@ out vec3 v_world_pos;
 out vec3 v_normal;
 out vec4 v_color;
 out vec2 v_uv;
+out vec2 v_uv1;
 
 // One RGBA32F texel (xyz) at strip position idx; exact texel centers with
 // NEAREST filtering, so no filtering support is needed for float textures.
@@ -98,6 +100,7 @@ void main() {
     v_normal = mat3(model) * morphed_nrm;
     v_color = color0;
     v_uv = texcoord0;
+    v_uv1 = texcoord1;
 }
 @end
 
@@ -228,6 +231,7 @@ in vec3 v_world_pos;
 in vec3 v_normal;
 in vec4 v_color;
 in vec2 v_uv;
+in vec2 v_uv1;
 
 out vec4 frag_color;
 
@@ -566,4 +570,3 @@ void main() {
 @end
 
 @program standard vs fs
-

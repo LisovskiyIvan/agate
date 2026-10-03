@@ -80,7 +80,7 @@ pub const DecodeOptions = struct {
 ```zig
 pub fn mipLevelCount(width: u32, height: u32) u32;
 pub fn getGpuMemoryBytes(self: *const Texture) usize; // все уровни, через pixelFormatBytes
-pub fn deinit(self: *Texture) void;                   // image + view + sampler
+pub fn deinit(self: *Texture) void;                   // image + view + sampler; borrow — no-op
 pub fn createWhite1x1/createBlack1x1/createFlatNormal1x1() Texture;
 pub fn createCheckerboard(...) Texture;
 pub fn createDefaultParticleDot32() Texture;
@@ -137,6 +137,11 @@ pub const CubeTexture = struct {
 ## Потоки и владение
 
 `Texture`/`CubeTexture` владеют sg-хендлами (image, view, sampler): создание и `deinit` — только на context-потоке. Декодирование (`decode*`, `buildRaw`, контейнерные `decode`) — чистые CPU-функции, безопасны на worker-потоках; именно их выполняет `UploadQueue`/`io_runner` (см. `./assets.md`). Сырые контейнеры (`RawTexture`, `RawHdrTexture`, `RawBlockTexture`, `DecodedImage`, `RawCubeMips`) владеют CPU-буферами и освобождаются через `deinit(allocator)` на любом потоке. Материальные слоты изначально null (рендерится `default_white`), патч — через `PendingTexture.addTarget`.
+
+Исключение: `RenderTarget.asTexture()` возвращает borrowed `Texture` с
+`owns_handles = false` (`deinit` — no-op). Сам RT остаётся владельцем;
+его resize/deinit инвалидирует borrow. Обновляйте текстуру материала до
+prepare, не replay'ьте старые draws после уничтожения views.
 
 ## Ошибки и краевые случаи
 

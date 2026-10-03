@@ -38,6 +38,21 @@ const ShaderDrawSnapshot = draw_record.ShaderDrawSnapshot;
 const buildShaderSnapshot = draw_record.buildShaderSnapshot;
 const buildDrawRecord = draw_record.buildDrawRecord;
 
+test "refraction is opt-in, staged and classified as transparent" {
+    var mat = PBRMaterial.init("glass");
+    mat.transmission.factor = 1;
+    try std.testing.expect(!mat.isTransparent());
+    mat.transmission.refract = true;
+    mat.transmission.thickness = 0.7;
+    try std.testing.expect(mat.isTransparent());
+    const cp = coatParamsFor(.{ .pbr = &mat }).?;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0.7, 1.5, 0 }, &cp.refraction_factors);
+    mat.transmission.ior = 0;
+    try std.testing.expectEqual(@as(f32, 1), mat.transmission.refractionPacked()[2]);
+    mat.transmission.factor = 0;
+    try std.testing.expect(!mat.isTransparent());
+}
+
 test "alpha_mode defaults to opaque (back-compat)" {
     const std_mat = StandardMaterial.init("m");
     try std.testing.expect(std_mat.alpha_mode == .@"opaque");

@@ -304,3 +304,90 @@ test "boxDownsampleU8 rounds the 4-tap sum half-up" {
     mip.boxDownsampleU8(&half, 2, 2, &dst, 1, 1);
     try std.testing.expectEqual(@as(u8, 1), dst[0]);
 }
+
+test "buildRawSrgbFused is bit-identical to convert-in-place + buildRaw" {
+    const allocator = std.testing.allocator;
+    // Varied RGB + alpha (alpha must pass through untouched), 2x2 so the
+    // 2:1 mip fast path also runs in both constructions.
+    const rgba = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   0,
+        0,   0,   255, 128,
+        96,  200, 25,  7,
+    };
+
+    // Classic path: convert a copy in place, then buildRaw with mips.
+    const classic_src = try allocator.dupe(u8, &rgba);
+    defer allocator.free(classic_src);
+    color.convertSrgbToLinearInPlace(classic_src);
+    var classic = try Texture.buildRaw(allocator, 2, 2, classic_src, true);
+    defer classic.deinit(allocator);
+
+    // Fused path: single convert-copy + same chain.
+    var fused = try Texture.buildRawSrgbFused(allocator, 2, 2, &rgba, true);
+    defer fused.deinit(allocator);
+
+    try std.testing.expectEqual(classic.num_levels, fused.num_levels);
+    for (0..classic.num_levels) |m| {
+        try std.testing.expectEqualSlices(u8, classic.levels[m].?, fused.levels[m].?);
+    }
+}
+
+test "buildRawSrgbFused preserves 1px, NPOT and alpha edge cases" {
+    const allocator = std.testing.allocator;
+
+    // 1x1: single level, alpha untouched.
+    {
+        const px = [_]u8{ 200, 128, 25, 42 };
+        var raw = try Texture.buildRawSrgbFused(allocator, 1, 1, &px, true);
+        defer raw.deinit(allocator);
+        try std.testing.expectEqual(@as(u32, 1), raw.num_levels);
+        try std.testing.expectEqual(color.srgbToLinearU8(200), raw.levels[0].?[0]);
+        try std.testing.expectEqual(color.srgbToLinearU8(128), raw.levels[0].?[1]);
+        try std.testing.expectEqual(color.srgbToLinearU8(25), raw.levels[0].?[2]);
+        try std.testing.expectEqual(@as(u8, 42), raw.levels[0].?[3]);
+    }
+
+    // NPOT 3x1 with mips: level count/shape follow mipLevelCount, tail
+    // behavior unchanged (generic clamped path).
+    {
+        const px = [_]u8{
+            255, 255, 255, 255,
+            96,  96,  96,  0,
+            200, 200, 200, 128,
+        };
+        var raw = try Texture.buildRawSrgbFused(allocator, 3, 1, &px, true);
+        defer raw.deinit(allocator);
+        try std.testing.expectEqual(@as(u32, 2), raw.num_levels);
+        try std.testing.expectEqual(@as(u8, 143), raw.levels[1].?[0]);
+        try std.testing.expectEqual(@as(u8, 128), raw.levels[1].?[3]);
+    }
+}
+
+test "buildRawSrgbFused with gen_mipmaps=false matches L0 of the classic path" {
+    const allocator = std.testing.allocator;
+    // Single-level builds skip the chain entirely: only the fused L0
+    // convert-copy runs, so compare level 0 against convert + buildRaw.
+    const rgba = [_]u8{
+        200, 128, 25,  42,
+        255, 0,   96,  255,
+        0,   255, 200, 0,
+    };
+    const classic_src = try allocator.dupe(u8, &rgba);
+    defer allocator.free(classic_src);
+    color.convertSrgbToLinearInPlace(classic_src);
+    var classic = try Texture.buildRaw(allocator, 3, 1, classic_src, false);
+    defer classic.deinit(allocator);
+    var fused = try Texture.buildRawSrgbFused(allocator, 3, 1, &rgba, false);
+    defer fused.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 1), fused.num_levels);
+    try std.testing.expectEqualSlices(u8, classic.levels[0].?, fused.levels[0].?);
+}
+
+test "buildRawSrgbFused rejects bad dimensions and short buffers like buildRaw" {
+    const allocator = std.testing.allocator;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    try std.testing.expectError(error.InvalidDimensions, Texture.buildRawSrgbFused(allocator, 0, 1, &px, true));
+    try std.testing.expectError(error.InvalidDimensions, Texture.buildRawSrgbFused(allocator, 2, 2, &px, true));
+    try std.testing.expectError(error.ImageTooLarge, Texture.buildRawSrgbFused(allocator, 100000, 100000, &px, true));
+}

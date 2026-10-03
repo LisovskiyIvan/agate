@@ -179,6 +179,7 @@ pub fn deinit(self: anytype) void {
 
     self.outline_meshes.deinit(self.allocator);
     self.postfx.deinit();
+    self.refraction.deinit();
 
     // sim domain (matches createParticleSystem in sim_api).
     self.particles.deinit(self.sim_allocator);

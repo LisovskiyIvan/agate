@@ -139,6 +139,14 @@ pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;
 
+// Render-to-texture target v1 (color+depth attachments, sampling views,
+// optional prepared-scene capture). See render_target.zig.
+pub const render_target = @import("render_target.zig");
+pub const RenderTarget = render_target.RenderTarget;
+pub const RenderTargetDesc = render_target.RenderTargetDesc;
+pub const RenderTargetCapabilities = render_target.Capabilities;
+pub const RenderTargetSceneOptions = render_target.SceneRenderOptions;
+
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;
 pub const InstancedMesh = mesh.InstancedMesh;
@@ -236,6 +244,7 @@ pub const TagQuery = tags.TagQuery;
 
 pub const loader = @import("loader/scene_loader.zig");
 pub const SceneLoader = loader.SceneLoader;
+pub const LoadTimings = loader.LoadTimings;
 pub const c = @import("c.zig").c;
 
 pub const postprocess = @import("postprocess.zig");
@@ -659,6 +668,10 @@ test "root re-exports cover recent Scene APIs" {
     _ = TagQuery;
     _ = Handoff;
     _ = AllocatorConfig;
+    _ = RenderTarget;
+    _ = RenderTargetDesc;
+    _ = RenderTargetCapabilities;
+    _ = RenderTargetSceneOptions;
 }
 
 test "root re-exports cover the runtime frame facade" {

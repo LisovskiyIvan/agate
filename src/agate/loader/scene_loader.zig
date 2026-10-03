@@ -1,4 +1,5 @@
 const std = @import("std");
+const sokol = @import("sokol");
 
 const c = @import("../c.zig").c;
 
@@ -17,6 +18,32 @@ const MorphMode = @import("../mesh.zig").MorphMode;
 const math = @import("math");
 const Mat4 = math.Mat4;
 const gpu_thread = @import("../gpu_thread.zig");
+
+pub const LoadTimings = struct {
+    /// Caller-owned per-stage wall times in milliseconds. The loader only
+    /// reads the clock when `LoadOptions.timings` is non-null (default null
+    /// = zero overhead, no logging). Clock: the app-owned sokol.time
+    /// timeline (same as `scene.elapsedMsSince` / the profiler): the host
+    /// must have called `sokol.time.setup()` once at startup (main.zig
+    /// does); the loader never calls setup itself (that would reset the
+    /// global origin for concurrent readers).
+    parse_ms: f64 = 0,
+    buffers_ms: f64 = 0,
+    meshopt_ms: f64 = 0,
+    /// Parallel stb/KTX2/DDS/Basis CPU decode (`decodeImagesInParallel`).
+    textures_ms: f64 = 0,
+    /// GPU upload + material wiring (`loadMaterials`, main thread).
+    materials_ms: f64 = 0,
+    /// Skins + joint mask + mesh spawn + animations + lights/cameras.
+    geometry_ms: f64 = 0,
+    total_ms: f64 = 0,
+};
+
+/// Milliseconds elapsed since a `sokol.time.now()` tick. Same expression
+/// as `scene.elapsedMsSince`; only called on the timings opt-in path.
+fn msSinceTicks(t0: u64) f64 {
+    return @floatCast(sokol.time.ms(sokol.time.now() -% t0));
+}
 
 pub const SceneLoader = struct {
     pub const LoadOptions = struct {
@@ -46,6 +73,11 @@ pub const SceneLoader = struct {
         /// replaces the anisotropy, and the LINEAR-filter clamp in
         /// `Texture.effectiveAnisotropy` still applies.
         max_anisotropy: ?u32 = null,
+        /// Optional caller-owned stage timings (parse/buffers/meshopt/
+        /// texture decode/materials upload/geometry/total, milliseconds).
+        /// Null (default) disables all timing reads: every existing call
+        /// keeps working unchanged and pays no clock cost.
+        timings: ?*LoadTimings = null,
     };
 
     /// Parses a glTF scene and spawns its content into `scene`. Both
@@ -56,13 +88,20 @@ pub const SceneLoader = struct {
     }
 
     pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh {
+        const t_total: u64 = if (load_options.timings != null) sokol.time.now() else 0;
+        if (load_options.timings) |t| t.* = .{};
+        defer if (load_options.timings) |t| {
+            t.total_ms = msSinceTicks(t_total);
+        };
         const path_z = try scene.allocator.dupeZ(u8, file_path);
         defer scene.allocator.free(path_z);
 
         var options = std.mem.zeroes(c.cgltf_options);
         var data: ?*c.cgltf_data = null;
 
+        const t_parse: u64 = if (load_options.timings != null) sokol.time.now() else 0;
         const parse_res = c.cgltf_parse_file(&options, path_z.ptr, &data);
+        if (load_options.timings) |t| t.parse_ms = msSinceTicks(t_parse);
         if (parse_res != c.cgltf_result_success or data == null) {
             return error.GltfParseFailed;
         }
@@ -82,7 +121,9 @@ pub const SceneLoader = struct {
         }
 
         // Load binary buffers (in GLB they are inside the buffer itself, in GLTF from .bin on disk)
+        const t_buffers: u64 = if (load_options.timings != null) sokol.time.now() else 0;
         const load_buf_res = c.cgltf_load_buffers(&options, data, path_z.ptr);
+        if (load_options.timings) |t| t.buffers_ms = msSinceTicks(t_buffers);
         if (load_buf_res != c.cgltf_result_success) {
             return error.GltfLoadBuffersFailed;
         }
@@ -90,12 +131,15 @@ pub const SceneLoader = struct {
         // EXT_meshopt_compression: decode compressed buffer views in place.
         // No-op (and bit-identical behaviour) for files without the extension;
         // see loader/meshopt.zig for the supported modes and limitations.
+        const t_meshopt: u64 = if (load_options.timings != null) sokol.time.now() else 0;
         const decode_res = c.agate_cgltf_decode_meshopt(&options, data);
+        if (load_options.timings) |t| t.meshopt_ms = msSinceTicks(t_meshopt);
         if (decode_res != c.cgltf_result_success) {
             return error.GltfMeshoptDecodeFailed;
         }
 
         const gltf = data.?;
+        try mesh_spawn_mod.validateTextureCoordinates(gltf);
         const base_dir = std.fs.path.dirname(file_path);
 
         // 1. Parse materials
@@ -132,9 +176,27 @@ pub const SceneLoader = struct {
         defer if (actx) |*a| a.deinit();
 
         if (!async_textures) {
+            const t_tex: u64 = if (load_options.timings != null) sokol.time.now() else 0;
             materials_mod.decodeImagesInParallel(scene, gltf, decoded, base_dir);
+            if (load_options.timings) |t| t.textures_ms = msSinceTicks(t_tex);
         }
-        try materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded, if (actx) |*a| a else null, load_options.max_anisotropy);
+        const t_mat: u64 = if (load_options.timings != null) sokol.time.now() else 0;
+        materials_mod.loadMaterials(scene, gltf, base_dir, materials, image_cache, decoded, if (actx) |*a| a else null, load_options.max_anisotropy) catch |e| {
+            // Error path: record time-to-failure so a failed upload stage
+            // stays diagnosable instead of reporting a silent 0.
+            if (load_options.timings) |t| t.materials_ms = msSinceTicks(t_mat);
+            return e;
+        };
+        if (load_options.timings) |t| t.materials_ms = msSinceTicks(t_mat);
+
+        const t_geo: u64 = if (load_options.timings != null) sokol.time.now() else 0;
+        // Confined to errors inside the geometry section: a plain
+        // function-scope errdefer would also fire for later failures and
+        // clobber the success value written below.
+        var geo_done = false;
+        errdefer if (!geo_done) {
+            if (load_options.timings) |t| t.geometry_ms = msSinceTicks(t_geo);
+        };
 
         // 2. Parse skeletons/skins
         const skeletons = try scene.allocator.alloc(?*Skeleton, gltf.skins_count);
@@ -171,6 +233,10 @@ pub const SceneLoader = struct {
         // No scene-level transform exists at this level, so identity is used.
         try lights_mod.loadLights(scene, gltf, Mat4.identity);
         _ = try lights_mod.loadCameras(scene, gltf, Mat4.identity);
+        if (load_options.timings) |t| {
+            t.geometry_ms = msSinceTicks(t_geo);
+        }
+        geo_done = true;
 
         return spawned_meshes.toOwnedSlice(scene.allocator);
     }
@@ -222,4 +288,12 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(!isExtensionSupported("KHR_materials_specular"));
     try std.testing.expect(!isExtensionSupported("KHR_texture_basisu_extra"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
+}
+
+test "LoadTimings defaults to zero and LoadOptions stays default-compatible" {
+    const t = LoadTimings{};
+    try std.testing.expectEqual(@as(f64, 0), t.parse_ms);
+    try std.testing.expectEqual(@as(f64, 0), t.total_ms);
+    const o = SceneLoader.LoadOptions{};
+    try std.testing.expect(o.timings == null);
 }

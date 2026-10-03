@@ -31,6 +31,8 @@ pub const Texture = struct {
     format: sg.PixelFormat = .RGBA8,
     /// True for float (HDR) textures: no gamma correction, linear sampling.
     is_hdr: bool = false,
+    /// Render-target borrows share handles but never destroy their owner.
+    owns_handles: bool = true,
 
     pub const Options = struct {
         min_filter: sg.Filter = .LINEAR,
@@ -212,7 +214,12 @@ pub const Texture = struct {
     /// Copies `rgba_pixels` and optionally builds the box-filtered mip chain.
     /// Public so the KTX2 reader (ktx2.zig) can reuse the generator for
     /// single-level files; the decode paths above use it internally.
+    /// L0 fast copy: plain `@memcpy` (no per-byte modulo/divide).
     pub fn buildRaw(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
+        return buildRawImpl(allocator, width, height, rgba_pixels, gen_mipmaps, false);
+    }
+
+    fn buildRawImpl(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool, comptime srgb: bool) !RawTexture {
         // Guard the public entry point: the mip chain treats the buffer as
         // width*height*4, and downsampleLevel runs unsafely, so a short
         // buffer would cause out-of-bounds reads. Checked arithmetic keeps
@@ -226,7 +233,7 @@ pub const Texture = struct {
         errdefer raw.deinit(allocator);
 
         const level0 = try allocator.alloc(u8, rgba_pixels.len);
-        @memcpy(level0, rgba_pixels);
+        if (srgb) copySrgbToLinearStride(level0, rgba_pixels) else @memcpy(level0, rgba_pixels);
         raw.levels[0] = level0;
 
         if (gen_mipmaps) {
@@ -247,6 +254,31 @@ pub const Texture = struct {
             }
         }
         return raw;
+    }
+
+    /// Fused L0 copy + sRGB->linear for the stb decode path: one pass over
+    /// level 0 instead of convert-in-place + memcpy (two passes). Output is
+    /// bit-identical to `convertSrgbToLinearInPlace` + `buildRaw`: same
+    /// `color.srgbToLinearU8` LUT on RGB lanes, alpha untouched, same
+    /// box-filter chain afterwards. Stride loop (no `i % 4` per byte).
+    pub fn buildRawSrgbFused(allocator: std.mem.Allocator, width: u32, height: u32, rgba_pixels: []const u8, gen_mipmaps: bool) !RawTexture {
+        return buildRawImpl(allocator, width, height, rgba_pixels, gen_mipmaps, true);
+    }
+
+    /// Stride-4 sRGB->linear copy: 3 LUT lookups per pixel, alpha copied
+    /// verbatim. Bit-identical to `color.convertSrgbToLinearInPlace` followed
+    /// by `@memcpy`; avoids the old per-byte `i % 4` branch.
+    fn copySrgbToLinearStride(dst: []u8, src: []const u8) void {
+        std.debug.assert(dst.len == src.len);
+        const pixels = dst.len / 4;
+        var i: usize = 0;
+        while (i < pixels) : (i += 1) {
+            const o = i * 4;
+            dst[o + 0] = color.srgbToLinearU8(src[o + 0]);
+            dst[o + 1] = color.srgbToLinearU8(src[o + 1]);
+            dst[o + 2] = color.srgbToLinearU8(src[o + 2]);
+            dst[o + 3] = src[o + 3];
+        }
     }
 
     /// Creates the GPU image from CPU-decoded pixels. Main thread only.
@@ -517,8 +549,13 @@ pub const Texture = struct {
         const width: u32 = @intCast(w);
         const height: u32 = @intCast(h);
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
-        // Convert before buildRaw so the box filter averages in linear space.
-        if (opts.srgb_to_linear) color.convertSrgbToLinearInPlace(data[0..size_bytes]);
+        // Fused L0 convert-copy (single pass, stride loop) so the box
+        // filter still averages in linear space with bit-identical bytes.
+        if (opts.srgb_to_linear) {
+            var raw = try buildRawSrgbFused(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
+            raw.is_srgb = opts.srgb_to_linear;
+            return raw;
+        }
         var raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
         raw.is_srgb = opts.srgb_to_linear;
         return raw;
@@ -1098,6 +1135,7 @@ pub const Texture = struct {
     }
 
     pub fn deinit(self: *Texture) void {
+        if (!self.owns_handles) return;
         sg.destroyView(self.view);
         sg.destroyImage(self.image);
         sg.destroySampler(self.sampler);

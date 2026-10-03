@@ -91,6 +91,7 @@ test {
     _ = @import("loader/skins.zig");
     _ = @import("loader/stl.zig");
     _ = @import("loader/stl_fuzz.zig");
+    _ = @import("loader/uv1_gltf_fixture.zig");
     _ = @import("material.zig");
     _ = @import("material/draw_record.zig");
     _ = @import("material/pbr.zig");
@@ -191,6 +192,7 @@ test {
     _ = @import("profiler/summary.zig");
     _ = @import("profiler/types.zig");
     _ = @import("ragdoll.zig");
+    _ = @import("render_target.zig");
     _ = @import("runtime.zig");
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");
@@ -234,6 +236,7 @@ test {
     _ = @import("scene/projection.zig");
     _ = @import("scene/query_api.zig");
     _ = @import("scene/queue_builder.zig");
+    _ = @import("scene/refraction.zig");
     _ = @import("scene/registry.zig");
     _ = @import("scene/render_queue.zig");
     _ = @import("scene/render_queue/build.zig");

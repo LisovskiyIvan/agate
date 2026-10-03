@@ -152,3 +152,9 @@ void coatSheenLight(vec3 N, vec3 V, vec3 L, vec3 H, float NdotV, float NdotL,
 vec3 specEnergyConservation(float lookup_g, vec3 F0) {
     return vec3(1.0) + F0 * (1.0 / max(lookup_g, 0.0001) - 1.0);
 }
+
+// Babylon's height-correlated environment LUT stores grazing reflectance
+// in R and normal-incidence reflectance in G (not the Karis scale/bias).
+vec3 environmentReflectance(vec3 F0, vec2 lookup) {
+    return mix(vec3(lookup.x), vec3(lookup.y), F0);
+}
