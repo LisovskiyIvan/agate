@@ -481,18 +481,49 @@ pub fn render(scene: anytype) void {
     gpu_timing.endPass(.post);
 
     sg.commit();
-    // GPU frame timer (v1, default off): last COMPLETED GPU frame duration,
-    // Metal-only. Fail-closed when disabled/headless/unsupported (0) — a
-    // cheap poll, never a GPU stall. Must be read here, right after the
-    // present commit, so the retained command buffer is this frame's.
-    scene.stats.gpu_frame_ms = gpu_timing.pollFrameMs();
-    // Per-pass GPU timers (v2, same opt-in): last COMPLETED sample per
-    // phase — real GL_TIME_ELAPSED values on GL4.1, always 0 on Metal
-    // (frame timer above is the only Metal GPU number). A skipped shadow
-    // phase records 0, never a stale sample.
-    scene.stats.gpu_shadow_ms = if (snap.shadows_enabled) gpu_timing.pollPassMs(.shadow) else 0;
-    scene.stats.gpu_main_ms = gpu_timing.pollPassMs(.main);
-    scene.stats.gpu_post_ms = gpu_timing.pollPassMs(.post);
+    // GPU timing (opt-in, default off): last COMPLETED samples observed
+    // here, right after the present commit, while the just-submitted work
+    // is still the latest submission. Optional samples distinguish
+    // unavailable (null -> duration 0, submit 0) from a valid quantized
+    // zero (submit != 0, ms == 0). A skipped shadow phase stores no sample,
+    // never a stale one. Each channel keeps its own submission id — pass
+    // values are never summed to fabricate a frame duration. Scopes are
+    // backend-specific (see gpu_timing.capabilities).
+    if (gpu_timing.pollFrameSample()) |sample| {
+        scene.stats.gpu_frame_ms = sample.ms;
+        scene.stats.gpu_frame_submit = sample.frame_index;
+    } else {
+        scene.stats.gpu_frame_ms = 0;
+        scene.stats.gpu_frame_submit = 0;
+    }
+    scene.stats.gpu_frame_scope = gpu_timing.capabilities().frame_scope;
+    if (scene.stats.gpu_frame_submit == 0) scene.stats.gpu_frame_scope = .none;
+    if (snap.shadows_enabled) {
+        if (gpu_timing.pollPassSample(.shadow)) |sample| {
+            scene.stats.gpu_shadow_ms = sample.ms;
+            scene.stats.gpu_shadow_submit = sample.frame_index;
+        } else {
+            scene.stats.gpu_shadow_ms = 0;
+            scene.stats.gpu_shadow_submit = 0;
+        }
+    } else {
+        scene.stats.gpu_shadow_ms = 0;
+        scene.stats.gpu_shadow_submit = 0;
+    }
+    if (gpu_timing.pollPassSample(.main)) |sample| {
+        scene.stats.gpu_main_ms = sample.ms;
+        scene.stats.gpu_main_submit = sample.frame_index;
+    } else {
+        scene.stats.gpu_main_ms = 0;
+        scene.stats.gpu_main_submit = 0;
+    }
+    if (gpu_timing.pollPassSample(.post)) |sample| {
+        scene.stats.gpu_post_ms = sample.ms;
+        scene.stats.gpu_post_submit = sample.frame_index;
+    } else {
+        scene.stats.gpu_post_ms = 0;
+        scene.stats.gpu_post_submit = 0;
+    }
     scene.stats.post_ms = msSince(t_post);
 
     // Перенос динамики в кадровую метрику: prepare-фаза (flush, стейджинг,
@@ -519,7 +550,32 @@ pub fn renderReuse(scene: anytype) void {
     scene.rendering_reuse = true;
     defer scene.rendering_reuse = false;
     scene.render();
+    // Reuse replays the saved CPU frame: restore the CPU stats, but keep
+    // the CURRENT (post-render) GPU samples — the replay's commit may have
+    // surfaced newly completed submissions, and restoring the pre-render
+    // GPU values would silently drop them for the profiler record below.
+    // (recordFrame itself does not run inside render() on this path: the
+    // `rendering_reuse` guard skips it there, so the record below is the
+    // only one — with restored CPU stats + fresh GPU metadata.)
+    const fresh_gpu_frame_ms = scene.stats.gpu_frame_ms;
+    const fresh_gpu_frame_submit = scene.stats.gpu_frame_submit;
+    const fresh_gpu_frame_scope = scene.stats.gpu_frame_scope;
+    const fresh_gpu_shadow_ms = scene.stats.gpu_shadow_ms;
+    const fresh_gpu_shadow_submit = scene.stats.gpu_shadow_submit;
+    const fresh_gpu_main_ms = scene.stats.gpu_main_ms;
+    const fresh_gpu_main_submit = scene.stats.gpu_main_submit;
+    const fresh_gpu_post_ms = scene.stats.gpu_post_ms;
+    const fresh_gpu_post_submit = scene.stats.gpu_post_submit;
     scene.stats = saved_stats;
+    scene.stats.gpu_frame_ms = fresh_gpu_frame_ms;
+    scene.stats.gpu_frame_submit = fresh_gpu_frame_submit;
+    scene.stats.gpu_frame_scope = fresh_gpu_frame_scope;
+    scene.stats.gpu_shadow_ms = fresh_gpu_shadow_ms;
+    scene.stats.gpu_shadow_submit = fresh_gpu_shadow_submit;
+    scene.stats.gpu_main_ms = fresh_gpu_main_ms;
+    scene.stats.gpu_main_submit = fresh_gpu_main_submit;
+    scene.stats.gpu_post_ms = fresh_gpu_post_ms;
+    scene.stats.gpu_post_submit = fresh_gpu_post_submit;
     if (scene.profiler.isRecording()) {
         scene.profiler_frame_seq +%= 1;
         scene.profiler.recordFrame(scene.profiler_frame_seq, &scene.stats);

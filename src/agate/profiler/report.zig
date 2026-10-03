@@ -15,24 +15,24 @@ const dominantPhase = types.dominantPhase;
 // Callers pass already-computed summary/findings/memory values;
 // Profiler wrapper methods in profiler.zig capture those first.
 
-/// True when at least one frame carries a measured GPU time (> 0).
-/// All GPU-specific report output (HTML/MD/trace) is gated on this so the
-/// disabled path (all zeros) stays byte-identical to the pre-GPU output.
+/// True when at least one frame carries an AVAILABLE GPU frame sample
+/// (submission id != 0 — valid quantized zeros count). All GPU-specific
+/// report output (HTML/MD/trace) is gated on this so the disabled path
+/// (no ids) stays byte-identical to the pre-GPU output.
 pub fn hasGpuData(frames: []const FrameRecord) bool {
     for (frames) |f| {
-        if (f.gpu_frame_ms > 0) return true;
+        if (f.gpu_frame_submit != 0) return true;
     }
     return false;
 }
 
-/// True when at least one frame carries a measured per-pass GPU time.
-/// Per-pass output (GL `GL_TIME_ELAPSED` samples; always 0 on Metal) is
-/// gated on this separately from `hasGpuData`, so Metal-only sessions
-/// (frame timer without per-pass samples) and the disabled path both
-/// render exactly the pre-per-pass output.
+/// True when at least one frame carries an AVAILABLE per-pass GPU sample
+/// (any phase submission id != 0, zeros included). Gated separately from
+/// `hasGpuData`, so frame-scope-only sessions (no per-pass samples) and
+/// the disabled path both render exactly the pre-per-pass output.
 pub fn hasGpuPassData(frames: []const FrameRecord) bool {
     for (frames) |f| {
-        if (f.gpu_shadow_ms > 0 or f.gpu_main_ms > 0 or f.gpu_post_ms > 0) return true;
+        if (f.gpu_shadow_submit != 0 or f.gpu_main_submit != 0 or f.gpu_post_submit != 0) return true;
     }
     return false;
 }
@@ -320,11 +320,11 @@ pub fn generateReportHtml(
     defer allocator.free(kpi_html);
     try buf.appendSlice(allocator, kpi_html);
 
-    // GPU frame time card (measured on GPU, Metal-only; gated so the
-    // disabled path renders exactly the pre-GPU report).
+    // GPU frame time card (measured on GPU via the opt-in gpu_timing
+    // samples; gated so the disabled path renders exactly the pre-GPU report).
     if (has_gpu) {
         const gpu_sub = if (hasGpuPassData(frames)) try std.fmt.allocPrint(allocator,
-            \\<div class="kpi-sub">Per-pass avg (measured): shadow {d:.2} / main {d:.2} / post {d:.2} ms | max: {d:.2} / {d:.2} / {d:.2} ms (GL timer queries; Metal per-pass unsupported)</div>
+            \\<div class="kpi-sub">Per-pass avg (available distinct samples): shadow {d:.2} / main {d:.2} / post {d:.2} ms | max: {d:.2} / {d:.2} / {d:.2} ms (backend phase spans; per-pass values are never summed into a frame)</div>
         , .{
             summary.avg_gpu_shadow_ms,
             summary.avg_gpu_main_ms,
@@ -339,7 +339,7 @@ pub fn generateReportHtml(
             \\  <div class="kpi-card">
             \\    <div class="kpi-label">GPU Frame (measured)</div>
             \\    <div class="kpi-val" style="color: #f472b6;">{d:.2} <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">ms</span></div>
-            \\    <div class="kpi-sub">Max: {d:.2} ms | Metal GPU time, lags 1 frame behind CPU submit</div>
+            \\    <div class="kpi-sub">Max: {d:.2} ms | Last-completed GPU sample, observed after commit (async; backend scope varies — not interchangeable with CPU submit)</div>
             \\{s}  </div>
             \\</div>
         , .{ summary.avg_gpu_frame_ms, summary.max_gpu_frame_ms, gpu_sub });
@@ -440,14 +440,15 @@ pub fn generateReportHtml(
             var cur_y = chart_y_bottom;
 
             // Group with native tooltip (stacked bars show CPU-submit phases, not GPU time).
-            // The GPU line below is the measured Metal frame time (previous
-            // completed frame); emitted only when GPU data exists so the
-            // disabled path stays byte-identical. Per-pass GPU lines
-            // (GL timer queries) append only when per-pass data exists.
+            // The GPU line below is the last-completed GPU sample observed at
+            // this CPU frame (async execution, no fixed lag promised);
+            // emitted only when GPU samples are available so the disabled
+            // path stays byte-identical. Per-pass GPU lines append only when
+            // per-pass samples are available.
             const tooltip_open = if (has_pass) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, last completed): {d:.2} мс&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.gpu_shadow_ms, f.gpu_main_ms, f.gpu_post_ms, f.draw_calls, f.triangles }) else if (has_gpu) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, prev frame): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, last completed): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.draw_calls, f.triangles }) else try std.fmt.allocPrint(allocator,
                 \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
@@ -520,8 +521,8 @@ pub fn generateReportHtml(
     );
 
     // Section: Top Spike Frames Table (ranked by CPU-submit time, not GPU/wall time).
-    // The GPU column is measured Metal time, appended only when GPU data
-    // exists (disabled path keeps the exact pre-GPU table).
+    // The GPU column is the last-completed GPU sample, appended only when
+    // GPU samples are available (disabled path keeps the exact pre-GPU table).
     if (has_gpu) {
         try buf.appendSlice(allocator,
             \\<div class="section-title">
@@ -904,15 +905,17 @@ pub fn generateReportMd(
     defer allocator.free(overview_table);
     try buf.appendSlice(allocator, overview_table);
 
-    // Measured GPU frame time (gated: disabled path keeps the exact
+    // Measured GPU samples (gated: disabled path keeps the exact
     // pre-GPU overview above). Per-pass averages append only when
-    // per-pass data exists (GL timer queries; Metal stays frame-only).
+    // per-pass samples are available.
     if (has_gpu) {
         const gpu_overview = try std.fmt.allocPrint(allocator,
-            \\| **Средний GPU frame (measured, Metal)** | {d:.2} мс | **Макс. GPU frame** | {d:.2} мс |
+            \\| **Средний GPU frame (measured)** | {d:.2} мс | **Макс. GPU frame** | {d:.2} мс |
             \\
-            \\GPU-время измерено на GPU (последний завершённый кадр, отстаёт на
-            \\1 кадр от CPU-submit); фазы выше — по-прежнему CPU-submit, не GPU.
+            \\GPU-время — последний завершённый семпл, наблюдённый после
+            \\коммита (асинхронно, без фиксированного лага; скоуп зависит от
+            \\бэкенда и не взаимозаменяем с CPU-submit); фазы выше —
+            \\по-прежнему CPU-submit, не GPU.
             \\
         , .{ summary.avg_gpu_frame_ms, summary.max_gpu_frame_ms });
         defer allocator.free(gpu_overview);
@@ -921,8 +924,9 @@ pub fn generateReportMd(
             const pass_overview = try std.fmt.allocPrint(allocator,
                 \\| **Средний GPU per-pass (measured)** | shadow {d:.2} / main {d:.2} / post {d:.2} мс | **Макс. GPU per-pass** | {d:.2} / {d:.2} / {d:.2} мс |
                 \\
-                \\Per-pass GPU-время — GL `GL_TIME_ELAPSED` (последний
-                \\завершённый семпл каждого прохода); на Metal всегда 0.
+                \\Per-pass GPU-время — последние завершённые семплы каждого
+                \\прохода; значения разных submission id никогда не
+                \\суммируются в длительность кадра.
                 \\
             , .{
                 summary.avg_gpu_shadow_ms,
@@ -961,7 +965,8 @@ pub fn generateReportMd(
     }
 
     // Section: Spike Frames (ranked by CPU-submit time, not GPU/wall time).
-    // GPU column is measured Metal time, present only with GPU data.
+    // GPU column is the last-completed GPU sample, present only when
+    // GPU samples are available.
     if (has_gpu) {
         try buf.appendSlice(allocator,
             \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
@@ -1122,22 +1127,49 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
 
-    // GPU events (cat "gpu", tid 2) carry measured Metal frame times only;
-    // the disabled path emits exactly the pre-GPU event stream.
+    // GPU events (cat "gpu", tid 2) carry last-completed GPU samples;
+    // the disabled path (no submission ids) emits exactly the pre-GPU
+    // event stream. NOTE: every GPU event below is anchored to the CPU
+    // observation time (the CPU frame start `ts`) — NOT to an absolute
+    // GPU timestamp or a synchronized GPU/CPU timeline. Durations are the
+    // completed-sample values; repeats of the same submission id across
+    // consecutive CPU frames (async re-poll before a newer completion)
+    // emit once, including valid zero-duration measurements.
     const has_gpu = hasGpuData(frames);
 
     try buf.appendSlice(allocator, "{\n  \"traceEvents\": [\n");
+
+    var last_trace_frame_submit: u32 = 0;
+    var last_trace_shadow_submit: u32 = 0;
+    var last_trace_main_submit: u32 = 0;
+    var last_trace_post_submit: u32 = 0;
 
     for (frames, 0..) |f, i| {
         const is_last_frame = (i + 1 == frames.len);
         const ts = f.timestamp_us;
         const dur_us: u64 = @intFromFloat(f.total_frame_ms * 1000.0);
 
+        // Whether this CPU frame introduces a NEW completed submission
+        // per channel (dedup: the same id on consecutive frames is one
+        // measurement observed again, not a new event).
+        const frame_new = f.gpu_frame_submit != 0 and f.gpu_frame_submit != last_trace_frame_submit;
+        const shadow_new = f.gpu_shadow_submit != 0 and f.gpu_shadow_submit != last_trace_shadow_submit;
+        const main_new = f.gpu_main_submit != 0 and f.gpu_main_submit != last_trace_main_submit;
+        const post_new = f.gpu_post_submit != 0 and f.gpu_post_submit != last_trace_post_submit;
+        if (f.gpu_frame_submit != 0) last_trace_frame_submit = f.gpu_frame_submit;
+        if (f.gpu_shadow_submit != 0) last_trace_shadow_submit = f.gpu_shadow_submit;
+        if (f.gpu_main_submit != 0) last_trace_main_submit = f.gpu_main_submit;
+        if (f.gpu_post_submit != 0) last_trace_post_submit = f.gpu_post_submit;
+        const pass_new_count: usize =
+            (if (shadow_new) @as(usize, 1) else 0) +
+            (if (main_new) @as(usize, 1) else 0) +
+            (if (post_new) @as(usize, 1) else 0);
+
         // Complete event for whole frame. dur covers the CPU-submit span;
         // fps/interval are observed wall-clock pacing.
         const frame_event = if (has_gpu) try std.fmt.allocPrint(allocator,
-            \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "gpu_frame_ms": {d:.3}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
-        , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.gpu_frame_ms, f.draw_calls, f.triangles, f.pipeline_switches }) else try std.fmt.allocPrint(allocator,
+            \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "gpu_frame_ms": {d:.3}, "gpu_frame_submit": {d}, "gpu_frame_scope": "{s}", "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
+        , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.gpu_frame_ms, f.gpu_frame_submit, @tagName(f.gpu_frame_scope), f.draw_calls, f.triangles, f.pipeline_switches }) else try std.fmt.allocPrint(allocator,
             \\    {{"name": "Frame #{d} (CPU submit)", "cat": "frame", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1, "args": {{"fps_wall": {d:.1}, "frame_interval_ms": {d:.3}, "cpu_submit_ms": {d:.3}, "draw_calls": {d}, "triangles": {d}, "switches": {d}}}}},
         , .{ f.frame_index, ts, dur_us, f.fps, f.frame_interval_ms, f.total_frame_ms, f.draw_calls, f.triangles, f.pipeline_switches });
         defer allocator.free(frame_event);
@@ -1202,19 +1234,17 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
         try buf.appendSlice(allocator, "\n");
         cur_ts += m_us;
 
-        // PostFX. A measured-GPU event may follow on tid 2 (emitted only
-        // for frames with gpu_frame_ms > 0, plus one per-pass event per
-        // pass with a sample > 0); the comma below accounts for them so
-        // the stream stays valid JSON in every combination.
-        const gpu_emit = has_gpu and f.gpu_frame_ms > 0;
+        // PostFX. A measured-GPU event may follow on tid 2 (emitted once
+        // per DISTINCT completed submission, zero durations included);
+        // the comma below accounts for them so the stream stays valid
+        // JSON in every combination.
+        const gpu_emit = frame_new;
         const pass_names = [_][]const u8{ "GPU Shadow (measured)", "GPU Main (measured)", "GPU PostFX (measured)" };
         const pass_keys = [_][]const u8{ "gpu_shadow_ms", "gpu_main_ms", "gpu_post_ms" };
         const pass_vals = [_]f32{ f.gpu_shadow_ms, f.gpu_main_ms, f.gpu_post_ms };
-        var pass_emit_count: usize = 0;
-        for (pass_vals) |v| {
-            if (v > 0) pass_emit_count += 1;
-        }
-        const trailing_count: usize = (if (gpu_emit) @as(usize, 1) else 0) + pass_emit_count;
+        const pass_submits = [_]u32{ f.gpu_shadow_submit, f.gpu_main_submit, f.gpu_post_submit };
+        const pass_news = [_]bool{ shadow_new, main_new, post_new };
+        const trailing_count: usize = (if (gpu_emit) @as(usize, 1) else 0) + pass_new_count;
         const post_comma = if (trailing_count > 0 or !is_last_frame) "," else "";
         const post_ev = try std.fmt.allocPrint(allocator,
             \\    {{"name": "PostFX (CPU submit)", "cat": "cpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 1}}{s}
@@ -1223,36 +1253,39 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
         try buf.appendSlice(allocator, post_ev);
         try buf.appendSlice(allocator, "\n");
 
-        // Measured GPU frame time: separate thread id and "gpu" category so
-        // it can never be mistaken for a CPU-submit slice. ts is the CPU
-        // frame start; the value itself is the last COMPLETED GPU frame
-        // (async execution lags one submit behind).
+        // Measured GPU frame sample: separate thread id and "gpu" category
+        // so it can never be mistaken for a CPU-submit slice. ts is the
+        // CPU frame start (observation time, not a GPU timestamp); the
+        // value is the newly completed submission's duration, and args
+        // carry the submission id plus the backend scope.
         if (gpu_emit) {
             const gpu_us: u64 = @intFromFloat(f.gpu_frame_ms * 1000.0);
-            const gpu_comma = if (pass_emit_count > 0 or !is_last_frame) "," else "";
+            const gpu_comma = if (pass_new_count > 0 or !is_last_frame) "," else "";
             const gpu_ev = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "GPU Frame (measured)", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 2, "args": {{"gpu_frame_ms": {d:.3}}}}}{s}
-            , .{ ts, gpu_us, f.gpu_frame_ms, gpu_comma });
+                \\    {{"name": "GPU Frame (measured)", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 2, "args": {{"gpu_frame_ms": {d:.3}, "gpu_frame_submit": {d}, "gpu_frame_scope": "{s}"}}}}{s}
+            , .{ ts, gpu_us, f.gpu_frame_ms, f.gpu_frame_submit, @tagName(f.gpu_frame_scope), gpu_comma });
             defer allocator.free(gpu_ev);
             try buf.appendSlice(allocator, gpu_ev);
             try buf.appendSlice(allocator, "\n");
         }
 
-        // Measured per-pass GPU times (GL timer queries, tid 2 alongside
-        // the frame event): one event per pass with a sample > 0, so the
-        // disabled path and Metal-only sessions emit exactly the
-        // pre-per-pass stream. ts is the CPU frame start; each value is
-        // the last COMPLETED sample for that pass (async execution lags
-        // behind the CPU submit, like the frame timer).
+        // Measured per-pass GPU samples (tid 2 alongside the frame event):
+        // one event per phase with a NEW completed submission (zero
+        // durations included), so the disabled path and frame-scope-only
+        // sessions emit exactly the pre-per-pass stream. ts is the CPU
+        // frame start (observation time); each value is that submission's
+        // duration, and args carry its submission id. Channels are
+        // independent — values from different submission ids are never
+        // combined.
         var pass_done: usize = 0;
-        for (pass_names, pass_keys, pass_vals) |pname, pkey, pval| {
-            if (pval <= 0) continue;
+        for (pass_names, pass_keys, pass_vals, pass_submits, pass_news) |pname, pkey, pval, psubmit, pnew| {
+            if (!pnew) continue;
             pass_done += 1;
-            const pass_comma = if (is_last_frame and pass_done == pass_emit_count) "" else ",";
+            const pass_comma = if (is_last_frame and pass_done == pass_new_count) "" else ",";
             const pass_us: u64 = @intFromFloat(pval * 1000.0);
             const pass_ev = try std.fmt.allocPrint(allocator,
-                \\    {{"name": "{s}", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 2, "args": {{"{s}": {d:.3}}}}}{s}
-            , .{ pname, ts, pass_us, pkey, pval, pass_comma });
+                \\    {{"name": "{s}", "cat": "gpu", "ph": "X", "ts": {d}, "dur": {d}, "pid": 1, "tid": 2, "args": {{"{s}": {d:.3}, "submit": {d}}}}}{s}
+            , .{ pname, ts, pass_us, pkey, pval, psubmit, pass_comma });
             defer allocator.free(pass_ev);
             try buf.appendSlice(allocator, pass_ev);
             try buf.appendSlice(allocator, "\n");
@@ -1382,12 +1415,15 @@ test "Profiler report HTML, MD, and JSON generation" {
     try std.testing.expect(std.mem.indexOf(u8, json, "gpu_frame_ms") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "GPU Shadow (measured)") == null);
 
-    // Enabled path: measured GPU times are exported under explicit GPU
+    // Enabled path: measured GPU samples are exported under explicit GPU
     // names, never relabeled as CPU-submit phases.
     var gpu_frames = frames;
     gpu_frames[0].gpu_frame_ms = 2.5;
-    // Last frame intentionally left at 0: exercises the no-GPU-event tail
-    // (PostFX of the final frame must carry no trailing comma).
+    gpu_frames[0].gpu_frame_submit = 51;
+    gpu_frames[0].gpu_frame_scope = .command_buffer;
+    // Last frame intentionally left without a sample: exercises the
+    // no-GPU-event tail (PostFX of the final frame must carry no
+    // trailing comma).
     try std.testing.expect(hasGpuData(&gpu_frames));
 
     var gpu_summary = summary;
@@ -1409,27 +1445,36 @@ test "Profiler report HTML, MD, and JSON generation" {
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"cat\": \"gpu\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"name\": \"GPU Frame (measured)\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_ms\": 2.500") != null);
+    // Trace args carry the submission identity and backend scope.
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_submit\": 51") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_scope\": \"command_buffer\"") != null);
     // CPU slices keep their submit labels; the stream has no trailing comma.
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"Main Pass (CPU submit)\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, ",\n  ]") == null);
-    // Frame-only session (Metal shape): no per-pass output anywhere.
+    // Frame-scope-only session (no per-pass samples): no per-pass output anywhere.
     try std.testing.expect(!hasGpuPassData(&gpu_frames));
     try std.testing.expect(std.mem.indexOf(u8, gpu_html, "Per-pass avg") == null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU shadow/main/post") == null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_md, "per-pass") == null);
     try std.testing.expect(std.mem.indexOf(u8, gpu_json, "GPU Shadow (measured)") == null);
 
-    // Per-pass session (GL shape): frame + per-pass samples flow through
+    // Per-pass session: frame + per-pass samples flow through
     // every export under explicit GPU names.
     var pass_frames = frames;
     pass_frames[0].gpu_frame_ms = 9.5;
+    pass_frames[0].gpu_frame_submit = 61;
+    pass_frames[0].gpu_frame_scope = .pass_sum;
     pass_frames[0].gpu_shadow_ms = 0.5;
+    pass_frames[0].gpu_shadow_submit = 62;
     pass_frames[0].gpu_main_ms = 8.0;
+    pass_frames[0].gpu_main_submit = 63;
     pass_frames[0].gpu_post_ms = 1.0;
-    // Second frame carries only a main sample: exercises per-frame
+    pass_frames[0].gpu_post_submit = 64;
+    // Second frame carries only a newer main sample: exercises per-frame
     // gating (no shadow/post events) and the no-GPU-event tail stays
     // on the LAST frame only when it has no samples at all.
     pass_frames[1].gpu_main_ms = 7.0;
+    pass_frames[1].gpu_main_submit = 65;
     try std.testing.expect(hasGpuPassData(&pass_frames));
 
     var pass_summary = summary;
@@ -1444,7 +1489,7 @@ test "Profiler report HTML, MD, and JSON generation" {
 
     const pass_html = try generateReportHtml(&pass_frames, pass_summary, &findings, null, ally);
     defer ally.free(pass_html);
-    try std.testing.expect(std.mem.indexOf(u8, pass_html, "Per-pass avg (measured)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass_html, "Per-pass avg (available distinct samples)") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass_html, "GPU shadow/main/post (measured)") != null);
 
     const pass_md = try generateReportMd(&pass_frames, pass_summary, &findings, null, ally);
@@ -1468,4 +1513,71 @@ test "Profiler report HTML, MD, and JSON generation" {
     try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"Shadow Pass (CPU submit)\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"PostFX (CPU submit)\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass_json, ",\n  ]") == null);
+    // Per-pass trace args carry submission ids; the frame event carries
+    // the frame submission id and scope.
+    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"submit\": 62") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_frame_submit\": 61") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_frame_scope\": \"pass_sum\"") != null);
+}
+
+test "Profiler reports treat valid GPU zeros as available and dedup repeats" {
+    const ally = std.testing.allocator;
+    // Availability is the submission id: a valid quantized zero (id != 0,
+    // ms == 0) gates GPU output ON, while bare zeros stay CPU-only.
+    var zero_frames = [_]FrameRecord{
+        .{ .frame_index = 1, .timestamp_us = 0, .total_frame_ms = 5.0 },
+        .{ .frame_index = 2, .timestamp_us = 5000, .total_frame_ms = 5.0 },
+    };
+    try std.testing.expect(!hasGpuData(&zero_frames));
+    try std.testing.expect(!hasGpuPassData(&zero_frames));
+
+    zero_frames[0].gpu_frame_submit = 71;
+    zero_frames[0].gpu_frame_scope = .native_pass_span;
+    zero_frames[0].gpu_main_submit = 72; // ms stays 0: valid zero
+    // Same submissions re-polled on the next CPU frame (async: no newer
+    // completion yet) — one measurement, not two.
+    zero_frames[1].gpu_frame_ms = 0;
+    zero_frames[1].gpu_frame_submit = 71;
+    zero_frames[1].gpu_frame_scope = .native_pass_span;
+    zero_frames[1].gpu_main_ms = 0;
+    zero_frames[1].gpu_main_submit = 72;
+    try std.testing.expect(hasGpuData(&zero_frames));
+    try std.testing.expect(hasGpuPassData(&zero_frames));
+
+    const findings = [_]DiagnosticFinding{};
+    const summary: SessionSummary = .{
+        .frame_count = 2,
+        .avg_gpu_frame_ms = 0,
+        .max_gpu_frame_ms = 0,
+        .gpu_frame_samples = 1,
+        .avg_gpu_main_ms = 0,
+        .max_gpu_main_ms = 0,
+        .gpu_main_samples = 1,
+    };
+    const html = try generateReportHtml(&zero_frames, summary, &findings, null, ally);
+    defer ally.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "GPU Frame (measured)") != null);
+
+    const json = try generateTraceJson(&zero_frames, ally);
+    defer ally.free(json);
+    // Exactly one GPU Frame event and one GPU Main event for the repeated
+    // submission id — including the zero duration.
+    var frame_events: usize = 0;
+    var main_events: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, json, cursor, "\"name\": \"GPU Frame (measured)\"")) |pos| {
+        frame_events += 1;
+        cursor = pos + 1;
+    }
+    cursor = 0;
+    while (std.mem.indexOfPos(u8, json, cursor, "\"name\": \"GPU Main (measured)\"")) |pos| {
+        main_events += 1;
+        cursor = pos + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), frame_events);
+    try std.testing.expectEqual(@as(usize, 1), main_events);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_ms\": 0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_submit\": 71") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_scope\": \"native_pass_span\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ",\n  ]") == null);
 }

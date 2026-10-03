@@ -203,13 +203,34 @@ pub const Pass = enum(c_int) { shadow = 0, main = 1, post = 2 };
 pub fn parseEnvFlag(value: ?[]const u8) bool; // "1"/"true"/"on"/"yes"
 pub fn setEnabled(on: bool) void;   // любое место, C-флаг — лениво при валидном контексте
 pub fn isEnabled() bool;
+pub const Sample = struct { ms: f32, frame_index: u32 };
+pub const FrameScope = enum { none, command_buffer, native_pass_span, pass_sum };
+pub const Capabilities = struct { frame: bool, passes: bool, frame_scope: FrameScope };
+pub fn capabilities() Capabilities; // поддержка device, независимо от intent
+pub fn pollFrameSample() ?Sample;
+pub fn pollPassSample(pass: Pass) ?Sample;
 pub fn pollFrameMs() f32;           // после sg.commit(); 0 = off/headless/not-ready/unsupported
 pub fn beginPass(pass: Pass) void;
 pub fn endPass(pass: Pass) void;
 pub fn pollPassMs(pass: Pass) f32;
 ```
 
-Лист-модуль (только std + sokol), чтобы `scene/frame_render.zig` опрашивал без цикла импорта. Значение отстаёт на кадр (асинхронный GPU); на Metal — одно число на кадр (один command buffer; per-pass — no-op/-1→0), на GL4.1 — реальные `GL_TIME_ELAPSED` пулы. Включение: программно или `AGATE_GPU_TIMINGS=1`. Headless/dummy — fail-closed: 0/false, без вызовов в C вне валидного контекста. Ноль изменений поведения пока выключено.
+Лист-модуль (std + sokol), без цикла импорта. `setEnabled` меняет только atomic intent;
+begin/end/poll применяют его на **context thread**. Замеры асинхронные, задержка не
+фиксирована в один кадр. `Sample.frame_index` — номер завершённой sokol submission,
+не `Scene.frame_id`: повторный poll может вернуть тот же sample. `null` означает
+off/headless/not-ready/unsupported, а `ms == 0` с валидным индексом — настоящий
+квантизованный замер. Старые `poll*Ms` сохраняют совместимый sentinel 0.
+
+Metal использует command-buffer frame time и, при поддержке timestamp counters,
+phase spans; WebGPU — timestamp-query spans; desktop GL — `GL_TIME_ELAPSED` фаз и
+их сумму **из одной submission**. Это разные scopes, не взаимозаменяемые frame
+метрики. Включение — программно или `AGATE_GPU_TIMINGS=1`. Для WebGPU дополнительно
+перед `sapp.run` задать `.wgpu_gpu_timing_enabled = gpu_timing.isEnabled()`:
+features нельзя включить после создания device. Неподдерживаемый адаптер остаётся
+рабочим, таймеры сообщают unavailable. `sg.shutdown()` сам освобождает timer
+resources; вручную выключать их перед shutdown больше не требуется.
+Подробности и GPU-гейт — [gpu-timing.md](./gpu-timing.md).
 
 ### gpu_upload_meter.zig — счётчик байт динамических GPU-апдейтов
 
@@ -240,7 +261,7 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 - Первые кадры: `reuseIfConsumable` → false (нечего переиспользовать), `renderFrame` → `.skipped`, пока первый build не готов.
 - `prepareSerial`/legacy-диагностика всегда лочат вне зависимости от кноба.
 - `Observable.add` без аллокатора → `error.NoAllocatorProvided`; `Handoff.claim` → null при насыщении (вместо блокировки — дроп/drain/skip).
-- `gpu_timing` вне контекста или выключенный — всегда 0, без паник.
+- `gpu_timing` вне контекста или выключенный — `null` sample / legacy 0, без паник.
 
 ## Производительность
 
@@ -248,7 +269,9 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 - `Mutex.tryLockWithin` — sleep-цикл шагом ≤50us (не `pthread_mutex_timedlock` из-за darwin-деклараций); превышение бюджета — максимум один sleep-шаг + jitter шедулера. Контекстный acquire ограничен, игровой — всегда блокирующий (тик дропать нельзя).
 - `renderFrame`/`beginPrepare` отчитываются `wait_ns`/`held_ns`: `prepare_ms` считается минус wait, contention не двоится.
 - `claim`/`takeLatest` — lock-free CAS-сканы; `releasePublished` — монотонные фильтр-лоады (промах = неполный drain → skip кадра, не коррупция); torn-copy скрывается seqlock-ретраем вместо блокировки publisher.
-- GPU-тайминги default OFF: нулевое влияние пока выключены; `AGATE_GPU_TIMINGS=1` без перекомпиляции.
+- GPU-тайминги default OFF: без timer allocations/encoding, без синхронного ожидания
+  результатов. Для WebGPU opt-in нужен до создания device; в браузере, где нет
+  process environment, intent устанавливает приложение.
 
 ## Смотрите также
 

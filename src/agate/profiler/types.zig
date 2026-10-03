@@ -1,9 +1,11 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_timing = @import("../gpu_timing.zig");
 
-// Pure profiler data types. Leaf module: imports nothing of ours
-// (only std + sokol), so report.zig and profiler.zig can both
+// Pure profiler data types. Leaf module: imports nothing of ours besides
+// the gpu_timing leaf (FrameScope only — gpu_timing itself imports just
+// std + sokol, so no cycle), so report.zig and profiler.zig can both
 // depend on it without creating an import cycle.
 
 /// Record of a single frame's timing and counters.
@@ -31,21 +33,38 @@ pub const FrameRecord = struct {
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
     post_ms: f32 = 0,
-    /// Last COMPLETED GPU frame time in ms (measured on GPU via the
-    /// vendored sokol patch, Metal frame timer / GL sum of per-pass
-    /// samples; 0 when disabled/headless/unsupported). Async execution:
-    /// lags one frame behind the CPU submit. NEVER a CPU-submit value
+    /// Last COMPLETED GPU frame time in ms (opt-in gpu_timing sample,
+    /// observed by render after commit; 0 both when unavailable and for a
+    /// valid quantized zero — availability is `gpu_frame_submit != 0`).
+    /// Async execution: the sample belongs to an earlier completed
+    /// submission (no fixed one-frame lag is promised); the value is
+    /// backend-scoped (see `gpu_frame_scope`) and never interchangeable
+    /// across backends as a full-frame number. NEVER a CPU-submit value
     /// under a GPU name — the CPU phases above stay the only submit
     /// timings.
     gpu_frame_ms: f32 = 0,
-    /// Last COMPLETED per-pass GPU times in ms (GL4.1 `GL_TIME_ELAPSED`
-    /// samples via the vendored sokol patch; always 0 on Metal — the
-    /// frame timer is the only Metal GPU number — and 0 when
-    /// disabled/headless/unsupported). Same lag semantics as
-    /// `gpu_frame_ms`; never CPU-submit values under GPU names.
+    /// Completed-submission id for `gpu_frame_ms` (gpu_timing.Sample
+    /// frame_index, NOT a Scene frame id; 0 = absent/unavailable).
+    /// Lets summaries and traces dedup repeated async polls of the same
+    /// submission and count valid zeros as real measurements.
+    gpu_frame_submit: u32 = 0,
+    /// Backend scope of the frame measurement at commit time (.none when
+    /// unavailable). Backend-specific, never copied across backends.
+    gpu_frame_scope: gpu_timing.FrameScope = .none,
+    /// Last COMPLETED per-pass GPU times in ms (opt-in gpu_timing phase
+    /// samples; same availability rule via the `*_submit` ids below: 0 id
+    /// means unsupported, disabled, or the phase was skipped — never a
+    /// stale sample). Same async semantics as `gpu_frame_ms`; never
+    /// CPU-submit values under GPU names. Phase brackets may span multiple
+    /// real passes; values from different submission ids must never be
+    /// summed to fabricate a frame duration.
     gpu_shadow_ms: f32 = 0,
     gpu_main_ms: f32 = 0,
     gpu_post_ms: f32 = 0,
+    /// Completed-submission ids for the per-pass measurements (0 = absent).
+    gpu_shadow_submit: u32 = 0,
+    gpu_main_submit: u32 = 0,
+    gpu_post_submit: u32 = 0,
 
     // Rendering counters
     draw_calls: u32 = 0,
@@ -180,19 +199,31 @@ pub const SessionSummary = struct {
     avg_shadow_ms: f32 = 0,
     avg_main_ms: f32 = 0,
     avg_post_ms: f32 = 0,
-    /// Measured GPU frame time (ms, last-completed semantics, 0 when the
-    /// timer was off). Average/max over all recorded frames.
+    /// Measured GPU frame time (ms, last-completed-sample semantics).
+    /// Average/max over AVAILABLE DISTINCT submissions only (valid zeros
+    /// included, repeated async polls of the same submission counted once);
+    /// both 0 when no sample was ever available. Backend-scoped — not an
+    /// interchangeable full-frame number.
     avg_gpu_frame_ms: f32 = 0,
     max_gpu_frame_ms: f32 = 0,
-    /// Measured per-pass GPU times (ms, last-completed semantics, 0 when
-    /// off or unsupported — Metal per-pass is always 0). Average/max
-    /// over all recorded frames.
+    /// Number of DISTINCT completed frame submissions behind the average/max.
+    gpu_frame_samples: usize = 0,
+    /// Measured per-pass GPU times (ms, last-completed-sample semantics).
+    /// Average/max over AVAILABLE DISTINCT submissions per pass, same
+    /// dedup rule as the frame channel; per-pass values are never summed
+    /// into a fabricated frame duration.
     avg_gpu_shadow_ms: f32 = 0,
     max_gpu_shadow_ms: f32 = 0,
+    /// Distinct completed shadow submissions behind the average/max.
+    gpu_shadow_samples: usize = 0,
     avg_gpu_main_ms: f32 = 0,
     max_gpu_main_ms: f32 = 0,
+    /// Distinct completed main submissions behind the average/max.
+    gpu_main_samples: usize = 0,
     avg_gpu_post_ms: f32 = 0,
     max_gpu_post_ms: f32 = 0,
+    /// Distinct completed post submissions behind the average/max.
+    gpu_post_samples: usize = 0,
 
     // Counter stats
     avg_draw_calls: u32 = 0,

@@ -45,6 +45,22 @@
 // context-owned (prepare/render), and the build's `build_seq` counters live
 // on Scene/the subsystems, never in this struct. A concurrent update must
 // never observe a half-written stats word while render reads it.
+//
+// GPU timing (opt-in via gpu_timing): render reads optional
+// `pollFrameSample`/`pollPassSample` AFTER sg.commit and stores each
+// completed measurement's duration (floats below, names kept for
+// compatibility) PLUS its completed-submission id (`*_submit`, 0 = absent)
+// and the backend frame scope (`gpu_frame_scope`). Availability is the
+// submit id, not the duration: a valid quantized zero (submit != 0,
+// ms == 0) is a real measurement. Scopes are backend-specific
+// (Metal command-buffer time, WebGPU first-to-last native-pass span,
+// GL same-frame phase sum; a phase bracket may span multiple real
+// render/compute passes) and MUST NOT be described as interchangeable
+// full-frame values, nor mixed across submission ids to fabricate a frame
+// duration — each channel keeps its own last-completed sample.
+
+const std = @import("std");
+const gpu_timing = @import("../gpu_timing.zig");
 pub const SceneStats = struct {
     total_meshes: u32 = 0,
     rendered_meshes: u32 = 0,
@@ -78,22 +94,40 @@ pub const SceneStats = struct {
     shadow_ms: f32 = 0,
     main_ms: f32 = 0,
     post_ms: f32 = 0,
-    /// Last COMPLETED GPU frame time in ms (gpu_timing.pollFrameMs, set in
-    /// render right after sg.commit; Metal-only via the vendored sokol
-    /// patch, 0 when disabled/headless/unsupported). Lags one frame behind
-    /// the CPU submit (async GPU execution). Context-owned like the phase
-    /// timings above: written by render, never merged from game-side builds.
+    /// Last COMPLETED GPU frame time in ms (gpu_timing.pollFrameSample,
+    /// read in render right after sg.commit; 0 when no completed sample is
+    /// available — which is also what a valid quantized zero reads as, so
+    /// availability is `gpu_frame_submit != 0`, never the duration).
+    /// Async GPU execution: the sample belongs to an earlier completed
+    /// submission, observed here after commit (no fixed one-frame lag is
+    /// promised). Context-owned like the phase timings above: written by
+    /// render, never merged from game-side builds.
     gpu_frame_ms: f32 = 0,
-    /// Last COMPLETED per-pass GPU times in ms (gpu_timing.pollPassMs,
-    /// set in render right after sg.commit alongside `gpu_frame_ms`).
-    /// Real `GL_TIME_ELAPSED` samples on GL4.1; always 0 on Metal (the
-    /// frame timer is the only Metal GPU number — one command buffer per
-    /// frame) and 0 when disabled/headless/unsupported. Same ownership
-    /// and lag semantics as `gpu_frame_ms`; like it, never merged from
-    /// game-side builds (see `mergeFrom` below).
+    /// Completed-submission id for `gpu_frame_ms` (gpu_timing.Sample
+    /// frame_index; 0 = absent/unavailable). Preserved alongside the
+    /// duration so profiler summaries and traces can dedup repeated async
+    /// polls of the same submission and count valid zeros.
+    gpu_frame_submit: u32 = 0,
+    /// Backend scope of the frame measurement (gpu_timing.capabilities at
+    /// commit time; .none when unavailable). Backend-specific, never a
+    /// cross-backend interchangeable full-frame value.
+    gpu_frame_scope: gpu_timing.FrameScope = .none,
+    /// Last COMPLETED per-pass GPU times in ms (gpu_timing.pollPassSample
+    /// per phase, read in render right after sg.commit alongside
+    /// `gpu_frame_ms`). A skipped phase stores no sample (duration 0,
+    /// submit 0), never a stale one. Same ownership and async semantics
+    /// as `gpu_frame_ms`; like it, never merged from game-side builds
+    /// (see `mergeFrom` below). Phase brackets may span multiple real
+    /// render/compute passes; pass values from different submission ids
+    /// must never be summed to fabricate a frame duration.
     gpu_shadow_ms: f32 = 0,
     gpu_main_ms: f32 = 0,
     gpu_post_ms: f32 = 0,
+    /// Completed-submission ids for the per-pass measurements above
+    /// (0 = absent: unsupported, disabled, or the phase was skipped).
+    gpu_shadow_submit: u32 = 0,
+    gpu_main_submit: u32 = 0,
+    gpu_post_submit: u32 = 0,
 
     /// Deferred merge of a game-side queue build (stage-2 increment B): adds
     /// the counter fields `buildFrameQueues` produces into the context-owned
@@ -108,8 +142,10 @@ pub const SceneStats = struct {
     ///   forms coincide for one build, and `=` keeps multi-view overwrite
     ///   semantics instead of summing).
     /// Timing/upload/size fields (update_ms/prepare_ms/shadow_ms/main_ms/
-    /// post_ms, gpu_frame_ms/gpu_shadow_ms/gpu_main_ms/gpu_post_ms,
-    /// uploaded_*/updated_bytes_frame, draw_calls/triangles/etc.)
+    /// post_ms, gpu_frame_ms/gpu_shadow_ms/gpu_main_ms/gpu_post_ms plus
+    /// gpu_frame_submit/gpu_shadow_submit/gpu_main_submit/gpu_post_submit
+    /// and gpu_frame_scope, uploaded_*/updated_bytes_frame,
+    /// draw_calls/triangles/etc.)
     /// are NEVER merged: they are context-owned (prepare/render), and the
     /// game-side build must not observe or disturb them.
     pub fn mergeFrom(self: *SceneStats, other: *const SceneStats) void {
@@ -121,3 +157,67 @@ pub const SceneStats = struct {
         self.occluder_triangles = other.occluder_triangles;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+test "SceneStats mergeFrom never touches context-owned GPU metadata" {
+    // Game-side build stats must not observe or disturb the render-owned
+    // GPU samples: durations, submission ids, and scope stay intact.
+    var latch: SceneStats = .{
+        .gpu_frame_ms = 2.5,
+        .gpu_frame_submit = 11,
+        .gpu_frame_scope = .command_buffer,
+        .gpu_shadow_ms = 0.5,
+        .gpu_shadow_submit = 11,
+        .gpu_main_ms = 1.5,
+        .gpu_main_submit = 12,
+        .gpu_post_ms = 0,
+        .gpu_post_submit = 13, // valid quantized zero: present, zero
+        .total_meshes = 4,
+    };
+    const build_side: SceneStats = .{
+        .total_meshes = 10,
+        .rendered_meshes = 6,
+        .culled_meshes = 2,
+        .occluded_meshes = 1,
+        .occluders_count = 3,
+        .occluder_triangles = 99,
+        // A hostile/stale game build carrying GPU-looking values must not
+        // leak them into the latch.
+        .gpu_frame_ms = 99.0,
+        .gpu_frame_submit = 99,
+        .gpu_frame_scope = .pass_sum,
+        .gpu_shadow_ms = 99.0,
+        .gpu_shadow_submit = 99,
+        .gpu_main_ms = 99.0,
+        .gpu_main_submit = 99,
+        .gpu_post_ms = 99.0,
+        .gpu_post_submit = 99,
+        .shadow_ms = 99.0,
+        .update_ms = 99.0,
+    };
+    latch.mergeFrom(&build_side);
+    try std.testing.expectEqual(@as(u32, 14), latch.total_meshes);
+    try std.testing.expectEqual(@as(f32, 2.5), latch.gpu_frame_ms);
+    try std.testing.expectEqual(@as(u32, 11), latch.gpu_frame_submit);
+    try std.testing.expectEqual(gpu_timing.FrameScope.command_buffer, latch.gpu_frame_scope);
+    try std.testing.expectEqual(@as(f32, 0.5), latch.gpu_shadow_ms);
+    try std.testing.expectEqual(@as(u32, 11), latch.gpu_shadow_submit);
+    try std.testing.expectEqual(@as(f32, 1.5), latch.gpu_main_ms);
+    try std.testing.expectEqual(@as(u32, 12), latch.gpu_main_submit);
+    try std.testing.expectEqual(@as(f32, 0), latch.gpu_post_ms);
+    try std.testing.expectEqual(@as(u32, 13), latch.gpu_post_submit);
+    try std.testing.expectEqual(@as(f32, 0), latch.shadow_ms);
+    try std.testing.expectEqual(@as(f32, 0), latch.update_ms);
+}
+
+test "SceneStats default reset carries no GPU sample" {
+    const empty: SceneStats = .{};
+    try std.testing.expectEqual(@as(u32, 0), empty.gpu_frame_submit);
+    try std.testing.expectEqual(@as(u32, 0), empty.gpu_shadow_submit);
+    try std.testing.expectEqual(@as(u32, 0), empty.gpu_main_submit);
+    try std.testing.expectEqual(@as(u32, 0), empty.gpu_post_submit);
+    try std.testing.expectEqual(gpu_timing.FrameScope.none, empty.gpu_frame_scope);
+}

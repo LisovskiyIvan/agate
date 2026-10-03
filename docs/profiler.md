@@ -19,7 +19,13 @@
 | `report.zig` | генераторы HTML/Markdown/Chrome-trace поверх плоских данных (импорт только `types`) |
 | `report_queue.zig` | `ReportWriteTask` + `enqueueReportWrite` — enqueue-only половина lock-free окна |
 
-Методология измерения честно зафиксирована в комментариях `types.zig`: CPU-фазы — время сабмита, `gpu_frame_ms` — время ПОСЛЕДНЕГО ЗАВЕРШЁННОГО GPU-кадра (отстаёт на кадр, 0 когда выключено/headless), и их нельзя смешивать.
+CPU-фазы — время сабмита, GPU-поля — ПОСЛЕДНИЙ ЗАВЕРШЁННЫЙ timestamp sample,
+с переменной async задержкой. Они не взаимозаменяемы. GPU availability определяется
+submission id (0 = отсутствует), а не `ms > 0`: квантизация может дать валидный ноль.
+Сводка усредняет уникальные available GPU samples, не CPU-кадры с повторным poll.
+Metal command-buffer time, WebGPU native-pass span и GL pass sum имеют разные scopes:
+см. [gpu-timing.md](./gpu-timing.md). Chrome-trace GPU events привязаны ко времени
+CPU-наблюдения и помечены submission id; это не синхронизированная GPU timeline.
 
 ## Быстрый старт
 
@@ -64,8 +70,11 @@ pub const FrameRecord = struct {
     total_frame_ms: f32 = 0,    // СУММА CPU-фаз (время сабмита, не wall time)
     update_ms: f32 = 0, physics_ms: f32 = 0, prepare_ms: f32 = 0,
     shadow_ms: f32 = 0, main_ms: f32 = 0, post_ms: f32 = 0,
-    gpu_frame_ms: f32 = 0,      // последний ЗАВЕРШЁННЫЙ GPU-кадр (лаг 1 кадр)
-    gpu_shadow_ms: f32 = 0, gpu_main_ms: f32 = 0, gpu_post_ms: f32 = 0, // GL only, на Metal всегда 0
+    gpu_frame_ms: f32 = 0,      // последний completed GPU sample, переменный лаг
+    gpu_shadow_ms: f32 = 0, gpu_main_ms: f32 = 0, gpu_post_ms: f32 = 0, // supported Metal/WebGPU/GL
+    gpu_frame_submit: u32 = 0, // 0 = unavailable; валидный ноль ms имеет ненулевой id
+    gpu_shadow_submit: u32 = 0, gpu_main_submit: u32 = 0, gpu_post_submit: u32 = 0,
+    gpu_frame_scope: agate.gpu_timing.FrameScope = .none,
     draw_calls: u32 = 0, triangles: u32 = 0, pipeline_switches: u32 = 0,
     rendered_meshes: u32 = 0, culled_objects: u32 = 0,
     uploaded_textures: u32 = 0, uploaded_bytes: usize = 0, // стриминг текстур, лимит 8 MiB
@@ -181,7 +190,7 @@ Enqueue-only окно: профайлер только ставит задачу
 - `captureMemorySnapshot` без сцены невозможен — требуется `*const Scene`; при `OutOfMemory` старый latched-снимок остаётся валиден.
 - `analyze` с `memory = null` — легально, memory-секция пропускается (а не ошибка).
 - `save*`/`generate*` на пустом рекордере (0 кадров) возвращают валидный пустой отчёт, а не ошибку — проверяйте `summarize().frame_count == 0` сами.
-- `generateTraceJson` без GPU-данных пишет только CPU-события (`hasGpuData`/`hasGpuPassData` управляют секциями; на Metal per-pass секций нет никогда).
+- `generateTraceJson` без GPU-данных пишет только CPU-события (`hasGpuData`/`hasGpuPassData` проверяют available submission ids; Metal per-pass требует поддержки timestamp counters).
 - `enqueueReportWrite` при ошибке создания НЕ забирает `data` — остаётся вашей (освободите сами); при успехе — не трогать.
 - `deinit` задачи до `isDone()` — use-after-free в worker-е. Всегда опрашивайте до освобождения.
 - `setMaxFrames(0)` — вырожденное окно: `recordFrame` ничего не хранит, отчёты пустые.
@@ -200,7 +209,7 @@ Enqueue-only окно: профайлер только ставит задачу
 
 - `./scene.md` — `SceneStats`: источник фазовых данных для `recordFrame`.
 - `./frame-pipeline.md` — что измеряют фазы update/physics/prepare/shadow/main/post.
-- `./render-pipeline.md` — GPU-таймеры (`gpu_frame_ms`, per-pass на GL).
+- `./gpu-timing.md` — GPU-таймеры: scopes, completed submission ids и availability.
 - `./architecture.md` — `io_runner` и потоковая модель движка.
 - `./serialization.md` — снапшоты сцены vs снимки памяти профайлера (разные задачи).
 - `./texture.md` — `uploaded_bytes` и лимит 8 MiB стриминга текстур.

@@ -17,6 +17,7 @@
 | Файл | О чём |
 |---|---|
 | [runtime.md](./runtime.md) | `Runtime` (фасад кадра, `beginPrepare*`/`produceBuild*`, `setProducerExclusion`, метрики), `Handoff`, affinity-маркер, job pool (`forkJoin`/`parallelFor`), наблюдаемость |
+| [gpu-timing.md](./gpu-timing.md) | Opt-in Metal/WebGPU/GL timestamps: capabilities, availability, submission ids, lifecycle и живой GPU-гейт |
 | [scene.md](./scene.md) | Фасад `Scene`: registry/content, lifecycle, камеры сцены, API-фасады (sim/query/lights/profile), снимки и статистика |
 | [frame-pipeline.md](./frame-pipeline.md) | Многопоточный кадр: 3-слотовый протокол (claim→build→stage→publish, pin/lease), lock-free контракт, `host_bytes`, режимы staged/mutex/serial |
 | [render-pipeline.md](./render-pipeline.md) | Cull/сортировка/биннинг, zero-dereference draw items, инстансинг (4 фазы), фабрика пайплайнов, `FrameContext`, PostFX-цепочка, тени CSM/spot/point |

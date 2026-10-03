@@ -30,12 +30,20 @@ pub fn summarize(self: anytype) SessionSummary {
     var sum_post: f64 = 0;
     var sum_gpu: f64 = 0;
     var max_gpu: f32 = 0;
+    var count_gpu: usize = 0;
+    var last_gpu_submit: u32 = 0;
     var sum_gpu_shadow: f64 = 0;
     var max_gpu_shadow: f32 = 0;
+    var count_gpu_shadow: usize = 0;
+    var last_gpu_shadow_submit: u32 = 0;
     var sum_gpu_main: f64 = 0;
     var max_gpu_main: f32 = 0;
+    var count_gpu_main: usize = 0;
+    var last_gpu_main_submit: u32 = 0;
     var sum_gpu_post: f64 = 0;
     var max_gpu_post: f32 = 0;
+    var count_gpu_post: usize = 0;
+    var last_gpu_post_submit: u32 = 0;
 
     var sum_draw_calls: u64 = 0;
     var max_draw_calls: u32 = 0;
@@ -91,14 +99,37 @@ pub fn summarize(self: anytype) SessionSummary {
         sum_shadow += frame.shadow_ms;
         sum_main += frame.main_ms;
         sum_post += frame.post_ms;
-        sum_gpu += frame.gpu_frame_ms;
-        max_gpu = @max(max_gpu, frame.gpu_frame_ms);
-        sum_gpu_shadow += frame.gpu_shadow_ms;
-        max_gpu_shadow = @max(max_gpu_shadow, frame.gpu_shadow_ms);
-        sum_gpu_main += frame.gpu_main_ms;
-        max_gpu_main = @max(max_gpu_main, frame.gpu_main_ms);
-        sum_gpu_post += frame.gpu_post_ms;
-        max_gpu_post = @max(max_gpu_post, frame.gpu_post_ms);
+        // GPU channels: average AVAILABLE DISTINCT completed submissions
+        // only — never divide by the CPU frame count. Availability is the
+        // submission id (0 = absent), so valid quantized zeros (id != 0,
+        // ms == 0) are real measurements. Repeated async polls of the same
+        // submission surface the same id on consecutive CPU frames; count
+        // each id once (consecutive-identity dedup suffices: reads are
+        // ordered last-completed polls, never an interleaved set).
+        if (frame.gpu_frame_submit != 0 and frame.gpu_frame_submit != last_gpu_submit) {
+            last_gpu_submit = frame.gpu_frame_submit;
+            sum_gpu += frame.gpu_frame_ms;
+            max_gpu = @max(max_gpu, frame.gpu_frame_ms);
+            count_gpu += 1;
+        }
+        if (frame.gpu_shadow_submit != 0 and frame.gpu_shadow_submit != last_gpu_shadow_submit) {
+            last_gpu_shadow_submit = frame.gpu_shadow_submit;
+            sum_gpu_shadow += frame.gpu_shadow_ms;
+            max_gpu_shadow = @max(max_gpu_shadow, frame.gpu_shadow_ms);
+            count_gpu_shadow += 1;
+        }
+        if (frame.gpu_main_submit != 0 and frame.gpu_main_submit != last_gpu_main_submit) {
+            last_gpu_main_submit = frame.gpu_main_submit;
+            sum_gpu_main += frame.gpu_main_ms;
+            max_gpu_main = @max(max_gpu_main, frame.gpu_main_ms);
+            count_gpu_main += 1;
+        }
+        if (frame.gpu_post_submit != 0 and frame.gpu_post_submit != last_gpu_post_submit) {
+            last_gpu_post_submit = frame.gpu_post_submit;
+            sum_gpu_post += frame.gpu_post_ms;
+            max_gpu_post = @max(max_gpu_post, frame.gpu_post_ms);
+            count_gpu_post += 1;
+        }
 
         sum_draw_calls += frame.draw_calls;
         max_draw_calls = @max(max_draw_calls, frame.draw_calls);
@@ -202,14 +233,18 @@ pub fn summarize(self: anytype) SessionSummary {
         .avg_shadow_ms = @floatCast(sum_shadow / nf),
         .avg_main_ms = @floatCast(sum_main / nf),
         .avg_post_ms = @floatCast(sum_post / nf),
-        .avg_gpu_frame_ms = @floatCast(sum_gpu / nf),
+        .avg_gpu_frame_ms = if (count_gpu > 0) @floatCast(sum_gpu / @as(f64, @floatFromInt(count_gpu))) else 0,
         .max_gpu_frame_ms = max_gpu,
-        .avg_gpu_shadow_ms = @floatCast(sum_gpu_shadow / nf),
+        .gpu_frame_samples = count_gpu,
+        .avg_gpu_shadow_ms = if (count_gpu_shadow > 0) @floatCast(sum_gpu_shadow / @as(f64, @floatFromInt(count_gpu_shadow))) else 0,
         .max_gpu_shadow_ms = max_gpu_shadow,
-        .avg_gpu_main_ms = @floatCast(sum_gpu_main / nf),
+        .gpu_shadow_samples = count_gpu_shadow,
+        .avg_gpu_main_ms = if (count_gpu_main > 0) @floatCast(sum_gpu_main / @as(f64, @floatFromInt(count_gpu_main))) else 0,
         .max_gpu_main_ms = max_gpu_main,
-        .avg_gpu_post_ms = @floatCast(sum_gpu_post / nf),
+        .gpu_main_samples = count_gpu_main,
+        .avg_gpu_post_ms = if (count_gpu_post > 0) @floatCast(sum_gpu_post / @as(f64, @floatFromInt(count_gpu_post))) else 0,
         .max_gpu_post_ms = max_gpu_post,
+        .gpu_post_samples = count_gpu_post,
         .avg_draw_calls = @intCast(sum_draw_calls / n),
         .max_draw_calls = max_draw_calls,
         .avg_triangles = @intCast(sum_triangles / n),
@@ -316,21 +351,28 @@ test "Profiler summarize tracks measured GPU frame time" {
         .triangles = 1000,
         .pipeline_switches = 1,
     };
-    // Disabled path: zeros flow through without touching CPU-submit stats.
+    // Disabled path: zeros with no submission id flow through without
+    // touching CPU-submit stats.
     prof.recordFrame(0, &stats);
     stats.gpu_frame_ms = 2.0;
+    stats.gpu_frame_submit = 31;
     prof.recordFrame(1, &stats);
     stats.gpu_frame_ms = 4.0;
+    stats.gpu_frame_submit = 32;
     prof.recordFrame(2, &stats);
     prof.stop();
 
     try std.testing.expectEqual(@as(f32, 0), prof.frames.items[0].gpu_frame_ms);
+    try std.testing.expectEqual(@as(u32, 0), prof.frames.items[0].gpu_frame_submit);
     try std.testing.expectEqual(@as(f32, 2.0), prof.frames.items[1].gpu_frame_ms);
     try std.testing.expectEqual(@as(f32, 4.0), prof.frames.items[2].gpu_frame_ms);
 
     const summary = prof.summarize();
-    try std.testing.expectEqual(@as(f32, 2.0), summary.avg_gpu_frame_ms);
+    // Average covers the two DISTINCT available submissions, not the three
+    // CPU frames: (2+4)/2 == 3.
+    try std.testing.expectEqual(@as(f32, 3.0), summary.avg_gpu_frame_ms);
     try std.testing.expectEqual(@as(f32, 4.0), summary.max_gpu_frame_ms);
+    try std.testing.expectEqual(@as(usize, 2), summary.gpu_frame_samples);
     // CPU-submit stats are untouched by the GPU field.
     try std.testing.expectEqual(@as(f32, 9.5), summary.avg_frame_ms);
 }

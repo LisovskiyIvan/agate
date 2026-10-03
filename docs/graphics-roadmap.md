@@ -149,10 +149,14 @@ postprocess bandwidth и shader variants. Сцены: много одинако�
 много уникальных материалов; почти всё видно / почти всё скрыто; тяжёлый pixel load.
 Оптимизировать только измеренный ограничитель.
 
-Metal сейчас даёт frame GPU time; per-pass Metal/WGPU не реализованы в hooks.
-Для атрибуции — GPU capture или отдельно спроектированные timestamps, не
-CPU-submit таймер с подписью GPU. Параллельные сборки/рендеры не допускаются
-во время сравнительного perf-прогона.
+В наших forks есть opt-in frame/phase timestamps для Metal и WebGPU с runtime
+capability gates, availability и submission ids — [gpu-timing.md](./gpu-timing.md).
+Metal frame — command-buffer duration, WebGPU frame — native-pass span, GL —
+сумма фаз одной submission: scope учитывать при сравнении. Shadow/main/post —
+группы проходов, не отдельные draw calls; unbracketed compute/probe/UI-capture
+не автоматически входят в фазовые метрики. Для более тонкой атрибуции нужен GPU
+capture, не CPU-submit таймер с подписью GPU. Параллельные сборки/рендеры не
+допускаются во время сравнительного perf-прогона.
 
 ### P1. Минимальный indirect контракт в наших форках
 

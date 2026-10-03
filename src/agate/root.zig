@@ -589,7 +589,7 @@ pub const DiagnosticSeverity = profiler.DiagnosticSeverity;
 pub const ReportWriteTask = profiler.ReportWriteTask;
 pub const ReportFiles = profiler.ReportFiles;
 
-/// GPU frame timings v1 (vendored sokol patch, default off).
+/// Opt-in GPU frame/phase timestamps, capabilities and completed samples.
 pub const gpu_timing = @import("gpu_timing.zig");
 
 pub const sokol = @import("sokol");

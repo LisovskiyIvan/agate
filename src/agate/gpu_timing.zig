@@ -1,57 +1,59 @@
-//! GPU frame timings, v1 (Metal-only) via the agate sokol fork.
+//! Agate phase mapping over sokol's engine-independent GPU timing scopes.
 //!
-//! Upstream sokol-gfx has no GPU-timestamp mechanism (trace hooks are
-//! CPU-side begin/end callbacks, not GPU time), so the engine profiler
-//! historically recorded CPU-submit times only. The `engine/sokol` fork
-//! carries a minimal C addition to `sokol_gfx.h`, and the
-//! `engine/sokol-zig` fork exposes it as generated wrappers:
+//! Metal reports command-buffer time and counter-supported phase spans;
+//! WebGPU reports native-pass/phase spans when timestamp-query was requested
+//! on the device; desktop GL reports elapsed phase queries and their sum.
+//! `capabilities` describes support and scope. Optional `Sample`s distinguish
+//! unavailable results from valid zero-duration (quantized) measurements.
+//! Sample indices identify completed sokol submissions, not Scene.frame_id.
 //!
-//! - `sg.agateSetGpuTimingEnabled(bool)` — default OFF. While on,
-//!   Metal retains each committed command buffer one extra frame;
-//!   on GLCORE-non-Win32 desktop GL each engine phase (shadow/main/post)
-//!   opens a `GL_TIME_ELAPSED` query (other backends: C-level -1).
-//! - `sg.agateQueryGpuFrameMs()` — last COMPLETED frame's GPU time
-//!   in ms (Metal `(GPUEndTime-GPUStartTime)`; GL sum of the
-//!   last-completed per-pass samples), or -1 when unavailable
-//!   (disabled, not ready yet, or an unsupported backend).
-//! - `sg.agateGpuPassBegin/End(int)` + `sg.agateQueryGpuPassMs`
-//!   — per-pass timers (GLCORE-non-Win32 desktop GL only; linked no-ops / C-level -1 elsewhere).
-//!
-//! Semantics: the value lags one frame behind the CPU submit (async GPU
-//! execution) and is a single frame-level number on Metal — per-pass GPU
-//! attribution is v2: engine-driven `GL_TIME_ELAPSED` pools on GLCORE-non-Win32
-//! desktop GL (`Pass` below; Metal begin/end are linked no-ops and per-pass
-//! queries are C-level -1 there (0 via `pollPassMs`) — the single Metal
-//! command buffer spans the whole frame, see the fork's C comments). Headless/dummy (no sg context)
-//! is fail-closed: every entry point returns 0/false and never calls
-//! into sokol C code outside a valid context.
-//!
-//! Enablement (default OFF, zero behavior change while off):
-//! - programmatic: `gpu_timing.setEnabled(true)` (call before or after
-//!   `sg.setup`; the C flag is applied lazily on the next poll once a
-//!   context exists), or
-//! - environment: `AGATE_GPU_TIMINGS=1` (also `true`/`on`/`yes`),
-//!   picked up lazily on first use — no sandbox flag plumbing needed.
-//! Disable on the context thread before `sg.shutdown()` to release the
-//! fork's retained command buffer/query pool; shutdown does not do it yet.
-//!
-//! Leaf module: imports std + sokol only, never the profiler or scene,
-//! so `scene/frame_render.zig` can poll it without an import cycle.
+//! Enable via `setEnabled(true)` or AGATE_GPU_TIMINGS=1/true/on/yes. For
+//! WebGPU also set sapp.Desc.wgpu_gpu_timing_enabled BEFORE device creation
+//! (e.g. to `isEnabled()`). Unsupported devices remain usable without timers.
+//! Intent is any-thread; begin/end/poll apply it only on the context thread.
+//! Default OFF encodes no timestamps. sg.shutdown owns timer teardown, and
+//! the next setup/poll reapplies intent without a stale context cache.
 
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 
-/// Engine render phases with GPU timers. Ids match the sokol fork's C
-/// side (`engine/sokol`): 0=shadow, 1=main, 2=post. GLCORE-non-Win32
-/// desktop GL carries a real `GL_TIME_ELAPSED` pool per phase; Metal
-/// compiles the brackets to linked no-ops (frame timer only — one command
-/// buffer per frame) and every other backend is fail-closed.
+/// Agate assigns three caller-defined sokol scopes; sokol has no phase names.
 pub const Pass = enum(c_int) {
     shadow = 0,
     main = 1,
     post = 2,
 };
+
+pub const FrameScope = enum { none, command_buffer, native_pass_span, pass_sum };
+
+pub const Capabilities = struct {
+    frame: bool = false,
+    passes: bool = false,
+    frame_scope: FrameScope = .none,
+};
+
+/// A completed GPU measurement. Index 0 is reserved for unavailable data.
+pub const Sample = struct {
+    ms: f32,
+    frame_index: u32,
+};
+
+/// Device support, independent of enablement. Context-thread query.
+pub fn capabilities() Capabilities {
+    if (!sg.isvalid()) return .{};
+    const frame = sg.gpuFrameTimingSupported();
+    return .{
+        .frame = frame,
+        .passes = sg.gpuScopeTimingSupported(),
+        .frame_scope = if (frame) switch (sg.queryBackend()) {
+            .METAL_MACOS, .METAL_IOS, .METAL_SIMULATOR => .command_buffer,
+            .WGPU => .native_pass_span,
+            .GLCORE => .pass_sum,
+            else => .none,
+        } else .none,
+    };
+}
 
 /// Truth values accepted for AGATE_GPU_TIMINGS (exact match, lowercase).
 pub fn parseEnvFlag(value: ?[]const u8) bool {
@@ -61,7 +63,6 @@ pub fn parseEnvFlag(value: ?[]const u8) bool {
 }
 
 var enabled: std.atomic.Value(bool) = .init(false);
-var c_applied: std.atomic.Value(bool) = .init(false);
 var env_checked: std.atomic.Value(bool) = .init(false);
 
 fn pollEnvOnce() void {
@@ -74,19 +75,13 @@ fn pollEnvOnce() void {
 /// touches C without a valid sg context.
 fn syncToC(want: bool) void {
     if (!sg.isvalid()) return;
-    if (c_applied.load(.acquire) == want) return;
-    sg.agateSetGpuTimingEnabled(want);
-    c_applied.store(want, .release);
+    sg.setGpuTimingEnabled(want);
 }
 
-/// Enables or disables GPU frame timings. Safe to call with no sg
-/// context (the C flag is applied lazily by `pollFrameMs` once a
-/// context exists). With a live context, call only on the context thread:
-/// applying the flag may allocate or release backend timing resources.
+/// Any-thread intent only. The next context-thread begin/end/poll applies it.
 pub fn setEnabled(on: bool) void {
     pollEnvOnce();
     enabled.store(on, .release);
-    syncToC(on);
 }
 
 /// Current enablement intent (includes the `AGATE_GPU_TIMINGS` opt-in).
@@ -95,62 +90,52 @@ pub fn isEnabled() bool {
     return enabled.load(.acquire);
 }
 
-/// Per-frame hook for the render thread: call once after `sg.commit()`.
-/// Returns the last completed GPU frame time in ms, or 0 when disabled,
-/// headless, not ready yet, or on a backend without support. On GL the
-/// frame value is the sum of the last-completed per-pass samples (a
-/// lower bound: inter-pass bubbles excluded). Never panics, never calls
-/// into C without context.
-pub fn pollFrameMs() f32 {
-    pollEnvOnce();
-    if (!enabled.load(.acquire)) {
-        syncToC(false);
-        return 0;
-    }
-    if (!sg.isvalid()) return 0;
-    syncToC(true);
-    const ms = sg.agateQueryGpuFrameMs();
-    return if (ms >= 0) ms else 0;
+fn applyIntent() bool {
+    const want = isEnabled();
+    if (!sg.isvalid()) return false;
+    syncToC(want);
+    return want;
 }
 
-/// Opens the GPU timer for phase `pass`. Bracket each engine phase
-/// (`frame_render.zig` shadow/main/post) with begin/end; strictly
-/// sequential, never nested. Fail-closed no-op when disabled or
-/// headless (never calls into C without context); linked no-op on
-/// Metal, so the same call sites serve every backend.
+fn sampleFromC(ms: f32, frame_index: u32) ?Sample {
+    if (frame_index == 0 or !std.math.isFinite(ms) or ms < 0) return null;
+    return .{ .ms = ms, .frame_index = frame_index };
+}
+
+/// Context-thread poll after commit. Does not wait for the current GPU frame.
+pub fn pollFrameSample() ?Sample {
+    if (!applyIntent()) return null;
+    const ms = sg.queryGpuFrameMs();
+    return sampleFromC(ms, sg.queryGpuFrameIndex());
+}
+
+/// Legacy profiler helper: unavailable samples map to 0, not CPU time.
+pub fn pollFrameMs() f32 {
+    return if (pollFrameSample()) |sample| sample.ms else 0;
+}
+
+/// Context-thread phase bracket; sequential, never nested. Unsupported is a no-op.
 pub fn beginPass(pass: Pass) void {
-    pollEnvOnce();
-    if (!enabled.load(.acquire)) return;
-    if (!sg.isvalid()) return;
-    syncToC(true);
-    sg.agateGpuPassBegin(@intFromEnum(pass));
+    if (!applyIntent()) return;
+    sg.gpuTimingScopeBegin(@intFromEnum(pass));
 }
 
 /// Closes the GPU timer for phase `pass`. Same fail-closed contract as
 /// `beginPass`; an end without begin is ignored by the C side.
 pub fn endPass(pass: Pass) void {
-    pollEnvOnce();
-    if (!enabled.load(.acquire)) return;
-    if (!sg.isvalid()) return;
-    syncToC(true);
-    sg.agateGpuPassEnd(@intFromEnum(pass));
+    if (!applyIntent()) return;
+    sg.gpuTimingScopeEnd(@intFromEnum(pass));
 }
 
-/// Reads the last COMPLETED sample for phase `pass` in ms (lags behind
-/// the CPU submit like the frame timer), or 0 when disabled, headless,
-/// not ready yet, or unsupported (Metal per-pass is always 0 — the
-/// frame timer is the only Metal GPU number). Never panics, never calls
-/// into C without context.
+/// Completed phase span, possibly several native passes. Context thread only.
+pub fn pollPassSample(pass: Pass) ?Sample {
+    if (!applyIntent()) return null;
+    const ms = sg.queryGpuScopeMs(@intFromEnum(pass));
+    return sampleFromC(ms, sg.queryGpuScopeFrameIndex(@intFromEnum(pass)));
+}
+
 pub fn pollPassMs(pass: Pass) f32 {
-    pollEnvOnce();
-    if (!enabled.load(.acquire)) {
-        syncToC(false);
-        return 0;
-    }
-    if (!sg.isvalid()) return 0;
-    syncToC(true);
-    const ms = sg.agateQueryGpuPassMs(@intFromEnum(pass));
-    return if (ms >= 0) ms else 0;
+    return if (pollPassSample(pass)) |sample| sample.ms else 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,12 +172,11 @@ test "gpu_timing is off by default and fail-closed headless" {
     try std.testing.expectEqual(@as(f32, 0), pollFrameMs());
 }
 
-test "gpu_timing pass ids match the sokol patch contract" {
-    // The C side indexes pools by these ids (0=shadow, 1=main, 2=post);
-    // a renumber here without the matching C change would misattribute.
+test "gpu_timing maps Agate phases to generic sokol scopes" {
     try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(Pass.shadow));
     try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(Pass.main));
     try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(Pass.post));
+    try std.testing.expect(@intFromEnum(Pass.post) < sg.max_gpu_timing_scopes);
 }
 
 test "gpu_timing per-pass brackets are fail-closed headless" {
@@ -219,4 +203,23 @@ test "gpu_timing per-pass brackets are fail-closed headless" {
     try std.testing.expectEqual(@as(f32, 0), pollPassMs(.shadow));
     try std.testing.expectEqual(@as(f32, 0), pollPassMs(.main));
     try std.testing.expectEqual(@as(f32, 0), pollPassMs(.post));
+}
+
+test "gpu_timing optional samples and capabilities are unavailable headless" {
+    const was_enabled = isEnabled();
+    defer setEnabled(was_enabled);
+    setEnabled(true);
+    try std.testing.expectEqual(Capabilities{}, capabilities());
+    try std.testing.expect(pollFrameSample() == null);
+    inline for (.{ Pass.shadow, Pass.main, Pass.post }) |pass| {
+        try std.testing.expect(pollPassSample(pass) == null);
+    }
+}
+
+test "gpu_timing preserves valid zero and rejects invalid samples" {
+    try std.testing.expectEqual(Sample{ .ms = 0, .frame_index = 7 }, sampleFromC(0, 7).?);
+    try std.testing.expect(sampleFromC(-1, 7) == null);
+    try std.testing.expect(sampleFromC(1, 0) == null);
+    try std.testing.expect(sampleFromC(std.math.nan(f32), 7) == null);
+    try std.testing.expect(sampleFromC(std.math.inf(f32), 7) == null);
 }

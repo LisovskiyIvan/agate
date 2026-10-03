@@ -289,6 +289,11 @@ pub fn build(b: *Build) !void {
         .wgpu = opt_wgpu,
     });
     const mod_sokol = dep_sokol.module("sokol");
+    if (is_web) {
+        const emsdk = dep_sokol.builder.dependency("emsdk", .{});
+        b.step("install-emsdk", "Install the workspace Emscripten SDK")
+            .dependOn(sokol.emSdkInstallStep(b, emsdk, .{}));
+    }
     const mod_math = b.createModule(.{ .root_source_file = b.path("src/agate/math.zig") });
 
     // Шейдеры: единая таблица "имя модуля -> вход/выход", slang общий для всех.
@@ -636,6 +641,43 @@ pub fn build(b: *Build) !void {
     const run_rtt = b.addRunArtifact(rtt_smoke);
     if (b.args) |args| run_rtt.addArgs(args);
     b.step("example-rtt", "Run render-target and refraction smoke (needs GPU/display)").dependOn(&run_rtt.step);
+
+    const timing_module = b.createModule(.{
+        .root_source_file = b.path(if (is_web) "examples/gpu_timing_web.zig" else "examples/gpu_timing.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const timing_build = b.step("gpu-timing", "Build the finite GPU timing/lifecycle smoke");
+    const timing_run = b.step("example-gpu-timing", "Run GPU timing/lifecycle smoke (needs GPU/display)");
+    if (is_web) {
+        const timing_lib = b.addLibrary(.{ .name = "gpu-timing", .root_module = timing_module });
+        const emsdk = dep_sokol.builder.dependency("emsdk", .{});
+        const link = try sokol.emLinkStep(b, .{
+            .lib_main = timing_lib,
+            .target = target,
+            .optimize = optimize,
+            .emsdk = emsdk,
+            .use_webgpu = opt_wgpu,
+            .use_webgl2 = !opt_wgpu,
+            .use_emmalloc = true,
+            .use_filesystem = true,
+            .shell_file_path = dep_sokol.path("src/sokol/web/shell.html"),
+            .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sINITIAL_MEMORY=128MB", "-sALLOW_MEMORY_GROWTH=1" },
+        });
+        timing_build.dependOn(&link.step);
+        const web_run = sokol.emRunStep(b, .{ .name = "gpu-timing", .emsdk = emsdk });
+        web_run.step.dependOn(&link.step);
+        timing_run.dependOn(&web_run.step);
+    } else {
+        const timing_exe = b.addExecutable(.{ .name = "gpu-timing", .root_module = timing_module });
+        timing_build.dependOn(&b.addInstallArtifact(timing_exe, .{}).step);
+        const native_run = b.addRunArtifact(timing_exe);
+        timing_run.dependOn(&native_run.step);
+    }
     const lib_tests = b.addTest(.{
         .root_module = mod_agate,
         // Vendored runner (tools/test_runner.zig): stock 0.16.0 fails to
