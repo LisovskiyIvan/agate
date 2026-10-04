@@ -91,6 +91,8 @@ const scene_lights = @import("light_rig.zig");
 const scene_clustered = @import("clustered_lights.zig");
 const ClusteredPointLight = lights.ClusteredPointLight;
 const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
+const ClusteredSpotLight = lights.ClusteredSpotLight;
+const ClusteredSpotLightOptions = lights.ClusteredSpotLightOptions;
 const scene_shadow = @import("shadow_system.zig");
 const scene_sky = @import("sky_layer.zig");
 const scene_probes = @import("probe_layer.zig");
@@ -859,6 +861,26 @@ pub const Scene = struct {
     /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn clusteredPointLightCount(self: *const Scene) usize {
         return scene_lights_api.clusteredPointLightCount(self);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn addClusteredSpotLight(self: *Scene, position: Vec3, options: ClusteredSpotLightOptions) error{TooManyClusteredLights}!usize {
+        return scene_lights_api.addClusteredSpotLight(self, position, options);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn removeClusteredSpotLight(self: *Scene, index: usize) void {
+        scene_lights_api.removeClusteredSpotLight(self, index);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn getClusteredSpotLight(self: *Scene, index: usize) ?*ClusteredSpotLight {
+        return scene_lights_api.getClusteredSpotLight(self, index);
+    }
+
+    /// See `scene/lights_api.zig` (owns the body + docs).
+    pub fn clusteredSpotLightCount(self: *const Scene) usize {
+        return scene_lights_api.clusteredSpotLightCount(self);
     }
 
     /// See `scene/attachments.zig` (owns the body + docs).

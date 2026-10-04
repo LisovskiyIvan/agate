@@ -14,6 +14,9 @@ const Color3 = math.Color3;
 /// (unshadowed by design, documented there).
 pub const max_clustered_lights: usize = 64;
 
+/// Maximum spot lights in the clustered forward pool.
+pub const max_clustered_spots: usize = 32;
+
 pub const ClusteredPointLightOptions = struct {
     color: Color3 = Color3.white,
     intensity: f32 = 1.0,
@@ -43,6 +46,42 @@ pub const ClusteredPointLight = struct {
             .color = options.color,
             .intensity = options.intensity,
             .radius = options.radius,
+            .is_enabled = options.enabled,
+        };
+    }
+};
+
+pub const ClusteredSpotLightOptions = struct {
+    direction: Vec3 = Vec3.new(0, -1, 0),
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    range: f32 = 15.0,
+    inner_angle_deg: f32 = 15.0,
+    outer_angle_deg: f32 = 30.0,
+    enabled: bool = true,
+};
+
+/// Clustered spot light (position, range, direction, inner/outer angles).
+/// Value type owned in a fixed array by LightRig and staged into FramePack.
+pub const ClusteredSpotLight = struct {
+    position: Vec3 = Vec3.zero,
+    direction: Vec3 = Vec3.new(0, -1, 0),
+    color: Color3 = Color3.white,
+    intensity: f32 = 1.0,
+    range: f32 = 15.0,
+    inner_angle_deg: f32 = 15.0,
+    outer_angle_deg: f32 = 30.0,
+    is_enabled: bool = true,
+
+    pub fn init(position: Vec3, options: ClusteredSpotLightOptions) ClusteredSpotLight {
+        return .{
+            .position = position,
+            .direction = if (options.direction.lengthSq() > 1e-12) options.direction.normalize() else Vec3.new(0, -1, 0),
+            .color = options.color,
+            .intensity = options.intensity,
+            .range = options.range,
+            .inner_angle_deg = options.inner_angle_deg,
+            .outer_angle_deg = options.outer_angle_deg,
             .is_enabled = options.enabled,
         };
     }

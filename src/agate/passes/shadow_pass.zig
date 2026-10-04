@@ -48,6 +48,7 @@ pub const ShadowPass = core.ShadowPass;
 
 // Atlas constants (live in shadow/types.zig).
 pub const SHADOW_ATLAS_SIZE = types.SHADOW_ATLAS_SIZE;
+pub const SPOT_SHADOW_SLOTS = types.SPOT_SHADOW_SLOTS;
 pub const SPOT_SHADOW_MAP_WIDTH = types.SPOT_SHADOW_MAP_WIDTH;
 pub const SPOT_SHADOW_MAP_HEIGHT = types.SPOT_SHADOW_MAP_HEIGHT;
 pub const SPOT_SHADOW_RES = types.SPOT_SHADOW_RES;
@@ -61,6 +62,7 @@ pub const POINT_SHADOW_MAP_HEIGHT = types.POINT_SHADOW_MAP_HEIGHT;
 pub const SpotShadowRenderInfo = types.SpotShadowRenderInfo;
 pub const PointShadowRenderInfo = types.PointShadowRenderInfo;
 
-// Point-atlas math (lives in shadow/types.zig).
+// Atlas math (lives in shadow/types.zig).
 pub const pointFaceForDir = types.pointFaceForDir;
 pub const pointTileOrigin = types.pointTileOrigin;
+pub const spotTileOrigin = types.spotTileOrigin;

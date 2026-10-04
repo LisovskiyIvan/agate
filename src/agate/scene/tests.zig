@@ -303,6 +303,55 @@ test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
     try std.testing.expect(!@hasField(@import("../serialization.zig").SceneState, "clustered"));
 }
 
+test "Scene exposes clustered spot pool: stages into FramePack, cap at 32, order-preserving removal" {
+    const alloc = std.testing.allocator;
+    const cluster_lights = @import("../lights.zig");
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+
+    var pack: scene_lights.LightRig.FramePack = undefined;
+    scene.updateLights(0.016);
+    try std.testing.expect(scene.light_handoff.takeLatest(&pack));
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_spot_count);
+
+    const idx0 = try scene.addClusteredSpotLight(Vec3.new(1.0, 2.0, 3.0), .{
+        .direction = Vec3.new(0, -1, 0),
+        .color = Color3.new(1.0, 0.0, 0.0),
+        .intensity = 2.0,
+        .range = 15.0,
+        .inner_angle_deg = 20.0,
+        .outer_angle_deg = 40.0,
+    });
+    const idx1 = try scene.addClusteredSpotLight(Vec3.zero, .{});
+    try std.testing.expectEqual(@as(usize, 0), idx0);
+    try std.testing.expectEqual(@as(usize, 1), idx1);
+    try std.testing.expectEqual(@as(usize, 2), scene.clusteredSpotLightCount());
+    try std.testing.expect(scene.getClusteredSpotLight(0).?.position.x == 1.0);
+    try std.testing.expect(scene.getClusteredSpotLight(2) == null);
+
+    scene.getClusteredSpotLight(0).?.is_enabled = false;
+    scene.updateLights(0.016);
+    _ = scene.light_handoff.takeLatest(&pack);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_spot_count);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_spot_pos_range[0]);
+    scene.getClusteredSpotLight(0).?.is_enabled = true;
+
+    // Hard cap: past 32 lights the add errors and the count is unchanged.
+    var k: usize = 2;
+    while (k < cluster_lights.max_clustered_spots) : (k += 1) {
+        _ = try scene.addClusteredSpotLight(Vec3.zero, .{});
+    }
+    try std.testing.expectEqual(cluster_lights.max_clustered_spots, scene.clusteredSpotLightCount());
+    try std.testing.expectError(error.TooManyClusteredLights, scene.addClusteredSpotLight(Vec3.zero, .{}));
+    try std.testing.expectEqual(cluster_lights.max_clustered_spots, scene.clusteredSpotLightCount());
+
+    scene.removeClusteredSpotLight(7_000); // out of range
+    try std.testing.expectEqual(cluster_lights.max_clustered_spots, scene.clusteredSpotLightCount());
+    scene.removeClusteredSpotLight(0);
+    try std.testing.expectEqual(cluster_lights.max_clustered_spots - 1, scene.clusteredSpotLightCount());
+}
+
+
 test "clustered removal retires live tile buffers; out-of-range never retires" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);

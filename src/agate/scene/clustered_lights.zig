@@ -113,6 +113,24 @@ pub const ClusterTileGpu = struct {
     count: u32 = 0,
 };
 
+/// Staging copy of one clustered spot light for the tile build:
+/// position + range (w), direction + cos_inner (w),
+/// color + cos_outer (w), intensity.
+pub const ClusteredSpotStage = struct {
+    pos_range: [4]f32,
+    dir_inner: [4]f32,
+    color_outer: [4]f32,
+    intensity: [4]f32,
+};
+
+/// GPU mirror of one clustered spot light (std430: four vec4, 64 bytes).
+pub const ClusterSpotGpu = struct {
+    pos_range: [4]f32 = .{ 0, 0, 0, 0 },
+    dir_inner: [4]f32 = .{ 0, 0, 0, 0 },
+    color_outer: [4]f32 = .{ 0, 0, 0, 0 },
+    intensity: [4]f32 = .{ 0, 0, 0, 0 },
+};
+
 /// Grid dimensions for a viewport, in tiles (ceiling division). Zero in a
 /// dimension when the viewport is empty — the build then writes nothing.
 pub const TileGrid = struct {
@@ -196,6 +214,11 @@ fn sphereOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, radius: f32) b
         if (!(dist >= -radius)) return false;
     }
     return true;
+}
+
+/// True when the cone bounded by the sphere (center, range) overlaps the tile column.
+pub fn spotOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, range: f32) bool {
+    return sphereOverlapsTileColumn(vp, rect, center, range);
 }
 
 /// Builds per-tile clustered-light index lists from staged pack data.

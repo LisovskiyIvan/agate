@@ -36,9 +36,11 @@ pub fn renderSpot(
         var spot_last_pipeline_id: u32 = 0;
 
         for (spot_shadows) |spot_info| {
-            const vx: i32 = if (spot_info.spot_index == 0) 0 else types.SPOT_SHADOW_RES;
-            sg.applyViewport(vx, 0, types.SPOT_SHADOW_RES, types.SPOT_SHADOW_RES, false);
-            sg.applyScissorRect(vx, 0, types.SPOT_SHADOW_RES, types.SPOT_SHADOW_RES, false);
+            const origin = types.spotTileOrigin(spot_info.spot_index);
+            const vx: i32 = if (spot_info.tile_x != 0 or spot_info.tile_y != 0) spot_info.tile_x else origin.x;
+            const vy: i32 = if (spot_info.tile_x != 0 or spot_info.tile_y != 0) spot_info.tile_y else origin.y;
+            sg.applyViewport(vx, vy, types.SPOT_SHADOW_RES, types.SPOT_SHADOW_RES, false);
+            sg.applyScissorRect(vx, vy, types.SPOT_SHADOW_RES, types.SPOT_SHADOW_RES, false);
 
             const spot_frustum = math.Frustum.fromViewProjection(spot_info.view_proj);
             buckets.renderBuckets(self, prepared, spot_info.view_proj, spot_frustum, null, &spot_last_pipeline_id, draw_calls);

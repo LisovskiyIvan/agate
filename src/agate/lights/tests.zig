@@ -13,10 +13,12 @@ const PointLight = lights_mod.PointLight;
 const SpotLight = lights_mod.SpotLight;
 const AreaLight = lights_mod.AreaLight;
 const ClusteredPointLight = lights_mod.ClusteredPointLight;
+const ClusteredSpotLight = lights_mod.ClusteredSpotLight;
 const max_directional_lights = lights_mod.max_directional_lights;
 const max_fill_directionals = lights_mod.max_fill_directionals;
 const max_area_lights = lights_mod.max_area_lights;
 const max_clustered_lights = lights_mod.max_clustered_lights;
+const max_clustered_spots = lights_mod.max_clustered_spots;
 const resolveSunDirection = lights_mod.resolveSunDirection;
 const resolveSunColor = lights_mod.resolveSunColor;
 const resolveSunIntensity = lights_mod.resolveSunIntensity;
@@ -266,4 +268,34 @@ test "PointLight.getShadowFaceViewProj centers each axis on its face" {
         const ndc_z = cz / cw;
         try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
     }
+}
+
+test "ClusteredSpotLight.init initializes all fields and defaults" {
+    const defaults = ClusteredSpotLight.init(Vec3.zero, .{});
+    try std.testing.expectEqual(Vec3.zero, defaults.position);
+    try std.testing.expectEqual(Vec3.new(0, -1, 0), defaults.direction);
+    try std.testing.expectEqual(Color3.white, defaults.color);
+    try std.testing.expectEqual(@as(f32, 1.0), defaults.intensity);
+    try std.testing.expectEqual(@as(f32, 15.0), defaults.range);
+    try std.testing.expectEqual(@as(f32, 15.0), defaults.inner_angle_deg);
+    try std.testing.expectEqual(@as(f32, 30.0), defaults.outer_angle_deg);
+    try std.testing.expect(defaults.is_enabled);
+
+    const custom = ClusteredSpotLight.init(Vec3.new(1.0, 2.0, 3.0), .{
+        .direction = Vec3.new(0.0, 0.0, 2.0),
+        .color = Color3.new(0.8, 0.4, 0.2),
+        .intensity = 5.0,
+        .range = 25.0,
+        .inner_angle_deg = 20.0,
+        .outer_angle_deg = 40.0,
+        .enabled = false,
+    });
+    try std.testing.expectEqual(Vec3.new(1.0, 2.0, 3.0), custom.position);
+    try std.testing.expectEqual(Vec3.new(0.0, 0.0, 1.0), custom.direction);
+    try std.testing.expectEqual(Color3.new(0.8, 0.4, 0.2), custom.color);
+    try std.testing.expectEqual(@as(f32, 5.0), custom.intensity);
+    try std.testing.expectEqual(@as(f32, 25.0), custom.range);
+    try std.testing.expectEqual(@as(f32, 20.0), custom.inner_angle_deg);
+    try std.testing.expectEqual(@as(f32, 40.0), custom.outer_angle_deg);
+    try std.testing.expect(!custom.is_enabled);
 }

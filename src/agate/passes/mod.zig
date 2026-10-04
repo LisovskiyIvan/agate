@@ -1,6 +1,7 @@
 pub const ShadowPass = @import("shadow_pass.zig").ShadowPass;
 pub const SpotShadowRenderInfo = @import("shadow_pass.zig").SpotShadowRenderInfo;
 pub const PointShadowRenderInfo = @import("shadow_pass.zig").PointShadowRenderInfo;
+pub const SPOT_SHADOW_SLOTS = @import("shadow_pass.zig").SPOT_SHADOW_SLOTS;
 pub const POINT_SHADOW_SLOTS = @import("shadow_pass.zig").POINT_SHADOW_SLOTS;
 pub const POINT_SHADOW_FACES = @import("shadow_pass.zig").POINT_SHADOW_FACES;
 pub const POINT_SHADOW_RES = @import("shadow_pass.zig").POINT_SHADOW_RES;
@@ -8,6 +9,7 @@ pub const POINT_SHADOW_MAP_WIDTH = @import("shadow_pass.zig").POINT_SHADOW_MAP_W
 pub const POINT_SHADOW_MAP_HEIGHT = @import("shadow_pass.zig").POINT_SHADOW_MAP_HEIGHT;
 pub const pointFaceForDir = @import("shadow_pass.zig").pointFaceForDir;
 pub const pointTileOrigin = @import("shadow_pass.zig").pointTileOrigin;
+pub const spotTileOrigin = @import("shadow_pass.zig").spotTileOrigin;
 pub const SkyboxPass = @import("skybox_pass.zig").SkyboxPass;
 pub const ParticlePass = @import("particle_pass.zig").ParticlePass;
 pub const PostProcessPass = @import("postprocess_pass.zig").PostProcessPass;

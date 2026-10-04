@@ -23,6 +23,7 @@ const Mesh = mesh_mod.Mesh;
 // sokol-shdc --defines only supports valueless macros, so the value cannot be
 // injected from the build and lives in these two places by convention.
 pub const SHADOW_ATLAS_SIZE: u32 = 2048;
+pub const SPOT_SHADOW_SLOTS: usize = 2;
 pub const SPOT_SHADOW_MAP_WIDTH: u32 = 1024;
 pub const SPOT_SHADOW_MAP_HEIGHT: u32 = 512;
 pub const SPOT_SHADOW_RES: i32 = 512;
@@ -46,6 +47,8 @@ pub const POINT_SHADOW_MAP_HEIGHT: u32 = 512;
 
 pub const SpotShadowRenderInfo = struct {
     spot_index: usize = 0,
+    tile_x: i32 = 0,
+    tile_y: i32 = 0,
     view_proj: Mat4 = Mat4.identity,
 };
 
@@ -56,6 +59,14 @@ pub const PointShadowRenderInfo = struct {
 };
 
 const Mat4 = math.Mat4;
+
+/// Pixel origin of a spot-shadow atlas page / tile: side-by-side tiles.
+pub fn spotTileOrigin(slot: usize) struct { x: i32, y: i32 } {
+    return .{
+        .x = @as(i32, @intCast(slot % SPOT_SHADOW_SLOTS)) * SPOT_SHADOW_RES,
+        .y = 0,
+    };
+}
 
 /// Cube-face index for a light-space direction, mirroring the GLSL
 /// pointFaceIndex in the forward shaders: major axis wins, ties prefer

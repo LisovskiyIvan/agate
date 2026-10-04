@@ -17,6 +17,8 @@ const AreaLight = lights.AreaLight;
 const AreaLightOptions = lights.AreaLightOptions;
 const ClusteredPointLight = lights.ClusteredPointLight;
 const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
+const ClusteredSpotLight = lights.ClusteredSpotLight;
+const ClusteredSpotLightOptions = lights.ClusteredSpotLightOptions;
 const light_selection = @import("light_selection.zig");
 const passes = @import("../passes/mod.zig");
 
@@ -50,6 +52,10 @@ pub const LightRig = struct {
     /// per tile (see scene/clustered_lights.zig).
     clustered: [lights.max_clustered_lights]ClusteredPointLight = [_]ClusteredPointLight{.{}} ** lights.max_clustered_lights,
     clustered_count: usize = 0,
+    /// Clustered forward spot lights: value array, at most
+    /// lights.max_clustered_spots, session-local.
+    clustered_spots: [lights.max_clustered_spots]ClusteredSpotLight = [_]ClusteredSpotLight{.{}} ** lights.max_clustered_spots,
+    clustered_spot_count: usize = 0,
 
     // Slot hysteresis (see light_selection.Hysteresis): without it two lights
     // trading the 4th/2nd slot pop every frame. `hysteresis_enabled = false`
@@ -213,6 +219,34 @@ pub const LightRig = struct {
         return self.clustered_count;
     }
 
+    /// Appends a clustered forward spot light; returns its index.
+    pub fn addClusteredSpotLight(self: *LightRig, position: Vec3, options: ClusteredSpotLightOptions) error{TooManyClusteredLights}!usize {
+        if (self.clustered_spot_count >= lights.max_clustered_spots) return error.TooManyClusteredLights;
+        const idx = self.clustered_spot_count;
+        self.clustered_spots[idx] = ClusteredSpotLight.init(position, options);
+        self.clustered_spot_count += 1;
+        return idx;
+    }
+
+    /// Removes clustered spot light `index`, order-preserving.
+    pub fn removeClusteredSpotLight(self: *LightRig, index: usize) void {
+        if (index >= self.clustered_spot_count) return;
+        for (index..self.clustered_spot_count - 1) |k| self.clustered_spots[k] = self.clustered_spots[k + 1];
+        self.clustered_spots[self.clustered_spot_count - 1] = .{};
+        self.clustered_spot_count -= 1;
+    }
+
+    /// Live clustered spot light state. Null when out of range.
+    pub fn getClusteredSpotLight(self: *LightRig, index: usize) ?*ClusteredSpotLight {
+        if (index >= self.clustered_spot_count) return null;
+        return &self.clustered_spots[index];
+    }
+
+    /// Number of owned clustered spot lights (at most lights.max_clustered_spots).
+    pub fn clusteredSpotLightCount(self: *const LightRig) usize {
+        return self.clustered_spot_count;
+    }
+
     // Sun resolution helpers (directional override, hemispheric fallback).
     pub fn sunDirection(self: *const LightRig) Vec3 {
         return lights.resolveSunDirection(self.directional, self.hemi);
@@ -290,6 +324,7 @@ pub const LightRig = struct {
     // declarations (4 point + 2 spot slots); selection picks the best subset.
     pub const point_slots = 4;
     pub const spot_slots = 2;
+    pub const spot_shadow_slots = 2;
     // Point-light shadow slots: at most this many packed point lights carry
     // a 6-face tile row in the point shadow atlas (matches the shader
     // point_view_proj[12] layout and ShadowPass.POINT_SHADOW_SLOTS).
@@ -351,6 +386,17 @@ pub const LightRig = struct {
         clustered_pos_range: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
         clustered_color_int: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
         clustered_count: usize = 0,
+        // APPENDED LAST (clustered forward spot lights, wave 3): up to
+        // lights.max_clustered_spots spots in creation order.
+        // xyz + range in clustered_spot_pos_range,
+        // xyz dir + cos_inner in clustered_spot_dir_inner,
+        // rgb color + cos_outer in clustered_spot_color_outer,
+        // intensity in clustered_spot_intensity.
+        clustered_spot_pos_range: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
+        clustered_spot_dir_inner: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
+        clustered_spot_color_outer: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
+        clustered_spot_intensity: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
+        clustered_spot_count: usize = 0,
     };
 
     /// Packs the directional suns for the frame uniforms: slot 0 mirrors
@@ -459,6 +505,69 @@ pub const LightRig = struct {
         }
     }
 
+    /// Stages the clustered forward spot pool for the tile build: position + range,
+    /// normalized direction + cos_inner, color + cos_outer, intensity.
+    fn packClusteredSpots(self: *const LightRig, pack: *FramePack) void {
+        for (self.clustered_spots[0..self.clustered_spot_count], 0..) |*sl, i| {
+            if (i >= lights.max_clustered_spots) break;
+            if (!sl.is_enabled) continue;
+            const dir = if (sl.direction.lengthSq() > 1e-12) sl.direction.normalize() else Vec3.new(0, -1, 0);
+            const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
+            const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
+            pack.clustered_spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
+            pack.clustered_spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
+            pack.clustered_spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
+            pack.clustered_spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
+        }
+        pack.clustered_spot_count = self.clustered_spot_count;
+    }
+
+    /// Picks up to spot_shadow_slots shadow casters among the candidate spot
+    /// lights by raw significance (atlas page caster selection), and fills
+    /// the spot shadow uniforms + depth-pass atlas page tiles.
+    /// Non-casters keep zeroed params, so their shader cost is one early-out.
+    fn packSpotShadows(pack: *FramePack, in_lights: []const *SpotLight, eye: Vec3, shadows_enabled: bool) void {
+        var best_idx: [spot_shadow_slots]usize = undefined;
+        var best_score: [spot_shadow_slots]f32 = undefined;
+        var n: usize = 0;
+        for (in_lights, 0..) |sl, i| {
+            if (!(sl.cast_shadows and shadows_enabled and sl.is_enabled)) continue;
+            const s = light_selection.scoreSpot(sl, eye);
+            var pos: usize = n;
+            for (0..n) |j| {
+                if (s > best_score[j]) {
+                    pos = j;
+                    break;
+                }
+            }
+            if (pos < spot_shadow_slots) {
+                const end = if (n < spot_shadow_slots) n else spot_shadow_slots - 1;
+                var k = end;
+                while (k > pos) : (k -= 1) {
+                    best_idx[k] = best_idx[k - 1];
+                    best_score[k] = best_score[k - 1];
+                }
+                best_idx[pos] = i;
+                best_score[pos] = s;
+                if (n < spot_shadow_slots) n += 1;
+            }
+        }
+        for (best_idx[0..n]) |pack_i| {
+            const sl = in_lights[pack_i];
+            const svp = sl.getShadowViewProj();
+            pack.spot_view_proj[pack_i] = svp;
+            pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
+            const origin = passes.spotTileOrigin(pack_i);
+            pack.spot_shadows[pack.num_spot_shadows] = .{
+                .spot_index = pack_i,
+                .tile_x = origin.x,
+                .tile_y = origin.y,
+                .view_proj = svp,
+            };
+            pack.num_spot_shadows += 1;
+        }
+    }
+
     /// Packs point & spot lights for the camera. Directions are normalized
     /// once here so the fragment shaders can use them raw (no per-pixel
     /// normalize()). The directional light overrides the legacy hemispheric
@@ -492,6 +601,7 @@ pub const LightRig = struct {
         self.packDirectionals(&pack);
         self.packAreaLights(&pack);
         self.packClusteredLights(&pack);
+        self.packClusteredSpots(&pack);
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With
@@ -538,23 +648,12 @@ pub const LightRig = struct {
                 pack.spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
                 pack.spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
                 pack.spot_intensity[i] = .{ fade_intensity, sl.exponent, 0.0, 0.0 };
-
-                // A fading-out shadow caster keeps its shadow: dropping the
-                // shadow earlier than the light itself would pop twice.
-                if (sl.cast_shadows and shadows_enabled and sl.is_enabled) {
-                    const svp = sl.getShadowViewProj();
-                    pack.spot_view_proj[i] = svp;
-                    pack.spot_shadow_params[i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
-                    pack.spot_shadows[pack.num_spot_shadows] = .{
-                        .spot_index = i,
-                        .view_proj = svp,
-                    };
-                    pack.num_spot_shadows += 1;
-                } else {
-                    pack.spot_shadow_params[i] = .{ 0.0, 0.0, 0.0, 0.0 };
-                }
             }
             pack.counts[1] = @floatFromInt(num_spot);
+
+            var spot_buf_h: [spot_slots]*SpotLight = undefined;
+            for (spot_packed[0..num_spot], 0..) |p, i| spot_buf_h[i] = p.light;
+            packSpotShadows(&pack, spot_buf_h[0..num_spot], eye, shadows_enabled);
             return pack;
         }
 
@@ -580,21 +679,9 @@ pub const LightRig = struct {
             pack.spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
             pack.spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
             pack.spot_intensity[i] = .{ sl.intensity, sl.exponent, 0.0, 0.0 };
-
-            if (sl.cast_shadows and shadows_enabled and sl.is_enabled) {
-                const svp = sl.getShadowViewProj();
-                pack.spot_view_proj[i] = svp;
-                pack.spot_shadow_params[i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
-                pack.spot_shadows[pack.num_spot_shadows] = .{
-                    .spot_index = i,
-                    .view_proj = svp,
-                };
-                pack.num_spot_shadows += 1;
-            } else {
-                pack.spot_shadow_params[i] = .{ 0.0, 0.0, 0.0, 0.0 };
-            }
         }
         pack.counts[1] = @floatFromInt(num_spot);
+        packSpotShadows(&pack, spot_buf[0..num_spot], eye, shadows_enabled);
 
         return pack;
     }

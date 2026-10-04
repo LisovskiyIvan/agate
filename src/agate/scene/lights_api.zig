@@ -21,6 +21,8 @@ const AreaLight = lights.AreaLight;
 const AreaLightOptions = lights.AreaLightOptions;
 const ClusteredPointLight = lights.ClusteredPointLight;
 const ClusteredPointLightOptions = lights.ClusteredPointLightOptions;
+const ClusteredSpotLight = lights.ClusteredSpotLight;
+const ClusteredSpotLightOptions = lights.ClusteredSpotLightOptions;
 
 // ---- Lights. ----
 
@@ -162,6 +164,30 @@ pub fn getClusteredPointLight(self: anytype, index: usize) ?*ClusteredPointLight
 /// lights.max_clustered_lights).
 pub fn clusteredPointLightCount(self: anytype) usize {
     return self.lights.clusteredPointLightCount();
+}
+
+/// Appends a clustered forward spot light at `position`; returns its index.
+pub fn addClusteredSpotLight(self: anytype, position: Vec3, options: ClusteredSpotLightOptions) error{TooManyClusteredLights}!usize {
+    const idx = try self.lights.addClusteredSpotLight(position, options);
+    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    return idx;
+}
+
+/// Removes clustered spot light `index`. Order-preserving: higher indices shift down.
+pub fn removeClusteredSpotLight(self: anytype, index: usize) void {
+    if (index >= self.lights.clusteredSpotLightCount()) return;
+    self.lights.removeClusteredSpotLight(index);
+    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+}
+
+/// Live clustered spot light state. Null when out of range.
+pub fn getClusteredSpotLight(self: anytype, index: usize) ?*ClusteredSpotLight {
+    return self.lights.getClusteredSpotLight(index);
+}
+
+/// Number of owned clustered spot lights (at most lights.max_clustered_spots).
+pub fn clusteredSpotLightCount(self: anytype) usize {
+    return self.lights.clusteredSpotLightCount();
 }
 
 /// Stage 3, slice 2: update-phase light packing. Selects the top-k

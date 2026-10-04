@@ -49,8 +49,11 @@ pub const PointLight = point.PointLight;
 
 const clustered = @import("lights/clustered.zig");
 pub const max_clustered_lights = clustered.max_clustered_lights;
+pub const max_clustered_spots = clustered.max_clustered_spots;
 pub const ClusteredPointLightOptions = clustered.ClusteredPointLightOptions;
 pub const ClusteredPointLight = clustered.ClusteredPointLight;
+pub const ClusteredSpotLightOptions = clustered.ClusteredSpotLightOptions;
+pub const ClusteredSpotLight = clustered.ClusteredSpotLight;
 
 const area = @import("lights/area.zig");
 pub const AreaLightOptions = area.AreaLightOptions;

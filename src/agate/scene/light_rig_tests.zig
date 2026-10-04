@@ -550,3 +550,109 @@ test "clustered packing is frame-independent (no fade, no selection)" {
     try std.testing.expectEqual(p0.clustered_pos_range, p1.clustered_pos_range);
     try std.testing.expectEqual(p0.clustered_color_int, p1.clustered_color_int);
 }
+
+test "addClusteredSpotLight stages creation-order lanes, get returns slot, cap at 32 errors" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_spot_count);
+    for (0..lights.max_clustered_spots) |k| {
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_pos_range[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_dir_inner[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_color_outer[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_intensity[k]);
+    }
+
+    const idx0 = try rig.addClusteredSpotLight(Vec3.new(1.0, 2.0, 3.0), .{
+        .direction = Vec3.new(0.0, -1.0, 0.0),
+        .color = Color3.new(1.0, 0.5, 0.25),
+        .intensity = 3.0,
+        .range = 12.0,
+        .inner_angle_deg = 20.0,
+        .outer_angle_deg = 40.0,
+    });
+    const idx1 = try rig.addClusteredSpotLight(Vec3.new(-1.0, 0.0, 0.0), .{ .intensity = 0.5 });
+    try std.testing.expectEqual(@as(usize, 0), idx0);
+    try std.testing.expectEqual(@as(usize, 1), idx1);
+    try std.testing.expect(rig.getClusteredSpotLight(0).?.position.x == 1.0);
+    try std.testing.expect(rig.getClusteredSpotLight(2) == null);
+
+    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_spot_count);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 12.0 }, pack.clustered_spot_pos_range[0]);
+    const cos_inner = @cos(20.0 * (std.math.pi / 180.0));
+    const cos_outer = @cos(40.0 * (std.math.pi / 180.0));
+    try std.testing.expectApproxEqAbs(pack.clustered_spot_dir_inner[0][3], cos_inner, 1e-5);
+    try std.testing.expectApproxEqAbs(pack.clustered_spot_color_outer[0][3], cos_outer, 1e-5);
+    try std.testing.expectEqual([4]f32{ 3.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_intensity[0]);
+
+    // Cap at max_clustered_spots
+    var k: usize = 2;
+    while (k < lights.max_clustered_spots) : (k += 1) {
+        _ = try rig.addClusteredSpotLight(Vec3.zero, .{});
+    }
+    try std.testing.expectEqual(lights.max_clustered_spots, rig.clusteredSpotLightCount());
+    try std.testing.expectError(error.TooManyClusteredLights, rig.addClusteredSpotLight(Vec3.zero, .{}));
+}
+
+test "removeClusteredSpotLight destroys order-preserving, out-of-range is a no-op" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+
+    _ = try rig.addClusteredSpotLight(Vec3.new(1, 0, 0), .{});
+    _ = try rig.addClusteredSpotLight(Vec3.new(2, 0, 0), .{});
+    _ = try rig.addClusteredSpotLight(Vec3.new(3, 0, 0), .{});
+    rig.removeClusteredSpotLight(99); // no-op
+    try std.testing.expectEqual(@as(usize, 3), rig.clusteredSpotLightCount());
+    rig.removeClusteredSpotLight(0);
+    try std.testing.expectEqual(@as(usize, 2), rig.clusteredSpotLightCount());
+    try std.testing.expectEqual(@as(f32, 2.0), rig.getClusteredSpotLight(0).?.position.x);
+    try std.testing.expectEqual(@as(f32, 3.0), rig.getClusteredSpotLight(1).?.position.x);
+    rig.removeClusteredSpotLight(1);
+    rig.removeClusteredSpotLight(0);
+    try std.testing.expectEqual(@as(usize, 0), rig.clusteredSpotLightCount());
+    try std.testing.expect(rig.getClusteredSpotLight(0) == null);
+}
+
+test "packSpotShadows selects up to 2 casters by significance with atlas page tile origins" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    _ = try rig.createSpotLight(allocator, "close_bright", .{
+        .position = Vec3.new(0, 2, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 20.0,
+        .intensity = 10.0,
+        .cast_shadows = true,
+        .shadow_bias = 0.003,
+        .shadow_normal_bias = 0.006,
+    });
+    _ = try rig.createSpotLight(allocator, "mid", .{
+        .position = Vec3.new(0, 5, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 20.0,
+        .intensity = 5.0,
+        .cast_shadows = true,
+        .shadow_bias = 0.002,
+        .shadow_normal_bias = 0.004,
+    });
+
+    const eye = Vec3.zero;
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 2), pack.num_spot_shadows);
+
+    try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[0].tile_x);
+    try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[0].tile_y);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.003, 0.006, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[0].spot_index]);
+
+    try std.testing.expectEqual(@as(i32, 512), pack.spot_shadows[1].tile_x);
+    try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[1].tile_y);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.002, 0.004, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[1].spot_index]);
+}
+
