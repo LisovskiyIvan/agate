@@ -18,38 +18,27 @@
 Приоритетный порядок следующих волн. Каждая требует гейтов (CPU golden +
 Metal native + browser WebGPU legs) перед закрытием.
 
-### A. Материалы/свет — консолидация (аудит п.7)
+### A. Материалы/свет — консолидация (аудит п.7) — ВЫПОЛНЕНО (04.10.2026)
 
-Карта готова (инвентаризация 04.10.2026), порядок строгий:
+1. PBR-эквивалент matte: правило конверсии `specular_color/power → roughness` (`roughnessFromSpecularPower`).
+2. Миграция `createStandardMaterial` → `createPBRMaterial`: все демо, showcases, stands, bench.
+3. `default_material` → PBR-backed.
+4. Clustered spot storage + atlas pages + caster selection.
+5. Удалены `standard.glsl`, `instanced.glsl`, Standard draw branches. Writer/reader v3 с backward-совместимостью.
 
-1. PBR-эквивалент matte: правило конверсии `specular_color/power →
-   roughness` до удаления Standard (`material/standard.zig:45`,
-   `shaders/standard.glsl:178`).
-2. Миграция `createStandardMaterial` → `createPBRMaterial`: demos (sandbox
-   stands ~15 сайтов, `sandbox_scene.zig:518-627`, showcase, bench ~8,
-   `examples/render_target_basic.zig:242-255`, `softbody.zig:724`).
-   glTF уже PBR-only. Демо сначала, engine-дефолты последними.
-3. `default_material` → PBR-backed (`scene/core.zig:243`,
-   `material/draw_record.zig:118-241`, `scene/render_queue/cull.zig:92`).
-4. Замена top-K ДО удаления: clustered spot storage (pos/range/dir/углы) +
-   atlas pages + caster selection (`scene/light_rig.zig:291-444`,
-   `lights/clustered.zig:8-15`, `passes/shadow/*`). Только после — удаление
-   top-K point/spot lanes.
-5. Удаление `standard.glsl`, `instanced.glsl`, Standard draw branch
-   (`draw_record.zig:201-225`), serialization kind cleanup (writer/reader
-   v3: старые файлы обязаны читаться).
-   Unlit/stylized/ShaderMaterial — продуктовые фичи, НЕ удаляются.
-   Риски: сериализационные байты, pinned Standard math в
-   `material/tests.zig:517-571`, никаких silent fallback'ов.
+### B. Чистка комментариев и разбиение тестов — ВЫПОЛНЕНО (04.10.2026)
 
-### B. Чистка комментариев (продолжение)
+1. Чистка комментариев: `scene/core.zig`, `scene/postfx_stack.zig`, `passes/postprocess_pass.zig`, `profiler/snapshot.zig`, `scene/frame_draws.zig`, `scene/upload_packets.zig` (исторические сравнения и нумерация волн убраны, сохранены контракты threading/ownership).
+2. Разбиение `scene/tests.zig` на доменные файлы:
+   - `scene/softbody_tests.zig`
+   - `scene/gui3d_tests.zig`
+   - `scene/probe_tests.zig`
+   - `scene/allocator_tests.zig`
+   - `scene/mesh_lifecycle_tests.zig`
+   - `scene/camera_tests.zig`
+   - `scene/clustered_lights_tests.zig`
+   - `scene/tests.zig` сфокусирован на staged-frame/concurrency ядре.
 
-Готово: `scene/core.zig`. Осталось: `scene/postfx_stack.zig`,
-`passes/postprocess_pass.zig`, `profiler/snapshot.zig`,
-`scene/frame_draws.zig`, `scene/upload_packets.zig` — убрать волновую
-нумерацию/исторические сравнения, сохранить контракты threading/ownership.
-Затем `scene/tests.zig` (8k строк) — разбиение на доменные файлы (отдельная
-волна, не раньше материалов).
 
 ### C. Качество графики — волны к Unreal-уровню (порядок по стоимости/эффекту)
 
