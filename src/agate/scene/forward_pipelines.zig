@@ -1,10 +1,8 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
-const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const skinned_pbr_shd = @import("skinned_pbr_shader");
-const inst_shd = @import("instanced_shader");
 const inst_pbr_shd = @import("instanced_pbr_shader");
 
 const scene_pipelines = @import("pipelines.zig");
@@ -102,8 +100,7 @@ pub const ShaderMaterialCache = struct {
                 slot.shader = shader;
                 var desc = forwardDesc(shader, self.sample_count, self.color_format);
                 scene_pipelines.pipelineLayoutFor(switch (entry.base) {
-                    .standard => .standard,
-                    .pbr => .pbr,
+                    .standard, .pbr => .pbr,
                 }, &desc);
                 scene_pipelines.makePipelinePair(desc, &slot.opaque_u16, &slot.opaque_u32, &slot.blend_u16, &slot.blend_u32);
                 scene_pipelines.makeCullOffPair(desc, &slot.ds_opaque_u16, &slot.ds_opaque_u32, &slot.ds_blend_u16, &slot.ds_blend_u32);
@@ -136,33 +133,25 @@ pub const ShaderMaterialCache = struct {
 };
 
 /// All forward-rendering GPU pipelines in one place: the opaque u16/u32
-/// pairs and their transparent blend twins for the 5 shader families, plus
+/// pairs and their transparent blend twins for the 3 shader families, plus
 /// the double-sided (cull-off) twin set. Created once at Scene init; the
 /// per-item selection helpers keep the established mapping bit-identical.
 pub const ForwardPipelines = struct {
     // Mesh Forward Pipelines
-    pipeline_u16: sg.Pipeline = .{},
-    pipeline_u32: sg.Pipeline = .{},
     pipeline_pbr_u16: sg.Pipeline = .{},
     pipeline_pbr_u32: sg.Pipeline = .{},
     pipeline_skinned_pbr_u16: sg.Pipeline = .{},
     pipeline_skinned_pbr_u32: sg.Pipeline = .{},
-    pipeline_instanced_u16: sg.Pipeline = .{},
-    pipeline_instanced_u32: sg.Pipeline = .{},
     pipeline_instanced_pbr_u16: sg.Pipeline = .{},
     pipeline_instanced_pbr_u32: sg.Pipeline = .{},
 
     // Transparent twin pipelines: same shaders/layouts as above, but with
     // alpha blending (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), depth test on and
     // depth write off. Selected per item when item.transparent is true.
-    pipeline_blend_u16: sg.Pipeline = .{},
-    pipeline_blend_u32: sg.Pipeline = .{},
     pipeline_pbr_blend_u16: sg.Pipeline = .{},
     pipeline_pbr_blend_u32: sg.Pipeline = .{},
     pipeline_skinned_pbr_blend_u16: sg.Pipeline = .{},
     pipeline_skinned_pbr_blend_u32: sg.Pipeline = .{},
-    pipeline_instanced_blend_u16: sg.Pipeline = .{},
-    pipeline_instanced_blend_u32: sg.Pipeline = .{},
     pipeline_instanced_pbr_blend_u16: sg.Pipeline = .{},
     pipeline_instanced_pbr_blend_u32: sg.Pipeline = .{},
 
@@ -198,9 +187,7 @@ pub const ForwardPipelines = struct {
     /// color format). Panics if a base pipeline fails to create.
     pub fn init(sample_count: i32, color_format: sg.PixelFormat) ForwardPipelines {
         const family_shaders = scene_pipelines.DoubleSidedSourceShaders{
-            .standard = sg.makeShader(shd.standardShaderDesc(sg.queryBackend())),
             .pbr = sg.makeShader(pbr_shd.pbrShaderDesc(sg.queryBackend())),
-            .instanced = sg.makeShader(inst_shd.instancedShaderDesc(sg.queryBackend())),
             .instanced_pbr = sg.makeShader(inst_pbr_shd.instancedPbrShaderDesc(sg.queryBackend())),
             .skinned_pbr = sg.makeShader(skinned_pbr_shd.skinnedPbrShaderDesc(sg.queryBackend())),
         };
@@ -243,28 +230,12 @@ pub const ForwardPipelines = struct {
             blend_u32: *sg.Pipeline,
         }{
             .{
-                .shader = family_shaders.standard,
-                .family = .standard,
-                .opaque_u16 = &self.pipeline_u16,
-                .opaque_u32 = &self.pipeline_u32,
-                .blend_u16 = &self.pipeline_blend_u16,
-                .blend_u32 = &self.pipeline_blend_u32,
-            },
-            .{
                 .shader = family_shaders.pbr,
                 .family = .pbr,
                 .opaque_u16 = &self.pipeline_pbr_u16,
                 .opaque_u32 = &self.pipeline_pbr_u32,
                 .blend_u16 = &self.pipeline_pbr_blend_u16,
                 .blend_u32 = &self.pipeline_pbr_blend_u32,
-            },
-            .{
-                .shader = family_shaders.instanced,
-                .family = .instanced,
-                .opaque_u16 = &self.pipeline_instanced_u16,
-                .opaque_u32 = &self.pipeline_instanced_u32,
-                .blend_u16 = &self.pipeline_instanced_blend_u16,
-                .blend_u32 = &self.pipeline_instanced_blend_u32,
             },
             .{
                 .shader = family_shaders.instanced_pbr,
@@ -298,24 +269,16 @@ pub const ForwardPipelines = struct {
         self.shader_materials.color_format = color_format;
 
         inline for (.{
-            .{ .pipe = self.pipeline_u16, .msg = "pipeline_u16 failed to create!" },
-            .{ .pipe = self.pipeline_u32, .msg = "pipeline_u32 failed to create!" },
             .{ .pipe = self.pipeline_pbr_u16, .msg = "pipeline_pbr_u16 failed to create!" },
             .{ .pipe = self.pipeline_pbr_u32, .msg = "pipeline_pbr_u32 failed to create!" },
             .{ .pipe = self.pipeline_skinned_pbr_u16, .msg = "pipeline_skinned_pbr_u16 failed to create!" },
             .{ .pipe = self.pipeline_skinned_pbr_u32, .msg = "pipeline_skinned_pbr_u32 failed to create!" },
-            .{ .pipe = self.pipeline_instanced_u16, .msg = "pipeline_instanced_u16 failed to create!" },
-            .{ .pipe = self.pipeline_instanced_u32, .msg = "pipeline_instanced_u32 failed to create!" },
             .{ .pipe = self.pipeline_instanced_pbr_u16, .msg = "pipeline_instanced_pbr_u16 failed to create!" },
             .{ .pipe = self.pipeline_instanced_pbr_u32, .msg = "pipeline_instanced_pbr_u32 failed to create!" },
-            .{ .pipe = self.pipeline_blend_u16, .msg = "pipeline_blend_u16 failed to create!" },
-            .{ .pipe = self.pipeline_blend_u32, .msg = "pipeline_blend_u32 failed to create!" },
             .{ .pipe = self.pipeline_pbr_blend_u16, .msg = "pipeline_pbr_blend_u16 failed to create!" },
             .{ .pipe = self.pipeline_pbr_blend_u32, .msg = "pipeline_pbr_blend_u32 failed to create!" },
             .{ .pipe = self.pipeline_skinned_pbr_blend_u16, .msg = "pipeline_skinned_pbr_blend_u16 failed to create!" },
             .{ .pipe = self.pipeline_skinned_pbr_blend_u32, .msg = "pipeline_skinned_pbr_blend_u32 failed to create!" },
-            .{ .pipe = self.pipeline_instanced_blend_u16, .msg = "pipeline_instanced_blend_u16 failed to create!" },
-            .{ .pipe = self.pipeline_instanced_blend_u32, .msg = "pipeline_instanced_blend_u32 failed to create!" },
             .{ .pipe = self.pipeline_instanced_pbr_blend_u16, .msg = "pipeline_instanced_pbr_blend_u16 failed to create!" },
             .{ .pipe = self.pipeline_instanced_pbr_blend_u32, .msg = "pipeline_instanced_pbr_blend_u32 failed to create!" },
         }) |entry| {
@@ -329,22 +292,14 @@ pub const ForwardPipelines = struct {
         sg.destroyImage(self.default_morph_image);
         sg.destroyView(self.default_morph_view);
         sg.destroySampler(self.morph_sampler);
-        sg.destroyPipeline(self.pipeline_u16);
-        sg.destroyPipeline(self.pipeline_u32);
         sg.destroyPipeline(self.pipeline_pbr_u16);
         sg.destroyPipeline(self.pipeline_pbr_u32);
         sg.destroyPipeline(self.pipeline_skinned_pbr_u16);
         sg.destroyPipeline(self.pipeline_skinned_pbr_u32);
-        sg.destroyPipeline(self.pipeline_instanced_u16);
-        sg.destroyPipeline(self.pipeline_instanced_u32);
-        sg.destroyPipeline(self.pipeline_blend_u16);
-        sg.destroyPipeline(self.pipeline_blend_u32);
         sg.destroyPipeline(self.pipeline_pbr_blend_u16);
         sg.destroyPipeline(self.pipeline_pbr_blend_u32);
         sg.destroyPipeline(self.pipeline_skinned_pbr_blend_u16);
         sg.destroyPipeline(self.pipeline_skinned_pbr_blend_u32);
-        sg.destroyPipeline(self.pipeline_instanced_blend_u16);
-        sg.destroyPipeline(self.pipeline_instanced_blend_u32);
         sg.destroyPipeline(self.pipeline_instanced_pbr_u16);
         sg.destroyPipeline(self.pipeline_instanced_pbr_u32);
         sg.destroyPipeline(self.pipeline_instanced_pbr_blend_u16);
@@ -353,9 +308,7 @@ pub const ForwardPipelines = struct {
         self.shader_materials.deinit();
         if (self.owns_shaders) {
             if (self.family_shaders) |fs| {
-                if (fs.standard.id != 0) sg.destroyShader(fs.standard);
                 if (fs.pbr.id != 0) sg.destroyShader(fs.pbr);
-                if (fs.instanced.id != 0) sg.destroyShader(fs.instanced);
                 if (fs.instanced_pbr.id != 0) sg.destroyShader(fs.instanced_pbr);
                 if (fs.skinned_pbr.id != 0) sg.destroyShader(fs.skinned_pbr);
             }
@@ -381,10 +334,6 @@ pub const ForwardPipelines = struct {
 
 test "pipeline selection follows transparency flag" {
     const pipelines = ForwardPipelines{
-        .pipeline_u16 = .{ .id = 11 },
-        .pipeline_u32 = .{ .id = 12 },
-        .pipeline_blend_u16 = .{ .id = 13 },
-        .pipeline_blend_u32 = .{ .id = 14 },
         .pipeline_pbr_u16 = .{ .id = 21 },
         .pipeline_pbr_u32 = .{ .id = 22 },
         .pipeline_pbr_blend_u16 = .{ .id = 23 },
@@ -398,24 +347,18 @@ test "pipeline selection follows transparency flag" {
     const Mat4 = @import("math").Mat4;
 
     // forRegularItem читает только render-owned снимки (P4: без живого меша).
-    const opaque_std = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 0, .transparent = false };
-    var blend_std = opaque_std;
-    blend_std.transparent = true;
-    try std.testing.expect(pipelines.forRegularItem(opaque_std) == 11);
-    try std.testing.expect(pipelines.forRegularItem(blend_std) == 13);
-
-    var opaque_u32 = opaque_std;
-    opaque_u32.is_u32 = true;
-    var blend_u32 = blend_std;
-    blend_u32.is_u32 = true;
-    try std.testing.expect(pipelines.forRegularItem(opaque_u32) == 12);
-    try std.testing.expect(pipelines.forRegularItem(blend_u32) == 14);
-
     const opaque_pbr = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = true, .texture_id = 0, .transparent = false };
     var blend_pbr = opaque_pbr;
     blend_pbr.transparent = true;
     try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 21);
     try std.testing.expect(pipelines.forRegularItem(blend_pbr) == 23);
+
+    var opaque_u32 = opaque_pbr;
+    opaque_u32.is_u32 = true;
+    var blend_u32 = blend_pbr;
+    blend_u32.is_u32 = true;
+    try std.testing.expect(pipelines.forRegularItem(opaque_u32) == 22);
+    try std.testing.expect(pipelines.forRegularItem(blend_u32) == 24);
 
     var skinned_pbr = opaque_pbr;
     skinned_pbr.is_skinned = true;
@@ -487,14 +430,12 @@ fn countPipelineFields(comptime T: type) usize {
 }
 
 test "pipeline tables cover every pipeline field (sample-count twins stay in sync)" {
-    // 5 families x opaque/blend x u16/u32. If a new pipeline field is added
-    // to ForwardPipelines, init's panic list and deinit must grow
-    // with it — the count change fails this test and forces the review.
+    // 3 families x opaque/blend x u16/u32 = 12 pipelines.
     const n_forward = comptime countPipelineFields(ForwardPipelines);
-    try std.testing.expectEqual(@as(usize, 20), n_forward);
-    // 5 families x opaque/blend x u16/u32 (cull-off twins).
+    try std.testing.expectEqual(@as(usize, 12), n_forward);
+    // 3 families x opaque/blend x u16/u32 (cull-off twins).
     const n_ds = comptime countPipelineFields(scene_pipelines.DoubleSidedPipelines);
-    try std.testing.expectEqual(@as(usize, 20), n_ds);
+    try std.testing.expectEqual(@as(usize, 12), n_ds);
     // opaque/blend x u16/u32 x regular/ds per registered shader material.
     const n_shader_mat = comptime countPipelineFields(ShaderMaterialSet);
     try std.testing.expectEqual(@as(usize, 8), n_shader_mat);

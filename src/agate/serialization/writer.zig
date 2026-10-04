@@ -23,6 +23,7 @@ const MAGIC = format.MAGIC;
 const VERSION = format.VERSION;
 const writePostProcess = format.writePostProcess;
 const alphaModeToU8 = props.alphaModeToU8;
+const PBRMaterial = @import("../material.zig").PBRMaterial;
 
 /// POD snapshot of a live scene. Meshes without a material snapshot as the
 /// standard default (white, alpha 1, opaque).
@@ -55,21 +56,32 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                     .double_sided = p.double_sided,
                 } };
             }
-            // Standard-shaped entries for every other variant. Documented
-            // limitation: shader materials serialize as plain standard
-            // materials carrying the tint/alpha state. The custom shader
-            // registration is not part of the snapshot format; after a
-            // roundtrip the mesh renders with the built-in shader (reassign
-            // the .shader_material variant after restore if needed).
+            if (mat == .standard) {
+                const s = mat.standard;
+                break :blk .{ .pbr = .{
+                    .albedo = .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b },
+                    .metallic = 0.0,
+                    .roughness = PBRMaterial.roughnessFromSpecularPower(s.specular_power),
+                    .emissive = .{ s.emissive_color.r, s.emissive_color.g, s.emissive_color.b },
+                    .alpha = s.alpha,
+                    .alpha_mode = alphaModeToU8(s.alpha_mode),
+                    .alpha_cutoff = s.alpha_cutoff,
+                    .double_sided = s.double_sided,
+                } };
+            }
+            // All other variants (e.g. shader materials) capture as PBR matte equivalent.
             const base = mat.baseColor3();
-            break :blk .{ .standard = .{
-                .diffuse = .{ base.r, base.g, base.b },
+            break :blk .{ .pbr = .{
+                .albedo = .{ base.r, base.g, base.b },
+                .metallic = 0.0,
+                .roughness = 0.5,
+                .emissive = .{ 0.0, 0.0, 0.0 },
                 .alpha = mat.alpha(),
                 .alpha_mode = alphaModeToU8(mat.alphaMode()),
                 .alpha_cutoff = mat.alphaCutoff(),
                 .double_sided = mat.isDoubleSided(),
             } };
-        } else .{ .standard = .{} };
+        } else .{ .pbr = .{} };
         try meshes.append(allocator, .{
             .id = mesh.id,
             .name = name,

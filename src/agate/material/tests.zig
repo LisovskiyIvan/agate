@@ -514,26 +514,23 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[2]);
 }
 
-test "MaterialDrawRecord routes the standard specular color and power (Babylon defaults)" {
+test "MaterialDrawRecord routes StandardMaterial via equivalent PBR matte" {
     const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
-    // Babylon's StandardMaterial defaults are specularColor white and
-    // specularPower 64, uploaded verbatim as `vSpecularColor` = (rgb, power):
-    // the lane must carry exactly that for a hand-built material.
+    // StandardMaterial maps specularPower to equivalent PBR roughness via
+    // PBRMaterial.roughnessFromSpecularPower, with metallic 0.0 (dielectric matte).
     var std_mat = StandardMaterial.init("spec");
     const rec_def = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 64.0 }, rec_def.pbr_factors);
+    const r_def = PBRMaterial.roughnessFromSpecularPower(64.0);
+    try std.testing.expectEqual([4]f32{ 0.0, r_def, 1.0, 1.0 }, rec_def.pbr_factors);
 
-    std_mat.specular_color = Color3.new(0.25, 0.5, 0.75);
     std_mat.specular_power = 8.0;
     const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual([4]f32{ 0.25, 0.5, 0.75, 8.0 }, rec_set.pbr_factors);
-    // The emissive lane is shared with the PBR family and means the same
-    // thing there; a hand-built StandardMaterial defaults to black, and a set
-    // colour must arrive verbatim (the standard shader used to ignore it).
-    // Its `w` lane carries the two-sided-lighting flag (0 by default).
+    const r_set = PBRMaterial.roughnessFromSpecularPower(8.0);
+    try std.testing.expectEqual([4]f32{ 0.0, r_set, 1.0, 1.0 }, rec_set.pbr_factors);
+
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, rec_def.emissive_color);
     std_mat.emissive_color = Color3.new(0.2, 0.1, 0.05);
     const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
@@ -619,7 +616,7 @@ test "Material unlit mode properly routes to DrawRecord" {
     try std.testing.expectEqual(@as(f32, 1.0), rec_pbr.uv_offsets[0][2]);
 
     const rec_std = buildDrawRecord(mat_std, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual(@as(f32, 1.0), rec_std.standard_uv_offset[2]);
+    try std.testing.expectEqual(@as(f32, 1.0), rec_std.uv_offsets[0][2]);
 }
 
 test "MaterialDrawRecord falls back to default PBR material when mat is null" {

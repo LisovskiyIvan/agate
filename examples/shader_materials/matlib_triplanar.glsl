@@ -14,7 +14,7 @@
 // Params are packed into the generated sm_user_params UB (8x vec4) and
 // editable at runtime through ShaderMaterial.setUniform(name, value).
 
-// base: standard
+// base: pbr
 
 // @param u_tri_x vec4 = 1.0 0.35 0.35 1.0
 // @param u_tri_y vec4 = 0.35 1.0 0.35 1.0

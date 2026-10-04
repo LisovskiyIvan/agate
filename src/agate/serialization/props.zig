@@ -53,7 +53,7 @@ pub const MeshEntry = struct {
     is_visible: bool = true,
     cast_shadows: bool = true,
     receive_shadows: bool = true,
-    material: MaterialEntry = .{ .standard = .{} },
+    material: MaterialEntry = .{ .pbr = .{} },
 
     pub fn deinit(self: *MeshEntry, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
@@ -306,19 +306,23 @@ pub fn findMeshByIdOrName(scene: *Scene, id: u64, name: []const u8) ?*Mesh {
 pub fn restoreMeshMaterial(scene: *Scene, mesh: *Mesh, src: *const MaterialEntry) void {
     switch (src.*) {
         .standard => |*s| {
-            const sm: *StandardMaterial = blk: {
+            // Legacy standard format restores into PBR matte equivalent
+            const pm: *PBRMaterial = blk: {
                 if (mesh.material) |m| {
-                    if (m == .standard) break :blk m.standard;
+                    if (m == .pbr) break :blk m.pbr;
                 }
-                const mat = scene.createStandardMaterial(mesh.name) catch return;
+                const mat = scene.createPBRMaterial(mesh.name) catch return;
                 break :blk mat;
             };
-            sm.diffuse_color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]);
-            sm.alpha = s.alpha;
-            sm.alpha_mode = alphaModeFromU8(s.alpha_mode);
-            sm.alpha_cutoff = s.alpha_cutoff;
-            sm.double_sided = s.double_sided;
-            mesh.material = .{ .standard = sm };
+            pm.albedo_color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]);
+            pm.metallic = 0.0;
+            pm.roughness = 0.5;
+            pm.emissive_color = Color3.new(0.0, 0.0, 0.0);
+            pm.alpha = s.alpha;
+            pm.alpha_mode = alphaModeFromU8(s.alpha_mode);
+            pm.alpha_cutoff = s.alpha_cutoff;
+            pm.double_sided = s.double_sided;
+            mesh.material = .{ .pbr = pm };
         },
         .pbr => |*p| {
             const pm: *PBRMaterial = blk: {

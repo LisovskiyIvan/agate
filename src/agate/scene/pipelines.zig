@@ -1,9 +1,7 @@
 const sokol = @import("sokol");
 const sg = sokol.gfx;
-const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const skinned_pbr_shd = @import("skinned_pbr_shader");
-const inst_shd = @import("instanced_shader");
 const inst_pbr_shd = @import("instanced_pbr_shader");
 
 const Vertex = @import("../mesh.zig").Vertex;
@@ -12,7 +10,7 @@ const render_queue = @import("render_queue.zig");
 
 // One shader + one vertex layout feeds an opaque u16/u32 pair plus its
 // transparent blend twins. Only initPipelines uses this table.
-pub const PipelineFamily = enum { standard, pbr, instanced, skinned_pbr, instanced_pbr };
+pub const PipelineFamily = enum { pbr, skinned_pbr, instanced_pbr };
 
 // Single funnel for the base descriptor of every main-target pipeline
 // (built-in families, double-sided twins, shader-material sets): the base
@@ -43,14 +41,6 @@ pub fn forwardDesc(shader: sg.Shader, sample_count: i32, color_format: sg.PixelF
 // layout risk lives here: attr changes must mirror the matching *.glsl.
 pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
     switch (family) {
-        .standard => {
-            desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-            desc.layout.attrs[shd.ATTR_standard_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-            desc.layout.attrs[shd.ATTR_standard_normal] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-            desc.layout.attrs[shd.ATTR_standard_color0] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-            desc.layout.attrs[shd.ATTR_standard_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-            desc.layout.attrs[shd.ATTR_standard_texcoord1] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
-        },
         .pbr => {
             desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
             desc.layout.attrs[pbr_shd.ATTR_pbr_position] = .{ .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
@@ -59,24 +49,6 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
             desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord0] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
             desc.layout.attrs[pbr_shd.ATTR_pbr_texcoord1] = .{ .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
             desc.layout.attrs[pbr_shd.ATTR_pbr_tangent] = .{ .format = .FLOAT4, .offset = @offsetOf(Vertex, "tangent") };
-        },
-        .instanced => {
-            desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
-            desc.layout.attrs[inst_shd.ATTR_instanced_position] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "position") };
-            desc.layout.attrs[inst_shd.ATTR_instanced_normal] = .{ .buffer_index = 0, .format = .FLOAT3, .offset = @offsetOf(Vertex, "normal") };
-            desc.layout.attrs[inst_shd.ATTR_instanced_color0] = .{ .buffer_index = 0, .format = .FLOAT4, .offset = @offsetOf(Vertex, "color") };
-            desc.layout.attrs[inst_shd.ATTR_instanced_texcoord0] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv") };
-            desc.layout.attrs[inst_shd.ATTR_instanced_texcoord1] = .{ .buffer_index = 0, .format = .FLOAT2, .offset = @offsetOf(Vertex, "uv1") };
-
-            desc.layout.buffers[1] = .{
-                .step_func = .PER_INSTANCE,
-                .step_rate = 1,
-                .stride = @sizeOf(Mat4),
-            };
-            desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
-            desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
-            desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
-            desc.layout.attrs[inst_shd.ATTR_instanced_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
         },
         .instanced_pbr => {
             desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
@@ -146,28 +118,22 @@ pub fn makeCullOffPair(base: sg.PipelineDesc, opaque_u16: *sg.Pipeline, opaque_u
 // creates these shader handles in initPipelines; it can retain them and
 // pass them here (or extend the specs table to also feed initFromShaders).
 pub const DoubleSidedSourceShaders = struct {
-    standard: sg.Shader,
     pbr: sg.Shader,
-    instanced: sg.Shader,
     instanced_pbr: sg.Shader,
     skinned_pbr: sg.Shader,
 };
 
 // Double-sided (cull-off) pipeline twins for every family: opaque u16/u32
-// plus blend u16/u32, i.e. 20 pipelines total (5 families x opaque/blend x
+// plus blend u16/u32, i.e. 12 pipelines total (3 families x opaque/blend x
 // u16/u32). Instanced twins are included: same table, no extra code.
 // Intended embedding (Scene gains ONE field, init/deinit forwarded):
 //   ds_pipelines: DoubleSidedPipelines = .{},
-//   self.ds_pipelines.initFromShaders(.{ .standard = std_sh, ... });
+//   self.ds_pipelines.initFromShaders(.{ .pbr = pbr_sh, ... });
 //   self.ds_pipelines.deinit();
 // NOTE: back-face lighting still uses geometric normals (no
 // gl_FrontFacing flip in the shaders); back faces may shade dark. This
 // matches the minimal cull-off scope.
 pub const DoubleSidedPipelines = struct {
-    standard_u16: sg.Pipeline = .{},
-    standard_u32: sg.Pipeline = .{},
-    standard_blend_u16: sg.Pipeline = .{},
-    standard_blend_u32: sg.Pipeline = .{},
     pbr_u16: sg.Pipeline = .{},
     pbr_u32: sg.Pipeline = .{},
     pbr_blend_u16: sg.Pipeline = .{},
@@ -176,16 +142,12 @@ pub const DoubleSidedPipelines = struct {
     skinned_pbr_u32: sg.Pipeline = .{},
     skinned_pbr_blend_u16: sg.Pipeline = .{},
     skinned_pbr_blend_u32: sg.Pipeline = .{},
-    instanced_u16: sg.Pipeline = .{},
-    instanced_u32: sg.Pipeline = .{},
-    instanced_blend_u16: sg.Pipeline = .{},
-    instanced_blend_u32: sg.Pipeline = .{},
     instanced_pbr_u16: sg.Pipeline = .{},
     instanced_pbr_u32: sg.Pipeline = .{},
     instanced_pbr_blend_u16: sg.Pipeline = .{},
     instanced_pbr_blend_u32: sg.Pipeline = .{},
 
-    // Builds all 20 cull-off twins from the family shaders (GPU calls).
+    // Builds all 12 cull-off twins from the family shaders (GPU calls).
     // Base descs mirror Scene.initPipelines (depth LESS_EQUAL/write on,
     // BACK cull, CCW winding) plus the main-target sample count and color
     // format (sokol requires pipelines to match the attachment sample
@@ -200,28 +162,12 @@ pub const DoubleSidedPipelines = struct {
             blend_u32: *sg.Pipeline,
         }{
             .{
-                .shader = shaders.standard,
-                .family = .standard,
-                .opaque_u16 = &self.standard_u16,
-                .opaque_u32 = &self.standard_u32,
-                .blend_u16 = &self.standard_blend_u16,
-                .blend_u32 = &self.standard_blend_u32,
-            },
-            .{
                 .shader = shaders.pbr,
                 .family = .pbr,
                 .opaque_u16 = &self.pbr_u16,
                 .opaque_u32 = &self.pbr_u32,
                 .blend_u16 = &self.pbr_blend_u16,
                 .blend_u32 = &self.pbr_blend_u32,
-            },
-            .{
-                .shader = shaders.instanced,
-                .family = .instanced,
-                .opaque_u16 = &self.instanced_u16,
-                .opaque_u32 = &self.instanced_u32,
-                .blend_u16 = &self.instanced_blend_u16,
-                .blend_u32 = &self.instanced_blend_u32,
             },
             .{
                 .shader = shaders.instanced_pbr,
@@ -250,14 +196,10 @@ pub const DoubleSidedPipelines = struct {
 
     pub fn deinit(self: *DoubleSidedPipelines) void {
         inline for (.{
-            &self.standard_u16,            &self.standard_u32,
-            &self.standard_blend_u16,      &self.standard_blend_u32,
             &self.pbr_u16,                 &self.pbr_u32,
             &self.pbr_blend_u16,           &self.pbr_blend_u32,
             &self.skinned_pbr_u16,         &self.skinned_pbr_u32,
             &self.skinned_pbr_blend_u16,   &self.skinned_pbr_blend_u32,
-            &self.instanced_u16,           &self.instanced_u32,
-            &self.instanced_blend_u16,     &self.instanced_blend_u32,
             &self.instanced_pbr_u16,       &self.instanced_pbr_u32,
             &self.instanced_pbr_blend_u16, &self.instanced_pbr_blend_u32,
         }) |pipe| {
@@ -272,10 +214,9 @@ pub const DoubleSidedPipelines = struct {
 // identical to the established mapping, so existing pipeline ids are untouched.
 // Reads ONLY render-owned snapshots (is_u32/is_skinned/double_sided flags):
 // draw-фаза не трогает живой Mesh/Material. `scene` is generic (anytype)
-// to avoid a scene.zig import cycle; it must expose the 12 pipeline_*
-// fields. `item` must expose .is_pbr/.transparent plus the snapshot flags
-// (.is_u32/.index_type and .is_skinned/.skin_index fallbacks cover foreign
-// mocks; живого .mesh здесь больше нет — P4 удалил его из очередей).
+// to avoid a scene.zig import cycle; it must expose the pipeline_*
+// fields. `item` snapshot flags (.is_u32/.index_type and .is_skinned/.skin_index
+// fallbacks cover foreign mocks; живого .mesh здесь больше нет — P4 удалил его из очередей).
 // Cutout items are opaque (transparent == false) and resolve to opaque ids.
 pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
     const is_u32 = blk: {
@@ -292,46 +233,33 @@ pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
 
     const ds = sceneDoubleSided(scene);
     const want_ds = if (ds) |_| itemDoubleSided(item) else false;
-    if (item.is_pbr) {
-        if (is_skinned) {
-            if (item.transparent) {
-                if (want_ds) {
-                    const id = if (is_u32) ds.?.skinned_pbr_blend_u32.id else ds.?.skinned_pbr_blend_u16.id;
-                    if (id != 0) return id;
-                }
-                return if (is_u32) scene.pipeline_skinned_pbr_blend_u32.id else scene.pipeline_skinned_pbr_blend_u16.id;
-            }
-            if (want_ds) {
-                const id = if (is_u32) ds.?.skinned_pbr_u32.id else ds.?.skinned_pbr_u16.id;
-                if (id != 0) return id;
-            }
-            return if (is_u32) scene.pipeline_skinned_pbr_u32.id else scene.pipeline_skinned_pbr_u16.id;
-        }
+
+    if (is_skinned) {
         if (item.transparent) {
             if (want_ds) {
-                const id = if (is_u32) ds.?.pbr_blend_u32.id else ds.?.pbr_blend_u16.id;
+                const id = if (is_u32) ds.?.skinned_pbr_blend_u32.id else ds.?.skinned_pbr_blend_u16.id;
                 if (id != 0) return id;
             }
-            return if (is_u32) scene.pipeline_pbr_blend_u32.id else scene.pipeline_pbr_blend_u16.id;
+            return if (is_u32) scene.pipeline_skinned_pbr_blend_u32.id else scene.pipeline_skinned_pbr_blend_u16.id;
         }
         if (want_ds) {
-            const id = if (is_u32) ds.?.pbr_u32.id else ds.?.pbr_u16.id;
+            const id = if (is_u32) ds.?.skinned_pbr_u32.id else ds.?.skinned_pbr_u16.id;
             if (id != 0) return id;
         }
-        return if (is_u32) scene.pipeline_pbr_u32.id else scene.pipeline_pbr_u16.id;
+        return if (is_u32) scene.pipeline_skinned_pbr_u32.id else scene.pipeline_skinned_pbr_u16.id;
     }
     if (item.transparent) {
         if (want_ds) {
-            const id = if (is_u32) ds.?.standard_blend_u32.id else ds.?.standard_blend_u16.id;
+            const id = if (is_u32) ds.?.pbr_blend_u32.id else ds.?.pbr_blend_u16.id;
             if (id != 0) return id;
         }
-        return if (is_u32) scene.pipeline_blend_u32.id else scene.pipeline_blend_u16.id;
+        return if (is_u32) scene.pipeline_pbr_blend_u32.id else scene.pipeline_pbr_blend_u16.id;
     }
     if (want_ds) {
-        const id = if (is_u32) ds.?.standard_u32.id else ds.?.standard_u16.id;
+        const id = if (is_u32) ds.?.pbr_u32.id else ds.?.pbr_u16.id;
         if (id != 0) return id;
     }
-    return if (is_u32) scene.pipeline_u32.id else scene.pipeline_u16.id;
+    return if (is_u32) scene.pipeline_pbr_u32.id else scene.pipeline_pbr_u16.id;
 }
 
 test "forwardDesc pins the exact target shape without leaking depth/cull/blend state" {
@@ -395,7 +323,6 @@ test "cullOffDescFor disables culling and preserves everything else" {
 // mesh.zig -> scene.zig -> pipelines.zig would be an import cycle). ---
 
 const TestItem = struct {
-    is_pbr: bool = false,
     transparent: bool = false,
     double_sided: bool = false,
     is_u32: bool = false,
@@ -404,186 +331,120 @@ const TestItem = struct {
 };
 
 fn testLegacyScene() struct {
-    pipeline_u16: sg.Pipeline,
-    pipeline_u32: sg.Pipeline,
     pipeline_pbr_u16: sg.Pipeline,
     pipeline_pbr_u32: sg.Pipeline,
     pipeline_skinned_pbr_u16: sg.Pipeline,
     pipeline_skinned_pbr_u32: sg.Pipeline,
-    pipeline_instanced_u16: sg.Pipeline,
-    pipeline_instanced_u32: sg.Pipeline,
     pipeline_instanced_pbr_u16: sg.Pipeline,
     pipeline_instanced_pbr_u32: sg.Pipeline,
-    pipeline_blend_u16: sg.Pipeline,
-    pipeline_blend_u32: sg.Pipeline,
     pipeline_pbr_blend_u16: sg.Pipeline,
     pipeline_pbr_blend_u32: sg.Pipeline,
     pipeline_skinned_pbr_blend_u16: sg.Pipeline,
     pipeline_skinned_pbr_blend_u32: sg.Pipeline,
-    pipeline_instanced_blend_u16: sg.Pipeline,
-    pipeline_instanced_blend_u32: sg.Pipeline,
     pipeline_instanced_pbr_blend_u16: sg.Pipeline,
     pipeline_instanced_pbr_blend_u32: sg.Pipeline,
 } {
     return .{
-        .pipeline_u16 = .{ .id = 11 },
-        .pipeline_u32 = .{ .id = 12 },
         .pipeline_pbr_u16 = .{ .id = 21 },
         .pipeline_pbr_u32 = .{ .id = 22 },
         .pipeline_skinned_pbr_u16 = .{ .id = 31 },
         .pipeline_skinned_pbr_u32 = .{ .id = 32 },
-        .pipeline_instanced_u16 = .{ .id = 41 },
-        .pipeline_instanced_u32 = .{ .id = 42 },
         .pipeline_instanced_pbr_u16 = .{ .id = 51 },
         .pipeline_instanced_pbr_u32 = .{ .id = 52 },
-        .pipeline_blend_u16 = .{ .id = 13 },
-        .pipeline_blend_u32 = .{ .id = 14 },
         .pipeline_pbr_blend_u16 = .{ .id = 23 },
         .pipeline_pbr_blend_u32 = .{ .id = 24 },
         .pipeline_skinned_pbr_blend_u16 = .{ .id = 33 },
         .pipeline_skinned_pbr_blend_u32 = .{ .id = 34 },
-        .pipeline_instanced_blend_u16 = .{ .id = 43 },
-        .pipeline_instanced_blend_u32 = .{ .id = 44 },
         .pipeline_instanced_pbr_blend_u16 = .{ .id = 53 },
         .pipeline_instanced_pbr_blend_u32 = .{ .id = 54 },
     };
 }
 
 const TestDsScene = struct {
-    pipeline_u16: sg.Pipeline,
-    pipeline_u32: sg.Pipeline,
     pipeline_pbr_u16: sg.Pipeline,
     pipeline_pbr_u32: sg.Pipeline,
     pipeline_skinned_pbr_u16: sg.Pipeline,
     pipeline_skinned_pbr_u32: sg.Pipeline,
-    pipeline_instanced_u16: sg.Pipeline,
-    pipeline_instanced_u32: sg.Pipeline,
     pipeline_instanced_pbr_u16: sg.Pipeline,
     pipeline_instanced_pbr_u32: sg.Pipeline,
-    pipeline_blend_u16: sg.Pipeline,
-    pipeline_blend_u32: sg.Pipeline,
     pipeline_pbr_blend_u16: sg.Pipeline,
     pipeline_pbr_blend_u32: sg.Pipeline,
     pipeline_skinned_pbr_blend_u16: sg.Pipeline,
     pipeline_skinned_pbr_blend_u32: sg.Pipeline,
-    pipeline_instanced_blend_u16: sg.Pipeline,
-    pipeline_instanced_blend_u32: sg.Pipeline,
     pipeline_instanced_pbr_blend_u16: sg.Pipeline,
     pipeline_instanced_pbr_blend_u32: sg.Pipeline,
     ds_pipelines: DoubleSidedPipelines,
 };
 
-test "legacy scenes keep existing pipeline ids; cutout resolves opaque" {
+test "forward scenes keep existing pipeline ids; cutout resolves opaque" {
     const std = @import("std");
     const scene = testLegacyScene();
 
-    // Opaque/transparent matrix, u16 + u32, standard + pbr + skinned.
+    // Opaque/transparent matrix, u16 + u32, pbr + skinned.
     // Флаги — только render-owned снимки (P4: живого меша здесь больше нет).
     var item = TestItem{};
-    try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
-    item.transparent = true;
-    try std.testing.expectEqual(@as(u32, 13), pipelineForRegularItem(scene, item));
-    item.transparent = false;
-    item.is_u32 = true;
-    try std.testing.expectEqual(@as(u32, 12), pipelineForRegularItem(scene, item));
-
-    item.is_pbr = true;
-    item.is_u32 = false;
     try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 23), pipelineForRegularItem(scene, item));
+    item.transparent = false;
+    item.is_u32 = true;
+    try std.testing.expectEqual(@as(u32, 22), pipelineForRegularItem(scene, item));
 
+    item.is_u32 = false;
     item.is_skinned = true;
     item.transparent = false;
     try std.testing.expectEqual(@as(u32, 31), pipelineForRegularItem(scene, item));
     item.transparent = true;
     try std.testing.expectEqual(@as(u32, 33), pipelineForRegularItem(scene, item));
     // P4: флаг is_skinned может отсутствовать — skin_index тоже ведёт в skinned-пайплайн.
-    item = TestItem{ .is_pbr = true, .skin_index = 5 };
+    item = TestItem{ .skin_index = 5 };
     try std.testing.expectEqual(@as(u32, 31), pipelineForRegularItem(scene, item));
 
     // Cutout material classifies opaque (transparent == false) and must
     // resolve to the opaque pipeline id, never a blend twin.
     item = TestItem{ .transparent = false };
-    try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
-    item.is_u32 = true;
-    try std.testing.expectEqual(@as(u32, 12), pipelineForRegularItem(scene, item));
-    item.is_pbr = true;
-    item.is_u32 = false;
-    // Note: std cutout material on a pbr item still picks the pbr pipe;
-    // the point is opaque (not blend) selection.
     try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
+    item.is_u32 = true;
+    try std.testing.expectEqual(@as(u32, 22), pipelineForRegularItem(scene, item));
 }
 
 test "double-sided items select cull-off twins, with regular fallback" {
     const std = @import("std");
     const legacy = testLegacyScene();
     const scene = TestDsScene{
-        .pipeline_u16 = legacy.pipeline_u16,
-        .pipeline_u32 = legacy.pipeline_u32,
         .pipeline_pbr_u16 = legacy.pipeline_pbr_u16,
         .pipeline_pbr_u32 = legacy.pipeline_pbr_u32,
         .pipeline_skinned_pbr_u16 = legacy.pipeline_skinned_pbr_u16,
         .pipeline_skinned_pbr_u32 = legacy.pipeline_skinned_pbr_u32,
-        .pipeline_instanced_u16 = legacy.pipeline_instanced_u16,
-        .pipeline_instanced_u32 = legacy.pipeline_instanced_u32,
         .pipeline_instanced_pbr_u16 = legacy.pipeline_instanced_pbr_u16,
         .pipeline_instanced_pbr_u32 = legacy.pipeline_instanced_pbr_u32,
-        .pipeline_blend_u16 = legacy.pipeline_blend_u16,
-        .pipeline_blend_u32 = legacy.pipeline_blend_u32,
         .pipeline_pbr_blend_u16 = legacy.pipeline_pbr_blend_u16,
         .pipeline_pbr_blend_u32 = legacy.pipeline_pbr_blend_u32,
         .pipeline_skinned_pbr_blend_u16 = legacy.pipeline_skinned_pbr_blend_u16,
         .pipeline_skinned_pbr_blend_u32 = legacy.pipeline_skinned_pbr_blend_u32,
-        .pipeline_instanced_blend_u16 = legacy.pipeline_instanced_blend_u16,
-        .pipeline_instanced_blend_u32 = legacy.pipeline_instanced_blend_u32,
         .pipeline_instanced_pbr_blend_u16 = legacy.pipeline_instanced_pbr_blend_u16,
         .pipeline_instanced_pbr_blend_u32 = legacy.pipeline_instanced_pbr_blend_u32,
         .ds_pipelines = .{
-            .standard_u16 = .{ .id = 111 },
-            .standard_u32 = .{ .id = 112 },
-            .standard_blend_u16 = .{ .id = 113 },
             .pbr_u16 = .{ .id = 121 },
             .pbr_blend_u32 = .{ .id = 124 },
-            .instanced_u16 = .{ .id = 141 },
             .instanced_pbr_u16 = .{ .id = 151 },
         },
     };
     var item = TestItem{ .double_sided = true };
-    try std.testing.expectEqual(@as(u32, 111), pipelineForRegularItem(scene, item));
-    item.is_u32 = true;
-    try std.testing.expectEqual(@as(u32, 112), pipelineForRegularItem(scene, item));
-    item.is_u32 = false;
-
-    // Blend + double-sided selects the cull-off blend twin.
-    item.transparent = true;
-    try std.testing.expectEqual(@as(u32, 113), pipelineForRegularItem(scene, item));
+    try std.testing.expectEqual(@as(u32, 121), pipelineForRegularItem(scene, item));
 
     // Missing twin (id 0) falls back to the regular pipeline.
     item.is_u32 = true;
-    try std.testing.expectEqual(@as(u32, 14), pipelineForRegularItem(scene, item));
-    item.is_u32 = false;
     item.transparent = false;
+    try std.testing.expectEqual(@as(u32, 22), pipelineForRegularItem(scene, item));
+
+    // Blend + double-sided selects the cull-off blend twin.
+    item.transparent = true;
+    try std.testing.expectEqual(@as(u32, 124), pipelineForRegularItem(scene, item));
 
     // Single-sided items keep regular ids even when the ds set exists.
     item = TestItem{};
-    try std.testing.expectEqual(@as(u32, 11), pipelineForRegularItem(scene, item));
-
-    // PBR family honors the same contract.
-    item.is_pbr = true;
-    item.double_sided = true;
-    try std.testing.expectEqual(@as(u32, 121), pipelineForRegularItem(scene, item));
-    item.transparent = true;
-    item.is_u32 = true;
-    try std.testing.expectEqual(@as(u32, 124), pipelineForRegularItem(scene, item));
-
-    // Instanced helper: ds twin, blend twin fallback, legacy scene.
-    try std.testing.expectEqual(@as(u32, 141), pipelineForInstancedMesh(scene, false, false, false, true));
-    try std.testing.expectEqual(@as(u32, 43), pipelineForInstancedMesh(scene, false, true, false, true));
-    try std.testing.expectEqual(@as(u32, 41), pipelineForInstancedMesh(scene, false, false, false, false));
-    try std.testing.expectEqual(@as(u32, 44), pipelineForInstancedMesh(scene, false, true, true, false));
-    try std.testing.expectEqual(@as(u32, 41), pipelineForInstancedMesh(legacy, false, false, false, true));
-    try std.testing.expectEqual(@as(u32, 43), pipelineForInstancedMesh(legacy, false, true, false, true));
+    try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
 
     // Instanced PBR:
     try std.testing.expectEqual(@as(u32, 151), pipelineForInstancedMesh(scene, true, false, false, true));
@@ -597,33 +458,20 @@ test "double-sided items select cull-off twins, with regular fallback" {
 // regular pipeline otherwise (scenes without the set behave exactly as before).
 // `scene` must expose the pipeline_instanced_* fields.
 pub fn pipelineForInstancedMesh(scene: anytype, is_pbr: bool, transparent: bool, is_u32: bool, double_sided: bool) u32 {
+    _ = is_pbr;
     if (sceneDoubleSided(scene)) |ds| {
         if (double_sided) {
-            if (is_pbr) {
-                const id = if (transparent)
-                    (if (is_u32) ds.instanced_pbr_blend_u32.id else ds.instanced_pbr_blend_u16.id)
-                else
-                    (if (is_u32) ds.instanced_pbr_u32.id else ds.instanced_pbr_u16.id);
-                if (id != 0) return id;
-            } else {
-                const id = if (transparent)
-                    (if (is_u32) ds.instanced_blend_u32.id else ds.instanced_blend_u16.id)
-                else
-                    (if (is_u32) ds.instanced_u32.id else ds.instanced_u16.id);
-                if (id != 0) return id;
-            }
+            const id = if (transparent)
+                (if (is_u32) ds.instanced_pbr_blend_u32.id else ds.instanced_pbr_blend_u16.id)
+            else
+                (if (is_u32) ds.instanced_pbr_u32.id else ds.instanced_pbr_u16.id);
+            if (id != 0) return id;
         }
-    }
-    if (is_pbr) {
-        if (transparent) {
-            return if (is_u32) scene.pipeline_instanced_pbr_blend_u32.id else scene.pipeline_instanced_pbr_blend_u16.id;
-        }
-        return if (is_u32) scene.pipeline_instanced_pbr_u32.id else scene.pipeline_instanced_pbr_u16.id;
     }
     if (transparent) {
-        return if (is_u32) scene.pipeline_instanced_blend_u32.id else scene.pipeline_instanced_blend_u16.id;
+        return if (is_u32) scene.pipeline_instanced_pbr_blend_u32.id else scene.pipeline_instanced_pbr_blend_u16.id;
     }
-    return if (is_u32) scene.pipeline_instanced_u32.id else scene.pipeline_instanced_u16.id;
+    return if (is_u32) scene.pipeline_instanced_pbr_u32.id else scene.pipeline_instanced_pbr_u16.id;
 }
 
 // Scene-side double-sided set, if the scene embeds one as `ds_pipelines`

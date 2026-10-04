@@ -428,7 +428,7 @@ test "serialization rejects huge counts and strings" {
     try std.testing.expectError(error.Truncated, deserializeAlloc(alloc, buf.items));
 }
 
-test "capture maps null material to standard default" {
+test "capture maps null material to pbr default" {
     const alloc = std.testing.allocator;
     var scene = testScene(alloc);
 
@@ -444,9 +444,11 @@ test "capture maps null material to standard default" {
     try std.testing.expectEqual(@as(usize, 1), state.meshes.len);
     try std.testing.expectEqualStrings("plain", state.meshes[0].name);
     try std.testing.expectEqual([3]f32{ 1.0, 2.0, 3.0 }, state.meshes[0].position);
-    try std.testing.expect(state.meshes[0].material == .standard);
-    try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, state.meshes[0].material.standard.diffuse);
-    try std.testing.expectEqual(@as(f32, 1.0), state.meshes[0].material.standard.alpha);
+    try std.testing.expect(state.meshes[0].material == .pbr);
+    try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, state.meshes[0].material.pbr.albedo);
+    try std.testing.expectEqual(@as(f32, 1.0), state.meshes[0].material.pbr.alpha);
+    try std.testing.expectEqual(@as(f32, 0.0), state.meshes[0].material.pbr.metallic);
+    try std.testing.expectEqual(@as(f32, 0.5), state.meshes[0].material.pbr.roughness);
     try std.testing.expect(state.camera == .none);
     try std.testing.expect(state.directional == null);
 }
@@ -458,9 +460,9 @@ test "restore applies by name and ignores missing" {
 
     var scene = testScene(alloc);
 
-    var std_mat = StandardMaterial.init("shared");
+    var pbr_mat = MaterialModule.PBRMaterial.init("shared");
     var mesh = testMesh("box");
-    mesh.material = .{ .standard = &std_mat };
+    mesh.material = .{ .pbr = &pbr_mat };
     try scene.meshes.append(alloc, &mesh);
 
     var state = SceneState{};
@@ -473,12 +475,12 @@ test "restore applies by name and ignores missing" {
         .is_visible = false,
         .cast_shadows = false,
         .receive_shadows = false,
-        .material = .{ .standard = .{ .diffuse = .{ 0.9, 0.1, 0.1 }, .alpha = 0.5, .alpha_mode = 1 } },
+        .material = .{ .pbr = .{ .albedo = .{ 0.9, 0.1, 0.1 }, .alpha = 0.5, .alpha_mode = 1 } },
     };
     entries[1] = .{
         .name = try alloc.dupe(u8, "ghost-missing"),
         .position = .{ 99.0, 99.0, 99.0 },
-        .material = .{ .standard = .{} },
+        .material = .{ .pbr = .{} },
     };
     state.meshes = entries;
     state.hemi = .{
@@ -515,8 +517,8 @@ test "restore applies by name and ignores missing" {
     try std.testing.expectEqual(Vec3.new(7.0, 8.0, 9.0), mesh.position);
     try std.testing.expectEqual(Vec3.new(3.0, 3.0, 3.0), mesh.scaling);
     try std.testing.expect(!mesh.is_visible);
-    try std.testing.expectEqual(@as(f32, 0.5), std_mat.alpha);
-    try std.testing.expect(std_mat.alpha_mode == .blend);
+    try std.testing.expectEqual(@as(f32, 0.5), pbr_mat.alpha);
+    try std.testing.expect(pbr_mat.alpha_mode == .blend);
     // Missing mesh ignored: no crash, light recreated, camera applied.
     try std.testing.expectEqual(@as(usize, 1), scene.lights.point_lights.items.len);
     try std.testing.expectEqualStrings("lamp", scene.lights.point_lights.items[0].name);
@@ -703,27 +705,67 @@ test "capture and restore cutout material fields" {
 
     var scene = testScene(alloc);
 
-    var std_mat = StandardMaterial.init("cut");
-    std_mat.alpha_mode = .cutout;
-    std_mat.alpha_cutoff = 0.2;
-    std_mat.double_sided = true;
+    var pbr_mat = MaterialModule.PBRMaterial.init("cut");
+    pbr_mat.alpha_mode = .cutout;
+    pbr_mat.alpha_cutoff = 0.2;
+    pbr_mat.double_sided = true;
     var mesh = testMesh("fence");
-    mesh.material = .{ .standard = &std_mat };
+    mesh.material = .{ .pbr = &pbr_mat };
     try scene.meshes.append(alloc, &mesh);
 
     var state = try capture(alloc, &scene);
-    try std.testing.expectEqual(@as(u8, 2), state.meshes[0].material.standard.alpha_mode);
-    try std.testing.expectEqual(@as(f32, 0.2), state.meshes[0].material.standard.alpha_cutoff);
-    try std.testing.expect(state.meshes[0].material.standard.double_sided);
+    try std.testing.expectEqual(@as(u8, 2), state.meshes[0].material.pbr.alpha_mode);
+    try std.testing.expectEqual(@as(f32, 0.2), state.meshes[0].material.pbr.alpha_cutoff);
+    try std.testing.expect(state.meshes[0].material.pbr.double_sided);
 
     // Mutate live, restore must bring the snapshot values back.
-    std_mat.alpha_cutoff = 0.9;
-    std_mat.double_sided = false;
-    std_mat.alpha_mode = .@"opaque";
+    pbr_mat.alpha_cutoff = 0.9;
+    pbr_mat.double_sided = false;
+    pbr_mat.alpha_mode = .@"opaque";
     restore(&scene, &state);
-    try std.testing.expect(std_mat.alpha_mode == .cutout);
-    try std.testing.expectEqual(@as(f32, 0.2), std_mat.alpha_cutoff);
-    try std.testing.expect(std_mat.double_sided);
+    try std.testing.expect(pbr_mat.alpha_mode == .cutout);
+    try std.testing.expectEqual(@as(f32, 0.2), pbr_mat.alpha_cutoff);
+    try std.testing.expect(pbr_mat.double_sided);
+}
+
+test "restore converts legacy standard material entry to pbr material" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var scene = testScene(alloc);
+
+    var mesh = testMesh("legacy_mesh");
+    try scene.meshes.append(alloc, &mesh);
+
+    var state = SceneState{};
+    const entries = try alloc.alloc(MeshEntry, 1);
+    entries[0] = .{
+        .name = try alloc.dupe(u8, "legacy_mesh"),
+        .material = .{ .standard = .{
+            .diffuse = .{ 0.8, 0.4, 0.2 },
+            .alpha = 0.8,
+            .alpha_mode = 2,
+            .alpha_cutoff = 0.3,
+            .double_sided = true,
+        } },
+    };
+    state.meshes = entries;
+
+    restore(&scene, &state);
+
+    try std.testing.expect(mesh.material != null);
+    try std.testing.expect(mesh.material.? == .pbr);
+    const pbr = mesh.material.?.pbr;
+    try std.testing.expectEqual(@as(f32, 0.8), pbr.albedo_color.r);
+    try std.testing.expectEqual(@as(f32, 0.4), pbr.albedo_color.g);
+    try std.testing.expectEqual(@as(f32, 0.2), pbr.albedo_color.b);
+    try std.testing.expectEqual(@as(f32, 0.0), pbr.metallic);
+    try std.testing.expectEqual(@as(f32, 0.5), pbr.roughness);
+    try std.testing.expectEqual(@as(f32, 0.8), pbr.alpha);
+    try std.testing.expect(pbr.alpha_mode == .cutout);
+    try std.testing.expectEqual(@as(f32, 0.3), pbr.alpha_cutoff);
+    try std.testing.expect(pbr.double_sided);
 }
 
 test "saveFileAsync and loadFileAsync round-trip with TaskRunner" {
@@ -840,19 +882,21 @@ test "capture and restore mesh hierarchy and entity id" {
     defer {
         for (scene.materials.items) |m| alloc.destroy(m);
         scene.materials.deinit(alloc);
+        for (scene.pbr_materials.items) |m| alloc.destroy(m);
+        scene.pbr_materials.deinit(alloc);
     }
 
-    var mat_parent = StandardMaterial.init("mat_parent");
+    var mat_parent = MaterialModule.PBRMaterial.init("mat_parent");
     var parent = testMesh("root_node");
     parent.id = 1001;
-    parent.material = .{ .standard = &mat_parent };
+    parent.material = .{ .pbr = &mat_parent };
     parent.position = Vec3.new(10.0, 0.0, 0.0);
     try scene.meshes.append(alloc, &parent);
 
-    var mat_child = StandardMaterial.init("mat_child");
+    var mat_child = MaterialModule.PBRMaterial.init("mat_child");
     var child = testMesh("child_node");
     child.id = 1002;
-    child.material = .{ .standard = &mat_child };
+    child.material = .{ .pbr = &mat_child };
     child.parent = &parent;
     child.position = Vec3.new(2.0, 3.0, 4.0);
     try scene.meshes.append(alloc, &child);

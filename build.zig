@@ -37,20 +37,20 @@ pub const UserShaderMaterial = struct {
     /// Path to the snippet file (build-root relative).
     snippet: []const u8,
     /// Engine template the snippet hooks into.
-    base: Base = .standard,
+    base: Base = .pbr,
     pub const Base = enum { standard, pbr };
 };
 
 pub const user_shader_materials = [_]UserShaderMaterial{
-    .{ .name = "ramp_wave", .snippet = "examples/shader_materials/ramp_wave.glsl" },
+    .{ .name = "ramp_wave", .snippet = "examples/shader_materials/ramp_wave.glsl", .base = .pbr },
     // Material library v1 presets (see src/agate/material_library.zig):
     // procedural Sky/Gradient/Grid/TriPlanar constructors over the same
     // hook-merge pipeline. Each entry compiles its snippet into the
-    // standard template under glsl430/metal_macos/hlsl5/wgsl at build time.
-    .{ .name = "matlib_sky", .snippet = "examples/shader_materials/matlib_sky.glsl" },
-    .{ .name = "matlib_gradient", .snippet = "examples/shader_materials/matlib_gradient.glsl" },
-    .{ .name = "matlib_grid", .snippet = "examples/shader_materials/matlib_grid.glsl" },
-    .{ .name = "matlib_triplanar", .snippet = "examples/shader_materials/matlib_triplanar.glsl" },
+    // PBR template under glsl430/metal_macos/hlsl5/wgsl at build time.
+    .{ .name = "matlib_sky", .snippet = "examples/shader_materials/matlib_sky.glsl", .base = .pbr },
+    .{ .name = "matlib_gradient", .snippet = "examples/shader_materials/matlib_gradient.glsl", .base = .pbr },
+    .{ .name = "matlib_grid", .snippet = "examples/shader_materials/matlib_grid.glsl", .base = .pbr },
+    .{ .name = "matlib_triplanar", .snippet = "examples/shader_materials/matlib_triplanar.glsl", .base = .pbr },
 };
 
 // ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ pub const UserShaderSpec = struct {
     /// Zig module name for the generated shader (also the @import name).
     name: []const u8,
     /// Downstream build-root-relative path to the .glsl (sokol-shdc format:
-    /// @vs/@fs/@program blocks, see src/agate/shaders/standard.glsl).
+    /// @vs/@fs/@program blocks, see src/agate/shaders/pbr.glsl).
     input: []const u8,
     /// Generated file name; default "<name>.zig".
     output: ?[]const u8 = null,
@@ -330,10 +330,8 @@ pub fn build(b: *Build) !void {
         // variants additionally share the BRDF math + channelSelect.
         // Deliberately NOT shared: fs_params blocks (layout parity +
         // differing probe semantics) and morph/skin vertex variants.
-        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig", .includes = true },
         .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
         .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
-        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .includes = true },
         .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
         .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
         .{ .name = "msaa_depth_shader", .input = "src/agate/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
@@ -888,12 +886,10 @@ fn createShaderMaterialRegistry(
         try seen_names.put(b.allocator, mat.name, {});
 
         const base_glsl = switch (mat.base) {
-            .standard => "src/agate/shaders/standard.glsl",
-            .pbr => "src/agate/shaders/pbr.glsl",
+            .standard, .pbr => "src/agate/shaders/pbr.glsl",
         };
         const prog_name: []const u8 = switch (mat.base) {
-            .standard => "standardShaderDesc",
-            .pbr => "pbrShaderDesc",
+            .standard, .pbr => "pbrShaderDesc",
         };
 
         // 1. Merge template + snippet (host tool step).

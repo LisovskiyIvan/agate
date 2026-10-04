@@ -25,6 +25,7 @@ pub const wrapNdotL = types.wrapNdotL;
 pub const StandardMaterial = standard.StandardMaterial;
 pub const PBRMaterial = pbr.PBRMaterial;
 pub const ShaderMaterial = shader_mat.ShaderMaterial;
+pub const roughnessFromSpecularPower = pbr.roughnessFromSpecularPower;
 
 // Material Union
 pub const Material = union_mod.Material;

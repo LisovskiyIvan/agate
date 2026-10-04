@@ -72,7 +72,7 @@ pub const Options = struct {
     snippet: ?[]const u8 = null,
     /// Expected base template name ("standard" / "pbr"); checked against the
     /// snippet's `// base:` header when that header is present.
-    base: []const u8 = "standard",
+    base: []const u8 = "pbr",
     /// For diagnostics in error messages.
     material_name: []const u8 = "",
 };
@@ -210,7 +210,9 @@ fn parseSnippet(allocator: std.mem.Allocator, snippet: []const u8, opts: Options
         const line = std.mem.trim(u8, lines[i].text, " \t\r");
         if (std.mem.startsWith(u8, line, "// base:")) {
             const declared = std.mem.trim(u8, line["// base:".len..], " \t");
-            if (declared.len > 0 and !std.mem.eql(u8, declared, opts.base)) {
+            const norm_decl = if (std.mem.eql(u8, declared, "standard")) "pbr" else declared;
+            const norm_base = if (std.mem.eql(u8, opts.base, "standard")) "pbr" else opts.base;
+            if (norm_decl.len > 0 and !std.mem.eql(u8, norm_decl, norm_base)) {
                 return Error.BaseMismatch;
             }
             continue;
@@ -575,40 +577,41 @@ test "param decls assign f32 offsets and generate the UB block" {
 }
 
 test "snippet base header mismatch fails the build" {
-    const snippet = "// base: pbr\n// @hook(albedo)\nbase.rgb = vec3(0.0);\n";
-    try std.testing.expectError(Error.BaseMismatch, merge(std.testing.allocator, .{ .template = test_template, .base = "standard", .snippet = snippet }));
+    const snippet = "// base: custom\n// @hook(albedo)\nbase.rgb = vec3(0.0);\n";
+    try std.testing.expectError(Error.BaseMismatch, merge(std.testing.allocator, .{ .template = test_template, .base = "pbr", .snippet = snippet }));
+}
+
+test "snippet base standard alias accepted under pbr base" {
+    const snippet = "// base: standard\n// @hook(albedo)\nbase.rgb = vec3(0.0);\n";
+    const res = try merge(std.testing.allocator, .{ .template = test_template, .base = "pbr", .snippet = snippet });
+    defer std.testing.allocator.free(res.glsl);
+    defer std.testing.allocator.free(res.params);
+    try std.testing.expect(std.mem.indexOf(u8, res.glsl, "base.rgb = vec3(0.0);") != null);
 }
 
 test "real engine templates merge byte-identical and accept an albedo hook" {
-    const standard_tmpl = @embedFile("../shaders/standard.glsl");
     const pbr_tmpl = @embedFile("../shaders/pbr.glsl");
 
-    // No snippet: exact identity for both templates.
-    const r0 = try merge(std.testing.allocator, .{ .template = standard_tmpl });
-    defer std.testing.allocator.free(r0.glsl);
-    defer std.testing.allocator.free(r0.params);
-    try std.testing.expectEqualSlices(u8, standard_tmpl, r0.glsl);
-
+    // No snippet: exact identity for PBR template.
     const r1 = try merge(std.testing.allocator, .{ .template = pbr_tmpl });
     defer std.testing.allocator.free(r1.glsl);
     defer std.testing.allocator.free(r1.params);
     try std.testing.expectEqualSlices(u8, pbr_tmpl, r1.glsl);
 
-    // A snippet overriding every standard.glsl hook merges cleanly.
+    // A snippet overriding every pbr.glsl hook merges cleanly.
     const snippet =
         "// @hook(vertex)\nmorphed_pos.z += 0.1;\n" ++
         "// @hook(albedo)\nbase.rgb = base.rgb.bgr;\n" ++
         "// @hook(post_lighting)\nfinal_rgb = pow(final_rgb, vec3(2.2));\n";
-    const r2 = try merge(std.testing.allocator, .{ .template = standard_tmpl, .snippet = snippet });
+    const r2 = try merge(std.testing.allocator, .{ .template = pbr_tmpl, .snippet = snippet });
     defer std.testing.allocator.free(r2.glsl);
     defer std.testing.allocator.free(r2.params);
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "morphed_pos.z += 0.1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "base.rgb = base.rgb.bgr;") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "final_rgb = pow(final_rgb, vec3(2.2));") != null);
     // Injection points kept their surrounding lines.
-    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "applyMorphDeltas(morphed_pos, morphed_nrm, gl_VertexIndex);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "frag_color = linearOutputColor(final_rgb, base.a);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "clamp(lit, 0.0, 1.0)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "applyMorphDeltas(morphed_pos, morphed_nrm, morphed_tan, gl_VertexIndex);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "frag_color = linearOutputColor(final_color, albedo_rgba.a);") != null);
 }
 
 test "reserved param names are rejected" {

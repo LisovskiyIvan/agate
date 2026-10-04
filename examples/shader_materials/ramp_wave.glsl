@@ -12,7 +12,7 @@
 // Params are packed into the generated sm_user_params UB (8x vec4) and
 // editable at runtime through ShaderMaterial.setUniform(name, value).
 
-// base: standard
+// base: pbr
 
 // @param u_wave_speed float = 4.0
 // @param u_wave_height float = 0.12

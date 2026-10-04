@@ -66,10 +66,6 @@ pub const MaterialDrawRecord = struct {
     uv_matrices: [5][4]f32 = @splat(.{ 1, 0, 0, 1 }),
     uv_offsets: [5][4]f32 = @splat(.{ 0, 0, 0, 0 }),
     channel_selectors: [4]f32 = .{ 0, 1, 2, 0 },
-
-    // Standard material diffuse UV matrix / offset
-    standard_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
-    standard_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 /// Render-owned копия изменяемых CPU-данных hook-материала: draw-путь читает
@@ -214,16 +210,27 @@ pub fn buildDrawRecord(
                 const tex = s.diffuse_texture orelse default_white.*;
                 rec.albedo_view = tex.view;
                 rec.albedo_sampler = tex.sampler;
+                rec.normal_view = default_normal.view;
+                rec.mr_view = default_white.view;
+                rec.emissive_view = default_white.view;
+                rec.occlusion_view = default_white.view;
+                rec.clearcoat_view = default_white.view;
+                rec.sheen_view = default_white.view;
+                rec.data_sampler = default_normal.sampler;
+                if (sky_texture) |st| {
+                    rec.env_view = st.view;
+                    rec.env_sampler = st.sampler;
+                } else {
+                    rec.env_view = default_cube.view;
+                    rec.env_sampler = default_cube.sampler;
+                }
                 rec.base_color = s.getDiffuseColor4();
                 rec.pbr_factors = .{
-                    s.specular_color.r,
-                    s.specular_color.g,
-                    s.specular_color.b,
-                    s.specular_power,
+                    0.0,
+                    PBRMaterial.roughnessFromSpecularPower(s.specular_power),
+                    1.0,
+                    ibl_intensity,
                 };
-                // Same lane and same meaning as the PBR family's emissive
-                // (Babylon's standard composition adds it too — it just used
-                // to be dropped on the floor for standard draws).
                 rec.emissive_color = .{
                     s.emissive_color.r,
                     s.emissive_color.g,
@@ -231,9 +238,9 @@ pub fn buildDrawRecord(
                     if (s.two_sided_lighting) 1.0 else 0.0,
                 };
                 rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
-                rec.standard_uv_matrix = s.diffuse_uv_transform.matrixRows();
-                rec.standard_uv_offset = s.diffuse_uv_transform.offsetPacked();
-                if (s.unlit) rec.standard_uv_offset[2] = 1.0;
+                rec.uv_matrices[0] = s.diffuse_uv_transform.matrixRows();
+                rec.uv_offsets[0] = s.diffuse_uv_transform.offsetPacked();
+                if (s.unlit) rec.uv_offsets[0][2] = 1.0;
             },
             .shader_material => |sm| {
                 const tex = sm.texture orelse default_white.*;

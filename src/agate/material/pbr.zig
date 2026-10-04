@@ -22,7 +22,11 @@ pub fn roughnessFromSpecularPower(power: f32) f32 {
     return @max(0.05, @min(1.0, @sqrt(2.0 / (@max(1.0, power) + 2.0))));
 }
 
+const file_roughness = roughnessFromSpecularPower;
+
 pub const PBRMaterial = struct {
+    pub const roughnessFromSpecularPower = file_roughness;
+
     name: []const u8 = "PBRMaterial",
     albedo_color: Color3 = Color3.white,
     alpha: f32 = 1.0,

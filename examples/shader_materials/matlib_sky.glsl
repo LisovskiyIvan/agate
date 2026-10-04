@@ -12,7 +12,7 @@
 // Params are packed into the generated sm_user_params UB (8x vec4) and
 // editable at runtime through ShaderMaterial.setUniform(name, value).
 
-// base: standard
+// base: pbr
 
 // @param u_sky_top vec4 = 0.20 0.45 0.80 1.0
 // @param u_sky_horizon vec4 = 0.75 0.85 0.95 1.0

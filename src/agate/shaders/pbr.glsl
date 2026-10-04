@@ -364,11 +364,20 @@ void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
     vec4 albedo_rgba = v_color * base_color_factor * albedo_tex_val;
 
+    // Geometric normal in world space available for early hooks (e.g. triplanar).
+    vec3 N = normalize(v_normal);
+
     // Shader material hook 'albedo': user snippets may modify albedo_rgba
     // (rgb and alpha; the alpha cutoff below sees the modified value).
     // In scope: albedo_rgba, v_uv, v_world_pos, v_color, base_color_factor.
+    #define base albedo_rgba
+    #define diffuse_tex albedo_tex
+    #define diffuse_color base_color_factor
     // @hook(albedo)
     // @endhook
+    #undef diffuse_color
+    #undef diffuse_tex
+    #undef base
 
     // Alpha test (cutout): cutout materials discard sub-cutoff fragments
     // before any lighting work. Opaque/blend materials upload 0.0, so this
@@ -393,7 +402,7 @@ void main() {
     vec3 map_n = texture(sampler2D(normal_tex, data_smp), uvApply(uv_matrix[1], uv_offset[1], v_uv)).xyz * 2.0 - 1.0;
     map_n.xy *= normal_scale;
     mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
-    vec3 N = normalize(TBN * map_n);
+    N = normalize(TBN * map_n);
 
     // Babylon's `TWOSIDEDLIGHTING` (pbrBlockNormalFinal): with back-face
     // culling OFF and the material flag ON, the shading normal is flipped on
@@ -840,8 +849,12 @@ void main() {
     // Shader material hook 'post_lighting': user snippets may modify
     // final_color (rim light, color grading). In scope: final_color,
     // ambient, ibl, Lo, emissive, albedo, v_world_pos, N, eye_pos.
+    #define final_rgb final_color
+    #define base albedo_rgba
     // @hook(post_lighting)
     // @endhook
+    #undef base
+    #undef final_rgb
 
     frag_color = linearOutputColor(final_color, albedo_rgba.a);
 }

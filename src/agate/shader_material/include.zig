@@ -279,9 +279,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         @embedFile("../shaders/volumetric_blur.glsl"),
         @embedFile("../shaders/volumetric_raymarch.glsl"),
         @embedFile("../shaders/postprocess.glsl"),
-        @embedFile("../shaders/standard.glsl"),
         @embedFile("../shaders/pbr.glsl"),
-        @embedFile("../shaders/instanced.glsl"),
         @embedFile("../shaders/instanced_pbr.glsl"),
         @embedFile("../shaders/skinned_pbr.glsl"),
     };
@@ -296,9 +294,6 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
     try std.testing.expect(std.mem.indexOf(u8, pbr, "float pcssBlockerAverage(") != null);
     try std.testing.expect(std.mem.indexOf(u8, pbr, "float distributionGGX(") != null);
     try std.testing.expect(std.mem.indexOf(u8, pbr, "float channelSelect(") != null);
-    const stdfs = try expand(alloc, @embedFile("../shaders/standard.glsl"), "x.glsl", "shaders", mem.fs());
-    try std.testing.expect(std.mem.indexOf(u8, stdfs, "float pcssBlockerAverage(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdfs, "float channelSelect(") == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,16 +313,12 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return n;
 }
 
-test "drift: fs_params probe lane parity across the five forward shaders" {
+test "drift: fs_params probe lane parity across the three forward shaders" {
     // Every forward fs_params block carries `vec4 probe_params;` exactly
-    // once (per-draw probe state appended last; layout parity with the
-    // regular standard FsParams is load-bearing — see build.zig and
-    // lights/probe uploads). Deleting or renaming it in one copy breaks
-    // uniform offsets silently; this test breaks loudly instead.
+    // once (per-draw probe state appended last; layout parity across PBR
+    // variants is load-bearing — see build.zig and lights/probe uploads).
     const shaders = [_][]const u8{
-        @embedFile("../shaders/standard.glsl"),
         @embedFile("../shaders/pbr.glsl"),
-        @embedFile("../shaders/instanced.glsl"),
         @embedFile("../shaders/instanced_pbr.glsl"),
         @embedFile("../shaders/skinned_pbr.glsl"),
     };
@@ -358,15 +349,9 @@ test "drift: depth-only twin programs (shadow vs msaa_depth)" {
     try std.testing.expect(std.mem.indexOf(u8, msaa, "in vec3 position;") != null);
 }
 
-test "drift: morph helper arity (standard vs PBR variants)" {
-    // applyMorphDeltas takes (pos, nrm, id) in standard.glsl but
-    // (pos, nrm, tan_xyz, id) in the PBR variants. Unifying the arity
-    // "for cleanliness" breaks the call sites; the difference is
-    // intentional — pin both signatures.
-    const standard = @embedFile("../shaders/standard.glsl");
+test "drift: morph helper arity (PBR variants)" {
     const pbr = @embedFile("../shaders/pbr.glsl");
     const skinned = @embedFile("../shaders/skinned_pbr.glsl");
-    try std.testing.expect(std.mem.indexOf(u8, standard, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, int vertex_id)") != null);
     try std.testing.expect(std.mem.indexOf(u8, pbr, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id)") != null);
     try std.testing.expect(std.mem.indexOf(u8, skinned, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id)") != null);
 }

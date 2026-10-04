@@ -1,10 +1,8 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
-const shd = @import("shader");
 const pbr_shd = @import("pbr_shader");
 const skinned_pbr_shd = @import("skinned_pbr_shader");
-const inst_shd = @import("instanced_shader");
 const inst_pbr_shd = @import("instanced_pbr_shader");
 
 const math = @import("math");
@@ -143,208 +141,135 @@ pub fn drawRegularItem(
     const morph_view = item.morph_view;
     const morph_uniforms = item.morph_uniforms;
 
-    if (item.is_pbr) {
-        bind.views[pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
-        bind.views[pbr_shd.VIEW_normal_tex] = rec.normal_view;
-        bind.views[pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
-        bind.views[pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
-        bind.views[pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
-        // PBR layers v1: coat/fabric masks (white fallback staged in the
-        // record when unset); sampled through data_smp, no extra sampler.
-        bind.views[pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
-        bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
-        bind.views[pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
-        bind.samplers[pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
-        bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
-        bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
-        // Babylon env-BRDF lookup: scales the analytic specular sum and the
-        // specular IBL (coloredEnergyConservationFactor).
-        bind.views[pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
-        bind.samplers[pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
+    bind.views[pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
+    bind.views[pbr_shd.VIEW_normal_tex] = rec.normal_view;
+    bind.views[pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
+    bind.views[pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
+    bind.views[pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+    // PBR layers v1: coat/fabric masks (white fallback staged in the
+    // record when unset); sampled through data_smp, no extra sampler.
+    bind.views[pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
+    bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+    bind.views[pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
+    bind.samplers[pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
+    bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
+    bind.samplers[pbr_shd.SMP_data_smp] = rec.data_sampler;
+    // Babylon env-BRDF lookup: scales the analytic specular sum and the
+    // specular IBL (coloredEnergyConservationFactor).
+    bind.views[pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
+    bind.samplers[pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
 
-        // Environment IBL Cubemap & Shadow Depth Map
-        const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube).view;
-        const cube_sampler = rec.env_sampler orelse (env.sky_texture orelse env.default_cube).sampler;
-        bind.views[pbr_shd.VIEW_env_tex] = cube_view;
-        bind.samplers[pbr_shd.SMP_env_smp] = cube_sampler;
+    // Environment IBL Cubemap & Shadow Depth Map
+    const cube_view = rec.env_view orelse (env.sky_texture orelse env.default_cube).view;
+    const cube_sampler = rec.env_sampler orelse (env.sky_texture orelse env.default_cube).sampler;
+    bind.views[pbr_shd.VIEW_env_tex] = cube_view;
+    bind.samplers[pbr_shd.SMP_env_smp] = cube_sampler;
 
-        bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-        bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-        bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-        bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-        bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-        bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-        bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
-        bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+    bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
+    bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
+    bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+    bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
+    bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
+    bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+    bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
+    bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
 
-        // Reflection probe (wave 25): winning probe cube or the default
-        // cube with zeroed params (legacy path) when none applies.
-        const prb = probeForDraw(env, item.model);
-        bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
-        bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
+    // Reflection probe (wave 25): winning probe cube or the default
+    // cube with zeroed params (legacy path) when none applies.
+    const prb = probeForDraw(env, item.model);
+    bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
+    bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
 
-        // Clustered tile storage (wave 30): real views when live, dummy
-        // otherwise (always valid binds; the uniform gates the loop).
-        bindClusteredViews(&bind, pbr_shd, env);
+    // Clustered tile storage (wave 30): real views when live, dummy
+    // otherwise (always valid binds; the uniform gates the loop).
+    bindClusteredViews(&bind, pbr_shd, env);
 
-        sg.applyBindings(bind);
+    sg.applyBindings(bind);
 
-        const vs_params = pbr_shd.VsParams{
-            .mvp = mvp,
-            .model = model,
+    const vs_params = pbr_shd.VsParams{
+        .mvp = mvp,
+        .model = model,
+    };
+    sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
+
+    const skel_bones: ?*const [MAX_BONES]Mat4 = if (item.is_skinned)
+        // Битый индекс skinned-записи (билдером недостижимо): пропуск draw
+        // вместо аплоада stale-униформы чужого draw.
+        render_queue.skinAt(skins, item.skin_index) orelse return
+    else
+        null;
+    if (skel_bones) |bones| {
+        const vs_skin = skinned_pbr_shd.VsSkin{
+            .bones = bones.*,
         };
-        sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
-
-        const skel_bones: ?*const [MAX_BONES]Mat4 = if (item.is_skinned)
-            // Битый индекс skinned-записи (билдером недостижимо): пропуск draw
-            // вместо аплоада stale-униформы чужого draw.
-            render_queue.skinAt(skins, item.skin_index) orelse return
-        else
-            null;
-        if (skel_bones) |bones| {
-            const vs_skin = skinned_pbr_shd.VsSkin{
-                .bones = bones.*,
-            };
-            sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
-            sg.applyUniforms(skinned_pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(skinned_pbr_shd, morph_uniforms)));
-        } else {
-            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
-        }
-
-        const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
-        const coat = resolveCoat(coats, item.coat_index);
-        const fs_params = pbr_shd.FsParams{
-            .eye_pos = f.eye_pos,
-            .light_dir = f.light_dir,
-            .light_color = f.light_color,
-            .ambient_color = f.ambient_color,
-            .hemi_dir_intensity = f.hemi_dir_intensity,
-            .hemi_diffuse = f.hemi_diffuse,
-            .base_color_factor = rec.base_color,
-            .pbr_factors = rec.pbr_factors,
-            .emissive_factor = rec.emissive_color,
-            .alpha_cutoff = rec.alpha_cutoff,
-            .normal_scale = rec.normal_scale,
-            .uv_matrix = rec.uv_matrices,
-            .uv_offset = rec.uv_offsets,
-            .channel_selectors = rec.channel_selectors,
-            .clearcoat_factors = coat.clearcoat_factors,
-            .clearcoat_color = coat.clearcoat_color,
-            .sheen_factors = coat.sheen_factors,
-            .sheen_color = coat.sheen_color,
-            .anisotropy_factors = coat.anisotropy_factors,
-            .transmission_factors = coat.transmission_factors,
-            .transmission_color = coat.transmission_color,
-            .sss_factors = coat.sss_factors,
-            .sss_color = coat.sss_color,
-            .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
-            .clearcoat_uv_offset = coat.clearcoat_uv_offset,
-            .sheen_uv_matrix = coat.sheen_uv_matrix,
-            .sheen_uv_offset = coat.sheen_uv_offset,
-            .refraction_factors = coat.refraction_factors,
-            .refraction_view_proj = env.refraction_view_proj,
-            .refraction_capture = env.refraction_capture,
-            .shadow_params = f.shadow_params,
-            .shadow_splits = f.shadow_splits,
-            .cascade_view_proj = f.cascade_view_proj,
-            .cascade_debug = f.cascade_debug,
-            .light_counts = f.light_counts,
-            .point_pos_range = f.point_pos_range,
-            .point_color_int = f.point_color_int,
-            .spot_pos_range = f.spot_pos_range,
-            .spot_dir_inner = f.spot_dir_inner,
-            .spot_color_outer = f.spot_color_outer,
-            .spot_intensity = f.spot_intensity,
-            .spot_view_proj = f.spot_view_proj,
-            .spot_shadow_params = f.spot_shadow_params,
-            .point_view_proj = f.point_view_proj,
-            .point_shadow_params = f.point_shadow_params,
-            .directional_dir = f.directional_dir,
-            .directional_color_int = f.directional_color_int,
-            .probe_params = prb.params,
-            .area_center_int = f.area_center_int,
-            .area_right = f.area_right,
-            .area_up = f.area_up,
-            .area_color = f.area_color,
-            .clustered_params = f.clustered_params,
-            .clustered_viewport = f.clustered_viewport,
-        };
-        if (skel_bones != null) {
-            sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
-        } else {
-            sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
-        }
+        sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
+        sg.applyUniforms(skinned_pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(skinned_pbr_shd, morph_uniforms)));
     } else {
-        bind.views[shd.VIEW_diffuse_tex] = rec.albedo_view;
-        bind.samplers[shd.SMP_smp] = rec.albedo_sampler;
+        sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
+    }
 
-        bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-        bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-        bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-        bind.views[shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-        bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-        bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-
-        bind.views[shd.VIEW_morph_tex] = morph_view;
-        bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
-
-        // Reflection probe (wave 25): see the PBR branch above.
-        const prb_std = probeForDraw(env, item.model);
-        bind.views[shd.VIEW_probe_tex] = prb_std.view;
-        bind.samplers[shd.SMP_probe_smp] = prb_std.sampler;
-
-        // Clustered tile storage (wave 30): see the PBR branch above.
-        bindClusteredViews(&bind, shd, env);
-
-        sg.applyBindings(bind);
-
-        const vs_params = shd.VsParams{
-            .mvp = mvp,
-            .model = model,
-        };
-        sg.applyUniforms(shd.UB_vs_params, sg.asRange(&vs_params));
-        sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_uniforms)));
-
-        const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
-        const fs_params = shd.FsParams{
-            .eye_pos = f.eye_pos,
-            .light_dir = f.light_dir,
-            .light_color = f.light_color,
-            .ambient_color = f.ambient_color,
-            .hemi_dir_intensity = f.hemi_dir_intensity,
-            .hemi_diffuse = f.hemi_diffuse,
-            .diffuse_color = rec.base_color,
-            .specular_color_power = rec.pbr_factors,
-            .emissive_color = rec.emissive_color,
-            .alpha_cutoff = rec.alpha_cutoff,
-            .uv_matrix = rec.standard_uv_matrix,
-            .uv_offset = rec.standard_uv_offset,
-            .shadow_params = f.shadow_params,
-            .shadow_splits = f.shadow_splits,
-            .cascade_view_proj = f.cascade_view_proj,
-            .cascade_debug = f.cascade_debug,
-            .light_counts = f.light_counts,
-            .point_pos_range = f.point_pos_range,
-            .point_color_int = f.point_color_int,
-            .spot_pos_range = f.spot_pos_range,
-            .spot_dir_inner = f.spot_dir_inner,
-            .spot_color_outer = f.spot_color_outer,
-            .spot_intensity = f.spot_intensity,
-            .spot_view_proj = f.spot_view_proj,
-            .spot_shadow_params = f.spot_shadow_params,
-            .point_view_proj = f.point_view_proj,
-            .point_shadow_params = f.point_shadow_params,
-            .directional_dir = f.directional_dir,
-            .directional_color_int = f.directional_color_int,
-            .probe_params = prb_std.params,
-            .area_center_int = f.area_center_int,
-            .area_right = f.area_right,
-            .area_up = f.area_up,
-            .area_color = f.area_color,
-            .clustered_params = f.clustered_params,
-            .clustered_viewport = f.clustered_viewport,
-        };
-        sg.applyUniforms(shd.UB_fs_params, sg.asRange(&fs_params));
+    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
+    const coat = resolveCoat(coats, item.coat_index);
+    const fs_params = pbr_shd.FsParams{
+        .eye_pos = f.eye_pos,
+        .light_dir = f.light_dir,
+        .light_color = f.light_color,
+        .ambient_color = f.ambient_color,
+        .hemi_dir_intensity = f.hemi_dir_intensity,
+        .hemi_diffuse = f.hemi_diffuse,
+        .base_color_factor = rec.base_color,
+        .pbr_factors = rec.pbr_factors,
+        .emissive_factor = rec.emissive_color,
+        .alpha_cutoff = rec.alpha_cutoff,
+        .normal_scale = rec.normal_scale,
+        .uv_matrix = rec.uv_matrices,
+        .uv_offset = rec.uv_offsets,
+        .channel_selectors = rec.channel_selectors,
+        .clearcoat_factors = coat.clearcoat_factors,
+        .clearcoat_color = coat.clearcoat_color,
+        .sheen_factors = coat.sheen_factors,
+        .sheen_color = coat.sheen_color,
+        .anisotropy_factors = coat.anisotropy_factors,
+        .transmission_factors = coat.transmission_factors,
+        .transmission_color = coat.transmission_color,
+        .sss_factors = coat.sss_factors,
+        .sss_color = coat.sss_color,
+        .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
+        .clearcoat_uv_offset = coat.clearcoat_uv_offset,
+        .sheen_uv_matrix = coat.sheen_uv_matrix,
+        .sheen_uv_offset = coat.sheen_uv_offset,
+        .refraction_factors = coat.refraction_factors,
+        .refraction_view_proj = env.refraction_view_proj,
+        .refraction_capture = env.refraction_capture,
+        .shadow_params = f.shadow_params,
+        .shadow_splits = f.shadow_splits,
+        .cascade_view_proj = f.cascade_view_proj,
+        .cascade_debug = f.cascade_debug,
+        .light_counts = f.light_counts,
+        .point_pos_range = f.point_pos_range,
+        .point_color_int = f.point_color_int,
+        .spot_pos_range = f.spot_pos_range,
+        .spot_dir_inner = f.spot_dir_inner,
+        .spot_color_outer = f.spot_color_outer,
+        .spot_intensity = f.spot_intensity,
+        .spot_view_proj = f.spot_view_proj,
+        .spot_shadow_params = f.spot_shadow_params,
+        .point_view_proj = f.point_view_proj,
+        .point_shadow_params = f.point_shadow_params,
+        .directional_dir = f.directional_dir,
+        .directional_color_int = f.directional_color_int,
+        .probe_params = prb.params,
+        .area_center_int = f.area_center_int,
+        .area_right = f.area_right,
+        .area_up = f.area_up,
+        .area_color = f.area_color,
+        .clustered_params = f.clustered_params,
+        .clustered_viewport = f.clustered_viewport,
+    };
+    if (skel_bones != null) {
+        sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+    } else {
+        sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
     }
 
     sg.draw(item.base_vertex, item.index_count, 1);
@@ -399,181 +324,109 @@ fn drawShaderMaterialItem(
     if (entry.engine_template) {
         const morph_view = item.morph_view;
         const morph_uniforms = item.morph_uniforms;
-        if (entry.base == .pbr) {
-            // PBR-base hook material: full PBR lighting with engine defaults
-            // for the maps the material does not override. Текстура — из
-            // prepare-снимка (дефолт уже подставлен при построении).
-            bind.views[pbr_shd.VIEW_albedo_tex] = snap.tex_view;
-            bind.views[pbr_shd.VIEW_normal_tex] = env.default_normal.view;
-            bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
-            bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
-            bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
-            // Hook materials carry no coat/fabric maps: white keeps the
-            // mask slots valid (identity sampling).
-            bind.views[pbr_shd.VIEW_clearcoat_tex] = env.default_white.view;
-            bind.views[pbr_shd.VIEW_sheen_tex] = env.default_white.view;
-            bind.samplers[pbr_shd.SMP_smp] = snap.tex_sampler;
-            // Hook materials have no per-slot data textures; the flat normal
-            // default's sampler keeps the data_smp contract satisfied.
-            bind.samplers[pbr_shd.SMP_data_smp] = env.default_normal.sampler;
-            const cube = env.sky_texture orelse env.default_cube;
-            bind.views[pbr_shd.VIEW_env_tex] = cube.view;
-            bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
-            bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-            bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-            bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-            bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-            bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-            bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+        // PBR-base hook material: full PBR lighting with engine defaults
+        // for the maps the material does not override. Текстура — из
+        // prepare-снимка (дефолт уже подставлен при построении).
+        bind.views[pbr_shd.VIEW_albedo_tex] = snap.tex_view;
+        bind.views[pbr_shd.VIEW_normal_tex] = env.default_normal.view;
+        bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
+        bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
+        bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
+        // Hook materials carry no coat/fabric maps: white keeps the
+        // mask slots valid (identity sampling).
+        bind.views[pbr_shd.VIEW_clearcoat_tex] = env.default_white.view;
+        bind.views[pbr_shd.VIEW_sheen_tex] = env.default_white.view;
+        bind.samplers[pbr_shd.SMP_smp] = snap.tex_sampler;
+        // Hook materials have no per-slot data textures; the flat normal
+        // default's sampler keeps the data_smp contract satisfied.
+        bind.samplers[pbr_shd.SMP_data_smp] = env.default_normal.sampler;
+        const cube = env.sky_texture orelse env.default_cube;
+        bind.views[pbr_shd.VIEW_env_tex] = cube.view;
+        bind.samplers[pbr_shd.SMP_env_smp] = cube.sampler;
+        bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
+        bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
+        bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
+        bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
+        bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
-            bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
-            bind.views[pbr_shd.VIEW_refraction_tex] = env.default_white.view;
-            bind.samplers[pbr_shd.SMP_refraction_smp] = env.default_white.sampler;
-            bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
-            // Reflection probe (wave 25): hook materials resolve like
-            // regular draws (per-object selection from the model).
-            const prb_hook = probeForDraw(env, item.model);
-            bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
-            bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
-            // Clustered tile storage (wave 30): see the regular PBR branch.
-            bindClusteredViews(&bind, pbr_shd, env);
-            sg.applyBindings(bind);
+        bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
+        bind.views[pbr_shd.VIEW_refraction_tex] = env.default_white.view;
+        bind.samplers[pbr_shd.SMP_refraction_smp] = env.default_white.sampler;
+        bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
+        // Reflection probe (wave 25): hook materials resolve like
+        // regular draws (per-object selection from the model).
+        const prb_hook = probeForDraw(env, item.model);
+        bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
+        bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
+        // Clustered tile storage (wave 30): see the regular PBR branch.
+        bindClusteredViews(&bind, pbr_shd, env);
+        sg.applyBindings(bind);
 
-            const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
-            sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
-            sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
+        const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
+        sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
+        sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
 
-            const fs_params = pbr_shd.FsParams{
-                .eye_pos = f.eye_pos,
-                .light_dir = f.light_dir,
-                .light_color = f.light_color,
-                .ambient_color = f.ambient_color,
-                .hemi_dir_intensity = f.hemi_dir_intensity,
-                .hemi_diffuse = f.hemi_diffuse,
-                .base_color_factor = snap.tint,
-                .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
-                .emissive_factor = .{ 0, 0, 0, 1 },
-                .alpha_cutoff = alpha_cutoff,
-                .normal_scale = 1.0,
-                // Hook materials carry no per-slot maps: identity UVs and
-                // the glTF channel conventions.
-                .uv_matrix = identityUvMatrices(),
-                .uv_offset = identityUvOffsets(),
-                .channel_selectors = pbrChannelSelectors(null),
-                // Hook materials carry no coat/fabric layers: neutral-disabled.
-                .clearcoat_factors = material_mod.CoatParams.neutral.clearcoat_factors,
-                .clearcoat_color = material_mod.CoatParams.neutral.clearcoat_color,
-                .sheen_factors = material_mod.CoatParams.neutral.sheen_factors,
-                .sheen_color = material_mod.CoatParams.neutral.sheen_color,
-                .anisotropy_factors = material_mod.CoatParams.neutral.anisotropy_factors,
-                .transmission_factors = material_mod.CoatParams.neutral.transmission_factors,
-                .transmission_color = material_mod.CoatParams.neutral.transmission_color,
-                .sss_factors = material_mod.CoatParams.neutral.sss_factors,
-                .sss_color = material_mod.CoatParams.neutral.sss_color,
-                .clearcoat_uv_matrix = material_mod.CoatParams.neutral.clearcoat_uv_matrix,
-                .clearcoat_uv_offset = material_mod.CoatParams.neutral.clearcoat_uv_offset,
-                .sheen_uv_matrix = material_mod.CoatParams.neutral.sheen_uv_matrix,
-                .sheen_uv_offset = material_mod.CoatParams.neutral.sheen_uv_offset,
-                .refraction_factors = material_mod.CoatParams.neutral.refraction_factors,
-                .refraction_view_proj = Mat4.identity,
-                .refraction_capture = .{ 0, 1, 1, 0 },
-                .shadow_params = f.shadow_params,
-                .shadow_splits = f.shadow_splits,
-                .cascade_view_proj = f.cascade_view_proj,
-                .cascade_debug = f.cascade_debug,
-                .light_counts = f.light_counts,
-                .point_pos_range = f.point_pos_range,
-                .point_color_int = f.point_color_int,
-                .spot_pos_range = f.spot_pos_range,
-                .spot_dir_inner = f.spot_dir_inner,
-                .spot_color_outer = f.spot_color_outer,
-                .spot_intensity = f.spot_intensity,
-                .spot_view_proj = f.spot_view_proj,
-                .spot_shadow_params = f.spot_shadow_params,
-                .point_view_proj = f.point_view_proj,
-                .point_shadow_params = f.point_shadow_params,
-                .directional_dir = f.directional_dir,
-                .directional_color_int = f.directional_color_int,
-                .probe_params = prb_hook.params,
-                .area_center_int = f.area_center_int,
-                .area_right = f.area_right,
-                .area_up = f.area_up,
-                .area_color = f.area_color,
-                .clustered_params = f.clustered_params,
-                .clustered_viewport = f.clustered_viewport,
-            };
-            sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
-        } else {
-            // Standard-base hook material (текстура из снимка).
-            bind.views[shd.VIEW_diffuse_tex] = snap.tex_view;
-            bind.samplers[shd.SMP_smp] = snap.tex_sampler;
-            bind.views[shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-            bind.views[shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-            bind.views[shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-            bind.views[shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-            bind.samplers[shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-            bind.samplers[shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-            bind.views[shd.VIEW_morph_tex] = morph_view;
-            bind.samplers[shd.SMP_morph_smp] = env.pipelines.morph_sampler;
-            // Reflection probe (wave 25): see the PBR hook branch above.
-            const prb_hook_std = probeForDraw(env, item.model);
-            bind.views[shd.VIEW_probe_tex] = prb_hook_std.view;
-            bind.samplers[shd.SMP_probe_smp] = prb_hook_std.sampler;
-            // Clustered tile storage (wave 30): see the regular PBR branch.
-            bindClusteredViews(&bind, shd, env);
-            sg.applyBindings(bind);
-
-            const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
-            sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
-            sg.applyUniforms(shd.UB_vs_morph, sg.asRange(&vsMorphUniform(shd, morph_uniforms)));
-
-            const fs_params = shd.FsParams{
-                .eye_pos = f.eye_pos,
-                .light_dir = f.light_dir,
-                .light_color = f.light_color,
-                .ambient_color = f.ambient_color,
-                .hemi_dir_intensity = f.hemi_dir_intensity,
-                .hemi_diffuse = f.hemi_diffuse,
-                .diffuse_color = snap.tint,
-                // Hook / shader materials carry no specular: Babylon's
-                // `ShaderMaterial` has none, and keeping it at zero means the
-                // existing presets (examples/shader_materials/*) keep exactly
-                // the look they had before the Blinn-Phong lobe was ported.
-                .specular_color_power = .{ 0.0, 0.0, 0.0, 64.0 },
-                // Hook materials carry no emissive of their own (their look is
-                // the tint + the user's own hooks), so this stays black.
-                .emissive_color = .{ 0.0, 0.0, 0.0, 1.0 },
-                .alpha_cutoff = alpha_cutoff,
-                // Hook materials have no UV transform: identity.
-                .uv_matrix = material_mod.UvTransform.identity.matrixRows(),
-                .uv_offset = material_mod.UvTransform.identity.offsetPacked(),
-                .shadow_params = f.shadow_params,
-                .shadow_splits = f.shadow_splits,
-                .cascade_view_proj = f.cascade_view_proj,
-                .cascade_debug = f.cascade_debug,
-                .light_counts = f.light_counts,
-                .point_pos_range = f.point_pos_range,
-                .point_color_int = f.point_color_int,
-                .spot_pos_range = f.spot_pos_range,
-                .spot_dir_inner = f.spot_dir_inner,
-                .spot_color_outer = f.spot_color_outer,
-                .spot_intensity = f.spot_intensity,
-                .spot_view_proj = f.spot_view_proj,
-                .spot_shadow_params = f.spot_shadow_params,
-                .point_view_proj = f.point_view_proj,
-                .point_shadow_params = f.point_shadow_params,
-                .directional_dir = f.directional_dir,
-                .directional_color_int = f.directional_color_int,
-                .probe_params = prb_hook_std.params,
-                .area_center_int = f.area_center_int,
-                .area_right = f.area_right,
-                .area_up = f.area_up,
-                .area_color = f.area_color,
-                .clustered_params = f.clustered_params,
-                .clustered_viewport = f.clustered_viewport,
-            };
-            sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
-        }
+        const fs_params = pbr_shd.FsParams{
+            .eye_pos = f.eye_pos,
+            .light_dir = f.light_dir,
+            .light_color = f.light_color,
+            .ambient_color = f.ambient_color,
+            .hemi_dir_intensity = f.hemi_dir_intensity,
+            .hemi_diffuse = f.hemi_diffuse,
+            .base_color_factor = snap.tint,
+            .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
+            .emissive_factor = .{ 0, 0, 0, 1 },
+            .alpha_cutoff = alpha_cutoff,
+            .normal_scale = 1.0,
+            // Hook materials carry no per-slot maps: identity UVs and
+            // the glTF channel conventions.
+            .uv_matrix = identityUvMatrices(),
+            .uv_offset = identityUvOffsets(),
+            .channel_selectors = pbrChannelSelectors(null),
+            // Hook materials carry no coat/fabric layers: neutral-disabled.
+            .clearcoat_factors = material_mod.CoatParams.neutral.clearcoat_factors,
+            .clearcoat_color = material_mod.CoatParams.neutral.clearcoat_color,
+            .sheen_factors = material_mod.CoatParams.neutral.sheen_factors,
+            .sheen_color = material_mod.CoatParams.neutral.sheen_color,
+            .anisotropy_factors = material_mod.CoatParams.neutral.anisotropy_factors,
+            .transmission_factors = material_mod.CoatParams.neutral.transmission_factors,
+            .transmission_color = material_mod.CoatParams.neutral.transmission_color,
+            .sss_factors = material_mod.CoatParams.neutral.sss_factors,
+            .sss_color = material_mod.CoatParams.neutral.sss_color,
+            .clearcoat_uv_matrix = material_mod.CoatParams.neutral.clearcoat_uv_matrix,
+            .clearcoat_uv_offset = material_mod.CoatParams.neutral.clearcoat_uv_offset,
+            .sheen_uv_matrix = material_mod.CoatParams.neutral.sheen_uv_matrix,
+            .sheen_uv_offset = material_mod.CoatParams.neutral.sheen_uv_offset,
+            .refraction_factors = material_mod.CoatParams.neutral.refraction_factors,
+            .refraction_view_proj = Mat4.identity,
+            .refraction_capture = .{ 0, 1, 1, 0 },
+            .shadow_params = f.shadow_params,
+            .shadow_splits = f.shadow_splits,
+            .cascade_view_proj = f.cascade_view_proj,
+            .cascade_debug = f.cascade_debug,
+            .light_counts = f.light_counts,
+            .point_pos_range = f.point_pos_range,
+            .point_color_int = f.point_color_int,
+            .spot_pos_range = f.spot_pos_range,
+            .spot_dir_inner = f.spot_dir_inner,
+            .spot_color_outer = f.spot_color_outer,
+            .spot_intensity = f.spot_intensity,
+            .spot_view_proj = f.spot_view_proj,
+            .spot_shadow_params = f.spot_shadow_params,
+            .point_view_proj = f.point_view_proj,
+            .point_shadow_params = f.point_shadow_params,
+            .directional_dir = f.directional_dir,
+            .directional_color_int = f.directional_color_int,
+            .probe_params = prb_hook.params,
+            .area_center_int = f.area_center_int,
+            .area_right = f.area_right,
+            .area_up = f.area_up,
+            .area_color = f.area_color,
+            .clustered_params = f.clustered_params,
+            .clustered_viewport = f.clustered_viewport,
+        };
+        sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
     } else {
         // Runtime-registered custom source: vertex/index binds plus the
         // material texture at view slot 0 (sokol tolerates binding slots the
@@ -589,7 +442,7 @@ fn drawShaderMaterialItem(
         bind.samplers[1] = snap.tex1_sampler;
         sg.applyBindings(bind);
 
-        const vs_params = shd.VsParams{ .mvp = mvp, .model = item.model };
+        const vs_params = pbr_shd.VsParams{ .mvp = mvp, .model = item.model };
         sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
     }
 
@@ -790,177 +643,110 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     bind.index_buffer = batch.index_buffer;
 
     const rec = batch.draw_record;
-    if (is_pbr) {
-        bind.views[inst_pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
-        bind.views[inst_pbr_shd.VIEW_normal_tex] = rec.normal_view;
-        bind.views[inst_pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
-        bind.views[inst_pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
-        bind.views[inst_pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
-        // PBR layers v1: see the regular PBR branch above.
-        bind.views[inst_pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
-        bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
-        bind.views[inst_pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
-        bind.samplers[inst_pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
-        bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
-        bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
-        // Babylon env-BRDF lookup: scales the analytic specular sum and the
-        // specular IBL (coloredEnergyConservationFactor).
-        bind.views[inst_pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
-        bind.samplers[inst_pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
+    bind.views[inst_pbr_shd.VIEW_albedo_tex] = rec.albedo_view;
+    bind.views[inst_pbr_shd.VIEW_normal_tex] = rec.normal_view;
+    bind.views[inst_pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
+    bind.views[inst_pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
+    bind.views[inst_pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
+    // PBR layers v1: see the regular PBR branch above.
+    bind.views[inst_pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
+    bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+    bind.views[inst_pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
+    bind.samplers[inst_pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
+    bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
+    bind.samplers[inst_pbr_shd.SMP_data_smp] = rec.data_sampler;
+    // Babylon env-BRDF lookup: scales the analytic specular sum and the
+    // specular IBL (coloredEnergyConservationFactor).
+    bind.views[inst_pbr_shd.VIEW_brdf_lut_tex] = rec.brdf_lut_view;
+    bind.samplers[inst_pbr_shd.SMP_brdf_lut_smp] = rec.brdf_lut_sampler;
 
-        // Environment IBL Cubemap & Shadow Depth Map
-        const cube_view = rec.env_view orelse (if (env.sky_texture) |s| s.view else env.default_cube.view);
-        const cube_sampler = rec.env_sampler orelse (if (env.sky_texture) |s| s.sampler else env.default_cube.sampler);
-        bind.views[inst_pbr_shd.VIEW_env_tex] = cube_view;
-        bind.samplers[inst_pbr_shd.SMP_env_smp] = cube_sampler;
+    // Environment IBL Cubemap & Shadow Depth Map
+    const cube_view = rec.env_view orelse (if (env.sky_texture) |s| s.view else env.default_cube.view);
+    const cube_sampler = rec.env_sampler orelse (if (env.sky_texture) |s| s.sampler else env.default_cube.sampler);
+    bind.views[inst_pbr_shd.VIEW_env_tex] = cube_view;
+    bind.samplers[inst_pbr_shd.SMP_env_smp] = cube_sampler;
 
-        bind.views[inst_pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-        bind.views[inst_pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-        bind.views[inst_pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-        bind.views[inst_pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-        bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-        bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
+    bind.views[inst_pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
+    bind.views[inst_pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
+    bind.views[inst_pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+    bind.views[inst_pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
+    bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
+    bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
-        // Reflection probes skip instanced batches in v1 (no single object
-        // position for selection): legacy path with valid binds.
-        bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
-        bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
+    // Reflection probes skip instanced batches in v1 (no single object
+    // position for selection): legacy path with valid binds.
+    bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
+    bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
 
-        // Clustered tile storage (wave 30): see the regular PBR branch.
-        bindClusteredViews(&bind, inst_pbr_shd, env);
+    // Clustered tile storage (wave 30): see the regular PBR branch.
+    bindClusteredViews(&bind, inst_pbr_shd, env);
 
-        sg.applyBindings(bind);
+    sg.applyBindings(bind);
 
-        const inst_vs = inst_pbr_shd.VsParams{
-            .view_proj = ctx.view_proj,
-        };
-        sg.applyUniforms(inst_pbr_shd.UB_vs_params, sg.asRange(&inst_vs));
+    const inst_vs = inst_pbr_shd.VsParams{
+        .view_proj = ctx.view_proj,
+    };
+    sg.applyUniforms(inst_pbr_shd.UB_vs_params, sg.asRange(&inst_vs));
 
-        const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
-        const coat = resolveCoat(coats, batch.coat_index);
-        const inst_fs = inst_pbr_shd.FsParams{
-            .eye_pos = f.eye_pos,
-            .light_dir = f.light_dir,
-            .light_color = f.light_color,
-            .ambient_color = f.ambient_color,
-            .hemi_dir_intensity = f.hemi_dir_intensity,
-            .hemi_diffuse = f.hemi_diffuse,
-            .base_color_factor = rec.base_color,
-            .pbr_factors = rec.pbr_factors,
-            .emissive_factor = rec.emissive_color,
-            .shadow_params = f.shadow_params,
-            .shadow_splits = f.shadow_splits,
-            .cascade_view_proj = f.cascade_view_proj,
-            .cascade_debug = f.cascade_debug,
-            .light_counts = f.light_counts,
-            .point_pos_range = f.point_pos_range,
-            .point_color_int = f.point_color_int,
-            .spot_pos_range = f.spot_pos_range,
-            .spot_dir_inner = f.spot_dir_inner,
-            .spot_color_outer = f.spot_color_outer,
-            .spot_intensity = f.spot_intensity,
-            .spot_view_proj = f.spot_view_proj,
-            .spot_shadow_params = f.spot_shadow_params,
-            .point_view_proj = f.point_view_proj,
-            .point_shadow_params = f.point_shadow_params,
-            .directional_dir = f.directional_dir,
-            .directional_color_int = f.directional_color_int,
-            .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
-            .area_center_int = f.area_center_int,
-            .area_right = f.area_right,
-            .area_up = f.area_up,
-            .area_color = f.area_color,
-            .clustered_params = f.clustered_params,
-            .clustered_viewport = f.clustered_viewport,
-            .alpha_cutoff = rec.alpha_cutoff,
-            .normal_scale = rec.normal_scale,
-            .uv_matrix = rec.uv_matrices,
-            .uv_offset = rec.uv_offsets,
-            .channel_selectors = rec.channel_selectors,
-            .clearcoat_factors = coat.clearcoat_factors,
-            .clearcoat_color = coat.clearcoat_color,
-            .sheen_factors = coat.sheen_factors,
-            .sheen_color = coat.sheen_color,
-            .anisotropy_factors = coat.anisotropy_factors,
-            .transmission_factors = coat.transmission_factors,
-            .transmission_color = coat.transmission_color,
-            .sss_factors = coat.sss_factors,
-            .sss_color = coat.sss_color,
-            .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
-            .clearcoat_uv_offset = coat.clearcoat_uv_offset,
-            .sheen_uv_matrix = coat.sheen_uv_matrix,
-            .sheen_uv_offset = coat.sheen_uv_offset,
-            .refraction_factors = coat.refraction_factors,
-            .refraction_view_proj = env.refraction_view_proj,
-            .refraction_capture = env.refraction_capture,
-        };
-        sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
-    } else {
-        bind.views[inst_shd.VIEW_diffuse_tex] = rec.albedo_view;
-        bind.samplers[inst_shd.SMP_smp] = rec.albedo_sampler;
-
-        bind.views[inst_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
-        bind.views[inst_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
-        bind.views[inst_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
-        bind.views[inst_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
-        bind.samplers[inst_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
-        bind.samplers[inst_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
-
-        // Reflection probes skip instanced batches in v1: legacy path.
-        bind.views[inst_shd.VIEW_probe_tex] = env.default_cube.view;
-        bind.samplers[inst_shd.SMP_probe_smp] = env.default_cube.sampler;
-
-        // Clustered tile storage (wave 30): see the regular PBR branch.
-        bindClusteredViews(&bind, inst_shd, env);
-
-        sg.applyBindings(bind);
-
-        const inst_vs = inst_shd.VsParams{
-            .view_proj = ctx.view_proj,
-        };
-        sg.applyUniforms(inst_shd.UB_vs_params, sg.asRange(&inst_vs));
-
-        const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
-        const inst_fs = inst_shd.FsParams{
-            .eye_pos = f.eye_pos,
-            .light_dir = f.light_dir,
-            .light_color = f.light_color,
-            .ambient_color = f.ambient_color,
-            .hemi_dir_intensity = f.hemi_dir_intensity,
-            .hemi_diffuse = f.hemi_diffuse,
-            .diffuse_color = rec.base_color,
-            .specular_color_power = rec.pbr_factors,
-            .emissive_color = rec.emissive_color,
-            .alpha_cutoff = rec.alpha_cutoff,
-            .uv_matrix = rec.standard_uv_matrix,
-            .uv_offset = rec.standard_uv_offset,
-            .shadow_params = f.shadow_params,
-            .shadow_splits = f.shadow_splits,
-            .cascade_view_proj = f.cascade_view_proj,
-            .cascade_debug = f.cascade_debug,
-            .light_counts = f.light_counts,
-            .point_pos_range = f.point_pos_range,
-            .point_color_int = f.point_color_int,
-            .spot_pos_range = f.spot_pos_range,
-            .spot_dir_inner = f.spot_dir_inner,
-            .spot_color_outer = f.spot_color_outer,
-            .spot_intensity = f.spot_intensity,
-            .spot_view_proj = f.spot_view_proj,
-            .spot_shadow_params = f.spot_shadow_params,
-            .point_view_proj = f.point_view_proj,
-            .point_shadow_params = f.point_shadow_params,
-            .directional_dir = f.directional_dir,
-            .directional_color_int = f.directional_color_int,
-            .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
-            .area_center_int = f.area_center_int,
-            .area_right = f.area_right,
-            .area_up = f.area_up,
-            .area_color = f.area_color,
-            .clustered_params = f.clustered_params,
-            .clustered_viewport = f.clustered_viewport,
-        };
-        sg.applyUniforms(inst_shd.UB_fs_params, sg.asRange(&inst_fs));
-    }
+    const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
+    const coat = resolveCoat(coats, batch.coat_index);
+    const inst_fs = inst_pbr_shd.FsParams{
+        .eye_pos = f.eye_pos,
+        .light_dir = f.light_dir,
+        .light_color = f.light_color,
+        .ambient_color = f.ambient_color,
+        .hemi_dir_intensity = f.hemi_dir_intensity,
+        .hemi_diffuse = f.hemi_diffuse,
+        .base_color_factor = rec.base_color,
+        .pbr_factors = rec.pbr_factors,
+        .emissive_factor = rec.emissive_color,
+        .shadow_params = f.shadow_params,
+        .shadow_splits = f.shadow_splits,
+        .cascade_view_proj = f.cascade_view_proj,
+        .cascade_debug = f.cascade_debug,
+        .light_counts = f.light_counts,
+        .point_pos_range = f.point_pos_range,
+        .point_color_int = f.point_color_int,
+        .spot_pos_range = f.spot_pos_range,
+        .spot_dir_inner = f.spot_dir_inner,
+        .spot_color_outer = f.spot_color_outer,
+        .spot_intensity = f.spot_intensity,
+        .spot_view_proj = f.spot_view_proj,
+        .spot_shadow_params = f.spot_shadow_params,
+        .point_view_proj = f.point_view_proj,
+        .point_shadow_params = f.point_shadow_params,
+        .directional_dir = f.directional_dir,
+        .directional_color_int = f.directional_color_int,
+        .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .area_center_int = f.area_center_int,
+        .area_right = f.area_right,
+        .area_up = f.area_up,
+        .area_color = f.area_color,
+        .clustered_params = f.clustered_params,
+        .clustered_viewport = f.clustered_viewport,
+        .alpha_cutoff = rec.alpha_cutoff,
+        .normal_scale = rec.normal_scale,
+        .uv_matrix = rec.uv_matrices,
+        .uv_offset = rec.uv_offsets,
+        .channel_selectors = rec.channel_selectors,
+        .clearcoat_factors = coat.clearcoat_factors,
+        .clearcoat_color = coat.clearcoat_color,
+        .sheen_factors = coat.sheen_factors,
+        .sheen_color = coat.sheen_color,
+        .anisotropy_factors = coat.anisotropy_factors,
+        .transmission_factors = coat.transmission_factors,
+        .transmission_color = coat.transmission_color,
+        .sss_factors = coat.sss_factors,
+        .sss_color = coat.sss_color,
+        .clearcoat_uv_matrix = coat.clearcoat_uv_matrix,
+        .clearcoat_uv_offset = coat.clearcoat_uv_offset,
+        .sheen_uv_matrix = coat.sheen_uv_matrix,
+        .sheen_uv_offset = coat.sheen_uv_offset,
+        .refraction_factors = coat.refraction_factors,
+        .refraction_view_proj = env.refraction_view_proj,
+        .refraction_capture = env.refraction_capture,
+    };
+    sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
 
     sg.draw(0, batch.index_count, batch.visible_instance_count);
     env.stats.main_draw_calls += 1;
@@ -1006,34 +792,17 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "clustered_viewport")) @compileError("FsParams missing clustered_viewport");
         }
     }
-    // Standard family: one diffuse slot.
-    comptime {
-        for ([_]type{ shd.FsParams, inst_shd.FsParams }) |P| {
-            if (!@hasField(P, "specular_color_power")) @compileError("FsParams missing specular_color_power");
-            if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
-            if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
-            if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
-            if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
-            if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
-            if (!@hasField(P, "area_center_int")) @compileError("FsParams missing area_center_int");
-            if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
-            if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
-            if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
-            if (!@hasField(P, "clustered_params")) @compileError("FsParams missing clustered_params");
-            if (!@hasField(P, "clustered_viewport")) @compileError("FsParams missing clustered_viewport");
-        }
-    }
-    // All five forward modules expose the clustered storage-view slots
+    // All three forward modules expose the clustered storage-view slots
     // (identical 12/13/14 in every shader; the draw binds through these).
     comptime {
-        for ([_]type{ shd, pbr_shd, skinned_pbr_shd, inst_shd, inst_pbr_shd }) |M| {
+        for ([_]type{ pbr_shd, skinned_pbr_shd, inst_pbr_shd }) |M| {
             if (!@hasDecl(M, "VIEW_ssbo_cluster_lights")) @compileError("shader module missing VIEW_ssbo_cluster_lights");
             if (!@hasDecl(M, "VIEW_ssbo_cluster_tiles")) @compileError("shader module missing VIEW_ssbo_cluster_tiles");
             if (!@hasDecl(M, "VIEW_ssbo_cluster_indices")) @compileError("shader module missing VIEW_ssbo_cluster_indices");
         }
-        if (shd.VIEW_ssbo_cluster_lights != 12) @compileError("clustered light slot moved");
+        if (pbr_shd.VIEW_ssbo_cluster_lights != 12) @compileError("clustered light slot moved");
         if (pbr_shd.VIEW_ssbo_cluster_tiles != 13) @compileError("clustered tile slot moved");
-        if (inst_shd.VIEW_ssbo_cluster_indices != 14) @compileError("clustered index slot moved");
+        if (inst_pbr_shd.VIEW_ssbo_cluster_indices != 14) @compileError("clustered index slot moved");
     }
 }
 
@@ -1088,15 +857,6 @@ test "pbr layer mask texture slots are pinned across the triple" {
         if (skinned_pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
         if (inst_pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
     }
-}
-
-test "standard FsParams clustered tail matches the instanced twin" {
-    // The regular standard struct value uploads to the instanced UB slot
-    // never (unlike the PBR triple), but the appended lanes must still land
-    // last in both so the draw fills them from the same FrameUniforms.
-    try std.testing.expect(@offsetOf(shd.FsParams, "clustered_params") > @offsetOf(shd.FsParams, "area_color"));
-    try std.testing.expectEqual(@offsetOf(shd.FsParams, "clustered_params"), @offsetOf(inst_shd.FsParams, "clustered_params"));
-    try std.testing.expectEqual(@offsetOf(shd.FsParams, "clustered_viewport"), @offsetOf(inst_shd.FsParams, "clustered_viewport"));
 }
 
 test "probeForDraw resolves the winning probe or the legacy fallback" {
