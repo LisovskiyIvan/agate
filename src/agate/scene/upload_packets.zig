@@ -1,5 +1,5 @@
 //! Slot-owned dynamic-upload packets (producer freeze-then-latch,
-//! phase 2 lock-free publication).
+//! lock-free publication).
 //!
 //! Producer side (`stageUploads`, game/update phase, sg-free): copies every
 //! per-frame GPU staging payload into the claimed `FrameDrawSlot` by value
@@ -19,9 +19,8 @@
 //! (`delivered` + created handles + consumed window). THE CONTEXT NEVER
 //! WRITES GAME-OWNED STATE on this path: no live flag clears, no live
 //! scalar publishes, no live handle installs, no live array frees, no live
-//! staging memcpy. No live staging BYTES drive uploads (the compute
-//! frozen-window memcpy reinstall is DELETED; upload is direct from packet
-//! bytes with frozen counts only) and no live mutable lengths are read
+//! staging memcpy. No live staging BYTES drive uploads (upload is direct from
+//! packet bytes with frozen counts only) and no live mutable lengths are read
 //! (allocation sizes ride frozen in the packets; `capacity` fields are
 //! immutable after system init — documented at each freeze site).
 //!

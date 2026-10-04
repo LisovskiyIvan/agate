@@ -46,9 +46,8 @@
 //! (`(front + k) % SLOT_COUNT`, k = 1..). Flipping `front` IS the publish —
 //! the lists themselves never move. With no pins held this cycles
 //! 0 -> 1 -> 2 -> 0, so every prepare hands the producer a slot the consumer
-//! is not reading: one slot deeper than the old 2-slot flip, which is what
-//! lets a presenting consumer keep its frame while the producer already
-//! builds the next one.
+//! is not reading, allowing a presenting consumer to keep its frame while the
+//! producer already builds the next one.
 //!
 //! Consumer pin/lease protocol (the prerequisite for a future true
 //! concurrent update/prepare rotation):

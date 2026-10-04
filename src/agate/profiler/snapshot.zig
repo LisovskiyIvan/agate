@@ -89,8 +89,7 @@ pub fn rtImageBytes(width: i32, height: i32, num_mipmaps: i32, sample_count: i32
     return total;
 }
 
-/// Leak-safe render-target append: the duped name frees on append OOM
-/// (the old inline `dupe`-then-`append` leaked the name on failure).
+/// Leak-safe render-target append: the duped name frees on append OOM.
 fn appendRt(
     allocator: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(RenderTargetRecord),
