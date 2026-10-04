@@ -271,6 +271,10 @@ pub const Runtime = runtime.Runtime;
 pub const RuntimeMetrics = runtime.Metrics;
 pub const RuntimeBeginResult = runtime.BeginResult;
 pub const RuntimeFrameResult = runtime.FrameResult;
+pub const app = @import("app.zig");
+pub const App = app.App;
+pub const AppConfig = app.AppConfig;
+pub const AppCallbacks = app.AppCallbacks;
 pub const handoff = @import("handoff.zig");
 pub const Handoff = handoff.Handoff;
 /// Graphics-context thread marker: apps call `markContextThread()` in their

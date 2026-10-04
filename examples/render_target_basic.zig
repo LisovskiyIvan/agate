@@ -183,12 +183,14 @@ fn makeUvStrip(scene: *z.Scene, name: []const u8, cx: f32, cy: f32) *z.Mesh {
 
 export fn init() callconv(.c) void {
     z.gpu_thread.markContextThread();
-    sg.setup(.{
-        .environment = sglue.environment(),
-        .logger = .{ .func = rttLogger },
-        .pipeline_pool_size = 256,
-        .shader_pool_size = 128,
-    });
+    if (!sg.isvalid()) {
+        sg.setup(.{
+            .environment = sglue.environment(),
+            .logger = .{ .func = rttLogger },
+            .pipeline_pool_size = 256,
+            .shader_pool_size = 128,
+        });
+    }
     sokol.time.setup();
     const allocator = gpa.allocator();
 
@@ -525,16 +527,35 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
 
 pub fn main(minimal: std.process.Init.Minimal) void {
     parseArgs(gpa.allocator(), minimal.args);
-    sapp.run(.{
-        .init_cb = init,
-        .frame_cb = frame,
-        .cleanup_cb = cleanup,
-        .event_cb = event,
-        .window_title = "agate rtt-smoke (capture/sample)",
+    var app = z.App.init(gpa.allocator(), .{
+        .title = "agate rtt-smoke (capture/sample)",
         .width = 800,
         .height = 600,
         .sample_count = 1,
-        .gl = .{ .major_version = 4, .minor_version = 3 },
-        .logger = .{ .func = rttLogger },
+        .gl_major = 4,
+        .gl_minor = 3,
+        .logger = rttLogger,
+    }, .{
+        .init = appInit,
+        .frame = appFrame,
+        .cleanup = appCleanup,
+        .event = appEvent,
     });
+    app.run();
+}
+
+fn appInit(_: *z.App) void {
+    init();
+}
+
+fn appFrame(_: *z.App) void {
+    frame();
+}
+
+fn appCleanup(_: *z.App) void {
+    cleanup();
+}
+
+fn appEvent(_: *z.App, ev: [*c]const sapp.Event) void {
+    event(ev);
 }

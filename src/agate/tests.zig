@@ -22,6 +22,7 @@ test {
     _ = @import("animation/sampler.zig");
     _ = @import("animation/skeleton.zig");
     _ = @import("animation/tests.zig");
+    _ = @import("app.zig");
     _ = @import("asset_manager.zig");
     _ = @import("assets.zig");
     _ = @import("assets_tests.zig");
