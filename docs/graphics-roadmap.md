@@ -68,8 +68,7 @@ Metal native + browser WebGPU legs) перед закрытием.
 
 ### E. Прочее
 
-- `render_target.zig`: 1 тест остался inline (private coupling) — вынести
-  при следующем касании файла.
+- `render_target.zig`: 1 тест остался inline (private coupling) — ВЫПОЛНЕНО (04.10.2026, вынесен в `render_target_tests.zig`).
 - App-обёртка (секция ниже) — после A, до C.3.
 
 ## TODO: обёртка App над окном sokol (двухуровневый API)

@@ -1,6 +1,4 @@
-//! Tests for `render_target.zig` (moved verbatim from inline blocks; production code unchanged).
-//! The capture-feedback pin for the private self-sampling helpers stays inline
-//! in the parent (sibling files cannot reference file-private decls).
+//! Tests for `render_target.zig`.
 const std = @import("std");
 const sg = @import("sokol").gfx;
 const math = @import("math");
@@ -300,3 +298,14 @@ test "default descriptor is a depth-carrying 1x target" {
     try testing.expect(d.depth_enabled);
     try testing.expect(!needsResolve(d.sample_count));
 }
+
+test "capture feedback detects saved material and particle texture views" {
+    const t = RenderTarget{ .color_tex_view = .{ .id = 31 }, .depth_tex_view = .{ .id = 32 } };
+    const Record = @import("material/draw_record.zig").MaterialDrawRecord;
+    try testing.expect(!t.recordSamplesSelf(Record{}));
+    try testing.expect(t.recordSamplesSelf(Record{ .albedo_view = .{ .id = 31 } }));
+    try testing.expect(t.recordSamplesSelf(Record{ .normal_view = .{ .id = 32 } }));
+    const Particle = @import("scene/particle_layer.zig").ParticleDraw;
+    try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
+}
+

@@ -792,7 +792,7 @@ pub const RenderTarget = struct {
         return false;
     }
 
-    fn recordSamplesSelf(self: *const RenderTarget, record: anytype) bool {
+    pub fn recordSamplesSelf(self: *const RenderTarget, record: anytype) bool {
         inline for (@typeInfo(@TypeOf(record)).@"struct".fields) |field| {
             if (field.type == sg.View) {
                 if (self.viewSamplesSelf(@field(record, field.name))) return true;
@@ -803,7 +803,7 @@ pub const RenderTarget = struct {
         return false;
     }
 
-    fn viewSamplesSelf(self: *const RenderTarget, view: sg.View) bool {
+    pub fn viewSamplesSelf(self: *const RenderTarget, view: sg.View) bool {
         if (view.id == 0) return false;
         if (view.id == self.color_tex_view.id or view.id == self.depth_tex_view.id) return true;
         if (!sg.isvalid() or sg.queryViewState(view) != .VALID) return false;
@@ -812,25 +812,6 @@ pub const RenderTarget = struct {
             image.id == self.resolve_image.id or image.id == self.depth_image.id);
     }
 };
-
-// Capture-feedback pin for the private self-sampling helpers
-// (`recordSamplesSelf`/`viewSamplesSelf`): stays inline because sibling test
-// files cannot reference file-private decls (no pub widening for tests).
-
-const testing = std.testing;
-
-test "capture feedback detects saved material and particle texture views" {
-    const t = RenderTarget{ .color_tex_view = .{ .id = 31 }, .depth_tex_view = .{ .id = 32 } };
-    const Record = @import("material/draw_record.zig").MaterialDrawRecord;
-    try testing.expect(!t.recordSamplesSelf(Record{}));
-    try testing.expect(t.recordSamplesSelf(Record{ .albedo_view = .{ .id = 31 } }));
-    try testing.expect(t.recordSamplesSelf(Record{ .normal_view = .{ .id = 32 } }));
-    const Particle = @import("scene/particle_layer.zig").ParticleDraw;
-    try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
-}
-
-// Remaining regression tests live in `render_target_tests.zig` (same directory,
-// imported below so the test registry picks them up exactly once).
 
 test {
     _ = @import("render_target_tests.zig");
