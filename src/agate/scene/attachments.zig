@@ -44,7 +44,7 @@ const HighlightOptions = scene_highlight.HighlightOptions;
 // past the cap is a hard `error.TooManyReflectionProbes`.
 //
 // Explicit non-goals (see scene/probe_layer.zig): box projection /
-// parallax, probe blending / weights, per-frame real-time updates,
+// parallax, per-frame real-time updates,
 // specular occlusion, irradiance SH, editor tooling.
 
 /// Adds a reflection probe at `position`; returns its index. The probe

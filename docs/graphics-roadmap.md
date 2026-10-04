@@ -18,13 +18,14 @@
 Приоритетный порядок следующих волн. Каждая требует гейтов (CPU golden +
 Metal native + browser WebGPU legs) перед закрытием.
 
-### A. Материалы/свет — консолидация (аудит п.7) — ВЫПОЛНЕНО (04.10.2026)
+### A. Материалы/свет — консолидация (аудит п.7) — GPU PBR migration выполнена, API/light routing ещё не закрыты
 
 1. PBR-эквивалент matte: правило конверсии `specular_color/power → roughness` (`roughnessFromSpecularPower`).
 2. Миграция `createStandardMaterial` → `createPBRMaterial`: все демо, showcases, stands, bench.
 3. `default_material` → PBR-backed.
 4. Clustered spot storage + atlas pages + caster selection.
 5. Удалены `standard.glsl`, `instanced.glsl`, Standard draw branches. Writer/reader v3 с backward-совместимостью.
+6. **TODO:** удалить публичный CPU `StandardMaterial` adapter, сохранив чтение старых material-kind tags в v3; свести local lights к одному storage/routing. В `light_rig.zig` и PBR shaders всё ещё работают отдельные top-K uniform lanes (4 point / 2 spot) рядом с clustered pools. Наличие spot storage и atlas-page allocator не означает удаления старого lighting path.
 
 ### B. Чистка комментариев и разбиение тестов — ВЫПОЛНЕНО (04.10.2026)
 
@@ -42,11 +43,9 @@ Metal native + browser WebGPU legs) перед закрытием.
 
 ### C. Качество графики — волны к Unreal-уровню (порядок по стоимости/эффекту)
 
-1. **Auto-exposure** (S) — ВЫПОЛНЕНО (04.10.2026): histogram/luminance buffer → экспозиция кадра (`postprocess/auto_exposure.zig`, `scene/postfx_stack.zig`, `scene/core.zig`). Гейт: CPU golden steps + сцена 1/4/16 без клипа пройдены.
-2. **GGX IBL** (M) — ВЫПОЛНЕНО (04.10.2026): GGX importance-sampled probe prefiltering, cosine-convolved diffuse irradiance, continuous multi-probe blending (`texture/ibl_prefilter.zig`, `shaders/probe_mip.glsl`, `scene/probe_render.zig`, `scene/probe_layer.zig`, `scene/draw.zig`, PBR shaders). Гейт: PBR-сцена с ENV-only светом и аналитический white furnace energy conservation пройдены (`scene/ibl_tests.zig`).
-3. **Velocity/TAA** (M): rigid+skinned+instanced velocity buffers → TAA
-   без ghosting в движении; потом reconstruction/upscaling. Гейт:
-   вращающаяся сцена, CPU golden репроекции.
+1. **Auto-exposure** (S) — CPU-основа реализована (04.10.2026): histogram/luminance math и temporal adaptation (`postprocess/auto_exposure.zig`, `scene/postfx_stack.zig`, `scene/core.zig`). Пройдены CPU goldens, включая radiance 1/4/16; это не GPU-metering. Renderer пока не измеряет яркость HDR-кадра и не вызывает `updateAutoExposure*` автоматически. TODO: реальный metering source, frame/cut/resize lifecycle и live-гейт изменения экспозиции.
+2. **GGX IBL** (M) — реализация и CPU-goldens, GPU-quality гейт не закрыт (04.10.2026): GGX importance-sampled probe prefiltering, cosine-convolved diffuse irradiance, continuous multi-probe blending (`texture/ibl_prefilter.zig`, `shaders/probe_mip.glsl`, `scene/probe_render.zig`, `scene/probe_layer.zig`, `scene/draw.zig`, PBR shaders). White-furnace energy conservation проверен на CPU (`scene/ibl_tests.zig`). TODO: исключить чтение незаполненных source mips при bake; проверить fresh capture, cube seams и probe-переходы на GPU. Instanced batches пока используют environment, не spatial probes.
+3. **Velocity/TAA** (M) — WIP на доведении (04.10.2026): rigid/skinned/instanced velocity target и postprocess-интеграция. CPU-аналитика не доказывает работу velocity shader или отсутствие ghosting. Гейт завершения: предыдущие состояния последнего отрисованного staged-frame (cancel/reuse/multi-view), instance growth/reorder, skin/morph fallback, camera-cut/reset, nearest velocity sampling, MSAA policy, реальные Metal/WebGPU draws и teardown без validation errors. Pixel/temporal-quality proof остаётся отдельным гейтом.
 4. **Clustered shadows** (M): spot/point shadow pages в atlas + routing
    (зависит от A.4).
 5. **Screen-space: GPU depth pyramid** (M): для SSR/SSAO/Hi-Z culling;
@@ -102,7 +101,7 @@ Metal native + browser WebGPU legs) перед закрытием.
 | Indirect уменьшит draw calls | Один indirect на батч заменяет CPU-аргументы на GPU-аргументы. Число submissions/bindings само не уменьшается. |
 | Frame graph даст async compute | Граф описывает зависимости/время жизни ресурсов. Текущий sokol не предоставляет API нескольких очередей; D3D11 не превращается в D3D12. |
 | TAA автоматически даст скорость | TAA камерный, history уже HDR. Сам по себе это дополнительная работа; экономия возможна через меньшее render resolution и проверенный reconstruction. |
-| IBL уже завершён | Probe mips — box-аппроксимация, не GGX-prefilter (HDR capture выполнен, quality-prefilter не закончен). Выбирается ближайшая проба без блендинга. |
+| IBL уже завершён | Исходный box-prefilter заменён GGX/irradiance, nearest-only выбор — top-2 blending. CPU-goldens не заменяют GPU-проверку source-mip lifetime, seams и переходов; instanced spatial probes ещё не реализованы. |
 | «80% Babylon API», «150–400 строк на backend» | Эти оценки не измерены. Использовать конкретные сценарии API и backend acceptance matrix. |
 
 Пути к доказательствам:
@@ -114,7 +113,7 @@ Metal native + browser WebGPU legs) перед закрытием.
   output — POST-проход `postprocess.glsl`.
 - TAA: `src/agate/shaders/postprocess.glsl`, `applyTAA`;
   jitter: `src/agate/postprocess/taa.zig`.
-- Probe approximation: `src/agate/shaders/probe_mip.glsl:1–7`.
+- Probe convolution и source LOD: `src/agate/shaders/probe_mip.glsl`, `scene/probe_render.zig`.
 - CPU occlusion: `src/agate/visibility/hiz_buffer.zig`, [visibility.md](./visibility.md).
 - Sorting/compaction уже реализованы: `scene/render_queue/items.zig`,
   `scene/instance_staging.zig`. Не планировать их заново.
@@ -161,7 +160,7 @@ MSAA и неподдерживаемый формат проверяются о�
 
 Сначала offline GGX-prefilter для environment + diffuse SH/irradiance.
 Проверить BRDF-LUT/roughness/LOD conventions и ориентацию cube faces.
-Потом улучшать on-demand probes: HDR capture выполнен (RGBA16F), корректный GGX-prefilter и box-prefilter quality — не закончены, spatial weights/blending и при необходимости box projection — дальше.
+On-demand probes: HDR capture (RGBA16F), GGX-prefilter, diffuse irradiance и top-2 spatial blending реализованы; source-mip correctness и GPU-quality гейты ещё требуется закрыть. Instanced spatial probes и при необходимости box projection — дальше.
 Это не автоматический GI и не «маленький дифф» без проверки всех PBR-контуров.
 
 **Гейт:** металлические/диэлектрические шары roughness 0→1, яркие маленькие

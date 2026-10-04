@@ -158,6 +158,6 @@ Apple M4, macOS; эти прогоны проверяют корректност
 Timing runtime этой волны проверен на Metal; прежние browser/C timing gates
 остаются историческими результатами и не заменяют этот прогон.
 
-Native WebGPU **app** не проверен: cached emdawn header имеет существующий drift
-в имени `WGPUSurfaceSourceMetalLayer`.
-Linux linker path optional callback test настроен, но на этом macOS host не запускался.
+Native WebGPU app намеренно не поддерживается: WebGPU используется только в
+браузере. Windows/D3D11 и Linux/GL 4.3 требуют live-прогонов на целевых ОС;
+codegen всех shader legs не заменяет эти проверки.

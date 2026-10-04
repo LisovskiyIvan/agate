@@ -1,8 +1,9 @@
 # Perf baseline (worktree `perf`)
 
 Дата: 05.10.2026. Хост: Apple M4, macOS, ReleaseFast (bench) / ReleaseSafe (timing).
-Сцена: sandbox showcase (windowed, vsync off; wall сошёлся к 16.667 ms — 60 Hz
-композиции окна).
+CPU-сцена: sandbox showcase (windowed, vsync off; wall сошёлся к 16.667 ms).
+Это оконный smoke-grade замер; причина pacing отдельно не измерена.
+GPU timing-gate использует другую сцену: один box и compute particles.
 
 ## CPU (bench-threads, 3 runs × 300 frames, means, ms)
 
@@ -17,14 +18,18 @@
 
 ## GPU (gpu-timing gate, Metal, ReleaseSafe, 270 frames, PASS)
 
-Полный GPU кадр (timer=0, scene): **5.1–6.4 ms**. Все 4 таймера дают
-уникальные положительные семплы (80/79/79/79 на волну), compute_dispatches=268,
-0 ошибок, 0 живых аллокаций.
+Первые уникальные frame samples трёх enable-волн (timer=0): **5.1–6.4 ms**.
+Это не среднее, медиана или диапазон всех кадров и не GPU-время sandbox
+showcase. Все 4 таймера дают уникальные положительные семплы (80/79/79/79
+на волну), compute_dispatches=268, 0 ошибок, 0 живых аллокаций. Этот гейт
+доказывает timing/lifecycle, не throughput или запас GPU целевой сцены.
 
 ## Выводы
 
-- Движок НЕ CPU-bound (1.2/16.7 ms) и не упирается в GPU (≈6/16.7 ms) на
-  этой сцене; до 60 fps запас ~2.7× по GPU.
+- Средний context callback sandbox занимает ~1.2 ms при wall ~16.7 ms.
+  Для вывода о bottleneck нужны GPU samples той же сцены, P95/P99 и
+  контролируемый unpaced прогон. Смешивать CPU showcase и GPU timing-gate
+  для заявления «запас GPU 2.7×» нельзя.
 - Доминирующая статья context-потока — submit draws (~1.06 ms): per-draw
   `sg.applyUniforms` в `scene/draw.zig` (vs_params на меш + fs_params на
   материал). Следующий реальный шаг — instance/storage-buffer packing
@@ -61,10 +66,10 @@ instanced-vs (regular vs_params всегда уникален — mvp/model).
 к сравнению непригоден.
 
 Вердикт: на прогретых ранах 1.01–1.18 против baseline 1.056 —
-движения нет (разброс ±20% — шум оконного harness). Вывод:
-многокилобайтный memcpy fs_params — не доминанта submit-стены;
-её определяют фиксированные per-draw издержки (applyBindings +
-Metal-диспетч кодера), дедуп их не снимает. Сортировка opaque под
+движения нет (разброс ±20% — шум оконного harness). Доказанный вывод:
+этот uniform-dedup кандидат не дал измеримого выигрыша. Фиксированные
+per-draw издержки (applyBindings + Metal-диспетч кодера) — гипотеза,
+для их атрибуции нужен capture или отдельный замер. Сортировка opaque под
 дедуп (план Б) при таком шуме измеримые ≥15% дать не может —
 не делаем. Кандидат откачен (`git status` чист от кода волны),
 сложность без выигрыша не шипаем. Gates кандидата: `zig build test`
