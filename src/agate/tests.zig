@@ -175,6 +175,7 @@ test {
     _ = @import("physics/world.zig");
     _ = @import("physics_mesh.zig");
     _ = @import("postprocess.zig");
+    _ = @import("postprocess/auto_exposure.zig");
     _ = @import("postprocess/bloom.zig");
     _ = @import("postprocess/color_curves.zig");
     _ = @import("postprocess/dof.zig");

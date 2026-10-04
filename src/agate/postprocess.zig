@@ -12,6 +12,7 @@ pub const taa = @import("postprocess/taa.zig");
 pub const shafts = @import("postprocess/shafts.zig");
 pub const options = @import("postprocess/options.zig");
 pub const hdr = @import("postprocess/hdr.zig");
+pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -24,6 +25,13 @@ pub const TaaBounds = types.TaaBounds;
 pub const LutStripLayout = types.LutStripLayout;
 pub const LutStripSample = types.LutStripSample;
 pub const PostProcessOptions = options.PostProcessOptions;
+pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
+pub const AutoExposureState = auto_exposure.AutoExposureState;
+pub const LuminanceHistogram = auto_exposure.LuminanceHistogram;
+pub const calcLuminance = auto_exposure.calcLuminance;
+pub const calcGeometricMeanLuminance = auto_exposure.calcGeometricMeanLuminance;
+pub const calcTargetExposure = auto_exposure.calcTargetExposure;
+pub const adaptExposure = auto_exposure.adaptExposure;
 
 // --- Bloom ---
 pub const BLOOM_PYRAMID_MIPS_MIN = bloom.BLOOM_PYRAMID_MIPS_MIN;
@@ -129,4 +137,5 @@ test {
     _ = shafts;
     _ = options;
     _ = hdr;
+    _ = auto_exposure;
 }

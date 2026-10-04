@@ -58,6 +58,8 @@ pub const PostFXStack = struct {
     taa_enabled_prev: bool = false,
     taa_explicit_reset: bool = false,
 
+    auto_exposure: postprocess.AutoExposureState = .{},
+
     warn_taa_msaa: msaa.WarnOnce = .{},
 
     pub fn init() PostFXStack {
@@ -272,6 +274,9 @@ pub const PostFXStack = struct {
     /// display pass binds its own placeholder for those slots.
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         var post = params.post.forFrame();
+        if (post.auto_exposure_enabled) {
+            post.exposure = self.auto_exposure.adapted_exposure;
+        }
         var ssao = params.ssao;
         if (!params.post.enabled) {
             ssao.enabled = false;
@@ -520,5 +525,25 @@ pub const PostFXStack = struct {
             self.taa_enabled_prev = true;
             self.taa_explicit_reset = false;
         }
+    }
+
+    pub fn updateAutoExposure(self: *PostFXStack, avg_lum: f32, opts: postprocess.AutoExposureOptions, dt: f32) f32 {
+        return self.auto_exposure.update(avg_lum, opts, dt);
+    }
+
+    pub fn updateAutoExposureFromBuffer(self: *PostFXStack, buffer: []const [3]f32, weights: ?[]const f32, opts: postprocess.AutoExposureOptions, dt: f32) f32 {
+        return self.auto_exposure.updateFromBuffer(buffer, weights, opts, dt);
+    }
+
+    pub fn updateAutoExposureFromHistogram(self: *PostFXStack, hist: *const postprocess.LuminanceHistogram, opts: postprocess.AutoExposureOptions, dt: f32) f32 {
+        return self.auto_exposure.updateFromHistogram(hist, opts, dt);
+    }
+
+    pub fn getAdaptedExposure(self: *const PostFXStack) f32 {
+        return self.auto_exposure.adapted_exposure;
+    }
+
+    pub fn resetAutoExposure(self: *PostFXStack) void {
+        self.auto_exposure.reset();
     }
 };

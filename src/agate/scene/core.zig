@@ -653,6 +653,26 @@ pub const Scene = struct {
         scene_lifecycle.setPostProcess(self, config);
     }
 
+    /// Updates auto-exposure with current average scene luminance and delta time.
+    pub fn updateAutoExposure(self: *Scene, avg_lum: f32, dt: f32) f32 {
+        return self.postfx.updateAutoExposure(avg_lum, self.post_process.autoExposureOptions(), dt);
+    }
+
+    /// Updates auto-exposure from an RGB radiance buffer and delta time.
+    pub fn updateAutoExposureFromBuffer(self: *Scene, buffer: []const [3]f32, weights: ?[]const f32, dt: f32) f32 {
+        return self.postfx.updateAutoExposureFromBuffer(buffer, weights, self.post_process.autoExposureOptions(), dt);
+    }
+
+    /// Updates auto-exposure from a luminance histogram and delta time.
+    pub fn updateAutoExposureFromHistogram(self: *Scene, hist: *const postprocess.LuminanceHistogram, dt: f32) f32 {
+        return self.postfx.updateAutoExposureFromHistogram(hist, self.post_process.autoExposureOptions(), dt);
+    }
+
+    /// Returns currently adapted exposure.
+    pub fn getAdaptedExposure(self: *const Scene) f32 {
+        return self.postfx.getAdaptedExposure();
+    }
+
     /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn setSSAO(self: *Scene, config: SSAOOptions) void {
         scene_lifecycle.setSSAO(self, config);

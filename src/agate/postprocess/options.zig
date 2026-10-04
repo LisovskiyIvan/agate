@@ -6,10 +6,12 @@ const glow = @import("glow.zig");
 const color_curves = @import("color_curves.zig");
 const lut = @import("lut.zig");
 const shafts = @import("shafts.zig");
+const auto_exposure = @import("auto_exposure.zig");
 
 pub const TonemappingType = types.TonemappingType;
 pub const LutFormat = types.LutFormat;
 pub const ShaftResolution = types.ShaftResolution;
+pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
 
 /// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
 /// toggles and their parameters). A flat config read/written by tooling;
@@ -20,6 +22,17 @@ pub const PostProcessOptions = struct {
     enabled: bool = false,
     exposure: f32 = 1.0,
     tonemapping: TonemappingType = .aces,
+
+    // Auto-Exposure (adaptive luminance / histogram metering)
+    auto_exposure_enabled: bool = false,
+    auto_exposure_min: f32 = 0.01,
+    auto_exposure_max: f32 = 16.0,
+    auto_exposure_key_value: f32 = 0.18,
+    auto_exposure_speed_up: f32 = 3.0,
+    auto_exposure_speed_down: f32 = 1.0,
+    auto_exposure_low_percentile: f32 = 0.10,
+    auto_exposure_high_percentile: f32 = 0.90,
+    auto_exposure_camera_cut: bool = false,
 
     // HDR bloom: Karis downsample + tent upsample pyramid.
     bloom_enabled: bool = true,
@@ -174,6 +187,13 @@ pub const PostProcessOptions = struct {
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
         var out = self;
         out.exposure = if (std.math.isFinite(self.exposure)) std.math.clamp(self.exposure, 0.0, 65504.0) else 1.0;
+        out.auto_exposure_min = if (std.math.isFinite(self.auto_exposure_min)) @max(self.auto_exposure_min, 0.0) else 0.01;
+        out.auto_exposure_max = if (std.math.isFinite(self.auto_exposure_max)) @max(self.auto_exposure_max, out.auto_exposure_min) else 16.0;
+        out.auto_exposure_key_value = if (std.math.isFinite(self.auto_exposure_key_value)) @max(self.auto_exposure_key_value, 0.001) else 0.18;
+        out.auto_exposure_speed_up = if (std.math.isFinite(self.auto_exposure_speed_up)) @max(self.auto_exposure_speed_up, 0.0) else 3.0;
+        out.auto_exposure_speed_down = if (std.math.isFinite(self.auto_exposure_speed_down)) @max(self.auto_exposure_speed_down, 0.0) else 1.0;
+        out.auto_exposure_low_percentile = if (std.math.isFinite(self.auto_exposure_low_percentile)) std.math.clamp(self.auto_exposure_low_percentile, 0.0, 1.0) else 0.10;
+        out.auto_exposure_high_percentile = if (std.math.isFinite(self.auto_exposure_high_percentile)) std.math.clamp(self.auto_exposure_high_percentile, out.auto_exposure_low_percentile, 1.0) else 0.90;
         out.bloom_threshold = @max(self.bloom_threshold, 0.0);
         out.bloom_intensity = @max(self.bloom_intensity, 0.0);
         out.bloom_radius = if (std.math.isFinite(self.bloom_radius)) std.math.clamp(self.bloom_radius, 0.0, 16.0) else 2.0;
@@ -239,6 +259,22 @@ pub const PostProcessOptions = struct {
         out.taa_enabled = false;
         out.shaft_enabled = false;
         return out;
+    }
+
+    /// Extract validated auto-exposure options for evaluation/adaptation.
+    pub fn autoExposureOptions(self: PostProcessOptions) auto_exposure.AutoExposureOptions {
+        const c = self.clamped();
+        return .{
+            .enabled = c.auto_exposure_enabled,
+            .min_exposure = c.auto_exposure_min,
+            .max_exposure = c.auto_exposure_max,
+            .key_value = c.auto_exposure_key_value,
+            .speed_up = c.auto_exposure_speed_up,
+            .speed_down = c.auto_exposure_speed_down,
+            .low_percentile = c.auto_exposure_low_percentile,
+            .high_percentile = c.auto_exposure_high_percentile,
+            .camera_cut = c.auto_exposure_camera_cut,
+        };
     }
 
     /// Bind a 2D-strip LUT texture (Babylon.js parity) and enable grading.

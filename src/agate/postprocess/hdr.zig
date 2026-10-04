@@ -115,6 +115,16 @@ pub fn displayColor(c: [3]f32, exposure: f32, mode: types.TonemappingType, srgb_
     return linearToSrgb3(t);
 }
 
+// Auto-exposure re-exports
+pub const auto_exposure = @import("auto_exposure.zig");
+pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
+pub const AutoExposureState = auto_exposure.AutoExposureState;
+pub const LuminanceHistogram = auto_exposure.LuminanceHistogram;
+pub const calcLuminance = auto_exposure.calcLuminance;
+pub const calcGeometricMeanLuminance = auto_exposure.calcGeometricMeanLuminance;
+pub const calcTargetExposure = auto_exposure.calcTargetExposure;
+pub const adaptExposure = auto_exposure.adaptExposure;
+
 // HDR regression tests live in `hdr_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
 

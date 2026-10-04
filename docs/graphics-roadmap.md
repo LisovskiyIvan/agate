@@ -42,9 +42,7 @@ Metal native + browser WebGPU legs) перед закрытием.
 
 ### C. Качество графики — волны к Unreal-уровню (порядок по стоимости/эффекту)
 
-1. **Auto-exposure** (S): histogram/ luminance buffer → экспозиция кадра;
-   сейчас только manual (`postprocess/hdr.zig`). Гейт: CPU golden steps +
-   сцена 1/4/16 без клипа.
+1. **Auto-exposure** (S) — ВЫПОЛНЕНО (04.10.2026): histogram/luminance buffer → экспозиция кадра (`postprocess/auto_exposure.zig`, `scene/postfx_stack.zig`, `scene/core.zig`). Гейт: CPU golden steps + сцена 1/4/16 без клипа пройдены.
 2. **GGX IBL** (M): prefilter probe mips (сейчас box-усреднение,
    `shaders/probe_mip.glsl`), irradiance, probe blending. Гейт: PBR-сцена
    с ENV-only светом.
