@@ -17,6 +17,7 @@ const material_mod = @import("../../material.zig");
 const Material = material_mod.Material;
 const MaterialDrawRecord = material_mod.MaterialDrawRecord;
 const StandardMaterial = material_mod.StandardMaterial;
+const PBRMaterial = material_mod.PBRMaterial;
 const Texture = @import("../../texture.zig").Texture;
 const CubeTexture = @import("../../texture.zig").CubeTexture;
 const morph_gpu = @import("../../mesh/morph_gpu.zig");
@@ -89,7 +90,7 @@ pub const FrameCullContext = struct {
 
     /// View id of the shared 1x1 white fallback (texture-less meshes).
     default_white_id: u32,
-    default_material: ?*const StandardMaterial = null,
+    default_material: ?*const PBRMaterial = null,
     default_white: ?*const Texture = null,
     default_normal: ?*const Texture = null,
     default_cube: ?*const CubeTexture = null,
@@ -193,13 +194,13 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
 pub fn buildMaterialRecord(ctx: FrameCullContext, mat: ?Material) MaterialDrawRecord {
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{}, .sampler = .{}, .size = 1 };
-    const dummy_std = StandardMaterial.init("default");
+    const dummy_pbr = PBRMaterial.init("default");
 
     const white_tex = ctx.default_white orelse &dummy_tex;
     const norm_tex = ctx.default_normal orelse &dummy_tex;
     const cube_tex = ctx.default_cube orelse &dummy_cube;
     const brdf_lut = ctx.default_brdf_lut orelse &dummy_tex;
-    const def_mat = ctx.default_material orelse &dummy_std;
+    const def_mat = ctx.default_material orelse &dummy_pbr;
 
     return material_mod.buildDrawRecord(
         mat,
@@ -278,7 +279,7 @@ pub fn cullNonInstancedMesh(
     stats.rendered_meshes += 1;
 
     const mat = render_mesh.material orelse mesh.material;
-    const is_pbr = if (mat) |m| (m == .pbr) else false;
+    const is_pbr = if (mat) |m| (m == .pbr) else true;
     const tex_id: u32 = if (mat) |m|
         if (m.primaryTexture()) |t| t.view.id else ctx.default_white_id
     else

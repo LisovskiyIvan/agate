@@ -447,12 +447,12 @@ test "wrapNdotL keeps the legacy value when off" {
 
 test "MaterialDrawRecord stages coat texture views with white fallback" {
     var pbr_mat = PBRMaterial.init("test_pbr");
-    const def_std = StandardMaterial.init("def");
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
     // Null slots stage the white fallback (identity sampling).
-    const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 42), rec.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 42), rec.sheen_view.id);
 
@@ -460,7 +460,7 @@ test "MaterialDrawRecord stages coat texture views with white fallback" {
     // frozen (staging discipline: the draw never sees the live write).
     pbr_mat.clearcoat.mask_texture = .{ .image = .{}, .view = .{ .id = 51 }, .sampler = .{ .id = 52 }, .width = 4, .height = 4 };
     pbr_mat.sheen.color_texture = .{ .image = .{}, .view = .{ .id = 61 }, .sampler = .{ .id = 62 }, .width = 4, .height = 4 };
-    const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
     pbr_mat.clearcoat.mask_texture.?.view.id = 99;
@@ -489,14 +489,14 @@ test "PBRMaterial slot defaults reproduce the glTF conventions" {
 
 test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w" {
     var pbr_mat = PBRMaterial.init("aa_pbr");
-    const def_std = StandardMaterial.init("def");
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
     // Hand-built PBRMaterial default = Babylon's own default (SPECULARAA off):
     // the w lane must stay 0 so the shader takes the legacy roughness path.
     try std.testing.expect(!pbr_mat.specular_anti_aliasing);
-    const rec_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[3]);
     // The three lane selectors are untouched by the flag (same uniform).
     try std.testing.expectEqual(@as(f32, 0.0), rec_off.channel_selectors[0]);
@@ -507,7 +507,7 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     pbr_mat.occlusion_channel = .a;
     pbr_mat.roughness_channel = .r;
     pbr_mat.metallic_channel = .a;
-    const rec_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_on.channel_selectors[3]);
     try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[0]);
     try std.testing.expectEqual(@as(f32, 0.0), rec_on.channel_selectors[1]);
@@ -515,7 +515,7 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
 }
 
 test "MaterialDrawRecord routes the standard specular color and power (Babylon defaults)" {
-    const def_std = StandardMaterial.init("def");
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
@@ -523,12 +523,12 @@ test "MaterialDrawRecord routes the standard specular color and power (Babylon d
     // specularPower 64, uploaded verbatim as `vSpecularColor` = (rgb, power):
     // the lane must carry exactly that for a hand-built material.
     var std_mat = StandardMaterial.init("spec");
-    const rec_def = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_def = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 64.0 }, rec_def.pbr_factors);
 
     std_mat.specular_color = Color3.new(0.25, 0.5, 0.75);
     std_mat.specular_power = 8.0;
-    const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual([4]f32{ 0.25, 0.5, 0.75, 8.0 }, rec_set.pbr_factors);
     // The emissive lane is shared with the PBR family and means the same
     // thing there; a hand-built StandardMaterial defaults to black, and a set
@@ -536,7 +536,7 @@ test "MaterialDrawRecord routes the standard specular color and power (Babylon d
     // Its `w` lane carries the two-sided-lighting flag (0 by default).
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, rec_def.emissive_color);
     std_mat.emissive_color = Color3.new(0.2, 0.1, 0.05);
-    const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual([4]f32{ 0.2, 0.1, 0.05, 0.0 }, rec_emis.emissive_color);
 }
 
@@ -545,7 +545,7 @@ test "MaterialDrawRecord routes two-sided lighting into the emissive w lane" {
     // twoSidedLighting == true` and then flips the shading normal on back
     // faces. The flag rides the emissive lane's w (unused by the vec3 emissive
     // upload), and it must reach BOTH families' shaders through the same lane.
-    const def_std = StandardMaterial.init("def");
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
@@ -554,16 +554,16 @@ test "MaterialDrawRecord routes two-sided lighting into the emissive w lane" {
     try std.testing.expect(!std_mat.two_sided_lighting);
     try std.testing.expect(!pbr_mat.two_sided_lighting);
 
-    const std_off = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const std_off = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 0.0), std_off.emissive_color[3]);
-    const pbr_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const pbr_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 0.0), pbr_off.emissive_color[3]);
 
     std_mat.two_sided_lighting = true;
     pbr_mat.two_sided_lighting = true;
-    const std_on = buildDrawRecord(.{ .standard = &std_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const std_on = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), std_on.emissive_color[3]);
-    const pbr_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_std, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const pbr_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), pbr_on.emissive_color[3]);
     // The emissive colour itself is untouched by the flag.
     try std.testing.expectEqual(@as(f32, 0.0), std_on.emissive_color[0]);
@@ -577,13 +577,13 @@ test "MaterialDrawRecord builds correctly from PBRMaterial" {
     pbr_mat.alpha_cutoff = 0.4;
     pbr_mat.alpha_mode = .cutout;
 
-    const def_std = StandardMaterial.init("def");
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
     const rec = buildDrawRecord(
         .{ .pbr = &pbr_mat },
-        &def_std,
+        &def_pbr,
         &dummy_tex,
         &dummy_tex,
         &dummy_cube,
@@ -605,6 +605,7 @@ test "Material unlit mode properly routes to DrawRecord" {
     var std_mat = StandardMaterial.init("unlit_std");
     std_mat.unlit = true;
 
+    const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
@@ -614,11 +615,29 @@ test "Material unlit mode properly routes to DrawRecord" {
     var mat_std = Material{ .standard = &std_mat };
     try std.testing.expect(mat_std.isUnlit());
 
-    const rec_pbr = buildDrawRecord(mat_pbr, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_pbr = buildDrawRecord(mat_pbr, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_pbr.uv_offsets[0][2]);
 
-    const rec_std = buildDrawRecord(mat_std, &std_mat, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    const rec_std = buildDrawRecord(mat_std, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_std.standard_uv_offset[2]);
+}
+
+test "MaterialDrawRecord falls back to default PBR material when mat is null" {
+    var def_pbr = PBRMaterial.init("def");
+    def_pbr.metallic = 0.5;
+    def_pbr.roughness = 0.75;
+    def_pbr.albedo_color = Color3.new(0.3, 0.4, 0.5);
+
+    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
+    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
+
+    const rec = buildDrawRecord(null, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
+    try std.testing.expectEqual(@as(u32, 42), rec.albedo_view.id);
+    try std.testing.expectEqual(@as(f32, 0.5), rec.pbr_factors[0]);
+    try std.testing.expectEqual(@as(f32, 0.75), rec.pbr_factors[1]);
+    try std.testing.expectEqual(@as(f32, 0.3), rec.base_color[0]);
+    try std.testing.expectEqual(@as(f32, 0.4), rec.base_color[1]);
+    try std.testing.expectEqual(@as(f32, 0.5), rec.base_color[2]);
 }
 
 test "P4: buildShaderSnapshot copies hook material CPU state" {

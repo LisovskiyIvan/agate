@@ -113,9 +113,87 @@ pub fn buildShaderSnapshot(mat: ?Material, default_white: *const Texture) ?Shade
     };
 }
 
+fn populatePbrRecord(
+    rec: *MaterialDrawRecord,
+    p: *const PBRMaterial,
+    default_white: *const Texture,
+    default_normal: *const Texture,
+    default_cube: *const CubeTexture,
+    sky_texture: ?CubeTexture,
+    ibl_intensity: f32,
+) void {
+    rec.refractive = p.transmission.isRefractive();
+    const albedo_tex = p.albedo_texture orelse default_white.*;
+    const normal_tex = p.normal_texture orelse default_normal.*;
+    const mr_tex = p.metallic_roughness_texture orelse default_white.*;
+    const emissive_tex = p.emissive_texture orelse default_white.*;
+    const occlusion_tex = p.occlusion_texture orelse default_white.*;
+    const clearcoat_tex = p.clearcoat.mask_texture orelse default_white.*;
+    const sheen_tex = p.sheen.color_texture orelse default_white.*;
+
+    rec.albedo_view = albedo_tex.view;
+    rec.albedo_sampler = albedo_tex.sampler;
+    rec.normal_view = normal_tex.view;
+    rec.mr_view = mr_tex.view;
+    rec.emissive_view = emissive_tex.view;
+    rec.occlusion_view = occlusion_tex.view;
+    rec.clearcoat_view = clearcoat_tex.view;
+    rec.sheen_view = sheen_tex.view;
+
+    const data_tex = p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex;
+    rec.data_sampler = data_tex.sampler;
+
+    if (p.environment_texture) |env_t| {
+        rec.env_view = env_t.view;
+        rec.env_sampler = env_t.sampler;
+    } else if (sky_texture) |st| {
+        rec.env_view = st.view;
+        rec.env_sampler = st.sampler;
+    } else {
+        rec.env_view = default_cube.view;
+        rec.env_sampler = default_cube.sampler;
+    }
+
+    rec.base_color = p.getAlbedoColor4();
+    rec.pbr_factors = .{
+        p.metallic,
+        p.roughness,
+        p.occlusion_strength,
+        ibl_intensity * p.environment_intensity,
+    };
+    rec.emissive_color = .{
+        p.emissive_color.r,
+        p.emissive_color.g,
+        p.emissive_color.b,
+        if (p.two_sided_lighting) 1.0 else 0.0,
+    };
+    rec.normal_scale = p.normal_scale;
+    rec.alpha_cutoff = if (p.alpha_mode == .cutout) p.alpha_cutoff else 0.0;
+
+    rec.uv_matrices[0] = p.albedo_uv_transform.matrixRows();
+    rec.uv_matrices[1] = p.normal_uv_transform.matrixRows();
+    rec.uv_matrices[2] = p.metallic_roughness_uv_transform.matrixRows();
+    rec.uv_matrices[3] = p.emissive_uv_transform.matrixRows();
+    rec.uv_matrices[4] = p.occlusion_uv_transform.matrixRows();
+
+    rec.uv_offsets[0] = p.albedo_uv_transform.offsetPacked();
+    if (p.unlit) rec.uv_offsets[0][2] = 1.0;
+    rec.uv_offsets[1] = p.normal_uv_transform.offsetPacked();
+    rec.uv_offsets[2] = p.metallic_roughness_uv_transform.offsetPacked();
+    rec.uv_offsets[3] = p.emissive_uv_transform.offsetPacked();
+    rec.uv_offsets[4] = p.occlusion_uv_transform.offsetPacked();
+
+    rec.channel_selectors = .{
+        p.occlusion_channel.selector(),
+        p.roughness_channel.selector(),
+        p.metallic_channel.selector(),
+        if (p.specular_anti_aliasing) 1.0 else 0.0,
+    };
+}
+
 pub fn buildDrawRecord(
     mat: ?Material,
-    default_material: *const StandardMaterial,
+    default_material: *const PBRMaterial,
     default_white: *const Texture,
     default_normal: *const Texture,
     default_cube: *const CubeTexture,
@@ -130,73 +208,7 @@ pub fn buildDrawRecord(
     if (mat) |m| {
         switch (m) {
             .pbr => |p| {
-                rec.refractive = p.transmission.isRefractive();
-                const albedo_tex = p.albedo_texture orelse default_white.*;
-                const normal_tex = p.normal_texture orelse default_normal.*;
-                const mr_tex = p.metallic_roughness_texture orelse default_white.*;
-                const emissive_tex = p.emissive_texture orelse default_white.*;
-                const occlusion_tex = p.occlusion_texture orelse default_white.*;
-                const clearcoat_tex = p.clearcoat.mask_texture orelse default_white.*;
-                const sheen_tex = p.sheen.color_texture orelse default_white.*;
-
-                rec.albedo_view = albedo_tex.view;
-                rec.albedo_sampler = albedo_tex.sampler;
-                rec.normal_view = normal_tex.view;
-                rec.mr_view = mr_tex.view;
-                rec.emissive_view = emissive_tex.view;
-                rec.occlusion_view = occlusion_tex.view;
-                rec.clearcoat_view = clearcoat_tex.view;
-                rec.sheen_view = sheen_tex.view;
-
-                const data_tex = p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex;
-                rec.data_sampler = data_tex.sampler;
-
-                if (p.environment_texture) |env_t| {
-                    rec.env_view = env_t.view;
-                    rec.env_sampler = env_t.sampler;
-                } else if (sky_texture) |st| {
-                    rec.env_view = st.view;
-                    rec.env_sampler = st.sampler;
-                } else {
-                    rec.env_view = default_cube.view;
-                    rec.env_sampler = default_cube.sampler;
-                }
-
-                rec.base_color = p.getAlbedoColor4();
-                rec.pbr_factors = .{
-                    p.metallic,
-                    p.roughness,
-                    p.occlusion_strength,
-                    ibl_intensity * p.environment_intensity,
-                };
-                rec.emissive_color = .{
-                    p.emissive_color.r,
-                    p.emissive_color.g,
-                    p.emissive_color.b,
-                    if (p.two_sided_lighting) 1.0 else 0.0,
-                };
-                rec.normal_scale = p.normal_scale;
-                rec.alpha_cutoff = if (p.alpha_mode == .cutout) p.alpha_cutoff else 0.0;
-
-                rec.uv_matrices[0] = p.albedo_uv_transform.matrixRows();
-                rec.uv_matrices[1] = p.normal_uv_transform.matrixRows();
-                rec.uv_matrices[2] = p.metallic_roughness_uv_transform.matrixRows();
-                rec.uv_matrices[3] = p.emissive_uv_transform.matrixRows();
-                rec.uv_matrices[4] = p.occlusion_uv_transform.matrixRows();
-
-                rec.uv_offsets[0] = p.albedo_uv_transform.offsetPacked();
-                if (p.unlit) rec.uv_offsets[0][2] = 1.0;
-                rec.uv_offsets[1] = p.normal_uv_transform.offsetPacked();
-                rec.uv_offsets[2] = p.metallic_roughness_uv_transform.offsetPacked();
-                rec.uv_offsets[3] = p.emissive_uv_transform.offsetPacked();
-                rec.uv_offsets[4] = p.occlusion_uv_transform.offsetPacked();
-
-                rec.channel_selectors = .{
-                    p.occlusion_channel.selector(),
-                    p.roughness_channel.selector(),
-                    p.metallic_channel.selector(),
-                    if (p.specular_anti_aliasing) 1.0 else 0.0,
-                };
+                populatePbrRecord(&rec, p, default_white, default_normal, default_cube, sky_texture, ibl_intensity);
             },
             .standard => |s| {
                 const tex = s.diffuse_texture orelse default_white.*;
@@ -232,13 +244,7 @@ pub fn buildDrawRecord(
             },
         }
     } else {
-        const tex = default_material.diffuse_texture orelse default_white.*;
-        rec.albedo_view = tex.view;
-        rec.albedo_sampler = tex.sampler;
-        rec.base_color = default_material.getDiffuseColor4();
-        rec.alpha_cutoff = if (default_material.alpha_mode == .cutout) default_material.alpha_cutoff else 0.0;
-        rec.standard_uv_matrix = default_material.diffuse_uv_transform.matrixRows();
-        rec.standard_uv_offset = default_material.diffuse_uv_transform.offsetPacked();
+        populatePbrRecord(&rec, default_material, default_white, default_normal, default_cube, sky_texture, ibl_intensity);
     }
     return rec;
 }

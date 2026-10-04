@@ -240,7 +240,7 @@ pub const Scene = struct {
     active_camera: ?Camera = null,
     active_camera_owned_name: ?[]const u8 = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
-    default_material: StandardMaterial = StandardMaterial.init("default"),
+    default_material: PBRMaterial = PBRMaterial.init("default"),
     default_white_texture: Texture,
     /// Babylon's environment-BRDF lookup (256x256, gammaSpace) behind
     /// `coloredEnergyConservationFactor`; owned by the scene like the other
