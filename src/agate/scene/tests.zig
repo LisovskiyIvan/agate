@@ -6376,6 +6376,8 @@ fn freeSoftbodyFixture(alloc: std.mem.Allocator, scene: *Scene) void {
     scene.meshes.deinit(alloc);
     for (scene.materials.items) |m| alloc.destroy(m);
     scene.materials.deinit(alloc);
+    for (scene.pbr_materials.items) |m| alloc.destroy(m);
+    scene.pbr_materials.deinit(alloc);
     scene.gpu_retire.deinit(alloc);
     scene.outline_meshes.deinit(alloc);
     scene.lights.deinit(alloc);
@@ -6421,13 +6423,14 @@ test "softbody mesh coupling: vertex layout matches the solver grid" {
     for (body.vertices, body.cloth.pos) |v, p| try std.testing.expectEqual(p.toArray(), v.position);
     try std.testing.expectEqual([2]f32{ 0.0, 0.0 }, body.vertices[0].uv);
     try std.testing.expectEqual([2]f32{ 1.0, 1.0 }, body.vertices[19].uv);
-    // Double-sided standard material; mesh registered in the scene.
-    const is_standard = switch (body.mesh.material.?) {
-        .standard => true,
+    // Double-sided PBR cloth material; mesh registered in the scene.
+    const is_pbr = switch (body.mesh.material.?) {
+        .pbr => true,
         else => false,
     };
-    try std.testing.expect(is_standard);
-    try std.testing.expect(body.mesh.material.?.standard.double_sided);
+    try std.testing.expect(is_pbr);
+    try std.testing.expect(body.mesh.material.?.pbr.double_sided);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), body.mesh.material.?.pbr.roughness, 0.0001);
     try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
     try std.testing.expect(body.mesh.local_bounding_box.isValid());
 }
@@ -6537,7 +6540,7 @@ test "softbody create OOM rolls back mesh/material/body at every allocation poin
             saw_success = true;
             try std.testing.expectEqual(@as(usize, 1), scene.softBodyCount());
             try std.testing.expectEqual(@as(usize, 1), scene.meshes.items.len);
-            try std.testing.expectEqual(@as(usize, 1), scene.materials.items.len);
+            try std.testing.expectEqual(@as(usize, 1), scene.pbr_materials.items.len);
             // Ownership nuance: the material name aliases the mesh-owned
             // slice (freed once via Mesh.deinit/owns_name).
             try std.testing.expect(body.material.name.ptr == body.mesh.name.ptr);
@@ -6549,7 +6552,7 @@ test "softbody create OOM rolls back mesh/material/body at every allocation poin
             saw_induced = true;
             try std.testing.expectEqual(@as(usize, 0), scene.softBodyCount());
             try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
-            try std.testing.expectEqual(@as(usize, 0), scene.materials.items.len);
+            try std.testing.expectEqual(@as(usize, 0), scene.pbr_materials.items.len);
             freeSoftbodyFixture(alloc, &scene);
         }
     }

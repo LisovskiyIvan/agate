@@ -660,3 +660,15 @@ test "P4: buildShaderSnapshot copies hook material CPU state" {
     try std.testing.expect(buildShaderSnapshot(.{ .standard = &std_mat }, &dummy_tex) == null);
     try std.testing.expect(buildShaderSnapshot(null, &dummy_tex) == null);
 }
+
+test "roughnessFromSpecularPower lobe-match goldens" {
+    // alpha = sqrt(2/(n+2)), floored at 0.05.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1741), pbr.roughnessFromSpecularPower(64.0), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4472), pbr.roughnessFromSpecularPower(8.0), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8165), pbr.roughnessFromSpecularPower(1.0), 0.001);
+    // Huge exponents clamp to the practical floor, never zero.
+    try std.testing.expectEqual(@as(f32, 0.05), pbr.roughnessFromSpecularPower(1_000_000.0));
+    // Degenerate exponents clamp to power 1 (roughness stays in range).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8165), pbr.roughnessFromSpecularPower(-4.0), 0.001);
+    try std.testing.expect(pbr.roughnessFromSpecularPower(0.0) <= 1.0);
+}

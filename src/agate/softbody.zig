@@ -53,7 +53,7 @@ const BoundingBox = math.BoundingBox;
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
 const computeNormals = @import("mesh.zig").computeNormals;
-const StandardMaterial = @import("material.zig").StandardMaterial;
+const PBRMaterial = @import("material.zig").PBRMaterial;
 const gpu_thread = @import("gpu_thread.zig");
 const upload_meter = @import("gpu_upload_meter.zig");
 const jobs = @import("jobs.zig");
@@ -540,7 +540,7 @@ pub const SoftBody = struct {
     allocator: std.mem.Allocator,
     cloth: Cloth,
     mesh: *Mesh,
-    material: *StandardMaterial,
+    material: *PBRMaterial,
     vertices: []Vertex,
     indices: []u32,
     buffers_pending: bool = false,
@@ -721,21 +721,22 @@ pub const SoftBodyLayer = struct {
             allocator.destroy(mesh);
         }
 
-        const mat = scene.createStandardMaterial(owned_name) catch return error.OutOfMemory;
+        const mat = scene.createPBRMaterial(owned_name) catch return error.OutOfMemory;
         // Material name aliases the mesh-owned slice; unlink + free the
         // struct before the mesh rollback above frees the name. A fresh
         // material owns no texture, so no texture teardown here.
         errdefer {
-            for (scene.materials.items, 0..) |m, i| {
+            for (scene.pbr_materials.items, 0..) |m, i| {
                 if (m == mat) {
-                    _ = scene.materials.swapRemove(i);
+                    _ = scene.pbr_materials.swapRemove(i);
                     break;
                 }
             }
             allocator.destroy(mat);
         }
         mat.double_sided = true;
-        mesh.material = .{ .standard = mat };
+        mat.roughness = 0.9;
+        mesh.material = .{ .pbr = mat };
 
         const body = allocator.create(SoftBody) catch return error.OutOfMemory;
         body.* = .{

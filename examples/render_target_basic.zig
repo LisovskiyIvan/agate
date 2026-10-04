@@ -97,7 +97,7 @@ fn rttLogger(tag: [*c]const u8, level: u32, item: u32, msg: [*c]const u8, line: 
 var capture_scene: z.Scene = undefined;
 var display_scene: z.Scene = undefined;
 var capture_box: *z.Mesh = undefined;
-var display_mat: *z.StandardMaterial = undefined;
+var display_mat: *z.PBRMaterial = undefined;
 var checker_tex: z.Texture = undefined;
 var checker_owned: bool = false;
 var rtt: z.RenderTarget = .{};
@@ -239,12 +239,12 @@ export fn init() callconv(.c) void {
         std.debug.panic("rtt-smoke: display quad failed: {}", .{err});
     };
     quad.position.z = -1.5;
-    display_mat = display_scene.createStandardMaterial("screen_mat") catch |err| {
+    display_mat = display_scene.createPBRMaterial("screen_mat") catch |err| {
         std.debug.panic("rtt-smoke: display material failed: {}", .{err});
     };
     display_mat.unlit = true;
     display_mat.double_sided = true;
-    quad.setStandardMaterial(display_mat);
+    quad.setPBRMaterial(display_mat);
 
     // --- UV1 proof strips: shared checker, tex_coord 0 vs 1 ---
     checker_tex = z.Texture.createCheckerboard(allocator, 128, 128, 16, .{ 30, 30, 30, 255 }, .{ 225, 225, 225, 255 }) catch |err| {
@@ -252,13 +252,14 @@ export fn init() callconv(.c) void {
     };
     checker_owned = true;
     const strip_a = makeUvStrip(&display_scene, "uv0_strip", -1.1, -2.1);
-    const mat_a = display_scene.createStandardMaterial("uv0_mat") catch |err| {
+    const mat_a = display_scene.createPBRMaterial("uv0_mat") catch |err| {
         std.debug.panic("rtt-smoke: uv0 material failed: {}", .{err});
     };
     mat_a.double_sided = true;
-    mat_a.diffuse_texture = checker_tex;
-    mat_a.diffuse_uv_transform = .{ .tex_coord = 0 };
-    strip_a.setStandardMaterial(mat_a);
+    mat_a.albedo_texture = checker_tex;
+    mat_a.albedo_uv_transform = .{ .tex_coord = 0 };
+    mat_a.roughness = 0.9;
+    strip_a.setPBRMaterial(mat_a);
     const strip_b = makeUvStrip(&display_scene, "uv1_strip", 1.1, -2.1);
     const mat_b = display_scene.createPBRMaterial("uv1_mat") catch |err| {
         std.debug.panic("rtt-smoke: uv1 material failed: {}", .{err});
@@ -339,9 +340,9 @@ export fn init() callconv(.c) void {
     defer sg.destroyView(alias);
     if (sg.queryViewState(alias) != .VALID) smokeFail("alternate sampling view creation failed", .{});
     borrow.view = alias;
-    display_mat.diffuse_texture = borrow;
+    display_mat.albedo_texture = borrow;
     const saved_material = capture_box.material;
-    capture_box.setStandardMaterial(display_mat);
+    capture_box.setPBRMaterial(display_mat);
     if (!prepare(&capture_scene)) smokeFail("feedback setup prepare failed", .{});
     if (rtt.renderPrimaryView(&capture_scene, .{})) |_| {
         smokeFail("alternate-view feedback capture unexpectedly succeeded", .{});
@@ -350,7 +351,7 @@ export fn init() callconv(.c) void {
     }
     if (rtt.isCapturing()) smokeFail("rejected feedback left a pass open", .{});
     capture_box.material = saved_material;
-    display_mat.diffuse_texture = null;
+    display_mat.albedo_texture = null;
 }
 
 export fn frame() callconv(.c) void {
@@ -398,9 +399,9 @@ export fn frame() callconv(.c) void {
     // frame (and a post-resize refresh would bind dead handles all frame).
     // Invalid target => null => default-texture fallback, never id-0 binds.
     if (rtt.isValid()) {
-        display_mat.diffuse_texture = rtt.asTexture();
+        display_mat.albedo_texture = rtt.asTexture();
     } else {
-        display_mat.diffuse_texture = null;
+        display_mat.albedo_texture = null;
     }
 
     const previous_capture_frame = capture_scene.preparedDraws().frame_id;
@@ -491,8 +492,8 @@ export fn cleanup() callconv(.c) void {
     // ever see a borrowed handle as owned (materials never owned them, but
     // the detach makes the discipline structural, not conventional).
     // Scene keeps split registries (materials / pbr_materials).
-    display_mat.diffuse_texture = null;
-    for (display_scene.materials.items) |mat| mat.diffuse_texture = null;
+    display_mat.albedo_texture = null;
+    for (display_scene.pbr_materials.items) |mat| mat.albedo_texture = null;
     for (display_scene.pbr_materials.items) |mat| {
         mat.albedo_texture = null;
         mat.normal_texture = null;
