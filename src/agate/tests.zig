@@ -202,11 +202,14 @@ test {
     _ = @import("runtime.zig");
     _ = @import("runtime_tests.zig");
     _ = @import("scene.zig");
+    _ = @import("scene/allocator_tests.zig");
     _ = @import("scene/animation_runtime.zig");
     _ = @import("scene/attachments.zig");
+    _ = @import("scene/camera_tests.zig");
     _ = @import("scene/cameras.zig");
     _ = @import("scene/cascades.zig");
     _ = @import("scene/clustered_lights.zig");
+    _ = @import("scene/clustered_lights_tests.zig");
     _ = @import("scene/content.zig");
     _ = @import("scene/core.zig");
     _ = @import("scene/decal_layer.zig");
@@ -221,6 +224,7 @@ test {
     _ = @import("scene/gpu_retire.zig");
     _ = @import("scene/gpu_retire_tests.zig");
     _ = @import("scene/gui3d_layer.zig");
+    _ = @import("scene/gui3d_tests.zig");
     _ = @import("scene/highlight_layer.zig");
     _ = @import("scene/instance_staging.zig");
     _ = @import("scene/lifecycle.zig");
@@ -229,6 +233,7 @@ test {
     _ = @import("scene/light_selection.zig");
     _ = @import("scene/light_selection_tests.zig");
     _ = @import("scene/lights_api.zig");
+    _ = @import("scene/mesh_lifecycle_tests.zig");
     _ = @import("scene/msaa.zig");
     _ = @import("scene/nav_layer.zig");
     _ = @import("scene/particle_layer.zig");
@@ -240,6 +245,7 @@ test {
     _ = @import("scene/postfx_stack.zig");
     _ = @import("scene/probe_layer.zig");
     _ = @import("scene/probe_render.zig");
+    _ = @import("scene/probe_tests.zig");
     _ = @import("scene/profile_api.zig");
     _ = @import("scene/project_cache.zig");
     _ = @import("scene/projection.zig");
@@ -261,6 +267,7 @@ test {
     _ = @import("scene/sim_api.zig");
     _ = @import("scene/sky_layer.zig");
     _ = @import("scene/snapshot.zig");
+    _ = @import("scene/softbody_tests.zig");
     _ = @import("scene/stats.zig");
     _ = @import("scene/tests.zig");
     _ = @import("scene/trail_layer.zig");
