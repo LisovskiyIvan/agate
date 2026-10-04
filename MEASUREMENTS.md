@@ -109,3 +109,45 @@ prepare/holdC при живом wall 16.667 ms, окклюзия окна) де�
 Было: 1.091/1.013/0.251 (артефакт) → прогретая полоса 1.01–1.18
 (±20%). Стало: медианы 1.045–1.078 (spread <5%). Gate ≥15% из волны 1
 снова разрешим: медиана — канонический сигнал для сравнений до/после.
+
+## Волна 2 (04.10.2026): vertex-pulled batching — отрицательный результат, прототип не строился
+
+API-фиasibility: ДА, блокера в sokol/shdc НЕТ. `sokol_gfx.h` (§storage
+buffers) документирует vertex pulling без `.layout` (vertexpull /
+instancing-pull samples) и shdc-синтаксис
+`layout(binding=N) readonly buffer` + `gl_VertexIndex` в `@vs`; тот же
+синтаксис уже живёт в дереве (`common/cluster.glsl` bindings 12–14,
+`particle_compute.glsl`), storage views биндятся через `views[]`
+(`draw.zig:652` `bindClusteredViews`). Пустой vertex layout валидацией
+не запрещён.
+
+Потолок сцены: батчить НЕЧЕГО. Gate-замер ниже (код не менялся):
+primary view рисует opaque=34/58/34 (по прогонам), opaque_inst=0,
+trans=6 (`mesh-vanish-probe` frame 0); в showcase ~61 distinct material
+(`createPBRMaterial|createStandardMaterial` в `sandbox_showcase.zig`).
+Единственная same-material группа (32 hidden gems, один `gem_mat`)
+за стеной и окклюдится — иначе заняла бы почти всю очередь из 34.
+Same-geometry группы (6 hysteresis orbs) — 6 РАЗНЫХ материалов
+(per-color), им нужен per-instance material indexing (вне bounded
+scope). Прототип (новое семейство шейдеров + пайплайны + merge staging
+поверх P4-снапшотов очередей) снял бы ~0 draws → gate ≥15% недостижим
+по построению. Не строим (прецедент волны 1, план Б); сложности без
+выигрыша не шипаем, откатывать нечего (`git status` чист в обоих
+worktree).
+
+Замер staged gpuSubmit 3×300 (same-machine, wall 16.667–16.669,
+occluded=[0,0,0], без изменений кода — сертификация harness):
+
+| метрика | run1 | run2 | run3 | spread |
+|---|---|---|---|---|
+| submit mean | 1.556 | 1.559 | 1.563 | 0.4% |
+| submit median | 1.541 | 1.546 | 1.551 | 0.6% |
+| submit p95 | 1.625 | 1.614 | 1.632 | 1.1% |
+
+Gates: `zig build test` exit 0 (зелёный; строка "failed command" —
+предсуществующий шум harness, как в волне 1).
+
+Дрейф: медиана 1.541–1.551 против baseline 1.045–1.078 (+47%) при
+чистых деревьях — machine-state, не код. Правило: абсолютные медианы
+между сессиями НЕ переносить; все сравнения до/после — только
+back-to-back внутри одной сессии (spread внутри сессии 0.6%).
