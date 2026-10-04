@@ -409,7 +409,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         const spot_bytes = @as(usize, SPOT_SHADOW_MAP_WIDTH) * SPOT_SHADOW_MAP_HEIGHT * 4;
         try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Spot Light Shadow Map", SPOT_SHADOW_MAP_WIDTH, SPOT_SHADOW_MAP_HEIGHT, .DEPTH, 1, spot_bytes);
 
-        // Reflection-probe cube targets (wave 25): one mipmapped color cube
+        // Reflection-probe cube targets: one mipmapped color cube
         // plus its depth target per captured probe. Same render-target
         // convention as the passes above (pure byte math, no GPU calls;
         // uncaptured probes own no target and contribute nothing).
@@ -422,7 +422,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
             try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, name, @intCast(probe_layer.face_resolution), @intCast(probe_layer.face_resolution), .RGBA16F, 1, probe_bytes);
         }
 
-        // 3D-GUI panel targets (wave 28): one RGBA8 color RT per panel with
+        // 3D-GUI panel targets: one RGBA8 color RT per panel with
         // a live target (probe precedent: pure byte math, no GPU calls;
         // panels without a target contribute nothing).
         for (0..scene.gui3d.panelCount()) |i| {
@@ -462,7 +462,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
     snap.render_targets = try rt_list.toOwnedSlice(self.allocator);
     snap.total_gpu_vram_bytes = snap.textures_vram_bytes + snap.meshes_vram_bytes + snap.render_targets_vram_bytes;
 
-    // P7 prepared-draw slots: retained CPU capacity across ALL rotation
+    // Prepared-draw slots: retained CPU capacity across ALL rotation
     // slots (same convention as the mesh CPU census above — capacities, not
     // lengths, because retention is the cost). One more slot of prepared
     // data appears here exactly like the existing ones.

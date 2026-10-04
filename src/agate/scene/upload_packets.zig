@@ -1,4 +1,4 @@
-//! Slot-owned dynamic-upload packets (producer freeze-then-latch slice 6,
+//! Slot-owned dynamic-upload packets (producer freeze-then-latch,
 //! phase 2 lock-free publication).
 //!
 //! Producer side (`stageUploads`, game/update phase, sg-free): copies every
@@ -7,7 +7,7 @@
 //! + indices, softbody verts + indices, greased verts + indices,
 //! pending-mesh creation geometry) plus frozen buffer ids / counts / bounds
 //! / allocation sizes. Empty-but-dirty owners freeze empty packets so the
-//! staged flush observes them exactly like the legacy flush. The producer
+//! staged flush observes them exactly like the quiesced drain. The producer
 //! clears each live dirty flag AT STAGE TIME (when it freezes the packet);
 //! a cancelled claim must not consume the upload, so `BuildClaim.cancel`
 //! re-arms every flag staged into the dropped slot via
@@ -104,7 +104,7 @@ fn stageMorphs(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
     for (scene.meshes.items, 0..) |m, i| {
         if (!m.morph_upload_needed) continue;
         const n = @min(m.morph_base.len, m.morph_staging.len);
-        // Empty staging still freezes an empty packet: the legacy flush
+        // Empty staging still freezes an empty packet: the quiesced drain
         // clears the flag unconditionally, so the staged flush must observe
         // it too instead of leaving a stale flag behind.
         const data_lo = slot.morph_data.items.len;
@@ -251,7 +251,7 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
         const vc: usize = tm.pending_vertex_count;
         const ic: usize = tm.pending_index_count;
         if (vc > tm.vertices.len or ic > tm.indices.len) continue;
-        // Empty-but-dirty freezes an empty packet: the legacy flush clears
+        // Empty-but-dirty freezes an empty packet: the quiesced drain clears
         // the flag and publishes index_count/bounds unconditionally.
         const v_lo = slot.trail_verts.items.len;
         const i_lo = slot.trail_indices.items.len;
@@ -290,7 +290,7 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
 fn stageSoftbodies(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.softbodies.bodies.items, 0..) |b, i| {
         if (!b.upload_pending) continue;
-        // Empty verts still freeze an empty packet: the legacy flush clears
+        // Empty verts still freeze an empty packet: the quiesced drain clears
         // the flag unconditionally. Indices are frozen alongside the verts
         // (grid topology is fixed at creation, but freezing keeps the staged
         // flush independent of every live array).
@@ -330,7 +330,7 @@ fn stageGreased(scene: anytype, slot: anytype, allocator: std.mem.Allocator) voi
     for (scene.greased_lines.items, 0..) |gl, i| {
         if (!gl.gpu_dirty) continue;
         // Empty verts still freeze an empty packet so a live context clears
-        // the flag exactly like the legacy flush. Indices are frozen
+        // the flag exactly like the quiesced drain. Indices are frozen
         // whenever a full upload may be needed: the staged full flag, or
         // missing live buffers (the flush will create them, which forces a
         // full index upload there).
@@ -375,7 +375,7 @@ fn stagePendingMeshes(scene: anytype, slot: anytype, allocator: std.mem.Allocato
     for (scene.meshes.items, 0..) |m, i| {
         if (!m.gpu_pending) continue;
         // Degenerate geometry still freezes a (possibly empty) packet: the
-        // legacy finish attempts creation whenever gpu_pending is set, so
+        // drain's finish attempts creation whenever gpu_pending is set, so
         // the staged flush must observe the same owner instead of skipping
         // it silently.
         //
@@ -542,7 +542,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
         var ibuf: sg.Buffer = .{};
         if (up.dynamic_update) {
             // Vertex creation through the canonical mesh seam (same descs as
-            // the legacy finish; frozen slot bytes, never live mesh state).
+            // the drain's finish; frozen slot bytes, never live mesh state).
             // Index creation stays a regular sg.makeBuffer here.
             vbuf = mesh_deferred.makeDeferredMeshVertexBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
@@ -757,10 +757,8 @@ fn flushParticleGpu(scene: anytype, slot: anytype) void {
 }
 
 fn flushParticleCompute(scene: anytype, slot: anytype) void {
-    // Direct staged upload from packet bytes (phase 2): the legacy
-    // helper's frozen-window memcpy reinstall into the live staging array
-    // is DELETED — no live staging bytes drive uploads, only frozen
-    // counts. No live reads, no live writes: creation/dispatch run on
+    // Direct staged upload from packet bytes: no live staging bytes
+    // drive uploads, only frozen counts. No live reads, no live writes: creation/dispatch run on
     // frozen ids + frozen capacity, outcomes ride the descriptor for the
     // game-side commit (ring advance, dt consume, handle installs,
     // unsupported latch) or stay undelivered for retry.
@@ -772,13 +770,13 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
         if (end > slot.p_compute_data.items.len) continue;
         if (!sg.isvalid()) {
             // Headless: full no-op that records undelivered for retry,
-            // exactly like the legacy helper's `if (!sg.isvalid()) return`.
+            // exactly like the drain's `if (!sg.isvalid()) return`.
             // The frozen bytes stay in the slot; the next funded build
             // re-freezes from the intact live window.
             continue;
         }
         if (!compute.supported()) {
-            // Latch unsupported context-side (mirrors the legacy helper:
+            // Latch unsupported context-side (mirrors the direct drain:
             // never a silent fallback, never a retry spin) — published
             // through the outcome, installed by the commit.
             up.unsupported = true;
@@ -1003,7 +1001,7 @@ fn flushTrails(scene: anytype, slot: anytype) void {
         } else {
             // Headless: an empty packet with no creation still delivers
             // (the commit publishes the zero scalars exactly like the
-            // legacy flush, consuming the generation); any payload or
+            // quiesced drain, consuming the generation); any payload or
             // creation need records undelivered for retry once a context
             // exists. Uploading to a zero id headless would be a no-op
             // mistaken for delivery, so the zero-id + payload case also
@@ -1083,11 +1081,9 @@ fn flushGreased(scene: anytype, slot: anytype) void {
         const i_end = up.index_lo + up.index_count;
         if (i_end > slot.greased_indices.items.len) continue;
         // Headless rule (see flushTrails): empty + existing targets still
-        // delivers (consumes the generation exactly like the legacy
-        // `if (!sg.isvalid()) return`-with-retain... no — the legacy path
-        // RETAINS the flag headless for retry. Match it: headless always
-        // records undelivered; the commit re-arms for retry once a context
-        // exists.
+        // delivers — the generation is consumed. Headless always records
+        // undelivered (the flag is retained for retry); the commit re-arms
+        // for retry once a context exists.
         if (!sg.isvalid()) continue;
         var vertex_id = up.vertex_buffer_id;
         var index_id = up.index_buffer_id;
@@ -1105,7 +1101,7 @@ fn flushGreased(scene: anytype, slot: anytype) void {
                 if (vb.id != 0) sg.destroyBuffer(vb);
                 if (ib.id != 0) sg.destroyBuffer(ib);
                 // Creation failed (pool exhaustion or FAILED state):
-                // undelivered, the commit re-arms for retry like the legacy
+                // undelivered, the commit re-arms for retry like the drain's
                 // path.
                 continue;
             }
@@ -1362,7 +1358,7 @@ fn commitParticleCompute(scene: anytype, front: anytype) void {
             up.dispatches = 0;
         }
         if (up.unsupported) {
-            // Backend without compute support (mirrors the legacy helper):
+            // Backend without compute support (mirrors the direct drain):
             // latch unsupported, drop the pending flags — never a silent
             // fallback, never a retry spin.
             ps.compute_known_unsupported = true;
@@ -1623,7 +1619,7 @@ fn commitTrails(scene: anytype, front: anytype) void {
         // buffers are only ever created from zero and nothing ever zeroes
         // them back, so a delivered outcome with zero live ids and no
         // created handles is the never-created manual/deferred fixture —
-        // the legacy flush likewise skips the upload and still publishes
+        // the quiesced drain likewise skips the upload and still publishes
         // the scalars below.
         // Scalar publish (index_count/bounds), skipped when a newer
         // producer mutation is already pending (live gpu_dirty set after
@@ -1669,7 +1665,7 @@ fn commitSoftbodies(scene: anytype, front: anytype) void {
         }
         // NOTE: no zero-target re-arm (see commitTrails): soft buffers are
         // only ever created from zero and nothing ever zeroes them back;
-        // the legacy flush likewise skips the upload and consumes the
+        // the quiesced drain likewise skips the upload and consumes the
         // generation. (Soft publishes no scalars.)
     }
 }
@@ -1778,8 +1774,8 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
         // Staged GPU-morph delta texture (see the module header): installed
         // atomically with the base buffers above, so the mesh leaves
         // gpu_pending fully drawable — no base-pose frame, no missing-view
-        // panic. The legacy fallback finish still owns meshes that never
-        // went through a staged build.
+        // panic. The quiesced drain still owns meshes that never went
+        // through a staged build.
         if (up.morph_delta_pending) {
             if (m.morph_delta_image.id != 0 or m.morph_delta_view.id != 0) {
                 // Defensive only (in practice only the context creates, so
@@ -1804,7 +1800,7 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
         if (up.dynamic_update) m.morph_upload_needed = true;
         m.pending_dynamic_update = false;
         // The retained CPU mirrors (cpu_positions/cpu_indices) stay — the
-        // legacy finish keeps them too; only the consumed pending copy is
+        // drain's finish keeps them too; only the consumed pending copy is
         // freed, game-side (the allocator is thread-safe).
         if (m.pending_vertices.len > 0) {
             scene.allocator.free(m.pending_vertices);

@@ -5,16 +5,16 @@
 //! ride these same queues — Trail.update stages CPU-side and the prepare
 //! flush uploads before the queue build bakes the values), plus the
 //! game-side UI CPU packet staging (`ui_vertices`/`ui_indices` + `ui_packet`
-//! header, CPU geometry only — the committed P6 `UiFrame` itself stays
+//! header, CPU geometry only — the committed `UiFrame` itself stays
 //! single-owned outside the slots); particles, physics-debug lines, and sky
 //! carry their own prepared frames/payloads — never these slots.
 //!
 //! Ownership / lifecycle block:
 //! - Owns only CPU-side queue storage (ArrayList buffers, skin/shader copies,
 //!   sort-order entries). GPU handles inside items (buffers/views/samplers/
-//!   pipelines) are BORROWED under the phase mutex / P3 epoch discipline —
+//!   pipelines) are BORROWED under the phase mutex / retire-epoch discipline —
 //!   this buffer never destroys them, never duplicates GPU buffers, and never
-//!   changes the P3 retire algorithm. CPU slot retention is NOT a GPU
+//!   changes the retire algorithm. CPU slot retention is NOT a GPU
 //!   lifetime pin: a retained slot may reference handles a GpuRetire flush
 //!   already destroyed.
 //! - Sequential phase contract: ONE pending frame, no concurrent
@@ -242,7 +242,7 @@ pub const StagedInstanceRecord = mesh_mod.StagedInstanceRecord;
 /// (`upload_packets.flushSlotUploads`) instead of any live mutable array.
 /// All descriptors are plain integers (tokens/ids/counts/offsets); the byte
 /// payloads live in the sibling flattened lists below. Buffer ids are
-/// borrowed values under the P3 epoch discipline (never destroyed/retired
+/// borrowed values under the retire-epoch discipline (never destroyed/retired
 /// through the packet). `reset` clears lengths retaining capacity; `deinit`
 /// frees; `cpuBytes` counts retained capacities.
 pub const MorphUpload = struct {
@@ -345,7 +345,7 @@ pub const ParticleComputeUpload = struct {
     /// Backend without compute support latched context-side
     /// (context-written): the game-side commit publishes it into
     /// `compute_known_unsupported` and drops the pending flags, mirroring
-    /// the legacy helper — never a silent fallback, never a retry spin.
+    /// the direct drain — never a silent fallback, never a retry spin.
     unsupported: bool = false,
     /// Actual dispatches issued by the staged flush for this packet
     /// (context-written, `+= 1` after each real `sg.dispatch`): the
@@ -444,8 +444,8 @@ pub const PendingMeshUpload = struct {
     /// those frozen bytes alongside the vertex/index buffers, and the
     /// game-side commit installs everything atomically — the per-frame CPU
     /// blend stays gone on the GPU path with no base-pose frame. False for
-    /// every non-morph and CPU-morph mesh (no bytes frozen, legacy paths
-    /// untouched).
+    /// every non-morph and CPU-morph mesh (no bytes frozen; non-GPU-morph
+    /// paths untouched).
     morph_delta_pending: bool = false,
     delta_lo: usize = 0,
     delta_count: usize = 0,
@@ -476,7 +476,7 @@ pub const FrameDrawSlot = struct {
     /// `buildQueuesInto` from `Scene.highlights`, consumed by the PASS 2.85
     /// mask/blur stage in `PostFXStack.renderChain`. No skin store: v1
     /// stages no skin matrices (skinned meshes are skipped at capture).
-    /// Borrowed GPU handles under the P3 epoch discipline, same as
+    /// Borrowed GPU handles under the retire-epoch discipline, same as
     /// outline_items above.
     highlight_items: std.ArrayListUnmanaged(HighlightDrawItem) = .empty,
     shadow: PreparedShadowDraws = .{},

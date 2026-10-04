@@ -13,6 +13,80 @@
 при этом создание сцены остаётся простым, как в Babylon. Не копировать Unreal
 целиком и не добавлять архитектуру без проверяемого потребителя.
 
+## TODO-ledger (05.10.2026, волна 3)
+
+Приоритетный порядок следующих волн. Каждая требует гейтов (CPU golden +
+Metal native + browser WebGPU legs) перед закрытием.
+
+### A. Материалы/свет — консолидация (аудит п.7)
+
+Карта готова (инвентаризация 04.10.2026), порядок строгий:
+
+1. PBR-эквивалент matte: правило конверсии `specular_color/power →
+   roughness` до удаления Standard (`material/standard.zig:45`,
+   `shaders/standard.glsl:178`).
+2. Миграция `createStandardMaterial` → `createPBRMaterial`: demos (sandbox
+   stands ~15 сайтов, `sandbox_scene.zig:518-627`, showcase, bench ~8,
+   `examples/render_target_basic.zig:242-255`, `softbody.zig:724`).
+   glTF уже PBR-only. Демо сначала, engine-дефолты последними.
+3. `default_material` → PBR-backed (`scene/core.zig:243`,
+   `material/draw_record.zig:118-241`, `scene/render_queue/cull.zig:92`).
+4. Замена top-K ДО удаления: clustered spot storage (pos/range/dir/углы) +
+   atlas pages + caster selection (`scene/light_rig.zig:291-444`,
+   `lights/clustered.zig:8-15`, `passes/shadow/*`). Только после — удаление
+   top-K point/spot lanes.
+5. Удаление `standard.glsl`, `instanced.glsl`, Standard draw branch
+   (`draw_record.zig:201-225`), serialization kind cleanup (writer/reader
+   v3: старые файлы обязаны читаться).
+   Unlit/stylized/ShaderMaterial — продуктовые фичи, НЕ удаляются.
+   Риски: сериализационные байты, pinned Standard math в
+   `material/tests.zig:517-571`, никаких silent fallback'ов.
+
+### B. Чистка комментариев (продолжение)
+
+Готово: `scene/core.zig`. Осталось: `scene/postfx_stack.zig`,
+`passes/postprocess_pass.zig`, `profiler/snapshot.zig`,
+`scene/frame_draws.zig`, `scene/upload_packets.zig` — убрать волновую
+нумерацию/исторические сравнения, сохранить контракты threading/ownership.
+Затем `scene/tests.zig` (8k строк) — разбиение на доменные файлы (отдельная
+волна, не раньше материалов).
+
+### C. Качество графики — волны к Unreal-уровню (порядок по стоимости/эффекту)
+
+1. **Auto-exposure** (S): histogram/ luminance buffer → экспозиция кадра;
+   сейчас только manual (`postprocess/hdr.zig`). Гейт: CPU golden steps +
+   сцена 1/4/16 без клипа.
+2. **GGX IBL** (M): prefilter probe mips (сейчас box-усреднение,
+   `shaders/probe_mip.glsl`), irradiance, probe blending. Гейт: PBR-сцена
+   с ENV-only светом.
+3. **Velocity/TAA** (M): rigid+skinned+instanced velocity buffers → TAA
+   без ghosting в движении; потом reconstruction/upscaling. Гейт:
+   вращающаяся сцена, CPU golden репроекции.
+4. **Clustered shadows** (M): spot/point shadow pages в atlas + routing
+   (зависит от A.4).
+5. **Screen-space: GPU depth pyramid** (M): для SSR/SSAO/Hi-Z culling;
+   сейчас CPU-пирамида (`visibility/`).
+6. **Contact shadows / локальный AO** (S): дёшево, видимо.
+7. **Local tonemapping + film LUT** (S): grading уже частично есть.
+8. **GI** (L): DDGI или baked probes — только после IBL; не раньше.
+   Не делать: deferred switch, mesh shaders, RTX — D3D11/sokol floor.
+
+### D. Перф — замерить перед оптимизацией
+
+- `bench-threads`/`phase_metrics`: добавить GPU-pass breakdown (timing API
+  уже `?Sample`), per-frame alloc tally в staged слотах.
+- Кандидаты по коду (проверить замером): per-draw uniform uploads в
+  `scene/draw.zig`, instance CPU sort в `instance_staging.zig`, bloom mip
+  count 3..7 vs fullscreen passes, occlusion CPU cost, jobs pool sizing.
+- Холодные пути (init, load) не трогать. После A.1-3 перезапустить
+  agate-vs-Babylon bench на новой цепочке (не acceptance, метрика регресса).
+
+### E. Прочее
+
+- `render_target.zig`: 1 тест остался inline (private coupling) — вынести
+  при следующем касании файла.
+- App-обёртка (секция ниже) — после A, до C.3.
+
 ## TODO: обёртка App над окном sokol (двухуровневый API)
 
 Движок должен закрывать весь жизненный цикл приложения, а не только кадр:
