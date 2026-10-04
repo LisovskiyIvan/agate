@@ -9,7 +9,7 @@ pub const sokol = @import("sokol");
 // without touching any engine source: the snippet is merged into the base
 // template's hook markers at build time (see
 // src/agate/shader_material/merge.zig), compiled by sokol-shdc under
-// glsl430 + metal_macos + hlsl5 (glsl430: the base templates carry the
+// glsl430 + metal_macos + hlsl5 + wgsl (glsl430: the base templates carry the
 // wave-30 clustered storage blocks, and SSBO syntax needs GLSL 4.30+),
 // and registered in the runtime registry
 // under `name`. Engine side picks it up by name:
@@ -28,8 +28,8 @@ pub const sokol = @import("sokol");
 //
 // Hooks: vertex (vs, morphed_pos/morphed_nrm), albedo, emissive (pbr only),
 // post_lighting, decls (owned by the generated user uniform block).
-// Snippets must be plain statement-level GLSL valid for GLSL 430, Metal and
-// HLSL 5 (the merge output is compiled under all three slangs).
+// Snippets must be plain statement-level GLSL valid for GLSL 430, Metal,
+// HLSL 5 and WGSL (the merge output is compiled under all four slangs).
 // ---------------------------------------------------------------------------
 pub const UserShaderMaterial = struct {
     /// Registry name ([a-z0-9_]); also the runtime lookup key (Wyhash).
@@ -46,7 +46,7 @@ pub const user_shader_materials = [_]UserShaderMaterial{
     // Material library v1 presets (see src/agate/material_library.zig):
     // procedural Sky/Gradient/Grid/TriPlanar constructors over the same
     // hook-merge pipeline. Each entry compiles its snippet into the
-    // standard template under glsl430/metal_macos/hlsl5 at build time.
+    // standard template under glsl430/metal_macos/hlsl5/wgsl at build time.
     .{ .name = "matlib_sky", .snippet = "examples/shader_materials/matlib_sky.glsl" },
     .{ .name = "matlib_gradient", .snippet = "examples/shader_materials/matlib_gradient.glsl" },
     .{ .name = "matlib_grid", .snippet = "examples/shader_materials/matlib_grid.glsl" },
@@ -97,8 +97,14 @@ pub const user_shader_materials = [_]UserShaderMaterial{
 // `@import("math")`, wired here to agate's math facade.
 // ---------------------------------------------------------------------------
 
-/// Engine and user shaders share the supported Metal/WebGPU graphics floor.
+/// Engine and user shaders share the supported graphics floor:
+/// Metal on macOS, WebGPU on browser, D3D11 on Windows (sokol auto backend),
+/// OpenGL 4.3 on Linux. One shdc invocation compiles every leg, so a broken
+/// leg fails the build here — never silently at runtime on another OS.
+/// No glsl410/WebGL fallback: SSBO storage blocks need GLSL 4.30+.
 pub const engine_shader_slang = sokol.shdc.Slang{
+    .glsl430 = true,
+    .hlsl5 = true,
     .metal_macos = true,
     .wgsl = true,
 };
@@ -112,8 +118,8 @@ pub const UserShaderSpec = struct {
     /// Generated file name; default "<name>.zig".
     output: ?[]const u8 = null,
     /// Slang set; default engine_shader_slang. shdc compiles every leg in
-    /// one invocation, so a broken Metal/HLSL leg fails the build here —
-    /// never silently at runtime on another OS.
+    /// one invocation, so a broken GLSL430/Metal/HLSL5/WGSL leg fails the
+    /// build here — never silently at runtime on another OS.
     slang: ?sokol.shdc.Slang = null,
     /// Must match the target/optimize of the downstream's agate dependency
     /// (used to resolve agate's sokol/shdc instances for this build).
@@ -277,9 +283,12 @@ pub fn build(b: *Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     const is_web = target.result.cpu.arch.isWasm();
-    const opt_wgpu = b.option(bool, "wgpu", "Force WebGPU (default: true for web)") orelse is_web;
+    // No `-Dwgpu` option: WebGPU is forced on web (`.wgpu = is_web`),
+    // native targets use the sokol auto backend (macOS Metal, Windows
+    // D3D11, Linux GL). A stray `-Dwgpu=...` is an unknown-option error,
+    // never a silent reroute; native WebGPU is unsupported.
+    const opt_wgpu = is_web;
     if (is_web and !opt_wgpu) return error.WebGPURequired;
-    if (!is_web and target.result.os.tag != .macos and !opt_wgpu) return error.ModernGraphicsBackendRequired;
 
     const dep_sokol = b.dependency("sokol", .{
         .target = target,
@@ -294,7 +303,8 @@ pub fn build(b: *Build) !void {
     }
     const mod_math = b.createModule(.{ .root_source_file = b.path("src/agate/math.zig") });
 
-    // Шейдеры: единая таблица "имя модуля -> вход/выход", slang общий для всех.
+    // Шейдеры: единая таблица "имя модуля -> вход/выход", slang общий для всех
+    // (engine_shader_slang: glsl430 + hlsl5 + metal_macos + wgsl).
     // NOTE: SHADOW_ATLAS_SIZE не передаётся через .defines: sokol-shdc этой
     // версии разворачивает любой дефайн в `#define NAME (1)` (проверено запуском
     // бинарника в /tmp: форма NAME=VALUE игнорируется с варнингом, форма
@@ -304,7 +314,7 @@ pub fn build(b: *Build) !void {
         name: []const u8,
         input: []const u8,
         output: []const u8,
-        /// Per-module override; default is Metal + WGSL. Compute support
+        /// Per-module override; default engine_shader_slang. Compute support
         /// still requires the runtime sg.queryFeatures().compute gate.
         slang: ?sokol.shdc.Slang = null,
         /// Шейдер содержит `// @include` директивы: перед shdc запускается
@@ -333,8 +343,8 @@ pub fn build(b: *Build) !void {
         // probe_mip.glsl is deliberately excluded (no Y-flip line).
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig", .includes = true },
         .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig", .includes = true },
-        // Stateful compute particles (wave 25): compute slang set (410 has
-        // no compute); runtime availability still gates on
+        // Stateful compute particles (wave 25): engine slang set (GLSL 4.30
+        // carries the SSBO blocks); runtime availability still gates on
         // compute.supported(), see src/agate/compute.zig.
         .{
             .name = "particle_compute_shader",
@@ -904,12 +914,11 @@ fn createShaderMaterialRegistry(
         // 2. Expand `// @include` directives in the merged GLSL (base
         // templates share common/*.glsl chunks; merge passes directives
         // through untouched) and run sokol-shdc on the result — same
-        // slangs as the engine forward shader table (glsl430 /
-        // metal_macos / hlsl5: hook materials inherit the clustered
-        // storage blocks from the templates, and SSBO syntax needs GLSL
-        // 4.30+). sokol.shdc's createModule only accepts build-root
-        // paths, so the invocation is replicated here to feed it the
-        // merge+expand steps' LazyPath outputs.
+        // engine_shader_slang as the engine shader table (hook materials
+        // inherit the clustered storage blocks from the templates, and
+        // SSBO syntax needs GLSL 4.30+). sokol.shdc's createModule only
+        // accepts build-root paths, so the invocation is replicated here
+        // to feed it the merge+expand steps' LazyPath outputs.
         // argv[0] = the sokol-shdc binary (resolved eagerly like
         // sokol.shdc does for zig 0.16).
         const run_expand = b.addRunArtifact(expand_tool);
@@ -920,7 +929,7 @@ fn createShaderMaterialRegistry(
         run_expand.addArg("--output");
         const expanded_glsl = run_expand.addOutputFileArg(b.fmt("shader_mat_{s}_expanded.glsl", .{mat.name}));
         const run_shdc = b.addSystemCommand(&.{shdc_exe.getPath(b)});
-        run_shdc.addArgs(&.{ "-l", "glsl430:metal_macos:hlsl5:wgsl", "-f", "sokol_zig" });
+        run_shdc.addArgs(&.{ "-l", includeSlangToString(b, engine_shader_slang), "-f", "sokol_zig" });
         run_shdc.addArg("--input");
         run_shdc.addFileArg(expanded_glsl);
         run_shdc.addArg("--output");

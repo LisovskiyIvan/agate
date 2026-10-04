@@ -391,6 +391,9 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .width = 800,
         .height = 600,
         .sample_count = 1,
+        // Desktop GL floor for the cluster storage buffers (Linux); Metal
+        // and D3D11 ignore this field.
+        .gl = .{ .major_version = 4, .minor_version = 3 },
         .wgpu_gpu_timing_enabled = z.gpu_timing.isEnabled(),
         .logger = .{ .func = slog.func },
     });

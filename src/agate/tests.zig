@@ -79,6 +79,7 @@ test {
     _ = @import("loader/gltf_util.zig");
     _ = @import("loader/lights.zig");
     _ = @import("loader/materials.zig");
+    _ = @import("loader/materials_tests.zig");
     _ = @import("loader/mesh_spawn.zig");
     _ = @import("loader/meshopt.zig");
     _ = @import("loader/meshopt_fuzz.zig");
@@ -129,6 +130,7 @@ test {
     _ = @import("particles/collisions.zig");
     _ = @import("particles/collisions_tests.zig");
     _ = @import("particles/compute_mode.zig");
+    _ = @import("particles/compute_mode_tests.zig");
     _ = @import("particles/cpu.zig");
     _ = @import("particles/flow.zig");
     _ = @import("particles/gpu.zig");
@@ -143,6 +145,7 @@ test {
     _ = @import("passes/mod.zig");
     _ = @import("passes/msaa_depth_pass.zig");
     _ = @import("passes/outline_pass.zig");
+    _ = @import("passes/outline_pass_tests.zig");
     _ = @import("passes/particle_pass.zig");
     _ = @import("passes/postprocess_pass.zig");
     _ = @import("passes/shadow/binning.zig");
@@ -177,6 +180,7 @@ test {
     _ = @import("postprocess/dof.zig");
     _ = @import("postprocess/glow.zig");
     _ = @import("postprocess/hdr.zig");
+    _ = @import("postprocess/hdr_tests.zig");
     _ = @import("postprocess/highlight.zig");
     _ = @import("postprocess/lut.zig");
     _ = @import("postprocess/options.zig");
@@ -194,7 +198,9 @@ test {
     _ = @import("profiler/types.zig");
     _ = @import("ragdoll.zig");
     _ = @import("render_target.zig");
+    _ = @import("render_target_tests.zig");
     _ = @import("runtime.zig");
+    _ = @import("runtime_tests.zig");
     _ = @import("scene.zig");
     _ = @import("scene/animation_runtime.zig");
     _ = @import("scene/attachments.zig");
@@ -209,9 +215,11 @@ test {
     _ = @import("scene/frame_api.zig");
     _ = @import("scene/frame_build.zig");
     _ = @import("scene/frame_draws.zig");
+    _ = @import("scene/frame_draws_tests.zig");
     _ = @import("scene/frame_prepare.zig");
     _ = @import("scene/frame_render.zig");
     _ = @import("scene/gpu_retire.zig");
+    _ = @import("scene/gpu_retire_tests.zig");
     _ = @import("scene/gui3d_layer.zig");
     _ = @import("scene/highlight_layer.zig");
     _ = @import("scene/instance_staging.zig");
@@ -260,6 +268,7 @@ test {
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/uniforms.zig");
     _ = @import("scene/upload_packets.zig");
+    _ = @import("scene/upload_packets_tests.zig");
     _ = @import("scene/view_render.zig");
     _ = @import("scene/viewport_clear.zig");
     _ = @import("serialization.zig");

@@ -121,9 +121,9 @@ const scene_retire = @import("gpu_retire.zig");
 const scene_ui_frame = @import("ui_frame.zig");
 const UiFrame = scene_ui_frame.UiFrame;
 const scene_frame_draws = @import("frame_draws.zig");
-/// P7 published consumable draw payload (one coherent prepared frame).
+/// Published consumable draw payload (one coherent prepared frame).
 const FrameDrawSlot = scene_frame_draws.FrameDrawSlot;
-/// P7 three retained owning queue slots (the variable-list triple buffer
+/// Three retained owning queue slots (the variable-list triple buffer
 /// with a consumer pin/lease protocol).
 const FrameDraws = scene_frame_draws.FrameDraws;
 const scene_draw = @import("draw.zig");
@@ -213,14 +213,13 @@ pub const Scene = struct {
 
     // ---- Content registries (kept flat: external code iterates them). ----
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    /// P3: очередь ретенции GPU-мешей с epoch-семантикой
+    /// Очередь ретенции GPU-мешей с epoch-семантикой
     /// (scene/gpu_retire.zig). destroyMesh вне context-потока только отвязывает
     /// меш и кладёт его сюда (retireMesh — с любого потока); уничтожает
     /// (sg.* + free) только context-поток во flush (начало кадра) и в deinit.
     /// Уже отвязанные меши невидимы для deinitMeshes — двойного free нет.
-    /// Tripwire P6: новые kind'ы записей (не только меши/буферы) добавлять в
-    /// GpuRetireQueue, новых очередей в Scene не заводить. (P5 — instance
-    /// buffer payload — уже там: см. retireBuffer.)
+    /// Новые kind'ы записей (не только меши/буферы) добавлять в
+    /// GpuRetireQueue, новых очередей в Scene не заводить.
     gpu_retire: scene_retire.GpuRetireQueue = .{},
     /// Epoch, начатый последним staged begin. render завершает его на ВСЕХ
     /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
@@ -277,16 +276,16 @@ pub const Scene = struct {
     shadows: scene_shadow.ShadowSystem,
     // Skybox texture/exposure + IBL intensity + skybox pass.
     sky: scene_sky.SkyboxLayer,
-    // Reflection probes (wave 25, v1): on-demand cube captures feeding the
+    // Reflection probes: on-demand cube captures feeding the
     // PBR/standard ambient terms. Empty by default: with no enabled probe
-    // every draw takes today's ambient/skybox path bit-identically.
+    // every draw takes the ambient/skybox path bit-identically.
     probes: scene_probes.ProbeLayer = .{},
-    // Clustered forward point lights (wave 30, v1): render-owned tile
-    // scratch + storage buffers for the EXTRA pool beyond the legacy
-    // lanes. Empty by default: with no clustered light staged every draw
-    // takes the exact legacy path (zeroed lanes, count uniform 0).
+    // Clustered forward point lights: render-owned tile
+    // scratch + storage buffers for the EXTRA pool beyond the
+    // fixed lanes. Empty by default: with no clustered light staged every
+    // draw takes the default path (zeroed lanes, count uniform 0).
     clustered: scene_clustered.ClusteredGpuCache = .{},
-    // 3D GUI panels (wave 28, v1): on-demand world-space UI quads. Empty
+    // 3D GUI panels: on-demand world-space UI quads. Empty
     // by default: with no panels every capture/draw hook early-outs with
     // zero sg.* calls, so rendering stays bit-identical.
     gui3d: scene_gui3d.Gui3dLayer = .{},
@@ -298,7 +297,7 @@ pub const Scene = struct {
     refraction: @import("refraction.zig").RefractionCapture = .{},
     // Particle systems + billboard pass.
     particles: scene_particles.ParticleLayer,
-    /// Stage 3, slice 2: light selection + packing (including the
+    /// Light selection + packing (including the
     /// incumbency-hysteresis fade simulation) runs in `updateLights`
     /// during the update phase and publishes through this mailbox; render
     /// takes the newest pack at frame start. Plain data end to end, so
@@ -331,16 +330,16 @@ pub const Scene = struct {
     nav: scene_nav.NavLayer = .{},
     // Physics world + debug wireframe overlay.
     physics: scene_physics.PhysicsIntegration = .{},
-    // PBD cloth bodies + their deformable meshes (wave 29, v1). Empty by
+    // PBD cloth bodies + their deformable meshes. Empty by
     // default: every hook early-outs over an empty list, so update and
     // rendering stay bit-identical with no soft bodies.
     softbodies: SoftBodyLayer = .{},
     // Per-frame draw queues + instance staging.
-    // P7 triple buffer: three retained owning slots encompassing PRIMARY +
+    // Triple buffer: three retained owning slots encompassing PRIMARY +
     // ALL PIP view queues, outline items+skins, and prepared shadow
     // items+skins+bin ranges. prepare builds a back slot, render reads the
     // published front slot via preparedDraws() — the ONLY low-level draw
-    // accessor (no legacy field aliases) — while holding a consumer pin on
+    // accessor — while holding a consumer pin on
     // it (see scene/frame_draws.zig for the ownership/lifecycle contract
     // and the pin/lease protocol).
     draws: scene_frame_draws.FrameDraws = .{},
@@ -398,11 +397,11 @@ pub const Scene = struct {
 
     // Highlighted meshes for the inverse-hull outline (postfx holds the
     // settings + pass). Kept flat: mock scenes in mesh tests construct it.
-    // The prepared outline items+skins live in the P7 slots (preparedDraws).
+    // The prepared outline items+skins live in the slots (preparedDraws).
     outline_meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
     // Per-mesh highlight entries (highlight layer v1, mask-RT inner glow).
     // Fixed-size layer (no allocation, no deinit — the entries borrow the
-    // mesh pointers; the staged items+handles live in the P7 slots). Empty
+    // mesh pointers; the staged items+handles live in the slots). Empty
     // by default: with zero highlights the whole mask/blur/composite chain
     // is gated off and rendering stays bit-identical.
     highlights: scene_highlight.HighlightLayer = .{},
@@ -412,7 +411,7 @@ pub const Scene = struct {
     /// so threaded applications must keep update-vs-prepare exclusion
     /// (producer update, consumer prepare); update may overlap render.
     frame_handoff: handoff_mod.Handoff(scene_snapshot.SceneFrameSnapshot, 2) = .{},
-    /// Prepare-side working/compat copy of the frame snapshot (wave 27):
+    /// Prepare-side working/compat copy of the frame snapshot:
     /// the fallback prepare path latches the mailbox (or a fresh pack) here
     /// and immediately stages it into the consumed back slot
     /// (`FrameDrawSlot.snapshot`); the build path mirrors the staged slot
@@ -466,13 +465,13 @@ pub const Scene = struct {
     /// pacing/timestamps are real.
     profiler_frame_seq: u64 = 0,
 
-    /// Stage 1 producer-build handoff (game/update phase → prepare latch):
+    /// Producer-build handoff (game/update phase → prepare latch):
     /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages the full
     /// frame payload into a claimed slot and publishes its generation.
     /// The staged begin consumes the build when `build_seq !=
     /// last_latched_seq` and otherwise returns null (no fresh frame:
     /// the context reuses the last front or skips the present).
-    /// Handoff edge (wave 30, atomic): `build_seq` is release-stored by the
+    /// Handoff edge (atomic): `build_seq` is release-stored by the
     /// producer (`BuildClaim.publish`) only after the whole build payload is
     /// staged (slot queues/records/snapshot/stats, frozen particle/physics
     /// slot captures, `build_slot`), and acquire-loaded by the staged begin (
@@ -497,8 +496,8 @@ pub const Scene = struct {
     /// it after observing a fresh seq and asserts it still is the back index
     /// (no intervening publish).
     build_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// Cooperative game-side yield for the concurrent-build path (wave 38,
-    /// contention-yield): nanoseconds the game thread parks inside
+    /// Cooperative game-side yield for the concurrent-build path
+    /// (contention-yield): nanoseconds the game thread parks inside
     /// `tryClaimBuildSlot` — but ONLY when the previous build is still
     /// unconsumed (`build_seq != last_latched_seq`) — when nonzero.
     /// Default 0 = OFF: the default (phase-locked) path never sets it, so
@@ -509,9 +508,7 @@ pub const Scene = struct {
     /// overproducing (hundreds of builds/s vs 60 latched frames/s), so
     /// parking before reserving the next slot donates its core to the
     /// context thread's prepare/render + pool workers instead of burning
-    /// CPU on builds the latch will supersede — the phase mutex used to
-    /// provide this yield implicitly by parking the game on contention
-    /// (§6.38 diagnosis). Backpressure, not a flat tax: when the consumer
+    /// CPU on builds the latch will supersede. Backpressure, not a flat tax: when the consumer
     /// is caught up the claim proceeds immediately (freshness preserved,
     /// zero added latency); the park also runs BEFORE the lease reserve,
     /// so no WRITING slot is ever held while parked. Overhead when
@@ -552,10 +549,10 @@ pub const Scene = struct {
     build_cache_seq: u64 = 0,
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
-    /// P6 render-owned UI frame: the staged prepare latches the claimed
+    /// Render-owned UI frame: the staged prepare latches the claimed
     /// slot's staged packet and uploads at the prepare/context
     /// boundary; render draws this frame (upload-free), never the live
-    /// canvas. Single-frame Scene ownership, no registry, no P7 overlap.
+    /// canvas. Single-frame Scene ownership, no registry.
     ui_frame: UiFrame = .{},
 
     // Built-in flight recorder & memory profiler.
@@ -607,7 +604,7 @@ pub const Scene = struct {
                 .intensity = 1.0,
             }),
             // Stays on core (NOT render): ShadowPass.prepareInto funds the
-            // core-owned P7 slot payloads (`back.shadow` in queue_builder)
+            // core-owned slot payloads (`back.shadow` in queue_builder)
             // with the pass's stored allocator, so it must equal core —
             // routing it to render would free slot memory across domains.
             .shadows = scene_shadow.ShadowSystem.init(allocator),
@@ -1282,21 +1279,20 @@ pub const Scene = struct {
         scene_frame.publishFrameSnapshot(self, aspect, cur_w, cur_h);
     }
 
-    /// Stage 3: prepares GPU uploads and acquires the frame-level snapshot.
+    /// Prepares GPU uploads and acquires the frame-level snapshot.
     /// Phase contract (actual update||render): prepare + render run
     /// SEQUENTIALLY on the context thread (next prepare NEVER concurrent
     /// with render); update-vs-prepare stay excluded under phase_mutex, but
-    /// update CAN overlap render — so phase ownership NO LONGER spans
-    /// staged prepare AND render, only update-vs-prepare. The draw phase
-    /// therefore reads ONLY render-owned captures: P4 mesh payload
+    /// update CAN overlap render. The draw phase
+    /// therefore reads ONLY render-owned captures: mesh payload
     /// (regular/instanced очереди, shadow-bins, outline-items — trails
     /// included: Trail.update is CPU-only staging, the prepare flush
-    /// uploads it, and P7 bakes handle/model/count values), P6 UI frame,
+    /// uploads it, and the slots bake handle/model/count values), UI frame,
     /// physics-debug capture + committed upload, particle prepared frame,
     /// sky params + default texture copies (snapshot), light pack
     /// (snapshot). Живые Mesh/Material/Skeleton/мир физики/sky/системы
     /// частиц во время отрисовки недоступны. Заимствованными остаются
-    /// только GPU-хендлы под фазовым мьютексом/P3
+    /// только GPU-хендлы под фазовым мьютексом/epoch-ретайром
     /// (буферы/вью/сэмплеры/пайплайны).
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
@@ -1348,7 +1344,7 @@ pub const Scene = struct {
     /// context ownership or quiesce; optional exclusion changes scheduling,
     /// not the frame's source of truth.
     pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
-        // Contention-yield (wave 38): when enabled AND the previous build
+        // Contention-yield: when enabled AND the previous build
         // is still unconsumed, park BEFORE reserving — the consumer is
         // behind, so another build now only adds CPU contention for a
         // payload the latch will supersede with a newer one. Gated on

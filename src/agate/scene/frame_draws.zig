@@ -1,4 +1,4 @@
-//! P7 triple-buffered prepared draw payload: three retained owning queue slots
+//! Triple-buffered prepared draw payload: three retained owning queue slots
 //! covering the prepared mesh draw lists — PRIMARY + ALL PIP view queues
 //! (with their skin/shader side stores), outline items+skins, and prepared
 //! shadow items+skins+bin ranges. Scope is mesh draws only (trail meshes
@@ -86,13 +86,12 @@
 //! - Do not copy a FrameDraws (it owns a Mutex); Scene holds the single
 //!   instance by value.
 //!
-//! Honest scope note — what this is NOT: the phase-mutex removal (true
-//! concurrent update+prepare) is still NOT done and is not claimed. This
-//! file makes the 3-slot rotation and the pin/lease primitives real and
-//! tested, wave 27 made the frame snapshot slot-owned (`FrameDrawSlot.
-//! snapshot`: prepare/render/reuse/UI-latch read the staged slot copy, never
-//! the live `Scene.frame_snapshot` — that closes the snapshot-tearing
-//! obstacle), and wave 28 closed the last prepare-latch live touches: the
+//! Scope note: true concurrent update+prepare (phase-mutex removal) is
+//! still NOT done and is not claimed. This file provides the 3-slot
+//! rotation and the pin/lease primitives. Slot-owned: the frame snapshot
+//! (`FrameDrawSlot.snapshot`: prepare/render/reuse/UI-latch read the staged
+//! slot copy, never the live `Scene.frame_snapshot`), and the remaining
+//! prepare-latch live touches are closed: the
 //! instance latch stages GPU purely from the slot-owned `staged_instances`
 //! records + scratch (outcomes mirrored into the records for the patch, no
 //! live mesh reads, no live mesh writes, not even a `record.mesh` compare)
@@ -108,29 +107,19 @@
 //!   systems, and live camera/light/sky state (`packFrameSnapshot`), and
 //!   writes live per-mesh previews/build_views — plus the commit itself
 //!   reads the live mesh list (game-side, ordered after publish, never
-//!   concurrent with the context; the committed SLOT is resolved through
-//!   the lease since the lockfree-closeout slice — no plain `front` word
-//!   read on the game side anymore). This is the app-side ordering problem:
-//!   the game must finish mutating before building, under exclusion.
+//!   concurrent with the context; the committed slot is resolved through
+//!   the lease — no plain `front` word read on the game side). The game
+//!   must finish mutating before building, under exclusion.
 //! - the frame mailbox (`frame_handoff`) producer/consumer pair is still
 //!   phase-excluded (a true concurrent producer would need the claim/pin API
 //!   here instead of the sequential claim/publish path).
-//! What IS already slot-owned (and therefore needs no lock once the mutex
-//! goes): the frame snapshot, the staged instance records (+ their latched
-//! outcomes), the UI packet lists + header + handles, the staged build stats
-//! (`FrameDrawSlot.build_stats`, frozen by the game build and merged by the
-//! prepare latch), the frozen particle capture (`particle_draws`) and the
-//! frozen physics-debug capture (`physics_lines`/`physics_visible`) — both
-//! frozen by the game build and consumed by the prepare latch instead of
-//! the shared staging stores — and the prepare-gated GPU uploads (P3 epochs
-//! + upload meter). Removing the phase mutex means moving the remaining
+//! The pin/lease here covers the variable-length draw payload plus the
+//! staged snapshot, stats, and particle/physics captures, deliberately
+//! nothing else. Removing the phase mutex means moving the remaining
 //! live reads above under the same freeze-then-latch shape (or an
-//! equivalent mailbox) — the pin/lease here covers the variable-length
-//! draw payload plus the staged snapshot, stats, and particle/physics
-//! captures, deliberately nothing else.
+//! equivalent mailbox).
 //!
-//! Wave 29 (concurrent-build ENGINE primitive — proof, not adoption): the
-//! game side can now `claimBack` a slot, fill it (`Scene.BuildClaim.build`
+//! Concurrent-build primitive: the game side can `claimBack` a slot, fill it (`Scene.BuildClaim.build`
 //! runs the real build core into the claimed slot), and hand it to prepare
 //! via `releaseHandoff` (no front flip — the flip stays context-owned in
 //! the staged finish via `tryPublish`) or drop it via `cancelClaim`.
@@ -139,44 +128,36 @@
 //! reads-after-pin: the producer's slot writes happen-before the mutex
 //! release in `tryPublish`/`releaseHandoff`, the consumer's mutex acquire
 //! in `pin`/`pinFront`/`frontIndex` synchronizes the subsequent payload
-//! reads). The stress test below proves slot-payload concurrency
-//! (claim/fill/publish vs pin/verify, increasing published ids, canary
-//! consistency, skip-on-saturation, no deadlock). The phase mutex between
-//! app update/build and prepare/render is STILL HELD by the apps — this
-//! slice changes no app-facing flow defaults and removes no mutex.
-//! - DONE: the handoff words (`build_seq`/`last_latched_seq`) plus
+//! reads).
+//! - The handoff words (`build_seq`/`last_latched_seq`) plus
 //!   `build_slot` are `std.atomic.Value` on `Scene` — release on
 //!   publish, acquire on latch/claim-consume (see the field docs in
 //!   scene.zig). The mutex still guards the payload the words order.
 //! - use `Scene.tryClaimBuildSlot` + `BuildClaim.build`/`stageUi` +
 //!   `publish`/`cancel` on the game thread; never touch raw `slots[i]`
 //!   writes concurrently.
-//! - DONE: staged prepare resolves its slot through the locked
+//! - Staged prepare resolves its slot through the locked
 //!   `claimLatestHandoff` claim — held for the whole prepare and released
 //!   at every exit (`tryPublish` on success, `cancelHandoffClaim` on
 //!   failure/cancel).
 //!   A concurrent game claim therefore never targets the slot prepare is
 //!   consuming (it skips the WRITING slot or saturates, counted), `pin`
 //!   refuses that slot (`SlotBusy`, counted), and prepare never resets a
-//!   game-held slot. Prepare's own publish flip stays context-owned exactly
-//!   as before (now via the locked `tryPublish`); a missed slot degrades to
-//!   a counted skip, never a wedge. What REMAINS for adoption is app-side
-//!   flow (the first bullet) + canvas quiesce + freeze-then-latch:
-//! - DONE (wave 32): particle/physics freeze-then-latch — the
+//!   game-held slot. Prepare's own publish flip stays context-owned
+//!   (via the locked `tryPublish`); a missed slot degrades to
+//!   a counted skip, never a wedge.
+//! - Particle/physics freeze-then-latch: the
 //!   particle capture and the physics-debug capture are slot payloads
-//!   (`FrameDrawSlot.particle_draws`, `physics_lines`/`physics_visible`,
-//!   lock-free-publication slices 4/5): the game build freezes a plain
-//!   copy into the claimed slot right after the shared build capture
+//!   (`FrameDrawSlot.particle_draws`, `physics_lines`/`physics_visible`):
+//!   the game build freezes a plain copy into the claimed slot right after the shared build capture
 //!   and the prepare latch consumes the SLOT copy, never the shared
 //!   `build_frame`/`build_lines` staging stores — so a game-thread
 //!   producer build colliding with the context-thread consumer latch
 //!   can no longer deliver a torn record for one frame. The shared
 //!   stores stay (direct layer tests + tooling compat) but the adopted
 //!   path never reads them. Staged-wins on OOM (fail-closes to
-//!   coherent-empty, same precedent as the snapshot/stats slices).
-//!   What REMAINS for adoption is app-side flow (the first bullet) +
-//!   canvas quiesce + the remaining live touches below:
-//! - epochs stay context-owned (`begin`/`complete`/`flush` only in
+//!   coherent-empty).
+//! - Epochs stay context-owned (`begin`/`complete`/`flush` only in
 //!   prepare/render): the build path must never gain epoch calls (tested).
 //! - remaining live touches (meshes/canvas/cameras/lights, the
 //!   `packFrameSnapshot` live reads, the
@@ -244,7 +225,7 @@ pub const HandoffClaim = struct {
 // explicit pin (which extends consumability past the next publish for
 // exactly that slot).
 //
-// Stage-2 increment B payload identity: every instanced batch / shadow item /
+// Payload identity: every instanced batch / shadow item /
 // outline item carries `source_uid` (stable `Mesh.uid`) + `source_mesh`
 // (mesh-list index at build time). Game-built (`.build_view`) payloads hold
 // provisional `instance_buffer`/`visible_instance_count` (plus shadow
@@ -254,7 +235,7 @@ pub const HandoffClaim = struct {
 // fallback (`.published`) payloads are final at build time.
 pub const StagedInstanceRecord = mesh_mod.StagedInstanceRecord;
 
-/// Slot-owned dynamic-upload packets (producer freeze-then-latch slice 6):
+/// Slot-owned dynamic-upload packets (producer freeze-then-latch):
 /// every per-frame GPU staging payload the prepare flush uploads is frozen
 /// here by value on the producer side (`buildIntoClaimedSlot` via
 /// `upload_packets.stageUploads`) and consumed by the staged prepare
@@ -499,7 +480,7 @@ pub const FrameDrawSlot = struct {
     /// outline_items above.
     highlight_items: std.ArrayListUnmanaged(HighlightDrawItem) = .empty,
     shadow: PreparedShadowDraws = .{},
-    /// Slot-owned staged instance records (lock-free-publication slice 1):
+    /// Slot-owned staged instance records:
     /// one per instance-bearing mesh with a fresh preview, frozen by
     /// `Scene.buildPreparedFrame` (`freezeStagedRecords`) and consumed by
     /// the prepare latch (`stageInstancesLatch` + `patchInstanceRefs`)
@@ -510,7 +491,7 @@ pub const FrameDrawSlot = struct {
     /// the latch/patch allocate nothing. Record `buffer` copies are borrowed
     /// read handles (never destroyed/retired through the record).
     staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
-    /// Slot-owned UI CPU packet (lock-free-publication slice 2, b): the
+    /// Slot-owned UI CPU packet: the
     /// game side (`BuildClaim.stageUi`) records live canvas CPU geometry
     /// into these back-slot lists and stamps `ui_packet` (presence + staged
     /// draw handles); the prepare latch consumes them into `Scene.ui_frame`
@@ -522,7 +503,7 @@ pub const FrameDrawSlot = struct {
     ui_vertices: std.ArrayListUnmanaged(ui_mod.UIVertex) = .empty,
     ui_indices: std.ArrayListUnmanaged(u16) = .empty,
     ui_packet: ui_frame_mod.UiPacketState = .{},
-    /// Slot-owned staged frame snapshot (wave 27, lock-free prerequisite):
+    /// Slot-owned staged frame snapshot:
     /// the frame-level camera/light/pass state the prepared payload was
     /// built against, frozen by value at build time. `Scene.buildPreparedFrame`
     /// (game side) stages `build_snapshot` here; the fallback prepare path
@@ -536,7 +517,7 @@ pub const FrameDrawSlot = struct {
     /// state: `Camera.name` slices alias the live camera names, but the draw
     /// path never dereferences names (projection matrices are precomputed in
     /// the snapshot); GPU handles (`sky_texture`, default copies, probe
-    /// views/samplers) are borrowed VALUES under the P3 epoch discipline
+    /// views/samplers) are borrowed VALUES under the retire-epoch discipline
     /// (same as every other handle in this slot — never destroyed/retired
     /// through the slot). Fixed-size (no allocation, no deinit); `reset`
     /// clears it so a skipped path can never resurface a prior frame, and
@@ -557,8 +538,8 @@ pub const FrameDrawSlot = struct {
     /// UI-packet-only claim. Staged-only prepare must not consume stale 3D
     /// data as if it belonged to a UI-only handoff.
     has_scene_build: bool = false,
-    /// Slot-owned frozen particle capture (wave 32, freeze-then-latch
-    /// slice 4): the game-side build (`Scene.buildIntoClaimedSlot`,
+    /// Slot-owned frozen particle capture: the game-side build
+    /// (`Scene.buildIntoClaimedSlot`,
     /// via `ParticleLayer.stageIntoSlot`) freezes the just-captured
     /// build frame here by value right after `buildCapture`; the
     /// prepare latch (`ParticleLayer.latchSlotFrame`) consumes THIS
@@ -568,21 +549,20 @@ pub const FrameDrawSlot = struct {
     /// only (borrowed handle ids, never destroyed/retired through the
     /// slot); `reset` clears the list (retaining capacity) so a reused
     /// slot can never resurface a prior frame's draws. Staged-wins on
-    /// OOM (fail-closes to coherent-empty, same as the build frame).
+    /// OOM (fail-closes to coherent-empty).
     particle_draws: std.ArrayListUnmanaged(particle_pass.ParticlePass.ParticleDraw) = .empty,
-    /// Slot-owned frozen physics debug capture (wave 32,
-    /// freeze-then-latch slice 5): the game-side build (via
+    /// Slot-owned frozen physics debug capture: the game-side build (via
     /// `PhysicsIntegration.stageIntoSlot`) freezes the just-captured
     /// build lines + visibility here right after `buildDebug`; the
     /// prepare latch (`PhysicsIntegration.latchSlotDebug`) consumes
     /// THESE into the render-owned capture instead of the shared
     /// `build_lines`/`build_visible`. Same plain-value, staged-wins,
-    /// coherent-empty-on-OOM contract as `particle_draws` above.
+    /// coherent-empty-on-OOM contract as `particle_draws`.
     physics_lines: std.ArrayListUnmanaged(physics_types.DebugLine) = .empty,
     /// Frozen visibility for the slot's physics debug capture (see
     /// `physics_lines`); `reset` clears it alongside the list.
     physics_visible: bool = false,
-    /// Slot-owned dynamic-upload packets (slice 6, see the packet structs
+    /// Slot-owned dynamic-upload packets (see the packet structs
     /// above): frozen producer-side by `upload_packets.stageUploads`,
     /// consumed context-side by `upload_packets.flushSlotUploads` on the
     /// fresh-build path. Descriptors + flattened byte stores; reset retains
@@ -607,12 +587,12 @@ pub const FrameDrawSlot = struct {
     pending_uploads: std.ArrayListUnmanaged(PendingMeshUpload) = .empty,
     pending_verts: std.ArrayListUnmanaged(mesh_mod.Vertex) = .empty,
     pending_indices: std.ArrayListUnmanaged(u32) = .empty,
-    /// Frozen GPU-morph delta pixels (slice 6, PendingMeshUpload delta
+    /// Frozen GPU-morph delta pixels (PendingMeshUpload delta
     /// fields): packed RGBA32F texels (4 f32 per texel, see
     /// mesh/morph_gpu.zig) for pending GPU-morph meshes only. Same
     /// freeze-then-latch contract as every other byte store here.
     pending_delta_data: std.ArrayListUnmanaged(f32) = .empty,
-    /// Slot-owned frozen host bytes (lock-free prepare host pipe): the
+    /// Slot-owned frozen host bytes: the
     /// producer (`BuildClaim.stageHostBytes`) copies small host-owned
     /// payloads here (picked-name bytes, memory-summary tallies) while it
     /// holds the claim; the context (`PrepareClaim.host_bytes`) reads the
@@ -788,7 +768,8 @@ fn queuesBytes(q: *const RenderQueues) usize {
 /// scratch is the first slot after `front` (modulo SLOT_COUNT) that is
 /// neither pinned nor claimed. Flipping `front` IS the publish — the
 /// lists themselves never move. See the header for the lease protocol and
-/// the threading split (legacy trio single-threaded-only vs claim/pin API).
+/// the threading split (sequential path: single-threaded-only; concurrent
+/// paths: claim/pin API only).
 pub const FrameDraws = struct {
     slots: [SLOT_COUNT]FrameDrawSlot = .{ .{}, .{}, .{} },
     front: usize = 0,
@@ -872,7 +853,7 @@ pub const FrameDraws = struct {
         return null;
     }
 
-    /// Locked specific-slot claim (wave 31, prepare-latch side): reserve
+    /// Locked specific-slot claim (prepare-latch side): reserve
     /// exactly `idx` for writing — the handoff slot a concurrent game build
     /// published via `releaseHandoff` (`Scene.build_slot`), which a blind
     /// `claimBack` is not guaranteed to return once game||prepare overlap.
@@ -972,7 +953,7 @@ pub const FrameDraws = struct {
         if (self.handoff == back_idx) self.handoff = null;
     }
 
-    /// Game-side handoff release (wave 29 concurrent-build primitive): hand
+    /// Game-side handoff release (concurrent-build primitive): hand
     /// a claimed slot to the prepare latch WITHOUT flipping `front` (the
     /// front flip stays context-owned in the staged finish). Clears WRITING so
     /// the slot is a normal rotation member again; the payload is kept for
@@ -1178,652 +1159,9 @@ pub const FrameDraws = struct {
     }
 };
 
-// --- wave-26 tests: 3-slot rotation + pin/lease protocol (CPU-only). ---
+// Lease-protocol regression tests live in `frame_draws_tests.zig` (same directory,
+// imported below so the test registry picks them up exactly once).
 
-const testing = std.testing;
-
-test "wave26: rotation cycles 0-1-2-0 without stalling, back never equals front" {
-    var draws = FrameDraws{};
-    try testing.expectEqual(SLOT_COUNT, draws.slots.len);
-    try testing.expectEqual(@as(usize, 0), draws.front);
-
-    // Six sequential publish round-trips (claim/tryPublish path):
-    // each build targets a claimed back, each publish flips to it.
-    var expect_front: usize = 0;
-    var round: usize = 0;
-    while (round < 6) : (round += 1) {
-        const back = draws.claimBack().?;
-        try testing.expect(back != draws.front);
-        try testing.expectEqual((expect_front + 1) % SLOT_COUNT, back);
-        draws.slotAt(back).frame_id = round + 1;
-        try draws.tryPublish(back);
-        expect_front = back;
-        try testing.expectEqual(expect_front, draws.front);
-        // The published front carries the build's frame; the other slots
-        // keep their own (no cross-slot copy, no wipe).
-        try testing.expectEqual(@as(u64, round + 1), draws.slotAtConst(draws.front).frame_id);
-    }
-    // Full cycle proof: after 6 publishes from 0 the front is back at 0.
-    try testing.expectEqual(@as(usize, 0), draws.front);
-}
-
-test "wave26: claimBack skips the front and pinned slots, publish flips" {
-    var draws = FrameDraws{};
-    // No pins: the claim lands off the front.
-    const c0 = draws.claimBack().?;
-    try testing.expect(c0 != draws.front);
-    draws.slotAt(c0).frame_id = 7;
-    try draws.tryPublish(c0);
-    try testing.expectEqual(c0, draws.front);
-
-    // Pin the front (a presenting consumer): the next claim must avoid both
-    // the front and the pin, and the next publish must flip to it.
-    const f = draws.front;
-    try draws.pin(f);
-    const c1 = draws.claimBack().?;
-    try testing.expect(c1 != f);
-    try testing.expect(!draws.isPinned(c1));
-    draws.slotAt(c1).frame_id = 42;
-    try draws.tryPublish(c1);
-    try testing.expectEqual(c1, draws.front);
-    try testing.expectEqual(@as(u64, 42), draws.slotAtConst(draws.front).frame_id);
-    // The old pinned front kept its own frame (presenting consumer undisturbed).
-    try testing.expect(draws.isPinned(f));
-    try testing.expectEqual(@as(u64, 7), draws.slotAtConst(f).frame_id);
-    try draws.unpin(f);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-}
-
-test "wave39: shared front reader coexists with render pin and blocks slot reuse" {
-    var draws = FrameDraws{};
-    const front = draws.pinFrontReader();
-    try testing.expectEqual(draws.front, front);
-    try testing.expect(draws.isReadPinned(front));
-    try testing.expect(!draws.isPinned(front));
-
-    // Rendering is a second immutable reader of the same published slot.
-    try testing.expectEqual(front, draws.pinFront());
-    try testing.expect(draws.isPinned(front));
-
-    // The producer/context may advance the front, but neither lease allows
-    // the old slot to be reclaimed while commit/render still reads it.
-    const next = draws.claimBack().?;
-    draws.slotAt(next).frame_id = 1;
-    try draws.tryPublish(next);
-    const third = draws.claimBack().?;
-    draws.slotAt(third).frame_id = 2;
-    try draws.tryPublish(third);
-    try testing.expect(draws.front != front);
-    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(front));
-
-    try draws.unpin(front);
-    try testing.expect(!draws.isPinned(front));
-    try testing.expect(draws.isReadPinned(front));
-    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(front));
-    try draws.unpinReader(front);
-    try testing.expect(!draws.isReadPinned(front));
-    try draws.claimSlot(front);
-    try draws.cancelClaim(front);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-}
-
-test "wave39: handoff slot and generation are claimed as one counted pair" {
-    var draws = FrameDraws{};
-    var build_slot = std.atomic.Value(usize).init(0);
-    var build_seq = std.atomic.Value(usize).init(0);
-
-    const slot = draws.claimBack().?;
-    draws.slotAt(slot).build_seq = 7;
-    draws.slotAt(slot).has_scene_build = true;
-    try draws.releaseHandoffWithSeq(slot, 7, &build_slot, &build_seq);
-    const claimed = (try draws.claimLatestHandoff(&build_slot, &build_seq, 0, true)).?;
-    try testing.expectEqual(slot, claimed.slot);
-    try testing.expectEqual(@as(usize, 7), claimed.seq);
-    try testing.expect(claimed.has_scene_build);
-    try draws.tryPublish(claimed.slot);
-    try testing.expect((try draws.claimLatestHandoff(&build_slot, &build_seq, 7, true)) == null);
-
-    const stale_slot = draws.claimBack().?;
-    draws.slotAt(stale_slot).build_seq = 8;
-    try draws.releaseHandoffWithSeq(stale_slot, 9, &build_slot, &build_seq);
-    try testing.expectError(LeaseError.SlotBusy, draws.claimLatestHandoff(&build_slot, &build_seq, 7, false));
-    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
-    // The fail-closed mismatch did not consume or wedge the handoff.
-    try draws.claimSlot(stale_slot);
-    try draws.cancelClaim(stale_slot);
-}
-
-test "wave26: pin/unpin contract — double pin, unpin without pin, counters" {
-    var draws = FrameDraws{};
-
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    try draws.pin(0);
-    try testing.expect(draws.isPinned(0));
-    try testing.expectEqual(@as(usize, 1), draws.pinsHeld());
-
-    // Double pin: error + denial counted, hold count unchanged.
-    try testing.expectError(LeaseError.AlreadyPinned, draws.pin(0));
-    try testing.expectEqual(@as(usize, 1), draws.pinsHeld());
-    try testing.expectEqual(@as(u64, 1), draws.pin_denials);
-
-    // Invalid slot pins/unpins: errors, no state change.
-    try testing.expectError(LeaseError.InvalidSlot, draws.pin(SLOT_COUNT));
-    try testing.expectError(LeaseError.InvalidSlot, draws.unpin(SLOT_COUNT));
-
-    // Unpin without pin: error + denial counted.
-    try testing.expectError(LeaseError.NotPinned, draws.unpin(1));
-    try testing.expectEqual(@as(u64, 1), draws.unpin_denials);
-
-    try draws.unpin(0);
-    try testing.expect(!draws.isPinned(0));
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    // Unpin twice: the second is without-pin again.
-    try testing.expectError(LeaseError.NotPinned, draws.unpin(0));
-    try testing.expectEqual(@as(u64, 2), draws.unpin_denials);
-
-    try testing.expectEqual(@as(u64, 1), draws.total_pins);
-}
-
-test "wave26: tryPublish refuses pinned targets, cancelClaim releases writes" {
-    var draws = FrameDraws{};
-
-    // Publish of a never-claimed slot: error, front unchanged.
-    const f0 = draws.front;
-    try testing.expectError(LeaseError.NotClaimed, draws.tryPublish((f0 + 1) % SLOT_COUNT));
-    try testing.expectEqual(f0, draws.front);
-
-    // Claim, then pin the CLAIMED slot is refused (SlotBusy); publish while
-    // pinned-after-unclaim... first: claim then pin attempt fails.
-    const c = draws.claimBack().?;
-    try testing.expectError(LeaseError.SlotBusy, draws.pin(c));
-    // Cancel the claim: the slot is free again and pinnable.
-    try draws.cancelClaim(c);
-    try testing.expectError(LeaseError.NotClaimed, draws.cancelClaim(c));
-    try draws.pin(c);
-    try draws.unpin(c);
-
-    // PinnedSlot refusal (white-box): correct API use can never produce a
-    // writing+pinned slot (claim skips pins, pin refuses writing), so the
-    // guard below is defense-in-depth — a presented frame is never
-    // overwritten even under an unforeseen interleaving. Forge the state by
-    // hand (same-file test, private access) and prove the refusal is
-    // fail-closed and counted.
-    const d = draws.claimBack().?;
-    lockLease(&draws.mutex);
-    draws.pinned[d] = true;
-    draws.mutex.unlock();
-    const front_before = draws.front;
-    try testing.expectError(LeaseError.PinnedSlot, draws.tryPublish(d));
-    try testing.expectEqual(@as(u64, 1), draws.publish_refusals);
-    try testing.expectEqual(front_before, draws.front);
-    lockLease(&draws.mutex);
-    draws.pinned[d] = false;
-    draws.mutex.unlock();
-    try draws.cancelClaim(d);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-}
-
-test "wave26: saturation with pins held degrades to counted skip, never wedge" {
-    var draws = FrameDraws{};
-
-    // front=0 pinned, the other two slots claimed as WRITING (producer
-    // mid-fill on both): {front pinned, two writing} leaves nothing free,
-    // so the THIRD claim must return null (counted skip), not block.
-    try draws.pin(draws.front);
-    const w1 = draws.claimBack().?;
-    try testing.expect(!draws.isPinned(w1));
-    const w2 = draws.claimBack().?;
-    try testing.expect(w2 != w1 and w2 != draws.front);
-    try testing.expect(draws.claimBack() == null);
-    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
-    // Still not wedged: cancel both claims + unpin restores the rotation.
-    try draws.cancelClaim(w1);
-    try draws.cancelClaim(w2);
-    try draws.unpin(draws.front);
-    const again = draws.claimBack().?;
-    try draws.tryPublish(again);
-    try testing.expectEqual(again, draws.front);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-}
-
-// Concurrent stress: single producer claims/builds/publishes while a
-// consumer holds pins and reads. Protocol guarantees under test: no torn
-// payload reads (frame_id/retire_epoch canary pair always consistent), no
-// deadlock (both threads finish), saturation degrades to skip (producer
-// counts skips only when the consumer deliberately over-pins).
-test "wave26: concurrent producer vs pinned consumer — no tears, no deadlock" {
-    var draws = FrameDraws{};
-    const total_publishes: u64 = 5000;
-
-    const Ctx = struct {
-        draws: *FrameDraws,
-        total: u64,
-        published: u64 = 0,
-        skipped: u64 = 0,
-        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        // Consumer-side observations (consumer thread writes; test thread
-        // reads after join).
-        reads: u64 = 0,
-    };
-
-    const Producer = struct {
-        fn run(c: *Ctx) void {
-            var seq: u64 = 1;
-            while (seq <= c.total) {
-                const idx = c.draws.claimBack() orelse {
-                    c.skipped += 1;
-                    std.atomic.spinLoopHint();
-                    continue;
-                };
-                // Fill BEFORE publish (single producer; the claimed slot is
-                // unpinned by construction, the consumer never reads it).
-                // Canary pair: retire_epoch is the bitwise inverse of
-                // frame_id — any torn concurrent read observes a mismatch.
-                c.draws.slotAt(idx).frame_id = seq;
-                c.draws.slotAt(idx).retire_epoch = ~seq;
-                c.draws.tryPublish(idx) catch |e| switch (e) {
-                    // A pin landing between claim and publish is impossible
-                    // (pin refuses writing slots); any error here is a bug.
-                    else => unreachable,
-                };
-                seq += 1;
-            }
-            c.published = c.total;
-            c.stop.store(true, .release);
-        }
-    };
-
-    const Consumer = struct {
-        fn run(c: *Ctx) void {
-            // Phase 1 (hold one pin, churn reads): pin the CURRENT front
-            // with latest-wins retry (a stale front may already be claimed
-            // for writing — pin then refuses with SlotBusy and we re-read).
-            // With exactly one pin held the producer must make progress with
-            // ZERO skips — 3 slots always leave a free one.
-            var held: usize = 0;
-            while (true) {
-                const f = c.draws.frontIndex();
-                c.draws.pin(f) catch |e| switch (e) {
-                    LeaseError.AlreadyPinned, LeaseError.SlotBusy => continue,
-                    else => unreachable,
-                };
-                held = f;
-                break;
-            }
-            var spins: usize = 0;
-            while (spins < 20000) : (spins += 1) {
-                const s = c.draws.slotAtConst(held);
-                const fid = s.frame_id;
-                const canary = s.retire_epoch;
-                // The pinned slot is never written by the producer: the
-                // pair is always the initial (0,0) or one fully published
-                // (seq,~seq) pair — never a mix.
-                if (!((fid == 0 and canary == 0) or canary == ~fid)) unreachable;
-                c.reads += 1;
-                std.atomic.spinLoopHint();
-            }
-            c.draws.unpin(held) catch unreachable;
-
-            // Phase 2 (pin/unpin churn on the live front): every read must
-            // still be canary-consistent; SlotBusy pins just retry. A freshly
-            // pinned front may still be unpublished (0,0) when the producer
-            // is slow to start — that is consistent, not torn.
-            while (!c.stop.load(.acquire)) {
-                const idx = c.draws.frontIndex();
-                c.draws.pin(idx) catch |e| switch (e) {
-                    LeaseError.AlreadyPinned, LeaseError.SlotBusy => continue,
-                    else => unreachable,
-                };
-                const s = c.draws.slotAtConst(idx);
-                const fid = s.frame_id;
-                const canary = s.retire_epoch;
-                if (!((fid == 0 and canary == 0) or canary == ~fid)) unreachable;
-                c.reads += 1;
-                c.draws.unpin(idx) catch unreachable;
-            }
-        }
-    };
-
-    var ctx = Ctx{ .draws = &draws, .total = total_publishes };
-    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
-    const cons = try std.Thread.spawn(.{}, Consumer.run, .{&ctx});
-    prod.join();
-    cons.join();
-
-    try testing.expectEqual(total_publishes, ctx.published);
-    // Phase 1 held exactly one pin: the producer always had a free slot, so
-    // saturation skips must be zero (phase 2 holds at most one pin with one
-    // claim outstanding — 3 slots never saturate there either).
-    try testing.expectEqual(@as(u64, 0), ctx.skipped);
-    try testing.expectEqual(@as(u64, 0), draws.saturation_skips);
-    try testing.expect(ctx.reads > 0);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    try testing.expectEqual(@as(u64, 0), draws.publish_refusals);
-    // Tail: every slot holds a consistent canary pair (no slot was ever
-    // published half-written); never-published slots are still (0,0).
-    for (0..SLOT_COUNT) |i| {
-        const s = draws.slotAtConst(i);
-        const fid = s.frame_id;
-        const canary = s.retire_epoch;
-        try testing.expect((fid == 0 and canary == 0) or canary == ~fid);
-    }
-    draws.deinit(testing.allocator);
-}
-
-// --- wave-29 tests: concurrent-build primitive proof (CPU-only). ---
-//
-// Producer claims -> builds (frame generation + canary pair + a slot-owned
-// snapshot word, all stamped from one seq) -> publishes while a consumer
-// pins the front as a prepare-equivalent read (pin -> validate -> unpin).
-// Invariants under test: fresh front deliveries never decrease (publications
-// are strictly increasing by single-producer construction; the front only
-// ever flips to a newer publish), every pinned read is canary-consistent
-// (no torn payload, including the slot-owned snapshot word), an uncongested
-// rotation never saturates (one held pin leaves a free slot), no deadlock
-// over 20000 publishes, and the tail front holds exactly the last publish.
-test "wave29: concurrent claim/build/publish vs pin/prepare-read — increasing ids, no tears, no deadlock" {
-    var draws = FrameDraws{};
-    const total_publishes: u64 = 20000;
-
-    const Ctx = struct {
-        draws: *FrameDraws,
-        total: u64,
-        skipped: u64 = 0,
-        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        reads: u64 = 0,
-        max_seen: u64 = 0,
-    };
-
-    const Producer = struct {
-        fn run(c: *Ctx) void {
-            var seq: u64 = 1;
-            while (seq <= c.total) {
-                const idx = c.draws.claimBack() orelse {
-                    c.skipped += 1;
-                    std.atomic.spinLoopHint();
-                    continue;
-                };
-                // Build BEFORE publish (owns the claimed slot; the consumer
-                // never reads it): one generation stamps the frame id, the
-                // inverse canary, and the slot-owned snapshot word.
-                const s = c.draws.slotAt(idx);
-                s.frame_id = seq;
-                s.retire_epoch = ~seq;
-                s.snapshot.frame_id = seq;
-                c.draws.tryPublish(idx) catch |e| switch (e) {
-                    // A pin landing between claim and publish is impossible
-                    // (pin refuses writing slots); any error here is a bug.
-                    else => unreachable,
-                };
-                seq += 1;
-            }
-            c.stop.store(true, .release);
-        }
-    };
-
-    const Consumer = struct {
-        fn run(c: *Ctx) void {
-            while (!c.stop.load(.acquire)) {
-                const f = c.draws.frontIndex();
-                c.draws.pin(f) catch |e| switch (e) {
-                    LeaseError.AlreadyPinned, LeaseError.SlotBusy => continue,
-                    else => unreachable,
-                };
-                // Stale pin (front moved between frontIndex and pin): only
-                // the canary check applies — monotonicity is a property of
-                // fresh front deliveries, and holding an older pinned slot
-                // is a legal explicit hold, never a resurfacing.
-                const fresh = c.draws.frontIndex() == f;
-                const s = c.draws.slotAtConst(f);
-                const fid = s.frame_id;
-                const canary = s.retire_epoch;
-                const snap_id = s.snapshot.frame_id;
-                if (!((fid == 0 and canary == 0 and snap_id == 0) or
-                    (canary == ~fid and snap_id == fid))) unreachable;
-                if (fresh and fid != 0) {
-                    if (fid < c.max_seen) unreachable;
-                    if (fid > c.max_seen) c.max_seen = fid;
-                }
-                c.reads += 1;
-                c.draws.unpin(f) catch unreachable;
-            }
-        }
-    };
-
-    var ctx = Ctx{ .draws = &draws, .total = total_publishes };
-    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
-    const cons = try std.Thread.spawn(.{}, Consumer.run, .{&ctx});
-    prod.join();
-    cons.join();
-
-    // Uncongested rotation (at most one pin held at a time): the producer
-    // always had a free slot — zero skips, all counted.
-    try testing.expectEqual(@as(u64, 0), ctx.skipped);
-    try testing.expectEqual(@as(u64, 0), draws.saturation_skips);
-    try testing.expect(ctx.reads > 0);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    try testing.expectEqual(@as(u64, 0), draws.publish_refusals);
-    // The tail front holds exactly the last publish (strictly-increasing
-    // publications end to end: nothing newer-or-older may surface).
-    const tail = draws.frontIndex();
-    try draws.pin(tail);
-    const ts = draws.slotAtConst(tail);
-    try testing.expectEqual(total_publishes, ts.frame_id);
-    try testing.expectEqual(~total_publishes, ts.retire_epoch);
-    try testing.expectEqual(total_publishes, ts.snapshot.frame_id);
-    // max_seen is a liveness witness (the consumer observed real fresh
-    // deliveries, never the future): it usually equals total, but the last
-    // publishes may land after the consumer's final iteration — the tail
-    // pin above is the deterministic end-to-end proof.
-    try testing.expect(ctx.max_seen > 0);
-    try testing.expect(ctx.max_seen <= total_publishes);
-    try draws.unpin(tail);
-    // Tail: every slot canary-consistent (triple word, snapshot included).
-    for (0..SLOT_COUNT) |i| {
-        const s = draws.slotAtConst(i);
-        const fid = s.frame_id;
-        try testing.expect((fid == 0 and s.retire_epoch == 0 and s.snapshot.frame_id == 0) or
-            (s.retire_epoch == ~fid and s.snapshot.frame_id == fid));
-    }
-    draws.deinit(testing.allocator);
-}
-
-// Saturation path: when the consumer holds pins on every slot, the producer
-// must observe counted skips (claimBack null) and keep spinning — never
-// block, never wedge — then drain to completion once pins release.
-test "wave29: consumer-held pins force the producer to skip, never stall" {
-    var draws = FrameDraws{};
-    const total_publishes: u64 = 3000;
-
-    const Ctx = struct {
-        draws: *FrameDraws,
-        total: u64,
-        skipped: u64 = 0,
-        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        reads: u64 = 0,
-    };
-
-    const Producer = struct {
-        fn run(c: *Ctx) void {
-            var seq: u64 = 1;
-            while (seq <= c.total) {
-                const idx = c.draws.claimBack() orelse {
-                    c.skipped += 1;
-                    std.atomic.spinLoopHint();
-                    continue;
-                };
-                const s = c.draws.slotAt(idx);
-                s.frame_id = seq;
-                s.retire_epoch = ~seq;
-                s.snapshot.frame_id = seq;
-                c.draws.tryPublish(idx) catch |e| switch (e) {
-                    else => unreachable,
-                };
-                seq += 1;
-                // Slowed publish (same precedent as the handoff 3-slot drain
-                // test's slowed consumer): gives the consumer thread time to
-                // accumulate pins on every slot so the saturation path is
-                // really exercised instead of lapped.
-                var spin: usize = 0;
-                while (spin < 2000) : (spin += 1) std.atomic.spinLoopHint();
-            }
-            c.stop.store(true, .release);
-        }
-    };
-
-    const Consumer = struct {
-        fn run(c: *Ctx) void {
-            while (!c.stop.load(.acquire)) {
-                // Accumulate a pin on every new front without releasing:
-                // consecutive fronts always differ, so after two pins the
-                // next publish must land on the third slot — pinnable too —
-                // and the rotation saturates deterministically.
-                const f = c.draws.frontIndex();
-                c.draws.pin(f) catch |e| switch (e) {
-                    LeaseError.AlreadyPinned, LeaseError.SlotBusy => {},
-                    else => unreachable,
-                };
-                if (c.draws.pinsHeld() >= SLOT_COUNT) {
-                    // Full hold: the producer must be skipping now. Hold
-                    // briefly so skips accumulate, then release everything
-                    // and let it drain.
-                    var spin: usize = 0;
-                    while (spin < 20000) : (spin += 1) std.atomic.spinLoopHint();
-                    for (0..SLOT_COUNT) |i| {
-                        if (c.draws.isPinned(i)) c.draws.unpin(i) catch unreachable;
-                    }
-                }
-                // Every pinned slot stays canary-consistent under the hold.
-                for (0..SLOT_COUNT) |i| {
-                    if (!c.draws.isPinned(i)) continue;
-                    const s = c.draws.slotAtConst(i);
-                    const fid = s.frame_id;
-                    if (!((fid == 0 and s.retire_epoch == 0 and s.snapshot.frame_id == 0) or
-                        (s.retire_epoch == ~fid and s.snapshot.frame_id == fid))) unreachable;
-                    c.reads += 1;
-                }
-            }
-            for (0..SLOT_COUNT) |i| {
-                if (c.draws.isPinned(i)) c.draws.unpin(i) catch unreachable;
-            }
-        }
-    };
-
-    var ctx = Ctx{ .draws = &draws, .total = total_publishes };
-    const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
-    const cons = try std.Thread.spawn(.{}, Consumer.run, .{&ctx});
-    prod.join();
-    cons.join();
-
-    // Saturation really happened (skips observed AND counted one-for-one),
-    // yet the producer still completed every publish: skip, never stall.
-    try testing.expect(ctx.skipped > 0);
-    try testing.expectEqual(ctx.skipped, draws.saturation_skips);
-    try testing.expect(ctx.reads > 0);
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    try testing.expectEqual(@as(u64, 0), draws.publish_refusals);
-    const tail = draws.frontIndex();
-    try draws.pin(tail);
-    try testing.expectEqual(total_publishes, draws.slotAtConst(tail).frame_id);
-    try draws.unpin(tail);
-    draws.deinit(testing.allocator);
-}
-
-// --- wave-31 tests: prepare-side specific claim (`claimSlot`). ---
-
-// `claimSlot` reserves exactly the handoff slot: success marks WRITING and
-// composes with `tryPublish`; a pinned target refuses with `PinnedSlot`
-// (counted in `publish_refusals`, presented frame never overwritten); an
-// already-claimed target refuses with `SlotBusy` (counted in
-// `saturation_skips`, skip-the-frame); out-of-range is `InvalidSlot`. State
-// is unchanged on every refusal.
-test "wave31: claimSlot reserves the handoff slot, refusals are fail-closed and counted" {
-    var draws = FrameDraws{};
-
-    // Success: the slot is marked WRITING and publishes normally.
-    try draws.claimSlot(1);
-    draws.slotAt(1).frame_id = 11;
-    try draws.tryPublish(1);
-    try testing.expectEqual(@as(usize, 1), draws.front);
-    try testing.expectEqual(@as(u64, 11), draws.slotAtConst(1).frame_id);
-
-    // Already claimed (a concurrent producer mid-fill): SlotBusy + counted.
-    const c = draws.claimBack().?;
-    try testing.expectError(LeaseError.SlotBusy, draws.claimSlot(c));
-    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
-    // Release then re-claim the same slot: now it succeeds.
-    try draws.cancelClaim(c);
-    try draws.claimSlot(c);
-    try draws.cancelClaim(c);
-
-    // Pinned (a presenting consumer): PinnedSlot + counted, front unchanged.
-    const f = draws.front;
-    try draws.pin(f);
-    const front_before = draws.front;
-    try testing.expectError(LeaseError.PinnedSlot, draws.claimSlot(f));
-    try testing.expectEqual(@as(u64, 1), draws.publish_refusals);
-    try testing.expectEqual(front_before, draws.front);
-    try draws.unpin(f);
-
-    // Out of range: InvalidSlot, no counter moves.
-    try testing.expectError(LeaseError.InvalidSlot, draws.claimSlot(SLOT_COUNT));
-    try testing.expectEqual(@as(u64, 1), draws.saturation_skips);
-    try testing.expectEqual(@as(u64, 1), draws.publish_refusals);
-
-    // Clean teardown: no pins held, nothing left WRITING (a claim without a
-    // matching release would wedge the rotation — the wave-31 prepare audit
-    // requires every claim to pair with publish/cancel at every exit).
-    try testing.expectEqual(@as(usize, 0), draws.pinsHeld());
-    for (0..SLOT_COUNT) |i| {
-        try testing.expectError(LeaseError.NotClaimed, draws.cancelClaim(i));
-    }
-    draws.deinit(testing.allocator);
-}
-
-test "wave42: handoff slot is protected from claimBack when free slot exists" {
-    var draws = FrameDraws{};
-
-    // Initial state: front is 0.
-    try testing.expectEqual(@as(usize, 0), draws.front);
-    try testing.expectEqual(@as(?usize, null), draws.handoff);
-
-    // Producer claims back: gets slot 1.
-    const slot1 = draws.claimBack().?;
-    try testing.expectEqual(@as(usize, 1), slot1);
-
-    // Producer hands off slot 1 to consumer.
-    try draws.releaseHandoff(slot1);
-    try testing.expectEqual(@as(?usize, 1), draws.handoff);
-
-    // Producer immediately claims next slot BEFORE consumer consumes slot 1:
-    // MUST NOT reclaim slot 1; MUST claim slot 2 instead!
-    const slot2 = draws.claimBack().?;
-    try testing.expectEqual(@as(usize, 2), slot2);
-    try testing.expect(slot2 != slot1);
-
-    // Consumer latches slot 1 while producer is filling slot 2:
-    // Slot 1 is NOT writing (producer is in slot 2), so claimSlot(1) SUCCEEDS without contention!
-    try draws.claimSlot(slot1);
-    try testing.expectEqual(@as(?usize, null), draws.handoff);
-
-    // Consumer publishes slot 1 (front flips to 1).
-    try draws.tryPublish(slot1);
-    try testing.expectEqual(@as(usize, 1), draws.front);
-
-    // Producer hands off slot 2.
-    try draws.releaseHandoff(slot2);
-    try testing.expectEqual(@as(?usize, 2), draws.handoff);
-
-    // Producer claims next slot: front is 1, (1+1)%3 = 2 is handoff, so claimBack avoids 2 and claims 0!
-    const slot0 = draws.claimBack().?;
-    try testing.expectEqual(@as(usize, 0), slot0);
-
-    // Consumer latches slot 2.
-    try draws.claimSlot(slot2);
-    try draws.tryPublish(slot2);
-    try testing.expectEqual(@as(usize, 2), draws.front);
-
-    // Teardown.
-    try draws.cancelClaim(slot0);
-    draws.deinit(testing.allocator);
+test {
+    _ = @import("frame_draws_tests.zig");
 }

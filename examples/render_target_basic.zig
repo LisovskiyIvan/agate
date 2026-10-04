@@ -533,6 +533,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .width = 800,
         .height = 600,
         .sample_count = 1,
+        .gl = .{ .major_version = 4, .minor_version = 3 },
         .logger = .{ .func = rttLogger },
     });
 }

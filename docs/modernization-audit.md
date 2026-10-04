@@ -298,7 +298,7 @@ BC1/BC3/BC7 как GPU-компрессия не устарели от возр�
 | 5 | Live-read prepare, UI fallback и обходные slot helpers удалены. Один claim/build/stage/publish → begin/finish/cancel → render протокол; render не готовит кадр автоматически. Cancel/repeated build получают отдельный per-attempt cache key, без тестовых invalidation/culling обходов. |
 | 6 | Незарегистрированный live owner запрещён; assert действует во всех build modes, Scene init проверяет owner до GPU-работы. Headless CPU cleanup сохранён; owner/unregistered/foreign policy проверена на живом Metal в ReleaseSafe и ReleaseFast. |
 | 7 | Не выполнено: материал Standard и top-K lights сохраняются до переноса материалов и настоящей замены spot/shadow routing. |
-| 8 | Codegen Metal/WGSL и обязательный browser WebGPU; другие Agate hosts не объявлены поддержанными. Универсальные sokol forks не урезаны. Native WGPU по-прежнему блокирован emdawn headers. |
+| 8 | Codegen восстановлен для всех целей: Metal/WGSL + HLSL5 (D3D11/Windows) + GLSL 4.3 (GL/Linux). Native WGPU убран из конфигурации Agate (`-Dwgpu` больше не существует); web всегда WebGPU. Явный GL 4.3 в `sapp.run` сайтах (требование cluster storage buffers). Cross-compile доказан кодгеном; live-прогоны Windows/Linux на целевых ОС пока не выполнены и поддержанными не заявлены. Универсальные sokol forks не урезаны. |
 | 9 | Float-only timing helpers удалены; `?Sample` сохраняет availability и submission id, валидные 0ms не теряются. |
 | 10 | Старые CLI flags отвергаются с exit 2. `--no-threads` и `--prepare-exclusion` меняют только scheduling/exclusion того же staged-протокола; GPU legs и measurement script переведены. |
 | 11 | Только AGSC v3 runtime reader, v2 отвергается. Порядок байтов v3 и значение `bloom_radius` сохранены; пользовательские assets не изменены. |
@@ -331,5 +331,5 @@ zig build bench-threads -Doptimize=ReleaseSafe -- --runs 1 --frames 90 --out /pa
 ```
 
 Следующие большие задачи — пункт 7, полная target shape и пункт 12;
-auto-exposure, GGX IBL и velocity — quality-волны. Native WGPU остаётся blocked,
-кодовые изменения этой волны пока не закоммичены.
+auto-exposure, GGX IBL и velocity — quality-волны. Кодовые изменения этой волны
+коммитятся по мере готовности гейтов.

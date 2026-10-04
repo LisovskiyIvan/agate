@@ -336,6 +336,7 @@ pub fn startApp() void {
         .width = 960,
         .height = 600,
         .sample_count = 1,
+        .gl = .{ .major_version = 4, .minor_version = 3 },
         .srgb = want_srgb,
         .logger = .{ .func = logger },
     });

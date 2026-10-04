@@ -227,6 +227,7 @@ pub fn startApp() void {
         .width = 640,
         .height = 480,
         .sample_count = 1,
+        .gl = .{ .major_version = 4, .minor_version = 3 },
         .wgpu_gpu_timing_enabled = device_timestamps,
         .logger = .{ .func = logger },
     });
