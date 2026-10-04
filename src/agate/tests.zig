@@ -227,6 +227,7 @@ test {
     _ = @import("scene/gui3d_layer.zig");
     _ = @import("scene/gui3d_tests.zig");
     _ = @import("scene/highlight_layer.zig");
+    _ = @import("scene/ibl_tests.zig");
     _ = @import("scene/instance_staging.zig");
     _ = @import("scene/lifecycle.zig");
     _ = @import("scene/light_rig.zig");
@@ -299,6 +300,7 @@ test {
     _ = @import("texture/core.zig");
     _ = @import("texture/core_tests.zig");
     _ = @import("texture/cube.zig");
+    _ = @import("texture/ibl_prefilter.zig");
     _ = @import("texture/mip.zig");
     _ = @import("texture/mip_tests.zig");
     _ = @import("ttf.zig");

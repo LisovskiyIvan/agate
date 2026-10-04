@@ -222,6 +222,8 @@ layout(binding = 1) uniform fs_params {
     vec4 refraction_factors;
     mat4 refraction_view_proj;
     vec4 refraction_capture;
+    // APPENDED LAST (probe blending, wave C.2): secondary probe state for smooth transitions.
+    vec4 probe2_params;
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -254,6 +256,7 @@ layout(binding = 3) uniform sampler depth_smp;
 // The draw always binds something valid here (probe cube or default cube);
 // the shader only samples it when probe_params.x > 0.5.
 layout(binding = 11) uniform textureCube probe_tex;
+layout(binding = 19) uniform textureCube probe2_tex;
 layout(binding = 6) uniform sampler probe_smp;
 layout(binding = 7) uniform sampler brdf_lut_smp;
 // PBR layers v1: coat/fabric masks sampled through data_smp (each texture
@@ -765,15 +768,32 @@ void main() {
     if (ibl_intensity > 0.001) {
         vec3 R = reflect(-V, N);
         float max_lod = 7.0;
-        float lod = roughness * max_lod;
-        vec3 prefiltered_spec;
-        vec3 irradiance;
-        if (probe_params.x > 0.5) {
-            prefiltered_spec = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(lod, 0.0, probe_params.z)).rgb * probe_params.y;
-            irradiance = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
-        } else {
-            prefiltered_spec = textureLod(samplerCube(env_tex, env_smp), R, lod).rgb;
-            irradiance = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
+        float spec_max_lod = max_lod - 1.0;
+        float lod = roughness * spec_max_lod;
+        vec3 prefiltered_spec = vec3(0.0);
+        vec3 irradiance = vec3(0.0);
+
+        float w0 = (probe_params.x > 0.5) ? (probe_params.w > 0.0001 ? probe_params.w : 1.0) : 0.0;
+        float w1 = (probe2_params.x > 0.5) ? probe2_params.w : 0.0;
+        float w_env = max(0.0, 1.0 - w0 - w1);
+
+        if (w0 > 0.001) {
+            vec3 p0_spec = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y;
+            vec3 p0_irr = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
+            prefiltered_spec += p0_spec * w0;
+            irradiance += p0_irr * w0;
+        }
+        if (w1 > 0.001) {
+            vec3 p1_spec = textureLod(samplerCube(probe2_tex, probe_smp), R, clamp(lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y;
+            vec3 p1_irr = textureLod(samplerCube(probe2_tex, probe_smp), N, probe2_params.z).rgb * probe2_params.y;
+            prefiltered_spec += p1_spec * w1;
+            irradiance += p1_irr * w1;
+        }
+        if (w_env > 0.001) {
+            vec3 env_spec = textureLod(samplerCube(env_tex, env_smp), R, lod).rgb;
+            vec3 env_irr = textureLod(samplerCube(env_tex, env_smp), N, max_lod).rgb;
+            prefiltered_spec += env_spec * w_env;
+            irradiance += env_irr * w_env;
         }
 
         vec3 reflectance_ibl = environmentReflectance(F0, environment_brdf);
@@ -787,12 +807,16 @@ void main() {
         vec3 cc_F_ibl = fresnelSchlickRoughness(NdotV, cc_F0, cc_rough) * cc_intensity;
         vec3 cc_spec_ibl = vec3(0.0);
         if (cc_intensity > 0.001) {
-            float cc_lod = cc_rough * max_lod;
-            vec3 cc_prefiltered;
-            if (probe_params.x > 0.5) {
-                cc_prefiltered = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(cc_lod, 0.0, probe_params.z)).rgb * probe_params.y;
-            } else {
-                cc_prefiltered = textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb;
+            float cc_lod = cc_rough * spec_max_lod;
+            vec3 cc_prefiltered = vec3(0.0);
+            if (w0 > 0.001) {
+                cc_prefiltered += textureLod(samplerCube(probe_tex, probe_smp), R, clamp(cc_lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y * w0;
+            }
+            if (w1 > 0.001) {
+                cc_prefiltered += textureLod(samplerCube(probe2_tex, probe_smp), R, clamp(cc_lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y * w1;
+            }
+            if (w_env > 0.001) {
+                cc_prefiltered += textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb * w_env;
             }
             vec2 cc_brdf = texture(sampler2D(brdf_lut_tex, brdf_lut_smp), vec2(NdotV, cc_rough)).xy;
             cc_spec_ibl = cc_prefiltered * environmentReflectance(cc_F0, cc_brdf) * cc_intensity;

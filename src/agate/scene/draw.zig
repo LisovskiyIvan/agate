@@ -174,10 +174,11 @@ pub fn drawRegularItem(
     bind.views[pbr_shd.VIEW_morph_tex] = morph_view;
     bind.samplers[pbr_shd.SMP_morph_smp] = env.pipelines.morph_sampler;
 
-    // Reflection probe (wave 25): winning probe cube or the default
+    // Reflection probe (wave 25, wave C.2): winning probe cubes or the default
     // cube with zeroed params (legacy path) when none applies.
     const prb = probeForDraw(env, item.model);
     bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
+    bind.views[pbr_shd.VIEW_probe2_tex] = prb.view2;
     bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
 
     // Clustered tile storage (wave 30): real views when live, dummy
@@ -259,6 +260,7 @@ pub fn drawRegularItem(
         .directional_dir = f.directional_dir,
         .directional_color_int = f.directional_color_int,
         .probe_params = prb.params,
+        .probe2_params = prb.params2,
         .area_center_int = f.area_center_int,
         .area_right = f.area_right,
         .area_up = f.area_up,
@@ -358,6 +360,7 @@ fn drawShaderMaterialItem(
         // regular draws (per-object selection from the model).
         const prb_hook = probeForDraw(env, item.model);
         bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
+        bind.views[pbr_shd.VIEW_probe2_tex] = prb_hook.view2;
         bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
         // Clustered tile storage (wave 30): see the regular PBR branch.
         bindClusteredViews(&bind, pbr_shd, env);
@@ -419,6 +422,7 @@ fn drawShaderMaterialItem(
             .directional_dir = f.directional_dir,
             .directional_color_int = f.directional_color_int,
             .probe_params = prb_hook.params,
+            .probe2_params = prb_hook.params2,
             .area_center_int = f.area_center_int,
             .area_right = f.area_right,
             .area_up = f.area_up,
@@ -468,30 +472,39 @@ fn drawShaderMaterialItem(
 
 threadlocal var fallback_uniforms: uniforms.FrameUniforms = undefined;
 
-/// Per-draw reflection-probe resolution (wave 25): the nearest
-/// enabled+captured probe containing the object's world position (from the
-/// model translation) wins; otherwise the legacy path (zeroed params, so
-/// the shader takes its bit-identical no-probe branch). The default-cube
-/// binds keep the declared probe texture/sampler slots valid when no probe
-/// applies. Pure (no GPU calls).
-fn probeForDraw(env: *const Environment, model: Mat4) struct {
+pub const ProbeDrawState = struct {
     params: [4]f32,
+    params2: [4]f32,
     view: sg.View,
+    view2: sg.View,
     sampler: sg.Sampler,
-} {
+};
+
+/// Per-draw reflection-probe resolution (wave 25, wave C.2): selects up to
+/// two overlapping enabled+captured probes containing the object's world
+/// position with smooth continuous falloff weights; otherwise the legacy path
+/// (zeroed params, so the shader takes its bit-identical no-probe branch).
+/// Pure (no GPU calls).
+fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
     const pos = Vec3.new(model.m[12], model.m[13], model.m[14]);
-    if (probe_layer.selectProbe(env.probes, pos)) |sel| {
-        return .{
-            .params = .{ 1.0, sel.intensity, sel.max_probe_lod, 0.0 },
-            .view = sel.view,
-            .sampler = sel.sampler,
-        };
-    }
-    return .{
+    const sel = probe_layer.selectProbes(env.probes, pos);
+    var out = ProbeDrawState{
         .params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .params2 = .{ 0.0, 0.0, 0.0, 0.0 },
         .view = env.default_cube.view,
+        .view2 = env.default_cube.view,
         .sampler = env.default_cube.sampler,
     };
+    if (sel.primary) |p0| {
+        out.params = .{ 1.0, p0.probe.intensity, p0.probe.max_probe_lod, p0.weight };
+        out.view = p0.probe.view;
+        out.sampler = p0.probe.sampler;
+    }
+    if (sel.secondary) |p1| {
+        out.params2 = .{ 1.0, p1.probe.intensity, p1.probe.max_probe_lod, p1.weight };
+        out.view2 = p1.probe.view;
+    }
+    return out;
 }
 
 // Binds the clustered tile storage views for one draw: the real views of
@@ -676,6 +689,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     // Reflection probes skip instanced batches in v1 (no single object
     // position for selection): legacy path with valid binds.
     bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
+    bind.views[inst_pbr_shd.VIEW_probe2_tex] = env.default_cube.view;
     bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
 
     // Clustered tile storage (wave 30): see the regular PBR branch.
@@ -718,6 +732,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         .directional_dir = f.directional_dir,
         .directional_color_int = f.directional_color_int,
         .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .probe2_params = .{ 0.0, 0.0, 0.0, 0.0 },
         .area_center_int = f.area_center_int,
         .area_right = f.area_right,
         .area_up = f.area_up,
@@ -784,6 +799,7 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
             if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
             if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
+            if (!@hasField(P, "probe2_params")) @compileError("FsParams missing probe2_params");
             if (!@hasField(P, "area_center_int")) @compileError("FsParams missing area_center_int");
             if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
             if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
@@ -799,10 +815,13 @@ test "forward shader FsParams carry the appended uv/channel uniforms" {
             if (!@hasDecl(M, "VIEW_ssbo_cluster_lights")) @compileError("shader module missing VIEW_ssbo_cluster_lights");
             if (!@hasDecl(M, "VIEW_ssbo_cluster_tiles")) @compileError("shader module missing VIEW_ssbo_cluster_tiles");
             if (!@hasDecl(M, "VIEW_ssbo_cluster_indices")) @compileError("shader module missing VIEW_ssbo_cluster_indices");
+            if (!@hasDecl(M, "VIEW_probe_tex")) @compileError("shader module missing VIEW_probe_tex");
+            if (!@hasDecl(M, "VIEW_probe2_tex")) @compileError("shader module missing VIEW_probe2_tex");
         }
         if (pbr_shd.VIEW_ssbo_cluster_lights != 12) @compileError("clustered light slot moved");
         if (pbr_shd.VIEW_ssbo_cluster_tiles != 13) @compileError("clustered tile slot moved");
         if (inst_pbr_shd.VIEW_ssbo_cluster_indices != 14) @compileError("clustered index slot moved");
+        if (pbr_shd.VIEW_probe2_tex != 19) @compileError("probe2_tex slot moved");
     }
 }
 
@@ -842,6 +861,8 @@ test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "transmission_color"), @offsetOf(inst_pbr_shd.FsParams, "transmission_color"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_factors"), @offsetOf(skinned_pbr_shd.FsParams, "sss_factors"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_color"), @offsetOf(inst_pbr_shd.FsParams, "sss_color"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe2_params"), @offsetOf(skinned_pbr_shd.FsParams, "probe2_params"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe2_params"), @offsetOf(inst_pbr_shd.FsParams, "probe2_params"));
 }
 
 test "pbr layer mask texture slots are pinned across the triple" {
@@ -878,9 +899,10 @@ test "probeForDraw resolves the winning probe or the legacy fallback" {
     // branch) with the default-cube binds keeping the slots valid.
     const off = probeForDraw(&empty_env, Mat4.identity);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, off.params);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, off.params2);
     try std.testing.expectEqual(@as(u32, 0), off.view.id);
 
-    // A covering probe: enabled lane with its intensity/lod/view/sampler.
+    // A covering probe: enabled lane with its intensity/lod/view/sampler and falloff weight 1.0 at center.
     // The identity model sits at the origin, inside the radius-5 probe.
     var entries = [_]probe_layer.ProbeFrameEntry{
         .{
@@ -897,9 +919,45 @@ test "probeForDraw resolves the winning probe or the legacy fallback" {
     var covered_env = empty_env;
     covered_env.probes = &entries;
     const on = probeForDraw(&covered_env, Mat4.identity);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 7.0, 0.0 }, on.params);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 7.0, 1.0 }, on.params);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, on.params2);
     try std.testing.expectEqual(@as(u32, 31), on.view.id);
     try std.testing.expectEqual(@as(u32, 32), on.sampler.id);
+
+    // Multi-probe blending test: two overlapping probes at (-2, 0, 0) and (2, 0, 0)
+    var blend_entries = [_]probe_layer.ProbeFrameEntry{
+        .{
+            .position = Vec3.new(-2.0, 0, 0),
+            .radius = 4.0,
+            .enabled = true,
+            .captured = true,
+            .intensity = 1.0,
+            .max_probe_lod = 7.0,
+            .view = .{ .id = 41 },
+            .sampler = .{ .id = 42 },
+        },
+        .{
+            .position = Vec3.new(2.0, 0, 0),
+            .radius = 4.0,
+            .enabled = true,
+            .captured = true,
+            .intensity = 1.0,
+            .max_probe_lod = 7.0,
+            .view = .{ .id = 51 },
+            .sampler = .{ .id = 52 },
+        },
+    };
+    var blend_env = empty_env;
+    blend_env.probes = &blend_entries;
+    const blended = probeForDraw(&blend_env, Mat4.identity);
+    // At origin, both probes are at distance 2 (u = 0.5, smoothstep = 0.5)
+    // Normalized weights: 0.5 and 0.5, sum = 1.0
+    try std.testing.expectEqual(@as(f32, 1.0), blended.params[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), blended.params2[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blended.params[3], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blended.params2[3], 0.01);
+    try std.testing.expect(blended.view.id != 0);
+    try std.testing.expect(blended.view2.id != 0);
 
     // Same pack, object outside the radius: legacy fallback again.
     const far_model = Mat4.translation(Vec3.new(100.0, 0.0, 0.0));

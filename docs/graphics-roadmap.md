@@ -43,9 +43,7 @@ Metal native + browser WebGPU legs) перед закрытием.
 ### C. Качество графики — волны к Unreal-уровню (порядок по стоимости/эффекту)
 
 1. **Auto-exposure** (S) — ВЫПОЛНЕНО (04.10.2026): histogram/luminance buffer → экспозиция кадра (`postprocess/auto_exposure.zig`, `scene/postfx_stack.zig`, `scene/core.zig`). Гейт: CPU golden steps + сцена 1/4/16 без клипа пройдены.
-2. **GGX IBL** (M): prefilter probe mips (сейчас box-усреднение,
-   `shaders/probe_mip.glsl`), irradiance, probe blending. Гейт: PBR-сцена
-   с ENV-only светом.
+2. **GGX IBL** (M) — ВЫПОЛНЕНО (04.10.2026): GGX importance-sampled probe prefiltering, cosine-convolved diffuse irradiance, continuous multi-probe blending (`texture/ibl_prefilter.zig`, `shaders/probe_mip.glsl`, `scene/probe_render.zig`, `scene/probe_layer.zig`, `scene/draw.zig`, PBR shaders). Гейт: PBR-сцена с ENV-only светом и аналитический white furnace energy conservation пройдены (`scene/ibl_tests.zig`).
 3. **Velocity/TAA** (M): rigid+skinned+instanced velocity buffers → TAA
    без ghosting в движении; потом reconstruction/upscaling. Гейт:
    вращающаяся сцена, CPU golden репроекции.

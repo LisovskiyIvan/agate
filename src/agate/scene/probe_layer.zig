@@ -228,8 +228,10 @@ pub const FramePack = struct {
     count: usize = 0,
 };
 
+const ibl_prefilter = @import("../texture/ibl_prefilter.zig");
+
 /// Result of per-object probe selection: the winning probe's sampling
-/// state. No blending in v1: exactly one probe (or none) applies.
+/// state.
 pub const SelectedProbe = struct {
     index: usize,
     intensity: f32,
@@ -237,6 +239,77 @@ pub const SelectedProbe = struct {
     view: sg.View,
     sampler: sg.Sampler,
 };
+
+/// One blended probe entry with its normalized spatial blend weight.
+pub const ProbeBlendEntry = struct {
+    probe: SelectedProbe,
+    weight: f32,
+};
+
+/// Multi-probe selection result for probe blending (roadmap C.2):
+/// Supports up to two overlapping probes with C1 smoothstep falloff weights
+/// and remaining weight allocated to the environment map.
+pub const SelectedProbes = struct {
+    primary: ?ProbeBlendEntry = null,
+    secondary: ?ProbeBlendEntry = null,
+    env_weight: f32 = 1.0,
+};
+
+/// Selects up to 2 overlapping probes at `pos` with continuous C1 smoothstep
+/// falloff weights based on distance to probe centers.
+/// When inside a single probe, the probe weight smoothly transitions to 0
+/// at radius with zero derivative, avoiding edge pops.
+/// When inside two overlapping probes, weights are normalized across both probes
+/// guaranteeing smooth transition across probe boundaries without jump/pop.
+pub fn selectProbes(entries: []const ProbeFrameEntry, pos: Vec3) SelectedProbes {
+    var best0: ?SelectedProbe = null;
+    var w0: f32 = 0.0;
+    var best1: ?SelectedProbe = null;
+    var w1: f32 = 0.0;
+
+    for (entries, 0..) |*e, i| {
+        if (!e.enabled or !e.captured) continue;
+        if (e.view.id == 0) continue;
+        const d = e.position.sub(pos).length();
+        if (d >= e.radius) continue;
+        const w = ibl_prefilter.smoothFalloff(d, e.radius);
+        if (w <= 0.0001) continue;
+
+        const sel = SelectedProbe{
+            .index = i,
+            .intensity = e.intensity,
+            .max_probe_lod = e.max_probe_lod,
+            .view = e.view,
+            .sampler = e.sampler,
+        };
+
+        if (w > w0) {
+            best1 = best0;
+            w1 = w0;
+            best0 = sel;
+            w0 = w;
+        } else if (w > w1) {
+            best1 = sel;
+            w1 = w;
+        }
+    }
+
+    if (best0 == null) {
+        return .{};
+    }
+
+    const blended = ibl_prefilter.blendProbeWeights(w0, w1);
+    var res = SelectedProbes{
+        .primary = .{ .probe = best0.?, .weight = blended.w0 },
+        .env_weight = blended.w_env,
+    };
+    if (best1) |b1| {
+        if (blended.w1 > 0.0001) {
+            res.secondary = .{ .probe = b1, .weight = blended.w1 };
+        }
+    }
+    return res;
+}
 
 /// Nearest enabled+captured probe whose radius contains `pos`; ties resolve
 /// to the lowest probe index (strict `<` keeps the first best). Returns null

@@ -247,12 +247,18 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
             bind.samplers[blit_probe_shd.SMP_smp] = scene.probes.blit_sampler;
             sg.applyBindings(bind);
 
+            const is_irradiance = (mip == scene_probes.max_mips - 1);
+            const roughness = if (is_irradiance)
+                1.0
+            else
+                @as(f32, @floatFromInt(mip)) / @as(f32, @floatFromInt(scene_probes.max_mips - 2));
+            const mode: f32 = if (is_irradiance) 1.0 else 0.0;
             const fs_params = blit_probe_shd.FsParams{
                 .params = .{
                     @floatFromInt(face_i),
-                    @floatFromInt(mip - 1),
-                    0.0,
-                    0.0,
+                    roughness,
+                    mode,
+                    @floatFromInt(scene_probes.face_resolution),
                 },
             };
             sg.applyUniforms(blit_probe_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -260,7 +266,7 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
             sg.endPass();
         }
 
-        // Pass B: Copy scratch_cube (mip) -> probe.gpu (mip)
+        // Pass B: Copy scratch_cube (mip) -> probe.gpu (mip) (mode 2.0 = blit copy)
         face_i = 0;
         while (face_i < 6) : (face_i += 1) {
             var pass = sg.Pass{
@@ -286,9 +292,9 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
             const fs_params = blit_probe_shd.FsParams{
                 .params = .{
                     @floatFromInt(face_i),
+                    0.0,
+                    2.0,
                     @floatFromInt(mip),
-                    0.0,
-                    0.0,
                 },
             };
             sg.applyUniforms(blit_probe_shd.UB_fs_params, sg.asRange(&fs_params));
