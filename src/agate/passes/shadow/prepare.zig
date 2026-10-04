@@ -25,15 +25,16 @@ const types = @import("types.zig");
 /// Core prepare algorithm, parameterized by the destination payload: bins
 /// meshes into the pass-owned `binned_meshes` scratch, then snapshots
 /// items + skin copies into `out`. `out` may be the standalone
-/// `prepared` (via `prepare`) or a Scene double-buffer slot (P7) — the
+/// `prepared` (via `prepare`) or a leased Scene frame slot — the
 /// algorithm runs once here, never duplicated. OOM semantics preserved:
 /// growth failure publishes a coherent-empty snapshot (items + skins +
 /// zero counts, never stale), skin-copy failure flags the single item
 /// gpu_pending without shifting bucket layout.
 ///
-/// `cache_key` tags the world-matrix/AABB cache (fallback: `Scene.frame_id`,
-/// game build: build-unique `(build_seq | (1<<63))`); `instance_source`
-/// selects the instanced state (`.published` = fallback `instance_render`,
+/// `cache_key` tags the world-matrix/AABB cache (standalone: `Scene.frame_id`,
+/// game build: per-attempt `build_cache_seq` in the high-bit namespace);
+/// `instance_source`
+/// selects the instanced state (`.published` = standalone immediate `instance_render`,
 /// `.build_view` = game-frozen provisional). No new caches, no
 /// invalidation change.
 pub fn prepareInto(
@@ -71,7 +72,7 @@ pub fn prepareInto(
         // (staged before this prepare); regular meshes use the fresh
         // world cache. No live instance/game-cache reads here.
         // Stage-2B: staged state resolves via instance_source
-        // (fallback `.published`, game build `.build_view` provisional).
+        // (standalone `.published`, game build `.build_view` provisional).
         const staged = mesh.instanceRenderSource(instance_source).*;
         const aabb_w = if (!is_inst) scene_render_queue.worldAABBCached(cache_key, mesh) else staged.bounds;
         const model = if (!is_inst) scene_render_queue.worldMatrixCached(cache_key, mesh) else Mat4.identity;
@@ -496,7 +497,7 @@ test "P5: shadow, main batch and outline read identical published state" {
     };
     const meshes = [_]*Mesh{&parent};
 
-    // Pre-stage кадра (как Scene.prepareFrame до shadow prepare).
+    // Pre-stage кадра (как staged begin до shadow prepare).
     var stage_queues = scene_render_queue.RenderQueues{};
     defer stage_queues.deinit(ally);
     instance_staging.stageInstances(.{

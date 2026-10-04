@@ -35,6 +35,9 @@ void main() {
 @end
 
 @fs fs
+// Shared finite-radiance guard (fragment scope; parent enables the build
+// include for this shader).
+// @include "common/linear_output.glsl"
 layout(binding = 0) uniform texture2D particle_tex;
 layout(binding = 0) uniform sampler smp;
 
@@ -45,7 +48,11 @@ out vec4 frag_color;
 
 void main() {
     vec4 tex = texture(sampler2D(particle_tex, smp), v_uv);
-    frag_color = tex * v_color;
+    // Linear radiance finite-bound via the shared guard: with additive
+    // blending a single overflowing/NaN sprite would otherwise seed
+    // non-finite values across the frame.
+    vec4 c = tex * v_color;
+    frag_color = vec4(boundRadiance(c.rgb), c.a);
 }
 @end
 

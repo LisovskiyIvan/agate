@@ -51,5 +51,7 @@
         "examples/render_target_basic.zig",
         "examples/gpu_timing.zig",
         "examples/gpu_timing_web.zig",
+        "examples/hdr_showcase.zig",
+        "examples/hdr_showcase_web.zig",
     },
 }

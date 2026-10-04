@@ -54,7 +54,7 @@ pub fn bloomTentWeight(ix: i32, iy: i32) f32 {
 /// Pass-construction decision (pure; PostFXStack.renderChain gates the GPU
 /// passes on this).
 pub fn bloomPyramidActive(post_enabled: bool, cfg: options.PostProcessOptions) bool {
-    return post_enabled and cfg.bloom_enabled and cfg.bloom_pyramid;
+    return post_enabled and cfg.bloom_enabled and cfg.bloom_intensity > 0;
 }
 
 test "bloom mips clamp" {

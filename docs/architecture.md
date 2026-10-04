@@ -28,10 +28,8 @@ box.material = .{ .standard = mat };
 // Кадр: game пишет, context готовит и рисует (см. ./runtime.md).
 var runtime: agate.Runtime = agate.Runtime.init();
 defer runtime.deinit();
-scene.publishFrameSnapshot(aspect, w, h);
-_ = runtime.produceBuild(&scene);
-const begun = runtime.beginPrepare(&scene);
-if (begun.claim) |c| { runtime.finishPrepare(&scene, c); scene.render(); }
+// game: _ = runtime.update(&scene, &tick_ctx, Tick.run); // simulate + producer build
+// context: switch (runtime.renderFrame(&scene)) { .prepared, .reused, .skipped, .busy }
 ```
 
 Импорт всегда `const agate = @import("agate");` (модуль `agate` собирается в `build.zig` из `src/agate/root.zig` + сгенерированных шейдер-модулей + `math` + `shader_material_registry`).
@@ -60,11 +58,11 @@ if (begun.claim) |c| { runtime.finishPrepare(&scene, c); scene.render(); }
 | io_runner (`jobs.TaskRunner`, 1 поток) | Декоды текстур, save/load кодирование + file IO | Живую сцену (только снапшоты) |
 | Jobs-воркеры (`jobs.Pool`, до 8) | CPU-чанки `parallelFor` (курсор-атомик) | `sg.*`, shared state, вложенный `parallelFor` |
 
-Фазовый мьютекс (`Runtime.mutex`, `jobs.Mutex`): update-vs-begin exclusion. По умолчанию staged begin идёт lock-free (см. ниже); `setProducerExclusion(true)` возвращает окно исключения; `prepareSerial` лочит всегда. `finish`/`render` перекрываются со следующим update. `sg.*` — только контекстный поток (`gpu_thread.markContextThread` один раз в init до спавна; `assertOnContextThread` на входах render-фазы; тесты без маркера — синхронный fallback).
+Фазовый мьютекс (`Runtime.mutex`, `jobs.Mutex`): update-vs-begin exclusion. По умолчанию staged begin идёт lock-free (см. ниже); `setProducerExclusion(true)` — только mutex-диагностика тех же данных/алгоритма. `finish`/`render` перекрываются со следующим update. `sg.*` — только контекстный поток (`gpu_thread.markContextThread` один раз до `Scene.initInto`; `assertOnContextThread` на входах render-фазы; headless без маркера — только CPU-cleanup).
 
 ### Lock-free staged prepare (одной страницей; детали — `./frame-pipeline.md`)
 
-Слоты (`FrameDraws`, тройной буфер переменных списков с pin/lease): продюсер `tryClaimBuildSlot → build → stageUi → stageHostBytes → publish` замораживает payloads в слот и релизит поколение (`build_seq`); контекст `beginStagedPrepare` лэтчит свежее поколение без мьютекса (только slot-owned + context-owned чтения), `finishStagedPrepare` публикует front, `render` рисует, `renderReuse` перепрезентует front при пустом begin. Живые dirty-флаги/скаляры потребляет game-side commit, `Scene.lock_free_prepare` гасит UI live-fallbacks, host live-reads едут замороженными `host_bytes` в claim. Пустой begin — никогда не live-fallback: reuse/skip. Каждый begin — ровно один finish/cancel.
+Слоты (`FrameDraws`, тройной буфер переменных списков с pin/lease): продюсер `tryClaimBuildSlot → build → stageUi → stageHostBytes → publish` (или `Scene.buildPreparedFrame`) замораживает payloads в слот и релизит поколение (`build_seq`); контекст `beginStagedPrepare` лэтчит свежее поколение без мьютекса (только slot-owned + context-owned чтения), `finishStagedPrepare` публикует front, `render` рисует подготовленное и никогда не готовит свежий кадр сам, `renderReuse` перепрезентует валидный front при пустом begin. Живые dirty-флаги/скаляры потребляет game-side commit, host live-reads едут замороженными `host_bytes` в claim. Пустой begin — никогда не live-fallback: reuse/skip. Каждый begin — ровно один finish/cancel (one-shot, живой GPU-владелец).
 
 ### Владение GPU-ресурсами (отложенное создание/уничтожение, retire)
 
@@ -141,7 +139,7 @@ zig build -Dtarget=wasm32-emscripten -Dweb-debug   # оставить Debug (и�
 
 ## Ошибки и краевые случаи
 
-- Нарушение контракта потоков (game пишет `stats`, воркер зовёт `sg.*`, registry-mutate поперёк latch) — баг приложения; tripwire'ы (`assertOnContextThread`, `Scene.lock_free_prepare`, commit guards) делают его громким, а не тихим.
+- Нарушение контракта потоков (game пишет `stats`, воркер зовёт `sg.*`, registry-mutate поперёк latch) — баг приложения; tripwire'ы (`assertOnContextThread`, commit guards) делают его громким, а не тихим.
 - Два продюсера, вложенный `parallelFor`, `sg.*` в job — запрещены контрактом (см. `./runtime.md`).
 - Headless (нет `sg.setup`): все GPU-пути fail-closed (тайминги 0, аплоады CPU-only + deferred, render early-out после эпохи).
 - OOM в реестрах/слотах — fail-closed (null/skip/drain, счётчики дропов), не паника, кроме debug-ассертов на двойные терминалы claim.

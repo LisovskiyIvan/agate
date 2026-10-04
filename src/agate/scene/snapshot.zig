@@ -41,7 +41,7 @@ pub const CameraSnapshot = struct {
 /// Frame-level camera/light/pass state published by the simulation side.
 /// Это frame mailbox (камеры/свет/конфиг проходов), а НЕ подготовленные
 /// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
-/// outline-items строятся позже в prepareFrame и живут отдельно — P7: в трёх
+/// outline-items строятся позже в staged begin/finish и живут отдельно — P7: в трёх
 /// retained-слотах Scene.draws (см. scene/frame_draws.zig: FrameDrawSlot),
 /// а не в этом snapshot.
 /// P4 покрывает только mesh-payload очередей; update-vs-prepare остаются
@@ -246,7 +246,7 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
 /// Publishes a complete frame snapshot through the lock-free mailbox.
 /// When the mailbox is saturated (consumer lagging, both slots
 /// published), stale published slots are drained first so the NEWEST
-/// snapshot wins — otherwise prepareFrame's takeLatest would resurface
+/// snapshot wins — otherwise the producer build's takeLatest would resurface
 /// an older published frame over the newer fallback.
 ///
 /// Render-ownership: the saturated fallback NEVER writes the consumed

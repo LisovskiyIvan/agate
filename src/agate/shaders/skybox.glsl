@@ -18,6 +18,9 @@ void main() {
 @end
 
 @fs fs
+// Shared finite-radiance guard (fragment scope; parent enables the build
+// include for this shader).
+// @include "common/linear_output.glsl"
 layout(binding = 1) uniform fs_params {
     vec4 params; // x: exposure / intensity, yzw: unused
 };
@@ -30,7 +33,10 @@ out vec4 frag_color;
 
 void main() {
     vec4 color = texture(samplerCube(sky_tex, smp), v_dir);
-    frag_color = vec4(color.rgb * params.x, color.a);
+    // Linear radiance scaled by intensity, finite-bound via the shared guard
+    // so the scaled sky can neither feed NaN/Inf into additive blending nor
+    // clamp >1 radiance (the composite owns exposure/tonemap).
+    frag_color = vec4(boundRadiance(color.rgb * params.x), color.a);
 }
 @end
 

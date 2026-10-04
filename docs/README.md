@@ -11,13 +11,14 @@
 |---|---|
 | [architecture.md](./architecture.md) | Слои движка, модель потоков (game/context/audio/io_runner), lock-free staged prepare одной страницей, владение GPU-ресурсами, сборка, тесты и гейты, карта модулей |
 | [graphics-roadmap.md](./graphics-roadmap.md) | План качества/перфа: HDR и IBL сначала, предпосылки GI/temporal/indirect, гейты и стоп-условия |
+| [modernization-audit.md](./modernization-audit.md) | Аудит устаревших путей/API: один HDR-renderer и staged-протокол, кандидаты на удаление, зависимости и проверки |
 
 ## Ядро и потоки
 
 | Файл | О чём |
 |---|---|
 | [runtime.md](./runtime.md) | `Runtime` (фасад кадра, `beginPrepare*`/`produceBuild*`, `setProducerExclusion`, метрики), `Handoff`, affinity-маркер, job pool (`forkJoin`/`parallelFor`), наблюдаемость |
-| [gpu-timing.md](./gpu-timing.md) | Opt-in Metal/WebGPU/GL timestamps: capabilities, availability, submission ids, lifecycle и живой GPU-гейт |
+| [gpu-timing.md](./gpu-timing.md) | Opt-in Metal/WebGPU timestamps: capabilities, availability, submission ids, lifecycle и живой GPU-гейт (только optional `Sample`, legacy `poll*Ms` удалены) |
 | [scene.md](./scene.md) | Фасад `Scene`: registry/content, lifecycle, камеры сцены, API-фасады (sim/query/lights/profile), снимки и статистика |
 | [frame-pipeline.md](./frame-pipeline.md) | Многопоточный кадр: 3-слотовый протокол (claim→build→stage→publish, pin/lease), lock-free контракт, `host_bytes`, режимы staged/mutex/serial |
 | [render-pipeline.md](./render-pipeline.md) | Cull/сортировка/биннинг, zero-dereference draw items, инстансинг (4 фазы), фабрика пайплайнов, `FrameContext`, PostFX-цепочка, тени CSM/spot/point |
@@ -58,8 +59,8 @@
 | [serialization.md](./serialization.md) | AGSC v1–v3, save/load память/файл/async, custom properties, что сохраняется |
 | [visibility.md](./visibility.md) | CPU Hi-Z окклюзия: пирамида, растеризатор окклюдеров, `OcclusionCuller` |
 | [shaders.md](./shaders.md) | Компиляция sokol-shdc, `// @include`-чанки `shaders/common/`, shader-материалы и hook-точки, drift-тесты |
-| [postprocess.md](./postprocess.md) | Все постэффекты, параметры/клампы, порядок composite-стека |
-| [passes.md](./passes.md) | 13 GPU-пассов: что рендерят, таргеты, включение |
+| [postprocess.md](./postprocess.md) | Единая HDR-цепочка, параметры/клампы, порядок composite-стека |
+| [passes.md](./passes.md) | GPU-пассы: что рендерят, таргеты, включение (bloom — единая HDR-пирамида) |
 
 ## Соглашения
 

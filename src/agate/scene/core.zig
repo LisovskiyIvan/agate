@@ -9,6 +9,8 @@
 //! Anti-cycle rule: leaves never import `core.zig` or the facade.
 const std = @import("std");
 const sokol = @import("sokol");
+const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const sapp = sokol.app;
 const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
@@ -220,7 +222,7 @@ pub const Scene = struct {
     /// GpuRetireQueue, новых очередей в Scene не заводить. (P5 — instance
     /// buffer payload — уже там: см. retireBuffer.)
     gpu_retire: scene_retire.GpuRetireQueue = .{},
-    /// Epoch, начатый последним prepareFrame. render завершает его на ВСЕХ
+    /// Epoch, начатый последним staged begin. render завершает его на ВСЕХ
     /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
     /// а не на камеру/view.
     retire_epoch: scene_retire.Epoch = 0,
@@ -239,33 +241,6 @@ pub const Scene = struct {
     active_camera: ?Camera = null,
     active_camera_owned_name: ?[]const u8 = null,
     clear_color: Color4 = Color4.new(0.12, 0.14, 0.18, 1.0),
-    /// Babylon's output stage for the PBR family: the final shaded value is
-    /// gamma-encoded in the shader (`applyImageProcessing` -> `toGammaSpace`
-    /// = `pow(color, 1/2.2)`) and written to a backbuffer that is NOT sRGB.
-    /// Babylon itself has no switch — every material shader ends that way —
-    /// so this defaults to ON, which is also the convention `clear_color`
-    /// above already follows (the default `(0.12, 0.14, 0.18)` is Babylon's
-    /// `Scene.clearColor`, i.e. a gamma-space value written verbatim).
-    ///
-    /// Set it to `false` for an sRGB backbuffer (`sapp_desc.srgb = true`),
-    /// where the hardware applies the exact piecewise sRGB curve to linear
-    /// shader output; leaving it ON there encodes twice. The two curves are
-    /// not the same function (they differ by ~1% in the midtones and by tens
-    /// of percent in deep shadow), which is why the flag must match the
-    /// backbuffer — see shaders/common/output_gamma.glsl and bench/PROBE.md
-    /// §10.13.
-    ///
-    /// Scope: the PBR shader family (`pbr`, `instanced_pbr`, `skinned_pbr`) —
-    /// and that scope is MEASURED, not inferred. Babylon's *assembled* WGSL
-    /// for a `StandardMaterial` contains the `applyImageProcessing` helper but
-    /// never calls it (the `IMAGEPROCESSING` define is off for it), so a
-    /// standard material writes LINEAR color to the canvas while a PBR one
-    /// writes `pow(color, 1/2.2)`. The bench probe pair `stdmat` / `stdmatns`
-    /// pins that down: with the ground on a StandardMaterial the two engines'
-    /// linear values agree to 0.8% (0.2646 vs 0.2667) once this flag is NOT
-    /// applied there. Do not extend it to the standard family — see
-    /// bench/PROBE.md §10.14.
-    output_gamma: bool = true,
     default_material: StandardMaterial = StandardMaterial.init("default"),
     default_white_texture: Texture,
     /// Babylon's environment-BRDF lookup (256x256, gammaSpace) behind
@@ -283,7 +258,7 @@ pub const Scene = struct {
     /// Update-side code NEVER writes here directly (render reads it
     /// concurrently with update); the update tick arrives via
     /// `pending_update_ms` + `recordUpdateTime` and is transferred by
-    /// prepareFrame.
+    /// staged prepare.
     stats: SceneStats = .{},
     /// Latest update timing crosses the producer/prepare boundary atomically.
     /// Prepare may finish a slot-owned frame while the producer starts the
@@ -292,7 +267,7 @@ pub const Scene = struct {
     pending_update_ms: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
     /// Latest physics timing, published with the same single-writer rule.
     pending_physics_ms: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
-    // Bumped once per render(); Mesh.cached_* entries tagged with this are fresh.
+    // Bumped once per finished prepared generation, never by renderReuse.
     frame_id: u64 = 0,
 
     // ---- Render subsystems. ----
@@ -333,8 +308,8 @@ pub const Scene = struct {
     /// pack was published since the previous frame (e.g. PIP: several
     /// render calls per one update).
     light_pack: scene_lights.LightRig.FramePack = std.mem.zeroes(scene_lights.LightRig.FramePack),
-    /// Async texture decode/upload pipeline. Drained at the top of
-    /// render(); deinit'd FIRST in deinit so in-flight decodes finish
+    /// Async texture decode/upload pipeline. Drained by staged begin;
+    /// producer build commits targets. Deinit joins in-flight decodes
     /// before any material they target is freed. Null = synchronous loads.
     uploads: ?assets_mod.UploadQueue = null,
     /// Dedicated file-I/O runner for async save/load (saveStateFileAsync /
@@ -342,8 +317,8 @@ pub const Scene = struct {
     /// disk I/O can never starve texture decodes. 1 thread: file ops are
     /// serial by nature. Null = NoTaskRunner, same fallback as uploads.
     io_runner: ?*jobs.TaskRunner = null,
-    /// Last prepareFrame texture-upload tally, published into
-    /// `stats.uploaded_*_frame` at render start (prepareFrame runs before
+    /// Last staged-begin texture-upload tally, published into
+    /// `stats.uploaded_*_frame` at render start (begin runs before
     /// the per-frame stats reset, so the tally is staged here first).
     frame_uploads: assets_mod.UploadQueue.DrainResult = .{},
     // Dynamic decals.
@@ -409,6 +384,7 @@ pub const Scene = struct {
     // attachment). Null until the first MSAA frame.
     forward_msaa: ?scene_forward.ForwardPipelines = null,
     warn_msaa_format: scene_msaa.WarnOnce = .{},
+    warn_main_target: scene_msaa.WarnOnce = .{},
 
     // Mesh-vanish probe state (pure diagnostic for the symptom "all meshes
     // gone from the main view while skybox + particles keep rendering").
@@ -458,7 +434,7 @@ pub const Scene = struct {
     /// reads/writes `frame_snapshot`, otherwise it races the draw under
     /// update||render.
     build_snapshot: scene_snapshot.SceneFrameSnapshot = .{},
-    /// Flag indicating whether prepareFrame() has already run for this frame.
+    /// Flag indicating whether the staged prepare has already run for this frame.
     frame_prepared: bool = false,
     /// Context-only linear-use guard for the split prepare token. A begin
     /// claims a slot and must be paired with exactly one finish or cancel.
@@ -466,25 +442,21 @@ pub const Scene = struct {
     prepare_claim_active: bool = false,
     prepare_claim_slot: usize = 0,
     prepare_claim_seq: usize = 0,
-    prepare_claim_have_build: bool = false,
-    prepare_claim_has_handoff: bool = false,
     /// Reuse guard owned by `renderReuse` on the context thread (set around
     /// the inner `render()` call, never observed concurrently): tells render
-    /// to skip the `prepareFrame` fallback and the profiler `recordFrame`
-    /// tail, so the already-consumed front is re-drawn as-is.
+    /// to accept the already-consumed front without a fresh prepared frame
+    /// and skip the profiler `recordFrame` tail (the wrapper records reuse).
     rendering_reuse: bool = false,
     /// Consecutive `renderReuse` presents without an intervening successful
-    /// prepare (context thread only: reset by `prepareFrame`, bumped by
+    /// prepare (context thread only: reset by staged finish, bumped by
     /// `renderReuse`). Observable staleness: retire/upload intents pile up
     /// for exactly this many frames (`GpuRetireQueue.pending_cap` bounds the
     /// pileup, `retainedCount`/`cappedDropCount` expose it). Read via
     /// `reuseStreak()`; never written by update.
     reuse_streak: u64 = 0,
-    /// True only while prepareFrame's own flushPendingGpuUploads runs
-    /// (context thread): the render pipeline commits that frame's buffer,
-    /// so the flush must not. Standalone flushes (quiesced-context
-    /// completion outside the frame pipeline) commit themselves — see the
-    /// flushPendingGpuUploads tail.
+    /// Context-owned staged-begin window: render commits its command buffer.
+    /// A quiesced standalone drain outside this window commits itself; normal
+    /// frame uploads consume slot packets and never scan the live arrays.
     flush_in_prepare: bool = false,
     /// Monotonic presented-frame counter, written only on the context thread:
     /// every presented frame (normal renders and `renderReuse` re-presents
@@ -495,32 +467,15 @@ pub const Scene = struct {
     profiler_frame_seq: u64 = 0,
 
     /// Stage 1 producer-build handoff (game/update phase → prepare latch):
-    /// `buildPreparedFrame` (game side, CPU-only, sg-free) first commits the
-    /// last published latch outcomes to the live meshes (game-side
-    /// `commitPublishedRecords` over the front slot — the old guarded
-    /// `instance_render` write-back, ordered after publish, never concurrent
-    /// with the context), then stages instance
-    /// matrices into the back-slot scratch + per-mesh previews, freezes the
-    /// slot-owned staged records, captures
-    /// the particle/physics CPU build frames and freezes them into the
-    /// claimed slot (`particle_draws`, `physics_lines`/`physics_visible` —
-    /// wave 32 freeze-then-latch, so the latch never reads the shared
-    /// staging stores), then bumps `build_seq`.
-    /// `prepareFrame` (context side) consumes the build when `build_seq !=
-    /// last_latched_seq` (GPU halves over the slot records + latch copies,
-    /// no CPU restaging, no live mesh reads or writes — outcomes land in
-    /// the slot records for the game-side commit) and
-    /// otherwise runs the historical inline path — so behavior stays correct
-    /// when `buildPreparedFrame` is never called. Two builds before a latch:
-    /// newest wins (single preview store recomputed, scratch overwritten,
-    /// record array reset and refilled).
-    /// A missed build never resurfaces a stale frame: every prepare (latch
-    /// or fallback) publishes a fresh slot; render reuses the last published
-    /// front only when prepare itself is not called (unchanged).
+    /// `buildPreparedFrame` (game side, CPU-only, sg-free) stages the full
+    /// frame payload into a claimed slot and publishes its generation.
+    /// The staged begin consumes the build when `build_seq !=
+    /// last_latched_seq` and otherwise returns null (no fresh frame:
+    /// the context reuses the last front or skips the present).
     /// Handoff edge (wave 30, atomic): `build_seq` is release-stored by the
     /// producer (`BuildClaim.publish`) only after the whole build payload is
     /// staged (slot queues/records/snapshot/stats, frozen particle/physics
-    /// slot captures, `build_slot`), and acquire-loaded by the context latch (`prepareFrame`
+    /// slot captures, `build_slot`), and acquire-loaded by the staged begin (
     /// freshness check + `last_latched_seq` stamp) — the release/acquire pair
     /// orders the payload before the generation the latch consumes. The claim
     /// reserve (`tryClaimBuildSlot`) monotonic-loads the committed generation
@@ -531,30 +486,10 @@ pub const Scene = struct {
     /// stats/profiler/frame_id/retire_epoch.
     build_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     last_latched_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// Game-side UI CPU packet sequence (lock-free-publication slice 2, b):
-    /// `stageUiPacket` (game side, sg-free) records live canvas geometry
-    /// into the back slot's `ui_vertices`/`ui_indices` + `ui_packet` header
-    /// and bumps `ui_packet_seq`; `prepareFrame` latches the packet into
-    /// `ui_frame` when `ui_packet_seq != last_latched_ui_seq` and stamps it
-    /// consumed. Independent of `build_seq`: UI-only apps never call
-    /// `buildPreparedFrame`. Handoff edge (wave 30, atomic):
-    /// `stageUiPacketInto` release-bumps `ui_packet_seq` only after the slot
-    /// packet bytes + header are staged, and the context latch
-    /// (`captureUiFrame`) acquire-loads it before consuming the packet and
-    /// monotonic-stamping `last_latched_ui_seq` consumed — the release/
-    /// acquire pair orders the packet before the generation the latch reads.
-    /// `last_latched_ui_seq` is stamped context-side only (the producer never
-    /// touches it). The stage touches no stats/profiler/frame_id/epoch and
-    /// no GPU state at all (CPU list copies + seq bump only).
-    ui_packet_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    last_latched_ui_seq: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// How many prepares actually consumed a staged packet as the geometry
-    /// source (the `capturePacket` path, not the legacy canvas read and not
-    /// the staged-absence clear). Observability only: lets an app/fixture
-    /// prove the staged path is live rather than merely staged. Monotonic;
-    /// read via `uiPacketLatchedCount()`. Plain u64, stays plain: incremented
-    /// only by the context latch (`captureUiFrame`) and read context-side —
-    /// never shared across the handoff edge.
+    /// How many staged prepares consumed a staged packet as the geometry
+    /// source (the `capturePacket` path, not the staged-absence clear).
+    /// Read via `uiPacketLatchedCount()`; incremented only by the context
+    /// latch, read context-side.
     ui_packet_latched: u64 = 0,
     /// Back-slot index the last `buildPreparedFrame` wrote (stamped by
     /// `BuildClaim.publish` with a release store BEFORE the `build_seq`
@@ -588,15 +523,6 @@ pub const Scene = struct {
     /// too small changes nothing, too large slows the sim tick rate
     /// (ticks/s floor: the latch needs one fresh build per 16.7 ms frame).
     concurrent_yield_ns: u64 = 0,
-    /// Lock-free staged prepare (phase 2, default ON): `Runtime.beginPrepare*`
-    /// sets this from its `producer_exclusion` knob on every begin
-    /// (`setProducerExclusion(true)` clears it again). It gates the last
-    /// live-list fallbacks on the fresh-build path (`captureUiFrame` degrades
-    /// an invalid staged UI packet to coherent-empty instead of re-reading
-    /// the live canvas lists); the upload-packet flush/commit needs no flag
-    /// (it never touches live state either way). Plain bool, written on the
-    /// context thread, read only there.
-    lock_free_prepare: bool = false,
     /// Last published frame whose staged-upload outcomes were committed
     /// (`commitSlotResults` at the next build). Game side only (written
     /// by the build core, never across the handoff edge): a repeat build
@@ -608,10 +534,26 @@ pub const Scene = struct {
     /// never across the handoff edge). Expected to stay zero: the encode
     /// is fixed-size into retained slot capacity.
     host_bytes_oob_drops: u64 = 0,
+    /// Per-build world-cache identity (game side only, plain u64 — never
+    /// across the handoff edge). Bumped on EVERY `buildIntoClaimedSlot`
+    /// call, published or not: a cancelled claim's world-matrix/AABB cache
+    /// entries (keyed `attempt | (1<<63)`) must never collide with the next
+    /// real build's key, and a repeated `BuildClaim.build` on the same
+    /// claim (same reserved handoff seq) must recompute instead of reading
+    /// its own stale entry (repeat-newest-wins). Deliberately separate
+    /// from `build_seq`: the handoff generation still reserves
+    /// `published + 1` and commits only on `publish()` (pin/lease/
+    /// retirement semantics unchanged). Uniqueness is 2^63 consecutive
+    /// builds (lower 63 bits; the top bit is the producer namespace, which
+    /// can never collide with a context `frame_id` counting up from 0) —
+    /// wrap reuses keys only after 2^63 builds, so no global registry is
+    /// needed. Zero until the first build; the counter itself skips 0 on
+    /// wrap so every attempt value is nonzero.
+    build_cache_seq: u64 = 0,
     // 2D & 3D UI canvas (lazy; created via createUI()).
     ui_canvas: ?UICanvas = null,
-    /// P6 render-owned UI frame: prepareFrame captures CPU geometry + draw
-    /// params out of `ui_canvas` and uploads at the prepare/context
+    /// P6 render-owned UI frame: the staged prepare latches the claimed
+    /// slot's staged packet and uploads at the prepare/context
     /// boundary; render draws this frame (upload-free), never the live
     /// canvas. Single-frame Scene ownership, no registry, no P7 overlap.
     ui_frame: UiFrame = .{},
@@ -638,6 +580,10 @@ pub const Scene = struct {
     }
 
     pub fn initIntoWithAllocators(self: *Scene, cfg: AllocatorConfig) void {
+        gpu_thread.assertOnContextThread();
+        if (sg.isvalid() and !@import("../postprocess/hdr.zig").queryCapabilities().supported()) {
+            @panic("Agate requires RGBA16F rendering, sampling, filtering and blending");
+        }
         self.initAllocatorsInto(cfg);
         const allocator = cfg.core;
         const io = self.io_allocator;
@@ -667,7 +613,7 @@ pub const Scene = struct {
             .shadows = scene_shadow.ShadowSystem.init(allocator),
             .sky = scene_sky.SkyboxLayer.init(),
             .postfx = scene_postfx.PostFXStack.init(),
-            .forward = scene_forward.ForwardPipelines.init(),
+            .forward = scene_forward.ForwardPipelines.init(1, .RGBA16F),
             .particles = scene_particles.ParticleLayer.init(),
         };
         // Async texture decode/uploads (stage 2): failures degrade to a
@@ -1277,8 +1223,8 @@ pub const Scene = struct {
     }
 
     /// See `scene/lifecycle.zig` (owns the body + docs).
-    pub fn ensureForwardMsaa(self: *Scene, samples: i32) *scene_forward.ForwardPipelines {
-        return scene_lifecycle.ensureForwardMsaa(self, samples);
+    pub fn forwardFor(self: *Scene, samples: i32, color_format: sokol.gfx.PixelFormat) *scene_forward.ForwardPipelines {
+        return scene_lifecycle.forwardFor(self, samples, color_format);
     }
 
     /// See `scene/frame_api.zig` (owns the body + docs).
@@ -1341,7 +1287,7 @@ pub const Scene = struct {
     /// SEQUENTIALLY on the context thread (next prepare NEVER concurrent
     /// with render); update-vs-prepare stay excluded under phase_mutex, but
     /// update CAN overlap render — so phase ownership NO LONGER spans
-    /// prepareFrame() AND render(), only update-vs-prepare. The draw phase
+    /// staged prepare AND render, only update-vs-prepare. The draw phase
     /// therefore reads ONLY render-owned captures: P4 mesh payload
     /// (regular/instanced очереди, shadow-bins, outline-items — trails
     /// included: Trail.update is CPU-only staging, the prepare flush
@@ -1364,11 +1310,6 @@ pub const Scene = struct {
     /// still makes progress. Tune only with a profiled reason.
     pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
     /// See `scene/frame_api.zig` (owns the body + docs).
-    pub fn stageUiPacket(self: *Scene) void {
-        scene_frame.stageUiPacket(self);
-    }
-
-    /// See `scene/frame_api.zig` (owns the body + docs).
     fn stageUiPacketInto(self: *Scene, slot: usize) void {
         scene_frame.stageUiPacketInto(self, slot);
     }
@@ -1388,36 +1329,24 @@ pub const Scene = struct {
         scene_frame.patchInstanceRefs(self, back);
     }
 
-    /// Concurrent-build claim (wave 29, game side): reserve a free draw slot
-    /// for the next build — a slot that is neither pinned nor front under
-    /// the lease protocol. Returns null when every non-front slot is pinned
-    /// or claimed (consumer lagging): skip the frame instead of blocking
-    /// (the documented latest-wins drop, counted in
-    /// `draws.saturation_skips`), never stall.
+    /// Producer claim: reserve a slot that is neither front, pinned nor
+    /// claimed. Saturation returns null (counted in `draws.saturation_skips`)
+    /// instead of blocking. One Scene producer owns live CPU state; complete
+    /// or cancel its claim before starting another.
     ///
-    /// The claim reserves (but does not commit) the next build generation
-    /// (`seq = build_seq + 1`): `build()` fills the slot against it,
-    /// `publish()` commits it (`build_seq`, `build_slot`) and releases the
-    /// slot into the prepare handoff WITHOUT flipping `front` (the flip
-    /// stays context-owned in `prepareFrame`, so the sequential
-    /// build→prepare flow below is bit-identical), `cancel()` drops the
-    /// claim without committing anything (the slot's provisional contents
-    /// are ignored by prepare and reset by the next claim). Do not
-    /// interleave a legacy `buildPreparedFrame` between claim and publish
-    /// (debug-asserted: the reserved seq must still be exactly next).
+    /// `seq = build_seq + 1` reserves the next published generation. Build
+    /// freezes all payloads and uses a separate per-attempt cache key, so
+    /// cancellation/repeated builds cannot reuse stale transform caches.
+    /// Publish release-stores the handoff without flipping front; only the
+    /// context-side finish publishes front. Cancel leaves the handoff intact
+    /// and re-arms dropped upload intents.
     ///
-    /// Threading: the claim holder owns the claimed slot's payload
-    /// exclusively (producer writes, no lock needed); the lease mutex pairs
-    /// those writes with the consumer's post-pin reads. Everything ELSE the
-    /// build touches (live meshes/canvas, `build_snapshot`, per-mesh
-    /// previews, the particle/physics shared build frames and their layer
-    /// seqs) is still phase-excluded today — the handoff seq words
-    /// themselves are atomic since wave 30 (release/acquire, see the field
-    /// docs), and since wave 32 the particle/physics payload the latch
-    /// consumes rides the slot too (frozen copies, never the shared
-    /// stores) — but the remaining live reads are not — see the adoption
-    /// checklist in scene/frame_draws.zig. The claim API alone does not
-    /// remove the phase mutex.
+    /// The producer owns the claimed slot exclusively; leases and the
+    /// release/acquire handoff order frozen bytes before context reads.
+    /// Prepare/render may overlap the next producer tick, never reading its
+    /// live geometry. Canvas GPU metadata/lifetime changes still require
+    /// context ownership or quiesce; optional exclusion changes scheduling,
+    /// not the frame's source of truth.
     pub fn tryClaimBuildSlot(self: *Scene) ?BuildClaim {
         // Contention-yield (wave 38): when enabled AND the previous build
         // is still unconsumed, park BEFORE reserving — the consumer is
@@ -1438,10 +1367,10 @@ pub const Scene = struct {
     }
 
     /// Game-side build claim: a reserved draw slot plus its reserved build
-    /// generation. Fill via `build()` (the real build core, shared with the
-    /// sequential path), optionally `stageUi()` (into the claimed slot —
-    /// AFTER `build`, which resets the slot), then exactly one terminal
-    /// call: `publish()` (hand to prepare) or `cancel()` (drop).
+    /// generation. Fill via `build()` (the real build core), then `stageUi()`
+    /// (into the claimed slot — AFTER `build`, which resets the slot), then
+    /// exactly one terminal call: `publish()` (hand to prepare, requires a
+    /// prior `build()`) or `cancel()` (drop).
     pub const BuildClaim = struct {
         scene: *Scene,
         slot: usize,
@@ -1452,18 +1381,16 @@ pub const Scene = struct {
         /// Run the shared build core into the claimed slot (commit of the
         /// last published latch outcomes, CPU staging, record freeze, queue/
         /// shadow/outline build). sg-free, game side. Repeatable (newest
-        /// wins); the generation is only committed by `publish()`.
+        /// wins — each call also advances the per-attempt world-cache key,
+        /// so a repeat never reads its own stale cache entries); the
+        /// generation is only committed by `publish()`.
         pub fn build(self: *BuildClaim) void {
             self.scene.buildIntoClaimedSlot(self.slot, self.seq);
             self.did_build = true;
         }
 
-        /// Stage the live canvas CPU packet into the CLAIMED slot (concurrent
-        /// path). Same newest-wins/OOM rules as `stageUiPacket`, but never
-        /// the latched slot: with overlapping build(N+1, game) and
-        /// prepare(N, context) the claim owns a different slot than the one
-        /// prepare latches. Call AFTER `build()` when both are used (the
-        /// build resets the slot); UI-only claims (no `build()`) are legal.
+        /// Stage the live canvas CPU packet into the CLAIMED slot. Call AFTER
+        /// `build()` (the build resets the slot).
         pub fn stageUi(self: *BuildClaim) void {
             self.scene.stageUiPacketInto(self.slot);
         }
@@ -1492,22 +1419,23 @@ pub const Scene = struct {
             };
         }
 
-        /// Hand the built slot to prepare: commit the reserved generation
-        /// (`build_seq`, `build_slot`) and release WRITING (payload kept —
-        /// prepare consumes it and flips `front` itself at latch time).
-        /// No front flip here: after publish the slot is still the back
-        /// index, exactly as after the legacy build.
+        /// Hand the fully built slot to prepare: commit the reserved
+        /// generation (`build_seq`, `build_slot`) and release WRITING
+        /// (payload kept — prepare consumes it and flips `front` itself
+        /// at latch time). Requires a prior `build()` (a stage-only frame
+        /// must never pretend to be a full frame). No front flip here:
+        /// after publish the slot is still the back index.
         pub fn publish(self: *BuildClaim) void {
             std.debug.assert(!self.completed);
+            std.debug.assert(self.did_build);
             self.completed = true;
             const s = self.scene;
             std.debug.assert(self.seq == s.build_seq.load(.monotonic) +% 1);
-            // UI-only claims are supported, so stamp every published slot
-            // here as well as the full build core. Prepare consumes this
-            // exact generation after newer producer claims may publish.
+            // Every published slot carries a full scene build (asserted above).
+            // Prepare consumes this exact generation.
             const slot = s.draws.slotAt(self.slot);
             slot.build_seq = self.seq;
-            slot.has_scene_build = self.did_build;
+            slot.has_scene_build = true;
             s.draws.releaseHandoffWithSeq(self.slot, self.seq, &s.build_slot, &s.build_seq) catch {
                 // A failed publish must not strand the producer lease. The
                 // generation remains uncommitted and prepare sees no handoff.
@@ -1515,10 +1443,9 @@ pub const Scene = struct {
             };
         }
 
-        /// Drop the claim without committing (seq/handoff untouched: prepare
-        /// sees no fresh build and runs its fallback; provisional previews
-        /// stamped with the uncommitted seq are overwritten by the next
-        /// build and never latched). Staged-upload flags frozen into the
+        /// Drop the claim without committing (seq/handoff untouched: the staged
+        /// begin sees no fresh build; provisional previews stamped with the
+        /// uncommitted seq are overwritten by the next build and never
         /// dropped slot are re-armed on their live owners
         /// (token/index/uid-validated), so a cancelled claim consumes no
         /// upload — the next funded build re-freezes from the intact live
@@ -1534,18 +1461,13 @@ pub const Scene = struct {
     };
 
     /// See `scene/frame_api.zig` (owns the body + docs).
-    pub fn buildPreparedFrame(self: *Scene) void {
-        scene_frame.buildPreparedFrame(self);
+    pub fn buildPreparedFrame(self: *Scene) bool {
+        return scene_frame.buildPreparedFrame(self);
     }
 
     /// See `scene/frame_api.zig` (owns the body + docs).
     fn buildIntoClaimedSlot(self: *Scene, slot: usize, seq: usize) void {
         scene_frame.buildIntoClaimedSlot(self, slot, seq);
-    }
-
-    /// See `scene/frame_api.zig` (owns the body + docs).
-    pub fn prepareFrame(self: *Scene) void {
-        scene_frame.prepareFrame(self);
     }
 
     /// Split context prepare at the caller's producer/live-state lock

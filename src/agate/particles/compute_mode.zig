@@ -283,10 +283,10 @@ pub fn dispatchCompute(self: anytype, staged: usize) void {
     self.compute_dispatches +%= 1;
 }
 
-/// Prepare-boundary compute work: creation, spawn upload, state clear and
-/// dispatch. Runs on the sg-context thread (called from
-/// `flushGpuUploads`, itself called by `Scene.flushPendingGpuUploads` at
-/// render start — the update phase stays free of sg.* calls).
+/// Quiesced/direct context-side compute work: creation, spawn upload, state
+/// clear and dispatch through `flushGpuUploads`. Normal Scene frames instead
+/// dispatch frozen slot packets and commit outcomes on the producer; update
+/// stays free of sg.* calls.
 /// Headless (`!sg.isvalid()`) is a safe no-op that keeps every staged
 /// flag for a later retry. On a live context WITHOUT compute support the
 /// pending flags are dropped and support is latched unsupported, so the

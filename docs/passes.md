@@ -60,15 +60,15 @@ pub fn pointTileOrigin(slot: u32, face: u32) [2]u32
 
 ```zig
 pub const BloomPass = struct {
-    pub fn bloomPixelFormat() sg.PixelFormat
+    pub fn bloomPixelFormat() sg.PixelFormat // RGBA16F, обязательный
     pub fn init() BloomPass
     pub fn resize(self: *BloomPass, width: i32, height: i32) void
-    pub fn render(self: *BloomPass, src_tex: sg.View, threshold: f32, mip_count: u32, base_w: i32, base_h: i32) sg.View
+    pub fn render(self: *BloomPass, src_tex: sg.View, threshold: f32, radius: f32, mip_count: u32, base_w: i32, base_h: i32) sg.View
     pub fn deinit(self: *BloomPass) void
 };
 ```
 
-Что рендерит: down-цепочку (`bloom_down.glsl`: первый уровень — bright-pass с `threshold`, глубже — Karis-average) + up-цепочку (`bloom_up.glsl`, tent-апсемпл) по `mip_count` (`clampBloomMips`). Возвращает view верхнего мипа для composite (`PostProcessPass.setBloomTexture`). Таргеты: `down_images[]`/`up` половинного разрешения лесенкой; формат — `bloomPixelFormat()` (HDR-совместимый). `render` при нулевых пайплайнах/вьюхах возвращает пустой view. Включение: `bloom_pyramid = true` + `bloom_enabled` (иначе composite идёт single-shader путём без пасса).
+Что рендерит: единую HDR-пирамиду: down-цепочку (`bloom_down.glsl`: первый уровень — bright-pass с `threshold`, глубже — Karis-average) + up-цепочку (`bloom_up.glsl`, tent-апсемпл с `radius` в текселях coarse-мипа [0,16]) по `mip_count` (`clampBloomMips` [3,7]). Возвращает view верхнего мипа для composite (`PostProcessPass.setBloomTexture`). Таргеты: `down_images[]`/`up` половинного разрешения лесенкой; формат — `bloomPixelFormat()` (обязательный RGBA16F). `render` при нулевых пайплайнах/вьюхах возвращает пустой view. Включение: `bloom_enabled` (inline-пути нет).
 
 ### GlowPass (`passes/glow_pass.zig`)
 
@@ -129,7 +129,7 @@ pub const OutlinePass = struct {
 };
 ```
 
-Что рендерит: контур выбранного (inflated backface-shell: `expandVertex` по нормали, `outlineParamsFor` пакует ширину/NDC-раскрытие). Четыре desc-конфигуратора — обычный/инстансинг/cutout/скиннинг пайплайны. Low-level API несёт render-owned индексы вместо живых указателей (осознанное изменение, зафиксировано в `mod.zig`; стабильные точки — `Scene.prepareFrame/render` и immediate `OutlinePass.render`). P4-контракт: `renderItems` для подготовленных айтемов, `render` — immediate по мешам. Включение: наличие outline-цели + ширина > 0 после `clampWidthPx`.
+Что рендерит: контур выбранного (inflated backface-shell: `expandVertex` по нормали, `outlineParamsFor` пакует ширину/NDC-раскрытие). Четыре desc-конфигуратора — обычный/инстансинг/cutout/скиннинг пайплайны. Low-level API несёт render-owned индексы вместо живых указателей (осознанное изменение, зафиксировано в `mod.zig`; стабильные точки — `Scene.buildPreparedFrame` / `beginStagedPrepare`+`finishStagedPrepare` / `render` и immediate `OutlinePass.render`). P4-контракт: `renderItems` для подготовленных айтемов, `render` — immediate по мешам. Включение: наличие outline-цели + ширина > 0 после `clampWidthPx`.
 
 ### ParticlePass (`passes/particle_pass.zig`)
 
@@ -163,7 +163,7 @@ pub const PostProcessPass = struct {
 };
 ```
 
-Что рендерит: финальный fullscreen composite (`postprocess.glsl`): bloom/glow/highlight/shafts подмесы → grading/LUT → vignette → tonemap → FXAA/TAA → sharpen/grain (порядок — в `./postprocess.md`). Держит fullscreen-квад, composite-пайплайн, depth-вью для DOF/SSR (`depthSampleView`) и два TAA history-таргета (`ensureTaaHistory` создаёт/пересоздаёт при ресайзе, `taaReset` сбрасывает после `taa_camera_cut`). `set*Texture` привязывают выходы других пассов (пустой view = ветвь скипается). Сложность — O(пиксели × включённые эффекты).
+Что рендерит: финальный fullscreen composite (`postprocess.glsl`): обязательный output pass (exposure+tonemap+display transfer выполняется даже при `enabled = false`) плюс опциональные bloom-pyramid/glow/highlight/shafts подмесы → grading/LUT → vignette → FXAA/TAA → sharpen/grain (порядок — в `./postprocess.md`). Держит fullscreen-квад, composite-пайплайн, depth-вью для DOF/SSR (`depthSampleView`) и два TAA history-таргета (`ensureTaaHistory` создаёт/пересоздаёт при ресайзе, `taaReset` сбрасывает после `taa_camera_cut`). `set*Texture` привязывают выходы других пассов (пустой view = ветвь скипается). Сложность — O(пиксели × включённые эффекты).
 
 ### SSAOPass (`passes/ssao_pass.zig`)
 
@@ -246,7 +246,7 @@ pub const VolumetricPass = struct {
 
 - Нулевые хэндлы (`pipeline.id == 0`, `view.id == 0`, `w/h <= 0`) — тихий no-op/пустой view, не assert. Это позволяет вызывать пассы до ленивой инициализации пайплайнов.
 - `resize` с тем же разрешением — дешёвый (пересоздания нет); с нулевым — таргеты инвалидируются до следующего валидного ресайза.
-- Потерянные входы composite (`setBloomTexture` не вызван, а `bloom_pyramid` включён) — ветвь composite работает с пустым view как с чёрным полем, а не падает; визуальный баг, не краш — проверяйте wiring при добавлении пассов.
+- Потерянные входы composite (`setBloomTexture` не вызван, а `bloom_enabled` включён) — ветвь composite работает с пустым view как с чёрным полем, а не падает; визуальный баг, не краш — проверяйте wiring при добавлении пассов.
 - `ensureTaaHistory` возвращает `false` при неудаче аллокации таргетов — вызывающий должен идти no-TAA путём в этом кадре.
 - Point-атлас переполнен (слотов `POINT_SHADOW_SLOTS` не хватило) — дальние точечные без теней в этом кадре (деградация, не ошибка).
 - `makeOutlineDrawItem`/`makeHighlightDrawItem` → `null` — штатный пропуск (скрытый/невалидный меш), не ошибка вызывающего.

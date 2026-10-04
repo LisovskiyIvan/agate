@@ -22,7 +22,7 @@ const HighlightOptions = @import("../scene/highlight_layer.zig").HighlightOption
 //     intensity, zero hull expansion) into a half-resolution mask RT under
 //     the primary camera's pixel viewport/scissor mapped onto the mask
 //     target (PIP-aware: fullscreen viewports map to the full target, so
-//     the legacy fullscreen path is unchanged; the blur stages stay
+//     the fullscreen mapping is exact; the blur stages stay
 //     fullscreen on their own targets — sokol's beginPass resets
 //     viewport+scissor to the full framebuffer). The
 //     pipelines reuse the rigid `outline` shader program with front-face
@@ -289,6 +289,7 @@ pub const HighlightPass = struct {
 
     pub fn resize(self: *HighlightPass, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
+        if (!sg.isvalid()) return;
         if (self.base_width == width and self.base_height == height) return;
 
         self.destroyTargets();
@@ -296,36 +297,62 @@ pub const HighlightPass = struct {
         const mask_fmt = glow_mod.GlowPass.glowPixelFormat();
         const size = pp.bloomMipSize(width, height, 0);
 
-        const mask_img = sg.makeImage(.{
+        // Store-first rollback: every handle lands in the struct before its
+        // state check, so a single destroyTargets frees the failed handle
+        // plus all partial handles (views before images). A failed resize
+        // leaves zero ids and a zero base size, and render() reports empty.
+        self.mask_image = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
             .width = size.w,
             .height = size.h,
             .pixel_format = mask_fmt,
             .sample_count = 1,
         });
-        self.mask_image = mask_img;
+        if (sg.queryImageState(self.mask_image) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.mask_att_view = sg.makeView(.{
-            .color_attachment = .{ .image = mask_img },
+            .color_attachment = .{ .image = self.mask_image },
         });
+        if (sg.queryViewState(self.mask_att_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.mask_tex_view = sg.makeView(.{
-            .texture = .{ .image = mask_img },
+            .texture = .{ .image = self.mask_image },
         });
+        if (sg.queryViewState(self.mask_tex_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
 
         for (0..2) |i| {
-            const blur_img = sg.makeImage(.{
+            self.blur_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
                 .pixel_format = mask_fmt,
                 .sample_count = 1,
             });
-            self.blur_images[i] = blur_img;
+            if (sg.queryImageState(self.blur_images[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = blur_img },
+                .color_attachment = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_att_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = blur_img },
+                .texture = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_tex_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
         }
 
         self.base_width = width;
@@ -455,6 +482,7 @@ pub const HighlightPass = struct {
         if (base_w <= 0 or base_h <= 0) return .{};
 
         self.resize(base_w, base_h);
+        if (self.base_width != base_w or self.base_height != base_h) return .{};
         if (self.mask_image.id == 0) return .{};
 
         var out = self.renderMask(view_proj, items, highlightMaskViewport(viewport, base_w, base_h));
@@ -474,17 +502,16 @@ pub const HighlightPass = struct {
     }
 
     fn destroyTargets(self: *HighlightPass) void {
-        if (self.mask_image.id == 0) return;
-        sg.destroyImage(self.mask_image);
-        sg.destroyView(self.mask_att_view);
-        sg.destroyView(self.mask_tex_view);
+        if (self.mask_att_view.id != 0) sg.destroyView(self.mask_att_view);
+        if (self.mask_tex_view.id != 0) sg.destroyView(self.mask_tex_view);
+        if (self.mask_image.id != 0) sg.destroyImage(self.mask_image);
         self.mask_image = .{};
         self.mask_att_view = .{};
         self.mask_tex_view = .{};
         for (0..2) |i| {
-            sg.destroyImage(self.blur_images[i]);
-            sg.destroyView(self.blur_att_views[i]);
-            sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_att_views[i].id != 0) sg.destroyView(self.blur_att_views[i]);
+            if (self.blur_tex_views[i].id != 0) sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_images[i].id != 0) sg.destroyImage(self.blur_images[i]);
             self.blur_images[i] = .{};
             self.blur_att_views[i] = .{};
             self.blur_tex_views[i] = .{};
@@ -612,8 +639,8 @@ test "makeHighlightDrawItem skips skinned meshes, proxies instanced ones" {
 }
 
 test "highlight mask viewport maps the primary rect onto the half-res target" {
-    // Fullscreen 1280x720: the full 640x360 mask target (legacy path —
-    // identical pixels to the pre-viewport mask).
+    // Fullscreen 1280x720: the full 640x360 mask target (fullscreen
+    // mapping — identical pixels to the unmapped mask).
     const full = highlightMaskViewport(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, 1280, 720);
     try std.testing.expectEqual(@as(i32, 0), full.x);
     try std.testing.expectEqual(@as(i32, 0), full.y);
@@ -639,9 +666,9 @@ test "highlight mask viewport maps the primary rect onto the half-res target" {
     const tiny = highlightMaskViewport(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, 1280, 720);
     try std.testing.expectEqual(@as(i32, 1), tiny.width);
     try std.testing.expectEqual(@as(i32, 1), tiny.height);
-    const fallback = highlightMaskViewport(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, 0, 720);
-    try std.testing.expectEqual(@as(i32, 1), fallback.width);
-    try std.testing.expectEqual(@as(i32, 360), fallback.height);
+    const degenerate = highlightMaskViewport(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, 0, 720);
+    try std.testing.expectEqual(@as(i32, 1), degenerate.width);
+    try std.testing.expectEqual(@as(i32, 360), degenerate.height);
 }
 
 test "highlight mask color folds intensity, frame sigma takes the max" {

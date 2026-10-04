@@ -84,19 +84,17 @@ pub fn prepareViewQueues(
     );
 }
 
-/// Shared queue/shadow/outline builder (stage-2 increment B): the code
-/// previously inline in `prepareFrame` (outline capture loop + shadow
-/// `prepareInto` + view-queue `prepareViewQueues` calls) in one internal
-/// function, callable from the game-side `buildPreparedFrame` (with
-/// `&build_snapshot` + `.build_view` + build-unique cache key +
-/// `&build_stats`) and from the fallback latch (with the staged slot
+/// Shared queue/shadow/outline builder: fills a `FrameDrawSlot` from the
+/// explicit `params` in one internal function, callable from the
+/// single-producer `buildIntoClaimedSlot` (with `&build_snapshot` +
+/// `.build_view` + build-unique cache key + `&build_stats`) and from
+/// standalone immediate builds (tests/tooling with the staged slot
 /// snapshot + `.published` + frame_id + `&self.stats`). Reads cameras
 /// ONLY from `params.snap` (never `self.frame_snapshot`/
 /// `self.build_snapshot` directly), so the build generation stays frozen. Producer `.build_view`
-/// freezes on the snapshot shadow switch alone; fallback keeps the
-/// historical live `shadows.enabled` gate.
-/// Fallback passes today's exact values (see `prepareFrame`) and stays
-/// bit-identical to the old inline path. Does NOT reset `back` (the
+/// freezes on the snapshot shadow switch alone; standalone keeps the
+/// explicit `shadows.enabled` gate.
+/// Does NOT reset `back` (the
 /// caller reset before consume, as before). sg-free when
 /// `instances_prepared=true` (view builds never retry staging mid-frame).
 pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildParams) void {
@@ -122,8 +120,8 @@ pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildP
     // different domain (subset, any order) and MUST NOT be stored. Each
     // outline mesh is resolved to its mesh-list index here; an outline
     // mesh absent from the mesh list gets the OOB sentinel `meshes.len`
-    // (deterministic, still emitted so the fallback — which never patches
-    // — stays bit-identical; the latch patch fail-closes the sentinel via
+    // (deterministic, still emitted so the standalone immediate build — which never patches
+    // — keeps shape; the latch patch fail-closes the sentinel via
     // its OOB branch).
     for (scene.outline_meshes.items) |m| {
         if (m.gpu_pending or !m.is_visible or m.index_count == 0) continue;
@@ -172,7 +170,7 @@ pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildP
     // Shadow pass preparation into the back slot (disabled shadows —
     // or no camera — leave the reset-empty payload: coherent, never
     // the front slot's prior bins). Producer `.build_view` freezes on the
-    // snapshot switch alone; fallback keeps the historical live gate.
+    // snapshot switch alone; standalone keeps the explicit live gate.
     if (snap.has_camera and snap.shadows_enabled and (params.instance_source == .build_view or scene.shadows.enabled)) {
         _ = scene.shadows.pass.prepareInto(&back.shadow, scene.meshes.items, params.cache_key, params.instance_source, jobs.global);
     }

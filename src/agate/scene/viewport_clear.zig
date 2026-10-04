@@ -14,19 +14,24 @@ const upload_meter = @import("../gpu_upload_meter.zig");
 pub const ViewportClearPass = struct {
     vb: sg.Buffer = .{},
     shader: sg.Shader = .{},
+    /// Single active pipeline slot, keyed by the exact target shape below.
+    /// Rebuilt when the requested shape changes (context thread, between
+    /// draws — never while bound).
     pipeline: sg.Pipeline = .{},
-    pipeline_msaa: sg.Pipeline = .{},
+    shape_samples: i32 = 0,
+    shape_format: sg.PixelFormat = .RGBA16F,
 
     pub fn deinit(self: *ViewportClearPass) void {
         if (!sg.isvalid()) return;
         if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
-        if (self.pipeline_msaa.id != 0) sg.destroyPipeline(self.pipeline_msaa);
         if (self.shader.id != 0) sg.destroyShader(self.shader);
         if (self.vb.id != 0) sg.destroyBuffer(self.vb);
         self.* = .{};
     }
 
-    pub fn ensureResources(self: *ViewportClearPass, samples: i32) void {
+    /// Ensures the quad buffer, debug shader, and the pipeline for the
+    /// exact target shape (sample count + color format).
+    pub fn ensureResources(self: *ViewportClearPass, samples: i32, color_format: sg.PixelFormat) void {
         if (self.vb.id == 0) {
             self.vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
@@ -36,8 +41,7 @@ pub const ViewportClearPass = struct {
         if (self.shader.id == 0) {
             self.shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
         }
-        const target_pip = if (samples > 1) &self.pipeline_msaa else &self.pipeline;
-        if (target_pip.id == 0) {
+        if (self.pipeline.id == 0 or self.shape_samples != samples or self.shape_format != color_format) {
             var pip_desc = sg.PipelineDesc{
                 .shader = self.shader,
                 .index_type = .NONE,
@@ -49,6 +53,7 @@ pub const ViewportClearPass = struct {
                 .cull_mode = .NONE,
                 .sample_count = samples,
             };
+            pip_desc.colors[0].pixel_format = color_format;
             pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(debug_pass.Vertex) };
             pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
                 .format = .FLOAT3,
@@ -58,20 +63,29 @@ pub const ViewportClearPass = struct {
                 .format = .FLOAT4,
                 .offset = @offsetOf(debug_pass.Vertex, "color"),
             };
-            target_pip.* = sg.makePipeline(pip_desc);
-            if (sg.queryPipelineState(target_pip.*) != .VALID) {
+            const pip = sg.makePipeline(pip_desc);
+            if (sg.queryPipelineState(pip) != .VALID) {
                 std.debug.print("[CLEAR PIPELINE FAILED]: shader_state={}, pip_state={}\n", .{
                     sg.queryShaderState(self.shader),
-                    sg.queryPipelineState(target_pip.*),
+                    sg.queryPipelineState(pip),
                 });
+                if (pip.id != 0) sg.destroyPipeline(pip);
+                return;
             }
+            if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
+            self.pipeline = pip;
+            self.shape_samples = samples;
+            self.shape_format = color_format;
         }
     }
 
-    pub fn clear(self: *ViewportClearPass, color: Color4, samples: i32) void {
-        self.ensureResources(samples);
-        const pip = if (samples > 1) self.pipeline_msaa else self.pipeline;
+    /// Clears the current viewport with a full-quad draw for the exact
+    /// target shape (sample count + color format).
+    pub fn clear(self: *ViewportClearPass, color: Color4, samples: i32, color_format: sg.PixelFormat) void {
+        self.ensureResources(samples, color_format);
+        const pip = self.pipeline;
         if (pip.id == 0 or self.vb.id == 0 or sg.queryPipelineState(pip) != .VALID) return;
+        if (self.shape_samples != samples or self.shape_format != color_format) return;
 
         const clear_verts = [_]debug_pass.Vertex{
             .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
@@ -83,7 +97,6 @@ pub const ViewportClearPass = struct {
         };
         const offset = sg.appendBuffer(self.vb, sg.asRange(&clear_verts));
         if (offset < 0) return;
-        // Учёт динамики: 6 вершин clear-квада через appendBuffer (байты те же — стрим в GPU-буфер).
         upload_meter.record(clear_verts.len * @sizeOf(debug_pass.Vertex));
 
         sg.applyPipeline(pip);

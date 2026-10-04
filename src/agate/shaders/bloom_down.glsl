@@ -11,6 +11,9 @@
 @end
 
 @fs fs
+// Shared finite-radiance guard (fragment scope; parent enables the build
+// include for this shader).
+// @include "common/linear_output.glsl"
 layout(binding = 0) uniform fs_params {
     vec4 src_texel; // xy: texel size of the source level, zw: unused
     vec4 params; // x: bright-pass threshold (< 0 disables), yzw: unused
@@ -27,8 +30,12 @@ float karisLuma(vec3 c) {
 }
 
 // One Karis-weighted tap: rgb holds color * weight, a holds the weight.
+// Finite-bound BEFORE luma via the shared guard, so a NaN/Inf lane (e.g.
+// additive particles overflowing the half main target) maps to 0 instead of
+// producing Inf*0 NaN in the weight. 0..65504 is identical for 0..1-range
+// sources (and a UNORM source cannot carry negatives).
 vec4 karisTap(vec2 uv) {
-    vec3 c = texture(sampler2D(src_tex, smp), uv).rgb;
+    vec3 c = boundRadiance(texture(sampler2D(src_tex, smp), uv).rgb);
     float w = 1.0 / (1.0 + max(karisLuma(c), 0.0));
     return vec4(c * w, w);
 }

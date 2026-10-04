@@ -4,7 +4,7 @@
 
 ## Что это
 
-Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппетов в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang» для GL, Metal, D3D11 и WebGPU. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
+Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппеты в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang». Engine codegen floor: Metal + WGSL. Старые GL/HLSL-леги и WebGL-линк удалены из engine-контракта; native WGPU не заявлен (blocked: cached emdawn headers, нет verified native-прогона — Windows/Linux поддержанными не объявлять). Универсальные Sokol-форки без изменений, их backend-контракт независим. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
 
 Ключевое ограничение, породившее всю механику: sokol-shdc не поддерживает `#include` (проверено: `#include` падает в glslang, флага `-I` у вендорного бинарника нет). Поэтому sharing — текстовая подстановка `// @include "common/<file>"` хост-утилитой `expand_shader_includes` (см. `shader_material/include.zig`) до запуска shdc.
 
@@ -16,7 +16,7 @@
 pub const user_shader_materials = [_]UserShaderMaterial{
     .{ .name = "my_wave", .snippet = "shaders/my_wave.glsl", .base = .standard },
 };
-// Сниппет — statement-level GLSL, валидный для GLSL 430 + Metal + HLSL 5.
+// Сниппет — statement-level GLSL, валидный для Metal + WGSL-легов.
 // Хуки шаблона: decls / pre_lighting / post_lighting (имена фиксированы,
 // неизвестный хук = Error.UnknownHook на сборке).
 
@@ -52,14 +52,14 @@ mesh.material = .{ .shader_material = mat };
 
 ### Таблица шейдеров (`build.zig`)
 
-Наборы slang:
+Наборы slang (engine floor: Metal + WGSL):
 
 | Набор | Леги | Кто |
 |---|---|---|
-| `default_slang` | glsl410 + metal_macos + hlsl5 + wgsl | большинство шейдеров (GL / Metal / D3D11 / WebGPU) |
-| `forward_slang` | glsl430 + metal_macos + hlsl5 + wgsl | 5 forward-шейдеров (SSBO-кластеры невалидны в GLSL 4.10) |
-| compute-набор | glsl430 + metal_macos + hlsl5 + wgsl | `particle_compute` (в 410 нет compute) |
-| `engine_shader_slang` | glsl430 + metal_macos + hlsl5 + wgsl | пользовательские шейдеры через `compileUserShader`, hook-merge |
+| `default_slang` | metal_macos + wgsl | большинство шейдеров |
+| `forward_slang` | metal_macos + wgsl | forward-шейдеры (SSBO-кластеры) |
+| compute-набор | metal_macos + wgsl | `particle_compute` |
+| `engine_shader_slang` | metal_macos + wgsl | пользовательские шейдеры через `compileUserShader`, hook-merge |
 
 Таблица (`ShaderSpec`: `name`, `input`, `output`, `slang?`, `includes`):
 
@@ -86,7 +86,7 @@ mesh.material = .{ .shader_material = mat };
 | `probe_mip_shader` | `probe_mip.glsl` | default | нет (осознанно!) |
 | `ui3d_panel_shader` | `ui3d_panel.glsl` | default | нет |
 
-Каждый сгенерированный модуль безусловно `@import("math")` (подключается в `build.zig`). shdc компилирует все леги одним вызовом — сломанный Metal/HLSL падает на сборке, никогда молча в рантайме на другой ОС.
+Каждый сгенерированный модуль безусловно `@import("math")` (подключается в `build.zig`). shdc компилирует все леги одним вызовом — сломанный Metal/WGSL-лег падает на сборке, никогда молча в рантайме на другой ОС.
 
 Назначение шейдеров (кратко; детали пассов — в `./passes.md`, эффектов — в `./postprocess.md`):
 
@@ -177,7 +177,7 @@ pub fn uniformBytes(storage: *const UniformStorage) []const u8
 ### compileUserShader (`build.zig`)
 
 ```zig
-pub const engine_shader_slang = sokol.shdc.Slang{ .glsl430 = true, .metal_macos = true, .hlsl5 = true, .wgsl = true };
+pub const engine_shader_slang = sokol.shdc.Slang{ .metal_macos = true, .wgsl = true };
 pub const UserShaderSpec = struct {
     name: []const u8, input: []const u8, output: ?[]const u8 = null,
     slang: ?sokol.shdc.Slang = null, // default engine_shader_slang
@@ -211,7 +211,7 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
 - `merge`: неизвестный хук сниппета — `UnknownHook` (почти наверняка опечатка в имени хука); params без `decls`-хука в шаблоне — ошибка (параметрам некуда приземлиться; `fs`-decls обязателен, `vs`-блок генерится только если вершинный хук их использует).
 - Зарезервированные имена параметров (`reserved_param_names`) в сниппете запрещены — коллизия с engine-юниформами.
 - `registerRuntime`: `user_bytes == 0`, не кратно 16 или > 32 байт → `UniformLimitExceeded`; `params` с `comps != 1/4` или выходящие за `user_bytes` → та же ошибка.
-- Сломанный Metal/HLSL-лег при валидном GLSL — падение сборки (shdc один вызов на все леги). Проверяйте сниппеты на всех трёх диалектах, а не только в GLSL.
+- Сломанный Metal/WGSL-лег при валидном GLSL — падение сборки (shdc один вызов на все леги). Проверяйте сниппеты на обоих диалектах, а не только в GLSL.
 - `probe_mip` без Y-flip: использование общего `fullscreen_vs` там — баг инвертированного зонда, отловленный drift-тестом.
 
 ## Производительность

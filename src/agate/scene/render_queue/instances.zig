@@ -51,8 +51,8 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
     // (instances_prepared) still skips them in the view builds.
     if (mesh.gpu_pending) return;
     // Pre-staged by instance_staging.stageInstances before the shadow pass
-    // when running under Scene.prepareFrame; the frame guard makes this a
-    // no-op then, while direct callers (tests, parallel merge tail) still
+    // in the producer build; the frame guard makes this a
+    // no-op then, while standalone immediate callers (tests, parallel merge tail) still
     // stage here. With instances_prepared the pre-stage publish is
     // definitive: consume it as-is, never retry mid-frame. LOD children
     // stay on the per-mesh guard (pre-stage and shadow both skip them, so

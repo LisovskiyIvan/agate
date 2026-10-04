@@ -607,7 +607,8 @@ test "real engine templates merge byte-identical and accept an albedo hook" {
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "final_rgb = pow(final_rgb, vec3(2.2));") != null);
     // Injection points kept their surrounding lines.
     try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "applyMorphDeltas(morphed_pos, morphed_nrm, gl_VertexIndex);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "frag_color = vec4(final_rgb, base.a);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "frag_color = linearOutputColor(final_rgb, base.a);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.glsl, "clamp(lit, 0.0, 1.0)") == null);
 }
 
 test "reserved param names are rejected" {

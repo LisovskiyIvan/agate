@@ -10,10 +10,13 @@
 @end
 
 @fs fs
+// Shared finite-radiance guard (fragment scope; parent enables the build
+// include for this shader).
+// @include "common/linear_output.glsl"
 layout(binding = 0) uniform fs_params {
-    vec4 params1; // x: exposure, y: bloom_threshold, z: bloom_intensity, w: bloom_radius
+    vec4 params1; // x: exposure, y: bloom_threshold (pyramid prefilter; composite ignores), z: bloom_intensity, w: unused (parent sets 0)
     vec4 params2; // x: vignette_intensity, y: vignette_radius, z: saturation, w: contrast
-    vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_enabled (1/0), w: vignette_enabled (1/0)
+    vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_available (1/0, parent packs enabled && view valid), w: vignette_enabled (1/0)
     vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: fxaa_enabled (1/0)
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
     vec4 camera_params; // x: near_z, y: far_z, z: ssr_steps, w: unused
@@ -25,7 +28,6 @@ layout(binding = 0) uniform fs_params {
     vec4 ssr_params; // x: ssr_enabled (1/0), y: ssr_intensity, z: ssr_thickness, w: ssr_max_distance
     vec4 params5; // x: sharpen_amount (0=off), y: grain_intensity (0=off), z: temperature [-1,1], w: tint [-1,1]
     vec4 dof_params; // x: dof_enabled (1/0), y: focus_distance, z: focus_range, w: max_blur_px
-    vec4 bloom_pyramid; // x: pyramid_enabled (1/0), y: mips, z/w: unused
     vec4 glow_params; // x: glow_enabled (1/0), y: intensity, z/w: unused
     vec4 glow_tint; // xyz: glow color multiplier, w: unused
     vec4 highlight_params; // x: highlight_enabled (1/0), y: baked global scale (always 1.0: per-item intensity folds into the mask), z/w: unused
@@ -40,6 +42,11 @@ layout(binding = 0) uniform fs_params {
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
+    // APPENDED LAST (display transfer): x = manual display encode needed
+    // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
+    // 0 = sRGB target: output linear, hardware encodes). yzw unused. Packed
+    // by the parent.
+    vec4 output_params;
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -73,12 +80,6 @@ vec3 ACESFilm(vec3 x) {
 
 vec3 Reinhard(vec3 x) {
     return x / (x + vec3(1.0));
-}
-
-vec3 extractBright(vec3 c, float thresh) {
-    float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    float factor = max(0.0, luma - thresh);
-    return c * (factor / max(luma, 0.0001));
 }
 
 vec3 reconstructWorldPos(vec2 uv, float depth) {
@@ -267,8 +268,9 @@ vec3 addShaftRadiance(vec3 color, vec2 uv) {
     return color;
 }
 
-// Sample scene HDR color, apply chromatic aberration, SSAO, SSR, Fog, and Motion Blur
-vec3 sampleSceneRaw(vec2 uv) {
+// Sample linear-radiance scene color: chromatic aberration, then the
+// depth-dependent passes (motion blur, SSR, SSAO, atmospheric fog).
+vec3 sampleScene(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
     if (ca > 0.00001) {
@@ -316,20 +318,6 @@ vec3 sampleSceneRaw(vec2 uv) {
     return color;
 }
 
-// Sample tonemapped LDR color for perceptual FXAA edge detection
-vec3 sampleSceneLDR(vec2 uv) {
-    vec3 color = addShaftRadiance(sampleSceneRaw(uv), uv);
-    color *= params1.x; // Exposure
-
-    float tonemap_mode = params3.x;
-    if (tonemap_mode > 1.5) {
-        color = Reinhard(color);
-    } else if (tonemap_mode > 0.5) {
-        color = ACESFilm(color);
-    }
-    return clamp(color, 0.0, 1.0);
-}
-
 float rgbToLuma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
@@ -342,9 +330,9 @@ float grainHash(vec2 p) {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-// Fast LDR sample for neighbor filtering (Sharpen, DoF, TAA neighborhood):
-// Single texture fetch from scene_tex with exposure + Reinhard/ACES tonemap.
-// Skips redundant SSAO fetches, SSR, fog, and chromatic aberration dispersion.
+// Fast tonemapped tap for perceptual proxies (sharpen): single scene fetch
+// + shaft + exposure + the existing Reinhard/ACES. Skips re-running SSR,
+// fog and chromatic dispersion on neighbor taps.
 vec3 sampleSceneFastLDR(vec2 uv) {
     vec3 color = addShaftRadiance(texture(sampler2D(scene_tex, smp), uv).rgb, uv) * params1.x; // Exposure
     float tonemap_mode = params3.x;
@@ -356,64 +344,12 @@ vec3 sampleSceneFastLDR(vec2 uv) {
     return clamp(color, 0.0, 1.0);
 }
 
-// Fast luma approximation for FXAA edge detection and tangent walking:
-// skips re-running tonemapping polynomials on every neighbor tap.
+// Fast luma approximation for FXAA edge classification: clamped
+// tonemapped luma as a perceptual proxy (no per-tap SSR cost).
 float sampleLumaFast(vec2 uv) {
     vec3 c = addShaftRadiance(texture(sampler2D(scene_tex, smp), uv).rgb, uv);
     float luma_hdr = dot(c, vec3(0.299, 0.587, 0.114)) * params1.x;
     return luma_hdr / (luma_hdr + 1.0);
-}
-
-// Temporal Anti-Aliasing neighborhood: 3x3 box (min/max/average) over the
-// tonemapped-LDR center + 8 fast-LDR taps (the same neighbor approximation
-// FXAA and sharpen use). Mirrors taaNeighborhoodBounds/taaNeighborhoodAvg
-// in postprocess.zig.
-void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, out vec3 avg) {
-    vec2 texel = resolution.zw;
-    box_min = center;
-    box_max = center;
-    vec3 sum = center;
-    vec3 t;
-    t = sampleSceneFastLDR(uv + vec2(-texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(0.0, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(-texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(-texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(0.0, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleSceneFastLDR(uv + vec2(texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    avg = sum / 9.0;
-}
-
-// Temporal Anti-Aliasing resolve on the tonemapped LDR image. Velocity comes
-// from depth reprojection with the (jittered) current/prev view-projection —
-// exactly the applyMotionBlur math — and the history sample is bilinear
-// (smp). Mirrors taaResolvePixel in postprocess.zig (bounds + clamp + blend
-// + sharpen). Disabled (or no valid history yet) returns `current` before
-// any history/depth sampling, so the off path stays bit-identical.
-vec3 applyTAA(vec3 current, vec2 uv) {
-    if (taa_params.x < 0.5) return current;
-    if (taa_state.x < 0.5) return current;
-    float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
-    if (raw_depth >= 0.9999) return current;
-
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
-    vec2 prev_uv = reprojectClipToPrevUv(clip);
-    if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
-    vec3 hist = texture(sampler2D(history_tex, smp), prev_uv).rgb;
-    vec3 box_min;
-    vec3 box_max;
-    vec3 avg;
-    taaNeighborhood(uv, current, box_min, box_max, avg);
-    float clamp_strength = clamp(taa_params.z, 0.0, 1.0);
-    vec3 hist_clamped = mix(hist, clamp(hist, box_min, box_max), clamp_strength);
-    float blend = clamp(taa_params.y, 0.0, 1.0);
-    vec3 outc = mix(current, hist_clamped, blend);
-    float sharp = clamp(taa_params.w, 0.0, 1.0);
-    if (sharp > 0.0001) {
-        outc = clamp(outc + (current - avg) * sharp, box_min, box_max);
-    }
-    return outc;
 }
 
 // FXAA 3.11 Quality Anti-Aliasing
@@ -422,175 +358,10 @@ vec3 applyTAA(vec3 current, vec2 uv) {
 #define FXAA_SUBPIX_CAP         0.75
 #define FXAA_SEARCH_STEPS       10
 
-vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
-    vec3 colorCenter = sampleSceneLDR(uv);
-    float lumaCenter = rgbToLuma(colorCenter);
-
-    // 4 cross neighbors (fast scalar luminance)
-    float lumaDown  = sampleLumaFast(uv + vec2(0.0, -rcpFrame.y));
-    float lumaUp    = sampleLumaFast(uv + vec2(0.0,  rcpFrame.y));
-    float lumaLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, 0.0));
-    float lumaRight = sampleLumaFast(uv + vec2( rcpFrame.x, 0.0));
-
-    float lumaMin = min(lumaCenter, min(min(lumaDown, lumaUp), min(lumaLeft, lumaRight)));
-    float lumaMax = max(lumaCenter, max(max(lumaDown, lumaUp), max(lumaLeft, lumaRight)));
-    float lumaRange = lumaMax - lumaMin;
-
-    // Early exit if contrast is below threshold
-    if (lumaRange < max(FXAA_EDGE_THRESHOLD_MIN, lumaMax * FXAA_EDGE_THRESHOLD)) {
-        return colorCenter;
-    }
-
-    // 4 corner neighbors
-    float lumaDownLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, -rcpFrame.y));
-    float lumaUpRight   = sampleLumaFast(uv + vec2( rcpFrame.x,  rcpFrame.y));
-    float lumaUpLeft    = sampleLumaFast(uv + vec2(-rcpFrame.x,  rcpFrame.y));
-    float lumaDownRight = sampleLumaFast(uv + vec2( rcpFrame.x, -rcpFrame.y));
-
-    // Edge orientation detection (horizontal vs vertical)
-    float lumaDownUp = lumaDown + lumaUp;
-    float lumaLeftRight = lumaLeft + lumaRight;
-
-    float lumaLeftCorners = lumaDownLeft + lumaUpLeft;
-    float lumaDownCorners = lumaDownLeft + lumaDownRight;
-    float lumaRightCorners = lumaDownRight + lumaUpRight;
-    float lumaUpCorners = lumaUpRight + lumaUpLeft;
-
-    float edgeHorizontal = abs(-2.0 * lumaLeft + lumaLeftCorners) +
-                           abs(-2.0 * lumaCenter + lumaDownUp) * 2.0 +
-                           abs(-2.0 * lumaRight + lumaRightCorners);
-    float edgeVertical   = abs(-2.0 * lumaUp + lumaUpCorners) +
-                           abs(-2.0 * lumaCenter + lumaLeftRight) * 2.0 +
-                           abs(-2.0 * lumaDown + lumaDownCorners);
-
-    bool isHorizontal = (edgeHorizontal >= edgeVertical);
-
-    // Select gradient perpendicular to edge
-    float luma1 = isHorizontal ? lumaDown : lumaLeft;
-    float luma2 = isHorizontal ? lumaUp : lumaRight;
-    float gradient1 = abs(luma1 - lumaCenter);
-    float gradient2 = abs(luma2 - lumaCenter);
-
-    bool is1Steeper = gradient1 >= gradient2;
-    float gradientScaled = 0.25 * max(gradient1, gradient2);
-
-    float stepLength = isHorizontal ? rcpFrame.y : rcpFrame.x;
-    float lumaLocalAverage = 0.0;
-
-    if (is1Steeper) {
-        stepLength = -stepLength;
-        lumaLocalAverage = 0.5 * (luma1 + lumaCenter);
-    } else {
-        lumaLocalAverage = 0.5 * (luma2 + lumaCenter);
-    }
-
-    vec2 currentUv = uv;
-    if (isHorizontal) {
-        currentUv.y += stepLength * 0.5;
-    } else {
-        currentUv.x += stepLength * 0.5;
-    }
-
-    // Search along edge tangent
-    vec2 offset = isHorizontal ? vec2(rcpFrame.x, 0.0) : vec2(0.0, rcpFrame.y);
-    vec2 uv1 = currentUv - offset;
-    vec2 uv2 = currentUv + offset;
-
-    float lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
-    float lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
-
-    bool reached1 = abs(lumaEnd1) >= gradientScaled;
-    bool reached2 = abs(lumaEnd2) >= gradientScaled;
-
-    if (!reached1) uv1 -= offset;
-    if (!reached2) uv2 += offset;
-
-    for (int i = 2; i < FXAA_SEARCH_STEPS; i++) {
-        if (!reached1) {
-            lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
-            reached1 = abs(lumaEnd1) >= gradientScaled;
-        }
-        if (!reached2) {
-            lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
-            reached2 = abs(lumaEnd2) >= gradientScaled;
-        }
-        if (reached1 && reached2) break;
-        if (!reached1) uv1 -= offset;
-        if (!reached2) uv2 += offset;
-    }
-
-    // Distance to edge ends
-    float distance1 = isHorizontal ? (uv.x - uv1.x) : (uv.y - uv1.y);
-    float distance2 = isHorizontal ? (uv2.x - uv.x) : (uv2.y - uv.y);
-
-    bool isDirection1 = distance1 < distance2;
-    float distanceFinal = min(distance1, distance2);
-    float edgeThickness = distance1 + distance2;
-
-    float lumaNearEnd = isDirection1 ? lumaEnd1 : lumaEnd2;
-    bool isOpposite = (lumaNearEnd < 0.0) != ((lumaCenter - lumaLocalAverage) < 0.0);
-
-    float pixelOffset = -distanceFinal / edgeThickness + 0.5;
-    float finalEdgeOffset = isOpposite ? pixelOffset : 0.0;
-
-    // Subpixel antialiasing
-    float lumaAverageCorners = lumaLeftCorners + lumaRightCorners;
-    float subpixLuma = (2.0 * (lumaDownUp + lumaLeftRight) + lumaAverageCorners) * (1.0 / 12.0);
-    float subpixRange = abs(subpixLuma - lumaCenter);
-    float subpixFactor = clamp(subpixRange / lumaRange, 0.0, 1.0);
-    float subpixBlend = (-2.0 * subpixFactor + 3.0) * subpixFactor * subpixFactor;
-    float subpixBlendFinal = subpixBlend * subpixBlend * FXAA_SUBPIX_CAP;
-
-    float finalOffset = max(finalEdgeOffset, subpixBlendFinal);
-
-    vec2 finalUv = uv;
-    if (isHorizontal) {
-        finalUv.y += finalOffset * stepLength;
-    } else {
-        finalUv.x += finalOffset * stepLength;
-    }
-
-    return sampleSceneLDR(finalUv);
-}
-
 float dofLinearize(float d) {
     float near = camera_params.x;
     float far = camera_params.y;
     return (near * far) / max(far - d * (far - near), 0.0001);
-}
-
-// Depth of Field: gather blur with a golden-angle spiral over the tonemapped
-// color. Pixels inside the focal plane return early with zero extra taps.
-// Sky (cleared depth) is treated as far plane distance.
-vec3 applyDoF(vec3 color, vec2 uv) {
-    if (dof_params.x < 0.5) return color;
-    float raw = texture(sampler2D(depth_tex, depth_smp), uv).r;
-    float lin = (raw >= 0.9999) ? camera_params.y : dofLinearize(raw);
-    float fr = max(dof_params.z, 0.0001);
-    float coc = clamp(abs(lin - dof_params.y) / fr, 0.0, 1.0) * max(dof_params.w, 0.0);
-    // In focus: no extra samples.
-    if (coc < 0.5) return color;
-
-    const int DOF_TAPS = 14;
-    // Precalculated 2D rotator for golden angle (2.3999632 rad):
-    // cos(2.3999632) ~= -0.7373688, sin(2.3999632) ~= 0.6754904
-    const vec2 rot_step = vec2(-0.73736882, 0.67549038);
-    vec2 rot = vec2(1.0, 0.0);
-
-    vec2 texel = resolution.zw;
-    vec3 acc = color;
-    float wsum = 1.0;
-    for (int i = 0; i < DOF_TAPS; i++) {
-        float fi = float(i);
-        float rr = (fi + 0.5) / float(DOF_TAPS) * coc;
-        vec2 off = rot * (rr * texel);
-        // Fast LDR path reuses the FXAA neighbor approximation (skips
-        // SSR/fog re-evaluation on taps).
-        acc += sampleSceneFastLDR(uv + off);
-        wsum += 1.0;
-        rot = vec2(rot.x * rot_step.x - rot.y * rot_step.y, rot.x * rot_step.y + rot.y * rot_step.x);
-    }
-    return acc / wsum;
 }
 
 // Parametric zone grade: per-channel lifts weighted by luminance zones.
@@ -628,108 +399,300 @@ vec3 applyLut(vec3 color) {
     return mix(color, mix(c0, c1, f), clamp(lut_params.y, 0.0, 1.0));
 }
 
+// Exact IEC 61966-2-1 sRGB encode for the UNORM display path. Input is
+// finite-bound first (NaN/Inf lanes map to 0 via boundRadiance), so the pow
+// below can never see a non-finite base; output stays in 0..1 (the caller
+// clamps the graded color before encoding).
+vec3 linearToSrgb(vec3 c) {
+    c = boundRadiance(c);
+    vec3 lo = c * 12.92;
+    vec3 hi = vec3(1.055) * pow(c, vec3(1.0 / 2.4)) - vec3(0.055);
+    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.0031308))));
+}
+
+// Fast radiance tap for the TAA neighborhood: scene radiance + shaft, no
+// exposure/tonemap (mirrors the full sampleScene minus its depth passes).
+// Finite-bound at the tap so a poisoned texel (NaN/Inf) maps to 0 before it
+// can widen the neighborhood box to Inf and let poisoned history through.
+vec3 sampleRadianceFast(vec2 uv) {
+    return boundRadiance(addShaftRadiance(texture(sampler2D(scene_tex, smp), uv).rgb, uv));
+}
+
+// TAA neighborhood: 3x3 box over linear radiance taps (values can exceed
+// 1, so no 0..1 clamp here). Mirrors taaNeighborhoodBounds/
+// taaNeighborhoodAvg in postprocess.zig.
+void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, out vec3 avg) {
+    vec2 texel = resolution.zw;
+    box_min = center;
+    box_max = center;
+    vec3 sum = center;
+    vec3 t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(0.0, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(0.0, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    avg = sum / 9.0;
+}
+
+// TAA resolve in pre-exposure radiance: same depth-reprojected velocity
+// and history bilinear as motion blur; the history holds radiance (parent
+// provides the RGBA16F capture target). Mirrors taaResolvePixel in
+// postprocess.zig (bounds + clamp + blend + sharpen). Disabled (or no valid
+// history yet) returns `current` before any history/depth sampling.
+vec3 applyTAA(vec3 current, vec2 uv) {
+    if (taa_params.x < 0.5) return current;
+    if (taa_state.x < 0.5) return current;
+    float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    if (raw_depth >= 0.9999) return current;
+
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
+    vec2 prev_uv = reprojectClipToPrevUv(clip);
+    if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
+    vec3 hist = boundRadiance(texture(sampler2D(history_tex, smp), prev_uv).rgb);
+    vec3 box_min;
+    vec3 box_max;
+    vec3 avg;
+    taaNeighborhood(uv, current, box_min, box_max, avg);
+    float clamp_strength = clamp(taa_params.z, 0.0, 1.0);
+    vec3 hist_clamped = mix(hist, clamp(hist, box_min, box_max), clamp_strength);
+    float blend = clamp(taa_params.y, 0.0, 1.0);
+    vec3 outc = mix(current, hist_clamped, blend);
+    float sharp = clamp(taa_params.w, 0.0, 1.0);
+    if (sharp > 0.0001) {
+        outc = clamp(outc + (current - avg) * sharp, box_min, box_max);
+    }
+    return boundRadiance(outc);
+}
+
+// Full linear resolve at one uv: existing depth math (motion/SSR/SSAO/fog
+// via sampleScene) + shaft, bounded to finite half. One full-cost
+// sample; edge/search taps stay on the cheap proxies.
+vec3 sampleRadiance(vec2 uv) {
+    return boundRadiance(addShaftRadiance(sampleScene(uv), uv));
+}
+
+// FXAA 3.11 resolve in linear radiance (honors params4.w). Edge
+// classification reuses the exact FXAA math, offsets and weights with the
+// cheap clamped-tonemapped-luma proxy taps (sampleLumaFast, no per-tap SSR
+// cost); the actual filter resolves LINEAR radiance at the walked uv, so
+// the output stays pre-tonemap and is never double-toned. OFF returns the
+// unmodified center resolve.
+vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
+    vec3 centerLin = sampleRadiance(uv);
+    float lumaCenter = sampleLumaFast(uv);
+
+    float lumaDown  = sampleLumaFast(uv + vec2(0.0, -rcpFrame.y));
+    float lumaUp    = sampleLumaFast(uv + vec2(0.0,  rcpFrame.y));
+    float lumaLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, 0.0));
+    float lumaRight = sampleLumaFast(uv + vec2( rcpFrame.x, 0.0));
+
+    float lumaMin = min(lumaCenter, min(min(lumaDown, lumaUp), min(lumaLeft, lumaRight)));
+    float lumaMax = max(lumaCenter, max(max(lumaDown, lumaUp), max(lumaLeft, lumaRight)));
+    float lumaRange = lumaMax - lumaMin;
+
+    if (lumaRange < max(FXAA_EDGE_THRESHOLD_MIN, lumaMax * FXAA_EDGE_THRESHOLD)) {
+        return centerLin;
+    }
+
+    float lumaDownLeft  = sampleLumaFast(uv + vec2(-rcpFrame.x, -rcpFrame.y));
+    float lumaUpRight   = sampleLumaFast(uv + vec2( rcpFrame.x,  rcpFrame.y));
+    float lumaUpLeft    = sampleLumaFast(uv + vec2(-rcpFrame.x,  rcpFrame.y));
+    float lumaDownRight = sampleLumaFast(uv + vec2( rcpFrame.x, -rcpFrame.y));
+
+    float lumaDownUp = lumaDown + lumaUp;
+    float lumaLeftRight = lumaLeft + lumaRight;
+
+    float lumaLeftCorners = lumaDownLeft + lumaUpLeft;
+    float lumaDownCorners = lumaDownLeft + lumaDownRight;
+    float lumaRightCorners = lumaDownRight + lumaUpRight;
+    float lumaUpCorners = lumaUpRight + lumaUpLeft;
+
+    float edgeHorizontal = abs(-2.0 * lumaLeft + lumaLeftCorners) +
+                           abs(-2.0 * lumaCenter + lumaDownUp) * 2.0 +
+                           abs(-2.0 * lumaRight + lumaRightCorners);
+    float edgeVertical   = abs(-2.0 * lumaUp + lumaUpCorners) +
+                           abs(-2.0 * lumaCenter + lumaLeftRight) * 2.0 +
+                           abs(-2.0 * lumaDown + lumaDownCorners);
+
+    bool isHorizontal = (edgeHorizontal >= edgeVertical);
+
+    float luma1 = isHorizontal ? lumaDown : lumaLeft;
+    float luma2 = isHorizontal ? lumaUp : lumaRight;
+    float gradient1 = abs(luma1 - lumaCenter);
+    float gradient2 = abs(luma2 - lumaCenter);
+
+    bool is1Steeper = gradient1 >= gradient2;
+    float gradientScaled = 0.25 * max(gradient1, gradient2);
+
+    float stepLength = isHorizontal ? rcpFrame.y : rcpFrame.x;
+    float lumaLocalAverage = 0.0;
+
+    if (is1Steeper) {
+        stepLength = -stepLength;
+        lumaLocalAverage = 0.5 * (luma1 + lumaCenter);
+    } else {
+        lumaLocalAverage = 0.5 * (luma2 + lumaCenter);
+    }
+
+    vec2 currentUv = uv;
+    if (isHorizontal) {
+        currentUv.y += stepLength * 0.5;
+    } else {
+        currentUv.x += stepLength * 0.5;
+    }
+
+    vec2 offset = isHorizontal ? vec2(rcpFrame.x, 0.0) : vec2(0.0, rcpFrame.y);
+    vec2 uv1 = currentUv - offset;
+    vec2 uv2 = currentUv + offset;
+
+    float lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
+    float lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
+
+    bool reached1 = abs(lumaEnd1) >= gradientScaled;
+    bool reached2 = abs(lumaEnd2) >= gradientScaled;
+
+    if (!reached1) uv1 -= offset;
+    if (!reached2) uv2 += offset;
+
+    for (int i = 2; i < FXAA_SEARCH_STEPS; i++) {
+        if (!reached1) {
+            lumaEnd1 = sampleLumaFast(uv1) - lumaLocalAverage;
+            reached1 = abs(lumaEnd1) >= gradientScaled;
+        }
+        if (!reached2) {
+            lumaEnd2 = sampleLumaFast(uv2) - lumaLocalAverage;
+            reached2 = abs(lumaEnd2) >= gradientScaled;
+        }
+        if (reached1 && reached2) break;
+        if (!reached1) uv1 -= offset;
+        if (!reached2) uv2 += offset;
+    }
+
+    float distance1 = isHorizontal ? (uv.x - uv1.x) : (uv.y - uv1.y);
+    float distance2 = isHorizontal ? (uv2.x - uv.x) : (uv2.y - uv.y);
+
+    bool isDirection1 = distance1 < distance2;
+    float distanceFinal = min(distance1, distance2);
+    float edgeThickness = distance1 + distance2;
+
+    float lumaNearEnd = isDirection1 ? lumaEnd1 : lumaEnd2;
+    bool isOpposite = (lumaNearEnd < 0.0) != ((lumaCenter - lumaLocalAverage) < 0.0);
+
+    float pixelOffset = -distanceFinal / edgeThickness + 0.5;
+    float finalEdgeOffset = isOpposite ? pixelOffset : 0.0;
+
+    float lumaAverageCorners = lumaLeftCorners + lumaRightCorners;
+    float subpixLuma = (2.0 * (lumaDownUp + lumaLeftRight) + lumaAverageCorners) * (1.0 / 12.0);
+    float subpixRange = abs(subpixLuma - lumaCenter);
+    float subpixFactor = clamp(subpixRange / lumaRange, 0.0, 1.0);
+    float subpixBlend = (-2.0 * subpixFactor + 3.0) * subpixFactor * subpixFactor;
+    float subpixBlendFinal = subpixBlend * subpixBlend * FXAA_SUBPIX_CAP;
+
+    float finalOffset = max(finalEdgeOffset, subpixBlendFinal);
+
+    vec2 finalUv = uv;
+    if (isHorizontal) {
+        finalUv.y += finalOffset * stepLength;
+    } else {
+        finalUv.x += finalOffset * stepLength;
+    }
+
+    return sampleRadiance(finalUv);
+}
+
+// DoF in linear radiance: reuses the existing CoC + golden-spiral gather
+// offsets, but gathers raw linear radiance (scene + shaft, no per-tap
+// SSR/fog cost) around a linear center, BEFORE bloom/glow adds + tonemap.
+vec3 applyDoF(vec3 color, vec2 uv) {
+    if (dof_params.x < 0.5) return color;
+    float raw = texture(sampler2D(depth_tex, depth_smp), uv).r;
+    float lin = (raw >= 0.9999) ? camera_params.y : dofLinearize(raw);
+    float fr = max(dof_params.z, 0.0001);
+    float coc = clamp(abs(lin - dof_params.y) / fr, 0.0, 1.0) * max(dof_params.w, 0.0);
+    if (coc < 0.5) return color;
+
+    const int DOF_TAPS = 14;
+    // Precalculated 2D rotator for golden angle (2.3999632 rad):
+    // cos(2.3999632) ~= -0.7373688, sin(2.3999632) ~= 0.6754904
+    const vec2 rot_step = vec2(-0.73736882, 0.67549038);
+    vec2 rot = vec2(1.0, 0.0);
+
+    vec2 texel = resolution.zw;
+    vec3 acc = color;
+    float wsum = 1.0;
+    for (int i = 0; i < DOF_TAPS; i++) {
+        float fi = float(i);
+        float rr = (fi + 0.5) / float(DOF_TAPS) * coc;
+        vec2 off = rot * (rr * texel);
+        vec2 tap_uv = uv + off;
+        acc += boundRadiance(addShaftRadiance(texture(sampler2D(scene_tex, smp), tap_uv).rgb, tap_uv));
+        wsum += 1.0;
+        rot = vec2(rot.x * rot_step.x - rot.y * rot_step.y, rot.x * rot_step.y + rot.y * rot_step.x);
+    }
+    return boundRadiance(acc / wsum);
+}
+
+// Pre-tonemap radiance: FXAA when params4.w is on (flag honored,
+// never silently off), then TAA. Chromatic/SSR/fog reuse their existing
+// math in this linear space via sampleScene.
+vec3 resolveRadiance(vec2 uv) {
+    vec3 hdr;
+    if (params4.w > 0.5) {
+        hdr = applyFXAA(uv, resolution.zw);
+    } else {
+        hdr = sampleRadiance(uv);
+    }
+    hdr = applyTAA(hdr, uv);
+    return boundRadiance(hdr);
+}
+
+// Bloom add pre-tonemap: the single bloom-pyramid composite (bloom_tex),
+// sampled iff bloom is available (params3.z, parent-packed) and intensity
+// is above zero. Always added before exposure/tonemap.
+vec3 bloomAdd(vec2 uv) {
+    if (params3.z > 0.5 && params1.z > 0.001) {
+        return texture(sampler2D(bloom_tex, smp), uv).rgb * params1.z;
+    }
+    return vec3(0.0);
+}
+
 void main() {
     vec2 uv = v_uv;
 
-    // SSAO Debug view early exit
+    // SSAO debug: diagnostic gray, no exposure/tonemap/encode. A
+    // capture-only re-entry stores this gray (history then reprojects gray;
+    // acceptable for a diagnostic view).
     if (params4.y > 0.5) {
         float ao_dbg = texture(sampler2D(ssao_tex, smp), uv).r;
         frag_color = vec4(ao_dbg, ao_dbg, ao_dbg, 1.0);
         return;
     }
 
-    // Anti-Aliasing (FXAA 3.11) or Direct Tonemapped Sample
-    vec3 color;
-    if (params4.w > 0.5) {
-        color = applyFXAA(uv, resolution.zw);
-    } else {
-        color = sampleSceneLDR(uv);
-    }
-
-    // Temporal Anti-Aliasing (tonemapped-LDR resolve against the reprojected
-    // history; same depth + current/prev VP velocity math as motion blur).
-    // Disabled (or no valid history yet) returns `color` before any
-    // history/depth sampling, so the off path is bit-identical to pre-TAA.
-    color = applyTAA(color, uv);
-    // History capture draws re-enter with taa_state.y = 1 and store exactly
-    // this post-TAA color for the next frame (PostFXStack.renderChain).
+    // Linear-radiance chain: FXAA-or-resolve + TAA in radiance, DoF in
+    // linear BEFORE bloom/glow adds, exactly one exposure + one tonemap +
+    // one display encode.
+    vec3 color = resolveRadiance(uv);
+    // History capture stores pre-exposure, pre-tonemap radiance (finite-half
+    // bound only, no 0..1 clamp, no encode): the next frame's applyTAA reads
+    // radiance, never display-encoded color.
     if (taa_state.y > 0.5) {
-        frag_color = vec4(clamp(color, 0.0, 1.0), 1.0);
+        frag_color = vec4(boundRadiance(color), 1.0);
         return;
     }
-
-    // Depth of Field (gather blur on the tonemapped image)
     color = applyDoF(color, uv);
-
-    // White Balance (post-tonemap channel gains, 0 = neutral)
-    float wb_temp = params5.z;
-    float wb_tint = params5.w;
-    if (abs(wb_temp) > 0.0001 || abs(wb_tint) > 0.0001) {
-        // Positive temperature warms (boosts red, cuts blue), negative cools.
-        // Positive tint pushes magenta (cuts green), negative pushes green.
-        vec3 wb_gains = vec3(1.0 + wb_temp * 0.20, 1.0 - wb_tint * 0.12, 1.0 - wb_temp * 0.20);
-        color = clamp(color * wb_gains, 0.0, 1.0);
-    }
-
-    // Sharpen (unsharp mask on tonemapped LDR, 5-tap cross kernel)
-    float sharpen_amt = params5.x;
-    if (sharpen_amt > 0.0001) {
-        // Neighbor taps reuse the fast LDR path (skips SSR/fog re-evaluation,
-        // same approximation FXAA itself uses for its neighbor taps).
-        vec2 texel = resolution.zw;
-        vec3 tap_up = sampleSceneFastLDR(uv + vec2(0.0, texel.y));
-        vec3 tap_down = sampleSceneFastLDR(uv - vec2(0.0, texel.y));
-        vec3 tap_left = sampleSceneFastLDR(uv - vec2(texel.x, 0.0));
-        vec3 tap_right = sampleSceneFastLDR(uv + vec2(texel.x, 0.0));
-        vec3 blur = (tap_up + tap_down + tap_left + tap_right) * 0.25;
-        // Clamp to the center+taps neighborhood so low amounts cannot ring.
-        vec3 n_min = min(min(tap_up, tap_down), min(min(tap_left, tap_right), color));
-        vec3 n_max = max(max(tap_up, tap_down), max(max(tap_left, tap_right), color));
-        color = clamp(color + (color - blur) * sharpen_amt, n_min, n_max);
-    }
-
-    // Bloom glow pass: high-quality pyramid composite when BloomPass fed
-    // bloom_tex, otherwise the legacy single-shader multi-tap fallback.
-    if (bloom_pyramid.x > 0.5 && params1.z > 0.001) {
-        vec3 glow = texture(sampler2D(bloom_tex, smp), uv).rgb;
-        vec3 bloom_scaled = glow * params1.z;
-        color += bloom_scaled;
-    } else if (params3.z > 0.5 && params1.z > 0.001) {
-        float thresh = params1.y;
-        vec2 texel = resolution.zw * params1.w;
-        vec3 bloom = vec3(0.0);
-
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2(-1.0, -1.0) * texel).rgb, thresh) * 0.0625;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0, -1.0) * texel).rgb, thresh) * 0.1250;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 1.0, -1.0) * texel).rgb, thresh) * 0.0625;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2(-1.0,  0.0) * texel).rgb, thresh) * 0.1250;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0,  0.0) * texel).rgb, thresh) * 0.2500;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 1.0,  0.0) * texel).rgb, thresh) * 0.1250;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2(-1.0,  1.0) * texel).rgb, thresh) * 0.0625;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0,  1.0) * texel).rgb, thresh) * 0.1250;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 1.0,  1.0) * texel).rgb, thresh) * 0.0625;
-
-        vec2 texel2 = texel * 2.5;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2(-1.0,  0.0) * texel2).rgb, thresh) * 0.1000;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 1.0,  0.0) * texel2).rgb, thresh) * 0.1000;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0, -1.0) * texel2).rgb, thresh) * 0.1000;
-        bloom += extractBright(texture(sampler2D(scene_tex, smp), uv + vec2( 0.0,  1.0) * texel2).rgb, thresh) * 0.1000;
-
-        vec3 bloom_scaled = bloom * params1.z;
-        color += bloom_scaled;
-    }
-
+    color = boundRadiance(color + bloomAdd(uv));
     // Glow layer v1 (global halo, independent of bloom): threshold-extracted
     // + separable-blurred glow_tex added with intensity * tint. Disabled (or
-    // intensity ~0) returns before sampling, so the off path is bit-identical
-    // to pre-glow. Composites AFTER bloom so either toggle leaves the other's
-    // contribution unchanged; before the grading chain so the halo grades
-    // with the same LDR the bloom halo uses.
+    // intensity ~0) returns before sampling. Composites AFTER bloom so
+    // either toggle leaves the other's contribution unchanged; before
+    // exposure/tonemap so the halo grades with the scene.
     if (glow_params.x > 0.5 && glow_params.y > 0.001) {
-        vec3 glow = texture(sampler2D(glow_tex, smp), uv).rgb;
-        color += glow * (glow_params.y * glow_tint.xyz);
+        color += texture(sampler2D(glow_tex, smp), uv).rgb * (glow_params.y * glow_tint.xyz);
     }
-
     // Highlight layer v1 (per-mesh inner glow): the raw per-item mask
     // (color x intensity folded at draw, frame-max sigma blur) minus its
     // blurred halo, floored at zero per channel and doubled, added with
@@ -743,37 +706,67 @@ void main() {
     // reaches 0 in the interior for any intensity. Mirrors
     // highlightInnerGlow/highlightComposite in postprocess.zig (same
     // per-channel math, same x2 gain). Disabled returns before sampling
-    // EITHER texture, so the off path is bit-identical to pre-highlight.
-    // Composites AFTER glow so either toggle leaves the other's
-    // contribution unchanged; before the grading chain so per-mesh colors
-    // grade with the same LDR the bloom/glow halos use.
+    // EITHER texture. Composites AFTER glow so either toggle leaves the
+    // other's contribution unchanged; before exposure/tonemap so per-mesh
+    // colors grade with the scene.
     if (highlight_params.x > 0.5) {
         vec3 hl_raw = texture(sampler2D(highlight_mask_tex, smp), uv).rgb;
         vec3 hl_blurred = texture(sampler2D(highlight_tex, smp), uv).rgb;
         vec3 hl_inner = max(hl_raw - hl_blurred, vec3(0.0)) * 2.0;
         color += hl_inner * highlight_params.y;
     }
-
+    color = boundRadiance(color);
+    color *= params1.x; // Exposure (once)
+    color = boundRadiance(color); // Bound AFTER exposure too (matches CPU tonemap)
+    float tonemap_mode = params3.x;
+    if (tonemap_mode > 1.5) {
+        color = Reinhard(color);
+    } else if (tonemap_mode > 0.5) {
+        color = ACESFilm(color);
+    }
+    // Display-referred tail (post-tonemap; DoF already ran in linear above).
+    // applyColorCurves/applyLut are the shared fns.
+    // White Balance (post-tonemap channel gains, 0 = neutral)
+    float wb_temp = params5.z;
+    float wb_tint = params5.w;
+    if (abs(wb_temp) > 0.0001 || abs(wb_tint) > 0.0001) {
+        // Positive temperature warms (boosts red, cuts blue), negative cools.
+        // Positive tint pushes magenta (cuts green), negative pushes green.
+        vec3 wb_gains = vec3(1.0 + wb_temp * 0.20, 1.0 - wb_tint * 0.12, 1.0 - wb_temp * 0.20);
+        color = clamp(color * wb_gains, 0.0, 1.0);
+    }
+    // Sharpen (unsharp mask, 5-tap cross kernel over tonemapped taps)
+    float sharpen_amt = params5.x;
+    if (sharpen_amt > 0.0001) {
+        // Neighbor taps reuse the fast tonemapped proxy (skips SSR/fog
+        // re-evaluation, same approximation FXAA itself uses for edge taps).
+        vec2 texel = resolution.zw;
+        vec3 tap_up = sampleSceneFastLDR(uv + vec2(0.0, texel.y));
+        vec3 tap_down = sampleSceneFastLDR(uv - vec2(0.0, texel.y));
+        vec3 tap_left = sampleSceneFastLDR(uv - vec2(texel.x, 0.0));
+        vec3 tap_right = sampleSceneFastLDR(uv + vec2(texel.x, 0.0));
+        vec3 blur = (tap_up + tap_down + tap_left + tap_right) * 0.25;
+        // Clamp to the center+taps neighborhood so low amounts cannot ring.
+        vec3 n_min = min(min(tap_up, tap_down), min(min(tap_left, tap_right), color));
+        vec3 n_max = max(max(tap_up, tap_down), max(max(tap_left, tap_right), color));
+        color = clamp(color + (color - blur) * sharpen_amt, n_min, n_max);
+    }
     // Contrast
     float contrast = params2.w;
     if (abs(contrast - 1.0) > 0.001) {
         color = (color - vec3(0.5)) * contrast + vec3(0.5);
     }
-
     // Saturation
     float saturation = params2.z;
     if (abs(saturation - 1.0) > 0.001) {
         float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
         color = mix(vec3(luma), color, saturation);
     }
-
     // Parametric color curves (shadows/midtones/highlights lifts)
     color = applyColorCurves(color);
-
     // Texture LUT grade, sampled after the curves so the LUT authors the
     // final look on top of the parametric grade.
     color = applyLut(color);
-
     // Vignette
     if (params3.w > 0.5 && params2.x > 0.001) {
         vec2 v_coord = uv * (vec2(1.0) - uv.yx);
@@ -781,7 +774,6 @@ void main() {
         vig = clamp(pow(vig, params2.y * 0.5), 0.0, 1.0);
         color = mix(color * vig, color, 1.0 - params2.x);
     }
-
     // Film Grain (static screen-space hash, last so FXAA never sees the noise
     // and sharpen never amplifies it; applied after vignette so grain stays uniform)
     float grain_amt = params5.y;
@@ -793,8 +785,13 @@ void main() {
         float lum_mask = clamp(1.0 - grain_luma * 1.2, 0.15, 1.0);
         color += grain_n * grain_amt * 2.0 * lum_mask;
     }
-
-    frag_color = vec4(clamp(color, 0.0, 1.0), 1.0);
+    color = clamp(color, 0.0, 1.0);
+    // Exactly one display transfer: manual exact piecewise encode for UNORM,
+    // linear for sRGB targets (hardware encodes).
+    if (output_params.x > 0.5) {
+        color = linearToSrgb(color);
+    }
+    frag_color = vec4(color, 1.0);
 }
 @end
 

@@ -23,7 +23,7 @@ var rt_nodepth = try agate.RenderTarget.create(.{
 });
 
 // 1. Отрендерить подготовленный primary view в таргет (между
-//    prepareFrame/staged finish и Scene.render, пока prepared draws
+//    staged build + begin/finish и Scene.render, пока prepared draws
 //    консьюмабельны). Неподдержанный захват — это ошибка
 //    (CaptureError), а не тихий пропуск: fallback — пропустить
 //    transmission-кадр и сэмплить прошлый захват.
@@ -64,7 +64,7 @@ pub fn deinit(self: *RenderTarget) void; // немедленное, context-по
 
 Ошибки: `InvalidDimensions` (нулевой размер), `ImageTooLarge` (переполнение `w*h` или превышение живого `max_image_size_2d`), `NoContext` (нет `sg`), `TargetCreationFailed` (откат уже выполнен; проверяется состояние ресурса, не только ненулевой id), `UnsupportedColorFormat` (формат не рендерится/не сэмплируется или не поддерживает запрошенную фильтрацию), `UnsupportedDepthFormat` (не depth-формат).
 
-MSAA: запрос прогоняется через ту же политику, что у main-таргета (`msaa.effectiveSampleCount`): неподдерживаемый уровень тихо деградирует к ближайшему валидному, а не валит создание. Фактический уровень — в `sample_count`. При `samples > 1` таргет несёт resolve-пару (цвет резолвится в конце прохода, сэмплинг читает 1x-копию), а depth texture view отсутствует (в sokol нет depth resolve — то же правило, что у main-таргета, см. `./render-pipeline.md` и `scene/msaa.zig`).
+MSAA: запрос прогоняется через ту же политику, что у main-таргета (`msaa.effectiveSampleCount`): неподдерживаемый уровень — явная ошибка запуска/panic на старте, а не тихая смена контракта. Обязательные sample/filter/render/blend-caps проверяются на старте. Фактический уровень — в `sample_count`. При `samples > 1` таргет несёт resolve-пару (цвет резолвится в конце прохода, сэмплинг читает 1x-копию), а depth texture view отсутствует (в sokol нет depth resolve — то же правило, что у main-таргета, см. `./render-pipeline.md` и `scene/msaa.zig`).
 
 ### Проходы: `begin` / `end` / `clear`
 
@@ -119,7 +119,7 @@ pub fn renderPrimaryView(self: *RenderTarget, scene: anytype, opts: SceneRenderO
 | `NoContext` | нет живого `sg` |
 | `NoConsumableFrame` | `!scene.hasConsumableFrame()` — prepare ещё не публиковал кадр |
 | `NoCamera` | в staged-снапшоте нет камеры |
-| `IncompatibleColorFormat` | color таргета ≠ `defaultColorFormat()` (явный RGBA8 против дефолтного BGRA8, RGBA16F, sRGB-варианты — молча менять каналы/кодирование нельзя) |
+| `IncompatibleColorFormat` | color таргета ≠ forward-формату сцены (обязательный RGBA16F; явный RGBA8/sRGB — молча менять каналы/кодирование нельзя) |
 | `DepthRequired` | у таргета нет depth (forward-пайплайны depth-tested, pass без depth невалиден для них) |
 | `IncompatibleDepthFormat` | depth таргета ≠ `defaultDepthFormat()` |
 | `PassBeginFailed` | защитная (все гейты пройдены, а `begin` отказал — на одном потоке недостижимо) |
@@ -143,9 +143,9 @@ pub fn estimatedBytesFor(w, h, color, depth, samples) usize; // чистый б�
 pub fn validateDimensions(w, h) CreateError!void;            // чистая валидация
 ```
 
-## Linear/sRGB семантика
+## Linear/sRGB семантика (HDR)
 
-Таргет хранит то, что записал pipeline. UNORM (RGBA8/BGRA8) не конвертирует цвет: для дальнейшего семплирования как linear-текстуры задайте capture-сцене `output_gamma = false`, кодируйте gamma один раз на выходе. Если захват уже display-referred, повторное gamma-кодирование ошибочно. Явные sRGB-форматы аппаратно кодируют запись и декодируют семплинг; общий scene capture их не принимает из-за несовместимости pipeline-формата. UNORM v1 ограничен 8-битной точностью и клипует HDR.
+Сцена/history/probe/refraction — обязательный RGBA16F linear. Main-таргеты создаются каноническим `prepareMainTargets` (required caps + alloc errors, fail-closed, без SDR-fallback); `resize(w, h, samples) bool`, `scene.forwardFor(samples, color_format)`. Таргет хранит то, что записал pipeline. UNORM — только display-выход: один IEC display transfer, ручной UNORM / hw-sRGB путь; output gamma-флаги удалены. Общий scene capture sRGB-варианты не принимает из-за несовместимости pipeline-формата. Скриншоты — визуальное подтверждение, не числовая radiance-метрика (GPU readback нет).
 
 ## Потоки и владение
 
@@ -183,7 +183,7 @@ Sokol-app программа с двумя сценами: capture-сцена (�
 
 Две процедурные полоски с UV0 ≠ UV1 (mirrored U) используют checker-текстуру: Standard выбирает UV0, PBR — UV1. Import/accessor/override/тангенты дополнительно покрыты GPU-free тестами.
 
-Smoke проверяет реальные ненулевые draws и GPU-валидацию, но не заменяет проверку пикселей. Универсального readback API в примере нет: окно можно захватить средствами ОС. Проверено 03.10.2026 на Metal/macOS в Debug: default (60 кадров), refraction (360 кадров, два прогона), 4x MSAA capture→resolve→sample (120 кадров) — `verdict=PASS`, ноль sokol errors. Resize и reuse также прошли.
+Smoke проверяет реальные ненулевые draws и GPU-валидацию, но не заменяет проверку пикселей. Универсального readback API в примере нет: окно можно захватить средствами ОС. Проверено 04.10.2026 на Metal/macOS: RT capture 120 кадров + refraction 4x — PASS, 0 ошибок. Полная shared-shape (depth+color+samples) — не завершена, не заявляется.
 
 Попиксельная проверка собственного окна, фиксированные камера/IOR=1.5: `--thickness 0` против `0.7` меняет 32 380 пикселей (31 288 с |Δ|>8), **все внутри сферы**, вне неё — ноль отличий. При толщине 0.7 изменение IOR 1→1.5 меняет 115 788 пикселей (30 956 с |Δ|>8), также только в сфере. Артефакты сохранены в `bench/screenshots/rtt_*`, метрики — `bench/rtt_pixel_proof.json`, логи — `bench/native_reports/rtt_*`. Это подтверждает работу выборки фона/оптических параметров в rigid PBR на Metal, не физическую точность или cross-backend parity.
 

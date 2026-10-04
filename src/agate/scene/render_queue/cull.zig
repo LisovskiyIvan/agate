@@ -102,8 +102,9 @@ pub const FrameCullContext = struct {
     /// Cache key for worldMatrixCached/worldAABBCached (stage-2 increment A).
     /// Replaces the direct `frame_id` read: the fallback passes
     /// `Scene.frame_id` (identical behavior); a game-side build passes its
-    /// own build-unique key `(build_seq | (1<<63))`. No new caches, no
-    /// invalidation change.
+    /// own per-attempt build-unique key (`build_cache_seq | (1<<63)` —
+    /// fresh on every build call, so cancelled/repeated builds never
+    /// alias). No new caches, no invalidation change.
     cache_key: u64,
     /// Which instance state instanced builders resolve (stage-2 increment B):
     /// `.published` reads `instance_render` (fallback, today's exact

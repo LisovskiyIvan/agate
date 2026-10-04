@@ -15,19 +15,18 @@ pub const ShaftResolution = types.ShaftResolution;
 /// toggles and their parameters). A flat config read/written by tooling;
 /// applied per frame by `Scene.postfx` (PostFXStack.renderChain).
 pub const PostProcessOptions = struct {
+    /// Artistic effects master switch. HDR output, exposure and tonemapping
+    /// remain active even when effects are disabled.
     enabled: bool = false,
     exposure: f32 = 1.0,
     tonemapping: TonemappingType = .aces,
 
-    // Bloom (bright pass filter + soft Gaussian halo)
+    // HDR bloom: Karis downsample + tent upsample pyramid.
     bloom_enabled: bool = true,
     bloom_threshold: f32 = 0.8,
     bloom_intensity: f32 = 0.5,
+    /// Upsample tent radius in source-mip texels.
     bloom_radius: f32 = 2.0,
-
-    // High-quality bloom pyramid (BloomPass, Karis down + tent up).
-    // When false, postprocess.glsl falls back to the single-shader bloom.
-    bloom_pyramid: bool = false,
     bloom_pyramid_mips: u32 = 5,
 
     // Glow layer v1 (global halo, distinct from bloom): luminance threshold
@@ -174,10 +173,10 @@ pub const PostProcessOptions = struct {
     // Never fails; safe to apply on load or before uploading uniforms.
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
         var out = self;
-        out.exposure = @max(self.exposure, 0.0);
+        out.exposure = if (std.math.isFinite(self.exposure)) std.math.clamp(self.exposure, 0.0, 65504.0) else 1.0;
         out.bloom_threshold = @max(self.bloom_threshold, 0.0);
         out.bloom_intensity = @max(self.bloom_intensity, 0.0);
-        out.bloom_radius = @max(self.bloom_radius, 0.0);
+        out.bloom_radius = if (std.math.isFinite(self.bloom_radius)) std.math.clamp(self.bloom_radius, 0.0, 16.0) else 2.0;
         out.bloom_pyramid_mips = bloom.clampBloomMips(self.bloom_pyramid_mips);
         out.glow_threshold = @max(self.glow_threshold, 0.0);
         out.glow_intensity = @max(self.glow_intensity, 0.0);
@@ -211,6 +210,34 @@ pub const PostProcessOptions = struct {
         if (out.lut_texture) |tex| {
             if (!lut.lutTextureValid(tex, out.lut_size)) out.lut_texture = null;
         }
+        return out;
+    }
+
+    /// Render-owned copy: disable effects, never the linear HDR/output path.
+    pub fn forFrame(self: PostProcessOptions) PostProcessOptions {
+        var out = self.clamped();
+        if (out.enabled) return out;
+        out.bloom_enabled = false;
+        out.glow_enabled = false;
+        out.vignette_enabled = false;
+        out.chromatic_aberration = 0;
+        out.saturation = 1;
+        out.contrast = 1;
+        out.dof_enabled = false;
+        out.grade_shadows = .{ 0, 0, 0 };
+        out.grade_midtones = .{ 0, 0, 0 };
+        out.grade_highlights = .{ 0, 0, 0 };
+        out.lut_enabled = false;
+        out.fxaa_enabled = false;
+        out.fog_enabled = false;
+        out.ssr_enabled = false;
+        out.sharpen_enabled = false;
+        out.grain_enabled = false;
+        out.temperature = 0;
+        out.tint = 0;
+        out.motion_blur_enabled = false;
+        out.taa_enabled = false;
+        out.shaft_enabled = false;
         return out;
     }
 
@@ -265,4 +292,28 @@ test "ssr and motion blur clamp quality options" {
     const c = custom.clamped();
     try std.testing.expectEqual(@as(u32, 4), c.ssr_steps);
     try std.testing.expectEqual(@as(u32, 32), c.motion_blur_samples);
+}
+
+test "manual exposure is finite and bounded for every output frame" {
+    const defaults = PostProcessOptions{};
+    try std.testing.expectEqual(defaults, defaults.clamped());
+    for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |value| {
+        const cfg = (PostProcessOptions{ .exposure = value }).clamped();
+        try std.testing.expectEqual(@as(f32, 1), cfg.exposure);
+    }
+    try std.testing.expectEqual(@as(f32, 0), (PostProcessOptions{ .exposure = -2 }).clamped().exposure);
+    try std.testing.expectEqual(@as(f32, 65504), (PostProcessOptions{ .exposure = 1e20 }).clamped().exposure);
+}
+
+test "effect master preserves exposure and tone curve without mutating authored config" {
+    const config = PostProcessOptions{ .exposure = 2, .tonemapping = .reinhard, .taa_enabled = true, .glow_enabled = true };
+    const frame = config.forFrame();
+    try std.testing.expectEqual(@as(f32, 2), frame.exposure);
+    try std.testing.expectEqual(TonemappingType.reinhard, frame.tonemapping);
+    try std.testing.expect(!frame.bloom_enabled and !frame.glow_enabled and !frame.taa_enabled and !frame.fxaa_enabled and !frame.fog_enabled and !frame.ssr_enabled);
+    try std.testing.expectEqual(@as(f32, 1), frame.saturation);
+    try std.testing.expectEqual(@as(f32, 1), frame.contrast);
+    try std.testing.expect(config.taa_enabled and config.glow_enabled);
+    const enabled = PostProcessOptions{ .enabled = true, .taa_enabled = true };
+    try std.testing.expectEqual(enabled.clamped(), enabled.forFrame());
 }

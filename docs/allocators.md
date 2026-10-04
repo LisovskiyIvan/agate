@@ -67,8 +67,8 @@ stored allocator are routed. Everything else stays on `core`.
    - `sim`: MUST be thread-safe. Game-side `update`/`buildCapture`
      (particle CPU growth, nav pathfinding) and context-side
      `captureFrame`/`latchSlotFrame` + `deinit` all allocate/free with
-     it, and under `--concurrent-build` the game build overlaps the
-     prepare latch.
+      it. The staged producer build may overlap the context-side latch;
+      the same allocator is used on both sides, including serial scheduling.
    - `render`: context-thread only (proved: `rebuildCpuForSlot` runs in
      `view_render` on the context thread; `ClusteredGpuCache.deinit`
      runs in context-only `Scene.deinit`). A non-thread-safe allocator

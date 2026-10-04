@@ -29,9 +29,9 @@ pub const PostProcessPass = struct {
     postprocess_quad_vb: sg.Buffer = .{},
     postprocess_quad_ib: sg.Buffer = .{},
     // Optional BloomPass result (pyramid glow, half resolution). Set via
-    // setBloomTexture(); empty by default, in which case the shader falls
-    // back to the legacy single-shader bloom and this binds the scene view
-    // as a harmless placeholder.
+    // setBloomTexture(); empty by default, in which case the composite
+    // skips the bloom block and this binds the scene view as a harmless
+    // placeholder.
     bloom_tex_view: sg.View = .{},
     // Optional GlowPass result (global halo, half resolution). Set via
     // setGlowTexture(); empty by default, in which case the shader skips the
@@ -61,9 +61,14 @@ pub const PostProcessPass = struct {
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
+    // Main-target color format metadata (diagnostics alongside
+    // width/height/sample_count, never a config mode). `.DEFAULT` = never
+    // built; after a successful resize this is RGBA16F, the sole contract
+    // format the color and resolve images are created with.
+    color_format: sg.PixelFormat = .DEFAULT,
     postprocess_shader: sg.Shader = .{},
-    // TAA history ping-pong (full-size color targets, same format path as
-    // the main target). Created on the context thread via
+    // TAA history ping-pong (full-size RGBA16F color targets, the sole
+    // main-target format). Created on the context thread via
     // ensureTaaHistory(); destroyed with the main targets on resize (an
     // automatic reset trigger). taa_read selects the slot the composite
     // samples; the capture draw writes 1 - taa_read.
@@ -72,7 +77,66 @@ pub const PostProcessPass = struct {
     taa_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
     taa_width: i32 = 0,
     taa_height: i32 = 0,
+    // History color format metadata (diagnostics, never a config mode:
+    // always RGBA16F once built, the sole capture format).
+    taa_format: sg.PixelFormat = .DEFAULT,
     taa_read: u8 = 0,
+    // Fullscreen history-capture pipeline: same shader/layout/quad as the
+    // display pipeline, but an explicit 1x target shape (sample_count = 1,
+    // depth NONE, color RGBA16F). Never the swapchain display pipeline
+    // (whose sample/depth shape mismatched the history target). Lazy:
+    // created with the history slots, destroyed with them.
+    taa_pipeline: sg.Pipeline = .{},
+    // Shared fullscreen-quad pipeline descriptor (pure: no sg calls). The
+    // display path passes the swapchain shape (color DEFAULT, samples 0,
+    // depth DEFAULT); the history capture path passes the explicit 1x
+    // shape (color RGBA16F, samples 1, depth NONE).
+    pub fn fullscreenPipelineDesc(
+        shader: sg.Shader,
+        color_fmt: sg.PixelFormat,
+        sample_count: i32,
+        depth_fmt: sg.PixelFormat,
+    ) sg.PipelineDesc {
+        var desc = sg.PipelineDesc{
+            .shader = shader,
+            .index_type = .UINT16,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .ALWAYS,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+            .sample_count = sample_count,
+        };
+        desc.colors[0].pixel_format = color_fmt;
+        desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        desc.layout.attrs[post_shd.ATTR_postprocess_position] = .{
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        desc.layout.attrs[post_shd.ATTR_postprocess_texcoord0] = .{
+            .format = .FLOAT2,
+            .offset = 2 * @sizeOf(f32),
+        };
+        return desc;
+    }
+
+    /// Tiny backbuffer sRGB predicate (local: render_target imports would
+    /// cycle here, and postprocess/hdr.zig owns capability math, not target
+    /// shape). True exactly for the hardware-sRGB swapchain variants.
+    pub fn isSrgbBackbuffer(fmt: sg.PixelFormat) bool {
+        return fmt == .SRGB8A8 or fmt == .SBGR8A8;
+    }
+
+    /// Pure output-params packing (no sg calls): x = 1 iff the backbuffer
+    /// default format needs the manual display encode (UNORM — the exact
+    /// piecewise sRGB encode runs once at the end; sRGB targets encode in
+    /// hardware); y/z/w = 0. The main target is always RGBA16F, so no
+    /// target-format lane exists.
+    pub fn outputParamsFor(backbuffer_fmt: sg.PixelFormat) [4]f32 {
+        const x: f32 = if (isSrgbBackbuffer(backbuffer_fmt)) 0.0 else 1.0;
+        return .{ x, 0.0, 0.0, 0.0 };
+    }
     pub fn init() PostProcessPass {
         // Fullscreen Quad (XY, UV)
         const quad_vertices = [_]f32{
@@ -121,25 +185,9 @@ pub const PostProcessPass = struct {
         });
 
         const shd = sg.makeShader(post_shd.postprocessShaderDesc(sg.queryBackend()));
-        var pp_desc = sg.PipelineDesc{
-            .shader = shd,
-            .index_type = .UINT16,
-            .depth = .{
-                .compare = .ALWAYS,
-                .write_enabled = false,
-            },
-            .cull_mode = .NONE,
-        };
-        pp_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
-        pp_desc.layout.attrs[post_shd.ATTR_postprocess_position] = .{
-            .format = .FLOAT2,
-            .offset = 0,
-        };
-        pp_desc.layout.attrs[post_shd.ATTR_postprocess_texcoord0] = .{
-            .format = .FLOAT2,
-            .offset = 2 * @sizeOf(f32),
-        };
-        const pip = sg.makePipeline(pp_desc);
+        // Display pipeline keeps the unchanged swapchain-default shape
+        // (color DEFAULT, default sample count, depth DEFAULT).
+        const pip = sg.makePipeline(fullscreenPipelineDesc(shd, .DEFAULT, 0, .DEFAULT));
 
         return .{
             .postprocess_sampler = smp,
@@ -159,14 +207,14 @@ pub const PostProcessPass = struct {
     /// is not samplable as a plain texture). 1x shape: plain color+depth,
     /// "resolve" views alias the color image.
     fn destroyTargets(self: *PostProcessPass) void {
-        if (self.offscreen_color_image.id != 0) sg.destroyImage(self.offscreen_color_image);
         if (self.offscreen_color_att_view.id != 0) sg.destroyView(self.offscreen_color_att_view);
-        if (self.offscreen_resolve_image.id != 0) sg.destroyImage(self.offscreen_resolve_image);
         if (self.offscreen_resolve_att_view.id != 0) sg.destroyView(self.offscreen_resolve_att_view);
         if (self.offscreen_resolve_tex_view.id != 0) sg.destroyView(self.offscreen_resolve_tex_view);
-        if (self.offscreen_depth_image.id != 0) sg.destroyImage(self.offscreen_depth_image);
         if (self.offscreen_depth_att_view.id != 0) sg.destroyView(self.offscreen_depth_att_view);
         if (self.offscreen_depth_tex_view.id != 0) sg.destroyView(self.offscreen_depth_tex_view);
+        if (self.offscreen_color_image.id != 0) sg.destroyImage(self.offscreen_color_image);
+        if (self.offscreen_resolve_image.id != 0) sg.destroyImage(self.offscreen_resolve_image);
+        if (self.offscreen_depth_image.id != 0) sg.destroyImage(self.offscreen_depth_image);
         self.offscreen_color_image = .{};
         self.offscreen_color_att_view = .{};
         self.offscreen_resolve_image = .{};
@@ -175,20 +223,27 @@ pub const PostProcessPass = struct {
         self.offscreen_depth_image = .{};
         self.offscreen_depth_att_view = .{};
         self.offscreen_depth_tex_view = .{};
+        self.width = 0;
+        self.height = 0;
+        self.sample_count = 1;
+        self.color_format = .DEFAULT;
         self.destroyTaaHistory();
     }
 
     fn destroyTaaHistory(self: *PostProcessPass) void {
         for (0..2) |i| {
-            if (self.taa_images[i].id != 0) sg.destroyImage(self.taa_images[i]);
             if (self.taa_att_views[i].id != 0) sg.destroyView(self.taa_att_views[i]);
             if (self.taa_tex_views[i].id != 0) sg.destroyView(self.taa_tex_views[i]);
+            if (self.taa_images[i].id != 0) sg.destroyImage(self.taa_images[i]);
             self.taa_images[i] = .{};
             self.taa_att_views[i] = .{};
             self.taa_tex_views[i] = .{};
         }
+        if (self.taa_pipeline.id != 0) sg.destroyPipeline(self.taa_pipeline);
+        self.taa_pipeline = .{};
         self.taa_width = 0;
         self.taa_height = 0;
+        self.taa_format = .DEFAULT;
         self.taa_read = 0;
     }
 
@@ -200,39 +255,83 @@ pub const PostProcessPass = struct {
         self.destroyTaaHistory();
     }
 
-    /// Ensures both history slots exist at `width`x`height`. Returns true
-    /// when (re)created — the caller's reset trigger for the frame (the
-    /// fresh targets carry no valid history). Reuses the main-target format
-    /// selection so the composite pipeline renders into the slots without
-    /// a format mismatch.
+    /// Ensures both history slots exist at `width`x`height` in RGBA16F
+    /// (pre-exposure HDR capture, the sole main-target format). Returns
+    /// true when (re)created — the caller's reset trigger for the frame
+    /// (fresh targets carry no valid history). Size changes recreate; main
+    /// destroyTargets resets history, so a main resize is also a reset.
+    /// Lazily creates the 1x explicit-format capture pipeline from the
+    /// same shader/layout as the display pipeline. On failure rolls back
+    /// all TAA handles and returns false (disable TAA for the frame — see
+    /// taaAvailable). No sg calls outside a valid context.
     pub fn ensureTaaHistory(self: *PostProcessPass, width: i32, height: i32) bool {
         if (width <= 0 or height <= 0) return false;
-        if (self.taa_width == width and self.taa_height == height and
-            self.taa_images[0].id != 0 and self.taa_images[1].id != 0) return false;
+        if (!sg.isvalid()) return false;
+        const hist_fmt: sg.PixelFormat = .RGBA16F;
+        if (self.taa_width == width and self.taa_height == height and self.taa_format == hist_fmt and
+            self.taa_images[0].id != 0 and self.taa_images[1].id != 0 and self.taa_pipeline.id != 0) return false;
 
         self.destroyTaaHistory();
 
-        const env_def = sg.queryDesc().environment.defaults;
-        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+        // Store-first rollback: sokol make* returns nonzero FAILED handles,
+        // so every handle lands in the struct before its state check and a
+        // single destroyTaaHistory frees the failed handle plus all partial
+        // handles. Views are destroyed before images.
         for (0..2) |i| {
-            const img = sg.makeImage(.{
+            self.taa_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = width,
                 .height = height,
-                .pixel_format = color_fmt,
+                .pixel_format = hist_fmt,
                 .sample_count = 1,
             });
-            self.taa_images[i] = img;
+            if (sg.queryImageState(self.taa_images[i]) != .VALID) {
+                self.destroyTaaHistory();
+                return false;
+            }
             self.taa_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = img },
+                .color_attachment = .{ .image = self.taa_images[i] },
             });
+            if (sg.queryViewState(self.taa_att_views[i]) != .VALID) {
+                self.destroyTaaHistory();
+                return false;
+            }
             self.taa_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = img },
+                .texture = .{ .image = self.taa_images[i] },
             });
+            if (sg.queryViewState(self.taa_tex_views[i]) != .VALID) {
+                self.destroyTaaHistory();
+                return false;
+            }
+        }
+        // Explicit 1x capture shape matched to the history format. The
+        // display pipeline targets the swapchain shape and must not render
+        // into the history targets.
+        self.taa_pipeline = sg.makePipeline(fullscreenPipelineDesc(self.postprocess_shader, hist_fmt, 1, .NONE));
+        if (sg.queryPipelineState(self.taa_pipeline) != .VALID) {
+            self.destroyTaaHistory();
+            return false;
         }
         self.taa_width = width;
         self.taa_height = height;
+        self.taa_format = hist_fmt;
         self.taa_read = 0;
+        return true;
+    }
+
+    /// True when both history slots plus the capture pipeline are fully
+    /// VALID (state queries, not id-only). Callers disable TAA for the
+    /// frame when this is false; an empty read view then means the caller
+    /// binds its dummy placeholder, never a dead handle.
+    pub fn taaAvailable(self: *const PostProcessPass) bool {
+        if (self.taa_width <= 0 or self.taa_height <= 0) return false;
+        if (!sg.isvalid()) return false;
+        if (sg.queryPipelineState(self.taa_pipeline) != .VALID) return false;
+        for (0..2) |i| {
+            if (sg.queryImageState(self.taa_images[i]) != .VALID) return false;
+            if (sg.queryViewState(self.taa_att_views[i]) != .VALID) return false;
+            if (sg.queryViewState(self.taa_tex_views[i]) != .VALID) return false;
+        }
         return true;
     }
 
@@ -249,79 +348,158 @@ pub const PostProcessPass = struct {
         return self.taa_att_views[1 - self.taa_read];
     }
 
-    pub fn resize(self: *PostProcessPass, width: i32, height: i32, sample_count: i32) void {
-        if (width <= 0 or height <= 0) return;
+    /// True when every main-target image/view is VALID (state queries, not
+    /// id-only). No sg calls outside a valid context (reports false).
+    pub fn targetsValid(self: *const PostProcessPass) bool {
+        if (self.width <= 0 or self.height <= 0) return false;
+        if (!sg.isvalid()) return false;
+        if (sg.queryImageState(self.offscreen_color_image) != .VALID) return false;
+        if (sg.queryViewState(self.offscreen_color_att_view) != .VALID) return false;
+        if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) return false;
+        if (sg.queryImageState(self.offscreen_depth_image) != .VALID) return false;
+        if (sg.queryViewState(self.offscreen_depth_att_view) != .VALID) return false;
+        if (self.sample_count > 1) {
+            if (sg.queryImageState(self.offscreen_resolve_image) != .VALID) return false;
+            if (sg.queryViewState(self.offscreen_resolve_att_view) != .VALID) return false;
+        } else {
+            if (sg.queryViewState(self.offscreen_depth_tex_view) != .VALID) return false;
+        }
+        return true;
+    }
+
+    /// Rebuilds the main target at `width`x`height` in the sole contract
+    /// format RGBA16F for color + resolve. Rebuilds on samples +
+    /// dimensions. Returns true only when every image/view is VALID (state
+    /// queries, not id-only). Creation failure rolls back all partial
+    /// handles, resets width/height to 0, and returns false — disable post
+    /// before any pass. No sg resource calls outside a valid context.
+    /// MSAA policy preserved: 1x samples the color image directly
+    /// ("resolve" views alias it); >1x adds a 1x resolve image and the
+    /// MSAA depth stays write-only (no depth texture view — sokol has no
+    /// depth resolve). Depth tracks the color sample count.
+    pub fn resize(
+        self: *PostProcessPass,
+        width: i32,
+        height: i32,
+        sample_count: i32,
+    ) bool {
+        if (width <= 0 or height <= 0) return false;
+        if (!sg.isvalid()) return false;
         const samples: i32 = if (sample_count < 1) 1 else sample_count;
-        if (self.width == width and self.height == height and self.sample_count == samples) return;
+        const env_def = sg.queryDesc().environment.defaults;
+        const actual_fmt: sg.PixelFormat = .RGBA16F;
+        if (self.width == width and self.height == height and
+            self.sample_count == samples and self.color_format == actual_fmt) return self.targetsValid();
 
         self.destroyTargets();
 
-        const env_def = sg.queryDesc().environment.defaults;
-        const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
         const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
 
+        // Store-first rollback throughout: sokol make* returns nonzero
+        // FAILED handles, so every handle lands in the struct before its
+        // state check and a single destroyTargets frees the failed handle
+        // plus all partial handles. Views are destroyed before images.
+        //
         // Color: attachment at the full sample count; when resolving, a
         // separate 1x resolve image (usage.resolve_attachment) receives the
         // MSAA resolve at end of pass and carries the texture view.
-        const col_img = sg.makeImage(.{
+        self.offscreen_color_image = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
             .width = width,
             .height = height,
-            .pixel_format = color_fmt,
+            .pixel_format = actual_fmt,
             .sample_count = samples,
         });
-        const col_att = sg.makeView(.{
-            .color_attachment = .{ .image = col_img },
+        if (sg.queryImageState(self.offscreen_color_image) != .VALID) {
+            self.destroyTargets();
+            return false;
+        }
+        self.offscreen_color_att_view = sg.makeView(.{
+            .color_attachment = .{ .image = self.offscreen_color_image },
         });
-        self.offscreen_color_image = col_img;
-        self.offscreen_color_att_view = col_att;
+        if (sg.queryViewState(self.offscreen_color_att_view) != .VALID) {
+            self.destroyTargets();
+            return false;
+        }
 
         if (samples > 1) {
-            const res_img = sg.makeImage(.{
+            self.offscreen_resolve_image = sg.makeImage(.{
                 .usage = .{ .resolve_attachment = true },
                 .width = width,
                 .height = height,
-                .pixel_format = color_fmt,
+                .pixel_format = actual_fmt,
                 .sample_count = 1,
             });
-            self.offscreen_resolve_image = res_img;
+            if (sg.queryImageState(self.offscreen_resolve_image) != .VALID) {
+                self.destroyTargets();
+                return false;
+            }
             self.offscreen_resolve_att_view = sg.makeView(.{
-                .resolve_attachment = .{ .image = res_img },
+                .resolve_attachment = .{ .image = self.offscreen_resolve_image },
             });
+            if (sg.queryViewState(self.offscreen_resolve_att_view) != .VALID) {
+                self.destroyTargets();
+                return false;
+            }
             self.offscreen_resolve_tex_view = sg.makeView(.{
-                .texture = .{ .image = res_img },
+                .texture = .{ .image = self.offscreen_resolve_image },
             });
+            if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) {
+                self.destroyTargets();
+                return false;
+            }
         } else {
-            // Legacy 1x shape: postfx samples the color image directly.
+            // 1x shape: postfx samples the color image directly.
             self.offscreen_resolve_tex_view = sg.makeView(.{
-                .texture = .{ .image = col_img },
+                .texture = .{ .image = self.offscreen_color_image },
             });
+            if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) {
+                self.destroyTargets();
+                return false;
+            }
         }
 
         // Depth: same sample count as color (sokol validation requires the
         // match). Only the 1x depth gets a texture view; MSAA depth is
-        // write-only for the post chain (scene/msaa.zig suppresses the
-        // depth-consuming effects instead).
-        const depth_img = sg.makeImage(.{
+        // write-only for the post chain (depth-consuming effects stay gated
+        // off while MSAA is active).
+        self.offscreen_depth_image = sg.makeImage(.{
             .usage = .{ .depth_stencil_attachment = true },
             .width = width,
             .height = height,
             .pixel_format = depth_fmt,
             .sample_count = samples,
         });
-        self.offscreen_depth_image = depth_img;
+        if (sg.queryImageState(self.offscreen_depth_image) != .VALID) {
+            self.destroyTargets();
+            return false;
+        }
         self.offscreen_depth_att_view = sg.makeView(.{
-            .depth_stencil_attachment = .{ .image = depth_img },
+            .depth_stencil_attachment = .{ .image = self.offscreen_depth_image },
         });
+        if (sg.queryViewState(self.offscreen_depth_att_view) != .VALID) {
+            self.destroyTargets();
+            return false;
+        }
         if (samples == 1) {
             self.offscreen_depth_tex_view = sg.makeView(.{
-                .texture = .{ .image = depth_img },
+                .texture = .{ .image = self.offscreen_depth_image },
             });
+            if (sg.queryViewState(self.offscreen_depth_tex_view) != .VALID) {
+                self.destroyTargets();
+                return false;
+            }
         }
 
         self.width = width;
         self.height = height;
         self.sample_count = samples;
+        self.color_format = actual_fmt;
+        if (!self.targetsValid()) {
+            self.destroyTargets();
+            return false;
+        }
+        return true;
     }
 
     /// Valid texture view for slots that semantically want scene depth.
@@ -362,14 +540,27 @@ pub const PostProcessPass = struct {
         // TAA resolve inputs: history texture sampled reprojected (bilinear
         // smp) plus the validity latch. Empty view + false keeps the
         // disabled/first-frame path (the shader early-outs before sampling).
-        // capture_only re-enters the shader to store exactly the post-TAA
-        // early-LDR color into the history slot (PostFXStack capture draw).
+        // capture_only re-enters the shader to store the TAA resolve output
+        // into the history slot (PostFXStack capture draw): pre-exposure
+        // HDR radiance in the RGBA16F history target.
         taa_history_view: sg.View,
         taa_history_valid: bool,
         taa_capture_only: bool,
     ) void {
-        if (self.postprocess_pipeline.id == 0) return;
-        sg.applyPipeline(self.postprocess_pipeline);
+        if (!sg.isvalid()) return;
+        if (sg.queryPipelineState(self.postprocess_pipeline) != .VALID) return;
+        if (taa_capture_only) {
+            // History capture renders into the 1x explicit-format history
+            // target: select the matched capture pipeline, never the
+            // swapchain display pipeline. Abort when the history allocation
+            // failed (bind a dummy placeholder instead of a dead handle
+            // and disable TAA for the frame).
+            if (!self.taaAvailable()) return;
+            if (self.taa_pipeline.id == 0) return;
+            sg.applyPipeline(self.taa_pipeline);
+        } else {
+            sg.applyPipeline(self.postprocess_pipeline);
+        }
         var post_bind = sg.Bindings{};
         post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
         post_bind.index_buffer = self.postprocess_quad_ib;
@@ -377,7 +568,8 @@ pub const PostProcessPass = struct {
         post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
         post_bind.views[post_shd.VIEW_depth_tex] = depth_view;
         // Pyramid glow when the parent fed a BloomPass result; otherwise a
-        // valid placeholder the shader never samples (pyramid flag off).
+        // valid placeholder the shader never samples (params3.z = 0 gates
+        // the bloom block off).
         post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)
             self.bloom_tex_view
         else
@@ -436,7 +628,7 @@ pub const PostProcessPass = struct {
                 config.exposure,
                 config.bloom_threshold,
                 config.bloom_intensity,
-                config.bloom_radius,
+                0.0,
             },
             .params2 = .{
                 config.vignette_intensity,
@@ -447,7 +639,7 @@ pub const PostProcessPass = struct {
             .params3 = .{
                 @floatFromInt(@intFromEnum(config.tonemapping)),
                 config.chromatic_aberration,
-                if (config.bloom_enabled) 1.0 else 0.0,
+                if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
                 if (config.vignette_enabled) 1.0 else 0.0,
             },
             .params4 = .{
@@ -516,12 +708,6 @@ pub const PostProcessPass = struct {
                 config.dof_focus_range,
                 config.dof_max_blur,
             },
-            .bloom_pyramid = .{
-                if (config.bloom_pyramid and self.bloom_tex_view.id != 0) 1.0 else 0.0,
-                @floatFromInt(config.bloom_pyramid_mips),
-                0.0,
-                0.0,
-            },
             // (enabled 1/0, intensity, 0, 0); zeros when glow is off, which
             // keeps the composite identical to the pre-glow path.
             .glow_params = postprocess.glowParams(config),
@@ -569,6 +755,13 @@ pub const PostProcessPass = struct {
             .taa_params = postprocess.taaParams(config),
             // (history_valid 1/0, capture_only 1/0).
             .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
+            // Output lane (appended last): x = manual display-encode flag
+            // iff the backbuffer default is NOT sRGB (UNORM encodes the
+            // exact piecewise sRGB once at the end; sRGB targets encode in
+            // hardware); y/z/w = 0. The main target is always RGBA16F.
+            .output_params = outputParamsFor(
+                sg.queryDesc().environment.defaults.color_format,
+            ),
         };
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
@@ -576,7 +769,7 @@ pub const PostProcessPass = struct {
 
     // Feed the BloomPass pyramid result into the composite. Call every frame
     // before render() once the parent owns a BloomPass; pass .{} to detach
-    // and return to the legacy single-shader bloom path.
+    // and skip the bloom block (params3.z = 0).
     pub fn setBloomTexture(self: *PostProcessPass, view: sg.View) void {
         self.bloom_tex_view = view;
     }
@@ -617,14 +810,86 @@ pub const PostProcessPass = struct {
     }
 
     pub fn deinit(self: *PostProcessPass) void {
+        // destroyTargets is the sole owner of main + TAA history targets,
+        // including the lazy capture pipeline (via destroyTaaHistory).
         self.destroyTargets();
-        sg.destroySampler(self.postprocess_sampler);
-        sg.destroySampler(self.depth_sampler);
-        sg.destroySampler(self.lut_sampler);
-        sg.destroyPipeline(self.postprocess_pipeline);
+        if (self.postprocess_sampler.id != 0) sg.destroySampler(self.postprocess_sampler);
+        if (self.depth_sampler.id != 0) sg.destroySampler(self.depth_sampler);
+        if (self.lut_sampler.id != 0) sg.destroySampler(self.lut_sampler);
+        if (self.postprocess_pipeline.id != 0) sg.destroyPipeline(self.postprocess_pipeline);
         if (self.postprocess_shader.id != 0) sg.destroyShader(self.postprocess_shader);
         self.postprocess_shader = .{};
-        sg.destroyBuffer(self.postprocess_quad_vb);
-        sg.destroyBuffer(self.postprocess_quad_ib);
+        if (self.postprocess_quad_vb.id != 0) sg.destroyBuffer(self.postprocess_quad_vb);
+        if (self.postprocess_quad_ib.id != 0) sg.destroyBuffer(self.postprocess_quad_ib);
     }
 };
+
+// --- headless pure tests (no sg calls, no context): output-encode
+// packing, descriptor identity, and empty guards. Live pixels stay a
+// real-run concern. ---
+
+const testing = @import("std").testing;
+
+test "outputParamsFor packs manual-encode flag, yzw zero" {
+    // UNORM backbuffer: manual encode on.
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.BGRA8));
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.RGBA8));
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.RGBA16F));
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.DEFAULT));
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.NONE));
+    // sRGB backbuffer: hardware encodes, no manual pass.
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.SRGB8A8));
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.SBGR8A8));
+}
+
+test "isSrgbBackbuffer flags exactly the hardware-sRGB swapchain variants" {
+    try testing.expect(PostProcessPass.isSrgbBackbuffer(.SRGB8A8));
+    try testing.expect(PostProcessPass.isSrgbBackbuffer(.SBGR8A8));
+    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.RGBA8));
+    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.BGRA8));
+    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.RGBA16F));
+    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.DEFAULT));
+    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.NONE));
+}
+
+test "fullscreenPipelineDesc keeps display shape default, capture shape explicit 1x" {
+    const shd: sg.Shader = .{};
+    const display = PostProcessPass.fullscreenPipelineDesc(shd, .DEFAULT, 0, .DEFAULT);
+    try testing.expectEqual(sg.PixelFormat.DEFAULT, display.colors[0].pixel_format);
+    try testing.expectEqual(@as(i32, 0), display.sample_count);
+    try testing.expectEqual(sg.PixelFormat.DEFAULT, display.depth.pixel_format);
+    try testing.expect(display.depth.compare == .ALWAYS);
+    try testing.expect(!display.depth.write_enabled);
+    try testing.expect(display.cull_mode == .NONE);
+    try testing.expect(display.index_type == .UINT16);
+
+    const capture = PostProcessPass.fullscreenPipelineDesc(shd, .RGBA16F, 1, .NONE);
+    try testing.expectEqual(sg.PixelFormat.RGBA16F, capture.colors[0].pixel_format);
+    try testing.expectEqual(@as(i32, 1), capture.sample_count);
+    try testing.expectEqual(sg.PixelFormat.NONE, capture.depth.pixel_format);
+    // Same quad layout on both (shared helper, no duplicate layout).
+    try testing.expectEqual(display.layout.buffers[0].stride, capture.layout.buffers[0].stride);
+    try testing.expectEqual(
+        display.layout.attrs[@import("postprocess_shader").ATTR_postprocess_position].format,
+        capture.layout.attrs[@import("postprocess_shader").ATTR_postprocess_position].format,
+    );
+}
+
+test "zero pass reports no valid targets and default shape metadata" {
+    const p = PostProcessPass{};
+    try testing.expectEqual(@as(i32, 0), p.width);
+    try testing.expectEqual(@as(i32, 0), p.height);
+    try testing.expectEqual(@as(i32, 1), p.sample_count);
+    try testing.expectEqual(sg.PixelFormat.DEFAULT, p.color_format);
+    try testing.expectEqual(sg.PixelFormat.DEFAULT, p.taa_format);
+    try testing.expectEqual(@as(u32, 0), p.taa_pipeline.id);
+    // Empty read view: callers bind a dummy placeholder, never this.
+    try testing.expectEqual(@as(u32, 0), p.taaReadView().id);
+    // Headless guards fail closed without touching sg resources.
+    try testing.expect(!p.targetsValid());
+    try testing.expect(!p.taaAvailable());
+    var q = PostProcessPass{};
+    try testing.expect(!q.resize(64, 64, 1));
+    try testing.expect(!q.ensureTaaHistory(64, 64));
+    try testing.expect(!q.taaAvailable());
+}

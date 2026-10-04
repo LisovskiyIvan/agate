@@ -64,7 +64,7 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_intensity[2];
     mat4 spot_view_proj[2];
     vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
-    // APPENDED LAST: existing offsets above must not shift for old bindings.
+    // APPENDED LAST: existing offsets above must not shift for existing bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
     // APPENDED LAST (wave/ktx2): diffuse-slot KHR_texture_transform UV map.
     vec4 uv_matrix; // rotation*scale rows [m00, m01, m10, m11]
@@ -148,7 +148,7 @@ layout(binding = 2) uniform sampler depth_smp;
 // Reflection probe cube (wave 25): binding 11 is the next free texture
 // slot in the shared pool (fs uses 0..4, the instanced vs uses no
 // textures), binding 6 the next free sampler slot. Instanced draws bind
-// the default cube with zeroed params (legacy path); the slots must still
+// the default cube with zeroed params (no-probe path); the slots must still
 // exist for layout parity with the regular standard family.
 layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 6) uniform sampler probe_smp;
@@ -202,7 +202,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // shadow_tex, regular sampler): PCSS_BLOCKER_SAMPLES Poisson taps inside
 // pcss_blocker_radius, average blocker depth -> penumbra ->
 // (d_receiver - d_blocker) / d_blocker * light_size, clamped to
-// [min_penumbra, max_penumbra]; the legacy Poisson PCF then runs with the
+// [min_penumbra, max_penumbra]; the fixed-radius Poisson PCF then runs with the
 // KHR_texture_transform: uv' = matrix * uv + offset (identity uniforms are
 // a no-op; see material.zig UvTransform for the packing).
 // @include "common/uv_apply.glsl"
@@ -214,7 +214,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 //   cascade_debug.w = pcss_blocker_radius (atlas-UV search radius)
 //   light_counts.z  = pcss_min_penumbra (atlas-UV clamp)
 //   light_counts.w  = pcss_max_penumbra (atlas-UV clamp)
-// Disabled (y <= 0.5): legacy fixed-radius 16x/8x Poisson PCF, bit-identical.
+// Disabled (y <= 0.5): fixed-radius 16x/8x Poisson PCF, bit-identical.
 // Counts mirror scene/shadow_pcss.zig (blocker_sample_count).
 #define PCSS_BLOCKER_SAMPLES 12
 
@@ -223,6 +223,8 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // needs the BRDF chunk and the PBR uniform lanes, neither of which the
 // standard material has.
 // @include "common/hemi.glsl"
+// Linear-radiance output bound (finite half range, never encoded here).
+// @include "common/linear_output.glsl"
 
 void main() {
     vec3 N = normalize(v_normal);
@@ -249,11 +251,11 @@ void main() {
     vec4 base = vec4(v_color.rgb * tex_val.rgb, v_color.a * diffuse_color.a * tex_val.a);
     if (base.a < alpha_cutoff) discard;
 
-    // Unlit mode: bypass all lighting and shadows. The albedo still gets the
-    // material colour (agate's documented unlit look), which the lit path
-    // receives through the lighting instead.
+    // Unlit mode: pure linear albedo (material colour x texture x vertex
+    // colour), no lighting, no clamp. The display transfer runs once in
+    // the postprocess output stage.
     if (uv_offset.z > 0.5) {
-        frag_color = vec4(base.rgb * diffuse_color.rgb, base.a);
+        frag_color = linearOutputColor(base.rgb * diffuse_color.rgb, base.a);
         return;
     }
 
@@ -397,7 +399,7 @@ void main() {
     }
 
     // Clustered forward point lights (up to 64, no shadows): pixel -> tile
-    // -> tile light indices -> the same point-light math as the legacy
+    // -> tile light indices -> the same point-light math as the direct
     // lanes above (windowed inverse-square, no shadow term). Gated on a
     // live tile grid (tiles_x/y > 0), a non-empty staged pool (count > 0)
     // and a landed GPU upload (w > 0.5); otherwise skipped entirely, so the
@@ -428,8 +430,8 @@ void main() {
 
             vec3 c_L = c_to_light / c_dist;
             float c_NdotL = max(dot(N, c_L), 0.0);
-            // Same STANDARD falloff and lobe as the legacy point lanes above:
-            // a clustered light must not shade differently from a legacy one.
+            // Same STANDARD falloff and lobe as the direct point lanes above:
+            // a clustered light must not shade differently from a direct one.
             float c_att = max(0.0, 1.0 - c_dist / c_range);
             diffuse += c_col * (c_NdotL * c_int * c_att);
             vec3 c_H = normalize(V + c_L);
@@ -440,15 +442,15 @@ void main() {
     // Directional ambient base. Reflection probe (wave 25): same
     // substitution as the regular standard shader (probe coarsest mip when
     // probe_params.x > 0.5). Instanced draws always upload zero here, so
-    // this stays legacy.
+    // this stays on the no-probe branch.
     // Hemispheric base (Babylon model — see common/hemi.glsl).
     // Hemispheric SPECULAR (Babylon's standard `computeHemisphericLighting`):
     // the same Blinn-Phong lobe against the light DIRECTION, with no NdotL
     // wrap and no attenuation — `specular = pow(max(0, dot(N,
     // normalize(V + L))), max(1, glossiness)) * vLightSpecular.rgb`, and
     // `vLightSpecular` is the light's specular (white by default) scaled by
-    // its intensity. NOTE: this is the LEGACY standard lobe, different from
-    // the Cook-Torrance hemispheric lobe the PBR family uses
+    // its intensity. NOTE: this is the standard Blinn-Phong lobe, different
+    // from the Cook-Torrance hemispheric lobe the PBR family uses
     // (common/hemi_pbr.glsl).
     vec3 hemi_H = normalize(V + hemi_dir_intensity.xyz);
     specular += vec3(pow(max(dot(N, hemi_H), 0.0), gloss)) * vec3(hemi_dir_intensity.w);
@@ -473,10 +475,12 @@ void main() {
     // §10.21). The scene-ambient lane Babylon also adds here is not modelled
     // (agate has no `Scene.ambient_color`; Babylon's default is black).
     vec3 lit = (ambient + diffuse) * diffuse_color.rgb + emissive_color.rgb;
-    vec3 final_rgb = clamp(lit, 0.0, 1.0) * base.rgb
+    // Linear radiance: no pre-albedo 0..1 clamp, so >1 values survive to
+    // the composite; the single display transfer runs in postprocess.
+    vec3 final_rgb = lit * base.rgb
                    + specular * specular_color_power.rgb
                    + debug_tint;
-    frag_color = vec4(final_rgb, base.a);
+    frag_color = linearOutputColor(final_rgb, base.a);
 }
 @end
 

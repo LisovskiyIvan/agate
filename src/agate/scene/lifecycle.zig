@@ -8,6 +8,8 @@
 /// Cross-leaf helpers consumed here are `pub` in their home module but are
 /// deliberately NOT re-exported by the facade.
 const gpu_thread = @import("../gpu_thread.zig");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 const serialization = @import("../serialization.zig");
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const SkyboxOptions = @import("../texture.zig").SkyboxOptions;
@@ -71,28 +73,29 @@ pub fn createDefaultSkybox(self: anytype, config: SkyboxOptions) !void {
     try self.sky.createDefault(self.allocator, config);
 }
 
-/// Forward pipeline set matching the MSAA main-target shape; created
-/// lazily (and recreated on count changes) on the first MSAA frame. The
-/// returned pointer aliases Scene state.
-pub fn ensureForwardMsaa(self: anytype, samples: i32) *scene_forward.ForwardPipelines {
-    if (self.forward_msaa == null or self.forward_msaa.?.sample_count != samples) {
+/// Forward pipeline set matching the exact target shape (sample count +
+/// color format). Returns the base `forward` set when both match the base
+/// shape; otherwise returns the lazy `forward_msaa` slot, recreated when
+/// the requested shape differs (it can also hold a 1x different-format
+/// variant). Borrows the base family shaders. The returned pointer aliases
+/// Scene state; never call mid-pass (creation destroys the previous twin
+/// of that slot).
+pub fn forwardFor(self: anytype, samples: i32, color_format: sg.PixelFormat) *scene_forward.ForwardPipelines {
+    if (samples == self.forward.sample_count and color_format == self.forward.color_format) return &self.forward;
+    if (self.forward_msaa == null or self.forward_msaa.?.sample_count != samples or self.forward_msaa.?.color_format != color_format) {
         if (self.forward_msaa) |*fw| fw.deinit();
         if (self.forward.family_shaders) |fs| {
-            self.forward_msaa = scene_forward.ForwardPipelines.initSampledWithShaders(samples, fs);
+            self.forward_msaa = scene_forward.ForwardPipelines.initWithShaders(samples, color_format, fs);
         } else {
-            self.forward_msaa = scene_forward.ForwardPipelines.initSampled(samples);
+            self.forward_msaa = scene_forward.ForwardPipelines.init(samples, color_format);
         }
     }
     return &self.forward_msaa.?;
 }
 
 pub fn deinit(self: anytype) void {
-    // Documented pre-condition (API.md: "deinit is context-thread only"):
-    // teardown touches sg.* and joins GPU-bound runners, so it must run on
-    // the marked context thread. Enforced in Debug/ReleaseSafe; unmarked
-    // threads (tests, tools, legacy single-threaded embedders) keep the
-    // gpu_thread compatibility fallback where every thread counts as
-    // context.
+    // Live GPU teardown requires the registered context owner in every build
+    // mode. Unregistered headless tools may perform CPU-only cleanup.
     gpu_thread.assertOnContextThread();
     self.profiler.deinit();
     // In-flight decodes target material fields; join them before any

@@ -1,6 +1,6 @@
 //! Bytes -> scene: binary parsing, snapshot restore, file + async load.
 //!
-//! deserializeAlloc() strictly validates magic, version (2..3), counts,
+//! deserializeAlloc() strictly validates magic, version (3 only; v2 rejected), counts,
 //! string lengths and offset arithmetic; any short read or invalid
 //! discriminant reports Truncated. restore() applies a snapshot to a live
 //! scene (meshes match by id-then-name, hierarchy re-linked in a second
@@ -218,7 +218,7 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
     scene.post_process = state.postprocess;
 }
 
-fn readMeshes(allocator: std.mem.Allocator, r: *Reader, version: u32) ![]MeshEntry {
+fn readMeshes(allocator: std.mem.Allocator, r: *Reader) ![]MeshEntry {
     const count = try r.readCount();
     var list: std.ArrayListUnmanaged(MeshEntry) = .empty;
     errdefer {
@@ -228,15 +228,10 @@ fn readMeshes(allocator: std.mem.Allocator, r: *Reader, version: u32) ![]MeshEnt
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         var entry = MeshEntry{};
-        if (version >= 3) {
-            entry.id = try r.readU64();
-            entry.name = try r.readString(allocator);
-            errdefer entry.deinit(allocator);
-            entry.parent_name = try r.readString(allocator);
-        } else {
-            entry.name = try r.readString(allocator);
-        }
+        entry.id = try r.readU64();
+        entry.name = try r.readString(allocator);
         errdefer entry.deinit(allocator);
+        entry.parent_name = try r.readString(allocator);
         entry.position = try r.readVec3();
         entry.rotation = try r.readVec3();
         entry.scaling = try r.readVec3();
@@ -414,12 +409,12 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
     var r = Reader{ .bytes = bytes, .pos = MAGIC.len };
 
     const version = try r.readU32();
-    if (version != 2 and version != 3) return error.UnsupportedVersion;
+    if (version != 3) return error.UnsupportedVersion;
 
     var state = SceneState{};
     errdefer state.deinit(allocator);
 
-    state.meshes = try readMeshes(allocator, &r, version);
+    state.meshes = try readMeshes(allocator, &r);
 
     state.hemi.name = try r.readString(allocator);
     state.hemi.direction = try r.readVec3();
@@ -445,7 +440,7 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
 
     state.postprocess = try readPostProcess(&r);
 
-    if (version >= 3) {
+    {
         const count = try r.readCount();
         var props_list: std.ArrayListUnmanaged(GameProperty) = .empty;
         errdefer {

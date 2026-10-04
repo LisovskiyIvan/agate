@@ -153,22 +153,12 @@ fn probeMeshVanish(scene: anytype, draws: anytype, snap: anytype) void {
 /// Core scene frame presentation pass.
 pub fn render(scene: anytype) void {
     gpu_thread.assertOnContextThread();
-    if (!scene.frame_prepared and !scene.rendering_reuse) {
-        scene.prepareFrame();
-        // Wave-31 counted skip: under lease contention prepare consumes
-        // nothing. When a pending frame from an earlier prepare exists
-        // (`frame_prepared` kept true by the skip) it is consumed below
-        // as usual — still the freshest prepared. With nothing pending
-        // (false) there is no retire epoch to complete (the claim sits
-        // before it) and no frame to present: drop the present instead
-        // of mislabeling the stale front in stats/profiler (latest-wins)
-        // and let the next frame retry. A still-open older epoch is
-        // closed by the next prepare's `begin`. Sequential behavior is
-        // unchanged (prepare never skips there).
-        if (!scene.frame_prepared) return;
-    }
+    // Presentation consumes a prepared frame only. The host must explicitly
+    // build and latch, or choose renderReuse; rendering never reads live state
+    // to manufacture a frame when no producer generation is available.
+    if (!scene.frame_prepared and !scene.rendering_reuse) return;
     scene.frame_prepared = false;
-    // Конец кадра (P3): epoch, начатый в prepareFrame, закрывается на ВСЕХ
+    // Конец кадра (P3): epoch, начатый в staged prepare, закрывается на ВСЕХ
     // выходах render — включая ранний возврат без камеры ниже. Поэтому
     // epoch — на кадр, а не на камеру/view.
     defer scene.gpu_retire.complete(scene.retire_epoch);
@@ -184,7 +174,7 @@ pub fn render(scene: anytype) void {
     // way). Unpin is mandatory — the defer covers every return below.
     const pinned_idx = scene.draws.pinFront();
     defer scene.draws.unpin(pinned_idx) catch {};
-    // Valid for this render; the next prepareFrame invalidates it (the
+    // Valid for this render; the next staged prepare invalidates it (the
     // pin only extends CPU-slot reuse exclusion, never GPU consumability
     // — see scene/frame_draws.zig).
     const draws = scene.preparedDraws();
@@ -215,18 +205,18 @@ pub fn render(scene: anytype) void {
     const cur_w = if (snap.screen_w > 0) snap.screen_w else sapp.width();
     const cur_h = if (snap.screen_h > 0) snap.screen_h else sapp.height();
 
-    // Effective main-target MSAA sample count for this frame
-    // (scene/msaa.zig holds the policy and the backend matrix).
-    const samples = scene_msaa.effectiveSampleCount(snap.msaa_sample_count, .{
-        .post_enabled = snap.post_process.enabled,
-        .formats_msaa_capable = scene_msaa.mainTargetFormatsMsaaCapable(),
-        .backend = sg.queryBackend(),
-    });
-    if (snap.post_process.enabled and snap.msaa_sample_count > 1 and samples == 1) {
+    var post_config = snap.post_process.forFrame();
+    const samples = scene.postfx.prepareMainTargets(&post_config, snap.msaa_sample_count, cur_w, cur_h) catch |err| {
+        _ = scene.warn_main_target.warn("HDR main target unavailable ({s}); frame skipped", .{@errorName(err)});
+        if (sg.isvalid()) sg.commit();
+        return;
+    };
+    const color_format: sg.PixelFormat = .RGBA16F;
+    if (snap.msaa_sample_count > 1 and samples == 1) {
         // Only the runtime format gate can nullify a > 1 request here
         // (clamping lands on a valid count, post-off forces 1 upstream).
         _ = scene.warn_msaa_format.warn(
-            "msaa: x{} requested but the main target formats cannot MSAA on this backend; running 1x",
+            "msaa: x{} unavailable for the HDR main target on this backend; running 1x",
             .{snap.msaa_sample_count},
         );
     }
@@ -240,10 +230,10 @@ pub fn render(scene: anytype) void {
     // advancing history against identical content. Forced off under MSAA
     // (no depth resolve for the velocity term; PostFXStack forces the
     // composite side off the same way).
-    const taa_on = snap.post_process.enabled and snap.post_process.taa_enabled and samples == 1;
+    const taa_on = post_config.taa_enabled and samples == 1;
     var taa_view_proj = snap.primary_cam.view_proj;
     if (taa_on) {
-        const jpx = postprocess.taaJitter(snap.frame_id, snap.post_process.taa_jitter_scale);
+        const jpx = postprocess.taaJitter(snap.frame_id, post_config.taa_jitter_scale);
         taa_view_proj = postprocess.applyTaaJitterToViewProj(snap.primary_cam.view_proj, jpx, cur_w, cur_h);
     }
 
@@ -306,7 +296,7 @@ pub fn render(scene: anytype) void {
     // VRAM. Cost is attributed to the main phase below.
     const t_main = sokol.time.now();
     var env = scene_draw.Environment{
-        .pipelines = if (samples > 1) scene.ensureForwardMsaa(samples) else &scene.forward,
+        .pipelines = scene.forwardFor(samples, color_format),
         .stats = &scene.stats,
         .default_white = snap.default_white,
         .default_normal = snap.default_normal,
@@ -320,7 +310,7 @@ pub fn render(scene: anytype) void {
     };
     @import("refraction.zig").capture(scene, draws, snap, &env);
     gpu_timing.beginPass(.main);
-    const depth_prepass = scene_msaa.depthPrepassActive(snap.post_process.enabled, snap.msaa_depth_prepass, samples);
+    const depth_prepass = scene_msaa.depthPrepassActive(post_config.enabled, snap.msaa_depth_prepass, samples);
     if (depth_prepass and !scene.rendering_reuse) {
         scene.postfx.renderMsaaDepthPrepass(
             snap.primary_cam.view_proj,
@@ -354,10 +344,14 @@ pub fn render(scene: anytype) void {
         .store_action = .STORE,
     };
 
-    // Offscreen target when post-processing is on, swapchain otherwise.
+    // Linear HDR is the sole scene target; display conversion runs afterwards.
     // (The .main GPU-timer bracket opened above at PASS 1.7, so the
     // prepass cost attributes to the main phase.)
-    scene.postfx.beginMainPass(main_pass_action, snap.post_process.enabled, samples, cur_w, cur_h);
+    if (!scene.postfx.beginMainPass(main_pass_action, samples, cur_w, cur_h)) {
+        gpu_timing.endPass(.main);
+        sg.commit();
+        return;
+    }
 
     if (snap.enable_multi_camera and snap.camera_count > 0) {
         const active_idx = snap.active_camera_idx;
@@ -388,7 +382,7 @@ pub fn render(scene: anytype) void {
 
             if (entry.clear_viewport) {
                 const clr = entry.clear_color orelse snap.clear_color;
-                scene.viewport_clear.clear(clr, samples);
+                scene.viewport_clear.clear(clr, samples, color_format);
             }
 
             scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env, secondary_ordinal);
@@ -412,23 +406,6 @@ pub fn render(scene: anytype) void {
         }
     }
 
-    if (!snap.post_process.enabled) {
-        // P6: single fullscreen UI draw AFTER the per-view
-        // viewport/scissor restoration above (both single- and
-        // multi-camera paths restore before this point). Draw site
-        // selection reads ONLY the prepared presence flag — never the
-        // live canvas — so the snapshot boundary is complete at
-        // prepare; the frame itself carries no canvas reference.
-        // Counter semantics unchanged (including the historical +1
-        // whenever a canvas existed at prepare, even for an empty
-        // frame).
-        if (scene.ui_frame.canvas_present) {
-            scene.ui_frame.drawPrepared();
-            scene.stats.post_draw_calls += 1;
-            scene.stats.draw_calls += 1;
-        }
-    }
-
     sg.endPass();
     gpu_timing.endPass(.main);
     scene.stats.main_ms = msSince(t_main);
@@ -447,7 +424,7 @@ pub fn render(scene: anytype) void {
     else
         snap.primary_cam.viewport;
     scene.postfx.renderChain(.{
-        .post = snap.post_process,
+        .post = post_config,
         .ssao = snap.ssao,
         .camera = snap.primary_cam.camera,
         .aspect = snap.primary_cam.aspect,
@@ -526,8 +503,8 @@ pub fn render(scene: anytype) void {
     }
     scene.stats.post_ms = msSince(t_post);
 
-    // Перенос динамики в кадровую метрику: prepare-фаза (flush, стейджинг,
-    // UI/debug upload'ы) уже накоплена в счётчике с prepareFrame, сюда
+    // Перенос динамики в кадровую метрику: staged begin (flush, стейджинг,
+    // UI/debug upload'ы) уже накоплена в счётчике со staged begin, сюда
     // добавились только clear-append'ы main-прохода выше. После take
     // счётчик чист для следующего кадра.
     scene.stats.updated_bytes_frame += upload_meter.takeAndReset();

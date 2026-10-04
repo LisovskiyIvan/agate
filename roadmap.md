@@ -4,7 +4,7 @@
 
 > Дата: 10.09.2026 (обновлено 03.10.2026).
 > Приоритеты будущего качества и GPU-масштабирования: [docs/graphics-roadmap.md](./docs/graphics-roadmap.md). Это план с гейтами, не статус реализованных фич.
-> **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, шейдеры компилируются под GL (Linux: forward-контуры — GLSL 4.30, нужен контекст 4.3+ из-за кластерных SSBO; остальные — GLSL 4.10), Metal (macOS), D3D11/HLSL5 (Windows).
+> **Agate** — нативный десктопный движок: Zig 0.16, sokol (app/gfx/glue/audio/time), встроенные C-библиотеки cgltf, stb_image и физический движок Box3D v0.1.0. Forward-рендер, engine shader floor — Metal (macOS) + WGSL (браузерный WebGPU); generic Sokol-форки сохраняют остальные бэкенды C SDK.
 > **Babylon.js** — 9.x (2026): WebGL2/WebGPU, TypeScript, браузер + Babylon Native/Node.js.
 >
 > Agate — **нативный движок без JS-слоя**: браузерных API Babylon (DOM/HTML, JS/TS API, npm, WebXR) в нём нет и не планируется. При этом с 30.09.2026 (`b54861e`) есть **экспериментальный сборочный таргет wasm32-emscripten + WebGPU**: движок, sandbox и бенч собираются под WebGPU (sokol WGPU) и запускаются в браузере — для веб-сравнения с Babylon.js. Это инструмент бенча и демо, а не продуктовая веб-платформа. Всё остальное, чего пока нет, — потенциальный бэклог, а не приговор.
@@ -68,7 +68,7 @@
 | Frame graph / node render graph | Фиксированный pipeline есть; граф зависимостей проходов не реализован | ❌ |
 | Gaussian splatting | — | ❌ |
 | Large world rendering, geospatial | — | ❌ |
-| Тесты/бенчмарки | `zig build test`: **1352 + 27 math = 1379 тестов**, 100% pass (03.10.2026). WebGPU visual matrix: 6/6 fixed-threshold gates; Metal RTT/refraction/MSAA/resize/reuse/feedback smoke и пиксельные IOR/thickness comparisons. Ранее существующие Sandbox gates: 29 headless-тестов и 8 live-GPU ног (в этой итерации не перезапускались). Smoke не является замером ускорения | ✅ |
+| Тесты/бенчмарки | `zig build test`: 1352 + 27 math = 1379 тестов, 100% pass — исторический срез 03.10.2026 (как и 1413 Safe / 1412 Debug HDR-волны); текущий полный юнит-прогон и native GPU-регрессия — pending. WebGPU visual matrix: 6/6 fixed-threshold gates; Metal RTT/refraction/MSAA/resize/reuse/feedback smoke и пиксельные IOR/thickness comparisons. Ранее существующие Sandbox gates: 29 headless-тестов и 8 live-GPU ног (в этой итерации не перезапускались). Smoke не является замером ускорения | ✅ |
 | In-game Entity Inspector | Нативный инспектор сущностей в Sandbox (трансформы, материалы/цвета/PBR, физика/импульсы, камера-фокус, быстрый выбор актеров) | ✅ |
 | Web-инспекторы, Playground, NME, браузерные редакторы GUI | — | 🚫 |
 | WebGL/WebGPU, DOM/HTML, JS/TS API, npm | wasm32-emscripten + WebGPU таргет (экспериментальный: сборка движка/sandbox/бенча под WebGPU для веб-сравнения с Babylon.js, `b54861e`) | 🟡 |
@@ -369,10 +369,10 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 
 | Направление | Файлы | Описание | Статус |
 |---|---|---|---|
-| Изоляция данных рендера | `scene/render_queue.zig`, `scene.zig` | Упаковка всех GPU-хэндлов, параметров материалов и матриц в `RenderMeshItem` и `RenderInstancedBatch` в `prepareFrame()` | ✅ |
+| Изоляция данных рендера | `scene/render_queue.zig`, `scene.zig` | Упаковка всех GPU-хэндлов, параметров материалов и матриц в `RenderMeshItem` и `RenderInstancedBatch` в `prepareFrame()` (историческое имя из таймлайна 16.09.2026; текущий API — staged build + begin/finish + render, см. `API.md`) | ✅ |
 | Zero-dereference render | `scene/draw.zig`, `scene.zig` | Полное исключение чтения и разыменования указателей `*Mesh` во время `Scene.render()` | ✅ |
 | Lock-free shadow & outline | `passes/shadow_pass.zig`, `passes/outline_pass.zig` | Автономные `ShadowDrawItem` и `OutlineDrawItem` со своими предвычисленными бинами и матрицами | ✅ |
-| Сужение мьютекса фаз | `scene.zig`, `main.zig` | `phase_mutex` удерживается только во время `prepareFrame()`; `Scene.render()` исполняется параллельно и lock-free относительно игрового цикла | ✅ |
+| Сужение мьютекса фаз | `scene.zig`, `main.zig` | `phase_mutex` удерживается только во время `prepareFrame()` (историческое имя из таймлайна 16.09.2026); `Scene.render()` исполняется параллельно и lock-free относительно игрового цикла | ✅ |
 
 ### Волна 18: Квантование glTF, генерация нормалей, unlit-материалы и Camera Motion Blur (16.09.2026)
 
@@ -502,19 +502,19 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * Scene graph: иерархия `Mesh.parent`, TRS-трансформы, ленивый пересчёт world-матриц за кадр (`scene.zig: worldMatrixCached`).
 * Математика: `Vec2/3/4`, `Mat4` (SIMD-перемножение), `Quat` (slerp/nlerp), `Color3/4`, `BoundingBox`, `Frustum`, `Ray`.
 * Статистика кадра: меши, отсечённые, draw calls, треугольники, переключения пайплайнов, тайминги фаз (`SceneStats`).
-* Многопоточность: game/render threads под узким phase mutex (`prepareFrame`), `jobs.Pool`/`TaskRunner`, lock-free `Handoff`/`SpscRing`, affinity-маркер `gpu_thread`, отложенные создание/обновление/уничтожение GPU-ресурсов вне графического потока.
+* Многопоточность: game/render threads (staged build + begin/finish + render; `Scene.buildPreparedFrame`, `beginStagedPrepare`/`finishStagedPrepare`), `jobs.Pool`/`TaskRunner`, lock-free `Handoff`/`SpscRing`, affinity-маркер `gpu_thread`, отложенные создание/обновление/уничтожение GPU-ресурсов вне графического потока.
 * Встроенный профилировщик (`profiler.zig`): точный замер фаз кадра (Update, Prepare, Shadow, Main, PostFX), автоматическая эвристическая диагностика боттлнеков с подсказками, экспорт в интерактивный HTML (SVG-таймлайн), Markdown и Chrome Trace Event JSON (`chrome://tracing`).
 * Мониторинг памяти (`MemorySnapshot`): раздельный учёт памяти геометрии на CPU, общих аллокаций рантайма и видеопамяти VRAM для GPU-буферов и текстур.
 * Сериализация состояния сцены v3 (`serialization.zig`): сохранение и загрузка сущностей с постоянными Entity ID, графом иерархии нод и произвольными игровыми свойствами (полная совместимость с версиями v1 и v2).
 * Система тегов объектов и булевых смарт-фильтров (`tags.zig`): `TagSet` (множество строковых тегов с регистронезависимым поиском, дедупликацией и разбором списков через разделители), `TagQuery` (парсер и AST-оценщик булевых выражений: `&`/`&&`/`and`, `|`/`||`/`or`, `!`/`not`, круглые скобки, неявный AND), нативная интеграция в `Mesh` (`tags`, `addTag`, `addTags`, `removeTag`, `hasTag`, `matchesTagQuery`) и `Scene` (`getMeshesByTag`, `getMeshesByQuery`, `countMeshesByTag`, `countMeshesByQuery`, `findFirstMeshByTag`, `findFirstMeshByQuery`, `pickWithRayTag`).
 * Дозирование загрузок и асинхронный I/O: покадровый лимит загрузки текстур на GPU (`upload_budget_per_frame = 4`), дедупликация файлов в очереди `UploadQueue`, отдельный поток `io_runner` под сохранение и загрузку сцен.
-* **1327 тестов библиотеки + 27 в отдельном math-шаге** (100% pass, актуализировано 01.10.2026; `zig build test` — 64/64 шагов сборки, ~2 с в Debug), sandbox: **29 headless-тестов + 8 live-GPU ног** (`zig build test-gpu`), отдельный sandbox с бенчмарками (`zig build fmt`, флаг `--bench`).
+* **1327 тестов библиотеки + 27 в отдельном math-шаге** (100% pass, исторический срез 01.10.2026; текущий полный юнит-прогон и native GPU-регрессия — pending), sandbox: **29 headless-тестов + 8 live-GPU ног** (`zig build test-gpu`), отдельный sandbox с бенчмарками (`zig build fmt`, флаг `--bench`).
 
 ### Рендеринг
 
-* Forward-рендер, шейдеры cross-compile через sokol-shdc (GLSL410/Metal/HLSL5; пять forward-контуров с кластерными SSBO — GLSL430/Metal/HLSL5, на Linux-GL нужен контекст 4.3+).
+* Forward-рендер, шейдеры через sokol-shdc, engine floor — Metal (macOS) + WGSL (браузерный WebGPU); generic Sokol-форки сохраняют остальные бэкенды C SDK (GL/D3D и др.), Agate валидирует только свой floor.
 * 8 пайплайнов: Standard, PBR, Instanced, Skinned PBR — каждый под u16/u32 индексы + double-sided твины.
-* Полностью неблокирующий рендеринг: zero-dereference рендер (`Scene.render` исполняется без захвата блокировок симуляции и не разыменовывает указатели `*Mesh`); все GPU-хэндлы, матрицы и дескрипторы материалов упаковываются в фазе `prepareFrame()` в изолированные структуры `RenderMeshItem`, `RenderInstancedBatch`, `ShadowDrawItem`, `OutlineDrawItem`.
+* Полностью неблокирующий рендеринг: zero-dereference рендер (`Scene.render` исполняется без захвата блокировок симуляции и не разыменовывает указатели `*Mesh`); все GPU-хэндлы, матрицы и дескрипторы материалов упаковываются в staged build-фазе в изолированные структуры `RenderMeshItem`, `RenderInstancedBatch`, `ShadowDrawItem`, `OutlineDrawItem`.
 * Сортировка очереди: непрозрачные Standard/PBR группами по текстуре, front-to-back для early-Z; back-to-front для прозрачных мешей.
 * OIT-сортировка прозрачных инстансов: поинстансная сортировка back-to-front внутри батча `submitInstancedMesh` перед заливкой в GPU instance-буфер.
 * Frustum culling AABB, включая SIMD-батч по 4 инстанса (`Frustum.intersectsAABB4`).
@@ -537,7 +537,7 @@ smoke-набор agate и sandbox (включая `--test-decal` и `--test-asyn
 * `HemisphericLight` (небо + ground color) — всегда одна.
 * `DirectionalLight` — `Scene.createDirectionalLight` (солнце: направление, цвет, интенсивность, 4-каскадный CSM) + до 3 shadowless fill через `Scene.addDirectionalLight` (всего до 4, `is_enabled`), hemi остаётся ambient.
 * До 4 `PointLight` с range/интенсивностью и до 2 `SpotLight` (inner/outer cone) — per-pixel затухание, выбор значимых источников в камере за 1 проход.
-* Clustered point lights до 64 (`Scene.addClusteredPointLight`, cap 64 с `error.TooManyClusteredLights`, values-only, session-local): tile-based forward+ (64×64 px window-grid tiles per view на context-потоке из staged snapshot; PIP независим; лаг 1 кадр), SSBO-блоки 12/13/14 во всех пяти forward-шейдерах (пустой pool — бит-идентичный legacy-путь), без теней в v1, 2D-column over-inclusion задокументирован (near/far игнорируются), без per-tile cap (worst-case ~0.5 МБ при 4K/64 — metered, unthrottled); forward-шейдеры glsl430 ради SSBO (Metal/D3D legs без изменений, Linux-GL требует 4.3+).
+* Clustered point lights до 64 (`Scene.addClusteredPointLight`, cap 64 с `error.TooManyClusteredLights`, values-only, session-local): tile-based forward+ (64×64 px window-grid tiles per view на context-потоке из staged snapshot; PIP независим; лаг 1 кадр), SSBO-блоки 12/13/14 во всех пяти forward-шейдерах (пустой pool — бит-идентичный legacy-путь), без теней в v1, 2D-column over-inclusion задокументирован (near/far игнорируются), без per-tile cap (worst-case ~0.5 МБ при 4K/64 — metered, unthrottled); engine slang floor — metal_macos + wgsl (см. `docs/shaders.md`).
 * До 2 `RectAreaLight` (`Scene.addAreaLight`, half-extent `right`/`up`, cap 2 с `error.TooManyAreaLights`) — документированная closest-point-on-rect аппроксимация (НЕ LTC: жёстче края у больших/близких rect, без rect-shape specular анизотропии, БЕЗ теней в v1); API-only, session-local.
 * Тени: 4-каскадный CSM (атлас 2048², 4 × 1024²), 16-выборок Poisson PCF / переменная полутень PCSS, depth bias + normal bias, мягкость, fade дальнего каскада.
 * Перспективные тени SpotLight: depth-атлас 1024×512 (до 2 прожекторов), 4-tap PCF-фильтрация.

@@ -29,6 +29,7 @@ var box: *z.Mesh = undefined;
 var particles: ?*z.ParticleSystem = null;
 var compute_dispatches: u64 = 0;
 var sokol_live_allocations: usize = 0;
+var rt: z.Runtime = z.Runtime.init();
 
 extern "c" fn malloc(size: usize) ?*anyopaque;
 extern "c" fn free(ptr: ?*anyopaque) void;
@@ -78,7 +79,6 @@ fn setupScene() void {
     _ = scene.createHemisphericLight("sky", .{ .intensity = 0.6 });
     box = z.MeshBuilder.createBox(&scene, "box", .{ .size = 2 }) catch @panic("box creation failed");
     scene.post_process.enabled = true;
-    scene.post_process.bloom_pyramid = true;
     scene.post_process.ssr_enabled = false;
     particles = null;
     if (z.compute.supported()) {
@@ -148,8 +148,21 @@ export fn frame() callconv(.c) void {
     if (frames == 110) wave = 1;
     box.rotation.y += 0.015;
     scene.update(1.0 / 60.0) catch |err| fail("update: {s}", .{@errorName(err)});
-    scene.prepareFrame();
-    scene.render();
+    // Staged producer build -> claim -> render. Every frame must carry a
+    // fresh FULL build; a null begin after a successful build (or a busy
+    // begin here — single-threaded, uncontended) fails loudly instead of
+    // silently skipping timer frames. Reuse only covers the failure path.
+    if (!scene.buildPreparedFrame()) {
+        fail("producer saturated at frame {}", .{frames});
+    }
+    const begun = rt.beginPrepare(&scene);
+    if (begun.claim) |c| {
+        rt.finishPrepare(&scene, c);
+        scene.render();
+    } else {
+        if (begun.busy) fail("begin busy at frame {}", .{frames}) else fail("fresh build not claimable at frame {}", .{frames});
+        if (!rt.reuseIfConsumable(&scene)) fail("no consumable frame at {}", .{frames});
+    }
     if (scene.stats.draw_calls == 0 or scene.stats.triangles == 0) fail("no real draws", .{});
     if (!timing.isEnabled()) {
         checkUnavailable();

@@ -13,9 +13,9 @@
 ```zig
 const agate = @import("agate");
 
-// После sokol.gfx.setup, на помеченном контекстном потоке.
+// После markContextThread + sokol.gfx.setup, на помеченном контекстном потоке.
 var scene: agate.Scene = undefined;
-scene.initInto(allocator);
+scene.initInto(allocator); // GPU-владелец помечен ДО сцены; headless без маркера — только CPU-cleanup
 defer scene.deinit();
 
 // Материал + меш (Scene-owned, реестр).
@@ -27,7 +27,7 @@ box.material = .{ .standard = mat };
 try scene.addCamera(.{ .name = "main", .camera = .{ .arc_rotate = cam } });
 scene.switchCameraByName("main");
 
-// Кадр, game-side:
+// Кадр, game-side (producer build BEFORE begin):
 scene.updateCamera(dt);
 scene.updateLights(dt);
 scene.updatePhysics(dt);
@@ -35,11 +35,13 @@ scene.updateAnimations(dt);
 try scene.updateParticles(dt);
 scene.updateDecals(dt);
 scene.publishFrameSnapshot(aspect, w, h);
-// ... claim → build → stageUi → publish (см. ./runtime.md) ...
+_ = scene.buildPreparedFrame(); // tryClaimBuild → build → stageUi → publish, полный freeze
 
-// Кадр, context-side:
-scene.prepareFrame(); // или begin/finish через Runtime
-scene.render();
+// Кадр, context-side (только свежий полный билд; render сам не готовит):
+if (scene.beginStagedPrepare()) |claim| {
+    scene.finishStagedPrepare(claim);
+    scene.render();
+} else scene.renderReuse(); // только при валидном front, иначе skip
 ```
 
 Аллокатор обязан быть thread-safe при воркерах (GPA с `.thread_safe = true`): prepare/render ленивые кэши и jobs-воркеры аллоцируют из него. Адрес `Scene` держать стабильным, дважды не инициализировать (`initInto` или `init`).
@@ -245,8 +247,8 @@ pub fn saveProfileReportsAsync(self: anytype, ...) !...;
 ## Потоки и владение
 
 - Game-side (`update`, симуляция, билдеры): живые регистры/канвас/трейлы/nav + mailboxes + `pending_update_ms`/`pending_physics_ms` (атомарные staged). `recordUpdateTime`/`recordPhysicsTime` — единственный легальный путь таймингов с игры; прямая запись `scene.stats.update_ms` запрещена (render читает конкурентно).
-- Context-side (`prepareFrame`/`beginStagedPrepare`+`finishStagedPrepare`, `flushPendingGpuUploads`, `render`): потребляет слоты + context-owned кэши, пишет `stats`. `flushPendingGpuUploads` + `resizeOffscreen` + `deinit` — только контекст (asserted).
-- `update` может перекрывать `render`; `prepare` и `render` строго последовательны на контекстном потоке; update-vs-prepare исключены фазовым мьютексом (см. `./runtime.md`).
+- Context-side (`beginStagedPrepare`+`finishStagedPrepare` (one-shot, живой GPU-владелец), `flushPendingGpuUploads`, `render`/`renderReuse`): потребляет слоты + context-owned кэши, пишет `stats`. `flushPendingGpuUploads` + `resizeOffscreen` + `deinit` — только контекст (asserted). `render` никогда не готовит свежий кадр сам.
+- `update` может перекрывать `render`; `prepare` и `render` строго последовательны на контекстном потоке; update-vs-prepare исключены фазовым мьютексом только в диагностике (`producer_exclusion`), данные и алгоритм те же.
 - GPU-владение: создание вне контекста — CPU-only + deferred (`pending_vertices`, `gpu_pending`), добилдится во flush; уничтожение вне контекста — unlink + retire с epoch-семантикой, добивка на render-start после завершения эпохи; `deinit` дренирует всё включая незавершённые эпохи.
 - Профайлер целиком render-owned: `recordFrame` только в конце `render`; воркеры/игровой поток его не трогают.
 - Сериализация: `saveStateFileAsync`/`loadStateFileAsync` — захват снапшота + file IO на `io_runner`, game/render потоки на диске не блокируются.

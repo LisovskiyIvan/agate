@@ -7,7 +7,7 @@
 //!   world matrices/AABB (parallel at >=256 instances), combined bounds,
 //!   visible count, matrix-bytes hash, transparent back-to-front sort by eye.
 //!   Appends each mesh's segment into the caller-provided scratch (the P7
-//!   back-slot `primary.instance_matrices` for `Scene.buildPreparedFrame`)
+//!   back-slot `primary.instance_matrices` for the producer build)
 //!   and records the small plain preview (`Mesh.instance_preview`); the
 //!   matrix bytes live ONLY in the scratch segment
 //!   `[scratch_lo, scratch_lo + count)`.
@@ -17,8 +17,8 @@
 //!   (bounds/count/`staged_frame`) only after the GPU half succeeded (or was
 //!   skipped: no context, empty set).
 //! - Latch (`stageInstancesLatch`, context side): consumes the slot-owned
-//!   `staged_instances` records of one `prepareFrame` (frozen by
-//!   `freezeStagedRecords` during `buildPreparedFrame`) + the slot scratch.
+//!   `staged_instances` records of one staged begin (frozen by
+//!   `freezeStagedRecords` during the producer build) + the slot scratch.
 //!   Each record carries its scratch segment, the staged matrices
 //!   (bounds/hash/count), and the prior resolved state, so the latch performs
 //!   NO live reads of any kind: no `instance_preview`, no `instance_render`,
@@ -32,7 +32,7 @@
 //!   Slices are bounds-checked so a contract violation (scratch reset
 //!   between build and latch) can never slice out of bounds.
 //! - Commit (`commitPublishedRecords`, game side, at the start of the NEXT
-//!   `buildPreparedFrame`): applies the published slot's latch outcomes to
+//!   producer build): applies the published slot's latch outcomes to
 //!   the live meshes — the old guarded `instance_render` write-back, moved
 //!   game-side and ordered after publish, never concurrent with the context.
 //!   The O(1) aliveness/identity guard (`meshes[record.mesh_index] ==
@@ -48,10 +48,10 @@
 //!   segment, created after the build) never reach the commit — their
 //!   previous complete `instance_render` stands, coherent, with no partial
 //!   publish.
-//! - Fallback (`stageInstances` / `stageInstancedMesh`, unchanged
-//!   behavior): the inline CPU+GPU path `prepareFrame` runs when no fresh
-//!   build exists, so apps that never call `buildPreparedFrame` behave
-//!   exactly as before.
+//! - Immediate (`stageInstances` / `stageInstancedMesh`, unchanged
+//!   behavior): the direct CPU+GPU path for standalone immediate users
+//!   (tests/tooling/one-off builds via `InstanceStageContext`), NOT a
+//!   Scene renderer path.
 //!
 //! No per-field atomics (phase ownership), no second GPU buffer versioning,
 //! no new dependencies. GPU handles stay borrowed under the P3 epochs.
@@ -111,7 +111,7 @@ const ParallelInstanceStage = struct {
     /// visibles, so the segment always fits). The serial tail compacts the
     /// segments into [out_base, out_base + total_visible). out_base is the
     /// append offset for the concatenated multi-mesh scratch (0 for the
-    /// single-mesh fallback path).
+    /// single-mesh immediate path).
     out_matrices: []Mat4,
     out_base: usize = 0,
 
@@ -179,7 +179,7 @@ pub fn testLastInjectedFailId() u32 {
 }
 
 /// Minimal per-frame input for instance staging, extracted from
-/// FrameCullContext (see render_queue.zig). Scene.prepareFrame pre-stages
+/// FrameCullContext (see render_queue.zig). The producer build pre-stages
 /// through this before the shadow pass so ShadowPass.prepare snapshots the
 /// same frame's published render state (bounds/buffer/count) instead of the
 /// previous frame's. The `staged_frame != frame_id` guard keeps staging once
@@ -214,9 +214,9 @@ pub const InstanceStageContext = struct {
 /// retry on a later call, while a completed stage stays once-per-frame even
 /// across shadow + N cameras.
 ///
-/// Historical inline path (fallback when no fresh game-side build exists):
-/// runs the CPU half into the caller's scratch and immediately the GPU half.
-/// Behavior is unchanged — see `stageSegmentCpu` + `stageInstancesGpu`.
+/// Historical immediate path (standalone direct users): runs the CPU half
+/// into the caller's scratch and immediately the GPU half. Behavior is
+/// unchanged — see `stageSegmentCpu` + `stageInstancesGpu`.
 pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
     // Stage-2A identity: lazy uid before any early-out (pending meshes get
     // one too; idempotent, no behavior change).
@@ -414,7 +414,7 @@ pub fn stageInstancesGpu(gctx: GpuStageContext, mesh: *Mesh, matrices: []const M
 /// skipped: no context, empty set). Never reads live instance TRS — only
 /// the staged slice plus the CPU result. The latch seeds `st` from the
 /// slot-owned record (never from live `instance_render`) and mirrors the
-/// result back; the inline fallback passes `&mesh.instance_render` directly.
+/// result back; the immediate helper passes `&mesh.instance_render` directly.
 pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, matrices: []const Mat4, cpu: CpuStageResult) void {
     if (st.staged_frame == gctx.frame_id) return;
 
@@ -423,10 +423,10 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
     if (active_count > 0 and sg.isvalid()) {
         // Владение GPU (P1): CPU-стейджинг выше может идти с воркеров
         // пула, но создание/обновление instance-буфера — только
-        // context-поток. prepareFrame сегодня выполняется на нём
-        // (покрыт ассертом Scene.prepareFrame/render), это внутренний
+        // context-поток. Staged begin выполняется на нём
+        // (покрыт ассертом staged begin/render во всех build modes), это внутренний
         // трипвайр: при выносе prepare на update-поток sg-блок уедет за
-        // handoff во flushPendingGpuUploads.
+        // handoff в quiesced drain.
         gpu_thread.assertOnContextThread();
         const items = matrices[0..active_count];
         if (st.buffer.id == 0 or st.capacity < active_count) {
@@ -518,8 +518,7 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
 
 /// CPU build over every instance-bearing mesh (stage 1, game side): stages
 /// each mesh's segment into the shared `scratch` (concatenated segments —
-/// the P7 back-slot `primary.instance_matrices` for
-/// `Scene.buildPreparedFrame`) and records its small plain preview
+/// the P7 back-slot `primary.instance_matrices` for the producer build) and records its small plain preview
 /// (`bounds`/`count`/`hash`/`build_seq`/`scratch_lo`). Skips LOD children,
 /// GPU-pending meshes, and meshes with no instances, exactly like the
 /// historical pre-stage. A mesh whose segment OOMs keeps its previous
@@ -1324,7 +1323,7 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
     const ally = std.testing.allocator;
 
     // Documented eye divergence: the game-side build sorts with the live
-    // (post-mutation) eye while the inline fallback sorts with the snapshot
+    // (post-mutation) eye while the immediate helper sorts with the snapshot
     // eye. Both orders are correct back-to-front for their own eye — they
     // are NOT forced equal. Two instances symmetric about the origin make
     // the divergence exact: opposite eyes give reverse orders.
@@ -1358,7 +1357,7 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch_build.items[1].m[12], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch_build.items[2].m[12], 1e-6);
 
-    // Inline fallback path with the snapshot eye on the right: farthest
+    // Immediate helper path with the snapshot eye on the right: farthest
     // (-10) first — the reverse order. Correct for its own eye, divergent
     // from the build by design (counts/bounds never diverge, only order).
     const eye_snap = Vec3.new(100, 0, 0);

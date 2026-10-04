@@ -62,7 +62,7 @@ pub const ParticlePass = struct {
             };
         }
 
-        /// Buffer the draw binds: mode-selected mirror of the legacy
+        /// Buffer the draw binds: mode-selected mirror of the
         /// `if (gpu) ps.gpu_slot_buffer else ps.instance_buffer` choice.
         /// `.compute` binds its baked draw buffer through the cpu pipeline
         /// (same `ParticleInstanceData` stride), so the analytic gpu branch
@@ -75,10 +75,10 @@ pub const ParticlePass = struct {
         }
     };
 
-    /// Legacy billboard stats in draw units, computed from snapshot counts
-    /// (active_count > 0 counts one draw call + two triangles per particle —
-    /// the exact legacy semantics, including draws whose buffer id is still
-    /// zero). Pure: shared by the immediate and the prepared stats paths.
+    /// Billboard stats in draw units, computed from snapshot counts
+    /// (active_count > 0 counts one draw call + two triangles per particle,
+    /// including draws whose buffer id is still zero). Pure: shared by the
+    /// immediate and the prepared stats paths.
     pub const DrawStats = struct {
         draw_calls: u32 = 0,
         triangles: u32 = 0,
@@ -105,9 +105,10 @@ pub const ParticlePass = struct {
     shader_cpu: sg.Shader = .{},
     shader_gpu: sg.Shader = .{},
 
-    /// Main-target sample count the render pipelines were built for
-    /// (scene/msaa.zig).
+    /// Main-target sample count the render pipelines were built for.
     sample_count: i32 = 1,
+    /// Main-target color format the render pipelines were built for.
+    color_format: sg.PixelFormat = .RGBA16F,
     quad_vb: sg.Buffer,
     quad_ib: sg.Buffer,
     sampler: sg.Sampler,
@@ -115,11 +116,11 @@ pub const ParticlePass = struct {
 
     /// Builds one pipeline variant per blend mode. `stride`/`attrs` differ
     /// between the CPU path (integrated instance data) and the GPU path
-    /// (spawn-slot data); quad geometry, depth and blend setup are shared,
-    /// matching the historical pipeline configs bit-for-bit. `sample_count`
-    /// must match the main render target (compute pipelines are exempt:
-    /// they run in attachment-less compute passes).
-    fn makePipeline(shader: sg.Shader, blend: sg.BlendState, slot_stride: usize, gpu: bool, sample_count: i32) sg.Pipeline {
+    /// (spawn-slot data); quad geometry, depth and blend setup are shared.
+    /// `sample_count`/`color_format` pin the exact main-target shape
+    /// (compute pipelines are exempt: they run in attachment-less compute
+    /// passes).
+    fn makePipeline(shader: sg.Shader, blend: sg.BlendState, slot_stride: usize, gpu: bool, sample_count: i32, color_format: sg.PixelFormat) sg.Pipeline {
         var desc = sg.PipelineDesc{
             .shader = shader,
             .index_type = .UINT16,
@@ -130,6 +131,7 @@ pub const ParticlePass = struct {
             .cull_mode = .NONE,
             .sample_count = sample_count,
         };
+        desc.colors[0].pixel_format = color_format;
         // Buffer 0: Unit quad
         desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
         desc.layout.attrs[part_shd.ATTR_particle_position] = .{
@@ -184,14 +186,9 @@ pub const ParticlePass = struct {
         return sg.makePipeline(desc);
     }
 
-    pub fn init() ParticlePass {
-        return initSampled(1);
-    }
-
-    /// Same pass at a different main-target sample count: sokol requires
-    /// pipeline.sample_count to match the attachments of the pass it draws
-    /// into.
-    pub fn initSampled(sample_count: i32) ParticlePass {
+    /// Same pass for an explicit target shape (sample count + color
+    /// format): each main-target shape needs its own pipeline variant.
+    pub fn init(sample_count: i32, color_format: sg.PixelFormat) ParticlePass {
         const particle_quad_vertices = [_]f32{
             // x,     y,     u,   v
             -0.5, -0.5, 0.0, 0.0,
@@ -244,6 +241,7 @@ pub const ParticlePass = struct {
                 @sizeOf(particles.ParticleInstanceData),
                 false,
                 sample_count,
+                color_format,
             ),
             .pipeline_alphablend = makePipeline(
                 shader_cpu,
@@ -251,6 +249,7 @@ pub const ParticlePass = struct {
                 @sizeOf(particles.ParticleInstanceData),
                 false,
                 sample_count,
+                color_format,
             ),
             .pipeline_gpu_additive = makePipeline(
                 shader_gpu,
@@ -258,6 +257,7 @@ pub const ParticlePass = struct {
                 @sizeOf(particles.GpuParticleSlot),
                 true,
                 sample_count,
+                color_format,
             ),
             .pipeline_gpu_alphablend = makePipeline(
                 shader_gpu,
@@ -265,6 +265,7 @@ pub const ParticlePass = struct {
                 @sizeOf(particles.GpuParticleSlot),
                 true,
                 sample_count,
+                color_format,
             ),
             .shader_cpu = shader_cpu,
             .shader_gpu = shader_gpu,
@@ -273,6 +274,7 @@ pub const ParticlePass = struct {
             .sampler = smp,
             .default_texture = Texture.createDefaultParticleDot32(),
             .sample_count = sample_count,
+            .color_format = color_format,
         };
     }
 
@@ -486,7 +488,7 @@ test "ParticleDraw.drawBuffer follows the simulation mode" {
 
 test "statsForDraws preserves the legacy count semantics" {
     const t = std.testing;
-    // Zero-count draws contribute nothing (legacy render skips them and the
+    // Zero-count draws contribute nothing (render skips them and the
     // stats loop only counts active_count > 0).
     const draws = [_]ParticlePass.ParticleDraw{
         .{ .active_count = 0 },
@@ -526,7 +528,7 @@ test "ParticleDraw.compute mode binds the baked buffer, keeps cpu visuals" {
     var gpu_draw = draw;
     gpu_draw.simulation_mode = .gpu;
     try t.expectEqual(@as(u32, 12), gpu_draw.drawBuffer().id);
-    // Stats keep the legacy count semantics in every mode.
+    // Stats keep the count semantics in every mode.
     const s = ParticlePass.statsForDraws(&[_]ParticlePass.ParticleDraw{draw});
     try t.expectEqual(@as(u32, 1), s.draw_calls);
     try t.expectEqual(@as(u32, 2 * 3), s.triangles);

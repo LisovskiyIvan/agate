@@ -10,17 +10,17 @@
 //!   game-owned `build_frame` and stamps `build_seq`. sg-free (handle ids
 //!   are copied as values, no sg.* calls), callable from any non-pool thread
 //!   under update-vs-prepare exclusion. Capture-after-flush still matters
-//!   for the latch below: the prepare flush creates deferred buffers, so a
+//!   for the latch below: the staged-begin flush creates deferred buffers, so a
 //!   build from before the flush would snapshot stale zero ids — apps must
-//!   call `Scene.buildPreparedFrame` AFTER the sim mutations of the tick
-//!   whose flush the prepare will run (same ordering the inline path had).
-//! - PREPARE (`captureFrame` inline fallback, or `latchFrame` consuming a
-//!   fresh build, context side, called by the integrator AFTER
+//!   build AFTER the sim mutations of the tick whose flush the staged begin
+//!   will run (same ordering the direct capture path needs).
+//! - PREPARE (context side, called by the staged begin AFTER
 //!   `flushGpuUploads` and BEFORE publish): publishes the retained `frame`
 //!   list. `latchFrame` copies `build_frame` → `frame` when `build_seq` is
 //!   newer than `latched_seq` (reserve-once, OOM coherent-empty, same as
-//!   the inline path); otherwise it runs the historical live capture, so a
-//!   latch without a fresh build stays coherent.
+//!   the direct capture); otherwise it runs the direct live capture, so a
+//!   latch without a fresh build stays coherent (direct/tooling path — Scene
+//!   itself always builds via buildCapture → stageIntoSlot → latchSlotFrame).
 //! - RENDER (`renderPrepared`, context side): draws ONLY `frame` through the
 //!   render-owned pass (MSAA twin lazy-created here, disjoint from game
 //!   state) plus snapshot-count stats. Never reads `systems`, never
@@ -86,8 +86,8 @@ pub const ParticleLayer = struct {
     systems: std.ArrayListUnmanaged(*ParticleSystem) = .empty,
 
     /// Retained owning prepared frame: one plain `ParticleDraw` per live
-    /// system, published by `captureFrame` (inline path) or `latchFrame`
-    /// (stage 1 build path), consumed by `renderPrepared`.
+    /// system, published by `captureFrame` (direct layer path) or `latchFrame`
+    /// (producer build path), consumed by `renderPrepared`.
     frame: std.ArrayListUnmanaged(ParticleDraw) = .empty,
 
     /// Game-owned build frame (stage 1): written by `buildCapture` on the
@@ -101,14 +101,14 @@ pub const ParticleLayer = struct {
 
     pass: passes.ParticlePass,
 
-    // MSAA twin pass (render pipeline sample counts must match the main
-    // target). Lazily created on the first MSAA frame, recreated on count
-    // changes. Compute simulation always runs through the 1x pass: compute
-    // pipelines have no attachments and are sample-count independent.
+    // Variant pass (render pipeline sample counts must match the main
+    // target). Lazily created on the first non-base frame, recreated on
+    // shape changes. Compute simulation always runs through the 1x pass:
+    // compute pipelines have no attachments and are sample-count independent.
     pass_msaa: ?passes.ParticlePass = null,
 
     pub fn init() ParticleLayer {
-        return .{ .pass = passes.ParticlePass.init() };
+        return .{ .pass = passes.ParticlePass.init(1, .RGBA16F) };
     }
 
     pub fn deinit(self: *ParticleLayer, allocator: std.mem.Allocator) void {
@@ -150,9 +150,10 @@ pub const ParticleLayer = struct {
     /// coherent empty frame. OOM fail-closes to coherent-empty (no stale
     /// records); retained capacity is reused, never shrunk here.
     ///
-    /// Inline fallback path: `Scene.prepareFrame` calls this when no fresh
-    /// game-side build exists, so apps that never call `buildPreparedFrame`
-    /// behave exactly as before.
+    /// Direct layer capture (also used by layer fixtures/tooling):
+    /// `latchFrame` falls back to this when no fresh producer build exists.
+    /// Scene itself always runs producer buildCapture → stageIntoSlot →
+    /// context latchSlotFrame.
     pub fn captureFrame(self: *ParticleLayer, allocator: std.mem.Allocator) void {
         captureInto(self.systems.items, allocator, &self.frame);
     }
@@ -172,11 +173,11 @@ pub const ParticleLayer = struct {
     /// Context-side latch (stage 1): when a fresh build exists (`build_seq`
     /// newer than `latched_seq`), copies `build_frame` → `frame`
     /// (reserve-once, OOM coherent-empty) and advances `latched_seq`.
-    /// Otherwise runs the historical live capture, so a latch without a
-    /// fresh build stays coherent. `renderPrepared` keeps reading `frame`
+    /// Otherwise runs the direct live capture, so a latch without a
+    /// fresh build stays coherent (direct/tooling path). `renderPrepared` keeps reading `frame`
     /// only — never `build_frame`, never live systems.
     ///
-    /// Sequential/fallback path only since wave 32: the adopted
+    /// Sequential/standalone path only since wave 32: the adopted
     /// concurrent-build path freezes into the claimed draw slot
     /// (`stageIntoSlot`) and latches from it (`latchSlotFrame`), so the
     /// prepare latch there never reads the shared `build_frame` — a
@@ -253,7 +254,7 @@ pub const ParticleLayer = struct {
         };
         out.clearRetainingCapacity();
         for (systems) |ps| {
-            // Zero-count systems draw and count nothing under the legacy
+            // Zero-count systems draw and count nothing under the count
             // semantics, so they occupy no frame slot; an all-empty layer
             // captures a coherent empty frame.
             if (ps.active_count == 0) continue;
@@ -270,20 +271,19 @@ pub const ParticleLayer = struct {
         self.frame.clearRetainingCapacity();
     }
 
-    /// Renders the prepared frame inside the main pass. `samples` is the
-    /// effective main-target sample count (scene/msaa.zig). Reads ONLY
+    /// Renders the prepared frame inside the main pass. `samples`/
+    /// `color_format` pin the exact main-target shape. Reads ONLY
     /// `frame` and the render-owned pass — never live systems. Upload-free:
     /// the prepare flush already moved every staged byte into the borrowed
-    /// buffers. Stats come from the snapshot counts with the legacy
-    /// semantics (active_count > 0 counts one draw call + two triangles per
-    /// particle). Headless-safe: without an sg context this is a no-op that
-    /// touches neither the pass (no passFor/MSAA creation) nor the stats —
-    /// a nonempty frame over an undefined pass draws nothing. The immediate
-    /// `render` below stays context-only by contrast.
-    pub fn renderPrepared(self: *ParticleLayer, camera: Camera, aspect: f32, samples: i32, stats: *SceneStats) void {
+    /// buffers. Stats come from the snapshot counts. Headless-safe: without
+    /// an sg context this is a no-op that touches neither the pass (no
+    /// passFor creation) nor the stats — a nonempty frame over an undefined
+    /// pass draws nothing. The immediate `render` below stays context-only
+    /// by contrast.
+    pub fn renderPrepared(self: *ParticleLayer, camera: Camera, aspect: f32, samples: i32, color_format: sg.PixelFormat, stats: *SceneStats) void {
         if (!sg.isvalid()) return;
         if (self.frame.items.len == 0) return;
-        const pass = self.passFor(samples);
+        const pass = self.passFor(samples, color_format);
         pass.renderDraws(self.frame.items, camera, aspect);
         const s = passes.ParticlePass.statsForDraws(self.frame.items);
         stats.main_draw_calls += s.draw_calls;
@@ -295,9 +295,9 @@ pub const ParticleLayer = struct {
     /// e.g. tooling/tests with a context). The sg algorithm is shared with
     /// `renderPrepared` via `ParticlePass.drawRecord` — this wrapper only
     /// selects the source (live systems vs retained frame).
-    pub fn render(self: *ParticleLayer, camera: Camera, aspect: f32, samples: i32, stats: *SceneStats) void {
+    pub fn render(self: *ParticleLayer, camera: Camera, aspect: f32, samples: i32, color_format: sg.PixelFormat, stats: *SceneStats) void {
         if (self.systems.items.len == 0) return;
-        const pass = self.passFor(samples);
+        const pass = self.passFor(samples, color_format);
         pass.render(self.systems.items, camera, aspect);
         for (self.systems.items) |ps| {
             if (ps.active_count > 0) {
@@ -308,12 +308,14 @@ pub const ParticleLayer = struct {
         }
     }
 
-    /// Pass variant matching the target sample count.
-    fn passFor(self: *ParticleLayer, samples: i32) *passes.ParticlePass {
-        if (samples <= 1) return &self.pass;
-        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples) {
+    /// Pass variant matching the exact target shape (sample count + color
+    /// format). The single twin slot serves every non-base shape, keyed by
+    /// both; the base shape stays on the base pass.
+    fn passFor(self: *ParticleLayer, samples: i32, color_format: sg.PixelFormat) *passes.ParticlePass {
+        if (samples == self.pass.sample_count and color_format == self.pass.color_format) return &self.pass;
+        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples or self.pass_msaa.?.color_format != color_format) {
             if (self.pass_msaa) |*p| p.deinit();
-            self.pass_msaa = passes.ParticlePass.initSampled(samples);
+            self.pass_msaa = passes.ParticlePass.init(samples, color_format);
         }
         return &self.pass_msaa.?;
     }
@@ -443,7 +445,7 @@ test "particle captureFrame packet is immutable under live mutations" {
     try t.expectEqual(math_mod.Vec3.new(1.0, -2.0, 3.0), layer.frame.items[1].gravity);
     try t.expectEqual(@as(u32, 4), layer.frame.items[1].spritesheet_columns);
 
-    // Stats from the snapshot preserve the legacy semantics.
+    // Stats from the snapshot preserve the count semantics.
     var stats = stats_mod.SceneStats{};
     const s = passes.ParticlePass.statsForDraws(layer.frame.items);
     stats.main_draw_calls += s.draw_calls;
@@ -555,12 +557,12 @@ test "particle renderPrepared is a headless no-op over a nonempty frame" {
 
     const cam: Camera = .{ .free = cam_mod.FreeCamera.init("test", .{}) };
     var stats = stats_mod.SceneStats{};
-    layer.renderPrepared(cam, 16.0 / 9.0, 1, &stats);
+    layer.renderPrepared(cam, 16.0 / 9.0, 1, .RGBA16F, &stats);
     try t.expectEqual(stats_mod.SceneStats{}, stats);
     try t.expectEqual(@as(u64, 0), meter.peek());
     // MSAA sample count would create the twin pass on a live context;
     // headless it stays a no-op with zero stats.
-    layer.renderPrepared(cam, 16.0 / 9.0, 4, &stats);
+    layer.renderPrepared(cam, 16.0 / 9.0, 4, .RGBA16F, &stats);
     try t.expectEqual(stats_mod.SceneStats{}, stats);
     try t.expectEqual(@as(u64, 0), meter.peek());
     try t.expect(layer.pass_msaa == null);

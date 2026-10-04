@@ -84,15 +84,9 @@ pub const VolumetricPass = struct {
     base_height: i32 = 0,
     resolution: pp.ShaftResolution = .quarter,
 
-    /// Render-target pixel format, shared convention with
-    /// BloomPass/GlowPass (HDR shaft radiance where the backend can
-    /// render to it, LDR fallback otherwise). Context thread only
-    /// (queries live sokol caps; headless sg aborts on pixelformat
-    /// queries).
-    pub fn shaftPixelFormat() sg.PixelFormat {
-        return glow_mod.GlowPass.glowPixelFormat();
-    }
-
+    /// Bytes per pixel of the shaft targets (always 8: RGBA16F, shared
+    /// with GlowPass). Pure (no sg calls, headless-safe); single source
+    /// of truth for profiler/snapshot.zig alongside targetBytes.
     pub fn shaftBytesPerPixel() usize {
         return glow_mod.GlowPass.glowBytesPerPixel();
     }
@@ -143,7 +137,7 @@ pub const VolumetricPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
-        const shaft_fmt = shaftPixelFormat();
+        const shaft_fmt = glow_mod.GlowPass.glowPixelFormat();
 
         const raymarch_shd_handle = sg.makeShader(raymarch_shd.volumetricRaymarchShaderDesc(sg.queryBackend()));
         var raymarch_desc = sg.PipelineDesc{
@@ -195,43 +189,70 @@ pub const VolumetricPass = struct {
 
     pub fn resize(self: *VolumetricPass, base_w: i32, base_h: i32, res: pp.ShaftResolution) void {
         if (base_w <= 0 or base_h <= 0) return;
+        if (!sg.isvalid()) return;
         if (self.base_width == base_w and self.base_height == base_h and self.resolution == res) return;
 
         self.destroyTargets();
 
-        const shaft_fmt = shaftPixelFormat();
+        const shaft_fmt = glow_mod.GlowPass.glowPixelFormat();
         const size = pp.shaftTargetSize(base_w, base_h, res);
 
-        const ray_img = sg.makeImage(.{
+        // Store-first rollback: every handle lands in the struct before its
+        // state check, so a single destroyTargets frees the failed handle
+        // plus all partial handles (views before images). A failed resize
+        // leaves zero ids and a zero base size, and render() reports empty.
+        self.raymarch_image = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
             .width = size.w,
             .height = size.h,
             .pixel_format = shaft_fmt,
             .sample_count = 1,
         });
-        self.raymarch_image = ray_img;
+        if (sg.queryImageState(self.raymarch_image) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.raymarch_att_view = sg.makeView(.{
-            .color_attachment = .{ .image = ray_img },
+            .color_attachment = .{ .image = self.raymarch_image },
         });
+        if (sg.queryViewState(self.raymarch_att_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.raymarch_tex_view = sg.makeView(.{
-            .texture = .{ .image = ray_img },
+            .texture = .{ .image = self.raymarch_image },
         });
+        if (sg.queryViewState(self.raymarch_tex_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
 
         for (0..2) |i| {
-            const blur_img = sg.makeImage(.{
+            self.blur_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
                 .pixel_format = shaft_fmt,
                 .sample_count = 1,
             });
-            self.blur_images[i] = blur_img;
+            if (sg.queryImageState(self.blur_images[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = blur_img },
+                .color_attachment = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_att_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = blur_img },
+                .texture = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_tex_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
         }
 
         self.base_width = base_w;
@@ -315,6 +336,7 @@ pub const VolumetricPass = struct {
         const bias = @max(args.shadow_bias, 0.0002);
 
         self.resize(args.base_w, args.base_h, cfg.shaft_resolution);
+        if (self.base_width != args.base_w or self.base_height != args.base_h) return .{};
         if (self.raymarch_image.id == 0) return .{};
 
         // Stage 1: raymarch into the raymarch target.
@@ -368,17 +390,16 @@ pub const VolumetricPass = struct {
     }
 
     fn destroyTargets(self: *VolumetricPass) void {
-        if (self.raymarch_image.id == 0) return;
-        sg.destroyImage(self.raymarch_image);
-        sg.destroyView(self.raymarch_att_view);
-        sg.destroyView(self.raymarch_tex_view);
+        if (self.raymarch_att_view.id != 0) sg.destroyView(self.raymarch_att_view);
+        if (self.raymarch_tex_view.id != 0) sg.destroyView(self.raymarch_tex_view);
+        if (self.raymarch_image.id != 0) sg.destroyImage(self.raymarch_image);
         self.raymarch_image = .{};
         self.raymarch_att_view = .{};
         self.raymarch_tex_view = .{};
         for (0..2) |i| {
-            sg.destroyImage(self.blur_images[i]);
-            sg.destroyView(self.blur_att_views[i]);
-            sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_att_views[i].id != 0) sg.destroyView(self.blur_att_views[i]);
+            if (self.blur_tex_views[i].id != 0) sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_images[i].id != 0) sg.destroyImage(self.blur_images[i]);
             self.blur_images[i] = .{};
             self.blur_att_views[i] = .{};
             self.blur_tex_views[i] = .{};
@@ -425,8 +446,8 @@ test "volumetric pass fail-closes headless with no state touched" {
 
 test "volumetric target bytes account three shaft-res targets" {
     // Pure byte math (no sg calls): exact and deterministic headless. The
-    // RGBA8 leg (4 Bpp) is pinned here; the RGBA16F leg (8 Bpp) shares the
-    // same formula with shaftBytesPerPixel (context-only, like glow).
+    // RGBA16F leg (8 Bpp, via the pure shaftBytesPerPixel) shares the same
+    // formula; the RGBA8 leg (4 Bpp) is pinned for the census shape.
     try std.testing.expectEqual(@as(usize, 3 * 320 * 180 * 4), VolumetricPass.targetBytes(1280, 720, 4, .quarter));
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 4), VolumetricPass.targetBytes(1280, 720, 4, .half));
     try std.testing.expectEqual(@as(usize, 3 * 320 * 180 * 8), VolumetricPass.targetBytes(1280, 720, 8, .quarter));

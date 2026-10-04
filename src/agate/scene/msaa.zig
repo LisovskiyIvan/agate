@@ -79,6 +79,7 @@ pub fn maxSamplesForBackend(backend: sg.Backend) i32 {
 /// Snap a requested sample count to the largest valid count <= requested,
 /// then cap it at the backend maximum. 1 and below means "off".
 pub fn clampSampleCount(backend: sg.Backend, requested: i32) i32 {
+    if (backend == .WGPU) return if (requested >= 4) 4 else 1;
     if (requested < 2) return 1;
     const max = maxSamplesForBackend(backend);
     var chosen: i32 = 1;
@@ -91,12 +92,8 @@ pub fn clampSampleCount(backend: sg.Backend, requested: i32) i32 {
 /// Inputs for effectiveSampleCount. Everything is a plain bool so the
 /// decision stays unit-testable without a GPU.
 pub const Inputs = struct {
-    /// Post-processing chain on? MSAA only applies to the offscreen main
-    /// target; with post off the main pass IS the swapchain, whose sample
-    /// count is fixed by sokol_app at startup (agate runs it at 1).
-    post_enabled: bool,
     /// Both main-target attachment formats support MSAA at runtime
-    /// (sg.queryPixelformat(fmt).msaa for the swapchain color and depth
+    /// (sg.queryPixelformat(fmt).msaa for RGBA16F color and environment depth
     /// formats). False forces 1x with a warn at the call site.
     formats_msaa_capable: bool = true,
     /// Backend reported by sg.queryBackend().
@@ -110,15 +107,14 @@ pub const Inputs = struct {
 /// post chain, not the target's sample count, and lives in PostFXStack
 /// (which owns the warn-once state).
 pub fn effectiveSampleCount(requested: i32, in: Inputs) i32 {
-    if (!in.post_enabled) return 1;
     if (!in.formats_msaa_capable) return 1;
     return clampSampleCount(in.backend, requested);
 }
 
 /// True when any depth-texture-consuming post effect would run this frame.
 /// While the main target is MSAA these are suppressed (see module docs).
-pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool) bool {
-    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled);
+pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool, motion_blur_enabled: bool) bool {
+    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled or motion_blur_enabled);
 }
 
 /// Single-sample depth-prepass gate (MSAA depth-resolve design v1).
@@ -166,14 +162,20 @@ pub const WarnOnce = struct {
     }
 };
 
-/// True when the swapchain color AND depth formats both support MSAA at
-/// runtime (the main target mirrors them; see postprocess_pass.resize).
+/// True when RGBA16F and environment depth support MSAA at runtime.
 /// sg.queryPixelformat is the sokol-provided backend gate.
 pub fn mainTargetFormatsMsaaCapable() bool {
     const env_def = sg.queryDesc().environment.defaults;
-    const color_fmt: sg.PixelFormat = if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
     const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
-    return sg.queryPixelformat(color_fmt).msaa and sg.queryPixelformat(depth_fmt).msaa;
+    return sg.queryPixelformat(.RGBA16F).msaa and sg.queryPixelformat(depth_fmt).msaa;
+}
+
+test "HDR sample policy rejects WebGPU 2x and preserves other choices" {
+    const web = Inputs{ .backend = .WGPU };
+    try std.testing.expectEqual(@as(i32, 1), effectiveSampleCount(2, web));
+    try std.testing.expectEqual(@as(i32, 1), effectiveSampleCount(3, web));
+    try std.testing.expectEqual(@as(i32, 4), effectiveSampleCount(4, web));
+    try std.testing.expectEqual(@as(i32, 2), effectiveSampleCount(2, .{ .backend = .METAL_MACOS }));
 }
 
 // --- GPU-free contract tests (visual AA quality cannot be unit-tested; it
@@ -183,7 +185,7 @@ const testing = std.testing;
 
 test "clampSampleCount snaps down to valid counts and caps by backend" {
     // Portable backends cap at 4 (see maxSamplesForBackend docs).
-    for ([_]sg.Backend{ .METAL_MACOS, .METAL_IOS, .D3D11, .VULKAN, .WGPU, .GLCORE, .GLES3 }) |backend| {
+    for ([_]sg.Backend{ .METAL_MACOS, .METAL_IOS, .D3D11, .VULKAN, .GLCORE, .GLES3 }) |backend| {
         try testing.expectEqual(@as(i32, 1), clampSampleCount(backend, 1));
         try testing.expectEqual(@as(i32, 1), clampSampleCount(backend, 0));
         try testing.expectEqual(@as(i32, 1), clampSampleCount(backend, -4));
@@ -199,30 +201,29 @@ test "clampSampleCount snaps down to valid counts and caps by backend" {
     try testing.expectEqual(@as(i32, 8), clampSampleCount(.DUMMY, 99));
 }
 
-test "effectiveSampleCount gates on post path and format support" {
-    const base = Inputs{ .post_enabled = true, .backend = .DUMMY };
+test "effectiveSampleCount gates only on target format support" {
+    const base = Inputs{ .backend = .DUMMY };
     try testing.expectEqual(@as(i32, 4), effectiveSampleCount(4, base));
-    // Post off: main pass is the 1x swapchain, MSAA never applies.
-    try testing.expectEqual(@as(i32, 1), effectiveSampleCount(4, .{ .post_enabled = false, .backend = .DUMMY }));
     // Runtime format gate (e.g. a backend that cannot MSAA the swapchain
     // color format): degrade to 1x rather than fail resource creation.
-    try testing.expectEqual(@as(i32, 1), effectiveSampleCount(4, .{ .post_enabled = true, .formats_msaa_capable = false, .backend = .DUMMY }));
+    try testing.expectEqual(@as(i32, 1), effectiveSampleCount(4, .{ .formats_msaa_capable = false, .backend = .DUMMY }));
     // Clamp still applies on the effective path (real-backend cap is 4;
     // the dummy backend used by base allows the full table).
-    try testing.expectEqual(@as(i32, 4), effectiveSampleCount(8, .{ .post_enabled = true, .backend = .METAL_MACOS }));
+    try testing.expectEqual(@as(i32, 4), effectiveSampleCount(8, .{ .backend = .METAL_MACOS }));
     try testing.expectEqual(@as(i32, 8), effectiveSampleCount(8, base));
 }
 
-test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog)" {
+test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog/MotionBlur)" {
     // SSAO defaults on in this engine: that alone counts as active.
-    try testing.expect(depthEffectsActive(true, true, false, false, false, false));
-    try testing.expect(depthEffectsActive(true, false, true, false, false, false)); // debug
-    try testing.expect(depthEffectsActive(true, false, false, true, false, false)); // SSR
-    try testing.expect(depthEffectsActive(true, false, false, false, true, false)); // DoF
-    try testing.expect(depthEffectsActive(true, false, false, false, false, true)); // Fog
-    try testing.expect(!depthEffectsActive(true, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, true, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, false, true, false, false, false, false)); // debug
+    try testing.expect(depthEffectsActive(true, false, false, true, false, false, false)); // SSR
+    try testing.expect(depthEffectsActive(true, false, false, false, true, false, false)); // DoF
+    try testing.expect(depthEffectsActive(true, false, false, false, false, true, false)); // Fog
+    try testing.expect(depthEffectsActive(true, false, false, false, false, false, true)); // MotionBlur
+    try testing.expect(!depthEffectsActive(true, false, false, false, false, false, false));
     // Without the post chain nothing runs at all.
-    try testing.expect(!depthEffectsActive(false, true, true, true, true, true));
+    try testing.expect(!depthEffectsActive(false, true, true, true, true, true, true));
 }
 
 test "needsResolveAttachment follows the sokol resolve contract" {

@@ -93,7 +93,7 @@ pub const InstancePreviewState = struct {
     /// Scene `build_seq` that produced this preview (0 = never built).
     build_seq: u64 = 0,
     /// Offset of this mesh's matrix segment into the back-slot staging
-    /// scratch (`draws.backSlot().primary.instance_matrices`).
+    /// scratch owned by the producer's claimed frame slot.
     scratch_lo: usize = 0,
 };
 
@@ -249,22 +249,51 @@ pub const BoneAttachment = struct {
 var mesh_uid_next: u64 = 1;
 
 /// Test-only deferred-creation failure injection (P5 5e): armed via
-/// testArmMeshFailOnce(), the next finishGpuUpload vertex allocation
+/// testArmMeshFailOnce(), the next makeDeferredMeshVertexBuffer call (the
+/// single vertex-creation seam owned here, used by BOTH the staged
+/// flushPendingCreations and the quiesced legacy-fallback finishGpuUpload)
 /// synthesizes a nonzero FAILED buffer (allocBuffer + failBuffer) instead of
-/// calling sg.makeBuffer, driving the REAL `.FAILED` handling below (destroy
-/// the failed slot, keep every pending flag for retry). Covers the FIRST
-/// vertex allocation for both the dynamic and the static branches (one shared
-/// site above the branch — whichever is reachable); the index allocation has
-/// no seam (vertex failure returns before any index buffer exists). State is
-/// private: the only writers/readers are the two context-thread-only
-/// accessors below, never a freely mutable production switch. A zero id at
-/// consume time (dry pool) falls through to the real makeBuffer so the
-/// failure mode stays pool-exhaustion, never a vacuous injection.
+/// the real makeBuffer, driving the REAL `.FAILED` handling in the owning
+/// caller (destroy the failed slot, keep every pending flag for retry).
+/// Covers the FIRST vertex allocation for both the dynamic and the static
+/// branches (one shared seam above the branch — whichever is reachable);
+/// the index allocation has no seam (vertex failure returns before any
+/// index buffer exists). State is private: the only writers/readers are
+/// the two context-thread-only accessors below, never a freely mutable
+/// production switch. A zero id at consume time (dry pool) falls through to
+/// the real makeBuffer so the failure mode stays pool-exhaustion, never a
+/// vacuous injection.
 var test_inject_mesh_fail_once: bool = false;
 /// Exact buffer id the last armed injection failed (0 = none consumed yet).
 /// Lets the test assert the failed handle itself reached INVALID, not just
 /// that the pool has room.
 var test_last_injected_mesh_fail_id: u32 = 0;
+
+/// Canonical deferred-mesh vertex creation seam (P5 5e): the ONLY stated
+/// makeBuffer site for deferred vertex buffers. Both the staged
+/// flushPendingCreations (frozen slot-payload desc, never live mesh state)
+/// and the quiesced legacy-fallback finishGpuUpload call this with the same
+/// desc shape they always built; the index allocation stays a regular
+/// sg.makeBuffer in the owning caller. Owns the one-shot nonzero FAILED
+/// injection above plus the regular make. Context thread only (asserted):
+/// neither flush path runs anywhere else. Rollback (.FAILED destroy,
+/// pending-flag retention, outcome recording) stays with the owning caller.
+/// A dry pool (alloc id 0) falls through to the real makeBuffer so the
+/// failure mode stays pool-exhaustion. Returns the buffer for the caller's
+/// VALID-only check (nonzero FAILED must be destroyed inline there).
+pub fn makeDeferredMeshVertexBuffer(desc: sg.BufferDesc) sg.Buffer {
+    gpu_thread.assertOnContextThread();
+    if (test_inject_mesh_fail_once) {
+        test_inject_mesh_fail_once = false;
+        const fb = sg.allocBuffer();
+        if (fb.id != 0) {
+            sg.failBuffer(fb);
+            test_last_injected_mesh_fail_id = fb.id;
+            return fb;
+        }
+    }
+    return sg.makeBuffer(desc);
+}
 
 /// Arms one injected deferred-creation failure. Context thread only
 /// (asserted): the finish path never runs anywhere else.
@@ -821,35 +850,17 @@ pub const Mesh = struct {
         // CPU-morph glTF meshes created off-context need the same empty
         // dynamic vertex buffer the immediate loader path builds (the first
         // frame's applyMorphs fills it); everything else uploads static.
-        //
-        // Test-only injection (P5 5e): synthesize a nonzero FAILED buffer
-        // instead of the real makeBuffer, so the validity check below
-        // exercises its `.FAILED` arm on the real path. The flag
-        // auto-resets; a dry pool (id 0) falls through to the real call so
-        // the mode stays pool-exhaustion, never vacuous.
-        var injected_fail = false;
-        var vbuf: sg.Buffer = undefined;
-        if (test_inject_mesh_fail_once) {
-            test_inject_mesh_fail_once = false;
-            const fb = sg.allocBuffer();
-            if (fb.id != 0) {
-                sg.failBuffer(fb);
-                test_last_injected_mesh_fail_id = fb.id;
-                vbuf = fb;
-                injected_fail = true;
-            }
-        }
-        if (!injected_fail) {
-            vbuf = if (self.pending_dynamic_update)
-                sg.makeBuffer(.{
-                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                    .size = self.pending_vertices.len * @sizeOf(Vertex),
-                })
-            else
-                sg.makeBuffer(.{
-                    .data = sg.asRange(self.pending_vertices),
-                });
-        }
+        // Vertex creation runs through the canonical seam (owns the one-shot
+        // FAILED injection); the VALID-only check below drives its arm.
+        const vbuf: sg.Buffer = if (self.pending_dynamic_update)
+            makeDeferredMeshVertexBuffer(.{
+                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .size = self.pending_vertices.len * @sizeOf(Vertex),
+            })
+        else
+            makeDeferredMeshVertexBuffer(.{
+                .data = sg.asRange(self.pending_vertices),
+            });
         // A failed makeBuffer may still hand out a nonzero id in FAILED
         // resource state (id == 0 means pool exhaustion only); draw rejects
         // FAILED permanently, so accept VALID only and keep every pending
@@ -1051,7 +1062,7 @@ pub const Mesh = struct {
 // Callers on a non-context thread (input-driven decal stamping, drag-box
 // creation on the game thread) must not touch sg.*: they take the deferred
 // path below (CPU-only + gpu_pending), and Scene.flushPendingGpuUploads
-// finishes the buffers on the context thread. prepareFrame() flushes before
+// finishes the buffers on the context thread. Staged prepare flushes before
 // queue building, so a pending mesh always has buffers before it can be
 // queued for drawing. The deferred path also covers "no valid sg context
 // yet", so context-less tests never crash inside makeBuffer.

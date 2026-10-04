@@ -79,10 +79,11 @@ if (timing.pollPassSample(.main)) |sample| {
 Фазы — `shadow`, `main`, `post`, последовательные, не вложенные. `Sample` содержит
 `ms: f32` и `frame_index: u32`; `null` означает disabled, unsupported, not-ready или
 отсутствие валидного контекста. Индекс — **не** `Scene.frame_id`, сбрасывается при
-новом `sg.setup`; по нему отличать новый sample от повторного poll. Задержка
+новом `sg.setup`; по нему отличать новый sample от повторного poll (индекс 0 —
+валиден, если sample не `null`). Задержка
 асинхронного результата переменна. Не смешивать фазовые значения разных submission
-для искусственного frame total. Legacy `poll*Ms()` возвращают 0 для unavailable;
-для проверки наличия данных использовать optional samples, не `ms > 0`.
+для искусственного frame total. `pollFrameMs/pollPassMs` удалены: наличие данных —
+только по optional `Sample`, не по `ms > 0`.
 В низкоуровневом C API сначала опрашивается `*_ms`, затем его snapshot index:
 индексный getter не делает второй reap и не перепривязывает старое время к новому
 кадру. Empty bracket без native pass на Metal/WebGPU не даёт измерения; GL может
@@ -133,25 +134,30 @@ unavailable. Custom allocator должен иметь 0 живых sokol allocat
 shutdown. Итог — `verdict=PASS` и `log_errors=0`. Сам PASS unsupported-path не
 доказывает измерения: отдельно проверить `frame_supported`/`pass_supported` и counts.
 
-### Подтверждённые прогоны — 04.10.2026
+### Подтверждённые прогоны — 04.10.2026, единый HDR/staged renderer
 
 Apple M4, macOS; эти прогоны проверяют корректность и совместимость, не сравнивают
 производительность backend-ов.
 
 | Гейт | Результат |
 |---|---|
-| Metal Debug и ReleaseSafe, enabled/OFF | 4/4 PASS, frame и все три фазы поддерживаются; 79–80 уникальных положительных samples на timer в каждом enabled-интервале |
-| Chrome 155.0.8059.27 WebGPU, enabled/OFF/no-device-feature | 3/3 PASS; enabled — 79–80 уникальных положительных samples на timer в каждом интервале; без feature — capabilities false и samples unavailable |
-| Toggle + shutdown/re-setup immediately after commit | Metal/WebGPU: 270 кадров и compute dispatches, 0 validation errors, 0 живых sokol allocations после shutdown |
-| Sokol native compile + GL/GLES/Metal/ARC/D3D11 functional suites | 955/955 testcase executions PASS |
-| Headless WGPU callback lifetime regression | 8/8 PASS: stale generation/context, reused slot, valid zero, completion order, abort; metadata не зависит от sg allocator |
-| Agate Debug / ReleaseSafe | 1394/1394 в каждом режиме |
-| Sandbox headless / native GPU | 29/29 tests, 8/8 GPU legs |
-| RTT capture/refraction/4x MSAA | 3/3 PASS, 0 validation errors |
-| Sandbox и bench WebGPU wasm builds | PASS |
-| Default-OFF WebGPU visual compatibility | 6/6 PASS: twosided/transparency/cutout/environment/morph/particles; MAE 0.00/0.01/0.00/0.90/0.00/0.14, tolerances неизменны; canonical parity artifacts не изменены |
+| Browser hdr-showcase, 4 legs × 240 кадров (`node tools/hdr_browser_gate.mjs --out DIR`; `--out` опционален — default свежий `$TMPDIR/opencode/hdr-browser-*`; `--frames >= 240`, builtin Chrome runner) | checks 1170 / 730 / 1170 / 1170 после strict-GPU + staged-гейта |
+| Metal hdr-showcase 1x / 4x / hardware-sRGB, по 240 кадров (`AGATE_HDR_FRAMES=240`, `AGATE_HDR_MSAA=4`, `AGATE_HDR_SRGB=1`) | 1170 / 730 / 1170 checks; 0 failures, errors и live SG alloc |
+| Native RTT + refraction 4x, 120 кадров | PASS, fresh-frame proof |
+| Metal gpu-timing, 270 кадров (`AGATE_GPU_TIMING_TEST_FRAMES=270`) | 268 real compute dispatches, PASS; 0 failures, errors и live SG alloc, shutdown/re-setup |
+| Agate full unit Debug / ReleaseSafe | 1418/1418 в каждом; включая cancel/repeated-build cache regressions и one-shot compute accounting |
+| Sandbox CPU / staged-GPU live gate | 29/29 CPU, 9/9 GPU legs; default, exclusion и serial используют один staged-протокол с включёнными cullers |
+| `test_hdr_targets` (real pool rollback + live ownership) | 97 checks в ReleaseSafe и ReleaseFast; image/view partial-allocation rollback, retry, owner/unregistered/foreign policy |
+| `bench-threads -- --runs 1 --frames 90` | staged / exclusion / serial: все три smoke runs прошли, новые metrics/CLI парсятся; это не controlled performance benchmark |
+
+Визуальное подтверждение — только скриншоты: GPU radiance readback нет,
+экраны — coarse-only. HDR-калибровка radiance 1/4/16 — CPU golden +
+отдельный scene visual proof.
+
+Текущий browser-гейт проверяет HDR output/lifecycle, не timestamp-readback.
+Timing runtime этой волны проверен на Metal; прежние browser/C timing gates
+остаются историческими результатами и не заменяют этот прогон.
 
 Native WebGPU **app** не проверен: cached emdawn header имеет существующий drift
-в имени `WGPUSurfaceSourceMetalLayer`. C gfx timing path компилируется с этим
-header; реальные timestamp/readback/lifecycle прогоны выше сделаны в браузере.
+в имени `WGPUSurfaceSourceMetalLayer`.
 Linux linker path optional callback test настроен, но на этом macOS host не запускался.

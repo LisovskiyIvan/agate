@@ -177,14 +177,14 @@ pub const ProbeGpu = struct {
     }
 };
 
-/// Estimated VRAM bytes of one fully created probe target: the RGBA8 cube
-/// with a full mip chain (all 6 faces) plus the depth target. Pure (no GPU
-/// calls); feeds the profiler's render-target census.
+/// Estimated VRAM bytes of one fully created probe target: the linear-HDR
+/// RGBA16F cube (8 B/px) with a full mip chain (all 6 faces) plus the depth
+/// target. Pure (no GPU calls); feeds the profiler's render-target census.
 pub fn targetBytes() usize {
     var total: usize = 0;
     var s: u32 = @intCast(face_resolution);
     while (true) {
-        total += @as(usize, s) * @as(usize, s) * 4 * 6;
+        total += @as(usize, s) * @as(usize, s) * 8 * 6;
         if (s == 1) break;
         s = @max(1, s / 2);
     }
@@ -392,11 +392,14 @@ pub const ProbeLayer = struct {
     }
 
     fn defaultColorFormat() sg.PixelFormat {
-        const env_def = sg.queryDesc().environment.defaults;
-        return if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE) env_def.color_format else .BGRA8;
+        return .RGBA16F;
     }
 
     fn createTarget(gpu: *ProbeGpu) bool {
+        // NOTE: plain `bool` return — `errdefer` does NOT run on `return
+        // false` (only on error propagation), so every failure path below
+        // destroys what it already made explicitly. Single owner: nothing
+        // is published into `gpu.*` until every handle validated.
         const img = sg.makeImage(.{
             .type = .CUBE,
             .usage = .{ .color_attachment = true },
@@ -407,12 +410,17 @@ pub const ProbeLayer = struct {
             .pixel_format = defaultColorFormat(),
             .sample_count = 1,
         });
-        if (img.id == 0) return false;
-        errdefer sg.destroyImage(img);
+        if (img.id == 0 or sg.queryImageState(img) != .VALID) {
+            if (img.id != 0) sg.destroyImage(img);
+            return false;
+        }
 
         const tex_view = sg.makeView(.{ .texture = .{ .image = img } });
-        if (tex_view.id == 0) return false;
-        errdefer sg.destroyView(tex_view);
+        if (tex_view.id == 0 or sg.queryViewState(tex_view) != .VALID) {
+            if (tex_view.id != 0) sg.destroyView(tex_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         const smp = sg.makeSampler(.{
             .min_filter = .LINEAR,
@@ -422,18 +430,14 @@ pub const ProbeLayer = struct {
             .wrap_v = .CLAMP_TO_EDGE,
             .wrap_w = .CLAMP_TO_EDGE,
         });
-        if (smp.id == 0) return false;
-        errdefer sg.destroySampler(smp);
+        if (smp.id == 0 or sg.querySamplerState(smp) != .VALID) {
+            if (smp.id != 0) sg.destroySampler(smp);
+            sg.destroyView(tex_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         var face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips;
-        errdefer {
-            for (&face_views) |*mip| {
-                for (mip) |*v| {
-                    sg.destroyView(v.*);
-                    v.* = .{};
-                }
-            }
-        }
         for (0..max_mips) |m| {
             for (0..6) |f| {
                 face_views[m][f] = sg.makeView(.{
@@ -443,7 +447,18 @@ pub const ProbeLayer = struct {
                         .slice = @intCast(f),
                     },
                 });
-                if (face_views[m][f].id == 0) return false;
+                if (face_views[m][f].id == 0 or sg.queryViewState(face_views[m][f]) != .VALID) {
+                    for (&face_views) |*mip| for (mip) |*v| {
+                        if (v.id != 0) {
+                            sg.destroyView(v.*);
+                            v.* = .{};
+                        }
+                    };
+                    sg.destroySampler(smp);
+                    sg.destroyView(tex_view);
+                    sg.destroyImage(img);
+                    return false;
+                }
             }
         }
 
@@ -454,11 +469,25 @@ pub const ProbeLayer = struct {
             .pixel_format = .DEPTH,
             .sample_count = 1,
         });
-        if (depth_img.id == 0) return false;
-        errdefer sg.destroyImage(depth_img);
+        if (depth_img.id == 0 or sg.queryImageState(depth_img) != .VALID) {
+            if (depth_img.id != 0) sg.destroyImage(depth_img);
+            for (&face_views) |*mip| for (mip) |*v| sg.destroyView(v.*);
+            sg.destroySampler(smp);
+            sg.destroyView(tex_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         const depth_view = sg.makeView(.{ .depth_stencil_attachment = .{ .image = depth_img } });
-        if (depth_view.id == 0) return false;
+        if (depth_view.id == 0 or sg.queryViewState(depth_view) != .VALID) {
+            if (depth_view.id != 0) sg.destroyView(depth_view);
+            sg.destroyImage(depth_img);
+            for (&face_views) |*mip| for (mip) |*v| sg.destroyView(v.*);
+            sg.destroySampler(smp);
+            sg.destroyView(tex_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         gpu.* = .{
             .image = img,
@@ -473,6 +502,8 @@ pub const ProbeLayer = struct {
     }
 
     fn createBlit(self: *ProbeLayer) bool {
+        // Same bool-fn discipline as createTarget: explicit destroy on
+        // every failure path; `self.*` fields publish only on success.
         const quad_vertices = [_]f32{
             // x,     y,    u,   v
             -1.0, -1.0, 0.0, 0.0,
@@ -483,14 +514,19 @@ pub const ProbeLayer = struct {
         const quad_indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
 
         const vb = sg.makeBuffer(.{ .data = sg.asRange(&quad_vertices) });
-        if (vb.id == 0) return false;
-        errdefer sg.destroyBuffer(vb);
+        if (vb.id == 0 or sg.queryBufferState(vb) != .VALID) {
+            if (vb.id != 0) sg.destroyBuffer(vb);
+            return false;
+        }
         const ib = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(&quad_indices),
         });
-        if (ib.id == 0) return false;
-        errdefer sg.destroyBuffer(ib);
+        if (ib.id == 0 or sg.queryBufferState(ib) != .VALID) {
+            if (ib.id != 0) sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         const smp = sg.makeSampler(.{
             .min_filter = .LINEAR,
@@ -500,12 +536,21 @@ pub const ProbeLayer = struct {
             .wrap_v = .CLAMP_TO_EDGE,
             .wrap_w = .CLAMP_TO_EDGE,
         });
-        if (smp.id == 0) return false;
-        errdefer sg.destroySampler(smp);
+        if (smp.id == 0 or sg.querySamplerState(smp) != .VALID) {
+            if (smp.id != 0) sg.destroySampler(smp);
+            sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         const shd = sg.makeShader(blit_shd.probeMipShaderDesc(sg.queryBackend()));
-        if (shd.id == 0) return false;
-        errdefer sg.destroyShader(shd);
+        if (shd.id == 0 or sg.queryShaderState(shd) != .VALID) {
+            if (shd.id != 0) sg.destroyShader(shd);
+            sg.destroySampler(smp);
+            sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         var desc = sg.PipelineDesc{
             .shader = shd,
@@ -523,8 +568,14 @@ pub const ProbeLayer = struct {
         desc.layout.attrs[blit_shd.ATTR_probe_mip_position] = .{ .format = .FLOAT2, .offset = 0 };
         desc.layout.attrs[blit_shd.ATTR_probe_mip_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
         const pip = sg.makePipeline(desc);
-        if (pip.id == 0) return false;
-        errdefer sg.destroyPipeline(pip);
+        if (pip.id == 0 or sg.queryPipelineState(pip) != .VALID) {
+            if (pip.id != 0) sg.destroyPipeline(pip);
+            sg.destroyShader(shd);
+            sg.destroySampler(smp);
+            sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         const scratch_cube = sg.makeImage(.{
             .type = .CUBE,
@@ -536,24 +587,29 @@ pub const ProbeLayer = struct {
             .pixel_format = defaultColorFormat(),
             .sample_count = 1,
         });
-        if (scratch_cube.id == 0) return false;
-        errdefer sg.destroyImage(scratch_cube);
+        if (scratch_cube.id == 0 or sg.queryImageState(scratch_cube) != .VALID) {
+            if (scratch_cube.id != 0) sg.destroyImage(scratch_cube);
+            sg.destroyPipeline(pip);
+            sg.destroyShader(shd);
+            sg.destroySampler(smp);
+            sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         const scratch_tex_view = sg.makeView(.{ .texture = .{ .image = scratch_cube } });
-        if (scratch_tex_view.id == 0) return false;
-        errdefer sg.destroyView(scratch_tex_view);
+        if (scratch_tex_view.id == 0 or sg.queryViewState(scratch_tex_view) != .VALID) {
+            if (scratch_tex_view.id != 0) sg.destroyView(scratch_tex_view);
+            sg.destroyImage(scratch_cube);
+            sg.destroyPipeline(pip);
+            sg.destroyShader(shd);
+            sg.destroySampler(smp);
+            sg.destroyBuffer(ib);
+            sg.destroyBuffer(vb);
+            return false;
+        }
 
         var scratch_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips;
-        errdefer {
-            for (&scratch_face_views) |*mip| {
-                for (mip) |*v| {
-                    if (v.id != 0) {
-                        sg.destroyView(v.*);
-                        v.* = .{};
-                    }
-                }
-            }
-        }
         for (0..max_mips) |m| {
             for (0..6) |f| {
                 scratch_face_views[m][f] = sg.makeView(.{
@@ -563,7 +619,22 @@ pub const ProbeLayer = struct {
                         .slice = @intCast(f),
                     },
                 });
-                if (scratch_face_views[m][f].id == 0) return false;
+                if (scratch_face_views[m][f].id == 0 or sg.queryViewState(scratch_face_views[m][f]) != .VALID) {
+                    for (&scratch_face_views) |*mip| for (mip) |*v| {
+                        if (v.id != 0) {
+                            sg.destroyView(v.*);
+                            v.* = .{};
+                        }
+                    };
+                    sg.destroyView(scratch_tex_view);
+                    sg.destroyImage(scratch_cube);
+                    sg.destroyPipeline(pip);
+                    sg.destroyShader(shd);
+                    sg.destroySampler(smp);
+                    sg.destroyBuffer(ib);
+                    sg.destroyBuffer(vb);
+                    return false;
+                }
             }
         }
 
@@ -814,10 +885,10 @@ test "captureFar scales with radius above a usable floor" {
     try std.testing.expectEqual(@as(i32, 1), mipSize(max_mips));
 }
 
-test "targetBytes accounts the cube chain plus depth" {
-    // RGBA8 cube 128..1 over 8 mips, all 6 faces, plus one 128x128 depth:
-    // (16384+4096+1024+256+64+16+4+1)*4*6 + 128*128*4 = 589816.
-    try std.testing.expectEqual(@as(usize, 589816), targetBytes());
+test "targetBytes accounts the HDR cube chain plus depth" {
+    // RGBA16F cube 128..1 over 8 mips, all 6 faces, plus one 128x128 depth:
+    // (16384+4096+1024+256+64+16+4+1)*8*6 + 128*128*4 = 1114096.
+    try std.testing.expectEqual(@as(usize, 1114096), targetBytes());
 }
 
 test "ensureGpu fails closed without a gpu context" {

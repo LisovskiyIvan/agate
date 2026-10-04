@@ -78,7 +78,7 @@ layout(binding = 1) uniform fs_params {
     vec4 spot_intensity[2];
     mat4 spot_view_proj[2];
     vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
-    // APPENDED LAST: existing offsets above must not shift for old bindings.
+    // APPENDED LAST: existing offsets above must not shift for existing bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
     float normal_scale; // normal map xy scale (glTF normalTexture.scale)
     // APPENDED LAST (wave/ktx2): per-slot KHR_texture_transform UV maps and
@@ -112,7 +112,7 @@ layout(binding = 1) uniform fs_params {
     vec4 directional_color_int[4]; // rgb: color, a: intensity
     // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
     // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
-    // Zeroed when no probe applies: the shader then takes the legacy
+    // Zeroed when no probe applies: the shader then takes the no-probe
     // ambient/IBL path bit-identically. Appended last so no offset shifts.
     // (Instanced draws always upload zero here — probes skip instanced
     // batches in v1 — but the lane must exist for layout parity with the
@@ -139,7 +139,7 @@ layout(binding = 1) uniform fs_params {
     vec4 clustered_viewport;
     // APPENDED LAST (pbr-layers v1): anisotropy / transmission / SSS.
     // All zeroed when unused: every new term gates on its factor (0 = off),
-    // so legacy materials shade bit-identically. Appended last so no
+    // so unlayered materials shade bit-identically. Appended last so no
     // existing offset shifts.
     vec4 anisotropy_factors; // x: intensity (0 = isotropic/off), y: tangent-plane rotation (rad), z/w: unused
     vec4 transmission_factors; // x: factor (0 = off), y/z/w: unused
@@ -152,15 +152,6 @@ layout(binding = 1) uniform fs_params {
     // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
     vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
     vec4 hemi_diffuse; // rgb: diffuse color, a: unused
-    // APPENDED LAST (Babylon output stage): x = gamma-encode flag (0/1),
-    // y/z/w unused. Babylon always ends its PBR fragment shader with
-    // `applyImageProcessing` -> `toGammaSpace` (pow(color, 1/2.2)) into a
-    // NON-sRGB backbuffer, so the encode is part of the shaded value (before
-    // blending and MSAA resolve); agate's default is linear color + the sRGB
-    // swapchain's exact piecewise-sRGB hardware encode. `Scene.output_gamma`
-    // selects Babylon's curve; see common/output_gamma.glsl. Appended last so
-    // no existing offset shifts.
-    vec4 output_params;
     vec4 clearcoat_uv_matrix;
     vec4 clearcoat_uv_offset;
     vec4 sheen_uv_matrix;
@@ -197,7 +188,7 @@ layout(binding = 3) uniform sampler depth_smp;
 // Reflection probe cube (wave 25): binding 11 is the next free texture
 // slot in the shared pool (fs uses 0..8 and 10, the instanced vs uses no
 // textures), binding 6 the next free sampler slot. Instanced draws bind
-// the default cube with zeroed params (legacy path); the slots must still
+// the default cube with zeroed params (no-probe path); the slots must still
 // exist for layout parity with the regular PBR family.
 layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 6) uniform sampler probe_smp;
@@ -267,7 +258,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // shadow_tex, regular sampler): PCSS_BLOCKER_SAMPLES Poisson taps inside
 // pcss_blocker_radius, average blocker depth -> penumbra ->
 // (d_receiver - d_blocker) / d_blocker * light_size, clamped to
-// [min_penumbra, max_penumbra]; the legacy Poisson PCF then runs with the
+// [min_penumbra, max_penumbra]; the fixed-radius Poisson PCF then runs with the
 // penumbra as its disk radius. Params ride free uniform lanes (fs_params
 // layout unchanged):
 //   cascade_debug.y = pcss_enabled (0.0/1.0)
@@ -275,7 +266,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 //   cascade_debug.w = pcss_blocker_radius (atlas-UV search radius)
 //   light_counts.z  = pcss_min_penumbra (atlas-UV clamp)
 //   light_counts.w  = pcss_max_penumbra (atlas-UV clamp)
-// Disabled (y <= 0.5): legacy fixed-radius 16x/8x Poisson PCF, bit-identical.
+// Disabled (y <= 0.5): fixed-radius 16x/8x Poisson PCF, bit-identical.
 // Counts mirror scene/shadow_pcss.zig (blocker_sample_count).
 #define PCSS_BLOCKER_SAMPLES 12
 
@@ -290,12 +281,12 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // Manual channel selection (no glTF counterpart; see Channel in
 // material.zig): picks one RGBA lane by uniform index through constant
 // branches — SPIRV-Cross cannot flatten dynamic component indexing for
-// legacy targets (HLSL5), same constraint as morphWeight.
+// HLSL5 targets, same constraint as morphWeight.
 // @include "common/channel_select.glsl"
 // @include "common/hemi.glsl"
 // @include "common/hemi_pbr.glsl"
 // @include "common/specular_aa.glsl"
-// @include "common/output_gamma.glsl"
+// @include "common/linear_output.glsl"
 
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
@@ -309,7 +300,7 @@ void main() {
     if (uv_offset[0].z > 0.5) {
         vec4 emissive_sample = texture(sampler2D(emissive_tex, data_smp), uvApply(uv_matrix[3], uv_offset[3], v_uv));
         vec3 emissive = emissive_factor.rgb * emissive_sample.rgb;
-        frag_color = babylonOutputColor(albedo_rgba.rgb + emissive, albedo_rgba.a);
+        frag_color = linearOutputColor(albedo_rgba.rgb + emissive, albedo_rgba.a);
         return;
     }
     vec3 albedo = albedo_rgba.rgb;
@@ -372,7 +363,7 @@ void main() {
     vec3 diffuse_albedo = albedo * (1.0 - dielectric_f0);
 
     // Clearcoat + sheen factors (scalar/color only, no textures this wave).
-    // Intensity 0 disables the lobe while keeping every legacy term exact.
+    // Intensity 0 disables the lobe while keeping every direct term exact.
     // Babylon's computeClearCoatLighting / computeSheenLighting apply the
     // same max(roughness, AARoughnessFactors.x) to the coat / sheen lobe.
     float cc_rough = max(clamp(clearcoat_factors.y, 0.03, 1.0), aa_rough);
@@ -416,7 +407,7 @@ void main() {
     // Transmission v1: thin-slab approx (no refraction target — non-goal).
     // Diffuse throughput scales by (1 - factor) AFTER F0 so metals keep
     // their F0; the additive back-light term lands in the post-Lo block.
-    // factor 0 skips: legacy albedo bit-identical.
+    // factor 0 skips: unlayered albedo bit-identical.
     vec3 orig_albedo = albedo;
     float transm_factor = clamp(transmission_factors.x, 0.0, 1.0);
     bool refracting = refraction_factors.x > 0.5 && refraction_capture.x > 0.5;
@@ -601,7 +592,7 @@ void main() {
     }
 
     // Clustered forward point lights (up to 64, no shadows): pixel -> tile
-    // -> tile light indices -> the same Cook-Torrance lobe as the legacy
+    // -> tile light indices -> the same Cook-Torrance lobe as the direct
     // lanes above (coat + sheen included, no shadow term). Gated on a live
     // tile grid (tiles_x/y > 0), a non-empty staged pool (count > 0) and a
     // landed GPU upload (w > 0.5); otherwise skipped entirely, so the empty
@@ -677,7 +668,7 @@ void main() {
     // Image-Based Lighting (IBL): two cube fetches + BRDF fit skipped when off.
     // Reflection probe (wave 25): same substitution as the regular PBR
     // shader (probe cube replaces env_tex when probe_params.x > 0.5).
-    // Instanced draws always upload zero here, so this stays legacy.
+    // Instanced draws always upload zero here, so this stays on the env-map branch.
     vec3 ibl = vec3(0.0);
     float ibl_intensity = pbr_factors.w;
     if (ibl_intensity > 0.001) {
@@ -700,7 +691,7 @@ void main() {
         // Clearcoat IBL: own roughness lobe; its fresnel attenuates the base
         // specular IBL (energy conservation). Sheen IBL: grazing-weighted
         // share of the diffuse irradiance. Both gated on intensity so the
-        // disabled path keeps the legacy IBL bit-identical (and skips the
+        // disabled path keeps the direct IBL bit-identical (and skips the
         // extra cube fetch).
         vec3 cc_F_ibl = fresnelSchlickRoughness(NdotV, cc_F0, cc_rough) * cc_intensity;
         vec3 cc_spec_ibl = vec3(0.0);
@@ -759,7 +750,7 @@ void main() {
     vec3 final_color = ambient + ibl + Lo + emissive + debug_tint;
     if (refracting) final_color += refractedBackground(N, V, roughness) * transm_factor * (1.0 - metallic) * transmission_color.rgb;
 
-    frag_color = babylonOutputColor(final_color, albedo_rgba.a);
+    frag_color = linearOutputColor(final_color, albedo_rgba.a);
 }
 @end
 

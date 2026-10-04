@@ -97,13 +97,9 @@ pub const user_shader_materials = [_]UserShaderMaterial{
 // `@import("math")`, wired here to agate's math facade.
 // ---------------------------------------------------------------------------
 
-/// Backend codegen shared by the engine forward shaders and user shaders
-/// (glsl430 carries the template SSBO syntax; metal_macos/hlsl5 cover the
-/// remaining desktop backends).
+/// Engine and user shaders share the supported Metal/WebGPU graphics floor.
 pub const engine_shader_slang = sokol.shdc.Slang{
-    .glsl430 = true,
     .metal_macos = true,
-    .hlsl5 = true,
     .wgsl = true,
 };
 
@@ -282,6 +278,8 @@ pub fn build(b: *Build) !void {
 
     const is_web = target.result.cpu.arch.isWasm();
     const opt_wgpu = b.option(bool, "wgpu", "Force WebGPU (default: true for web)") orelse is_web;
+    if (is_web and !opt_wgpu) return error.WebGPURequired;
+    if (!is_web and target.result.os.tag != .macos and !opt_wgpu) return error.ModernGraphicsBackendRequired;
 
     const dep_sokol = b.dependency("sokol", .{
         .target = target,
@@ -306,35 +304,15 @@ pub fn build(b: *Build) !void {
         name: []const u8,
         input: []const u8,
         output: []const u8,
-        /// Необязательный пер-модульный набор слэнгов. Дефолт (null) — общий
-        /// набор glsl410/metal_macos/hlsl5. Compute-шейдеры не выражаются в
-        /// GLSL 410, поэтому им нужен свой вызов shdc с glsl430 (доступность
-        /// на рантайме всё равно гейтится sg.queryFeatures().compute, см.
-        /// src/agate/compute.zig).
+        /// Per-module override; default is Metal + WGSL. Compute support
+        /// still requires the runtime sg.queryFeatures().compute gate.
         slang: ?sokol.shdc.Slang = null,
         /// Шейдер содержит `// @include` директивы: перед shdc запускается
         /// препроход expand_shader_includes (см. createShaderWithIncludes).
         /// Остальные идут напрямую через sokol.shdc.createModule.
         includes: bool = false,
     };
-    const default_slang = sokol.shdc.Slang{
-        .glsl410 = true, // Linux (GL)
-        .metal_macos = true, // macOS (Metal)
-        .hlsl5 = true, // Windows (D3D11)
-        .wgsl = true, // WebGPU
-    };
-    // Forward shaders with fragment-stage storage buffers (clustered
-    // lights, wave 30): SSBO syntax is not valid GLSL 4.10, so these five
-    // compile the GLSL leg as 4.30 (a strict superset for everything else
-    // they use). The Metal/HLSL legs are unchanged. Runtime GLSL needs a
-    // 4.3+ context (true on Linux desktop GL; macOS desktop GL caps at 4.1
-    // and never supported storage buffers — see src/agate/compute.zig).
-    const forward_slang = sokol.shdc.Slang{
-        .glsl430 = true,
-        .metal_macos = true,
-        .hlsl5 = true,
-        .wgsl = true, // WebGPU
-    };
+    const default_slang = engine_shader_slang;
     const shader_specs = [_]ShaderSpec{
         // Increment 2 of the shader-include refactor: the five forward
         // shaders share cluster structs, the shadow/PCF block,
@@ -342,19 +320,19 @@ pub fn build(b: *Build) !void {
         // variants additionally share the BRDF math + channelSelect.
         // Deliberately NOT shared: fs_params blocks (layout parity +
         // differing probe semantics) and morph/skin vertex variants.
-        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig", .slang = forward_slang, .includes = true },
-        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .slang = forward_slang, .includes = true },
-        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .slang = forward_slang, .includes = true },
-        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .slang = forward_slang, .includes = true },
-        .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .slang = forward_slang, .includes = true },
+        .{ .name = "shader", .input = "src/agate/shaders/standard.glsl", .output = "standard_shader.zig", .includes = true },
+        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
+        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
+        .{ .name = "instanced_shader", .input = "src/agate/shaders/instanced.glsl", .output = "instanced_shader.zig", .includes = true },
+        .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
         .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
         .{ .name = "msaa_depth_shader", .input = "src/agate/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
-        .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig" },
+        .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig", .includes = true },
         // Increment 1 of the shader-include refactor: these nine share the
         // fullscreen @vs body (src/agate/shaders/common/fullscreen_vs.glsl).
         // probe_mip.glsl is deliberately excluded (no Y-flip line).
         .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig", .includes = true },
-        .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig" },
+        .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig", .includes = true },
         // Stateful compute particles (wave 25): compute slang set (410 has
         // no compute); runtime availability still gates on
         // compute.supported(), see src/agate/compute.zig.
@@ -362,7 +340,7 @@ pub fn build(b: *Build) !void {
             .name = "particle_compute_shader",
             .input = "src/agate/shaders/particle_compute.glsl",
             .output = "particle_compute_shader.zig",
-            .slang = .{ .glsl430 = true, .metal_macos = true, .hlsl5 = true, .wgsl = true },
+            .slang = engine_shader_slang,
         },
         .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
@@ -661,8 +639,8 @@ pub fn build(b: *Build) !void {
             .target = target,
             .optimize = optimize,
             .emsdk = emsdk,
-            .use_webgpu = opt_wgpu,
-            .use_webgl2 = !opt_wgpu,
+            .use_webgpu = true,
+            .use_webgl2 = false,
             .use_emmalloc = true,
             .use_filesystem = true,
             .shell_file_path = dep_sokol.path("src/sokol/web/shell.html"),
@@ -677,6 +655,41 @@ pub fn build(b: *Build) !void {
         timing_build.dependOn(&b.addInstallArtifact(timing_exe, .{}).step);
         const native_run = b.addRunArtifact(timing_exe);
         timing_run.dependOn(&native_run.step);
+    }
+    const hdr_module = b.createModule(.{
+        .root_source_file = b.path(if (is_web) "examples/hdr_showcase_web.zig" else "examples/hdr_showcase.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const hdr_build = b.step("hdr-showcase", "Build the linear HDR studio showcase and finite GPU gate");
+    const hdr_run = b.step("run-hdr-showcase", "Run the HDR studio (B bloom, E exposure, Space effects)");
+    if (is_web) {
+        const hdr_lib = b.addLibrary(.{ .name = "hdr-showcase", .root_module = hdr_module });
+        const emsdk = dep_sokol.builder.dependency("emsdk", .{});
+        const link = try sokol.emLinkStep(b, .{
+            .lib_main = hdr_lib,
+            .target = target,
+            .optimize = optimize,
+            .emsdk = emsdk,
+            .use_webgpu = true,
+            .use_webgl2 = false,
+            .use_emmalloc = true,
+            .use_filesystem = true,
+            .shell_file_path = dep_sokol.path("src/sokol/web/shell.html"),
+            .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sINITIAL_MEMORY=128MB", "-sALLOW_MEMORY_GROWTH=1" },
+        });
+        hdr_build.dependOn(&link.step);
+        const web_run = sokol.emRunStep(b, .{ .name = "hdr-showcase", .emsdk = emsdk });
+        web_run.step.dependOn(&link.step);
+        hdr_run.dependOn(&web_run.step);
+    } else {
+        const hdr_exe = b.addExecutable(.{ .name = "hdr-showcase", .root_module = hdr_module });
+        hdr_build.dependOn(&b.addInstallArtifact(hdr_exe, .{}).step);
+        hdr_run.dependOn(&b.addRunArtifact(hdr_exe).step);
     }
     const lib_tests = b.addTest(.{
         .root_module = mod_agate,

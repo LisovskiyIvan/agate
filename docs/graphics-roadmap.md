@@ -3,6 +3,12 @@
 Дата: 03.10.2026. Основание: чтение текущего кода и два независимых исследования.
 Это **план**, а не список реализованных фич или обещание ускорения.
 
+Обновление направления 04.10.2026: только современная архитектура, без сохранения
+второго renderer и API ради обратной совместимости. Приоритеты удаления и
+переходов — [modernization-audit.md](./modernization-audit.md). HDR WIP
+закрыт 04.10.2026 единой linear-HDR цепочкой (см. Q1 ниже); двух режимов
+нет, staged-frame — единственная основа.
+
 Цель: выразительный PBR-свет и стабильная картинка в заданном бюджете GPU,
 при этом создание сцены остаётся простым, как в Babylon. Не копировать Unreal
 целиком и не добавлять архитектуру без проверяемого потребителя.
@@ -11,20 +17,24 @@
 
 | Прежняя предпосылка | Уточнение |
 |---|---|
-| Начать с auto-exposure | Сначала линейная HDR-цепочка. Main/history сейчас следуют формату backbuffer, обычно BGRA8/RGBA8; PBR compatibility-output может также обрезать цвет до записи. |
+| Начать с auto-exposure | Сначала единая линейная HDR-цепочка. Исходный main/history следовал backbuffer (обычно BGRA8/RGBA8); ранний PBR output-stage также обрезал цвет. Незавершённый HDR WIP не считать закрытием этой проблемы. |
 | Для SSGI уже есть Hi-Z | `visibility/` — CPU-пирамида из упрощённых окклюдеров, не GPU-глубина сцены. Для экранных лучей нужна отдельная GPU depth pyramid. |
 | DDGI даст свет вне экрана через Hi-Z | Экранные данные не содержат скрытую геометрию. Нужны baked probes либо трассировка по геометрии/BVH/SDF, материалы и проверка видимости. |
 | Indirect уменьшит draw calls | Один indirect на батч заменяет CPU-аргументы на GPU-аргументы. Число submissions/bindings само не уменьшается. |
 | Frame graph даст async compute | Граф описывает зависимости/время жизни ресурсов. Текущий sokol не предоставляет API нескольких очередей; D3D11 не превращается в D3D12. |
-| TAA автоматически даст скорость | TAA сейчас камерный, с LDR-history. Сам по себе это дополнительная работа; экономия возможна через меньшее render resolution и проверенный reconstruction. |
-| IBL уже завершён | Probe mips — box-аппроксимация, не GGX-prefilter. Выбирается ближайшая проба без блендинга. |
+| TAA автоматически даст скорость | TAA камерный, history уже HDR. Сам по себе это дополнительная работа; экономия возможна через меньшее render resolution и проверенный reconstruction. |
+| IBL уже завершён | Probe mips — box-аппроксимация, не GGX-prefilter (HDR capture выполнен, quality-prefilter не закончен). Выбирается ближайшая проба без блендинга. |
 | «80% Babylon API», «150–400 строк на backend» | Эти оценки не измерены. Использовать конкретные сценарии API и backend acceptance matrix. |
 
 Пути к доказательствам:
 
-- Main/history format: `src/agate/passes/postprocess_pass.zig:208–237,252–285`.
-- Gamma/clamp compatibility-path: `src/agate/shaders/common/output_gamma.glsl:25–42`.
-- TAA: `src/agate/shaders/postprocess.glsl:367–417`; jitter: `postprocess/taa.zig`.
+- Main/history format: `src/agate/passes/postprocess_pass.zig`, методы
+  `resize` и `ensureTaaHistory`.
+- Ранний gamma/clamp для совпадения с Babylon удалён из scene shading;
+  линейный выход — `src/agate/shaders/common/linear_output.glsl`, единый
+  output — POST-проход `postprocess.glsl`.
+- TAA: `src/agate/shaders/postprocess.glsl`, `applyTAA`;
+  jitter: `src/agate/postprocess/taa.zig`.
 - Probe approximation: `src/agate/shaders/probe_mip.glsl:1–7`.
 - CPU occlusion: `src/agate/visibility/hiz_buffer.zig`, [visibility.md](./visibility.md).
 - Sorting/compaction уже реализованы: `scene/render_queue/items.zig`,
@@ -32,10 +42,11 @@
 - Sokol draw/compute/usage: `sokol/sokol_gfx.h` относительно workspace `engine/`;
   indirect-consumer API и публичного buffer readback сейчас нет.
 
-## Два независимых режима проверки
+## Проверка собственного контракта
 
-**Совместимость:** оставить существующий Babylon parity-path и неизменные
-пороги `bench/visual_gate.py`. Выключенные новые эффекты не меняют этот режим.
+**Корректность:** radiance, blending, resolve, transfer, владение и жизненный цикл
+проверяются по контракту Agate. Babylon — сравнительный reference, а не требование
+сохранять его output-stage или pixel tolerances при смене renderer.
 
 **Качество:** отдельные reference-сцены, экспозиция/свет зафиксированы,
 проверяются клиппинг, light leaks, temporal artifacts и стоимость каждого эффекта.
@@ -59,19 +70,9 @@ wall interval, P95/P99, VRAM, texture uploads и dynamic updates — разны�
 **Гейт:** воспроизводимый baseline, лицензированные ассеты, стабильная камера;
 скриншоты и короткие траектории движения, не только замороженный кадр.
 
-### Q1. Linear HDR → exposure → final output
+### Q1. Linear HDR → exposure → final output — инфраструктура выполнена 04.10.2026
 
-Opt-in HDR main target (кандидат RGBA16F), совместимые пайплайны/resolve/MSAA.
-Проверить не только renderability, но sampling/filtering/blending и sample counts.
-Не менять один enum: scene shading, transparency, sky/probes, bloom и output
-должны согласовать цветовое пространство. Убрать ранний gamma/clamp только
-в новом HDR-path; тонемаппинг и display transfer выполняются один раз в конце.
-Compatibility-path остаётся прежним.
-
-Затем добавить экспонометр: сначала downsample log-luminance, при необходимости
-histogram compute; metering mask, EV/min-max limits, asymmetric adaptation,
-camera-cut reset, детерминированный manual exposure для тестов.
-Не читать среднюю яркость обратно на CPU каждый кадр.
+Единый HDR main target (обязательный RGBA16F), согласованные пайплайны/resolve/MSAA (`prepareMainTargets` канонический, fail-closed, без SDR-fallback; обязательные sample/filter/render/blend-caps — явная ошибка старта). Ранний display gamma/clamp удалён; тонемаппинг и display transfer — один раз в конце (один IEC transfer, ручной UNORM / hw-sRGB). Отключение эффектов не отключает output pass (exposure+tonemap всегда). Затем exposure: сейчас ручной `exposure`, auto-exposure (downsample log-luminance / histogram, metering mask, EV-limits, adaptation, camera-cut reset) — будущее.
 
 **Гейт:** свет >1 сохраняется до tonemap; тёмная комната → яркое окно без
 клиппинга промежуточных targets, pumping, NaN или двойной gamma. Resize,
@@ -81,8 +82,7 @@ MSAA и неподдерживаемый формат проверяются о�
 
 Сначала offline GGX-prefilter для environment + diffuse SH/irradiance.
 Проверить BRDF-LUT/roughness/LOD conventions и ориентацию cube faces.
-Потом улучшать on-demand probes: HDR capture, корректный prefilter,
-обоснованные spatial weights/blending и при необходимости box projection.
+Потом улучшать on-demand probes: HDR capture выполнен (RGBA16F), корректный GGX-prefilter и box-prefilter quality — не закончены, spatial weights/blending и при необходимости box projection — дальше.
 Это не автоматический GI и не «маленький дифф» без проверки всех PBR-контуров.
 
 **Гейт:** металлические/диэлектрические шары roughness 0→1, яркие маленькие
@@ -114,7 +114,7 @@ moving object. Для SSGI свет за экраном обязан иметь 
 
 Добавить velocity для opaque rigid/skinned/instanced, предыдущие трансформы
 в prepared snapshots, depth/history rejection и reset при resize/camera cut.
-Потом variance clipping/reactive treatment для стекла, частиц и disocclusion.
+Камера TAA — без velocity-формирования; history уже HDR (не LDR). Потом variance clipping/reactive treatment для стекла, частиц и disocclusion.
 Выбрать HDR/pre-exposed историю и согласовать её с exposure, не просто менять формат.
 
 Затем сравнить native resolution с render-scale + spatial/temporal reconstruction.
@@ -165,8 +165,10 @@ CPU-authored indexed arguments → compute-authored arguments для **фикс�
 
 Нужны: indirect+storage usage, точный ABI/count/offset/alignment, index type,
 base vertex/instance capability gates, overflow/bounds validation, trace hooks
-и backend-owned compute-write→indirect-read synchronization. Проверить Metal,
-D3D11, GL и WebGPU отдельно; unsupported-политика явная, CPU path сохраняется.
+и backend-owned compute-write→indirect-read synchronization. В Agate проверить
+Metal и WebGPU; общий fork сокола отдельно проверяет свои backend-контракты
+для других потребителей. Unsupported-политика явная; CPU-authored arguments
+остаются полезным reference и рабочим вариантом, а не compatibility renderer.
 Сокращение числа вызовов — отдельная multi-draw/material-routing задача.
 
 **Гейт:** CPU- и GPU-authored args дают одинаковые pixels/counts; zero instances,
@@ -211,11 +213,13 @@ Quality presets/feature capabilities должны быть явными; unsuppo
 
 ## Ближайший выбор и критерий остановки
 
-После закрытия WIP — **Q0 → Q1 → Q2**. Далее выбрать **один GI-трек Q3**,
+После закрытия WIP — **Q0 → Q1 (инфраструктура выполнена, auto-exposure будущее) → Q2**. Далее выбрать **один GI-трек Q3**,
 а temporal Q4 / atmosphere Q5 ранжировать по reference-сценам. P0 идёт рядом,
 P1 запускается только при доказанной задаче GPU visibility или CPU submission.
-Всё новое opt-in до визуальных и ресурсных гейтов. Достигли целевой картинки
-и frame budget — остановиться, а не автоматически реализовывать весь backlog.
+Художественные эффекты включаются явно; HDR/output и staged-frame — единая основа,
+не альтернативные режимы. Смену основы завершать переносом consumers и новыми
+визуальными/ресурсными гейтами, без постоянного второго renderer. Достигли целевой
+картинки и frame budget — остановиться, а не автоматически реализовывать весь backlog.
 
 ## Первичные источники
 

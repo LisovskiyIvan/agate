@@ -113,6 +113,23 @@ fn smokeFail(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("rtt-smoke FAIL: " ++ fmt ++ "\n", args);
 }
 
+/// Staged prepare helper (test-only): requires a fresh FULL producer build,
+/// then claims + finishes it. Preserves an already-prepared pending frame
+/// (no rebuild). Returns false + records a failure when no fresh build can
+/// be claimed/finished.
+fn prepare(scn: *z.Scene) bool {
+    if (!scn.buildPreparedFrame()) {
+        smokeFail("staged build saturated at frame {}", .{frame_count});
+        return false;
+    }
+    const claim = scn.beginStagedPrepare() orelse {
+        smokeFail("fresh build not claimable at frame {}", .{frame_count});
+        return false;
+    };
+    scn.finishStagedPrepare(claim);
+    return true;
+}
+
 fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) void {
     var it = std.process.Args.Iterator.initAllocator(args, allocator) catch return;
     defer it.deinit();
@@ -186,8 +203,6 @@ export fn init() callconv(.c) void {
     // --- capture scene: camera + light + box, DEFAULT materials only ---
     // (no RTT view is ever bound here: feedback impossible by construction).
     capture_scene = z.Scene.init(allocator);
-    // Texture inputs are linear: encode only once, in the display scene.
-    capture_scene.output_gamma = false;
     capture_scene.active_camera = .{ .arc_rotate = z.ArcRotateCamera.init("cap_cam", .{
         .alpha = std.math.pi / 4.0,
         .beta = std.math.pi / 3.0,
@@ -327,7 +342,7 @@ export fn init() callconv(.c) void {
     display_mat.diffuse_texture = borrow;
     const saved_material = capture_box.material;
     capture_box.setStandardMaterial(display_mat);
-    capture_scene.prepareFrame();
+    if (!prepare(&capture_scene)) smokeFail("feedback setup prepare failed", .{});
     if (rtt.renderPrimaryView(&capture_scene, .{})) |_| {
         smokeFail("alternate-view feedback capture unexpectedly succeeded", .{});
     } else |err| {
@@ -388,8 +403,12 @@ export fn frame() callconv(.c) void {
         display_mat.diffuse_texture = null;
     }
 
-    capture_scene.prepareFrame();
-    display_scene.prepareFrame();
+    const previous_capture_frame = capture_scene.preparedDraws().frame_id;
+    if (!prepare(&capture_scene)) smokeFail("capture prepare failed at frame {}", .{frame_count});
+    if (!prepare(&display_scene)) smokeFail("display prepare failed at frame {}", .{frame_count});
+    if (capture_scene.preparedDraws().frame_id != previous_capture_frame + 1) {
+        smokeFail("capture did not consume a fresh producer frame {}", .{frame_count});
+    }
     const cap_draws_before = capture_scene.stats.draw_calls;
     const cap_tris_before = capture_scene.stats.triangles;
 

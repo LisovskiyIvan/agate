@@ -15,16 +15,19 @@
 //! Правила epoch:
 //! - `begin` открывает новый epoch кадра; `complete(e)` закрывает epoch e;
 //!   кадры строго последовательны, поэтому `begin` заодно закрывает
-//!   предыдущий незакрытый epoch (защита от prepareFrame без парного render).
+//!   предыдущий незакрытый epoch (защита от staged begin без парного render/finish).
 //! - Запись, ушедшая в ретенцию в epoch E, уничтожается первым `flush` после
 //!   `complete(E)` (условие `entry.epoch <= lastCompleted()`). Запись текущего
 //!   (ещё не завершённого) epoch ждёт следующего завершения — render, который
 //!   мог её использовать, гарантированно закончился.
 //! - Однопоточное поведение не меняется: отсрочка максимум на кадр, как раньше
 //!   с `pending_gpu_destroys`.
-//! Где flush: `Scene.flushPendingGpuUploads` (начало кадра, внутри prepareFrame)
-//! и `Scene.deinit` (через `deinit`, уничтожающий и незавершённые эпохи).
-//! Каденция flush — context-поток при УСПЕШНОМ prepare: пока prepare не
+//! Где flush: staged `flushSlotUploads` (retire.flush + создание из slot
+//! byte-пакетов; продьюсер коммитит созданные хендлы game-side следующим
+//! билдом) и quiesced drain через `Scene.flushPendingGpuUploads`
+//! (тесты/teardown/creation drain + P5 seam — НЕ нормальный кадровый путь),
+//! плюс `Scene.deinit` (через `deinit`, уничтожающий и незавершённые эпохи).
+//! Каденция flush — context-поток при УСПЕШНОМ staged begin: пока begin не
 //! проходит (длинная серия `Scene.renderReuse` без владения фазой), flush не
 //! наступает и ретенция растёт как skip-streak × destroy-rate. Рост НЕ
 //! безграничен: `pending_cap` ограничивает суммарно удерживаемые записи
@@ -165,7 +168,7 @@ pub const GpuRetireQueue = struct {
     /// Начало render-кадра: открывает новый epoch и возвращает его. Заодно
     /// закрывает предыдущий незакрытый epoch — кадры строго последовательны
     /// (владение фазой P1), поэтому старт кадра N+1 означает конец кадра N.
-    /// Только context-поток (зовёт Scene.prepareFrame).
+    /// Только context-поток (зовёт staged begin).
     pub fn begin(self: *Self) Epoch {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();

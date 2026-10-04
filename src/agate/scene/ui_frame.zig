@@ -1,12 +1,12 @@
 //! P6 UI handoff: Scene UI draw consumes an immutable render-owned frame.
 //!
 //! Ownership block (mirrors the P4/P5 shape, one boundary at a time):
-//! - WRITES the capture at prepare/context ownership boundary
-//!   (`Scene.prepareFrame`, context thread, under the overall phase_mutex):
-//!   `capture` copies CPU geometry + draw parameters out of the live
-//!   `UICanvas`, `upload` grows/refreshes the canvas-owned GPU buffers and
-//!   spends the sokol frame's single `updateBuffer` per buffer. Both run
-//!   back-to-back inside prepareFrame; neither runs during draw.
+//! - Producer `BuildClaim.stageUi` freezes canvas geometry in its claimed
+//!   slot. Context-side staged prepare calls `capturePacket` on those bytes;
+//!   it never copies live canvas geometry. `upload` grows/refreshes the
+//!   context-owned canvas GPU pair and spends one `updateBuffer` per buffer.
+//!   Standalone callers may explicitly use `capture(canvas)` outside Scene.
+//!   Neither capture nor upload runs during prepared drawing.
 //! - READS the committed packet at draw time (`drawPrepared`, upload-free):
 //!   Scene's direct path and `PostFXStack.renderChain` draw the frame, never
 //!   the live canvas lists, style/input state, or live pipeline/font fields.
@@ -21,7 +21,7 @@
 //!   `GpuRetireQueue.retireBuffer` (same epochs, no new queue/kind); the
 //!   null-queue standalone case destroys immediately with the documented
 //!   caller obligation (no outstanding snapshots), exactly like P5 staging.
-//!   Both upload paths (frame + legacy immediate) share the single
+//!   Both upload paths (prepared frame + standalone immediate) share the single
 //!   `UICanvas.ensureUiBufferPair` routine: every needed replacement is
 //!   created + VALIDated before any upload/install/retire.
 //! - Same-sokol-frame policy: FIRST-COMMITTED-WINS, automatic. The window
@@ -59,12 +59,11 @@
 //!   (a FAILED state is possible with a nonzero id, so the id is never the
 //!   validity check); any failure keeps the owned GPU pair valid and drops
 //!   the frame to coherent-empty for a next-frame retry.
-//! - Single-frame Scene ownership, prepare/render SEQUENTIAL on the context
-//!   thread (no P7 double buffering). Variable-length slices never cross a
-//!   frame mailbox: Scene holds this frame directly. Update CAN overlap
-//!   render (actual update||render boundary) — safe because the draw reads
-//!   only this committed frame (upload-free), never the live canvas; update
-//!   vs prepare stay excluded under phase_mutex.
+//! - Prepare/render are sequential on the context thread. Variable-length
+//!   producer geometry crosses only through leased slot-owned copies; Scene
+//!   holds the committed GPU packet directly. Update may overlap prepare and
+//!   render: both consume frozen geometry, never the live canvas lists. Canvas
+//!   GPU metadata and lifetime changes still require context ownership/quiesce.
 //!
 //! Headless note: every `sg.*` WRITE sits behind `sg.isvalid()`, so unit
 //! tests exercise capture/packet/policy purely on CPU. `capture` may query

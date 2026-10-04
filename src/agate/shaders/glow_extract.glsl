@@ -1,8 +1,8 @@
 // Glow Threshold-Extract Shader for agate (glow layer v1).
 // Soft bright-pass of the resolved scene color into the half-resolution
-// glow target. Mirrors extractBright in postprocess.glsl (and glowExtract
-// in postprocess.zig, which pins the formula for CPU tests); the separable
-// blur stages (glow_blur.glsl) widen it into the halo.
+// glow target. Same formula as glowExtract in postprocess.zig (which pins
+// it for CPU tests); the separable blur stages (glow_blur.glsl) widen it
+// into the halo.
 @header const m = @import("math")
 
 @vs vs

@@ -57,17 +57,15 @@ pub const GlowPass = struct {
     base_width: i32 = 0,
     base_height: i32 = 0,
 
-    /// Render-target pixel format, shared convention with
-    /// BloomPass.bloomPixelFormat (HDR halo where the backend can render
-    /// to it, LDR fallback otherwise). Context thread only (queries live
-    /// sokol caps; headless sg aborts on pixelformat queries).
+    /// Sole-contract render-target pixel format (always RGBA16F; the
+    /// backend capability is validated once at Scene startup). Pure
+    /// (no sg calls, headless-safe).
     pub fn glowPixelFormat() sg.PixelFormat {
-        if (sg.queryPixelformat(.RGBA16F).render) return .RGBA16F;
-        return .RGBA8;
+        return .RGBA16F;
     }
 
-    /// Bytes per pixel of the pass targets for the census. Context thread
-    /// only (see glowPixelFormat).
+    /// Bytes per pixel of the pass targets (always 8: RGBA16F). Pure
+    /// (no sg calls, headless-safe).
     pub fn glowBytesPerPixel() usize {
         return if (glowPixelFormat() == .RGBA16F) 8 else 4;
     }
@@ -162,6 +160,7 @@ pub const GlowPass = struct {
 
     pub fn resize(self: *GlowPass, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
+        if (!sg.isvalid()) return;
         if (self.base_width == width and self.base_height == height) return;
 
         self.destroyTargets();
@@ -169,36 +168,62 @@ pub const GlowPass = struct {
         const glow_fmt = glowPixelFormat();
         const size = pp.bloomMipSize(width, height, 0);
 
-        const extract_img = sg.makeImage(.{
+        // Store-first rollback: every handle lands in the struct before its
+        // state check, so a single destroyTargets frees the failed handle
+        // plus all partial handles (views before images). A failed resize
+        // leaves zero ids and a zero base size, and render() reports empty.
+        self.extract_image = sg.makeImage(.{
             .usage = .{ .color_attachment = true },
             .width = size.w,
             .height = size.h,
             .pixel_format = glow_fmt,
             .sample_count = 1,
         });
-        self.extract_image = extract_img;
+        if (sg.queryImageState(self.extract_image) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.extract_att_view = sg.makeView(.{
-            .color_attachment = .{ .image = extract_img },
+            .color_attachment = .{ .image = self.extract_image },
         });
+        if (sg.queryViewState(self.extract_att_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
         self.extract_tex_view = sg.makeView(.{
-            .texture = .{ .image = extract_img },
+            .texture = .{ .image = self.extract_image },
         });
+        if (sg.queryViewState(self.extract_tex_view) != .VALID) {
+            self.destroyTargets();
+            return;
+        }
 
         for (0..2) |i| {
-            const blur_img = sg.makeImage(.{
+            self.blur_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
                 .pixel_format = glow_fmt,
                 .sample_count = 1,
             });
-            self.blur_images[i] = blur_img;
+            if (sg.queryImageState(self.blur_images[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = blur_img },
+                .color_attachment = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_att_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.blur_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = blur_img },
+                .texture = .{ .image = self.blur_images[i] },
             });
+            if (sg.queryViewState(self.blur_tex_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
         }
 
         self.base_width = width;
@@ -257,6 +282,7 @@ pub const GlowPass = struct {
         if (base_w <= 0 or base_h <= 0) return .{};
 
         self.resize(base_w, base_h);
+        if (self.base_width != base_w or self.base_height != base_h) return .{};
         if (self.extract_image.id == 0) return .{};
 
         // Stage 1: threshold extract into the extract target.
@@ -300,17 +326,16 @@ pub const GlowPass = struct {
     }
 
     fn destroyTargets(self: *GlowPass) void {
-        if (self.extract_image.id == 0) return;
-        sg.destroyImage(self.extract_image);
-        sg.destroyView(self.extract_att_view);
-        sg.destroyView(self.extract_tex_view);
+        if (self.extract_att_view.id != 0) sg.destroyView(self.extract_att_view);
+        if (self.extract_tex_view.id != 0) sg.destroyView(self.extract_tex_view);
+        if (self.extract_image.id != 0) sg.destroyImage(self.extract_image);
         self.extract_image = .{};
         self.extract_att_view = .{};
         self.extract_tex_view = .{};
         for (0..2) |i| {
-            sg.destroyImage(self.blur_images[i]);
-            sg.destroyView(self.blur_att_views[i]);
-            sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_att_views[i].id != 0) sg.destroyView(self.blur_att_views[i]);
+            if (self.blur_tex_views[i].id != 0) sg.destroyView(self.blur_tex_views[i]);
+            if (self.blur_images[i].id != 0) sg.destroyImage(self.blur_images[i]);
             self.blur_images[i] = .{};
             self.blur_att_views[i] = .{};
             self.blur_tex_views[i] = .{};
@@ -352,12 +377,15 @@ test "glow pass fail-closes headless with no state touched" {
     // Base size untouched: no resize happened.
     try std.testing.expectEqual(@as(i32, 0), pass.base_width);
     try std.testing.expectEqual(@as(i32, 0), pass.base_height);
+    // The sole-contract format helpers are pure (no sg calls).
+    try std.testing.expectEqual(sg.PixelFormat.RGBA16F, GlowPass.glowPixelFormat());
+    try std.testing.expectEqual(@as(usize, 8), GlowPass.glowBytesPerPixel());
 }
 
 test "glow target bytes account three half-res targets" {
     // Pure byte math (no sg calls): exact and deterministic headless. The
-    // RGBA8 leg (4 Bpp) is pinned here; the RGBA16F leg (8 Bpp) shares the
-    // same formula with glowBytesPerPixel (context-only, like bloom).
+    // RGBA16F leg (8 Bpp, via the pure glowBytesPerPixel) shares the same
+    // formula; the RGBA8 leg (4 Bpp) is pinned for the census shape.
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 4), GlowPass.targetBytes(1280, 720, 4));
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 8), GlowPass.targetBytes(1280, 720, 8));
     // Doubling both dims quadruples the census (area scaling).

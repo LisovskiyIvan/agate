@@ -109,11 +109,6 @@ pub fn pollFrameSample() ?Sample {
     return sampleFromC(ms, sg.queryGpuFrameIndex());
 }
 
-/// Legacy profiler helper: unavailable samples map to 0, not CPU time.
-pub fn pollFrameMs() f32 {
-    return if (pollFrameSample()) |sample| sample.ms else 0;
-}
-
 /// Context-thread phase bracket; sequential, never nested. Unsupported is a no-op.
 pub fn beginPass(pass: Pass) void {
     if (!applyIntent()) return;
@@ -134,13 +129,9 @@ pub fn pollPassSample(pass: Pass) ?Sample {
     return sampleFromC(ms, sg.queryGpuScopeFrameIndex(@intFromEnum(pass)));
 }
 
-pub fn pollPassMs(pass: Pass) f32 {
-    return if (pollPassSample(pass)) |sample| sample.ms else 0;
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests (all headless: no sg context here, so every call must be a
-// fail-closed no-op returning 0 and must never reach the C symbols).
+// fail-closed no-op returning null and must never reach the C symbols).
 // ---------------------------------------------------------------------------
 
 test "gpu_timing parses AGATE_GPU_TIMINGS flag values" {
@@ -164,12 +155,12 @@ test "gpu_timing is off by default and fail-closed headless" {
 
     try std.testing.expect(!sg.isvalid());
     try std.testing.expect(!isEnabled());
-    try std.testing.expectEqual(@as(f32, 0), pollFrameMs());
+    try std.testing.expect(pollFrameSample() == null);
 
-    // Enabled intent but no sg context: still 0, no C call, no panic.
+    // Enabled intent but no sg context: still null, no C call, no panic.
     setEnabled(true);
     try std.testing.expect(isEnabled());
-    try std.testing.expectEqual(@as(f32, 0), pollFrameMs());
+    try std.testing.expect(pollFrameSample() == null);
 }
 
 test "gpu_timing maps Agate phases to generic sokol scopes" {
@@ -184,15 +175,15 @@ test "gpu_timing per-pass brackets are fail-closed headless" {
     defer setEnabled(was_enabled);
     try std.testing.expect(!sg.isvalid());
 
-    // Disabled: brackets are pure no-ops, polls read 0.
+    // Disabled: brackets are pure no-ops, polls read null.
     setEnabled(false);
     beginPass(.shadow);
     endPass(.shadow);
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.shadow));
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.main));
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.post));
+    try std.testing.expect(pollPassSample(.shadow) == null);
+    try std.testing.expect(pollPassSample(.main) == null);
+    try std.testing.expect(pollPassSample(.post) == null);
 
-    // Enabled intent but no sg context: still no C call, no panic, 0.
+    // Enabled intent but no sg context: still no C call, no panic, null.
     setEnabled(true);
     beginPass(.main);
     beginPass(.post);
@@ -200,9 +191,9 @@ test "gpu_timing per-pass brackets are fail-closed headless" {
     endPass(.post);
     // Unbalanced end (no begin) must also stay a safe no-op.
     endPass(.shadow);
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.shadow));
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.main));
-    try std.testing.expectEqual(@as(f32, 0), pollPassMs(.post));
+    try std.testing.expect(pollPassSample(.shadow) == null);
+    try std.testing.expect(pollPassSample(.main) == null);
+    try std.testing.expect(pollPassSample(.post) == null);
 }
 
 test "gpu_timing optional samples and capabilities are unavailable headless" {

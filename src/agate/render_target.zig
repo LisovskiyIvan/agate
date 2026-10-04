@@ -16,11 +16,11 @@
 //! - Single 2D color attachment (+ optional depth), single mip level, no
 //!   array/cube/MSAA-resolve-texture subtleties beyond the standard
 //!   MSAA color-resolve pair the main target already uses.
-//! - Default formats mirror the swapchain (`sg.queryDesc` environment
-//!   defaults, else BGRA8/DEPTH) so the forward pipelines match without any
-//!   pipeline work. Custom formats are allowed for clear/sample-only use;
-//!   drawing scene content into a non-default format needs matching
-//!   pipelines (main-thread integration, not here).
+//! - Default color format is linear HDR `RGBA16F` (the renderer is always
+//!   linear HDR now; `desc.color_format = .DEFAULT` resolves to it). Custom
+//!   formats are allowed for clear/sample-only use; drawing scene content
+//!   into a non-HDR format is refused by `renderPrimaryView` (lossless
+//!   radiance contract: exactly one scene HDR format, no silent LDR clamp).
 //! - No retire-queue kind: `GpuRetireQueue` lives under `scene/` (owned by
 //!   the main thread) and only knows mesh/buffer/probe/ui3d payloads. This
 //!   target is context-thread owned and destroys immediately in `deinit`.
@@ -45,14 +45,12 @@
 //! or two distinct ping-pong targets; a saved previous-frame borrow of the
 //! SAME attachment is still feedback and capture preflight rejects it.
 //!
-//! Linear/sRGB semantics: the target stores exactly what the bound pipeline
-//! writes. The default UNORM formats (RGBA8/BGRA8) apply no hardware
-//! conversion — with `Scene.output_gamma = true` (the default) the forward
-//! shaders already emit display-referred color, so sampling the target in a
-//! later pass must treat it as display-referred unless the scene renders
-//! with `output_gamma = false`. The explicit sRGB GPU variants (`SRGB8A8` /
-//! `SBGR8A8`, see `isSrgbFormat`) perform hardware sRGB encoding on write on
-//! backends that support it; v1 recommends the default UNORM path.
+//! Linear HDR semantics: the target stores exactly what the bound pipeline
+//! writes. The renderer is always linear HDR now: the default `RGBA16F`
+//! target holds linear radiance (no display-referred encoding, no hardware
+//! sRGB conversion). Explicit sRGB GPU variants (`SRGB8A8` / `SBGR8A8`, see
+//! `isSrgbFormat`) perform hardware sRGB encoding on write on backends that
+//! support it; v1 recommends the HDR default for any scene capture.
 //!
 //! Borrow rule for `asTexture`: the returned `Texture` is BORROWED — the
 //! target keeps owning every handle (`owns_handles = false`); any
@@ -89,9 +87,9 @@ pub const RenderTargetDesc = struct {
     /// request the backend cannot serve degrades to the closest valid count
     /// (never a creation failure). The actual count lands in `sample_count`.
     sample_count: i32 = 1,
-    /// `.DEFAULT` resolves to the swapchain color format (else RGBA8 — the
-    /// same selection as the postfx main target, so forward pipelines
-    /// match). Must be renderable (`sg.queryPixelformat(fmt).render`).
+    /// `.DEFAULT` resolves to the HDR default (`RGBA16F` — the same format
+    /// as the main target, so forward pipelines match). Must be renderable
+    /// (`sg.queryPixelformat(fmt).render`).
     color_format: sg.PixelFormat = .DEFAULT,
     /// `.DEFAULT` resolves to the swapchain depth format (else DEPTH).
     /// `.NONE` disables the depth attachment (same as `depth_enabled =
@@ -160,16 +158,10 @@ pub fn isDepthFormat(fmt: sg.PixelFormat) bool {
         else => false,
     };
 }
-/// Swapchain color format fallback chain shared with the postfx main target:
-/// environment default, else BGRA8. Requires no live context to *read*
-/// (`sg.queryDesc` is a plain struct copy); only used on paths that already
-/// require one.
+/// HDR color default (pure, no `sg` calls): the renderer is always linear
+/// HDR, so the default capture format is `RGBA16F` unconditionally.
 pub fn defaultColorFormat() sg.PixelFormat {
-    const env_def = sg.queryDesc().environment.defaults;
-    return if (env_def.color_format != .DEFAULT and env_def.color_format != .NONE)
-        env_def.color_format
-    else
-        .BGRA8;
+    return .RGBA16F;
 }
 
 /// Swapchain depth format fallback chain shared with the postfx main target:
@@ -202,6 +194,7 @@ pub const Capabilities = struct {
     color_sample: bool = false,
     color_filter: bool = false,
     color_render: bool = false,
+    color_blend: bool = false,
     color_msaa: bool = false,
     depth_render: bool = false,
     depth_msaa: bool = false,
@@ -218,12 +211,25 @@ pub const Capabilities = struct {
 
     /// True when the color format can be rendered into and the depth format
     /// (unless `.NONE`) is a depth format. Pure — the live per-format
-    /// capability bits are checked separately in `create`.
+    /// capability bits are checked separately in `create`. Blend is NOT
+    /// required here: opaque/clear-only targets on other formats stay
+    /// creatable; scene capture gates blend separately (see
+    /// `supportsCapture`).
     pub fn supportsTarget(self: Capabilities, color_format: sg.PixelFormat, depth_format: sg.PixelFormat) bool {
         if (color_format == .NONE or color_format == .DEFAULT) return false;
         if (!self.color_render) return false;
         if (depth_format == .NONE) return true;
         if (!isDepthFormat(depth_format)) return false;
+        return self.depth_render;
+    }
+
+    /// True when the pair can carry a scene capture: renderable HDR color
+    /// with sample + filter + blend (every scene material family blends
+    /// alpha) plus a renderable depth format. Pure.
+    pub fn supportsCapture(self: Capabilities, color_format: sg.PixelFormat, depth_format: sg.PixelFormat) bool {
+        if (color_format != .RGBA16F) return false;
+        if (!self.color_render or !self.color_sample or !self.color_filter or !self.color_blend) return false;
+        if (depth_format == .NONE or !isDepthFormat(depth_format)) return false;
         return self.depth_render;
     }
 };
@@ -241,6 +247,7 @@ pub fn queryCapabilities(color_format: sg.PixelFormat, depth_format: sg.PixelFor
         .color_sample = ci.sample,
         .color_filter = ci.filter,
         .color_render = ci.render,
+        .color_blend = ci.blend,
         .color_msaa = ci.msaa,
         .depth_render = di.depth,
         .depth_msaa = depth_format == .NONE or di.msaa,
@@ -268,12 +275,10 @@ pub const CaptureError = error{
     InvalidViewSlot,
     /// The prepared snapshot carries no camera (scene has none).
     NoCamera,
-    /// Target color format differs from the swapchain/forward format
-    /// (`defaultColorFormat()`). Scene capture renders with the forward
-    /// pipelines, which are built for the main-target formats; anything
-    /// else (explicit RGBA8 vs BGRA8 default, RGBA16F, sRGB variants)
-    /// would silently swap channels or change encoding, so it is refused.
-    /// Clear/sample-only use of such targets is unaffected.
+    /// Target color format is not the scene HDR format (`RGBA16F` — the
+    /// only scene-capture format, so radiance survives losslessly). Any
+    /// other format (explicit RGBA8/BGRA8, sRGB variants, RGBA32F) is
+    /// refused. Clear/sample-only use of such targets is unaffected.
     IncompatibleColorFormat,
     /// Target has no depth attachment. Scene capture needs depth: the
     /// forward pipelines are depth-tested with writes on, and a pass
@@ -364,7 +369,6 @@ pub const RenderTarget = struct {
         const backend = sg.queryBackend();
         const formats_msaa_capable = ci.msaa and (depth_fmt == .NONE or sg.queryPixelformat(depth_fmt).msaa);
         const samples = msaa.effectiveSampleCount(desc.sample_count, .{
-            .post_enabled = true,
             .formats_msaa_capable = formats_msaa_capable,
             .backend = backend,
         });
@@ -378,6 +382,10 @@ pub const RenderTarget = struct {
             .min_filter = desc.min_filter,
             .mag_filter = desc.mag_filter,
         };
+        // Rollback: every handle below is stored into `self` first and each
+        // step is validated with `query*State != .VALID` (never id-only), so
+        // a later failure destroys all earlier FAILED-but-nonzero objects —
+        // views before images — and never publishes a half-alive target.
         errdefer self.deinit();
 
         const w: i32 = @intCast(desc.width);
@@ -621,6 +629,7 @@ pub const RenderTarget = struct {
     /// pass is open the handles report empty (dims/format metadata intact)
     /// — same self-sampling rule as `sampleView`.
     pub fn asTexture(self: *const RenderTarget) Texture {
+        const hdr = self.color_format == .RGBA16F or self.color_format == .RGBA32F;
         if (self.pass_open) {
             return .{
                 .image = .{},
@@ -630,7 +639,7 @@ pub const RenderTarget = struct {
                 .height = self.height,
                 .num_mipmaps = 1,
                 .format = self.color_format,
-                .is_hdr = false,
+                .is_hdr = hdr,
                 .owns_handles = false,
             };
         }
@@ -642,7 +651,7 @@ pub const RenderTarget = struct {
             .height = self.height,
             .num_mipmaps = 1,
             .format = self.color_format,
-            .is_hdr = false,
+            .is_hdr = hdr,
             .owns_handles = false,
         };
     }
@@ -658,14 +667,15 @@ pub const RenderTarget = struct {
     /// (`pinFront`/`unpin`, same as `Scene.render`) across the whole read,
     /// so a concurrent producer cannot reclaim the slot mid-capture and an
     /// invalid/never-prepared front is refused up front instead of drawn.
-    /// Scene-capture format layout is enforced, not documented-and-hoped:
-    /// the color format must equal `defaultColorFormat()` and a depth
-    /// attachment in `defaultDepthFormat()` is required (see
-    /// `CaptureError`; clear/sample-only targets with exotic formats keep
-    /// working — only scene capture is gated).
+    /// Scene-capture format contract is enforced, not documented-and-hoped:
+    /// the color format must be the scene HDR format (`RGBA16F`) with live
+    /// sample + filter + render + blend caps (every scene material family
+    /// blends alpha), and a depth attachment in `defaultDepthFormat()` is
+    /// required (see `CaptureError`; clear/sample-only targets with exotic
+    /// formats keep working — only scene capture is gated).
     ///
     /// Frame-ordering contract (for the pipeline owner): call between
-    /// `prepareFrame` (or a staged begin/finish) and `Scene.render`, while
+    /// a staged begin/finish and `Scene.render`, while
     /// the prepared draws are consumable. Shadow maps and probe contents
     /// are the previous frame's when the capture runs before this frame's
     /// shadow/probe passes — the same documented one-frame lag as probe
@@ -680,12 +690,26 @@ pub const RenderTarget = struct {
         gpu_thread.assertOnContextThread();
         if (!scene.hasConsumableFrame()) return error.NoConsumableFrame;
 
-        // Layout gate before touching any slot: the forward pipelines are
-        // built for the main-target formats, so anything else would
-        // silently corrupt channels/encoding (see CaptureError).
-        if (self.color_format != defaultColorFormat()) return error.IncompatibleColorFormat;
+        // HDR scene contract before touching any slot: scene capture keeps
+        // radiance lossless in RGBA16F through the matching forward set.
+        // Float32 is deliberately NOT accepted (one contract, no silent
+        // precision/format drift). Blend is required: scene materials blend.
+        if (self.color_format != .RGBA16F) return error.IncompatibleColorFormat;
         if (!self.hasDepth()) return error.DepthRequired;
         if (self.depth_format != defaultDepthFormat()) return error.IncompatibleDepthFormat;
+        {
+            const caps = sg.queryPixelformat(self.color_format);
+            if (!caps.render or !caps.sample or !caps.blend) return error.IncompatibleColorFormat;
+            if ((self.min_filter == .LINEAR or self.mag_filter == .LINEAR) and !caps.filter)
+                return error.IncompatibleColorFormat;
+        }
+
+        // Resolve the forward set BEFORE opening the pass: forwardFor may
+        // recreate the MSAA/format twin (destroying the previous one), which
+        // must never happen mid-pass. The pointer borrows Scene state and
+        // stays valid across the capture (no producer mutation mid-capture:
+        // the pin below holds the prepared slot).
+        const fwd_pipelines = scene.forwardFor(self.sample_count, self.color_format);
 
         // Consumer pin across the whole capture (render's own discipline):
         // the presenting capture holds the lease, so a concurrent producer
@@ -707,10 +731,10 @@ pub const RenderTarget = struct {
 
         // Render-owned draw environment: snapshot copies only (same shape
         // as frame_render's main pass, minus multi-camera and TAA jitter —
-        // the capture is always the primary view, unjittered). Single-sample
-        // forward set for 1x targets, the MSAA twin otherwise.
+        // the capture is always the primary view, unjittered). The forward
+        // set was resolved above (never mid-pass).
         const env = scene_draw.Environment{
-            .pipelines = if (self.sample_count > 1) scene.ensureForwardMsaa(self.sample_count) else &scene.forward,
+            .pipelines = fwd_pipelines,
             .stats = &scene.stats,
             .default_white = snap.default_white,
             .default_normal = snap.default_normal,
@@ -849,6 +873,15 @@ test "estimatedBytesFor accounts color, MSAA store, resolve, and depth" {
     try testing.expectEqual(@as(usize, 0), estimatedBytesFor(0, 0, .RGBA8, .NONE, 1));
 }
 
+test "defaultColorFormat is pure linear HDR" {
+    // No sg calls: the HDR default holds headless (no context needed).
+    try testing.expectEqual(sg.PixelFormat.RGBA16F, defaultColorFormat());
+    // .DEFAULT in the descriptor resolves to that same HDR format.
+    const d = RenderTargetDesc{ .color_format = .DEFAULT };
+    const resolved = if (d.color_format != .DEFAULT) d.color_format else defaultColorFormat();
+    try testing.expectEqual(sg.PixelFormat.RGBA16F, resolved);
+}
+
 test "zero target is invalid, estimates zero, and exposes empty views" {
     var t = RenderTarget{};
     try testing.expect(!t.isValid());
@@ -946,13 +979,13 @@ test "renderPrimaryView enforces its gates as errors, headless" {
         invalid.renderPrimaryView(&scene, .{ .view_slot = clustered_lights.MAX_VIEW_SLOTS }),
     );
 
-    // A populated value passes the pure gates and fails at the context
+    // A populated HDR value passes the pure gates and fails at the context
     // gate headless (live: format/consumable/camera gates follow).
     var headless = RenderTarget{
         .width = 64,
         .height = 64,
         .sample_count = 1,
-        .color_format = .RGBA8,
+        .color_format = .RGBA16F,
         .depth_format = .DEPTH,
         .color_image = .{ .id = 21 },
         .color_att_view = .{ .id = 22 },
@@ -990,6 +1023,7 @@ test "capabilities predicates stay pure and conservative" {
         .color_sample = true,
         .color_filter = true,
         .color_render = true,
+        .color_blend = true,
         .color_msaa = true,
         .depth_render = true,
         .depth_msaa = true,
@@ -998,6 +1032,16 @@ test "capabilities predicates stay pure and conservative" {
     };
     try testing.expect(hw.supportsTarget(.RGBA8, .DEPTH));
     try testing.expect(hw.supportsTarget(.RGBA8, .NONE));
+    // Capture needs exactly the HDR scene format with full blend caps.
+    try testing.expect(hw.supportsCapture(.RGBA16F, .DEPTH));
+    try testing.expect(!hw.supportsCapture(.RGBA8, .DEPTH));
+    try testing.expect(!hw.supportsCapture(.RGBA32F, .DEPTH));
+    try testing.expect(!hw.supportsCapture(.RGBA16F, .NONE));
+    var no_blend = hw;
+    no_blend.color_blend = false;
+    try testing.expect(!no_blend.supportsCapture(.RGBA16F, .DEPTH));
+    // Creation stays blend-agnostic (opaque/clear-only targets allowed).
+    try testing.expect(no_blend.supportsTarget(.RGBA16F, .DEPTH));
     // A non-depth format is never a valid depth attachment; unresolved
     // sentinels are never valid targets.
     try testing.expect(!hw.supportsTarget(.RGBA8, .RGBA8));
@@ -1041,6 +1085,9 @@ test "asTexture borrows handles without taking ownership" {
     try testing.expectEqual(@as(u32, 1), tex.num_mipmaps);
     try testing.expectEqual(sg.PixelFormat.RGBA8, tex.format);
     try testing.expect(!tex.is_hdr);
+    // HDR targets borrow as HDR (linear radiance, not display-referred).
+    const h = RenderTarget{ .color_format = .RGBA16F, .valid = true };
+    try testing.expect(h.asTexture().is_hdr);
 }
 
 test "capture feedback detects saved material and particle texture views" {

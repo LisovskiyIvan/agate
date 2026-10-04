@@ -138,7 +138,6 @@ pub fn renderSceneView(
         .area_color = snap.light_pack.area_color,
         .clustered_params = cl_params,
         .clustered_viewport = cl_viewport,
-        .output_params = .{ if (env.gamma_override orelse scene.output_gamma) 1.0 else 0.0, 0.0, 0.0, 0.0 },
     };
 
     var shadow_state_with = env.shadow_uniforms;
@@ -191,7 +190,7 @@ pub fn renderSceneView(
     // count with zero sg.* calls when no panel is drawable, so
     // panel-less frames are bit-identical. Probe face captures never
     // reach this path (renderProbeFace inlines its own draws).
-    if (!env.capture_opaque_only) scene.gui3d.drawPanels(scene.allocator, view_proj, samples, env.stats);
+    if (!env.capture_opaque_only) scene.gui3d.drawPanels(scene.allocator, view_proj, samples, env.pipelines.color_format, env.stats);
 
     // Inverse-hull outline for highlighted meshes (P7: published slot
     // payload, never live Scene fields).
@@ -201,6 +200,7 @@ pub fn renderSceneView(
         outline_items,
         outline_skins,
         samples,
+        env.pipelines.color_format,
         &scene.stats,
         snap.outline_enabled,
         snap.outline_color,
@@ -210,7 +210,7 @@ pub fn renderSceneView(
     // Physics debug lines: prepared capture only — no live world,
     // no show_debug read at draw time (update may step the world
     // concurrently). One committed upload (prepare), one draw per view.
-    if (!env.capture_opaque_only) scene.physics.renderDebugPrepared(view_proj, samples, &scene.stats);
+    if (!env.capture_opaque_only) scene.physics.renderDebugPrepared(view_proj, samples, env.pipelines.color_format, &scene.stats);
 
     // Skybox Pass: captured enabled/texture/exposure only. The cube is
     // the snapshot sky texture orelse the snapshot's render-owned
@@ -222,10 +222,11 @@ pub fn renderSceneView(
         snap.sky_texture orelse snap.default_cube,
         snap.sky_exposure,
         samples,
+        env.pipelines.color_format,
         &scene.stats,
     );
 
     // Particle Pass: prepared frame only — no live ParticleSystem reads
     // at draw time (the update side may step systems concurrently).
-    if (!env.capture_opaque_only) scene.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, &scene.stats);
+    if (!env.capture_opaque_only) scene.particles.renderPrepared(cam_snap.camera, cam_snap.aspect, samples, env.pipelines.color_format, &scene.stats);
 }

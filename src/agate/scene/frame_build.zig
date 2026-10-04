@@ -14,6 +14,18 @@ const scene_upload_packets = @import("upload_packets.zig");
 /// stamped by `BuildClaim.publish`, so a cancelled claim leaves no
 /// handoff behind.
 ///
+/// CACHE IDENTITY (cancel-safe): the world-matrix/AABB `cache_key` is
+/// `Scene.build_cache_seq | (1<<63)` — bumped on EVERY call, including
+/// cancelled and repeated builds — NOT `seq | (1<<63)`. A cancelled build
+/// stamps the shared mesh caches with an uncommitted handoff seq, and a
+/// repeated `BuildClaim.build` reuses its reserved seq; keying the cache
+/// on `seq` would let the next real build (same seq) read those stale
+/// entries as hits (stale TRS driving queues/culling/geometry). Instance
+/// previews/record stamps keep `seq` (single preview store, always
+/// rewritten in place — no early skip — so repeats/cancels cannot go
+/// stale there); only the world-cache identity is per-attempt.
+/// See `Scene.build_cache_seq` for the uniqueness discipline.
+///
 /// EPOCH DISCIPLINE (wave 29): this core must never call
 /// `GpuRetire.begin`/`complete`/`flush` and never passes a `retire_queue`
 /// anywhere — epochs stay context-owned (prepare/render own the
@@ -23,6 +35,13 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
     // a spawned worker. Everything below is sg-free (the commit, the CPU
     // staging half, the plain captures, the CPU queue/shadow/outline
     // build with instances_prepared=true); any sg.* here would be a bug.
+    // Per-attempt world-cache identity FIRST (see the header docs): every
+    // call owns a fresh key — published, cancelled, or repeated on one
+    // claim — so no two builds ever share cache entries. Wrapping +% keeps
+    // it branch-cheap; the 0 skip keeps every attempt nonzero (the key's
+    // high bit is the producer namespace in any case).
+    scene.build_cache_seq +%= 1;
+    if (scene.build_cache_seq == 0) scene.build_cache_seq = 1;
     // Commit the last published latch outcomes FIRST. Resolve and hold a
     // shared read lease on the exact front: render may already be pinning it,
     // and prepare may advance front while this producer build continues.
@@ -146,7 +165,11 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
     // build and restore after: the queue build with instances_prepared
     // never appends to it, so the staged segments survive intact.
     {
-        const build_key = seq | (@as(u64, 1) << 63);
+        // Attempt-scoped world-cache key (lower 63 bits of the per-build
+        // attempt counter under the producer high-bit namespace): unique
+        // per call, so cancelled/repeated builds never alias. No mesh
+        // invalidation walk — stale entries simply never hit again.
+        const build_key = (scene.build_cache_seq & (((@as(u64, 1) << 63) - 1))) | (@as(u64, 1) << 63);
         const sky_tex = scene.build_snapshot.sky_texture;
         const ibl_int = scene.build_snapshot.ibl_intensity;
         const saved_scratch = back.primary.instance_matrices;

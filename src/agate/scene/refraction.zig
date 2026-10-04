@@ -1,4 +1,6 @@
-//! Screen-space slab refraction v1. No work/resources without opt-in draws.
+//! Screen-space slab refraction v1 (linear HDR). No work/resources without
+//! opt-in draws. The background target is half-res linear HDR (RGBA16F) and
+//! renders the same clipped opaque geometry the main view draws.
 const sg = @import("sokol").gfx;
 const target = @import("../render_target.zig");
 const draw = @import("draw.zig");
@@ -35,14 +37,16 @@ pub fn capture(scene: anytype, draws: anytype, snap: *const snapshot.SceneFrameS
     if (!scene.rendering_reuse) {
         scene.refraction.captured_frame = null;
         if (!rt.isValid()) {
-            rt.* = target.RenderTarget.create(.{ .width = width, .height = height }) catch return;
+            rt.* = target.RenderTarget.create(.{ .width = width, .height = height, .color_format = .RGBA16F }) catch return;
         } else if (!rt.resize(width, height)) return;
         if (rt.queuesSampleSelf(&draws.primary, false)) return;
+        // Resolve the HDR forward set BEFORE opening the pass: forwardFor
+        // may recreate the twin, which must never happen mid-pass.
+        const fwd = scene.forwardFor(1, .RGBA16F);
         if (!rt.begin(snap.clear_color, 1)) return;
         var capture_env = env.*;
-        capture_env.pipelines = &scene.forward;
+        capture_env.pipelines = fwd;
         capture_env.capture_opaque_only = true;
-        capture_env.gamma_override = false;
         var capture_snap = snap.*;
         capture_snap.screen_w = @intCast(width);
         capture_snap.screen_h = @intCast(height);

@@ -10,7 +10,7 @@ const std = @import("std");
 //
 // Потокобезопасность: стейджинг инстансов может выполняться с воркеров
 // пула (scene/instance_staging.zig), поэтому счётчик атомарный.
-// Сброс раз в кадр: Scene.prepareFrame обнуляет счётчик в начале кадра,
+// Сброс раз в кадр: staged begin обнуляет счётчик в начале кадра,
 // Scene.render забирает значение в stats.updated_bytes_frame перед
 // Profiler.recordFrame (включая UI/debug-апдейты, идущие уже внутри render).
 const builtin = @import("builtin");

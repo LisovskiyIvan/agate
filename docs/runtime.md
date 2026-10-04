@@ -4,9 +4,11 @@
 
 ## Что это
 
-`runtime.zig` — тонкий фасад жизненного цикла кадра для threaded-приложений. Он владеет порядком вызовов (producer `claim → build → stageUi → publish` на игровой стороне, `beginStagedPrepare` под исключением продюсера на контекстной стороне, `finishStagedPrepare` + `render` без лока, fallback `renderReuse`), стартом/остановкой воркера и честными счётчиками. Хосты (демо `src/main.zig`, sandbox) компоновкой из него собирают цикл вместо ручной хореографии.
+`runtime.zig` — тонкий фасад жизненного цикла кадра для threaded-приложений. Он владеет порядком вызовов (producer `tryClaimBuildSlot → build → stageUi → publish` на игровой стороне, `beginStagedPrepare` только по свежему полному билду на контекстной стороне, `finishStagedPrepare` + `render` без лока, fallback `renderReuse`), стартом/остановкой воркера и честными счётчиками. Хосты (демо `src/main.zig`, sandbox) компоновкой из него собирают цикл вместо ручной хореографии.
 
-Инвариант по умолчанию — lock-free staged prepare: свежий producer-build замораживает все upload-пayloads в слот (`stageUploads` + `stageUi` + `stageHostBytes`), а живые dirty-флаги/скаляры потребляет game-side commit (`commitSlotResults`), а не контекст. Поэтому `beginPrepare*`/`renderFrame` мьютекс не берут. `setProducerExclusion(true)` возвращает старый контракт (диагностика/rollback): контекст держит `mutex` поперёк `beginPrepare*`.
+Staged-only: свежего producer-build нет — `beginStagedPrepare` возвращает `null`, никакого live-чтения. `Scene.buildPreparedFrame()` — `tryClaimBuild → stageUi → publish` полностью замороженного кадра. `Render` никогда сам не готовит свежий кадр: только подготовленный front или явный `renderReuse` валидного front. Latest-wins лизы сохраняются.
+
+Порядок init: `agate.gpu_thread.markContextThread()` один раз до `Scene.initInto` — объект помечает GPU-владельца до сцены. Headless без маркера: только CPU-cleanup, это не живое GPU-владение.
 
 ## Быстрый старт
 
@@ -18,14 +20,11 @@ defer runtime.deinit();
 
 // Игровой поток: один продюсер.
 fn gameLoop() void {
-    while (runtime.shouldRun()) {
-        runtime.gameLock();
-        // ... simulate(scene, dt) ...
-        scene.publishFrameSnapshot(aspect, w, h);
-        _ = runtime.produceBuild(scene);
-        scene.recordUpdateTime(dt_ms);
-        runtime.gameUnlock();
-    }
+    runtime.gameLock();
+    // ... simulate(scene, dt) ...
+    _ = runtime.produceBuild(scene); // build BEFORE begin: claim → build → stageUi → publish
+    scene.recordUpdateTime(dt_ms);
+    runtime.gameUnlock();
 }
 
 // Простой путь (демо src/main.zig работает на этих двух вызовах):
@@ -58,7 +57,6 @@ pub const Metrics = struct {
     cancels: u64 = 0,
     reuses: u64 = 0,
     skipped_presents: u64 = 0,
-    serial_prepares: u64 = 0,
 };
 
 pub const Runtime = struct {
@@ -88,7 +86,6 @@ pub const Runtime = struct {
     pub fn finishPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void;
     pub fn cancelPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void;
     pub fn reuseIfConsumable(self: *Runtime, scene: *Scene) bool;
-    pub fn prepareSerial(self: *Runtime, scene: *Scene) void;
 };
 ```
 
@@ -99,10 +96,10 @@ pub const Runtime = struct {
 | Жизненный цикл воркера | `init`, `spawnWorker`, `quiesce`, `shouldRun`, `deinit` | Владеют порядком старт/стоп; `spawnWorker` возвращает `false` при ошибке спавна (деградация в single-threaded) |
 | Простой путь | `update`, `renderFrame` | Весь кадр для обычных приложений; `update` держит мьютекс только при включённом exclusion |
 | Game-side producer | `gameLock`/`gameUnlock`, `produceBuild`, `produceBuildWithHostBytes` | One-liner `tryClaimBuildSlot → build → stageUi → publish`; `false` — все не-front слоты заняты (counted skip) |
-| Advanced context | `beginPrepare`, `beginPrepareWith`, `finishPrepare`, `cancelPrepare`, `reuseIfConsumable`, `prepareSerial`, `tryRunLocked` | Инструментированные хосты; `finishPrepare` ассертит `claim.have_build` |
+| Advanced context | `beginPrepare`, `beginPrepareWith`, `finishPrepare`, `cancelPrepare`, `reuseIfConsumable`, `tryRunLocked` | Инструментированные хосты; finish/cancel — one-shot, только на живом GPU-владельце |
 | Тюнинг исключения | `setProducerExclusion`, `setLockWaitNs` | Переключение lock-free/exclusion и бюджет аквизиции (0 = чистый non-blocking try) |
 
-Сложность/аллокации/ошибки: все методы O(1) поверх scene-операций, аллокаций нет (счётчики — обычные целые, не атомики: каждый метод выполняется на одном owner-потоке). `produceBuild` не возвращает ошибку — только `bool`. `finishPrepare` паникует в Debug при `!claim.have_build` (fallback-claim нельзя завершать разблокированно — он читает живые меши). `renderFrame` вычитает `wait_ns` из `prepare_ms`, чтобы contention не двоился в prepare-тайминге.
+Сложность/аллокации/ошибки: все методы O(1) поверх scene-операций, аллокаций нет (счётчики — обычные целые, не атомики: каждый метод выполняется на одном owner-потоке). `produceBuild` не возвращает ошибку — только `bool`. `renderFrame` вычитает `wait_ns` из `prepare_ms`, чтобы contention не двоился в prepare-тайминге.
 
 ### handoff.zig — `Handoff(T, slot_count)`
 
@@ -209,18 +206,17 @@ pub const Capabilities = struct { frame: bool, passes: bool, frame_scope: FrameS
 pub fn capabilities() Capabilities; // поддержка device, независимо от intent
 pub fn pollFrameSample() ?Sample;
 pub fn pollPassSample(pass: Pass) ?Sample;
-pub fn pollFrameMs() f32;           // после sg.commit(); 0 = off/headless/not-ready/unsupported
 pub fn beginPass(pass: Pass) void;
 pub fn endPass(pass: Pass) void;
-pub fn pollPassMs(pass: Pass) f32;
 ```
 
 Лист-модуль (std + sokol), без цикла импорта. `setEnabled` меняет только atomic intent;
 begin/end/poll применяют его на **context thread**. Замеры асинхронные, задержка не
 фиксирована в один кадр. `Sample.frame_index` — номер завершённой sokol submission,
 не `Scene.frame_id`: повторный poll может вернуть тот же sample. `null` означает
-off/headless/not-ready/unsupported, а `ms == 0` с валидным индексом — настоящий
-квантизованный замер. Старые `poll*Ms` сохраняют совместимый sentinel 0.
+off/headless/not-ready/unsupported, а `ms == 0` с ненулевым индексом —
+настоящий квантизованный замер. `pollFrameMs/pollPassMs` удалены: только optional
+`Sample`, наличие данных — по `null`, не по `ms > 0`.
 
 Metal использует command-buffer frame time и, при поддержке timestamp counters,
 phase spans; WebGPU — timestamp-query spans; desktop GL — `GL_TIME_ELAPSED` фаз и
@@ -244,10 +240,10 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 
 ## Потоки и владение
 
-- Game producer (один, обязателен): `gameLock` поперёк всего тика (`simulate` + `produceBuild`); `update` берёт лок только при `producer_exclusion`. Пишет живые регистры, mailboxes, `pending_update_ms`; в `stats` напрямую — никогда.
-- Context render: `beginPrepare*` (по умолчанию без мьютекса; с exclusion — bounded acquire `lock_wait_ns`, 0 = чистый try), затем `finishPrepare` + `render` разблокированно. Только контекст вызывает `begin/finish/cancel/prepareSerial` (движок ассертит) и `markContextThread`.
-- `finish`/`render` перекрываются со следующим update свободно; `prepareSerial` (legacy `--no-concurrent-build`) всегда держит мьютекс поперёк всего `prepareFrame`.
-- Lock-free контракт требует: все payloads заморожены в слот до `publish` (staging после publish — гонка с latch); `Scene.lock_free_prepare` выставляется из этого кноба (UI live-list fallbacks fail closed); host live-reads переехали в `stageHostBytes` или доказано context-owned; никакого registry add/remove поперёк in-flight latch (commit guards держат когерентность, но контракт приложения это запрещает).
+- Game producer (один, обязателен): `gameLock` поперёк всего тика (`simulate` + `produceBuild`); `update` берёт лок только при включённом exclusion. Пишет живые регистры, mailboxes, `pending_update_ms`; в `stats` напрямую — никогда.
+- Context render: `beginPrepare*` (по умолчанию без мьютекса; с exclusion — bounded acquire `lock_wait_ns`, 0 = чистый try), затем `finishPrepare` + `render` разблокированно. Только контекст вызывает `begin/finish/cancel` (движок ассертит) и `markContextThread` до `Scene.initInto`.
+- `finish`/`render` перекрываются со следующим update свободно. `update`/`renderFrame` одинаковы для worker и single-thread (`--no-threads` — тот же staged-алгоритм); `producer_exclusion` — только mutex-диагностика тех же замороженных данных, не откат render-пути.
+- Lock-free контракт требует: все payloads заморожены в слот до `publish` (staging после publish — гонка с latch); missing/failure-пакеты — coherent-empty, живую canvas-геометрию никто не читает; host live-reads переехали в `stageHostBytes` или доказано context-owned; никакого registry add/remove поперёк in-flight latch (commit guards держат когерентность, но контракт приложения это запрещает).
 - Jobs-воркеры: только CPU чанки через atomic cursor; `pending` считает участников (воркеры + вызывающий), вызывающий спинит до `pending == 0`. `TaskRunner` (io_runner, asset decode) — отдельные треды, `post` под parking-lot мьютексом, `deinit` дренирует.
 - `quiesce` вызывать с НЕДЕРЖАЩИМСЯ мьютексом (воркер может быть припаркован на его аквизиции); после join game-owned plain-поля безопасно читать с этого потока.
 
@@ -255,13 +251,13 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 
 - `beginPrepare` → `claim == null, busy == false`: свежего build нет — не live-fallback; caller делает reuse/skip. `busy == true` (только exclusion-mode): мьютекс не взялся в бюджет — тот же reuse/skip, но счёт как contention (`begin_busy`), не idle.
 - `produceBuild → false`: все не-front слоты pinned/claimed (consumer lagging) — counted skip, контекст переиспользует front.
-- Каждый успешный begin — ровно один `finish` или `cancel` (иначе клин: следующие begin возвращают null).
+- Каждый успешный begin — ровно один `finish` или `cancel` (иначе клин: следующие begin возвращают null). Finish/cancel — one-shot: контекст — живой зарегистрированный GPU-владелец.
 - `render` между begin и finish видит `frame_prepared == false` и дропает present — держать пару смежно.
 - Самозахваченный мьютекс (non-recursive): bounded begin сообщает `busy`, не блокируется.
 - Первые кадры: `reuseIfConsumable` → false (нечего переиспользовать), `renderFrame` → `.skipped`, пока первый build не готов.
-- `prepareSerial`/legacy-диагностика всегда лочат вне зависимости от кноба.
+- `prepareSerial`/legacy-диагностика: удалены; single-thread идёт тем же staged-путём (`--no-threads` — тот же алгоритм).
 - `Observable.add` без аллокатора → `error.NoAllocatorProvided`; `Handoff.claim` → null при насыщении (вместо блокировки — дроп/drain/skip).
-- `gpu_timing` вне контекста или выключенный — `null` sample / legacy 0, без паник.
+- `gpu_timing` вне контекста или выключенный — `null` sample, без паник.
 
 ## Производительность
 

@@ -16,14 +16,14 @@ pub const PipelineFamily = enum { standard, pbr, instanced, skinned_pbr, instanc
 
 // Single funnel for the base descriptor of every main-target pipeline
 // (built-in families, double-sided twins, shader-material sets): the base
-// depth/cull state plus the target sample count. Sokol validation rejects
-// sg_apply_pipeline when pipeline.sample_count differs from any attachment
-// image of the current pass (color AND depth), so every pipeline that can
-// draw into the main target must be built through here with the same count
-// as the target (scene/msaa.zig decides that count; the 1x set and the
-// sampled twin sets in Scene must never be mixed within a frame).
-pub fn forwardBaseDesc(shader: sg.Shader, sample_count: i32) sg.PipelineDesc {
-    return .{
+// depth/cull state plus the exact target sample count and color format.
+// Sokol validation rejects sg_apply_pipeline when pipeline.sample_count
+// differs from any attachment image of the current pass (color AND depth),
+// so every pipeline that draws into the main target is built through here
+// with the target shape (scene/msaa.zig decides the count; twin sets in
+// Scene are keyed by shape and never mixed within a frame).
+pub fn forwardDesc(shader: sg.Shader, sample_count: i32, color_format: sg.PixelFormat) sg.PipelineDesc {
+    var desc = sg.PipelineDesc{
         .shader = shader,
         .index_type = .UINT16,
         .depth = .{
@@ -34,10 +34,12 @@ pub fn forwardBaseDesc(shader: sg.Shader, sample_count: i32) sg.PipelineDesc {
         .face_winding = .CCW,
         .sample_count = sample_count,
     };
+    desc.colors[0].pixel_format = color_format;
+    return desc;
 }
 
-// Fills the vertex layout for a family exactly as the legacy hand-written
-// descs did (same buffers, attr slots, formats, offsets). Any shader-side
+// Fills the vertex layout for a family matching the established per-family
+// configs (same buffers, attr slots, formats, offsets). Any shader-side
 // layout risk lives here: attr changes must mirror the matching *.glsl.
 pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
     switch (family) {
@@ -110,7 +112,7 @@ pub fn pipelineLayoutFor(family: PipelineFamily, desc: *sg.PipelineDesc) void {
 }
 
 // Creates an opaque u16/u32 pair plus transparent blend twins from one
-// base desc. Order and index_type switches match the legacy code.
+// base desc. Order and index_type switches match the selection order.
 pub fn makePipelinePair(base: sg.PipelineDesc, opaque_u16: *sg.Pipeline, opaque_u32: *sg.Pipeline, blend_u16: *sg.Pipeline, blend_u32: *sg.Pipeline) void {
     var desc = base;
     desc.index_type = .UINT16;
@@ -185,10 +187,10 @@ pub const DoubleSidedPipelines = struct {
 
     // Builds all 20 cull-off twins from the family shaders (GPU calls).
     // Base descs mirror Scene.initPipelines (depth LESS_EQUAL/write on,
-    // BACK cull, CCW winding) plus the main-target sample count (sokol
-    // requires pipelines to match the attachment sample count they draw
-    // into); makeCullOffPair forces cull off.
-    pub fn initFromShaders(self: *DoubleSidedPipelines, shaders: DoubleSidedSourceShaders, sample_count: i32) void {
+    // BACK cull, CCW winding) plus the main-target sample count and color
+    // format (sokol requires pipelines to match the attachment sample
+    // count they draw into); makeCullOffPair forces cull off.
+    pub fn initFromShaders(self: *DoubleSidedPipelines, shaders: DoubleSidedSourceShaders, sample_count: i32, color_format: sg.PixelFormat) void {
         const specs = [_]struct {
             shader: sg.Shader,
             family: PipelineFamily,
@@ -240,7 +242,7 @@ pub const DoubleSidedPipelines = struct {
         };
 
         for (specs) |spec| {
-            var desc = forwardBaseDesc(spec.shader, sample_count);
+            var desc = forwardDesc(spec.shader, sample_count, color_format);
             pipelineLayoutFor(spec.family, &desc);
             makeCullOffPair(desc, spec.opaque_u16, spec.opaque_u32, spec.blend_u16, spec.blend_u32);
         }
@@ -267,7 +269,7 @@ pub const DoubleSidedPipelines = struct {
 
 // Selects the forward pipeline for a regular (non-instanced) queue item.
 // Transparent items resolve to the blend twins; opaque selection is
-// identical to the legacy logic, so existing pipeline ids are untouched.
+// identical to the established mapping, so existing pipeline ids are untouched.
 // Reads ONLY render-owned snapshots (is_u32/is_skinned/double_sided flags):
 // draw-фаза не трогает живой Mesh/Material. `scene` is generic (anytype)
 // to avoid a scene.zig import cycle; it must expose the 12 pipeline_*
@@ -330,6 +332,38 @@ pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
         if (id != 0) return id;
     }
     return if (is_u32) scene.pipeline_u32.id else scene.pipeline_u16.id;
+}
+
+test "forwardDesc pins the exact target shape without leaking depth/cull/blend state" {
+    const std = @import("std");
+    const hdr = forwardDesc(.{}, 1, .RGBA16F);
+    try std.testing.expect(hdr.colors[0].pixel_format == .RGBA16F);
+    // Invariants shared with the base desc: depth/cull/winding/samples.
+    try std.testing.expect(hdr.depth.compare == .LESS_EQUAL);
+    try std.testing.expect(hdr.depth.write_enabled);
+    try std.testing.expect(hdr.cull_mode == .BACK);
+    try std.testing.expect(hdr.face_winding == .CCW);
+    try std.testing.expectEqual(sg.IndexType.UINT16, hdr.index_type);
+    const msaa_hdr = forwardDesc(.{}, 4, .RGBA16F);
+    try std.testing.expect(msaa_hdr.colors[0].pixel_format == .RGBA16F);
+    try std.testing.expectEqual(@as(i32, 4), msaa_hdr.sample_count);
+    try std.testing.expect(msaa_hdr.depth.write_enabled);
+    // Exact second shape: 1x BGRA8 pins its own format and count.
+    const ldr = forwardDesc(.{}, 1, .BGRA8);
+    try std.testing.expect(ldr.colors[0].pixel_format == .BGRA8);
+    try std.testing.expectEqual(@as(i32, 1), ldr.sample_count);
+    // Composes with blendDescFor: HDR blend twins keep the format, gain
+    // blend, and drop the depth write (transparent-twin contract).
+    const blend_hdr = render_queue.blendDescFor(hdr);
+    try std.testing.expect(blend_hdr.colors[0].pixel_format == .RGBA16F);
+    try std.testing.expect(blend_hdr.colors[0].blend.enabled);
+    try std.testing.expect(!blend_hdr.depth.write_enabled);
+    try std.testing.expect(blend_hdr.depth.compare == .LESS_EQUAL);
+    // Composes with cullOffDescFor: double-sided twins keep the format.
+    const ds_hdr = cullOffDescFor(hdr);
+    try std.testing.expect(ds_hdr.colors[0].pixel_format == .RGBA16F);
+    try std.testing.expect(ds_hdr.cull_mode == .NONE);
+    try std.testing.expect(ds_hdr.depth.write_enabled);
 }
 
 test "cullOffDescFor disables culling and preserves everything else" {
@@ -560,7 +594,7 @@ test "double-sided items select cull-off twins, with regular fallback" {
 
 // Selects the instanced pipeline. Same double-sided contract as
 // pipelineForRegularItem: cull-off twin when requested and available,
-// regular pipeline otherwise (legacy scenes behave exactly as before).
+// regular pipeline otherwise (scenes without the set behave exactly as before).
 // `scene` must expose the pipeline_instanced_* fields.
 pub fn pipelineForInstancedMesh(scene: anytype, is_pbr: bool, transparent: bool, is_u32: bool, double_sided: bool) u32 {
     if (sceneDoubleSided(scene)) |ds| {
@@ -593,7 +627,7 @@ pub fn pipelineForInstancedMesh(scene: anytype, is_pbr: bool, transparent: bool,
 }
 
 // Scene-side double-sided set, if the scene embeds one as `ds_pipelines`
-// (see DoubleSidedPipelines). Missing field (legacy Scene) means no
+// (see DoubleSidedPipelines). Missing field (scenes without the set) means no
 // double-sided pipelines: selection falls back to regular ids. Accepts
 // both Scene values and pointers; the set is returned BY VALUE because
 // `&scene.ds_pipelines` would dangle for by-value args (the field would

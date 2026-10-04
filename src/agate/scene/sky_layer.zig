@@ -1,4 +1,6 @@
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 const Camera = @import("../camera.zig").Camera;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const SkyboxOptions = @import("../texture.zig").SkyboxOptions;
@@ -20,12 +22,12 @@ pub const SkyboxLayer = struct {
 
     pass: passes.SkyboxPass,
 
-    // MSAA twin pass (pipeline sample count must match the main target).
-    // Lazily created on the first MSAA frame, recreated on count changes.
+    // Variant pass (pipeline sample count must match the main target).
+    // Lazily created on the first non-base frame, recreated on shape changes.
     pass_msaa: ?passes.SkyboxPass = null,
 
     pub fn init() SkyboxLayer {
-        return .{ .pass = passes.SkyboxPass.init() };
+        return .{ .pass = passes.SkyboxPass.init(1, .RGBA16F) };
     }
 
     pub fn deinit(self: *SkyboxLayer) void {
@@ -52,8 +54,8 @@ pub const SkyboxLayer = struct {
     /// caller resolves `cube_tex` as snapshot sky texture orelse the
     /// snapshot's render-owned default copy — never the game-mutatable
     /// shared default), so a concurrent update mutating the live layer
-    /// cannot race the draw. `samples` is the effective main-target sample
-    /// count (scene/msaa.zig). Headless-safe: no `sg.*` without a context,
+    /// cannot race the draw. `samples`/`color_format` pin the exact
+    /// main-target shape. Headless-safe: no `sg.*` without a context,
     /// and the counters bump only when the pass actually draws.
     pub fn renderPrepared(
         self: *SkyboxLayer,
@@ -63,40 +65,41 @@ pub const SkyboxLayer = struct {
         cube_tex: CubeTexture,
         exposure: f32,
         samples: i32,
+        color_format: sg.PixelFormat,
         stats: *SceneStats,
     ) void {
         if (!enabled) return;
-        const sokol = @import("sokol");
         // Context first (before touching the pass: headless fixtures may
-        // hold an uninitialized pass, and MSAA twins create GPU objects).
-        if (!sokol.gfx.isvalid()) return;
-        const pass = self.passFor(samples);
+        // hold an uninitialized pass, and variant passes create GPU objects).
+        if (!sg.isvalid()) return;
+        const pass = self.passFor(samples, color_format);
         // Consumability guard (FAILED pipeline): the pass itself early-outs
         // there, so check first to keep counters exact.
-        if (pass.pipeline.id == 0) return;
-        pass.render(camera, aspect, cube_tex, exposure);
+        if (sg.queryPipelineState(pass.pipeline) != .VALID) return;
+        pass.render(camera, aspect, cube_tex, @import("../postprocess/hdr.zig").sanitizeExposure(exposure));
         stats.main_draw_calls += 1;
         stats.draw_calls += 1;
         stats.triangles += 12;
     }
 
     /// Renders the skybox inside the main pass. `fallback` is the shared
-    /// default cubemap used when no custom skybox texture is set; `samples`
-    /// is the effective main-target sample count (scene/msaa.zig).
+    /// default cubemap used when no custom skybox texture is set.
     ///
-    /// Legacy live-state path: Scene.render no longer calls this — it draws
+    /// Live-state path: Scene.render no longer calls this — it draws
     /// from the snapshot via renderPrepared. Kept for standalone/tooling.
-    pub fn render(self: *SkyboxLayer, camera: Camera, aspect: f32, fallback: CubeTexture, samples: i32, stats: *SceneStats) void {
+    pub fn render(self: *SkyboxLayer, camera: Camera, aspect: f32, fallback: CubeTexture, samples: i32, color_format: sg.PixelFormat, stats: *SceneStats) void {
         if (!self.enabled) return;
-        self.renderPrepared(true, camera, aspect, self.texture orelse fallback, self.exposure, samples, stats);
+        self.renderPrepared(true, camera, aspect, self.texture orelse fallback, self.exposure, samples, color_format, stats);
     }
 
-    /// Pass variant matching the target sample count.
-    fn passFor(self: *SkyboxLayer, samples: i32) *passes.SkyboxPass {
-        if (samples <= 1) return &self.pass;
-        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples) {
+    /// Pass variant matching the exact target shape (sample count + color
+    /// format). The single twin slot serves every non-base shape, keyed by
+    /// both; the base shape stays on the base pass.
+    fn passFor(self: *SkyboxLayer, samples: i32, color_format: sg.PixelFormat) *passes.SkyboxPass {
+        if (samples == self.pass.sample_count and color_format == self.pass.color_format) return &self.pass;
+        if (self.pass_msaa == null or self.pass_msaa.?.sample_count != samples or self.pass_msaa.?.color_format != color_format) {
             if (self.pass_msaa) |*p| p.deinit();
-            self.pass_msaa = passes.SkyboxPass.initSampled(samples);
+            self.pass_msaa = passes.SkyboxPass.init(samples, color_format);
         }
         return &self.pass_msaa.?;
     }

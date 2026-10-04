@@ -11,8 +11,13 @@ Render pipeline превращает live-меши сцены в отсорти�
 Напрямую эти модули обычно не вызываются — их оркеструет кадр (см. `./frame-pipeline.md`):
 
 ```zig
-// Серийный кадр: build очередей + тени + виды — внутри prepare/render.
-scene.prepareFrame(); // queue_builder -> render_queue -> shadow -> latch
+// Кадр: producer build (game) + staged prepare/finish (context) + render.
+// render сам ничего не готовит: без consumable frame — пропуск/reuse.
+const built = scene.buildPreparedFrame(); // tryClaimBuildSlot+build+stageUi+publish; false = saturation
+_ = built;
+if (scene.beginStagedPrepare()) |claim| {
+    scene.finishStagedPrepare(claim); // queue_builder -> render_queue -> shadow -> latch
+}
 scene.render();       // view_render -> draw -> postfx_stack.renderChain
 ```
 

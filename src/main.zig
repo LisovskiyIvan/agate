@@ -92,7 +92,7 @@ fn msSince(t0: u64) f32 {
 
 /// Compact one-line frame metrics, printed every `stats_interval` frames
 /// when `--stats` is passed. update/prepare are measured around
-/// Scene.update (staged via recordUpdateTime) / prepareFrame; shadow/main/
+/// Scene.update (staged via recordUpdateTime) / staged begin+finish; shadow/main/
 /// post are timed inside Scene.render. Runs AFTER render on the context
 /// thread: stats is context-owned and the update side never writes it, so
 /// the game thread running the next update concurrently cannot race this
@@ -257,7 +257,7 @@ fn simulate(dt_sec: f32) void {
     // -> publish, right after this body). Kept out of here so the simple
     // path owns the ordering in one place.
     // Stage the update tick WITHOUT touching stats (context-owned; render
-    // may read it concurrently): prepareFrame transfers it next frame.
+    // may read it concurrently): the staged begin transfers it next frame.
     scene.recordUpdateTime(msSince(t_update));
 }
 
@@ -302,7 +302,8 @@ export fn frame() callconv(.c) void {
 
         if (show_stats) printFrameStats();
     } else {
-        // Single-threaded: same two calls inline (mutex uncontended).
+        // Single-threaded: SAME two calls inline (mutex uncontended) —
+        // identical ordering to the worker path above.
         var tick = TickCtx{ .dt_sec = @floatCast(sapp.frameDuration()) };
         _ = runtime.update(&scene, &tick, gameTick);
         _ = runtime.renderFrame(&scene);

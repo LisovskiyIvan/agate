@@ -104,7 +104,7 @@ float sheenVisibilityNeubelt(float NoV, float NoL) {
 }
 
 // Anisotropy v1 (Heitz-style GGX): stretches the base-lobe NDF along the
-// tangent frame; intensity 0 early-returns to the legacy isotropic NDF
+// tangent frame; intensity 0 early-returns to the base isotropic NDF
 // (bit-identical), geometry G stays isotropic and IBL stays isotropic
 // (v1 scope, documented). CPU mirror: material.anisotropyAxes.
 float anisoNDF(vec3 N, vec3 T, vec3 B, vec3 H, float roughness) {

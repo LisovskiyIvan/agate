@@ -49,12 +49,11 @@
 //! pixels into `pending_delta_data` at stage time (write-once), the context
 //! creates the delta image + view from those frozen bytes alongside the
 //! base buffers, and the commit installs everything atomically — the mesh
-//! leaves `gpu_pending` fully drawable (no base-pose frame). The legacy
-//! `finishGpuUpload` still owns meshes that never went through a staged
-//! build (no-build fallback path).
+//! leaves `gpu_pending` fully drawable (no base-pose frame).
 //!
-//! The legacy `flushPendingGpuUploads` stays for the no-build fallback
-//! (serialized by contract) and is never called on the fresh-build path.
+//! `flushPendingGpuUploads` is a separate quiesced completion drain: its
+//! `finishGpuUpload` scans require a stopped/excluded producer, never replace
+//! staged frame preparation, and are not called by the normal renderer.
 //!
 //! Identity: descriptors carry `token` (@intFromPtr of the live owner) +
 //! list index (+ uid for meshes). The COMMIT validates token/index (/uid)
@@ -83,6 +82,7 @@ const math = @import("math");
 const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const morph_gpu = @import("../mesh/morph_gpu.zig");
+const mesh_deferred = @import("../mesh/mesh.zig");
 const gpu_retire = @import("gpu_retire.zig");
 
 /// Producer freeze (game side, sg-free). Copies every dirty staging payload
@@ -488,6 +488,11 @@ fn resetOutcomes(slot: anytype) void {
         up.unsupported = false;
         up.consumed_staged = 0;
         up.consumed_dt = 0.0;
+        // `dispatches` is an attempt counter, NOT a delivery outcome: a
+        // cancelled prepare re-flushes the same slot, and the re-flush must
+        // still transfer the earlier attempt's dispatch. Only the commit
+        // (exactly-once transfer) or a fresh packet list (slot reset)
+        // clears it.
         up.created_state_buffer_id = 0;
         up.created_spawn_buffer_id = 0;
         up.created_draw_buffer_id = 0;
@@ -536,7 +541,10 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
         var vbuf: sg.Buffer = .{};
         var ibuf: sg.Buffer = .{};
         if (up.dynamic_update) {
-            vbuf = sg.makeBuffer(.{
+            // Vertex creation through the canonical mesh seam (same descs as
+            // the legacy finish; frozen slot bytes, never live mesh state).
+            // Index creation stays a regular sg.makeBuffer here.
+            vbuf = mesh_deferred.makeDeferredMeshVertexBuffer(.{
                 .usage = .{ .vertex_buffer = true, .dynamic_update = true },
                 .size = verts.len * @sizeOf(@TypeOf(verts[0])),
             });
@@ -567,7 +575,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             up.created_vertex_buffer_id = vbuf.id;
             up.created_index_buffer_id = ibuf.id;
         } else {
-            vbuf = sg.makeBuffer(.{ .data = sg.asRange(verts) });
+            vbuf = mesh_deferred.makeDeferredMeshVertexBuffer(.{ .data = sg.asRange(verts) });
             if (vbuf.id == 0 or sg.queryBufferState(vbuf) != .VALID) {
                 if (vbuf.id != 0) sg.destroyBuffer(vbuf);
                 continue;
@@ -931,6 +939,10 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                 sg.applyUniforms(pc_shd.UB_cs_params, sg.asRange(&params));
                 sg.dispatch(@intCast(compute.groupCount(up.high_water, workgroup_size)), 1, 1);
                 sg.endPass();
+                // Slot-owned attempt outcome: counted only after the real
+                // dispatch above (headless/unsupported/empty paths never
+                // reach here, so they stay 0 — never faked).
+                up.dispatches +%= 1;
             }
             up.consumed_staged = up.data_count;
             up.consumed_dt = up.dt_accum;
@@ -1334,8 +1346,21 @@ fn commitParticleCompute(scene: anytype, front: anytype) void {
     for (front.p_compute_uploads.items) |*up| {
         const ps = commitParticleAt(scene, up.sys_index, up.token) orelse {
             retireComputeCreated(scene, up);
+            // Owner gone: the count cannot be applied to any other object
+            // (the next token is unrelated), so it is dropped with the
+            // packet instead of credited elsewhere.
+            up.dispatches = 0;
             continue;
         };
+        // Attempt-count transfer (verified token only): every real dispatch
+        // the flush issued for this packet lands in the game-owned counter
+        // exactly once, BEFORE the delivered/unsupported branches — an
+        // earlier attempt counts even when a later retry fails or latches
+        // unsupported.
+        if (up.dispatches != 0) {
+            ps.compute_dispatches +%= up.dispatches;
+            up.dispatches = 0;
+        }
         if (up.unsupported) {
             // Backend without compute support (mirrors the legacy helper):
             // latch unsupported, drop the pending flags — never a silent
@@ -3214,4 +3239,83 @@ test "upload packets: pending delta undelivered re-arms both flags, bytes intact
     restageDroppedSlot(&fake_scene, &slot);
     try t.expect(mesh.gpu_pending);
     try t.expect(mesh.morph_upload_pending);
+}
+
+test "upload packets: compute dispatch count transfers exactly once, survives reflush" {
+    // Real-GPU gate regression: the staged flush issues sg.dispatch but the
+    // old outcome carried no count, so compute_dispatches stayed 0 while
+    // waves ran. The slot-owned `dispatches` attempt counter closes it:
+    // the flush increments after each real dispatch, the commit transfers
+    // at the verified token exactly once (even on later undelivered
+    // retries), a wrong token credits nothing, and a headless re-flush
+    // preserves the count without adding to it.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var ps = try sys_mod.makeComputeSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&ps);
+    var systems = [_]*sys_mod.ParticleSystem{&ps};
+    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
+    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
+    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
+    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer retire.deinit(t.allocator);
+    var fake_scene = .{
+        .allocator = t.allocator,
+        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
+        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
+        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
+        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
+        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
+        .gpu_retire = &retire,
+        .flush_in_prepare = true,
+    };
+    const token = @intFromPtr(&ps);
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = token,
+        .sys_index = 0,
+        .capacity = 4,
+        .delivered = true,
+        .dispatches = 2,
+    });
+
+    // Delivered: count transfers, outcome zeroes (exactly-once).
+    commitSlotResults(&fake_scene, &slot);
+    try t.expectEqual(@as(u64, 2), ps.compute_dispatches);
+    try t.expectEqual(@as(u64, 0), slot.p_compute_uploads.items[0].dispatches);
+    // Repeat commit: no extra credit.
+    commitSlotResults(&fake_scene, &slot);
+    try t.expectEqual(@as(u64, 2), ps.compute_dispatches);
+
+    // Undelivered retry carrying a prior actual attempt: still counts
+    // one-shot on top of the earlier transfer.
+    slot.p_compute_uploads.items[0].delivered = false;
+    slot.p_compute_uploads.items[0].dispatches = 3;
+    commitSlotResults(&fake_scene, &slot);
+    try t.expectEqual(@as(u64, 5), ps.compute_dispatches);
+    try t.expectEqual(@as(u64, 0), slot.p_compute_uploads.items[0].dispatches);
+
+    // Wrong token: no credit to the unrelated live object.
+    slot.p_compute_uploads.items[0].token +%= 1;
+    slot.p_compute_uploads.items[0].delivered = true;
+    slot.p_compute_uploads.items[0].dispatches = 7;
+    commitSlotResults(&fake_scene, &slot);
+    try t.expectEqual(@as(u64, 5), ps.compute_dispatches);
+    try t.expectEqual(@as(u64, 0), slot.p_compute_uploads.items[0].dispatches);
+
+    // Headless re-flush preserves the attempt count without crediting the
+    // game counter (no sg context => no dispatch => no fake count).
+    slot.p_compute_uploads.items[0].token = token;
+    slot.p_compute_uploads.items[0].dispatches = 9;
+    slot.p_compute_uploads.items[0].delivered = true;
+    flushSlotUploads(&fake_scene, &slot);
+    try t.expectEqual(@as(u64, 9), slot.p_compute_uploads.items[0].dispatches);
+    try t.expect(!slot.p_compute_uploads.items[0].delivered);
+    try t.expectEqual(@as(u64, 5), ps.compute_dispatches);
 }

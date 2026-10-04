@@ -81,8 +81,10 @@ pub const DebugPass = struct {
     vertex_buffer: sg.Buffer = .{},
     staging: std.ArrayListUnmanaged(Vertex) = .empty,
     capacity_lines: usize = 0,
-    /// Main-target sample count the pipeline was built for (scene/msaa.zig).
+    /// Main-target sample count the pipeline was built for.
     sample_count: i32 = 1,
+    /// Main-target color format the pipeline was built for.
+    color_format: sg.PixelFormat = .RGBA16F,
     shader: sg.Shader = .{},
     /// Vertices committed by the last upload(), drawn by drawPrepared().
     /// Upload-free draws read this, never the caller's slice — one upload
@@ -96,14 +98,9 @@ pub const DebugPass = struct {
     upload_commit: u32 = 0,
     upload_armed: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) !DebugPass {
-        return initSampled(allocator, 1);
-    }
-
-    /// Same pass at a different main-target sample count: sokol requires
-    /// pipeline.sample_count to match the attachments of the pass it draws
-    /// into.
-    pub fn initSampled(allocator: std.mem.Allocator, sample_count: i32) !DebugPass {
+    /// Same pass for an explicit target shape (sample count + color
+    /// format): each main-target shape needs its own pipeline variant.
+    pub fn init(allocator: std.mem.Allocator, sample_count: i32, color_format: sg.PixelFormat) !DebugPass {
         var staging: std.ArrayListUnmanaged(Vertex) = .empty;
         try staging.ensureTotalCapacity(allocator, verticesForLineCount(initial_capacity_lines));
 
@@ -124,6 +121,7 @@ pub const DebugPass = struct {
             .cull_mode = .NONE,
             .sample_count = sample_count,
         };
+        pip_desc.colors[0].pixel_format = color_format;
         pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
         pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
             .format = .FLOAT3,
@@ -142,6 +140,7 @@ pub const DebugPass = struct {
             .staging = staging,
             .capacity_lines = initial_capacity_lines,
             .sample_count = sample_count,
+            .color_format = color_format,
             .shader = shd,
         };
     }
@@ -200,7 +199,7 @@ pub const DebugPass = struct {
     /// with no per-view re-upload.
     ///
     /// Overflow beyond max_capacity_lines is clamped (oldest lines win:
-    /// prefix is drawn, tail dropped) — same as the legacy render().
+    /// prefix is drawn, tail dropped) — same as render().
     /// Headless-safe: packing + staging are pure CPU, every `sg.*` sits
     /// behind `sg.isvalid()` (no meter bytes headless either).
     /// Returns true when drawable data is staged (live: on the GPU).
@@ -275,7 +274,7 @@ pub const DebugPass = struct {
     /// needed — the pass reads the already-bound depth buffer.
     /// Overflow beyond max_capacity_lines is clamped (oldest lines win:
     /// prefix is drawn, tail dropped).
-    /// Legacy single-view path (upload + draw); multi-view callers upload
+    /// Single-view path (upload + draw); multi-view callers upload
     /// once and drawPrepared per view instead.
     pub fn render(self: *DebugPass, view_proj: Mat4, lines: []const DebugLine) void {
         if (!self.upload(lines)) return;
@@ -396,7 +395,7 @@ test "upload clamps at max capacity, oldest lines win" {
     try pass.staging.ensureTotalCapacity(t.allocator, verticesForLineCount(max_capacity_lines));
 
     // max + 2 lines: growth is capped, so the prefix draws, tail drops —
-    // same clamp as the legacy render().
+    // same clamp as render().
     const n = max_capacity_lines + 2;
     const lines = try t.allocator.alloc(DebugLine, n);
     defer t.allocator.free(lines);

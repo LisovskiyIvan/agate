@@ -26,6 +26,26 @@ const scene_lights = @import("light_rig.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 
+// Staged-protocol test helpers (test-only, NOT a production compat wrapper):
+// - buildForTest: full producer build (claim.build -> stageUi -> publish),
+//   requires success (saturation is a test failure).
+// - finishForTest: consumes the pending FULL build via begin/finish; panics
+//   when no fresh staged build is pending (hides-nothing: a missing build
+//   fails loudly instead of falling back).
+// - stageAndPrepareForTest: fresh-build sites only (no pending build):
+//   explicit build + begin/finish producer step.
+fn buildForTest(scene: *Scene) !void {
+    try std.testing.expect(scene.buildPreparedFrame());
+}
+fn finishForTest(scene: *Scene) void {
+    const claim = scene.beginStagedPrepare() orelse std.debug.panic("{s}", .{"finishForTest: no fresh staged build"});
+    scene.finishStagedPrepare(claim);
+}
+fn stageAndPrepareForTest(scene: *Scene) !void {
+    try buildForTest(scene);
+    finishForTest(scene);
+}
+
 test "Scene camera switching and cycling" {
     const ally = std.testing.allocator;
     var scene: Scene = undefined;
@@ -117,11 +137,12 @@ test "updateLights packs point lights into the frame payload" {
     try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
 }
 
-test "publishFrameSnapshot and prepareFrame snapshot handoff" {
+test "publishFrameSnapshot and staged finish snapshot handoff" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -129,7 +150,7 @@ test "publishFrameSnapshot and prepareFrame snapshot handoff" {
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     try std.testing.expect(!scene.frame_prepared);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expect(scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(i32, 1920), scene.frame_snapshot.screen_w);
@@ -315,22 +336,23 @@ test "clustered removal retires live tile buffers; out-of-range never retires" {
     try std.testing.expect(!scene.clustered.isLive(0));
 }
 
-test "saturated frame mailbox keeps the newest snapshot" {
+test "saturated snapshot mailbox keeps the newest generation" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
-    // Reproducer for the fallback-overwrite bug: three publishes without a
-    // consuming prepareFrame saturate the 2-slot mailbox. The third publish
-    // must drain the stale slots and land, so prepareFrame takes 300 — not
-    // an older published frame over the newer fallback. packFrameSnapshot
+    // Staged newest-wins: three publishes without a consuming finish,
+    // then staged begin/finish consumes the newest; stale slots drain so
+    // the finish takes 300 — not an older published generation over
+    // the newer staged build. packFrameSnapshot sets screen_w before
     // sets screen_w before the no-camera early-out, so no camera is needed.
     scene.publishFrameSnapshot(1.0, 100, 100);
     scene.publishFrameSnapshot(1.0, 200, 200);
     scene.publishFrameSnapshot(1.0, 300, 300);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_h);
@@ -543,25 +565,26 @@ test "destroyMesh вне контекста: ретенция + flush на ко�
     try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
 }
 
-test "prepareFrame stages an empty upload tally without an upload queue" {
+test "staged build stages an empty upload tally without an upload queue" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
-    // No uploads queue and no io runner on the fixture: prepareFrame takes
+    // No uploads queue and no io runner on the fixture: the staged finish takes
     // the synchronous path and stages a zero tally for the stats publish.
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 0), scene.frame_uploads.count);
     try std.testing.expectEqual(@as(u64, 0), scene.frame_uploads.bytes);
     // Без GPU-контекста динамических апдейтов нет: метрика нулевая,
-    // счётчик meter сброшен в начале prepareFrame.
+    // счётчик meter сброшен в начале staged finish.
     try std.testing.expectEqual(@as(u64, 0), scene.stats.updated_bytes_frame);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
 }
 
-test "prepareFrame rebuilds outline snapshots without GPU" {
+test "staged finish rebuilds outline snapshots without GPU" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -571,7 +594,7 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
 
     // No GPU context on the fixture (default textures zeroed): outline
     // capture still runs unconditionally after the (skipped) pre-stage, as
-    // before P5 — snapshots clear and rebuild every prepareFrame (P7: into
+    // before P5 — snapshots clear and rebuild every staged finish (P7: into
     // the published slot, read via preparedDraws()).
     var mesh = Mesh{
         .name = "headless_outline",
@@ -582,19 +605,19 @@ test "prepareFrame rebuilds outline snapshots without GPU" {
     };
     try scene.outline_meshes.append(alloc, &mesh);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     // Rebuild, not accumulate.
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     // Clearing works: a hidden mesh rebuilds to empty.
     mesh.is_visible = false;
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().outline_items.items.len);
 }
 
-test "prepareFrame stages highlight snapshots without GPU" {
+test "staged finish stages highlight snapshots without GPU" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -618,7 +641,7 @@ test "prepareFrame stages highlight snapshots without GPU" {
     try std.testing.expectEqual(@as(usize, 0), id);
     try std.testing.expectEqual(@as(usize, 1), scene.highlightCount());
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
     const staged = scene.preparedDraws().highlight_items.items[0];
@@ -627,11 +650,11 @@ test "prepareFrame stages highlight snapshots without GPU" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), staged.intensity, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), staged.model.m[12], 1e-4);
     // Rebuild, not accumulate.
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
     // Clearing works: a hidden mesh rebuilds to empty.
     m.is_visible = false;
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
     m.is_visible = true;
 }
@@ -654,14 +677,14 @@ test "highlight staged items freeze the model (no live reads at render time)" {
     }
     _ = try scene.addHighlightMesh(m, .{});
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
     // Game-side mutation after prepare cannot tear the published front:
     // the render consumes this frozen model, never the live mesh.
     m.position = Vec3.new(9, 0, 0);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
     // The next prepare picks the new transform up (freshness preserved).
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), scene.preparedDraws().highlight_items.items[0].model.m[12], 1e-4);
 }
 
@@ -678,7 +701,7 @@ test "destroyMesh drops highlight entries and the stage rebuilds empty" {
     m.index_count = 3;
     try scene.meshes.append(alloc, m);
     _ = try scene.addHighlightMesh(m, .{});
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().highlight_items.items.len);
 
     // Off-context destroy (headless fixture: no context thread, so the
@@ -687,7 +710,7 @@ test "destroyMesh drops highlight entries and the stage rebuilds empty" {
     scene.destroyMesh(m);
     try std.testing.expectEqual(@as(usize, 0), scene.highlightCount());
     try std.testing.expect(scene.getHighlightMesh(0) == null);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
 }
 
@@ -701,7 +724,7 @@ test "zero highlights is structurally bit-identical (no passes, no state)" {
     // Fresh scene (and every load — highlights are transient, never
     // serialized): zero entries, zero staged items, gate closed.
     try std.testing.expectEqual(@as(usize, 0), scene.highlightCount());
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
     const postprocess = @import("../postprocess.zig");
     try std.testing.expect(!postprocess.highlightActive(scene.post_process.enabled, scene.preparedDraws().highlight_items.items.len));
@@ -757,14 +780,15 @@ test "shaft defaults are off with zero GPU state (bit-identical)" {
     try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.raymarch_image.id);
 }
 
-test "prepareFrame transfers staged update tick, preserves prepare_ms" {
+test "staged finish transfers update tick, preserves prepare_ms" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
     // Игровая фаза сложила тик через recordUpdateTime (НЕ в stats),
-    // прошлый кадр оставил счётчики и post_ms: сброс prepareFrame обязан
+    // прошлый кадр оставил счётчики и post_ms: сброс staged finish обязан
     // перенести staged update_ms и сохранить prepare_ms, остальное обнулить.
     // Прямая запись stats.update_ms с update-стороны запрещена (контракт
     // recordUpdateTime): этот тест пишет только staged поле + prepare_ms.
@@ -774,14 +798,14 @@ test "prepareFrame transfers staged update tick, preserves prepare_ms" {
     scene.stats.triangles = 1000;
     scene.stats.post_ms = 3.0;
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
 
     try std.testing.expectEqual(@as(f32, 2.5), scene.stats.update_ms);
     try std.testing.expectEqual(@as(f32, 1.25), scene.stats.prepare_ms);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.draw_calls);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.triangles);
     try std.testing.expectEqual(@as(f32, 0.0), scene.stats.post_ms);
-    // prepare_ms следующего кадра app перезапишет поверх после prepareFrame
+    // prepare_ms следующего кадра app перезапишет поверх после staged finish
     // (frame() в main) — handoff не мешает новому замеру.
 }
 
@@ -790,8 +814,9 @@ test "recordUpdateTime stages without touching stats (update||render disjoint)" 
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(f32, 0.0), scene.stats.update_ms);
 
     // Update-сторона (game thread): только staged поле, stats не тронуты —
@@ -802,7 +827,7 @@ test "recordUpdateTime stages without touching stats (update||render disjoint)" 
 
     // Последний тик wins до prepare; prepare переносит его в stats.
     scene.recordUpdateTime(8.25);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(f32, 8.25), scene.stats.update_ms);
 }
 
@@ -818,11 +843,12 @@ test "async save/load report NoTaskRunner without an io runner" {
     try std.testing.expectError(error.NoTaskRunner, scene.loadStateFileAsync("no_runner.agsc"));
 }
 
-test "P6: prepareFrame captures UI into the render-owned frame" {
+test "P6: staged finish captures UI into the render-owned frame" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
     defer scene.ui_frame.deinit(alloc);
 
     // Headless canvas (no GPU init): draws only fill CPU-side lists.
@@ -845,7 +871,7 @@ test "P6: prepareFrame captures UI into the render-owned frame" {
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     // Frame owns copies of the full geometry; dims come from the scene
     // snapshot (not live sapp values); borrowed handle IDs are captured.
@@ -866,15 +892,16 @@ test "P6: prepareFrame captures UI into the render-owned frame" {
     // Newest capture wins across prepares.
     canvas_ui.drawRect(1, 2, 3, 4, Color4.white);
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(canvas_ui.vertices.items.len, scene.ui_frame.vertices.items.len);
 }
 
-test "P6: camera-less prepare clears stale UI (no prior overlay)" {
+test "P6: camera-less staged finish clears stale UI (no prior overlay)" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
     defer scene.ui_frame.deinit(alloc);
 
     scene.ui_canvas = UICanvas{
@@ -893,7 +920,7 @@ test "P6: camera-less prepare clears stale UI (no prior overlay)" {
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.ui_frame.has_capture);
 
     // Camera lost: the next prepare must not redisplay the prior overlay.
@@ -903,18 +930,19 @@ test "P6: camera-less prepare clears stale UI (no prior overlay)" {
     scene.cameras.clearRetainingCapacity();
     scene.active_camera = null;
     scene.active_camera_index = null;
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(!scene.ui_frame.has_capture);
     try std.testing.expectEqual(@as(usize, 0), scene.ui_frame.vertices.items.len);
     scene.ui_frame.drawPrepared();
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
 }
 
-test "P6: prepare snapshots canvas presence apart from content" {
+test "P6: staged finish snapshots canvas presence apart from content" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
     defer scene.ui_frame.deinit(alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
@@ -922,7 +950,7 @@ test "P6: prepare snapshots canvas presence apart from content" {
 
     // No canvas at all: presence false, content empty.
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(!scene.ui_frame.canvas_present);
     try std.testing.expect(!scene.ui_frame.has_capture);
 
@@ -940,7 +968,7 @@ test "P6: prepare snapshots canvas presence apart from content" {
         scene.ui_canvas = null;
     }
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.ui_frame.canvas_present);
     try std.testing.expect(!scene.ui_frame.has_capture);
     scene.ui_frame.drawPrepared();
@@ -953,13 +981,13 @@ test "P6: prepare snapshots canvas presence apart from content" {
     }
     scene.ui_canvas = null;
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(!scene.ui_frame.canvas_present);
 }
 
 // ---- P7 triple-buffered prepared draws. ----
 
-// Headless full-path integration runs prepareFrame with a faked GPU-init
+// Headless full-path integration runs the staged build+finish with a faked GPU-init
 // flag (default_white_texture.view.id != 0) plus a CPU-only shadow pass
 // (allocator + empty scratch/payload, zero GPU handles). No sg.* fires on
 // the prepare path for plain/skinned/hook meshes: instance staging skips
@@ -1073,7 +1101,7 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     scene.active_camera_index = 0;
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     const front0 = scene.draws.front;
     const d0 = scene.preparedDraws();
@@ -1090,18 +1118,13 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), d0.outline_items.items[0].model.m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), p7FindByMeshIndex(d0.primary.items.items, 0).?.model.m[12], 1e-4);
 
-    // Front intact while building back: move mesh_a, build the OTHER slot
-    // directly, and prove the published front is untouched (lists, skins,
-    // shader, outline, shadow ranges) while the back sees the new state.
+    // Front intact while building back: move mesh_a, build a claimed slot
+    // via the single staged protocol (claim.build), and prove the published
+    // front is untouched while the claimed back sees the new state.
     mesh_a.position = Vec3.new(9, 0, 0);
-    // Slot-count agnostic: the scratch is whatever backIndex() reports, not
-    // `1 - front` (that two-slot math is exactly what wave 26 removed).
-    const back_idx = scene.draws.backIndex();
-    // New frame id for the manual back build (as prepareFrame would bump):
-    // the world-matrix cache keys on it, and the published front snapshot
-    // must stay at the old pose regardless.
-    scene.frame_id +%= 1;
-    scene.prepareViewQueues(&scene.draws.slots[back_idx].primary, scene.frame_snapshot.primary_cam, null, 1.0, scene.frame_id, &scene.stats, true, .published);
+    var scratch = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"scratch claim saturated"});
+    scratch.build();
+    const back_idx = scratch.slot;
     const front_still = &scene.draws.slots[front0];
     try std.testing.expectEqual(@as(usize, 3), front_still.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), front_still.primary.skin_storage.items.len);
@@ -1113,15 +1136,14 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), p7FindByMeshIndex(front_still.primary.items.items, 0).?.model.m[12], 1e-4);
     const back_built = &scene.draws.slots[back_idx];
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), p7FindByMeshIndex(back_built.primary.items.items, 0).?.model.m[12], 1e-4);
-    // View builds never touch outline: the scratch back holds none.
-    try std.testing.expectEqual(@as(usize, 0), back_built.outline_items.items.len);
+    // The staged build freezes the full payload (outline included) at the new pose.
+    try std.testing.expectEqual(@as(usize, 1), back_built.outline_items.items.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), back_built.outline_items.items[0].model.m[12], 1e-4);
+    scratch.publish();
 
-    // Warmup: the other slots are still cold (the manual build above only ran
-    // the primary view queues, never outline/shadow/UI), so run full prepares
-    // until every slot has been built once as back — the refusal proof below
-    // needs all three slots warm.
-    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-    scene.prepareFrame();
+    // Warmup: consume the claimed build (no rebuild: frozen pose wins), then
+    // keep warming until every slot has been built once as back.
+    finishForTest(&scene);
     try std.testing.expectEqual(back_idx, scene.draws.front);
     const d1 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 3), d1.primary.items.items.len);
@@ -1141,8 +1163,9 @@ test "P7: slots alternate, newest wins, front intact while building back" {
     // warms exactly one slot as back — the third slot is still cold.
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
     {
-        const want = scene.draws.backIndex();
-        scene.prepareFrame();
+        try buildForTest(&scene);
+        const want = scene.build_slot.load(.monotonic);
+        finishForTest(&scene);
         try std.testing.expectEqual(want, scene.draws.front);
         try std.testing.expectApproxEqAbs(@as(f32, 9.0), scene.preparedDraws().outline_items.items[0].model.m[12], 1e-4);
     }
@@ -1169,13 +1192,15 @@ test "P7: slots alternate, newest wins, front intact while building back" {
             .resize_fail_index = 0,
         });
         scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-        // Rotation-agnostic expectation: the publish lands on the back index
-        // captured before the build, whatever the slot count.
-        const want_front = scene.draws.backIndex();
+        // Warm slots prove zero allocator traffic on BOTH halves: the
+        // refusing wrapper covers the staged build and the finish.
         const saved_alloc = scene.allocator;
         scene.allocator = refusing.allocator();
         scene.shadows.pass.allocator = refusing.allocator();
-        scene.prepareFrame();
+        // Rotation-agnostic expectation: the staged claim slot becomes front.
+        try buildForTest(&scene);
+        const want_front = scene.build_slot.load(.monotonic);
+        finishForTest(&scene);
         scene.allocator = saved_alloc;
         scene.shadows.pass.allocator = saved_alloc;
         try std.testing.expect(!refusing.has_induced_failure);
@@ -1241,7 +1266,7 @@ test "P7: main and PIP view slots stay isolated" {
     scene.active_camera_index = 0;
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const draws = scene.preparedDraws();
     // Primary (all-mask active camera) sees both meshes.
     try std.testing.expectEqual(@as(usize, 2), draws.primary.items.items.len);
@@ -1257,14 +1282,14 @@ test "P7: main and PIP view slots stay isolated" {
     // resurfacing the mesh_b frame above.
     scene.cameras.items[1].enabled = false;
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const draws2 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 0), draws2.views[1].items.items.len);
     try std.testing.expectEqual(@as(usize, 2), draws2.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(draws2));
 }
 
-test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
+test "P7: repeated staged builds win newest, no duplicate outline/UI capture" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -1303,17 +1328,18 @@ test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     const ui_n = canvas_ui.vertices.items.len;
     try std.testing.expectEqual(ui_n, scene.ui_frame.vertices.items.len);
 
-    // More UI + moved outline, then a repeated prepare with no new camera
-    // publish (fallback snapshot path): newest wins, nothing accumulates.
+    // More UI + moved outline, then a fresh staged build with no new camera
+    // publish (build packs fresh live state): newest wins, nothing accumulates.
     canvas_ui.drawRect(1, 2, 3, 4, Color4.white);
     mesh.position = Vec3.new(7, 0, 0);
-    const want_rep = scene.draws.backIndex();
-    scene.prepareFrame();
+    try buildForTest(&scene);
+    const want_rep = scene.build_slot.load(.monotonic);
+    finishForTest(&scene);
     try std.testing.expectEqual(want_rep, scene.draws.front);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().outline_items.items.len);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), scene.preparedDraws().outline_items.items[0].model.m[12], 1e-4);
@@ -1321,7 +1347,7 @@ test "P7: repeated prepare wins newest, no duplicate outline/UI capture" {
     try std.testing.expect(canvas_ui.vertices.items.len > ui_n);
 }
 
-test "P7: no-camera/headless and disabled shadows clear coherently, epochs consumed" {
+test "P7: no-camera/headless staged builds clear coherently, epochs consumed" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -1349,7 +1375,7 @@ test "P7: no-camera/headless and disabled shadows clear coherently, epochs consu
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 1), scene.preparedDraws().primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), p7ShadowTotal(scene.preparedDraws()));
     const epoch1 = scene.retire_epoch;
@@ -1362,7 +1388,7 @@ test "P7: no-camera/headless and disabled shadows clear coherently, epochs consu
     scene.cameras.clearRetainingCapacity();
     scene.active_camera = null;
     scene.active_camera_index = null;
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const cleared = scene.preparedDraws();
     try std.testing.expect(!scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(usize, 0), cleared.primary.items.items.len);
@@ -1387,14 +1413,14 @@ test "P7: no-camera/headless and disabled shadows clear coherently, epochs consu
     _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
     scene.shadows.enabled = false;
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const noshadow = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), noshadow.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 0), noshadow.shadow.items.items.len);
     for (noshadow.shadow.bin.counts) |c| try std.testing.expectEqual(@as(usize, 0), c);
 }
 
-test "P7: allocator-failure back stays coherent and recovers without stale items" {
+test "P7: allocator-failure staged slot stays coherent and recovers" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -1436,7 +1462,7 @@ test "P7: allocator-failure back stays coherent and recovers without stale items
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 2), scene.preparedDraws().primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 2), p7ShadowTotal(scene.preparedDraws()));
 
@@ -1449,7 +1475,7 @@ test "P7: allocator-failure back stays coherent and recovers without stale items
     scene.allocator = failing.allocator();
     scene.shadows.pass.allocator = failing.allocator();
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     scene.allocator = real_alloc;
     scene.shadows.pass.allocator = real_alloc;
     const oom = scene.preparedDraws();
@@ -1480,7 +1506,7 @@ test "P7: allocator-failure back stays coherent and recovers without stale items
     // Recovery with the working allocator: no stale items, full frame back.
     mesh_a.position = Vec3.new(6, 0, 0);
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const rec = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), rec.primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 1), rec.primary.skin_storage.items.len);
@@ -1498,11 +1524,12 @@ test "saturated frame mailbox drops instead of overwriting the consumed snapshot
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
     // Consumed snapshot (screen dims are set before the no-camera
     // early-out, so no camera is needed for this ownership proof).
     scene.publishFrameSnapshot(1.0, 111, 111);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(i32, 111), scene.frame_snapshot.screen_w);
 
     // Force the last-unclaimable case: hold BOTH slots in WRITING (a lagging
@@ -1522,7 +1549,7 @@ test "saturated frame mailbox drops instead of overwriting the consumed snapshot
     scene.frame_handoff.slot(b).* = scene.packFrameSnapshot(1.0, 333, 333);
     scene.frame_handoff.publish(b);
     scene.publishFrameSnapshot(1.0, 444, 444);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(i32, 444), scene.frame_snapshot.screen_w);
 }
 
@@ -1566,9 +1593,9 @@ test "debug capture: off/world-empty stay empty, capture immutable, OOM coherent
 
     // Headless upload/draw: safe no-ops, stats clean, no pass created.
     var stats = SceneStats{};
-    scene.physics.uploadDebug(alloc, 1);
+    scene.physics.uploadDebug(alloc, 1, .RGBA16F);
     try std.testing.expect(scene.physics.debug_pass == null);
-    scene.physics.renderDebugPrepared(Mat4.identity, 1, &stats);
+    scene.physics.renderDebugPrepared(Mat4.identity, 1, .RGBA16F, &stats);
     try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
     try std.testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
 
@@ -1577,7 +1604,7 @@ test "debug capture: off/world-empty stay empty, capture immutable, OOM coherent
     scene.physics.debug_pass = @import("../passes/debug_pass.zig").DebugPass{ .allocator = alloc };
     try std.testing.expect(scene.physics.prepared_visible);
     try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
-    scene.physics.renderDebugPrepared(Mat4.identity, 1, &stats);
+    scene.physics.renderDebugPrepared(Mat4.identity, 1, .RGBA16F, &stats);
     try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
     try std.testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
     // Pull the fake pass back out: DebugPass.deinit issues sg.destroy*
@@ -1654,6 +1681,7 @@ test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -1667,7 +1695,7 @@ test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
     scene.sky.ibl_intensity = 0.5;
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.sky_enabled);
     try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectEqual(@as(f32, 0.5), scene.frame_snapshot.ibl_intensity);
@@ -1702,6 +1730,7 @@ test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
         scene.frame_snapshot.sky_texture orelse scene.frame_snapshot.default_cube,
         scene.frame_snapshot.sky_exposure,
         1,
+        .RGBA16F,
         &stats,
     );
     try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
@@ -1715,6 +1744,7 @@ test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
         scene.frame_snapshot.sky_texture orelse scene.frame_snapshot.default_cube,
         scene.frame_snapshot.sky_exposure,
         1,
+        .RGBA16F,
         &stats,
     );
     try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
@@ -1738,7 +1768,7 @@ test "sky snapshot freezes enabled/texture/exposure/defaults at prepare" {
     try std.testing.expectEqual(@as(u32, 67), repacked.default_cube.sampler.id);
     // Publish + prepare consume the newest mailbox frame.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.sky_enabled);
     try std.testing.expectEqual(@as(f32, 4.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectEqual(@as(u32, 88), scene.frame_snapshot.sky_texture.?.view.id);
@@ -1752,6 +1782,7 @@ test "worker churn after prepare cannot mutate consumed snapshot/timings" {
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
     defer scene.physics.deinit(alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
@@ -1760,7 +1791,7 @@ test "worker churn after prepare cannot mutate consumed snapshot/timings" {
     scene.sky.exposure = 1.5;
     scene.recordUpdateTime(3.0);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(f32, 3.0), scene.stats.update_ms);
 
@@ -1798,7 +1829,7 @@ test "worker churn after prepare cannot mutate consumed snapshot/timings" {
 
     // Next prepare picks up the newest live state (newest wins).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(!scene.frame_snapshot.sky_enabled);
     try std.testing.expectEqual(@as(f32, 9.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectEqual(@as(f32, 99.0), scene.stats.update_ms);
@@ -1890,7 +1921,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
         scene: *Scene,
         victim: *Mesh,
         fn run(self: @This()) void {
-            self.scene.buildPreparedFrame();
+            std.debug.assert(self.scene.buildPreparedFrame());
             self.scene.destroyMesh(self.victim);
         }
     };
@@ -1915,7 +1946,9 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
     try std.testing.expectEqual(std.math.maxInt(u64), parent.instance_render.staged_frame);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    // Consume the worker's pending FULL build without rebuilding:
+    // post-build mutation must not leak into the latched frame.
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     // Latch published the mirrors; live meshes still untouched.
@@ -1946,7 +1979,7 @@ test "stage1: worker build + main latch publishes previews; post-build mutation 
 
     // Commit (next game-side build) applies the published mirrors to live:
     // parent lands, the unlinked victim is skipped by the identity guard.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(preview_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
@@ -2000,25 +2033,25 @@ test "stage1: two builds before latch, newest wins" {
     };
     try scene.meshes.append(alloc, &parent);
 
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const first_bounds = parent.instance_preview.bounds;
     // Mutate, rebuild: the single preview store is recomputed in place.
     mem[2].position = Vec3.new(40, 0, 0);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u64, 2), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
     try std.testing.expect(parent.instance_preview.bounds.max.x > first_bounds.max.x + 10.0);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq.load(.monotonic));
     // Commit (next game-side build) applies the newest publish to live.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
     try std.testing.expect(parent.instance_render.bounds.max.x > first_bounds.max.x + 10.0);
 }
 
-test "stage1: no build runs the inline fallback with identical counts/bounds" {
+test "stage1: serial producer builds latch identical counts/bounds" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
@@ -2059,11 +2092,11 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     };
     try scene.meshes.append(alloc, &parent);
 
-    // Latch path first: the outcome lands in the published record mirror
-    // (live meshes stay untouched — no write-back on the latch path).
-    scene.buildPreparedFrame();
+    // Serial producer first: publish then build; the outcome lands in the
+    // published record mirror.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try buildForTest(&scene);
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const mirror = scene.preparedDraws().staged_instances.items[0];
@@ -2071,18 +2104,17 @@ test "stage1: no build runs the inline fallback with identical counts/bounds" {
     const latched_bounds = mirror.bounds;
     const latched_hash = mirror.uploaded_hash;
 
-    // Same live state, no fresh build: the inline fallback must publish the
-    // identical counts/bounds/hash into the live mesh (only staged_frame
-    // advances past the mirror's frame).
+    // Same live state, serial second build: the staged protocol latches
+    // identical counts/bounds/hash (only staged_frame advances).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
+    try stageAndPrepareForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 2), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(mirror.count, parent.instance_render.count);
     try std.testing.expectEqual(latched_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(latched_hash, parent.instance_render.hash);
 }
 
-test "stage1: fallback after latch is not clobbered by the later commit" {
+test "stage1: second staged build republishes without stale mirrors" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
@@ -2122,30 +2154,31 @@ test "stage1: fallback after latch is not clobbered by the later commit" {
     };
     try scene.meshes.append(alloc, &parent);
 
-    // Latch (frame 1): outcome sits in the slot mirror, live untouched.
-    scene.buildPreparedFrame();
+    // Serial build (frame 1): outcome sits in the slot mirror.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try buildForTest(&scene);
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
 
-    // Fallback (frame 2, no fresh build): the inline path publishes live
-    // directly — the pending frame-1 mirrors must not leak back in later.
+    // Serial build (frame 2): the staged build republishes the same live
+    // state — frame-1 mirrors must not leak back in later. The frame-2
+    // latch outcomes commit at the NEXT build, so live still shows the
+    // frame-1 commit here (staged_frame 1, never a stale mirror).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
-    try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
+    try std.testing.expectEqual(@as(u64, 1), parent.instance_render.staged_frame);
 
-    // Next build commits: the front slot is the fallback's (no records), so
-    // this is a no-op — live keeps the frame-2 state, never regresses to
-    // the stale frame-1 mirror.
-    scene.buildPreparedFrame();
+    // Next build commits newest-wins: live keeps the frame-2 state, never
+    // regresses to the stale frame-1 mirror.
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
 
     // A fresh latch + commit republishes identically.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 3), parent.instance_render.staged_frame);
 }
@@ -2191,27 +2224,27 @@ test "stage1: commit resolves the latest latched front through the lease" {
     try scene.meshes.append(alloc, &parent);
 
     // Generation 1: build + latch (count 3). Live untouched by the latch.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     const front_f1 = scene.draws.frontIndex();
     try std.testing.expectEqual(@as(u64, 1), scene.draws.slots[front_f1].frame_id);
 
     // Generation 2: hide one instance, build (commits the F1 mirror), latch.
     mem[0].is_visible = false;
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 1), parent.instance_render.staged_frame);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const front_f2 = scene.draws.frontIndex();
     try std.testing.expectEqual(@as(u64, 2), scene.draws.slots[front_f2].frame_id);
 
     // Generation 3: hide another, build — the commit must apply the LATEST
     // latched front (F2, count 2), never a superseded slot's mirror.
     mem[1].is_visible = false;
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(u64, 2), parent.instance_render.staged_frame);
     // The lease is balanced: the commit takes no pins and the front the
@@ -2261,15 +2294,15 @@ test "stage1: serial same-thread build+latch parity" {
     };
     try scene.meshes.append(alloc, &parent);
 
-    scene.buildPreparedFrame();
-    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot.load(.monotonic));
+    try buildForTest(&scene);
+    try std.testing.expect(scene.build_slot.load(.monotonic) < scene.draws.slots.len);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
 
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     // Commit (next game-side build) applies the publish to live.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(parent.instance_preview.count, parent.instance_render.count);
     try std.testing.expectEqual(@as(u32, 6), parent.instance_render.count);
     try std.testing.expectEqual(parent.instance_preview.bounds, parent.instance_render.bounds);
@@ -2320,10 +2353,10 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
 
     // Prime: funded build + latch publishes the complete state; the next
     // build commits it to the live mesh.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     const primed_bounds = parent.instance_render.bounds;
     const primed_hash = parent.instance_render.hash;
     try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
@@ -2336,7 +2369,7 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     const real_alloc = scene.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     scene.allocator = failing.allocator();
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.allocator = real_alloc;
     try std.testing.expectEqual(@as(u64, 3), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), parent.instance_preview.build_seq);
@@ -2345,17 +2378,17 @@ test "stage1: OOM build advances nothing, latch keeps previous, then recovers" {
     // Latch: the stale mesh is skipped — previous complete state stands,
     // no partial publish.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
     try std.testing.expectEqual(primed_hash, parent.instance_render.hash);
 
     // Recovery: a funded build + latch + commit publishes the mutated state.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u64, 5), parent.instance_preview.build_seq);
     try std.testing.expect(parent.instance_render.bounds.max.x > primed_bounds.max.x + 10.0);
 }
@@ -2399,7 +2432,7 @@ test "stage1: particle build on worker + latch on main freezes the frame" {
     const Builder = struct {
         scene: *Scene,
         fn run(self: @This()) void {
-            self.scene.buildPreparedFrame();
+            std.debug.assert(self.scene.buildPreparedFrame());
         }
     };
     const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
@@ -2408,10 +2441,11 @@ test "stage1: particle build on worker + latch on main freezes the frame" {
     try std.testing.expectEqual(@as(usize, 1), scene.particles.build_frame.items.len);
     try std.testing.expectEqual(@as(usize, 0), scene.particles.frame.items.len);
 
-    // Live mutation after the build must not reach the render-owned frame.
+    // Live mutation after the worker build must not reach the render-owned
+    // frame: consume the pending build without rebuilding.
     ps.active_count = 1;
     ps.instance_buffer = .{ .id = 99 };
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(u64, 1), scene.particles.latched_seq);
     try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
@@ -2477,7 +2511,7 @@ test "stage1: compute particle capture borrows the baked buffer; retire takes al
     try std.testing.expectEqual(@as(u32, 23), draw.drawBuffer().id);
 
     // Teardown: all five particle buffers retire through the queue from any
-    // thread (fake ids: retire into the open epoch like prepareFrame would,
+    // thread (fake ids: retire into the open epoch like the staged finish would,
     // so the pre-complete flush keeps them without sg.*, then manual cleanup
     // — mirrors the retireBuffer unit-test handling).
     _ = scene.gpu_retire.begin();
@@ -2516,7 +2550,7 @@ test "stage1: physics build on worker + latch on main freezes the capture" {
     const Builder = struct {
         scene: *Scene,
         fn run(self: @This()) void {
-            self.scene.buildPreparedFrame();
+            std.debug.assert(self.scene.buildPreparedFrame());
         }
     };
     const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &scene }});
@@ -2526,10 +2560,11 @@ test "stage1: physics build on worker + latch on main freezes the capture" {
     try std.testing.expectEqual(@as(usize, 12), scene.physics.build_lines.items.len);
     try std.testing.expect(!scene.physics.prepared_visible);
 
-    // Live mutation after the build must not reach the prepared capture.
+    // Live mutation after the worker build must not reach the prepared
+    // capture: consume the pending build without rebuilding.
     const x0 = scene.physics.build_lines.items[0].a.x;
     pmesh.position = Vec3.new(5, 0, 0);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(u64, 1), scene.physics.latched_seq);
     try std.testing.expect(scene.physics.prepared_visible);
@@ -2580,8 +2615,8 @@ test "stage1: instances cleared between build and latch take the regular path" {
     try scene.meshes.append(alloc, &parent);
 
     // Build while instanced: the preview records 3 (the build never
-    // publishes — instance_render stays empty until a latch or fallback).
-    scene.buildPreparedFrame();
+    // publishes — instance_render stays empty until the staged latch).
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
 
@@ -2594,7 +2629,7 @@ test "stage1: instances cleared between build and latch take the regular path" {
     // not this one.
     parent.instances.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
@@ -2606,10 +2641,10 @@ test "stage1: instances cleared between build and latch take the regular path" {
     // Next build: the commit skips the emptied mesh (live stays empty) and
     // the rebuild reroutes to the regular path; the following latch draws
     // the regular item with no instanced payload.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws2 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), draws2.primary.items.items.len);
     try std.testing.expectEqual(@as(u32, 0), parent.instance_render.count);
@@ -2657,14 +2692,14 @@ test "stage1: latch consumes slot records when live previews are cleared" {
 
     // Build freezes the slot-owned records; wiping the live previews after
     // that must not matter — the latch reads records + scratch only.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_preview.count);
-    try std.testing.expectEqual(@as(usize, 1), scene.draws.backSlot().staged_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items.len);
     parent.instance_preview = .{};
     try std.testing.expectEqual(@as(u64, 0), parent.instance_preview.build_seq);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     // Post-latch state mirrors into the slot record (the patch source) even
@@ -2681,7 +2716,7 @@ test "stage1: latch consumes slot records when live previews are cleared" {
 
     // Commit (next game-side build) applies the published mirror to live.
     // (The rebuild recomputes the wiped preview from unchanged live TRS.)
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 4), parent.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
     try std.testing.expect(parent.instance_render.bounds.isValid());
@@ -2731,10 +2766,10 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
 
     // Round 1: funded build + latch publishes the complete state; the next
     // build commits it to the live mesh.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expect(parent.instance_render.bounds.isValid());
 
@@ -2753,11 +2788,11 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
     // untouched — ST2-C covers the makeBuffer-failure detection itself on a
     // real GPU).
     parent.instances.items = ptrs[0..4];
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 5), parent.instance_preview.count);
-    scene.draws.backSlot().primary.instance_matrices.clearRetainingCapacity();
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).primary.instance_matrices.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
 
     // Previous COMPLETE state kept in every field; staged_frame NOT advanced
     // to the current frame (residual readers can tell nothing new published).
@@ -2808,10 +2843,10 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
 
     // Recovery: restore the scratch with a funded rebuild, latch, and commit
     // publishes the grown state.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 5), parent.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, parent.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 5), scene.preparedDraws().primary.opaque_instanced.items[0].visible_instance_count);
@@ -2870,7 +2905,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     try scene.meshes.append(alloc, &mesh_b);
 
     // Scratch is concatenated [A0 A1 A2 B0 B1]: A.lo=0, B.lo=3.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), mesh_a.instance_preview.scratch_lo);
     try std.testing.expectEqual(@as(usize, 4), mesh_b.instance_preview.scratch_lo);
 
@@ -2892,7 +2927,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     try scene.meshes.append(alloc, &mesh_c);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     // Slot-owned latch: the reorder is invisible here (no live-list read
     // remains) — both records publish from slot data and the patch finalizes
     // the frozen batches from them. Live meshes stay exactly as built
@@ -2920,7 +2955,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
     for (draws.primary.opaque_instanced.items) |b| {
         try std.testing.expect(b.visible_instance_count == 4 or b.visible_instance_count == 3);
     }
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 0), mesh_a.instance_render.count);
     try std.testing.expectEqual(std.math.maxInt(u64), mesh_a.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 0), mesh_b.instance_render.count);
@@ -2928,10 +2963,10 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
 
     // Recovery: a funded build + latch + commit publishes the live list
     // (B + C).
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
     try std.testing.expectEqual(@as(u32, 3), mesh_c.instance_render.count);
     try std.testing.expectEqual(scene.frame_id, mesh_b.instance_render.staged_frame);
@@ -2984,10 +3019,10 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
 
     // Prime: funded build + latch publishes the complete state; the next
     // build commits it to the live mesh.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     const primed_bounds = parent.instance_render.bounds;
     try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
 
@@ -2995,24 +3030,24 @@ test "stage1: truncated scratch between build and latch is skipped safely" {
     // contract violation the latch must survive): the out-of-range slice is
     // skipped via the bounds check and the previous state stands.
     mem[0].position = Vec3.new(100, 0, 0);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u64, 3), parent.instance_preview.build_seq);
-    scene.draws.backSlot().primary.instance_matrices.clearRetainingCapacity();
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).primary.instance_matrices.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u64, 3), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(primed_bounds, parent.instance_render.bounds);
 
     // Recovery: a funded build + latch + commit publishes the mutated state.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expect(parent.instance_render.bounds.max.x > primed_bounds.max.x + 10.0);
 }
 
-test "stage-2A: buildQueuesInto with fallback params equals two runs" {
+test "stage-2A: buildQueuesInto with staged params equals two runs" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.meshes.deinit(alloc);
@@ -3157,7 +3192,7 @@ test "stage-2B(a): build+latch finalizes handles and freezes sets" {
     try scene.meshes.append(alloc, &regular);
     try scene.outline_meshes.append(alloc, &parent);
 
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const frozen_bounds = parent.instance_preview.bounds;
     const frozen_reg_pos = regular.position;
 
@@ -3175,7 +3210,7 @@ test "stage-2B(a): build+latch finalizes handles and freezes sets" {
     const poisoned = parent.instance_render;
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(poisoned.buffer.id, parent.instance_render.buffer.id);
     try std.testing.expectEqual(poisoned.capacity, parent.instance_render.capacity);
     try std.testing.expectEqual(poisoned.count, parent.instance_render.count);
@@ -3225,7 +3260,7 @@ test "stage-2B(a): build+latch finalizes handles and freezes sets" {
 
     // Commit (next game-side build) applies the published mirror to live:
     // the poison is gone, the frozen state lands verbatim.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(mirror.count, parent.instance_render.count);
     try std.testing.expectEqual(mirror.buffer.id, parent.instance_render.buffer.id);
     try std.testing.expectEqual(frozen_bounds, parent.instance_render.bounds);
@@ -3277,7 +3312,7 @@ test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
     try scene.meshes.append(alloc, &parent);
     try scene.outline_meshes.append(alloc, &parent);
 
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     // Provisional handle is the old one.
     try std.testing.expectEqual(@as(u32, 100), parent.instance_build_view.buffer.id);
 
@@ -3290,19 +3325,19 @@ test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
     // latch epoch) so the prepare-leading flush never destroys a fake
     // headless id — mirroring the real growth order (new first, old retired
     // into the current epoch, VALID until a later complete+flush).
-    try std.testing.expectEqual(@as(usize, 1), scene.draws.backSlot().staged_instances.items.len);
-    const old_buf = scene.draws.backSlot().staged_instances.items[0].buffer;
+    try std.testing.expectEqual(@as(usize, 1), scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items.len);
+    const old_buf = scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].buffer;
     try std.testing.expectEqual(@as(u32, 100), old_buf.id);
-    scene.draws.backSlot().staged_instances.items[0].buffer = .{ .id = 200 };
-    scene.draws.backSlot().staged_instances.items[0].capacity = 4;
-    scene.draws.backSlot().staged_instances.items[0].uploaded_count = 4;
-    scene.draws.backSlot().staged_instances.items[0].uploaded_hash =
-        scene.draws.backSlot().staged_instances.items[0].hash;
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].buffer = .{ .id = 200 };
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].capacity = 4;
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].uploaded_count = 4;
+    scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].uploaded_hash =
+        scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances.items[0].hash;
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     // Commit (next game-side build) applies the published mirror to live.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const draws = scene.preparedDraws();
     // The record mirror carries the grown handle into instance_render and
     // every payload ref.
@@ -3395,12 +3430,12 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
     try scene.outline_meshes.append(alloc, &mesh_a);
     try scene.outline_meshes.append(alloc, &mesh_b);
 
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     // Simulate an OOM-skipped segment at latch: drop B's staged record so
     // the latch has nothing to consume for it (previous complete state
     // stands, patch must zero its provisional entries — no partial mix).
     {
-        const recs = &scene.draws.backSlot().staged_instances;
+        const recs = &scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances;
         var i: usize = 0;
         while (i < recs.items.len) : (i += 1) {
             if (recs.items[i].mesh == &mesh_b) break;
@@ -3410,7 +3445,7 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
     }
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws.primary.opaque_instanced.items.len);
     for (draws.primary.opaque_instanced.items) |batch| {
@@ -3435,9 +3470,9 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
         }
     }
     // Retry next frame recovers.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws2 = scene.preparedDraws();
     for (draws2.primary.opaque_instanced.items) |batch| {
         try std.testing.expectEqual(@as(u32, 3), batch.visible_instance_count);
@@ -3508,7 +3543,7 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     try scene.outline_meshes.append(alloc, &mesh_b);
 
     const uid_a = blk: {
-        scene.buildPreparedFrame();
+        try buildForTest(&scene);
         break :blk mesh_a.uid;
     };
     const uid_b = mesh_b.uid;
@@ -3517,7 +3552,7 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     // mismatch on the next latch in a second round below.
     _ = scene.meshes.swapRemove(2);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws = scene.preparedDraws();
     // A/B still draw (indices stable), no OOB from the removed tail.
     var a_ok = false;
@@ -3538,11 +3573,11 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     // stages through (no live-list read remains) and the patch finalizes
     // the frozen batches from the records — no OOB, no UAF. Live meshes
     // still hold the round-1 commit (the write-back is game-side now).
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     _ = scene.meshes.swapRemove(0); // [B] (A unlinked); re-append A → [B, A]
     try scene.meshes.append(alloc, &mesh_a);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws2 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws2.primary.opaque_instanced.items.len);
     for (draws2.primary.opaque_instanced.items) |batch| {
@@ -3556,7 +3591,7 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     // skips both (pointer compares, never a dereference): previous complete
     // state stands for both, the stale generation never lands.
     _ = scene.meshes.swapRemove(1); // [B] (A unlinked again)
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 3), mesh_a.instance_render.count);
     try std.testing.expect(mesh_a.instance_render.staged_frame != scene.frame_id);
     try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
@@ -3565,17 +3600,17 @@ test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/
     // Recovery: a funded rebuild + latch + commit over the live order passes
     // the guard again and lands the newest generation on B (A stays skipped
     // — still unlinked — with its previous complete state).
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    scene.buildPreparedFrame();
+    finishForTest(&scene);
+    try buildForTest(&scene);
     try std.testing.expectEqual(scene.frame_id, mesh_b.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 3), mesh_b.instance_render.count);
     try std.testing.expectEqual(@as(u32, 3), mesh_a.instance_render.count);
     try std.testing.expect(mesh_a.instance_render.staged_frame != scene.frame_id);
 }
 
-test "stage-2B(e): fallback equivalence with build+latch" {
+test "stage-2B(e): serial producer equals concurrent producer" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
 
@@ -3600,7 +3635,7 @@ test "stage-2B(e): fallback equivalence with build+latch" {
             // `stage1FillInstances(&f.src, ...)` inside `init` would store a
             // pointer to this frame's `f.src` local, which dangles once the
             // struct is returned by value (the shadow/instanced bounds then
-            // stage from dead stack memory — fallback-zero vs build-garbage).
+            // stage from dead stack memory — serial-zero vs worker-garbage).
             // The caller fills against its own stable `fix.src` instead.
             f.parent = Mesh{
                 .name = "b2e_parent",
@@ -3625,7 +3660,7 @@ test "stage-2B(e): fallback equivalence with build+latch" {
         }
     };
 
-    // Path 1: build+latch.
+    // Path 1: serial producer (same-thread build + finish).
     var scene_b = stage1Scene(alloc);
     defer scene_b.lights.deinit(alloc);
     defer scene_b.cameras.deinit(alloc);
@@ -3646,13 +3681,13 @@ test "stage-2B(e): fallback equivalence with build+latch" {
     try scene_b.meshes.append(alloc, &fix_b.regular);
     try scene_b.outline_meshes.append(alloc, &fix_b.parent);
     scene_b.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene_b.buildPreparedFrame();
-    scene_b.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene_b.prepareFrame();
+    try buildForTest(&scene_b);
+    finishForTest(&scene_b);
     const draws_b = scene_b.preparedDraws();
     const stats_b = scene_b.stats;
 
-    // Path 2: fallback (never built).
+    // Path 2: concurrent producer (worker-thread build + main finish) —
+    // same staged protocol, whole payload identity preserved.
     var scene_f = stage1Scene(alloc);
     defer scene_f.lights.deinit(alloc);
     defer scene_f.cameras.deinit(alloc);
@@ -3673,7 +3708,18 @@ test "stage-2B(e): fallback equivalence with build+latch" {
     try scene_f.meshes.append(alloc, &fix_f.regular);
     try scene_f.outline_meshes.append(alloc, &fix_f.parent);
     scene_f.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene_f.prepareFrame();
+    const Worker = struct {
+        scene: *Scene,
+        fn run(w: @This()) void {
+            var c = w.scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"worker saturated"});
+            c.build();
+            c.stageUi();
+            c.publish();
+        }
+    };
+    const wt = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .scene = &scene_f }});
+    wt.join();
+    finishForTest(&scene_f);
     const draws_f = scene_f.preparedDraws();
     const stats_f = scene_f.stats;
 
@@ -3684,8 +3730,8 @@ test "stage-2B(e): fallback equivalence with build+latch" {
     // within each scene first (`meshes[source_mesh].uid == source_uid`, the
     // same invariant `patchInstanceRefs` enforces); an item with
     // `source_uid == 0` (never uid-assigned) falls back to positional pairing
-    // for that item only. A prior failure here (fallback-zero vs
-    // build-garbage on the instanced shadow bounds) traced to the Fixture
+    // for that item only. A prior failure here (serial-zero vs
+    // worker-garbage on the instanced shadow bounds) traced to the Fixture
     // storing `&f.src` inside `init` — a pointer to the init frame's local
     // that dangles after the struct is returned by value — not to either
     // code path: both stage faithfully from `source_mesh`, so both read the
@@ -3834,9 +3880,9 @@ test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-        scene.buildPreparedFrame();
+        try buildForTest(&scene);
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-        scene.prepareFrame();
+        finishForTest(&scene);
     }
     const warm_primary = scene.preparedDraws().primary.items.items.len;
     const warm_outline = scene.preparedDraws().outline_items.items.len;
@@ -3849,9 +3895,9 @@ test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
     scene.allocator = refusing.allocator();
     scene.shadows.pass.allocator = refusing.allocator();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     scene.allocator = saved_alloc;
     scene.shadows.pass.allocator = saved_shadow_alloc;
     try std.testing.expect(!refusing.has_induced_failure);
@@ -3869,7 +3915,7 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
     const Builder = struct {
         scene: *Scene,
         fn run(self: @This()) void {
-            self.scene.buildPreparedFrame();
+            std.debug.assert(self.scene.buildPreparedFrame());
         }
     };
 
@@ -3909,9 +3955,9 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
     try serial.meshes.append(alloc, &parent_s);
     try serial.outline_meshes.append(alloc, &parent_s);
     serial.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    serial.buildPreparedFrame();
+    try buildForTest(&serial);
     serial.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    serial.prepareFrame();
+    finishForTest(&serial);
 
     // Worker-build path (same live state, build on a spawned thread).
     var threaded = stage1Scene(alloc);
@@ -3952,7 +3998,7 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
     const t = try std.Thread.spawn(.{}, Builder.run, .{Builder{ .scene = &threaded }});
     t.join();
     threaded.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    threaded.prepareFrame();
+    try stageAndPrepareForTest(&threaded);
 
     // Parity: counts and buffer ids match across threads (distinct Mesh
     // instances, so pairing is positional on the identical single-mesh
@@ -4046,11 +4092,11 @@ test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
     try scene.outline_meshes.append(alloc, &mesh_a);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     // Commit (next game-side build) applies the published mirrors to live.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const draws = scene.preparedDraws();
     // No outline dropped; each item carries its MESH-LIST index (not the
     // outline-list position) and patches from its own mesh.
@@ -4076,9 +4122,9 @@ test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
     _ = scene.outline_meshes.swapRemove(0); // [A]
     try scene.outline_meshes.append(alloc, &mesh_b); // [A, B]
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws2 = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 2), draws2.outline_items.items.len);
     try std.testing.expectEqual(mesh_a.uid, draws2.outline_items.items[0].source_uid);
@@ -4132,11 +4178,11 @@ test "stage-2B(i): PIP views patch each built view" {
     try scene.meshes.append(alloc, &parent);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     // Commit (next game-side build) applies the published mirror to live.
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const draws = scene.preparedDraws();
     // Primary finalized.
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
@@ -4193,7 +4239,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     };
     try scene.meshes.append(alloc, &parent);
 
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u32, 3), parent.instance_preview.count);
     // Drop the staged record so the latch skips (as after an OOM/GPU
     // failure): the transparent batch patch-zeroes but its
@@ -4202,7 +4248,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     // (renderSceneView needs a live camera + sg context, impractical
     // headless; documented).
     {
-        const recs = &scene.draws.backSlot().staged_instances;
+        const recs = &scene.draws.slotAt(scene.build_slot.load(.monotonic)).staged_instances;
         var i: usize = 0;
         while (i < recs.items.len) : (i += 1) {
             if (recs.items[i].mesh == &parent) break;
@@ -4212,7 +4258,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     }
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     const draws = scene.preparedDraws();
     try std.testing.expectEqual(@as(usize, 1), draws.primary.transparent_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 0), draws.primary.transparent_instanced.items[0].visible_instance_count);
@@ -4224,7 +4270,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     try std.testing.expect(found_stale);
 }
 
-test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
+test "stage-2B(k): same-scene staged builds keep cache-key isolation" {
     const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
@@ -4272,29 +4318,151 @@ test "stage-2B(k): same-scene build-then-fallback cache-key isolation" {
     try scene.meshes.append(alloc, &parent);
     try scene.meshes.append(alloc, &regular);
 
-    // Round 1: build+latch (world cache tagged with the build key).
+    // Round 1: staged build + finish (world cache tagged with the build key).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
-    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try buildForTest(&scene);
+    finishForTest(&scene);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     const built_reg_x = p7FindByMeshIndex(scene.preparedDraws().primary.items.items, 1).?.model.m[12];
 
-    // Mutate live, then suppress the build: fallback must recompute under the
-    // frame_id key (not reuse stale build-key entries).
+    // Mutate live, then run a fresh staged build: it must recompute under
+    // the new build key (not reuse stale build-key entries).
     regular.position = Vec3.new(25, 0, 0);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame(); // have_build == false → inline fallback
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     const draws = scene.preparedDraws();
     const fb_item = p7FindByMeshIndex(draws.primary.items.items, 1).?;
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), fb_item.model.m[12], 1e-4);
     try std.testing.expect(fb_item.model.m[12] != built_reg_x);
-    // Cache retagged with the context frame_id (not the build high-bit key).
-    try std.testing.expectEqual(scene.frame_id, regular.cached_frame);
+    // Cache retagged with the fresh staged build attempt key (high-bit
+    // producer namespace over the per-build attempt counter), not the
+    // stale entry and not the context frame_id. Derived from the actual
+    // attempt field — never hardcoded — so cancel/repeat builds that bump
+    // attempts without publishing stay isolated too.
+    const attempt_mask = (@as(u64, 1) << 63) - 1;
+    const want_key = (scene.build_cache_seq & attempt_mask) | (@as(u64, 1) << 63);
+    try std.testing.expectEqual(want_key, regular.cached_frame);
     try std.testing.expectEqual(@as(u32, 3), parent.instance_render.count);
     try std.testing.expectEqual(@as(usize, 1), draws.primary.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(u32, 3), draws.primary.opaque_instanced.items[0].visible_instance_count);
+}
+
+test "stage-2B(l): cancelled build leaves no stale world cache; next publish sees the mutation" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var regular = Mesh{
+        .name = "b2l_reg",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &regular);
+
+    // Prime: staged build + latch publishes generation 1 (world cache tagged).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try buildForTest(&scene);
+    finishForTest(&scene);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), p7FindByMeshIndex(scene.preparedDraws().primary.items.items, 0).?.model.m[12], 1e-4);
+    const attempts_primed = scene.build_cache_seq;
+
+    // Cancelled build stamps the world cache under its reserved (uncommitted)
+    // seq key, then drops the handoff: build_seq stays 1, the slot payload
+    // is ignored by prepare. Uses the pure public producer path
+    // (claim.build/cancel), never a manual cached_frame reset.
+    var dropped = scene.tryClaimBuildSlot().?;
+    dropped.build();
+    dropped.cancel();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    // Every build call advances the cache identity, published or not.
+    try std.testing.expect(scene.build_cache_seq > attempts_primed);
+
+    // Mutate live, then publish a REAL build with no manual cache reset: it
+    // reserves the same handoff seq the cancelled build used, so only a
+    // per-attempt cache key keeps it from reading the stale entry.
+    regular.position = Vec3.new(25, 0, 0);
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try buildForTest(&scene);
+    finishForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 2), scene.build_seq.load(.monotonic));
+
+    // Correct model, bounds, and queue inclusion — never the cancelled
+    // build's frozen TRS.
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.items.items.len);
+    const item = p7FindByMeshIndex(draws.primary.items.items, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), item.model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 24.0), regular.cached_aabb.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 26.0), regular.cached_aabb.max.x, 1e-4);
+}
+
+test "stage-2B(m): repeat build on the same claim wins newest despite identical seq" {
+    const alloc = std.testing.allocator;
+    var scene = stage1Scene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.meshes.deinit(alloc);
+    defer scene.outline_meshes.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    defer scene.gpu_retire.deinit(alloc);
+    defer scene.ui_frame.deinit(alloc);
+    defer scene.shadows.pass.binned_meshes.deinit(alloc);
+    defer scene.shadows.pass.binned_source.deinit(alloc);
+    defer scene.shadows.pass.prepared.deinit(alloc);
+    p7CpuShadowPass(&scene, alloc);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    var regular = Mesh{
+        .name = "b2m_reg",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(5, 0, 0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    try scene.meshes.append(alloc, &regular);
+
+    // One claim, two builds, one publish: the repeat build runs under the
+    // SAME reserved seq, so the queued payload must still freeze the newest
+    // live TRS (repeat-newest-wins), with a single handoff generation and
+    // no partial UI packet.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var claim = scene.tryClaimBuildSlot().?;
+    claim.build();
+    regular.position = Vec3.new(25, 0, 0);
+    claim.build();
+    claim.stageUi();
+    claim.publish();
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    finishForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
+
+    const draws = scene.preparedDraws();
+    try std.testing.expectEqual(@as(usize, 1), draws.primary.items.items.len);
+    const item = p7FindByMeshIndex(draws.primary.items.items, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 25.0), item.model.m[12], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 24.0), regular.cached_aabb.min.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 26.0), regular.cached_aabb.max.x, 1e-4);
+    try std.testing.expect(!scene.ui_frame.has_capture);
 }
 
 test "snapshot ownership repro: build must not touch consumed frame_snapshot" {
@@ -4316,9 +4484,9 @@ test "snapshot ownership repro: build must not touch consumed frame_snapshot" {
     scene.sky.enabled = true;
     scene.sky.exposure = 2.0;
 
-    // Frame A: publish + latch (fallback, no build).
+    // Frame A: publish + staged build + finish.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.has_camera);
     const eye_a = scene.frame_snapshot.primary_cam.eye;
     try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
@@ -4329,7 +4497,7 @@ test "snapshot ownership repro: build must not touch consumed frame_snapshot" {
     if (scene.cameras.items.len > 0) scene.cameras.items[0].camera.free.position = Vec3.new(10, 0, 0);
     scene.sky.exposure = 9.0;
     scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
 
     // The consumed render snapshot must still be A: the producer build owns
     // its own snapshot and never overwrites frame_snapshot (update may
@@ -4375,11 +4543,11 @@ test "snapshot ownership: latch freezes B incl PIP/shadow; post-build C waits" {
 
     // Prime A so the latch below is a B-vs-C comparison, not empty-vs-B.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
 
     // Build B (frozen generation).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const eye_b = scene.build_snapshot.primary_cam.eye;
     try std.testing.expect(scene.build_snapshot.has_camera);
     try std.testing.expect(scene.build_snapshot.shadows_enabled);
@@ -4394,7 +4562,7 @@ test "snapshot ownership: latch freezes B incl PIP/shadow; post-build C waits" {
     scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
 
     // Latch: frame_snapshot must be exactly B, queues frozen at B.
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expect(scene.frame_snapshot.shadows_enabled);
@@ -4407,8 +4575,8 @@ test "snapshot ownership: latch freezes B incl PIP/shadow; post-build C waits" {
     try std.testing.expectEqual(@as(usize, 1), draws.views[1].items.items.len);
     try std.testing.expect(p7ShadowTotal(draws) > 0);
 
-    // C waited: the next fallback (no build) sees it.
-    scene.prepareFrame();
+    // C waited in the mailbox: the next staged build sees it.
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(i32, 640), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(f32, 9.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expect(!scene.frame_snapshot.shadows_enabled);
@@ -4416,7 +4584,7 @@ test "snapshot ownership: latch freezes B incl PIP/shadow; post-build C waits" {
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), scene.preparedDraws().primary.items.items[0].model.m[12], 1e-4);
 }
 
-test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; fallback" {
+test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; staged" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
     defer scene.lights.deinit(alloc);
@@ -4435,17 +4603,17 @@ test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; 
     scene.sky.enabled = true;
     scene.sky.exposure = 1.0;
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
 
     // Two builds before one latch: newest wins.
     scene.sky.exposure = 2.0;
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.sky.exposure = 5.0;
     scene.publishFrameSnapshot(16.0 / 9.0, 640, 480);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(f32, 5.0), scene.build_snapshot.sky_exposure);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(f32, 5.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectEqual(@as(i32, 640), scene.frame_snapshot.screen_w);
 
@@ -4453,10 +4621,10 @@ test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; 
     scene.sky.exposure = 7.0;
     if (scene.active_camera) |*c| c.free.position = Vec3.new(3, 0, 0);
     if (scene.cameras.items.len > 0) scene.cameras.items[0].camera.free.position = Vec3.new(3, 0, 0);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(f32, 7.0), scene.build_snapshot.sky_exposure);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(f32, 7.0), scene.frame_snapshot.sky_exposure);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
 
@@ -4467,19 +4635,19 @@ test "snapshot ownership: multi-build newest wins; no-publish refresh; removal; 
     scene.cameras.clearRetainingCapacity();
     scene.active_camera = null;
     scene.active_camera_index = null;
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expect(!scene.build_snapshot.has_camera);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(!scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().primary.items.items.len);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().shadow.items.items.len);
 
-    // Fallback unchanged: publish + prepare without a build takes the publish.
+    // Staged: publish + fresh build takes the published generation.
     const cam2 = Camera{ .free = camera_mod.FreeCamera.init("Cam2", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam2", .camera = cam2 });
     scene.sky.exposure = 4.0;
     scene.publishFrameSnapshot(16.0 / 9.0, 320, 240);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.has_camera);
     try std.testing.expectEqual(@as(i32, 320), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(f32, 4.0), scene.frame_snapshot.sky_exposure);
@@ -4516,15 +4684,15 @@ test "snapshot ownership: producer shadow freezes on snapshot, ignores live togg
     scene.shadows.enabled = true;
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     scene.shadows.enabled = false;
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expect(scene.build_snapshot.shadows_enabled);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_snapshot.shadows_enabled);
     try std.testing.expect(p7ShadowTotal(scene.preparedDraws()) > 0);
 
-    // Fallback keeps the historical live gate: no build, live still off, so
-    // the fresh pack disables shadows and the payload is empty.
-    scene.prepareFrame();
+    // Staged with live-off publish: the fresh build disables shadows
+    // and the payload is empty.
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(!scene.frame_snapshot.shadows_enabled);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().shadow.items.items.len);
 }
@@ -4583,7 +4751,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     var cube_b = std.mem.zeroes(CubeTexture);
     cube_b.view.id = 88;
     scene.sky.setSkybox(cube_b);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
 
     // Frozen generation: published eye/sky, not the live mutation.
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.build_snapshot.primary_cam.eye.x, 1e-4);
@@ -4595,7 +4763,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch[0].m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch[1].m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch[2].m[12], 1e-4);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectApproxEqAbs(@as(f32, -100.0), scene.frame_snapshot.primary_cam.eye.x, 1e-4);
     try std.testing.expectEqual(@as(u32, 77), scene.frame_snapshot.sky_texture.?.view.id);
 }
@@ -4612,7 +4780,7 @@ test "renderReuse re-draws the consumed front without a prepare" {
     // Camera-less headless fixture: prepare publishes a consumable front
     // (frame_id != 0), render consumes it via the no-camera early return
     // (no sg.* headless).
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expect(scene.draws.slots[scene.draws.front].frame_id != 0);
     const front0 = scene.draws.front;
@@ -4667,7 +4835,7 @@ test "pending prepared frame is consumed by render, not renderReuse" {
     // frame_prepared == false (debug assert), so a pending frame must go
     // through render(). This pins the documented pending-frame behavior
     // without tripping the assert (which traps in Debug/ReleaseSafe).
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     const pending_front = scene.draws.front;
     const pending_slot = scene.preparedDraws().frame_id;
@@ -4697,7 +4865,7 @@ test "renderReuse records the re-presented frame with the consumed stats" {
     // headless. The renderReuse wrapper path below is camera-independent,
     // so this exercises the real new recording code end to end (no helper
     // indirection needed).
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     scene.render();
     try std.testing.expect(!scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 0), scene.profiler.frames.items.len);
@@ -4740,7 +4908,7 @@ test "reuse applies no retire flush and no upload application" {
     defer scene.gpu_retire.deinit(alloc);
 
     // Publish + consume one frame so reuse has a front to re-present.
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     scene.render();
     try std.testing.expect(scene.hasConsumableFrame());
 
@@ -4766,7 +4934,7 @@ test "reuse applies no retire flush and no upload application" {
     try std.testing.expectEqual(@as(u64, 2), scene.reuseStreak());
 
     // The next successful prepare ends the streak and flushes the retire.
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
     try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
 }
@@ -4780,7 +4948,7 @@ test "prepare resets the reuse streak, reuse bumps it" {
     defer scene.draws.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
 
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
     scene.render();
     try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
@@ -4789,7 +4957,7 @@ test "prepare resets the reuse streak, reuse bumps it" {
     scene.renderReuse();
     try std.testing.expectEqual(@as(u64, 3), scene.reuseStreak());
     try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
 }
 
@@ -4797,7 +4965,7 @@ test "prepare resets the reuse streak, reuse bumps it" {
 // the back slot (sg-free, zero meter bytes); the latch consumes the staged
 // bytes even when the canvas is mutated afterwards; a second prepare
 // without a new stage falls back to the legacy canvas read.
-test "ui packet stage-latch equals legacy, staged bytes win over later canvas mutation" {
+test "ui packet staged build freezes bytes; post-stage canvas mutation invisible" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     _ = upload_meter.takeAndReset();
@@ -4830,11 +4998,18 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     const staged_idx = canvas.indices.items.len;
     try std.testing.expect(staged_verts > 0 and staged_idx > 0);
 
-    // Game-side stage: CPU copies into the back slot, no GPU touched.
-    scene.stageUiPacket();
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq.load(.monotonic));
-    const back = scene.draws.backSlot();
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
+
+    // Full producer build then UI stage into the claimed slot (build resets
+    // the slot, so stageUi runs after build), then publish. No GPU touched.
+    var uic = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"ui build saturated"});
+    uic.build();
+    uic.stageUi();
+    uic.publish();
+    const staged_slot = scene.build_slot.load(.monotonic);
+    const back = scene.draws.slotAt(staged_slot);
     try std.testing.expect(back.ui_packet.valid);
     try std.testing.expect(back.ui_packet.canvas_present);
     try std.testing.expectEqual(staged_verts, back.ui_vertices.items.len);
@@ -4844,8 +5019,8 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     try std.testing.expectEqual(@as(u32, 23), back.ui_packet.handles.index_buffer.id);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
 
-    // Mutate the canvas AFTER the stage (geometry AND handles): the latch
-    // must still see staged.
+    // Mutate the canvas AFTER the stage (geometry AND handles): the latched
+    // frame must still see the frozen staged bytes.
     canvas.begin();
     canvas.drawRect(1, 2, 3, 4, Color4.white);
     canvas.pipeline = .{ .id = 70 };
@@ -4853,20 +5028,15 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     canvas.index_buffer = .{ .id = 230 };
     try std.testing.expect(canvas.vertices.items.len != staged_verts);
 
-    // Keep a copy of the staged bytes: the fallback prepare below resets
-    // the back slot (the latch must have consumed the packet first).
     const UIVertex = @import("../ui.zig").UIVertex;
     const want_verts = try alloc.dupe(UIVertex, back.ui_vertices.items);
     defer alloc.free(want_verts);
     const want_idx = try alloc.dupe(u16, back.ui_indices.items);
     defer alloc.free(want_idx);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-    scene.prepareFrame();
+    // Consume WITHOUT rebuild: post-build mutation must not leak.
+    finishForTest(&scene);
 
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(staged_verts, scene.ui_frame.vertices.items.len);
@@ -4884,17 +5054,15 @@ test "ui packet stage-latch equals legacy, staged bytes win over later canvas mu
     try std.testing.expect(!scene.ui_frame.gpu_ready);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
 
-    // Second prepare without a new stage: no double-consume — the legacy
-    // canvas read runs and now reflects the MUTATED canvas.
+    // Fresh build picks the mutated canvas up: newest wins, count advances.
     scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-    scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
+    try stageAndPrepareForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 2), scene.uiPacketLatchedCount());
     try std.testing.expectEqual(canvas.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expect(canvas.vertices.items.len != staged_verts);
 }
 
-test "ui packet unused keeps the legacy path bit-identical" {
+test "ui packet build always stages live canvas geometry" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -4921,16 +5089,16 @@ test "ui packet unused keeps the legacy path bit-identical" {
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
     scene.publishFrameSnapshot(1.0, 640, 480);
 
-    // No stageUiPacket call: seqs stay zero, the legacy canvas read runs.
-    scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 0), scene.ui_packet_seq.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), scene.last_latched_ui_seq.load(.monotonic));
+    // Every producer build stages the live canvas into the claimed slot.
+    try stageAndPrepareForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expect(scene.ui_frame.has_capture);
+    try std.testing.expect(scene.ui_frame.canvas_present);
     try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expectEqual(@as(f32, 640.0), scene.ui_frame.screen_w);
 }
 
-test "ui packet stage OOM degrades to the legacy canvas read" {
+test "ui packet stage OOM fail-closes coherent-empty" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -4952,24 +5120,38 @@ test "ui packet stage OOM degrades to the legacy canvas read" {
         scene.ui_canvas = null;
     }
     scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
 
-    // Refuse the slot copy: the packet is marked invalid (never partial),
-    // but the seq still advances so the latch degrades exactly once.
+    // Warm the build path first so retained capacity funds the build halves;
+    // the failing allocator below then targets the UI slot copy specifically.
+    scene.publishFrameSnapshot(1.0, 640, 480);
+    try stageAndPrepareForTest(&scene);
+    const warm_latched = scene.uiPacketLatchedCount();
+    try std.testing.expectEqual(@as(u64, 1), warm_latched);
+    try std.testing.expect(scene.ui_frame.has_capture);
+
+    // Refuse the UI slot copy: the packet is marked invalid (never partial).
+    scene.publishFrameSnapshot(1.0, 640, 480);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     const real_alloc = scene.allocator;
     scene.allocator = failing.allocator();
-    scene.stageUiPacket();
+    var oom = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"oom claim saturated"});
+    oom.build();
+    oom.stageUi();
+    oom.publish();
     scene.allocator = real_alloc;
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
-    try std.testing.expect(!scene.draws.backSlot().ui_packet.valid);
+    try std.testing.expect(!scene.draws.slotAt(scene.build_slot.load(.monotonic)).ui_packet.valid);
 
-    // The latch falls back to the legacy canvas read (content intact there):
-    // the frame still captures, and the seq is stamped consumed (no retry).
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    // Coherent-empty: no partial geometry latched, counter unstamped.
+    finishForTest(&scene);
+    try std.testing.expectEqual(warm_latched, scene.uiPacketLatchedCount());
+    try std.testing.expect(!scene.ui_frame.has_capture);
+    try std.testing.expectEqual(@as(usize, 0), scene.ui_frame.vertices.items.len);
+
+    // Recovery: a funded build stages and latches again.
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 1), scene.last_latched_ui_seq.load(.monotonic));
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.ui_frame.has_capture);
     try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
 }
@@ -5036,6 +5218,7 @@ test "reflection probe state packs into the frame snapshot" {
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
     scene.gpu_retire = .{};
     defer scene.gpu_retire.deinit(alloc);
     // testScene leaves non-tested subsystems undefined: zero everything
@@ -5055,8 +5238,6 @@ test "reflection probe state packs into the frame snapshot" {
     scene.physics.build_lines = .empty;
     scene.build_seq.store(0, .monotonic);
     scene.last_latched_seq.store(0, .monotonic);
-    scene.ui_packet_seq.store(0, .monotonic);
-    scene.last_latched_ui_seq.store(0, .monotonic);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -5075,7 +5256,7 @@ test "reflection probe state packs into the frame snapshot" {
     try std.testing.expect(snap.probe_pack.entries[0].enabled);
     try std.testing.expect(!snap.probe_pack.entries[1].enabled);
     // Nothing captured headlessly: selection skips everything (disabled-
-    // probe path leaves the draw state untouched — legacy fallback).
+    // probe path leaves the draw state untouched — staged empty).
     try std.testing.expect(!snap.probe_pack.entries[0].captured);
     try std.testing.expect(scene_probes.selectProbe(snap.probe_pack.entries[0..snap.probe_pack.count], Vec3.new(1, 2, 3)) == null);
 
@@ -5083,7 +5264,7 @@ test "reflection probe state packs into the frame snapshot" {
     // copy renderReuse later re-presents without capturing): publish, then
     // prepare latches it verbatim.
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 2), scene.frame_snapshot.probe_pack.count);
     try std.testing.expectEqual(Vec3.new(1, 2, 3), scene.frame_snapshot.probe_pack.entries[0].position);
@@ -5135,8 +5316,9 @@ test "wave26: 3-slot prepare rotation visits every slot, newest wins" {
     while (f < 4) : (f += 1) {
         mesh.position = Vec3.new(@floatFromInt(f * 10), 0, 0);
         scene.publishFrameSnapshot(16.0 / 9.0, 1920, 1080);
-        const want = scene.draws.backIndex();
-        scene.prepareFrame();
+        try buildForTest(&scene);
+        const want = scene.build_slot.load(.monotonic);
+        finishForTest(&scene);
         try std.testing.expect(scene.frame_prepared);
         try std.testing.expectEqual(want, scene.draws.front);
         fronts[f] = scene.draws.front;
@@ -5222,11 +5404,17 @@ test "wave26: staged records + UI packet latch correctly across all three slots"
         }
         const staged_verts = canvas.vertices.items.len;
 
-        scene.buildPreparedFrame();
-        build_slots[frame] = scene.build_slot.load(.monotonic);
-        scene.stageUiPacket();
+        // Single staged claim per frame: publish then full build + UI stage
+        // into the same claimed slot (build resets, so stageUi runs after).
         scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-        scene.prepareFrame();
+        {
+            var __uic = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"stageUi: saturated"});
+            __uic.build();
+            __uic.stageUi();
+            __uic.publish();
+        }
+        build_slots[frame] = scene.build_slot.load(.monotonic);
+        finishForTest(&scene);
 
         try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
         try std.testing.expectEqual(@as(u64, frame + 1), scene.uiPacketLatchedCount());
@@ -5266,7 +5454,7 @@ test "wave26: render pins/unpins the front; prepare rotates under a held pin" {
 
     // Camera-less headless fixture: prepare publishes, render consumes via
     // the no-camera early return (no sg.* headless).
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     const front0 = scene.draws.front;
 
@@ -5277,12 +5465,12 @@ test "wave26: render pins/unpins the front; prepare rotates under a held pin" {
     try std.testing.expectEqual(front0, scene.draws.front);
     const consumed_id = scene.draws.slots[front0].frame_id;
 
-    // A pinned presented frame is never a build target: the next prepare
-    // publishes a different slot and leaves the pinned one untouched.
+    // A pinned presented frame is never a build target: the staged build
+    // claims a different slot and leaves the pinned one untouched.
     try scene.draws.pin(front0);
-    const want = scene.draws.backIndex();
+    try stageAndPrepareForTest(&scene);
+    const want = scene.draws.front;
     try std.testing.expect(want != front0);
-    scene.prepareFrame();
     try std.testing.expectEqual(want, scene.draws.front);
     try std.testing.expectEqual(consumed_id, scene.draws.slots[front0].frame_id);
     try std.testing.expect(scene.draws.isPinned(front0));
@@ -5318,7 +5506,7 @@ test "wave27: build stages the slot snapshot equal to the published generation" 
     scene.sky.exposure = 2.0;
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
 
     // The claim slot stages the exact build generation (plain value copy).
     const staged = &scene.draws.slots[scene.build_slot.load(.monotonic)].snapshot;
@@ -5353,7 +5541,7 @@ test "wave27: post-build live mutation does not change the prepared frame" {
 
     // Generation B: publish + build (frozen).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(i32, 800), scene.draws.slots[scene.build_slot.load(.monotonic)].snapshot.screen_w);
 
     // Live mutations AFTER the build: both working copies plus a newer
@@ -5367,7 +5555,7 @@ test "wave27: post-build live mutation does not change the prepared frame" {
 
     // Latch: the prepared frame is exactly B — staged wins over every
     // post-build mutation. The compat mirror follows the staged copy.
-    scene.prepareFrame();
+    finishForTest(&scene);
     const front = scene.preparedDraws();
     try std.testing.expectEqual(@as(i32, 800), front.snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 600), front.snapshot.screen_h);
@@ -5375,13 +5563,13 @@ test "wave27: post-build live mutation does not change the prepared frame" {
     try std.testing.expectEqual(@as(i32, 800), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(f32, 2.0), scene.frame_snapshot.sky_exposure);
 
-    // C waited in the mailbox: the next fallback (no build) sees it.
-    scene.prepareFrame();
+    // C waited in the mailbox: the next staged build sees it.
+    try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
     try std.testing.expectEqual(@as(f32, 5.0), scene.preparedDraws().snapshot.sky_exposure);
 }
 
-test "wave27: fallback stages the slot snapshot; render+reuse present it" {
+test "wave27: staged build freezes the slot snapshot; render+reuse present it" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -5393,7 +5581,7 @@ test "wave27: fallback stages the slot snapshot; render+reuse present it" {
     // Camera-less headless fixture: dims latch before the no-camera
     // early-out; render consumes via the no-camera return (no sg.*).
     scene.publishFrameSnapshot(1.0, 640, 480);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     const front0 = scene.draws.front;
     try std.testing.expectEqual(@as(i32, 640), scene.preparedDraws().snapshot.screen_w);
@@ -5447,16 +5635,21 @@ test "wave27: UI latch reads the staged snapshot dims" {
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
 
-    // Generation B through the build path; the UI stage lands after the
-    // build (the build reset would wipe an earlier packet).
+    // Generation B through the staged claim path; the UI stage lands after
+    // the build into the same claimed slot (the build reset would wipe an
+    // earlier packet).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
-    scene.stageUiPacket();
+    {
+        var uic = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"ui claim saturated"});
+        uic.build();
+        uic.stageUi();
+        uic.publish();
+    }
     // Post-build live mutation of the working copy: the latch must still
     // capture the staged dims.
     scene.build_snapshot.screen_w = 111;
     scene.build_snapshot.screen_h = 222;
-    scene.prepareFrame();
+    finishForTest(&scene);
 
     try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
     try std.testing.expectEqual(@as(f32, 800.0), scene.ui_frame.screen_w);
@@ -5479,7 +5672,7 @@ test "wave27: 3-slot rotation keeps per-slot snapshots distinct" {
     const widths = [_]i32{ 111, 222, 333 };
     for (widths, 0..) |w, i| {
         scene.publishFrameSnapshot(1.0, w, w);
-        scene.prepareFrame();
+        try stageAndPrepareForTest(&scene);
         fronts[i] = scene.draws.front;
         try std.testing.expectEqual(w, scene.preparedDraws().snapshot.screen_w);
     }
@@ -5538,7 +5731,7 @@ test "wave28: Scene pickUi3dPanel uses the staged snapshot camera" {
     defer scene.gui3d.deinit(alloc);
     defer scene.gpu_retire.deinit(alloc);
 
-    // No staged camera: clean miss (never a fallback ray into the scene).
+    // No staged camera: clean miss (never a live ray into the scene).
     try std.testing.expect(scene.pickUi3dPanel(400, 300) == null);
 
     // Stage a snapshot camera headlessly: identity view-proj over 800x600,
@@ -5606,21 +5799,21 @@ test "wave29: claim build+stageUi+publish latches the claimed slot, counters san
     try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
     claim.build();
     try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
-    claim.stageUi(); // no canvas: stages the absence packet, bumps the seq
-    try std.testing.expectEqual(@as(u64, 1), scene.ui_packet_seq.load(.monotonic));
+    claim.stageUi(); // no canvas: stages absence (presence false, no geometry)
+    try std.testing.expect(!scene.draws.slotAt(slot).ui_packet.canvas_present);
     claim.publish();
     try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(slot, scene.build_slot.load(.monotonic));
-    try std.testing.expectEqual(scene.draws.backIndex(), scene.build_slot.load(.monotonic));
+    try std.testing.expect(scene.build_slot.load(.monotonic) < scene.draws.slots.len);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
 
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
     try std.testing.expectEqual(scene.frame_id, scene.preparedDraws().frame_id);
-    // The staged absence packet was consumed (seq stamped, not re-latched).
-    try std.testing.expectEqual(scene.ui_packet_seq.load(.monotonic), scene.last_latched_ui_seq.load(.monotonic));
+    // The staged absence packet latched presence (no geometry => latched count stays zero).
+    try std.testing.expectEqual(@as(u64, 0), scene.uiPacketLatchedCount());
     // Counter sanity: a clean claim flow counts nothing.
     try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
     try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
@@ -5655,7 +5848,7 @@ test "wave29: cancelled claim commits nothing, rotation unaffected" {
     try std.testing.expectEqual(funded.slot, scene.build_slot.load(.monotonic));
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u64, 1), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
     try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
@@ -5692,7 +5885,7 @@ test "wave38: concurrent_yield_ns publish keeps handoff semantics, default 0" {
     claim2.publish();
     try std.testing.expectEqual(@as(u64, 2), scene.build_seq.load(.monotonic));
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(scene.build_slot.load(.monotonic), scene.draws.front);
     try std.testing.expectEqual(@as(u64, 0), scene.draws.saturation_skips);
@@ -5723,7 +5916,7 @@ test "wave29: build path never begins/completes retire epochs" {
     try std.testing.expectEqual(done0, scene.gpu_retire.lastCompleted());
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(cur0 + 1, scene.gpu_retire.current());
     scene.render();
     try std.testing.expectEqual(scene.gpu_retire.current(), scene.gpu_retire.lastCompleted());
@@ -5733,10 +5926,10 @@ test "wave29: build path never begins/completes retire epochs" {
 // ---- Wave 30: concurrent-build handoff edge (atomic seq words). ----
 //
 // A producer thread runs the adoption-edge claim flow (claim -> stageUi ->
-// publish: the UI stage release-bumps `ui_packet_seq`, the publish
+// publish: the build commits the generation (`build_slot` then `build_seq`)
 // release-stores `build_slot` then `build_seq`) while a consumer thread runs
-// the latch half of the edge (acquire-reads `build_seq`/`ui_packet_seq`,
-// stamps `last_latched_seq`/`last_latched_ui_seq`). No full build/prepare
+// the latch half of the edge (acquire-reads `build_seq`,
+// stamps `last_latched_seq`). No full build/prepare
 // runs here: the remaining live touches are still phase-excluded (see the
 // adoption checklist in scene/frame_draws.zig) — this proves exactly the
 // atomic handoff: the consumer never observes a seq older than one already
@@ -5775,9 +5968,9 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
                     std.atomic.spinLoopHint();
                     continue;
                 };
-                // No canvas: stages the absence packet and release-bumps
-                // `ui_packet_seq` (one stage per publish, like the
-                // build+stage claim flow).
+                // Full staged claim: build then stageUi (absence packet, no
+                // canvas) before publish — UI rides the owned full slot.
+                claim.build();
                 claim.stageUi();
                 // Release edge: `build_slot` then `build_seq`.
                 claim.publish();
@@ -5789,8 +5982,11 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
 
     const Consumer = struct {
         fn latchOnce(c: *Ctx) void {
-            // Acquire: pairs with the publish/stage release-stores — a fresh
-            // generation implies the staged payload is visible.
+            // Acquire: pairs with the publish release-stores — a fresh
+            // generation implies the staged payload is visible. Track the
+            // owned full-slot packet generation (h.seq) with a fresh build
+            // counter, and prove stage-byte happens-before by reading the
+            // staged slot payload itself, not just the counter word.
             const b = c.scene.build_seq.load(.acquire);
             // Never stale: generations are strictly increasing by
             // single-producer construction, so an older read after a newer
@@ -5799,10 +5995,11 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
             if (b > c.max_build_seen) c.max_build_seen = b;
             // Context-side stamp only (the producer never touches this word).
             c.scene.last_latched_seq.store(b, .monotonic);
-            const u = c.scene.ui_packet_seq.load(.acquire);
-            if (u < c.max_ui_seen) unreachable;
-            if (u > c.max_ui_seen) c.max_ui_seen = u;
-            c.scene.last_latched_ui_seq.store(u, .monotonic);
+            const s = c.scene.build_slot.load(.acquire);
+            const pkt = c.scene.draws.slotAtConst(s);
+            if (pkt.build_seq != b) return; // unpublished slot yet; counter-only latch
+            if (b < c.max_ui_seen) unreachable;
+            if (b > c.max_ui_seen) c.max_ui_seen = b;
             c.latches += 1;
         }
 
@@ -5832,8 +6029,6 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
     // the seqs ARE the counters, no separate tally to drift).
     try std.testing.expectEqual(total_publishes, scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(total_publishes, scene.last_latched_seq.load(.monotonic));
-    try std.testing.expectEqual(total_publishes, scene.ui_packet_seq.load(.monotonic));
-    try std.testing.expectEqual(total_publishes, scene.last_latched_ui_seq.load(.monotonic));
     try std.testing.expectEqual(total_publishes, ctx.max_build_seen);
     try std.testing.expectEqual(total_publishes, ctx.max_ui_seen);
     // The published slot index rode the same edge: it names a real slot and
@@ -5898,7 +6093,7 @@ test "wave32: adopted build freezes particle+physics into the slot; prepare latc
     defer scene.physics.deinit(alloc);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
     const slot = scene.build_slot.load(.monotonic);
     const frozen = scene.draws.slotAtConst(slot);
@@ -5922,7 +6117,7 @@ test "wave32: adopted build freezes particle+physics into the slot; prepare latc
     try std.testing.expectApproxEqAbs(x0, frozen.physics_lines.items[0].a.x, 1e-4);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(slot, scene.draws.front);
 
@@ -5939,13 +6134,13 @@ test "wave32: adopted build freezes particle+physics into the slot; prepare latc
     try std.testing.expect(scene.physics.prepared_visible);
     try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
     try std.testing.expectApproxEqAbs(x0, scene.physics.prepared_lines.items[0].a.x, 1e-4);
-    // Both layer generations were consumed (a later fallback runs live).
+    // Both layer generations were consumed by the staged latch.
     try std.testing.expectEqual(scene.particles.build_seq.load(.acquire), scene.particles.latched_seq);
     try std.testing.expectEqual(scene.physics.build_seq.load(.acquire), scene.physics.latched_seq);
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
 
-test "wave32: fallback (no build) still captures particles+physics live" {
+test "wave32: staged build freezes particle+physics slot copies" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -5968,19 +6163,22 @@ test "wave32: fallback (no build) still captures particles+physics live" {
     scene.physics.show_debug = true;
     defer scene.physics.deinit(alloc);
 
-    // No build: prepare runs the historical inline captures unchanged.
+    // Staged build freezes the particle/physics copies into the claimed
+    // slot; the finish latches exactly those slot copies (never live).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
-    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
+    try stageAndPrepareForTest(&scene);
+    try std.testing.expectEqual(@as(u64, 1), scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
+    const front = scene.draws.slotAtConst(scene.draws.front);
+    try std.testing.expectEqual(@as(usize, 1), front.particle_draws.items.len);
+    try std.testing.expectEqual(@as(usize, 2), front.particle_draws.items[0].active_count);
+    try std.testing.expect(front.physics_visible);
+    try std.testing.expectEqual(@as(usize, 12), front.physics_lines.items.len);
+    // Prepared captures mirror the frozen slot copies.
     try std.testing.expectEqual(@as(usize, 1), scene.particles.frame.items.len);
     try std.testing.expectEqual(@as(usize, 2), scene.particles.frame.items[0].active_count);
     try std.testing.expect(scene.physics.prepared_visible);
     try std.testing.expectEqual(@as(usize, 12), scene.physics.prepared_lines.items.len);
-    // The slots staged nothing: a skipped path never resurfaces a prior frame.
-    const front = scene.draws.slotAtConst(scene.draws.front);
-    try std.testing.expectEqual(@as(usize, 0), front.particle_draws.items.len);
-    try std.testing.expectEqual(@as(usize, 0), front.physics_lines.items.len);
-    try std.testing.expect(!front.physics_visible);
 }
 
 // Concurrent stress: a producer thread runs the adopted claim flow
@@ -6414,9 +6612,9 @@ test "softbody disabled body pauses: no step, no upload flag" {
     try std.testing.expect(body.upload_pending);
 }
 
-// ---- Wave 31: prepareFrame holds its working slot as a lease claim. ----
+// ---- Wave 31: the staged finish holds its working slot as a lease claim. ----
 //
-// prepare resolves its slot via `claimBack` (fallback) or
+// the staged begin resolves its slot via the lease claim,
 // `claimSlot(build_slot)` (latch) at the top and releases it at every exit
 // (`tryPublish` on success, `cancelClaim`/early return on contention). These
 // tests prove the three properties that motivated the slice: prepares make
@@ -6489,7 +6687,7 @@ test "wave31: prepare publishes under a concurrent pinned front (stress), no lea
         // keep a stale `frame_prepared` from an earlier pending frame, so
         // the flag alone cannot tell them apart — the flip can).
         const f0 = scene.draws.front;
-        scene.prepareFrame();
+        try stageAndPrepareForTest(&scene);
         if (scene.draws.front != f0) ok += 1;
         try std.testing.expect(scene.frame_prepared);
     }
@@ -6540,14 +6738,14 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
 
-    // Baseline: the fallback and latch exits pair every claim.
+    // Baseline: the staged begin/finish exits pair every claim.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
     try expectClean(&scene);
@@ -6558,7 +6756,7 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     // the slot payload is untouched, no side effect ran (the claim sits
     // before the retire/stats/frame prologue).
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const pending_slot = scene.build_slot.load(.monotonic);
     const pending_seq = scene.build_seq.load(.monotonic);
     const latched_before = scene.last_latched_seq.load(.monotonic);
@@ -6568,7 +6766,9 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     const sat0 = scene.draws.saturation_skips;
     const front0 = scene.draws.front;
     const fid0 = scene.frame_id;
-    scene.prepareFrame();
+    // Contended begin degrades to a counted null skip — nothing consumed,
+    // the build stays fresh, no side effect ran.
+    try std.testing.expect(scene.beginStagedPrepare() == null);
     // Skip discards nothing: the earlier pending frame stays consumable.
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(front0, scene.draws.front);
@@ -6577,9 +6777,10 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     try std.testing.expectEqual(sat0 + 1, scene.draws.saturation_skips);
     try std.testing.expectEqual(fid0, scene.frame_id);
     try std.testing.expectEqual(snap_w, scene.draws.slots[pending_slot].snapshot.screen_w);
-    // Release and retry: the pending build latches exactly once.
+    // Release and retry: the still-pending build latches exactly once
+    // (no rebuild — the fresh generation must not be superseded).
     try scene.draws.cancelClaim(pending_slot);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(pending_slot, scene.draws.front);
     try std.testing.expectEqual(pending_seq, scene.last_latched_seq.load(.monotonic));
@@ -6588,33 +6789,39 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     // (b) Latch-path pinned handoff: a presented frame is never overwritten —
     // PinnedSlot refusal, counted, build stays fresh; unpin restores.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     const pinned_slot = scene.build_slot.load(.monotonic);
     const pinned_seq = scene.build_seq.load(.monotonic);
     try std.testing.expect(pinned_seq != scene.last_latched_seq.load(.monotonic));
     try scene.draws.pin(pinned_slot);
     const ref0 = scene.draws.publish_refusals;
-    scene.prepareFrame();
+    // Pinned handoff refuses the staged begin (counted); the build stays
+    // fresh and nothing is consumed.
+    try std.testing.expect(scene.beginStagedPrepare() == null);
     // Skip discards nothing: the earlier pending frame stays consumable.
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(ref0 + 1, scene.draws.publish_refusals);
     try std.testing.expectEqual(pinned_seq, scene.build_seq.load(.monotonic));
     try std.testing.expect(pinned_seq != scene.last_latched_seq.load(.monotonic));
     try scene.draws.unpin(pinned_slot);
-    scene.prepareFrame();
+    // Unpin restores: the still-pending build latches exactly (no rebuild).
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(pinned_slot, scene.draws.front);
     try expectClean(&scene);
 
     // (c) Fallback saturation: every non-front slot held degrades to a
     // counted skip, never a wedge; releasing restores the rotation.
+    // Saturated build refuses (false, counted) and the staged begin stays
+    // null: the earlier pending frame stays consumable.
     try scene.draws.pin(scene.draws.front);
     const h1 = scene.draws.claimBack().?;
     const h2 = scene.draws.claimBack().?;
     try std.testing.expect(scene.draws.claimBack() == null);
     const sat1 = scene.draws.saturation_skips;
     const front1 = scene.draws.front;
-    scene.prepareFrame();
+    try std.testing.expect(!scene.buildPreparedFrame());
+    try std.testing.expect(scene.beginStagedPrepare() == null);
     // Skip discards nothing: the earlier pending frame stays consumable.
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(front1, scene.draws.front);
@@ -6622,7 +6829,7 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
     try scene.draws.cancelClaim(h1);
     try scene.draws.cancelClaim(h2);
     try scene.draws.unpin(front1);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try expectClean(&scene);
 }
@@ -6637,20 +6844,22 @@ test "wave31: skip with nothing pending leaves nothing consumable; render drops 
     defer scene.gpu_retire.deinit(alloc);
     defer scene.profiler.deinit();
 
-    // Fresh scene: saturate every non-front slot, then prepare. With no
+    // Fresh scene: saturate every non-front slot. The staged build
+    // refuses (false, counted) and the staged begin stays null. With no
     // earlier pending frame the skip keeps `frame_prepared` false and the
     // front untouched — and nothing is consumable yet.
     try scene.draws.pin(scene.draws.front);
     const g1 = scene.draws.claimBack().?;
     const g2 = scene.draws.claimBack().?;
     const sat0 = scene.draws.saturation_skips;
-    scene.prepareFrame();
+    try std.testing.expect(!scene.buildPreparedFrame());
+    try std.testing.expect(scene.beginStagedPrepare() == null);
     try std.testing.expect(!scene.frame_prepared);
     try std.testing.expectEqual(@as(usize, 0), scene.draws.front);
     try std.testing.expectEqual(sat0 + 1, scene.draws.saturation_skips);
     try std.testing.expect(!scene.hasConsumableFrame());
 
-    // `render` on the skipped state drops the present via its fallback
+    // `render` on the skipped state drops the present (no staged frame)
     // guard (no pin, no epoch, no stats record) instead of mislabeling the
     // stale front — then the rotation recovers cleanly once released.
     scene.render();
@@ -6662,7 +6871,7 @@ test "wave31: skip with nothing pending leaves nothing consumable; render drops 
     try scene.draws.cancelClaim(g1);
     try scene.draws.cancelClaim(g2);
     try scene.draws.unpin(0);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expect(scene.hasConsumableFrame());
     // The pending frame consumes through the camera-less render path.
@@ -6698,12 +6907,12 @@ test "wave31: concurrent game claim can never target prepare's slot (steering + 
     };
     try scene.meshes.append(alloc, &regular);
 
-    // Prime one fallback frame so the rotation is warm.
+    // Prime one staged frame so the rotation is warm.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    try stageAndPrepareForTest(&scene);
     const front0 = scene.draws.front;
 
-    // A claim taken exactly the way the fallback prepare takes it.
+    // A claim taken exactly the way the staged begin takes it.
     const held = scene.draws.claimBack().?;
     try std.testing.expect(held != front0);
 
@@ -6730,16 +6939,21 @@ test "wave31: concurrent game claim can never target prepare's slot (steering + 
     try std.testing.expectError(LeaseError.SlotBusy, scene.draws.pin(held));
     try std.testing.expectEqual(den0 + 1, scene.draws.pin_denials);
 
-    // The legacy stage path steers away too: it targets the unlocked back
-    // index, which skips WRITING slots — never the held one.
-    try std.testing.expect(scene.draws.backIndex() != held);
-    scene.stageUiPacket();
+    // A second full claim steers away too: claimBack skips WRITING slots,
+    // so it never targets the held one either.
+    try std.testing.expect(scene.build_slot.load(.monotonic) != held);
+    {
+        var __uic = scene.tryClaimBuildSlot() orelse std.debug.panic("{s}", .{"stageUi: saturated"});
+        __uic.build();
+        __uic.stageUi();
+        __uic.publish();
+    }
     try std.testing.expect(!scene.draws.slots[held].ui_packet.valid);
 
     // Release the simulated prepare hold, then run the real prepare: it
     // latches exactly the published handoff slot and pairs every claim.
     try scene.draws.cancelClaim(held);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(game_slot, scene.draws.front);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
@@ -6766,18 +6980,18 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
         skipped: u64 = 0, // game-side null-claims (saturation)
         published: u64 = 0,
         cancelled: u64 = 0,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     const Producer = struct {
         fn run(c: *Ctx) void {
-            // Game-side concurrent flow (UI-only claims, the wave-30 shape):
-            // reserve, stage, hand off — or cancel every 16th reservation to
-            // exercise `cancelClaim` under prepare pressure. Never touches
-            // live scene state: the claimed slot payload is producer-owned
-            // (no canvas, so no canvas reads either) and the seq words are
-            // the release edge. Full `build()` calls stay out: the live
-            // mesh/snapshot reads they need are still phase-excluded (the
-            // documented remainder, not this slice).
+            // Game-side concurrent flow (full staged claims: reserve, build,
+            // stage, hand off — or cancel every 16th reservation to
+            // exercise `cancelClaim` under prepare pressure). The fixture
+            // owns no live content (no meshes, no canvas, no systems), so
+            // the build's live reads race nothing the prepare latch
+            // mutates; the handoff meets under the lease mutex and the
+            // seq words are the release edge.
             var n: u64 = 0;
             while (n < c.claims) {
                 // A null-claim is a skip, not a reservation: it must not
@@ -6791,12 +7005,14 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
                     claim.cancel();
                     c.cancelled += 1;
                 } else {
+                    claim.build();
                     claim.stageUi();
                     claim.publish();
                     c.published += 1;
                 }
                 n += 1;
             }
+            c.done.store(true, .release);
         }
     };
 
@@ -6804,42 +7020,61 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
     var ctx = Ctx{ .scene = &scene, .claims = total_claims };
     const prod = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
     var prepared_ok: usize = 0;
+    var prepare_skips: u64 = 0;
     var i: usize = 0;
-    while (i < total_prepares) : (i += 1) {
-        // Per-call success is the front flip: a contended prepare keeps a
-        // stale `frame_prepared` from an earlier pending frame (the skip
-        // discards nothing), so the flag alone cannot count skips — while
-        // every genuine prepare flips to a slot that was not the front.
+    while (i < total_prepares) {
+        // Per-iteration success is the front flip. A null begin is either
+        // counted contention (bumped the skip counter: consume the
+        // iteration) or a no-fresh-build miss (uncounted: retry without
+        // consuming an iteration, so the exact equation below only ever
+        // sees counted outcomes). A contended skip keeps the earlier
+        // pending frame (discards nothing), so the flag alone cannot count
+        // skips — while every genuine finish flips to a new front.
         const f0 = scene.draws.front;
-        scene.prepareFrame();
-        if (scene.draws.front != f0) prepared_ok += 1;
+        const sat_b = scene.draws.saturation_skips;
+        if (scene.beginStagedPrepare()) |claim| {
+            scene.finishStagedPrepare(claim);
+            i += 1;
+            // Every genuine finish flips to a slot that was not the
+            // front (claims never target the presented slot).
+            try std.testing.expect(scene.draws.front != f0);
+            prepared_ok += 1;
+        } else if (scene.draws.saturation_skips != sat_b) {
+            i += 1;
+            prepare_skips += 1;
+        } else if (ctx.done.load(.acquire) and
+            scene.build_seq.load(.acquire) == scene.last_latched_seq.load(.monotonic))
+        {
+            // Producer joined-out with nothing fresh pending: no future
+            // iteration could flip or count, so stop instead of spinning.
+            break;
+        } else {
+            std.atomic.spinLoopHint();
+        }
     }
     prod.join();
     // Drain: consume any build published after the last prepare. No
-    // contention is left (the producer is joined), so every drain prepare
-    // flips unless nothing is pending.
+    // contention is left (the producer is joined), so each drain finish
+    // flips — and no rebuild runs, so the published generation count is
+    // untouched.
     var drain: usize = 0;
     while (scene.last_latched_seq.load(.monotonic) != scene.build_seq.load(.monotonic) and drain < 10) : (drain += 1) {
         const f0 = scene.draws.front;
-        scene.prepareFrame();
+        finishForTest(&scene);
         try std.testing.expect(scene.draws.front != f0);
     }
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
 
     // Exact skip accounting: every game-side null-claim and every contended
-    // prepare (fallback null-claim and latch SlotBusy alike) bumps
-    // `saturation_skips` exactly once — the sum must match, proving no
-    // silent interference in either direction (a missed release would wedge
-    // the drain or leak WRITING below instead).
-    const prepare_skips = total_prepares - prepared_ok;
+    // begin bumps `saturation_skips` exactly once — the sum must match,
+    // proving no silent interference in either direction (a missed release
+    // would wedge the drain or leak WRITING below instead).
     try std.testing.expectEqual(ctx.skipped + prepare_skips, scene.draws.saturation_skips - sat0);
     // Every non-cancelled reservation published exactly once (the seqs ARE
     // the counters: one stage + one generation per publish, cancels commit
     // nothing).
     try std.testing.expectEqual(ctx.published + ctx.cancelled, total_claims);
     try std.testing.expectEqual(ctx.published, scene.build_seq.load(.monotonic));
-    try std.testing.expectEqual(ctx.published, scene.ui_packet_seq.load(.monotonic));
-    try std.testing.expectEqual(ctx.published, scene.last_latched_ui_seq.load(.monotonic));
     // No pin/refusal activity anywhere in this flow (nothing is presented
     // mid-loop, nothing publishes onto a pin).
     try std.testing.expectEqual(@as(u64, 0), scene.draws.publish_refusals);
@@ -6853,7 +7088,7 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
 // ---- Wave 31 (second slice): build_stats as a slot payload. ----
 //
 // The game-side queue build writes its counters directly into the claimed
-// slot; `prepareFrame` merges that exact slot payload into context stats.
+// slot; the staged finish merges that exact slot payload into context stats.
 // There is no producer-shared stats accumulator for prepare to race.
 
 test "wave31b: build stages slot build_stats; post-build accumulation never leaks into the merge" {
@@ -6897,7 +7132,7 @@ test "wave31b: build stages slot build_stats; post-build accumulation never leak
     claim.publish();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(scene.build_seq.load(.monotonic), scene.last_latched_seq.load(.monotonic));
 
     // Merge point: stats carry exactly the staged copy, not the live field.
@@ -6946,18 +7181,18 @@ test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stal
 
     // Round 1 (meshes present): the latch merges nonzero staged stats.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.stats.total_meshes > 0);
 
     // Round 2 (mesh list emptied, slots reused): the reused slot stages a
     // fresh zero copy — no stale round-1 stats resurface in the merge.
     scene.meshes.clearRetainingCapacity();
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.buildPreparedFrame();
+    try buildForTest(&scene);
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.total_meshes);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.rendered_meshes);
     try std.testing.expectEqual(@as(u32, 0), scene.stats.culled_meshes);
@@ -7036,7 +7271,7 @@ test "wave39: cancelled split prepare releases its slot and closes its epoch" {
     try std.testing.expectEqual(@as(u64, 0), scene.last_latched_seq.load(.monotonic));
 }
 
-test "wave39: staged-only prepare leaves UI-only handoff for serialized fallback" {
+test "wave39: no fresh staged build begins null, front stays reusable" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -7046,30 +7281,32 @@ test "wave39: staged-only prepare leaves UI-only handoff for serialized fallback
     defer scene.gpu_retire.deinit(alloc);
     defer scene.profiler.deinit();
 
-    var ui_only = scene.tryClaimBuildSlot().?;
-    ui_only.stageUi();
-    ui_only.publish();
-    const ui_seq = scene.build_seq.load(.monotonic);
+    // No fresh producer build: staged begin returns null and touches
+    // nothing (no stats/epoch/live reads/uploads); the consumed front stays
+    // available for reuse.
+    const epoch0 = scene.retire_epoch;
+    const stats0 = scene.stats;
     try std.testing.expect(scene.beginStagedPrepare() == null);
-    try std.testing.expectEqual(ui_seq, scene.build_seq.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), scene.build_seq.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), scene.last_latched_seq.load(.monotonic));
-    try std.testing.expect(scene.draws.handoff != null);
+    try std.testing.expectEqual(epoch0, scene.retire_epoch);
+    try std.testing.expect(!scene.frame_prepared);
 
-    // A full producer build supersedes the UI-only handoff; staged-only
-    // prepare then consumes the fresh 3D payload and exact generation.
+    // A full producer build then latches the exact generation.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     var full = scene.tryClaimBuildSlot().?;
     full.build();
     full.stageUi();
     full.publish();
+    const ui_seq = scene.build_seq.load(.monotonic);
     const claim = scene.beginStagedPrepare().?;
-    try std.testing.expect(claim.have_build);
-    try std.testing.expect(claim.build_seq > ui_seq);
+    try std.testing.expect(claim.build_seq == ui_seq);
     scene.finishStagedPrepare(claim);
     try std.testing.expectEqual(full.seq, scene.last_latched_seq.load(.monotonic));
+    _ = stats0;
 }
 
-test "wave39: serialized fallback consumes a lone UI-only handoff; staged stays null" {
+test "wave39: staged build consumes the exact generation; empty stays null" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
@@ -7079,21 +7316,19 @@ test "wave39: serialized fallback consumes a lone UI-only handoff; staged stays 
     defer scene.gpu_retire.deinit(alloc);
     defer scene.profiler.deinit();
 
-    var ui_only = scene.tryClaimBuildSlot().?;
-    ui_only.stageUi();
-    ui_only.publish();
+    // Full staged build consumes the exact generation; afterwards no
+    // fresh build remains so staged begin stays null (no live reads).
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    var full_b = scene.tryClaimBuildSlot().?;
+    full_b.build();
+    full_b.stageUi();
+    full_b.publish();
     const ui_seq = scene.build_seq.load(.monotonic);
-    const pkt_seq = scene.ui_packet_seq.load(.monotonic);
-
-    // The serialized legacy path consumes the UI-only handoff through the
-    // fallback branch (fresh snapshot pack + inline queue build) and stamps
-    // the exact generation after publication.
-    scene.prepareFrame();
+    finishForTest(&scene);
     try std.testing.expect(scene.frame_prepared);
     try std.testing.expectEqual(ui_seq, scene.last_latched_seq.load(.monotonic));
-    try std.testing.expectEqual(pkt_seq, scene.last_latched_ui_seq.load(.monotonic));
 
-    // Nothing pending: staged-only prepare stays null, no live fallback.
+    // Nothing pending: staged begin stays null, pins released.
     try std.testing.expect(scene.beginStagedPrepare() == null);
     try std.testing.expectEqual(ui_seq, scene.last_latched_seq.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
@@ -7592,7 +7827,6 @@ test "slice6: staged prepare consumes frozen trail packet despite live mutation"
     tm.pending_max_pt = Vec3.new(100, 100, 100);
 
     const claim = scene.beginStagedPrepare().?;
-    try std.testing.expect(claim.have_build);
     // Begin flushes headless: the packet records undelivered WITHOUT
     // touching live state (phase 2 ownership — no flag clears, no scalar
     // publishes, no handle installs on the context path). The frozen

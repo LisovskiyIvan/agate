@@ -9,10 +9,18 @@ Scene creation, resource ownership, named-object lookup, and thread boundaries.
 
 ```zig
 // Run after sokol.gfx.setup, on the marked graphics-context thread.
+agate.gpu_thread.markContextThread(); // once, in the sokol init callback, before spawning the game thread
 var scene: agate.Scene = undefined;
 scene.initInto(allocator);
 defer scene.deinit();
 ```
+
+- `markContextThread` is strict and always live in every build mode
+  (including ReleaseFast/ReleaseSmall): with a live `sg` context every
+  non-marked thread fails `isOnContextThread` and every off-owner GPU
+  touch panics. Unmarked + headless is a CPU-phase inline decision, not
+  GPU authorization. With no marked thread (unit tests, tools) every
+  thread counts as the context thread only while headless.
 
 - Alternatively, use `var scene = agate.Scene.init(allocator)`; do not
   initialize the same Scene twice. Keep its address stable once content
@@ -46,8 +54,8 @@ requirements: **[docs/allocators.md](./docs/allocators.md)**.
   - GPU teardown is context-thread only. On the context thread the
     buffers are destroyed inline; off-context the mesh is unlinked now
     and retired into `gpu_retire` (epoch-stamped, no `sg.*`, no frees).
-    The next render-start flush (`flushPendingGpuUploads`, inside
-    `prepareFrame`) destroys due entries after their epoch completes;
+    The next render-start flush (`flushPendingGpuUploads`, inside staged
+    `finishStagedPrepare`) destroys due entries after their epoch completes;
     `deinit` destroys everything, including uncompleted epochs.
   - Never call `sg.destroy*` on a mesh yourself; never `destroy` the
     struct directly — always go through `destroyMesh`.
@@ -173,7 +181,8 @@ callbacks may enqueue, but must not reset or destroy their manager.
   `destroyMesh`/`destroyTrailMesh`/`renameMesh` (pure CPU plus the retire
   path), step decals/particles/trails/physics/animations, publish frame
   snapshots and prepared builds.
-- Context thread (prepare + render, sequential): `prepareFrame`,
+- Context thread (staged prepare + render, sequential): `buildPreparedFrame`
+  (producer-side frozen build), `beginStagedPrepare`/`finishStagedPrepare`,
   `render`/`renderReuse`, flushes, all `sg.*` creation/destruction,
   `Scene.deinit`, `resizeOffscreen`. Workers and the update side never
   touch the frame snapshot, render passes, or render-owned caches.
@@ -182,7 +191,7 @@ callbacks may enqueue, but must not reset or destroy their manager.
   with no marked thread (unit tests, tools) every thread counts as the
   context thread. Update-side code never writes `scene.stats` directly —
   timings cross via `recordUpdateTime`/`recordPhysicsTime` and are
-  transferred by `prepareFrame`.
+  transferred by the finished staged prepare.
 
 ## Runtime facade (threaded frame lifecycle)
 
@@ -219,17 +228,19 @@ fn gameLoop() void {
   inside it; bounded by `setLockWaitNs`).
 - Advanced path (instrumented hosts, e.g. Sandbox): `gameLock`/
   `gameUnlock`, `produceBuild`/`produceBuildWithHostBytes`,
-  `beginPrepare`/`beginPrepareWith`, `finishPrepare`, `cancelPrepare`,
-  `reuseIfConsumable`, `prepareSerial`, and `tryRunLocked` (never blocks;
+  `beginPrepare`/`beginPrepareWith` (return `BeginResult`
+  `{ claim, busy, wait_ns, held_ns }`: null claim + `busy == false` means
+  no fresh build — reuse or skip; `busy == true` means the exclusion
+  budget was exceeded), `finishPrepare`/`cancelPrepare`,
+  `reuseIfConsumable`, and `tryRunLocked` (never blocks;
   false means the caller keeps its previous snapshot/title).
-  `finishPrepare` must be called unlocked and only for claims with
-  `have_build` (asserted).
 - Claim contract: a successful begin must pair with exactly one
   `finishPrepare` or `cancelPrepare`. `finishPrepare` and
   `render`/`renderReuse` are context-owned and overlap the next producer
   tick.
-- Still mutex-dependent by design: `prepareSerial` (the
-  `--no-concurrent-build`/`--no-threads` diagnostics), profiler control and
+- Still mutex-dependent by design: the `--no-concurrent-build`/
+  `--no-threads` diagnostics (explicit produce + begin/finish inline
+  under `gameLock`/exclusion instead of a helper), profiler control and
   report file IO (bounded window only when a request is pending), and
   registry add/remove while a latch is in flight (an app-contract
   violation, kept coherent by the commit guards).
@@ -239,12 +250,23 @@ fn gameLoop() void {
   twice.
 - `RuntimeMetrics` counts what each call did (`producer_builds`,
   `producer_skips`, `begins`, `begin_empty`, `begin_busy`, `finishes`,
-  `cancels`, `reuses`, `skipped_presents`, `serial_prepares`). Hosts that
+  `cancels`, `reuses`, `skipped_presents`). Hosts that
   keep bespoke legacy branches bump the counter for the event they
   perform, so totals stay truthful.
-- The `--no-concurrent-build`/`--no-threads` diagnostics use
-  `prepareSerial`: the full live-reading `prepareFrame` under the
-  exclusion, released before render.
+- Serial diagnostic (no worker): run the explicit frozen-frame sequence
+  inline — `produceBuild` (game side, under `gameLock`), then
+  `beginPrepare` + `finishPrepare`/`cancelPrepare`, then
+  `render`/`renderReuse`. `render` never auto-prepares: with no
+  consumable frame it drops the present (first frames skip until the
+  first build is ready). `Scene.buildPreparedFrame() bool` is the
+  fully-claimed helper for the same sequence (`tryClaimBuildSlot` +
+  `build` + `stageUi` + `publish`); it returns false when every
+  non-front slot is pinned/claimed (latest-wins skip — the context
+  reuses the last front).
+
+> Breaking API (historic names, not instructions): `Scene.prepareFrame`,
+> `Runtime.prepareSerial`, and the `FrameDraws` back-slot accessors are
+> removed. `PrepareClaim` is `{ token_id, back_idx, build_seq, host_bytes }`.
 
 The contracts above still describe the `Scene` itself: what the game
 thread may do, what the context thread owns, and when destruction

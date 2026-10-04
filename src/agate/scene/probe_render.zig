@@ -25,8 +25,8 @@ const FrameDrawSlot = @import("frame_draws.zig").FrameDrawSlot;
 /// chain to populate the remaining mips. The main-pass viewport is
 /// untouched. When several probes are dirty, the lowest dirty + enabled
 /// index captures now and the rest wait for later frames (one capture
-/// per frame maximum). The fresh content reaches draws one prepare
-/// later (the snapshot is packed in `prepareFrame`, before `render`
+/// per frame maximum). The fresh content reaches draws one staged prepare
+/// later (the snapshot is staged by the producer build, before `render`
 /// captures) — a documented one-frame lag.
 pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void {
     const idx = scene.probes.nextDirtyIndex() orelse return;
@@ -57,12 +57,14 @@ pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void 
 }
 
 /// Renders the prepared primary draw list plus the sky into one cube
-/// face of probe `index` (mip 0). Capture-local state throughout:
-/// scratch stats (discarded — the frame's counters must not 7x), the 1x
-/// forward set (the cube target is single-sampled even in MSAA frames),
-/// and an EMPTY probe pack (capture draws take the legacy env path —
-/// no probe self-sampling or feedback). Shadow maps are the frame's
-/// own (captured right after the shadow depth pass).
+/// face of probe `index` (mip 0, linear HDR RGBA16F). Capture-local state
+/// throughout: scratch stats (discarded — the frame's counters must not 7x),
+/// the 1x HDR forward set (`forwardFor(1, RGBA16F)`, resolved BEFORE the
+/// pass opens — forwardFor may recreate the twin and must never run
+/// mid-pass), and an EMPTY probe pack (capture draws take the legacy env
+/// path — no probe self-sampling or feedback). Shadow maps are the frame's
+/// own (captured right after the shadow depth pass). Invalid/FAILED probe
+/// views fail closed (no pass is opened).
 pub fn renderProbeFace(
     scene: anytype,
     index: usize,
@@ -72,6 +74,14 @@ pub fn renderProbeFace(
     far: f32,
 ) void {
     const probe = &scene.probes.probes[index];
+    // Resolve the HDR forward set before touching the pass (see above).
+    const fwd = scene.forwardFor(1, .RGBA16F);
+    // FAILED-state guard: nonzero ids are not logical validity (retired
+    // epoch handles keep ids). Refuse the face instead of drawing into a
+    // dead attachment.
+    if (probe.gpu.mip_face_views[0][@intFromEnum(face)].id == 0 or
+        sg.queryViewState(probe.gpu.mip_face_views[0][@intFromEnum(face)]) != .VALID) return;
+    if (probe.gpu.depth_view.id == 0 or sg.queryViewState(probe.gpu.depth_view) != .VALID) return;
     const eye = probe.position;
     const view = scene_probes.faceView(face, eye);
     const proj = Mat4.perspective(90.0, 1.0, scene_probes.capture_near, far);
@@ -102,7 +112,7 @@ pub fn renderProbeFace(
 
     var scratch = SceneStats{};
     const env = scene_draw.Environment{
-        .pipelines = &scene.forward,
+        .pipelines = fwd,
         .stats = &scratch,
         .default_white = snap.default_white,
         .default_normal = snap.default_normal,
@@ -200,9 +210,16 @@ pub fn renderProbeFace(
 /// Box-prefilter blit chain for probe `index`: mip `m` (every face) is
 /// rendered from mip `m - 1` through the fullscreen blit pipeline, which
 /// samples with LINEAR filtering at exact 2:1 texel centers (an exact
-/// 2x2 box average per texel — the documented roughness approximation,
-/// not a GGX prefilter). No depth attachment; the pipeline is depth-off.
+/// 2x2 box average per texel). Quality limitation (wave 1 scope): this is a
+/// box average, NOT a GGX importance-sampled prefilter and NOT full-IBL
+/// physical — the shader's `roughness * max_lod` lookup only approximates
+/// lobe widening, with no per-roughness lobe shaping and no parallax
+/// correction. No depth attachment; the pipeline is depth-off. A dead blit
+/// pipeline fails closed (no passes opened).
 pub fn runProbePrefilter(scene: anytype, index: usize) void {
+    if (scene.probes.blit_pipeline.id == 0 or sg.queryPipelineState(scene.probes.blit_pipeline) != .VALID) return;
+    if (scene.probes.blit_vb.id == 0 or sg.queryBufferState(scene.probes.blit_vb) != .VALID) return;
+    if (scene.probes.blit_ib.id == 0 or sg.queryBufferState(scene.probes.blit_ib) != .VALID) return;
     const probe = &scene.probes.probes[index];
     var mip: u32 = 1;
     while (mip < scene_probes.max_mips) : (mip += 1) {

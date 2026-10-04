@@ -27,8 +27,8 @@
 //!   phase_mutex instead — phase ownership no longer spans prepare+render.
 //! - GPU consumability of a published slot ends at the consuming render's
 //!   return or — when no render consumes it — at the START of the next
-//!   prepareFrame: a repeated prepare discards the pending frame BEFORE
-//!   GpuRetire.begin/flush (Scene.prepareFrame clears its consumable flag
+//!   prepare: a repeated begin discards the pending frame BEFORE
+//!   GpuRetire.begin/flush (the staged begin clears its consumable flag
 //!   first), and that flush may tear down the borrowed handles the old
 //!   front references. It also ends at Scene.deinit. The new publish at
 //!   the end of prepare re-associates frame_id/retire_epoch.
@@ -54,8 +54,8 @@
 //! concurrent update/prepare rotation):
 //! - The render/present path PINs the slot it is presenting (`pin` /
 //!   `pinFront`) and MUST unpin it when done (`unpin`). While pinned, a slot
-//!   is never handed out as a build target (`backIndex` / `claimBack` skip
-//!   it) and can never become a publish target (`publish` asserts it,
+//!   is never handed out as a build target (`claimBack` skips
+//!   it) and can never become a publish target (
 //!   `tryPublish` refuses it with `error.PinnedSlot` and counts the refusal).
 //! - The concurrent producer path is `claimBack` (reserve a free slot for
 //!   writing; null = saturated, skip the frame — the documented latest-wins
@@ -80,13 +80,9 @@
 //!   `cancelHandoffClaim` / `tryPublish` / `cancelClaim` / `pin` /
 //!   `pinFront` / `pinFrontReader` / `unpin` / `unpinReader` / `frontIndex` /
 //!   `isPinned` / `isReadPinned` / `pinsHeld`.
-//!   The legacy trio (`backIndex` / `backSlot` / `publish`) plus direct
-//!   `slots[i]` payload access are SINGLE-THREADED ONLY (the sequential
-//!   legacy `stageUiPacket` path and the wave-26 rotation tests):
-//!   `prepareFrame` itself resolves its working slot through the locked
-//!   claim API since wave 31. The legacy trio reads `pinned`/`writing`
-//!   without the mutex and must never run concurrently with lease activity.
-//!   Concurrent producers/consumers must use the claim/pin API exclusively.
+//!   Direct `slots[i]` payload access is SINGLE-THREADED ONLY: the holder
+//!   must own the slot via the claim/pin protocol. Concurrent
+//!   producers/consumers must use the claim/pin API exclusively.
 //! - Do not copy a FrameDraws (it owns a Mutex); Scene holds the single
 //!   instance by value.
 //!
@@ -108,7 +104,7 @@
 //! - build-side live reads: `Scene.buildPreparedFrame` reads live meshes
 //!   (TRS, materials, culling flags, `instance_render` as the prior state
 //!   for the record freeze + `instance_build_view`), the live canvas
-//!   (`stageUiPacket` geometry + handle stamps), live particle/physics
+//!   (`BuildClaim.stageUi` geometry + handle stamps), live particle/physics
 //!   systems, and live camera/light/sky state (`packFrameSnapshot`), and
 //!   writes live per-mesh previews/build_views — plus the commit itself
 //!   reads the live mesh list (game-side, ordered after publish, never
@@ -116,13 +112,9 @@
 //!   the lease since the lockfree-closeout slice — no plain `front` word
 //!   read on the game side anymore). This is the app-side ordering problem:
 //!   the game must finish mutating before building, under exclusion.
-//! - the inline fallback paths (no fresh build): context-side `prepareFrame`
-//!   stages instances and captures UI/particles/physics-debug straight from
-//!   live state and writes live `instance_render` — unchanged legacy
-//!   behavior for apps that never call `buildPreparedFrame`/`stageUiPacket`.
 //! - the frame mailbox (`frame_handoff`) producer/consumer pair is still
 //!   phase-excluded (a true concurrent producer would need the claim/pin API
-//!   here instead of the sequential backIndex/publish path).
+//!   here instead of the sequential claim/publish path).
 //! What IS already slot-owned (and therefore needs no lock once the mutex
 //! goes): the frame snapshot, the staged instance records (+ their latched
 //! outcomes), the UI packet lists + header + handles, the staged build stats
@@ -141,38 +133,28 @@
 //! game side can now `claimBack` a slot, fill it (`Scene.BuildClaim.build`
 //! runs the real build core into the claimed slot), and hand it to prepare
 //! via `releaseHandoff` (no front flip — the flip stays context-owned in
-//! `prepareFrame`) or drop it via `cancelClaim`. Payload reads/writes on
-//! distinct slots need no locking (single producer; the lease mutex pairs
-//! payload writes-before-release with reads-after-pin: the producer's slot
-//! writes happen-before the mutex release in `tryPublish`/`releaseHandoff`,
-//! the consumer's mutex acquire in `pin`/`pinFront`/`frontIndex`
-//! synchronizes the subsequent payload reads). The wave-29 stress test
-//! below proves slot-payload concurrency (claim/fill/publish vs pin/verify,
-//! increasing published ids, canary consistency, skip-on-saturation, no
-//! deadlock). The phase mutex between app update/build and prepare/render
-//! is STILL HELD by the apps — this slice changes no app-facing flow
-//! defaults and removes no mutex. App-side adoption checklist (NEXT wave,
-//! not this one — wave 30 closed the seq-words item, the rest is app-side
-//! flow):
-//! - DONE (wave 30): the four handoff seq words (`build_seq`/
-//!   `last_latched_seq`, `ui_packet_seq`/`last_latched_ui_seq`) plus
+//! the staged finish via `tryPublish`) or drop it via `cancelClaim`.
+//! Payload reads/writes on distinct slots need no locking (single
+//! producer; the lease mutex pairs payload writes-before-release with
+//! reads-after-pin: the producer's slot writes happen-before the mutex
+//! release in `tryPublish`/`releaseHandoff`, the consumer's mutex acquire
+//! in `pin`/`pinFront`/`frontIndex` synchronizes the subsequent payload
+//! reads). The stress test below proves slot-payload concurrency
+//! (claim/fill/publish vs pin/verify, increasing published ids, canary
+//! consistency, skip-on-saturation, no deadlock). The phase mutex between
+//! app update/build and prepare/render is STILL HELD by the apps — this
+//! slice changes no app-facing flow defaults and removes no mutex.
+//! - DONE: the handoff words (`build_seq`/`last_latched_seq`) plus
 //!   `build_slot` are `std.atomic.Value` on `Scene` — release on
-//!   publish/stage, acquire on latch/claim-consume, monotonic for the
-//!   single-producer reserve and the context-side latch stamps (see the
-//!   field docs in scene.zig). Sequential behavior is bit-identical and the
-//!   wave-30 handoff-edge test proves the release/acquire pairing across
-//!   threads. The mutex still guards the payload the words order; what
-//!   REMAINS before it can go:
-//! - stop calling bare `buildPreparedFrame`/`stageUiPacket` across threads:
-//!   use `Scene.tryClaimBuildSlot` + `BuildClaim.build`/`stageUi` +
-//!   `publish`/`cancel` on the game thread; never touch `backIndex`/
-//!   `backSlot`/raw `slots[i]` writes concurrently (those stay
-//!   single-threaded-only, as does legacy `stageUiPacket`, which must not
-//!   run concurrently with prepare).
-//! - DONE (wave 31): `prepareFrame`'s back resolution is a locked claim —
-//!   `claimBack` on the fallback path, `claimSlot(build_slot)` on the latch
-//!   path — held for the whole prepare and released at every exit
-//!   (`tryPublish` on success, `cancelClaim`/early return on contention).
+//!   publish, acquire on latch/claim-consume (see the field docs in
+//!   scene.zig). The mutex still guards the payload the words order.
+//! - use `Scene.tryClaimBuildSlot` + `BuildClaim.build`/`stageUi` +
+//!   `publish`/`cancel` on the game thread; never touch raw `slots[i]`
+//!   writes concurrently.
+//! - DONE: staged prepare resolves its slot through the locked
+//!   `claimLatestHandoff` claim — held for the whole prepare and released
+//!   at every exit (`tryPublish` on success, `cancelHandoffClaim` on
+//!   failure/cancel).
 //!   A concurrent game claim therefore never targets the slot prepare is
 //!   consuming (it skips the WRITING slot or saturates, counted), `pin`
 //!   refuses that slot (`SlotBusy`, counted), and prepare never resets a
@@ -197,7 +179,7 @@
 //! - epochs stay context-owned (`begin`/`complete`/`flush` only in
 //!   prepare/render): the build path must never gain epoch calls (tested).
 //! - remaining live touches (meshes/canvas/cameras/lights, the
-//!   `packFrameSnapshot` live reads, the inline fallback paths, the
+//!   `packFrameSnapshot` live reads, the
 //!   `frame_handoff` producer/consumer exclusion) move under
 //!   freeze-then-latch before the mutex can go; `ui_canvas` mutation
 //!   must additionally quiesce before prepare (the latch reads upload
@@ -384,6 +366,16 @@ pub const ParticleComputeUpload = struct {
     /// `compute_known_unsupported` and drops the pending flags, mirroring
     /// the legacy helper — never a silent fallback, never a retry spin.
     unsupported: bool = false,
+    /// Actual dispatches issued by the staged flush for this packet
+    /// (context-written, `+= 1` after each real `sg.dispatch`): the
+    /// game-side commit transfers the count into the owner's
+    /// `compute_dispatches` exactly once (then zeroes it here), so the
+    /// real-GPU gate observes every dispatch even when the packet's
+    /// upload later fails and retries. An attempt counter, not a delivery
+    /// outcome: `resetOutcomes` deliberately leaves it (a cancelled
+    /// prepare re-flushes the same slot and must not lose the earlier
+    /// attempt). Headless flushes never dispatch, so this stays 0 there.
+    dispatches: u64 = 0,
     /// Lock-free publication outcome (context-written, see MorphUpload).
     delivered: bool = false,
 };
@@ -519,7 +511,7 @@ pub const FrameDrawSlot = struct {
     /// read handles (never destroyed/retired through the record).
     staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
     /// Slot-owned UI CPU packet (lock-free-publication slice 2, b): the
-    /// game side (`Scene.stageUiPacket`) records live canvas CPU geometry
+    /// game side (`BuildClaim.stageUi`) records live canvas CPU geometry
     /// into these back-slot lists and stamps `ui_packet` (presence + staged
     /// draw handles); the prepare latch consumes them into `Scene.ui_frame`
     /// instead of reading the live canvas lists or handles. Plain CPU data
@@ -535,7 +527,7 @@ pub const FrameDrawSlot = struct {
     /// built against, frozen by value at build time. `Scene.buildPreparedFrame`
     /// (game side) stages `build_snapshot` here; the fallback prepare path
     /// stages `frame_snapshot` here after the takeLatest-else-pack latch.
-    /// `prepareFrame`/`render`/`renderReuse`/the UI latch all read THIS copy
+    /// `beginStagedPrepare`/`render`/`renderReuse`/the UI latch all read THIS copy
     /// (prepare reads the slot it is consuming, render/reuse read the front
     /// slot's copy) — never the live `Scene.frame_snapshot`, so a concurrent
     /// game-side mutation cannot tear the in-flight frame.
@@ -631,7 +623,7 @@ pub const FrameDrawSlot = struct {
     host_bytes: std.ArrayListUnmanaged(u8) = .empty,
     /// Scene.frame_id that built this slot.
     frame_id: u64 = 0,
-    /// GpuRetire epoch opened by the prepareFrame that built this slot.
+    /// GpuRetire epoch opened by the staged begin that built this slot.
     retire_epoch: Epoch = 0,
 
     /// Clear lengths for reuse, retaining all capacity. Covers EVERY list —
@@ -833,27 +825,6 @@ pub const FrameDraws = struct {
     publish_refusals: u64 = 0,
     saturation_skips: u64 = 0,
 
-    /// SINGLE-THREADED ONLY (see header): the back index for the sequential
-    /// legacy stage path and the rotation tests. First slot after `front`
-    /// that is neither pinned nor claimed; asserts one exists (the
-    /// sequential path never holds pins or claims across the call, so with
-    /// 3 slots one is always free). `prepareFrame` no longer uses this
-    /// (wave 31: locked claim); concurrent callers must use `claimBack`.
-    pub fn backIndex(self: *const FrameDraws) usize {
-        if (self.handoff) |h| return h;
-        var k: usize = 1;
-        while (k < SLOT_COUNT) : (k += 1) {
-            const idx = (self.front + k) % SLOT_COUNT;
-            if (!self.pinned[idx] and self.read_pins[idx] == 0 and !self.writing[idx]) return idx;
-        }
-        unreachable; // sequential path holds no pins/claims: a slot is free
-    }
-
-    /// SINGLE-THREADED ONLY (see header): the build scratch slot.
-    pub fn backSlot(self: *FrameDraws) *FrameDrawSlot {
-        return &self.slots[self.backIndex()];
-    }
-
     /// Slot accessor by index (no locking; the caller must own the slot via
     /// the protocol: producer owns claimed slots, consumer owns pinned ones,
     /// the sequential path owns back/front between publish boundaries).
@@ -865,17 +836,6 @@ pub const FrameDraws = struct {
     pub fn slotAtConst(self: *const FrameDraws, idx: usize) *const FrameDrawSlot {
         std.debug.assert(idx < SLOT_COUNT);
         return &self.slots[idx];
-    }
-
-    /// SINGLE-THREADED ONLY (see header): publish the sequentially built
-    /// back slot. Must be exactly the current back index and unpinned.
-    /// Rotation-test helper since wave 31 (`prepareFrame` publishes via the
-    /// locked `tryPublish` instead).
-    pub fn publish(self: *FrameDraws, back_idx: usize) void {
-        std.debug.assert(back_idx == self.backIndex());
-        std.debug.assert(!self.pinned[back_idx] and self.read_pins[back_idx] == 0);
-        self.front = back_idx;
-        if (self.handoff == back_idx) self.handoff = null;
     }
 
     /// Concurrent-producer claim: reserve a free slot for writing. Returns
@@ -1014,7 +974,7 @@ pub const FrameDraws = struct {
 
     /// Game-side handoff release (wave 29 concurrent-build primitive): hand
     /// a claimed slot to the prepare latch WITHOUT flipping `front` (the
-    /// front flip stays context-owned in `prepareFrame`). Clears WRITING so
+    /// front flip stays context-owned in the staged finish). Clears WRITING so
     /// the slot is a normal rotation member again; the payload is kept for
     /// prepare, which consumes it via the `build_slot`/`build_seq` handoff
     /// and flips `front` itself at latch time. Refuses (counted, state
@@ -1227,16 +1187,16 @@ test "wave26: rotation cycles 0-1-2-0 without stalling, back never equals front"
     try testing.expectEqual(SLOT_COUNT, draws.slots.len);
     try testing.expectEqual(@as(usize, 0), draws.front);
 
-    // Six sequential publish round-trips (legacy single-threaded path):
-    // each build targets the back, each publish flips to it.
+    // Six sequential publish round-trips (claim/tryPublish path):
+    // each build targets a claimed back, each publish flips to it.
     var expect_front: usize = 0;
     var round: usize = 0;
     while (round < 6) : (round += 1) {
-        const back = draws.backIndex();
+        const back = draws.claimBack().?;
         try testing.expect(back != draws.front);
         try testing.expectEqual((expect_front + 1) % SLOT_COUNT, back);
         draws.slotAt(back).frame_id = round + 1;
-        draws.publish(back);
+        try draws.tryPublish(back);
         expect_front = back;
         try testing.expectEqual(expect_front, draws.front);
         // The published front carries the build's frame; the other slots
@@ -1249,11 +1209,9 @@ test "wave26: rotation cycles 0-1-2-0 without stalling, back never equals front"
 
 test "wave26: claimBack skips the front and pinned slots, publish flips" {
     var draws = FrameDraws{};
-    // No pins: the claim lands on the back index (capture it BEFORE the
-    // claim — claiming marks the slot WRITING, which backIndex then skips).
-    const want0 = draws.backIndex();
+    // No pins: the claim lands off the front.
     const c0 = draws.claimBack().?;
-    try testing.expectEqual(want0, c0);
+    try testing.expect(c0 != draws.front);
     draws.slotAt(c0).frame_id = 7;
     try draws.tryPublish(c0);
     try testing.expectEqual(c0, draws.front);

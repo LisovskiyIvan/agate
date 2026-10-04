@@ -5,7 +5,7 @@
 //! PostProcessOptions persistence contract (field list IS the byte order).
 //! No scene knowledge here; see writer.zig (scene -> bytes) and reader.zig
 //! (bytes -> scene). Layout documented in full on serializeAlloc/writer side;
-//! summary: magic[4]="AGSC", version u32 (2..3), mesh/light/camera/render/
+//! summary: magic[4]="AGSC", version u32 (3 only; v2 rejected), mesh/light/camera/render/
 //! postprocess/game-property sections, all integers LE, f32 as IEEE754 LE
 //! bits, bool as u8 0/1, string as u32 length + raw bytes, no padding.
 
@@ -15,7 +15,7 @@ const PostProcessOptions = @import("../postprocess.zig").PostProcessOptions;
 pub const MAGIC: [4]u8 = .{ 'A', 'G', 'S', 'C' };
 /// v3: adds mesh stable entity `id` (u64) and `parent_name` (string) for hierarchy
 /// persistence, plus custom game key-value properties table at file tail.
-/// Backwards-compatible: v2 files parse cleanly without parent/game-properties.
+/// v2 files are rejected with UnsupportedVersion, not parsed as v3.
 pub const VERSION: u32 = 3;
 
 /// Hard caps for untrusted input. Counts above max_entries and strings above
@@ -188,7 +188,7 @@ pub fn readOptions(comptime T: type, r: *Reader, comptime persisted: []const []c
 }
 
 /// PostProcessOptions fields persisted in save states, in byte order.
-/// Anything not listed here (transient knobs like bloom_pyramid, dof_*,
+/// Anything not listed here (transient knobs like bloom_pyramid_mips, dof_*,
 /// grade_*) is rebuilt from defaults on load.
 pub const postprocess_persisted = [_][]const u8{
     "enabled",              "exposure",           "tonemapping",

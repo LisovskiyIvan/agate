@@ -2,6 +2,7 @@ const std = @import("std");
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
+const hdr = @import("hdr.zig");
 const types = @import("types.zig");
 const options = @import("options.zig");
 
@@ -77,7 +78,7 @@ pub fn taaShouldReset(r: TaaReset) bool {
 
 /// 3x3 neighborhood bounds over center + 8 neighbors. Mirrors the GLSL
 /// taaNeighborhood box (component-wise min/max); the shader feeds the
-/// tonemapped-LDR center + 8 fast-LDR taps.
+/// finite-bound radiance center + 8 finite-bound fast taps.
 pub fn taaNeighborhoodBounds(center: [3]f32, neighbors: [8][3]f32) TaaBounds {
     var mn = center;
     var mx = center;
@@ -134,7 +135,11 @@ pub fn taaApplySharpen(resolved: [3]f32, current: [3]f32, avg: [3]f32, amount: f
 }
 
 /// Full pixel resolve (bounds + clamp + blend + sharpen): the exact GLSL
-/// applyTAA tail after reprojection. Headless golden tests pin it.
+/// applyTAA tail after reprojection, plus the finite-HDR bound counterpart:
+/// inputs are finite-bound on entry (history tap, center, neighbors) and the
+/// result is finite-bound on exit, mirroring the shader's boundRadiance at
+/// the history read, the neighborhood taps, and the resolve return.
+/// Headless golden tests pin it.
 pub fn taaResolvePixel(
     current: [3]f32,
     neighbors: [8][3]f32,
@@ -143,11 +148,15 @@ pub fn taaResolvePixel(
     clamp_strength: f32,
     sharpness: f32,
 ) [3]f32 {
-    const box = taaNeighborhoodBounds(current, neighbors);
-    const avg = taaNeighborhoodAvg(current, neighbors);
-    const hc = taaClampHistory(history, box.min, box.max, clamp_strength);
-    const r = taaResolve(current, hc, blend);
-    return taaApplySharpen(r, current, avg, sharpness, box.min, box.max);
+    const c = hdr.boundHdr3(current);
+    var ns: [8][3]f32 = undefined;
+    for (neighbors, 0..) |n, i| ns[i] = hdr.boundHdr3(n);
+    const h = hdr.boundHdr3(history);
+    const box = taaNeighborhoodBounds(c, ns);
+    const avg = taaNeighborhoodAvg(c, ns);
+    const hc = taaClampHistory(h, box.min, box.max, clamp_strength);
+    const r = taaResolve(c, hc, blend);
+    return hdr.boundHdr3(taaApplySharpen(r, c, avg, sharpness, box.min, box.max));
 }
 
 /// Pack the shader taa_params vec4: (enabled 1/0, blend, clamp, sharpness).
@@ -336,6 +345,41 @@ test "taa neighborhood clamp and resolve math" {
     const px2 = taaResolvePixel(center, neighbors, .{ 0.8, 0.8, 0.8 }, 0.5, 1.0, 0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.65), px2[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.65), px2[1], 1e-6);
+}
+
+test "taa resolve pixel bounds HDR radiance and rejects poisoned history" {
+    // HDR neighborhood 1/4/16: values above 1 survive the resolve and stay
+    // distinct when history sits inside the box.
+    const n16 = [_][3]f32{.{ 16.0, 16.0, 16.0 }} ** 8;
+    const r1 = taaResolvePixel(.{ 1.0, 1.0, 1.0 }, [_][3]f32{.{ 1.0, 1.0, 1.0 }} ** 8, .{ 1.0, 1.0, 1.0 }, 0.5, 1.0, 0.0);
+    const r4 = taaResolvePixel(.{ 4.0, 4.0, 4.0 }, n16, .{ 4.0, 4.0, 4.0 }, 0.5, 1.0, 0.0);
+    const r16 = taaResolvePixel(.{ 16.0, 16.0, 16.0 }, n16, .{ 16.0, 16.0, 16.0 }, 0.5, 1.0, 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r1[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), r4[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0), r16[0], 1e-6);
+
+    // Poisoned history (NaN/Inf) finite-bounds to 0/65504 first, then the
+    // box clamp pulls it inside: output stays finite and inside the box.
+    const center = [3]f32{ 4.0, 4.0, 4.0 };
+    const poisoned = taaResolvePixel(center, n16, .{ std.math.nan(f32), std.math.inf(f32), std.math.inf(f32) }, 0.5, 1.0, 0.5);
+    for (poisoned) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        try std.testing.expect(v >= 4.0 and v <= 16.0);
+    }
+    // Poisoned current and neighbors cannot widen the box to non-finite:
+    // NaN center bounds to 0, Inf neighbors bound to half max.
+    const bad_box = taaResolvePixel(
+        .{ std.math.nan(f32), 4.0, 4.0 },
+        .{ .{ std.math.inf(f32), 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 }, .{ 4.0, 4.0, 4.0 } },
+        .{ 4.0, 4.0, 4.0 },
+        0.5,
+        1.0,
+        0.0,
+    );
+    for (bad_box) |v| try std.testing.expect(std.math.isFinite(v));
+    // NaN center bounds to 0 on entry, then blends halfway toward history.
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), bad_box[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), bad_box[1], 1e-6);
 }
 
 test "taa params and state packing" {

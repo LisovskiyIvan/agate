@@ -335,6 +335,8 @@ pub const Gui3dLayer = struct {
     panel_pipeline: sg.Pipeline = .{},
     /// Main-target sample count `panel_pipeline` was built for (0 = none).
     pipeline_samples: i32 = 0,
+    /// Main-target color format `panel_pipeline` was built for.
+    pipeline_format: sg.PixelFormat = .RGBA16F,
     quad_vb: sg.Buffer = .{},
     quad_ib: sg.Buffer = .{},
 
@@ -755,16 +757,17 @@ pub const Gui3dLayer = struct {
         return true;
     }
 
-    /// Draws every drawable panel quad into the CURRENT main pass (called
-    /// from `renderSceneView` after the transparent queue). Zero `sg.*`
+    /// Draws every drawable panel quad into the CURRENT main pass for the
+    /// exact target shape (called from `renderSceneView` after the
+    /// transparent queue). Zero `sg.*`
     /// calls unless at least one panel is drawable — the pure `drawCount`
     /// check runs first, so panel-less frames are bit-identical.
-    pub fn drawPanels(self: *Gui3dLayer, allocator: std.mem.Allocator, view_proj: Mat4, samples: i32, stats: *SceneStats) void {
+    pub fn drawPanels(self: *Gui3dLayer, allocator: std.mem.Allocator, view_proj: Mat4, samples: i32, color_format: sg.PixelFormat, stats: *SceneStats) void {
         if (self.drawCount() == 0) return;
         if (!sg.isvalid()) return;
         gpu_thread.assertOnContextThread();
         if (!self.ensureShared(allocator)) return;
-        if (!self.ensurePanelPipeline(samples)) return;
+        if (!self.ensurePanelPipeline(samples, color_format)) return;
         for (self.panels[0..self.count]) |*panel| {
             if (!panel.enabled or !panel.captured or !panel.gpu.valid) continue;
             if (panel.gpu.target.image.id == 0) continue;
@@ -783,12 +786,12 @@ pub const Gui3dLayer = struct {
         }
     }
 
-    /// (Re)builds the quad pipeline for the main target's sample count.
+    /// (Re)builds the quad pipeline for the exact main-target shape.
     /// The old pipeline is destroyed immediately on change (context thread,
     /// between draws — never while bound). Fails closed (false) on
     /// creation failure; the previous pipeline (if any) stays bound-able.
-    fn ensurePanelPipeline(self: *Gui3dLayer, samples: i32) bool {
-        if (self.panel_pipeline.id != 0 and self.pipeline_samples == samples) return true;
+    fn ensurePanelPipeline(self: *Gui3dLayer, samples: i32, color_format: sg.PixelFormat) bool {
+        if (self.panel_pipeline.id != 0 and self.pipeline_samples == samples and self.pipeline_format == color_format) return true;
         var desc = sg.PipelineDesc{
             .shader = self.panel_shader,
             .index_type = .UINT16,
@@ -796,6 +799,7 @@ pub const Gui3dLayer = struct {
             .cull_mode = .NONE,
             .sample_count = samples,
         };
+        desc.colors[0].pixel_format = color_format;
         desc.colors[0].blend = .{
             .enabled = true,
             .src_factor_rgb = .SRC_ALPHA,
@@ -819,6 +823,7 @@ pub const Gui3dLayer = struct {
         if (self.panel_pipeline.id != 0) sg.destroyPipeline(self.panel_pipeline);
         self.panel_pipeline = pip;
         self.pipeline_samples = samples;
+        self.pipeline_format = color_format;
         return true;
     }
 
@@ -1191,7 +1196,7 @@ test "gpu entry points fail closed headless with dirty retained" {
     // needed, no crash): uncaptured panel draws nothing.
     try t.expectEqual(@as(usize, 0), layer.drawCount());
     var stats = std.mem.zeroes(SceneStats);
-    layer.drawPanels(t.allocator, Mat4.identity, 1, &stats);
+    layer.drawPanels(t.allocator, Mat4.identity, 1, .RGBA16F, &stats);
     try t.expectEqual(@as(u32, 0), stats.draw_calls);
 
     // A panel faked as drawable still draws nothing headless (isvalid
@@ -1199,7 +1204,7 @@ test "gpu entry points fail closed headless with dirty retained" {
     // while the byte math stays pure.
     layer.get(0).?.captured = true;
     layer.get(0).?.gpu.valid = true;
-    layer.drawPanels(t.allocator, Mat4.identity, 1, &stats);
+    layer.drawPanels(t.allocator, Mat4.identity, 1, .RGBA16F, &stats);
     try t.expectEqual(@as(u32, 0), stats.draw_calls);
     try t.expectEqual(@as(usize, 0), layer.drawCount());
     try t.expectEqual(@as(usize, 0), layer.censusBytes());
@@ -1207,7 +1212,7 @@ test "gpu entry points fail closed headless with dirty retained" {
     layer.get(0).?.gpu.target.image = .{ .id = 77 };
     try t.expectEqual(@as(usize, 1), layer.drawCount());
     try t.expectEqual(@as(usize, 512 * 256 * 4), layer.censusBytes());
-    layer.drawPanels(t.allocator, Mat4.identity, 1, &stats);
+    layer.drawPanels(t.allocator, Mat4.identity, 1, .RGBA16F, &stats);
     try t.expectEqual(@as(u32, 0), stats.draw_calls);
 }
 
@@ -1226,6 +1231,6 @@ test "disabled panels draw and schedule nothing" {
     layer.get(0).?.gpu.valid = true;
     layer.get(0).?.gpu.target.image = .{ .id = 77 };
     try t.expectEqual(@as(usize, 0), layer.drawCount());
-    layer.drawPanels(t.allocator, Mat4.identity, 1, &stats);
+    layer.drawPanels(t.allocator, Mat4.identity, 1, .RGBA16F, &stats);
     try t.expectEqual(@as(u32, 0), stats.draw_calls);
 }

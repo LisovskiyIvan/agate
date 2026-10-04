@@ -266,7 +266,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/hemi.glsl", .text = @embedFile("../shaders/common/hemi.glsl") },
         .{ .name = "shaders/common/hemi_pbr.glsl", .text = @embedFile("../shaders/common/hemi_pbr.glsl") },
         .{ .name = "shaders/common/specular_aa.glsl", .text = @embedFile("../shaders/common/specular_aa.glsl") },
-        .{ .name = "shaders/common/output_gamma.glsl", .text = @embedFile("../shaders/common/output_gamma.glsl") },
+        .{ .name = "shaders/common/linear_output.glsl", .text = @embedFile("../shaders/common/linear_output.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{

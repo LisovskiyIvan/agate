@@ -38,20 +38,18 @@ if (scene.tryClaimBuildSlot()) |*claim| {
     claim.stageHostBytes(host_bytes);
     claim.publish();
 }
-// context (begin — под исключением producer'а, finish — без):
+// или one-liner: _ = scene.buildPreparedFrame(); // tryClaimBuild + stageUi + publish, полный freeze
+// context (begin — без мьютекса по умолчанию, finish — без):
 if (scene.beginStagedPrepare()) |claim| {
     scene.finishStagedPrepare(claim);
 } 
 ...
-scene.render();
+scene.render(); // никогда не готовит свежий кадр сам; без prepared — только renderReuse валидного front
 ```
 
-Серийный путь (один поток, `--no-concurrent-build` / `--no-threads`):
+Серийный путь (один поток, `--no-threads`): тот же staged-алгоритм — `rt.update` + `rt.renderFrame`.
 
-```zig
-rt.prepareSerial(&scene);
-scene.render();
-```
+> Breaking API: `Scene.prepareFrame`, `Runtime.prepareSerial`, `FrameDraws.backIndex/backSlot/publish`, `Scene.lock_free_prepare` удалены. `PrepareClaim` — `{ token_id, back_idx, build_seq, host_bytes }`.
 
 ## API
 
@@ -80,22 +78,14 @@ pub const PrepareClaim = struct {
     token_id: u64,
     back_idx: usize,
     build_seq: u64,
-    have_build: bool,
-    has_handoff: bool,
     host_bytes: []const u8 = &.{},
 };
-pub fn beginPrepare(scene: anytype, allow_fallback: bool) ?PrepareClaim
-pub fn finishPrepare(scene: anytype, claim: PrepareClaim) void
-pub fn cancelPrepare(scene: anytype, claim: PrepareClaim) void
-pub fn prepareFrame(scene: anytype) void
-// Методы Scene (frame_api.zig):
 pub fn beginStagedPrepare(self: anytype) ?PrepareClaim
 pub fn finishStagedPrepare(self: anytype, claim: PrepareClaim) void
 pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void
-pub fn prepareFrame(self: anytype) void
 ```
 
-`beginPrepare(scene, allow_fallback)`: `allow_fallback=true` — серийный путь (нет свежего билда — строит из live-состояния внутри окна исключения); `false` — конкурентный путь (нет handoff — `null`, без live-чтений). Выполняет: lease-claim слота (`claimLatestHandoff` или `claimBack`, удерживается весь prepare), сброс `frame_prepared`, `retire_epoch = gpu_retire.begin()`, сброс статистики с переносом staged скаляров (`pending_update_ms`/`pending_physics_ms` через acquire), закрытие предыдущего незакрытого epoch. `finishPrepare`: потребляет токен один раз, для `have_build` — только latch (GPU-половины по слотовым записям, `patchInstanceRefs`, merge `build_stats`), без перестройки очередей; для fallback — полный инлайн-билд из live; затем `tryPublish` и штамп `last_latched_seq`. `cancelPrepare`: снимает lease, `frame_prepared=false`, `gpu_retire.complete(epoch)`.
+`beginStagedPrepare`: null при отсутствии свежего полного билда — никогда live-чтений. Выполняет: lease-claim слота (удерживается весь prepare), сброс `frame_prepared`, `retire_epoch = gpu_retire.begin()`, сброс статистики с переносом staged скаляров (`pending_update_ms`/`pending_physics_ms` через acquire), закрытие предыдущего незакрытого epoch. `finishStagedPrepare`: потребляет токен один раз (one-shot, живой GPU-владелец) — только latch (GPU-половины по слотовым записям, `patchInstanceRefs`, merge `build_stats`), без перестройки очередей; затем `tryPublish` и штамп `last_latched_seq`. `cancelStagedPrepare`: снимает lease, `frame_prepared=false`, `gpu_retire.complete(epoch)`.
 
 ### Тройной буфер (`scene/frame_draws.zig`)
 
@@ -123,7 +113,7 @@ pub const FrameDraws = struct {
     pub fn pinsHeld(self: *FrameDraws) usize
     pub fn cpuBytes(self: *const FrameDraws) usize
     pub fn deinit(self: *FrameDraws, allocator: std.mem.Allocator) void
-    // Только однопоточно (legacy): backIndex / backSlot / publish / slots[i].
+    // Claim/lease/pin только через claimBack/claimSlot/claimLatestHandoff/tryPublish/releaseHandoff/pin/unpin.
 };
 ```
 
@@ -191,6 +181,7 @@ pub const GpuRetireQueue = struct {
 // patch_instance_refs.zig — финализация provisional build_view хэндлов
 pub fn patchInstanceRefs(back: *FrameDrawSlot) void
 // ui_capture.zig
+// ui_capture.zig (внутреннее, только через BuildClaim.stageUi / buildPreparedFrame):
 pub fn stageUiPacketInto(scene: anytype, slot: usize) void
 pub fn captureUiFrame(scene: anytype, snap: *const SceneFrameSnapshot, back: *FrameDrawSlot) void
 // ui_frame.zig
@@ -211,7 +202,7 @@ pub fn render(scene: anytype) void
 pub fn renderReuse(scene: *anytype) void
 ```
 
-`patchInstanceRefs` сверяет `source_uid` записей с live-мешами и финализирует `instance_buffer`/`visible_instance_count` из post-latch `instance_render`; несовпадение — fail-closed в ноль (невидимо). `stageUiPacketInto` пишет CPU-геометрию канваса в слот и штампует хэндлы пайплайна/шрифта/буферов; latch (`captureUiFrame`) потребляет слот, не live-канвас. `UiFrame` — одиночный committed кадр вне слотов: `capture`/`capturePacket` — CPU, `upload` — GPU, `drawPrepared` — отрисовка без загрузок. `render` читает только pinned front; `renderReuse` перепрезентует последний front (счётчик `reuse_streak`).
+`patchInstanceRefs` сверяет `source_uid` записей с live-мешами и финализирует `instance_buffer`/`visible_instance_count` из post-latch `instance_render`; несовпадение — fail-closed в ноль (невидимо). UI staged-пакет — latch из слота, не live-канвас (first-wins lifecycle; uploads/retires валидны); missing/failure — coherent-empty. `UiFrame` — одиночный committed кадр вне слотов: `capture`/`capturePacket` — CPU, `upload` — GPU, `drawPrepared` — отрисовка без загрузок. `render` читает только pinned front и никогда не готовит свежий кадр сам; `renderReuse` перепрезентует последний валидный front (счётчик `reuse_streak`).
 
 Наблюдаемость (`frame_api.zig`): `hasConsumableFrame() bool`, `reuseStreak() u64`, `uiPacketLatchedCount() u64`, `pendingRetires() usize`, `preparedDraws() *const FrameDrawSlot` (валиден только пока `frame_prepared` или под pin'ом).
 
@@ -220,7 +211,7 @@ pub fn renderReuse(scene: *anytype) void
 ```zig
 pub const BeginResult = struct { claim: ?Scene.PrepareClaim, busy: bool, wait_ns: u64, held_ns: u64 };
 pub const FrameResult = enum { prepared, reused, skipped, busy };
-pub const Metrics = struct { producer_builds, producer_skips, begins, begin_empty, begin_busy, finishes, cancels, reuses, skipped_presents, serial_prepares: u64 };
+pub const Metrics = struct { producer_builds, producer_skips, begins, begin_empty, begin_busy, finishes, cancels, reuses, skipped_presents: u64 };
 pub const Runtime = struct {
     pub fn init() Runtime
     pub fn setProducerExclusion(self: *Runtime, excluded: bool) void
@@ -241,15 +232,14 @@ pub const Runtime = struct {
     pub fn finishPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void
     pub fn cancelPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void
     pub fn reuseIfConsumable(self: *Runtime, scene: *Scene) bool
-    pub fn prepareSerial(self: *Runtime, scene: *Scene) void
 };
 ```
 
 | Режим | Begin | Finish/render | Когда |
 |---|---|---|---|
 | Staged lock-free (default) | без мьютекса | без мьютекса | свежий билд заморозил всё; commit — game-side |
-| Staged с исключением (`--prepare-exclusion`) | под `mutex` (`lock_wait_ns`, 0 = try) | без | диагностика/откат, незамороженные пейлоады, live host-чтения |
-| Serial (`--no-concurrent-build`) | `mutex` на весь `prepareFrame` | render перекрывается | один поток, live-fallback внутри окна |
+| Staged с исключением (`--prepare-exclusion`) | под `mutex` (`lock_wait_ns`, 0 = try) | без | диагностика тех же данных/алгоритма, не откат render-пути |
+| Single-thread (`--no-threads`) | тот же staged-путь | render перекрывается | один поток, `rt.update` + `rt.renderFrame` |
 
 Сложность/аллокации: claim/pin/publish — O(1) под внутренним мьютексом слотов; `reset` — O(списки) без освобождения (retained capacity); slot payload растёт до high-water-mark и переиспользуется; `cpuBytes` — O(число списков).
 
@@ -257,10 +247,10 @@ pub const Runtime = struct {
 
 - Game-поток: `update` (только update-owned состояние + mailbox'ы + `pending_update_ms`), `tryClaimBuildSlot`/`build`/`stageUi`/`stageHostBytes`/`publish`/`cancel`, `commitSlotResults` + `commitPublishedRecords` в начале каждого билда. Никогда `sg.*`, никогда эпохи retire.
 - Context-поток: `beginPrepare*` (по режиму — с исключением producer'а или без), `finishPrepare`/`cancelPrepare` (всегда без фазового мьютекса — только слот + context-owned), `render`/`renderReuse`, `flushSlotUploads`, `GpuRetire.begin/complete/flush`.
-- Lock-free контракт требует одновременно: билд заморозил загрузки (`stageUploads`) + UI (`stageUi`) + host-байты; `Scene.lock_free_prepare` выставлен; host читает live только через `stageHostBytes` или доказано context-owned; нет гонок registry add/remove с in-flight latch (commit-guard'ы держат когерентность, но контракт приложения это запрещает).
+- Lock-free контракт требует одновременно: билд заморозил загрузки (`stageUploads`) + UI (`stageUi`) + host-байты; host читает live только через `stageHostBytes` или доказано context-owned; нет гонок registry add/remove с in-flight latch (commit-guard'ы держат когерентность, но контракт приложения это запрещает).
 - Skip-if-newer скаляры: `recordUpdateTime(ms)`/`recordPhysicsTime(ms)` пишут в атомики (`pending_update_ms`, release); begin читает (acquire) в `stats` — монотонная передача без мьютекса, последнее значение побеждает.
 - `host_bytes`/`stageHostBytes`: game копирует мелкие host-пейлоады (имя пика, tally памяти, ≤128B на практике) в claimed слот; context читает `PrepareClaim.host_bytes` вместо live host-состояния. OOM — fail-closed (область чистится, счётчик `host_bytes_oob_drops`).
-- UI: staged пакет (`ui_vertices`/`ui_indices` + `ui_packet` с замороженными хэндлами) — latch в `Scene.ui_frame` без чтения live-канваса; мутации `ui_canvas` должны затихнуть до prepare (latch читает upload-identity из live-канваса даже на staged-пути).
+- UI: staged пакет (`ui_vertices`/`ui_indices` + `ui_packet` с замороженными хэндлами) — latch из слота без чтения live-канваса (GPU canvas metadata + first-wins/uploads/retires валидны); мутации `ui_canvas` должны затихнуть до prepare.
 - Эпохи retire открываются/закрываются только на context; повторный prepare сбрасывает `frame_prepared` до flush (старый front теряет GPU-потребляемость, CPU-память остаётся как scratch).
 
 ## Ошибки и краевые случаи

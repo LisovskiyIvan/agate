@@ -48,15 +48,6 @@ pub const FrameContext = struct {
     clustered_viewport: [4]f32,
     uniforms_with_shadows: ?*const FrameUniforms = null,
     uniforms_without_shadows: ?*const FrameUniforms = null,
-    /// Babylon's output stage (`applyImageProcessing` -> `toGammaSpace`:
-    /// `pow(color, 1/2.2)` into a NON-sRGB backbuffer) for this view, as the
-    /// exact lane the shader reads: x = 1 enables the encode, y/z/w reserved.
-    /// Zeroed for passes that are not the colour presentation (shadow
-    /// atlases, reflection-probe cubemaps) so they never encode radiance; the
-    /// view render sets it from `Scene.output_gamma`. Kept as the packed
-    /// [4]f32 rather than a bool so the frame context keeps one lane group
-    /// (see buildFrameUniforms). See shaders/common/output_gamma.glsl.
-    output_params: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 // Fragment uniforms shared by the standard, PBR and instanced shaders:
@@ -119,11 +110,6 @@ pub const FrameUniforms = struct {
     // shaders/common/hemi.glsl). Appended last so no existing offset shifts.
     hemi_dir_intensity: [4]f32,
     hemi_diffuse: [4]f32,
-    // APPENDED LAST (Babylon output stage): x = gamma-encode flag (0/1),
-    // y/z/w unused. Mirrors the `output_params` lane the PBR shader family
-    // appends to fs_params; see shaders/common/output_gamma.glsl. Appended
-    // last so no existing offset shifts.
-    output_params: [4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -211,7 +197,6 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .clustered_viewport = ctx.clustered_viewport,
         .hemi_dir_intensity = .{ shadow.hemi_dir.x, shadow.hemi_dir.y, shadow.hemi_dir.z, shadow.hemi_intensity },
         .hemi_diffuse = .{ shadow.hemi_diffuse.r, shadow.hemi_diffuse.g, shadow.hemi_diffuse.b, 0.0 },
-        .output_params = ctx.output_params,
     };
 }
 
@@ -288,59 +273,13 @@ test "buildFrameUniforms passes directional lanes through, legacy lanes intact" 
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, f.probe_params);
 }
 
-test "buildFrameUniforms routes the Babylon output-gamma flag, default off" {
+test "linear output contract: no output_params lanes on the frame structs" {
     const std = @import("std");
-    const ctx = FrameContext{
-        .view_proj = undefined,
-        .eye = undefined,
-        .sun_dir = undefined,
-        .sun_color = undefined,
-        .sun_intensity = 0,
-        .directional_dir = undefined,
-        .directional_color_int = undefined,
-        .cascades = undefined,
-        .light_counts = undefined,
-        .point_pos_range = undefined,
-        .point_color_int = undefined,
-        .spot_pos_range = undefined,
-        .spot_dir_inner = undefined,
-        .spot_color_outer = undefined,
-        .spot_intensity = undefined,
-        .spot_view_proj = undefined,
-        .spot_shadow_params = undefined,
-        .point_view_proj = undefined,
-        .point_shadow_params = undefined,
-        .area_center_int = undefined,
-        .area_right = undefined,
-        .area_up = undefined,
-        .area_color = undefined,
-        .clustered_params = undefined,
-        .clustered_viewport = undefined,
-    };
-    const shadow = ShadowState{
-        .ground_color = undefined,
-        .enable_shadows = false,
-        .mesh_receive_shadows = false,
-        .bias = 0,
-        .intensity = 0,
-        .normal_bias = 0,
-        .softness = 0,
-        .debug_cascades = false,
-        .splits = undefined,
-    };
-    // Default: the lane stays 0 so the encode is off unless a view asks for it.
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, buildFrameUniforms(shadow, &ctx).output_params);
-    // `Scene.output_gamma` (default true) sets x = 1 and leaves the rest zero:
-    // the flag lives in ONE lane, which is what the shader tests with `> 0.5`.
-    var on = ctx;
-    on.output_params = .{ 1.0, 0.0, 0.0, 0.0 };
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, buildFrameUniforms(shadow, &on).output_params);
-}
-
-test "FrameUniforms appends the output-gamma lane last (offsets unmoved)" {
-    const std = @import("std");
-    try std.testing.expect(@offsetOf(FrameUniforms, "output_params") > @offsetOf(FrameUniforms, "hemi_diffuse"));
-    try std.testing.expect(@offsetOf(FrameUniforms, "output_params") > @offsetOf(FrameUniforms, "clustered_viewport"));
+    // Scene shaders always write linear radiance (see
+    // shaders/common/linear_output.glsl): no gamma/HDR mode lanes ride the
+    // frame uniforms, and the display transfer lives in postprocess only.
+    try std.testing.expect(!@hasField(FrameContext, "output_params"));
+    try std.testing.expect(!@hasField(FrameUniforms, "output_params"));
 }
 
 test "FrameUniforms appends area lanes last (existing offsets unmoved)" {
@@ -370,7 +309,6 @@ test "FrameUniforms appends clustered lanes after the area lanes (offsets unmove
     // the GLSL source plus the `FsParams` contract test in scene/draw.zig.
     try std.testing.expect(@hasField(FrameContext, "clustered_params"));
     try std.testing.expect(@hasField(FrameContext, "clustered_viewport"));
-    try std.testing.expect(@hasField(FrameContext, "output_params"));
 }
 
 test "alphaCutoffFor gates the cutoff on cutout mode" {

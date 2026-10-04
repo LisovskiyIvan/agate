@@ -4,7 +4,7 @@
 
 ## Что это
 
-Модуль `postprocess` — CPU-сторона цепочки постэффектов: конфиг `PostProcessOptions`, чистая математика эффектов и клампы (`clamped()`), плюс per-эффект хелперы, которыми `PostProcessPass` (см. `./passes.md`) пакует юниформы для composite-шейдера `postprocess.glsl`. Сам composite выполняется на GPU; здесь — всё, что нужно, чтобы его сконфигурировать, провалидировать и посчитать на CPU (веса ядер, mip-геометрия, Halton-джиттер TAA, LUT-координаты).
+Модуль `postprocess` — CPU-сторона единой HDR-цепочки постэффектов: конфиг `PostProcessOptions`, чистая математика эффектов и клампы (`clamped()`), плюс per-эффект хелперы, которыми `PostProcessPass` (см. `./passes.md`) пакует юниформы для composite-шейдера `postprocess.glsl`. Цепочка одна (HDR linear → effects → exposure → tonemap → display transfer); `enabled = false` не выключает обязательный output pass (exposure+tonemap всё равно выполняются).
 
 Структура (`postprocess.zig` — фасад-реэкспорт, `postprocess/` — листья):
 
@@ -80,8 +80,7 @@ pub const ShaftResolution = enum { half, quarter };
 | Эффект | Поля | Дефолт | Клампы |
 |---|---|---|---|
 | Master | `enabled`, `exposure`, `tonemapping` | off, 1.0, aces | exposure ≥ 0 |
-| Bloom (single-shader) | `bloom_enabled`, `bloom_threshold`, `bloom_intensity`, `bloom_radius` | on, 0.8, 0.5, 2.0 | все ≥ 0 |
-| Bloom-пирамида | `bloom_pyramid`, `bloom_pyramid_mips` | off, 5 | mips → `clampBloomMips` (см. ниже) |
+| Bloom (HDR pyramid, одна реализация) | `bloom_enabled`, `bloom_threshold`, `bloom_intensity`, `bloom_radius`, `bloom_pyramid_mips` | on, 0.8, 0.5, 2.0, 5 | threshold/intensity ≥ 0; `bloom_radius` — quality upsample-tent по coarse-мипам в текселях [0,16]; mips → `clampBloomMips` [3,7] |
 | Glow v1 (global halo) | `glow_enabled`, `glow_threshold`, `glow_intensity`, `glow_radius`, `glow_tint` | off, const-дефолты, тинт {1,1,1} | ≥ 0; тинт `clampTint` в [0,1] |
 | Vignette | `vignette_enabled`, `vignette_intensity`, `vignette_radius` | on, 0.35, 0.8 | — |
 | Grading (параметрический) | `saturation`, `contrast`, `grade_shadows/midtones/highlights` | 1.05, 1.05, нули | грейды `clampGrade` в [-1,1] |
@@ -97,21 +96,21 @@ pub const ShaftResolution = enum { half, quarter };
 | Shafts v1 | `shaft_enabled`, `shaft_intensity`, `shaft_steps`, `shaft_density`, `shaft_anisotropy`, `shaft_max_distance`, `shaft_resolution`, `shaft_blur_sigma`, `shaft_edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
 | DOF | `dof_enabled`, `dof_focus_distance`, `dof_focus_range`, `dof_max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
 
-Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom → glow → highlight → shafts → grading/LUT → vignette → tonemap → FXAA/TAA-resolve → sharpen/grain. Точный порядок зафиксирован шейдером; перестановка — правкой шейдера, не конфига.
+Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom-pyramid → glow → highlight → shafts → grading/LUT → vignette → exposure/tonemap → display transfer → FXAA/TAA-resolve → sharpen/grain. Exposure ручной (`exposure`); auto-exposure — будущее. Output gamma-флаги удалены: один IEC display transfer, ручной UNORM / hw-sRGB путь.
 
 ### Bloom (`postprocess/bloom.zig`)
 
 ```zig
-pub const BLOOM_PYRAMID_MIPS_MIN / BLOOM_PYRAMID_MIPS_MAX / BLOOM_MAX_MIPS = ...;
+pub const BLOOM_PYRAMID_MIPS_MIN: u32 = 3; // quality-бюджет мипов
+pub const BLOOM_PYRAMID_MIPS_MAX: u32 = 7;
 pub fn clampBloomMips(mips: u32) u32
 pub fn bloomMipSize(base_w: i32, base_h: i32, mip: u32) BloomMipSize
 pub fn karisWeight(color: [3]f32) f32
 pub fn tentWeight1D(x: f32) f32
 pub fn bloomTentWeight(x: f32, y: f32) f32
-pub fn bloomPyramidActive(options: PostProcessOptions) bool
 ```
 
-Два режима: single-shader bloom (дефолт, в composite) и пирамида (`BloomPass`: Karis-down + tent-up, `bloom_pyramid = true`). `bloomMipSize` — геометрия мипа для аллокации таргетов; `karisWeight`/`tentWeight` — CPU-зеркала шейдерных весов (для тестов паритета и тулзов). Сложность пирамиды O(пиксели × mips).
+Одна реализация — HDR bloom-pyramid (`BloomPass`: Karis-down + tent-up); `bloom_pyramid` удалён, inline-gather пути нет. `bloomMipSize` — геометрия мипа для аллокации таргетов; `karisWeight`/`tentWeight` — CPU-зеркала шейдерных весов (для тестов паритета и тулзов). Сложность O(пиксели × mips). `bloom_radius` — quality радиуса upsample-tent по coarse-мипам в текселях [0,16]; `bloom_pyramid_mips` — quality-бюджет [3,7].
 
 ### Glow (`postprocess/glow.zig`)
 
@@ -215,12 +214,12 @@ pub fn shaftKernelSum(...) f32
 ## Ошибки и краевые случаи
 
 - Ошибок как значений почти нет: все клампы total (`clamped()` не падает). Единственный fallible путь — LUT-билдеры (`OutOfMemory`) и `setColorGradingLut` с невалидной текстурой (не ошибка — тихий сброс в `null` + `lut_enabled = false`).
-- `bloom_pyramid_mips` вне `[MIN, MAX]` — кламп, а не игнор: эффект остаётся включённым с ближайшим валидным числом мипов.
+- `bloom_pyramid_mips` вне `[3, 7]` — кламп, а не игнор: эффект остаётся включённым с ближайшим валидным числом мипов.
 - `shaft_steps` клампится к [4,32] (граница шейдерного цикла); `shaft_anisotropy` — к ±0.9 (сингулярность HG-фазы при |g|→1).
 - `motion_blur_samples`/`ssr_steps` клампятся к своим диапазонам; нулевые значения невозможны после `clamped()`.
 - LUT с `lut_size`, не прошедшим `validLutSize`, или с геометрией strip, не совпадающей с размером, — сброс привязки (шейдер идёт по no-LUT пути, а не сэмплит мусор).
 - `taa_camera_cut = true` при выключенном TAA — безвреден (истории нет, сбрасывать нечего).
-- Все `*Active` гейты (`bloomPyramidActive`, `glowActive`, `highlightActive`, `shaftActive`) — единственный источник правды для `PostProcessPass` о том, запускать ли пассы; не дублируйте условия на стороне сцены.
+- Все `*Active` гейты (`glowActive`, `highlightActive`, `shaftActive`) — единственный источник правды для `PostProcessPass` о том, запускать ли пассы; bloom идёт единой пирамидой при `bloom_enabled`.
 
 ## Производительность
 
@@ -229,6 +228,7 @@ pub fn shaftKernelSum(...) f32
 - CPU-математика модуля — O(1) на вызов (веса, UV, джиттер); исключение — `buildIdentityLutStrip` O(size³) однократно при создании LUT.
 - TAA держит два history-таргета полного разрешения (`ensureTaaHistory`) — самая заметная видеопамять модуля; `taaReset` при ресайзе обязателен (иначе репроекция из чужого разрешения).
 - `clamped()` — дешёвый (скаляры), вызывайте без страха каждый кадр после твиков UI; кэшировать не нужно.
+- HDR-showcase: `zig build hdr-showcase` / `run-hdr-showcase`, сцены Studio B/E/Space; конечный прогон `AGATE_HDR_FRAMES=240`, `MSAA4`, `SRGB1`; browser-кадры — query-параметром. Скриншоты — визуальные, не числовая radiance-метрика.
 
 ## Смотрите также
 

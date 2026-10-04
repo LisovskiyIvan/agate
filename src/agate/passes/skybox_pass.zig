@@ -12,18 +12,17 @@ pub const SkyboxPass = struct {
     mesh_vb: sg.Buffer,
     mesh_ib: sg.Buffer,
     sampler: sg.Sampler,
-    /// Main-target sample count the pipeline was built for (scene/msaa.zig).
+    /// Main-target sample count the pipeline was built for.
     sample_count: i32 = 1,
+    /// Main-target color format the pipeline was built for.
+    color_format: sg.PixelFormat = .RGBA16F,
     shader: sg.Shader = .{},
 
-    pub fn init() SkyboxPass {
-        return initSampled(1);
-    }
-
-    /// Same pass at a different main-target sample count: sokol requires
-    /// pipeline.sample_count to match the attachments of the pass it draws
-    /// into, so MSAA main targets need their own pipeline variant.
-    pub fn initSampled(sample_count: i32) SkyboxPass {
+    /// Same pass for an explicit target shape (sample count + color
+    /// format): each main-target shape needs its own pipeline variant
+    /// because sokol requires pipeline.sample_count to match the
+    /// attachments of the pass it draws into.
+    pub fn init(sample_count: i32, color_format: sg.PixelFormat) SkyboxPass {
         const skybox_positions = [_][3]f32{
             .{ -1.0, -1.0, -1.0 }, // 0
             .{ 1.0, -1.0, -1.0 }, // 1
@@ -77,6 +76,7 @@ pub const SkyboxPass = struct {
             .cull_mode = .NONE,
             .sample_count = sample_count,
         };
+        pip_desc.colors[0].pixel_format = color_format;
         pip_desc.layout.buffers[0] = .{ .stride = 3 * @sizeOf(f32) };
         pip_desc.layout.attrs[skybox_shd.ATTR_skybox_position] = .{
             .format = .FLOAT3,
@@ -92,6 +92,7 @@ pub const SkyboxPass = struct {
             .sampler = smp,
             .sample_count = sample_count,
             .shader = shd,
+            .color_format = color_format,
         };
     }
 
@@ -114,7 +115,7 @@ pub const SkyboxPass = struct {
     pub fn renderMatrices(self: *SkyboxPass, rot_view: Mat4, proj: Mat4, cube_tex: CubeTexture, exposure: f32) void {
         const view_proj = Mat4.mul(proj, rot_view);
 
-        if (self.pipeline.id == 0) return;
+        if (!sg.isvalid() or sg.queryPipelineState(self.pipeline) != .VALID) return;
         sg.applyPipeline(self.pipeline);
 
         var bind = sg.Bindings{};

@@ -72,7 +72,7 @@ float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
 
     // PCSS: blocker search sets a receiver-dependent filter radius. Params
     // ride free lanes (cascade_debug.yzw / light_counts.zw); disabled keeps
-    // the legacy fixed-radius path below bit-identical.
+    // the fixed-radius path below bit-identical.
     if (cascade_debug.y > 0.5) {
         float blocker_avg = pcssBlockerAverage(shadow_depth_tex, depth_smp, atlas_uv, depth, rot, cascade_debug.w, quad_min, quad_max);
         if (blocker_avg < 0.0) return 1.0;

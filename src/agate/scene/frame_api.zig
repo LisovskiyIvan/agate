@@ -43,7 +43,7 @@ const CubeTexture = @import("../texture.zig").CubeTexture;
 
 /// Stages the update-phase wall time measured by the app around
 /// Scene.update. Update-side write (game thread, under update-vs-prepare
-/// phase ownership); prepareFrame transfers the last tick into
+/// phase ownership); the staged begin transfers the last tick into
 /// stats.update_ms. This is the ONLY update-side timing write — direct
 /// `scene.stats.*` writes from the update thread are forbidden (stats is
 /// context-owned; render reads it concurrently with update).
@@ -63,9 +63,11 @@ pub fn recordPhysicsTime(self: anytype, ms: f32) void {
 /// `frame_id` as `cache_key`, `&self.stats`, the snapshot primary eye,
 /// snapshot primary eye, the resolved snapshot sky/ibl, `true`, and
 /// `.published` (today's exact behavior). The game-side build passes
-/// `&build_snapshot` with the build-unique key `(build_seq | (1<<63))`
-/// (high bit set: cannot collide with any context `frame_id`, which
-/// counts up from 0), the claimed slot's `&back.build_stats`, the frozen snapshot eye,
+/// `&build_snapshot` with the per-attempt build-unique key
+/// (`build_cache_seq | (1<<63)` under the producer high-bit namespace —
+/// fresh on every build call, including cancelled/repeated ones — never
+/// the handoff `build_seq`, which a cancelled build leaves uncommitted
+/// for the next build to reuse), the claimed slot's `&back.build_stats`, the frozen snapshot eye,
 /// the exact snapshot sky/ibl, `true`, and `.build_view`
 /// (provisional buffer/count until the latch patch).
 /// Payload identity invariant: every instanced batch / shadow item /
@@ -76,8 +78,7 @@ pub fn recordPhysicsTime(self: anytype, ms: f32) void {
 /// eye; the build passes the live eye for future transparent-sort use
 /// and for the instance CPU staging eye, which is threaded separately).
 /// `stats` stays a direct pointer: the game-side build passes the claimed
-/// slot's counter accumulator, while the serialized fallback passes
-/// `&self.stats` directly.
+/// slot's counter accumulator.
 // internal, used by scene tests
 pub fn prepareViewQueues(
     self: anytype,
@@ -130,8 +131,8 @@ pub fn renderSceneView(
 /// probe-owned targets — so the single-upload-per-frame discipline is
 /// untouched. When several probes are dirty, the lowest dirty + enabled
 /// index captures now and the rest wait for later frames (one capture
-/// per frame maximum). The fresh content reaches draws one prepare
-/// later (the snapshot is packed in `prepareFrame`, before `render`
+/// per frame maximum). The fresh content reaches draws one staged prepare
+/// later (the snapshot is staged by the build, before `render`
 /// captures) — a documented one-frame lag.
 pub fn captureDirtyProbes(self: anytype, snap: *const SceneFrameSnapshot) void {
     scene_probe_render.captureDirtyProbes(self, snap);
@@ -159,57 +160,20 @@ pub fn packFrameSnapshot(self: anytype, aspect: f32, cur_w: i32, cur_h: i32) sce
 /// Publishes a complete frame snapshot through the lock-free mailbox.
 /// When the mailbox is saturated (consumer lagging, both slots
 /// published), stale published slots are drained first so the NEWEST
-/// snapshot wins — otherwise prepareFrame's takeLatest would resurface
-/// an older published frame over the newer fallback.
+/// snapshot wins — otherwise the build's takeLatest would resurface
+/// an older published frame over the newer tick.
 pub fn publishFrameSnapshot(self: anytype, aspect: f32, cur_w: i32, cur_h: i32) void {
     scene_snapshot.publishFrameSnapshot(self, aspect, cur_w, cur_h);
 }
 
-/// Game-side UI CPU packet staging (lock-free-publication slice 2, b):
-/// records the live canvas CPU geometry into the back slot's
-/// slot-owned packet lists (`ui_vertices`/`ui_indices` + `ui_packet`
-/// header) for the prepare latch to consume into `ui_frame`.
-///
-/// Runs on the game side (any non-pool thread under update-vs-prepare
-/// exclusion — same exclusion as `buildPreparedFrame`), sg-free by
-/// design: CPU list copies into retained slot capacity + plain handle
-/// stamps + one seq bump. No GPU upload and no GPU handle mutation on
-/// this path — the draw handles (pipeline, resolved font view/sampler,
-/// canvas buffer ids) and the writer watermark (`ui_upload_seq`) are
-/// frozen as plain values for the latch to consume instead of reading
-/// the live canvas; screen dims already come from the staged slot
-/// snapshot at latch time. Call AFTER the tick's UI build
-/// (canvas holds the frame's geometry) and, when `buildPreparedFrame`
-/// is also used, AFTER it (the build resets the back slot and would
-/// wipe an earlier packet; the latch then degrades to the legacy canvas
-/// read, which still holds the content — correct, just an extra copy).
-/// Staging twice before a latch: newest wins (lists overwritten, single
-/// header). OOM mid-stage: the packet is marked invalid and the latch
-/// takes the legacy path (the canvas still holds the content) — never a
-/// partial packet. Skipping the stage is always legal: with
-/// `ui_packet_seq == last_latched_ui_seq` the legacy path runs
-/// bit-identically and the slot lists stay empty.
-pub fn stageUiPacket(self: anytype) void {
-    // Sequential-only: targets the unlocked back index — must never run
-    // concurrently with prepareFrame (on the concurrent path use
-    // `BuildClaim.stageUi`, which targets the claimed slot, never the
-    // one prepare is latching). Since wave 31 prepare additionally holds
-    // its slot WRITING for the whole prepare, a concurrent legacy stage
-    // would not even target the latched slot (the unlocked back index
-    // skips WRITING slots) — it would stage into a slot nobody latches,
-    // silently dropping the packet. The prohibition stands.
-    stageUiPacketInto(self, self.draws.backIndex());
-}
-
-/// Shared UI stage core behind `stageUiPacket` and `BuildClaim.stageUi`:
-/// the exact historical stage body targeted at `slot`.
+/// Game-side UI CPU packet staging core behind `BuildClaim.stageUi`:
+/// the stage body targeted at `slot`.
 pub fn stageUiPacketInto(self: anytype, slot: usize) void {
     scene_ui_capture.stageUiPacketInto(self, slot);
 }
 
-/// P6 UI handoff: captures CPU geometry + draw parameters out of the
-/// live canvas into the render-owned frame and uploads at this
-/// prepare/context boundary (phase mutex held, context thread).
+/// P6 UI handoff: latches the claimed slot's staged UI packet into the
+/// render-owned frame and uploads at this prepare/context boundary.
 pub fn captureUiFrame(self: anytype, snap: *const SceneFrameSnapshot, back: *FrameDrawSlot) void {
     scene_ui_capture.captureUiFrame(self, snap, back);
 }
@@ -232,7 +196,7 @@ pub fn captureUiFrame(self: anytype, snap: *const SceneFrameSnapshot, back: *Fra
 /// epochs, no second GPU copies); CPU slot retention is NOT a GPU
 /// lifetime pin. GPU consumability ends at the consuming render's return
 /// or — when no render consumes the frame — at the START of the next
-/// prepareFrame (a repeated prepare discards the pending frame before
+/// staged prepare (a repeated begin discards the pending frame before
 /// GpuRetire.begin/flush, and that flush may tear down its borrowed
 /// handles); it also ends at deinit. Retained CPU storage may be reused
 /// as back scratch by any prepare, so the returned pointer (and any slice
@@ -302,94 +266,31 @@ pub fn patchInstanceRefs(self: anytype, back: *FrameDrawSlot) void {
     scene_patch_instances.patchInstanceRefs(back);
 }
 
-/// Stage-2 increment B producer build (game/update phase, CPU-only,
-/// sg-free): sequential convenience over the claim flow above
-/// (`tryClaimBuildSlot` + `build` + `publish` under one call — the SAME
-/// code path, so behavior cannot diverge; sequential callers observe no
-/// change). Commits the last published latch outcomes to the live
-/// meshes, then stages the CPU halves the prepare latch will consume —
-/// instance matrices into the back-slot scratch + per-mesh previews +
-/// the slot-owned staged records, the
-/// particle build frame, the physics debug build capture — then freezes
-/// the provisional `instance_build_view` per mesh and builds the full
-/// queue/shadow/outline payload into the back slot via the shared
-/// `buildQueuesInto` (with `.build_view` + build-unique cache key + the
-/// claimed slot's `build_stats`), and bumps `build_seq`.
-///
-/// The particle build frame and the physics debug build capture staged
-/// above are additionally frozen into the claimed slot by value; the
-/// prepare latch consumes the slot copies (`latchSlotFrame`/
-/// `latchSlotDebug`), never the shared stores.
-///
-/// Call AFTER the sim mutations of the tick (update boundary), BEFORE
-/// the context `prepareFrame`; sequential with update, excluded vs
-/// prepare (phase ownership; the handoff seq words are atomic since wave
-/// 30, everything else plain). Callable from
-/// any non-pool thread (game thread or a spawned worker — never
-/// concurrent with update or prepare); also callable on the
-/// context/single thread. Two builds before a latch: newest wins (the
-/// single preview store is recomputed, the scratch overwritten) — no
-/// build queue, bounded, no allocs beyond retained capacity.
-///
-/// Build-view freeze: for each mesh with a fresh preview
-/// (`preview.build_seq == build_seq`) set `instance_build_view` from the
-/// preview count/bounds/hash + the current `instance_render`
-/// buffer/capacity/uploaded_count/staged_frame (provisional handle); for
-/// a stale/absent preview set all-zero (invisible). The queue build then
-/// resolves instanced state via `.build_view`; the latch `patchInstanceRefs`
-/// finalizes handles after `stageInstancesLatch`.
-///
-/// Snapshot: consumes the newest published tick into the producer-owned
-/// `build_snapshot` (update-vs-prepare excluded) BEFORE any CPU staging,
-/// then freezes that generation into the claim slot's staged `snapshot`
-/// (wave 27, by value); when nothing new was published ALWAYS packs
-/// fresh live state — never reuses the consumed render snapshot, so the
-/// build works without a publish and after camera removal. Staging eye,
-/// queue culling, shadow switch, and sky/ibl all freeze on this
-/// generation (fixed-size snapshot values only; live meshes/materials/
-/// culling flags stay live by design). Never reads or writes
-/// `frame_snapshot` (the latch consumes the staged slot copy, staged
-/// wins over a post-build `build_snapshot` mutation).
-/// Cache key is the build-unique `(build_seq | (1<<63))` (high bit set:
-/// cannot collide with any context `frame_id`). Queue stats accumulate
-/// directly into the claimed slot and the latch merges that slot copy.
-///
-/// Touches NOTHING else: no sg.*, no GpuRetire begin/complete/flush (view
-/// builds run with `instances_prepared=true`, never retrying staging),
-/// no frame_id/retire_epoch (stamped by the latch), no UI canvas/frame,
-/// no `self.stats`, no profiler. Mutates under game-phase ownership only:
-/// live mesh `instance_render` (commit of the last published latch
-/// outcomes, guarded — see above), back-slot queues/shadow/outline +
-/// scratch, previews/build_views,
-/// staged records, the staged slot `snapshot` and `build_stats`,
-/// particle/physics build frames, `build_snapshot` (refreshed), shadow
-/// bin scratch, occlusion-culler frame state, world-matrix cache (tagged
-/// with the build key).
-///
-/// App contract: no latch is possible while a build runs (update-vs-
-/// prepare exclusion), and the mesh list MUST NOT be mutated between a
-/// build and its latch (a violation no longer fail-closes at latch time —
-/// the latch stages whatever the slot owns — but the commit guard skips
-/// the displaced meshes and the patch already resolved the payload from
-/// the records; the next funded build recomputes). A mesh
-/// whose upload finishes between build and latch, or whose segment OOMs,
-/// keeps its previous complete `instance_render` for one frame
-/// (documented, coherent); the next funded build+latch picks it up.
-pub fn buildPreparedFrame(self: anytype) void {
-    // Sequential path holds no pins or claims across the build, so with
-    // 3 slots one is always free (same guarantee as the old backIndex
-    // assert — a null here is unreachable, never a skip).
-    var claim = self.tryClaimBuildSlot() orelse unreachable;
+/// Stage-2 producer build (game/update phase, CPU-only, sg-free): the sole
+/// Stage-2 producer build (game/update phase, CPU-only, sg-free): the sole
+/// producer convenience over the claim flow (`tryClaimBuildSlot` + `build` +
+/// `stageUi` + `publish` on the SAME path). Returns true when a fully built
+/// frame published, false when every non-front slot was pinned/claimed
+/// (counted latest-wins skip — the context reuses the last front).
+/// The producer freezes only: instance scratch + previews + staged records +
+/// particle/physics captures + upload packets + snapshot + queue payload.
+/// The context latch consumes the staged slot copy unconditionally.
+pub fn buildPreparedFrame(self: anytype) bool {
+    var claim = self.tryClaimBuildSlot() orelse return false;
     claim.build();
+    claim.stageUi();
     claim.publish();
+    return true;
 }
 
 /// Shared build core behind `buildPreparedFrame` and `BuildClaim.build`:
 /// the exact historical build body targeted at the claimed `slot` under
-/// the reserved generation `seq` (preview stamps, record freeze, build
-/// cache key). Commits NOTHING global: `build_seq`/`build_slot` are
-/// stamped by `BuildClaim.publish`, so a cancelled claim leaves no
-/// handoff behind.
+/// the reserved generation `seq` (preview stamps, record freeze). Commits
+/// NOTHING global: `build_seq`/`build_slot` are stamped by
+/// `BuildClaim.publish`, so a cancelled claim leaves no handoff behind.
+/// The world-cache key is per-attempt (`build_cache_seq | (1<<63)`,
+/// bumped on every call) rather than per-`seq`, so cancelled/repeated
+/// builds never alias cache entries with the next real build.
 ///
 /// EPOCH DISCIPLINE (wave 29): this core must never call
 /// `GpuRetire.begin`/`complete`/`flush` and never passes a `retire_queue`
@@ -399,16 +300,11 @@ pub fn buildIntoClaimedSlot(self: anytype, slot: usize, seq: usize) void {
     scene_frame_build.buildIntoClaimedSlot(self, slot, seq);
 }
 
-pub fn prepareFrame(self: anytype) void {
-    scene_frame_prepare.prepareFrame(self);
-}
-
 pub const PrepareClaim = scene_frame_prepare.PrepareClaim;
 
-/// Begins concurrent preparation while the caller excludes producer-side
-/// live-scene mutation (game thread held out of simulate/build for the
-/// duration of THIS call). Returns null when no fresh producer frame is
-/// ready; unlike `prepareFrame`, this never enters the live-read fallback.
+/// Begins staged preparation: claims the latest fully built producer frame
+/// and holds its slot for the whole prepare. Returns null when no fresh
+/// producer frame is ready — never a live read.
 ///
 /// Token contract: every successful begin MUST be paired with exactly one
 /// `finishStagedPrepare` or `cancelStagedPrepare` on the same thread, on
@@ -418,7 +314,7 @@ pub const PrepareClaim = scene_frame_prepare.PrepareClaim;
 /// keep the pair adjacent around the unlock window. Only the context
 /// thread may call any of the three.
 pub fn beginStagedPrepare(self: anytype) ?PrepareClaim {
-    return scene_frame_prepare.beginPrepare(self, false);
+    return scene_frame_prepare.beginPrepare(self);
 }
 
 /// Completes a claim from `beginStagedPrepare`. The producer lock may be
@@ -448,24 +344,23 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
 /// touch ONLY update-owned state (live cameras/lights/world/meshes/
 /// materials/canvas/particles/trails/nav + the mailboxes +
 /// pending_update_ms). It must NEVER touch stats/Profiler/render-owned
-/// caches or prepared payloads, and never call sg.* (uploads flush on
-/// the context thread in prepare). Update-vs-prepare stay excluded
-/// under phase_mutex.
+/// caches or prepared payloads, and never call sg.* (frozen upload packets
+/// flush on the context thread during staged prepare). A single producer
+/// owns these mutations and freezes them before publishing its claim.
 ///
 /// Deliberately NOT included: `updateTrails` and `updateNavAgents` —
 /// both require real-seconds dt (the 60fps-normalized dt breaks their
 /// SI tuning), so apps drive them explicitly with their own time base.
-/// Those explicit CPU mutators run under the SAME update-vs-prepare
-/// exclusion as this entry point (game side, never concurrent with
-/// prepare; render sees only their staged/uploaded results) — the fact
+/// Those explicit CPU mutators run on the same producer before its build
+/// (prepare/render see only their staged/uploaded results) — the fact
 /// that `Scene.update` skips them is a dt-base distinction, not a
 /// thread-ownership one: no render path traces into their live state.
 ///
 /// Stage 1: after this (and any explicit mutators), the app may call
-/// `buildPreparedFrame` — still on the game side, still under the same
-/// exclusion — to stage the CPU halves the prepare latch will consume.
-/// Skipping the build is always legal: `prepareFrame` then runs the
-/// historical inline path.
+/// `buildPreparedFrame` on the game side to freeze the CPU payloads and UI
+/// packet the context-side prepare will consume.
+/// Without a fresh build the staged begin returns null and the context
+/// reuses the last front or skips the present.
 pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     self.updateCamera(dt);
     self.updateLights(dt);
@@ -483,8 +378,9 @@ pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
 
 /// Stage 3: uploads the GPU buffers that the update phase staged
 /// (particle instances, soft-body cloth vertices, trail geometry).
-/// Called at render start so every sg.* touch stays on the context
-/// thread; the update phase is free of sg.* calls.
+/// Quiesced-context drain only: the producer must be stopped/excluded while
+/// this scans live arrays. Normal frames use immutable slot upload packets,
+/// never this routine; the update phase remains free of sg.* calls.
 pub fn flushPendingGpuUploads(self: anytype) void {
     gpu_thread.assertOnContextThread();
     // Deferred off-context destroys first: unlinking already happened in
@@ -501,8 +397,8 @@ pub fn flushPendingGpuUploads(self: anytype) void {
     for (self.trails.meshes.items) |tm| tm.flushGpuUploads();
     for (self.greased_lines.items) |gl| gl.flushGpuUploads();
     for (self.meshes.items) |m| m.flushGpuUploads();
-    // Standalone completion (quiesced-context drains — NOT the
-    // prepareFrame path, whose frame a render commits): the
+    // Standalone completion (quiesced-context drains — NOT the staged
+    // begin path, whose frame a render commits): the
     // compute-particle dispatch above can open the frame's command
     // buffer, and a buffer that is never committed keeps its in-flight
     // semaphore forever — sg_shutdown waits NUM_INFLIGHT_FRAMES signals
@@ -512,7 +408,7 @@ pub fn flushPendingGpuUploads(self: anytype) void {
     if (!self.flush_in_prepare and sg.isvalid()) sg.commit();
 }
 
-/// Render entry: draws the frame prepared by prepareFrame (context
+/// Render entry: draws the frame published by the staged prepare (context
 /// thread, SEQUENTIAL with prepare — never concurrent; update MAY run
 /// concurrently on the game side). Reads ONLY render-owned captures
 /// (prepared draws + the staged slot snapshot incl. sky/default copies,
@@ -525,8 +421,8 @@ pub fn flushPendingGpuUploads(self: anytype) void {
 ///
 /// Non-blocking consumer: when the app skipped the phase-lock acquire it
 /// calls `renderReuse` instead, which re-draws the already-consumed front
-/// through this same function with `rendering_reuse` set — the
-/// `prepareFrame` fallback below is skipped and the profiler tail is
+/// through this same function with `rendering_reuse` set — the staged
+/// begin below is skipped and the profiler tail is
 /// suppressed while the stats are still accumulating inside; the
 /// `renderReuse` wrapper records the re-presented frame after restoring
 /// them. Every presented frame is recorded once, including reuses.
@@ -552,8 +448,7 @@ pub fn reuseStreak(self: anytype) u64 {
 }
 
 /// Prepares that consumed a staged UI packet as the geometry source
-/// (`capturePacket`), i.e. proof the staged path is live. The legacy
-/// canvas read and the staged-absence clear do not count.
+/// (`capturePacket`). The staged-absence clear does not count.
 pub fn uiPacketLatchedCount(self: anytype) u64 {
     return self.ui_packet_latched;
 }

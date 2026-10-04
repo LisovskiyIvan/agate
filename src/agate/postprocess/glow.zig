@@ -213,7 +213,7 @@ test "glow params and tint packing, independent of bloom" {
 
     // Bloom knobs never leak into the glow uniforms and vice versa: the two
     // effects stay independently toggleable.
-    const bloom_only = options.PostProcessOptions{ .bloom_enabled = true, .bloom_pyramid = true, .bloom_intensity = 0.9 };
+    const bloom_only = options.PostProcessOptions{ .bloom_enabled = true, .bloom_intensity = 0.9 };
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glowParams(bloom_only));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glowTintParams(bloom_only));
     try std.testing.expect(bloom.bloomPyramidActive(true, bloom_only));
@@ -222,19 +222,19 @@ test "glow params and tint packing, independent of bloom" {
 
 test "glow and bloom pass decisions are independent" {
     const def = options.PostProcessOptions{};
-    // Default: legacy single-shader bloom path only, no pyramid, no glow.
-    try std.testing.expect(!bloom.bloomPyramidActive(true, def));
+    // Bloom uses one pyramid implementation; glow remains a separate effect.
+    try std.testing.expect(bloom.bloomPyramidActive(true, def));
     try std.testing.expect(!bloom.bloomPyramidActive(false, def));
     try std.testing.expect(!glowActive(true, def));
     // Post off disables both regardless of their own toggles.
-    const both_on = options.PostProcessOptions{ .bloom_pyramid = true, .glow_enabled = true };
+    const both_on = options.PostProcessOptions{ .glow_enabled = true };
     try std.testing.expect(!bloom.bloomPyramidActive(false, both_on));
     try std.testing.expect(!glowActive(false, both_on));
     try std.testing.expect(bloom.bloomPyramidActive(true, both_on));
     try std.testing.expect(glowActive(true, both_on));
 
     // Toggling glow never changes the bloom decision (and vice versa).
-    var cfg = options.PostProcessOptions{ .bloom_pyramid = true };
+    var cfg = options.PostProcessOptions{};
     const bloom_before = bloom.bloomPyramidActive(true, cfg);
     cfg.glow_enabled = true;
     try std.testing.expectEqual(bloom_before, bloom.bloomPyramidActive(true, cfg));
@@ -242,7 +242,7 @@ test "glow and bloom pass decisions are independent" {
     cfg.glow_enabled = false;
     try std.testing.expect(!glowActive(true, cfg));
     try std.testing.expectEqual(bloom_before, bloom.bloomPyramidActive(true, cfg));
-    cfg.bloom_pyramid = false;
+    cfg.bloom_enabled = false;
     try std.testing.expect(!bloom.bloomPyramidActive(true, cfg));
     try std.testing.expect(!glowActive(true, cfg));
 

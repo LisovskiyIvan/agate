@@ -375,7 +375,7 @@ test "serialization rejects unsupported version" {
     const bytes = try serializeAlloc(alloc, &original);
     defer alloc.free(bytes);
 
-    // Current VERSION must parse; anything else (incl. legacy v1) is rejected.
+    // Current VERSION must parse; anything else (incl. v1) is rejected.
     var ok = try deserializeAlloc(alloc, bytes);
     ok.deinit(alloc);
 
@@ -779,17 +779,17 @@ test "loadFileAsync reports failure for non-existent file" {
     try std.testing.expect(load_task.err_name != null);
 }
 
-test "serialization backwards compatibility with version 2" {
+test "serialization rejects version 2" {
     const alloc = std.testing.allocator;
     var w = Writer{ .alloc = alloc };
     defer w.buf.deinit(alloc);
 
     try w.bytes(MAGIC[0..]);
-    try w.u32le(2); // version 2
+    try w.u32le(2); // version 2: rejected, not parsed as v3
 
-    // 1 mesh
+    // 1 mesh in v2 layout (no id/parent_name prefix)
     try w.u32le(1);
-    try w.str("legacy_cube");
+    try w.str("v2_cube");
     try w.vec3(.{ 1.0, 2.0, 3.0 });
     try w.vec3(.{ 0.0, 45.0, 0.0 });
     try w.vec3(.{ 1.0, 1.0, 1.0 });
@@ -831,15 +831,7 @@ test "serialization backwards compatibility with version 2" {
     const pp = PostProcessOptions{};
     try writePostProcess(&w, &pp);
 
-    // Now deserialize with deserializeAlloc
-    var state = try deserializeAlloc(alloc, w.buf.items);
-    defer state.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), state.meshes.len);
-    try std.testing.expectEqualStrings("legacy_cube", state.meshes[0].name);
-    try std.testing.expectEqual(@as(u64, 0), state.meshes[0].id);
-    try std.testing.expectEqualStrings("", state.meshes[0].parent_name);
-    try std.testing.expectEqual(@as(usize, 0), state.game_properties.len);
+    try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, w.buf.items));
 }
 
 test "capture and restore mesh hierarchy and entity id" {

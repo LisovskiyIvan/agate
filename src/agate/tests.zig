@@ -176,6 +176,7 @@ test {
     _ = @import("postprocess/color_curves.zig");
     _ = @import("postprocess/dof.zig");
     _ = @import("postprocess/glow.zig");
+    _ = @import("postprocess/hdr.zig");
     _ = @import("postprocess/highlight.zig");
     _ = @import("postprocess/lut.zig");
     _ = @import("postprocess/options.zig");

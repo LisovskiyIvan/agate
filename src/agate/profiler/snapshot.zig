@@ -19,6 +19,7 @@ const shadow_pass = @import("../passes/shadow_pass.zig");
 const glow_pass_mod = @import("../passes/glow_pass.zig");
 const highlight_pass_mod = @import("../passes/highlight_pass.zig");
 const volumetric_pass_mod = @import("../passes/volumetric_pass.zig");
+const bloom_mod = @import("../postprocess/bloom.zig");
 
 const Scene = scene_mod.Scene;
 const Texture = texture_mod.Texture;
@@ -37,6 +38,81 @@ fn isCleanAscii(str: []const u8) bool {
         if (!std.ascii.isPrint(c)) return false;
     }
     return true;
+}
+
+/// Estimated bytes for the HDR main target shape (pure, no sg calls):
+/// RGBA16F color (8 B/px) + depth (4 B/px), both scaled by samples, plus
+/// one 1x RGBA16F resolve copy under MSAA.
+pub fn mainTargetBytes(width: u32, height: u32, samples: u32) usize {
+    const px: usize = @as(usize, width) * @as(usize, height);
+    const s: usize = @as(usize, @max(1, samples));
+    var total: usize = px * 8 * s + px * 4 * s;
+    if (s > 1) total += px * 8;
+    return total;
+}
+
+/// Estimated bytes for the TAA history ping-pong (pure): 2 full-size
+/// RGBA16F slots (8 B/px each).
+pub fn taaHistoryBytes(width: u32, height: u32) usize {
+    return @as(usize, width) * @as(usize, height) * 8 * 2;
+}
+
+/// Estimated bytes for the bloom pyramid (pure): down + up chains over the
+/// actual per-mip dims (bloomMipSize floors odd sizes, never a coarse
+/// base-size scaling).
+pub fn bloomPyramidBytes(base_w: i32, base_h: i32, mip_count: usize, bytes_per_pixel: usize) usize {
+    var total: usize = 0;
+    for (0..mip_count) |i| {
+        const s = bloom_mod.bloomMipSize(base_w, base_h, @intCast(i));
+        total += @as(usize, @intCast(@max(1, s.w))) * @as(usize, @intCast(@max(1, s.h))) * bytes_per_pixel;
+    }
+    return total * 2; // down + up
+}
+
+/// Estimated bytes for one live render-target image desc (pure): the full
+/// mip chain at `bpp`, scaled by the sample count. Single-level targets
+/// (the bloom pyramid shape) collapse to w*h*bpp*samples.
+pub fn rtImageBytes(width: i32, height: i32, num_mipmaps: i32, sample_count: i32, bpp: usize) usize {
+    if (width <= 0 or height <= 0) return 0;
+    var w: usize = @intCast(width);
+    var h: usize = @intCast(height);
+    const s: usize = @as(usize, @intCast(@max(1, sample_count)));
+    const levels: usize = @intCast(@max(1, num_mipmaps));
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < levels) : (i += 1) {
+        total += w * h * bpp * s;
+        if (w == 1 and h == 1) break;
+        w = @max(1, w / 2);
+        h = @max(1, h / 2);
+    }
+    return total;
+}
+
+/// Leak-safe render-target append: the duped name frees on append OOM
+/// (the old inline `dupe`-then-`append` leaked the name on failure).
+fn appendRt(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(RenderTargetRecord),
+    vram_sum: *usize,
+    name: []const u8,
+    width: u32,
+    height: u32,
+    format: sg.PixelFormat,
+    samples: u32,
+    bytes: usize,
+) !void {
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try list.append(allocator, .{
+        .name = owned,
+        .width = width,
+        .height = height,
+        .format = format,
+        .samples = samples,
+        .gpu_bytes = bytes,
+    });
+    vram_sum.* += bytes;
 }
 
 /// Captures a complete snapshot of CPU memory and GPU VRAM allocations in the scene.
@@ -230,45 +306,54 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
             const w: u32 = @intCast(pp.width);
             const h: u32 = @intCast(pp.height);
             const samples: u32 = @intCast(@max(1, pp.sample_count));
-            const color_bpp: usize = 4;
+            const color_bpp: usize = 8; // RGBA16F sole HDR contract
             const depth_bpp: usize = 4;
 
-            // Offscreen Color
+            // Offscreen Color (HDR)
             const color_bytes = @as(usize, w) * h * color_bpp * samples;
-            snap.render_targets_vram_bytes += color_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "Main Offscreen Color Target"),
-                .width = w,
-                .height = h,
-                .format = .RGBA8,
-                .samples = samples,
-                .gpu_bytes = color_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Main Offscreen Color Target (HDR)", w, h, .RGBA16F, samples, color_bytes);
 
             // Offscreen Depth
             const depth_bytes = @as(usize, w) * h * depth_bpp * samples;
-            snap.render_targets_vram_bytes += depth_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "Main Offscreen Depth Target"),
-                .width = w,
-                .height = h,
-                .format = .DEPTH,
-                .samples = samples,
-                .gpu_bytes = depth_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Main Offscreen Depth Target", w, h, .DEPTH, samples, depth_bytes);
 
             // Resolve Color if MSAA
             if (samples > 1) {
                 const resolve_bytes = @as(usize, w) * h * color_bpp;
-                snap.render_targets_vram_bytes += resolve_bytes;
-                try rt_list.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, "MSAA Resolve Target"),
-                    .width = w,
-                    .height = h,
-                    .format = .RGBA8,
-                    .samples = 1,
-                    .gpu_bytes = resolve_bytes,
-                });
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "MSAA Resolve Target (HDR)", w, h, .RGBA16F, 1, resolve_bytes);
+            }
+
+            // TAA history ping-pong: only when both slots are really VALID
+            // (state query, not id-only: FAILED-but-nonzero counts nothing).
+            if (pp.taaAvailable()) {
+                const tw: u32 = @intCast(pp.taa_width);
+                const th: u32 = @intCast(pp.taa_height);
+                const hist_bytes = taaHistoryBytes(tw, th);
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "TAA History (Ping-Pong 2x HDR)", tw, th, .RGBA16F, 1, hist_bytes);
+            }
+        }
+
+        // Bloom pyramid: sum the ACTUAL allocated down+up images (VALID
+        // only, desc dims/mips/samples at 8 B/px) into one named 16F entry.
+        // Never a free-allocation or configured-mip estimate: unallocated
+        // slots and FAILED handles contribute nothing.
+        {
+            const bloom = &scene.postfx.bloom_pass;
+            if (bloom.base_width > 0 and bloom.base_height > 0) {
+                var bloom_bytes: usize = 0;
+                for (bloom.down_images) |img| {
+                    if (sg.queryImageState(img) != .VALID) continue;
+                    const d = sg.queryImageDesc(img);
+                    bloom_bytes += rtImageBytes(d.width, d.height, d.num_mipmaps, d.sample_count, 8);
+                }
+                for (bloom.up_images) |img| {
+                    if (sg.queryImageState(img) != .VALID) continue;
+                    const d = sg.queryImageDesc(img);
+                    bloom_bytes += rtImageBytes(d.width, d.height, d.num_mipmaps, d.sample_count, 8);
+                }
+                if (bloom_bytes > 0) {
+                    try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Bloom Targets (Down+Up Pyramid HDR)", @intCast(bloom.base_width), @intCast(bloom.base_height), .RGBA16F, 1, bloom_bytes);
+                }
             }
         }
 
@@ -276,15 +361,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         const ssao = &scene.postfx.ssao_pass;
         if (ssao.width > 0 and ssao.height > 0) {
             const ssao_bytes = @as(usize, @intCast(ssao.width)) * @as(usize, @intCast(ssao.height)) * 4 * 2; // raw + blur
-            snap.render_targets_vram_bytes += ssao_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "SSAO Targets (Raw + Blur)"),
-                .width = @intCast(ssao.width),
-                .height = @intCast(ssao.height),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = ssao_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSAO Targets (Raw + Blur)", @intCast(ssao.width), @intCast(ssao.height), .RGBA8, 1, ssao_bytes);
         }
 
         // Glow layer targets (extract + H/V ping-pong, half res): pass-owned
@@ -295,15 +372,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         const glow = &scene.postfx.glow_pass;
         if (glow.base_width > 0 and glow.base_height > 0) {
             const glow_bytes = glow_pass_mod.GlowPass.targetBytes(glow.base_width, glow.base_height, glow_pass_mod.GlowPass.glowBytesPerPixel());
-            snap.render_targets_vram_bytes += glow_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "Glow Targets (Extract + Blur Ping-Pong)"),
-                .width = @intCast(glow.base_width),
-                .height = @intCast(glow.base_height),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = glow_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Glow Targets (Extract + Blur Ping-Pong)", @intCast(glow.base_width), @intCast(glow.base_height), .RGBA16F, 1, glow_bytes);
         }
 
         // Highlight layer targets (mask + H/V ping-pong, half res):
@@ -316,15 +385,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         const hl = &scene.postfx.highlight_pass;
         if (hl.base_width > 0 and hl.base_height > 0) {
             const hl_bytes = highlight_pass_mod.HighlightPass.targetBytes(hl.base_width, hl.base_height, glow_pass_mod.GlowPass.glowBytesPerPixel());
-            snap.render_targets_vram_bytes += hl_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "Highlight Targets (Mask + Blur Ping-Pong)"),
-                .width = @intCast(hl.base_width),
-                .height = @intCast(hl.base_height),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = hl_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Highlight Targets (Mask + Blur Ping-Pong)", @intCast(hl.base_width), @intCast(hl.base_height), .RGBA16F, 1, hl_bytes);
         }
 
         // Volumetric shaft targets (raymarch + bilateral H/V ping-pong,
@@ -337,40 +398,16 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         const shaft = &scene.postfx.volumetric_pass;
         if (shaft.base_width > 0 and shaft.base_height > 0) {
             const shaft_bytes = volumetric_pass_mod.VolumetricPass.targetBytes(shaft.base_width, shaft.base_height, volumetric_pass_mod.VolumetricPass.shaftBytesPerPixel(), shaft.resolution);
-            snap.render_targets_vram_bytes += shaft_bytes;
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, "Volumetric Shaft Targets (Raymarch + Blur Ping-Pong)"),
-                .width = @intCast(shaft.base_width),
-                .height = @intCast(shaft.base_height),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = shaft_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Volumetric Shaft Targets (Raymarch + Blur Ping-Pong)", @intCast(shaft.base_width), @intCast(shaft.base_height), .RGBA16F, 1, shaft_bytes);
         }
 
         // Shadow Atlas
         const shadow_atlas_bytes = @as(usize, SHADOW_ATLAS_SIZE) * SHADOW_ATLAS_SIZE * 4;
-        snap.render_targets_vram_bytes += shadow_atlas_bytes;
-        try rt_list.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, "CSM Directional Shadow Atlas"),
-            .width = SHADOW_ATLAS_SIZE,
-            .height = SHADOW_ATLAS_SIZE,
-            .format = .DEPTH,
-            .samples = 1,
-            .gpu_bytes = shadow_atlas_bytes,
-        });
+        try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "CSM Directional Shadow Atlas", SHADOW_ATLAS_SIZE, SHADOW_ATLAS_SIZE, .DEPTH, 1, shadow_atlas_bytes);
 
         // Spot Shadow Atlas
         const spot_bytes = @as(usize, SPOT_SHADOW_MAP_WIDTH) * SPOT_SHADOW_MAP_HEIGHT * 4;
-        snap.render_targets_vram_bytes += spot_bytes;
-        try rt_list.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, "Spot Light Shadow Map"),
-            .width = SPOT_SHADOW_MAP_WIDTH,
-            .height = SPOT_SHADOW_MAP_HEIGHT,
-            .format = .DEPTH,
-            .samples = 1,
-            .gpu_bytes = spot_bytes,
-        });
+        try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Spot Light Shadow Map", SPOT_SHADOW_MAP_WIDTH, SPOT_SHADOW_MAP_HEIGHT, .DEPTH, 1, spot_bytes);
 
         // Reflection-probe cube targets (wave 25): one mipmapped color cube
         // plus its depth target per captured probe. Same render-target
@@ -378,19 +415,11 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         // uncaptured probes own no target and contribute nothing).
         for (0..scene.probes.count) |i| {
             const probe = &scene.probes.probes[i];
-            if (probe.gpu.image.id == 0) continue;
+            if (sg.queryImageState(probe.gpu.image) != .VALID) continue;
             const probe_bytes = probe_layer.targetBytes();
-            snap.render_targets_vram_bytes += probe_bytes;
             var name_buf: [64]u8 = undefined;
             const name = std.fmt.bufPrint(&name_buf, "Reflection Probe {d} (cube+mips+depth)", .{i}) catch "Reflection Probe";
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, name),
-                .width = @intCast(probe_layer.face_resolution),
-                .height = @intCast(probe_layer.face_resolution),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = probe_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, name, @intCast(probe_layer.face_resolution), @intCast(probe_layer.face_resolution), .RGBA16F, 1, probe_bytes);
         }
 
         // 3D-GUI panel targets (wave 28): one RGBA8 color RT per panel with
@@ -398,19 +427,35 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         // panels without a target contribute nothing).
         for (0..scene.gui3d.panelCount()) |i| {
             const panel = &scene.gui3d.panels[i];
-            if (panel.gpu.target.image.id == 0) continue;
+            if (sg.queryImageState(panel.gpu.target.image) != .VALID) continue;
             const panel_bytes = gui3d_layer.targetBytes(panel.canvas_width, panel.canvas_height);
-            snap.render_targets_vram_bytes += panel_bytes;
             var name_buf: [64]u8 = undefined;
             const name = std.fmt.bufPrint(&name_buf, "3D GUI Panel {d} (color)", .{i}) catch "3D GUI Panel";
-            try rt_list.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, name),
-                .width = @intCast(panel.canvas_width),
-                .height = @intCast(panel.canvas_height),
-                .format = .RGBA8,
-                .samples = 1,
-                .gpu_bytes = panel_bytes,
-            });
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, name, @intCast(panel.canvas_width), @intCast(panel.canvas_height), .RGBA8, 1, panel_bytes);
+        }
+
+        // Refraction background target (half-res HDR + depth): only when
+        // the target is really allocated (isValid + VALID color image).
+        {
+            const rt = &scene.refraction.target;
+            if (rt.isValid() and sg.queryImageState(rt.color_image) == .VALID) {
+                const refr_bytes = rt.estimatedBytes();
+                if (refr_bytes > 0) {
+                    const rs: u32 = @intCast(@max(1, rt.sample_count));
+                    try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Refraction Background Target (Half-Res HDR + Depth)", rt.width, rt.height, .RGBA16F, rs, refr_bytes);
+                }
+            }
+        }
+
+        // MSAA depth prepass target (1x depth, 4 B/px): only when really
+        // allocated (VALID image, no other new resources).
+        if (scene.postfx.msaa_depth) |*md| {
+            if (md.width > 0 and md.height > 0 and sg.queryImageState(md.image) == .VALID) {
+                const mw: u32 = @intCast(md.width);
+                const mh: u32 = @intCast(md.height);
+                const md_bytes = @as(usize, mw) * mh * 4;
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "MSAA Depth Prepass Target", mw, mh, .DEPTH, 1, md_bytes);
+            }
         }
     }
 
@@ -434,6 +479,22 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+test "hdr census byte math" {
+    // 1x HDR main: 8 color + 4 depth = 12 B/px.
+    try std.testing.expectEqual(@as(usize, 12), mainTargetBytes(1, 1, 1));
+    // 4x MSAA: 8*4 + 4*4 color/depth store + one 1x 8 resolve = 56 B/px.
+    try std.testing.expectEqual(@as(usize, 56), mainTargetBytes(1, 1, 4));
+    // TAA history ping-pong: 2 full-size RGBA16F slots = 16 B/px.
+    try std.testing.expectEqual(@as(usize, 16), taaHistoryBytes(1, 1));
+    try std.testing.expectEqual(@as(usize, 2 * 4 * 8 * 2), taaHistoryBytes(2, 4));
+    // Odd bloom base uses actual floored mip dims, not coarse scaling:
+    // base 3x3 -> mip0 1x1, so one level down+up = 2*1*1*8.
+    try std.testing.expectEqual(@as(usize, 16), bloomPyramidBytes(3, 3, 1, 8));
+    // Single live image, single mip: plain w*h*bpp*samples.
+    try std.testing.expectEqual(@as(usize, 640 * 360 * 8), rtImageBytes(640, 360, 1, 1, 8));
+    try std.testing.expectEqual(@as(usize, 0), rtImageBytes(0, 8, 1, 1, 8));
+}
 
 test "Profiler memory snapshot and file saving" {
     const Profiler = @import("core.zig").Profiler;

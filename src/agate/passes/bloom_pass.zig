@@ -1,3 +1,4 @@
+const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const down_shd = @import("bloom_down_shader");
@@ -14,12 +15,12 @@ const pp = @import("../postprocess.zig");
 // fullscreen postprocess pass:
 //
 //   var bloom_view = empty_view; // e.g. default white texture view
-//   if (self.post_process.enabled and self.post_process.bloom_enabled and
-//       self.post_process.bloom_pyramid) {
+//   if (self.post_process.enabled and self.post_process.bloom_enabled) {
 //       bloom_view = self.bloom_pass.render(
 //           self.postprocess_pass.offscreen_resolve_tex_view,
 //           self.post_process.bloom_threshold,
 //           self.post_process.bloom_pyramid_mips,
+//           self.post_process.bloom_radius,
 //           cur_w, cur_h,
 //       );
 //       self.stats.draw_calls += ...;
@@ -45,9 +46,19 @@ pub const BloomPass = struct {
     base_width: i32 = 0,
     base_height: i32 = 0,
 
+    /// Sole-contract render-target pixel format (always RGBA16F; the
+    /// backend capability is validated once at Scene startup). Pure
+    /// (no sg calls, headless-safe).
     pub fn bloomPixelFormat() sg.PixelFormat {
-        if (sg.queryPixelformat(.RGBA16F).render) return .RGBA16F;
-        return .RGBA8;
+        return .RGBA16F;
+    }
+
+    /// Sanitizes the upsample tent radius (pure, no sg calls): finite
+    /// clamped to 0..16; non-finite falls back to 1.0 (the single-texel
+    /// tent). 0 collapses every tap onto the center (point upscale).
+    pub fn sanitizeBloomRadius(r: f32) f32 {
+        if (!std.math.isFinite(r)) return 1.0;
+        return @min(@max(r, 0.0), 16.0);
     }
 
     pub fn init() BloomPass {
@@ -130,6 +141,7 @@ pub const BloomPass = struct {
 
     pub fn resize(self: *BloomPass, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
+        if (!sg.isvalid()) return;
         if (self.base_width == width and self.base_height == height) return;
 
         self.destroyTargets();
@@ -138,37 +150,63 @@ pub const BloomPass = struct {
 
         // Down chain: level 0 is half resolution, each level halves again.
         // Up chain mirrors down sizes so every upsample lands 1:1.
+        // Store-first rollback: every handle lands in the struct before its
+        // state check, so a single destroyTargets frees the failed handle
+        // plus all partial handles (views before images). A failed resize
+        // leaves zero ids and a zero base size, and render() reports empty.
         for (0..pp.BLOOM_MAX_MIPS) |i| {
             const size = pp.bloomMipSize(width, height, @intCast(i));
-            const down_img = sg.makeImage(.{
+            self.down_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
                 .pixel_format = bloom_fmt,
                 .sample_count = 1,
             });
-            self.down_images[i] = down_img;
+            if (sg.queryImageState(self.down_images[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.down_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = down_img },
+                .color_attachment = .{ .image = self.down_images[i] },
             });
+            if (sg.queryViewState(self.down_att_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.down_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = down_img },
+                .texture = .{ .image = self.down_images[i] },
             });
+            if (sg.queryViewState(self.down_tex_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
 
-            const up_img = sg.makeImage(.{
+            self.up_images[i] = sg.makeImage(.{
                 .usage = .{ .color_attachment = true },
                 .width = size.w,
                 .height = size.h,
                 .pixel_format = bloom_fmt,
                 .sample_count = 1,
             });
-            self.up_images[i] = up_img;
+            if (sg.queryImageState(self.up_images[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.up_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = up_img },
+                .color_attachment = .{ .image = self.up_images[i] },
             });
+            if (sg.queryViewState(self.up_att_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
             self.up_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = up_img },
+                .texture = .{ .image = self.up_images[i] },
             });
+            if (sg.queryViewState(self.up_tex_views[i]) != .VALID) {
+                self.destroyTargets();
+                return;
+            }
         }
 
         self.base_width = width;
@@ -176,13 +214,17 @@ pub const BloomPass = struct {
     }
 
     // Build the pyramid from `src_tex` and return the composited glow view
-    // (half-resolution up_tex[0]). Returns an empty view when inactive so
-    // the caller can fall back to the single-shader bloom path.
+    // (half-resolution up_tex[0]). `radius` scales the upsample tent
+    // footprint in coarse-mip texel units (1.0 = the single-texel tent, 0 =
+    // point upscale); the downsample Karis kernel is untouched, so radius
+    // controls the upsample halo only. Returns an empty view when inactive
+    // or when the targets failed, so the composite skips the bloom block.
     pub fn render(
         self: *BloomPass,
         src_tex: sg.View,
         threshold: f32,
         mip_count: u32,
+        radius: f32,
         base_w: i32,
         base_h: i32,
     ) sg.View {
@@ -191,6 +233,7 @@ pub const BloomPass = struct {
         if (base_w <= 0 or base_h <= 0) return .{};
 
         self.resize(base_w, base_h);
+        if (self.base_width != base_w or self.base_height != base_h) return .{};
         if (self.down_images[0].id == 0) return .{};
 
         const n: usize = @intCast(pp.clampBloomMips(mip_count));
@@ -235,6 +278,10 @@ pub const BloomPass = struct {
 
         // Up chain: tent-upsample the coarse level, add the finer level.
         // Intensity scaling stays in the postprocess composite (blend = 1).
+        // The packed texel carries the sanitized tent radius: offsets are
+        // measured in coarse-mip (source) texels, so the radius widens the
+        // halo without touching the downsample kernel.
+        const tent_radius = sanitizeBloomRadius(radius);
         var current = self.down_tex_views[n - 1];
         var i: usize = n - 1;
         while (i > 0) {
@@ -263,7 +310,7 @@ pub const BloomPass = struct {
             const low_w: f32 = @floatFromInt(low_size.w);
             const low_h: f32 = @floatFromInt(low_size.h);
             const fs_params = up_shd.FsParams{
-                .texel = .{ 1.0 / low_w, 1.0 / low_h, 0.0, 0.0 },
+                .texel = .{ tent_radius / low_w, tent_radius / low_h, 0.0, 0.0 },
                 .params = .{ 1.0, 0.0, 0.0, 0.0 },
             };
             sg.applyUniforms(up_shd.UB_fs_params, sg.asRange(&fs_params));
@@ -277,14 +324,13 @@ pub const BloomPass = struct {
     }
 
     fn destroyTargets(self: *BloomPass) void {
-        if (self.down_images[0].id == 0) return;
         for (0..pp.BLOOM_MAX_MIPS) |i| {
-            sg.destroyImage(self.down_images[i]);
-            sg.destroyView(self.down_att_views[i]);
-            sg.destroyView(self.down_tex_views[i]);
-            sg.destroyImage(self.up_images[i]);
-            sg.destroyView(self.up_att_views[i]);
-            sg.destroyView(self.up_tex_views[i]);
+            if (self.down_att_views[i].id != 0) sg.destroyView(self.down_att_views[i]);
+            if (self.down_tex_views[i].id != 0) sg.destroyView(self.down_tex_views[i]);
+            if (self.up_att_views[i].id != 0) sg.destroyView(self.up_att_views[i]);
+            if (self.up_tex_views[i].id != 0) sg.destroyView(self.up_tex_views[i]);
+            if (self.down_images[i].id != 0) sg.destroyImage(self.down_images[i]);
+            if (self.up_images[i].id != 0) sg.destroyImage(self.up_images[i]);
             self.down_images[i] = .{};
             self.down_att_views[i] = .{};
             self.down_tex_views[i] = .{};
@@ -309,3 +355,34 @@ pub const BloomPass = struct {
         sg.destroyBuffer(self.quad_ib);
     }
 };
+
+test "bloom pass fail-closes headless with no state touched" {
+    // Zero-initialized pass (never init'ed: no sg context headless) must
+    // return an empty view before any sg.* call.
+    var pass: BloomPass = .{};
+    const empty = pass.render(.{}, 1.0, 5, 2.0, 1280, 720);
+    try std.testing.expectEqual(@as(u32, 0), empty.id);
+    // Empty source, degenerate size, and missing pipelines all fail closed
+    // the same way (guard order: pipelines first, then source, then size).
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .id = 9 }, 1.0, 5, 2.0, 1280, 720).id);
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .id = 9 }, 1.0, 5, 2.0, 0, 720).id);
+    // The sole-contract format is pinned headless (no sg calls).
+    try std.testing.expectEqual(sg.PixelFormat.RGBA16F, BloomPass.bloomPixelFormat());
+    // Base size untouched: no resize happened.
+    try std.testing.expectEqual(@as(i32, 0), pass.base_width);
+    try std.testing.expectEqual(@as(i32, 0), pass.base_height);
+}
+
+test "sanitizeBloomRadius clamps finite, neutral on non-finite" {
+    // Pure CPU (no sg calls): identity inside the range, 1.0 preserved.
+    try std.testing.expectEqual(@as(f32, 1.0), BloomPass.sanitizeBloomRadius(1.0));
+    try std.testing.expectEqual(@as(f32, 2.0), BloomPass.sanitizeBloomRadius(2.0));
+    // 0 is valid: every upsample tap lands on the center (point upscale).
+    try std.testing.expectEqual(@as(f32, 0.0), BloomPass.sanitizeBloomRadius(0.0));
+    // Finite clamps at both ends.
+    try std.testing.expectEqual(@as(f32, 0.0), BloomPass.sanitizeBloomRadius(-3.0));
+    try std.testing.expectEqual(@as(f32, 16.0), BloomPass.sanitizeBloomRadius(99.0));
+    // Non-finite falls back to the neutral single-texel tent.
+    try std.testing.expectEqual(@as(f32, 1.0), BloomPass.sanitizeBloomRadius(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.0), BloomPass.sanitizeBloomRadius(std.math.inf(f32)));
+}

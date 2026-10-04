@@ -332,16 +332,16 @@ pub const OutlinePass = struct {
     shader_cutout: sg.Shader = .{},
 
     /// Sample count the pipelines were built for. Draw calls into the main
-    /// pass must use the variant matching the target (scene/msaa.zig).
+    /// pass must use the variant matching the target shape.
     sample_count: i32 = 1,
+    /// Main-target color format the pipelines were built for.
+    color_format: sg.PixelFormat = .RGBA16F,
 
-    pub fn init() OutlinePass {
-        return initSampled(1);
-    }
-
-    /// Same pass at a different main-target sample count (sokol requires
-    /// pipeline.sample_count to equal the attachment's on every draw).
-    pub fn initSampled(sample_count: i32) OutlinePass {
+    /// Same pass for an explicit target shape (sample count + color
+    /// format): each main-target shape needs its own pipeline variant
+    /// (sokol requires pipeline.sample_count to equal the attachment's on
+    /// every draw).
+    pub fn init(sample_count: i32, color_format: sg.PixelFormat) OutlinePass {
         // One shader object per program family: the @program entries in
         // outline.glsl generate separate desc functions, each with its own
         // uniform block table (only the skinned program declares vs_skin,
@@ -352,34 +352,42 @@ pub const OutlinePass = struct {
         const shd_cutout = sg.makeShader(outline_shd.outlineCutoutShaderDesc(sg.queryBackend()));
 
         var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16, .sample_count = sample_count };
+        desc_u16.colors[0].pixel_format = color_format;
         configureOutlineDesc(&desc_u16);
         const pip_u16 = sg.makePipeline(desc_u16);
 
         var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32, .sample_count = sample_count };
+        desc_u32.colors[0].pixel_format = color_format;
         configureOutlineDesc(&desc_u32);
         const pip_u32 = sg.makePipeline(desc_u32);
 
         var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16, .sample_count = sample_count };
+        desc_inst_u16.colors[0].pixel_format = color_format;
         configureOutlineInstDesc(&desc_inst_u16);
         const pip_inst_u16 = sg.makePipeline(desc_inst_u16);
 
         var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32, .sample_count = sample_count };
+        desc_inst_u32.colors[0].pixel_format = color_format;
         configureOutlineInstDesc(&desc_inst_u32);
         const pip_inst_u32 = sg.makePipeline(desc_inst_u32);
 
         var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16, .sample_count = sample_count };
+        desc_skin_u16.colors[0].pixel_format = color_format;
         configureOutlineSkinnedDesc(&desc_skin_u16);
         const pip_skin_u16 = sg.makePipeline(desc_skin_u16);
 
         var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32, .sample_count = sample_count };
+        desc_skin_u32.colors[0].pixel_format = color_format;
         configureOutlineSkinnedDesc(&desc_skin_u32);
         const pip_skin_u32 = sg.makePipeline(desc_skin_u32);
 
         var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16, .sample_count = sample_count };
+        desc_cut_u16.colors[0].pixel_format = color_format;
         configureOutlineCutoutDesc(&desc_cut_u16);
         const pip_cut_u16 = sg.makePipeline(desc_cut_u16);
 
         var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32, .sample_count = sample_count };
+        desc_cut_u32.colors[0].pixel_format = color_format;
         configureOutlineCutoutDesc(&desc_cut_u32);
         const pip_cut_u32 = sg.makePipeline(desc_cut_u32);
 
@@ -397,6 +405,7 @@ pub const OutlinePass = struct {
             .shader_skin = shd_skin,
             .shader_cutout = shd_cutout,
             .sample_count = sample_count,
+            .color_format = color_format,
         };
     }
 
@@ -423,7 +432,7 @@ pub const OutlinePass = struct {
         if (items.len == 0) return;
         const width = clampWidthPx(width_px);
         if (width <= 0.0) return;
-        if (self.pipeline_u16.id == 0 and self.pipeline_u32.id == 0) return;
+        if (!sg.isvalid()) return;
 
         for (items) |item| {
             if (!item.is_visible or item.gpu_pending or item.index_count == 0) continue;
@@ -441,7 +450,7 @@ pub const OutlinePass = struct {
                 (if (is_u32) self.pipeline_cutout_u32 else self.pipeline_cutout_u16)
             else
                 (if (is_u32) self.pipeline_u32 else self.pipeline_u16);
-            if (pip.id == 0) continue;
+            if (sg.queryPipelineState(pip) != .VALID) continue;
 
             if (item.vertex_buffer.id == 0) continue;
             if (sg.isvalid()) {

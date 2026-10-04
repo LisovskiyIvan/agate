@@ -11,6 +11,7 @@ pub const lut = @import("postprocess/lut.zig");
 pub const taa = @import("postprocess/taa.zig");
 pub const shafts = @import("postprocess/shafts.zig");
 pub const options = @import("postprocess/options.zig");
+pub const hdr = @import("postprocess/hdr.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -127,4 +128,5 @@ test {
     _ = taa;
     _ = shafts;
     _ = options;
+    _ = hdr;
 }
