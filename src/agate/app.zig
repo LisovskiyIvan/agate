@@ -16,6 +16,24 @@
 //! Headless Mode:
 //! - `App.runHeadless(steps)` executes the complete lifecycle on CPU without opening a
 //!   window or requiring a GPU, enabling headless testing and CI validation.
+//!
+//! Dimension units: `window_width`/`window_height` (and `width()`/`height()`)
+//! are FRAMEBUFFER pixels, matching `sapp.width()`/`sapp.height()`. The
+//! `RESIZED` event carries both units; `App` stores the framebuffer pair.
+//! Logical (screen-coordinate) size is `logicalWidth()`/`logicalHeight()`
+//! (framebuffer divided by `dpi_scale`).
+//!
+//! Event contract: when an `event` callback is installed it owns ALL input
+//! routing (including forwarding to `App.scene`, e.g. after UI layers
+//! consume). `App` forwards events to the scene only when no callback is
+//! installed, so cameras never observe UI-consumed input.
+//!
+//! Ownership: `initScene`/`initRuntime` create App-owned systems (repeated
+//! calls return the existing instance, never dropping live state).
+//! `onCleanup` quiesces the owned worker BEFORE user cleanup runs, then
+//! deinits the owned runtime, the owned scene, and the sg context.
+//! Borrowed (`scene`/`runtime` pointing at caller memory) systems are never
+//! touched on cleanup.
 
 const std = @import("std");
 const sokol = @import("sokol");
@@ -70,7 +88,7 @@ pub const AppConfig = struct {
     headless: bool = false,
 };
 
-/// High-level user callbacks.
+/// High-level user callbacks (event-routing contract: see module docs).
 pub const AppCallbacks = struct {
     /// Invoked once after GPU context and subsystems are initialized.
     init: ?*const fn (*App) void = null,
@@ -121,7 +139,9 @@ pub const App = struct {
     time_seconds: f64 = 0.0,
     delta_time: f32 = 0.0,
     last_time: u64 = 0,
+    /// Framebuffer width in physical pixels (see module docs).
     window_width: i32 = 1280,
+    /// Framebuffer height in physical pixels (see module docs).
     window_height: i32 = 720,
     dpi_scale: f32 = 1.0,
 
@@ -141,29 +161,35 @@ pub const App = struct {
     }
 
     /// Convenience helper to allocate and initialize an internal Scene owned by App.
+    /// Guarded: repeated calls return the existing owned scene (never drops it).
+    /// Requires a live GPU context (Scene builds GPU resources); call from the
+    /// init callback or later, never headless.
     pub fn initScene(self: *App) *Scene {
+        if (self.own_scene) |*owned| {
+            self.scene = owned;
+            return self.scene.?;
+        }
         self.own_scene = Scene.init(self.allocator);
         self.scene = &self.own_scene.?;
         return self.scene.?;
     }
 
     /// Convenience helper to initialize an internal Runtime owned by App.
+    /// Guarded: repeated calls return the existing owned runtime (a live
+    /// worker is never dropped).
     pub fn initRuntime(self: *App) *Runtime {
+        if (self.own_runtime) |*owned| {
+            self.runtime = owned;
+            return self.runtime.?;
+        }
         self.own_runtime = Runtime.init();
         self.runtime = &self.own_runtime.?;
         return self.runtime.?;
     }
 
-    /// Starts the application lifecycle. Calls `sapp.run` in windowed mode,
-    /// or runs a single tick in headless mode.
-    pub fn run(self: *App) void {
-        active_app = self;
-        if (self.config.headless) {
-            self.runHeadless(1);
-            return;
-        }
-
-        sapp.run(.{
+    /// sokol-app startup descriptor built from config.
+    fn sappDesc(self: *const App) sapp.Desc {
+        return .{
             .init_cb = appInitCb,
             .frame_cb = appFrameCb,
             .cleanup_cb = appCleanupCb,
@@ -172,6 +198,7 @@ pub const App = struct {
             .width = self.config.width,
             .height = self.config.height,
             .sample_count = self.config.sample_count,
+            .srgb = self.config.srgb_backbuffer,
             .gl = .{ .major_version = self.config.gl_major, .minor_version = self.config.gl_minor },
             .high_dpi = self.config.high_dpi,
             .disable_vsync = self.config.disable_vsync,
@@ -180,11 +207,40 @@ pub const App = struct {
                 .disable_display_sync = self.config.metal_disable_display_sync,
             },
             .logger = if (self.config.logger) |l| .{ .func = l } else .{},
-        });
+        };
+    }
+
+    /// sokol-gfx descriptor built from config (`env` supplied by the caller).
+    fn sgDesc(self: *const App, env: sg.Environment) sg.Desc {
+        return .{
+            .environment = env,
+            .logger = if (self.config.logger) |l| .{ .func = l } else .{},
+            .buffer_pool_size = self.config.buffer_pool_size,
+            .image_pool_size = self.config.image_pool_size,
+            .sampler_pool_size = self.config.sampler_pool_size,
+            .view_pool_size = self.config.view_pool_size,
+            .pipeline_pool_size = self.config.pipeline_pool_size,
+            .shader_pool_size = self.config.shader_pool_size,
+            .uniform_buffer_size = self.config.uniform_buffer_size,
+        };
+    }
+
+    /// Starts the application lifecycle. Calls `sapp.run` in windowed mode,
+    /// or runs a single tick in headless mode.
+    pub fn run(self: *App) void {
+        if (self.config.headless) {
+            self.runHeadless(1);
+            return;
+        }
+
+        std.debug.assert(active_app == null);
+        active_app = self;
+        sapp.run(self.sappDesc());
     }
 
     /// Executes `steps` frames headlessly without window creation or GPU requirement.
     pub fn runHeadless(self: *App, steps: usize) void {
+        std.debug.assert(active_app == null);
         active_app = self;
         self.is_headless = true;
         self.onInit();
@@ -211,17 +267,7 @@ pub const App = struct {
             stime.setup();
             self.last_time = stime.now();
             if (!sg.isvalid()) {
-                sg.setup(.{
-                    .environment = sglue.environment(),
-                    .logger = if (self.config.logger) |l| .{ .func = l } else .{},
-                    .buffer_pool_size = self.config.buffer_pool_size,
-                    .image_pool_size = self.config.image_pool_size,
-                    .sampler_pool_size = self.config.sampler_pool_size,
-                    .view_pool_size = self.config.view_pool_size,
-                    .pipeline_pool_size = self.config.pipeline_pool_size,
-                    .shader_pool_size = self.config.shader_pool_size,
-                    .uniform_buffer_size = self.config.uniform_buffer_size,
-                });
+                sg.setup(self.sgDesc(sglue.environment()));
             }
             self.window_width = sapp.width();
             self.window_height = sapp.height();
@@ -263,26 +309,37 @@ pub const App = struct {
 
     /// Lifecycle hook: event handling.
     pub fn onEvent(self: *App, ev: [*c]const sapp.Event) void {
-        if (ev != null) {
-            if (ev.*.type == .RESIZED) {
-                self.window_width = ev.*.window_width;
-                self.window_height = ev.*.window_height;
-            }
-            if (self.scene) |sc| {
-                sc.handleEvent(ev);
-            }
+        if (ev != null and ev.*.type == .RESIZED) {
+            // Framebuffer units (matches sapp.width()/height()); fall back
+            // to window units when the backend reports no framebuffer size.
+            self.window_width = if (ev.*.framebuffer_width > 0) ev.*.framebuffer_width else ev.*.window_width;
+            self.window_height = if (ev.*.framebuffer_height > 0) ev.*.framebuffer_height else ev.*.window_height;
         }
 
         if (self.callbacks.event) |cb| {
             cb(self, ev);
+        } else if (self.scene) |sc| {
+            if (ev != null) {
+                sc.handleEvent(ev);
+            }
         }
     }
 
     /// Lifecycle hook: cleanup and context teardown.
     pub fn onCleanup(self: *App) void {
         self.running = false;
+        if (self.own_runtime) |*rt| {
+            rt.quiesce();
+        }
+
         if (self.callbacks.cleanup) |cb| {
             cb(self);
+        }
+
+        if (self.own_runtime) |*rt| {
+            rt.deinit();
+            self.own_runtime = null;
+            self.runtime = null;
         }
 
         if (self.own_scene) |*sc| {
@@ -309,11 +366,14 @@ pub const App = struct {
         return rt.renderFrame(sc);
     }
 
-    // Accessors
+    // Accessors (framebuffer-pixel units unless noted).
+
+    /// Framebuffer width in physical pixels (matches `sapp.width()`).
     pub inline fn width(self: *const App) i32 {
         return self.window_width;
     }
 
+    /// Framebuffer height in physical pixels (matches `sapp.height()`).
     pub inline fn height(self: *const App) i32 {
         return self.window_height;
     }
@@ -322,12 +382,24 @@ pub const App = struct {
         return self.dpi_scale;
     }
 
-    pub inline fn framebufferWidth(self: *const App) i32 {
-        return @intFromFloat(@as(f32, @floatFromInt(self.window_width)) * self.dpi_scale);
+    /// Logical width in screen coordinates (framebuffer divided by DPI scale).
+    pub inline fn logicalWidth(self: *const App) i32 {
+        return @intFromFloat(@as(f32, @floatFromInt(self.window_width)) / self.dpi_scale);
     }
 
+    /// Logical height in screen coordinates (framebuffer divided by DPI scale).
+    pub inline fn logicalHeight(self: *const App) i32 {
+        return @intFromFloat(@as(f32, @floatFromInt(self.window_height)) / self.dpi_scale);
+    }
+
+    /// Framebuffer width in physical pixels (same as `width()`; for GPU-target sizing).
+    pub inline fn framebufferWidth(self: *const App) i32 {
+        return self.window_width;
+    }
+
+    /// Framebuffer height in physical pixels (same as `height()`; for GPU-target sizing).
     pub inline fn framebufferHeight(self: *const App) i32 {
-        return @intFromFloat(@as(f32, @floatFromInt(self.window_height)) * self.dpi_scale);
+        return self.window_height;
     }
 
     pub inline fn deltaTime(self: *const App) f32 {
@@ -347,91 +419,16 @@ pub const App = struct {
     }
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-test "App headless lifecycle: init, frame stepping, timings, event dispatch, and cleanup" {
-    const alloc = std.testing.allocator;
-
-    const State = struct {
-        initialized: bool = false,
-        frames_run: usize = 0,
-        cleaned_up: bool = false,
-        events_received: usize = 0,
-    };
-
-    var state = State{};
-
-    const TestApp = struct {
-        fn onInit(app: *App) void {
-            const s = app.getUserData(State);
-            s.initialized = app.running and app.is_headless;
-        }
-
-        fn onFrame(app: *App) void {
-            const s = app.getUserData(State);
-            s.frames_run += 1;
-            if (app.deltaTime() > 0.0 and app.time() > 0.0) {
-                // Timing is valid
-            }
-        }
-
-        fn onEvent(app: *App, ev: [*c]const sapp.Event) void {
-            const s = app.getUserData(State);
-            s.events_received += 1;
-            _ = ev;
-        }
-
-        fn onCleanup(app: *App) void {
-            const s = app.getUserData(State);
-            s.cleaned_up = true;
-        }
-    };
-
-    var app = App.init(alloc, .{
-        .title = "Headless Test App",
-        .width = 800,
-        .height = 600,
-        .headless = true,
-    }, .{
-        .init = TestApp.onInit,
-        .frame = TestApp.onFrame,
-        .cleanup = TestApp.onCleanup,
-        .event = TestApp.onEvent,
-    });
-    app.user_data = &state;
-
-    // Run 5 headless frames
-    app.runHeadless(5);
-
-    try std.testing.expect(state.initialized);
-    try std.testing.expectEqual(@as(usize, 5), state.frames_run);
-    try std.testing.expectEqual(@as(u64, 5), app.frameCount());
-    try std.testing.expect(state.cleaned_up);
-    try std.testing.expect(!app.running);
+test {
+    _ = @import("app_tests.zig");
 }
 
-test "App staged frame integration and raw sokol access in headless mode" {
+test "App descriptor mapping covers every flag and pool" {
+    // Bridge only: the private builders are reachable here, while all
+    // config data and expectations live in the test sibling.
+    const t = @import("app_tests.zig");
     const alloc = std.testing.allocator;
-
-    var app = App.init(alloc, .{
-        .title = "App Staged Frame Test",
-        .width = 640,
-        .height = 480,
-        .headless = true,
-    }, .{});
-
-    _ = app.initRuntime();
-    try std.testing.expect(app.runtime != null);
-
-    // Context thread is marked during onInit
-    app.onInit();
-    defer app.onCleanup();
-
-    try std.testing.expect(gpu_thread.isOnContextThread());
-
-    // Step frame without scene: should return .skipped safely without crash
-    const res = app.renderStagedFrame();
-    try std.testing.expectEqual(FrameResult.skipped, res);
+    const app = App.init(alloc, t.configForMappingTest(), .{});
+    const def = App.init(alloc, .{}, .{});
+    try t.expectMappings(app.sappDesc(), app.sgDesc(.{}), def.sappDesc(), def.sgDesc(.{}));
 }
