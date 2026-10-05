@@ -30,10 +30,10 @@ showcase. Все 4 таймера дают уникальные положите
   Для вывода о bottleneck нужны GPU samples той же сцены, P95/P99 и
   контролируемый unpaced прогон. Смешивать CPU showcase и GPU timing-gate
   для заявления «запас GPU 2.7×» нельзя.
-- Доминирующая статья context-потока — submit draws (~1.06 ms): per-draw
-  `sg.applyUniforms` в `scene/draw.zig` (vs_params на меш + fs_params на
-  материал). Следующий реальный шаг — instance/storage-buffer packing
-  (gpu-driven батчи) — это архитектурная волна, не точечный фикс.
+- Самая большая измеренная CPU-фаза context-потока — submit draws
+  (~1.06 ms). В неё входят uniforms, bindings и backend encoding;
+  замер не разделяет их вклад. Batching/storage packing — кандидаты,
+  а не доказанный способ ускорения; нужен подходящий workload и A/B-гейт.
 - serial update (1.95 ms vs 0.67 staged) — ожидаемо: один поток делает
   update+render последовательно; cbWall serial 2.88 ms всё ещё < 18% бюджета.
 - exclusion-режим стабильно дороже на waitC (0.131 ms) — цена диагностического
@@ -70,8 +70,8 @@ instanced-vs (regular vs_params всегда уникален — mvp/model).
 этот uniform-dedup кандидат не дал измеримого выигрыша. Фиксированные
 per-draw издержки (applyBindings + Metal-диспетч кодера) — гипотеза,
 для их атрибуции нужен capture или отдельный замер. Сортировка opaque под
-дедуп (план Б) при таком шуме измеримые ≥15% дать не может —
-не делаем. Кандидат откачен (`git status` чист от кода волны),
+дедуп (план Б) не измерялась — основания обещать ≥15% нет,
+поэтому не делаем. Кандидат откачен (`git status` чист от кода волны),
 сложность без выигрыша не шипаем. Gates кандидата: `zig build test`
 зелёный (1408/1408, exit 0; строка "failed command" в логе —
 предсуществующий шум harness, есть и на baseline); gpu-timing на
