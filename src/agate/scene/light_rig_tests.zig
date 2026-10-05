@@ -655,4 +655,3 @@ test "packSpotShadows selects up to 2 casters by significance with atlas page ti
     try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[1].tile_y);
     try std.testing.expectEqual([4]f32{ 1.0, 0.002, 0.004, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[1].spot_index]);
 }
-

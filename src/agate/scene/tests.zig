@@ -46,8 +46,6 @@ fn stageAndPrepareForTest(scene: *Scene) !void {
     finishForTest(scene);
 }
 
-
-
 test "publishFrameSnapshot and staged finish snapshot handoff" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
@@ -67,7 +65,6 @@ test "publishFrameSnapshot and staged finish snapshot handoff" {
     try std.testing.expectEqual(@as(i32, 1920), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 1080), scene.frame_snapshot.screen_h);
 }
-
 
 test "saturated snapshot mailbox keeps the newest generation" {
     const alloc = std.testing.allocator;
@@ -90,9 +87,6 @@ test "saturated snapshot mailbox keeps the newest generation" {
     try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_w);
     try std.testing.expectEqual(@as(i32, 300), scene.frame_snapshot.screen_h);
 }
-
-
-
 
 test "staged build stages an empty upload tally without an upload queue" {
     const alloc = std.testing.allocator;
@@ -4685,7 +4679,6 @@ test "ui packet stage OOM fail-closes coherent-empty" {
     try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
 }
 
-
 test "wave26: 3-slot prepare rotation visits every slot, newest wins" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
@@ -5088,7 +5081,6 @@ test "wave27: 3-slot rotation keeps per-slot snapshots distinct" {
         try std.testing.expectEqual(w, scene.draws.slots[f].snapshot.screen_w);
     }
 }
-
 
 // ---- Wave 29: concurrent-build claim flow (sequential proof; the phase
 // mutex is still held — the lease-level stress test in frame_draws.zig
@@ -5677,7 +5669,6 @@ test "wave32: concurrent claim/build/publish vs slot-latch — no torn records, 
 // discipline, retire-on-remove. Headless: no sg.* below (buffers stay
 // deferred without a context; the main test thread is context-marked by the
 // earlier gpu_thread tests, so the flush paths take their real branches).
-
 
 // ---- Wave 31: the staged finish holds its working slot as a lease claim. ----
 //
@@ -6489,7 +6480,6 @@ test "wave39: pinned handoff refuses the staged begin, counted, stamp untouched"
     try std.testing.expectEqual(@as(usize, 0), scene.draws.pinsHeld());
 }
 
-
 test "slice6: staged prepare consumes frozen trail packet despite live mutation" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
@@ -6597,4 +6587,3 @@ test "slice6: staged prepare consumes frozen trail packet despite live mutation"
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), tm.mesh.local_bounding_box.max.x, 1e-6);
     build2.publish();
 }
-

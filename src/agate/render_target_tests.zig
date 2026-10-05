@@ -308,4 +308,3 @@ test "capture feedback detects saved material and particle texture views" {
     const Particle = @import("scene/particle_layer.zig").ParticleDraw;
     try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
 }
-

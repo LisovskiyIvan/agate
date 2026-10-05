@@ -23,6 +23,7 @@ test {
     _ = @import("animation/skeleton.zig");
     _ = @import("animation/tests.zig");
     _ = @import("app.zig");
+    _ = @import("app_tests.zig");
     _ = @import("asset_manager.zig");
     _ = @import("assets.zig");
     _ = @import("assets_tests.zig");
@@ -138,6 +139,7 @@ test {
     _ = @import("particles/sampling.zig");
     _ = @import("particles/subemitters.zig");
     _ = @import("particles/system.zig");
+    _ = @import("particles/system_tests.zig");
     _ = @import("particles/types.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");
@@ -160,6 +162,7 @@ test {
     _ = @import("passes/shadow_pass.zig");
     _ = @import("passes/skybox_pass.zig");
     _ = @import("passes/ssao_pass.zig");
+    _ = @import("passes/velocity_pass.zig");
     _ = @import("passes/volumetric_pass.zig");
     _ = @import("physics.zig");
     _ = @import("physics/body.zig");
@@ -223,6 +226,7 @@ test {
     _ = @import("scene/frame_draws_tests.zig");
     _ = @import("scene/frame_prepare.zig");
     _ = @import("scene/frame_render.zig");
+    _ = @import("scene/frame_reset_tests.zig");
     _ = @import("scene/gpu_retire.zig");
     _ = @import("scene/gpu_retire_tests.zig");
     _ = @import("scene/gui3d_layer.zig");
@@ -263,6 +267,7 @@ test {
     _ = @import("scene/render_queue/build/parallel.zig");
     _ = @import("scene/render_queue/build/snapshots.zig");
     _ = @import("scene/render_queue/cull.zig");
+    _ = @import("scene/render_queue/cull_tests.zig");
     _ = @import("scene/render_queue/instances.zig");
     _ = @import("scene/render_queue/items.zig");
     _ = @import("scene/shadow_pcss.zig");
@@ -279,6 +284,7 @@ test {
     _ = @import("scene/uniforms.zig");
     _ = @import("scene/upload_packets.zig");
     _ = @import("scene/upload_packets_tests.zig");
+    _ = @import("scene/velocity_tests.zig");
     _ = @import("scene/view_render.zig");
     _ = @import("scene/viewport_clear.zig");
     _ = @import("serialization.zig");
