@@ -367,10 +367,8 @@ pub const ParticleSystem = struct {
         const alive_scratch = try allocator.alloc(u8, capacity);
         errdefer allocator.free(alive_scratch);
 
-        // Off-context construction (runtime spawn on the game thread) must
-        // not touch sg.*: defer the instance buffer to flushGpuUploads,
-        // which runs on the render side.
-        const deferred = !gpu_thread.isOnContextThread();
+        // CPU-phase ownership is not GPU authorization without a live context.
+        const deferred = !sg.isvalid() or !gpu_thread.isOnContextThread();
         const buf = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .dynamic_update = true },
             .size = capacity * @sizeOf(ParticleInstanceData),
