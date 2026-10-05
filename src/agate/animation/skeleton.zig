@@ -38,6 +38,13 @@ pub const Skeleton = struct {
     render_slot: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// Simulation-thread view of the latest computed skin matrices (preserves backward compatibility)
     skin_matrices: [MAX_BONES]Mat4 = [_]Mat4{Mat4.identity} ** MAX_BONES,
+    /// Previous PRESENTED frame's skin matrices for velocity calculation.
+    /// Written only by Skeleton.commitPresentedSkin (game side, once per
+    /// published front slot) — never by update() — so sim update rate and
+    /// cancelled/repeated builds cannot advance it.
+    prev_skin_matrices: [MAX_BONES]Mat4 = [_]Mat4{Mat4.identity} ** MAX_BONES,
+    /// Front-slot frame_id that produced prev_skin_matrices (maxInt = never).
+    vel_presented_frame: u64 = std.math.maxInt(u64),
 
     pub fn init(allocator: std.mem.Allocator, bone_count: usize) !*Skeleton {
         const skel = try allocator.create(Skeleton);
@@ -74,6 +81,8 @@ pub const Skeleton = struct {
         self.update();
         self.skin_slots[0] = self.skin_matrices;
         self.skin_slots[1] = self.skin_matrices;
+        self.prev_skin_matrices = self.skin_matrices;
+        self.vel_presented_frame = std.math.maxInt(u64);
     }
 
     pub fn update(self: *Skeleton) void {
@@ -96,6 +105,22 @@ pub const Skeleton = struct {
     pub fn getRenderSkinMatrices(self: *const Skeleton) *const [MAX_BONES]Mat4 {
         const slot = self.render_slot.load(.acquire) & 1;
         return &self.skin_slots[slot];
+    }
+
+    pub fn getPrevSkinMatrices(self: *const Skeleton) *const [MAX_BONES]Mat4 {
+        // Unpresented skeletons report zero motion: the cull pairs this
+        // with the current slot on first presentation (see cullNonInstancedMesh).
+        if (self.vel_presented_frame == std.math.maxInt(u64)) return self.getRenderSkinMatrices();
+        return &self.prev_skin_matrices;
+    }
+
+    /// Presented-frame commit (game side, once per published front slot):
+    /// freezes the queue's skin copy as this skeleton's previous frame.
+    /// The caller resolves ownership (mesh.skeleton); repeated commits of
+    /// the same frame are idempotent.
+    pub fn commitPresentedSkin(self: *Skeleton, presented: *const [MAX_BONES]Mat4, frame_id: u64) void {
+        self.prev_skin_matrices = presented.*;
+        self.vel_presented_frame = frame_id;
     }
 
     fn computeBoneMatrix(self: *Skeleton, index: usize, computed: []bool) void {

@@ -27,20 +27,28 @@ fn patchBatchList(
     for (list.items) |*b| {
         if (is_gpu and (b.vertex_buffer.id == 0 or sg.queryBufferState(b.vertex_buffer) != .VALID)) {
             b.instance_buffer = .{};
+            b.prev_instance_buffer = .{};
+            b.prev_frame = std.math.maxInt(u64);
             b.visible_instance_count = 0;
             continue;
         }
         const rec = findStagedRecord(records, b.source_mesh) orelse {
             b.instance_buffer = .{};
+            b.prev_instance_buffer = .{};
+            b.prev_frame = std.math.maxInt(u64);
             b.visible_instance_count = 0;
             continue;
         };
         if (rec.uid != b.source_uid or rec.staged_frame != fid) {
             b.instance_buffer = .{};
+            b.prev_instance_buffer = .{};
+            b.prev_frame = std.math.maxInt(u64);
             b.visible_instance_count = 0;
             continue;
         }
         b.instance_buffer = rec.buffer;
+        b.prev_instance_buffer = rec.prev_buffer;
+        b.prev_frame = rec.prev_frame;
         b.visible_instance_count = rec.count;
     }
 }

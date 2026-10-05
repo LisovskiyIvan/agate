@@ -95,6 +95,8 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
         const batch = RenderInstancedBatch{
             .vertex_buffer = mesh.vertex_buffer,
             .instance_buffer = staged.buffer,
+            .prev_instance_buffer = staged.prev_buffer,
+            .prev_frame = staged.prev_frame,
             .index_buffer = mesh.index_buffer,
             .index_count = mesh.index_count,
             .index_type = mesh.index_type,

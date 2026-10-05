@@ -35,6 +35,7 @@ pub const PostFXStack = struct {
     glow_pass: passes.GlowPass,
     highlight_pass: passes.HighlightPass,
     volumetric_pass: passes.VolumetricPass = .{},
+    velocity_pass: passes.VelocityPass = .{},
     outline_pass: passes.OutlinePass,
 
     outline_msaa: ?passes.OutlinePass = null,
@@ -70,6 +71,7 @@ pub const PostFXStack = struct {
             .glow_pass = passes.GlowPass.init(),
             .highlight_pass = passes.HighlightPass.init(),
             .volumetric_pass = passes.VolumetricPass.init(),
+            .velocity_pass = passes.VelocityPass.init(),
             .outline_pass = passes.OutlinePass.init(1, .RGBA16F),
         };
     }
@@ -81,6 +83,7 @@ pub const PostFXStack = struct {
         self.glow_pass.deinit();
         self.highlight_pass.deinit();
         self.volumetric_pass.deinit();
+        self.velocity_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
@@ -97,6 +100,7 @@ pub const PostFXStack = struct {
         if (self.ssao_pass.width != 0) self.ssao_pass.resize(width, height);
         if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(width, height);
         if (self.glow_pass.base_width != 0) self.glow_pass.resize(width, height);
+        if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -266,6 +270,11 @@ pub const PostFXStack = struct {
         shaft_shadow_bias: f32 = 0.0,
         shadows_enabled: bool = false,
         ui: ?*const UiFrame = null,
+        /// True only when this frame's velocity pass actually rendered into
+        /// a valid target (ensure succeeded). Gates the composite's velocity
+        /// view: a failed ensure must feed the zero fallback, never a
+        /// stale-sized target.
+        velocity_valid: bool = false,
     };
 
     /// Effect stages plus the display pass. The display pass always runs;
@@ -426,6 +435,7 @@ pub const PostFXStack = struct {
         var taa_history_view = self.postprocess_pass.offscreen_resolve_tex_view;
         var taa_history_valid = false;
         var taa_capture = false;
+        var taa_reset_now = false;
         if (taa_active) {
             const recreated = self.postprocess_pass.ensureTaaHistory(cur_w, cur_h);
             self.postprocess_pass.taa_read = postprocess.taaReadIndex(self.taa_frame);
@@ -436,6 +446,7 @@ pub const PostFXStack = struct {
                 .camera_cut = post.taa_camera_cut,
                 .explicit_reset = self.taa_explicit_reset,
             });
+            taa_reset_now = reset;
             if (self.postprocess_pass.taaReadView().id != 0) {
                 taa_history_view = self.postprocess_pass.taaReadView();
             }
@@ -443,6 +454,29 @@ pub const PostFXStack = struct {
             taa_history_valid = !reset and taa_capture and taa_history_view.id != 0;
             if (!taa_capture) taa_history_valid = false;
         }
+
+        // Cut-frame temporal suppression: on a TAA reset (first frame,
+        // toggle, resize, camera cut, explicit reset) the velocity target
+        // still holds pre-cut vectors, so bind the zero mask and skip the
+        // blur gather for exactly this composite — TAA already discards
+        // history via taa_history_valid, the blur needs the same one-frame
+        // gate. Under blur-only (TAA off) a camera cut suppresses the same
+        // way. Steady frames are untouched (no per-frame reset).
+        const suppress_velocity = passes.velocity_pass.cutSuppressesVelocity(
+            taa_reset_now,
+            post.motion_blur_enabled,
+            post.taa_camera_cut,
+        );
+        if (suppress_velocity) post.motion_blur_enabled = false;
+        // The velocity view is valid only when this frame's pass rendered
+        // into it (params.velocity_valid, gated on the ensure result in
+        // frame_render): otherwise the zero fallback, so a failed ensure
+        // can never feed a stale-sized target to the composite.
+        const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
+            self.velocity_pass.velocityTexView()
+        else
+            sg.View{};
+        const vel_view = if (suppress_velocity) sg.View{} else vel_view_in;
 
         var swap_action = sg.PassAction{};
         swap_action.colors[0] = .{ .load_action = .DONTCARE };
@@ -471,6 +505,7 @@ pub const PostFXStack = struct {
             taa_history_view,
             taa_history_valid,
             false,
+            vel_view,
         );
         self.prev_view_proj = params.view_proj;
         self.has_prev_view_proj = true;
@@ -512,6 +547,7 @@ pub const PostFXStack = struct {
                 taa_history_view,
                 taa_history_valid,
                 true,
+                vel_view,
             );
             sg.endPass();
             self.taa_frame += 1;

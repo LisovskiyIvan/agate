@@ -112,10 +112,24 @@ pub fn finishPrepare(scene: anytype, claim: PrepareClaim) void {
     back.retire_epoch = scene.retire_epoch;
     if (is_gpu_init) {
         if (back.snapshot.has_camera) {
+            // Retained prior-generation payloads for velocity pairing: every
+            // slot's staged frame, records, and matrix scratch. The latch
+            // only reads these (never live meshes); a missing or mismatched
+            // entry falls back to zero motion per record.
+            var prev_sources: [scene.draws.slots.len]scene_instance_staging.PrevFrameSource = undefined;
+            for (0..scene.draws.slots.len) |i| {
+                const slot = &scene.draws.slots[i];
+                prev_sources[i] = .{
+                    .frame_id = slot.frame_id,
+                    .records = slot.staged_instances.items,
+                    .scratch = slot.primary.instance_matrices.items,
+                };
+            }
             scene_instance_staging.stageInstancesLatch(.{
                 .allocator = scene.allocator,
                 .frame_id = scene.frame_id,
                 .retire_queue = &scene.gpu_retire,
+                .prev_frames = &prev_sources,
             }, back.staged_instances.items, &back.primary.instance_matrices);
         }
     }

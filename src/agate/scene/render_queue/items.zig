@@ -24,6 +24,21 @@ const SceneStats = stats_mod.SceneStats;
 
 pub const RenderMeshItem = struct {
     model: Mat4,
+    prev_model: Mat4 = Mat4.identity,
+    /// Staged generation that produced `prev_model` (maxInt = none). The
+    /// velocity draw uses it only when it equals the last rendered
+    /// generation — otherwise the frame was staged but never presented
+    /// and the draw falls back to zero motion. Frozen at cull time from
+    /// the mesh's presented state; never advanced by builds.
+    prev_frame: u64 = std.math.maxInt(u64),
+    /// Stable source-mesh uid at build time (0 = unassigned, test-only
+    /// legacy path). The presented-frame commit resolves by uid, never by
+    /// bare list index, so same-length shuffles/removals cannot mis-stamp.
+    source_uid: u64 = 0,
+    /// True when GPU-morph displacement is active on this draw: the velocity
+    /// pass has no morph path, so it must skip the item (mask 0 → depth
+    /// reprojection fallback) rather than emit a false rigid vector.
+    velocity_depth_fallback: bool = false,
     distance_sq: f32,
     is_pbr: bool,
     texture_id: u32,
@@ -52,6 +67,13 @@ pub const RenderMeshItem = struct {
     /// draw-путь резолвит его через хранилище той же очереди уже после всех
     /// реаллокаций prepare-фазы, поэтому индекс стабилен при росте буфера.
     skin_index: ?u32 = null,
+    /// Staged generation that produced the `prev_skin_storage` slot
+    /// (maxInt = none). Same draw-time match rule as `prev_frame`.
+    skin_prev_frame: u64 = std.math.maxInt(u64),
+    /// Stable uid of the mesh whose skeleton was snapshotted (the active
+    /// LOD proxy, not necessarily the entity): the commit stamps that
+    /// skeleton, never the entity's unrelated one. 0 = unassigned.
+    skin_source_uid: u64 = 0,
     /// Индекс ShaderDrawSnapshot в RenderQueues.shader_storage (null = не hook).
     /// Draw-путь hook-материалов читает только этот снимок.
     shader_index: ?u32 = null,
@@ -92,6 +114,11 @@ pub const RenderMeshItem = struct {
 pub const RenderInstancedBatch = struct {
     vertex_buffer: sg.Buffer = .{},
     instance_buffer: sg.Buffer = .{},
+    prev_instance_buffer: sg.Buffer = .{},
+    /// Staged generation whose matrices `prev_instance_buffer` holds
+    /// (maxInt = none). Draw-time match rule identical to item.prev_frame:
+    /// a staged-but-never-rendered prev never pairs.
+    prev_frame: u64 = std.math.maxInt(u64),
     index_buffer: sg.Buffer = .{},
     index_count: u32 = 0,
     index_type: sg.IndexType = .UINT16,
@@ -147,6 +174,8 @@ pub const CulledMesh = struct {
     /// Заимствованный опубликованный слот скелета (prepare-время; фазовый
     /// мьютекс держит update-поток вне prepare/render, слот стабилен до копии).
     skin_src: ?*const [MAX_BONES]Mat4 = null,
+    /// Previous frame's skin matrices slot for velocity buffer
+    prev_skin_src: ?*const [MAX_BONES]Mat4 = null,
     /// Готовый снимок hook-материала (чистая копия, без живых указателей).
     shader_snap: ?material_mod.ShaderDrawSnapshot = null,
     /// Готовый снимок clearcoat/sheen-факторов (чистая копия 64 Б; в скретче
@@ -248,6 +277,7 @@ pub const RenderQueues = struct {
     // draw-фазе) и снимки hook-материалов (резолв по shader_index). Рост
     // буферов в prepare-фазе безопасен: очереди хранят индексы, а не указатели.
     skin_storage: SkinStorage = .empty,
+    prev_skin_storage: SkinStorage = .empty,
     shader_storage: ShaderStorage = .empty,
     // Render-owned снимки clearcoat/sheen-факторов (резолв по coat_index на
     // draw-фазе). Рост буферов в prepare-фазе безопасен: очереди хранят
@@ -268,6 +298,7 @@ pub const RenderQueues = struct {
         self.instance_matrices.clearRetainingCapacity();
         self.transparent_order.clearRetainingCapacity();
         self.skin_storage.clearRetainingCapacity();
+        self.prev_skin_storage.clearRetainingCapacity();
         self.shader_storage.clearRetainingCapacity();
         self.coat_storage.clearRetainingCapacity();
     }
@@ -280,6 +311,7 @@ pub const RenderQueues = struct {
         self.instance_matrices.deinit(allocator);
         self.transparent_order.deinit(allocator);
         self.skin_storage.deinit(allocator);
+        self.prev_skin_storage.deinit(allocator);
         self.shader_storage.deinit(allocator);
         self.coat_storage.deinit(allocator);
         self.parallel_scratch.deinit(allocator);

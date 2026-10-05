@@ -21,6 +21,8 @@ const PBRMaterial = material_mod.PBRMaterial;
 const Texture = @import("../../texture.zig").Texture;
 const CubeTexture = @import("../../texture.zig").CubeTexture;
 const morph_gpu = @import("../../mesh/morph_gpu.zig");
+const skeleton_mod = @import("../../animation/skeleton.zig");
+const Skeleton = skeleton_mod.Skeleton;
 const visibility = @import("../../visibility/mod.zig");
 const jobs = @import("../../jobs.zig");
 const stats_mod = @import("../stats.zig");
@@ -72,6 +74,106 @@ pub fn worldAABBCached(cache_key: u64, mesh: *Mesh) BoundingBox {
     if (mesh.cached_frame == cache_key) return mesh.cached_aabb;
     _ = worldMatrixCached(cache_key, mesh);
     return mesh.cached_aabb;
+}
+
+/// True when GPU-morph displacement is active: the velocity shaders have no
+/// morph path, so such draws must take the depth-reprojection fallback.
+/// Pure (no sg calls); enabled flag + any nonzero weight.
+pub fn morphNeedsDepthFallback(morph_u: morph_gpu.VsUniforms) bool {
+    if (morph_u.params[0] < 0.5) return false;
+    for (morph_u.weights0) |w| if (w != 0.0) return true;
+    for (morph_u.weights1) |w| if (w != 0.0) return true;
+    return false;
+}
+
+/// Presented-frame velocity commit (game side, once per published front
+/// slot, under update-vs-prepare exclusion): stamps every queued mesh's
+/// previous-frame world matrix from the front payload. Queue builds never
+/// write prev state, so cancelled/repeated/multi-view builds cannot advance
+/// it; repeating the same front commit is idempotent.
+///
+/// Identity is by stable uid, never by bare list index: the build-time
+/// `mesh_index` is only a fast hint, verified against `source_uid`, with a
+/// linear uid fallback — so a same-length shuffle or removal between build
+/// and commit stamps the right entity or skips, never the wrong one. A
+/// zero `source_uid` (unassigned, unit-test-only path) keeps the legacy
+/// index behavior. Skins resolve through the frozen LOD-proxy uid and stamp
+/// THAT skeleton, never the entity's unrelated one.
+pub fn commitPresentedVelocityQueue(
+    meshes: []const *Mesh,
+    queues: *const RenderQueues,
+    frame_id: u64,
+) void {
+    commitPresentedModels(meshes, queues.items.items, frame_id);
+    commitPresentedModels(meshes, queues.transparent.items, frame_id);
+    commitPresentedSkins(meshes, queues.items.items, queues.skin_storage.items, frame_id);
+    commitPresentedSkins(meshes, queues.transparent.items, queues.skin_storage.items, frame_id);
+}
+
+/// Fast-hint + fallback mesh resolve: `meshes[hint]` when its uid matches,
+/// else a linear uid scan. Returns null on any mismatch (removed mesh,
+/// shuffled list, address reuse) — the caller keeps previous state.
+fn resolveMeshByUid(meshes: []const *Mesh, hint_index: usize, uid: u64) ?*Mesh {
+    if (uid == 0) {
+        if (hint_index >= meshes.len) return null;
+        return meshes[hint_index];
+    }
+    if (hint_index < meshes.len and meshes[hint_index].uid == uid) return meshes[hint_index];
+    for (meshes) |m| if (m.uid == uid) return m;
+    return null;
+}
+
+fn commitPresentedModels(meshes: []const *Mesh, list: []const items.RenderMeshItem, frame_id: u64) void {
+    for (list) |it| {
+        const mesh = resolveMeshByUid(meshes, it.mesh_index, it.source_uid) orelse continue;
+        mesh.prev_matrix = it.model;
+        mesh.vel_presented_frame = frame_id;
+    }
+}
+
+fn resolveSkinTarget(meshes: []const *Mesh, it: items.RenderMeshItem) ?*Skeleton {
+    if (it.skin_index == null) return null;
+    if (it.skin_source_uid != 0) {
+        // The frozen LOD-proxy uid wins: the cull snapshotted THAT
+        // skeleton. Falls back to the entity only when the proxy uid was
+        // never assigned (0) — see below.
+        if (it.mesh_index < meshes.len and meshes[it.mesh_index].uid == it.skin_source_uid) {
+            return meshes[it.mesh_index].skeleton;
+        }
+        for (meshes) |m| if (m.uid == it.skin_source_uid) return m.skeleton;
+        return null;
+    }
+    const mesh = resolveMeshByUid(meshes, it.mesh_index, it.source_uid) orelse return null;
+    return mesh.skeleton;
+}
+
+fn commitPresentedSkins(
+    meshes: []const *Mesh,
+    list: []const items.RenderMeshItem,
+    skins: []const [items.MAX_BONES]Mat4,
+    frame_id: u64,
+) void {
+    for (list) |it| {
+        const skin_idx = it.skin_index orelse continue;
+        if (skin_idx >= skins.len) continue;
+        const skel = resolveSkinTarget(meshes, it) orelse continue;
+        skel.commitPresentedSkin(&skins[skin_idx], frame_id);
+    }
+}
+
+/// Pre-commit sweep (same game-side commit, `frame_id` = the front being
+/// committed): meshes — and their attached skeletons — absent from every
+/// presented view queue report zero motion on their next appearance instead
+/// of a stale multi-frame jump. Entries stamped by this same commit compare
+/// equal and are kept, so reset-then-commit order is safe and idempotent.
+pub fn resetPresentedVelocity(meshes: []const *Mesh, frame_id: u64) void {
+    const never = std.math.maxInt(u64);
+    for (meshes) |mesh| {
+        if (mesh.vel_presented_frame != frame_id) mesh.vel_presented_frame = never;
+        if (mesh.skeleton) |skel| {
+            if (skel.vel_presented_frame != frame_id) skel.vel_presented_frame = never;
+        }
+    }
 }
 
 /// Everything buildFrameQueues needs from Scene for one frame. Explicit
@@ -153,8 +255,11 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
     var item = culled.item;
     if (culled.skin_src) |src| {
         ctx.queues.skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.prev_skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
         const idx: u32 = @intCast(ctx.queues.skin_storage.items.len);
         ctx.queues.skin_storage.appendAssumeCapacity(src.*);
+        const prev_src = culled.prev_skin_src orelse src;
+        ctx.queues.prev_skin_storage.appendAssumeCapacity(prev_src.*);
         item.skin_index = idx;
     }
     if (culled.shader_snap) |snap| {
@@ -288,6 +393,7 @@ pub fn cullNonInstancedMesh(
     const draw_rec = buildMaterialRecord(ctx, mat);
 
     const skin_mat = if (render_mesh.skeleton) |skel| skel.getRenderSkinMatrices() else null;
+    const prev_skin_mat = if (render_mesh.skeleton) |skel| skel.getPrevSkinMatrices() else null;
     const morph_u = if (render_mesh.morph_mode == .gpu)
         morph_gpu.vsUniforms(render_mesh)
     else
@@ -304,6 +410,20 @@ pub fn cullNonInstancedMesh(
     const d_sq = world_aabb.center().sub(eye).lengthSq();
     const is_decal = render_mesh.is_decal or mesh.is_decal;
     const transparent = materialIsTransparent(mat) or is_decal;
+    // Velocity previous state is PRESENTED-frame state (commitPresentedVelocity
+    // stamps it game-side once per published front slot): queue builds only
+    // read, so cancelled/repeated/multi-view builds cannot advance it. Never
+    // presented → zero motion for this draw. The frozen generation travels
+    // with the payload so the draw can refuse staged-but-never-presented
+    // state (see velocity_pass.usePresentedPrev).
+    const prev_model = if (mesh.vel_presented_frame == std.math.maxInt(u64)) model else mesh.prev_matrix;
+    const prev_frame = mesh.vel_presented_frame;
+    const skin_prev_frame = if (render_mesh.skeleton) |skel| skel.vel_presented_frame else std.math.maxInt(u64);
+    // GPU-morph displacement has no velocity-shader path: force the depth
+    // reprojection fallback (mask 0) instead of a false rigid vector.
+    // Instanced batches need no flag — the instanced shader family has no
+    // morph block either, and the main pass draws them unmorphed too.
+    const vel_fallback = morphNeedsDepthFallback(morph_u);
     // Снимок hook-материала строится здесь же (prepare-фаза, живые данные
     // ещё доступны); в очередь попадёт только после копии в appendRenderItem.
     const dummy_white = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
@@ -315,6 +435,12 @@ pub fn cullNonInstancedMesh(
         .item = .{
             .draw_record = draw_rec,
             .model = model,
+            .prev_model = prev_model,
+            .prev_frame = prev_frame,
+            .source_uid = mesh.uid,
+            .skin_prev_frame = skin_prev_frame,
+            .skin_source_uid = render_mesh.uid,
+            .velocity_depth_fallback = vel_fallback,
             .distance_sq = d_sq,
             .is_pbr = is_pbr,
             .texture_id = tex_id,
@@ -333,6 +459,7 @@ pub fn cullNonInstancedMesh(
             .is_skinned = render_mesh.skeleton != null,
         },
         .skin_src = skin_mat,
+        .prev_skin_src = prev_skin_mat,
         .shader_snap = shader_snap,
         .coat = coat,
     };
@@ -381,7 +508,6 @@ test "worldMatrixCached caches per frame and resolves parents" {
 
 test "worldMatrixCached honors bone attachment like getWorldMatrix" {
     const ally = std.testing.allocator;
-    const Skeleton = @import("../../animation/skeleton.zig").Skeleton;
 
     // Host: identity TRS with a one-bone skeleton whose bone sits at (2,0,0).
     var host: Mesh = undefined;
@@ -432,4 +558,8 @@ test "worldMatrixCached honors bone attachment like getWorldMatrix" {
     try std.testing.expectEqual(@as(f32, 0.0), fallback.m[12]);
     try std.testing.expectEqual(@as(f32, 0.0), fallback.m[13]);
     try std.testing.expectEqual(@as(f32, 3.0), fallback.m[14]);
+}
+
+test "uid resolve prefers the hint, scans on shuffle, skips unknown" {
+    try @import("cull_tests.zig").checkUidResolve(resolveMeshByUid);
 }

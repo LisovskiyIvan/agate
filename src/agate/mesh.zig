@@ -19,6 +19,9 @@ pub const Mesh = mesh_impl.Mesh;
 pub const InstanceRenderState = mesh_impl.InstanceRenderState;
 pub const InstancePreviewState = mesh_impl.InstancePreviewState;
 pub const InstanceSource = mesh_impl.InstanceSource;
+pub const InstancePairMode = mesh_impl.InstancePairMode;
+pub const instancePairMode = mesh_impl.instancePairMode;
+pub const normalizeInstancePingPong = mesh_impl.normalizeInstancePingPong;
 pub const StagedInstanceRecord = mesh_impl.StagedInstanceRecord;
 pub const uploadGeometry = mesh_impl.uploadGeometry;
 // Mesh-referencing instance vocabulary (lives in mesh/mesh.zig with the

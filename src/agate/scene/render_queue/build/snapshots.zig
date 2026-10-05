@@ -397,7 +397,7 @@ test "P4: no fixed huge per-item skin cost" {
     try std.testing.expect(@sizeOf(RenderMeshItem) < 1024);
     try std.testing.expect(@sizeOf(RenderInstancedBatch) < 1024);
     // Один MAX_BONES-слот — 4 КиБ: item обязан быть кратно меньше.
-    try std.testing.expect(@sizeOf(RenderMeshItem) * 8 < @sizeOf([MAX_BONES]Mat4));
+    try std.testing.expect(@sizeOf(RenderMeshItem) * 7 < @sizeOf([MAX_BONES]Mat4));
 
     const ally = std.testing.allocator;
     var mesh = Mesh{

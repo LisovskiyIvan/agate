@@ -46,6 +46,12 @@ const TagSet = @import("../tags.zig").TagSet;
 pub const InstanceRenderState = struct {
     /// Current GPU instance buffer (dynamic_update, .size-created).
     buffer: sg.Buffer = .{},
+    /// Previous frame's GPU instance buffer for velocity calculation.
+    prev_buffer: sg.Buffer = .{},
+    /// Ping-pong buffers owned by this state: buffers[active_slot] is the current buffer,
+    /// buffers[active_slot ^ 1] is the previous frame's buffer.
+    buffers: [2]sg.Buffer = .{ .{}, .{} },
+    active_slot: u8 = 0,
     /// Buffer capacity in Mat4 slots (geometric growth).
     capacity: usize = 0,
     /// Visible instance count published this frame (draw count).
@@ -58,6 +64,15 @@ pub const InstanceRenderState = struct {
     hash: u64 = 0,
     /// Matrix count of the last upload (hash+count gate sg.updateBuffer).
     uploaded_count: usize = 0,
+    /// Ordered identity layout of the last upload: Wyhash over the stable
+    /// per-instance uids in exact upload order (source entry first when
+    /// visible). Index pairing is valid only while this matches the staged
+    /// layout — any membership/order change zeroes the batch for the frame.
+    layout_hash: u64 = 0,
+    /// Staged generation whose matrices the `prev_buffer` holds (maxInt =
+    /// none: prev aliases cur or is empty). The velocity draw uses the prev
+    /// buffer only when this equals the last rendered generation.
+    prev_frame: u64 = std.math.maxInt(u64),
     /// Frame id of the last complete publish (maxInt = never staged).
     staged_frame: u64 = std.math.maxInt(u64),
 };
@@ -90,6 +105,10 @@ pub const InstancePreviewState = struct {
     count: u32 = 0,
     /// Wyhash of the staged matrix bytes (feeds the GPU upload dedup gate).
     hash: u64 = 0,
+    /// Ordered identity layout of the staged segment: Wyhash over stable
+    /// per-instance uids in exact upload order (feeds the velocity pairing
+    /// gate — same membership in the same order pairs by index).
+    layout_hash: u64 = 0,
     /// Scene `build_seq` that produced this preview (0 = never built).
     build_seq: u64 = 0,
     /// Offset of this mesh's matrix segment into the back-slot staging
@@ -147,11 +166,18 @@ pub const StagedInstanceRecord = struct {
     /// Wyhash of the staged matrix bytes: the `cpu.hash` input of the GPU
     /// upload dedup gate (compare-only, never the "last uploaded" state).
     hash: u64,
+    /// Wyhash of the staged identity layout: the `cpu.layout_hash` input
+    /// of the velocity pairing gate (compare-only, same split).
+    layout_hash: u64,
     /// Last-uploaded matrix-bytes hash at build time (prior
     /// `instance_render.hash`): the `st.hash` seed of the dedup gate. Kept
     /// separate from `hash` above — seeding the gate with the staged hash
     /// would compare it against itself and skip every same-count upload.
     uploaded_hash: u64,
+    /// Last-published identity layout at build time (prior
+    /// `instance_render.layout_hash`): the pairing-gate seed. Same
+    /// staged-vs-published split as `hash`/`uploaded_hash` above.
+    uploaded_layout: u64,
     /// Mesh position at build time: outline `world_center` fallback when
     /// the staged bounds are invalid (frozen; the patch performs no live
     /// reads, so this replaces the old live `mesh.position` fallback).
@@ -164,10 +190,67 @@ pub const StagedInstanceRecord = struct {
     /// fail-closed (`staged_frame = maxInt`, null buffer, count 0) so the
     /// patch zeroes the payload entries.
     buffer: sg.Buffer = .{},
+    prev_buffer: sg.Buffer = .{},
+    buffers: [2]sg.Buffer = .{ .{}, .{} },
+    active_slot: u8 = 0,
     capacity: usize = 0,
     uploaded_count: usize = 0,
+    /// Staged generation whose matrices the mirrored `prev_buffer` holds
+    /// (maxInt = none). The patch copies it into the batch so the velocity
+    /// draw can generation-match it against the last rendered frame.
+    prev_frame: u64 = std.math.maxInt(u64),
+    /// Handles the latch created while staging this record (growth buffer,
+    /// fresh second slot — at most two, zero padded). Owned by the record
+    /// until the game-side commit either installs them into the mesh or
+    /// retires them on an abandon-skip path; cleared on both so a repeated
+    /// commit can never double-retire. Empty when the latch reused prior
+    /// handles (dedup hit) or never ran.
+    latch_created: [2]sg.Buffer = .{ .{}, .{} },
     staged_frame: u64 = std.math.maxInt(u64),
 };
+/// Per-instance pairing mode across one staging publish (pure, no sg):
+/// pairs by index only for the same membership in the same order
+/// (translation/rotation of stable instances is real motion); any count
+/// change (growth, visibility toggles, compaction) or layout change
+/// (substitution, reorder, transparent re-sort) zeroes the whole batch for
+/// the frame instead of pairing unrelated instances.
+pub const InstancePairMode = enum { pair, zero };
+
+pub fn instancePairMode(prev_count: usize, new_count: usize, prev_layout: u64, new_layout: u64) InstancePairMode {
+    if (prev_count != new_count) return .zero;
+    if (prev_layout != new_layout) return .zero;
+    return .pair;
+}
+
+/// Adopts a legacy/foreign ping-pong state into the buffers[] invariant
+/// (pure handle shuffling, sg-free): `buffer` must alias `buffers[0 or 1]`
+/// and `prev_buffer` must alias one of them or `buffer`. Unknown-generation
+/// prev handles collapse to zero motion (prev aliases cur) rather than a
+/// false pairing; garbage slot indices are clamped. No-ops on coherent
+/// states (all current writers maintain the invariant).
+pub fn normalizeInstancePingPong(st: *InstanceRenderState) void {
+    const inSlots = (st.buffers[0].id != 0 and st.buffer.id == st.buffers[0].id) or
+        (st.buffers[1].id != 0 and st.buffer.id == st.buffers[1].id);
+    if (st.buffer.id != 0 and !inSlots) {
+        st.buffers[0] = st.buffer;
+        st.buffers[1] = .{};
+        st.active_slot = 0;
+    }
+    if (st.buffers[0].id == 0 and st.buffers[1].id != 0) {
+        st.buffers[0] = st.buffers[1];
+        st.buffers[1] = .{};
+        st.active_slot = 0;
+    }
+    st.active_slot &= 1;
+    if (st.buffer.id == 0) {
+        st.buffer = st.buffers[st.active_slot];
+    }
+    const prev_known = (st.prev_buffer.id != 0) and
+        (st.prev_buffer.id == st.buffer.id or
+            st.prev_buffer.id == st.buffers[0].id or
+            st.prev_buffer.id == st.buffers[1].id);
+    if (!prev_known) st.prev_buffer = st.buffer;
+}
 /// Mesh-referencing instance vocabulary (moved verbatim from `types.zig`):
 /// `LODLevel`, `InstancedMesh`, and `BoneAttachment` all hold `*Mesh`, so
 /// they live here with the `Mesh` owner instead of in the pure-data
@@ -191,6 +274,10 @@ pub const InstancedMesh = struct {
     culling_strategy: CullingStrategy = .frustum,
     layer_mask: u32 = 0xFFFFFFFF,
     source_mesh: *Mesh,
+    /// Stable per-instance identity for the velocity layout hash (never
+    /// reused after free, 0 = unassigned — same discipline as Mesh.uid).
+    /// Assigned serially before any parallel staging read.
+    uid: u64 = 0,
 
     cached_world_matrix: Mat4 = Mat4.identity,
     cached_bounding_box: BoundingBox = BoundingBox.zero,
@@ -201,6 +288,22 @@ pub const InstancedMesh = struct {
 
     pub fn markDirty(self: *InstancedMesh) void {
         self.dirty = true;
+    }
+
+    /// Lazily assigns a nonzero stable uid (same never-reuse discipline as
+    /// Mesh.ensureUid, separate counter). Serial-use only before parallel
+    /// staging reads; the layout hash keys off these, never addresses.
+    pub fn ensureUid(self: *InstancedMesh) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = inst_uid_next;
+        if (id == 0) {
+            id = 1;
+            inst_uid_next = 1;
+        }
+        inst_uid_next +%= 1;
+        if (inst_uid_next == 0) inst_uid_next = 1;
+        self.uid = id;
+        return id;
     }
 
     pub fn computeWorldMatrix(self: InstancedMesh) Mat4 {
@@ -247,6 +350,11 @@ pub const BoneAttachment = struct {
 /// and behavior-identical. Starts at 1 (0 = unassigned, never assigned);
 /// wraps with +% and skips 0, never reuses a live uid (2^64 space).
 var mesh_uid_next: u64 = 1;
+
+/// Per-instance uid counter (see InstancedMesh.ensureUid): separate from
+/// the mesh counter so instance churn never consumes mesh ids and a mesh
+/// id can never alias an instance id inside one layout hash.
+var inst_uid_next: u64 = 1;
 
 /// Test-only deferred-creation failure injection (P5 5e): armed via
 /// testArmMeshFailOnce(), the next makeDeferredMeshVertexBuffer call (the
@@ -416,6 +524,13 @@ pub const Mesh = struct {
     /// Never read by the fallback (`.published`).
     instance_build_view: InstanceRenderState = .{},
     // Per-frame transform cache (Scene.worldMatrixCached fills these once per render()).
+    /// Previous PRESENTED frame's world matrix for the velocity buffer.
+    /// Written only by the presented-frame commit (cull.commitPresentedVelocity,
+    /// game side, once per published front slot) — never by queue builds — so
+    /// cancelled/repeated/multi-view builds cannot advance it.
+    prev_matrix: Mat4 = Mat4.identity,
+    /// Front-slot frame_id that produced prev_matrix (maxInt = never presented).
+    vel_presented_frame: u64 = std.math.maxInt(u64),
     cached_matrix: Mat4 = Mat4.identity,
     cached_aabb: BoundingBox = BoundingBox.zero,
     cached_frame: u64 = std.math.maxInt(u64),
@@ -994,7 +1109,23 @@ pub const Mesh = struct {
         if (self.index_buffer.id != 0) {
             sg.destroyBuffer(self.index_buffer);
         }
-        if (self.instance_render.buffer.id != 0) {
+        if (self.instance_render.buffers[0].id != 0) {
+            sg.destroyBuffer(self.instance_render.buffers[0]);
+        }
+        if (self.instance_render.buffers[1].id != 0 and self.instance_render.buffers[1].id != self.instance_render.buffers[0].id) {
+            sg.destroyBuffer(self.instance_render.buffers[1]);
+        }
+        if (self.instance_render.prev_buffer.id != 0 and
+            self.instance_render.prev_buffer.id != self.instance_render.buffers[0].id and
+            self.instance_render.prev_buffer.id != self.instance_render.buffers[1].id and
+            self.instance_render.prev_buffer.id != self.instance_render.buffer.id)
+        {
+            sg.destroyBuffer(self.instance_render.prev_buffer);
+        }
+        if (self.instance_render.buffer.id != 0 and
+            self.instance_render.buffer.id != self.instance_render.buffers[0].id and
+            self.instance_render.buffer.id != self.instance_render.buffers[1].id)
+        {
             sg.destroyBuffer(self.instance_render.buffer);
         }
         for (self.instances.items) |inst| {

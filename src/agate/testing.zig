@@ -47,6 +47,7 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
             // default is pinned structurally against this fixture (no
             // mask/blur pipelines, no targets).
             .highlight_pass = .{},
+            .velocity_pass = .{},
             .outline_pass = undefined,
         },
         .forward = .{},

@@ -51,7 +51,30 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
         const front_idx = scene.draws.pinFrontReader();
         defer scene.draws.unpinReader(front_idx) catch {};
         const front = &scene.draws.slots[front_idx];
-        scene_instance_staging.commitPublishedRecords(front.staged_instances.items, scene.meshes.items, front.frame_id);
+        scene_instance_staging.commitPublishedRecords(
+            front.staged_instances.items,
+            scene.meshes.items,
+            front.frame_id,
+            .{ .allocator = scene.allocator, .queue = &scene.gpu_retire },
+        );
+        // Velocity chronology seeding (game side, sg-free): copies the last
+        // STAGED front's models/skins into mesh/skeleton prev state with the
+        // front's generation. This is best-effort, not a presented-frame
+        // proof — the context publishes this front in finishPrepare before
+        // any render, and the producer may already be building the next
+        // frame. Enforcement happens at draw time: frozen prev payloads
+        // carry their generation and the velocity pass uses them only when
+        // it matches the last actually rendered generation (see
+        // velocity_pass.usePresentedPrev); anything staged-but-unrendered
+        // falls back to zero motion. Queue builds only read this state, so
+        // cancelled/repeated/multi-view builds cannot advance it; repeating
+        // the same front commit is idempotent.
+        if (front.frame_id != 0) {
+            const cull = @import("render_queue/cull.zig");
+            cull.resetPresentedVelocity(scene.meshes.items, front.frame_id);
+            cull.commitPresentedVelocityQueue(scene.meshes.items, &front.primary, front.frame_id);
+            for (&front.views) |*q| cull.commitPresentedVelocityQueue(scene.meshes.items, q, front.frame_id);
+        }
         // Phase 2 lock-free publication: apply the staged-upload outcomes
         // published by the last latch (handle installs, scalar publishes,
         // pending-array frees, compute ring advance) or re-arm the flags
@@ -114,11 +137,14 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
         if (m.instance_preview.build_seq == seq) {
             m.instance_build_view = .{
                 .buffer = m.instance_render.buffer,
+                .prev_buffer = m.instance_render.prev_buffer,
                 .capacity = m.instance_render.capacity,
                 .count = m.instance_preview.count,
                 .bounds = m.instance_preview.bounds,
                 .hash = m.instance_preview.hash,
+                .layout_hash = m.instance_preview.layout_hash,
                 .uploaded_count = m.instance_render.uploaded_count,
+                .prev_frame = m.instance_render.prev_frame,
                 .staged_frame = m.instance_render.staged_frame,
             };
         } else {

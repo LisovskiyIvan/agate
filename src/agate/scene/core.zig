@@ -455,6 +455,22 @@ pub const Scene = struct {
     /// pileup, `retainedCount`/`cappedDropCount` expose it). Read via
     /// `reuseStreak()`; never written by update.
     reuse_streak: u64 = 0,
+    /// Last actually presented slot generation (context thread only):
+    /// stamped by `render` after the present commit (normal renders and
+    /// `renderReuse` re-presents alike — reuse restamps the same value,
+    /// idempotent). Skipped presents (no camera, target failure, unconsumed
+    /// front) never stamp. Frozen velocity prev payloads carry the staged
+    /// generation that produced them; the velocity draw uses them only on
+    /// an exact match with this value, so staged-but-never-rendered state
+    /// can never drive motion. Atomic for the same reason as the handoff
+    /// words: a future concurrent producer must never observe a torn
+    /// generation next to slot payloads. The word is usize like those
+    /// handoff words (u64 atomics have no wasm32 baseline); a 32-bit
+    /// generation only ever wraps into the safe zero-motion fallback, and
+    /// only after 2^32 presented frames.
+    last_rendered_frame: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Cross-thread reset intent; only render consumes it and mutates postfx.
+    taa_reset_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Context-owned staged-begin window: render commits its command buffer.
     /// A quiesced standalone drain outside this window commits itself; normal
     /// frame uploads consume slot packets and never scan the live arrays.
@@ -1542,6 +1558,11 @@ pub const Scene = struct {
     /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn render(self: *Scene) void {
         scene_frame.render(self);
+    }
+
+    /// Requests a TAA history reset at the next render; safe from either thread.
+    pub fn resetTaa(self: *Scene) void {
+        self.taa_reset_requested.store(true, .release);
     }
 
     /// See `scene/frame_api.zig` (owns the body + docs).

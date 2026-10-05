@@ -60,10 +60,13 @@ layout(binding = 6) uniform texture2D glow_tex;
 layout(binding = 7) uniform texture2D highlight_tex;
 layout(binding = 8) uniform texture2D highlight_mask_tex;
 layout(binding = 9) uniform texture2D shaft_tex;
+layout(binding = 10) uniform texture2D velocity_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
 layout(binding = 1) uniform sampler depth_smp;
+@sampler_type velocity_smp nonfiltering
+layout(binding = 3) uniform sampler velocity_smp;
 layout(binding = 2) uniform sampler lut_smp;
 
 in vec2 v_uv;
@@ -229,16 +232,21 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
     return mix(scene_color, current_fog_color, fog_amount);
 }
 
-// Camera Motion Blur: gathers samples along screen velocity derived from depth reprojection
+// Camera & Object Motion Blur: gathers samples along screen velocity derived from velocity buffer or depth reprojection
 vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     if (motion_blur_params.x < 0.5) return color;
     if (depth >= 1.0) return color;
 
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    vec2 prev_uv = reprojectClipToPrevUv(clip);
-    if (prev_uv.x < 0.0) return color;
-
-    vec2 velocity = (uv - prev_uv) * motion_blur_params.y;
+    vec4 vel_sample = texture(sampler2D(velocity_tex, velocity_smp), uv);
+    vec2 velocity;
+    if (vel_sample.a > 0.5) {
+        velocity = vel_sample.xy * motion_blur_params.y;
+    } else {
+        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+        vec2 prev_uv = reprojectClipToPrevUv(clip);
+        if (prev_uv.x < 0.0) return color;
+        velocity = (uv - prev_uv) * motion_blur_params.y;
+    }
     float max_blur = motion_blur_params.z * resolution.z;
     float speed = length(velocity);
     if (speed > max_blur) {
@@ -438,8 +446,8 @@ void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, o
     avg = sum / 9.0;
 }
 
-// TAA resolve in pre-exposure radiance: same depth-reprojected velocity
-// and history bilinear as motion blur; the history holds radiance (parent
+// TAA resolve in pre-exposure radiance: per-object velocity buffer with
+// depth-reprojected camera velocity fallback; the history holds radiance (parent
 // provides the RGBA16F capture target). Mirrors taaResolvePixel in
 // postprocess.zig (bounds + clamp + blend + sharpen). Disabled (or no valid
 // history yet) returns `current` before any history/depth sampling.
@@ -449,8 +457,14 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     if (raw_depth >= 0.9999) return current;
 
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
-    vec2 prev_uv = reprojectClipToPrevUv(clip);
+    vec4 vel_sample = texture(sampler2D(velocity_tex, velocity_smp), uv);
+    vec2 prev_uv;
+    if (vel_sample.a > 0.5) {
+        prev_uv = uv - vel_sample.xy;
+    } else {
+        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
+        prev_uv = reprojectClipToPrevUv(clip);
+    }
     if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
     vec3 hist = boundRadiance(texture(sampler2D(history_tex, smp), prev_uv).rgb);
     vec3 box_min;

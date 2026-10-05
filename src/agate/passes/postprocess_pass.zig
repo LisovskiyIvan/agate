@@ -21,6 +21,12 @@ pub const PostProcessPass = struct {
     offscreen_resolve_tex_view: sg.View = .{},
     postprocess_sampler: sg.Sampler = .{},
     depth_sampler: sg.Sampler = .{},
+    // Nearest sampler for the velocity buffer (motion vectors + geometry
+    // mask): bilinear filtering would smear vectors and the alpha gate
+    // across silhouettes. Mirrors depth_sampler.
+    velocity_sampler: sg.Sampler = .{},
+    default_zero_image: sg.Image = .{},
+    default_zero_view: sg.View = .{},
     // Dedicated LUT sampler: bilinear inside the strip with LOD pinned to
     // the base level, so a mipped LUT upload can never smear cube slices
     // through box-filtered mips.
@@ -61,6 +67,11 @@ pub const PostProcessPass = struct {
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
+    // Main-target depth format (env default or DEPTH): the velocity pass
+    // borrows the main depth attachment and must build its pipelines with
+    // this exact format. Set on every successful resize; reset with the
+    // targets (unknown while unbuilt).
+    depth_format: sg.PixelFormat = .DEFAULT,
     // Main-target color format metadata (diagnostics alongside
     // width/height/sample_count, never a config mode). `.DEFAULT` = never
     // built; after a successful resize this is RGBA16F, the sole contract
@@ -173,6 +184,13 @@ pub const PostProcessPass = struct {
             .wrap_v = .CLAMP_TO_EDGE,
         });
 
+        const velocity_smp = sg.makeSampler(.{
+            .min_filter = .NEAREST,
+            .mag_filter = .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+
         const lut_smp = sg.makeSampler(.{
             .min_filter = .LINEAR,
             .mag_filter = .LINEAR,
@@ -189,10 +207,27 @@ pub const PostProcessPass = struct {
         // (color DEFAULT, default sample count, depth DEFAULT).
         const pip = sg.makePipeline(fullscreenPipelineDesc(shd, .DEFAULT, 0, .DEFAULT));
 
+        // 1x1 zero dummy texture (clear velocity fallback)
+        const zero_pixels = [_]f16{ 0.0, 0.0, 0.0, 0.0 };
+        var zero_data = sg.ImageData{};
+        zero_data.mip_levels[0] = sg.asRange(&zero_pixels);
+        const zero_img = sg.makeImage(.{
+            .width = 1,
+            .height = 1,
+            .pixel_format = .RGBA16F,
+            .data = zero_data,
+        });
+        const zero_view = sg.makeView(.{
+            .texture = .{ .image = zero_img },
+        });
+
         return .{
             .postprocess_sampler = smp,
             .depth_sampler = depth_smp,
+            .velocity_sampler = velocity_smp,
             .lut_sampler = lut_smp,
+            .default_zero_image = zero_img,
+            .default_zero_view = zero_view,
             .postprocess_pipeline = pip,
             .postprocess_quad_vb = vb,
             .postprocess_quad_ib = ib,
@@ -227,6 +262,7 @@ pub const PostProcessPass = struct {
         self.height = 0;
         self.sample_count = 1;
         self.color_format = .DEFAULT;
+        self.depth_format = .DEFAULT;
         self.destroyTaaHistory();
     }
 
@@ -394,6 +430,7 @@ pub const PostProcessPass = struct {
         self.destroyTargets();
 
         const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
+        self.depth_format = depth_fmt;
 
         // Store-first rollback throughout: sokol make* returns nonzero
         // FAILED handles, so every handle lands in the struct before its
@@ -546,6 +583,7 @@ pub const PostProcessPass = struct {
         taa_history_view: sg.View,
         taa_history_valid: bool,
         taa_capture_only: bool,
+        velocity_view: sg.View,
     ) void {
         if (!sg.isvalid()) return;
         if (sg.queryPipelineState(self.postprocess_pipeline) != .VALID) return;
@@ -618,8 +656,16 @@ pub const PostProcessPass = struct {
             taa_history_view
         else
             self.offscreen_resolve_tex_view;
+        // Screen-space velocity buffer: per-object motion vector + alpha mask;
+        // binds default_zero_view when no velocity view was fed so the shader
+        // falls back to depth reprojection cleanly.
+        post_bind.views[post_shd.VIEW_velocity_tex] = if (velocity_view.id != 0)
+            velocity_view
+        else
+            self.default_zero_view;
         post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
         post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
+        post_bind.samplers[post_shd.SMP_velocity_smp] = self.velocity_sampler;
         post_bind.samplers[post_shd.SMP_lut_smp] = self.lut_sampler;
         sg.applyBindings(post_bind);
 
@@ -815,7 +861,10 @@ pub const PostProcessPass = struct {
         self.destroyTargets();
         if (self.postprocess_sampler.id != 0) sg.destroySampler(self.postprocess_sampler);
         if (self.depth_sampler.id != 0) sg.destroySampler(self.depth_sampler);
+        if (self.velocity_sampler.id != 0) sg.destroySampler(self.velocity_sampler);
         if (self.lut_sampler.id != 0) sg.destroySampler(self.lut_sampler);
+        if (self.default_zero_view.id != 0) sg.destroyView(self.default_zero_view);
+        if (self.default_zero_image.id != 0) sg.destroyImage(self.default_zero_image);
         if (self.postprocess_pipeline.id != 0) sg.destroyPipeline(self.postprocess_pipeline);
         if (self.postprocess_shader.id != 0) sg.destroyShader(self.postprocess_shader);
         self.postprocess_shader = .{};

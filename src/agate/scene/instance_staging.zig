@@ -68,6 +68,8 @@ const Mesh = @import("../mesh.zig").Mesh;
 const InstancedMesh = @import("../mesh.zig").InstancedMesh;
 const InstancePreviewState = @import("../mesh.zig").InstancePreviewState;
 const InstanceRenderState = @import("../mesh.zig").InstanceRenderState;
+const instancePairMode = @import("../mesh.zig").instancePairMode;
+const normalizeInstancePingPong = @import("../mesh.zig").normalizeInstancePingPong;
 const StagedInstanceRecord = @import("../mesh.zig").StagedInstanceRecord;
 const material_mod = @import("../material.zig");
 const Material = material_mod.Material;
@@ -114,6 +116,10 @@ const ParallelInstanceStage = struct {
     /// single-mesh immediate path).
     out_matrices: []Mat4,
     out_base: usize = 0,
+    /// Parallel trail to `out_matrices`: chunk c owns the same segment in
+    /// `out_uids` and packs visible instance uids densely at its start.
+    out_uids: []u64 = &.{},
+    uid_base: usize = 0,
 
     fn runChunks(stage: *ParallelInstanceStage, start: usize, end: usize) void {
         for (start..end) |chunk_id| {
@@ -128,13 +134,17 @@ const ParallelInstanceStage = struct {
             }
             const rel_hi = @min(rel_lo + stage.span, stage.instances.len);
             const lo = stage.out_base + rel_lo;
+            const ulo = stage.uid_base + rel_lo;
             var aabb = BoundingBox.zero;
             var dst = lo;
+            var udst = ulo;
             for (stage.instances[rel_lo..rel_hi]) |inst| {
                 if (!inst.is_visible) continue;
                 const world = instanceWorldMatrix(inst);
                 stage.out_matrices[dst] = world;
+                stage.out_uids[udst] = inst.uid;
                 dst += 1;
+                udst += 1;
                 const box = instanceWorldAABB(inst, world);
                 if (aabb.isValid()) {
                     aabb = aabb.merge(box);
@@ -251,7 +261,16 @@ pub fn stageInstancedMesh(sc: InstanceStageContext, mesh: *Mesh) void {
 pub const CpuStageResult = struct {
     bounds: BoundingBox,
     hash: u64,
+    /// Ordered identity layout of the staged segment: Wyhash over stable
+    /// per-instance uids in exact upload order (source entry first when
+    /// visible, post transparent re-sort). Feeds the velocity pairing gate.
+    layout_hash: u64,
 };
+
+/// Hashes an ordered uid sequence (the velocity layout identity).
+pub fn layoutHashFor(uids: []const u64) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(uids));
+}
 
 pub fn stageSegmentCpu(
     allocator: std.mem.Allocator,
@@ -263,6 +282,16 @@ pub fn stageSegmentCpu(
 ) std.mem.Allocator.Error!CpuStageResult {
     std.debug.assert(lo <= scratch.items.len);
     var combined_aabb = BoundingBox.zero;
+    // Stable identity FIRST (serial, before any parallel read): instance
+    // uids feed the velocity layout hash, never addresses — a deleted and
+    // recreated instance must not alias its predecessor.
+    _ = mesh.ensureUid();
+    for (mesh.instances.items) |inst| _ = inst.ensureUid();
+    // Parallel uid trail: uids[i] is the identity of scratch.items[lo + i].
+    // Allocated/freed here (one temp per mesh build); OOM restores the
+    // scratch to `lo` and propagates, like every other staging OOM.
+    var uids: std.ArrayListUnmanaged(u64) = .empty;
+    defer uids.deinit(allocator);
     // Babylon semantics (`Mesh._renderWithInstances`): the instanced batch is
     // the visible instances PLUS one entry for the source mesh's own world
     // matrix (its instance buffer is sized `(visible + 1) * 16` floats), so a
@@ -284,9 +313,14 @@ pub fn stageSegmentCpu(
 
         // Scratch upper bound first: OOM here stages nothing (scratch
         // unchanged — resize fails before mutating) and a later call may
-        // retry.
+        // retry. The uid trail resizes in lockstep (same OOM contract).
         try scratch.resize(allocator, lo + self_count + mesh.instances.items.len);
-        if (self_visible) scratch.items[lo] = self_world;
+        try uids.resize(allocator, self_count + mesh.instances.items.len);
+        errdefer scratch.items.len = lo;
+        if (self_visible) {
+            scratch.items[lo] = self_world;
+            uids.items[0] = mesh.uid;
+        }
 
         var chunk_aabbs_buf: [64]BoundingBox = undefined;
         var chunk_visible_buf: [64]usize = undefined;
@@ -298,6 +332,8 @@ pub fn stageSegmentCpu(
             .chunk_visible_counts = chunk_visible_buf[0..chunk_count],
             .out_matrices = scratch.items,
             .out_base = lo + self_count,
+            .out_uids = uids.items,
+            .uid_base = self_count,
         };
 
         pool.forkJoin(ParallelInstanceStage, &stage, ParallelInstanceStage.runChunks, chunk_count);
@@ -307,7 +343,9 @@ pub fn stageSegmentCpu(
         // sources (offset_c <= c*span relative to lo: every earlier chunk
         // contributes at most span), so the forward copy is overlap-safe.
         // The source entry, when present, already occupies [lo, lo + self_count)
-        // and is compacted to the head of the [lo, ...) segment.
+        // and is compacted to the head of the [lo, ...) segment. The uid
+        // trail compacts identically, so uids[i] stays the identity of
+        // scratch.items[lo + i].
         var total_visible: usize = self_count;
         if (self_aabb) |box| combined_aabb = box;
         for (0..chunk_count) |c| {
@@ -318,6 +356,11 @@ pub fn stageSegmentCpu(
                     Mat4,
                     scratch.items[lo + total_visible .. lo + total_visible + count],
                     scratch.items[src_lo .. src_lo + count],
+                );
+                std.mem.copyForwards(
+                    u64,
+                    uids.items[total_visible .. total_visible + count],
+                    uids.items[self_count + c * span .. self_count + c * span + count],
                 );
                 total_visible += count;
             }
@@ -332,14 +375,16 @@ pub fn stageSegmentCpu(
         scratch.items.len = lo + total_visible;
     } else {
         try scratch.ensureUnusedCapacity(allocator, self_count + mesh.instances.items.len);
+        try uids.ensureTotalCapacity(allocator, self_count + mesh.instances.items.len);
         if (self_visible) {
             scratch.appendAssumeCapacity(self_world);
-            combined_aabb = self_aabb.?;
+            uids.appendAssumeCapacity(mesh.uid);
         }
         for (mesh.instances.items) |inst| {
             if (!inst.is_visible) continue;
             const world = instanceWorldMatrix(inst);
             scratch.appendAssumeCapacity(world);
+            uids.appendAssumeCapacity(inst.uid);
             const box = instanceWorldAABB(inst, world);
             if (combined_aabb.isValid()) {
                 combined_aabb = combined_aabb.merge(box);
@@ -349,34 +394,59 @@ pub fn stageSegmentCpu(
         }
     }
     const segment = scratch.items[lo..];
+    const uid_segment = uids.items[0..segment.len];
+    std.debug.assert(uid_segment.len == segment.len);
 
     // Per-instance transparency sorting (OIT):
     // When the instanced mesh is transparent or a decal, sort its instance
     // matrices back-to-front relative to the camera eye. Farthest instances
     // render first, blending nearer instances over them correctly.
+    // The uid trail sorts WITH the matrices (same permutation), so the
+    // layout hash below always describes the exact upload order — a re-sort
+    // changes the layout and zeroes the batch instead of mispairing.
     if (segment.len > 1 and (isTransparentMaterial(mesh.material) or mesh.is_decal)) {
-        const SortCtx = struct {
+        const Pair = struct {
+            m: Mat4,
+            u: u64,
+        };
+        const Ctx = struct {
             eye: Vec3,
-            pub fn sortFn(c: @This(), a: Mat4, b: Mat4) bool {
-                const pos_a = Vec3.new(a.m[12], a.m[13], a.m[14]);
-                const pos_b = Vec3.new(b.m[12], b.m[13], b.m[14]);
+            pub fn less(c: @This(), a: Pair, b: Pair) bool {
+                const pos_a = Vec3.new(a.m.m[12], a.m.m[13], a.m.m[14]);
+                const pos_b = Vec3.new(b.m.m[12], b.m.m[13], b.m.m[14]);
                 const dist_a = pos_a.sub(c.eye).lengthSq();
                 const dist_b = pos_b.sub(c.eye).lengthSq();
                 if (dist_a != dist_b) {
                     return dist_a > dist_b; // back-to-front: farthest first
                 }
                 for (0..16) |i| {
-                    if (a.m[i] != b.m[i]) return a.m[i] < b.m[i];
+                    if (a.m.m[i] != b.m.m[i]) return a.m.m[i] < b.m.m[i];
                 }
-                return false;
+                // Total order: never leave equal-but-distinct pairs
+                // unordered, so serial and parallel paths agree exactly.
+                return a.u < b.u;
             }
         };
-        std.mem.sort(Mat4, segment, SortCtx{ .eye = eye }, SortCtx.sortFn);
+        // Pair sort (fallible alloc, same OOM contract): matrices and uids
+        // travel as one record, so the uid trail always describes the exact
+        // upload order — never matrices alone.
+        const pairs = allocator.alloc(Pair, segment.len) catch {
+            scratch.items.len = lo;
+            return error.OutOfMemory;
+        };
+        defer allocator.free(pairs);
+        for (pairs, segment, uid_segment) |*p, m, u| p.* = .{ .m = m, .u = u };
+        std.mem.sort(Pair, pairs, Ctx{ .eye = eye }, Ctx.less);
+        for (pairs, segment, uid_segment) |p, *m, *u| {
+            m.* = p.m;
+            u.* = p.u;
+        }
     }
 
     return .{
         .bounds = combined_aabb,
         .hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(segment)),
+        .layout_hash = layoutHashFor(uid_segment),
     };
 }
 
@@ -387,6 +457,46 @@ pub fn stageSegmentCpu(
 /// (bounds/count/`staged_frame`) only after the GPU half succeeded (or was
 /// skipped: no context, empty set). Never reads live instance TRS — only
 /// the staged slice plus the CPU result.
+pub const PrevFrameSource = struct {
+    /// Generation that staged this payload (`FrameDrawSlot.frame_id`).
+    frame_id: u64,
+    /// That slot's staged instance records (frozen at build time).
+    records: []const StagedInstanceRecord,
+    /// That slot's concatenated matrix scratch
+    /// (`primary.instance_matrices`).
+    scratch: []const Mat4,
+};
+
+/// Retained prior-generation lookup for velocity pairing (pure, sg-free):
+/// finds the slot payload staged under `prior_frame` and, within it, the
+/// record for `uid` with exactly `count` matrices; returns that record's
+/// own scratch slice, bounds-checked. Anything missing or mismatched
+/// (unknown generation, unknown uid, zero uid, count mismatch, OOB slice)
+/// yields null — the caller falls back to zero motion. Never a live read,
+/// never `record.mesh` (identity is uid-only, like the patch).
+pub fn findPrevMatrices(
+    prev_frames: []const PrevFrameSource,
+    prior_frame: u64,
+    uid: u64,
+    count: usize,
+) ?[]const Mat4 {
+    if (prior_frame == std.math.maxInt(u64)) return null;
+    if (uid == 0) return null;
+    if (count == 0) return null;
+    for (prev_frames) |pf| {
+        if (pf.frame_id != prior_frame) continue;
+        for (pf.records) |*pr| {
+            if (pr.uid != uid) continue;
+            if (pr.count != count) return null;
+            const lo: usize = pr.scratch_lo;
+            const end = lo + count;
+            if (lo > pf.scratch.len or end > pf.scratch.len) return null;
+            return pf.scratch[lo..end];
+        }
+    }
+    return null;
+}
+
 pub const GpuStageContext = struct {
     allocator: std.mem.Allocator,
     frame_id: u64,
@@ -398,6 +508,16 @@ pub const GpuStageContext = struct {
     /// already requires the context thread. A null queue is NOT a guarantee
     /// about snapshots; it is the caller taking responsibility for them.
     retire_queue: ?*gpu_retire.GpuRetireQueue = null,
+    /// Retained slot payloads for the velocity pairing lookup (set once per
+    /// latch by the prepare path from `scene.draws.slots`; empty by default
+    /// so standalone callers compile unchanged). The latch resolves each
+    /// record's prior generation into `prev_matrices` below.
+    prev_frames: []const PrevFrameSource = &.{},
+    /// Previous generation's staged matrices for the record currently being
+    /// latched (set per-record by `stageInstancesLatch` via
+    /// `findPrevMatrices`; null = unavailable). The pair branch only trusts
+    /// it when its length equals the staged matrices length.
+    prev_matrices: ?[]const Mat4 = null,
 };
 
 pub fn stageInstancesGpu(gctx: GpuStageContext, mesh: *Mesh, matrices: []const Mat4, cpu: CpuStageResult) void {
@@ -417,6 +537,11 @@ pub fn stageInstancesGpu(gctx: GpuStageContext, mesh: *Mesh, matrices: []const M
 /// result back; the immediate helper passes `&mesh.instance_render` directly.
 pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, matrices: []const Mat4, cpu: CpuStageResult) void {
     if (st.staged_frame == gctx.frame_id) return;
+    // Adopt any legacy/foreign handle state into the buffers[] invariant
+    // first (pure, sg-free): later branches may assume buffer aliases a
+    // slot and prev aliases a known handle, so the old owned handle can
+    // never be lost off the books.
+    normalizeInstancePingPong(st);
 
     const active_count = matrices.len;
 
@@ -478,28 +603,100 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
             sg.updateBuffer(new_buf, sg.asRange(items));
             // Учёт динамики: active_count матриц Mat4 (потокобезопасно — счётчик атомарный).
             upload_meter.record(active_count * @sizeOf(Mat4));
-            const old = st.buffer;
-            if (old.id != 0) {
-                if (gctx.retire_queue) |q| {
-                    q.retireBuffer(gctx.allocator, old);
-                } else {
-                    // Standalone low-level caller without a queue (see the
-                    // context docs): no cross-frame snapshot exists, and we
-                    // are on the context thread — destroy immediately.
-                    sg.destroyBuffer(old);
-                }
+            const old0 = st.buffers[0];
+            const old1 = st.buffers[1];
+            if (gctx.retire_queue) |q| {
+                if (old0.id != 0) q.retireBuffer(gctx.allocator, old0);
+                if (old1.id != 0 and old1.id != old0.id) q.retireBuffer(gctx.allocator, old1);
+            } else {
+                if (old0.id != 0) sg.destroyBuffer(old0);
+                if (old1.id != 0 and old1.id != old0.id) sg.destroyBuffer(old1);
             }
+            st.buffers[0] = new_buf;
+            st.buffers[1] = .{};
+            st.active_slot = 0;
             st.buffer = new_buf;
+            st.prev_buffer = new_buf;
+            // Growth collapses history: prev aliases the fresh upload.
+            st.prev_frame = gctx.frame_id;
             st.capacity = new_cap;
             st.hash = cpu.hash;
             st.uploaded_count = active_count;
+            st.layout_hash = cpu.layout_hash;
         } else {
             if (active_count != st.uploaded_count or cpu.hash != st.hash) {
-                sg.updateBuffer(st.buffer, sg.asRange(items));
+                // Pairing gate (see instancePairMode): same count AND same
+                // ordered identity layout pairs by index; anything else
+                // zeroes the whole batch — no slot flip, prev aliases cur.
+                if (instancePairMode(st.uploaded_count, active_count, st.layout_hash, cpu.layout_hash) == .zero) {
+                    sg.updateBuffer(st.buffer, sg.asRange(items));
+                    st.prev_buffer = st.buffer;
+                    st.prev_frame = gctx.frame_id;
+                } else {
+                    // .pair: SAME cur buffer id (committed renderer
+                    // contract), updated in place. Real per-instance
+                    // velocity comes from CPU history: the previous
+                    // generation's staged matrices go into the OTHER slot
+                    // BEFORE cur is overwritten (one update per buffer per
+                    // frame — different buffers, legal).
+                    const prev_items = gctx.prev_matrices;
+                    const have_prev = prev_items != null and prev_items.?.len == active_count;
+                    if (have_prev) {
+                        // Ensure the other slot (rollback-safe create;
+                        // FAILED ids are destroyed, never adopted).
+                        var other = st.buffers[st.active_slot ^ 1];
+                        if (other.id != 0 and sg.queryBufferState(other) != .VALID) {
+                            sg.destroyBuffer(other);
+                            other = .{};
+                        }
+                        if (other.id == 0) {
+                            other = sg.makeBuffer(.{
+                                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                                .size = st.capacity * @sizeOf(Mat4),
+                            });
+                            if (other.id == 0 or sg.queryBufferState(other) != .VALID) {
+                                if (other.id != 0) sg.destroyBuffer(other);
+                                other = .{};
+                            }
+                        }
+                        // A legacy-aliased other slot (same id as cur) must
+                        // not take a second update this frame: fall back to
+                        // zero motion instead of clobbering cur.
+                        if (other.id != 0 and other.id != st.buffer.id) {
+                            st.buffers[st.active_slot ^ 1] = other;
+                            sg.updateBuffer(other, sg.asRange(prev_items.?));
+                            st.prev_buffer = other;
+                            // The other slot now holds the previously
+                            // published upload: its generation is the frame
+                            // this state last published.
+                            st.prev_frame = st.staged_frame;
+                        } else {
+                            // Second-slot creation failure (or alias):
+                            // zero motion, never stale pairing.
+                            st.prev_buffer = st.buffer;
+                            st.prev_frame = gctx.frame_id;
+                        }
+                    } else {
+                        // No prev source (no lookup, generation/uid/count
+                        // mismatch, creation failure above): zero motion,
+                        // never stale pairing.
+                        st.prev_buffer = st.buffer;
+                        st.prev_frame = gctx.frame_id;
+                    }
+                    sg.updateBuffer(st.buffer, sg.asRange(items));
+                    // NOTE: st.active_slot and st.buffer are intentionally
+                    // UNCHANGED here (no ping-pong flip): within-capacity
+                    // updates keep buffer identity per the committed
+                    // renderer contract.
+                }
                 // Учёт динамики: только при реальном изменении (dedup по хешу выше).
                 upload_meter.record(active_count * @sizeOf(Mat4));
                 st.hash = cpu.hash;
                 st.uploaded_count = active_count;
+                st.layout_hash = cpu.layout_hash;
+            } else {
+                st.prev_buffer = st.buffer;
+                st.prev_frame = gctx.frame_id;
             }
         }
     }
@@ -543,6 +740,7 @@ pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq:
             .bounds = cpu.bounds,
             .count = @intCast(ctx.scratch.items.len - lo),
             .hash = cpu.hash,
+            .layout_hash = cpu.layout_hash,
             .build_seq = build_seq,
             .scratch_lo = lo,
         };
@@ -583,11 +781,17 @@ pub fn freezeStagedRecords(
             .count = pv.count,
             .bounds = pv.bounds,
             .hash = pv.hash,
+            .layout_hash = pv.layout_hash,
             .uploaded_hash = mesh.instance_render.hash,
+            .uploaded_layout = mesh.instance_render.layout_hash,
             .mesh_position = mesh.position,
             .buffer = mesh.instance_render.buffer,
+            .prev_buffer = mesh.instance_render.prev_buffer,
+            .buffers = mesh.instance_render.buffers,
+            .active_slot = mesh.instance_render.active_slot,
             .capacity = mesh.instance_render.capacity,
             .uploaded_count = mesh.instance_render.uploaded_count,
+            .prev_frame = mesh.instance_render.prev_frame,
             .staged_frame = mesh.instance_render.staged_frame,
         }) catch continue;
     }
@@ -597,14 +801,57 @@ pub fn freezeStagedRecords(
 /// zero capacities/counts, `staged_frame` back to never-staged, so
 /// `patchInstanceRefs` zeroes every payload entry resolving to this record.
 /// The frozen input half (identity/scratch_lo/bounds/hash/mesh_position) is
-/// left intact for debuggability.
+/// left intact for debuggability. Latch-created handles are cleared WITHOUT
+/// retiring here: on the OOB-slice path the latch never ran (nothing was
+/// created); on the GPU-half-failure path the core already destroyed the
+/// failed handle and created nothing else.
 fn failRecord(rec: *StagedInstanceRecord) void {
     rec.buffer = .{};
+    rec.prev_buffer = .{};
+    rec.buffers = .{ .{}, .{} };
+    rec.active_slot = 0;
     rec.capacity = 0;
     rec.count = 0;
     rec.uploaded_count = 0;
     rec.uploaded_hash = 0;
+    rec.uploaded_layout = 0;
+    rec.prev_frame = std.math.maxInt(u64);
+    rec.latch_created = .{ .{}, .{} };
     rec.staged_frame = std.math.maxInt(u64);
+}
+
+/// Handles the latch created while staging one record: post-latch handles
+/// minus pre-latch handles (pure, sg-free). Growth contributes the fresh
+/// buffer; the steady path contributes a fresh second slot, if any.
+/// Dedup hits contribute nothing. At most two handles (fixed array, zero
+/// padded) — the commit retires exactly these on abandon-skip paths.
+pub fn latchCreatedBuffers(
+    pre_buffer: sg.Buffer,
+    pre_prev: sg.Buffer,
+    pre_slots: [2]sg.Buffer,
+    post: *const InstanceRenderState,
+) [2]sg.Buffer {
+    var created = [_]sg.Buffer{ .{}, .{} };
+    var n: usize = 0;
+    const pre = [_]sg.Buffer{ pre_buffer, pre_prev, pre_slots[0], pre_slots[1] };
+    const post_handles = [_]sg.Buffer{ post.buffer, post.prev_buffer, post.buffers[0], post.buffers[1] };
+    for (post_handles) |h| {
+        if (h.id == 0) continue;
+        var known = false;
+        for (pre) |p| if (p.id == h.id) {
+            known = true;
+            break;
+        };
+        for (created[0..n]) |c| if (c.id == h.id) {
+            known = true;
+            break;
+        };
+        if (!known and n < created.len) {
+            created[n] = h;
+            n += 1;
+        }
+    }
+    return created;
 }
 
 /// GPU latch over the slot-owned staged records (stage 1, context side):
@@ -651,16 +898,27 @@ pub fn stageInstancesLatch(
         }
         var st = InstanceRenderState{
             .buffer = rec.buffer,
+            .prev_buffer = rec.prev_buffer,
+            .buffers = rec.buffers,
+            .active_slot = rec.active_slot,
             .capacity = rec.capacity,
             .count = rec.count,
             .bounds = rec.bounds,
             .hash = rec.uploaded_hash,
             .uploaded_count = rec.uploaded_count,
+            .layout_hash = rec.uploaded_layout,
+            .prev_frame = rec.prev_frame,
             .staged_frame = rec.staged_frame,
         };
-        stageInstancesGpuState(gctx, &st, scratch.items[rec.scratch_lo..end], .{
+        // Velocity pairing source: the previous generation's staged matrices
+        // for this uid, resolved from retained slot payloads (never live).
+        // Missing/mismatched => the pair branch falls back to zero motion.
+        var rctx = gctx;
+        rctx.prev_matrices = findPrevMatrices(gctx.prev_frames, rec.staged_frame, rec.uid, count);
+        stageInstancesGpuState(rctx, &st, scratch.items[rec.scratch_lo..end], .{
             .bounds = rec.bounds,
             .hash = rec.hash,
+            .layout_hash = rec.layout_hash,
         });
         if (st.staged_frame != gctx.frame_id) {
             // The GPU half did not publish (growth buffer failure): fail-close
@@ -672,7 +930,15 @@ pub fn stageInstancesLatch(
             failRecord(rec);
             continue;
         }
+        // Latch-created handles for the commit's abandon paths: post-latch
+        // handles minus the pre-latch set the record was seeded with (read
+        // BEFORE the mirror assignments below overwrite it). The commit
+        // retires exactly these when it cannot adopt the mirror.
+        const created = latchCreatedBuffers(rec.buffer, rec.prev_buffer, rec.buffers, &st);
         rec.buffer = st.buffer;
+        rec.prev_buffer = st.prev_buffer;
+        rec.buffers = st.buffers;
+        rec.active_slot = st.active_slot;
         rec.capacity = st.capacity;
         rec.count = st.count;
         rec.bounds = st.bounds;
@@ -680,7 +946,12 @@ pub fn stageInstancesLatch(
         // never mirrored); the post-latch uploaded hash lands below.
         rec.uploaded_hash = st.hash;
         rec.uploaded_count = st.uploaded_count;
+        // Same split for the layout gate: staged input stays frozen, the
+        // published layout lands here for the next build's pairing seed.
+        rec.uploaded_layout = st.layout_hash;
+        rec.prev_frame = st.prev_frame;
         rec.staged_frame = st.staged_frame;
+        rec.latch_created = created;
     }
 }
 
@@ -707,30 +978,80 @@ pub fn stageInstancesLatch(
 /// - Already applied (`instance_render.staged_frame == commit_frame`):
 ///   skip — the values are already this exact publish (double build without
 ///   an intervening latch), so the write would be redundant.
+/// - Abandon (`retire` handling): the two skip branches above (identity
+///   guard, live re-checks) retire the record's latch-created handles
+///   through `retire` (exactly once — the set is cleared), because no live
+///   mesh can adopt them anymore. Fail-closed/stale/already-applied paths
+///   retire nothing: the former never created anything, the latter's values
+///   are already mesh-owned. A null `retire` keeps the historical
+///   standalone behavior (caller obligation, same as the null retire_queue
+///   in the GPU half).
 /// Otherwise the mirror lands in `mesh.instance_render` verbatim — the
 /// identical bytes the old latch wrote back synchronously, so sequential
 /// build → latch → build usage commits exactly the same states (same
 /// stats, same fail paths).
+/// Retire sink for latch-created buffers the commit cannot adopt (game
+/// side, sg-free: `retireBuffer` only enqueues under a spinlock, never
+/// destroys — destruction stays context-owned in flush/deinit). Null marks
+/// a standalone caller (tests, one-off tooling) under the same obligation
+/// as the null `retire_queue` in the GPU half: no live snapshot may
+/// reference the abandoned handles, and the leak is the caller's.
+pub const CommitRetire = struct {
+    allocator: std.mem.Allocator,
+    queue: *gpu_retire.GpuRetireQueue,
+};
+
+/// Retires a record's latch-created handles exactly once (clears the set):
+/// called only on abandon-skip paths, where the mesh keeps its previous
+/// complete state and the mirror's fresh handles would otherwise strand.
+/// Borrowed prior handles are never touched here — their lifetime stays
+/// with the (possibly dead) owner's deinit/retireMesh path.
+fn retireAbandonedLatchCreated(rec: *StagedInstanceRecord, retire: ?CommitRetire) void {
+    const created = rec.latch_created;
+    rec.latch_created = .{ .{}, .{} };
+    const ctx = retire orelse return;
+    for (created) |h| {
+        if (h.id != 0) ctx.queue.retireBuffer(ctx.allocator, h);
+    }
+}
+
 pub fn commitPublishedRecords(
     records: []StagedInstanceRecord,
     meshes: []const *Mesh,
     commit_frame: u64,
+    retire: ?CommitRetire,
 ) void {
     for (records) |*rec| {
         if (rec.staged_frame == std.math.maxInt(u64)) continue;
         if (rec.staged_frame != commit_frame) continue;
         const idx: usize = rec.mesh_index;
-        if (idx >= meshes.len or meshes[idx] != rec.mesh or meshes[idx].uid != rec.uid) continue;
+        if (idx >= meshes.len or meshes[idx] != rec.mesh or meshes[idx].uid != rec.uid) {
+            // Aliveness/identity guard failed (destroyed, unlinked, address
+            // reuse): keep previous state AND retire the latch-created
+            // handles, which no live mesh can now adopt.
+            retireAbandonedLatchCreated(rec, retire);
+            continue;
+        }
         const mesh = rec.mesh;
-        if (mesh.is_lod_child or mesh.gpu_pending or mesh.instances.items.len == 0) continue;
+        if (mesh.is_lod_child or mesh.gpu_pending or mesh.instances.items.len == 0) {
+            // Live re-checks failed after a successful latch: same abandon
+            // rule — the mesh keeps its previous complete state.
+            retireAbandonedLatchCreated(rec, retire);
+            continue;
+        }
         if (mesh.instance_render.staged_frame == rec.staged_frame) continue;
         mesh.instance_render = .{
             .buffer = rec.buffer,
+            .prev_buffer = rec.prev_buffer,
+            .buffers = rec.buffers,
+            .active_slot = rec.active_slot,
             .capacity = rec.capacity,
             .count = rec.count,
             .bounds = rec.bounds,
             .hash = rec.uploaded_hash,
             .uploaded_count = rec.uploaded_count,
+            .layout_hash = rec.uploaded_layout,
+            .prev_frame = rec.prev_frame,
             .staged_frame = rec.staged_frame,
         };
     }
@@ -790,6 +1111,12 @@ test "P5: runChunks handles all-hidden chunks and empty tail chunks" {
 
     const out = try ally.alloc(Mat4, n);
     defer ally.free(out);
+    const out_uids = try ally.alloc(u64, n);
+    defer ally.free(out_uids);
+    @memset(out_uids, 0);
+    // Production contract: uids are assigned serially before any parallel
+    // read (stageSegmentCpu does this); the chunker only trails them.
+    for (ptrs) |inst| _ = inst.ensureUid();
     var aabbs_buf: [64]BoundingBox = undefined;
     var counts_buf: [64]usize = undefined;
     var stage = ParallelInstanceStage{
@@ -798,13 +1125,16 @@ test "P5: runChunks handles all-hidden chunks and empty tail chunks" {
         .chunk_aabbs = aabbs_buf[0..chunk_count],
         .chunk_visible_counts = counts_buf[0..chunk_count],
         .out_matrices = out,
+        .out_uids = out_uids,
     };
     ParallelInstanceStage.runChunks(&stage, 0, chunk_count);
 
-    // Chunk 0: 5 visibles packed at the segment start, matrices exact.
+    // Chunk 0: 5 visibles packed at the segment start, matrices exact, and
+    // the uid trail carries the chunk's instance identities in the same order.
     try std.testing.expectEqual(@as(usize, 5), counts_buf[0]);
     for (0..5) |k| {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(k)), out[k].m[12], 1e-6);
+        try std.testing.expectEqual(ptrs[k].uid, out_uids[k]);
     }
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), aabbs_buf[0].min.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), aabbs_buf[0].max.x, 1e-4);
@@ -961,7 +1291,7 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     try std.testing.expectEqual(@as(u32, 5), records.items[1].count);
 
     // Commit (next game-side build) applies the published mirrors to live.
-    commitPublishedRecords(records.items, &meshes, 21);
+    commitPublishedRecords(records.items, &meshes, 21, null);
     try std.testing.expectEqual(@as(u32, 5), fa.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u32, 5), fb.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 21), fa.mesh.instance_render.staged_frame);
@@ -974,7 +1304,7 @@ test "stage1: concatenated scratch + latch consume slot records, skip missing" {
     const keep_bounds = fb.mesh.instance_render.bounds;
     _ = records.pop(); // drop B's record: same as a segment that never froze
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 22 }, records.items, &scratch);
-    commitPublishedRecords(records.items, &meshes, 22);
+    commitPublishedRecords(records.items, &meshes, 22, null);
     try std.testing.expectEqual(@as(u64, 22), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 21), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(keep_bounds, fb.mesh.instance_render.bounds);
@@ -1013,7 +1343,7 @@ test "stage1: latch ignores cleared live previews, consumes records only" {
     try std.testing.expectEqual(std.math.maxInt(u64), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(std.math.maxInt(u64), fb.mesh.instance_render.staged_frame);
 
-    commitPublishedRecords(records.items, &meshes, 33);
+    commitPublishedRecords(records.items, &meshes, 33, null);
     try std.testing.expectEqual(@as(u32, 4), fa.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u32, 3), fb.mesh.instance_render.count);
     try std.testing.expectEqual(@as(u64, 33), fa.mesh.instance_render.staged_frame);
@@ -1061,7 +1391,7 @@ test "stage1: latch stages from slot data alone; reorder is caught at commit, ne
     // (index 1) is out of range → skip. Neither mesh publishes, previous
     // (never-staged) state stands, and the dangling record mesh is never
     // dereferenced (pointer compare only).
-    commitPublishedRecords(records.items, &reordered, 44);
+    commitPublishedRecords(records.items, &reordered, 44, null);
     try std.testing.expectEqual(std.math.maxInt(u64), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(std.math.maxInt(u64), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 0), fa.mesh.instance_render.count);
@@ -1069,7 +1399,7 @@ test "stage1: latch stages from slot data alone; reorder is caught at commit, ne
 
     // The records themselves stay published (the patch already resolved the
     // payload from them); restoring the list lets a later commit apply them.
-    commitPublishedRecords(records.items, &built, 44);
+    commitPublishedRecords(records.items, &built, 44, null);
     try std.testing.expectEqual(@as(u64, 44), fa.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u64, 44), fb.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 3), fa.mesh.instance_render.count);
@@ -1103,7 +1433,7 @@ test "stage1: latch never touches record.mesh — dangling pointer proof" {
 
     // The commit only compares the pointer (never dereferences it): the
     // dangling record skips, the live mesh keeps its previous state.
-    commitPublishedRecords(records.items, &meshes, 45);
+    commitPublishedRecords(records.items, &meshes, 45, null);
     try std.testing.expectEqual(std.math.maxInt(u64), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 0), f.mesh.instance_render.count);
 }
@@ -1130,12 +1460,12 @@ test "stage1: truncated scratch skips the record, previous stands" {
     // never an OOB slice; the later commit skips the fail-closed record so
     // the previous complete live state stands.
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 50 }, records.items, &scratch);
-    commitPublishedRecords(records.items, &meshes, 50);
+    commitPublishedRecords(records.items, &meshes, 50, null);
     try std.testing.expectEqual(@as(u32, 4), f.mesh.instance_render.count);
     const primed = f.mesh.instance_render.bounds;
     scratch.clearRetainingCapacity();
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 51 }, records.items, &scratch);
-    commitPublishedRecords(records.items, &meshes, 51);
+    commitPublishedRecords(records.items, &meshes, 51, null);
     try std.testing.expectEqual(@as(u32, 4), f.mesh.instance_render.count);
     try std.testing.expectEqual(primed, f.mesh.instance_render.bounds);
     try std.testing.expectEqual(@as(u64, 50), f.mesh.instance_render.staged_frame);
@@ -1159,13 +1489,13 @@ test "stage1: commit skips stale generations, fail-closed mirrors, and skips re-
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 60 }, records.items, &scratch);
 
     // Stale generation (a newer slot already published): never commits.
-    commitPublishedRecords(records.items, &meshes, 61);
+    commitPublishedRecords(records.items, &meshes, 61, null);
     try std.testing.expectEqual(std.math.maxInt(u64), f.mesh.instance_render.staged_frame);
 
     // Fail-closed mirror (GPU-half failure zeroed it): never commits, even
     // against its own generation.
     records.items[0].staged_frame = std.math.maxInt(u64);
-    commitPublishedRecords(records.items, &meshes, 60);
+    commitPublishedRecords(records.items, &meshes, 60, null);
     try std.testing.expectEqual(std.math.maxInt(u64), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 0), f.mesh.instance_render.count);
 
@@ -1173,11 +1503,11 @@ test "stage1: commit skips stale generations, fail-closed mirrors, and skips re-
     // no-op (already-applied skip), so double builds never regress.
     records.items[0].staged_frame = 60;
     records.items[0].count = 2;
-    commitPublishedRecords(records.items, &meshes, 60);
+    commitPublishedRecords(records.items, &meshes, 60, null);
     try std.testing.expectEqual(@as(u64, 60), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 2), f.mesh.instance_render.count);
     f.mesh.instance_preview.count = 9; // live drift must not resurrect
-    commitPublishedRecords(records.items, &meshes, 60);
+    commitPublishedRecords(records.items, &meshes, 60, null);
     try std.testing.expectEqual(@as(u64, 60), f.mesh.instance_render.staged_frame);
     try std.testing.expectEqual(@as(u32, 2), f.mesh.instance_render.count);
 
@@ -1186,19 +1516,19 @@ test "stage1: commit skips stale generations, fail-closed mirrors, and skips re-
     // their previous complete state.
     f.mesh.is_lod_child = true;
     records.items[0].staged_frame = 61;
-    commitPublishedRecords(records.items, &meshes, 61);
+    commitPublishedRecords(records.items, &meshes, 61, null);
     try std.testing.expectEqual(@as(u64, 60), f.mesh.instance_render.staged_frame);
     f.mesh.is_lod_child = false;
     f.mesh.gpu_pending = true;
-    commitPublishedRecords(records.items, &meshes, 61);
+    commitPublishedRecords(records.items, &meshes, 61, null);
     try std.testing.expectEqual(@as(u64, 60), f.mesh.instance_render.staged_frame);
     f.mesh.gpu_pending = false;
     const saved = f.mesh.instances.items;
     f.mesh.instances.items = &.{};
-    commitPublishedRecords(records.items, &meshes, 61);
+    commitPublishedRecords(records.items, &meshes, 61, null);
     try std.testing.expectEqual(@as(u64, 60), f.mesh.instance_render.staged_frame);
     f.mesh.instances.items = saved;
-    commitPublishedRecords(records.items, &meshes, 61);
+    commitPublishedRecords(records.items, &meshes, 61, null);
     try std.testing.expectEqual(@as(u64, 61), f.mesh.instance_render.staged_frame);
 }
 
@@ -1218,7 +1548,9 @@ test "stage1: failRecord zeroes the not-published mirror, keeps frozen input" {
         .count = 7,
         .bounds = frozen_bounds,
         .hash = 123,
+        .layout_hash = 124,
         .uploaded_hash = 456,
+        .uploaded_layout = 457,
         .mesh_position = Vec3.new(9, 0, 0),
         .buffer = .{ .id = 9 },
         .capacity = 11,
@@ -1276,7 +1608,7 @@ test "stage1: two record freezes, newest wins" {
     try std.testing.expect(records.items[0].bounds.max.x > first_bounds.max.x + 10.0);
 
     stageInstancesLatch(.{ .allocator = ally, .frame_id = 60 }, records.items, &scratch);
-    commitPublishedRecords(records.items, &meshes, 60);
+    commitPublishedRecords(records.items, &meshes, 60, null);
     try std.testing.expectEqual(records.items[0].bounds, f.mesh.instance_render.bounds);
     try std.testing.expect(records.items[0].bounds.max.x > first_bounds.max.x + 10.0);
 }

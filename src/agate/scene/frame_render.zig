@@ -212,6 +212,9 @@ pub fn render(scene: anytype) void {
         return;
     };
     const color_format: sg.PixelFormat = .RGBA16F;
+    if (scene.taa_reset_requested.swap(false, .acq_rel)) {
+        scene.postfx.taa_explicit_reset = true;
+    }
     if (snap.msaa_sample_count > 1 and samples == 1) {
         // Only the runtime format gate can nullify a > 1 request here
         // (clamping lands on a valid count, post-off forces 1 upstream).
@@ -410,6 +413,60 @@ pub fn render(scene: anytype) void {
     gpu_timing.endPass(.main);
     scene.stats.main_ms = msSince(t_main);
 
+    // Velocity buffer pass: per-object screen-space motion vectors, exactly
+    // when the composite consumes them (TAA at 1x, or 1x motion blur; under
+    // MSAA the pass is suppressed and the blur uses camera depth
+    // reprojection). The pass borrows the just-rendered single-sample MAIN
+    // depth attachment (LOAD, writes off, EQUAL) instead of replaying its
+    // own depth: nearer morph-displaced and opaque main pixels occlude
+    // farther velocity draws, and cutout holes fail the match. The frozen
+    // prev payloads are generation-checked inside against the last rendered
+    // frame, so a staged-but-unrendered prev collapses to zero motion here.
+    const velocity_needed = @import("../passes/velocity_pass.zig").velocityNeeded(
+        taa_on,
+        post_config.motion_blur_enabled,
+        samples,
+    ) and cur_w > 0 and cur_h > 0 and sg.isvalid();
+    // Primary view rect (same mapping the main pass drew under, both
+    // single- and multi-camera paths): the velocity draws must land on the
+    // exact pixels whose main depth they test against.
+    const velocity_viewport = if (snap.enable_multi_camera and snap.camera_count > 0)
+        (if (snap.active_camera_idx < snap.camera_count) snap.cameras[snap.active_camera_idx].viewport else snap.primary_cam.viewport)
+    else
+        snap.primary_cam.viewport;
+    // Gated on the ensure RESULT (never the published size): a failed
+    // ensure must neither render into a stale-sized target nor feed a stale
+    // view to the composite.
+    var velocity_ok = false;
+    if (velocity_needed) {
+        const vrect = velocity_viewport.toPixelRect(cur_w, cur_h);
+        sg.applyViewport(vrect.x, vrect.y, vrect.width, vrect.height, true);
+        sg.applyScissorRect(vrect.x, vrect.y, vrect.width, vrect.height, true);
+        defer {
+            sg.applyViewport(0, 0, cur_w, cur_h, true);
+            sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+        }
+        if (scene.postfx.velocity_pass.ensure(cur_w, cur_h)) {
+            const main_depth_view = scene.postfx.postprocess_pass.offscreen_depth_att_view;
+            const main_depth_fmt = scene.postfx.postprocess_pass.depth_format;
+            if (main_depth_view.id != 0 and main_depth_fmt != .DEFAULT and main_depth_fmt != .NONE) {
+                const prev_vp = if (scene.postfx.has_prev_view_proj) scene.postfx.prev_view_proj else taa_view_proj;
+                scene.postfx.velocity_pass.render(
+                    taa_view_proj,
+                    prev_vp,
+                    &draws.primary,
+                    draws.primary.skin_storage.items,
+                    draws.primary.prev_skin_storage.items,
+                    main_depth_view,
+                    main_depth_fmt,
+                    @as(u64, scene.last_rendered_frame.load(.acquire)),
+                    &scene.stats,
+                );
+                velocity_ok = true;
+            }
+        }
+    }
+
     // ==============================================
     // PASS 2.5 (SSAO) + 2.75 (bloom) + 2.8 (glow) + 2.85 (highlight) + 3 (composite & UI overlay)
     // ==============================================
@@ -454,10 +511,18 @@ pub fn render(scene: anytype) void {
         .shadows_enabled = snap.shadows_enabled,
         .ui = if (scene.ui_frame.canvas_present) &scene.ui_frame else null,
         .stats = &scene.stats,
+        // Velocity composite gate: only a rendered-this-frame target feeds
+        // the TAA/blur resolve; anything else binds the zero fallback.
+        .velocity_valid = velocity_ok,
     }, cur_w, cur_h);
     gpu_timing.endPass(.post);
 
     sg.commit();
+    // Actually presented: stamp the rendered slot generation so staged
+    // velocity prev payloads can generation-match it on later draws.
+    // Reuse restamps the same value (idempotent); skipped presents never
+    // reach here (early returns above).
+    scene.last_rendered_frame.store(@intCast(draws.frame_id), .release);
     // GPU timing (opt-in, default off): last COMPLETED samples observed
     // here, right after the present commit, while the just-submitted work
     // is still the latest submission. Optional samples distinguish
