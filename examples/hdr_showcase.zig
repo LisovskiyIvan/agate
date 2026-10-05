@@ -13,6 +13,9 @@
 //! camera-cut phases, draws every frame even with the master off).
 //! `AGATE_HDR_MSAA` / `?msaa=4` (default 1), `AGATE_HDR_SRGB=1` / `?srgb=1`
 //! single-encode proof via `sapp_desc.srgb`.
+//! Finite runs also draw animated rigid/skinned/instanced geometry, exercise
+//! instance membership/growth, and capture/recapture a GGX reflection probe.
+//! These are live pipeline/lifetime checks, not velocity pixel readback.
 //!
 //! Keys: B bloom toggle, E exposure cycle, SPACE effects master, ESC quit.
 //! Staged frame protocol, serial on the context thread (no worker):
@@ -41,6 +44,10 @@ var scene: z.Scene = undefined;
 var hero: *z.Mesh = undefined;
 var orbs: [5]*z.Mesh = undefined;
 var sokol_live_allocations: usize = 0;
+var temporal_skin: ?*z.Skeleton = null;
+var temporal_source: ?*z.Mesh = null;
+var temporal_instances: [3]*z.InstancedMesh = undefined;
+var temporal_probe: ?usize = null;
 
 extern "c" fn malloc(size: usize) ?*anyopaque;
 extern "c" fn free(ptr: ?*anyopaque) void;
@@ -91,12 +98,100 @@ fn emissiveMat(name: []const u8, radiance: z.Color3) *z.PBRMaterial {
     return m;
 }
 
+fn setupFiniteFixtures() void {
+    const allocator = std.heap.c_allocator;
+    const skel = z.Skeleton.init(allocator, 1) catch @panic("hdr-showcase: skeleton failed");
+    scene.skeletons.append(allocator, skel) catch @panic("hdr-showcase: skeleton registration failed");
+    temporal_skin = skel;
+    const skinned = z.MeshBuilder.createBox(&scene, "velocity_skin", .{ .size = 0.7 }) catch @panic("hdr-showcase: skinned mesh failed");
+    skinned.position = z.Vec3.new(0, 1.8, 0);
+    skinned.skeleton = skel;
+    skinned.culling_strategy = .always_render;
+    skinned.setPBRMaterial(pbrMat("velocity_skin_mat", z.Color3.new(0.22, 0.46, 0.52), 0, 0.6));
+
+    const source = z.MeshBuilder.createBox(&scene, "velocity_instances", .{ .size = 0.35 }) catch @panic("hdr-showcase: instance source failed");
+    source.position = z.Vec3.new(3.4, 1.3, 1.2);
+    source.culling_strategy = .always_render;
+    source.setPBRMaterial(pbrMat("velocity_instance_mat", z.Color3.new(0.45, 0.35, 0.25), 0.2, 0.5));
+    temporal_source = source;
+    const names = [_][]const u8{ "velocity_i0", "velocity_i1", "velocity_i2" };
+    for (names, 0..) |name, i| {
+        const inst = source.createInstance(&scene, name) catch @panic("hdr-showcase: instance failed");
+        inst.position = z.Vec3.new(-1.8 + @as(f32, @floatFromInt(i)) * 1.3, 1.1, 1.0);
+        temporal_instances[i] = inst;
+    }
+    temporal_instances[2].is_visible = false;
+    const alpha_pixels = [_]u8{
+        255, 255, 255, 255, 255, 255, 255, 0,
+        255, 255, 255, 0,   255, 255, 255, 255,
+    };
+    const cutout = pbrMat("velocity_cutout_mat", z.Color3.new(0.36, 0.55, 0.3), 0, 0.6);
+    cutout.alpha_mode = .cutout;
+    cutout.alpha_cutoff = 0.5;
+    cutout.albedo_texture = z.Texture.initRaw(2, 2, &alpha_pixels, .{
+        .min_filter = .NEAREST,
+        .mag_filter = .NEAREST,
+        .mipmaps = false,
+    });
+    const cutout_mesh = z.MeshBuilder.createBox(&scene, "velocity_cutout", .{ .size = 0.65 }) catch @panic("hdr-showcase: cutout failed");
+    cutout_mesh.position = z.Vec3.new(2.1, 1.8, -0.6);
+    cutout_mesh.culling_strategy = .always_render;
+    cutout_mesh.setPBRMaterial(cutout);
+    temporal_probe = scene.addReflectionProbe(z.Vec3.new(0, 1.5, 0), .{ .radius = 11 }) catch @panic("hdr-showcase: probe failed");
+    scene.post_process.motion_blur_enabled = true;
+}
+
+fn updateFiniteFixtures(f: u32, dt: f32) void {
+    if (temporal_skin) |skel| {
+        skel.bones[0].local_position.y = 0.12 * @sin(@as(f32, @floatFromInt(f)) * dt * 2.0);
+        skel.update();
+    }
+    const source = temporal_source orelse return;
+    temporal_instances[0].position.x = -1.8 + 0.15 * @sin(@as(f32, @floatFromInt(f)) * dt);
+    if (f == 80) {
+        temporal_instances[1].is_visible = false;
+        temporal_instances[2].is_visible = true;
+    }
+    if (f == 140) temporal_instances[1].is_visible = true;
+    if (f == 175) std.mem.swap(*z.InstancedMesh, &source.instances.items[0], &source.instances.items[2]);
+    if (f == 180) scene.captureReflectionProbe(temporal_probe.?);
+    if (f == 190) {
+        for (0..14) |i| {
+            const inst = source.createInstance(&scene, "velocity_growth") catch @panic("hdr-showcase: growth instance failed");
+            inst.position = z.Vec3.new(-2.0 + 0.3 * @as(f32, @floatFromInt(i)), 0.3, 1.7);
+        }
+    }
+}
+
+fn checkFinitePrepared(f: u32) void {
+    const source = temporal_source orelse return;
+    const draws = scene.preparedDraws();
+    var has_skin = false;
+    for (draws.primary.items.items) |it| {
+        if (it.is_skinned and it.skin_index != null and it.index_count > 0) has_skin = true;
+    }
+    check("skinned-payload", has_skin);
+    check("instanced-payload", draws.primary.opaque_instanced.items.len > 0);
+    var found_source = false;
+    for (draws.staged_instances.items) |rec| {
+        if (rec.mesh != source) continue;
+        found_source = true;
+        check("instance-gpu-current", rec.buffer.id != 0 and sg.queryBufferState(rec.buffer) == .VALID);
+        if (f == 80 or f == 140 or f == 175 or f == 190) {
+            check("instance-membership-zero-motion", rec.prev_buffer.id == rec.buffer.id);
+        }
+        if (f == 190) check("instance-growth", rec.count > 16 and rec.capacity >= rec.count);
+    }
+    check("instance-source-staged", found_source);
+}
+
 fn setupScene() void {
     sg.setup(.{
         .environment = sokol.glue.environment(),
         .logger = .{ .func = logger },
         .pipeline_pool_size = 256,
         .shader_pool_size = 128,
+        .view_pool_size = 256,
         .allocator = .{ .alloc_fn = sokolAlloc, .free_fn = sokolFree },
     });
     scene = z.Scene.init(std.heap.c_allocator);
@@ -170,6 +265,7 @@ fn setupScene() void {
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
     scene.post_process.fog_enabled = false;
+    if (frame_limit > 0) setupFiniteFixtures();
     std.debug.print("hdr-showcase: setup backend={s} msaa={} srgb={} env_color_fmt={s} swapchain_fmt={s} hdr_caps_sample={} hdr_caps_filter={} hdr_caps_render={} hdr_caps_blend={} hdr_caps_msaa={}\n", .{
         @tagName(sg.queryBackend()),
         msaa_count,
@@ -210,6 +306,7 @@ export fn frame() callconv(.c) void {
         if (f == 111) scene.post_process.enabled = true;
         if (f == 160) scene.post_process.taa_camera_cut = true;
         if (f == 161) scene.post_process.taa_camera_cut = false;
+        if (f == 170) scene.resetTaa();
         if (f == 130) {
             scene.resizeOffscreen(320, 180);
             const pp = &scene.postfx.postprocess_pass;
@@ -226,6 +323,7 @@ export fn frame() callconv(.c) void {
     }
 
     scene.update(dt) catch |err| fail("update: {s}", .{@errorName(err)});
+    if (gate) updateFiniteFixtures(f, dt);
     const w: i32 = @max(2, sapp.width());
     const h: i32 = @max(2, sapp.height());
     const aspect: f32 = @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(h));
@@ -243,7 +341,18 @@ export fn frame() callconv(.c) void {
         fail("staged claim unavailable after successful build at frame {}", .{f});
         return;
     }
+    if (gate) checkFinitePrepared(f);
     scene.render();
+    if (gate and f == 200) {
+        // renderReuse restores CPU stats after the replay (by design), so
+        // draw counts cannot prove the replay. Assert the protocol ran:
+        // streak advanced and the front slot stayed consumable. The replay
+        // itself re-draws every pipeline — validation failures would land
+        // in log_errors and fail the verdict.
+        const streak = scene.reuseStreak();
+        scene.renderReuse();
+        check("temporal-front-reuse", scene.reuseStreak() == streak + 1 and scene.hasConsumableFrame());
+    }
 
     const pp = &scene.postfx.postprocess_pass;
     check("hdr-target", pp.color_format == .RGBA16F);
@@ -252,8 +361,20 @@ export fn frame() callconv(.c) void {
     if (scene.post_process.enabled and scene.post_process.taa_enabled and scene.postfx.main_samples == 1) {
         check("taa-history-available", pp.taaAvailable());
         check("taa-history-hdr", pp.taa_format == .RGBA16F);
+        const vp = &scene.postfx.velocity_pass;
+        check("velocity-target", vp.width == w and vp.height == h and sg.queryImageState(vp.image) == .VALID);
+        check("velocity-rigid-pipeline", sg.queryPipelineState(vp.pip_rigid_u16) == .VALID);
+        check("velocity-skinned-pipeline", sg.queryPipelineState(vp.pip_skin_u16) == .VALID);
+        check("velocity-instanced-pipeline", sg.queryPipelineState(vp.pip_inst_u16) == .VALID);
     }
     if (gate) {
+        if (temporal_probe) |index| {
+            const probe = scene.getReflectionProbe(index).?;
+            check("probe-captured", probe.captured and !probe.dirty);
+            check("probe-bake-source", probe.gpu.bake_view.id != 0 and sg.queryViewState(probe.gpu.bake_view) == .VALID);
+            const bake = sg.queryViewDesc(probe.gpu.bake_view);
+            check("probe-source-mip0-only", bake.texture.mip_levels.base == 0 and bake.texture.mip_levels.count == 1);
+        }
         if (f == 1) check("initial-cut", scene.post_process.taa_camera_cut);
         if (f == 61) check("exposure-61", scene.post_process.exposure == exposures[2]);
         if (f == 91) check("master-off", !scene.post_process.enabled);
@@ -261,6 +382,7 @@ export fn frame() callconv(.c) void {
         if (f == 130) check("resize-reverted", pp.width == w and pp.height == h);
         if (f == 160) check("cut-160", scene.post_process.taa_camera_cut);
         if (f == 161) check("cut-cleared", !scene.post_process.taa_camera_cut);
+        if (f == 170) check("explicit-reset-consumed", !scene.taa_reset_requested.load(.acquire));
     }
     if (f % 60 == 0) {
         std.debug.print("hdr-showcase: frame {} draws={} exposure={d:.2} master={} bloom={} samples={} srgb={} size={}x{}\n", .{
