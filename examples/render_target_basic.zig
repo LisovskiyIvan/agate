@@ -65,7 +65,6 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sapp = sokol.app;
 const sg = sokol.gfx;
-const sglue = sokol.glue;
 const slog = sokol.log;
 const z = @import("agate");
 
@@ -182,16 +181,8 @@ fn makeUvStrip(scene: *z.Scene, name: []const u8, cx: f32, cy: f32) *z.Mesh {
 }
 
 export fn init() callconv(.c) void {
-    z.gpu_thread.markContextThread();
-    if (!sg.isvalid()) {
-        sg.setup(.{
-            .environment = sglue.environment(),
-            .logger = .{ .func = rttLogger },
-            .pipeline_pool_size = 256,
-            .shader_pool_size = 128,
-        });
-    }
-    sokol.time.setup();
+    std.debug.assert(z.gpu_thread.isOnContextThread());
+    std.debug.assert(sg.isvalid());
     const allocator = gpa.allocator();
 
     // Regression checks with teeth: creation failures must fail loudly
@@ -503,14 +494,13 @@ export fn cleanup() callconv(.c) void {
         mat.emissive_texture = null;
         mat.occlusion_texture = null;
     }
-    // Context lifecycle: scenes, then owned textures/targets, then context.
+    // App tears down the context after this callback releases its resources.
     capture_scene.deinit();
     display_scene.deinit();
     if (checker_owned) checker_tex.deinit();
     rtt.deinit();
     rtt_msaa4.deinit();
     _ = gpa.deinit();
-    sg.shutdown();
     if (!verdict_pass) std.process.exit(1);
 }
 
@@ -535,6 +525,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .gl_major = 4,
         .gl_minor = 3,
         .logger = rttLogger,
+        .shader_pool_size = 128,
     }, .{
         .init = appInit,
         .frame = appFrame,
