@@ -1,14 +1,11 @@
-//! Reflection probes, wave 25 (v1): on-demand cube captures that feed the
-//! PBR/standard ambient terms.
+//! On-demand reflection probes for PBR ambient lighting.
 //!
 //! Design (bounded, additive, OFF by default):
 //! - At most `max_probes` (4) probes per scene; `add` past the cap is a hard
 //!   `error.TooManyReflectionProbes` (never a silent clamp), mirroring the
 //!   directional-fill cap in `light_rig.zig`.
 //! - A probe with no capture yet (`captured == false`), a disabled probe, or
-//!   an object outside every probe radius falls back to today's
-//!   ambient/skybox path, so rendering with no enabled probe is
-//!   bit-identical to before this wave.
+//!   an object outside every probe radius uses the ambient/environment path.
 //! - Capture is explicit and on-demand: `markDirty` (via
 //!   `Scene.captureReflectionProbe`) flags one probe, `Scene.render` captures
 //!   at most ONE dirty probe per frame on the context thread (lowest dirty +
@@ -18,24 +15,21 @@
 //!   interaction on this path, so the single-upload-per-frame discipline is
 //!   untouched; capture performs zero `sg.updateBuffer`/`sg.appendBuffer`
 //!   traffic (only draws into probe-owned targets).
-//! - Roughness prefilter is a GPU box/blit chain, NOT a GGX
-//!   importance-sampled prefilter: after the 6 base faces render, each mip is
-//!   produced by sampling the previous mip with LINEAR filtering at exact
-//!   2:1 texel centers, which is an exact 2x2 box average per texel. The
-//!   shader then picks `textureLod(probe, R, roughness * max_lod)` for the
-//!   specular term and the coarsest mip for the diffuse term. Documented
-//!   approximation: no parallax correction, no per-roughness lobe shaping.
-//! - Selection is per object, CPU-side, at draw time: the nearest
-//!   enabled+captured probe whose radius contains the object's world
-//!   position wins; ties resolve to the lowest probe index. NO blending
-//!   between probes in v1 (documented).
+//! - After the six base faces render, GGX convolution produces specular mips
+//!   and cosine-weighted convolution produces E/pi in the coarsest mip.
+//!   Convolution samples only captured mip 0 into a separate scratch cube;
+//!   copy passes populate the probe outputs without source feedback.
+//! - Regular/skinned draws select up to two captured probes with spatial
+//!   falloff weights; remaining weight belongs to the environment.
+//!   Instanced draws currently use the environment only. `selectProbe`
+//!   retains the explicit nearest-probe query, separate from draw blending.
 //! - Uniform packing follows the light-rig pattern: `packFrame` snapshots
 //!   plain data + borrowed GPU handle VALUES (view/sampler) into `FramePack`,
 //!   which rides the `SceneFrameSnapshot` into the draw; the draw never reads
 //!   live layer state.
 //!
-//! Explicit non-goals (v1): box projection / parallax correction,
-//! probe blending / weights, real-time per-frame updates (captures are
+//! Explicit non-goals: box projection / parallax correction,
+//! real-time per-frame updates (captures are
 //! on-demand, at most one per frame), specular occlusion, probe-baked
 //! irradiance spherical harmonics, and editor tooling.
 //!
@@ -129,6 +123,30 @@ pub fn mipSize(mip: u32) i32 {
     return @max(1, face_resolution >> @intCast(mip));
 }
 
+/// Convolution reads captured mip 0 only; coarse mips are its outputs.
+fn bakeViewDesc(image: sg.Image) sg.ViewDesc {
+    return .{
+        .texture = .{
+            .image = image,
+            .mip_levels = .{ .base = 0, .count = 1 },
+        },
+    };
+}
+
+/// Roughness ladder for the specular bake: mip `m` in 1..`max_mips - 2`
+/// maps linearly to 0..1; the coarsest mip is diffuse irradiance
+/// (roughness 1.0 by convention).
+pub fn roughnessForMip(mip: u32) f32 {
+    if (isIrradianceMip(mip)) return 1.0;
+    return @as(f32, @floatFromInt(mip)) / @as(f32, @floatFromInt(max_mips - 2));
+}
+
+/// True only for the coarsest mip, which stores cosine-weighted diffuse
+/// irradiance (E/pi convention) instead of a specular lobe.
+pub fn isIrradianceMip(mip: u32) bool {
+    return mip == max_mips - 1;
+}
+
 /// Creation options for one probe. A new probe starts dirty (first render
 /// captures it) but uncaptured, so selection falls back until the capture
 /// lands and pre-capture frames stay bit-identical.
@@ -148,6 +166,11 @@ pub const ReflectionProbeOptions = struct {
 pub const ProbeGpu = struct {
     image: sg.Image = .{},
     tex_view: sg.View = .{},
+    /// Mip-0-only texture view of `image`: the bake source for the
+    /// GGX/irradiance convolution (Pass A). Capture renders mip 0 while
+    /// mips 1..7 are still stale, so the convolution must never sample
+    /// the full chain. Same lifetime as `tex_view`.
+    bake_view: sg.View = .{},
     sampler: sg.Sampler = .{},
     mip_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips,
     depth_image: sg.Image = .{},
@@ -164,6 +187,7 @@ pub const ProbeGpu = struct {
         if (!sg.isvalid()) return;
         sg.destroySampler(self.sampler);
         sg.destroyView(self.tex_view);
+        sg.destroyView(self.bake_view);
         sg.destroyView(self.depth_view);
         for (&self.mip_face_views) |*mip| {
             for (mip) |*v| {
@@ -246,7 +270,7 @@ pub const ProbeBlendEntry = struct {
     weight: f32,
 };
 
-/// Multi-probe selection result for probe blending (roadmap C.2):
+/// Multi-probe selection result:
 /// Supports up to two overlapping probes with C1 smoothstep falloff weights
 /// and remaining weight allocated to the environment map.
 pub const SelectedProbes = struct {
@@ -562,9 +586,22 @@ pub const ProbeLayer = struct {
             return false;
         }
 
+        const bake_view = sg.makeView(bakeViewDesc(img));
+        if (bake_view.id == 0 or sg.queryViewState(bake_view) != .VALID) {
+            if (bake_view.id != 0) sg.destroyView(bake_view);
+            sg.destroyView(depth_view);
+            sg.destroyImage(depth_img);
+            for (&face_views) |*mip| for (mip) |*v| sg.destroyView(v.*);
+            sg.destroySampler(smp);
+            sg.destroyView(tex_view);
+            sg.destroyImage(img);
+            return false;
+        }
+
         gpu.* = .{
             .image = img,
             .tex_view = tex_view,
+            .bake_view = bake_view,
             .sampler = smp,
             .mip_face_views = face_views,
             .depth_image = depth_img,
@@ -962,6 +999,10 @@ test "targetBytes accounts the HDR cube chain plus depth" {
     // RGBA16F cube 128..1 over 8 mips, all 6 faces, plus one 128x128 depth:
     // (16384+4096+1024+256+64+16+4+1)*8*6 + 128*128*4 = 1114096.
     try std.testing.expectEqual(@as(usize, 1114096), targetBytes());
+}
+
+test "probe convolution source view excludes output mips" {
+    try @import("ibl_tests.zig").expectBakeSourcePlan(bakeViewDesc(.{ .id = 77 }));
 }
 
 test "ensureGpu fails closed without a gpu context" {

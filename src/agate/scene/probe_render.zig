@@ -19,9 +19,9 @@ const SceneStats = scene_stats.SceneStats;
 const scene_probes = @import("probe_layer.zig");
 const FrameDrawSlot = @import("frame_draws.zig").FrameDrawSlot;
 
-/// Runs at most ONE pending reflection probe capture (wave 25, v1). Render-
+/// Runs at most ONE pending reflection probe capture. Render-
 /// local: draws the primary view queues from the probe position into the
-/// probe's cube target (mip 0), then runs the box-prefilter downsample
+/// probe's cube target (mip 0), then runs the GGX/irradiance convolution
 /// chain to populate the remaining mips. The main-pass viewport is
 /// untouched. When several probes are dirty, the lowest dirty + enabled
 /// index captures now and the rest wait for later frames (one capture
@@ -61,7 +61,7 @@ pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void 
 /// throughout: scratch stats (discarded — the frame's counters must not 7x),
 /// the 1x HDR forward set (`forwardFor(1, RGBA16F)`, resolved BEFORE the
 /// pass opens — forwardFor may recreate the twin and must never run
-/// mid-pass), and an EMPTY probe pack (capture draws take the legacy env
+/// mid-pass), and an EMPTY probe pack (capture draws take the environment
 /// path — no probe self-sampling or feedback). Shadow maps are the frame's
 /// own (captured right after the shadow depth pass). Invalid/FAILED probe
 /// views fail closed (no pass is opened).
@@ -207,24 +207,28 @@ pub fn renderProbeFace(
     sg.endPass();
 }
 
-/// Box-prefilter blit chain for probe `index`: mip `m` (every face) is
-/// rendered from mip `m - 1` through the fullscreen blit pipeline, which
-/// samples with LINEAR filtering at exact 2:1 texel centers (an exact
-/// 2x2 box average per texel). Quality limitation (wave 1 scope): this is a
-/// box average, NOT a GGX importance-sampled prefilter and NOT full-IBL
-/// physical — the shader's `roughness * max_lod` lookup only approximates
-/// lobe widening, with no per-roughness lobe shaping and no parallax
-/// correction. No depth attachment; the pipeline is depth-off. A dead blit
-/// pipeline fails closed (no passes opened).
+/// GGX/irradiance bake chain for probe `index`. Mip routing (fixed by the
+/// mip-contamination plan in `probe_layer`):
+/// - Pass A renders scratch mip `m` from the probe's mip-0-only bake view
+///   at explicit LOD 0: mode 0 (GGX convolution, `roughnessForMip(m)`) for
+///   mips 1..`max_mips - 2`, mode 1 (cosine irradiance, E/pi convention)
+///   for the coarsest mip. The full-chain sample view is never a bake
+///   source — its coarse mips are stale until Pass B lands them.
+/// - Pass B copies scratch mip `m` into probe mip `m` (mode 2, exact mip).
+/// Roughness ladder, irradiance convention, and probe lifetime/resize
+/// rollback are unchanged. A dead blit pipeline fails closed.
 pub fn runProbePrefilter(scene: anytype, index: usize) void {
     if (scene.probes.blit_pipeline.id == 0 or sg.queryPipelineState(scene.probes.blit_pipeline) != .VALID) return;
     if (scene.probes.blit_vb.id == 0 or sg.queryBufferState(scene.probes.blit_vb) != .VALID) return;
     if (scene.probes.blit_ib.id == 0 or sg.queryBufferState(scene.probes.blit_ib) != .VALID) return;
     const probe = &scene.probes.probes[index];
+    // Bake-source guard: without the mip-0-only view the convolution would
+    // sample stale coarse mips of the full chain. Fail closed like above.
+    if (probe.gpu.bake_view.id == 0 or sg.queryViewState(probe.gpu.bake_view) != .VALID) return;
     var mip: u32 = 1;
     while (mip < scene_probes.max_mips) : (mip += 1) {
         const size = scene_probes.mipSize(mip);
-        // Pass A: Downsample probe.gpu (mip - 1) -> scratch_cube (mip)
+        // Pass A: Convolve probe.gpu bake view (mip 0) -> scratch_cube (mip)
         var face_i: u8 = 0;
         while (face_i < 6) : (face_i += 1) {
             var pass = sg.Pass{
@@ -243,15 +247,12 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = scene.probes.blit_vb;
             bind.index_buffer = scene.probes.blit_ib;
-            bind.views[blit_probe_shd.VIEW_src_tex] = probe.gpu.tex_view;
+            bind.views[blit_probe_shd.VIEW_src_tex] = probe.gpu.bake_view;
             bind.samplers[blit_probe_shd.SMP_smp] = scene.probes.blit_sampler;
             sg.applyBindings(bind);
 
-            const is_irradiance = (mip == scene_probes.max_mips - 1);
-            const roughness = if (is_irradiance)
-                1.0
-            else
-                @as(f32, @floatFromInt(mip)) / @as(f32, @floatFromInt(scene_probes.max_mips - 2));
+            const is_irradiance = scene_probes.isIrradianceMip(mip);
+            const roughness = scene_probes.roughnessForMip(mip);
             const mode: f32 = if (is_irradiance) 1.0 else 0.0;
             const fs_params = blit_probe_shd.FsParams{
                 .params = .{

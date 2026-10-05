@@ -14,9 +14,21 @@ const Texture = @import("../texture.zig").Texture;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const gpu_thread = @import("../gpu_thread.zig");
 
+pub fn expectBakeSourcePlan(desc: @import("sokol").gfx.ViewDesc) !void {
+    try std.testing.expectEqual(@as(u32, 77), desc.texture.image.id);
+    try std.testing.expectEqual(@as(i32, 0), desc.texture.mip_levels.base);
+    try std.testing.expectEqual(@as(i32, 1), desc.texture.mip_levels.count);
+    try std.testing.expect(probe_layer.isIrradianceMip(probe_layer.max_mips - 1));
+    try std.testing.expect(!probe_layer.isIrradianceMip(probe_layer.max_mips - 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 6.0), probe_layer.roughnessForMip(1), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), probe_layer.roughnessForMip(6), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), probe_layer.roughnessForMip(probe_layer.max_mips - 1), 1e-6);
+}
+
 test "PBR scene with ENV-only light: zero punctual lights, active environment, verify draw record factors" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
+    defer gpu_thread.resetContextThreadForTest();
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
     defer scene.cameras.deinit(alloc);
