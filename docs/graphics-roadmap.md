@@ -149,7 +149,7 @@ wall interval, P95/P99, VRAM, texture uploads и dynamic updates — разны�
 
 ### Q1. Linear HDR → exposure → final output — инфраструктура выполнена 04.10.2026
 
-Единый HDR main target (обязательный RGBA16F), согласованные пайплайны/resolve/MSAA (`prepareMainTargets` канонический, fail-closed, без SDR-fallback; обязательные sample/filter/render/blend-caps — явная ошибка старта). Ранний display gamma/clamp удалён; тонемаппинг и display transfer — один раз в конце (один IEC transfer, ручной UNORM / hw-sRGB). Отключение эффектов не отключает output pass (exposure+tonemap всегда). Затем exposure: сейчас ручной `exposure`, auto-exposure (downsample log-luminance / histogram, metering mask, EV-limits, adaptation, camera-cut reset) — будущее.
+Единый HDR main target (обязательный RGBA16F), согласованные пайплайны/resolve/MSAA (`prepareMainTargets` канонический, fail-closed, без SDR-fallback; обязательные sample/filter/render/blend-caps — явная ошибка старта). Ранний display gamma/clamp удалён; тонемаппинг и display transfer — один раз в конце (один IEC transfer, ручной UNORM / hw-sRGB). Отключение эффектов не отключает output pass (exposure+tonemap всегда). Exposure: ручной `exposure` и автоматический auto-exposure (аналитический scene metering source с калибровкой middle-gray 18%, temporal eye adaptation с настраиваемыми скоростями speed_up/down, EV/exposure limits, автоматический camera-cut reset при `Scene.update`).
 
 **Гейт:** свет >1 сохраняется до tonemap; тёмная комната → яркое окно без
 клиппинга промежуточных targets, pumping, NaN или двойной gamma. Resize,
@@ -290,7 +290,7 @@ Quality presets/feature capabilities должны быть явными; unsuppo
 
 ## Ближайший выбор и критерий остановки
 
-После закрытия WIP — **Q0 → Q1 (инфраструктура выполнена, auto-exposure будущее) → Q2**. Далее выбрать **один GI-трек Q3**,
+После закрытия WIP — **Q0 → Q1 (инфраструктура и auto-exposure выполнены) → Q2**. Далее выбрать **один GI-трек Q3**,
 а temporal Q4 / atmosphere Q5 ранжировать по reference-сценам. P0 идёт рядом,
 P1 запускается только при доказанной задаче GPU visibility или CPU submission.
 Художественные эффекты включаются явно; HDR/output и staged-frame — единая основа,

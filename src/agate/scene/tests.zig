@@ -25,6 +25,7 @@ const RenderMeshItem = scene_mod.RenderMeshItem;
 const scene_lights = @import("light_rig.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
+const postprocess = @import("../postprocess.zig");
 
 // Staged-protocol test helpers (test-only, NOT a production compat wrapper):
 // - buildForTest: full producer build (claim.build -> stageUi -> publish),
@@ -249,7 +250,6 @@ test "zero highlights is structurally bit-identical (no passes, no state)" {
     try std.testing.expectEqual(@as(usize, 0), scene.highlightCount());
     try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(usize, 0), scene.preparedDraws().highlight_items.items.len);
-    const postprocess = @import("../postprocess.zig");
     try std.testing.expect(!postprocess.highlightActive(scene.post_process.enabled, scene.preparedDraws().highlight_items.items.len));
     // Post ON with zero items stays gated off too: renderChain skips the
     // whole PASS 2.85 block, so no mask/blur draws run and — by the lazy
@@ -282,7 +282,6 @@ test "shaft defaults are off with zero GPU state (bit-identical)" {
     // Fresh scene (and every load — shafts are transient, never
     // serialized): disabled by default, and the gate needs post + shaft
     // + live CSM data, so the default fixture keeps PASS 2.9 closed.
-    const postprocess = @import("../postprocess.zig");
     try std.testing.expect(!scene.post_process.shaft_enabled);
     try std.testing.expect(!postprocess.shaftActive(scene.post_process.enabled, scene.post_process, true));
     try std.testing.expect(!postprocess.shaftActive(true, scene.post_process, true));
@@ -6586,4 +6585,82 @@ test "slice6: staged prepare consumes frozen trail packet despite live mutation"
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), tm.mesh.local_bounding_box.min.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), tm.mesh.local_bounding_box.max.x, 1e-6);
     build2.publish();
+}
+
+test "auto-exposure: Scene.update automatic luminance metering and temporal lifecycle" {
+    const alloc = std.testing.allocator;
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+
+    scene.meshes = .empty;
+    scene.outline_meshes = .empty;
+    scene.cameras = .empty;
+    scene.draws = .{};
+    scene.frame_handoff = .{};
+    scene.light_handoff = .{};
+    scene.uploads = null;
+    scene.particles.systems = .empty;
+    scene.particles.frame = .empty;
+    scene.physics.world = null;
+    scene.physics.debug_lines = .empty;
+    scene.physics.prepared_lines = .empty;
+    scene.physics.build_lines = .empty;
+    scene.build_seq.store(0, .monotonic);
+    scene.last_latched_seq.store(0, .monotonic);
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Enable auto-exposure with calibrated middle-gray 0.18
+    var post = postprocess.PostProcessOptions{
+        .enabled = true,
+        .auto_exposure_enabled = true,
+        .auto_exposure_key_value = 0.18,
+        .auto_exposure_speed_up = 3.0,
+        .auto_exposure_speed_down = 3.0,
+        .auto_exposure_min = 0.01,
+        .auto_exposure_max = 16.0,
+    };
+    scene.lights.hemi.intensity = 0.0;
+    scene.setPostProcess(post);
+
+    // Initial adapted exposure is 1.0
+    try std.testing.expectEqual(@as(f32, 1.0), scene.getAdaptedExposure());
+
+    // 1. Moderate sun: sun intensity = 1.0
+    // First update tick performs instant snap (no history yet)
+    _ = try scene.createDirectionalLight("Sun", .{ .direction = Vec3.new(0, -1, 0), .diffuse = Color3.white, .intensity = 1.0 });
+    try scene.update(0.016);
+    const exp1 = scene.getAdaptedExposure();
+    try std.testing.expect(exp1 > 0.5 and exp1 < 2.0);
+
+    // 2. Bright sun jumps to 20.0: scene becomes much brighter
+    scene.lights.directional.?.intensity = 20.0;
+    // Over several updates with dt=0.1s, exposure adapts downward smoothly
+    var prev_exp = exp1;
+    for (0..10) |_| {
+        try scene.update(0.1);
+        const cur_exp = scene.getAdaptedExposure();
+        try std.testing.expect(cur_exp < prev_exp);
+        prev_exp = cur_exp;
+    }
+    // After adaptation, exposure is significantly lower than initial
+    try std.testing.expect(scene.getAdaptedExposure() < 0.15);
+
+    // 3. Camera cut test: when cut flag is set, adaptation snaps instantly in 1 tick
+    scene.post_process.auto_exposure_camera_cut = true;
+    // Set sun to pitch black
+    scene.lights.directional.?.intensity = 0.0;
+    try scene.update(0.016);
+    // Instant snap to near max exposure (pitch black scene)
+    try std.testing.expect(scene.getAdaptedExposure() > 10.0);
+    // Camera cut flag was cleared after consumption
+    try std.testing.expect(!scene.post_process.auto_exposure_camera_cut);
+
+    // 4. Disabling auto-exposure resets exposure to 1.0
+    post.auto_exposure_enabled = false;
+    scene.setPostProcess(post);
+    try std.testing.expectEqual(@as(f32, 1.0), scene.getAdaptedExposure());
 }

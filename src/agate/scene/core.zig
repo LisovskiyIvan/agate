@@ -687,6 +687,66 @@ pub const Scene = struct {
         return self.postfx.getAdaptedExposure();
     }
 
+    /// Estimates scene illuminance/luminance at the active camera for automatic auto-exposure metering.
+    pub fn estimateSceneLuminance(self: *const Scene) f32 {
+        var illuminance: f32 = 0.0;
+
+        // Hemispheric ambient contribution (ground + diffuse)
+        const hemi = self.lights.hemi;
+        if (hemi.intensity > 0.001) {
+            const hemi_luma = postprocess.calcLuminance(.{ hemi.ground_color.r, hemi.ground_color.g, hemi.ground_color.b }) * 0.3 +
+                postprocess.calcLuminance(.{ hemi.diffuse.r, hemi.diffuse.g, hemi.diffuse.b }) * 0.7;
+            illuminance += hemi_luma * hemi.intensity;
+        }
+
+        // Sky contribution
+        if (self.sky.enabled and self.sky.texture != null) {
+            illuminance += self.sky.exposure * 0.25;
+        }
+
+        // Directional sun contribution
+        if (self.lights.directional) |sun| {
+            if (sun.is_enabled and sun.intensity > 0.001) {
+                const sun_luma = postprocess.calcLuminance(.{ sun.diffuse.r, sun.diffuse.g, sun.diffuse.b }) * sun.intensity;
+                const inc = @max(-sun.direction.y, 0.2);
+                illuminance += sun_luma * inc;
+            }
+        }
+        for (self.lights.extra_directionals.items) |sun| {
+            if (sun.is_enabled and sun.intensity > 0.001) {
+                const sun_luma = postprocess.calcLuminance(.{ sun.diffuse.r, sun.diffuse.g, sun.diffuse.b }) * sun.intensity;
+                const inc = @max(-sun.direction.y, 0.2);
+                illuminance += sun_luma * inc;
+            }
+        }
+
+        // Local point/spot lights near active camera eye
+        const eye = if (self.active_camera) |cam| cam.getPosition() else Vec3.zero;
+
+        for (self.lights.point_lights.items) |pt| {
+            if (!pt.is_enabled or pt.intensity <= 0.001) continue;
+            const d2 = pt.position.sub(eye).lengthSq();
+            const r2 = pt.range * pt.range;
+            if (d2 < r2 * 4.0) {
+                const att = 1.0 / (1.0 + d2 / @max(r2, 1.0));
+                illuminance += postprocess.calcLuminance(.{ pt.color.r, pt.color.g, pt.color.b }) * pt.intensity * att * 0.25;
+            }
+        }
+        for (self.lights.spot_lights.items) |sp| {
+            if (!sp.is_enabled or sp.intensity <= 0.001) continue;
+            const d2 = sp.position.sub(eye).lengthSq();
+            const r2 = sp.range * sp.range;
+            if (d2 < r2 * 4.0) {
+                const att = 1.0 / (1.0 + d2 / @max(r2, 1.0));
+                illuminance += postprocess.calcLuminance(.{ sp.color.r, sp.color.g, sp.color.b }) * sp.intensity * att * 0.25;
+            }
+        }
+
+        // Calibrated 18% middle-gray average reflectance
+        const avg_luminance = illuminance * 0.18;
+        return @max(avg_luminance, postprocess.auto_exposure.LUMA_EPSILON);
+    }
+
     /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn setSSAO(self: *Scene, config: SSAOOptions) void {
         scene_lifecycle.setSSAO(self, config);

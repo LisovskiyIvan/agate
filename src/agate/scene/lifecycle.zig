@@ -34,7 +34,11 @@ pub fn resizeOffscreen(self: anytype, width: i32, height: i32) void {
 }
 
 pub fn setPostProcess(self: anytype, config: PostProcessOptions) void {
+    const was_enabled = self.post_process.auto_exposure_enabled;
     self.post_process = config;
+    if (was_enabled and !config.auto_exposure_enabled) {
+        self.postfx.resetAutoExposure();
+    }
 }
 
 pub fn setSSAO(self: anytype, config: SSAOOptions) void {

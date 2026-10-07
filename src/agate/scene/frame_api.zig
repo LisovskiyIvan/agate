@@ -370,6 +370,12 @@ pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     try self.updateParticles(dt);
     self.updateDecals(dt);
 
+    if (self.post_process.auto_exposure_enabled) {
+        const est_lum = self.estimateSceneLuminance();
+        _ = self.updateAutoExposure(est_lum, dt);
+        self.post_process.auto_exposure_camera_cut = false;
+    }
+
     const cur_w = sapp.width();
     const cur_h = sapp.height();
     const aspect = if (cur_h > 0) @as(f32, @floatFromInt(cur_w)) / @as(f32, @floatFromInt(cur_h)) else 1.0;
