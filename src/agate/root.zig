@@ -139,6 +139,8 @@ pub const DdsDecodeOptions = dds.DecodeOptions;
 pub const ExrDecodeError = exr.DecodeError;
 pub const ExrDecoded = exr.Decoded;
 pub const Texture = texture.Texture;
+pub const TextureColorSpace = texture.TextureColorSpace;
+pub const TextureSlot = texture.TextureSlot;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;
 
@@ -655,6 +657,8 @@ test "root re-exports cover recent Scene APIs" {
     _ = RawBlockTexture;
     _ = DdsDecodeError;
     _ = DdsDecodeOptions;
+    _ = TextureColorSpace;
+    _ = TextureSlot;
     _ = ExrDecodeError;
     _ = ExrDecoded;
     _ = LutFormat;

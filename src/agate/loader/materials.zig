@@ -45,7 +45,13 @@ const DecodeJob = struct {
     out: ?Texture.DecodedImage = null,
 
     fn run(self: *DecodeJob) void {
-        const opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = self.srgb, .basis_target = self.basis_target };
+        const opts: Texture.DecodeOptions = .{
+            .gen_mipmaps = true,
+            .srgb_to_linear = self.srgb,
+            .slot = if (self.srgb) .color else .data,
+            .color_space = if (self.srgb) .srgb else .linear,
+            .basis_target = self.basis_target,
+        };
         if (self.bytes) |b| {
             self.out = Texture.decodeImageMemory(self.allocator, b, opts) catch null;
         } else if (self.path) |p| {
@@ -231,6 +237,8 @@ pub fn textureOptionsFor(tex: [*c]const c.cgltf_texture, srgb: bool, max_anisotr
     }
     if (max_anisotropy) |a| opts.max_anisotropy = a;
     opts.srgb_to_linear = srgb;
+    opts.slot = if (srgb) .color else .data;
+    opts.color_space = if (srgb) .srgb else .linear;
     return opts;
 }
 
@@ -337,7 +345,13 @@ pub const AsyncTexCtx = struct {
         }
 
         const tex_options = textureOptionsFor(tex, srgb, self.max_anisotropy);
-        const decode_opts: Texture.DecodeOptions = .{ .gen_mipmaps = true, .srgb_to_linear = srgb, .basis_target = self.basis_target };
+        const decode_opts: Texture.DecodeOptions = .{
+            .gen_mipmaps = true,
+            .srgb_to_linear = srgb,
+            .slot = if (srgb) .color else .data,
+            .color_space = if (srgb) .srgb else .linear,
+            .basis_target = self.basis_target,
+        };
 
         const img = &self.gltf.images[img_idx];
         var pending: ?*assets.PendingTexture = null;
@@ -531,7 +545,9 @@ pub fn loadTextureFromView(
 fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Options) ?Texture {
     var dec = Texture.decodeImageMemory(scene.allocator, bytes, .{
         .gen_mipmaps = tex_options.mipmaps,
-        .srgb_to_linear = tex_options.srgb_to_linear,
+        .srgb_to_linear = tex_options.isColorSlot(),
+        .color_space = tex_options.color_space,
+        .slot = tex_options.slot,
         // Context thread here (asserted by the caller): snapshot the backend
         // so Basis payloads transcode to an uploadable target.
         .basis_target = Texture.basisTargetForCurrentThread(),
@@ -546,7 +562,9 @@ fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Op
 fn uploadDecodedFile(scene: *Scene, path: []const u8, tex_options: Texture.Options) ?Texture {
     var dec = Texture.decodeImageFile(scene.allocator, path, .{
         .gen_mipmaps = tex_options.mipmaps,
-        .srgb_to_linear = tex_options.srgb_to_linear,
+        .srgb_to_linear = tex_options.isColorSlot(),
+        .color_space = tex_options.color_space,
+        .slot = tex_options.slot,
         .basis_target = Texture.basisTargetForCurrentThread(),
     }) catch return null;
     defer dec.deinit(scene.allocator);

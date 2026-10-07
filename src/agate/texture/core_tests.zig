@@ -293,6 +293,65 @@ test "decodeMemory srgb_to_linear converts decoded pixels before upload" {
     try std.testing.expectEqual(@as(u8, 42), px[3]); // alpha never converted
 }
 
+test "decodeMemory TextureSlot and TextureColorSpace contract" {
+    const allocator = std.testing.allocator;
+    sokol.time.setup();
+
+    const scanlines = [_]u8{ 0, 200, 128, 25, 42 };
+    const png = try TestPng.build(allocator, 1, 1, 8, 6, null, &scanlines);
+    defer allocator.free(png);
+
+    // .slot = .color -> converts sRGB to linear, is_srgb = true
+    {
+        var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false, .slot = .color });
+        defer raw.deinit(allocator);
+        try std.testing.expect(raw.is_srgb);
+        const px = raw.levels[0].?;
+        try std.testing.expectEqual(@as(u8, 147), px[0]);
+    }
+
+    // .slot = .data -> keeps linear raw bytes, is_srgb = false
+    {
+        var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false, .slot = .data });
+        defer raw.deinit(allocator);
+        try std.testing.expect(!raw.is_srgb);
+        const px = raw.levels[0].?;
+        try std.testing.expectEqual(@as(u8, 200), px[0]);
+    }
+
+    // .color_space = .srgb -> converts
+    {
+        var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false, .color_space = .srgb });
+        defer raw.deinit(allocator);
+        try std.testing.expect(raw.is_srgb);
+        const px = raw.levels[0].?;
+        try std.testing.expectEqual(@as(u8, 147), px[0]);
+    }
+
+    // .color_space = .linear -> does not convert
+    {
+        var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = false, .color_space = .linear });
+        defer raw.deinit(allocator);
+        try std.testing.expect(!raw.is_srgb);
+        const px = raw.levels[0].?;
+        try std.testing.expectEqual(@as(u8, 200), px[0]);
+    }
+
+    // Precedence: color_space overrides slot and srgb_to_linear
+    {
+        var raw = try Texture.decodeMemory(allocator, png, .{
+            .gen_mipmaps = false,
+            .slot = .color,
+            .srgb_to_linear = true,
+            .color_space = .linear,
+        });
+        defer raw.deinit(allocator);
+        try std.testing.expect(!raw.is_srgb);
+        const px = raw.levels[0].?;
+        try std.testing.expectEqual(@as(u8, 200), px[0]);
+    }
+}
+
 test "buildRaw mip chain has correct levels, sizes and box-filter colors" {
     const allocator = std.testing.allocator;
 

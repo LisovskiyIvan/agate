@@ -62,13 +62,38 @@ pub const DecodeError = error{
     OutOfMemory,
 };
 
-/// Decode switches. `srgb` is the LEGACY sRGB decision: legacy
-/// DXT1/DXT3/DXT5 headers carry no color-space tag, so true selects the
-/// sRGB GPU variant where one exists (DXT5 -> BC3_SRGBA; DXT1/DXT3 stay
-/// UNORM — sokol has no BC1_SRGBA/BC2_SRGBA). DX10 files ignore it: the
-/// DXGI _SRGB code is authoritative.
+pub const TextureColorSpace = enum {
+    linear,
+    srgb,
+};
+
+pub const TextureSlot = enum {
+    color, // albedo, emissive, base color (sRGB)
+    data, // normal, metallic_roughness, occlusion, height, lookup (linear)
+
+    pub fn colorSpace(self: TextureSlot) TextureColorSpace {
+        return switch (self) {
+            .color => .srgb,
+            .data => .linear,
+        };
+    }
+};
+
+/// Decode switches. `srgb` is the legacy sRGB decision: legacy
+/// DXT1/DXT3/DXT5 headers carry no color-space tag, so true (or slot = .color
+/// or color_space = .srgb) selects the sRGB GPU variant where one exists
+/// (DXT5 -> BC3_SRGBA; DXT1/DXT3 stay UNORM — sokol has no BC1_SRGBA/BC2_SRGBA).
+/// DX10 files ignore it: the DXGI _SRGB code is authoritative.
 pub const DecodeOptions = struct {
     srgb: bool = false,
+    color_space: ?TextureColorSpace = null,
+    slot: ?TextureSlot = null,
+
+    pub fn isSrgb(self: DecodeOptions) bool {
+        if (self.color_space) |cs| return cs == .srgb;
+        if (self.slot) |s| return s.colorSpace() == .srgb;
+        return self.srgb;
+    }
 };
 
 // DDS_HEADER dwFlags bits.
@@ -189,7 +214,7 @@ fn parseHeader(bytes: []const u8, opts: DecodeOptions) DecodeError!Layout {
     const format: ktx2.BlockFormat = switch (fourcc) {
         fourcc_dxt1 => .bc1_unorm,
         fourcc_dxt3 => .bc2_unorm,
-        fourcc_dxt5 => if (opts.srgb) .bc3_srgb else .bc3_unorm,
+        fourcc_dxt5 => if (opts.isSrgb()) .bc3_srgb else .bc3_unorm,
         fourcc_dx10 => blk: {
             if (bytes.len < magic.len + header_size + dx10_size) return error.Truncated;
             const dx = base + header_size;
@@ -498,6 +523,29 @@ test "format mapping covers fourCC, DXGI and the legacy sRGB decision" {
     var srgb_raw = try decodeBlock2D(allocator, srgb_file, .{ .srgb = true });
     defer srgb_raw.deinit(allocator);
     try testing.expect(srgb_raw.format.isSrgb());
+
+    // Explicit TextureSlot contract
+    var slot_color = try decodeBlock2D(allocator, srgb_file, .{ .slot = .color });
+    defer slot_color.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc3_srgb, slot_color.format);
+
+    var slot_data = try decodeBlock2D(allocator, srgb_file, .{ .slot = .data });
+    defer slot_data.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc3_unorm, slot_data.format);
+
+    // Explicit TextureColorSpace contract
+    var cs_srgb = try decodeBlock2D(allocator, srgb_file, .{ .color_space = .srgb });
+    defer cs_srgb.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc3_srgb, cs_srgb.format);
+
+    var cs_linear = try decodeBlock2D(allocator, srgb_file, .{ .color_space = .linear });
+    defer cs_linear.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc3_unorm, cs_linear.format);
+
+    // Precedence: color_space overrides slot and srgb boolean
+    var override_cs = try decodeBlock2D(allocator, srgb_file, .{ .slot = .color, .color_space = .linear, .srgb = true });
+    defer override_cs.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc3_unorm, override_cs.format);
 }
 
 test "decodeBlock2D rejects bad magic, sizes and malformed headers" {
@@ -653,6 +701,20 @@ test "Texture.decodeImageMemory routes DDS payloads to the block path" {
     defer color.deinit(allocator);
     switch (color) {
         .block => |b| try testing.expectEqual(ktx2.BlockFormat.bc3_srgb, b.format),
+        .rgba => return error.TestUnexpectedResult,
+    }
+
+    var slot_color = try Texture.decodeImageMemory(allocator, file, .{ .slot = .color });
+    defer slot_color.deinit(allocator);
+    switch (slot_color) {
+        .block => |b| try testing.expectEqual(ktx2.BlockFormat.bc3_srgb, b.format),
+        .rgba => return error.TestUnexpectedResult,
+    }
+
+    var slot_data = try Texture.decodeImageMemory(allocator, file, .{ .slot = .data });
+    defer slot_data.deinit(allocator);
+    switch (slot_data) {
+        .block => |b| try testing.expectEqual(ktx2.BlockFormat.bc3_unorm, b.format),
         .rgba => return error.TestUnexpectedResult,
     }
 

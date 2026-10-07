@@ -19,7 +19,15 @@ const exr = @import("../exr.zig");
 const color = @import("color.zig");
 const mip = @import("mip.zig");
 
+pub const TextureColorSpace = dds.TextureColorSpace;
+pub const TextureSlot = dds.TextureSlot;
+
 pub const Texture = struct {
+    pub const TextureColorSpace = dds.TextureColorSpace;
+    pub const TextureSlot = dds.TextureSlot;
+    pub const ColorSpace = dds.TextureColorSpace;
+    pub const Slot = dds.TextureSlot;
+
     image: sg.Image,
     view: sg.View,
     sampler: sg.Sampler,
@@ -57,13 +65,26 @@ pub const Texture = struct {
         /// Signed distance fields must not be box-downsampled: the mip chain
         /// dilutes thin strokes and the shader edge drifts. Disable for fonts.
         mipmaps: bool = true,
+        /// Explicit color space contract. Takes precedence over `slot` and `srgb_to_linear`.
+        color_space: ?dds.TextureColorSpace = null,
+        /// Semantic asset slot contract:
+        /// - `.color`: albedo / emissive / base color (sRGB space)
+        /// - `.data`: normal / metallic_roughness / occlusion / height / lookup (linear space)
+        slot: ?dds.TextureSlot = null,
         /// Convert sRGB to linear at load time, BEFORE mip generation (the
         /// box filter then averages in linear space). Turn ON for LDR color
         /// textures that feed lighting math (glTF albedo/emissive), keep OFF
         /// for data textures (normal / metallic-roughness / occlusion: they
         /// are authored linear) and for GPU-bound views where the raw bytes
         /// matter (fonts, LUTs, sprites drawn without lighting).
+        /// Kept for backward compatibility; prefer explicit `color_space` or `slot`.
         srgb_to_linear: bool = false,
+
+        pub fn isColorSlot(self: Options) bool {
+            if (self.color_space) |cs| return cs == .srgb;
+            if (self.slot) |s| return s.colorSpace() == .srgb;
+            return self.srgb_to_linear;
+        }
     };
 
     /// Mip selection filter actually handed to sokol: the authored filter
@@ -312,9 +333,16 @@ pub const Texture = struct {
     }
 
     /// Decode-time switches for the CPU paths (GPU-free, thread-safe).
-    /// srgb_to_linear converts RGB lanes before the mip chain is built.
     pub const DecodeOptions = struct {
         gen_mipmaps: bool = true,
+        /// Explicit color space contract. Takes precedence over `slot` and `srgb_to_linear`.
+        color_space: ?dds.TextureColorSpace = null,
+        /// Semantic asset slot contract:
+        /// - `.color`: albedo / emissive / base color (sRGB space)
+        /// - `.data`: normal / metallic_roughness / occlusion / height / lookup (linear space)
+        slot: ?dds.TextureSlot = null,
+        /// Legacy fallback: converts RGB lanes before the mip chain is built, or selects
+        /// the legacy DDS sRGB variant. Kept for backward compatibility.
         srgb_to_linear: bool = false,
         /// Transcode target for KTX2 Basis payloads (ETC1S/UASTC); ignored
         /// by every other format. Null = desktop-first .bc7 default (the
@@ -323,6 +351,12 @@ pub const Texture = struct {
         /// basisTargetForCurrentThread() so worker decodes already carry the
         /// backend-accurate target.
         basis_target: ?ktx2.BasisTarget = null,
+
+        pub fn isColorSlot(self: DecodeOptions) bool {
+            if (self.color_space) |cs| return cs == .srgb;
+            if (self.slot) |s| return s.colorSpace() == .srgb;
+            return self.srgb_to_linear;
+        }
     };
 
     // -----------------------------------------------------------------------
@@ -506,6 +540,7 @@ pub const Texture = struct {
     /// with DdsRequiresBlockDecode) — use decodeImageMemory or
     /// fromDdsMemory instead.
     pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
+        const is_color = opts.isColorSlot();
         if (ktx2.isBasisKtx2(bytes)) {
             // Report the file's own validation error when malformed (init or
             // subset gate), so a corrupt Basis file never degrades into a
@@ -517,7 +552,11 @@ pub const Texture = struct {
             // Report the file's own validation error when malformed, so a
             // corrupt DDS never degrades into a generic stb failure; a
             // valid DDS names the correct API instead.
-            var tmp = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = opts.srgb_to_linear });
+            var tmp = try dds.decodeBlock2D(allocator, bytes, .{
+                .srgb = is_color,
+                .color_space = opts.color_space,
+                .slot = opts.slot,
+            });
             tmp.deinit(allocator);
             return error.DdsRequiresBlockDecode;
         }
@@ -527,7 +566,7 @@ pub const Texture = struct {
                 // The caller's per-slot color/data decision is authoritative;
                 // ktx2's format-tag auto detection applies only to its own
                 // direct API (DecodeOptions.srgb_to_linear = null).
-                .srgb_to_linear = opts.srgb_to_linear,
+                .srgb_to_linear = is_color,
             });
         }
 
@@ -551,13 +590,13 @@ pub const Texture = struct {
         const size_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
         // Fused L0 convert-copy (single pass, stride loop) so the box
         // filter still averages in linear space with bit-identical bytes.
-        if (opts.srgb_to_linear) {
+        if (is_color) {
             var raw = try buildRawSrgbFused(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
-            raw.is_srgb = opts.srgb_to_linear;
+            raw.is_srgb = true;
             return raw;
         }
         var raw = try buildRaw(allocator, width, height, data[0..size_bytes], opts.gen_mipmaps);
-        raw.is_srgb = opts.srgb_to_linear;
+        raw.is_srgb = false;
         return raw;
     }
 
@@ -625,20 +664,27 @@ pub const Texture = struct {
     /// the authored levels and the GPU format). For Basis, srgb_to_linear is
     /// the explicit RGBA32-path decision (block targets follow the file DFD).
     pub fn decodeImageMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !DecodedImage {
+        const is_color = opts.isColorSlot();
         if (ktx2.isBasisKtx2(bytes)) {
             const t = opts.basis_target orelse .bc7;
             return try ktx2.decodeBasis2D(allocator, bytes, t, .{
                 .gen_mipmaps = opts.gen_mipmaps,
-                .srgb_to_linear = opts.srgb_to_linear,
+                .srgb_to_linear = is_color,
             });
         }
         if (ktx2.isBlockKtx2(bytes)) {
             return .{ .block = try ktx2.decodeBlock2D(allocator, bytes) };
         }
         if (dds.sniff(bytes)) {
-            return .{ .block = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = opts.srgb_to_linear }) };
+            return .{ .block = try dds.decodeBlock2D(allocator, bytes, .{
+                .srgb = is_color,
+                .color_space = opts.color_space,
+                .slot = opts.slot,
+            }) };
         }
-        return .{ .rgba = try decodeMemory(allocator, bytes, opts) };
+        var raw_opts = opts;
+        raw_opts.srgb_to_linear = is_color;
+        return .{ .rgba = try decodeMemory(allocator, bytes, raw_opts) };
     }
 
     /// File variant of decodeImageMemory. Same buffered-read pattern as
@@ -805,7 +851,9 @@ pub const Texture = struct {
     pub fn fromMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
         var raw = try decodeMemory(allocator, bytes, .{
             .gen_mipmaps = options.mipmaps,
-            .srgb_to_linear = options.srgb_to_linear,
+            .srgb_to_linear = options.isColorSlot(),
+            .color_space = options.color_space,
+            .slot = options.slot,
         });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
@@ -814,7 +862,9 @@ pub const Texture = struct {
     pub fn fromFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
         var raw = try decodeFile(allocator, file_path, .{
             .gen_mipmaps = options.mipmaps,
-            .srgb_to_linear = options.srgb_to_linear,
+            .srgb_to_linear = options.isColorSlot(),
+            .color_space = options.color_space,
+            .slot = options.slot,
         });
         defer raw.deinit(allocator);
         return fromRaw(&raw, options);
@@ -848,7 +898,7 @@ pub const Texture = struct {
         const t = target orelse basisTargetForCurrentThread() orelse .bc7;
         var dec = try ktx2.decodeBasis2D(allocator, bytes, t, .{
             .gen_mipmaps = options.mipmaps,
-            .srgb_to_linear = options.srgb_to_linear,
+            .srgb_to_linear = options.isColorSlot(),
         });
         defer dec.deinit(allocator);
         return switch (dec) {
@@ -889,7 +939,11 @@ pub const Texture = struct {
     /// glTF never references .dds (the spec has no such image MIME), so
     /// there is no glTF wiring — this is the standalone entry point.
     pub fn fromDdsMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
-        var raw = try dds.decodeBlock2D(allocator, bytes, .{ .srgb = options.srgb_to_linear });
+        var raw = try dds.decodeBlock2D(allocator, bytes, .{
+            .srgb = options.isColorSlot(),
+            .color_space = options.color_space,
+            .slot = options.slot,
+        });
         defer raw.deinit(allocator);
         return fromRawBlock(&raw, options);
     }

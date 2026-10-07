@@ -38,6 +38,8 @@ const cube = @import("texture/cube.zig");
 
 // 2D texture (lives in texture/core.zig).
 pub const Texture = core.Texture;
+pub const TextureColorSpace = core.TextureColorSpace;
+pub const TextureSlot = core.TextureSlot;
 
 // Cube texture and its gradient options (live in texture/cube.zig).
 pub const CubeTexture = cube.CubeTexture;

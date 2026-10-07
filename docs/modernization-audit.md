@@ -302,7 +302,7 @@ BC1/BC3/BC7 как GPU-компрессия не устарели от возр�
 | 9 | Float-only timing helpers удалены; `?Sample` сохраняет availability и submission id, валидные 0ms не теряются. |
 | 10 | Старые CLI flags отвергаются с exit 2. `--no-threads` и `--prepare-exclusion` меняют только scheduling/exclusion того же staged-протокола; GPU legs и measurement script переведены. |
 | 11 | Только AGSC v3 runtime reader, v2 отвергается. Порядок байтов v3 и значение `bloom_radius` сохранены; пользовательские assets не изменены. |
-| 12 | Инвентаризация Agate/sandbox/bench нашла один DDS: `sandbox/assets/fox_basecolor.dds`, DX10/BC7 sRGB (DXGI 99). FourCC reader и color/data-slot API пока не переделаны; внешний набор ассетов этим поиском не покрыт. |
+| 12 | Инвентаризация Agate/sandbox/bench нашла один DDS: `sandbox/assets/fox_basecolor.dds`, DX10/BC7 sRGB (DXGI 99). Введён явный контракт `TextureSlot` (`.color`/`.data`) и `TextureColorSpace` (`.srgb`/`.linear`) в `Texture.Options`, `Texture.DecodeOptions` и `dds.DecodeOptions`; приоритет `color_space` → `slot` → `srgb_to_linear` (булев флаг оставлен как fallback). Решение применяется единообразно к RGBA-конверсии, Basis RGBA32, KTX2 и legacy FourCC DDS; DX10/KTX2 теги остаются авторитетными. glTF loader передаёт явный slot/color_space. Удаление FourCC reader отложено до инвентаризации внешних ассетов. |
 
 Текущая staged-сборка: browser WebGPU — четыре 240-frame leg (1× UNORM,
 4× UNORM, 1× hardware-sRGB, запрос 2× → 1×), без ошибок и живых sokol allocations
