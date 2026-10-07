@@ -183,6 +183,7 @@ test {
     _ = @import("postprocess/bloom.zig");
     _ = @import("postprocess/bloom_tests.zig");
     _ = @import("postprocess/color_curves.zig");
+    _ = @import("postprocess/contact_shadows.zig");
     _ = @import("postprocess/depth_pyramid.zig");
     _ = @import("postprocess/dof.zig");
     _ = @import("postprocess/dof_tests.zig");

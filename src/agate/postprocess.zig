@@ -14,6 +14,7 @@ pub const options = @import("postprocess/options.zig");
 pub const hdr = @import("postprocess/hdr.zig");
 pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
+pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -133,6 +134,14 @@ pub const depthPyramidMipSize = depth_pyramid.depthPyramidMipSize;
 pub const computeMipCount = depth_pyramid.computeMipCount;
 pub const reduceConservativeDepth = depth_pyramid.reduceConservativeDepth;
 pub const depthPyramidActive = depth_pyramid.depthPyramidActive;
+// --- Contact Shadows ---
+pub const CONTACT_SHADOWS_STEPS_MIN = contact_shadows.CONTACT_SHADOWS_STEPS_MIN;
+pub const CONTACT_SHADOWS_STEPS_MAX = contact_shadows.CONTACT_SHADOWS_STEPS_MAX;
+pub const CONTACT_SHADOWS_DISTANCE_MIN = contact_shadows.CONTACT_SHADOWS_DISTANCE_MIN;
+pub const CONTACT_SHADOWS_THICKNESS_MIN = contact_shadows.CONTACT_SHADOWS_THICKNESS_MIN;
+pub const contactShadowsActive = contact_shadows.contactShadowsActive;
+pub const contactShadowParams = contact_shadows.contactShadowParams;
+pub const calcContactShadowAttenuation = contact_shadows.calcContactShadowAttenuation;
 
 test {
     _ = types;
@@ -148,4 +157,5 @@ test {
     _ = hdr;
     _ = auto_exposure;
     _ = depth_pyramid;
+    _ = contact_shadows;
 }

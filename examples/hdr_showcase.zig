@@ -265,6 +265,7 @@ fn setupScene() void {
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
     scene.post_process.fog_enabled = false;
+    scene.post_process.contact_shadows_enabled = true;
     if (frame_limit > 0) setupFiniteFixtures();
     std.debug.print("hdr-showcase: setup backend={s} msaa={} srgb={} env_color_fmt={s} swapchain_fmt={s} hdr_caps_sample={} hdr_caps_filter={} hdr_caps_render={} hdr_caps_blend={} hdr_caps_msaa={}\n", .{
         @tagName(sg.queryBackend()),

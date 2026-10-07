@@ -708,7 +708,7 @@ pub const PostProcessPass = struct {
                 near_z,
                 far_z,
                 @floatFromInt(config.ssr_steps),
-                0.0,
+                @floatFromInt(config.contact_shadows_steps),
             },
             .camera_pos = .{
                 camera_pos.x,
@@ -770,6 +770,8 @@ pub const PostProcessPass = struct {
             // (enabled 1/0, intensity, 0, 0); zeros when the shaft is off,
             // which keeps the composite identical to the pre-shaft path.
             .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
+            // (enabled 1/0, intensity, distance, thickness); zeros when off
+            .contact_shadow_params = postprocess.contactShadowParams(config),
             .grade_shadows = .{
                 config.grade_shadows[0],
                 config.grade_shadows[1],

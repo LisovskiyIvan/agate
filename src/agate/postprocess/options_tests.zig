@@ -46,10 +46,34 @@ test "effect master preserves exposure and tone curve without mutating authored 
     const frame = config.forFrame();
     try std.testing.expectEqual(@as(f32, 2), frame.exposure);
     try std.testing.expectEqual(TonemappingType.reinhard, frame.tonemapping);
-    try std.testing.expect(!frame.bloom_enabled and !frame.glow_enabled and !frame.taa_enabled and !frame.fxaa_enabled and !frame.fog_enabled and !frame.ssr_enabled);
+    try std.testing.expect(!frame.bloom_enabled and !frame.glow_enabled and !frame.taa_enabled and !frame.fxaa_enabled and !frame.fog_enabled and !frame.ssr_enabled and !frame.contact_shadows_enabled);
     try std.testing.expectEqual(@as(f32, 1), frame.saturation);
     try std.testing.expectEqual(@as(f32, 1), frame.contrast);
     try std.testing.expect(config.taa_enabled and config.glow_enabled);
     const enabled = PostProcessOptions{ .enabled = true, .taa_enabled = true };
     try std.testing.expectEqual(enabled.clamped(), enabled.forFrame());
+}
+
+test "contact shadows options clamp and validate correctly" {
+    var custom = PostProcessOptions{
+        .contact_shadows_intensity = 2.5,
+        .contact_shadows_distance = -0.5,
+        .contact_shadows_thickness = -0.1,
+        .contact_shadows_steps = 100,
+    };
+    const c = custom.clamped();
+    try std.testing.expectEqual(@as(f32, 1.0), c.contact_shadows_intensity);
+    try std.testing.expectEqual(@as(f32, 0.01), c.contact_shadows_distance);
+    try std.testing.expectEqual(@as(f32, 0.001), c.contact_shadows_thickness);
+    try std.testing.expectEqual(@as(u32, 32), c.contact_shadows_steps);
+
+    // Non-finite values fallback gracefully
+    const nan_cfg = (PostProcessOptions{
+        .contact_shadows_intensity = std.math.nan(f32),
+        .contact_shadows_distance = std.math.inf(f32),
+        .contact_shadows_thickness = -std.math.inf(f32),
+    }).clamped();
+    try std.testing.expectEqual(@as(f32, 0.5), nan_cfg.contact_shadows_intensity);
+    try std.testing.expectEqual(@as(f32, 0.3), nan_cfg.contact_shadows_distance);
+    try std.testing.expectEqual(@as(f32, 0.05), nan_cfg.contact_shadows_thickness);
 }

@@ -42,6 +42,7 @@ layout(binding = 0) uniform fs_params {
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
+    vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
     // APPENDED LAST (display transfer): x = manual display encode needed
     // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
     // 0 = sRGB target: output linear, hardware encodes). yzw unused. Packed
@@ -112,14 +113,7 @@ vec3 projectWorldToUvDepth(vec3 world_pos) {
     return vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
 }
 
-vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
-    if (ssr_params.x < 0.5) return scene_color;
-    if (raw_depth >= 0.9999) return scene_color;
-
-    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
-    vec3 V = normalize(world_pos - camera_pos.xyz);
-
-    // Reconstruct world normal from depth buffer
+vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {
     vec2 texel = resolution.zw;
     float d_r = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
     float d_l = texture(sampler2D(depth_tex, depth_smp), uv - vec2(texel.x, 0.0)).r;
@@ -133,7 +127,18 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
     vec3 dx = (abs(p_r.z - world_pos.z) < abs(p_l.z - world_pos.z)) ? (p_r - world_pos) : (world_pos - p_l);
     vec3 dy = (abs(p_u.z - world_pos.z) < abs(p_d.z - world_pos.z)) ? (p_u - world_pos) : (world_pos - p_d);
-    vec3 N = normalize(cross(dx, dy));
+    vec3 n = cross(dx, dy);
+    float len_sq = dot(n, n);
+    return (len_sq > 1e-6) ? (n * inversesqrt(len_sq)) : vec3(0.0, 1.0, 0.0);
+}
+
+vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
+    if (ssr_params.x < 0.5) return scene_color;
+    if (raw_depth >= 0.9999) return scene_color;
+
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec3 V = normalize(world_pos - camera_pos.xyz);
+    vec3 N = reconstructWorldNormal(uv, world_pos);
 
     // Only reflect on upward horizontal surfaces (floor/ground)
     if (N.y < 0.45) return scene_color;
@@ -190,6 +195,83 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
             scene_color = mix(scene_color, refl_color, ssr_params.y * edge_fade * dist_fade * fresnel);
             break;
         }
+    }
+
+    return scene_color;
+}
+
+vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
+    if (contact_shadow_params.x < 0.5) return scene_color;
+    if (raw_depth >= 0.9999) return scene_color;
+
+    float intensity = contact_shadow_params.y;
+    if (intensity <= 0.001) return scene_color;
+
+    vec3 L = sun_dir.xyz;
+    if (dot(L, L) < 0.1) return scene_color;
+
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec3 N = reconstructWorldNormal(uv, world_pos);
+
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0) return scene_color;
+
+    float max_dist = contact_shadow_params.z;
+    float thickness = contact_shadow_params.w;
+    int steps = int(camera_params.w);
+    if (steps < 4) steps = 12;
+
+    float step_size = max_dist / float(steps);
+    // Ray offset from surface to avoid self-shadowing acne
+    vec3 ray_start = world_pos + N * 0.015 + L * 0.008;
+    vec3 ray_dir_step = L * step_size;
+
+    vec4 clip_start = view_proj * vec4(ray_start, 1.0);
+    vec4 clip_step = view_proj * vec4(ray_dir_step, 0.0);
+
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float occlusion = 0.0;
+
+    for (int i = 1; i <= steps; i++) {
+        float t = float(i) - (1.0 - jitter);
+        vec4 march_clip = clip_start + clip_step * t;
+        if (march_clip.w <= 0.0001) break;
+
+        vec3 ndc = march_clip.xyz / march_clip.w;
+        vec2 march_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+        if (march_uv.x < 0.005 || march_uv.x > 0.995 || march_uv.y < 0.005 || march_uv.y > 0.995) {
+            break;
+        }
+
+        float scene_d = texture(sampler2D(depth_tex, depth_smp), march_uv).r;
+        if (scene_d >= 0.9999) continue;
+
+        if (ndc.z < scene_d) continue;
+
+        vec3 ray_pos = ray_start + ray_dir_step * t;
+        vec3 scene_pos = reconstructWorldPos(march_uv, scene_d);
+
+        float ray_cam_dist = length(ray_pos - camera_pos.xyz);
+        float scene_cam_dist = length(scene_pos - camera_pos.xyz);
+        float depth_diff = ray_cam_dist - scene_cam_dist;
+
+        if (depth_diff >= 0.0 && depth_diff < thickness) {
+            vec2 edge_dist = min(march_uv, vec2(1.0) - march_uv);
+            float edge_fade = clamp(min(edge_dist.x, edge_dist.y) * 20.0, 0.0, 1.0);
+
+            float dist_ratio = t / float(steps);
+            float dist_fade = 1.0 - dist_ratio * dist_ratio;
+            float hit_factor = 1.0 - (depth_diff / thickness);
+
+            occlusion = hit_factor * dist_fade * edge_fade;
+            break;
+        }
+    }
+
+    if (occlusion > 0.0) {
+        float shadow_attenuation = clamp(1.0 - occlusion * intensity * NdotL, 0.0, 1.0);
+        scene_color *= shadow_attenuation;
     }
 
     return scene_color;
@@ -294,9 +376,9 @@ vec3 sampleScene(vec2 uv) {
 
     vec3 color = base_color;
 
-    // Depth-dependent passes: Motion Blur, SSR, SSAO, and Atmospheric Fog
+    // Depth-dependent passes: Motion Blur, Contact Shadows, SSR, SSAO, and Atmospheric Fog
     float raw_depth = 0.0;
-    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5);
+    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5);
     if (needs_depth) {
         raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     }
@@ -304,6 +386,11 @@ vec3 sampleScene(vec2 uv) {
     // Camera Motion Blur: gathers HDR scene samples along screen velocity
     if (motion_blur_params.x > 0.5) {
         color = applyMotionBlur(color, uv, raw_depth);
+    }
+
+    // Screen-Space Contact Shadows & Local Occlusion
+    if (contact_shadow_params.x > 0.5) {
+        color = applyContactShadows(color, uv, raw_depth);
     }
 
     // Screen-Space Reflections (SSR)
