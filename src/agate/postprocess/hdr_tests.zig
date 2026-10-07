@@ -45,7 +45,7 @@ test "radiance above 1 survives until the tonemap and stays distinct" {
     const e2 = tonemap(.{ 1.0, 1.0, 1.0 }, 2.0, m)[0];
     try std.testing.expect(e2 > t1);
     // Zero exposure renders black on every mode.
-    for ([_]types.TonemappingType{ .none, .aces, .reinhard }) |mode| {
+    for ([_]types.TonemappingType{ .none, .aces, .reinhard, .filmic, .agx, .neutral }) |mode| {
         const black = tonemap(.{ 8.0, 4.0, 2.0 }, 0.0, mode);
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), black[0], 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), black[1], 1e-6);
@@ -72,7 +72,7 @@ test "finite bound, half max, and exposure sanitize as documented" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), zero_inf[0], 1e-6);
     for (zero_inf[1..]) |v| try std.testing.expect(std.math.isFinite(v));
     // Post-exposure bound: huge/Inf exposure stays finite on every mode.
-    for ([_]types.TonemappingType{ .none, .aces, .reinhard }) |mode| {
+    for ([_]types.TonemappingType{ .none, .aces, .reinhard, .filmic, .agx, .neutral }) |mode| {
         const huge = tonemap(.{ 4.0, 2.0, 1.0 }, 1e10, mode);
         for (huge) |v| try std.testing.expect(std.math.isFinite(v) and v >= 0.0 and v <= 1.0);
         const inf_e = tonemap(.{ 4.0, 2.0, 1.0 }, std.math.inf(f32), mode);
@@ -87,4 +87,19 @@ test "exactly one output encode: linear for sRGB targets, encoded for UNORM" {
     const t = tonemap(c, 1.0, .aces);
     try std.testing.expectEqual(t, lin);
     try std.testing.expectEqual(linearToSrgb3(t), enc);
+}
+
+test "filmic, agx, and neutral curves preserve monotonic brightness and finite bounds" {
+    const modes = [_]types.TonemappingType{ .filmic, .agx, .neutral };
+    for (modes) |m| {
+        const dark = tonemap(.{ 0.1, 0.1, 0.1 }, 1.0, m);
+        const mid = tonemap(.{ 0.5, 0.5, 0.5 }, 1.0, m);
+        const bright = tonemap(.{ 1.0, 1.0, 1.0 }, 1.0, m);
+        const super = tonemap(.{ 5.0, 5.0, 5.0 }, 1.0, m);
+
+        try std.testing.expect(dark[0] < mid[0]);
+        try std.testing.expect(mid[0] < bright[0]);
+        try std.testing.expect(bright[0] <= super[0]);
+        try std.testing.expect(super[0] <= 1.0);
+    }
 }

@@ -134,6 +134,127 @@ pub fn buildIdentityLutStrip(allocator: std.mem.Allocator, size: u32) ![]u8 {
     return buf;
 }
 
+pub const FilmLutPreset = enum {
+    identity,
+    cinematic_warm,
+    cinematic_cold,
+    teal_orange,
+    bleach_bypass,
+    monochrome_film,
+};
+
+pub fn applyFilmLutPreset(rgb: [3]f32, preset: FilmLutPreset) [3]f32 {
+    const r = std.math.clamp(rgb[0], 0.0, 1.0);
+    const g = std.math.clamp(rgb[1], 0.0, 1.0);
+    const b = std.math.clamp(rgb[2], 0.0, 1.0);
+    const luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+
+    switch (preset) {
+        .identity => return .{ r, g, b },
+        .cinematic_warm => {
+            const cr = r * r * (3.0 - 2.0 * r);
+            const cg = g * g * (3.0 - 2.0 * g);
+            const cb = b * b * (3.0 - 2.0 * b);
+            const w_shadow = std.math.clamp(1.0 - luma * 2.0, 0.0, 1.0);
+            const w_high = std.math.clamp((luma - 0.5) * 2.0, 0.0, 1.0);
+            return .{
+                std.math.clamp(cr + 0.06 * w_shadow + 0.05 * w_high, 0.0, 1.0),
+                std.math.clamp(cg + 0.02 * w_shadow + 0.03 * w_high, 0.0, 1.0),
+                std.math.clamp(cb - 0.04 * w_shadow - 0.02 * w_high, 0.0, 1.0),
+            };
+        },
+        .cinematic_cold => {
+            const w_shadow = std.math.clamp(1.0 - luma * 2.0, 0.0, 1.0);
+            const sat = 0.82;
+            const dr = luma + (r - luma) * sat;
+            const dg = luma + (g - luma) * sat;
+            const db = luma + (b - luma) * sat;
+            return .{
+                std.math.clamp(dr - 0.04 * w_shadow, 0.0, 1.0),
+                std.math.clamp(dg + 0.02 * w_shadow, 0.0, 1.0),
+                std.math.clamp(db + 0.09 * w_shadow, 0.0, 1.0),
+            };
+        },
+        .teal_orange => {
+            const w_s = std.math.clamp(1.0 - luma * 2.0, 0.0, 1.0);
+            const w_h = std.math.clamp((luma - 0.5) * 2.0, 0.0, 1.0);
+            const out_r = r - 0.08 * w_s + 0.12 * w_h;
+            const out_g = g + 0.02 * w_s + 0.04 * w_h;
+            const out_b = b + 0.14 * w_s - 0.08 * w_h;
+            return .{
+                std.math.clamp(out_r, 0.0, 1.0),
+                std.math.clamp(out_g, 0.0, 1.0),
+                std.math.clamp(out_b, 0.0, 1.0),
+            };
+        },
+        .bleach_bypass => {
+            const desat_r = luma + (r - luma) * 0.45;
+            const desat_g = luma + (g - luma) * 0.45;
+            const desat_b = luma + (b - luma) * 0.45;
+            const contrast = 1.35;
+            return .{
+                std.math.clamp((desat_r - 0.5) * contrast + 0.5, 0.0, 1.0),
+                std.math.clamp((desat_g - 0.5) * contrast + 0.5, 0.0, 1.0),
+                std.math.clamp((desat_b - 0.5) * contrast + 0.5, 0.0, 1.0),
+            };
+        },
+        .monochrome_film => {
+            const mono_luma = r * 0.299 + g * 0.587 + b * 0.114;
+            const curve = mono_luma * mono_luma * (3.0 - 2.0 * mono_luma);
+            const v = std.math.clamp(curve, 0.0, 1.0);
+            return .{ v, v, v };
+        },
+    }
+}
+
+pub fn writeFilmLutStrip(buf: []u8, size: u32, preset: FilmLutPreset) !void {
+    if (!validLutSize(size)) return error.InvalidLutStrip;
+    const n: usize = @as(usize, size);
+    if (buf.len != n * n * n * 4) return error.InvalidLutStrip;
+    const denom: f32 = @floatFromInt(size - 1);
+    var b: u32 = 0;
+    while (b < size) : (b += 1) {
+        var g: u32 = 0;
+        while (g < size) : (g += 1) {
+            var r: u32 = 0;
+            while (r < size) : (r += 1) {
+                const in_r = @as(f32, @floatFromInt(r)) / denom;
+                const in_g = @as(f32, @floatFromInt(g)) / denom;
+                const in_b = @as(f32, @floatFromInt(b)) / denom;
+                const out_rgb = applyFilmLutPreset(.{ in_r, in_g, in_b }, preset);
+                const x: usize = @as(usize, b * size + r);
+                const y: usize = @as(usize, g);
+                const off = (y * n * n + x) * 4;
+                buf[off] = @intFromFloat(@round(out_rgb[0] * 255.0));
+                buf[off + 1] = @intFromFloat(@round(out_rgb[1] * 255.0));
+                buf[off + 2] = @intFromFloat(@round(out_rgb[2] * 255.0));
+                buf[off + 3] = 255;
+            }
+        }
+    }
+}
+
+pub fn buildFilmLutStrip(allocator: std.mem.Allocator, size: u32, preset: FilmLutPreset) ![]u8 {
+    if (!validLutSize(size)) return error.InvalidLutStrip;
+    const n: usize = @as(usize, size);
+    const buf = try allocator.alloc(u8, n * n * n * 4);
+    errdefer allocator.free(buf);
+    try writeFilmLutStrip(buf, size, preset);
+    return buf;
+}
+
+pub fn createFilmLutTexture(allocator: std.mem.Allocator, size: u32, preset: FilmLutPreset) !texture_mod.Texture {
+    const bytes = try buildFilmLutStrip(allocator, size, preset);
+    defer allocator.free(bytes);
+    return texture_mod.Texture.initRaw(size * size, size, bytes, .{
+        .generate_mips = false,
+        .wrap_u = .clamp_to_edge,
+        .wrap_v = .clamp_to_edge,
+        .min_filter = .linear,
+        .mag_filter = .linear,
+    });
+}
+
 /// Pack the shader lut_params vec4: (enabled 1/0, strength, size N, 0).
 /// Anything that cannot sample — no binding, dead view, bad size,
 /// mismatched strip dims, disabled flag — packs all zeros, which is exactly

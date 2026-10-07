@@ -4,6 +4,9 @@ pub const TonemappingType = enum(u32) {
     none = 0,
     aces = 1,
     reinhard = 2,
+    filmic = 3,
+    agx = 4,
+    neutral = 5,
 };
 
 /// LUT texture packing. Only the 2D strip is supported (an N*N x N RGBA8

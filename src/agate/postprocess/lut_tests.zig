@@ -314,3 +314,39 @@ test "identity LUT strip maps color to itself" {
         try std.testing.expectApproxEqAbs(cy, uv[1], 1e-5);
     }
 }
+
+test "film lut presets build valid strips and produce distinct profiles" {
+    const allocator = std.testing.allocator;
+    const presets = [_]prod.FilmLutPreset{
+        .identity,
+        .cinematic_warm,
+        .cinematic_cold,
+        .teal_orange,
+        .bleach_bypass,
+        .monochrome_film,
+    };
+
+    for (presets) |preset| {
+        const strip = try prod.buildFilmLutStrip(allocator, 16, preset);
+        defer allocator.free(strip);
+
+        try std.testing.expectEqual(@as(usize, 16 * 16 * 16 * 4), strip.len);
+
+        // Alpha is always 255
+        var i: usize = 0;
+        while (i < strip.len) : (i += 4) {
+            try std.testing.expectEqual(@as(u8, 255), strip[i + 3]);
+            if (preset == .monochrome_film) {
+                try std.testing.expectEqual(strip[i], strip[i + 1]);
+                try std.testing.expectEqual(strip[i + 1], strip[i + 2]);
+            }
+        }
+    }
+
+    // Identity preset matches buildIdentityLutStrip exactly
+    const id_preset = try prod.buildFilmLutStrip(allocator, 16, .identity);
+    defer allocator.free(id_preset);
+    const id_direct = try prod.buildIdentityLutStrip(allocator, 16);
+    defer allocator.free(id_direct);
+    try std.testing.expectEqualSlices(u8, id_direct, id_preset);
+}

@@ -91,7 +91,25 @@ pub const lutSampleUv = lut.lutSampleUv;
 pub const applyLutStrip = lut.applyLutStrip;
 pub const writeIdentityLutStrip = lut.writeIdentityLutStrip;
 pub const buildIdentityLutStrip = lut.buildIdentityLutStrip;
+pub const FilmLutPreset = lut.FilmLutPreset;
+pub const applyFilmLutPreset = lut.applyFilmLutPreset;
+pub const writeFilmLutStrip = lut.writeFilmLutStrip;
+pub const buildFilmLutStrip = lut.buildFilmLutStrip;
+pub const createFilmLutTexture = lut.createFilmLutTexture;
 pub const lutParams = lut.lutParams;
+
+// --- Local Tonemapping ---
+pub fn localTonemapParams(cfg: PostProcessOptions) [4]f32 {
+    if (!cfg.local_tonemapping_enabled or cfg.local_tonemapping_intensity <= 0.001) {
+        return .{ 0.0, 0.0, 0.0, 0.0 };
+    }
+    return .{
+        1.0,
+        cfg.local_tonemapping_intensity,
+        cfg.local_tonemapping_contrast,
+        0.0,
+    };
+}
 
 // --- Temporal Anti-Aliasing (TAA) ---
 pub const TAA_JITTER_PERIOD = taa.TAA_JITTER_PERIOD;

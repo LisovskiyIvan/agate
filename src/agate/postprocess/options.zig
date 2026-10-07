@@ -123,6 +123,11 @@ pub const PostProcessOptions = struct {
     contact_shadows_thickness: f32 = 0.05,
     contact_shadows_steps: u32 = 12,
 
+    // Local Tonemapping & Contrast Adaptation (compresses wide dynamic range while preserving local details)
+    local_tonemapping_enabled: bool = false,
+    local_tonemapping_intensity: f32 = 0.5,
+    local_tonemapping_contrast: f32 = 0.3,
+
     // Sharpen (post-tonemap unsharp mask)
     sharpen_enabled: bool = false,
     sharpen_amount: f32 = 0.3,
@@ -220,6 +225,8 @@ pub const PostProcessOptions = struct {
         out.contact_shadows_distance = if (std.math.isFinite(self.contact_shadows_distance)) @max(self.contact_shadows_distance, 0.01) else 0.3;
         out.contact_shadows_thickness = if (std.math.isFinite(self.contact_shadows_thickness)) @max(self.contact_shadows_thickness, 0.001) else 0.05;
         out.contact_shadows_steps = std.math.clamp(self.contact_shadows_steps, 4, 32);
+        out.local_tonemapping_intensity = if (std.math.isFinite(self.local_tonemapping_intensity)) std.math.clamp(self.local_tonemapping_intensity, 0.0, 1.0) else 0.5;
+        out.local_tonemapping_contrast = if (std.math.isFinite(self.local_tonemapping_contrast)) std.math.clamp(self.local_tonemapping_contrast, 0.0, 1.0) else 0.3;
         out.motion_blur_samples = std.math.clamp(self.motion_blur_samples, 2, 32);
         out.motion_blur_intensity = std.math.clamp(self.motion_blur_intensity, 0.0, 3.0);
         out.motion_blur_max_blur_px = std.math.clamp(self.motion_blur_max_blur_px, 1.0, 128.0);
@@ -266,6 +273,7 @@ pub const PostProcessOptions = struct {
         out.fog_enabled = false;
         out.ssr_enabled = false;
         out.contact_shadows_enabled = false;
+        out.local_tonemapping_enabled = false;
         out.sharpen_enabled = false;
         out.grain_enabled = false;
         out.temperature = 0;

@@ -266,6 +266,8 @@ fn setupScene() void {
     scene.post_process.taa_camera_cut = true;
     scene.post_process.fog_enabled = false;
     scene.post_process.contact_shadows_enabled = true;
+    scene.post_process.local_tonemapping_enabled = true;
+    scene.post_process.local_tonemapping_intensity = 0.4;
     if (frame_limit > 0) setupFiniteFixtures();
     std.debug.print("hdr-showcase: setup backend={s} msaa={} srgb={} env_color_fmt={s} swapchain_fmt={s} hdr_caps_sample={} hdr_caps_filter={} hdr_caps_render={} hdr_caps_blend={} hdr_caps_msaa={}\n", .{
         @tagName(sg.queryBackend()),
@@ -299,10 +301,14 @@ export fn frame() callconv(.c) void {
 
     if (gate) {
         if (f == 2) scene.post_process.taa_camera_cut = false;
+        if (f == 20) scene.post_process.tonemapping = .filmic;
+        if (f == 40) scene.post_process.tonemapping = .agx;
+        if (f == 60) scene.post_process.tonemapping = .neutral;
         if (f == 61) {
             exposure_idx = 2;
             scene.post_process.exposure = exposures[exposure_idx];
         }
+        if (f == 80) scene.post_process.tonemapping = .aces;
         if (f == 91) scene.post_process.enabled = false;
         if (f == 111) scene.post_process.enabled = true;
         if (f == 160) scene.post_process.taa_camera_cut = true;

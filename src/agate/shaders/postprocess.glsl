@@ -43,6 +43,7 @@ layout(binding = 0) uniform fs_params {
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
+    vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
     // APPENDED LAST (display transfer): x = manual display encode needed
     // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
     // 0 = sRGB target: output linear, hardware encodes). yzw unused. Packed
@@ -84,6 +85,108 @@ vec3 ACESFilm(vec3 x) {
 
 vec3 Reinhard(vec3 x) {
     return x / (x + vec3(1.0));
+}
+
+vec3 UchimuraTonemap(vec3 x) {
+    const float P = 1.0;
+    const float a = 1.0;
+    const float m = 0.22;
+    const float l = 0.4;
+    const float c = 1.33;
+    const float b = 0.0;
+    float l0 = ((P - m) * l) / a;
+    float S0 = m + l0;
+    float S1 = m + a * l0;
+    float C2 = (a * P) / (P - S1);
+    float cp = -C2 / P;
+
+    vec3 w0 = vec3(1.0) - smoothstep(vec3(0.0), vec3(m), x);
+    vec3 w2 = step(vec3(m + l0), x);
+    vec3 w1 = vec3(1.0) - w0 - w2;
+
+    vec3 T = m * pow(max(x / m, vec3(0.0)), vec3(c)) + b;
+    vec3 S = P - (P - S1) * exp(cp * (x - S0));
+    vec3 L = m + a * (x - m);
+
+    return clamp(T * w0 + L * w1 + S * w2, 0.0, 1.0);
+}
+
+vec3 AgXTonemap(vec3 color) {
+    if (color.r <= 0.0 && color.g <= 0.0 && color.b <= 0.0) return vec3(0.0);
+
+    const mat3 agx_mat = mat3(
+        0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+        0.0784335996993431, 0.878468636469772, 0.0784336099914461,
+        0.0792237451477422, 0.0791661274605434, 0.879142973798673
+    );
+    const mat3 agx_mat_inv = mat3(
+        1.19687900512017, -0.0528968517590771, -0.0529716355084725,
+        -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+        -0.0990297440797205, -0.098961176813784, 1.15107367264185
+    );
+    color = max(color, vec3(1e-6));
+    color = agx_mat * color;
+
+    const float min_ev = -10.0;
+    const float max_ev = 6.5;
+    color = clamp((log2(max(color, vec3(1e-6))) - min_ev) / (max_ev - min_ev), 0.0, 1.0);
+
+    vec3 x2 = color * color;
+    vec3 x4 = x2 * x2;
+    color = + 15.5 * x4 * color
+            - 40.14 * x4
+            + 31.96 * x2 * color
+            - 6.868 * x2
+            + 0.4298 * color
+            + 0.1191;
+    color = clamp((color - vec3(0.1191)) / (1.0 - 0.1191), 0.0, 1.0);
+    color = agx_mat_inv * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+vec3 PBRNeutralTonemap(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = (x < 0.08) ? (x - 6.25 * x * x) : 0.04;
+    color = max(color - offset, vec3(0.0));
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return clamp(mix(color, newPeak * vec3(1.0), g), 0.0, 1.0);
+}
+
+vec3 applyLocalTonemapping(vec3 color, vec2 uv) {
+    if (local_tonemap_params.x < 0.5) return color;
+    float intensity = local_tonemap_params.y;
+    if (intensity <= 0.001) return color;
+    float contrast = local_tonemap_params.z;
+
+    float local_luma;
+    if (params3.z > 0.5) {
+        vec3 bloom_sample = texture(sampler2D(bloom_tex, smp), uv).rgb;
+        local_luma = dot(bloom_sample, vec3(0.2126, 0.7152, 0.0722));
+    } else {
+        vec2 off = resolution.zw * 24.0;
+        float l0 = dot(texture(sampler2D(scene_tex, smp), uv).rgb, vec3(0.2126, 0.7152, 0.0722));
+        float l1 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+        float l2 = dot(texture(sampler2D(scene_tex, smp), uv - vec2(off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+        float l3 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(-off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+        float l4 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, -off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+        local_luma = (l0 + l1 + l2 + l3 + l4) * 0.2;
+    }
+
+    float pixel_luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    float denom = max(0.18 + local_luma, 1e-4);
+    float numer = max(0.18 + pixel_luma, 1e-4);
+    float scale = pow(numer / denom, contrast);
+    scale = clamp(scale, 0.25, 4.0);
+
+    vec3 adapted_color = color * scale;
+    return mix(color, adapted_color, intensity);
 }
 
 vec3 reconstructWorldPos(vec2 uv, float depth) {
@@ -819,8 +922,19 @@ void main() {
     color = boundRadiance(color);
     color *= params1.x; // Exposure (once)
     color = boundRadiance(color); // Bound AFTER exposure too (matches CPU tonemap)
+
+    // Local Tonemapping & Contrast Adaptation (compresses dynamic range while preserving local details)
+    color = applyLocalTonemapping(color, uv);
+    color = boundRadiance(color);
+
     float tonemap_mode = params3.x;
-    if (tonemap_mode > 1.5) {
+    if (tonemap_mode > 4.5) {
+        color = PBRNeutralTonemap(color);
+    } else if (tonemap_mode > 3.5) {
+        color = AgXTonemap(color);
+    } else if (tonemap_mode > 2.5) {
+        color = UchimuraTonemap(color);
+    } else if (tonemap_mode > 1.5) {
         color = Reinhard(color);
     } else if (tonemap_mode > 0.5) {
         color = ACESFilm(color);

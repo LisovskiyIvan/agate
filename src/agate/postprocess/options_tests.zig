@@ -46,7 +46,7 @@ test "effect master preserves exposure and tone curve without mutating authored 
     const frame = config.forFrame();
     try std.testing.expectEqual(@as(f32, 2), frame.exposure);
     try std.testing.expectEqual(TonemappingType.reinhard, frame.tonemapping);
-    try std.testing.expect(!frame.bloom_enabled and !frame.glow_enabled and !frame.taa_enabled and !frame.fxaa_enabled and !frame.fog_enabled and !frame.ssr_enabled and !frame.contact_shadows_enabled);
+    try std.testing.expect(!frame.bloom_enabled and !frame.glow_enabled and !frame.taa_enabled and !frame.fxaa_enabled and !frame.fog_enabled and !frame.ssr_enabled and !frame.contact_shadows_enabled and !frame.local_tonemapping_enabled);
     try std.testing.expectEqual(@as(f32, 1), frame.saturation);
     try std.testing.expectEqual(@as(f32, 1), frame.contrast);
     try std.testing.expect(config.taa_enabled and config.glow_enabled);
@@ -76,4 +76,21 @@ test "contact shadows options clamp and validate correctly" {
     try std.testing.expectEqual(@as(f32, 0.5), nan_cfg.contact_shadows_intensity);
     try std.testing.expectEqual(@as(f32, 0.3), nan_cfg.contact_shadows_distance);
     try std.testing.expectEqual(@as(f32, 0.05), nan_cfg.contact_shadows_thickness);
+}
+
+test "local tonemapping options clamp and validate correctly" {
+    var custom = PostProcessOptions{
+        .local_tonemapping_intensity = 3.0,
+        .local_tonemapping_contrast = -2.0,
+    };
+    const c = custom.clamped();
+    try std.testing.expectEqual(@as(f32, 1.0), c.local_tonemapping_intensity);
+    try std.testing.expectEqual(@as(f32, 0.0), c.local_tonemapping_contrast);
+
+    const nan_cfg = (PostProcessOptions{
+        .local_tonemapping_intensity = std.math.nan(f32),
+        .local_tonemapping_contrast = std.math.inf(f32),
+    }).clamped();
+    try std.testing.expectEqual(@as(f32, 0.5), nan_cfg.local_tonemapping_intensity);
+    try std.testing.expectEqual(@as(f32, 0.3), nan_cfg.local_tonemapping_contrast);
 }
