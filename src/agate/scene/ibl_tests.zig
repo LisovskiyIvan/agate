@@ -299,3 +299,44 @@ test "diffuse irradiance spherical harmonics: preserves directional hemisphere c
     const horiz_luma = horiz_irr.x * 0.2126 + horiz_irr.y * 0.7152 + horiz_irr.z * 0.0722;
     try std.testing.expect(horiz_luma > down_luma and horiz_luma < up_luma);
 }
+
+test "instanced batches spatial reflection probe selection using world_center" {
+    const dummy_view = @import("sokol").gfx.View{ .id = 42 };
+    const dummy_sampler = @import("sokol").gfx.Sampler{ .id = 43 };
+
+    const entries = [_]probe_layer.ProbeFrameEntry{
+        .{
+            .position = Vec3.new(10.0, 0.0, 0.0),
+            .radius = 15.0,
+            .intensity = 1.5,
+            .max_probe_lod = 7.0,
+            .enabled = true,
+            .captured = true,
+            .view = dummy_view,
+            .sampler = dummy_sampler,
+        },
+    };
+
+    // Instanced batch with world_center placed at probe center (10, 0, 0)
+    const render_queue = @import("render_queue.zig");
+    const batch_inside = render_queue.RenderInstancedBatch{
+        .world_center = Vec3.new(10.0, 0.0, 0.0),
+    };
+
+    const sel_inside = probe_layer.selectProbes(&entries, batch_inside.world_center);
+    try std.testing.expect(sel_inside.primary != null);
+    try std.testing.expectEqual(@as(usize, 0), sel_inside.primary.?.probe.index);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sel_inside.primary.?.weight, 0.001);
+    try std.testing.expectEqual(@as(f32, 1.5), sel_inside.primary.?.probe.intensity);
+    try std.testing.expectEqual(@as(f32, 0.0), sel_inside.env_weight);
+
+    // Instanced batch far outside (50, 0, 0)
+    const batch_outside = render_queue.RenderInstancedBatch{
+        .world_center = Vec3.new(50.0, 0.0, 0.0),
+    };
+
+    const sel_outside = probe_layer.selectProbes(&entries, batch_outside.world_center);
+    try std.testing.expect(sel_outside.primary == null);
+    try std.testing.expect(sel_outside.secondary == null);
+    try std.testing.expectEqual(@as(f32, 1.0), sel_outside.env_weight);
+}

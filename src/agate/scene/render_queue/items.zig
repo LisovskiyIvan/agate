@@ -133,6 +133,8 @@ pub const RenderInstancedBatch = struct {
     source_mesh: u32 = 0,
     /// Как RenderMeshItem.coat_index, но для инстансированных групп.
     coat_index: ?u32 = null,
+    /// Центр группы инстансов в мировых координатах для выбора reflection probes.
+    world_center: Vec3 = Vec3.zero,
 };
 
 /// Render-owned хранилище копий скин-матриц: один слот на skinned-draw кадра

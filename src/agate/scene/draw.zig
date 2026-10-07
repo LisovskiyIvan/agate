@@ -484,8 +484,7 @@ pub const ProbeDrawState = struct {
 /// position with smooth continuous falloff weights; otherwise the legacy path
 /// (zeroed params, so the shader takes its bit-identical no-probe branch).
 /// Pure (no GPU calls).
-fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
-    const pos = Vec3.new(model.m[12], model.m[13], model.m[14]);
+fn probeForDrawPos(env: *const Environment, pos: Vec3) ProbeDrawState {
     const sel = probe_layer.selectProbes(env.probes, pos);
     var out = ProbeDrawState{
         .params = .{ 0.0, 0.0, 0.0, 0.0 },
@@ -504,6 +503,11 @@ fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
         out.view2 = p1.probe.view;
     }
     return out;
+}
+
+fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
+    const pos = Vec3.new(model.m[12], model.m[13], model.m[14]);
+    return probeForDrawPos(env, pos);
 }
 
 // Binds the clustered tile storage views for one draw: the real views of
@@ -685,11 +689,12 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
     bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
 
-    // Reflection probes skip instanced batches in v1 (no single object
-    // position for selection): legacy path with valid binds.
-    bind.views[inst_pbr_shd.VIEW_probe_tex] = env.default_cube.view;
-    bind.views[inst_pbr_shd.VIEW_probe2_tex] = env.default_cube.view;
-    bind.samplers[inst_pbr_shd.SMP_probe_smp] = env.default_cube.sampler;
+    // Reflection probe (wave 25, wave C.2): selected probe cubes for batch.world_center
+    // or default cube with zeroed params when none applies.
+    const prb = probeForDrawPos(env, batch.world_center);
+    bind.views[inst_pbr_shd.VIEW_probe_tex] = prb.view;
+    bind.views[inst_pbr_shd.VIEW_probe2_tex] = prb.view2;
+    bind.samplers[inst_pbr_shd.SMP_probe_smp] = prb.sampler;
 
     // Clustered tile storage (wave 30): see the regular PBR branch.
     bindClusteredViews(&bind, inst_pbr_shd, env);
@@ -730,8 +735,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         .point_shadow_params = f.point_shadow_params,
         .directional_dir = f.directional_dir,
         .directional_color_int = f.directional_color_int,
-        .probe_params = .{ 0.0, 0.0, 0.0, 0.0 },
-        .probe2_params = .{ 0.0, 0.0, 0.0, 0.0 },
+        .probe_params = prb.params,
+        .probe2_params = prb.params2,
         .area_center_int = f.area_center_int,
         .area_right = f.area_right,
         .area_up = f.area_up,

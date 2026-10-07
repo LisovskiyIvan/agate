@@ -92,6 +92,7 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
             ctx.queues.coat_storage.appendAssumeCapacity(cp);
         }
 
+        const center = if (staged.bounds.isValid()) staged.bounds.center() else mesh.position;
         const batch = RenderInstancedBatch{
             .vertex_buffer = mesh.vertex_buffer,
             .instance_buffer = staged.buffer,
@@ -110,6 +111,7 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
             .source_uid = mesh.uid,
             .source_mesh = @intCast(mesh_index),
             .coat_index = coat_index,
+            .world_center = center,
         };
 
         if (is_trans) {
@@ -120,7 +122,6 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
             // Group distance key: combined staged bounds center (batch draws
             // as one; no per-instance sorting). Falls back to the mesh
             // position when the staged bounds are degenerate.
-            const center = if (staged.bounds.isValid()) staged.bounds.center() else mesh.position;
             const idx: u32 = @intCast(ctx.queues.transparent_instanced.items.len);
             const seq: u32 = @intCast(mesh_index);
             ctx.queues.transparent_instanced.appendAssumeCapacity(batch);
