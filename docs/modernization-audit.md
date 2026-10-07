@@ -297,7 +297,7 @@ BC1/BC3/BC7 как GPU-компрессия не устарели от возр�
 | 4 | Дублирующие target constructors удалены; color format и samples явные. Depth пока задан окружением, полная shared shape остаётся отдельной задачей. Реальные MSAA/history/display варианты сохранены. |
 | 5 | Live-read prepare, UI fallback и обходные slot helpers удалены. Один claim/build/stage/publish → begin/finish/cancel → render протокол; render не готовит кадр автоматически. Cancel/repeated build получают отдельный per-attempt cache key, без тестовых invalidation/culling обходов. |
 | 6 | Незарегистрированный live owner запрещён; assert действует во всех build modes, Scene init проверяет owner до GPU-работы. Headless CPU cleanup сохранён; owner/unregistered/foreign policy проверена на живом Metal в ReleaseSafe и ReleaseFast. |
-| 7 | Default и GPU draw paths переведены на PBR; Standard/instanced shaders удалены. Публичный CPU `StandardMaterial` adapter и `Material.standard` полностью удалены (07.10.2026), `Material` union сведён к `pbr | shader_material`, старые binary v3 ассеты десериализуются в matte PBRMaterial. Top-K uniform lanes (4 point / 2 spot) и их hysteresis всё ещё шейдятся отдельно от clustered pools (`light_rig.zig`, PBR shaders): консолидация local lights — TODO. |
+| 7 | Default и GPU draw paths переведены на PBR; Standard/instanced shaders удалены. Публичный CPU `StandardMaterial` adapter и `Material.standard` удалены (07.10.2026), `Material` union сведён к `pbr | shader_material`. Local lights консолидированы в единый clustered storage/routing pool (`ClusterLightGpu`, binding 12, 64 байта) во всех трёх forward PBR шейдерах (`pbr.glsl`, `instanced_pbr.glsl`, `skinned_pbr.glsl`). Caster selection отвязано от числа освещающих источников (до 2 point и 2 spot shadow casters в atlas slots, до 64 освещающих источников). Uniform loops сохранены как fallback для режимов без SSBO (probe captures). |
 | 8 | Codegen восстановлен для всех целей: Metal/WGSL + HLSL5 (D3D11/Windows) + GLSL 4.3 (GL/Linux). Native WGPU убран из конфигурации Agate (`-Dwgpu` больше не существует); web всегда WebGPU. Явный GL 4.3 в `sapp.run` сайтах (требование cluster storage buffers). Cross-compile доказан кодгеном; live-прогоны Windows/Linux на целевых ОС пока не выполнены и поддержанными не заявлены. Универсальные sokol forks не урезаны. |
 | 9 | Float-only timing helpers удалены; `?Sample` сохраняет availability и submission id, валидные 0ms не теряются. |
 | 10 | Старые CLI flags отвергаются с exit 2. `--no-threads` и `--prepare-exclusion` меняют только scheduling/exclusion того же staged-протокола; GPU legs и measurement script переведены. |
@@ -330,6 +330,6 @@ zig build test test-gpu -Doptimize=ReleaseSafe --summary all
 zig build bench-threads -Doptimize=ReleaseSafe -- --runs 1 --frames 90 --out /path/to/evidence
 ```
 
-Следующие большие задачи — пункт 7, полная target shape и пункт 12;
+Следующие большие задачи — полная target shape и пункт 12;
 auto-exposure, GGX IBL и velocity — quality-волны. Кодовые изменения этой волны
 коммитятся по мере готовности гейтов.

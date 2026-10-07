@@ -167,19 +167,17 @@ int pointFaceIndex(vec3 d) {
 // is picked from the world-space direction to the light, then the fragment
 // is projected by that face's view-projection matrix and PCF-sampled with
 // the same 2D compare path as the spot atlas (4 taps + bias, shadow
-// strength from shadow_params.y like every other shadow term here).
-float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
-    if (point_shadow_params[light_idx].x < 0.5) return 0.0;
+float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N, vec3 L) {
+    if (slot < 0 || slot >= 2) return 0.0;
     if (shadow_params.y <= 0.001) return 0.0;
 
-    int slot = int(point_shadow_params[light_idx].x - 1.0);
-    vec3 to_frag = world_pos - point_pos_range[light_idx].xyz;
+    vec3 to_frag = world_pos - light_pos;
     int face = pointFaceIndex(to_frag);
 
     float cos_theta = max(dot(N, L), 0.0);
-    float bias = point_shadow_params[light_idx].y;
+    float bias = point_shadow_params[slot].y;
     float depth_bias = max(bias * (1.0 - cos_theta), bias * 0.2);
-    vec3 normal_offset = N * (point_shadow_params[light_idx].z * (1.0 - cos_theta));
+    vec3 normal_offset = N * (point_shadow_params[slot].z * (1.0 - cos_theta));
 
     vec4 lpos = point_view_proj[slot * 6 + face] * vec4(world_pos + normal_offset, 1.0);
     #if !SOKOL_GLSL
@@ -207,6 +205,18 @@ float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
     lit *= 0.25;
 
     return (1.0 - lit) * shadow_params.y;
+}
+
+// Point-light shadows: each shadow-casting point light owns 6 cube-face
+// tiles (one atlas row, 256px tiles in the 1536x512 point atlas). The face
+// is picked from the world-space direction to the light, then the fragment
+// is projected by that face's view-projection matrix and PCF-sampled with
+// the same 2D compare path as the spot atlas (4 taps + bias, shadow
+// strength from shadow_params.y like every other shadow term here).
+float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
+    if (point_shadow_params[light_idx].x < 0.5) return 0.0;
+    int slot = int(point_shadow_params[light_idx].x - 1.0);
+    return calculatePointShadowSlot(slot, point_pos_range[light_idx].xyz, world_pos, N, L);
 }
 
 // Rect area-light irradiance v1 (wave 26): analytic approximation, NOT LTC

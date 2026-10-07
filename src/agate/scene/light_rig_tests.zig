@@ -655,3 +655,73 @@ test "packSpotShadows selects up to 2 casters by significance with atlas page ti
     try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[1].tile_y);
     try std.testing.expectEqual([4]f32{ 1.0, 0.002, 0.004, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[1].spot_index]);
 }
+
+test "packFrame consolidates local points and spots into unified clustered pool with shadow tags" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    // Create 2 point lights (1 casting shadows)
+    _ = try rig.createPointLight(allocator, "p0", .{
+        .position = Vec3.new(1, 2, 3),
+        .range = 10.0,
+        .intensity = 5.0,
+        .cast_shadows = true,
+        .shadow_bias = 0.005,
+    });
+    _ = try rig.createPointLight(allocator, "p1", .{
+        .position = Vec3.new(4, 5, 6),
+        .range = 8.0,
+        .intensity = 2.0,
+    });
+
+    // Create 2 spot lights (1 casting shadows)
+    _ = try rig.createSpotLight(allocator, "s0", .{
+        .position = Vec3.new(0, 5, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 15.0,
+        .intensity = 4.0,
+        .inner_angle_deg = 20.0,
+        .outer_angle_deg = 35.0,
+        .cast_shadows = true,
+        .shadow_bias = 0.004,
+    });
+    _ = try rig.createSpotLight(allocator, "s1", .{
+        .position = Vec3.new(1, 1, 1),
+        .range = 12.0,
+        .intensity = 1.0,
+    });
+
+    const eye = Vec3.zero;
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+
+    // Total 4 lights consolidated into clustered pool
+    try std.testing.expectEqual(@as(usize, 4), pack.clustered_count);
+
+    // Light 0: Point light with shadow (slot 0)
+    try std.testing.expectEqual([4]f32{ 1, 2, 3, 10 }, pack.clustered_lights[0].pos_range);
+    try std.testing.expect(pack.clustered_lights[0].dir_inner[3] < -1.5); // point light marker
+    try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[0].spot_params[1]); // point shadow type
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[0].spot_params[2]); // shadow slot 0
+    try std.testing.expectEqual(@as(f32, 0.005), pack.clustered_lights[0].spot_params[3]); // shadow bias
+
+    // Light 1: Point light without shadow
+    try std.testing.expectEqual([4]f32{ 4, 5, 6, 8 }, pack.clustered_lights[1].pos_range);
+    try std.testing.expect(pack.clustered_lights[1].dir_inner[3] < -1.5);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[1].spot_params[1]); // no shadow
+
+    // Light 2: Spot light with shadow (slot 0)
+    try std.testing.expectEqual([4]f32{ 0, 5, 0, 15 }, pack.clustered_lights[2].pos_range);
+    const cos_inner = @cos(20.0 * (std.math.pi / 180.0));
+    const cos_outer = @cos(35.0 * (std.math.pi / 180.0));
+    try std.testing.expectApproxEqAbs(cos_inner, pack.clustered_lights[2].dir_inner[3], 1e-5);
+    try std.testing.expectApproxEqAbs(cos_outer, pack.clustered_lights[2].spot_params[0], 1e-5);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.clustered_lights[2].spot_params[1]); // spot shadow type
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[2].spot_params[2]); // shadow slot 0
+    try std.testing.expectEqual(@as(f32, 0.004), pack.clustered_lights[2].spot_params[3]); // shadow bias
+
+    // Light 3: Spot light without shadow
+    try std.testing.expectEqual([4]f32{ 1, 1, 1, 12 }, pack.clustered_lights[3].pos_range);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[3].spot_params[1]); // no shadow
+}

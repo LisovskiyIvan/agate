@@ -97,12 +97,13 @@ pub const ClusteredLightStage = struct {
     color_int: [4]f32,
 };
 
-/// GPU mirror of one clustered light (std430: two vec4, 32 bytes, stride
-/// is a multiple of the 16-byte vec4 alignment). Uploaded verbatim from
-/// the staged pack; the shader indexes it by the tile index list.
-pub const ClusterLightGpu = struct {
+/// GPU mirror of one clustered light (std430: four vec4, 64 bytes).
+/// Uploaded verbatim from the staged pack; the shader indexes it by the tile index list.
+pub const ClusterLightGpu = extern struct {
     pos_range: [4]f32 = .{ 0, 0, 0, 0 },
     color_int: [4]f32 = .{ 0, 0, 0, 0 },
+    dir_inner: [4]f32 = .{ 0, 0, 0, -2.0 },
+    spot_params: [4]f32 = .{ -2.0, 0, 0, 0 },
 };
 
 /// GPU mirror of one tile header (std430 uvec2: byte offset into the
@@ -221,6 +222,48 @@ pub fn spotOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, range: f32) 
     return sphereOverlapsTileColumn(vp, rect, center, range);
 }
 
+/// Builds per-tile clustered-light index lists from ClusterLightGpu slice.
+pub fn buildTileListsFromLights(
+    lights_slice: []const ClusterLightGpu,
+    view_proj: Mat4,
+    tiles_x: u32,
+    tiles_y: u32,
+    view: ViewRect,
+    win_w: i32,
+    win_h: i32,
+    headers: [][2]u32,
+    indices: []u32,
+) usize {
+    const tiles: usize = @as(usize, tiles_x) * @as(usize, tiles_y);
+    std.debug.assert(headers.len >= tiles);
+    for (headers[0..tiles]) |*h| h.* = .{ 0, 0 };
+    if (tiles == 0 or lights_slice.len == 0) return 0;
+    const n = @min(lights_slice.len, lights.max_clustered_lights);
+    var written: usize = 0;
+    var ty: u32 = 0;
+    while (ty < tiles_y) : (ty += 1) {
+        var tx: u32 = 0;
+        while (tx < tiles_x) : (tx += 1) {
+            const tid: usize = @as(usize, ty) * @as(usize, tiles_x) + @as(usize, tx);
+            const rect = tileNdcRect(tx, ty, view, win_w, win_h);
+            const start = written;
+            var li: usize = 0;
+            while (li < n) : (li += 1) {
+                const pr = lights_slice[li].pos_range;
+                const ci = lights_slice[li].color_int;
+                if (!(ci[3] > 0.0) or !(pr[3] > 0.0)) continue;
+                const center = Vec3.new(pr[0], pr[1], pr[2]);
+                if (!sphereOverlapsTileColumn(view_proj, rect, center, pr[3])) continue;
+                if (written >= indices.len) break; // Defensive saturate.
+                indices[written] = @intCast(li);
+                written += 1;
+            }
+            headers[tid] = .{ @intCast(start), @intCast(written - start) };
+        }
+    }
+    return written;
+}
+
 /// Builds per-tile clustered-light index lists from staged pack data.
 /// Tiles row-major (tile id = ty * tiles_x + tx); indices within a tile in
 /// light order — fully deterministic for a given pack + camera.
@@ -243,34 +286,17 @@ pub fn buildTileLists(
     headers: [][2]u32,
     indices: []u32,
 ) usize {
-    const tiles: usize = @as(usize, tiles_x) * @as(usize, tiles_y);
-    std.debug.assert(headers.len >= tiles);
-    for (headers[0..tiles]) |*h| h.* = .{ 0, 0 };
-    if (tiles == 0 or count == 0) return 0;
     const n = @min(count, pos_range.len, color_int.len, lights.max_clustered_lights);
-    var written: usize = 0;
-    var ty: u32 = 0;
-    while (ty < tiles_y) : (ty += 1) {
-        var tx: u32 = 0;
-        while (tx < tiles_x) : (tx += 1) {
-            const tid: usize = @as(usize, ty) * @as(usize, tiles_x) + @as(usize, tx);
-            const rect = tileNdcRect(tx, ty, view, win_w, win_h);
-            const start = written;
-            var li: usize = 0;
-            while (li < n) : (li += 1) {
-                const pr = pos_range[li];
-                const ci = color_int[li];
-                if (!(ci[3] > 0.0) or !(pr[3] > 0.0)) continue;
-                const center = Vec3.new(pr[0], pr[1], pr[2]);
-                if (!sphereOverlapsTileColumn(view_proj, rect, center, pr[3])) continue;
-                if (written >= indices.len) break; // Defensive saturate.
-                indices[written] = @intCast(li);
-                written += 1;
-            }
-            headers[tid] = .{ @intCast(start), @intCast(written - start) };
-        }
+    var lights_buf: [lights.max_clustered_lights]ClusterLightGpu = undefined;
+    for (0..n) |i| {
+        lights_buf[i] = .{
+            .pos_range = pos_range[i],
+            .color_int = color_int[i],
+            .dir_inner = .{ 0, 0, 0, -2.0 },
+            .spot_params = .{ -2.0, 0, 0, 0 },
+        };
     }
-    return written;
+    return buildTileListsFromLights(lights_buf[0..n], view_proj, tiles_x, tiles_y, view, win_w, win_h, headers, indices);
 }
 
 /// View triple for one draw (see ClusteredGpuCache.bindingViews).
@@ -368,16 +394,11 @@ pub const ClusteredGpuCache = struct {
         );
     }
 
-    /// Slot-explicit rebuild: same as `rebuildCpu` but clears the liveness
-    /// of `view_slot` (the view being rebuilt). View callers pass their
-    /// own slot so a secondary rebuild never clears the primary's live
-    /// flag (or vice versa).
-    pub fn rebuildCpuForSlot(
+    /// Rebuilds CPU tile scratch directly from a ClusterLightGpu slice for a specific slot.
+    pub fn rebuildCpuFromLights(
         self: *ClusteredGpuCache,
         allocator: std.mem.Allocator,
-        pos_range: []const [4]f32,
-        color_int: []const [4]f32,
-        count: usize,
+        lights_slice: []const ClusterLightGpu,
         view_proj: Mat4,
         win_w: i32,
         win_h: i32,
@@ -389,14 +410,11 @@ pub const ClusteredGpuCache = struct {
         self.tiles_y = grid.y;
         self.slots[clampSlot(view_slot)].live = false;
         const tiles: usize = @as(usize, grid.x) * @as(usize, grid.y);
-        const n = @min(count, pos_range.len, color_int.len, lights.max_clustered_lights);
+        const n = @min(lights_slice.len, lights.max_clustered_lights);
         self.staged_count = n;
 
         self.cpu_lights.clearRetainingCapacity();
-        var li: usize = 0;
-        while (li < n) : (li += 1) {
-            try self.cpu_lights.append(allocator, .{ .pos_range = pos_range[li], .color_int = color_int[li] });
-        }
+        try self.cpu_lights.appendSlice(allocator, lights_slice[0..n]);
 
         self.cpu_headers.clearRetainingCapacity();
         try self.cpu_headers.ensureTotalCapacity(allocator, tiles);
@@ -413,8 +431,34 @@ pub const ClusteredGpuCache = struct {
             // as the pairs buildTileLists writes (layout pinned below).
             as_pairs = @ptrCast(self.cpu_headers.items);
         }
-        const written = buildTileLists(pos_range, color_int, n, view_proj, grid.x, grid.y, view, win_w, win_h, as_pairs, self.cpu_indices.items);
+        const written = buildTileListsFromLights(lights_slice[0..n], view_proj, grid.x, grid.y, view, win_w, win_h, as_pairs, self.cpu_indices.items);
         self.cpu_indices.items.len = written;
+    }
+
+    /// Slot-explicit rebuild: legacy entry point wrapping rebuildCpuFromLights.
+    pub fn rebuildCpuForSlot(
+        self: *ClusteredGpuCache,
+        allocator: std.mem.Allocator,
+        pos_range: []const [4]f32,
+        color_int: []const [4]f32,
+        count: usize,
+        view_proj: Mat4,
+        win_w: i32,
+        win_h: i32,
+        view: ViewRect,
+        view_slot: usize,
+    ) !void {
+        const n = @min(count, pos_range.len, color_int.len, lights.max_clustered_lights);
+        var lights_buf: [lights.max_clustered_lights]ClusterLightGpu = undefined;
+        for (0..n) |i| {
+            lights_buf[i] = .{
+                .pos_range = pos_range[i],
+                .color_int = color_int[i],
+                .dir_inner = .{ 0, 0, 0, -2.0 },
+                .spot_params = .{ -2.0, 0, 0, 0 },
+            };
+        }
+        return self.rebuildCpuFromLights(allocator, lights_buf[0..n], view_proj, win_w, win_h, view, view_slot);
     }
 
     /// Ensures the shared 16-byte dummy buffer + view exist so draws can
@@ -799,10 +843,12 @@ test "buildTileLists is empty-safe and deterministic" {
 }
 
 test "gpu mirror structs match the std430 shader layout" {
-    // ClusterLightGpu == struct { vec4; vec4 }: 32 bytes, 16-aligned lanes.
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(ClusterLightGpu));
+    // ClusterLightGpu == struct { vec4; vec4; vec4; vec4 }: 64 bytes, 16-aligned lanes.
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ClusterLightGpu));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(ClusterLightGpu, "pos_range"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ClusterLightGpu, "color_int"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ClusterLightGpu, "dir_inner"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(ClusterLightGpu, "spot_params"));
     // ClusterTileGpu == uvec2 (offset, count): 8 bytes, 4-aligned lanes.
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(ClusterTileGpu));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(ClusterTileGpu, "offset"));

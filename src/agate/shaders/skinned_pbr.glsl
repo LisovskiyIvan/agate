@@ -275,7 +275,7 @@ layout(binding = 8) uniform sampler refraction_smp;
 // Clustered forward lights (wave 30, v1): storage buffers for the tile
 // walk. Bindings 12..14 are free view slots in the shared pool of every
 // forward shader (this family uses fs 0..8, 10, 11 and vs 9 for morph).
-// Layouts mirror scene/clustered_lights.zig (ClusterLightGpu = 2x vec4,
+// Layouts mirror scene/clustered_lights.zig (ClusterLightGpu = 4x vec4,
 // ClusterTileGpu = uvec2, indices = u32); every buffer block holds exactly
 // one flexible array of a struct (sokol-shdc requirement). The draw always
 // binds something valid here (real tile buffers when a GPU upload landed,
@@ -542,96 +542,98 @@ void main() {
         Lo += (d_kD * diffuse_albedo / PI + d_spec * d_atten * spec_ec + d_additive) * d_rad * d_NdotL;
     }
 
-    // 2. Point Lights (up to 4)
-    int num_points = int(light_counts.x);
-    for (int i = 0; i < 4; i++) {
-        if (i >= num_points) break;
-        vec3 p_pos = point_pos_range[i].xyz;
-        float p_range = point_pos_range[i].w;
-        vec3 p_col = point_color_int[i].rgb;
-        float p_int = point_color_int[i].w;
+    // 2. Point Lights (up to 4) & 3. Spot Lights (up to 2) - uniform fallback when clustered is off
+    if (clustered_params.w < 0.5) {
+        int num_points = int(light_counts.x);
+        for (int i = 0; i < 4; i++) {
+            if (i >= num_points) break;
+            vec3 p_pos = point_pos_range[i].xyz;
+            float p_range = point_pos_range[i].w;
+            vec3 p_col = point_color_int[i].rgb;
+            float p_int = point_color_int[i].w;
 
-        vec3 p_to_light = p_pos - v_world_pos;
-        float dist = length(p_to_light);
-        if (dist >= p_range || dist < 0.0001) continue;
+            vec3 p_to_light = p_pos - v_world_pos;
+            float dist = length(p_to_light);
+            if (dist >= p_range || dist < 0.0001) continue;
 
-        vec3 p_L = p_to_light / dist;
-        vec3 p_H = normalize(V + p_L);
+            vec3 p_L = p_to_light / dist;
+            vec3 p_H = normalize(V + p_L);
 
-        float d_norm = dist / p_range;
-        float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
-        float att = (factor * factor) / (dist * dist + 1.0);
+            float d_norm = dist / p_range;
+            float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
+            float att = (factor * factor) / (dist * dist + 1.0);
 
-        float p_NdotL = max(dot(N, p_L), 0.0);
-        if (p_NdotL > 0.0) {
-            float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, spec_roughness);
-            float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, spec_roughness);
-            vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
+            float p_NdotL = max(dot(N, p_L), 0.0);
+            if (p_NdotL > 0.0) {
+                float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, spec_roughness);
+                float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, spec_roughness);
+                vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
-            vec3 p_spec = p_NDF * p_Vis * p_F;
-            vec3 p_kD = vec3(1.0 - metallic);
-            vec3 p_rad = p_col * (p_int * att);
-            vec3 p_atten;
-            vec3 p_additive;
-            coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, p_atten, p_additive);
-
-            float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
-            Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten * spec_ec + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
-        }
-        if (transm_factor > 0.0 && !refracting) {
-            float p_transm_back = max(dot(-N, p_L), 0.0);
-            if (p_transm_back > 0.0) {
+                vec3 p_spec = p_NDF * p_Vis * p_F;
+                vec3 p_kD = vec3(1.0 - metallic);
                 vec3 p_rad = p_col * (p_int * att);
-                Lo += transmission_color.rgb * transm_factor * orig_albedo / PI * p_rad * p_transm_back;
+                vec3 p_atten;
+                vec3 p_additive;
+                coatSheenLight(N, V, p_L, p_H, NdotV, p_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, p_atten, p_additive);
+
+                float point_shadow = calculatePointShadow(i, v_world_pos, N, p_L);
+                Lo += (p_kD * diffuse_albedo / PI + p_spec * p_atten * spec_ec + p_additive) * p_rad * p_NdotL * (1.0 - point_shadow);
+            }
+            if (transm_factor > 0.0 && !refracting) {
+                float p_transm_back = max(dot(-N, p_L), 0.0);
+                if (p_transm_back > 0.0) {
+                    vec3 p_rad = p_col * (p_int * att);
+                    Lo += transmission_color.rgb * transm_factor * orig_albedo / PI * p_rad * p_transm_back;
+                }
             }
         }
-    }
 
-    // 3. Spot Lights (up to 2)
-    int num_spots = int(light_counts.y);
-    for (int i = 0; i < 2; i++) {
-        if (i >= num_spots) break;
-        vec3 s_pos = spot_pos_range[i].xyz;
-        float s_range = spot_pos_range[i].w;
-        vec3 s_dir = spot_dir_inner[i].xyz;
-        float cos_inner = spot_dir_inner[i].w;
-        vec3 s_col = spot_color_outer[i].rgb;
-        float cos_outer = spot_color_outer[i].w;
-        float s_int = spot_intensity[i].x;
+        // 3. Spot Lights (up to 2)
+        int num_spots = int(light_counts.y);
+        for (int i = 0; i < 2; i++) {
+            if (i >= num_spots) break;
+            vec3 s_pos = spot_pos_range[i].xyz;
+            float s_range = spot_pos_range[i].w;
+            vec3 s_dir = spot_dir_inner[i].xyz;
+            float cos_inner = spot_dir_inner[i].w;
+            vec3 s_col = spot_color_outer[i].rgb;
+            float cos_outer = spot_color_outer[i].w;
+            float s_int = spot_intensity[i].x;
 
-        vec3 s_to_light = s_pos - v_world_pos;
-        float dist = length(s_to_light);
-        if (dist >= s_range || dist < 0.0001) continue;
+            vec3 s_to_light = s_pos - v_world_pos;
+            float dist = length(s_to_light);
+            if (dist >= s_range || dist < 0.0001) continue;
 
-        vec3 s_L = s_to_light / dist;
-        vec3 s_H = normalize(V + s_L);
+            vec3 s_L = s_to_light / dist;
+            vec3 s_H = normalize(V + s_L);
 
-        float d_norm = dist / s_range;
-        float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
-        float dist_att = (factor * factor) / (dist * dist + 1.0);
+            float d_norm = dist / s_range;
+            float factor = clamp(1.0 - d_norm * d_norm * d_norm * d_norm, 0.0, 1.0);
+            float dist_att = (factor * factor) / (dist * dist + 1.0);
 
-        float cos_angle = dot(-s_L, s_dir);
-        float cone_att = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 0.0001), 0.0, 1.0);
-        cone_att *= cone_att;
+            float cos_angle = dot(-s_L, s_dir);
+            float cone_att = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 0.0001), 0.0, 1.0);
+            cone_att *= cone_att;
 
-        float total_att = dist_att * cone_att;
-        if (total_att <= 0.0) continue;
+            float total_att = dist_att * cone_att;
+            if (total_att <= 0.0) continue;
 
-        float s_NdotL = max(dot(N, s_L), 0.0);
-        if (s_NdotL > 0.0) {
-            float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, spec_roughness);
-            float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, spec_roughness);
-            vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
+            float s_NdotL = max(dot(N, s_L), 0.0);
+            if (s_NdotL > 0.0) {
+                float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, spec_roughness);
+                float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, spec_roughness);
+                vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
-            vec3 s_spec = s_NDF * s_Vis * s_F;
-            vec3 s_kD = vec3(1.0 - metallic);
-            vec3 s_rad = s_col * (s_int * total_att);
-            vec3 s_atten;
-            vec3 s_additive;
-            coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, s_atten, s_additive);
+                vec3 s_spec = s_NDF * s_Vis * s_F;
+                vec3 s_kD = vec3(1.0 - metallic);
+                vec3 s_rad = s_col * (s_int * total_att);
+                vec3 s_atten;
+                vec3 s_additive;
+                coatSheenLight(N, V, s_L, s_H, NdotV, s_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, s_atten, s_additive);
 
-            float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
-            Lo += (s_kD * diffuse_albedo / PI + s_spec * s_atten * spec_ec + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
+                float spot_shadow = calculateSpotShadow(i, v_world_pos, N, s_L);
+                Lo += (s_kD * diffuse_albedo / PI + s_spec * s_atten * spec_ec + s_additive) * s_rad * s_NdotL * (1.0 - spot_shadow);
+            }
         }
     }
 
@@ -694,6 +696,17 @@ void main() {
             float c_factor = clamp(1.0 - c_d_norm * c_d_norm * c_d_norm * c_d_norm, 0.0, 1.0);
             float c_att = (c_factor * c_factor) / (c_dist * c_dist + 1.0);
 
+            // Spot cone attenuation
+            if (cluster_lights[c_li].dir_inner.w > -1.5) {
+                vec3 s_dir = cluster_lights[c_li].dir_inner.xyz;
+                float cos_inner = cluster_lights[c_li].dir_inner.w;
+                float cos_outer = cluster_lights[c_li].spot_params.x;
+                float cos_angle = dot(-c_L, s_dir);
+                float cone_att = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 0.0001), 0.0, 1.0);
+                c_att *= cone_att * cone_att;
+                if (c_att <= 0.0) continue;
+            }
+
             float c_NdotL = max(dot(N, c_L), 0.0);
             if (c_NdotL > 0.0) {
                 float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, spec_roughness);
@@ -705,7 +718,25 @@ void main() {
                 vec3 c_atten;
                 vec3 c_additive;
                 coatSheenLight(N, V, c_L, c_H, NdotV, c_NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, c_atten, c_additive);
-                Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten * spec_ec + c_additive) * c_rad * c_NdotL;
+
+                float shadow = 0.0;
+                float shadow_type = cluster_lights[c_li].spot_params.y;
+                if (shadow_type > 1.5) {
+                    int s_slot = int(cluster_lights[c_li].spot_params.z);
+                    shadow = calculateSpotShadow(s_slot, v_world_pos, N, c_L);
+                } else if (shadow_type > 0.5) {
+                    int p_slot = int(cluster_lights[c_li].spot_params.z);
+                    shadow = calculatePointShadowSlot(p_slot, c_pos, v_world_pos, N, c_L);
+                }
+
+                Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten * spec_ec + c_additive) * c_rad * c_NdotL * (1.0 - shadow);
+            }
+            if (transm_factor > 0.0 && !refracting) {
+                float c_transm_back = max(dot(-N, c_L), 0.0);
+                if (c_transm_back > 0.0) {
+                    vec3 c_rad = c_col * (c_int * c_att);
+                    Lo += transmission_color.rgb * transm_factor * orig_albedo / PI * c_rad * c_transm_back;
+                }
             }
         }
     }

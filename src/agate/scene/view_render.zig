@@ -79,11 +79,9 @@ pub fn renderSceneView(
         // (cpu_lights/headers/indices, freed in ClusteredGpuCache.deinit
         // with render). upload below stays core: its allocator funds appends
         // into the core-owned gpu_retire queue on buffer growth.
-        scene.clustered.rebuildCpuForSlot(
+        scene.clustered.rebuildCpuFromLights(
             scene.render_allocator,
-            &snap.light_pack.clustered_pos_range,
-            &snap.light_pack.clustered_color_int,
-            cl_count,
+            snap.light_pack.clustered_lights[0..cl_count],
             view_proj,
             snap.screen_w,
             snap.screen_h,

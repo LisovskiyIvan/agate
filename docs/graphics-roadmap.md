@@ -18,14 +18,14 @@
 Приоритетный порядок следующих волн. Каждая требует гейтов (CPU golden +
 Metal native + browser WebGPU legs) перед закрытием.
 
-### A. Материалы/свет — консолидация (аудит п.7) — GPU PBR migration выполнена, API/light routing ещё не закрыты
+### A. Материалы/свет — консолидация (аудит п.7) — ВЫПОЛНЕНО (07.10.2026)
 
 1. PBR-эквивалент matte: правило конверсии `specular_color/power → roughness` (`roughnessFromSpecularPower`).
 2. Миграция `createStandardMaterial` → `createPBRMaterial`: все демо, showcases, stands, bench.
 3. `default_material` → PBR-backed.
-4. Clustered spot storage + atlas pages + caster selection.
+4. **ВЫПОЛНЕНО (07.10.2026):** Clustered spot storage + atlas pages + caster selection.
 6. **ВЫПОЛНЕНО (07.10.2026):** удалён публичный CPU `StandardMaterial` adapter (`src/agate/material/standard.zig`), `Material` union сведён к `pbr | shader_material`, `createStandardMaterial`/`setStandardMaterial` устранены, движок и тесты консолидированы на `PBRMaterial`. В AGSC v3 reader сохранена обратная совместимость десериализации старых standard-записей через эквивалентный dielectric matte `PBRMaterial`.
-7. **TODO:** свести local lights к одному storage/routing. В `light_rig.zig` и PBR shaders всё ещё работают отдельные top-K uniform lanes (4 point / 2 spot) рядом с clustered pools. Наличие spot storage и atlas-page allocator не означает удаления старого lighting path.
+7. **ВЫПОЛНЕНО (07.10.2026):** сведено хранение и шейдинг local lights к единому clustered storage/routing (`ClusterLightGpu`, binding 12, 64 байта) во всех трёх forward PBR шейдерах (`pbr.glsl`, `instanced_pbr.glsl`, `skinned_pbr.glsl`). Caster selection (до 2 point и 2 spot shadow casters) отвязано от числа освещающих источников (до 64 в clustered пуле) с динамической адресацией atlas slots и параметров смещения. Старые uniform loops сохранены как fallback для режимов без SSBO (probe captures, `clustered_params.w < 0.5`).
 
 ### B. Чистка комментариев и разбиение тестов — ВЫПОЛНЕНО (04.10.2026)
 

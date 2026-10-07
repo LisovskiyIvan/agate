@@ -298,3 +298,38 @@ test "saturated light mailbox keeps the newest pack" {
     try std.testing.expectEqual(@as(f32, 0.0), pack_out.counts[0]);
     try std.testing.expect(!scene.light_handoff.takeLatest(&pack_out));
 }
+
+test "rebuildCpuFromLights builds tiles with spots and shadow-casting lights" {
+    const alloc = std.testing.allocator;
+    const scene_clustered = @import("clustered_lights.zig");
+    var cache = scene_clustered.ClusteredGpuCache{};
+    defer {
+        cache.cpu_lights.deinit(alloc);
+        cache.cpu_headers.deinit(alloc);
+        cache.cpu_indices.deinit(alloc);
+    }
+
+    const lights_arr = [_]scene_clustered.ClusterLightGpu{
+        .{
+            .pos_range = .{ 0.75, 0.75, 0.0, 5.0 },
+            .color_int = .{ 1.0, 0.0, 0.0, 2.0 },
+            .dir_inner = .{ 0, 0, 0, -2.0 },
+            .spot_params = .{ -2.0, 1.0, 0.0, 0.002 }, // Point caster
+        },
+        .{
+            .pos_range = .{ -0.75, -0.75, 0.0, 5.0 },
+            .color_int = .{ 0.0, 1.0, 0.0, 2.0 },
+            .dir_inner = .{ 0, -1, 0, 0.9 }, // Spot caster
+            .spot_params = .{ 0.7, 2.0, 1.0, 0.003 },
+        },
+    };
+
+    const full = scene_clustered.ViewRect{ .x = 0, .y = 0, .w = 128, .h = 128 };
+    try cache.rebuildCpuFromLights(alloc, &lights_arr, math.Mat4.identity, 128, 128, full, 0);
+
+    try std.testing.expectEqual(@as(usize, 2), cache.staged_count);
+    try std.testing.expectEqual(@as(usize, 2), cache.cpu_lights.items.len);
+    try std.testing.expectEqual(@as(f32, 1.0), cache.cpu_lights.items[0].spot_params[1]); // point shadow tag
+    try std.testing.expectEqual(@as(f32, 2.0), cache.cpu_lights.items[1].spot_params[1]); // spot shadow tag
+    try std.testing.expect(cache.cpu_indices.items.len > 0);
+}
