@@ -12,7 +12,6 @@ const Vec3 = math.Vec3;
 const Texture = @import("../texture.zig").Texture;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const material_mod = @import("../material.zig");
-const StandardMaterial = material_mod.StandardMaterial;
 const PBRMaterial = material_mod.PBRMaterial;
 const Material = material_mod.Material;
 const passes = @import("../passes/mod.zig");
@@ -1008,8 +1007,8 @@ test "pbr uniform packing defaults are identity and glTF conventions" {
 }
 
 test "instanced decal forces transparent + double-sided like regular decals" {
-    var opaque_mat = StandardMaterial.init("opaque");
-    const solid_mat: Material = .{ .standard = &opaque_mat };
+    var opaque_mat = PBRMaterial.init("opaque");
+    const solid_mat: Material = .{ .pbr = &opaque_mat };
     // No material, no decal: opaque single-sided (legacy behavior).
     const plain = instancedDrawFlags(null, false);
     try std.testing.expect(!plain.transparent and !plain.double_sided);

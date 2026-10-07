@@ -689,7 +689,6 @@ test "UV1 end-to-end: missing TEXCOORD_1 is MissingTextureCoordinate, scene regi
     const scene = testScene(arena.allocator());
     try std.testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
     try std.testing.expectEqual(@as(usize, 0), scene.pbr_materials.items.len);
-    try std.testing.expectEqual(@as(usize, 0), scene.materials.items.len);
 }
 
 test "UV1 end-to-end: transform override to coord 2 is UnsupportedTextureCoordinate" {

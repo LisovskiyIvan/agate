@@ -12,7 +12,6 @@ const MaterialModule = @import("material.zig");
 const Camera = CameraModule.Camera;
 const TargetCamera = CameraModule.TargetCamera;
 const FlyCamera = CameraModule.FlyCamera;
-const StandardMaterial = MaterialModule.StandardMaterial;
 const PostProcessOptions = @import("postprocess.zig").PostProcessOptions;
 const Writer = format_mod.Writer;
 const writePostProcess = format_mod.writePostProcess;
@@ -880,8 +879,6 @@ test "capture and restore mesh hierarchy and entity id" {
     const alloc = std.testing.allocator;
     var scene = testScene(alloc);
     defer {
-        for (scene.materials.items) |m| alloc.destroy(m);
-        scene.materials.deinit(alloc);
         for (scene.pbr_materials.items) |m| alloc.destroy(m);
         scene.pbr_materials.deinit(alloc);
     }

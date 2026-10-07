@@ -79,7 +79,6 @@ pub const GeometryData = struct {
 pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mesh;
 pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh;
 pub fn ensureUid(self: *Mesh) u64;
-pub fn setStandardMaterial(self: *Mesh, mat: *StandardMaterial) void;
 pub fn setPBRMaterial(self: *Mesh, mat: *PBRMaterial) void;
 pub fn attachToBone(self: *Mesh, host_mesh: *Mesh, bone_index: usize) void;
 pub fn attachToBoneByName(self: *Mesh, host_mesh: *Mesh, bone_name: []const u8) !void;

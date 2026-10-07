@@ -123,7 +123,7 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         else
             0,
         .mesh_count = scene.meshes.items.len,
-        .material_count = scene.materials.items.len,
+        .material_count = scene.pbr_materials.items.len,
         .pbr_material_count = scene.pbr_materials.items.len,
         .light_count = scene.lights.point_lights.items.len + scene.lights.spot_lights.items.len + dir_count + 1,
         .camera_count = scene.cameras.items.len,
@@ -215,17 +215,6 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
     // Skybox texture
     if (scene.sky.texture) |sky_cube| {
         try addCubeTexture(self.allocator, &textures_list, &seen_images, sky_cube, "Skybox Environment Cubemap", &snap.textures_vram_bytes);
-    }
-
-    // Standard materials textures
-    for (scene.materials.items, 0..) |mat, idx| {
-        var name_buf: [64]u8 = undefined;
-        const base_name = if (isCleanAscii(mat.name)) mat.name else std.fmt.bufPrint(&name_buf, "material_{d}", .{idx}) catch "material";
-        if (mat.diffuse_texture) |t| {
-            const name = try std.fmt.allocPrint(self.allocator, "{s} (diffuse)", .{base_name});
-            defer self.allocator.free(name);
-            try addTexture(self.allocator, &textures_list, &seen_images, t, name, &snap.textures_vram_bytes);
-        }
     }
 
     // PBR materials textures

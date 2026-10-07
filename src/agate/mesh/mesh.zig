@@ -17,7 +17,6 @@ const GeometryData = types.GeometryData;
 const SkinJointWeight = types.SkinJointWeight;
 
 const Material = @import("../material.zig").Material;
-const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const Scene = @import("../scene.zig").Scene;
@@ -606,10 +605,6 @@ pub const Mesh = struct {
             .published => &self.instance_render,
             .build_view => &self.instance_build_view,
         };
-    }
-
-    pub fn setStandardMaterial(self: *Mesh, mat: *StandardMaterial) void {
-        self.material = .{ .standard = mat };
     }
 
     pub fn setPBRMaterial(self: *Mesh, mat: *PBRMaterial) void {

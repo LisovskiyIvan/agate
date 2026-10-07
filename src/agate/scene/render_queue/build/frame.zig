@@ -15,7 +15,7 @@ const Mesh = @import("../../../mesh.zig").Mesh;
 const InstancedMesh = @import("../../../mesh.zig").InstancedMesh;
 const material_mod = @import("../../../material.zig");
 const Material = material_mod.Material;
-const StandardMaterial = material_mod.StandardMaterial;
+const PBRMaterial = material_mod.PBRMaterial;
 const Texture = @import("../../../texture.zig").Texture;
 const skeleton_mod = @import("../../../animation/skeleton.zig");
 const visibility = @import("../../../visibility/mod.zig");
@@ -322,9 +322,9 @@ test "transparent regular+instanced groups share one back-to-front order" {
     const ally = std.testing.allocator;
     const material = @import("../../../material.zig");
 
-    var blend_mat = material.StandardMaterial.init("blend");
+    var blend_mat = material.PBRMaterial.init("blend");
     blend_mat.alpha_mode = .blend;
-    const blend: Material = .{ .standard = &blend_mat };
+    const blend: Material = .{ .pbr = &blend_mat };
     const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
 
     var regular = Mesh{
@@ -466,9 +466,9 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
         .index_type = .UINT16,
     };
 
-    var trans_mat = StandardMaterial.init("trans_mat");
+    var trans_mat = PBRMaterial.init("trans_mat");
     trans_mat.alpha_mode = .blend;
-    mesh.material = .{ .standard = &trans_mat };
+    mesh.material = .{ .pbr = &trans_mat };
 
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &mesh, .position = Vec3.new(0, 0, 10) };
     var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &mesh, .position = Vec3.new(0, 0, 30) };
@@ -503,9 +503,9 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
     try std.testing.expectEqual(@as(f32, 0.0), queues.instance_matrices.items[3].m[14]);
 
     // Opaque instanced mesh preserves original instance creation order
-    var opaque_mat = StandardMaterial.init("opaque_mat");
+    var opaque_mat = PBRMaterial.init("opaque_mat");
     opaque_mat.alpha_mode = .@"opaque";
-    mesh.material = .{ .standard = &opaque_mat };
+    mesh.material = .{ .pbr = &opaque_mat };
 
     queues.reset();
     buildFrameQueues(.{

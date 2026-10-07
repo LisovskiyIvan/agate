@@ -1,10 +1,12 @@
 # Материалы
 
-> Путь: src/agate/material.zig, src/agate/material/, src/agate/node_material.zig, src/agate/material_library.zig · Импорт: agate.Material, agate.PBRMaterial, agate.StandardMaterial (root.zig) · Потоки: создание и мутация на любом потоке (plain data), чтение draw-контуром на context-потоке
+> Путь: src/agate/material.zig, src/agate/material/, src/agate/node_material.zig, src/agate/material_library.zig · Импорт: agate.Material, agate.PBRMaterial, agate.ShaderMaterial (root.zig) · Потоки: создание и мутация на любом потоке (plain data), чтение draw-контуром на context-потоке
 
 ## Что это
 
-Материал описывает, как поверхность меша взаимодействует со светом. Ядро — три вида: `StandardMaterial` (простой диффузный, Babylon-паритет), `PBRMaterial` (металлик-рафнесс PBR с расширениями glTF и слоями clearcoat/sheen/anisotropy/transmission/subsurface), `ShaderMaterial` (пользовательский шейдер, см. `./shaders.md`). Полиморфная обёртка `Material` — union указателей (`standard | pbr | shader`), хранимый в `Mesh.material`. Рендер-данные кадра готовит `buildDrawRecord`/`buildShaderSnapshot` (`draw_record.zig`); процедурные графы компилирует `node_material.zig`; готовые пресеты шейдерных материалов даёт `material_library.zig`.
+Материал описывает, как поверхность меша взаимодействует со светом. Все стандартные и glTF поверхности используют единую модель `PBRMaterial` (металлик-рафнесс PBR с расширениями glTF и слоями clearcoat/sheen/anisotropy/transmission/subsurface; дешёвый matte-диэлектрик получается установкой `metallic = 0.0, roughness = 0.5..1.0`). Для кастомных эффектов используется `ShaderMaterial` (пользовательский шейдер, см. `./shaders.md`). Полиморфная обёртка `Material` — union указателей (`pbr | shader_material`), хранимый в `Mesh.material`. Рендер-данные кадра готовит `buildDrawRecord`/`buildShaderSnapshot` (`draw_record.zig`); процедурные графы компилирует `node_material.zig`; готовые пресеты шейдерных материалов даёт `material_library.zig`.
+
+Исторические бинарные AGSC v3 ассеты со `standard` материалами автоматически десериализуются в эквивалентный matte `PBRMaterial` с вычислением шероховатости через `PBRMaterial.roughnessFromSpecularPower`.
 
 ## Быстрый старт
 
@@ -27,7 +29,7 @@ glass.* = .{ .name = "glass", .alpha_mode = .blend, .alpha = 0.4, .double_sided 
 
 // Шейдерный пресет из библиотеки.
 var sky = agate.material_library.sky("sky_mat", .{});
-mesh.material = .{ .shader = &sky };
+mesh.material = .{ .shader_material = &sky };
 
 // Проверка очереди без знания вида.
 if (mesh.material) |m| {
@@ -42,9 +44,8 @@ if (mesh.material) |m| {
 ```zig
 pub const AlphaMode = enum { @"opaque", cutout, blend };
 pub const Material = union(enum) {
-    standard: *StandardMaterial,
     pbr: *PBRMaterial,
-    shader: *ShaderMaterial,
+    shader_material: *ShaderMaterial,
     pub fn isTransparent(self: Material) bool; // .blend или opt-in PBR refraction
     pub fn isCutout(self: Material) bool;      // .cutout: альфа-тест в opaque-очереди
     pub fn isDoubleSided(self: Material) bool;
@@ -62,29 +63,6 @@ pub fn coatParamsFor(mat: ?Material) ?CoatParams;
 ```
 
 Семантика режимов: `opaque` — запись глубины, без блендинга; `cutout` — тот же opaque-контур, но фрагменты с alpha < `alpha_cutoff` отбрасываются (сортировки нет); `blend` — `SRC_ALPHA/ONE_MINUS_SRC_ALPHA`, тест глубины включён, запись выключена, отрисовка после всей непрозрачной геометрии с сортировкой сзади-вперёд.
-
-### `StandardMaterial` (`material/standard.zig`)
-
-```zig
-pub const StandardMaterial = struct {
-    name: []const u8 = "StandardMaterial",
-    diffuse_color: Color3 = Color3.white,
-    alpha: f32 = 1.0,
-    alpha_mode: AlphaMode = .@"opaque",
-    alpha_cutoff: f32 = 0.5,   // только для .cutout
-    double_sided: bool = false, // выключает cull (отдельный twin-контур)
-    unlit: bool = false,        // bypass освещения: base color + emissive
-    emissive_color: Color3 = Color3.black,
-    diffuse_texture: ?Texture = null,
-    diffuse_uv_transform: UvTransform = .{},
-    pub fn init(name: []const u8) StandardMaterial;
-    pub fn getDiffuseColor4(self: StandardMaterial) [4]f32;
-    pub fn isTransparent(self: StandardMaterial) bool;
-    pub fn isCutout(self: StandardMaterial) bool;
-};
-```
-
-Минимальный дешёвый материал для UI, дебага, неметаллических поверхностей без IBL. glTF никогда не порождает standard-материалы — только ручное создание.
 
 ### `PBRMaterial` (`material/pbr.zig`)
 
@@ -297,7 +275,7 @@ LUT по собственной roughness. Fixed-threshold `environment` gate: M
 ## Смотрите также
 
 - `./shaders.md` — реестр шейдеров, юниформы, мерж параметров для `ShaderMaterial`
-- `./mesh.md` — `Mesh.material`, назначение через `setPBRMaterial/setStandardMaterial`
+- `./mesh.md` — `Mesh.material`, назначение через `setPBRMaterial`
 - `./texture.md` — текстуры слотов, sRGB, мипмапы, блочные форматы
 - `./lights.md` — источники, с которыми взаимодействует PBR
 - `./loader.md` — импорт glTF-материалов, семплеры, `KHR_texture_transform`

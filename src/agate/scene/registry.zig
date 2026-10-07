@@ -12,7 +12,6 @@
 const std = @import("std");
 const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
-const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const TagQuery = @import("../tags.zig").TagQuery;
@@ -40,14 +39,6 @@ const TrailMesh = trail_mod.TrailMesh;
 //   particle entry kind. Removing one mid-life would also need to scrub
 //   sub-emitter back-references and the prepared/build frames that borrow
 //   its handle ids by value. Create systems sparingly and reuse them.
-
-pub fn createStandardMaterial(self: anytype, name: []const u8) !*StandardMaterial {
-    const mat = try self.allocator.create(StandardMaterial);
-    errdefer self.allocator.destroy(mat);
-    mat.* = StandardMaterial.init(name);
-    try self.materials.append(self.allocator, mat);
-    return mat;
-}
 
 pub fn createPBRMaterial(self: anytype, name: []const u8) !*PBRMaterial {
     const mat = try self.allocator.create(PBRMaterial);

@@ -92,12 +92,6 @@ fn extractMaterial(mat_opt: ?Material) ?ExportMaterial {
             .metallic = p.metallic,
             .roughness = p.roughness,
         },
-        .standard => |s| .{
-            .name = s.name,
-            .base_color = .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b, s.alpha },
-            .metallic = 0.0,
-            .roughness = 0.5,
-        },
         else => null,
     };
 }

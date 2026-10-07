@@ -75,11 +75,11 @@ pub const AreaLight = lights.AreaLight;
 pub const max_area_lights = lights.max_area_lights;
 
 pub const material = @import("material.zig");
-pub const StandardMaterial = material.StandardMaterial;
 pub const PBRMaterial = material.PBRMaterial;
 pub const Material = material.Material;
 pub const AlphaMode = material.AlphaMode;
 pub const ShaderMaterial = material.ShaderMaterial;
+pub const roughnessFromSpecularPower = material.roughnessFromSpecularPower;
 
 // Custom shader materials: build-time hook materials (build.zig
 // `user_shader_materials`) and runtime-registered sources. See

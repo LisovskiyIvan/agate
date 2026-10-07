@@ -18,10 +18,6 @@ const Subsurface = types.Subsurface;
 const CoatParams = types.CoatParams;
 const anisotropyAxes = types.anisotropyAxes;
 const wrapNdotL = types.wrapNdotL;
-
-const standard = @import("standard.zig");
-const StandardMaterial = standard.StandardMaterial;
-
 const pbr = @import("pbr.zig");
 const PBRMaterial = pbr.PBRMaterial;
 
@@ -54,11 +50,6 @@ test "refraction is opt-in, staged and classified as transparent" {
 }
 
 test "alpha_mode defaults to opaque (back-compat)" {
-    const std_mat = StandardMaterial.init("m");
-    try std.testing.expect(std_mat.alpha_mode == .@"opaque");
-    try std.testing.expect(!std_mat.isTransparent());
-    try std.testing.expect(std_mat.alpha == 1.0);
-
     const pbr_mat = PBRMaterial.init("p");
     try std.testing.expect(pbr_mat.alpha_mode == .@"opaque");
     try std.testing.expect(!pbr_mat.isTransparent());
@@ -66,77 +57,49 @@ test "alpha_mode defaults to opaque (back-compat)" {
 }
 
 test "Material.isTransparent follows alpha_mode" {
-    var std_mat = StandardMaterial.init("m");
     var pbr_mat = PBRMaterial.init("p");
-
-    const m_std: Material = .{ .standard = &std_mat };
     const m_pbr: Material = .{ .pbr = &pbr_mat };
-    try std.testing.expect(!m_std.isTransparent());
     try std.testing.expect(!m_pbr.isTransparent());
 
-    std_mat.alpha_mode = .blend;
     pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(m_std.isTransparent());
     try std.testing.expect(m_pbr.isTransparent());
 }
 
 test "cutout classifies as opaque, never transparent" {
-    var std_mat = StandardMaterial.init("m");
     var pbr_mat = PBRMaterial.init("p");
-    std_mat.alpha_mode = .cutout;
     pbr_mat.alpha_mode = .cutout;
 
-    try std.testing.expect(std_mat.isCutout());
     try std.testing.expect(pbr_mat.isCutout());
     // Cutout stays in the opaque queue: not transparent.
-    try std.testing.expect(!std_mat.isTransparent());
     try std.testing.expect(!pbr_mat.isTransparent());
 
-    const m_std: Material = .{ .standard = &std_mat };
     const m_pbr: Material = .{ .pbr = &pbr_mat };
-    try std.testing.expect(m_std.isCutout());
     try std.testing.expect(m_pbr.isCutout());
-    try std.testing.expect(!m_std.isTransparent());
     try std.testing.expect(!m_pbr.isTransparent());
 
-    // Every mode on both material kinds: only blend is transparent,
+    // Every mode on PBRMaterial: only blend is transparent,
     // only cutout is cutout.
     for ([_]AlphaMode{ .@"opaque", .cutout, .blend }) |mode| {
-        std_mat.alpha_mode = mode;
         pbr_mat.alpha_mode = mode;
-        try std.testing.expectEqual(mode == .blend, std_mat.isTransparent());
         try std.testing.expectEqual(mode == .blend, pbr_mat.isTransparent());
-        try std.testing.expectEqual(mode == .cutout, std_mat.isCutout());
         try std.testing.expectEqual(mode == .cutout, pbr_mat.isCutout());
     }
 }
 
 test "alpha_cutoff and double_sided defaults are back-compatible" {
-    const std_mat = StandardMaterial.init("m");
-    try std.testing.expectEqual(@as(f32, 0.5), std_mat.alpha_cutoff);
-    try std.testing.expect(!std_mat.double_sided);
-
     const pbr_mat = PBRMaterial.init("p");
     try std.testing.expectEqual(@as(f32, 0.5), pbr_mat.alpha_cutoff);
     try std.testing.expect(!pbr_mat.double_sided);
 
     // Union-level accessors mirror the concrete materials.
-    var std_mut = std_mat;
     var pbr_mut = pbr_mat;
-    const m_std: Material = .{ .standard = &std_mut };
     const m_pbr: Material = .{ .pbr = &pbr_mut };
-    try std.testing.expectEqual(@as(f32, 0.5), m_std.alphaCutoff());
     try std.testing.expectEqual(@as(f32, 0.5), m_pbr.alphaCutoff());
-    try std.testing.expect(!m_std.isDoubleSided());
     try std.testing.expect(!m_pbr.isDoubleSided());
 
-    std_mut.alpha_cutoff = 0.25;
-    std_mut.double_sided = true;
     pbr_mut.alpha_cutoff = 0.75;
     pbr_mut.double_sided = true;
-    try std.testing.expectEqual(@as(f32, 0.25), m_std.alphaCutoff());
     try std.testing.expectEqual(@as(f32, 0.75), m_pbr.alphaCutoff());
-    try std.testing.expect(m_std.isDoubleSided());
     try std.testing.expect(m_pbr.isDoubleSided());
 }
 
@@ -318,8 +281,6 @@ test "CoatParams snapshot is present when enabled, neutral when disabled" {
     var off = PBRMaterial.init("off");
     try std.testing.expect(coatParamsFor(.{ .pbr = &off }) == null);
     try std.testing.expect(coatParamsFor(null) == null);
-    var std_mat = StandardMaterial.init("s");
-    try std.testing.expect(coatParamsFor(.{ .standard = &std_mat }) == null);
 
     // Neutral fallback: intensities zero, companion defaults.
     const n = CoatParams.neutral;
@@ -514,56 +475,25 @@ test "MaterialDrawRecord routes specular anti-aliasing into channel_selectors.w"
     try std.testing.expectEqual(@as(f32, 3.0), rec_on.channel_selectors[2]);
 }
 
-test "MaterialDrawRecord routes StandardMaterial via equivalent PBR matte" {
-    const def_pbr = PBRMaterial.init("def");
-    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
-    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
-
-    // StandardMaterial maps specularPower to equivalent PBR roughness via
-    // PBRMaterial.roughnessFromSpecularPower, with metallic 0.0 (dielectric matte).
-    var std_mat = StandardMaterial.init("spec");
-    const rec_def = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    const r_def = PBRMaterial.roughnessFromSpecularPower(64.0);
-    try std.testing.expectEqual([4]f32{ 0.0, r_def, 1.0, 1.0 }, rec_def.pbr_factors);
-
-    std_mat.specular_power = 8.0;
-    const rec_set = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    const r_set = PBRMaterial.roughnessFromSpecularPower(8.0);
-    try std.testing.expectEqual([4]f32{ 0.0, r_set, 1.0, 1.0 }, rec_set.pbr_factors);
-
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, rec_def.emissive_color);
-    std_mat.emissive_color = Color3.new(0.2, 0.1, 0.05);
-    const rec_emis = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual([4]f32{ 0.2, 0.1, 0.05, 0.0 }, rec_emis.emissive_color);
-}
-
 test "MaterialDrawRecord routes two-sided lighting into the emissive w lane" {
     // Babylon defines TWOSIDEDLIGHTING only for `backFaceCulling == false &&
     // twoSidedLighting == true` and then flips the shading normal on back
     // faces. The flag rides the emissive lane's w (unused by the vec3 emissive
-    // upload), and it must reach BOTH families' shaders through the same lane.
+    // upload), and it must reach the shader through the same lane.
     const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
 
-    var std_mat = StandardMaterial.init("ts_std");
     var pbr_mat = PBRMaterial.init("ts_pbr");
-    try std.testing.expect(!std_mat.two_sided_lighting);
     try std.testing.expect(!pbr_mat.two_sided_lighting);
 
-    const std_off = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual(@as(f32, 0.0), std_off.emissive_color[3]);
     const pbr_off = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 0.0), pbr_off.emissive_color[3]);
 
-    std_mat.two_sided_lighting = true;
     pbr_mat.two_sided_lighting = true;
-    const std_on = buildDrawRecord(.{ .standard = &std_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual(@as(f32, 1.0), std_on.emissive_color[3]);
     const pbr_on = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), pbr_on.emissive_color[3]);
     // The emissive colour itself is untouched by the flag.
-    try std.testing.expectEqual(@as(f32, 0.0), std_on.emissive_color[0]);
     try std.testing.expectEqual(@as(f32, 0.0), pbr_on.emissive_color[0]);
 }
 
@@ -599,9 +529,6 @@ test "Material unlit mode properly routes to DrawRecord" {
     var pbr_mat = PBRMaterial.init("unlit_pbr");
     pbr_mat.unlit = true;
 
-    var std_mat = StandardMaterial.init("unlit_std");
-    std_mat.unlit = true;
-
     const def_pbr = PBRMaterial.init("def");
     const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
     const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
@@ -609,14 +536,8 @@ test "Material unlit mode properly routes to DrawRecord" {
     var mat_pbr = Material{ .pbr = &pbr_mat };
     try std.testing.expect(mat_pbr.isUnlit());
 
-    var mat_std = Material{ .standard = &std_mat };
-    try std.testing.expect(mat_std.isUnlit());
-
     const rec_pbr = buildDrawRecord(mat_pbr, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(f32, 1.0), rec_pbr.uv_offsets[0][2]);
-
-    const rec_std = buildDrawRecord(mat_std, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
-    try std.testing.expectEqual(@as(f32, 1.0), rec_std.uv_offsets[0][2]);
 }
 
 test "MaterialDrawRecord falls back to default PBR material when mat is null" {
@@ -672,8 +593,8 @@ test "P4: buildShaderSnapshot copies hook material CPU state" {
     try std.testing.expectEqual(@as(u32, 7), fallback.tex_view.id);
 
     // Не-hook материалы снимка не дают.
-    var std_mat = StandardMaterial.init("s");
-    try std.testing.expect(buildShaderSnapshot(.{ .standard = &std_mat }, &dummy_tex) == null);
+    var pbr_mat = PBRMaterial.init("p");
+    try std.testing.expect(buildShaderSnapshot(.{ .pbr = &pbr_mat }, &dummy_tex) == null);
     try std.testing.expect(buildShaderSnapshot(null, &dummy_tex) == null);
 }
 

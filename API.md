@@ -96,8 +96,7 @@ requirements: **[docs/allocators.md](./docs/allocators.md)**.
 
 ### Materials
 
-- Create: `scene.createStandardMaterial(name)`,
-  `scene.createPBRMaterial(name)`, `scene.createShaderMaterial(name,
+- Create: `scene.createPBRMaterial(name)`, `scene.createShaderMaterial(name,
   shader_name)` (null on an unknown shader or allocation failure).
 - Destroy: `scene.destroyPBRMaterial(mat)` unlinks and frees the CPU
   material immediately with no GPU retire — prepared draw records carry
@@ -105,10 +104,10 @@ requirements: **[docs/allocators.md](./docs/allocators.md)**.
   GPU objects needing deferred teardown.
   Detach live mesh references first and let pending asynchronous uploads
   targeting the material finish before destroying it.
-- Standard/shader materials remain Scene-owned until `Scene.deinit`;
+- Shader materials remain Scene-owned until `Scene.deinit`;
   there is no individual destroy API for them.
-- Material names are borrowed: `StandardMaterial.init(name)` /
-  `PBRMaterial.init(name)` (and the `create*Material` wrappers) store
+- Material names are borrowed: `PBRMaterial.init(name)`
+  (and the `createPBRMaterial` wrapper) stores
   the slice as-is — no dupe, no `owns_name` flag, nothing freed at
   destroy. The name storage must outlive the material (string literals
   or caller-owned buffers kept alive). Contrast mesh names, which are

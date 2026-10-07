@@ -16,7 +16,6 @@ const Mesh = @import("../../mesh.zig").Mesh;
 const material_mod = @import("../../material.zig");
 const Material = material_mod.Material;
 const MaterialDrawRecord = material_mod.MaterialDrawRecord;
-const StandardMaterial = material_mod.StandardMaterial;
 const PBRMaterial = material_mod.PBRMaterial;
 const Texture = @import("../../texture.zig").Texture;
 const CubeTexture = @import("../../texture.zig").CubeTexture;

@@ -6,7 +6,6 @@ const CubeTexture = @import("../texture.zig").CubeTexture;
 const shader_material = @import("../shader_material.zig");
 
 const types = @import("types.zig");
-const StandardMaterial = @import("standard.zig").StandardMaterial;
 const PBRMaterial = @import("pbr.zig").PBRMaterial;
 const ShaderMaterial = @import("shader_mat.zig").ShaderMaterial;
 const union_mod = @import("union.zig");
@@ -205,42 +204,6 @@ pub fn buildDrawRecord(
         switch (m) {
             .pbr => |p| {
                 populatePbrRecord(&rec, p, default_white, default_normal, default_cube, sky_texture, ibl_intensity);
-            },
-            .standard => |s| {
-                const tex = s.diffuse_texture orelse default_white.*;
-                rec.albedo_view = tex.view;
-                rec.albedo_sampler = tex.sampler;
-                rec.normal_view = default_normal.view;
-                rec.mr_view = default_white.view;
-                rec.emissive_view = default_white.view;
-                rec.occlusion_view = default_white.view;
-                rec.clearcoat_view = default_white.view;
-                rec.sheen_view = default_white.view;
-                rec.data_sampler = default_normal.sampler;
-                if (sky_texture) |st| {
-                    rec.env_view = st.view;
-                    rec.env_sampler = st.sampler;
-                } else {
-                    rec.env_view = default_cube.view;
-                    rec.env_sampler = default_cube.sampler;
-                }
-                rec.base_color = s.getDiffuseColor4();
-                rec.pbr_factors = .{
-                    0.0,
-                    PBRMaterial.roughnessFromSpecularPower(s.specular_power),
-                    1.0,
-                    ibl_intensity,
-                };
-                rec.emissive_color = .{
-                    s.emissive_color.r,
-                    s.emissive_color.g,
-                    s.emissive_color.b,
-                    if (s.two_sided_lighting) 1.0 else 0.0,
-                };
-                rec.alpha_cutoff = if (s.alpha_mode == .cutout) s.alpha_cutoff else 0.0;
-                rec.uv_matrices[0] = s.diffuse_uv_transform.matrixRows();
-                rec.uv_offsets[0] = s.diffuse_uv_transform.offsetPacked();
-                if (s.unlit) rec.uv_offsets[0][2] = 1.0;
             },
             .shader_material => |sm| {
                 const tex = sm.texture orelse default_white.*;

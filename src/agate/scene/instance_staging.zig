@@ -1659,7 +1659,7 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
     // eye. Both orders are correct back-to-front for their own eye — they
     // are NOT forced equal. Two instances symmetric about the origin make
     // the divergence exact: opposite eyes give reverse orders.
-    var blend_mat = material_mod.StandardMaterial.init("s1_blend");
+    var blend_mat = material_mod.PBRMaterial.init("s1_blend");
     blend_mat.alpha_mode = .blend;
 
     var src = splitSrcMesh();
@@ -1673,7 +1673,7 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .material = .{ .standard = &blend_mat },
+        .material = .{ .pbr = &blend_mat },
         .instances = .{ .items = &ptrs, .capacity = 2 },
     };
     const meshes = [_]*Mesh{&mesh};

@@ -576,7 +576,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
     const Vec3 = math.Vec3;
     const BoundingBox = math.BoundingBox;
     const material = @import("../../material.zig");
-    var blend_mat = material.StandardMaterial.init("blend");
+    var blend_mat = material.PBRMaterial.init("blend");
     blend_mat.alpha_mode = .blend;
 
     var src = Mesh{
@@ -594,7 +594,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .material = .{ .standard = &blend_mat },
+        .material = .{ .pbr = &blend_mat },
         .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 2 },
     };
     const meshes = [_]*Mesh{&parent};

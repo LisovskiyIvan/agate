@@ -3738,7 +3738,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
 
-    var blend_mat = material_mod.StandardMaterial.init("b2j_blend");
+    var blend_mat = material_mod.PBRMaterial.init("b2j_blend");
     blend_mat.alpha_mode = .blend;
     var src = Mesh{
         .name = "b2j_src",
@@ -3757,7 +3757,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .material = .{ .standard = &blend_mat },
+        .material = .{ .pbr = &blend_mat },
         .instances = .{ .items = ptrs, .capacity = 2 },
     };
     try scene.meshes.append(alloc, &parent);
@@ -4237,7 +4237,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
     p7CpuShadowPass(&scene, alloc);
     scene.shadows.enabled = false;
 
-    var blend_mat = material_mod.StandardMaterial.init("snap_eye_blend");
+    var blend_mat = material_mod.PBRMaterial.init("snap_eye_blend");
     blend_mat.alpha_mode = .blend;
     var src = Mesh{
         .name = "snap_eye_src",
@@ -4256,7 +4256,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .material = .{ .standard = &blend_mat },
+        .material = .{ .pbr = &blend_mat },
         .instances = .{ .items = &ptrs, .capacity = 2 },
     };
     try scene.meshes.append(alloc, &parent);

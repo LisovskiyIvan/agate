@@ -24,8 +24,8 @@ Metal native + browser WebGPU legs) перед закрытием.
 2. Миграция `createStandardMaterial` → `createPBRMaterial`: все демо, showcases, stands, bench.
 3. `default_material` → PBR-backed.
 4. Clustered spot storage + atlas pages + caster selection.
-5. Удалены `standard.glsl`, `instanced.glsl`, Standard draw branches. Writer/reader v3 с backward-совместимостью.
-6. **TODO:** удалить публичный CPU `StandardMaterial` adapter, сохранив чтение старых material-kind tags в v3; свести local lights к одному storage/routing. В `light_rig.zig` и PBR shaders всё ещё работают отдельные top-K uniform lanes (4 point / 2 spot) рядом с clustered pools. Наличие spot storage и atlas-page allocator не означает удаления старого lighting path.
+6. **ВЫПОЛНЕНО (07.10.2026):** удалён публичный CPU `StandardMaterial` adapter (`src/agate/material/standard.zig`), `Material` union сведён к `pbr | shader_material`, `createStandardMaterial`/`setStandardMaterial` устранены, движок и тесты консолидированы на `PBRMaterial`. В AGSC v3 reader сохранена обратная совместимость десериализации старых standard-записей через эквивалентный dielectric matte `PBRMaterial`.
+7. **TODO:** свести local lights к одному storage/routing. В `light_rig.zig` и PBR shaders всё ещё работают отдельные top-K uniform lanes (4 point / 2 spot) рядом с clustered pools. Наличие spot storage и atlas-page allocator не означает удаления старого lighting path.
 
 ### B. Чистка комментариев и разбиение тестов — ВЫПОЛНЕНО (04.10.2026)
 

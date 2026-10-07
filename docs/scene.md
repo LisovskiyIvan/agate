@@ -19,9 +19,9 @@ scene.initInto(allocator); // GPU-владелец помечен ДО сцен�
 defer scene.deinit();
 
 // Материал + меш (Scene-owned, реестр).
-const mat = try scene.createStandardMaterial("wall");
+const mat = try scene.createPBRMaterial("wall");
 const box = try agate.MeshBuilder.createBox(&scene, "box", .{});
-box.material = .{ .standard = mat };
+box.material = .{ .pbr = mat };
 
 // Камера.
 try scene.addCamera(.{ .name = "main", .camera = .{ .arc_rotate = cam } });
@@ -51,7 +51,6 @@ if (scene.beginStagedPrepare()) |claim| {
 ### Создание/удаление контента — `scene/registry.zig`, `scene/content.zig`
 
 ```zig
-pub fn createStandardMaterial(self: anytype, name: []const u8) !*StandardMaterial;
 pub fn createPBRMaterial(self: anytype, name: []const u8) !*PBRMaterial;
 pub fn createShaderMaterial(self: anytype, name: []const u8, shader_name: []const u8) ?*ShaderMaterial;
 pub fn destroyPBRMaterial(self: anytype, mat: *PBRMaterial) void;

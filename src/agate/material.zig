@@ -2,7 +2,6 @@
 //! Re-exports concrete materials, tagged union, PBR layer types, and draw records.
 
 pub const types = @import("material/types.zig");
-pub const standard = @import("material/standard.zig");
 pub const pbr = @import("material/pbr.zig");
 pub const shader_mat = @import("material/shader_mat.zig");
 pub const union_mod = @import("material/union.zig");
@@ -22,7 +21,6 @@ pub const anisotropyAxes = types.anisotropyAxes;
 pub const wrapNdotL = types.wrapNdotL;
 
 // Concrete Materials
-pub const StandardMaterial = standard.StandardMaterial;
 pub const PBRMaterial = pbr.PBRMaterial;
 pub const ShaderMaterial = shader_mat.ShaderMaterial;
 pub const roughnessFromSpecularPower = pbr.roughnessFromSpecularPower;
@@ -39,7 +37,6 @@ pub const buildDrawRecord = draw_record.buildDrawRecord;
 
 test {
     _ = types;
-    _ = standard;
     _ = pbr;
     _ = shader_mat;
     _ = union_mod;

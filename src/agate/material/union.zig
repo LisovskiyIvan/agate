@@ -5,12 +5,10 @@ const Texture = @import("../texture.zig").Texture;
 const types = @import("types.zig");
 const AlphaMode = types.AlphaMode;
 const CoatParams = types.CoatParams;
-const StandardMaterial = @import("standard.zig").StandardMaterial;
 const PBRMaterial = @import("pbr.zig").PBRMaterial;
 const ShaderMaterial = @import("shader_mat.zig").ShaderMaterial;
 
 pub const Material = union(enum) {
-    standard: *StandardMaterial,
     pbr: *PBRMaterial,
     shader_material: *ShaderMaterial,
 
@@ -34,7 +32,6 @@ pub const Material = union(enum) {
 
     pub fn isUnlit(self: Material) bool {
         return switch (self) {
-            .standard => |s| s.unlit,
             .pbr => |p| p.unlit,
             .shader_material => false,
         };
@@ -42,7 +39,6 @@ pub const Material = union(enum) {
 
     pub fn setUnlit(self: *Material, unlit_val: bool) void {
         switch (self.*) {
-            .standard => |s| s.unlit = unlit_val,
             .pbr => |p| p.unlit = unlit_val,
             .shader_material => {},
         }
@@ -86,7 +82,6 @@ pub const Material = union(enum) {
     /// workflow; the mapping lives here so call sites never hand-switch.
     pub fn baseColor3(self: Material) Color3 {
         return switch (self) {
-            .standard => |s| s.diffuse_color,
             .pbr => |p| p.albedo_color,
             .shader_material => |sm| sm.tint_color,
         };
@@ -95,7 +90,6 @@ pub const Material = union(enum) {
     /// The material's primary texture (diffuse/albedo slot), or null.
     pub fn primaryTexture(self: Material) ?Texture {
         return switch (self) {
-            .standard => |s| s.diffuse_texture,
             .pbr => |p| p.albedo_texture,
             .shader_material => |sm| sm.texture,
         };
@@ -104,7 +98,6 @@ pub const Material = union(enum) {
     /// Tint * alpha as uploaded to the albedo color uniform.
     pub fn tintColor4(self: Material) [4]f32 {
         return switch (self) {
-            .standard => |s| s.getDiffuseColor4(),
             .pbr => |p| p.getAlbedoColor4(),
             .shader_material => |sm| sm.getTintColor4(),
         };

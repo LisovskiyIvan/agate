@@ -16,7 +16,7 @@ const Mesh = @import("../../../mesh.zig").Mesh;
 const InstancedMesh = @import("../../../mesh.zig").InstancedMesh;
 const material_mod = @import("../../../material.zig");
 const Material = material_mod.Material;
-const StandardMaterial = material_mod.StandardMaterial;
+const PBRMaterial = material_mod.PBRMaterial;
 const Texture = @import("../../../texture.zig").Texture;
 const skeleton_mod = @import("../../../animation/skeleton.zig");
 const visibility = @import("../../../visibility/mod.zig");
@@ -45,11 +45,9 @@ const buildFrameQueues = frame.buildFrameQueues;
 
 test "material alpha modes route regular and instanced draws with frozen cutoffs" {
     const ally = std.testing.allocator;
-    var standard = StandardMaterial.init("standard");
-    var pbr = material_mod.PBRMaterial.init("pbr");
+    var pbr = PBRMaterial.init("pbr");
     var shader = material_mod.ShaderMaterial.init("shader");
     const materials = [_]Material{
-        .{ .standard = &standard },
         .{ .pbr = &pbr },
         .{ .shader_material = &shader },
     };
@@ -134,14 +132,14 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
 
-    var std_mat = material_mod.StandardMaterial.init("snap");
-    std_mat.diffuse_color = math.Color3.new(0.2, 0.4, 0.6);
-    const mat: Material = .{ .standard = &std_mat };
+    var std_mat = material_mod.PBRMaterial.init("snap");
+    std_mat.albedo_color = math.Color3.new(0.2, 0.4, 0.6);
+    const mat: Material = .{ .pbr = &std_mat };
 
-    var blend_mat = material_mod.StandardMaterial.init("snap_blend");
+    var blend_mat = material_mod.PBRMaterial.init("snap_blend");
     blend_mat.alpha_mode = .blend;
-    blend_mat.diffuse_color = math.Color3.new(0.1, 0.2, 0.3);
-    const blend: Material = .{ .standard = &blend_mat };
+    blend_mat.albedo_color = math.Color3.new(0.1, 0.2, 0.3);
+    const blend: Material = .{ .pbr = &blend_mat };
 
     const skel = try Skeleton.init(ally, 1);
     defer skel.deinit();
@@ -203,8 +201,8 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     // перезаписывает исходный слот новым значением x=5).
     opaque_mesh.position = Vec3.new(99, 99, 99);
     trans_mesh.position = Vec3.new(99, 99, 99);
-    std_mat.diffuse_color = math.Color3.new(9, 9, 9);
-    blend_mat.diffuse_color = math.Color3.new(9, 9, 9);
+    std_mat.albedo_color = math.Color3.new(9, 9, 9);
+    blend_mat.albedo_color = math.Color3.new(9, 9, 9);
     skel.bones[0].local_position = Vec3.new(5, 0, 0);
     skel.update();
     skel.update();
@@ -225,8 +223,8 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
 test "P4: instanced batch record survives source mutation" {
     const ally = std.testing.allocator;
 
-    var inst_mat = material_mod.StandardMaterial.init("inst_snap");
-    inst_mat.diffuse_color = math.Color3.new(0.5, 0.25, 0.125);
+    var inst_mat = material_mod.PBRMaterial.init("inst_snap");
+    inst_mat.albedo_color = math.Color3.new(0.5, 0.25, 0.125);
     const unit_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
     var src = Mesh{
         .name = "inst_src",
@@ -241,7 +239,7 @@ test "P4: instanced batch record survives source mutation" {
         .index_buffer = .{},
         .index_count = 36,
         .index_type = .UINT16,
-        .material = .{ .standard = &inst_mat },
+        .material = .{ .pbr = &inst_mat },
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 10) };
     var ptrs = [_]*InstancedMesh{&inst0};
@@ -267,7 +265,7 @@ test "P4: instanced batch record survives source mutation" {
     });
     try std.testing.expectEqual(@as(usize, 1), queues.opaque_instanced.items.len);
 
-    inst_mat.diffuse_color = math.Color3.new(9, 9, 9);
+    inst_mat.albedo_color = math.Color3.new(9, 9, 9);
     mesh.position = Vec3.new(99, 0, 0);
     const batch = queues.opaque_instanced.items[0];
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), batch.draw_record.base_color[0], 1e-6);
@@ -469,11 +467,11 @@ test "P4: OOM never leaves items with dangling or live skin refs" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
 
-    var std_mat = material_mod.StandardMaterial.init("oom");
-    const mat: Material = .{ .standard = &std_mat };
-    var blend_mat = material_mod.StandardMaterial.init("oom_blend");
+    var std_mat = material_mod.PBRMaterial.init("oom");
+    const mat: Material = .{ .pbr = &std_mat };
+    var blend_mat = material_mod.PBRMaterial.init("oom_blend");
     blend_mat.alpha_mode = .blend;
-    const blend: Material = .{ .standard = &blend_mat };
+    const blend: Material = .{ .pbr = &blend_mat };
     var hook_mat = material_mod.ShaderMaterial.init("oom_hook");
     const hook: Material = .{ .shader_material = &hook_mat };
     var hook_blend_mat = material_mod.ShaderMaterial.init("oom_hook_blend");

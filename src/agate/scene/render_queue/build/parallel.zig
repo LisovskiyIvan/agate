@@ -20,7 +20,6 @@ const Mesh = @import("../../../mesh.zig").Mesh;
 const InstancedMesh = @import("../../../mesh.zig").InstancedMesh;
 const material_mod = @import("../../../material.zig");
 const Material = material_mod.Material;
-const StandardMaterial = material_mod.StandardMaterial;
 const Texture = @import("../../../texture.zig").Texture;
 const skeleton_mod = @import("../../../animation/skeleton.zig");
 const visibility = @import("../../../visibility/mod.zig");

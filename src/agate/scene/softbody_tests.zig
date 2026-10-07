@@ -12,8 +12,6 @@ fn freeSoftbodyFixture(alloc: std.mem.Allocator, scene: *Scene) void {
         alloc.destroy(m);
     }
     scene.meshes.deinit(alloc);
-    for (scene.materials.items) |m| alloc.destroy(m);
-    scene.materials.deinit(alloc);
     for (scene.pbr_materials.items) |m| alloc.destroy(m);
     scene.pbr_materials.deinit(alloc);
     scene.gpu_retire.deinit(alloc);

@@ -69,7 +69,6 @@ const LODLevelSpec = simplify_mod.LODLevelSpec;
 const ai_mod = @import("../ai.zig");
 const NavMesh = ai_mod.NavMesh;
 const NavAgent = ai_mod.NavAgent;
-const StandardMaterial = @import("../material.zig").StandardMaterial;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const Texture = @import("../texture.zig").Texture;
@@ -227,7 +226,6 @@ pub const Scene = struct {
     /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
     /// а не на камеру/view.
     retire_epoch: scene_retire.Epoch = 0,
-    materials: std.ArrayListUnmanaged(*StandardMaterial) = .empty,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
@@ -947,11 +945,6 @@ pub const Scene = struct {
     /// See `scene/attachments.zig` (owns the body + docs).
     pub fn updateSoftBodies(self: *Scene, dt: f32) void {
         scene_attachments.updateSoftBodies(self, dt);
-    }
-
-    /// See `scene/registry.zig` (owns the body + docs).
-    pub fn createStandardMaterial(self: *Scene, name: []const u8) !*StandardMaterial {
-        return scene_registry.createStandardMaterial(self, name);
     }
 
     /// See `scene/registry.zig` (owns the body + docs).

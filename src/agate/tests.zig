@@ -99,7 +99,6 @@ test {
     _ = @import("material/draw_record.zig");
     _ = @import("material/pbr.zig");
     _ = @import("material/shader_mat.zig");
-    _ = @import("material/standard.zig");
     _ = @import("material/tests.zig");
     _ = @import("material/types.zig");
     _ = @import("material/union.zig");

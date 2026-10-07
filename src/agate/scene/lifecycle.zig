@@ -144,7 +144,6 @@ pub fn deinit(self: anytype) void {
     self.softbodies.deinit(self.allocator);
 
     scene_content.deinitMeshes(self.allocator, &self.meshes);
-    scene_content.deinitMaterials(self.allocator, &self.materials);
     scene_content.deinitPbrMaterials(self.allocator, &self.pbr_materials);
     scene_content.deinitShaderMaterials(self.allocator, &self.shader_materials);
 

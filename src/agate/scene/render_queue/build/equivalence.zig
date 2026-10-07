@@ -18,7 +18,6 @@ const Mesh = @import("../../../mesh.zig").Mesh;
 const InstancedMesh = @import("../../../mesh.zig").InstancedMesh;
 const material_mod = @import("../../../material.zig");
 const Material = material_mod.Material;
-const StandardMaterial = material_mod.StandardMaterial;
 const Texture = @import("../../../texture.zig").Texture;
 const skeleton_mod = @import("../../../animation/skeleton.zig");
 const visibility = @import("../../../visibility/mod.zig");
@@ -352,9 +351,9 @@ test "parallel cull mixed scene matches serial on all queues" {
     const ally = std.testing.allocator;
     const material = @import("../../../material.zig");
 
-    var blend_mat = material.StandardMaterial.init("mixed_blend");
+    var blend_mat = material.PBRMaterial.init("mixed_blend");
     blend_mat.alpha_mode = .blend;
-    const blend: Material = .{ .standard = &blend_mat };
+    const blend: Material = .{ .pbr = &blend_mat };
     const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
 
     var opaque_a = Mesh{
@@ -655,9 +654,9 @@ test "parallel setup OOM falls back to serial queues" {
     const ally = std.testing.allocator;
     const material = @import("../../../material.zig");
 
-    var blend_mat = material.StandardMaterial.init("fallback_blend");
+    var blend_mat = material.PBRMaterial.init("fallback_blend");
     blend_mat.alpha_mode = .blend;
-    const blend: Material = .{ .standard = &blend_mat };
+    const blend: Material = .{ .pbr = &blend_mat };
     const unit_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
 
     var plain_a = Mesh{

@@ -318,26 +318,20 @@ test "alphaCutoffFor gates the cutoff on cutout mode" {
     // No material: opaque legacy, test disabled.
     try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(null));
 
-    var std_mat = material.StandardMaterial.init("m");
     var pbr_mat = material.PBRMaterial.init("p");
 
     // Opaque and blend upload 0.0 even with a customized cutoff stored.
-    std_mat.alpha_cutoff = 0.3;
     pbr_mat.alpha_cutoff = 0.7;
     for ([_]material.AlphaMode{ .@"opaque", .blend }) |mode| {
-        std_mat.alpha_mode = mode;
         pbr_mat.alpha_mode = mode;
-        try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(.{ .standard = &std_mat }));
         try std.testing.expectEqual(@as(f32, 0.0), alphaCutoffFor(.{ .pbr = &pbr_mat }));
     }
 
     // Cutout uploads the material value (default 0.5).
-    std_mat.alpha_mode = .cutout;
     pbr_mat.alpha_mode = .cutout;
-    try std.testing.expectEqual(@as(f32, 0.3), alphaCutoffFor(.{ .standard = &std_mat }));
     try std.testing.expectEqual(@as(f32, 0.7), alphaCutoffFor(.{ .pbr = &pbr_mat }));
 
-    var std_default = material.StandardMaterial.init("d");
-    std_default.alpha_mode = .cutout;
-    try std.testing.expectEqual(@as(f32, 0.5), alphaCutoffFor(.{ .standard = &std_default }));
+    var pbr_default = material.PBRMaterial.init("d");
+    pbr_default.alpha_mode = .cutout;
+    try std.testing.expectEqual(@as(f32, 0.5), alphaCutoffFor(.{ .pbr = &pbr_default }));
 }

@@ -14,7 +14,6 @@ const SceneModule = @import("../scene.zig");
 const Scene = SceneModule.Scene;
 const PostProcessOptions = @import("../postprocess.zig").PostProcessOptions;
 const MaterialModule = @import("../material.zig");
-const StandardMaterial = MaterialModule.StandardMaterial;
 const PBRMaterial = MaterialModule.PBRMaterial;
 const AlphaMode = MaterialModule.AlphaMode;
 const Mesh = @import("../mesh.zig").Mesh;

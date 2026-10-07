@@ -393,36 +393,25 @@ test "cutout stays opaque, blend stays transparent" {
     try std.testing.expect(!materialIsCutout(null));
     try std.testing.expect(!materialIsDoubleSided(null));
 
-    var std_mat = material.StandardMaterial.init("m");
     var pbr_mat = material.PBRMaterial.init("p");
 
     // Opaque default: opaque queue, not cutout, single-sided.
-    try std.testing.expect(!materialIsTransparent(.{ .standard = &std_mat }));
     try std.testing.expect(!materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(!materialIsCutout(.{ .standard = &std_mat }));
     try std.testing.expect(!materialIsCutout(.{ .pbr = &pbr_mat }));
 
     // Cutout: still NOT in the transparent queue, but flagged cutout.
-    std_mat.alpha_mode = .cutout;
     pbr_mat.alpha_mode = .cutout;
-    try std.testing.expect(!materialIsTransparent(.{ .standard = &std_mat }));
     try std.testing.expect(!materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(materialIsCutout(.{ .standard = &std_mat }));
     try std.testing.expect(materialIsCutout(.{ .pbr = &pbr_mat }));
 
     // Blend: transparent queue, never cutout.
-    std_mat.alpha_mode = .blend;
     pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(materialIsTransparent(.{ .standard = &std_mat }));
     try std.testing.expect(materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(!materialIsCutout(.{ .standard = &std_mat }));
     try std.testing.expect(!materialIsCutout(.{ .pbr = &pbr_mat }));
 
     // Double-sided is orthogonal to the alpha mode.
-    try std.testing.expect(!materialIsDoubleSided(.{ .standard = &std_mat }));
-    std_mat.double_sided = true;
+    try std.testing.expect(!materialIsDoubleSided(.{ .pbr = &pbr_mat }));
     pbr_mat.double_sided = true;
-    try std.testing.expect(materialIsDoubleSided(.{ .standard = &std_mat }));
     try std.testing.expect(materialIsDoubleSided(.{ .pbr = &pbr_mat }));
 }
 
@@ -432,13 +421,9 @@ test "transparent classification follows material alpha mode" {
     const material = @import("../../material.zig");
 
     try std.testing.expect(!materialIsTransparent(null));
-    var std_mat = material.StandardMaterial.init("s");
     var pbr_mat = material.PBRMaterial.init("p");
-    try std.testing.expect(!materialIsTransparent(Material{ .standard = &std_mat }));
     try std.testing.expect(!materialIsTransparent(Material{ .pbr = &pbr_mat }));
-    std_mat.alpha_mode = .blend;
     pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(materialIsTransparent(Material{ .standard = &std_mat }));
     try std.testing.expect(materialIsTransparent(Material{ .pbr = &pbr_mat }));
 }
 

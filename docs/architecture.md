@@ -21,9 +21,9 @@ defer scene.deinit();
 // Слои снизу вверх: math → mesh/material → scene → runtime.
 var cam = agate.ArcRotateCamera.new(...);
 try scene.addCamera(.{ .name = "main", .camera = .{ .arc_rotate = cam } });
-const mat = try scene.createStandardMaterial("wall");
+const mat = try scene.createPBRMaterial("wall");
 const box = try agate.MeshBuilder.createBox(&scene, "box", .{});
-box.material = .{ .standard = mat };
+box.material = .{ .pbr = mat };
 
 // Кадр: game пишет, context готовит и рисует (см. ./runtime.md).
 var runtime: agate.Runtime = agate.Runtime.init();

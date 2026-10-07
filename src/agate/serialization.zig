@@ -36,7 +36,6 @@ const Camera = CameraModule.Camera;
 const TargetCamera = CameraModule.TargetCamera;
 const FlyCamera = CameraModule.FlyCamera;
 const MaterialModule = @import("material.zig");
-const StandardMaterial = MaterialModule.StandardMaterial;
 
 // Format re-exports (header/version constants, caps, decode errors).
 pub const MAGIC = format_mod.MAGIC;

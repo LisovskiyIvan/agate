@@ -232,10 +232,10 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     // Cutout-снимок: вью/сэмплер/катoff скопированы, живой материал не читается.
     const material_mod = @import("../material.zig");
     const texture_mod = @import("../texture.zig");
-    var cut_mat = material_mod.StandardMaterial.init("outline_cut");
+    var cut_mat = material_mod.PBRMaterial.init("outline_cut");
     cut_mat.alpha_mode = .cutout;
     cut_mat.alpha_cutoff = 0.3;
-    cut_mat.diffuse_texture = texture_mod.Texture{
+    cut_mat.albedo_texture = texture_mod.Texture{
         .image = .{},
         .view = .{ .id = 77 },
         .sampler = .{ .id = 78 },
@@ -247,7 +247,7 @@ test "P4: outline item owns model, skin and cutout snapshots" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .material = .{ .standard = &cut_mat },
+        .material = .{ .pbr = &cut_mat },
     };
     var skins2: scene_render_queue.SkinStorage = .empty;
     defer skins2.deinit(ally);
@@ -258,7 +258,7 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     try std.testing.expectEqual(@as(u32, 5), cut.source_mesh);
 
     cut_mat.alpha_cutoff = 0.9;
-    cut_mat.diffuse_texture = null;
+    cut_mat.albedo_texture = null;
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), cut.cutout_cutoff, 1e-6);
     try std.testing.expectEqual(@as(u32, 77), cut.cutout_view.?.id);
     try std.testing.expectEqual(@as(u32, 78), cut.cutout_sampler.?.id);

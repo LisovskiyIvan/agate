@@ -350,14 +350,14 @@ test "velocity alpha uniforms map the frozen record slot-0 lanes exactly" {
     try std.testing.expectEqual(@as(f32, 0.0), alpha_opaque.alpha_cutoff);
     try std.testing.expectEqual(@as(u32, 201), rec_opaque.albedo_view.id);
 
-    // Standard family maps its diffuse lane onto the same slot-0 contract.
-    var std_mat = material_mod.StandardMaterial.init("velocity_alpha_std");
-    std_mat.alpha_mode = .cutout;
-    std_mat.alpha_cutoff = 0.42;
-    std_mat.diffuse_texture = albedo;
-    std_mat.diffuse_uv_transform = .{ .offset = .{ 0.125, 0.75 }, .rotation = 0.0, .scale = .{ 1.0, 1.0 }, .tex_coord = 0 };
-    const rec_std = material_mod.buildDrawRecord(
-        .{ .standard = &std_mat },
+    // Cutout with UV transform maps onto the slot-0 contract.
+    var pbr_cut = material_mod.PBRMaterial.init("velocity_alpha_pbr");
+    pbr_cut.alpha_mode = .cutout;
+    pbr_cut.alpha_cutoff = 0.42;
+    pbr_cut.albedo_texture = albedo;
+    pbr_cut.albedo_uv_transform = .{ .offset = .{ 0.125, 0.75 }, .rotation = 0.0, .scale = .{ 1.0, 1.0 }, .tex_coord = 0 };
+    const rec_pbr_cut = material_mod.buildDrawRecord(
+        .{ .pbr = &pbr_cut },
         &def_mat,
         &white,
         &normal,
@@ -366,11 +366,11 @@ test "velocity alpha uniforms map the frozen record slot-0 lanes exactly" {
         null,
         1.0,
     );
-    const alpha_std = velocity_pass.velocityAlphaUniforms(rec_std);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.42), alpha_std.alpha_cutoff, 1e-7);
-    try std.testing.expectEqual(rec_std.uv_matrices[0], alpha_std.uv_matrix);
-    try std.testing.expectEqual(rec_std.uv_offsets[0], alpha_std.uv_offset);
-    try std.testing.expectEqual(@as(u32, 201), rec_std.albedo_view.id);
+    const alpha_cut = velocity_pass.velocityAlphaUniforms(rec_pbr_cut);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), alpha_cut.alpha_cutoff, 1e-7);
+    try std.testing.expectEqual(rec_pbr_cut.uv_matrices[0], alpha_cut.uv_matrix);
+    try std.testing.expectEqual(rec_pbr_cut.uv_offsets[0], alpha_cut.uv_offset);
+    try std.testing.expectEqual(@as(u32, 201), rec_pbr_cut.albedo_view.id);
 }
 
 test "TAA reset flags recognize cuts and explicit resets" {
@@ -478,7 +478,7 @@ test "instance uids are stable, unique, and order the layout hash" {
 
 test "transparent re-sort changes the layout instead of mispairing" {
     const ally = std.testing.allocator;
-    var blend_mat = material_mod.StandardMaterial.init("blend_sort");
+    var blend_mat = material_mod.PBRMaterial.init("blend_sort");
     blend_mat.alpha_mode = .blend;
 
     var source_mesh = Mesh{
@@ -499,7 +499,7 @@ test "transparent re-sort changes the layout instead of mispairing" {
         .index_buffer = .{},
         .index_count = 36,
         .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(11, 11, 11)),
-        .material = .{ .standard = &blend_mat },
+        .material = .{ .pbr = &blend_mat },
         .instances = .{ .items = &ptrs, .capacity = 2 },
     };
     var scratch: std.ArrayListUnmanaged(Mat4) = .empty;

@@ -56,19 +56,6 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                     .double_sided = p.double_sided,
                 } };
             }
-            if (mat == .standard) {
-                const s = mat.standard;
-                break :blk .{ .pbr = .{
-                    .albedo = .{ s.diffuse_color.r, s.diffuse_color.g, s.diffuse_color.b },
-                    .metallic = 0.0,
-                    .roughness = PBRMaterial.roughnessFromSpecularPower(s.specular_power),
-                    .emissive = .{ s.emissive_color.r, s.emissive_color.g, s.emissive_color.b },
-                    .alpha = s.alpha,
-                    .alpha_mode = alphaModeToU8(s.alpha_mode),
-                    .alpha_cutoff = s.alpha_cutoff,
-                    .double_sided = s.double_sided,
-                } };
-            }
             // All other variants (e.g. shader materials) capture as PBR matte equivalent.
             const base = mat.baseColor3();
             break :blk .{ .pbr = .{
