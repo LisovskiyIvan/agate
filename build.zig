@@ -364,6 +364,7 @@ pub fn build(b: *Build) !void {
         .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
         .{ .name = "probe_mip_shader", .input = "src/agate/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
         .{ .name = "ui3d_panel_shader", .input = "src/agate/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },
+        .{ .name = "depth_pyramid_shader", .input = "src/agate/shaders/depth_pyramid.glsl", .output = "depth_pyramid_shader.zig", .includes = true },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});

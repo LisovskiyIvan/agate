@@ -36,3 +36,5 @@ pub const MsaaDepthPass = @import("msaa_depth_pass.zig").MsaaDepthPass;
 pub const msaa_depth_pass = @import("msaa_depth_pass.zig");
 pub const VelocityPass = @import("velocity_pass.zig").VelocityPass;
 pub const velocity_pass = @import("velocity_pass.zig");
+pub const DepthPyramidPass = @import("depth_pyramid_pass.zig").DepthPyramidPass;
+pub const depth_pyramid_pass = @import("depth_pyramid_pass.zig");

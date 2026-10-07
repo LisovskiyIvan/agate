@@ -13,6 +13,7 @@ pub const shafts = @import("postprocess/shafts.zig");
 pub const options = @import("postprocess/options.zig");
 pub const hdr = @import("postprocess/hdr.zig");
 pub const auto_exposure = @import("postprocess/auto_exposure.zig");
+pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -125,6 +126,14 @@ pub const shaftCascadeIndex = shafts.shaftCascadeIndex;
 pub const shaftBilateralWeight = shafts.shaftBilateralWeight;
 pub const shaftKernelSum = shafts.shaftKernelSum;
 
+// --- Depth Pyramid ---
+pub const DEPTH_PYRAMID_MAX_MIPS = depth_pyramid.DEPTH_PYRAMID_MAX_MIPS;
+pub const DepthPyramidMipSize = depth_pyramid.DepthPyramidMipSize;
+pub const depthPyramidMipSize = depth_pyramid.depthPyramidMipSize;
+pub const computeMipCount = depth_pyramid.computeMipCount;
+pub const reduceConservativeDepth = depth_pyramid.reduceConservativeDepth;
+pub const depthPyramidActive = depth_pyramid.depthPyramidActive;
+
 test {
     _ = types;
     _ = bloom;
@@ -138,4 +147,5 @@ test {
     _ = options;
     _ = hdr;
     _ = auto_exposure;
+    _ = depth_pyramid;
 }

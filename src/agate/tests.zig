@@ -142,6 +142,7 @@ test {
     _ = @import("particles/types.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/debug_pass.zig");
+    _ = @import("passes/depth_pyramid_pass.zig");
     _ = @import("passes/glow_pass.zig");
     _ = @import("passes/highlight_pass.zig");
     _ = @import("passes/mod.zig");
@@ -182,6 +183,7 @@ test {
     _ = @import("postprocess/bloom.zig");
     _ = @import("postprocess/bloom_tests.zig");
     _ = @import("postprocess/color_curves.zig");
+    _ = @import("postprocess/depth_pyramid.zig");
     _ = @import("postprocess/dof.zig");
     _ = @import("postprocess/dof_tests.zig");
     _ = @import("postprocess/glow.zig");

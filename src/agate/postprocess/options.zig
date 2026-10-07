@@ -113,6 +113,9 @@ pub const PostProcessOptions = struct {
     ssr_thickness: f32 = 0.4,
     ssr_steps: u32 = 16,
 
+    // Hierarchical GPU Depth Pyramid (Hi-Z downsample mips for SSR, contact shadows, occlusion)
+    depth_pyramid_enabled: bool = false,
+
     // Sharpen (post-tonemap unsharp mask)
     sharpen_enabled: bool = false,
     sharpen_amount: f32 = 0.3,

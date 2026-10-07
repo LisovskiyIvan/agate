@@ -687,6 +687,16 @@ pub const Scene = struct {
         return self.postfx.getAdaptedExposure();
     }
 
+    /// Texture view of the level 0 (half-res) GPU depth pyramid, or .{} if unallocated/disabled.
+    pub fn depthPyramidView(self: *const Scene) sg.View {
+        return self.postfx.depthPyramidView();
+    }
+
+    /// Texture view of a specific mip level in the GPU depth pyramid, or .{} if unallocated/out-of-range.
+    pub fn depthPyramidMip(self: *const Scene, level: usize) sg.View {
+        return self.postfx.depthPyramidMip(level);
+    }
+
     /// Estimates scene illuminance/luminance at the active camera for automatic auto-exposure metering.
     pub fn estimateSceneLuminance(self: *const Scene) f32 {
         var illuminance: f32 = 0.0;

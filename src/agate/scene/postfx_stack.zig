@@ -36,6 +36,7 @@ pub const PostFXStack = struct {
     highlight_pass: passes.HighlightPass,
     volumetric_pass: passes.VolumetricPass = .{},
     velocity_pass: passes.VelocityPass = .{},
+    depth_pyramid_pass: passes.DepthPyramidPass = .{},
     outline_pass: passes.OutlinePass,
 
     outline_msaa: ?passes.OutlinePass = null,
@@ -72,6 +73,7 @@ pub const PostFXStack = struct {
             .highlight_pass = passes.HighlightPass.init(),
             .volumetric_pass = passes.VolumetricPass.init(),
             .velocity_pass = passes.VelocityPass.init(),
+            .depth_pyramid_pass = passes.DepthPyramidPass.init(),
             .outline_pass = passes.OutlinePass.init(1, .RGBA16F),
         };
     }
@@ -84,6 +86,7 @@ pub const PostFXStack = struct {
         self.highlight_pass.deinit();
         self.volumetric_pass.deinit();
         self.velocity_pass.deinit();
+        self.depth_pyramid_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
@@ -101,6 +104,7 @@ pub const PostFXStack = struct {
         if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(width, height);
         if (self.glow_pass.base_width != 0) self.glow_pass.resize(width, height);
         if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(width, height);
+        if (self.depth_pyramid_pass.base_width != 0) self.depth_pyramid_pass.resize(width, height);
         passes.OutlinePass.resize(width, height);
     }
 
@@ -343,6 +347,21 @@ pub const PostFXStack = struct {
             }
         }
 
+        var depth_pyramid_view: sg.View = .{};
+        if (postprocess.depthPyramidActive(post.enabled, post)) {
+            const v = self.depth_pyramid_pass.render(
+                self.depthSampleView(depth_prepass),
+                cur_w,
+                cur_h,
+            );
+            if (v.id != 0) {
+                depth_pyramid_view = v;
+                params.stats.post_draw_calls += self.depth_pyramid_pass.mip_count;
+                params.stats.draw_calls += self.depth_pyramid_pass.mip_count;
+                params.stats.triangles += 2 * self.depth_pyramid_pass.mip_count;
+            }
+        }
+
         var bloom_view: sg.View = .{};
         if (postprocess.bloomPyramidActive(post.enabled, post)) {
             const v = self.bloom_pass.render(
@@ -581,5 +600,13 @@ pub const PostFXStack = struct {
 
     pub fn resetAutoExposure(self: *PostFXStack) void {
         self.auto_exposure.reset();
+    }
+
+    pub fn depthPyramidView(self: *const PostFXStack) sg.View {
+        return self.depth_pyramid_pass.mipView(0);
+    }
+
+    pub fn depthPyramidMip(self: *const PostFXStack, level: usize) sg.View {
+        return self.depth_pyramid_pass.mipView(level);
     }
 };
