@@ -1,0 +1,20 @@
+.{
+    .name = .agate_examples,
+    .version = "0.0.0",
+    .fingerprint = 0xca32f937d49d855a,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .agate = .{
+            .path = "..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "render_target_basic.zig",
+        "gpu_timing.zig",
+        "gpu_timing_web.zig",
+        "hdr_showcase.zig",
+        "hdr_showcase_web.zig",
+    },
+}

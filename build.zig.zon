@@ -44,14 +44,6 @@
         "build.zig.zon",
         "API.md",
         "src",
-        // Build inputs outside src/; exclude unrelated tools and assets.
         "tools/test_runner.zig",
-        "tools/bench_texture.zig",
-        "examples/shader_materials",
-        "examples/render_target_basic.zig",
-        "examples/gpu_timing.zig",
-        "examples/gpu_timing_web.zig",
-        "examples/hdr_showcase.zig",
-        "examples/hdr_showcase_web.zig",
     },
 }

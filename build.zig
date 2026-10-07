@@ -8,7 +8,7 @@ pub const sokol = @import("sokol");
 // Add one entry + one GLSL snippet file to get a custom shader material
 // without touching any engine source: the snippet is merged into the base
 // template's hook markers at build time (see
-// src/agate/shader_material/merge.zig), compiled by sokol-shdc under
+// src/shader_material/merge.zig), compiled by sokol-shdc under
 // glsl430 + metal_macos + hlsl5 + wgsl (glsl430: the base templates carry the
 // wave-30 clustered storage blocks, and SSBO syntax needs GLSL 4.30+),
 // and registered in the runtime registry
@@ -42,22 +42,22 @@ pub const UserShaderMaterial = struct {
 };
 
 pub const user_shader_materials = [_]UserShaderMaterial{
-    .{ .name = "ramp_wave", .snippet = "examples/shader_materials/ramp_wave.glsl", .base = .pbr },
-    // Material library v1 presets (see src/agate/material_library.zig):
+    .{ .name = "ramp_wave", .snippet = "src/shader_material/snippets/ramp_wave.glsl", .base = .pbr },
+    // Material library v1 presets (see src/material_library.zig):
     // procedural Sky/Gradient/Grid/TriPlanar constructors over the same
     // hook-merge pipeline. Each entry compiles its snippet into the
     // PBR template under glsl430/metal_macos/hlsl5/wgsl at build time.
-    .{ .name = "matlib_sky", .snippet = "examples/shader_materials/matlib_sky.glsl", .base = .pbr },
-    .{ .name = "matlib_gradient", .snippet = "examples/shader_materials/matlib_gradient.glsl", .base = .pbr },
-    .{ .name = "matlib_grid", .snippet = "examples/shader_materials/matlib_grid.glsl", .base = .pbr },
-    .{ .name = "matlib_triplanar", .snippet = "examples/shader_materials/matlib_triplanar.glsl", .base = .pbr },
+    .{ .name = "matlib_sky", .snippet = "src/shader_material/snippets/matlib_sky.glsl", .base = .pbr },
+    .{ .name = "matlib_gradient", .snippet = "src/shader_material/snippets/matlib_gradient.glsl", .base = .pbr },
+    .{ .name = "matlib_grid", .snippet = "src/shader_material/snippets/matlib_grid.glsl", .base = .pbr },
+    .{ .name = "matlib_triplanar", .snippet = "src/shader_material/snippets/matlib_triplanar.glsl", .base = .pbr },
 };
 
 // ---------------------------------------------------------------------------
 // Public: user-owned shader compilation (ShaderMaterial v1 external path).
 //
 // A downstream project compiles its OWN .glsl (sokol-shdc format, like
-// src/agate/shaders/*.glsl) without editing any agate source, from its own
+// src/shaders/*.glsl) without editing any agate source, from its own
 // build.zig:
 //
 //   const agate_build = @import("agate"); // agate's build.zig, like sokol's
@@ -113,7 +113,7 @@ pub const UserShaderSpec = struct {
     /// Zig module name for the generated shader (also the @import name).
     name: []const u8,
     /// Downstream build-root-relative path to the .glsl (sokol-shdc format:
-    /// @vs/@fs/@program blocks, see src/agate/shaders/pbr.glsl).
+    /// @vs/@fs/@program blocks, see src/shaders/pbr.glsl).
     input: []const u8,
     /// Generated file name; default "<name>.zig".
     output: ?[]const u8 = null,
@@ -143,7 +143,7 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
         .slang = spec.slang orelse engine_shader_slang,
     });
     const mod_math = b.createModule(.{
-        .root_source_file = dep_agate.path("src/agate/math.zig"),
+        .root_source_file = dep_agate.path("src/math.zig"),
     });
     shader_mod.addImport("math", mod_math);
     return shader_mod;
@@ -165,7 +165,7 @@ pub fn sokolShellPath(dep_agate: *Build.Dependency) Build.LazyPath {
 // ---------------------------------------------------------------------------
 // Test aggregation, dir-based.
 //
-// src/agate/tests.zig is GENERATED from the src/agate tree, so a newly added
+// src/tests.zig is GENERATED from the src tree, so a newly added
 // module's tests are picked up without touching any hand-maintained import
 // list (the historical failure mode: tests silently stopped reaching the
 // runner while the suite stayed green).
@@ -180,12 +180,12 @@ pub fn sokolShellPath(dep_agate: *Build.Dependency) Build.LazyPath {
 //
 // Zig 0.16 requires `@import` operands to be string literals, so the
 // generated literals must live in a real file. That file is tracked as
-// src/agate/tests.zig, but a normal `zig build` (including builds that use
+// src/tests.zig, but a normal `zig build` (including builds that use
 // agate as a dependency) MUST NOT rewrite it: silent source mutation breaks
 // packaging reproducibility and races with concurrent edits.
 //
 // Explicit workflow (run from an agate checkout, then commit the result):
-//   zig build update-tests   # regenerate src/agate/tests.zig from the tree
+//   zig build update-tests   # regenerate src/tests.zig from the tree
 //   zig build test           # fails via CheckFile while the registry is stale
 //
 // Ordinary library/exe builds never run the CheckFile step, and the vendored
@@ -202,9 +202,9 @@ fn computeTestRegistryBytes(b: *Build) []const u8 {
         paths.deinit(gpa);
     }
 
-    const src_path = b.path("src/agate").getPath3(b, null);
+    const src_path = b.path("src").getPath3(b, null);
     var dir = src_path.root_dir.handle.openDir(io, src_path.subPathOrDot(), .{ .iterate = true }) catch
-        @panic("test registry: cannot open src/agate");
+        @panic("test registry: cannot open src");
     defer dir.close(io);
 
     var walker = dir.walk(gpa) catch @panic("test registry: OOM");
@@ -227,9 +227,9 @@ fn computeTestRegistryBytes(b: *Build) []const u8 {
     // configure phase, and both CheckFile (`expected_exact`) and
     // UpdateSourceFiles (`addBytesToSource`) retain the slice without copying.
     out.appendSlice(gpa,
-        \\//! GENERATED by build.zig (computeTestRegistryBytes) from the src/agate tree.
+        \\//! GENERATED by build.zig (computeTestRegistryBytes) from the src tree.
         \\//! Do not edit by hand: regenerate with `zig build update-tests`.
-        \\//! Every module file under src/agate is imported so its `test` blocks
+        \\//! Every module file under src is imported so its `test` blocks
         \\//! reach the runner; math is a separate build module and is imported
         \\//! by name (its own test block aggregates math/*.zig).
         \\
@@ -276,8 +276,8 @@ pub fn build(b: *Build) !void {
     // `zig build update-tests` (UpdateSourceFiles, make-phase mutation).
     const expected_test_registry = computeTestRegistryBytes(b);
     const update_sources = b.addUpdateSourceFiles();
-    update_sources.addBytesToSource(expected_test_registry, "src/agate/tests.zig");
-    b.step("update-tests", "Regenerate src/agate/tests.zig from the src/agate tree").dependOn(&update_sources.step);
+    update_sources.addBytesToSource(expected_test_registry, "src/tests.zig");
+    b.step("update-tests", "Regenerate src/tests.zig from the src tree").dependOn(&update_sources.step);
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -301,7 +301,7 @@ pub fn build(b: *Build) !void {
         b.step("install-emsdk", "Install the workspace Emscripten SDK")
             .dependOn(sokol.emSdkInstallStep(b, emsdk, .{}));
     }
-    const mod_math = b.createModule(.{ .root_source_file = b.path("src/agate/math.zig") });
+    const mod_math = b.createModule(.{ .root_source_file = b.path("src/math.zig") });
 
     // Шейдеры: единая таблица "имя модуля -> вход/выход", slang общий для всех
     // (engine_shader_slang: glsl430 + hlsl5 + metal_macos + wgsl).
@@ -330,51 +330,51 @@ pub fn build(b: *Build) !void {
         // variants additionally share the BRDF math + channelSelect.
         // Deliberately NOT shared: fs_params blocks (layout parity +
         // differing probe semantics) and morph/skin vertex variants.
-        .{ .name = "pbr_shader", .input = "src/agate/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
-        .{ .name = "skinned_pbr_shader", .input = "src/agate/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
-        .{ .name = "instanced_pbr_shader", .input = "src/agate/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
-        .{ .name = "shadow_shader", .input = "src/agate/shaders/shadow.glsl", .output = "shadow_shader.zig" },
-        .{ .name = "msaa_depth_shader", .input = "src/agate/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
-        .{ .name = "velocity_shader", .input = "src/agate/shaders/velocity.glsl", .output = "velocity_shader.zig" },
-        .{ .name = "skybox_shader", .input = "src/agate/shaders/skybox.glsl", .output = "skybox_shader.zig", .includes = true },
+        .{ .name = "pbr_shader", .input = "src/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
+        .{ .name = "skinned_pbr_shader", .input = "src/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
+        .{ .name = "instanced_pbr_shader", .input = "src/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
+        .{ .name = "shadow_shader", .input = "src/shaders/shadow.glsl", .output = "shadow_shader.zig" },
+        .{ .name = "msaa_depth_shader", .input = "src/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
+        .{ .name = "velocity_shader", .input = "src/shaders/velocity.glsl", .output = "velocity_shader.zig" },
+        .{ .name = "skybox_shader", .input = "src/shaders/skybox.glsl", .output = "skybox_shader.zig", .includes = true },
         // Increment 1 of the shader-include refactor: these nine share the
-        // fullscreen @vs body (src/agate/shaders/common/fullscreen_vs.glsl).
+        // fullscreen @vs body (src/shaders/common/fullscreen_vs.glsl).
         // probe_mip.glsl is deliberately excluded (no Y-flip line).
-        .{ .name = "postprocess_shader", .input = "src/agate/shaders/postprocess.glsl", .output = "postprocess_shader.zig", .includes = true },
-        .{ .name = "particle_shader", .input = "src/agate/shaders/particle.glsl", .output = "particle_shader.zig", .includes = true },
+        .{ .name = "postprocess_shader", .input = "src/shaders/postprocess.glsl", .output = "postprocess_shader.zig", .includes = true },
+        .{ .name = "particle_shader", .input = "src/shaders/particle.glsl", .output = "particle_shader.zig", .includes = true },
         // Stateful compute particles (wave 25): engine slang set (GLSL 4.30
         // carries the SSBO blocks); runtime availability still gates on
-        // compute.supported(), see src/agate/compute.zig.
+        // compute.supported(), see src/compute.zig.
         .{
             .name = "particle_compute_shader",
-            .input = "src/agate/shaders/particle_compute.glsl",
+            .input = "src/shaders/particle_compute.glsl",
             .output = "particle_compute_shader.zig",
             .slang = engine_shader_slang,
         },
-        .{ .name = "ui_shader", .input = "src/agate/shaders/ui.glsl", .output = "ui_shader.zig" },
-        .{ .name = "ssao_shader", .input = "src/agate/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
-        .{ .name = "ssao_blur_shader", .input = "src/agate/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig", .includes = true },
-        .{ .name = "debug_shader", .input = "src/agate/shaders/debug.glsl", .output = "debug_shader.zig" },
-        .{ .name = "bloom_down_shader", .input = "src/agate/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
-        .{ .name = "bloom_up_shader", .input = "src/agate/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },
-        .{ .name = "glow_extract_shader", .input = "src/agate/shaders/glow_extract.glsl", .output = "glow_extract_shader.zig", .includes = true },
-        .{ .name = "glow_blur_shader", .input = "src/agate/shaders/glow_blur.glsl", .output = "glow_blur_shader.zig", .includes = true },
-        .{ .name = "volumetric_raymarch_shader", .input = "src/agate/shaders/volumetric_raymarch.glsl", .output = "volumetric_raymarch_shader.zig", .includes = true },
-        .{ .name = "volumetric_blur_shader", .input = "src/agate/shaders/volumetric_blur.glsl", .output = "volumetric_blur_shader.zig", .includes = true },
-        .{ .name = "outline_shader", .input = "src/agate/shaders/outline.glsl", .output = "outline_shader.zig" },
-        .{ .name = "probe_mip_shader", .input = "src/agate/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
-        .{ .name = "ui3d_panel_shader", .input = "src/agate/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },
-        .{ .name = "depth_pyramid_shader", .input = "src/agate/shaders/depth_pyramid.glsl", .output = "depth_pyramid_shader.zig", .includes = true },
+        .{ .name = "ui_shader", .input = "src/shaders/ui.glsl", .output = "ui_shader.zig" },
+        .{ .name = "ssao_shader", .input = "src/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
+        .{ .name = "ssao_blur_shader", .input = "src/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig", .includes = true },
+        .{ .name = "debug_shader", .input = "src/shaders/debug.glsl", .output = "debug_shader.zig" },
+        .{ .name = "bloom_down_shader", .input = "src/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
+        .{ .name = "bloom_up_shader", .input = "src/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },
+        .{ .name = "glow_extract_shader", .input = "src/shaders/glow_extract.glsl", .output = "glow_extract_shader.zig", .includes = true },
+        .{ .name = "glow_blur_shader", .input = "src/shaders/glow_blur.glsl", .output = "glow_blur_shader.zig", .includes = true },
+        .{ .name = "volumetric_raymarch_shader", .input = "src/shaders/volumetric_raymarch.glsl", .output = "volumetric_raymarch_shader.zig", .includes = true },
+        .{ .name = "volumetric_blur_shader", .input = "src/shaders/volumetric_blur.glsl", .output = "volumetric_blur_shader.zig", .includes = true },
+        .{ .name = "outline_shader", .input = "src/shaders/outline.glsl", .output = "outline_shader.zig" },
+        .{ .name = "probe_mip_shader", .input = "src/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
+        .{ .name = "ui3d_panel_shader", .input = "src/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },
+        .{ .name = "depth_pyramid_shader", .input = "src/shaders/depth_pyramid.glsl", .output = "depth_pyramid_shader.zig", .includes = true },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});
     // Host prepass for `// @include` directives (see
-    // src/agate/shader_material/include.zig): sokol-shdc cannot resolve
+    // src/shader_material/include.zig): sokol-shdc cannot resolve
     // includes itself, so they are expanded textually before shdc runs.
     const expand_tool = b.addExecutable(.{
         .name = "expand_shader_includes",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agate/shader_material/expand_main.zig"),
+            .root_source_file = b.path("src/shader_material/expand_main.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
         }),
@@ -418,7 +418,7 @@ pub fn build(b: *Build) !void {
     agate_imports[1 + shader_specs.len] = .{ .name = "math", .module = mod_math };
     agate_imports[2 + shader_specs.len] = .{ .name = "shader_material_registry", .module = mod_registry };
     const mod_agate = b.addModule("agate", .{
-        .root_source_file = b.path("src/agate/root.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &agate_imports,
@@ -431,10 +431,10 @@ pub fn build(b: *Build) !void {
             mod_agate.addSystemIncludePath(dep_emsdk.path("upstream/emscripten/cache/ports/emdawnwebgpu/emdawnwebgpu_pkg/webgpu/include"));
         }
     }
-    mod_agate.addIncludePath(b.path("src/agate/c"));
-    mod_agate.addIncludePath(b.path("src/agate/c/box3d/include"));
+    mod_agate.addIncludePath(b.path("src/c"));
+    mod_agate.addIncludePath(b.path("src/c/box3d/include"));
     mod_agate.addCSourceFile(.{
-        .file = b.path("src/agate/c/c_impl.c"),
+        .file = b.path("src/c/c_impl.c"),
         // Asset decoding dominates scene startup at -O0. Keep Zig debug checks
         // and the selected release optimization mode unchanged.
         // stb_image only compiles its NEON paths when asked; without the define
@@ -460,63 +460,63 @@ pub fn build(b: *Build) !void {
         },
     });
     // Box3D v0.1.0, vendored C17 sources (MIT). Public headers under
-    // src/agate/c/box3d/include, internal headers resolve inside src/.
+    // src/c/box3d/include, internal headers resolve inside src/.
     // In Debug: -O2 prevents physics from bottlenecking frame time at -O0.
     // In Release: -O3, -DNDEBUG, -fno-math-errno, -fno-trapping-math, -fvectorize,
     // -fslp-vectorize, -fomit-frame-pointer enable hardware sqrt/rsqrt instructions,
     // remove assertion branches, and vectorize collision and solver loops.
     mod_agate.addCSourceFiles(.{
         .files = &.{
-            "src/agate/c/box3d/src/aabb.c",
-            "src/agate/c/box3d/src/arena_allocator.c",
-            "src/agate/c/box3d/src/bitset.c",
-            "src/agate/c/box3d/src/block_allocator.c",
-            "src/agate/c/box3d/src/body.c",
-            "src/agate/c/box3d/src/broad_phase.c",
-            "src/agate/c/box3d/src/capsule.c",
-            "src/agate/c/box3d/src/compound.c",
-            "src/agate/c/box3d/src/constraint_graph.c",
-            "src/agate/c/box3d/src/contact.c",
-            "src/agate/c/box3d/src/contact_solver.c",
-            "src/agate/c/box3d/src/convex_manifold.c",
-            "src/agate/c/box3d/src/core.c",
-            "src/agate/c/box3d/src/distance.c",
-            "src/agate/c/box3d/src/distance_joint.c",
-            "src/agate/c/box3d/src/dynamic_tree.c",
-            "src/agate/c/box3d/src/height_field.c",
-            "src/agate/c/box3d/src/hull.c",
-            "src/agate/c/box3d/src/id_pool.c",
-            "src/agate/c/box3d/src/island.c",
-            "src/agate/c/box3d/src/joint.c",
-            "src/agate/c/box3d/src/manifold.c",
-            "src/agate/c/box3d/src/math_functions.c",
-            "src/agate/c/box3d/src/mesh.c",
-            "src/agate/c/box3d/src/mesh_contact.c",
-            "src/agate/c/box3d/src/motor_joint.c",
-            "src/agate/c/box3d/src/mover.c",
-            "src/agate/c/box3d/src/name_cache.c",
-            "src/agate/c/box3d/src/parallel_for.c",
-            "src/agate/c/box3d/src/parallel_joint.c",
-            "src/agate/c/box3d/src/physics_world.c",
-            "src/agate/c/box3d/src/prismatic_joint.c",
-            "src/agate/c/box3d/src/recording.c",
-            "src/agate/c/box3d/src/recording_replay.c",
-            "src/agate/c/box3d/src/revolute_joint.c",
-            "src/agate/c/box3d/src/scheduler.c",
-            "src/agate/c/box3d/src/sensor.c",
-            "src/agate/c/box3d/src/shape.c",
-            "src/agate/c/box3d/src/simd.c",
-            "src/agate/c/box3d/src/solver.c",
-            "src/agate/c/box3d/src/solver_set.c",
-            "src/agate/c/box3d/src/sphere.c",
-            "src/agate/c/box3d/src/spherical_joint.c",
-            "src/agate/c/box3d/src/table.c",
-            "src/agate/c/box3d/src/timer.c",
-            "src/agate/c/box3d/src/triangle_manifold.c",
-            "src/agate/c/box3d/src/types.c",
-            "src/agate/c/box3d/src/weld_joint.c",
-            "src/agate/c/box3d/src/wheel_joint.c",
-            "src/agate/c/box3d/src/world_snapshot.c",
+            "src/c/box3d/src/aabb.c",
+            "src/c/box3d/src/arena_allocator.c",
+            "src/c/box3d/src/bitset.c",
+            "src/c/box3d/src/block_allocator.c",
+            "src/c/box3d/src/body.c",
+            "src/c/box3d/src/broad_phase.c",
+            "src/c/box3d/src/capsule.c",
+            "src/c/box3d/src/compound.c",
+            "src/c/box3d/src/constraint_graph.c",
+            "src/c/box3d/src/contact.c",
+            "src/c/box3d/src/contact_solver.c",
+            "src/c/box3d/src/convex_manifold.c",
+            "src/c/box3d/src/core.c",
+            "src/c/box3d/src/distance.c",
+            "src/c/box3d/src/distance_joint.c",
+            "src/c/box3d/src/dynamic_tree.c",
+            "src/c/box3d/src/height_field.c",
+            "src/c/box3d/src/hull.c",
+            "src/c/box3d/src/id_pool.c",
+            "src/c/box3d/src/island.c",
+            "src/c/box3d/src/joint.c",
+            "src/c/box3d/src/manifold.c",
+            "src/c/box3d/src/math_functions.c",
+            "src/c/box3d/src/mesh.c",
+            "src/c/box3d/src/mesh_contact.c",
+            "src/c/box3d/src/motor_joint.c",
+            "src/c/box3d/src/mover.c",
+            "src/c/box3d/src/name_cache.c",
+            "src/c/box3d/src/parallel_for.c",
+            "src/c/box3d/src/parallel_joint.c",
+            "src/c/box3d/src/physics_world.c",
+            "src/c/box3d/src/prismatic_joint.c",
+            "src/c/box3d/src/recording.c",
+            "src/c/box3d/src/recording_replay.c",
+            "src/c/box3d/src/revolute_joint.c",
+            "src/c/box3d/src/scheduler.c",
+            "src/c/box3d/src/sensor.c",
+            "src/c/box3d/src/shape.c",
+            "src/c/box3d/src/simd.c",
+            "src/c/box3d/src/solver.c",
+            "src/c/box3d/src/solver_set.c",
+            "src/c/box3d/src/sphere.c",
+            "src/c/box3d/src/spherical_joint.c",
+            "src/c/box3d/src/table.c",
+            "src/c/box3d/src/timer.c",
+            "src/c/box3d/src/triangle_manifold.c",
+            "src/c/box3d/src/types.c",
+            "src/c/box3d/src/weld_joint.c",
+            "src/c/box3d/src/wheel_joint.c",
+            "src/c/box3d/src/world_snapshot.c",
         },
         .flags = if (is_web)
             if (optimize == .Debug)
@@ -529,14 +529,14 @@ pub fn build(b: *Build) !void {
             &.{ "-std=c17", "-O3", "-DNDEBUG", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", no_sancov },
     });
     // meshoptimizer v1.2 (MIT), decoder-only subset vendored under
-    // src/agate/c/meshopt. Compiled as C++: the decoder sources are
+    // src/c/meshopt. Compiled as C++: the decoder sources are
     // runtime-free C++ (no exceptions/RTTI/stdlib), so no libc++ link is
     // needed and the module's existing libc link stays intact.
     mod_agate.addCSourceFiles(.{
         .files = &.{
-            "src/agate/c/meshopt/indexcodec.cpp",
-            "src/agate/c/meshopt/vertexcodec.cpp",
-            "src/agate/c/meshopt/vertexfilter.cpp",
+            "src/c/meshopt/indexcodec.cpp",
+            "src/c/meshopt/vertexcodec.cpp",
+            "src/c/meshopt/vertexfilter.cpp",
         },
         .flags = if (optimize == .Debug)
             &.{ "-std=c++17", "-O2", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", no_sancov, no_ubsan }
@@ -544,10 +544,10 @@ pub fn build(b: *Build) !void {
             &.{ "-std=c++17", "-O3", "-DNDEBUG", "-fno-exceptions", "-fno-rtti", "-fno-math-errno", "-fno-trapping-math", "-fvectorize", "-fslp-vectorize", "-fomit-frame-pointer", no_sancov },
     });
     // Basis Universal transcoder (Apache-2.0, BinomialLLC/basis_universal,
-    // vendored verbatim under src/agate/c/basisu including the zstd decoder;
-    // see src/agate/c/LICENSES.md). KTX2 ETC1S (BasisLZ) + UASTC LDR 4x4 ->
-    // BC7/ASTC 4x4/RGBA32 at load time (src/agate/c/basis_glue.cpp,
-    // src/agate/ktx2.zig). No -fno-exceptions/-fno-rtti: basisu_containers
+    // vendored verbatim under src/c/basisu including the zstd decoder;
+    // see src/c/LICENSES.md). KTX2 ETC1S (BasisLZ) + UASTC LDR 4x4 ->
+    // BC7/ASTC 4x4/RGBA32 at load time (src/c/basis_glue.cpp,
+    // src/ktx2.zig). No -fno-exceptions/-fno-rtti: basisu_containers
     // pulls in <exception>. -fno-sanitize=alignment: the official transcoder
     // deliberately reinterprets byte-stream level data as block structs
     // (uastc_block reads at arbitrary file offsets); that is its shipped
@@ -558,8 +558,8 @@ pub fn build(b: *Build) !void {
     // scene startup at -O0 the same way stb_image did (see c_impl.c note).
     mod_agate.addCSourceFiles(.{
         .files = &.{
-            "src/agate/c/basisu/transcoder/basisu_transcoder.cpp",
-            "src/agate/c/basis_glue.cpp",
+            "src/c/basisu/transcoder/basisu_transcoder.cpp",
+            "src/c/basis_glue.cpp",
         },
         .flags = if (optimize == .Debug)
             &.{ "-std=c++17", "-O2", "-fno-math-errno", "-fno-sanitize=alignment", no_sancov, no_ubsan }
@@ -570,7 +570,7 @@ pub fn build(b: *Build) !void {
     // (transcoder.cpp uses ZSTD_decompress/isError/getFrameContentSize).
     mod_agate.addCSourceFiles(.{
         .files = &.{
-            "src/agate/c/basisu/zstd/zstddeclib.c",
+            "src/c/basisu/zstd/zstddeclib.c",
         },
         .flags = if (optimize == .Debug)
             &.{ "-std=c11", "-O2", "-fno-math-errno", no_sancov, no_ubsan }
@@ -584,123 +584,6 @@ pub fn build(b: *Build) !void {
     mod_agate.link_libcpp = true;
     mod_agate.linkSystemLibrary("m", .{});
 
-    const exe = b.addExecutable(.{
-        .name = "agate",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sokol", .module = mod_sokol },
-                .{ .name = "agate", .module = mod_agate },
-            },
-        }),
-    });
-    b.installArtifact(exe);
-
-    const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
-    b.step("run", "Run the window").dependOn(&run.step);
-    const bench_texture = b.addExecutable(.{
-        .name = "bench-texture",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/bench_texture.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "agate", .module = mod_agate }},
-        }),
-    });
-    const run_bench_texture = b.addRunArtifact(bench_texture);
-    if (b.args) |args| run_bench_texture.addArgs(args);
-    b.step("bench-texture", "Measure bit-identical sRGB conversion and mip generation").dependOn(&run_bench_texture.step);
-    const rtt_smoke = b.addExecutable(.{
-        .name = "rtt-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/render_target_basic.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sokol", .module = mod_sokol },
-                .{ .name = "agate", .module = mod_agate },
-            },
-        }),
-    });
-    b.installArtifact(rtt_smoke);
-    const run_rtt = b.addRunArtifact(rtt_smoke);
-    if (b.args) |args| run_rtt.addArgs(args);
-    b.step("example-rtt", "Run render-target and refraction smoke (needs GPU/display)").dependOn(&run_rtt.step);
-
-    const timing_module = b.createModule(.{
-        .root_source_file = b.path(if (is_web) "examples/gpu_timing_web.zig" else "examples/gpu_timing.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sokol", .module = mod_sokol },
-            .{ .name = "agate", .module = mod_agate },
-        },
-    });
-    const timing_build = b.step("gpu-timing", "Build the finite GPU timing/lifecycle smoke");
-    const timing_run = b.step("example-gpu-timing", "Run GPU timing/lifecycle smoke (needs GPU/display)");
-    if (is_web) {
-        const timing_lib = b.addLibrary(.{ .name = "gpu-timing", .root_module = timing_module });
-        const emsdk = dep_sokol.builder.dependency("emsdk", .{});
-        const link = try sokol.emLinkStep(b, .{
-            .lib_main = timing_lib,
-            .target = target,
-            .optimize = optimize,
-            .emsdk = emsdk,
-            .use_webgpu = true,
-            .use_webgl2 = false,
-            .use_emmalloc = true,
-            .use_filesystem = true,
-            .shell_file_path = dep_sokol.path("src/sokol/web/shell.html"),
-            .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sINITIAL_MEMORY=128MB", "-sALLOW_MEMORY_GROWTH=1" },
-        });
-        timing_build.dependOn(&link.step);
-        const web_run = sokol.emRunStep(b, .{ .name = "gpu-timing", .emsdk = emsdk });
-        web_run.step.dependOn(&link.step);
-        timing_run.dependOn(&web_run.step);
-    } else {
-        const timing_exe = b.addExecutable(.{ .name = "gpu-timing", .root_module = timing_module });
-        timing_build.dependOn(&b.addInstallArtifact(timing_exe, .{}).step);
-        const native_run = b.addRunArtifact(timing_exe);
-        timing_run.dependOn(&native_run.step);
-    }
-    const hdr_module = b.createModule(.{
-        .root_source_file = b.path(if (is_web) "examples/hdr_showcase_web.zig" else "examples/hdr_showcase.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sokol", .module = mod_sokol },
-            .{ .name = "agate", .module = mod_agate },
-        },
-    });
-    const hdr_build = b.step("hdr-showcase", "Build the linear HDR studio showcase and finite GPU gate");
-    const hdr_run = b.step("run-hdr-showcase", "Run the HDR studio (B bloom, E exposure, Space effects)");
-    if (is_web) {
-        const hdr_lib = b.addLibrary(.{ .name = "hdr-showcase", .root_module = hdr_module });
-        const emsdk = dep_sokol.builder.dependency("emsdk", .{});
-        const link = try sokol.emLinkStep(b, .{
-            .lib_main = hdr_lib,
-            .target = target,
-            .optimize = optimize,
-            .emsdk = emsdk,
-            .use_webgpu = true,
-            .use_webgl2 = false,
-            .use_emmalloc = true,
-            .use_filesystem = true,
-            .shell_file_path = dep_sokol.path("src/sokol/web/shell.html"),
-            .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sINITIAL_MEMORY=128MB", "-sALLOW_MEMORY_GROWTH=1" },
-        });
-        hdr_build.dependOn(&link.step);
-        const web_run = sokol.emRunStep(b, .{ .name = "hdr-showcase", .emsdk = emsdk });
-        web_run.step.dependOn(&link.step);
-        hdr_run.dependOn(&web_run.step);
-    } else {
-        const hdr_exe = b.addExecutable(.{ .name = "hdr-showcase", .root_module = hdr_module });
-        hdr_build.dependOn(&b.addInstallArtifact(hdr_exe, .{}).step);
-        hdr_run.dependOn(&b.addRunArtifact(hdr_exe).step);
-    }
     const lib_tests = b.addTest(.{
         .root_module = mod_agate,
         // Vendored runner (tools/test_runner.zig): stock 0.16.0 fails to
@@ -721,14 +604,14 @@ pub fn build(b: *Build) !void {
     // CheckFile), leaving ordinary library/exe builds untouched. The vendored
     // runner stays lazy: `b.path("tools/test_runner.zig")` above only
     // materializes when this test compile actually builds.
-    const check_test_registry = b.addCheckFile(b.path("src/agate/tests.zig"), .{ .expected_exact = expected_test_registry });
+    const check_test_registry = b.addCheckFile(b.path("src/tests.zig"), .{ .expected_exact = expected_test_registry });
     run_lib_tests.step.dependOn(&check_test_registry.step);
-    const test_step = b.step("test", "Run library tests (fails while src/agate/tests.zig is stale; run `zig build update-tests`)");
+    const test_step = b.step("test", "Run library tests (fails while src/tests.zig is stale; run `zig build update-tests`)");
     test_step.dependOn(&run_lib_tests.step);
 
     const math_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agate/math.zig"),
+            .root_source_file = b.path("src/math.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -782,7 +665,7 @@ fn createShaderWithIncludes(
     // it for rebuilds).
     const run_expand = b.addRunArtifact(expand_tool);
     run_expand.addArg("--root");
-    run_expand.addDirectoryArg(b.path("src/agate/shaders"));
+    run_expand.addDirectoryArg(b.path("src/shaders"));
     run_expand.addArg("--input");
     run_expand.addFileArg(b.path(spec.input));
     run_expand.addArg("--output");
@@ -796,15 +679,15 @@ fn createShaderWithIncludes(
     // Register every chunk as an explicit input of every expansion.
     {
         const io = b.graph.io;
-        const chunks = b.path("src/agate/shaders/common").getPath3(b, null);
+        const chunks = b.path("src/shaders/common").getPath3(b, null);
         var dir = chunks.root_dir.handle.openDir(io, chunks.subPathOrDot(), .{ .iterate = true }) catch
-            @panic("shader includes: cannot open src/agate/shaders/common");
+            @panic("shader includes: cannot open src/shaders/common");
         defer dir.close(io);
         var it = dir.iterate();
         while (it.next(io) catch |err| @panic(@errorName(err))) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".glsl")) continue;
-            run_expand.addFileInput(b.path(b.fmt("src/agate/shaders/common/{s}", .{entry.name})));
+            run_expand.addFileInput(b.path(b.fmt("src/shaders/common/{s}", .{entry.name})));
         }
     }
 
@@ -836,7 +719,7 @@ fn createShaderMaterialRegistry(
     const merge_tool = b.addExecutable(.{
         .name = "merge_shader_material",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agate/shader_material/tool_main.zig"),
+            .root_source_file = b.path("src/shader_material/tool_main.zig"),
             // Host tool: runs inside the build graph.
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
@@ -888,7 +771,7 @@ fn createShaderMaterialRegistry(
         try seen_names.put(b.allocator, mat.name, {});
 
         const base_glsl = switch (mat.base) {
-            .standard, .pbr => "src/agate/shaders/pbr.glsl",
+            .standard, .pbr => "src/shaders/pbr.glsl",
         };
         const prog_name: []const u8 = switch (mat.base) {
             .standard, .pbr => "pbrShaderDesc",
@@ -921,7 +804,7 @@ fn createShaderMaterialRegistry(
         // sokol.shdc does for zig 0.16).
         const run_expand = b.addRunArtifact(expand_tool);
         run_expand.addArg("--root");
-        run_expand.addDirectoryArg(b.path("src/agate/shaders"));
+        run_expand.addDirectoryArg(b.path("src/shaders"));
         run_expand.addArg("--input");
         run_expand.addFileArg(merged_glsl);
         run_expand.addArg("--output");
