@@ -30,6 +30,9 @@ fn waitForState(p: *PendingTexture, comptime states: []const TextureState) bool 
 fn findFontPng() ?[]const u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const candidates = [_][]const u8{
+        "src/assets/font_sdf.png",
+        "agate/src/assets/font_sdf.png",
+        "../agate/src/assets/font_sdf.png",
         "src/agate/assets/font_sdf.png",
         "agate/src/agate/assets/font_sdf.png",
         "../agate/src/agate/assets/font_sdf.png",
@@ -69,6 +72,9 @@ test "real PNG decodes to ready off-thread; drain reports nothing without sg" {
     // @src().file yields only the basename under this build, so probe the
     // known repo-relative locations for the test's cwd.
     const font_candidates = [_][]const u8{
+        "src/assets/font_sdf.png",
+        "agate/src/assets/font_sdf.png",
+        "../agate/src/assets/font_sdf.png",
         "src/agate/assets/font_sdf.png",
         "agate/src/agate/assets/font_sdf.png",
         "../agate/src/agate/assets/font_sdf.png",

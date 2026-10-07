@@ -937,14 +937,18 @@ pub const Mesh = struct {
     /// Pushes update-staged morph vertex data into the GPU vertex buffer.
     /// Called at render start on the context thread (flushPendingGpuUploads pattern).
     pub fn flushGpuUploads(self: *Mesh) void {
-        if (!self.morph_upload_needed) return;
-        self.morph_upload_needed = false;
         const n = @min(self.morph_base.len, self.morph_staging.len);
         if (n > 0 and self.vertex_buffer.id != 0) {
-            sg.updateBuffer(self.vertex_buffer, sg.asRange(self.morph_staging[0..n]));
-            // Учёт динамики: полный морф-стейджинг (n вершин).
-            upload_meter.record(n * @sizeOf(Vertex));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.vertex_buffer },
+                .src = .{ .data = sg.asRange(self.morph_staging[0..n]) },
+            });
+            if (self.morph_upload_needed) {
+                // Учёт динамики: полный морф-стейджинг (n вершин).
+                upload_meter.record(n * @sizeOf(Vertex));
+            }
         }
+        self.morph_upload_needed = false;
     }
 
     /// Completes a deferred GPU upload: creates the vertex/index buffers from
@@ -959,12 +963,12 @@ pub const Mesh = struct {
         if (!sg.isvalid()) return;
         // CPU-morph glTF meshes created off-context need the same empty
         // dynamic vertex buffer the immediate loader path builds (the first
-        // frame's applyMorphs fills it); everything else uploads static.
-        // Vertex creation runs through the canonical seam (owns the one-shot
+        // frame's applyMorphs fills it) instead of a static
+        // buffer. Vertex creation runs through the canonical seam (owns the one-shot
         // FAILED injection); the VALID-only check below drives its arm.
         const vbuf: sg.Buffer = if (self.pending_dynamic_update)
             makeDeferredMeshVertexBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.pending_vertices.len * @sizeOf(Vertex),
             })
         else

@@ -560,9 +560,9 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
             // one retired — never destroyed immediately, so in-flight
             // snapshots keep reading valid geometry.
             //
-            // Sokol pinned API: .dynamic_update buffers are created with
+            // Sokol pinned API: .write_transient buffers are created with
             // .size only (no initial .data) and get at most ONE
-            // sg.updateBuffer per buffer per sokol frame; the fresh buffer
+            // writeBufferTransient per buffer per sokol frame; the fresh buffer
             // takes this frame's single update, the retired one takes none.
             const min_cap: usize = 16;
             const new_cap = std.math.ceilPowerOfTwo(usize, @max(active_count, @max(st.capacity * 2, min_cap))) catch @max(active_count, st.capacity * 2);
@@ -585,7 +585,7 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
             }
             if (!injected_fail) {
                 new_buf = sg.makeBuffer(.{
-                    .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                    .usage = .{ .vertex_buffer = true, .write_transient = true },
                     .size = new_cap * @sizeOf(Mat4),
                 });
             }
@@ -600,7 +600,10 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                 if (new_buf.id != 0) sg.destroyBuffer(new_buf);
                 return;
             }
-            sg.updateBuffer(new_buf, sg.asRange(items));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = new_buf },
+                .src = .{ .data = sg.asRange(items) },
+            });
             // Учёт динамики: active_count матриц Mat4 (потокобезопасно — счётчик атомарный).
             upload_meter.record(active_count * @sizeOf(Mat4));
             const old0 = st.buffers[0];
@@ -629,7 +632,10 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                 // ordered identity layout pairs by index; anything else
                 // zeroes the whole batch — no slot flip, prev aliases cur.
                 if (instancePairMode(st.uploaded_count, active_count, st.layout_hash, cpu.layout_hash) == .zero) {
-                    sg.updateBuffer(st.buffer, sg.asRange(items));
+                    sg.writeBufferTransient(.{
+                        .dst = .{ .buffer = st.buffer },
+                        .src = .{ .data = sg.asRange(items) },
+                    });
                     st.prev_buffer = st.buffer;
                     st.prev_frame = gctx.frame_id;
                 } else {
@@ -651,7 +657,7 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                         }
                         if (other.id == 0) {
                             other = sg.makeBuffer(.{
-                                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                                .usage = .{ .vertex_buffer = true, .write_transient = true },
                                 .size = st.capacity * @sizeOf(Mat4),
                             });
                             if (other.id == 0 or sg.queryBufferState(other) != .VALID) {
@@ -664,7 +670,10 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                         // zero motion instead of clobbering cur.
                         if (other.id != 0 and other.id != st.buffer.id) {
                             st.buffers[st.active_slot ^ 1] = other;
-                            sg.updateBuffer(other, sg.asRange(prev_items.?));
+                            sg.writeBufferTransient(.{
+                                .dst = .{ .buffer = other },
+                                .src = .{ .data = sg.asRange(prev_items.?) },
+                            });
                             st.prev_buffer = other;
                             // The other slot now holds the previously
                             // published upload: its generation is the frame
@@ -683,7 +692,10 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                         st.prev_buffer = st.buffer;
                         st.prev_frame = gctx.frame_id;
                     }
-                    sg.updateBuffer(st.buffer, sg.asRange(items));
+                    sg.writeBufferTransient(.{
+                        .dst = .{ .buffer = st.buffer },
+                        .src = .{ .data = sg.asRange(items) },
+                    });
                     // NOTE: st.active_slot and st.buffer are intentionally
                     // UNCHANGED here (no ping-pong flip): within-capacity
                     // updates keep buffer identity per the committed
@@ -695,6 +707,12 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                 st.uploaded_count = active_count;
                 st.layout_hash = cpu.layout_hash;
             } else {
+                if (active_count > 0 and st.buffer.id != 0) {
+                    sg.writeBufferTransient(.{
+                        .dst = .{ .buffer = st.buffer },
+                        .src = .{ .data = sg.asRange(items) },
+                    });
+                }
                 st.prev_buffer = st.buffer;
                 st.prev_frame = gctx.frame_id;
             }

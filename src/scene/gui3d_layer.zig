@@ -655,13 +655,13 @@ pub const Gui3dLayer = struct {
         errdefer sg.destroySampler(smp);
 
         const vb = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = panel.gpu.cap_v * @sizeOf(UIVertex),
         });
         if (vb.id == 0) return false;
         errdefer sg.destroyBuffer(vb);
         const ib = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true, .dynamic_update = true },
+            .usage = .{ .index_buffer = true, .write_transient = true },
             .size = panel.gpu.cap_i * @sizeOf(u16),
         });
         if (ib.id == 0) return false;

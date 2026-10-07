@@ -544,7 +544,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             // the drain's finish; frozen slot bytes, never live mesh state).
             // Index creation stays a regular sg.makeBuffer here.
             vbuf = mesh_deferred.makeDeferredMeshVertexBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = verts.len * @sizeOf(@TypeOf(verts[0])),
             });
             // Nonzero id may still be FAILED state (pool exhaustion is id 0
@@ -673,7 +673,10 @@ fn flushMorphs(scene: anytype, slot: anytype) void {
         }
         if (!sg.isvalid()) continue;
         if (up.buffer_id == 0) continue;
-        sg.updateBuffer(.{ .id = up.buffer_id }, sg.asRange(slot.morph_data.items[up.data_lo..end]));
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = .{ .id = up.buffer_id } },
+            .src = .{ .data = sg.asRange(slot.morph_data.items[up.data_lo..end]) },
+        });
         upload_meter.record(up.count * @sizeOf(@TypeOf(slot.morph_data.items[0])));
         up.delivered = true;
     }
@@ -695,7 +698,7 @@ fn flushParticleCpu(scene: anytype, slot: anytype) void {
             if (!sg.isvalid()) continue;
             if (up.capacity == 0) continue;
             const created = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.capacity * @sizeOf(@TypeOf(slot.p_cpu_data.items[0])),
             });
             // Nonzero id may still be FAILED state (same contract as
@@ -713,7 +716,10 @@ fn flushParticleCpu(scene: anytype, slot: anytype) void {
             continue;
         }
         if (!sg.isvalid()) continue;
-        sg.updateBuffer(.{ .id = target_id }, sg.asRange(slot.p_cpu_data.items[up.data_lo..end]));
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = .{ .id = target_id } },
+            .src = .{ .data = sg.asRange(slot.p_cpu_data.items[up.data_lo..end]) },
+        });
         upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_cpu_data.items[0])));
         up.delivered = true;
     }
@@ -730,7 +736,7 @@ fn flushParticleGpu(scene: anytype, slot: anytype) void {
             if (!sg.isvalid()) continue;
             if (up.capacity == 0) continue;
             const created = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.capacity * @sizeOf(@TypeOf(slot.p_gpu_data.items[0])),
             });
             // Nonzero id may still be FAILED state (same contract as
@@ -748,7 +754,10 @@ fn flushParticleGpu(scene: anytype, slot: anytype) void {
             continue;
         }
         if (!sg.isvalid()) continue;
-        sg.updateBuffer(.{ .id = target_id }, sg.asRange(slot.p_gpu_data.items[up.data_lo..end]));
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = .{ .id = target_id } },
+            .src = .{ .data = sg.asRange(slot.p_gpu_data.items[up.data_lo..end]) },
+        });
         upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_gpu_data.items[0])));
         up.delivered = true;
     }
@@ -816,7 +825,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             }
             if (spawn_id == 0) {
                 const created = sg.makeBuffer(.{
-                    .usage = .{ .storage_buffer = true, .dynamic_update = true },
+                    .usage = .{ .storage_buffer = true, .write_transient = true },
                     .size = cap * @sizeOf(@import("../particles/types.zig").GpuParticleSlot),
                 });
                 if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
@@ -892,7 +901,26 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             const zeros = scene.allocator.alloc(u8, cap * @sizeOf(@import("../particles/types.zig").ComputeParticleState)) catch continue;
             defer scene.allocator.free(zeros);
             @memset(zeros, 0);
-            sg.updateBuffer(.{ .id = state_id }, sg.Range{ .ptr = zeros.ptr, .size = zeros.len });
+            const created_buf = sg.makeBuffer(.{
+                .usage = .{ .storage_buffer = true },
+                .data = sg.Range{ .ptr = zeros.ptr, .size = zeros.len },
+            });
+            if (created_buf.id != 0 and sg.queryBufferState(created_buf) == .VALID) {
+                const created_view = compute.makeStorageView(created_buf, "compute-particles-state");
+                if (created_view.id != 0 and sg.queryViewState(created_view) == .VALID) {
+                    up.created_state_buffer_id = created_buf.id;
+                    up.created_state_view_id = created_view.id;
+                    state_id = created_buf.id;
+                    state_view = created_view.id;
+                } else {
+                    if (created_view.id != 0) sg.destroyView(created_view);
+                    sg.destroyBuffer(created_buf);
+                    continue;
+                }
+            } else {
+                if (created_buf.id != 0) sg.destroyBuffer(created_buf);
+                continue;
+            }
             upload_meter.record(zeros.len);
         }
         // Creation incomplete (a make* failed; partial handles ride the
@@ -900,9 +928,22 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
         // consume nothing.
         if (pipeline_id == 0) continue;
         const pkt = slot.p_compute_data.items[up.data_lo..end];
-        if (up.data_count > 0 and spawn_id != 0) {
-            sg.updateBuffer(.{ .id = spawn_id }, sg.asRange(pkt));
-            upload_meter.record(up.data_count * @sizeOf(@TypeOf(pkt[0])));
+        const will_dispatch = (up.flush_pending or up.data_count > 0) and up.high_water > 0;
+        if (spawn_id != 0) {
+            if (up.data_count > 0) {
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = .{ .id = spawn_id } },
+                    .src = .{ .data = sg.asRange(pkt) },
+                });
+                upload_meter.record(up.data_count * @sizeOf(@TypeOf(pkt[0])));
+            } else if (will_dispatch) {
+                var dummy: @import("../particles/types.zig").GpuParticleSlot = undefined;
+                @memset(std.mem.asBytes(&dummy), 0);
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = .{ .id = spawn_id } },
+                    .src = .{ .data = sg.asRange(&dummy) },
+                });
+            }
         }
         // Dispatch on staged spawns even without a frame update (a
         // sub-emitter child may hold spawns while its own update did not
@@ -965,11 +1006,11 @@ fn flushTrails(scene: anytype, slot: anytype) void {
         if (up.buffers_pending) {
             if (!sg.isvalid()) continue;
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.vert_cap * @sizeOf(@TypeOf(slot.trail_verts.items[0])),
             });
             const ib = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = up.index_cap * @sizeOf(@TypeOf(slot.trail_indices.items[0])),
             });
             // Pair-atomic VALID-only creation: a nonzero FAILED id must not
@@ -989,11 +1030,17 @@ fn flushTrails(scene: anytype, slot: anytype) void {
         }
         if (sg.isvalid()) {
             if (up.vert_count > 0 and vertex_id != 0) {
-                sg.updateBuffer(.{ .id = vertex_id }, sg.asRange(slot.trail_verts.items[up.vert_lo..v_end]));
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = .{ .id = vertex_id } },
+                    .src = .{ .data = sg.asRange(slot.trail_verts.items[up.vert_lo..v_end]) },
+                });
                 upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.trail_verts.items[0])));
             }
             if (up.index_count > 0 and index_id != 0) {
-                sg.updateBuffer(.{ .id = index_id }, sg.asRange(slot.trail_indices.items[up.index_lo..i_end]));
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = .{ .id = index_id } },
+                    .src = .{ .data = sg.asRange(slot.trail_indices.items[up.index_lo..i_end]) },
+                });
                 upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.trail_indices.items[0])));
             }
             up.delivered = true;
@@ -1029,7 +1076,7 @@ fn flushSoftbodies(scene: anytype, slot: anytype) void {
         if (up.buffers_pending) {
             if (!sg.isvalid()) continue;
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.vert_cap * @sizeOf(@TypeOf(slot.soft_data.items[0])),
             });
             // Cloth index buffers are always u32 (vertices cap at 4096, so
@@ -1057,7 +1104,10 @@ fn flushSoftbodies(scene: anytype, slot: anytype) void {
                 continue;
             }
             if (vertex_id == 0) continue;
-            sg.updateBuffer(.{ .id = vertex_id }, sg.asRange(slot.soft_data.items[up.data_lo..end]));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = .{ .id = vertex_id } },
+                .src = .{ .data = sg.asRange(slot.soft_data.items[up.data_lo..end]) },
+            });
             upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.soft_data.items[0])));
             up.delivered = true;
         } else {
@@ -1089,11 +1139,11 @@ fn flushGreased(scene: anytype, slot: anytype) void {
         var just_created = false;
         if (vertex_id == 0) {
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.vert_cap * @sizeOf(@TypeOf(slot.greased_verts.items[0])),
             });
             const ib = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = up.index_cap * @sizeOf(@TypeOf(slot.greased_indices.items[0])),
             });
             if (vb.id == 0 or ib.id == 0 or sg.queryBufferState(vb) != .VALID or sg.queryBufferState(ib) != .VALID) {
@@ -1111,7 +1161,10 @@ fn flushGreased(scene: anytype, slot: anytype) void {
             just_created = true;
         }
         if (up.vert_count > 0 and vertex_id != 0) {
-            sg.updateBuffer(.{ .id = vertex_id }, sg.asRange(slot.greased_verts.items[up.vert_lo..v_end]));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = .{ .id = vertex_id } },
+                .src = .{ .data = sg.asRange(slot.greased_verts.items[up.vert_lo..v_end]) },
+            });
             upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.greased_verts.items[0])));
         }
         // A just-created index buffer is empty: it needs the full index
@@ -1119,7 +1172,10 @@ fn flushGreased(scene: anytype, slot: anytype) void {
         // froze indices whenever live buffers were missing, precisely for
         // this case).
         if ((up.full_upload or just_created) and up.index_count > 0 and index_id != 0) {
-            sg.updateBuffer(.{ .id = index_id }, sg.asRange(slot.greased_indices.items[up.index_lo..i_end]));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = .{ .id = index_id } },
+                .src = .{ .data = sg.asRange(slot.greased_indices.items[up.index_lo..i_end]) },
+            });
             upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.greased_indices.items[0])));
             up.full_delivered = true;
         } else if (up.full_upload and up.index_count == 0) {
@@ -1455,6 +1511,10 @@ fn installComputeCreated(scene: anytype, ps: anytype, up: anytype) void {
         if (ps.compute_state_buffer.id == 0) {
             ps.compute_state_buffer = .{ .id = up.created_state_buffer_id };
             state_buf_wins = true;
+        } else if (up.state_clear_pending) {
+            lost.state_buffer = ps.compute_state_buffer;
+            ps.compute_state_buffer = .{ .id = up.created_state_buffer_id };
+            state_buf_wins = true;
         } else {
             lost.state_buffer = .{ .id = up.created_state_buffer_id };
         }
@@ -1494,9 +1554,10 @@ fn installComputeCreated(scene: anytype, ps: anytype, up: anytype) void {
         up.created_shader_id = 0;
     }
     if (up.created_state_view_id != 0) {
-        if (ps.compute_state_view.id == 0 and ps.compute_state_buffer.id != 0 and
+        if ((ps.compute_state_view.id == 0 or up.state_clear_pending) and ps.compute_state_buffer.id != 0 and
             (!made_state_buf or state_buf_wins))
         {
+            if (ps.compute_state_view.id != 0) lost.state_view = ps.compute_state_view;
             ps.compute_state_view = .{ .id = up.created_state_view_id };
         } else {
             lost.state_view = .{ .id = up.created_state_view_id };

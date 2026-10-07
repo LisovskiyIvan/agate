@@ -89,7 +89,7 @@ pub fn ensureUiBufferPair(
     var new_ib: sg.Buffer = .{};
     if (want_vb) {
         new_vb = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = target_cap_v * @sizeOf(UIVertex),
         });
         if (new_vb.id == 0 or sg.queryBufferState(new_vb) != .VALID) {
@@ -99,7 +99,7 @@ pub fn ensureUiBufferPair(
     }
     if (want_ib) {
         new_ib = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true, .dynamic_update = true },
+            .usage = .{ .index_buffer = true, .write_transient = true },
             .size = target_cap_i * @sizeOf(u16),
         });
         if (new_ib.id == 0 or sg.queryBufferState(new_ib) != .VALID) {
@@ -129,8 +129,14 @@ pub fn uploadUiBuffers(
     verts: []const UIVertex,
     indices: []const u16,
 ) void {
-    sg.updateBuffer(vertex_buffer, sg.asRange(verts));
-    sg.updateBuffer(index_buffer, sg.asRange(indices));
+    sg.writeBufferTransient(.{
+        .dst = .{ .buffer = vertex_buffer },
+        .src = .{ .data = sg.asRange(verts) },
+    });
+    sg.writeBufferTransient(.{
+        .dst = .{ .buffer = index_buffer },
+        .src = .{ .data = sg.asRange(indices) },
+    });
     // Учёт динамики: весь UI-батч кадра (вершины + u16-индексы).
     upload_meter.record(ui_draw.batchUploadBytes(verts.len, indices.len));
 }

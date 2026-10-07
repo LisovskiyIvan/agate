@@ -576,7 +576,7 @@ pub const SoftBody = struct {
     pub fn flushGpuUploads(self: *SoftBody) void {
         if (self.buffers_pending and sg.isvalid()) {
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
             });
             // Cloth index buffers are always u32 (vertices cap at 4096, so
@@ -596,12 +596,16 @@ pub const SoftBody = struct {
                 if (ib.id != 0) sg.destroyBuffer(ib);
             }
         }
-        if (!self.upload_pending) return;
-        self.upload_pending = false;
-        if (self.mesh.vertex_buffer.id != 0) {
-            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
-            upload_meter.record(self.vertices.len * @sizeOf(Vertex));
+        if (self.vertices.len > 0 and self.mesh.vertex_buffer.id != 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.mesh.vertex_buffer },
+                .src = .{ .data = sg.asRange(self.vertices) },
+            });
+            if (self.upload_pending) {
+                upload_meter.record(self.vertices.len * @sizeOf(Vertex));
+            }
         }
+        self.upload_pending = false;
     }
 };
 

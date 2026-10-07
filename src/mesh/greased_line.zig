@@ -381,11 +381,11 @@ pub const GreasedLineMesh = struct {
         // (VALIDATE_UPDATEBUF_ONCE). `.data` at creation is not an option:
         // this sokol rejects desc.data for .write_* (dynamic_update) buffers.
         const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = total_verts * @sizeOf(Vertex),
         });
         const ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true, .dynamic_update = true },
+            .usage = .{ .index_buffer = true, .write_transient = true },
             .size = total_indices * @sizeOf(u32),
         });
 
@@ -490,16 +490,15 @@ pub const GreasedLineMesh = struct {
     /// twice in one frame: the first call after creation does the full
     /// upload (vertex + index), later rebuilds update vertices only.
     pub fn flushGpuUploads(self: *GreasedLineMesh) void {
-        if (!self.gpu_dirty) return;
         if (!sg.isvalid()) return; // keep dirty: retry once a context exists
         if (self.mesh.vertex_buffer.id == 0) {
             if (self.vertices.len == 0) return;
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
             });
             const ib = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = self.indices.len * @sizeOf(u32),
             });
             if (vb.id == 0 or ib.id == 0) {
@@ -513,16 +512,26 @@ pub const GreasedLineMesh = struct {
             self.mesh.index_buffer = ib;
             self.gpu_needs_full_upload = true;
         }
-        if (self.vertices.len > 0) {
-            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices));
-            // Учёт динамики: весь вершинный массив линии.
-            upload_meter.record(self.vertices.len * @sizeOf(Vertex));
+        if (self.vertices.len > 0 and self.mesh.vertex_buffer.id != 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.mesh.vertex_buffer },
+                .src = .{ .data = sg.asRange(self.vertices) },
+            });
+            if (self.gpu_dirty) {
+                // Учёт динамики: весь вершинный массив линии.
+                upload_meter.record(self.vertices.len * @sizeOf(Vertex));
+            }
         }
-        if (self.gpu_needs_full_upload and self.indices.len > 0) {
-            sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices));
-            // Учёт динамики: индексный массив (полная заливка при создании).
-            upload_meter.record(self.indices.len * @sizeOf(u32));
-            self.gpu_needs_full_upload = false;
+        if (self.indices.len > 0 and self.mesh.index_buffer.id != 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.mesh.index_buffer },
+                .src = .{ .data = sg.asRange(self.indices) },
+            });
+            if (self.gpu_needs_full_upload) {
+                // Учёт динамики: индексный массив (полная заливка при создании).
+                upload_meter.record(self.indices.len * @sizeOf(u32));
+                self.gpu_needs_full_upload = false;
+            }
         }
         self.gpu_dirty = false;
     }

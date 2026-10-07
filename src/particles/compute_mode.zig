@@ -219,7 +219,7 @@ pub fn ensureComputeGpu(self: anytype) void {
     }
     if (self.compute_spawn_buffer.id == 0) {
         self.compute_spawn_buffer = sg.makeBuffer(.{
-            .usage = .{ .storage_buffer = true, .dynamic_update = true },
+            .usage = .{ .storage_buffer = true, .write_transient = true },
             .size = cap * @sizeOf(GpuParticleSlot),
         });
     }
@@ -257,11 +257,14 @@ pub fn ensureComputeGpu(self: anytype) void {
 /// called from flushComputeUploads when staged.
 pub fn clearComputeState(self: anytype) void {
     if (self.compute_state_buffer.id == 0) return;
-    const zeros = self.allocator.alloc(u8, self.capacity * @sizeOf(ComputeParticleState)) catch return;
-    defer self.allocator.free(zeros);
-    @memset(zeros, 0);
-    sg.updateBuffer(self.compute_state_buffer, sg.Range{ .ptr = zeros.ptr, .size = zeros.len });
-    upload_meter.record(zeros.len);
+    if (self.compute_state_view.id != 0) {
+        sg.destroyView(self.compute_state_view);
+        self.compute_state_view = .{};
+    }
+    sg.destroyBuffer(self.compute_state_buffer);
+    self.compute_state_buffer = .{};
+    ensureComputeGpu(self);
+    upload_meter.record(self.capacity * @sizeOf(ComputeParticleState));
 }
 
 /// Runs the compute dispatch for the staged window. Context thread only;
@@ -310,16 +313,27 @@ pub fn flushComputeUploads(self: anytype) void {
     // for a retry): keep everything staged, consume nothing.
     if (self.compute_pipeline.id == 0) return;
     const staged = self.compute_staged;
-    if (staged > 0 and self.compute_spawn_buffer.id != 0) {
-        sg.updateBuffer(self.compute_spawn_buffer, sg.asRange(self.compute_staging[0..staged]));
-        upload_meter.record(staged * @sizeOf(GpuParticleSlot));
+    const will_dispatch = (self.compute_flush_pending or staged > 0) and self.compute_high_water > 0;
+    if (self.compute_spawn_buffer.id != 0) {
+        if (staged > 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.compute_spawn_buffer },
+                .src = .{ .data = sg.asRange(self.compute_staging[0..staged]) },
+            });
+            upload_meter.record(staged * @sizeOf(GpuParticleSlot));
+        } else if (will_dispatch and self.compute_staging.len > 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.compute_spawn_buffer },
+                .src = .{ .data = sg.asRange(self.compute_staging[0..1]) },
+            });
+        }
     }
     // Dispatch on staged spawns even without a frame update (a
     // sub-emitter child may hold spawns while its own update did not run;
     // dt 0 then integrates nothing but still applies respawns). Consumes
     // the window/dt/flag only here, after the upload above.
-    if (self.compute_flush_pending or staged > 0) {
-        if (self.compute_high_water > 0) dispatchCompute(self, staged);
+    if (will_dispatch) {
+        dispatchCompute(self, staged);
         self.compute_flush_pending = false;
         self.compute_dt_accum = 0.0;
         self.compute_staged = 0;

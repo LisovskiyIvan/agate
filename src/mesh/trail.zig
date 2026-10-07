@@ -85,11 +85,11 @@ pub const TrailMesh = struct {
         // whole session" when init raced the crowd VAT buffer flood).
         const deferred = !gpu_thread.isOnContextThread();
         var vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = max_verts * @sizeOf(Vertex),
         });
         var ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true, .dynamic_update = true },
+            .usage = .{ .index_buffer = true, .write_transient = true },
             .size = max_indices * @sizeOf(u16),
         });
         const partial = !deferred and (vb.id == 0 or ib.id == 0);
@@ -307,11 +307,11 @@ pub const TrailMesh = struct {
         // here, on the render side, then upload whatever was staged.
         if (self.buffers_pending and sg.isvalid()) {
             const vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
             });
             const ib = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true, .dynamic_update = true },
+                .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = self.indices.len * @sizeOf(u16),
             });
             if (vb.id != 0 and ib.id != 0) {
@@ -326,18 +326,27 @@ pub const TrailMesh = struct {
                 if (ib.id != 0) sg.destroyBuffer(ib);
             }
         }
-        if (!self.gpu_dirty) return;
+        if (self.pending_vertex_count > 0 and self.mesh.vertex_buffer.id != 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.mesh.vertex_buffer },
+                .src = .{ .data = sg.asRange(self.vertices[0..self.pending_vertex_count]) },
+            });
+            if (self.gpu_dirty) {
+                // Учёт динамики: только staged-префикс вершин.
+                upload_meter.record(self.pending_vertex_count * @sizeOf(Vertex));
+            }
+        }
+        if (self.pending_index_count > 0 and self.mesh.index_buffer.id != 0) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = self.mesh.index_buffer },
+                .src = .{ .data = sg.asRange(self.indices[0..self.pending_index_count]) },
+            });
+            if (self.gpu_dirty) {
+                // Учёт динамики: только staged-префикс индексов (u16).
+                upload_meter.record(self.pending_index_count * @sizeOf(u16));
+            }
+        }
         self.gpu_dirty = false;
-        if (self.mesh.vertex_buffer.id != 0) {
-            sg.updateBuffer(self.mesh.vertex_buffer, sg.asRange(self.vertices[0..self.pending_vertex_count]));
-            // Учёт динамики: только staged-префикс вершин.
-            upload_meter.record(self.pending_vertex_count * @sizeOf(Vertex));
-        }
-        if (self.mesh.index_buffer.id != 0) {
-            sg.updateBuffer(self.mesh.index_buffer, sg.asRange(self.indices[0..self.pending_index_count]));
-            // Учёт динамики: только staged-префикс индексов (u16).
-            upload_meter.record(self.pending_index_count * @sizeOf(u16));
-        }
         self.mesh.index_count = @intCast(self.pending_index_count);
         self.mesh.local_bounding_box = BoundingBox.init(self.pending_min_pt, self.pending_max_pt);
         self.mesh.cached_aabb = self.mesh.local_bounding_box;

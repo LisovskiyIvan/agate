@@ -370,7 +370,7 @@ pub const ParticleSystem = struct {
         // CPU-phase ownership is not GPU authorization without a live context.
         const deferred = !sg.isvalid() or !gpu_thread.isOnContextThread();
         const buf = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = capacity * @sizeOf(ParticleInstanceData),
         });
 
@@ -709,7 +709,7 @@ pub const ParticleSystem = struct {
         // buffer here, on the render side, and upload any staged data.
         if (self.instance_buffer_pending and sg.isvalid()) {
             self.instance_buffer = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.capacity * @sizeOf(ParticleInstanceData),
             });
             if (self.instance_buffer.id != 0) {
@@ -720,7 +720,10 @@ pub const ParticleSystem = struct {
         if (self.instance_dirty) {
             self.instance_dirty = false;
             if (self.active_count > 0 and self.instance_buffer.id != 0) {
-                sg.updateBuffer(self.instance_buffer, sg.asRange(self.instances[0..self.active_count]));
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = self.instance_buffer },
+                    .src = .{ .data = sg.asRange(self.instances[0..self.active_count]) },
+                });
                 // Учёт динамики: active_count инстансов целиком.
                 upload_meter.record(self.active_count * @sizeOf(ParticleInstanceData));
             }
@@ -729,7 +732,7 @@ pub const ParticleSystem = struct {
         // context the flag stays set and a later flush retries.
         if (self.gpu_slot_buffer_pending and self.gpu_slot_buffer.id == 0 and sg.isvalid()) {
             self.gpu_slot_buffer = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+                .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.capacity * @sizeOf(GpuParticleSlot),
             });
             if (self.gpu_slot_buffer.id != 0) self.gpu_slot_buffer_pending = false;

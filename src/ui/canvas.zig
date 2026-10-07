@@ -153,12 +153,12 @@ pub const UICanvas = struct {
         const max_i: usize = 49152;
 
         const vb = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = max_v * @sizeOf(UIVertex),
         });
 
         const ib = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true, .dynamic_update = true },
+            .usage = .{ .index_buffer = true, .write_transient = true },
             .size = max_i * @sizeOf(u16),
         });
 

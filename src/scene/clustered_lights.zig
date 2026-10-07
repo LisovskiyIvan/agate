@@ -492,15 +492,24 @@ pub const ClusteredGpuCache = struct {
         const slot = &self.slots[s];
 
         if (self.cpu_lights.items.len > 0) {
-            sg.updateBuffer(slot.light_buffer, sg.asRange(self.cpu_lights.items));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = slot.light_buffer },
+                .src = .{ .data = sg.asRange(self.cpu_lights.items) },
+            });
             upload_meter.record(self.cpu_lights.items.len * @sizeOf(ClusterLightGpu));
         }
         if (self.cpu_headers.items.len > 0) {
-            sg.updateBuffer(slot.header_buffer, sg.asRange(self.cpu_headers.items));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = slot.header_buffer },
+                .src = .{ .data = sg.asRange(self.cpu_headers.items) },
+            });
             upload_meter.record(self.cpu_headers.items.len * @sizeOf(ClusterTileGpu));
         }
         if (self.cpu_indices.items.len > 0) {
-            sg.updateBuffer(slot.index_buffer, sg.asRange(self.cpu_indices.items));
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = slot.index_buffer },
+                .src = .{ .data = sg.asRange(self.cpu_indices.items) },
+            });
             upload_meter.record(self.cpu_indices.items.len * @sizeOf(u32));
         }
         self.ensureViews(s);
@@ -670,7 +679,7 @@ pub const ClusteredGpuCache = struct {
         }
         const grow = growBytes(need_bytes);
         buffer.* = sg.makeBuffer(.{
-            .usage = .{ .storage_buffer = true, .dynamic_update = true },
+            .usage = .{ .storage_buffer = true, .write_transient = true },
             .size = grow,
         });
         if (buffer.*.id == 0) return false;

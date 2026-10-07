@@ -124,7 +124,10 @@ pub fn gpuUploadRange(self: anytype) ?[]GpuParticleSlot {
 pub fn flushGpuUpload(self: anytype) void {
     if (self.gpu_slot_buffer.id == 0) return;
     if (gpuUploadRange(self)) |range| {
-        sg.updateBuffer(self.gpu_slot_buffer, sg.asRange(range));
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = self.gpu_slot_buffer },
+            .src = .{ .data = sg.asRange(range) },
+        });
         // Учёт динамики: весь переданный диапазон ушёл в GPU-буфер.
         upload_meter.record(range.len * @sizeOf(GpuParticleSlot));
     }

@@ -105,7 +105,7 @@ pub const DebugPass = struct {
         try staging.ensureTotalCapacity(allocator, verticesForLineCount(initial_capacity_lines));
 
         const vb = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = verticesForLineCount(initial_capacity_lines) * @sizeOf(Vertex),
         });
 
@@ -158,7 +158,7 @@ pub const DebugPass = struct {
             return;
         }
         const new_vb = sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = verticesForLineCount(new_cap) * @sizeOf(Vertex),
         });
         // A failed makeBuffer may hand out a nonzero FAILED id (pool
@@ -231,7 +231,10 @@ pub const DebugPass = struct {
         self.prepared_verts = self.staging.items.len;
         if (!sg.isvalid()) return true; // headless: staged, no GPU calls
 
-        sg.updateBuffer(self.vertex_buffer, sg.asRange(self.staging.items));
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = self.vertex_buffer },
+            .src = .{ .data = sg.asRange(self.staging.items) },
+        });
         // Учёт динамики: все staged debug-вершины кадра.
         upload_meter.record(self.staging.items.len * @sizeOf(Vertex));
         self.markUploaded();

@@ -12,7 +12,8 @@ const upload_meter = @import("../gpu_upload_meter.zig");
 /// Renders a full-quad clear in the current viewport/scissor.
 /// Used for per-camera viewport clears in multi-camera / PIP rendering.
 pub const ViewportClearPass = struct {
-    vb: sg.Buffer = .{},
+    vbs: [16]sg.Buffer = [_]sg.Buffer{.{}} ** 16,
+    cur_vb: usize = 0,
     shader: sg.Shader = .{},
     /// Single active pipeline slot, keyed by the exact target shape below.
     /// Rebuilt when the requested shape changes (context thread, between
@@ -25,18 +26,22 @@ pub const ViewportClearPass = struct {
         if (!sg.isvalid()) return;
         if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
         if (self.shader.id != 0) sg.destroyShader(self.shader);
-        if (self.vb.id != 0) sg.destroyBuffer(self.vb);
+        for (&self.vbs) |*vb| {
+            if (vb.id != 0) sg.destroyBuffer(vb.*);
+        }
         self.* = .{};
     }
 
     /// Ensures the quad buffer, debug shader, and the pipeline for the
     /// exact target shape (sample count + color format).
     pub fn ensureResources(self: *ViewportClearPass, samples: i32, color_format: sg.PixelFormat) void {
-        if (self.vb.id == 0) {
-            self.vb = sg.makeBuffer(.{
-                .usage = .{ .vertex_buffer = true, .dynamic_update = true },
-                .size = 16 * 6 * @sizeOf(debug_pass.Vertex),
-            });
+        for (&self.vbs) |*vb| {
+            if (vb.id == 0) {
+                vb.* = sg.makeBuffer(.{
+                    .usage = .{ .vertex_buffer = true, .write_transient = true },
+                    .size = 6 * @sizeOf(debug_pass.Vertex),
+                });
+            }
         }
         if (self.shader.id == 0) {
             self.shader = sg.makeShader(debug_shd.debugShaderDesc(sg.queryBackend()));
@@ -84,9 +89,7 @@ pub const ViewportClearPass = struct {
     pub fn clear(self: *ViewportClearPass, color: Color4, samples: i32, color_format: sg.PixelFormat) void {
         self.ensureResources(samples, color_format);
         const pip = self.pipeline;
-        if (pip.id == 0 or self.vb.id == 0 or sg.queryPipelineState(pip) != .VALID) return;
-        if (self.shape_samples != samples or self.shape_format != color_format) return;
-
+        if (pip.id == 0 or self.vbs[0].id == 0 or sg.queryPipelineState(pip) != .VALID) return;
         const clear_verts = [_]debug_pass.Vertex{
             .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
             .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
@@ -95,14 +98,19 @@ pub const ViewportClearPass = struct {
             .{ .position = .{ 1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
             .{ .position = .{ -1.0, 1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
         };
-        const offset = sg.appendBuffer(self.vb, sg.asRange(&clear_verts));
-        if (offset < 0) return;
+        const vb = self.vbs[self.cur_vb % self.vbs.len];
+        self.cur_vb +%= 1;
+        if (vb.id == 0 or sg.queryBufferState(vb) != .VALID) return;
+
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = vb },
+            .src = .{ .data = sg.asRange(&clear_verts) },
+        });
         upload_meter.record(clear_verts.len * @sizeOf(debug_pass.Vertex));
 
         sg.applyPipeline(pip);
         var bind = sg.Bindings{};
-        bind.vertex_buffers[0] = self.vb;
-        bind.vertex_buffer_offsets[0] = offset;
+        bind.vertex_buffers[0] = vb;
         sg.applyBindings(bind);
 
         const vs_params = debug_shd.VsParams{

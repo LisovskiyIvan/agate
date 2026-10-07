@@ -406,7 +406,7 @@ pub fn parsePrimitive(
         sg.makeBuffer(.{ .data = sg.asRange(vertices) })
     else
         sg.makeBuffer(.{
-            .usage = .{ .vertex_buffer = true, .dynamic_update = true },
+            .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = vertices.len * @sizeOf(Vertex),
         });
 
