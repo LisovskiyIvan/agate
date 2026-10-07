@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sglue = sokol.glue;
@@ -145,6 +146,9 @@ pub const PostProcessPass = struct {
     /// hardware); y/z/w = 0. The main target is always RGBA16F, so no
     /// target-format lane exists.
     pub fn outputParamsFor(backbuffer_fmt: sg.PixelFormat) [4]f32 {
+        // On WebGPU, the canvas compositor expects linear output and applies
+        // display transfer automatically; manual shader encode causes double gamma / washed out screen.
+        if (builtin.cpu.arch.isWasm()) return .{ 0.0, 0.0, 0.0, 0.0 };
         const x: f32 = if (isSrgbBackbuffer(backbuffer_fmt)) 0.0 else 1.0;
         return .{ x, 0.0, 0.0, 0.0 };
     }
