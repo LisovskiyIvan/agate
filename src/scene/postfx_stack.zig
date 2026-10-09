@@ -45,6 +45,12 @@ pub const PostFXStack = struct {
     main_samples: i32 = 1,
     main_color_format: sg.PixelFormat = .RGBA16F,
 
+    /// Last clamped `PostProcessOptions.render_scale` the main target was
+    /// prepared/resized with. resizeOffscreen (window resize) reuses it so
+    /// the offscreen targets stay at the scaled size between frames; the
+    /// per-frame prepareMainTargets call refreshes it from the config.
+    render_scale: f32 = 1.0,
+
     warn_depth_effects: msaa.WarnOnce = .{},
     warn_taa_target: msaa.WarnOnce = .{},
 
@@ -96,16 +102,32 @@ pub const PostFXStack = struct {
     /// Window-resize path: the main target is mandatory, auxiliary targets
     /// only when already allocated (avoids provisioning VRAM for effects
     /// that never ran). Highlight/shaft targets stay lazy under render().
+    /// Applies the current `render_scale`: every viewport-sized target here
+    /// belongs to the scaled scene/effect resolution, never the swapchain.
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
         if (!sg.isvalid()) return;
-        _ = self.postprocess_pass.resize(width, height, self.main_samples);
-        if (self.ssao_pass.width != 0) self.ssao_pass.resize(width, height);
-        if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(width, height);
-        if (self.glow_pass.base_width != 0) self.glow_pass.resize(width, height);
-        if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(width, height);
-        if (self.depth_pyramid_pass.base_width != 0) self.depth_pyramid_pass.resize(width, height);
-        passes.OutlinePass.resize(width, height);
+        const size = postprocess.scaledRenderSize(width, height, self.render_scale);
+        _ = self.postprocess_pass.resize(size.w, size.h, self.main_samples);
+        if (self.ssao_pass.width != 0) self.ssao_pass.resize(size.w, size.h);
+        if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(size.w, size.h);
+        if (self.glow_pass.base_width != 0) self.glow_pass.resize(size.w, size.h);
+        if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(size.w, size.h);
+        if (self.depth_pyramid_pass.base_width != 0) self.depth_pyramid_pass.resize(size.w, size.h);
+        passes.OutlinePass.resize(size.w, size.h);
+    }
+
+    /// Actual size of the allocated HDR main target — the render-scale
+    /// resolution the scene pass, effect passes and history targets run
+    /// at. 0 until prepareMainTargets succeeds; callers fall back to the
+    /// swapchain size. Single source of truth: never recompute the scale
+    /// math in the render path.
+    pub fn renderWidth(self: *const PostFXStack) i32 {
+        return self.postprocess_pass.width;
+    }
+
+    pub fn renderHeight(self: *const PostFXStack) i32 {
+        return self.postprocess_pass.height;
     }
 
     pub fn destroyMsaaDepth(self: *PostFXStack) void {
@@ -160,8 +182,10 @@ pub const PostFXStack = struct {
     }
 
     /// Allocates the HDR main target (RGBA16F, sole format) plus the TAA
-    /// history when applicable. Fails closed with a clear error before any
-    /// pass begins; never provisions an alternate color path.
+    /// history when applicable. `width`/`height` are the SWAPCHAIN size;
+    /// the target is allocated at the render scale from `config` (native
+    /// size at 1.0). Fails closed with a clear error before any pass
+    /// begins; never provisions an alternate color path.
     pub fn prepareMainTargets(
         self: *PostFXStack,
         config: *PostProcessOptions,
@@ -172,12 +196,14 @@ pub const PostFXStack = struct {
         if (!sg.isvalid()) return error.UnsupportedHDR;
         if (!postprocess.hdr.queryCapabilities().supported()) return error.UnsupportedHDR;
         if (width <= 0 or height <= 0) return error.TargetAllocationFailed;
+        self.render_scale = config.render_scale;
+        const size = postprocess.scaledRenderSize(width, height, self.render_scale);
         const samples = targetSampleCount(requested);
-        if (!self.postprocess_pass.resize(width, height, samples)) return error.TargetAllocationFailed;
+        if (!self.postprocess_pass.resize(size.w, size.h, samples)) return error.TargetAllocationFailed;
         self.main_samples = samples;
         self.main_color_format = .RGBA16F;
         if (config.taa_enabled and samples == 1) {
-            if (self.postprocess_pass.ensureTaaHistory(width, height)) self.taa_explicit_reset = true;
+            if (self.postprocess_pass.ensureTaaHistory(size.w, size.h)) self.taa_explicit_reset = true;
             if (!self.postprocess_pass.taaAvailable()) {
                 _ = self.warn_taa_target.warn("TAA: history allocation failed; continuing with spatial AA", .{});
                 config.taa_enabled = false;
@@ -285,8 +311,18 @@ pub const PostFXStack = struct {
     /// effect stages run only while the master switch and their own flag
     /// are on. Empty views (.{} ) mark inactive/failed effect results; the
     /// display pass binds its own placeholder for those slots.
+    ///
+    /// Render-scale split: `cur_w`/`cur_h` is the SWAPCHAIN (display) size;
+    /// every scene-side size (effect targets, TAA history, and the
+    /// composite's SOURCE texel size) is the allocated main-target size
+    /// (`fx_*`, see PostFXStack.renderWidth). At scale 1.0 the two are
+    /// equal and the chain is bit-identical to the native path; below 1.0
+    /// the main target is smaller and the display pass UV-maps (bilinear)
+    /// upscale it, while UI draws after the composite at full resolution.
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void {
         var post = params.post.forFrame();
+        const fx_w = if (self.postprocess_pass.width > 0) self.postprocess_pass.width else cur_w;
+        const fx_h = if (self.postprocess_pass.height > 0) self.postprocess_pass.height else cur_h;
         if (post.auto_exposure_enabled) {
             post.exposure = self.auto_exposure.adapted_exposure;
         }
@@ -335,8 +371,8 @@ pub const PostFXStack = struct {
                 params.aspect,
                 self.depthSampleView(depth_prepass),
                 ssao,
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
             );
             const out = self.ssao_pass.ssao_blur_tex_view;
             if (out.id != 0) {
@@ -351,8 +387,8 @@ pub const PostFXStack = struct {
         if (postprocess.depthPyramidActive(post.enabled, post)) {
             const v = self.depth_pyramid_pass.render(
                 self.depthSampleView(depth_prepass),
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
             );
             if (v.id != 0) {
                 depth_pyramid_view = v;
@@ -369,8 +405,8 @@ pub const PostFXStack = struct {
                 post.bloom_threshold,
                 post.bloom_pyramid_mips,
                 post.bloom_radius,
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
             );
             if (v.id != 0) {
                 bloom_view = v;
@@ -388,8 +424,8 @@ pub const PostFXStack = struct {
                 self.postprocess_pass.offscreen_resolve_tex_view,
                 post.glow_threshold,
                 post.glow_radius,
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
             );
             if (v.id != 0) {
                 glow_view = v;
@@ -403,12 +439,12 @@ pub const PostFXStack = struct {
         var highlight_view: sg.View = .{};
         var highlight_mask_view: sg.View = .{};
         if (postprocess.highlightActive(post.enabled, params.highlight_items.len)) {
-            const hl_rect = params.highlight_viewport.toPixelRect(cur_w, cur_h);
+            const hl_rect = params.highlight_viewport.toPixelRect(fx_w, fx_h);
             const hl = self.highlight_pass.render(
                 params.view_proj,
                 params.highlight_items,
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
                 hl_rect,
             );
             if (hl.view.id != 0) {
@@ -436,8 +472,8 @@ pub const PostFXStack = struct {
                 .cascades = params.shaft_cascades,
                 .shadow_bias = params.shaft_shadow_bias,
                 .config = post,
-                .base_w = cur_w,
-                .base_h = cur_h,
+                .base_w = fx_w,
+                .base_h = fx_h,
             });
             if (v.id != 0) {
                 shaft_view = v;
@@ -456,7 +492,7 @@ pub const PostFXStack = struct {
         var taa_capture = false;
         var taa_reset_now = false;
         if (taa_active) {
-            const recreated = self.postprocess_pass.ensureTaaHistory(cur_w, cur_h);
+            const recreated = self.postprocess_pass.ensureTaaHistory(fx_w, fx_h);
             self.postprocess_pass.taa_read = postprocess.taaReadIndex(self.taa_frame);
             const reset = postprocess.taaShouldReset(.{
                 .first_frame = !self.taa_has_history,
@@ -510,8 +546,8 @@ pub const PostFXStack = struct {
             ssao.enabled,
             ssao.debug_mode,
             ssao.intensity,
-            cur_w,
-            cur_h,
+            fx_w,
+            fx_h,
             params.view_proj,
             inv_view_proj,
             prev_vp,
@@ -552,8 +588,8 @@ pub const PostFXStack = struct {
                 ssao.enabled,
                 ssao.debug_mode,
                 ssao.intensity,
-                cur_w,
-                cur_h,
+                fx_w,
+                fx_h,
                 params.view_proj,
                 inv_view_proj,
                 prev_vp,

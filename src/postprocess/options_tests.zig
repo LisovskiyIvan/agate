@@ -94,3 +94,44 @@ test "local tonemapping options clamp and validate correctly" {
     try std.testing.expectEqual(@as(f32, 0.5), nan_cfg.local_tonemapping_intensity);
     try std.testing.expectEqual(@as(f32, 0.3), nan_cfg.local_tonemapping_contrast);
 }
+
+test "render scale clamps to [min, 1] with a finite default" {
+    var over = PostProcessOptions{ .render_scale = 1.5 };
+    try std.testing.expectEqual(@as(f32, 1.0), over.clamped().render_scale);
+    var under = PostProcessOptions{ .render_scale = 0.1 };
+    try std.testing.expectEqual(prod.min_render_scale, under.clamped().render_scale);
+    var nan = PostProcessOptions{ .render_scale = std.math.nan(f32) };
+    try std.testing.expectEqual(@as(f32, 1.0), nan.clamped().render_scale);
+    var zero = PostProcessOptions{ .render_scale = 0.0 };
+    try std.testing.expectEqual(prod.min_render_scale, zero.clamped().render_scale);
+    // Default (fresh struct) is native: the pre-scale path stays bit-identical.
+    try std.testing.expectEqual(@as(f32, 1.0), (PostProcessOptions{}).render_scale);
+}
+
+test "scaledRenderSize rounds, keeps aspect, and never collapses a dimension" {
+    // Native identity at scale 1.0 (byte-identical to the pre-scale path).
+    const native = prod.scaledRenderSize(1920, 1080, 1.0);
+    try std.testing.expectEqual(@as(i32, 1920), native.w);
+    try std.testing.expectEqual(@as(i32, 1080), native.h);
+
+    // Nearest rounding, aspect error under half a source pixel.
+    const half = prod.scaledRenderSize(1920, 1080, 0.5);
+    try std.testing.expectEqual(@as(i32, 960), half.w);
+    try std.testing.expectEqual(@as(i32, 540), half.h);
+    const twothirds = prod.scaledRenderSize(1920, 1080, 0.66);
+    try std.testing.expectEqual(@as(i32, 1267), twothirds.w); // 1267.2 -> 1267
+    try std.testing.expectEqual(@as(i32, 713), twothirds.h); // 712.8 -> 713
+    try std.testing.expectApproxEqAbs(1920.0 / 1080.0, @as(f64, @floatFromInt(twothirds.w)) / @as(f64, @floatFromInt(twothirds.h)), 0.002);
+
+    // Defensive clamps: scale above 1 falls back to native, and each
+    // dimension stays >= 1.
+    try std.testing.expectEqual(@as(i32, 1920), prod.scaledRenderSize(1920, 1080, 4.0).w);
+    try std.testing.expectEqual(@as(i32, 1080), prod.scaledRenderSize(1920, 1080, 4.0).h);
+    const tiny = prod.scaledRenderSize(4, 4, prod.min_render_scale);
+    try std.testing.expectEqual(@as(i32, 1), tiny.w);
+    try std.testing.expectEqual(@as(i32, 1), tiny.h);
+    // Degenerate window passes through unchanged (callers reject <= 0).
+    const zero = prod.scaledRenderSize(0, 1080, 0.5);
+    try std.testing.expectEqual(@as(i32, 0), zero.w);
+    try std.testing.expectEqual(@as(i32, 1080), zero.h);
+}

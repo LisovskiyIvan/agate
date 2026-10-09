@@ -204,6 +204,14 @@ pub fn render(scene: anytype) void {
         return;
     };
     const color_format: sg.PixelFormat = .RGBA16F;
+    // Render-scale split: everything that draws into or samples the scene
+    // HDR main target (main pass viewports, TAA jitter, velocity, MSAA
+    // prepass) uses the ALLOCATED main-target size — under render scale <
+    // 1.0 it is smaller than the swapchain. `renderWidth` is the single
+    // source of truth (PostFXStack owns the scale math); 0 before the
+    // first successful prepare, hence the fallback to the window size.
+    const tgt_w = if (scene.postfx.renderWidth() > 0) scene.postfx.renderWidth() else cur_w;
+    const tgt_h = if (scene.postfx.renderHeight() > 0) scene.postfx.renderHeight() else cur_h;
     if (scene.taa_reset_requested.swap(false, .acq_rel)) {
         scene.postfx.taa_explicit_reset = true;
     }
@@ -229,7 +237,7 @@ pub fn render(scene: anytype) void {
     var taa_view_proj = snap.primary_cam.view_proj;
     if (taa_on) {
         const jpx = postprocess.taaJitter(snap.frame_id, post_config.taa_jitter_scale);
-        taa_view_proj = postprocess.applyTaaJitterToViewProj(snap.primary_cam.view_proj, jpx, cur_w, cur_h);
+        taa_view_proj = postprocess.applyTaaJitterToViewProj(snap.primary_cam.view_proj, jpx, tgt_w, tgt_h);
     }
 
     // 1. Directional Light Cascaded Shadow View-Projections
@@ -312,8 +320,8 @@ pub fn render(scene: anytype) void {
             &draws.primary,
             draws.primary.skin_storage.items,
             snap.primary_cam.viewport,
-            cur_w,
-            cur_h,
+            tgt_w,
+            tgt_h,
             &scene.stats,
         );
     } else if (!depth_prepass) {
@@ -342,7 +350,7 @@ pub fn render(scene: anytype) void {
     // Linear HDR is the sole scene target; display conversion runs afterwards.
     // (The .main GPU-timer bracket opened above at PASS 1.7, so the
     // prepass cost attributes to the main phase.)
-    if (!scene.postfx.beginMainPass(main_pass_action, samples, cur_w, cur_h)) {
+    if (!scene.postfx.beginMainPass(main_pass_action, samples, tgt_w, tgt_h)) {
         gpu_timing.endPass(.main);
         sg.commit();
         return;
@@ -351,7 +359,7 @@ pub fn render(scene: anytype) void {
     if (snap.enable_multi_camera and snap.camera_count > 0) {
         const active_idx = snap.active_camera_idx;
         const primary_snap = if (active_idx < snap.camera_count) snap.cameras[active_idx] else snap.primary_cam;
-        const primary_rect = primary_snap.viewport.toPixelRect(cur_w, cur_h);
+        const primary_rect = primary_snap.viewport.toPixelRect(tgt_w, tgt_h);
         sg.applyViewport(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
         sg.applyScissorRect(primary_rect.x, primary_rect.y, primary_rect.width, primary_rect.height, true);
         // Only the TAA view (primary) is jittered; secondary views keep
@@ -371,7 +379,7 @@ pub fn render(scene: anytype) void {
         for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
             if (i == active_idx or !entry.enabled) continue;
             secondary_ordinal += 1;
-            const rect = entry.viewport.toPixelRect(cur_w, cur_h);
+            const rect = entry.viewport.toPixelRect(tgt_w, tgt_h);
             sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
             sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
@@ -383,11 +391,11 @@ pub fn render(scene: anytype) void {
             scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env, secondary_ordinal);
         }
         // Restore full viewport
-        sg.applyViewport(0, 0, cur_w, cur_h, true);
-        sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+        sg.applyViewport(0, 0, tgt_w, tgt_h, true);
+        sg.applyScissorRect(0, 0, tgt_w, tgt_h, true);
     } else {
         const vp = snap.primary_cam.viewport;
-        const rect = vp.toPixelRect(cur_w, cur_h);
+        const rect = vp.toPixelRect(tgt_w, tgt_h);
         sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
         sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
 
@@ -395,9 +403,9 @@ pub fn render(scene: anytype) void {
         if (taa_on) primary_jittered.view_proj = taa_view_proj;
         scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env, 0);
 
-        if (rect.width != cur_w or rect.height != cur_h or rect.x != 0 or rect.y != 0) {
-            sg.applyViewport(0, 0, cur_w, cur_h, true);
-            sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+        if (rect.width != tgt_w or rect.height != tgt_h or rect.x != 0 or rect.y != 0) {
+            sg.applyViewport(0, 0, tgt_w, tgt_h, true);
+            sg.applyScissorRect(0, 0, tgt_w, tgt_h, true);
         }
     }
 
@@ -431,14 +439,14 @@ pub fn render(scene: anytype) void {
     // view to the composite.
     var velocity_ok = false;
     if (velocity_needed) {
-        const vrect = velocity_viewport.toPixelRect(cur_w, cur_h);
+        const vrect = velocity_viewport.toPixelRect(tgt_w, tgt_h);
         sg.applyViewport(vrect.x, vrect.y, vrect.width, vrect.height, true);
         sg.applyScissorRect(vrect.x, vrect.y, vrect.width, vrect.height, true);
         defer {
-            sg.applyViewport(0, 0, cur_w, cur_h, true);
-            sg.applyScissorRect(0, 0, cur_w, cur_h, true);
+            sg.applyViewport(0, 0, tgt_w, tgt_h, true);
+            sg.applyScissorRect(0, 0, tgt_w, tgt_h, true);
         }
-        if (scene.postfx.velocity_pass.ensure(cur_w, cur_h)) {
+        if (scene.postfx.velocity_pass.ensure(tgt_w, tgt_h)) {
             const main_depth_view = scene.postfx.postprocess_pass.offscreen_depth_att_view;
             const main_depth_fmt = scene.postfx.postprocess_pass.depth_format;
             if (main_depth_view.id != 0 and main_depth_fmt != .DEFAULT and main_depth_fmt != .NONE) {

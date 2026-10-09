@@ -34,6 +34,15 @@ const exposures = [_]f32{ 1.0, 0.6, 1.6, 2.5 };
 var frame_limit: u32 = 0;
 var msaa_count: i32 = 1;
 var want_srgb: bool = false;
+// Q4 render-scale A/B gate knob (see docs/graphics-roadmap.md Q4).
+var render_scale: f32 = 1.0;
+// GPU frame-sample tally (opt-in AGATE_HDR_TIMINGS=1): the engine stores the
+// last COMPLETED submission's ms in scene.stats.gpu_frame_ms; availability
+// is gpu_frame_submit != 0 (a valid zero-ms sample still counts).
+var gpu_samples: u32 = 0;
+var gpu_sum_ms: f64 = 0.0;
+var gpu_min_ms: f64 = std.math.inf(f64);
+var gpu_max_ms: f64 = 0.0;
 var frames: u32 = 0;
 var checks: u32 = 0;
 var failures: u32 = 0;
@@ -264,6 +273,10 @@ fn setupScene() void {
     scene.post_process.bloom_pyramid_mips = 5;
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
+    // Render scale (Q4): scene+effects render at scale x swapchain size,
+    // the composite/UI present at full res. 1.0 = native baseline for the
+    // A/B gate (native vs 0.66/0.75, same scene, same TAA).
+    scene.post_process.render_scale = render_scale;
     scene.post_process.fog_enabled = false;
     scene.post_process.contact_shadows_enabled = true;
     scene.post_process.local_tonemapping_enabled = true;
@@ -286,13 +299,25 @@ fn setupScene() void {
 export fn init() callconv(.c) void {
     z.gpu_thread.markContextThread();
     sokol.time.setup();
-    timing.setEnabled(false);
+    timing.setEnabled(envFlag("AGATE_HDR_TIMINGS") or envFlag("AGATE_GPU_TIMINGS"));
     setupScene();
 }
 
 export fn frame() callconv(.c) void {
     frames += 1;
     const f = frames;
+    if (f == 2) {
+        // Proof of the render-scale split (after one full frame): the main
+        // target is the scaled size while the composite/UI present at the
+        // swapchain size.
+        std.debug.print("hdr-showcase: render target {}x{} scale={d:.2} swapchain {}x{}\n", .{
+            scene.postfx.renderWidth(),
+            scene.postfx.renderHeight(),
+            scene.post_process.render_scale,
+            sapp.width(),
+            sapp.height(),
+        });
+    }
     const gate = frame_limit > 0;
     defer if (gate and f >= frame_limit) sapp.quit();
     // Finite gate uses a fixed step so UNORM/sRGB captures compare exactly
@@ -350,6 +375,17 @@ export fn frame() callconv(.c) void {
     }
     if (gate) checkFinitePrepared(f);
     scene.render();
+    // GPU sample poll must live HERE: render writes stats.gpu_frame_* at its
+    // end (post-commit), and the next frame's staged begin resets `stats`.
+    if (timing.isEnabled() and scene.stats.gpu_frame_submit != 0) {
+        const ms = @as(f64, scene.stats.gpu_frame_ms);
+        if (ms >= 0 and std.math.isFinite(ms)) {
+            gpu_samples += 1;
+            gpu_sum_ms += ms;
+            gpu_min_ms = @min(gpu_min_ms, ms);
+            gpu_max_ms = @max(gpu_max_ms, ms);
+        }
+    }
     if (gate and f == 200) {
         // renderReuse restores CPU stats after the replay (by design), so
         // draw counts cannot prove the replay. Assert the protocol ran:
@@ -399,6 +435,19 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
+    if (gpu_samples > 0) {
+        std.debug.print("hdr-showcase: gpu frame ms n={} mean={d:.3} min={d:.3} max={d:.3} (render target {}x{}, scale {d:.2})\n", .{
+            gpu_samples,
+            gpu_sum_ms / @as(f64, @floatFromInt(gpu_samples)),
+            gpu_min_ms,
+            gpu_max_ms,
+            scene.postfx.renderWidth(),
+            scene.postfx.renderHeight(),
+            scene.post_process.render_scale,
+        });
+    } else if (timing.isEnabled()) {
+        std.debug.print("hdr-showcase: gpu timing enabled but no frame samples completed\n", .{});
+    }
     scene.deinit();
     sg.shutdown();
     if (sokol_live_allocations != 0) fail("allocator still owns {} allocations after shutdown", .{sokol_live_allocations});
@@ -439,6 +488,11 @@ fn envI32(name: [*:0]const u8, fallback: i32) i32 {
     return std.fmt.parseInt(i32, std.mem.span(value), 10) catch fallback;
 }
 
+fn envF32(name: [*:0]const u8, fallback: f32) f32 {
+    const value = std.c.getenv(name) orelse return fallback;
+    return std.fmt.parseFloat(f32, std.mem.span(value)) catch fallback;
+}
+
 fn envFlag(name: [*:0]const u8) bool {
     const value = std.c.getenv(name) orelse return false;
     const s = std.mem.span(value);
@@ -450,12 +504,15 @@ pub fn startApp() void {
         frame_limit = @intCast(@max(0, emscripten_run_script_int("(()=>{const n=parseInt(new URLSearchParams(location.search).get('frames')||'0',10);return isNaN(n)?0:n;})()")));
         msaa_count = emscripten_run_script_int("(()=>{const n=parseInt(new URLSearchParams(location.search).get('msaa')||'1',10);return isNaN(n)?1:n;})()");
         want_srgb = emscripten_run_script_int("new URLSearchParams(location.search).has('srgb')") != 0;
+        render_scale = @floatFromInt(emscripten_run_script_int("(()=>{const n=parseFloat(new URLSearchParams(location.search).get('rscale')||'1');return isNaN(n)?1:n;})()"));
     } else {
         frame_limit = envU32("AGATE_HDR_FRAMES", 0);
         msaa_count = envI32("AGATE_HDR_MSAA", 1);
         want_srgb = envFlag("AGATE_HDR_SRGB");
+        render_scale = envF32("AGATE_HDR_RENDER_SCALE", 1.0);
     }
     msaa_count = std.math.clamp(msaa_count, 1, 4);
+    render_scale = @min(@max(render_scale, z.postprocess.min_render_scale), 1.0);
     sapp.run(.{
         .init_cb = init,
         .frame_cb = frame,

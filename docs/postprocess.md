@@ -93,6 +93,7 @@ pub const ShaftResolution = enum { half, quarter };
 | White balance | `temperature`, `tint` | 0, 0 (нейтрально) | — |
 | Motion blur | `motion_blur_enabled`, `motion_blur_intensity`, `motion_blur_max_blur_px`, `motion_blur_samples` | off, 0.5, 32.0, 8 | intensity [0,3], max [1,128], samples [2,32] |
 | TAA | `taa_enabled`, `taa_blend`, `taa_jitter_scale`, `taa_sharpness`, `taa_clamp_strength`, `taa_camera_cut` | off, 0.9, 1.0, 0.0, 1.0, false | blend/sharp/clamp [0,1], jitter [0,4] |
+| Render scale | `render_scale` | 1.0 (native) | [0.25, 1]; main HDR-таргет/TAA-история/velocity/эффекты считаются в масштабе, композит+UI — в натуральном разрешении |
 | Shafts v1 | `shaft_enabled`, `shaft_intensity`, `shaft_steps`, `shaft_density`, `shaft_anisotropy`, `shaft_max_distance`, `shaft_resolution`, `shaft_blur_sigma`, `shaft_edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
 | DOF | `dof_enabled`, `dof_focus_distance`, `dof_focus_range`, `dof_max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
 

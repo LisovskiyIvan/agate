@@ -98,6 +98,16 @@ pub const PostProcessOptions = struct {
     // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
     fxaa_enabled: bool = true,
 
+    // Render scale (Q4): scene + effects render into a scaled-down HDR
+    // main target (RGBA16F), the composite/UI present at the swapchain
+    // size. 1.0 = native (bit-identical to the pre-scale path: every
+    // target keeps the window size); 0.5..0.75 trades sharpness for GPU
+    // headroom with TAA reconstruction (see docs/graphics-roadmap.md Q4).
+    // The TAA history/velocity/auxiliary targets all follow the scaled
+    // main size; a scale change resizes them and resets TAA history the
+    // same way a window resize does.
+    render_scale: f32 = 1.0,
+
     // Atmospheric Depth & Height Fog
     fog_enabled: bool = true,
     fog_density: f32 = 0.015,
@@ -201,6 +211,7 @@ pub const PostProcessOptions = struct {
     // Never fails; safe to apply on load or before uploading uniforms.
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
         var out = self;
+        out.render_scale = if (std.math.isFinite(self.render_scale)) std.math.clamp(self.render_scale, min_render_scale, 1.0) else 1.0;
         out.exposure = if (std.math.isFinite(self.exposure)) std.math.clamp(self.exposure, 0.0, 65504.0) else 1.0;
         out.auto_exposure_min = if (std.math.isFinite(self.auto_exposure_min)) @max(self.auto_exposure_min, 0.0) else 0.01;
         out.auto_exposure_max = if (std.math.isFinite(self.auto_exposure_max)) @max(self.auto_exposure_max, out.auto_exposure_min) else 16.0;
@@ -326,6 +337,25 @@ pub const PostProcessOptions = struct {
         self.lut_enabled = false;
     }
 };
+
+/// Lowest accepted `render_scale` (below this the upscale is mush and the
+/// TAA reconstruction cannot keep up; raise the floor before lowering it).
+pub const min_render_scale: f32 = 0.25;
+
+/// Scaled main-target size for a window size and a render scale. Pure
+/// math (no GPU), mirrored by PostFXStack.prepareMainTargets/resizeAll:
+/// nearest rounding keeps the aspect error under half a source pixel, and
+/// each dimension clamps to at least 1 so a degenerate window never
+/// produces a zero-sized target. Pass an already-clamped scale.
+pub const RenderSize = struct { w: i32, h: i32 };
+
+pub fn scaledRenderSize(width: i32, height: i32, scale: f32) RenderSize {
+    if (width <= 0 or height <= 0) return .{ .w = width, .h = height };
+    const s = std.math.clamp(scale, min_render_scale, 1.0);
+    const w: i32 = @intFromFloat(@max(1.0, @round(@as(f32, @floatFromInt(width)) * s)));
+    const h: i32 = @intFromFloat(@max(1.0, @round(@as(f32, @floatFromInt(height)) * s)));
+    return .{ .w = w, .h = h };
+}
 
 // Options regression tests live in `options_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).

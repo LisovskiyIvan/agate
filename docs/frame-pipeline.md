@@ -265,6 +265,21 @@ pub const Runtime = struct {
 - `render` между `begin` и `finish` видит `frame_prepared == false` и роняет present — держать пару смежно.
 - Отмена prepare закрывает epoch паринга (`complete`), иначе эпоха повиснет до следующего begin (авто-закрытие там же).
 
+## Известная проблема: transient-буферы в reuse-кадре
+
+**Симптом.** `renderReuse` перепрезентирует front-слот БЕЗ staged prepare: `flushSlotUploads` не выполняется, а draw-records всё равно биндят буферы с `usage.write_transient` (morph-дельты, particle instance payloads, трейлы/softbody/greased, отложенные mesh-вершины; см. `upload_packets.zig`). sokol валидатор ловит `VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING` («bound usage.write_transient buffer hasn't been written this frame»).
+
+**Воспроизведение.** `examples/hdr_showcase.zig`: прогон с `--frames >= 400` (reuse-проба в кадрах ~200-250) валит sokol-валидацию и в non-`SOKOL_VALIDATE_NON_FATAL` сборках паникует (`VALIDATION_FAILED`). Проверено на baseline до всех текущих правок (worktree HEAD): баг пре-существующий, не регрессия.
+
+**Почему это не «просто переписать флаш».** Наивный повтор `flushSlotUploads(front)` на reuse-кадре небезопасен: `flushParticleCompute` в повторном прогоне заново обнуляет `state_clear_pending` буферы (сброс состояния частиц на повторном кадре — семантическая ошибка), плюс двойной учёт в `upload_meter`/`delivered`/outcome-полях. Метаданные (`commitSlotResults`) рассчитаны на «один flush на слот».
+
+**Кандидаты фикса (требуют отдельного гейта).**
+1. Выделить `rewriteTransientWrites(scene, slot)`: только `sg_write_buffer_transient` по staged payload'ам без meter/delivered/outcome/creation — write-only семантика; particle-compute clear исключить (он идёт на render-пути).
+2. Запретить reuse, когда во front-слоте есть недоставленные transient-записи (coherent skip вместо риска валидации).
+3. Перевести персистентные vertex/index буферы с `write_transient` на `dynamic_update`+`sg_update_buffer` (шире по bandwidth, но переносимо на все бэкенды).
+
+Статус: открыто (не в шипе). Q4 render-scale меряется после выбора варианта — длинные прогоны сейчас упираются в этот баг.
+
 ## Производительность
 
 - Горячий путь аллокаций не делает: слоты reuse capacity, latch/patch поверх записей без live-чтений; `build_stats` мержится из immutable копии без общего аккумулятора.
