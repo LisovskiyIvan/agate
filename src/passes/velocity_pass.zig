@@ -14,6 +14,7 @@ const sg = sokol.gfx;
 const velocity_shd = @import("velocity_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
 const mesh_mod = @import("../mesh.zig");
 const Vertex = mesh_mod.Vertex;
 const scene_render_queue = @import("../scene/render_queue.zig");
@@ -24,6 +25,10 @@ const msaa_depth = @import("msaa_depth_pass.zig");
 pub const itemContributesDepth = msaa_depth.itemContributesDepth;
 const material_mod = @import("../material.zig");
 const MaterialDrawRecord = material_mod.MaterialDrawRecord;
+const particle_pass_mod = @import("particle_pass.zig");
+const ParticleDraw = particle_pass_mod.ParticlePass.ParticleDraw;
+const particles_mod = @import("../particles.zig");
+const taa_mod = @import("../postprocess/taa.zig");
 
 /// Packs the FS alpha-test uniforms from a frozen draw record (the actual
 /// mapping the draws use — never hand-rolled per call): slot-0 albedo UV
@@ -100,6 +105,52 @@ pub fn velocityDepthPassAction() sg.PassAction {
     return a;
 }
 
+/// Reactive-marker depth state (pure plan, C.3 v2): depth writes OFF like
+/// the opaque velocity path, but LESS_EQUAL instead of EQUAL. Marker content
+/// (particles) writes NO main depth, so its fragments sit IN FRONT of the
+/// stored background depth and would fail the EQUAL match; LESS_EQUAL lets
+/// exactly the visible coverage through while still rejecting occlusion by
+/// nearer opaque pixels. Per-pipeline state, so opaque EQUAL draws and
+/// marker draws share one pass over the same borrowed depth attachment.
+pub fn reactiveMarkerDepthState() sg.DepthState {
+    return .{
+        .compare = .LESS_EQUAL,
+        .write_enabled = false,
+    };
+}
+
+/// Per-draw marker decision (pure, no sg calls): a prepared particle record
+/// contributes a marker draw iff it has live instances AND a bound instance
+/// buffer. The sg-side render rechecks handle validity (a zero/dead buffer
+/// id fails closed to no draw); this helper is the headless-testable shape
+/// of the same predicate.
+pub fn particleMarkerDrawDecision(active_count: usize, has_instance_buffer: bool) bool {
+    return active_count > 0 and has_instance_buffer;
+}
+
+/// Marker-draw arguments for VelocityPass.render: prepared particle records
+/// (borrowed values from the consumed front slot, same records the main
+/// pass drew), the camera basis for billboarding, and the master enable.
+/// Disabled (or empty) renders zero marker draws and leaves the velocity
+/// buffer bit-identical to the pre-marker path.
+pub const MarkerArgs = struct {
+    enabled: bool = false,
+    draws: []const ParticleDraw = &.{},
+    cam_right: Vec3 = Vec3.zero,
+    cam_up: Vec3 = Vec3.zero,
+};
+
+// Write/read contract with the TAA resolve (taaVelocityKind in
+// postprocess/taa.zig): the stamped band value must sit strictly inside the
+// classify-reactive band and below the per-object gate, or marked pixels
+// would misclassify on the resolve side. Fails at compile time, not as a
+// silent ghosting regression.
+comptime {
+    if (!(taa_mod.TAA_REACTIVE_MARKER_LO < taa_mod.TAA_REACTIVE_MARKER_ALPHA and
+        taa_mod.TAA_REACTIVE_MARKER_ALPHA < taa_mod.TAA_REACTIVE_MARKER_HI)) @compileError("marker alpha outside the reactive band");
+    if (!(taa_mod.TAA_REACTIVE_MARKER_HI < 0.5)) @compileError("marker band collides with the per-object gate");
+}
+
 pub const VelocityPass = struct {
     image: sg.Image = .{},
     att_view: sg.View = .{},
@@ -117,6 +168,21 @@ pub const VelocityPass = struct {
     pip_inst_u32: sg.Pipeline = .{},
     pip_skin_u16: sg.Pipeline = .{},
     pip_skin_u32: sg.Pipeline = .{},
+    /// Reactive-marker pipelines (C.3 v2): particle billboard coverage with
+    /// a constant band-alpha FS (LESS_EQUAL against the borrowed main
+    /// depth). CPU layout serves .cpu AND .compute records (both ride the
+    /// ParticleInstanceData stride via drawBuffer()); the GPU layout serves
+    /// .gpu spawn slots. Single UINT16 index type (unit-quad ib, like the
+    /// main particle pipelines).
+    pip_marker_cpu: sg.Pipeline = .{},
+    pip_marker_gpu: sg.Pipeline = .{},
+    /// Marker shader (reactive_marker + reactive_marker_gpu programs).
+    marker_shader: sg.Shader = .{},
+    marker_gpu_shader: sg.Shader = .{},
+    /// Unit-quad geometry for marker billboards (same shape as the particle
+    /// pass quad; owned here so marker draws never borrow pass state).
+    marker_quad_vb: sg.Buffer = .{},
+    marker_quad_ib: sg.Buffer = .{},
 
     rigid_shader: sg.Shader = .{},
     inst_shader: sg.Shader = .{},
@@ -186,17 +252,53 @@ pub const VelocityPass = struct {
             out.deinit();
             return .{};
         }
-        // Pipelines stay unbuilt here: their depth format must match the
-        // borrowed main depth attachment, which is only known at render
-        // time (see ensurePipelinesFor).
+        out.marker_shader = sg.makeShader(velocity_shd.reactiveMarkerShaderDesc(backend));
+        if (sg.queryShaderState(out.marker_shader) != .VALID) {
+            out.deinit();
+            return .{};
+        }
+        out.marker_gpu_shader = sg.makeShader(velocity_shd.reactiveMarkerGpuShaderDesc(backend));
+        if (sg.queryShaderState(out.marker_gpu_shader) != .VALID) {
+            out.deinit();
+            return .{};
+        }
+        // The marker quad is format-free static geometry, so it is created
+        // now under the same rollback (pipelines stay unbuilt: their depth
+        // format must match the borrowed main depth attachment, which is
+        // only known at render time — see ensurePipelinesFor).
+        const marker_quad_vertices = [_]f32{
+            // x,     y,     u,   v (uv rides unconsumed in the stride)
+            -0.5, -0.5, 0.0, 0.0,
+            0.5,  -0.5, 1.0, 0.0,
+            0.5,  0.5,  1.0, 1.0,
+            -0.5, 0.5,  0.0, 1.0,
+        };
+        const marker_quad_indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
+        out.marker_quad_vb = sg.makeBuffer(.{ .data = sg.asRange(&marker_quad_vertices) });
+        if (sg.queryBufferState(out.marker_quad_vb) != .VALID) {
+            out.deinit();
+            return .{};
+        }
+        out.marker_quad_ib = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = sg.asRange(&marker_quad_indices),
+        });
+        if (sg.queryBufferState(out.marker_quad_ib) != .VALID) {
+            out.deinit();
+            return .{};
+        }
         return out;
     }
 
-    /// Builds (or rebuilds on format change) the six pipelines for the
-    /// borrowed main-depth format. Locals-first like everywhere else: the
-    /// working set is preserved when a rebuild fails. All pipelines share
-    /// the shared-depth plan (writes off, EQUAL compare — see
-    /// velocityDepthState).
+    /// Builds (or rebuilds on format change) the six opaque pipelines plus
+    /// the two reactive-marker pipelines for the borrowed main-depth
+    /// format. Locals-first like everywhere else: the working set is
+    /// preserved when a rebuild fails. Opaque pipelines share the
+    /// shared-depth plan (writes off, EQUAL compare — see
+    /// velocityDepthState); marker pipelines share the marker plan (writes
+    /// off, LESS_EQUAL compare — see reactiveMarkerDepthState). All eight
+    /// are all-or-nothing: a failed build skips the whole pass for the
+    /// frame (fail-closed to the zero-mask fallback, never a half pass).
     fn ensurePipelinesFor(self: *VelocityPass, depth_fmt: sg.PixelFormat) bool {
         if (!sg.isvalid()) return false;
         if (depth_fmt == .DEFAULT or depth_fmt == .NONE) return false;
@@ -206,11 +308,14 @@ pub const VelocityPass = struct {
             sg.queryPipelineState(self.pip_inst_u16) == .VALID and
             sg.queryPipelineState(self.pip_inst_u32) == .VALID and
             sg.queryPipelineState(self.pip_skin_u16) == .VALID and
-            sg.queryPipelineState(self.pip_skin_u32) == .VALID)
+            sg.queryPipelineState(self.pip_skin_u32) == .VALID and
+            sg.queryPipelineState(self.pip_marker_cpu) == .VALID and
+            sg.queryPipelineState(self.pip_marker_gpu) == .VALID)
         {
             return true;
         }
         if (self.rigid_shader.id == 0 or self.inst_shader.id == 0 or self.skin_shader.id == 0) return false;
+        if (self.marker_shader.id == 0 or self.marker_gpu_shader.id == 0) return false;
 
         var r_desc = sg.PipelineDesc{
             .shader = self.rigid_shader,
@@ -346,12 +451,84 @@ pub const VelocityPass = struct {
         s_desc.index_type = .UINT32;
         const pip_s_u32 = sg.makePipeline(s_desc);
 
+        // Reactive-marker pipelines (C.3 v2): particle billboard coverage
+        // with the constant band-alpha FS. Buffer 0 is the owned unit quad
+        // (uv lanes ride unconsumed in the stride); buffer 1 is the
+        // per-instance record (ParticleInstanceData for .cpu/.compute,
+        // GpuParticleSlot x5 for .gpu). Single UINT16 index type (quad ib).
+        var m_desc = sg.PipelineDesc{
+            .shader = self.marker_shader,
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        m_desc.colors[0].pixel_format = .RGBA16F;
+        m_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        m_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        m_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(particles_mod.ParticleInstanceData),
+        };
+        m_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_inst_pos_size] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = @offsetOf(particles_mod.ParticleInstanceData, "pos_size"),
+        };
+        m_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_inst_rotation] = .{
+            .buffer_index = 1,
+            .format = .FLOAT4,
+            .offset = @offsetOf(particles_mod.ParticleInstanceData, "rotation_misc"),
+        };
+        const pip_m_cpu = sg.makePipeline(m_desc);
+
+        var mg_desc = sg.PipelineDesc{
+            .shader = self.marker_gpu_shader,
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+        };
+        mg_desc.colors[0].pixel_format = .RGBA16F;
+        mg_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT2,
+            .offset = 0,
+        };
+        mg_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(particles_mod.GpuParticleSlot),
+        };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+        mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot4] = .{ .buffer_index = 1, .offset = 64, .format = .FLOAT4 };
+        const pip_m_gpu = sg.makePipeline(mg_desc);
+
         if (sg.queryPipelineState(pip_r_u16) != .VALID or
             sg.queryPipelineState(pip_r_u32) != .VALID or
             sg.queryPipelineState(pip_i_u16) != .VALID or
             sg.queryPipelineState(pip_i_u32) != .VALID or
             sg.queryPipelineState(pip_s_u16) != .VALID or
-            sg.queryPipelineState(pip_s_u32) != .VALID)
+            sg.queryPipelineState(pip_s_u32) != .VALID or
+            sg.queryPipelineState(pip_m_cpu) != .VALID or
+            sg.queryPipelineState(pip_m_gpu) != .VALID)
         {
             // Roll back every partial handle; the previous working set
             // (if any) stays installed for the next attempt.
@@ -361,6 +538,8 @@ pub const VelocityPass = struct {
             if (pip_i_u32.id != 0) sg.destroyPipeline(pip_i_u32);
             if (pip_s_u16.id != 0) sg.destroyPipeline(pip_s_u16);
             if (pip_s_u32.id != 0) sg.destroyPipeline(pip_s_u32);
+            if (pip_m_cpu.id != 0) sg.destroyPipeline(pip_m_cpu);
+            if (pip_m_gpu.id != 0) sg.destroyPipeline(pip_m_gpu);
             return false;
         }
         self.destroyPipelines();
@@ -370,6 +549,8 @@ pub const VelocityPass = struct {
         self.pip_inst_u32 = pip_i_u32;
         self.pip_skin_u16 = pip_s_u16;
         self.pip_skin_u32 = pip_s_u32;
+        self.pip_marker_cpu = pip_m_cpu;
+        self.pip_marker_gpu = pip_m_gpu;
         self.depth_format = depth_fmt;
         return true;
     }
@@ -381,12 +562,16 @@ pub const VelocityPass = struct {
         if (self.pip_inst_u32.id != 0) sg.destroyPipeline(self.pip_inst_u32);
         if (self.pip_skin_u16.id != 0) sg.destroyPipeline(self.pip_skin_u16);
         if (self.pip_skin_u32.id != 0) sg.destroyPipeline(self.pip_skin_u32);
+        if (self.pip_marker_cpu.id != 0) sg.destroyPipeline(self.pip_marker_cpu);
+        if (self.pip_marker_gpu.id != 0) sg.destroyPipeline(self.pip_marker_gpu);
         self.pip_rigid_u16 = .{};
         self.pip_rigid_u32 = .{};
         self.pip_inst_u16 = .{};
         self.pip_inst_u32 = .{};
         self.pip_skin_u16 = .{};
         self.pip_skin_u32 = .{};
+        self.pip_marker_cpu = .{};
+        self.pip_marker_gpu = .{};
         self.depth_format = .DEFAULT;
     }
 
@@ -399,6 +584,14 @@ pub const VelocityPass = struct {
         if (self.rigid_shader.id != 0) sg.destroyShader(self.rigid_shader);
         if (self.inst_shader.id != 0) sg.destroyShader(self.inst_shader);
         if (self.skin_shader.id != 0) sg.destroyShader(self.skin_shader);
+        if (self.marker_shader.id != 0) sg.destroyShader(self.marker_shader);
+        if (self.marker_gpu_shader.id != 0) sg.destroyShader(self.marker_gpu_shader);
+        self.marker_shader = .{};
+        self.marker_gpu_shader = .{};
+        if (self.marker_quad_ib.id != 0) sg.destroyBuffer(self.marker_quad_ib);
+        if (self.marker_quad_vb.id != 0) sg.destroyBuffer(self.marker_quad_vb);
+        self.marker_quad_ib = .{};
+        self.marker_quad_vb = .{};
         self.* = .{};
     }
 
@@ -487,6 +680,7 @@ pub const VelocityPass = struct {
         main_depth_format: sg.PixelFormat,
         last_rendered: u64,
         stats: *SceneStats,
+        markers: MarkerArgs,
     ) void {
         if (!sg.isvalid()) return;
         // Own color target plus the BORROWED main depth attachment (never
@@ -516,10 +710,65 @@ pub const VelocityPass = struct {
         for (queues.opaque_instanced.items) |batch| {
             if (self.drawInstancedOne(cur_view_proj, prev_view_proj, batch, last_rendered)) draws += 1;
         }
+        // Reactive markers (C.3 v2) stamp AFTER the opaque velocity draws:
+        // marker coverage overwrites the background motion underneath with
+        // the reactive band value (the blended pixel's history is wrong
+        // either way). Disabled or empty draws nothing — the buffer stays
+        // bit-identical to the pre-marker path.
+        if (markers.enabled) {
+            draws += self.drawParticleMarkers(cur_view_proj, markers);
+        }
 
         sg.endPass();
         stats.main_draw_calls += draws;
         stats.draw_calls += draws;
+    }
+
+    /// Particle reactive-marker draws (C.3 v2): one quad draw per live
+    /// prepared record through the LESS_EQUAL marker pipelines. Sg-free
+    /// skips first (particleMarkerDrawDecision shape), then handle
+    /// validation, then draws. Returns the issued draw count for stats.
+    fn drawParticleMarkers(self: *VelocityPass, view_proj: Mat4, markers: MarkerArgs) u32 {
+        if (markers.draws.len == 0) return 0;
+        if (self.marker_quad_vb.id == 0 or sg.queryBufferState(self.marker_quad_vb) != .VALID) return 0;
+        if (self.marker_quad_ib.id == 0 or sg.queryBufferState(self.marker_quad_ib) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_cpu) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_gpu) != .VALID) return 0;
+        var draws: u32 = 0;
+        for (markers.draws) |draw| {
+            const instance_buf = draw.drawBuffer();
+            if (!particleMarkerDrawDecision(draw.active_count, instance_buf.id != 0)) continue;
+            if (sg.queryBufferState(instance_buf) != .VALID) continue;
+            const gpu = draw.simulation_mode == .gpu;
+            sg.applyPipeline(if (gpu) self.pip_marker_gpu else self.pip_marker_cpu);
+            var bind = sg.Bindings{};
+            bind.vertex_buffers[0] = self.marker_quad_vb;
+            bind.vertex_buffers[1] = instance_buf;
+            bind.index_buffer = self.marker_quad_ib;
+            sg.applyBindings(bind);
+            const vs_params = velocity_shd.VsMarkerParams{
+                .view_proj = view_proj,
+                .camera_right = .{ markers.cam_right.x, markers.cam_right.y, markers.cam_right.z, 0.0 },
+                .camera_up = .{ markers.cam_up.x, markers.cam_up.y, markers.cam_up.z, 0.0 },
+            };
+            sg.applyUniforms(velocity_shd.UB_vs_marker_params, sg.asRange(&vs_params));
+            if (gpu) {
+                const gpu_params = velocity_shd.MarkerGpuParams{
+                    .time_drag = .{ draw.clock_seconds, draw.drag, 0.0, 0.0 },
+                    .gravity = .{ draw.gravity.x, draw.gravity.y, draw.gravity.z, 0.0 },
+                    .sprite = .{
+                        @floatFromInt(if (draw.spritesheet_columns == 0) 1 else draw.spritesheet_columns),
+                        @floatFromInt(if (draw.spritesheet_rows == 0) 1 else draw.spritesheet_rows),
+                        draw.spritesheet_loops,
+                        0.0,
+                    },
+                };
+                sg.applyUniforms(velocity_shd.UB_marker_gpu_params, sg.asRange(&gpu_params));
+            }
+            sg.draw(0, 6, @intCast(draw.active_count));
+            draws += 1;
+        }
+        return draws;
     }
 
     fn drawRegularOne(

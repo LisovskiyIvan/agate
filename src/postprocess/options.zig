@@ -80,6 +80,7 @@ const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
     .{ .name = "taa_sharpness", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "taa_clamp_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "taa_reactive_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "taa_reactive_marker_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "shaft_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .name = "shaft_steps", .spec = .{ .uint_clamp = .{ .min = shafts.SHAFT_STEPS_MIN, .max = shafts.SHAFT_STEPS_MAX } } },
     .{ .name = "shaft_density", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
@@ -266,6 +267,14 @@ pub const PostProcessOptions = struct {
     // composite stays bit-identical to the pre-reactive path.
     taa_reactive_enabled: bool = false,
     taa_reactive_strength: f32 = 0.5,
+    // True-marker shed (C.3 v2) for velocity-pass particle coverage: marked
+    // pixels shed history by this strength with no edge ramp (1 = full
+    // history reject, 0 = markers drawn but ignored). Default 1.0 (full):
+    // the stamped coverage IS the signal. Master-gated by
+    // taa_reactive_enabled like the heuristic lane (same packed vec4, z
+    // slot); a numeric strength, so forFrame() leaves it alone exactly like
+    // taa_reactive_strength (inert while the flag is off).
+    taa_reactive_marker_strength: f32 = 1.0,
     // One-frame history reset request (camera teleport/cut/cinematic).
     // Snapshot-carried, so the update thread sets it safely for one frame.
     taa_camera_cut: bool = false,

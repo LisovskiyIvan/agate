@@ -192,6 +192,29 @@ fn setupScene() void {
     const mirror_mat = pbr("mirror_pbr", .{ 0.98, 0.98, 0.98 }, 1.0, 0.04);
     mirror.setPBRMaterial(mirror_mat);
 
+    // Dust motes in the sun shaft (TAA reactive-marker live path, C.3 v2):
+    // a slow alpha-blended CPU emitter whose billboards write NO depth and
+    // carry NO velocity, so their pixels stamp the velocity-pass reactive
+    // marker when taa_reactive is on. AGATE_Q0_NO_PARTICLES=1 isolates the
+    // particle-free baseline bit-identically (no draws, no markers).
+    if (!envFlag("AGATE_Q0_NO_PARTICLES")) {
+        const dust = scene.createParticleSystem("q0_dust", 256) catch @panic("q0: dust failed");
+        dust.emitter_position = z.Vec3.new(0.0, 1.8, 0.2);
+        dust.emitter_box_min = z.Vec3.new(-1.4, -0.9, -1.2);
+        dust.emitter_box_max = z.Vec3.new(1.4, 0.9, 1.2);
+        dust.emit_rate = 24.0;
+        dust.lifetime_min = 2.0;
+        dust.lifetime_max = 3.5;
+        dust.speed_min = 0.05;
+        dust.speed_max = 0.22;
+        dust.size_start = 0.06;
+        dust.size_end = 0.02;
+        dust.color_start = z.Color4.new(1.0, 0.9, 0.75, 0.35);
+        dust.color_end = z.Color4.new(1.0, 0.85, 0.65, 0.0);
+        dust.blend_mode = .alpha_blend;
+        dust.start();
+    }
+
     // Fill-bound by design: the heaviest legal per-pixel chain.
     scene.post_process.enabled = true;
     scene.post_process.exposure = 1.1;

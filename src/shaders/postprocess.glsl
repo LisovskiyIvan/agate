@@ -43,7 +43,7 @@ layout(binding = 0) uniform fs_params {
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
-    vec4 taa_reactive_params; // x: reactive_enabled (1/0), y: strength [0,1], zw: unused (0)
+    vec4 taa_reactive_params; // x: reactive_enabled (1/0), y: heuristic strength [0,1], z: marker strength [0,1], w: unused (0)
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
     vec4 contact_shadow_params2; // x: raymarch steps, yzw: spare
@@ -764,17 +764,25 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     float max_dist = max(max(dist_min.x, dist_max.x), max(max(dist_min.y, dist_max.y), max(dist_min.z, dist_max.z)));
     float reject_weight = 1.0 / (1.0 + max_dist * max_dist * 4.0);
 
-    // Reactive treatment for velocity-less content (particles, glass,
-    // disocclusion over background): those pixels carry the background
-    // depth AND the background velocity, so their true motion is invisible
-    // to the resolve. The structurally unsafe class is the camera-fallback
-    // path (velocity mask < 0.5) over an inconsistent cross-depth
-    // neighborhood: shed history there, bounded by the strength lane.
-    // Static flat pixels (zero depth spread) and per-object-velocity
-    // pixels get exactly zero boost. Mirrors taaReactiveBoost in
-    // postprocess/taa.zig (knees 0.0001/0.002 raw-depth units).
+    // Reactive treatment for velocity-less content (C.3 v1 heuristic +
+    // v2 true marker): those pixels carry the background depth AND the
+    // background velocity, so their true motion is invisible to the
+    // resolve. The v2 marker wins where present — the velocity pass stamps
+    // particle coverage with exactly 0.25 in the velocity alpha (see
+    // velocity.glsl fs_marker), and the stamped coverage IS the signal, so
+    // history sheds by the dedicated marker lane with no edge ramp (at 1.0
+    // the blend goes to zero). Unmarked fallback-path pixels keep the v1
+    // edge heuristic (camera-fallback mask < 0.5 over an inconsistent
+    // cross-depth neighborhood, knees 0.0001/0.002 raw-depth units).
+    // Static flat pixels and per-object-velocity pixels get exactly zero
+    // from both lanes. Mirrors taaReactiveMarkerBoost / taaReactiveBoost in
+    // postprocess/taa.zig. One extra velocity tap: none — vel_sample is
+    // already in hand; the marker test is pure ALU on it.
     float reactive = 0.0;
-    if (taa_reactive_params.x > 0.5 && vel_sample.a < 0.5) {
+    bool taa_is_marker = (vel_sample.a > 0.15 && vel_sample.a < 0.35);
+    if (taa_reactive_params.x > 0.5 && taa_is_marker) {
+        reactive = clamp(taa_reactive_params.z, 0.0, 1.0);
+    } else if (taa_reactive_params.x > 0.5 && vel_sample.a < 0.5) {
         float d_spread = worst_depth - best_depth;
         float edge = clamp((d_spread - 0.0001) / (0.002 - 0.0001), 0.0, 1.0);
         reactive = clamp(taa_reactive_params.y, 0.0, 1.0) * edge;

@@ -2,6 +2,8 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
+const math = @import("math");
+const Vec3 = math.Vec3;
 const postprocess = @import("../postprocess.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 const gpu_timing = @import("../gpu_timing.zig");
@@ -462,6 +464,24 @@ pub fn render(scene: anytype) void {
             const main_depth_fmt = scene.postfx.postprocess_pass.depth_format;
             if (main_depth_view.id != 0 and main_depth_fmt != .DEFAULT and main_depth_fmt != .NONE) {
                 const prev_vp = if (scene.postfx.has_prev_view_proj) scene.postfx.prev_view_proj else taa_view_proj;
+                // Reactive particle markers (C.3 v2): drawn only when the TAA
+                // resolve consumes them (taa_on implies samples == 1) and
+                // the reactive family is on. The camera basis comes from the
+                // unjittered view matrix (jitter is translation-only, so the
+                // rotation basis is exact); the marker view_proj is the
+                // jittered matrix the main pass drew with, so coverage lands
+                // on the exact blended pixels.
+                const velocity_pass_mod = @import("../passes/velocity_pass.zig");
+                var markers = velocity_pass_mod.MarkerArgs{};
+                if (postprocess.taaReactiveMarkersActive(taa_on, post_config)) {
+                    const view_mat = snap.primary_cam.camera.getViewMatrix();
+                    markers = .{
+                        .enabled = true,
+                        .draws = draws.particle_draws.items,
+                        .cam_right = Vec3.new(view_mat.m[0], view_mat.m[4], view_mat.m[8]),
+                        .cam_up = Vec3.new(view_mat.m[1], view_mat.m[5], view_mat.m[9]),
+                    };
+                }
                 scene.postfx.velocity_pass.render(
                     taa_view_proj,
                     prev_vp,
@@ -472,6 +492,7 @@ pub fn render(scene: anytype) void {
                     main_depth_fmt,
                     @as(u64, scene.last_rendered_frame.load(.acquire)),
                     &scene.stats,
+                    markers,
                 );
                 velocity_ok = true;
             }

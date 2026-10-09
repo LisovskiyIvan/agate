@@ -11,6 +11,10 @@ const usePresentedPrev = velocity_pass.usePresentedPrev;
 const velocityDepthState = velocity_pass.velocityDepthState;
 const velocityDepthPassAction = velocity_pass.velocityDepthPassAction;
 const velocityDrawDecision = velocity_pass.velocityDrawDecision;
+const reactiveMarkerDepthState = velocity_pass.reactiveMarkerDepthState;
+const particleMarkerDrawDecision = velocity_pass.particleMarkerDrawDecision;
+const MarkerArgs = velocity_pass.MarkerArgs;
+const taa_mod = @import("../postprocess/taa.zig");
 const scene_render_queue = @import("../scene/render_queue.zig");
 const RenderQueues = scene_render_queue.RenderQueues;
 const stats_mod = @import("../scene/stats.zig");
@@ -86,7 +90,7 @@ test "headless pass stays zero: init, ensure, render, tex view" {
     defer queues.deinit(std.testing.allocator);
     var stats = SceneStats{};
     const skins = [_][scene_render_queue.MAX_BONES]Mat4{};
-    pass.render(Mat4.identity, Mat4.identity, &queues, &skins, &skins, .{}, .DEFAULT, 0, &stats);
+    pass.render(Mat4.identity, Mat4.identity, &queues, &skins, &skins, .{}, .DEFAULT, 0, &stats, .{});
     try std.testing.expectEqual(@as(u32, 0), stats.draw_calls);
     try std.testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
 
@@ -130,4 +134,37 @@ test "shared-depth plan binds visible main pixels, never clears depth" {
     // Cutout (alpha-tested, opaque) DRAWS: its holes fail the EQUAL match
     // against main depth instead of needing an in-shader discard.
     try std.testing.expectEqual(.draw, velocityDrawDecision(.{ .index_count = 3, .is_cutout = true }));
+}
+
+test "reactive marker plan: LESS_EQUAL depth, write off, band value" {
+    // Marker fragments sit IN FRONT of the stored background depth
+    // (particles write no depth), so they need LESS_EQUAL where opaque
+    // draws need EQUAL; writes stay off on both (the post chain samples
+    // the borrowed main depth afterwards).
+    const opaque_ds = velocityDepthState();
+    const marker = reactiveMarkerDepthState();
+    try std.testing.expect(!marker.write_enabled);
+    try std.testing.expectEqual(sg.CompareFunc.LESS_EQUAL, marker.compare);
+    try std.testing.expectEqual(sg.CompareFunc.EQUAL, opaque_ds.compare);
+    // Write/read contract: the stamped constant classifies reactive on the
+    // resolve side (taaVelocityKind), never fallback or per-object.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), taa_mod.TAA_REACTIVE_MARKER_ALPHA, 1e-7);
+    try std.testing.expectEqual(
+        taa_mod.TaaVelocityKind.reactive,
+        taa_mod.taaVelocityKind(taa_mod.TAA_REACTIVE_MARKER_ALPHA),
+    );
+}
+
+test "particle marker draw decision fires only on live buffered records" {
+    // Empty records (or records whose buffer id is still zero) draw
+    // nothing: no marker, no false reactive stamp.
+    try std.testing.expect(!particleMarkerDrawDecision(0, true));
+    try std.testing.expect(!particleMarkerDrawDecision(0, false));
+    try std.testing.expect(!particleMarkerDrawDecision(3, false));
+    try std.testing.expect(particleMarkerDrawDecision(1, true));
+    try std.testing.expect(particleMarkerDrawDecision(256, true));
+    // Disabled-by-default MarkerArgs carries no draws.
+    const off = MarkerArgs{};
+    try std.testing.expect(!off.enabled);
+    try std.testing.expectEqual(@as(usize, 0), off.draws.len);
 }

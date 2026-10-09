@@ -180,3 +180,123 @@ void main() {
 @program velocity vs_rigid fs_velocity
 @program velocity_instanced vs_inst fs_velocity
 @program velocity_skinned vs_skinned fs_velocity
+
+// Reactive-marker writers (C.3 v2): particle coverage into the velocity
+// buffer alpha for content that cannot carry velocity. The billboard math
+// mirrors particle.glsl `vs` / `vs_gpu` exactly (same quad + instance
+// layouts, same analytic integration) so the marker covers the exact pixels
+// the main pass blended; the FS writes a constant band value (0.25) the TAA
+// resolve classifies as reactive (see taaVelocityKind in postprocess/taa.zig).
+// No texture sample: full-quad mark covers every blended pixel and can only
+// over-mark transparent quad corners (bounded extra history shed, never a
+// missed ghost). No loops: one quad per instance, zero tap cost.
+@vs vs_marker_cpu
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_marker_params {
+    mat4 view_proj;
+    vec4 camera_right;
+    vec4 camera_up;
+};
+
+// Quad corner (buffer 0) + CPU integrated instance record (buffer 1,
+// ParticleInstanceData layout: only the center/size + rotation lanes are
+// read; color/uv lanes ride along unconsumed in the stride).
+in vec2 position;
+in vec4 inst_pos_size;
+in vec4 inst_rotation;
+
+out vec4 v_clip;
+
+void main() {
+    float c = cos(inst_rotation.x);
+    float s = sin(inst_rotation.x);
+    vec2 rotated = vec2(c * position.x - s * position.y, s * position.x + c * position.y);
+    vec3 world_pos = inst_pos_size.xyz +
+        (camera_right.xyz * rotated.x + camera_up.xyz * rotated.y) * inst_pos_size.w;
+    gl_Position = view_proj * vec4(world_pos, 1.0);
+    v_clip = gl_Position;
+}
+@end
+
+@vs vs_marker_gpu
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_marker_params {
+    mat4 view_proj;
+    vec4 camera_right;
+    vec4 camera_up;
+};
+layout(binding = 1) uniform marker_gpu_params {
+    // x = seconds since the system's epoch clock, y = exponential drag k
+    // (1/s, 0 = off), zw unused. Mirrors particle.glsl gpu_params.
+    vec4 time_drag;
+    // xyz = world-space gravity acceleration, w unused.
+    vec4 gravity;
+    // x = spritesheet columns, y = rows, z = loops over lifetime, w unused
+    // (frame math omitted here: the marker needs coverage only, and every
+    // frame of one slot shares the same billboard center).
+    vec4 sprite;
+};
+
+// Mirror of GpuParticleSlot (particles.zig), five FLOAT4 attributes.
+in vec2 position;
+in vec4 gpu_slot0;
+in vec4 gpu_slot1;
+in vec4 gpu_slot2;
+in vec4 gpu_slot3;
+in vec4 gpu_slot4;
+
+out vec4 v_clip;
+
+void main() {
+    // Same analytic trajectory as particle.glsl vs_gpu (copy, not include:
+    // this shader has no include lane): p = p0 + v0*s + g*s2.
+    float age = time_drag.x - gpu_slot0.w;
+    float t = age / max(gpu_slot1.w, 1.0e-4);
+    if (t < 0.0 || t >= 1.0) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        v_clip = gl_Position;
+        return;
+    }
+    float s;
+    float s2;
+    float k = time_drag.y;
+    if (k > 1.0e-6) {
+        s = (1.0 - exp(-k * age)) / k;
+        s2 = (age - s) / k;
+    } else {
+        s = age;
+        s2 = 0.5 * age * age;
+    }
+    vec3 center = gpu_slot0.xyz + gpu_slot1.xyz * s + gravity.xyz * s2;
+    float size = mix(gpu_slot4.x, gpu_slot4.y, t);
+    float rot = gpu_slot4.z + gpu_slot4.w * age;
+    float c = cos(rot);
+    float sn = sin(rot);
+    vec2 rotated = vec2(c * position.x - sn * position.y, sn * position.x + c * position.y);
+    vec3 world_pos = center + (camera_right.xyz * rotated.x + camera_up.xyz * rotated.y) * size;
+    gl_Position = view_proj * vec4(world_pos, 1.0);
+    v_clip = gl_Position;
+}
+@end
+
+@fs fs_marker
+in vec4 v_clip;
+
+out vec4 frag_velocity;
+
+void main() {
+    // Behind-camera (or degenerate) projections carry no valid coverage:
+    // report the zero mask so the composite falls back to depth
+    // reprojection instead of marking mirrored garbage as reactive.
+    if (v_clip.w <= 0.0001) {
+        frag_velocity = vec4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+    // Reactive band value: must equal TAA_REACTIVE_MARKER_ALPHA in
+    // postprocess/taa.zig (the resolve classifies 0.15..0.35 as reactive).
+    frag_velocity = vec4(0.0, 0.0, 0.0, 0.25);
+}
+@end
+
+@program reactive_marker vs_marker_cpu fs_marker
+@program reactive_marker_gpu vs_marker_gpu fs_marker

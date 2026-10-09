@@ -22,7 +22,12 @@ const taaRejectionWeight = taa.taaRejectionWeight;
 const taaClosestDepthOffset = taa.taaClosestDepthOffset;
 const taaResolvePixelWithRejection = taa.taaResolvePixelWithRejection;
 const taaResolvePixelReactive = taa.taaResolvePixelReactive;
+const taaResolvePixelMarker = taa.taaResolvePixelMarker;
 const taaReactiveBoost = taa.taaReactiveBoost;
+const taaReactiveMarkerBoost = taa.taaReactiveMarkerBoost;
+const taaVelocityKind = taa.taaVelocityKind;
+const TaaVelocityKind = taa.TaaVelocityKind;
+const taaReactiveMarkersActive = taa.taaReactiveMarkersActive;
 const taaReactiveParams = taa.taaReactiveParams;
 const taaReactiveActive = taa.taaReactiveActive;
 const taaResolvePixel = taa.taaResolvePixel;
@@ -53,6 +58,11 @@ test "taa clamps" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa_reactive_strength, 1e-6);
     bad.taa_reactive_strength = -1.0;
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_reactive_strength, 1e-6);
+    // Marker strength clamps to [0, 1] on the same raw lane.
+    bad.taa_reactive_marker_strength = 2.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa_reactive_marker_strength, 1e-6);
+    bad.taa_reactive_marker_strength = -1.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_reactive_marker_strength, 1e-6);
 }
 
 test "taa halton jitter sequence, wrap, and scale" {
@@ -399,12 +409,94 @@ test "taa reactive lane packs zeros when inactive" {
     off.taa_reactive_strength = 0.0;
     try std.testing.expect(!taaReactiveActive(off));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(off));
-    // Enabled packs (1, strength-clamped, 0, 0).
+    // Enabled packs (1, strength-clamped, marker-clamped, 0).
     var on = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_enabled = true, .taa_reactive_strength = 0.5 };
     try std.testing.expect(taaReactiveActive(on));
-    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.0, 0.0 }, taaReactiveParams(on));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 1.0, 0.0 }, taaReactiveParams(on));
     on.taa_reactive_strength = 3.0;
-    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaReactiveParams(on));
+    on.taa_reactive_marker_strength = 3.0;
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 0.0 }, taaReactiveParams(on));
+    on.taa_reactive_marker_strength = 0.25;
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.25, 0.0 }, taaReactiveParams(on));
+}
+
+test "taa velocity alpha classification: fallback, marker band, per-object" {
+    // Clear value and the gap band (no writer) fail closed to fallback.
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(0.0));
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(0.14));
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(0.36));
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(0.5));
+    // The stamped marker value classifies reactive (write/read contract).
+    try std.testing.expectEqual(TaaVelocityKind.reactive, taaVelocityKind(taa.TAA_REACTIVE_MARKER_ALPHA));
+    try std.testing.expectEqual(TaaVelocityKind.reactive, taaVelocityKind(0.15));
+    try std.testing.expectEqual(TaaVelocityKind.reactive, taaVelocityKind(0.35));
+    // Per-object gate unchanged (strictly above 0.5).
+    try std.testing.expectEqual(TaaVelocityKind.per_object, taaVelocityKind(0.5001));
+    try std.testing.expectEqual(TaaVelocityKind.per_object, taaVelocityKind(1.0));
+    // Non-finite input never manufactures a marker.
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(std.math.nan(f32)));
+    try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(std.math.inf(f32)));
+}
+
+test "taa reactive marker boost is the clamped strength, no edge ramp" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveMarkerBoost(0.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), taaReactiveMarkerBoost(0.5), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), taaReactiveMarkerBoost(1.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), taaReactiveMarkerBoost(2.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveMarkerBoost(-1.0), 1e-7);
+}
+
+test "taa reactive markers render only for an active TAA resolve" {
+    const on = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_enabled = true, .taa_reactive_strength = 0.5 };
+    const off = options.PostProcessOptions{};
+    // TAA resolve active + reactive on: markers drawn.
+    try std.testing.expect(taaReactiveMarkersActive(true, on));
+    // Blur-only (TAA off): no markers — the zero-mask path stays bit-identical.
+    try std.testing.expect(!taaReactiveMarkersActive(false, on));
+    // Reactive off: no markers even under TAA.
+    try std.testing.expect(!taaReactiveMarkersActive(true, off));
+    var weak = on;
+    weak.taa_reactive_strength = 0.0;
+    try std.testing.expect(!taaReactiveMarkersActive(true, weak));
+}
+
+test "taa marker resolve is bit-identical to rejection resolve when unmarked" {
+    const current = [3]f32{ 0.55, 0.55, 0.55 };
+    const neighbors = [8][3]f32{
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+    };
+    const history = [3]f32{ 0.52, 0.52, 0.52 };
+    const plain = taaResolvePixelWithRejection(current, neighbors, history, 0.9, 1.0, 0.0, 1.25);
+    // Unmarked (or zero marker strength): exactly the v1 resolve.
+    const unmarked = taaResolvePixelMarker(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, false, 1.0);
+    try std.testing.expectEqual(plain, unmarked);
+    const zero = taaResolvePixelMarker(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.0);
+    try std.testing.expectEqual(plain, zero);
+}
+
+test "taa marker resolve fully sheds history at strength 1, monotonic below" {
+    const current = [3]f32{ 0.55, 0.55, 0.55 };
+    const neighbors = [8][3]f32{
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+    };
+    const history = [3]f32{ 0.52, 0.52, 0.52 };
+    const plain = taaResolvePixelWithRejection(current, neighbors, history, 0.9, 1.0, 0.0, 1.25);
+    const err_plain = @abs(plain[0] - current[0]);
+    try std.testing.expect(err_plain > 0.0);
+    // Marked pixels ignore the (flat, zero) depth heuristic and shed by the
+    // marker lane instead: stronger treatment lands closer to current.
+    const r_half = taaResolvePixelMarker(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.5);
+    const r_full = taaResolvePixelMarker(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 1.0);
+    const err_half = @abs(r_half[0] - current[0]);
+    const err_full = @abs(r_full[0] - current[0]);
+    try std.testing.expect(err_half < err_plain);
+    try std.testing.expect(err_full < err_half);
+    // Full marker strength rejects history exactly (near-zero blend).
+    try std.testing.expectApproxEqAbs(current[0], r_full[0], 1e-6);
+    try std.testing.expectApproxEqAbs(current[1], r_full[1], 1e-6);
+    try std.testing.expectApproxEqAbs(current[2], r_full[2], 1e-6);
 }
 
 test "taa reactive resolve keeps static pixels bit-identical" {

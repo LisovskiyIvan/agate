@@ -166,6 +166,14 @@ pub const taaReactiveActive = taa.taaReactiveActive;
 pub const taaReactiveParams = taa.taaReactiveParams;
 pub const TAA_REACTIVE_DEPTH_LO = taa.TAA_REACTIVE_DEPTH_LO;
 pub const TAA_REACTIVE_DEPTH_HI = taa.TAA_REACTIVE_DEPTH_HI;
+pub const TAA_REACTIVE_MARKER_ALPHA = taa.TAA_REACTIVE_MARKER_ALPHA;
+pub const TAA_REACTIVE_MARKER_LO = taa.TAA_REACTIVE_MARKER_LO;
+pub const TAA_REACTIVE_MARKER_HI = taa.TAA_REACTIVE_MARKER_HI;
+pub const TaaVelocityKind = taa.TaaVelocityKind;
+pub const taaVelocityKind = taa.taaVelocityKind;
+pub const taaReactiveMarkerBoost = taa.taaReactiveMarkerBoost;
+pub const taaReactiveMarkersActive = taa.taaReactiveMarkersActive;
+pub const taaResolvePixelMarker = taa.taaResolvePixelMarker;
 pub const taaParams = taa.taaParams;
 pub const taaState = taa.taaState;
 

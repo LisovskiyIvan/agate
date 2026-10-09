@@ -299,13 +299,58 @@ pub fn taaReactiveActive(cfg: options.PostProcessOptions) bool {
     return cfg.taa_reactive_enabled and cfg.taa_reactive_strength > 0.001;
 }
 
-/// Pack the shader taa_reactive_params vec4: (enabled 1/0, strength, 0, 0).
-/// Zeros when inactive, which keeps the composite bit-identical to the
-/// pre-reactive path (the shader multiplies a zero boost into the blend).
+/// True-reactive marker band (C.3 v2): the velocity pass stamps particle
+/// coverage with exactly TAA_REACTIVE_MARKER_ALPHA (see velocity.glsl
+/// fs_marker); content that cannot carry velocity is therefore identifiable
+/// per pixel, unlike the v1 depth-spread heuristic above. The band sits
+/// strictly between the clear value (0.0) and the per-object gate (0.5) so
+/// the existing fallback/per-object branches never misclassify it. Nearest
+/// sampling (velocity_smp) keeps the stamped value exact — no filtering
+/// smear across the band edges.
+pub const TAA_REACTIVE_MARKER_ALPHA: f32 = 0.25;
+pub const TAA_REACTIVE_MARKER_LO: f32 = 0.15;
+pub const TAA_REACTIVE_MARKER_HI: f32 = 0.35;
+
+/// Velocity-alpha classification mirror of the applyTAA branch (the gap
+/// band (HI, 0.5] has no writer and fails closed to fallback, keeping the
+/// v1 heuristic as its treatment; non-finite input is fallback, never a
+/// marker).
+pub const TaaVelocityKind = enum { fallback, reactive, per_object };
+
+pub fn taaVelocityKind(alpha: f32) TaaVelocityKind {
+    if (!std.math.isFinite(alpha)) return .fallback;
+    if (alpha > 0.5) return .per_object;
+    if (alpha >= TAA_REACTIVE_MARKER_LO and alpha <= TAA_REACTIVE_MARKER_HI) return .reactive;
+    return .fallback;
+}
+
+/// True-marker history shed in [0, 1]: the stamped coverage IS the signal,
+/// so there is no depth edge ramp — at marker strength 1 the history weight
+/// goes to exactly zero (near-zero blend toward history). Replaces the v1
+/// heuristic for marked pixels (the resolve multiplies one term or the
+/// other, never both).
+pub fn taaReactiveMarkerBoost(marker_strength: f32) f32 {
+    return std.math.clamp(marker_strength, 0.0, 1.0);
+}
+
+/// Marker-draw gate for the velocity pass (pure): markers are a TAA signal,
+/// so they render only when the TAA resolve is active (taa_on already
+/// implies samples == 1 in frame_render) AND the reactive family is on.
+/// Blur-only mode keeps its bit-identical zero-mask path; under MSAA the
+/// whole velocity pass is suppressed upstream, so markers are 1x-only and
+/// the composite degrades to the v1 heuristic (and TAA itself is off).
+pub fn taaReactiveMarkersActive(taa_on: bool, cfg: options.PostProcessOptions) bool {
+    return taa_on and taaReactiveActive(cfg);
+}
+
+/// Pack the shader taa_reactive_params vec4: (enabled 1/0, heuristic
+/// strength, marker strength, 0). Zeros when inactive, which keeps the
+/// composite bit-identical to the pre-reactive path (the shader multiplies
+/// a zero boost into the blend on both the marker and the heuristic lane).
 pub fn taaReactiveParams(cfg: options.PostProcessOptions) [4]f32 {
     if (!taaReactiveActive(cfg)) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ 1.0, c.taa_reactive_strength, 0.0, 0.0 };
+    return .{ 1.0, c.taa_reactive_strength, c.taa_reactive_marker_strength, 0.0 };
 }
 
 /// Full pixel resolve with variance clipping, history rejection, AND the
@@ -336,6 +381,37 @@ pub fn taaResolvePixelReactive(
     const rb = taaReactiveBoost(is_fallback, depth_min, depth_max, reactive_strength);
     const hc = taaClampHistory(h, box.min, box.max, clamp_strength);
     const r = taaResolve(c, hc, blend * reject * (1.0 - rb));
+    return hdr.boundHdr3(taaApplySharpen(r, c, avg, sharpness, box.min, box.max));
+}
+
+/// Full pixel resolve with variance clipping, history rejection, AND the
+/// true-reactive marker treatment: on stamped (marker-band) pixels the
+/// history weight sheds by the marker boost (multiplicative with the
+/// rejection weight, so already-rejected history stays rejected), REPLACING
+/// the v1 depth-spread heuristic (which cannot see velocity-less content and
+/// stays exactly zero here). With is_marker=false this is bit-identical to
+/// taaResolvePixelWithRejection (pinned by test). Headless golden tests pin it.
+pub fn taaResolvePixelMarker(
+    current: [3]f32,
+    neighbors: [8][3]f32,
+    history: [3]f32,
+    blend: f32,
+    clamp_strength: f32,
+    sharpness: f32,
+    gamma: f32,
+    is_marker: bool,
+    marker_strength: f32,
+) [3]f32 {
+    const c = hdr.boundHdr3(current);
+    var ns: [8][3]f32 = undefined;
+    for (neighbors, 0..) |n, i| ns[i] = hdr.boundHdr3(n);
+    const h = hdr.boundHdr3(history);
+    const box = taaVarianceBounds(c, ns, gamma);
+    const avg = taaNeighborhoodAvg(c, ns);
+    const reject = taaRejectionWeight(h, box.min, box.max);
+    const mb = if (is_marker) taaReactiveMarkerBoost(marker_strength) else 0.0;
+    const hc = taaClampHistory(h, box.min, box.max, clamp_strength);
+    const r = taaResolve(c, hc, blend * reject * (1.0 - mb));
     return hdr.boundHdr3(taaApplySharpen(r, c, avg, sharpness, box.min, box.max));
 }
 
