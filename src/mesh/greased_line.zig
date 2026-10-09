@@ -405,6 +405,15 @@ pub const GreasedLineMesh = struct {
         try mesh.retainCpuGeometryU32(allocator, vertices, indices);
 
         const greased = try allocator.create(GreasedLineMesh);
+        // Ownership split on failure: vertices/indices are still freed by
+        // their own errdefers above (they would double-free through
+        // `deinit`), and the mesh struct by its errdefer — so this cleans
+        // only what THIS struct uniquely owns (points/widths buffers).
+        errdefer {
+            greased.points_buffer.deinit(allocator);
+            greased.widths_buffer.deinit(allocator);
+            allocator.destroy(greased);
+        }
         greased.* = .{
             .allocator = allocator,
             .scene = scene,

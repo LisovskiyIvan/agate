@@ -74,6 +74,7 @@ pub const AnimationGroup = struct {
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, channels: []AnimationChannel, duration: f32) !*AnimationGroup {
         const ag = try allocator.create(AnimationGroup);
+        errdefer allocator.destroy(ag);
         ag.* = .{
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),

@@ -570,6 +570,7 @@ pub const Mesh = struct {
 
     pub fn createInstance(self: *Mesh, scene: *Scene, name: []const u8) !*InstancedMesh {
         const inst = try scene.allocator.create(InstancedMesh);
+        errdefer scene.allocator.destroy(inst);
         inst.* = .{
             .name = name,
             .source_mesh = self,

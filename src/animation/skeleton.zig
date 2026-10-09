@@ -48,6 +48,7 @@ pub const Skeleton = struct {
 
     pub fn init(allocator: std.mem.Allocator, bone_count: usize) !*Skeleton {
         const skel = try allocator.create(Skeleton);
+        errdefer allocator.destroy(skel);
         const bones = try allocator.alloc(Bone, bone_count);
         for (bones) |*b| {
             b.* = .{};
