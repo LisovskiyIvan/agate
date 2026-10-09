@@ -169,7 +169,7 @@ layout(binding = 1) uniform fs_params {
     // (+X,-X,+Y,-Y,+Z,-Z). Zeroed by default: the shader early-outs with
     // zero cost when no point light casts shadows.
     mat4 point_view_proj[12];
-    vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: unused
+    vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: source_radius (0 = legacy 4-tap PCF, > epsilon = point PCSS)
     // APPENDED LAST (multi-directional): up to 4 suns; slot 0 mirrors the
     // primary (light_dir/light_color, the only shadow caster), slots 1..3
     // are shadowless fills. Unused/disabled slots are zeroed (intensity 0
@@ -245,6 +245,8 @@ layout(binding = 20) uniform texture2D spot_shadow_depth_tex; // same atlas view
 // Binding 10: vs uses texture 9 (morph), fs uses 0..8 — next free slot in
 // the shared pool. Sampled through the shared shadow_smp compare sampler.
 layout(binding = 10) uniform texture2D point_shadow_tex;
+@image_sample_type point_shadow_depth_tex unfilterable_float
+layout(binding = 21) uniform texture2D point_shadow_depth_tex; // same atlas view as point_shadow_tex, raw-depth reads for point PCSS (binding 21: next free view slot — fs uses 0..8, 10, 11, 15..20, vs uses 9, storage uses 12..14)
 layout(binding = 17) uniform texture2D brdf_lut_tex; // Babylon env-BRDF lookup (coloredEnergyConservationFactor)
 layout(binding = 0) uniform sampler smp; // color slot: albedo (its own sampler)
 // Data slots (normal / metallic-roughness / occlusion / emissive) sample
@@ -364,6 +366,23 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 #define SPOT_PCSS_BLOCKER_RADIUS 0.01
 #define SPOT_PCSS_MIN_PENUMBRA 0.0005
 #define SPOT_PCSS_MAX_PENUMBRA 0.01
+
+// Point-light PCSS (cube-face atlas): blocker search + variable penumbra
+// per face tile. source_radius rides point_shadow_params[slot].w
+// (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
+// calculatePointShadowSlot). Blocker search reads raw depths from
+// point_shadow_depth_tex (same atlas view as point_shadow_tex) through the
+// shared depth_smp; the penumbra reuses pcssPenumbraRadius (same formula as
+// the sun/spot paths, see scene/shadow_pcss.zig). Tap budgets mirror
+// scene/shadow_pcss.zig (point_blocker_sample_count, point_pcf_tap_count).
+// v1 clamps every tap to the fragment's own face tile (no neighbor-face
+// traversal — see the face-clamping note in shadow_pcf.glsl).
+#define POINT_PCSS_BLOCKER_SAMPLES 8
+#define POINT_PCSS_PCF_TAPS 8
+#define POINT_PCSS_EPSILON 0.0001
+#define POINT_PCSS_BLOCKER_RADIUS 0.01
+#define POINT_PCSS_MIN_PENUMBRA 0.0005
+#define POINT_PCSS_MAX_PENUMBRA 0.01
 
 // @include "common/shadow_pcf.glsl"
 

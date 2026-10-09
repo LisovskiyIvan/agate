@@ -122,6 +122,21 @@ fn setupScene() void {
         .source_radius = if (spot_pcss_off) 0.0 else 0.02,
     }) catch @panic("q0: spot failed");
 
+    // Point PCSS calibration light: a small shadow-casting point near the
+    // content cluster. source_radius > 0 runs the point PCSS path (blocker
+    // search + variable penumbra, taps clamped to the fragment's own
+    // cube-face tile); AGATE_Q0_NO_POINT_PCSS=1 falls back to the legacy
+    // fixed PCF bit-identically (0.0 disables).
+    const point_pcss_off = envFlag("AGATE_Q0_NO_POINT_PCSS");
+    _ = scene.createPointLight("q0_key_point", .{
+        .position = z.Vec3.new(-1.2, 2.6, 1.2),
+        .color = z.Color3.new(1.0, 0.8, 0.6),
+        .intensity = 8.0,
+        .range = 10.0,
+        .cast_shadows = true,
+        .source_radius = if (point_pcss_off) 0.0 else 0.02,
+    }) catch @panic("q0: point failed");
+
     // Warm ceiling area panel + emissive quad (bloom picks the emitter up).
     _ = scene.addAreaLight("area_panel", .{
         .center = z.Vec3.new(0.0, 3.85, -0.8),

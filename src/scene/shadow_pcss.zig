@@ -96,3 +96,36 @@ pub const spot_pcss_epsilon: f32 = 0.0001;
 pub fn spotPcssEnabled(source_radius: f32) bool {
     return source_radius > spot_pcss_epsilon;
 }
+
+// Point-light PCSS (cube-face atlas): mirrors the point branch of
+// calculatePointShadowSlot in shaders/common/shadow_pcf.glsl. The penumbra
+// formula is shared with the sun and the spots (penumbraRadius above); only
+// the tap budgets and the search geometry differ (one 256px cube-face tile
+// per face/slot instead of a spot atlas page). v1 clamps every tap to the
+// fragment's own face tile (no neighbor-face traversal — see the shader
+// comment for the documented border artifact).
+
+// Fixed point blocker-search tap count. Must match POINT_PCSS_BLOCKER_SAMPLES
+// in the shaders (pbr/instanced_pbr/skinned_pbr.glsl).
+pub const point_blocker_sample_count: u32 = 8;
+// Fixed point variable-radius PCF tap count. Must match POINT_PCSS_PCF_TAPS
+// in the shaders.
+pub const point_pcf_tap_count: u32 = 8;
+
+// Point blocker-search radius in atlas UV. Must match
+// POINT_PCSS_BLOCKER_RADIUS in the shaders.
+pub const point_blocker_radius: f32 = 0.01;
+// Point penumbra clamp range in atlas UV. Must match
+// POINT_PCSS_MIN_PENUMBRA / POINT_PCSS_MAX_PENUMBRA in the shaders.
+pub const point_min_penumbra: f32 = 0.0005;
+pub const point_max_penumbra: f32 = 0.01;
+
+// Thresholds the packed source_radius lane (point_shadow_params[i].w) at
+// this epsilon, mirroring the `source_radius > POINT_PCSS_EPSILON` shader
+// branch. Zero (the default) keeps the legacy fixed 4-tap PCF bit-identical.
+pub const point_pcss_epsilon: f32 = 0.0001;
+
+// Whether a point light runs the PCSS path: source_radius above epsilon.
+pub fn pointPcssEnabled(source_radius: f32) bool {
+    return source_radius > point_pcss_epsilon;
+}

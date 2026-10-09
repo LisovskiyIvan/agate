@@ -236,6 +236,27 @@ test "packFrame packs spot source_radius into the shadow params w lane" {
     try std.testing.expectEqual([4]f32{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.02 }, pack.spot_shadow_params[0]);
 }
 
+test "packFrame packs point source_radius into the shadow params w lane" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+
+    const eye = Vec3.zero;
+    const pl = try rig.createPointLight(allocator, "lamp", .{
+        .position = Vec3.new(1, 2, 3),
+        .range = 10.0,
+        .intensity = 2.0,
+        .cast_shadows = true,
+        .source_radius = 0.02,
+    });
+
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 6), pack.num_point_shadows);
+    // x shadow slot + 1, y/z bias knobs, w source_radius (point PCSS emitter size).
+    try std.testing.expectEqual([4]f32{ 1.0, pl.shadow_bias, pl.shadow_normal_bias, 0.02 }, pack.point_shadow_params[0]);
+}
+
 test "packFrame scales intensity by the slot fade factor" {
     const allocator = std.testing.allocator;
     var rig = LightRig.init("hemi", .{});

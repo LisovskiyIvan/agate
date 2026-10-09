@@ -364,8 +364,9 @@ pub const LightRig = struct {
         num_spot_shadows: usize = 0,
         // Point-light shadows, keyed by PACKED point slot (the shader light
         // loop index): x carries shadow_slot + 1 (0 = no shadow), y/z the
-        // light's bias/normal-bias knobs, w is reserved (always 0: point
-        // PCSS is deferred, see docs/graphics-roadmap.md). The 6 face matrices of shadow slot
+        // light's bias/normal-bias knobs, w source_radius (0 = legacy fixed
+        // PCF, > epsilon enables point PCSS; see scene/shadow_pcss.zig).
+        // The 6 face matrices of shadow slot
         // s live in point_view_proj[s * 6 .. s * 6 + 6]; the depth pass tiles
         // come from point_shadows (6 entries per slot). All zeroed when no
         // point light casts shadows, so the shaders early-out with zero cost.
@@ -502,9 +503,9 @@ pub const LightRig = struct {
         for (best_idx[0..n], 0..) |pack_i, slot| {
             const pl = in_lights[pack_i];
             casters[slot] = pl;
-            pack.point_shadow_params[slot] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, 0.0 };
+            pack.point_shadow_params[slot] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, pl.source_radius };
             if (pack_i != slot and pack_i < 4) {
-                pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, 0.0 };
+                pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, pl.source_radius };
             }
             for (0..passes.POINT_SHADOW_FACES) |f| {
                 const vp = pl.getShadowFaceViewProj(f);

@@ -64,6 +64,28 @@ float pcssSpotBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_
     return blocker_sum / float(blocker_count);
 }
 
+// Point-light PCSS blocker search: same math as pcssSpotBlockerAverage
+// above, but bounded by the point tap budget (POINT_PCSS_BLOCKER_SAMPLES)
+// and clamped to the fragment's own cube-face tile — v1 does NOT traverse
+// into neighboring faces (see the face-clamping note in
+// calculatePointShadowSlot). Kept as a separate function so the sun and
+// spot paths stay byte-identical. Returns the average blocker depth, or
+// -1.0 when nothing blocks (caller early-outs to fully lit).
+float pcssPointBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius, vec2 tile_min, vec2 tile_max) {
+    float blocker_sum = 0.0;
+    int blocker_count = 0;
+    for (int i = 0; i < POINT_PCSS_BLOCKER_SAMPLES; i++) {
+        vec2 tap_uv = clamp(atlas_uv + rot * POISSON_DISK[i] * search_radius, tile_min, tile_max);
+        float tap_depth = texture(sampler2D(depth_tex, depth_smp), tap_uv).r;
+        if (tap_depth < receiver_depth) {
+            blocker_sum += tap_depth;
+            blocker_count += 1;
+        }
+    }
+    if (blocker_count == 0) return -1.0;
+    return blocker_sum / float(blocker_count);
+}
+
 float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     float cos_theta = max(dot(N, L), 0.0);
     float depth_bias = max(shadow_params.x * (1.0 - cos_theta), shadow_params.x * 0.2);
@@ -256,6 +278,46 @@ float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N,
     vec2 clamped_uv = clamp(local_uv, 0.002, 0.998);
     vec2 atlas_uv = vec2((float(face) + clamped_uv.x) / 6.0, float(slot) * 0.5 + clamped_uv.y * 0.5);
     float depth = proj.z - depth_bias;
+
+    // Point PCSS (source_radius > POINT_PCSS_EPSILON): blocker search over
+    // the fragment's own cube-face tile -> average blocker depth ->
+    // variable penumbra via the same formula as the sun/spot paths
+    // (pcssPenumbraRadius mirrors penumbraRadius in
+    // scene/shadow_pcss.zig) -> variable-radius PCF.
+    // Tap budgets (compile-time bounded): POINT_PCSS_BLOCKER_SAMPLES
+    // blocker taps + POINT_PCSS_PCF_TAPS filter taps. source_radius at or
+    // below the epsilon falls through to the legacy fixed 4-tap PCF
+    // bit-identically.
+    //
+    // v1 face clamping (documented heuristic, NOT silent breakage): every
+    // tap clamps to the fragment's own face tile. Blocker/PCF taps whose
+    // disk reaches across a cube-face boundary sample the clamped edge
+    // texel instead of the neighboring face, so occluders sitting just
+    // across the boundary are missed and the penumbra near the 12 cube
+    // edges smears along the edge. Visible only when a shadow-casting edge
+    // falls within ~filter radius of a face-boundary direction from the
+    // light — narrow bands along projected cube edges, worst with large
+    // source_radius. A full fix needs world-space disk offsets around the
+    // receiver, per-tap face selection + projection through that face's
+    // matrix, and cross-face depth normalization (view-space z differs per
+    // face orientation, so raw depths are not directly comparable).
+    float source_radius = point_shadow_params[slot].w;
+    if (source_radius > POINT_PCSS_EPSILON) {
+        vec2 tile_min = vec2((float(face) + 0.002) / 6.0, float(slot) * 0.5 + 0.001);
+        vec2 tile_max = vec2((float(face) + 0.998) / 6.0, float(slot) * 0.5 + 0.499);
+        mat2 rot = pcssDitherRotation(gl_FragCoord.xy);
+        float blocker_avg = pcssPointBlockerAverage(point_shadow_depth_tex, depth_smp, atlas_uv, depth, rot, POINT_PCSS_BLOCKER_RADIUS, tile_min, tile_max);
+        if (blocker_avg < 0.0) return 0.0;
+        float filter_radius = pcssPenumbraRadius(depth, blocker_avg, source_radius, POINT_PCSS_MIN_PENUMBRA, POINT_PCSS_MAX_PENUMBRA);
+        float pcss_lit = 0.0;
+        for (int i = 0; i < POINT_PCSS_PCF_TAPS; i++) {
+            vec2 offset = rot * POISSON_DISK[i] * filter_radius;
+            vec2 sample_uv = clamp(atlas_uv + offset, tile_min, tile_max);
+            pcss_lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(sample_uv, depth));
+        }
+        pcss_lit /= float(POINT_PCSS_PCF_TAPS);
+        return (1.0 - pcss_lit) * shadow_params.y;
+    }
 
     vec2 texel = vec2(1.0 / 1536.0, 1.0 / 512.0);
     float lit = 0.0;
