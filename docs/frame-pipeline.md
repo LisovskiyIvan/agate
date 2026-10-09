@@ -1,6 +1,6 @@
 # Кадровый конвейер (многопоточный кадр)
 
-> Путь: `src/agate/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig`, `frame_render.zig`, `upload_packets.zig`, `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/agate/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
+> Путь: `src/agate/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig`, `frame_render.zig`, `upload_packets.zig` (фасад: `upload_packets_stage/flush/commit/transient.zig`), `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/agate/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
 
 ## Что это
 
@@ -137,7 +137,7 @@ pub const FrameDraws = struct {
 
 Прочие типы пакетов (`frame_draws.zig`): `MorphUpload`, `ParticleCpuUpload`, `ParticleGpuUpload`, `ParticleComputeUpload`, `TrailUpload`, `SoftUpload`, `GreasedUpload`, `PendingMeshUpload` — у каждого `token`/`uid`/индексы для валидации commit'а и флаг `delivered` (плюс `created_*_id` для установок хэндлов).
 
-### Заморозка загрузок (`scene/upload_packets.zig`)
+### Заморозка загрузок (`scene/upload_packets.zig` — фасад; код разложен по типам ресурсов и фазам: `upload_packets_stage.zig` — producer-freeze, `upload_packets_flush.zig` — context-flush, `upload_packets_commit.zig` — game-side commit + re-arm, `upload_packets_transient.zig` — reuse-переподача; публичный API фасада неизменен)
 
 ```zig
 pub fn stageUploads(scene: anytype, slot: anytype) void
@@ -269,7 +269,7 @@ pub const Runtime = struct {
 
 **Симптом (был).** `renderReuse` перепрезентирует front-слот БЕЗ staged prepare: `flushSlotUploads` не выполнялся, а draw-records биндили буферы с `usage.write_transient` (instance-матрицы, morph-дельты, particle cpu/gpu payloads, трейлы/softbody/greased). sokol валидатор ловил `VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING`, а в non-`SOKOL_VALIDATE_NON_FATAL` сборках — паника (`VALIDATION_FAILED`). Гейт-воспроизведение: `hdr-showcase --frames >= 400` (reuse-проба на кадре 200).
 
-**Фикс.** Reuse-кадр переподаёт staged payload'ы фрот-лота в те же transient-буферы ДО любых draw'ов: `upload_packets.rewriteTransientWrites` (morph / particle cpu+gpu / trails / softbodies / greased) и `instance_staging.rewriteSlotInstanceBuffers` (cur в bound-буфер; парный prev — тем же payload'ом, повтор кадра = нулевая instance-моушн-семантика). Вызов из `frame_render.render()` под `if (scene.rendering_reuse)`. Write-only по контракту: без upload-meter, без delivered/outcome-мутаций, без создания буферов и без particle-compute state clear (это семантика — состояние симуляции переживает повтор).
+**Фикс.** Reuse-кадр переподаёт staged payload'ы фрот-лота в те же transient-буферы ДО любых draw'ов: `upload_packets.rewriteTransientWrites` (`upload_packets_transient.zig`: morph / particle cpu+gpu / trails / softbodies / greased) и `instance_staging.rewriteSlotInstanceBuffers` (cur в bound-буфер; парный prev — тем же payload'ом, повтор кадра = нулевая instance-моушн-семантика). Вызов из `frame_render.render()` под `if (scene.rendering_reuse)`. Write-only по контракту: без upload-meter, без delivered/outcome-мутаций, без создания буферов и без particle-compute state clear (это семантика — состояние симуляции переживает повтор).
 
 **Гейт.** `hdr-showcase --frames 400`: 0 ошибок валидации, 0 паник (было 1 + panic на baseline). Известные непокрытые corner'ы (осознанно, не в шипе): pending-mesh создания (their ids съедены commit'ом) и compute-particle state буферы (пишутся на render-time compute-пути, который reuse-кадр перепрогоняет).
 

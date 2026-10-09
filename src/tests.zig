@@ -397,7 +397,12 @@ test {
     _ = @import("scene/uniforms.zig");
     _ = @import("scene/uniforms_tests.zig");
     _ = @import("scene/upload_packets.zig");
+    _ = @import("scene/upload_packets_commit.zig");
+    _ = @import("scene/upload_packets_flush.zig");
+    _ = @import("scene/upload_packets_reuse_tests.zig");
+    _ = @import("scene/upload_packets_stage.zig");
     _ = @import("scene/upload_packets_tests.zig");
+    _ = @import("scene/upload_packets_transient.zig");
     _ = @import("scene/velocity_tests.zig");
     _ = @import("scene/view_render.zig");
     _ = @import("scene/viewport_clear.zig");
