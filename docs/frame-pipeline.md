@@ -1,6 +1,6 @@
 # Кадровый конвейер (многопоточный кадр)
 
-> Путь: `src/agate/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig`, `frame_render.zig`, `upload_packets.zig` (фасад: `upload_packets_stage/flush/commit/transient.zig`), `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/agate/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
+> Путь: `src/agate/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig` (фасад: `frame_draws_packets/slot/lease.zig`), `frame_render.zig`, `upload_packets.zig` (фасад: `upload_packets_stage/flush/commit/transient.zig`), `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/agate/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
 
 ## Что это
 
@@ -87,7 +87,7 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void
 
 `beginStagedPrepare`: null при отсутствии свежего полного билда — никогда live-чтений. Выполняет: lease-claim слота (удерживается весь prepare), сброс `frame_prepared`, `retire_epoch = gpu_retire.begin()`, сброс статистики с переносом staged скаляров (`pending_update_ms`/`pending_physics_ms` через acquire), закрытие предыдущего незакрытого epoch. `finishStagedPrepare`: потребляет токен один раз (one-shot, живой GPU-владелец) — только latch (GPU-половины по слотовым записям, `patchInstanceRefs`, merge `build_stats`), без перестройки очередей; затем `tryPublish` и штамп `last_latched_seq`. `cancelStagedPrepare`: снимает lease, `frame_prepared=false`, `gpu_retire.complete(epoch)`.
 
-### Тройной буфер (`scene/frame_draws.zig`)
+### Тройной буфер (`scene/frame_draws.zig` — фасад; слот: `frame_draws_slot.zig`, lease: `frame_draws_lease.zig`)
 
 ```zig
 pub const SLOT_COUNT: usize = 3;
@@ -119,7 +119,7 @@ pub const FrameDraws = struct {
 
 Протокол: `claimBack` → заполнить → `tryPublish` (producer) или `releaseHandoff` (передача prepare без переворота `front`); consumer — `pin`/`pinFront` → читать → `unpin`. `pin` отказывает пишущему слоту (`SlotBusy`), publish в pinned слот отказывает (`PinnedSlot`) — всё со счётчиками (`saturation_skips`, `publish_refusals`, `pin_denials`, `unpin_denials`). Потерянный `unpin` — никогда клин: только сжимает свободное множество; `deinit` ассертит отсутствие пинов.
 
-### Содержимое слота (`FrameDrawSlot`)
+### Содержимое слота (`FrameDrawSlot` — `frame_draws_slot.zig`)
 
 | Группа | Поля |
 |---|---|
@@ -135,7 +135,7 @@ pub const FrameDraws = struct {
 
 Методы: `reset()` (чистит длины всех списков, сохраняя capacity — stale невозможен), `deinit(allocator)`, `cpuBytes()` (сумма retained capacity; фиксированный снимок не считается).
 
-Прочие типы пакетов (`frame_draws.zig`): `MorphUpload`, `ParticleCpuUpload`, `ParticleGpuUpload`, `ParticleComputeUpload`, `TrailUpload`, `SoftUpload`, `GreasedUpload`, `PendingMeshUpload` — у каждого `token`/`uid`/индексы для валидации commit'а и флаг `delivered` (плюс `created_*_id` для установок хэндлов).
+Прочие типы пакетов (`frame_draws_packets.zig`): `MorphUpload`, `ParticleCpuUpload`, `ParticleGpuUpload`, `ParticleComputeUpload`, `TrailUpload`, `SoftUpload`, `GreasedUpload`, `PendingMeshUpload` — у каждого `token`/`uid`/индексы для валидации commit'а и флаг `delivered` (плюс `created_*_id` для установок хэндлов).
 
 ### Заморозка загрузок (`scene/upload_packets.zig` — фасад; код разложен по типам ресурсов и фазам: `upload_packets_stage.zig` — producer-freeze, `upload_packets_flush.zig` — context-flush, `upload_packets_commit.zig` — game-side commit + re-arm, `upload_packets_transient.zig` — reuse-переподача; публичный API фасада неизменен)
 

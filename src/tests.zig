@@ -311,6 +311,9 @@ test {
     _ = @import("scene/frame_api.zig");
     _ = @import("scene/frame_build.zig");
     _ = @import("scene/frame_draws.zig");
+    _ = @import("scene/frame_draws_lease.zig");
+    _ = @import("scene/frame_draws_packets.zig");
+    _ = @import("scene/frame_draws_slot.zig");
     _ = @import("scene/frame_draws_tests.zig");
     _ = @import("scene/frame_prepare.zig");
     _ = @import("scene/frame_render.zig");
