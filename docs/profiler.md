@@ -16,7 +16,7 @@
 | `snapshot.zig` | `captureMemorySnapshot` — перепись CPU/GPU-памяти |
 | `summary.zig` | `summarize` — статистика сессии + pacing |
 | `diagnostics.zig` | `analyze` — поиск бутылочных горлышек |
-| `report.zig` | генераторы HTML/Markdown/Chrome-trace поверх плоских данных (импорт только `types`) |
+| `report.zig` | фасад: реэкспорт генераторов HTML/Markdown/Chrome-trace (`report_gates`/`report_html`/`report_markdown`/`report_trace`) поверх плоских данных (импорт только `types`) |
 | `report_queue.zig` | `ReportWriteTask` + `enqueueReportWrite` — enqueue-only половина lock-free окна |
 
 CPU-фазы — время сабмита, GPU-поля — ПОСЛЕДНИЙ ЗАВЕРШЁННЫЙ timestamp sample,
@@ -129,10 +129,10 @@ pub fn captureMemorySnapshot(self: *Profiler, scene: *const Scene) !*const Memor
 
 Снимок — перепись CPU/GPU-памяти: текстуры (имя, размеры, мипы, байты), меши, рендер-таргеты. Хранится ВНУТРИ профайлера (latched mailbox): указатель валиден до следующего `captureMemorySnapshot`/`reset`/`deinit` — не освобождайте и не храните долше этого окна. Ошибка только `OutOfMemory`.
 
-### Отчёты (`report.zig`, `core.zig`)
+### Отчёты (`report.zig` — фасад, `core.zig`)
 
 ```zig
-// Чистые генераторы (report.zig) — только данные + аллокатор:
+// Чистые генераторы (report.zig — фасад над report_gates/report_html/report_markdown/report_trace) — только данные + аллокатор:
 pub fn hasGpuData(frames: []const FrameRecord) bool
 pub fn hasGpuPassData(frames: []const FrameRecord) bool
 pub fn formatBytes(allocator: std.mem.Allocator, bytes: usize) ![]u8

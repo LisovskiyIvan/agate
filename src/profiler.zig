@@ -6,8 +6,10 @@
 //!
 //! - `profiler/types.zig` — data types (`FrameRecord`, `MemorySnapshot`,
 //!   `SessionSummary`, diagnostics, `dominantPhase`). Leaf: no sibling imports.
-//! - `profiler/report.zig` — standalone HTML/Markdown/Chrome-trace
-//!   generators over plain data values. Imports `types` only.
+//! - `profiler/report.zig` — facade re-exporting the standalone
+//!   HTML/Markdown/Chrome-trace generators over plain data values
+//!   (leaves: `report_gates`/`report_html`/`report_markdown`/`report_trace`;
+//!   imports `types` only).
 //! - `profiler/core.zig` — owns the `Profiler` type: recorder fields, the
 //!   trivial lifecycle plus the report/save glue, and thin forwarders into
 //!   the siblings below, so every call site keeps working unchanged.

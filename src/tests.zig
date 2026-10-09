@@ -277,9 +277,13 @@ test {
     _ = @import("profiler/recording.zig");
     _ = @import("profiler/recording_tests.zig");
     _ = @import("profiler/report.zig");
+    _ = @import("profiler/report_gates.zig");
+    _ = @import("profiler/report_html.zig");
+    _ = @import("profiler/report_markdown.zig");
     _ = @import("profiler/report_queue.zig");
     _ = @import("profiler/report_queue_tests.zig");
     _ = @import("profiler/report_tests.zig");
+    _ = @import("profiler/report_trace.zig");
     _ = @import("profiler/snapshot.zig");
     _ = @import("profiler/snapshot_tests.zig");
     _ = @import("profiler/summary.zig");
