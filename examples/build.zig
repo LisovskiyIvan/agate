@@ -94,4 +94,23 @@ pub fn build(b: *std.Build) !void {
     const run_rw = b.addRunArtifact(rw_exe);
     if (b.args) |args| run_rw.addArgs(args);
     b.step("run-runtime-worker", "Run the Runtime worker-thread smoke (needs GPU/display)").dependOn(&run_rw.step);
+
+    // 5. Q0 calibration interior (fill-bound render-scale A/B workload)
+    const q0_mod = b.createModule(.{
+        .root_source_file = b.path("q0_interior.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const q0_exe = b.addExecutable(.{
+        .name = "q0-interior",
+        .root_module = q0_mod,
+    });
+    b.installArtifact(q0_exe);
+    const run_q0 = b.addRunArtifact(q0_exe);
+    if (b.args) |args| run_q0.addArgs(args);
+    b.step("run-q0", "Run the Q0 calibration interior (fill-bound A/B; AGATE_Q0_FRAMES/AGATE_Q0_TIMINGS)").dependOn(&run_q0.step);
 }

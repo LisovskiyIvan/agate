@@ -28,6 +28,8 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const timing = z.gpu_timing;
+const bench_mod = @import("gpu_phase_bench.zig");
+var bench: bench_mod.Bench = .{};
 
 const exposures = [_]f32{ 1.0, 0.6, 1.6, 2.5 };
 
@@ -36,34 +38,6 @@ var msaa_count: i32 = 1;
 var want_srgb: bool = false;
 // Q4 render-scale A/B gate knob (see docs/graphics-roadmap.md Q4).
 var render_scale: f32 = 1.0;
-// GPU frame-sample tally (opt-in AGATE_HDR_TIMINGS=1): the engine stores the
-// last COMPLETED submission's ms in scene.stats.gpu_frame_ms; availability
-// is gpu_frame_submit != 0 (a valid zero-ms sample still counts).
-// Post-warmup samples are retained for median/p95 — the MEDIAN is the
-// canonical signal for before/after compares (their run-to-run mean spread
-// is +-20%: window occlusion, wall jitter), warmup matches the phase gate.
-const gpu_warmup_samples: u32 = 30;
-const gpu_max_samples: usize = 4096;
-var gpu_sample_store: [gpu_max_samples]f32 = undefined;
-var gpu_samples: []f32 = gpu_sample_store[0..0];
-var gpu_warmup_seen: u32 = 0;
-var gpu_occluded: u32 = 0;
-
-// Three-phase in-window A/B: the SAME window and scene walk native ->
-// 0.75 -> 0.66 render scale back to back (one sokol process, per the
-// measurement rule: only same-session back-to-back compares count; a
-// drifting window resizes all phases equally and every phase prints its
-// own realized target size).
-var phase_scales = [_]f32{ 1.0, 0.75, 0.66 }; // reversed via env to test time-drift
-
-var phase_frames: u32 = 120;
-var phase_index: usize = 0;
-var phase_target_w: i32 = 0;
-var phase_target_h: i32 = 0;
-// Occlusion state from the event stream (sokol-zig has no isMinimized
-// binding): ICONIFIED/SUSPENDED flip it, a degenerate framebuffer counts
-// as hidden too (macOS zero-size swapchain while minimized).
-var window_hidden: bool = false;
 var frames: u32 = 0;
 var checks: u32 = 0;
 var failures: u32 = 0;
@@ -297,6 +271,7 @@ fn setupScene() void {
     // Render scale (Q4): scene+effects render at scale x swapchain size,
     // the composite/UI present at full res. 1.0 = native baseline for the
     // A/B gate (native vs 0.66/0.75, same scene, same TAA).
+    bench.overrideScale(render_scale);
     scene.post_process.render_scale = render_scale;
     scene.post_process.fog_enabled = false;
     scene.post_process.contact_shadows_enabled = true;
@@ -327,12 +302,9 @@ export fn init() callconv(.c) void {
 export fn frame() callconv(.c) void {
     frames += 1;
     const f = frames;
-    if (f == 2 or (frame_limit > 0 and ((f - 1) % phase_frames) == 0)) {
-        // Proof of the render-scale split (after one full frame): the main
-        // target is the scaled size while the composite/UI present at the
-        // swapchain size.
-        phase_target_w = scene.postfx.renderWidth();
-        phase_target_h = scene.postfx.renderHeight();
+    bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+    if (f == 2 or bench.phase_started) {
+        // Proof of the render-scale split: main target vs swapchain size.
         std.debug.print("hdr-showcase: render target {}x{} scale={d:.2} swapchain {}x{}\n", .{
             scene.postfx.renderWidth(),
             scene.postfx.renderHeight(),
@@ -343,16 +315,14 @@ export fn frame() callconv(.c) void {
     }
     const gate = frame_limit > 0;
     defer if (gate and f >= frame_limit) sapp.quit();
-    // Phase advance: switch render scale on fixed frame boundaries so all
-    // scales share one window, one warmup policy, one session. Single-scale
-    // runs (fewer frames than 3 phases) keep the env selection.
-    if (gate and f > 1 and ((f - 1) % phase_frames) == 0 and f - 1 < phase_scales.len * phase_frames) {
-        if (timing.isEnabled()) reportPhase(phase_index);
-        phase_index = @intCast((f - 1) / phase_frames);
-        scene.post_process.render_scale = if (frame_limit >= phase_scales.len * phase_frames) phase_scales[phase_index] else render_scale;
-        scene.resetTaa();
-        gpu_warmup_seen = 0;
-        gpu_samples = gpu_sample_store[0..0];
+    // Phase advance through the shared bench: same window/session for all
+    // scales, 30-frame warmup per phase, median as the canonical stat.
+    if (gate) {
+        if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
+        if (bench.phase_started) {
+            scene.post_process.render_scale = bench.currentScale();
+            scene.resetTaa();
+        }
     }
     // Finite gate uses a fixed step so UNORM/sRGB captures compare exactly
     // (same jitter/animation frame); interactive mode keeps live timing.
@@ -411,25 +381,7 @@ export fn frame() callconv(.c) void {
     scene.render();
     // GPU sample poll must live HERE: render writes stats.gpu_frame_* at its
     // end (post-commit), and the next frame's staged begin resets `stats`.
-    if (timing.isEnabled()) {
-        // Occluded/minimized windows still render but never sample: they
-        // would drag the mean down with idle-vsync frames. Counted apart,
-        // never silently dropped.
-        const occluded = window_hidden or sapp.width() <= 1 or sapp.height() <= 1;
-        if (occluded) {
-            gpu_occluded += 1;
-        } else if (scene.stats.gpu_frame_submit != 0) {
-            const ms = scene.stats.gpu_frame_ms;
-            if (ms >= 0 and std.math.isFinite(ms)) {
-                if (gpu_warmup_seen < gpu_warmup_samples) {
-                    gpu_warmup_seen += 1;
-                } else if (gpu_samples.len < gpu_max_samples) {
-                    gpu_sample_store[gpu_samples.len] = ms;
-                    gpu_samples = gpu_sample_store[0 .. gpu_samples.len + 1];
-                }
-            }
-        }
-    }
+    if (timing.isEnabled()) bench.recordSample(scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
     if (gate and f == 200) {
         // renderReuse restores CPU stats after the replay (by design), so
         // draw counts cannot prove the replay. Assert the protocol ran:
@@ -479,7 +431,7 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
-    if (timing.isEnabled()) reportPhase(phase_index);
+    if (timing.isEnabled()) bench_mod.Bench.printPhase(bench.report(bench.index));
     scene.deinit();
     sg.shutdown();
     if (sokol_live_allocations != 0) fail("allocator still owns {} allocations after shutdown", .{sokol_live_allocations});
@@ -493,11 +445,7 @@ export fn cleanup() callconv(.c) void {
 }
 
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
-    switch (ev.*.type) {
-        .ICONIFIED, .SUSPENDED => window_hidden = true,
-        .RESTORED, .RESUMED => window_hidden = false,
-        else => {},
-    }
+    bench.noteEvent(ev.*);
     switch (ev.*.type) {
         .KEY_DOWN => switch (ev.*.key_code) {
             .ESCAPE => sapp.quit(),
@@ -536,25 +484,6 @@ fn envFlag(name: [*:0]const u8) bool {
     return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
 }
 
-/// Canonical statistic for one finished phase: median over its post-warmup
-/// samples, plus the realized target/window sizes and the occlusion count.
-fn reportPhase(idx: usize) void {
-    if (gpu_samples.len == 0) {
-        std.debug.print("phase {}: no samples (warmup {} occl {})\n", .{ idx, gpu_warmup_seen, gpu_occluded });
-        return;
-    }
-    const sorted = gpu_sample_store[0..gpu_samples.len];
-    std.mem.sort(f32, sorted, {}, std.sort.asc(f32));
-    var sum: f64 = 0;
-    for (gpu_samples) |v| sum += v;
-    const n = gpu_samples.len;
-    std.debug.print("phase {}: scale={d:.2} target={}x{} window={}x{} n={} occl={} mean={d:.3} median={d:.3} p95={d:.3} min={d:.3} max={d:.3}\n", .{
-        idx,           phase_scales[idx], phase_target_w,                   phase_target_h, sapp.width(),                        sapp.height(),
-        n,             gpu_occluded,      sum / @as(f64, @floatFromInt(n)), sorted[n / 2],  sorted[@min(n - 1, (n * 95) / 100)], sorted[0],
-        sorted[n - 1],
-    });
-}
-
 pub fn startApp() void {
     if (builtin.cpu.arch.isWasm()) {
         frame_limit = @intCast(@max(0, emscripten_run_script_int("(()=>{const n=parseInt(new URLSearchParams(location.search).get('frames')||'0',10);return isNaN(n)?0:n;})()")));
@@ -566,8 +495,8 @@ pub fn startApp() void {
         msaa_count = envI32("AGATE_HDR_MSAA", 1);
         want_srgb = envFlag("AGATE_HDR_SRGB");
         render_scale = envF32("AGATE_HDR_RENDER_SCALE", 1.0);
-        phase_frames = @max(30, envU32("AGATE_HDR_PHASE_FRAMES", 120));
-        if (envFlag("AGATE_HDR_PHASES_REVERSED")) phase_scales = .{ 0.66, 0.75, 1.0 };
+        bench.phase_frames = @max(30, envU32("AGATE_HDR_PHASE_FRAMES", 120));
+        if (envFlag("AGATE_HDR_PHASES_REVERSED")) bench.scales = .{ 0.66, 0.75, 1.0 };
     }
     msaa_count = std.math.clamp(msaa_count, 1, 4);
     render_scale = @min(@max(render_scale, z.postprocess.min_render_scale), 1.0);
