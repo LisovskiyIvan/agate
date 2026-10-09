@@ -67,12 +67,8 @@ pub const MaterialDrawRecord = struct {
     channel_selectors: [4]f32 = .{ 0, 1, 2, 0 },
 };
 
-/// Render-owned копия изменяемых CPU-данных hook-материала: draw-путь читает
-/// только этот снимок, живой ShaderMaterial (tint/uniforms/texture/entry)
-/// во время отрисовки не трогается. Резолюция entry_index через глобальный
-/// реестр остаётся заимствованием (как GPU-хендлы под фазовым мьютексом P3).
-/// Хранится в side-таблице очередей (только для shader-draws), чтобы не
-/// раздувать каждую запись фиксированной ценой uniform-блока.
+/// Frozen render-owned copy of mutable hook material CPU data.
+/// Kept in a side table to avoid inflating uniform block storage per draw item.
 pub const ShaderDrawSnapshot = struct {
     entry_index: u32 = shader_material.invalid_index,
     tint: [4]f32 = .{ 1, 1, 1, 1 },
@@ -83,13 +79,11 @@ pub const ShaderDrawSnapshot = struct {
     tex1_view: sg.View = .{},
     tex1_sampler: sg.Sampler = .{},
     uniforms: shader_material.UniformStorage = .{.{ 0, 0, 0, 0 }} ** shader_material.merge.user_slot_count,
-    /// Собственный double_sided материала (без decal-форсинга item: раньше draw
-    /// читал sm.double_sided напрямую, поведение сохранено точь-в-точь).
+    /// Authoring-level double_sided flag (distinct from decal-forced flag).
     double_sided: bool = false,
 };
 
-/// Строит ShaderDrawSnapshot из живого материала (только prepare-фаза).
-/// Null для всех не-shader материалов — их draw-пути снимок не используют.
+/// Builds a ShaderDrawSnapshot from a material instance (prepare phase only).
 pub fn buildShaderSnapshot(mat: ?Material, default_white: *const Texture) ?ShaderDrawSnapshot {
     const m = mat orelse return null;
     if (m != .shader_material) return null;

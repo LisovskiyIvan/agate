@@ -43,7 +43,3 @@ pub const CharacterController = character_mod.CharacterController;
 const rope_mod = @import("physics/rope.zig");
 pub const Rope = rope_mod.Rope;
 pub const RopeOptions = rope_mod.RopeOptions;
-
-test {
-    _ = @import("physics/tests.zig");
-}

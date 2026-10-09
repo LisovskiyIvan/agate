@@ -91,9 +91,9 @@ pub const ShadowPass = struct {
     pub const bucket_order: [6]Bucket = types.bucket_order;
     pub const BinResult = types.BinResult;
 
-    /// Self-contained per-item payload for shadow rendering. Хранит только
-    /// render-owned снимки (модель, AABB, хендлы, индекс копии скина):
-    /// живых указателей на Mesh/Skeleton здесь нет.
+    /// Self-contained per-item payload for shadow rendering. Holds only
+    /// render-owned snapshots (model, AABB, handles, skin copy index);
+    /// no live pointers to Mesh/Skeleton exist here.
     ///
     /// Identity (stage-2 increment A, refactor-only): `source_uid` is the
     /// source mesh's `Mesh.uid` (nonzero, stable for lifetime), `source_mesh`
@@ -124,7 +124,7 @@ pub const ShadowPass = struct {
         lod_index_buffer: sg.Buffer = .{},
         lod_index_count: u32 = 0,
         has_shadow_lod: bool = false,
-        /// Индекс копии скин-матриц в PreparedShadowDraws.skins (null = не скин).
+        /// Index of bone matrix copy in PreparedShadowDraws.skins (null if unskinned).
         skin_index: ?u32 = null,
         bucket: Bucket = .regular_u16,
         is_instanced: bool = false,
@@ -329,8 +329,8 @@ pub const ShadowPass = struct {
     /// items (coherent-empty on OOM, never stale ranges).
     pub const PreparedShadowDraws = struct {
         items: std.ArrayListUnmanaged(ShadowDrawItem) = .empty,
-        /// Render-owned копии скин-матриц shadow-draws (резолв по skin_index).
-        /// Сбрасывается в prepareInto, переживает кадры (без per-frame churn).
+        /// Render-owned copies of bone matrices for shadow draws (resolved via skin_index).
+        /// Cleared in prepareInto, retained across frames to avoid churn.
         skins: scene_render_queue.SkinStorage = .empty,
         bin: BinResult = .{
             .counts = [_]usize{0} ** 6,

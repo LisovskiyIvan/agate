@@ -238,7 +238,3 @@ pub const adaptExposure = auto_exposure.adaptExposure;
 
 // HDR regression tests live in `hdr_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("hdr_tests.zig");
-}

@@ -251,7 +251,7 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 
 - `beginPrepare` → `claim == null, busy == false`: свежего build нет — не live-fallback; caller делает reuse/skip. `busy == true` (только exclusion-mode): мьютекс не взялся в бюджет — тот же reuse/skip, но счёт как contention (`begin_busy`), не idle.
 - `produceBuild → false`: все не-front слоты pinned/claimed (consumer lagging) — counted skip, контекст переиспользует front.
-- Каждый успешный begin — ровно один `finish` или `cancel` (иначе клин: следующие begin возвращают null). Finish/cancel — one-shot: контекст — живой зарегистрированный GPU-владелец.
+- Каждый успешный begin — ровно один `finish` или `cancel`. Нарушение пейринга (stale/double/потерянный токен) не клинит конвейер: лог err + защитный release активного claim (кадр теряется, begin-ы продолжаются). Finish/cancel — one-shot: контекст — живой зарегистрированный GPU-владелец.
 - `render` между begin и finish видит `frame_prepared == false` и дропает present — держать пару смежно.
 - Самозахваченный мьютекс (non-recursive): bounded begin сообщает `busy`, не блокируется.
 - Первые кадры: `reuseIfConsumable` → false (нечего переиспользовать), `renderFrame` → `.skipped`, пока первый build не готов.

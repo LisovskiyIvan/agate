@@ -13,6 +13,9 @@ const cull = @import("cull.zig");
 const morphNeedsDepthFallback = cull.morphNeedsDepthFallback;
 const commitPresentedVelocityQueue = cull.commitPresentedVelocityQueue;
 const resetPresentedVelocity = cull.resetPresentedVelocity;
+const worldMatrixCached = cull.worldMatrixCached;
+const worldAABBCached = cull.worldAABBCached;
+const resolveMeshByUid = cull.resolveMeshByUid;
 
 test "morphNeedsDepthFallback gates on enabled flag and nonzero weights" {
     const morph_gpu_mod = @import("../../mesh/morph_gpu.zig");
@@ -217,4 +220,103 @@ pub fn checkUidResolve(resolve: anytype) !void {
     try std.testing.expect(resolve(&meshes, 99, ub) == &mb);
     try std.testing.expect(resolve(&meshes, 1, 0) == &mb);
     try std.testing.expect(resolve(&meshes, 99, 0) == null);
+}
+
+test "worldMatrixCached caches per frame and resolves parents" {
+    var parent: Mesh = undefined;
+    var child: Mesh = undefined;
+
+    // TRS inputs must be fully defined: undefined garbage would poison the
+    // composed matrix (the fields have no defaults on a raw Mesh).
+    parent.position = Vec3.new(1.0, 0.0, 0.0);
+    parent.rotation = Vec3.zero;
+    parent.scaling = Vec3.new(1.0, 1.0, 1.0);
+    parent.base_matrix = Mat4.identity;
+    parent.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    parent.parent = null;
+    parent.attach_bone = null;
+    parent.cached_frame = 0;
+    child.position = Vec3.new(0.0, 1.0, 0.0);
+    child.rotation = Vec3.zero;
+    child.scaling = Vec3.new(1.0, 1.0, 1.0);
+    child.base_matrix = Mat4.identity;
+    child.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    child.parent = &parent;
+    child.attach_bone = null;
+    child.cached_frame = 0;
+
+    const world = worldMatrixCached(7, &child);
+    // Child = parent TRS composed with local TRS: translation (1, 1, 0).
+    try std.testing.expectEqual(@as(f32, 1.0), world.m[12]);
+    try std.testing.expectEqual(@as(f32, 1.0), world.m[13]);
+    try std.testing.expectEqual(@as(f32, 0.0), world.m[14]);
+    // Both nodes are tagged with the frame id now.
+    try std.testing.expectEqual(@as(u64, 7), child.cached_frame);
+    try std.testing.expectEqual(@as(u64, 7), parent.cached_frame);
+
+    // Same frame: cache hit returns the stored matrix without recomputing.
+    const cached = worldMatrixCached(7, &child);
+    try std.testing.expectEqual(world, cached);
+
+    // worldAABBCached derives the world-space AABB from the same cache.
+    const aabb = worldAABBCached(7, &child);
+    try std.testing.expect(aabb.isValid());
+}
+
+test "worldMatrixCached honors bone attachment like getWorldMatrix" {
+    const ally = std.testing.allocator;
+
+    // Host: identity TRS with a one-bone skeleton whose bone sits at (2,0,0).
+    var host: Mesh = undefined;
+    host.position = Vec3.zero;
+    host.rotation = Vec3.zero;
+    host.scaling = Vec3.new(1.0, 1.0, 1.0);
+    host.base_matrix = Mat4.identity;
+    host.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    host.parent = null;
+    host.cached_frame = 0;
+    host.attach_bone = null;
+    host.skeleton = null;
+
+    const skel = try Skeleton.init(ally, 1);
+    defer skel.deinit();
+    skel.bones[0].model_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    skel.bones[0].model_matrix.m[12] = 2.0; // bone at x=2
+    host.skeleton = skel;
+
+    // Attached mesh: offset (0,1,0) on the bone, local TRS at (0,0,3).
+    var attached: Mesh = undefined;
+    attached.position = Vec3.new(0.0, 0.0, 3.0);
+    attached.rotation = Vec3.zero;
+    attached.scaling = Vec3.new(1.0, 1.0, 1.0);
+    attached.base_matrix = Mat4.identity;
+    attached.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
+    attached.parent = null;
+    attached.cached_frame = 0;
+    attached.skeleton = null;
+    attached.attach_bone = .{ .host_mesh = &host, .bone_index = 0, .offset_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0)) };
+    attached.attach_bone.?.offset_matrix.m[13] = 1.0;
+
+    const cached = worldMatrixCached(5, &attached);
+    const direct = attached.getWorldMatrix();
+    // The cache must agree with the uncached bone-aware path everywhere:
+    // bone (x=2) + offset (y=1) + local (z=3).
+    try std.testing.expectEqual(direct, cached);
+    try std.testing.expectEqual(@as(f32, 2.0), cached.m[12]);
+    try std.testing.expectEqual(@as(f32, 1.0), cached.m[13]);
+    try std.testing.expectEqual(@as(f32, 3.0), cached.m[14]);
+    try std.testing.expectEqual(@as(u64, 5), attached.cached_frame);
+
+    // Dead-skeleton host: falls through to the plain parent-less matrix.
+    // Per getWorldMatrix semantics the offset applies only on the bone
+    // path, so the fallback is the bare local TRS (z=3).
+    host.skeleton = null;
+    const fallback = worldMatrixCached(6, &attached);
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[12]);
+    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[13]);
+    try std.testing.expectEqual(@as(f32, 3.0), fallback.m[14]);
+}
+
+test "uid resolve prefers the hint, scans on shuffle, skips unknown" {
+    try checkUidResolve(resolveMeshByUid);
 }

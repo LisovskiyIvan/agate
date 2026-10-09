@@ -32,7 +32,3 @@ pub fn dofTapOffset(index: u32, taps: u32, radius_px: f32) [2]f32 {
 
 // DoF regression tests live in `dof_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("dof_tests.zig");
-}

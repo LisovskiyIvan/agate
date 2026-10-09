@@ -11,34 +11,15 @@
 // ownership below), shadow/main/post_ms are timed inside Scene.render. All
 // default to zero, so `SceneStats{}` and `self.stats = .{}` stay valid resets.
 //
-// Владение при actual update||render (update CAN overlap render; prepare and
-// render stay SEQUENTIAL on the context thread, next prepare NEVER runs
-// concurrently with render):
-// - update_ms пишет ТОЛЬКО context-поток: staged begin переносит в stats
-//   последний тик pending_update_ms, который игровой поток сложил через
-//   Scene.recordUpdateTime (фазовый мьютекс update-vs-prepare; это staged
-//   f32, НЕ stats). Прямая запись scene.stats.update_ms с игрового потока
-//   ЗАПРЕЩЕНА: stats читает render (Profiler.recordFrame в конце
-//   Scene.render) конкурентно с update — поле обязано быть context-owned.
-//   staged begin сбрасывает stats, сохраняя перенесённый update_ms и
-//   app-записанный prepare_ms (handoff через pending/keep).
-// - prepare_ms пишет app на context-потоке (frame() вокруг staged begin —
-//   тот же поток, что render); uploaded_*, shadow/main/post_ms и все
-//   счётчики пишет context-поток (staged begin/render); updated_bytes_frame
-//   идёт через атомарный gpu_upload_meter (воркеры стейджинга пишут record(),
-//   render забирает takeAndReset()). UI-байты с P6 записываются в staged begin
-//   (capture-upload в staged prepare), а не в render — сумма за кадр та же,
-//   меняется только prepare-vs-render атрибуция.
-// - Profiler целиком render-owned: recordFrame вызывается только в конце
-//   render, start/stop/reset/saveReports — с context-потока между
-//   submissions (окно/тулы; F8-колбэк того же потока, конкурентного render
-//   там нет), captureMemorySnapshot — с context-потока под фазовым мьютексом
-//   (читает живые регистры, update исключён). Воркеры/игровой поток к
-//   Profiler не прикасаются никогда.
-// Поля остаются обычными (не атомарными): синхронизация фазовая
-// (phase_mutex update-vs-prepare + границы prepare/render), а не поточечная;
-// update_ms/статистика и pending тик — РАЗНЫЕ поля, поэтому update||render
-// не делят ни одного слова памяти.
+// Ownership during concurrent update and render:
+// - update_ms is written ONLY by the GPU context thread: staged begin transfers
+//   the latest pending_update_ms tick recorded from the update thread. Direct
+//   writes to scene.stats.update_ms from the update thread are prohibited.
+// - prepare_ms is written by the app on the context thread; uploaded_*,
+//   shadow/main/post_ms and all counters are written by the context thread.
+//   updated_bytes_frame tracks dynamic buffer updates via gpu_upload_meter.
+// - Profiler is entirely context/render-owned.
+// Fields use phase-based synchronization and do not require atomic overhead.
 //
 // Stage 1 producer build (`Scene.buildPreparedFrame`, game/update side)
 // intentionally writes NO stats here — not even counters: stats stay
@@ -74,18 +55,17 @@ pub const SceneStats = struct {
     post_draw_calls: u32 = 0,
     triangles: u32 = 0,
     pipeline_switches: u32 = 0,
+    /// Render items/batches/upload packets dropped by the queue build or the
+    /// staged upload flush because an allocation failed (fail-closed OOM:
+    /// the item vanishes coherently, never half-appended). Merged from the
+    /// game-side `build_stats` like the mesh counters above, so a frame that
+    /// silently lost draws is diagnosable instead of invisible.
+    build_oom_drops: u32 = 0,
     /// Textures uploaded by the staged begin's bounded drain this frame.
     uploaded_textures_frame: u32 = 0,
-    /// GPU bytes uploaded this frame: ТОЛЬКО текстуры из UploadQueue
-    /// (drainCountedBudget, бюджет upload_byte_budget_per_frame = 8 MiB).
-    /// Динамические обновления буферов через sg.updateBuffer/appendBuffer
-    /// (инстансы, морфы, частицы, трейлы, UI, debug-линии) учитываются
-    /// отдельно в updated_bytes_frame и на троттлинг не влияют.
+    /// GPU bytes uploaded this frame from UploadQueue textures (subject to 8 MiB budget).
     uploaded_bytes_frame: u64 = 0,
-    /// Байты динамических обновлений GPU-буферов за кадр (uncounted-budget):
-    /// сумма диапазонов всех фактических sg.updateBuffer/appendBuffer,
-    /// накопленная через gpu_upload_meter (сброс в staged begin, перенос
-    /// в render перед Profiler.recordFrame).
+    /// Bytes of dynamic GPU buffer updates this frame (instances, morphs, particles, UI).
     updated_bytes_frame: u64 = 0,
     /// Wall-clock phase timings in milliseconds (see header for writers).
     update_ms: f32 = 0,
@@ -141,6 +121,9 @@ pub const SceneStats = struct {
     ///   that assignment — with `self` starting from the latch reset the two
     ///   forms coincide for one build, and `=` keeps multi-view overwrite
     ///   semantics instead of summing).
+    /// - build_oom_drops: `+=` (items/batches/packets dropped on allocation
+    ///   failure by the build and the staged upload flush; fail-closed
+    ///   drops stay observable).
     /// Timing/upload/size fields (update_ms/prepare_ms/shadow_ms/main_ms/
     /// post_ms, gpu_frame_ms/gpu_shadow_ms/gpu_main_ms/gpu_post_ms plus
     /// gpu_frame_submit/gpu_shadow_submit/gpu_main_submit/gpu_post_submit
@@ -155,69 +138,6 @@ pub const SceneStats = struct {
         self.occluded_meshes += other.occluded_meshes;
         self.occluders_count = other.occluders_count;
         self.occluder_triangles = other.occluder_triangles;
+        self.build_oom_drops += other.build_oom_drops;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-test "SceneStats mergeFrom never touches context-owned GPU metadata" {
-    // Game-side build stats must not observe or disturb the render-owned
-    // GPU samples: durations, submission ids, and scope stay intact.
-    var latch: SceneStats = .{
-        .gpu_frame_ms = 2.5,
-        .gpu_frame_submit = 11,
-        .gpu_frame_scope = .command_buffer,
-        .gpu_shadow_ms = 0.5,
-        .gpu_shadow_submit = 11,
-        .gpu_main_ms = 1.5,
-        .gpu_main_submit = 12,
-        .gpu_post_ms = 0,
-        .gpu_post_submit = 13, // valid quantized zero: present, zero
-        .total_meshes = 4,
-    };
-    const build_side: SceneStats = .{
-        .total_meshes = 10,
-        .rendered_meshes = 6,
-        .culled_meshes = 2,
-        .occluded_meshes = 1,
-        .occluders_count = 3,
-        .occluder_triangles = 99,
-        // A hostile/stale game build carrying GPU-looking values must not
-        // leak them into the latch.
-        .gpu_frame_ms = 99.0,
-        .gpu_frame_submit = 99,
-        .gpu_frame_scope = .pass_sum,
-        .gpu_shadow_ms = 99.0,
-        .gpu_shadow_submit = 99,
-        .gpu_main_ms = 99.0,
-        .gpu_main_submit = 99,
-        .gpu_post_ms = 99.0,
-        .gpu_post_submit = 99,
-        .shadow_ms = 99.0,
-        .update_ms = 99.0,
-    };
-    latch.mergeFrom(&build_side);
-    try std.testing.expectEqual(@as(u32, 14), latch.total_meshes);
-    try std.testing.expectEqual(@as(f32, 2.5), latch.gpu_frame_ms);
-    try std.testing.expectEqual(@as(u32, 11), latch.gpu_frame_submit);
-    try std.testing.expectEqual(gpu_timing.FrameScope.command_buffer, latch.gpu_frame_scope);
-    try std.testing.expectEqual(@as(f32, 0.5), latch.gpu_shadow_ms);
-    try std.testing.expectEqual(@as(u32, 11), latch.gpu_shadow_submit);
-    try std.testing.expectEqual(@as(f32, 1.5), latch.gpu_main_ms);
-    try std.testing.expectEqual(@as(u32, 12), latch.gpu_main_submit);
-    try std.testing.expectEqual(@as(f32, 0), latch.gpu_post_ms);
-    try std.testing.expectEqual(@as(u32, 13), latch.gpu_post_submit);
-    try std.testing.expectEqual(@as(f32, 0), latch.shadow_ms);
-    try std.testing.expectEqual(@as(f32, 0), latch.update_ms);
-}
-
-test "SceneStats default reset carries no GPU sample" {
-    const empty: SceneStats = .{};
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_frame_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_shadow_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_main_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_post_submit);
-    try std.testing.expectEqual(gpu_timing.FrameScope.none, empty.gpu_frame_scope);
-}

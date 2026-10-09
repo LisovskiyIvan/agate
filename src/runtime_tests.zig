@@ -65,6 +65,46 @@ test "runtime: produceBuild publishes one build; begin/finish consume it" {
     try testing.expect(scene.frame_prepared);
 }
 
+test "runtime: mismatched finish/cancel auto-recovers instead of wedging begins" {
+    // Contract violations (double finish, stale token against an active
+    // claim) must log and release the active claim — never wedge the
+    // pipeline into reuse-forever like the historical assert path did in
+    // ReleaseFast.
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const begun = rt.beginPrepare(&scene);
+    const claim = begun.claim orelse return error.TestUnexpectedResult;
+    rt.finishPrepare(&scene, claim);
+
+    // Double finish: stale claim, no active claim — logged no-op, no crash.
+    rt.finishPrepare(&scene, claim);
+
+    // Mismatched token against an ACTIVE claim: released defensively; the
+    // slot lease is gone and no claim stays active.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const second = rt.beginPrepare(&scene);
+    _ = second.claim orelse return error.TestUnexpectedResult;
+    rt.finishPrepare(&scene, claim); // stale token vs active claim2
+    try testing.expect(!scene.prepare_claim_active);
+
+    // The pipeline stays live: a fresh build is still consumable.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const third = rt.beginPrepare(&scene);
+    const claim3 = third.claim orelse return error.TestUnexpectedResult;
+    rt.finishPrepare(&scene, claim3);
+    try testing.expect(scene.hasConsumableFrame());
+    try testing.expect(scene.frame_prepared);
+}
+
 var begin_window_probe: struct {
     ran: bool = false,
 } = .{};

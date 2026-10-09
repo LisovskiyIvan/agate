@@ -158,9 +158,8 @@ pub fn render(scene: anytype) void {
     // to manufacture a frame when no producer generation is available.
     if (!scene.frame_prepared and !scene.rendering_reuse) return;
     scene.frame_prepared = false;
-    // Конец кадра (P3): epoch, начатый в staged prepare, закрывается на ВСЕХ
-    // выходах render — включая ранний возврат без камеры ниже. Поэтому
-    // epoch — на кадр, а не на камеру/view.
+    // Frame end: epoch begun in staged prepare closes on all render exits
+    // (including early return without camera). Epoch is per-frame.
     defer scene.gpu_retire.complete(scene.retire_epoch);
 
     // P7: consume the published front slot (const payloads only) under a
@@ -178,22 +177,15 @@ pub fn render(scene: anytype) void {
     // pin only extends CPU-slot reuse exclusion, never GPU consumability
     // — see scene/frame_draws.zig).
     const draws = scene.preparedDraws();
-    // Wave 27 slot-owned snapshot: the whole draw below reads the front
+    // Slot-owned snapshot: the whole draw below reads the front
     // slot's staged copy — never the live `frame_snapshot` — so a
     // concurrent game-side mutation cannot tear the in-flight frame.
-    // Staged verbatim at prepare, so sequential usage is bit-identical.
     const snap = &draws.snapshot;
     if (!snap.has_camera) {
-        // Камеры нет — UI/debug-проходов не будет: переносим только
-        // prepare-фазу динамики, чтобы счётчик не утёк в следующий кадр.
+        // No camera — no UI/debug passes: transfer dynamic upload metrics
+        // so the meter resets for the next frame.
         scene.stats.updated_bytes_frame = upload_meter.takeAndReset();
-        // Кадровый command buffer уже мог быть открыт prepare-фазой
-        // (compute-диспетч частиц): commit и здесь — иначе кадр взял
-        // in-flight semaphore и никогда его не вернёт, а sg_shutdown
-        // ждёт SIG_NUM_INFLIGHT_FRAMES сигналов безусловно и виснет
-        // (наблюдалось как редкий зависание на выходе: 1 кадр из ~1245,
-        // waits=commits+1 в инструментированном прогоне). commit с nil
-        // buffer — no-op; headless (sg не поднят) пропускаем целиком.
+        // Commit in-flight command buffer if open (e.g. particle compute dispatch).
         if (sg.isvalid()) sg.commit();
         return;
     }
@@ -568,10 +560,10 @@ pub fn render(scene: anytype) void {
     }
     scene.stats.post_ms = msSince(t_post);
 
-    // Перенос динамики в кадровую метрику: staged begin (flush, стейджинг,
-    // UI/debug upload'ы) уже накоплена в счётчике со staged begin, сюда
-    // добавились только clear-append'ы main-прохода выше. После take
-    // счётчик чист для следующего кадра.
+    // Transfer dynamic upload metrics: staged begin (flush, staging,
+    // UI/debug uploads) accumulated in the meter since staged begin,
+    // joined by clear-append uploads from the main pass above.
+    // Meter resets after take for the next frame.
     scene.stats.updated_bytes_frame += upload_meter.takeAndReset();
 
     if (scene.profiler.isRecording() and !scene.rendering_reuse) {

@@ -8,7 +8,6 @@
 //! `zig build test` (corpus smoke pass) and `zig build test --fuzz[=limit]`
 //! (coverage-guided deep fuzzing) share the same runner. When the toolchain
 //! ships a fixed runner, delete this file and the build.zig wiring.
-
 //! Default test runner for unit tests.
 const builtin = @import("builtin");
 

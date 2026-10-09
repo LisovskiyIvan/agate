@@ -203,107 +203,39 @@ pub fn blendProbeWeights(w0: f32, w1: f32) struct { w0: f32, w1: f32, w_env: f32
     return .{ .w0 = w0, .w1 = w1, .w_env = 1.0 - sum };
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+/// Parallax-corrected reflection vector for interior reflection probes (Lagarde 2012).
+/// Given an uncorrected reflection ray `r` from world position `world_pos` within
+/// a probe with center `probe_pos` and bounding box half-extent `box_extent`,
+/// finds the intersection point with the bounding box and returns the corrected
+/// reflection direction from `probe_pos` toward that point.
+/// Returns `r` unmodified if `box_extent <= 0.001` (infinite/unbounded probe).
+pub fn boxProjectReflection(r: Vec3, world_pos: Vec3, probe_pos: Vec3, box_extent: f32) Vec3 {
+    if (box_extent <= 0.001) return r;
+    const box_min = probe_pos.sub(Vec3.new(box_extent, box_extent, box_extent));
+    const box_max = probe_pos.add(Vec3.new(box_extent, box_extent, box_extent));
 
-test "hammersley generates low discrepancy points in [0, 1)^2" {
-    const n = 64;
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        const pt = hammersley(i, n);
-        try std.testing.expect(pt[0] >= 0.0 and pt[0] < 1.0);
-        try std.testing.expect(pt[1] >= 0.0 and pt[1] < 1.0);
-    }
-}
+    const inv_rx: f32 = if (@abs(r.x) > 1e-6) 1.0 / r.x else (if (r.x >= 0.0) 1e6 else -1e6);
+    const inv_ry: f32 = if (@abs(r.y) > 1e-6) 1.0 / r.y else (if (r.y >= 0.0) 1e6 else -1e6);
+    const inv_rz: f32 = if (@abs(r.z) > 1e-6) 1.0 / r.z else (if (r.z >= 0.0) 1e6 else -1e6);
 
-test "importanceSampleGGX generates normalized vectors in upper hemisphere" {
-    const n = Vec3.new(0, 1, 0);
-    var i: u32 = 0;
-    while (i < 32) : (i += 1) {
-        const xi = hammersley(i, 32);
-        const h = importanceSampleGGX(xi, n, 0.5);
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), h.length(), 0.001);
-        try std.testing.expect(h.dot(n) >= -0.001);
-    }
-}
+    const t_min_x = (box_min.x - world_pos.x) * inv_rx;
+    const t_max_x = (box_max.x - world_pos.x) * inv_rx;
+    const t_far_x = @max(t_min_x, t_max_x);
 
-test "sampleCosineHemisphere generates cosine-distributed directions" {
-    const n = Vec3.new(0, 0, 1);
-    var i: u32 = 0;
-    var avg_z: f32 = 0.0;
-    const count = 128;
-    while (i < count) : (i += 1) {
-        const xi = hammersley(i, count);
-        const l = sampleCosineHemisphere(xi, n);
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), l.length(), 0.001);
-        try std.testing.expect(l.z >= 0.0);
-        avg_z += l.z;
-    }
-    // Theoretical expected value of cos(theta) under cosine distribution is 2/3 ~ 0.667
-    avg_z /= @floatFromInt(count);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.667), avg_z, 0.05);
-}
+    const t_min_y = (box_min.y - world_pos.y) * inv_ry;
+    const t_max_y = (box_max.y - world_pos.y) * inv_ry;
+    const t_far_y = @max(t_min_y, t_max_y);
 
-test "smoothFalloff is continuous, 1 at center, 0 at radius, with zero derivative at bounds" {
-    const r: f32 = 10.0;
-    try std.testing.expectEqual(@as(f32, 1.0), smoothFalloff(0.0, r));
-    try std.testing.expectEqual(@as(f32, 0.0), smoothFalloff(10.0, r));
-    try std.testing.expectEqual(@as(f32, 0.0), smoothFalloff(15.0, r));
+    const t_min_z = (box_min.z - world_pos.z) * inv_rz;
+    const t_max_z = (box_max.z - world_pos.z) * inv_rz;
+    const t_far_z = @max(t_min_z, t_max_z);
 
-    // Midpoint: u = 0.5 -> 1 - (3*0.25 - 2*0.125) = 1 - (0.75 - 0.25) = 0.5
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), smoothFalloff(5.0, r), 0.001);
+    const t = @min(t_far_x, @min(t_far_y, t_far_z));
+    if (t <= 0.0) return r;
 
-    // Monotonicity check
-    var prev = smoothFalloff(0.0, r);
-    var d: f32 = 0.5;
-    while (d <= r) : (d += 0.5) {
-        const cur = smoothFalloff(d, r);
-        try std.testing.expect(cur <= prev);
-        prev = cur;
-    }
-}
-
-test "blendProbeWeights transitions smoothly between probes and environment" {
-    // Isolated probe 0 at center (w0 = 1, w1 = 0)
-    const b0 = blendProbeWeights(1.0, 0.0);
-    try std.testing.expectEqual(@as(f32, 1.0), b0.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b0.w1);
-    try std.testing.expectEqual(@as(f32, 0.0), b0.w_env);
-
-    // Probe 0 fading out near edge (w0 = 0.6, w1 = 0)
-    const b1 = blendProbeWeights(0.6, 0.0);
-    try std.testing.expectEqual(@as(f32, 0.6), b1.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b1.w1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), b1.w_env, 0.001);
-
-    // Overlapping probes (w0 = 0.5, w1 = 0.5)
-    const b2 = blendProbeWeights(0.5, 0.5);
-    try std.testing.expectEqual(@as(f32, 0.5), b2.w0);
-    try std.testing.expectEqual(@as(f32, 0.5), b2.w1);
-    try std.testing.expectEqual(@as(f32, 0.0), b2.w_env);
-
-    // Outside both probes
-    const b3 = blendProbeWeights(0.0, 0.0);
-    try std.testing.expectEqual(@as(f32, 0.0), b3.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b3.w1);
-    try std.testing.expectEqual(@as(f32, 1.0), b3.w_env);
-}
-
-test "white furnace test: uniform environment radiance preserves energy <= 1" {
-    // In a uniform white environment (radiance = 1.0 in all directions):
-    // Diffuse cosine integral over hemisphere = integral(1 * cos(theta) dOmega) = pi
-    // Divided by pi = 1.0
-    const count = 128;
-    var irr_sum: f32 = 0.0;
-    const n = Vec3.new(0, 1, 0);
-    for (0..count) |i| {
-        const xi = hammersley(@intCast(i), count);
-        const l = sampleCosineHemisphere(xi, n);
-        _ = l;
-        // Sample is drawn proportional to cos(theta)/pi, so each sample contributes 1.0 / count
-        irr_sum += 1.0;
-    }
-    const irr = irr_sum / @as(f32, @floatFromInt(count));
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), irr, 0.01);
+    const intersect = world_pos.add(r.scale(t));
+    const diff = intersect.sub(probe_pos);
+    const len = diff.length();
+    if (len <= 1e-6) return r;
+    return diff.scale(1.0 / len);
 }

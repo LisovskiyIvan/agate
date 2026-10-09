@@ -1,62 +1,26 @@
-const std = @import("std");
+//! Frame-level byte meter for dynamic GPU buffer updates.
+//!
+//! Tracks bytes sent via sg.updateBuffer / sg.appendBuffer during a frame.
+//! Uses an atomic counter so worker threads can safely record transfers
+//! during parallel instance staging. Reset once per frame on the context thread.
 
-// Счётчик байтов динамических обновлений GPU-буферов за текущий кадр.
-//
-// Каждый фактический вызов sg.updateBuffer / sg.appendBuffer в движке
-// сопровождается вызовом record() с числом байт переданного диапазона.
-// Метрика uncounted-budget: на троттлинг текстурного стриминга
-// (upload_byte_budget_per_frame = 8 MiB) не влияет, служит только честной
-// диагностике в SceneStats.updated_bytes_frame и профайлере.
-//
-// Потокобезопасность: стейджинг инстансов может выполняться с воркеров
-// пула (scene/instance_staging.zig), поэтому счётчик атомарный.
-// Сброс раз в кадр: staged begin обнуляет счётчик в начале кадра,
-// Scene.render забирает значение в stats.updated_bytes_frame перед
-// Profiler.recordFrame (включая UI/debug-апдейты, идущие уже внутри render).
+const std = @import("std");
 const builtin = @import("builtin");
+
 const MeterInt = if (builtin.cpu.arch.isWasm()) usize else u64;
 var pending_bytes: std.atomic.Value(MeterInt) = std.atomic.Value(MeterInt).init(0);
 
-/// Учитывает очередные `bytes` байт, записанные в GPU-буфер.
-/// Вызывать строго рядом с фактическим sg.updateBuffer/appendBuffer,
-/// внутри того же guard'а (без sokol-контекста эти ветки недостижимы,
-/// счётчик в тестах остаётся нулевым).
+/// Records `bytes` written to a GPU buffer.
 pub fn record(bytes: usize) void {
     _ = pending_bytes.fetchAdd(@as(MeterInt, @intCast(bytes)), .monotonic);
 }
 
-/// Забирает накопленное значение и обнуляет счётчик (раз в кадр).
+/// Takes the accumulated byte count and resets the counter to zero.
 pub fn takeAndReset() u64 {
     return @as(u64, pending_bytes.swap(0, .acq_rel));
 }
 
-/// Текущее значение без сброса (для тестов и отладки).
+/// Reads the current byte count without resetting.
 pub fn peek() u64 {
     return @as(u64, pending_bytes.load(.monotonic));
-}
-
-test "record накапливает, takeAndReset возвращает сумму и обнуляет" {
-    _ = takeAndReset();
-    record(100);
-    record(56);
-    try std.testing.expectEqual(@as(u64, 156), peek());
-    try std.testing.expectEqual(@as(u64, 156), takeAndReset());
-    try std.testing.expectEqual(@as(u64, 0), peek());
-    try std.testing.expectEqual(@as(u64, 0), takeAndReset());
-}
-
-test "параллельные record с воркеров не теряют байты" {
-    _ = takeAndReset();
-    const Worker = struct {
-        fn run(n: usize) void {
-            var i: usize = 0;
-            while (i < n) : (i += 1) record(64);
-        }
-    };
-    const thread_count = 4;
-    const per_thread = 1000;
-    var threads: [thread_count]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{per_thread});
-    for (&threads) |*t| t.join();
-    try std.testing.expectEqual(@as(u64, thread_count * per_thread * 64), takeAndReset());
 }

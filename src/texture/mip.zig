@@ -120,17 +120,3 @@ pub fn pixelFormatBytes(format: sg.PixelFormat) usize {
         else => 4,
     };
 }
-
-test "checkedFaceBytes rejects empty and overflowing sizes" {
-    try std.testing.expectError(error.InvalidDimensions, checkedFaceBytes(0));
-    // 100000^2 overflows u32: old `size * size * 4` wrapped to a small
-    // alloc size; now ImageTooLarge before any allocation or GPU upload.
-    try std.testing.expectError(error.ImageTooLarge, checkedFaceBytes(100000));
-    try std.testing.expectEqual(@as(usize, 2 * 2 * 4), try checkedFaceBytes(2));
-}
-
-test {
-    // sRGB/linear mip-contract suites (decode -> convert -> box filter)
-    // live in a sibling file; this file is the test-root import target.
-    _ = @import("mip_tests.zig");
-}

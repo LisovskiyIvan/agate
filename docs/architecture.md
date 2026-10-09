@@ -1,12 +1,12 @@
 # Архитектура движка Agate
 
-> Путь: src/agate/ (root.zig — фасад) · Импорт: agate.X (root.zig) · Потоки: game producer / context render / audio / io_runner
+> Путь: src/ (root.zig — фасад) · Импорт: agate.X (root.zig) · Потоки: game producer / context render / audio / io_runner
 
 ## Что это
 
-Agate — Babylon.js-style 3D-движок на Zig поверх sokol (`sokol.app` + `sokol.gfx` + `sokol.glue`). `src/agate/root.zig` — фасад библиотеки: всё публичное достижимо через `@import("agate")`, модульные пути (`agate.mesh.Mesh`, `agate.scene.Scene`) остаются для точечного доступа. Соглашения имён: `Type.new(...)`/`Type.init(name, options)` для значений, `create*` для Scene/GPU-владеющих сущностей, `make*` для sokol-обёрток в духе `sg.makePipeline`, `build*Data → GeometryData` для чистой сборки без GPU-эффектов, `*Options` для дефолтных ручек, `*Desc` для регистрационных дескрипторов с обязательными полями, `*Params` для вычисленных покадровых паков.
+Agate — Babylon.js-style 3D-движок на Zig поверх sokol (`sokol.app` + `sokol.gfx` + `sokol.glue`). `src/root.zig` — фасад библиотеки: всё публичное достижимо через `@import("agate")`, модульные пути (`agate.mesh.Mesh`, `agate.scene.Scene`) остаются для точечного доступа. Соглашения имён: `Type.new(...)`/`Type.init(name, options)` для значений, `create*` для Scene/GPU-владеющих сущностей, `make*` для sokol-обёрток в духе `sg.makePipeline`, `build*Data → GeometryData` для чистой сборки без GPU-эффектов, `*Options` для дефолтных ручек, `*Desc` для регистрационных дескрипторов с обязательными полями, `*Params` для вычисленных покадровых паков.
 
-`scene.zig` — оркестратор, разбитый на владельца (`scene/core.zig`, тип `Scene`) и листья `scene/` (free-функции + форвардеры; листья берут сцену как `anytype` и никогда не импортируют фасад назад — то же правило, что в `audio/*` и `profiler/*`). Демо — `src/main.zig` (бинарник `agate`), шейдеры компилируются в build-time через sokol-shdc.
+`scene.zig` — оркестратор, разбитый на владельца (`scene/core.zig`, тип `Scene`) и листья `scene/` (free-функции + форвардеры; листья берут сцену как `anytype` и никогда не импортируют фасад назад — то же правило, что в `audio/*` и `profiler/*`). Живые примеры-приложения — `examples/` (RTT/gpu-timing/HDR, включая веб-варианты) и интерактивный sandbox в отдельном репозитории `../sandbox`; шейдеры компилируются в build-time через sokol-shdc.
 
 ## Быстрый старт
 
@@ -19,8 +19,7 @@ scene.initInto(gpa.allocator());
 defer scene.deinit();
 
 // Слои снизу вверх: math → mesh/material → scene → runtime.
-var cam = agate.ArcRotateCamera.new(...);
-try scene.addCamera(.{ .name = "main", .camera = .{ .arc_rotate = cam } });
+scene.active_camera = .{ .arc_rotate = agate.ArcRotateCamera.init("cam", .{}) };
 const mat = try scene.createPBRMaterial("wall");
 const box = try agate.MeshBuilder.createBox(&scene, "box", .{});
 box.material = .{ .pbr = mat };
@@ -32,7 +31,7 @@ defer runtime.deinit();
 // context: switch (runtime.renderFrame(&scene)) { .prepared, .reused, .skipped, .busy }
 ```
 
-Импорт всегда `const agate = @import("agate");` (модуль `agate` собирается в `build.zig` из `src/agate/root.zig` + сгенерированных шейдер-модулей + `math` + `shader_material_registry`).
+Импорт всегда `const agate = @import("agate");` (модуль `agate` собирается в `build.zig` из `src/root.zig` + сгенерированных шейдер-модулей + `math` + `shader_material_registry`).
 
 ## API
 
@@ -73,39 +72,38 @@ defer runtime.deinit();
 
 ### Сборка и инструменты (build.zig)
 
-- Модуль `agate`: `root.zig` + N сгенерированных шейдер-модулей (`standard`, `pbr`, `skinned_pbr`, `instanced`, `instanced_pbr`, `shadow`, `msaa_depth`, `skybox`, `postprocess`, `particle`, `particle_compute`, `ui`, `ssao`, `ssao_blur`, `debug`, `bloom_down/up`, `glow_extract/blur`, `volumetric_raymarch/blur`, `outline`, `probe_mip`, `ui3d_panel`) + `math` + `shader_material_registry`. Slang по умолчанию `glsl410/metal_macos/hlsl5`; forward-шейдеры со storage-блоками и compute — `glsl430/...`; `// @include` раскрываются хост-препроходом `expand_shader_includes`.
-- Shader-material registry: таблица `user_shader_materials` (hook-уровень: имя + snippet + base `standard/pbr`) → merge-tool встраивает сниппет в базовый шаблон по hook-маркерам → shdc (`glsl430/metal_macos/hlsl5`) → генерированный `shader_material_registry` (имя/key-Wyhash/base/UB-индексы/params/`make_shader`). Плюс user-owned путь `compileUserShader` для downstream-проектов без правок движка (тот же sokol-инстанс через `dep_agate`).
+- Модуль `agate`: `root.zig` + N сгенерированных шейдер-модулей (`pbr`, `skinned_pbr`, `instanced_pbr`, `shadow`, `msaa_depth`, `velocity`, `skybox`, `postprocess`, `particle`, `particle_compute`, `ui`, `ssao`, `ssao_blur`, `debug`, `bloom_down/up`, `glow_extract/blur`, `volumetric_raymarch/blur`, `outline`, `probe_mip`, `ui3d_panel`, `depth_pyramid`) + `math` + `shader_material_registry`. Единый slang для всех ног — `engine_shader_slang` (`glsl430` + `hlsl5` + `metal_macos` + `wgsl`; формат floor — Metal/WebGPU/D3D11/GL 4.3, без glsl410/WebGL-фолбэка — SSBO-блокам нужен GLSL 4.30+); `// @include` раскрываются хост-препроходом `expand_shader_includes`.
+- Shader-material registry: таблица `user_shader_materials` (hook-уровень: имя + snippet + base `standard/pbr`) → merge-tool встраивает сниппет в базовый шаблон по hook-маркерам → shdc (тот же `engine_shader_slang`) → генерированный `shader_material_registry` (имя/key-Wyhash/base/UB-индексы/params/`make_shader`). Плюс user-owned путь `compileUserShader` для downstream-проектов без правок движка (тот же sokol-инстанс через `dep_agate`).
 - C/C++: `c_impl.c` (stb, `-DSTBI_NEON` на aarch64), Box3D v0.1.0 (C17), meshoptimizer decoder-subset (C++, без исключений/RTTI), BasisU transcoder + zstd (transcode KTX2 в `ktx2.zig`).
-- Тестовый реестр `src/agate/tests.zig` — GENERATED обходом дерева (`zig build update-tests`, затем `zig build test` с CheckFile-гейтом; обычные сборки реестр не переписывают). Fuzz: вендорный раннер `tools/test_runner.zig`, `zig build test --fuzz[=limit]`; C-флаги гасят sancov-инструментацию (`no_sancov`).
-- Демо-бинарник `agate` (`src/main.zig`, `zig build run`): threaded game/context, CLI `--frames/--particles/--msaa/--stats`; headless-smoke `agate --frames 120 --msaa 4` без sokol validation errors.
+- Тестовый реестр `src/tests.zig` — GENERATED обходом дерева (`zig build update-tests`, затем `zig build test` с CheckFile-гейтом; обычные сборки реестр не переписывают). Fuzz: вендорный раннер `tools/test_runner.zig`, `zig build test --fuzz[=limit]`; C-флаги гасят sancov-инструментацию (`no_sancov`).
+- Примеры `examples/` (`zig build run-rtt / run-gpu-timing / run-hdr / run-runtime-worker`, нужны GPU/дисплей): RTT+refraction smoke, GPU timing/lifecycle gate, HDR-showcase и threaded staged-фрейм (`Runtime.spawnWorker` — lock-free producer на игровом потоке; wasm/single-thread деградирует в inline serial). У gpu-timing и hdr есть веб-варианты (`*_web.zig`). Интерактивное демо всего движка — отдельный репозиторий `../sandbox` (зоны, физика, аудио, UI, save/load).
 
 ### Веб-таргет (wasm32-emscripten + WebGPU)
 
-Экспериментальный сборочный таргет (`b54861e`, 30.09.2026): движок, sandbox и бенч собираются под `wasm32-emscripten` и рисуют через WebGPU (бэкенд sokol WGPU). Это инструмент для веб-сравнения с Babylon.js, а не продуктовая веб-платформа.
+Экспериментальный сборочный таргет: движок и примеры собираются под `wasm32-emscripten` и рисуют через WebGPU (бэкенд sokol WGPU). Это инструмент для веб-сравнения с Babylon.js, а не продуктовая веб-платформа.
 
 ```sh
-# sandbox/ — сборка в sandbox/zig-out/web/ (sandbox.html/js/wasm/data)
+# в agate/examples/: gpu-timing и hdr-showcase имеют *_web.zig варианты
 zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast
-zig build -Dtarget=wasm32-emscripten -Dweb-debug   # оставить Debug (иначе Debug флорится в ReleaseFast)
 ```
 
-- `build.zig` (агент): `is_web = target.result.cpu.arch.isWasm()`; `opt_wgpu = -Dwgpu orelse is_web` (строка ~275–276). Зависимость sokol подключается с `.wgpu = is_web` — тот же флаг прокидывается в `compileUserShader` для downstream-шейдеров (`build.zig` ~129–133). Для wasm добавляются system-include-пути emsdk: `upstream/emscripten/cache/sysroot/include`, `.../include/c++/v1` и, при WGPU, `.../cache/ports/emdawnwebgpu/emdawnwebgpu_pkg/webgpu/include` (~425–430); C-флаги Box3D/вендоров зависят от `is_web` (~520). `pub fn getEmsdk(dep_agate)` (~150) отдаёт downstream-сборкам тот же emsdk; при `-Doptimize=Debug` на wasm C-часть собирается `-O2` (нативный Debug оставляет `-O0`).
-- `sandbox/build.zig`: на веб-таргете root-модуль — `src/web_main.zig` вместо `main.zig`, статическая библиотека линкуется через `agate_build.sokol.emLinkStep` (`use_webgpu = true`, `use_webgl2 = false`, `use_emmalloc = true`, `use_filesystem = true`, `shell_file_path = agate_build.sokolShellPath(dep_agate)` (резолвит sokol-пакет через граф зависимостей agate), `--preload-file assets@assets`, `-sSTACK_SIZE=1MB`, `-sINITIAL_MEMORY=128MB`, `-sALLOW_MEMORY_GROWTH=1`); `emRunStep` даёт `zig build run` в браузере. Без `-Dweb-debug` Debug-сборка на wasm флорится в `ReleaseFast` (неоптимизированный был бы с `-O0` + safety-checks + `SAFE_HEAP`, что даёт неприемлемый FPS).
-- Уже работает: WebGPU-бэкенд через sokol WGPU, sandbox и бенч собираются и запускаются в браузере, 32-битная wasm-совместимость.
+- `build.zig`: `is_web = target.result.cpu.arch.isWasm()`; WebGPU форсируется на вебе (`.wgpu = is_web`), опции `-Dwgpu` нет — stray-флаг это unknown-option error, нативный WebGPU не поддерживается (натив — sokol auto backend: macOS Metal, Windows D3D11, Linux GL). Для wasm добавляются system-include-пути emsdk (включая webgpu-порты при WGPU); C-флаги Box3D/вендоров зависят от `is_web`. `pub fn getEmsdk(dep_agate)` отдаёт downstream-сборкам тот же emsdk; при `-Doptimize=Debug` на wasm C-часть собирается `-O2`.
+- Downstream-линковка (как в `../sandbox/build.zig`): статическая библиотека через `agate_build.sokol.emLinkStep` (`use_webgpu = true`, emmalloc, preload-file с ассетами, shell из `agate_build.sokolShellPath(dep_agate)`), `emRunStep` даёт `zig build run` в браузере.
+- Уже работает: WebGPU-бэкенд через sokol WGPU, примеры и sandbox собираются и запускаются в браузере, 32-битная wasm-совместимость.
 - Не входит: JS/TS API, DOM/HTML, npm, WebXR (см. `../roadmap.md`, раздел 🟡/🚫).
 
 ### Тесты и гейты
 
-- `zig build test` — юнит-реестр (все `test`-блоки дерева; math отдельно) + `zig fmt --check` гейт (`zig build fmt`).
-- GPU-гейт `test-gpu` (8 legs — пишут/держат другие агенты, см. `./render-pipeline.md`): headed-прогоны проходов/пайплайнов.
-- Bench: `scene.stats` + `Profiler`/`SessionSummary` + `AGATE_GPU_TIMINGS=1` для GPU-чисел; `--stats` каждые 120 кадров в демо.
+- `zig build test` — юнит-реестр (все `test`-блоки дерева; math отдельно) + `zig fmt --check` гейт (`zig build fmt`). Гейт зелёный = exit 0; строка `failed command` в логе раннера — предсуществующий шум harness (см. `../MEASUREMENTS.md`).
+- Headless-прогон без GPU/окна: `agate.App.runHeadless` (юнит-тесты движка уже идут headless: `sg.isvalid()` early-out в проходах).
+- Headed GPU-smoke: `examples/` — `run-rtt` (render target + refraction), `run-gpu-timing` (timing/lifecycle gate из `../MEASUREMENTS.md`), `run-hdr` (HDR-студия). Perf-гейты (bench-threads CPU + gpu-timing GPU, правило «только back-to-back внутри сессии») — в sandbox, см. `../MEASUREMENTS.md`.
 - Сериализация/экспорт: fuzz-корпуса (`serialization_fuzz.zig`), round-trip тесты.
 
 ### Карта модулей
 
 | Doc | Файлы | Что это |
 |---|---|---|
-| `./architecture.md` | `root.zig`, `build.zig`, `src/main.zig` | Эта карта: слои, потоки, владение, сборка, гейты |
+| `./architecture.md` | `root.zig`, `build.zig`, `examples/` | Эта карта: слои, потоки, владение, сборка, гейты |
 | `./runtime.md` | `runtime.zig`, `handoff.zig`, `gpu_thread.zig`, `jobs.zig`, `observable.zig`, `gpu_timing.zig`, `gpu_upload_meter.zig` | Жизненный цикл кадра, mailbox newest-wins, affinity-маркер, job pool, события, GPU-тайминги |
 | `./scene.md` | `scene.zig`, `scene/lifecycle.zig`, `content.zig`, `registry.zig`, `stats.zig`, `sim_api.zig`, `query_api.zig`, `lights_api.zig`, `profile_api.zig`, `snapshot.zig`, `cameras.zig`, `attachments.zig` | Реестры контента, update-проходы, pick/query, API-фасады |
 | `./frame-pipeline.md` | `scene/frame_api.zig`, `frame_build.zig`, `frame_prepare.zig`, `frame_render.zig`, `frame_draws.zig`, `upload_packets.zig`, `instance_staging.zig`, `gpu_retire.zig` | Слоты, freeze→commit, host_bytes, staged prepare, retire-эпохи |
@@ -142,7 +140,7 @@ zig build -Dtarget=wasm32-emscripten -Dweb-debug   # оставить Debug (и�
 - Нарушение контракта потоков (game пишет `stats`, воркер зовёт `sg.*`, registry-mutate поперёк latch) — баг приложения; tripwire'ы (`assertOnContextThread`, commit guards) делают его громким, а не тихим.
 - Два продюсера, вложенный `parallelFor`, `sg.*` в job — запрещены контрактом (см. `./runtime.md`).
 - Headless (нет `sg.setup`): все GPU-пути fail-closed (тайминги 0, аплоады CPU-only + deferred, render early-out после эпохи).
-- OOM в реестрах/слотах — fail-closed (null/skip/drain, счётчики дропов), не паника, кроме debug-ассертов на двойные терминалы claim.
+- OOM в реестрах/слотах — fail-closed (null/skip/drain, счётчики дропов: `SceneStats.build_oom_drops` для очередей/аплоадов), не паника. Нарушение пейринга claim-токенов (stale/double finish) — warn-лог + защитный release активного claim: кадр теряется, конвейер не клинится.
 
 ## Производительность
 

@@ -423,9 +423,8 @@ test "upload packets: duplicate compute creation retires the loser, winner insta
     var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
     var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
-    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
-    // проверенные ниже записи сбрасываются вручную без уничтожения —
-    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    // Teardown for fake-id outcomes (no GPU resource behind handles):
+    // entries verified below are cleared manually without calling sg.destroy*.
     defer {
         retire.pending.clearRetainingCapacity();
         @memset(&retire.overflow, null);
@@ -532,9 +531,8 @@ test "upload packets: stale compute views lose with their buffers, never dangle"
     var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
     var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
-    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
-    // проверенные ниже записи сбрасываются вручную без уничтожения —
-    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    // Teardown for fake-id outcomes (no GPU resource behind handles):
+    // entries verified below are cleared manually without calling sg.destroy*.
     defer {
         retire.pending.clearRetainingCapacity();
         @memset(&retire.overflow, null);
@@ -616,9 +614,8 @@ test "upload packets: owner-gone compute outcome retires whole, live stands" {
     var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
     var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
-    // Teardown для fake-id исходов (за хендлами нет GPU-ресурса):
-    // проверенные ниже записи сбрасываются вручную без уничтожения —
-    // flush/deinit прогнали бы fake id через sg.destroy* без контекста.
+    // Teardown for fake-id outcomes (no GPU resource behind handles):
+    // entries verified below are cleared manually without calling sg.destroy*.
     defer {
         retire.pending.clearRetainingCapacity();
         @memset(&retire.overflow, null);

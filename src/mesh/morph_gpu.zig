@@ -242,9 +242,3 @@ fn destroyDeltaResources(mesh: *Mesh) void {
     mesh.morph_tex_width = 0;
     mesh.morph_tex_height = 0;
 }
-
-test "supported reports false without an sg context" {
-    // Headless unit-test environment has no sokol context: the capability
-    // gate must fail closed (never claim RGBA32F support it cannot verify).
-    try std.testing.expect(!supported());
-}

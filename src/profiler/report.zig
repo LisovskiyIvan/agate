@@ -251,8 +251,8 @@ pub fn generateReportHtml(
     // Header metadata: wall-clock pacing is primary; CPU-submit sum is separate.
     const total_sec = summary.total_time_ms / 1000.0;
     const meta_str = try std.fmt.allocPrint(allocator,
-        \\<div style="font-size: 14px; font-weight: 700; color: #fff;">{d} Кадров ({d:.2} с CPU-submit)</div>
-        \\<div class="meta-sub">Avg {d:.1} FPS (wall) | P99 интервала: {d:.1} мс | CPU-submit avg: {d:.2} мс</div>
+        \\<div style="font-size: 14px; font-weight: 700; color: #fff;">{d} Frames ({d:.2} s CPU submit)</div>
+        \\<div class="meta-sub">Avg {d:.1} FPS (wall) | P99 interval: {d:.1} ms | CPU-submit avg: {d:.2} ms</div>
         \\</div></header>
     , .{ summary.frame_count, total_sec, summary.observed_avg_fps, summary.p99_interval_ms, summary.avg_frame_ms });
     defer allocator.free(meta_str);
@@ -274,7 +274,7 @@ pub fn generateReportHtml(
         \\    <div class="kpi-sub">Avg interval: {d:.2} ms | CPU-submit avg: {d:.2} ms</div>
         \\  </div>
         \\  <div class="kpi-card">
-        \\    <div class="kpi-label">1% Low FPS (wall)</div>
+        \\    <div class="kpi-label">1% Low FPS (wall clock)</div>
         \\    <div class="kpi-val" style="color: {s};">{d:.1}</div>
         \\    <div class="kpi-sub">0.1% low (wall): {d:.1} FPS</div>
         \\  </div>
@@ -347,11 +347,11 @@ pub fn generateReportHtml(
         try buf.appendSlice(allocator, gpu_html);
     }
 
-    // Section: "Что не так / Автоматическая диагностика"
+    // Section: Bottleneck diagnostics
     try buf.appendSlice(allocator,
         \\<div class="section-title">
         \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#eab308" stroke-width="2"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
-        \\  Что не так / Автоматическая диагностика
+        \\  Bottleneck Diagnostics
         \\</div>
         \\<div class="diag-list">
     );
@@ -364,10 +364,10 @@ pub fn generateReportHtml(
             .critical => "critical",
         };
         const sev_label = switch (finding.severity) {
-            .good => "НОРМА",
-            .info => "ИНФО",
-            .warning => "ВНИМАНИЕ",
-            .critical => "КРИТИЧНО",
+            .good => "OK",
+            .info => "INFO",
+            .warning => "WARNING",
+            .critical => "CRITICAL",
         };
         const f_html = try std.fmt.allocPrint(allocator,
             \\  <div class="diag-card {s}">
@@ -376,7 +376,7 @@ pub fn generateReportHtml(
             \\      <span class="diag-title">{s}</span>
             \\    </div>
             \\    <div class="diag-desc">{s}</div>
-            \\    <div class="diag-rec"><strong>Рекомендация:</strong> {s}</div>
+            \\    <div class="diag-rec"><strong>Recommendation:</strong> {s}</div>
             \\  </div>
         , .{ sev_class, sev_class, sev_label, finding.title, finding.details, finding.recommendation });
         defer allocator.free(f_html);
@@ -388,7 +388,7 @@ pub fn generateReportHtml(
     try buf.appendSlice(allocator,
         \\<div class="section-title">
         \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        \\  График времени кадров по фазам (Stacked Frame Timeline)
+        \\  Stacked Frame Timeline
         \\</div>
         \\<div class="chart-box">
         \\  <svg viewBox="0 0 1000 240" class="timeline-svg" preserveAspectRatio="none">
@@ -446,11 +446,11 @@ pub fn generateReportHtml(
             // path stays byte-identical. Per-pass GPU lines append only when
             // per-pass samples are available.
             const tooltip_open = if (has_pass) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, last completed): {d:.2} мс&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                \\<g><title>Frame #{d}: {d:.2} ms CPU-submit (FPS wall: {d:.1}, wall interval: {d:.2} ms)&#10;Update: {d:.2} ms&#10;Physics (Box3D): {d:.2} ms&#10;Prepare: {d:.2} ms&#10;Shadow (CPU submit): {d:.2} ms&#10;Main (CPU submit): {d:.2} ms&#10;Post (CPU submit): {d:.2} ms&#10;GPU (measured, last completed): {d:.2} ms&#10;GPU shadow/main/post (measured): {d:.2} / {d:.2} / {d:.2} ms&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.gpu_shadow_ms, f.gpu_main_ms, f.gpu_post_ms, f.draw_calls, f.triangles }) else if (has_gpu) try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;GPU (measured, last completed): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                \\<g><title>Frame #{d}: {d:.2} ms CPU-submit (FPS wall: {d:.1}, wall interval: {d:.2} ms)&#10;Update: {d:.2} ms&#10;Physics (Box3D): {d:.2} ms&#10;Prepare: {d:.2} ms&#10;Shadow (CPU submit): {d:.2} ms&#10;Main (CPU submit): {d:.2} ms&#10;Post (CPU submit): {d:.2} ms&#10;GPU (measured, last completed): {d:.2} ms&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.gpu_frame_ms, f.draw_calls, f.triangles }) else try std.fmt.allocPrint(allocator,
-                \\<g><title>Кадр #{d}: {d:.2} мс CPU-submit (FPS wall: {d:.1}, интервал wall: {d:.2} мс)&#10;Update: {d:.2} мс&#10;Physics (Box3D): {d:.2} мс&#10;Prepare: {d:.2} мс&#10;Shadow (CPU submit): {d:.2} мс&#10;Main (CPU submit): {d:.2} мс&#10;Post (CPU submit): {d:.2} мс&#10;Draw calls: {d} | Tris: {d}</title>
+                \\<g><title>Frame #{d}: {d:.2} ms CPU-submit (FPS wall: {d:.1}, wall interval: {d:.2} ms)&#10;Update: {d:.2} ms&#10;Physics (Box3D): {d:.2} ms&#10;Prepare: {d:.2} ms&#10;Shadow (CPU submit): {d:.2} ms&#10;Main (CPU submit): {d:.2} ms&#10;Post (CPU submit): {d:.2} ms&#10;Draw calls: {d} | Tris: {d}</title>
             , .{ f.frame_index, f.total_frame_ms, f.fps, f.frame_interval_ms, f.update_ms, f.physics_ms, f.prepare_ms, f.shadow_ms, f.main_ms, f.post_ms, f.draw_calls, f.triangles });
             defer allocator.free(tooltip_open);
             try buf.appendSlice(allocator, tooltip_open);
@@ -527,23 +527,23 @@ pub fn generateReportHtml(
         try buf.appendSlice(allocator,
             \\<div class="section-title">
             \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\  Spike Frames (CPU-submit time)
             \\</div>
             \\<div class="card-table">
             \\<table>
             \\  <thead>
             \\    <tr>
-            \\      <th>Ранг</th>
-            \\      <th>Кадр #</th>
-            \\      <th class="num">Время CPU-submit</th>
+            \\      <th>Rank</th>
+            \\      <th>Frame #</th>
+            \\      <th class="num">CPU Submit Time</th>
             \\      <th class="num">GPU (measured)</th>
             \\      <th class="num">FPS (wall)</th>
-            \\      <th>Главная причина (CPU-фаза)</th>
+            \\      <th>Dominant Phase (CPU)</th>
             \\      <th class="num">Draw Calls</th>
-            \\      <th class="num">Треугольники</th>
+            \\      <th class="num">Triangles</th>
             \\      <th class="num">Pipeline Switches</th>
-            \\      <th class="num">Текстуры (КБ)</th>
-            \\      <th class="num">Динамика (КБ)</th>
+            \\      <th class="num">Textures (KB)</th>
+            \\      <th class="num">Dynamic (KB)</th>
             \\    </tr>
             \\  </thead>
             \\  <tbody>
@@ -552,22 +552,22 @@ pub fn generateReportHtml(
         try buf.appendSlice(allocator,
             \\<div class="section-title">
             \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            \\  Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\  Spike Frames (CPU-submit time)
             \\</div>
             \\<div class="card-table">
             \\<table>
             \\  <thead>
             \\    <tr>
-            \\      <th>Ранг</th>
-            \\      <th>Кадр #</th>
-            \\      <th class="num">Время CPU-submit</th>
+            \\      <th>Rank</th>
+            \\      <th>Frame #</th>
+            \\      <th class="num">CPU Submit Time</th>
             \\      <th class="num">FPS (wall)</th>
-            \\      <th>Главная причина (CPU-фаза)</th>
+            \\      <th>Dominant Phase (CPU)</th>
             \\      <th class="num">Draw Calls</th>
-            \\      <th class="num">Треугольники</th>
+            \\      <th class="num">Triangles</th>
             \\      <th class="num">Pipeline Switches</th>
-            \\      <th class="num">Текстуры (КБ)</th>
-            \\      <th class="num">Динамика (КБ)</th>
+            \\      <th class="num">Textures (KB)</th>
+            \\      <th class="num">Dynamic (KB)</th>
             \\    </tr>
             \\  </thead>
             \\  <tbody>
@@ -593,11 +593,11 @@ pub fn generateReportHtml(
             const row = if (has_gpu) try std.fmt.allocPrint(allocator,
                 \\    <tr>
                 \\      <td><strong>#{d}</strong></td>
-                \\      <td>Кадр {d}</td>
-                \\      <td class="num"><span style="color: {s}; font-weight: 700;">{d:.2} мс</span></td>
-                \\      <td class="num">{d:.2} мс</td>
+                \\      <td>Frame #{d}</td>
+                \\      <td class="num"><span style="color: {s}; font-weight: 700;">{d:.2} ms</span></td>
+                \\      <td class="num">{d:.2} ms</td>
                 \\      <td class="num">{d:.1}</td>
-                \\      <td><span style="color: #fff; font-weight: 600;">{s}</span> <span style="color: var(--text-muted);">({d:.1} мс, {d:.0}%)</span></td>
+                \\      <td><span style="color: #fff; font-weight: 600;">{s}</span> <span style="color: var(--text-muted);">({d:.1} ms, {d:.0}%)</span></td>
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
@@ -622,10 +622,10 @@ pub fn generateReportHtml(
             }) else try std.fmt.allocPrint(allocator,
                 \\    <tr>
                 \\      <td><strong>#{d}</strong></td>
-                \\      <td>Кадр {d}</td>
-                \\      <td class="num"><span style="color: {s}; font-weight: 700;">{d:.2} мс</span></td>
+                \\      <td>Frame #{d}</td>
+                \\      <td class="num"><span style="color: {s}; font-weight: 700;">{d:.2} ms</span></td>
                 \\      <td class="num">{d:.1}</td>
-                \\      <td><span style="color: #fff; font-weight: 600;">{s}</span> <span style="color: var(--text-muted);">({d:.1} мс, {d:.0}%)</span></td>
+                \\      <td><span style="color: #fff; font-weight: 600;">{s}</span> <span style="color: var(--text-muted);">({d:.1} ms, {d:.0}%)</span></td>
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
                 \\      <td class="num">{d}</td>
@@ -658,7 +658,7 @@ pub fn generateReportHtml(
         try buf.appendSlice(allocator,
             \\<div class="section-title">
             \\  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-            \\  Распределение видеопамяти (VRAM Breakdown)
+            \\  Video Memory Distribution (VRAM Breakdown)
             \\</div>
         );
 
@@ -677,14 +677,14 @@ pub fn generateReportHtml(
 
         const vram_bar_html = try std.fmt.allocPrint(allocator,
             \\<div class="vram-bar">
-            \\  <div class="vram-seg" style="width: {d:.1}%; background: #38bdf8;" title="Текстуры: {s} ({d:.1}%)"></div>
-            \\  <div class="vram-seg" style="width: {d:.1}%; background: #a855f7;" title="Меши: {s} ({d:.1}%)"></div>
+            \\  <div class="vram-seg" style="width: {d:.1}%; background: #38bdf8;" title="Textures: {s} ({d:.1}%)"></div>
+            \\  <div class="vram-seg" style="width: {d:.1}%; background: #a855f7;" title="Meshes: {s} ({d:.1}%)"></div>
             \\  <div class="vram-seg" style="width: {d:.1}%; background: #f59e0b;" title="Render Targets: {s} ({d:.1}%)"></div>
             \\</div>
             \\<div class="chart-legend" style="margin-bottom: 24px;">
-            \\  <div class="legend-item"><div class="legend-dot" style="background: #38bdf8;"></div>Текстуры: {s} ({d:.1}%)</div>
-            \\  <div class="legend-item"><div class="legend-dot" style="background: #a855f7;"></div>Меши (VBO/IBO): {s} ({d:.1}%)</div>
-            \\  <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div>Буферы кадров (RT): {s} ({d:.1}%)</div>
+            \\  <div class="legend-item"><div class="legend-dot" style="background: #38bdf8;"></div>Textures: {s} ({d:.1}%)</div>
+            \\  <div class="legend-item"><div class="legend-dot" style="background: #a855f7;"></div>Meshes (VBO/IBO): {s} ({d:.1}%)</div>
+            \\  <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div>Render Targets (RT): {s} ({d:.1}%)</div>
             \\</div>
         , .{ tex_pct, tex_vram_str, tex_pct, mesh_pct, mesh_vram_str, mesh_pct, rt_pct, rt_vram_str, rt_pct, tex_vram_str, tex_pct, mesh_vram_str, mesh_pct, rt_vram_str, rt_pct });
         defer allocator.free(vram_bar_html);
@@ -692,16 +692,16 @@ pub fn generateReportHtml(
 
         // Top Textures Table
         try buf.appendSlice(allocator,
-            \\<div class="section-title" style="font-size: 16px;">Текстуры (отсортированы по размеру VRAM)</div>
+            \\<div class="section-title" style="font-size: 16px;">Textures (sorted by VRAM size)</div>
             \\<div class="card-table">
             \\<table>
             \\  <thead>
             \\    <tr>
-            \\      <th>Название / Назначение</th>
-            \\      <th>Разрешение</th>
-            \\      <th>Тип</th>
+            \\      <th>Name / Usage</th>
+            \\      <th>Resolution</th>
+            \\      <th>Type</th>
             \\      <th>Mips</th>
-            \\      <th>Формат</th>
+            \\      <th>Format</th>
             \\      <th class="num">VRAM</th>
             \\    </tr>
             \\  </thead>
@@ -736,17 +736,17 @@ pub fn generateReportHtml(
 
         // Top Meshes Table
         try buf.appendSlice(allocator,
-            \\<div class="section-title" style="font-size: 16px;">Меши (геометрия сцены)</div>
+            \\<div class="section-title" style="font-size: 16px;">Meshes (Scene Geometry)</div>
             \\<div class="card-table">
             \\<table>
             \\  <thead>
             \\    <tr>
-            \\      <th>Имя меша</th>
-            \\      <th class="num">Вершины</th>
-            \\      <th class="num">Индексы</th>
-            \\      <th>Тип индексов</th>
-            \\      <th class="num">VRAM Буферы</th>
-            \\      <th class="num">CPU Память</th>
+            \\      <th>Mesh Name</th>
+            \\      <th class="num">Vertices</th>
+            \\      <th class="num">Indices</th>
+            \\      <th>Index Type</th>
+            \\      <th class="num">VRAM Buffers</th>
+            \\      <th class="num">CPU Memory</th>
             \\    </tr>
             \\  </thead>
             \\  <tbody>
@@ -783,15 +783,15 @@ pub fn generateReportHtml(
 
         // Render Targets Table
         try buf.appendSlice(allocator,
-            \\<div class="section-title" style="font-size: 16px;">Таргеты рендера (Offscreen Targets)</div>
+            \\<div class="section-title" style="font-size: 16px;">Render Targets (Offscreen Targets)</div>
             \\<div class="card-table">
             \\<table>
             \\  <thead>
             \\    <tr>
-            \\      <th>Название таргета</th>
-            \\      <th>Разрешение</th>
-            \\      <th>MSAA Сэмплы</th>
-            \\      <th>Формат</th>
+            \\      <th>Target Name</th>
+            \\      <th>Resolution</th>
+            \\      <th>MSAA Samples</th>
+            \\      <th>Format</th>
             \\      <th class="num">VRAM</th>
             \\    </tr>
             \\  </thead>
@@ -819,7 +819,7 @@ pub fn generateReportHtml(
     // Footer
     try buf.appendSlice(allocator,
         \\<footer>
-        \\  Сгенерировано встроенным модулем профилирования Agate Engine &bull; Совместимо с Chrome Trace & Perfetto
+        \\  Generated by Agate Engine profiler &bull; Compatible with Chrome Trace & Perfetto
         \\</footer>
         \\</div>
         \\</body>
@@ -842,9 +842,9 @@ pub fn generateReportMd(
 
     // Header & Overview
     try buf.appendSlice(allocator,
-        \\# Agate Engine - Отчет о производительности и памяти
+        \\# Agate Engine - Performance & Memory Profile Report
         \\
-        \\## 1. Сводка сессии (Session Overview)
+        \\## 1. Session Overview
         \\
     );
 
@@ -856,24 +856,24 @@ pub fn generateReportMd(
     const has_pass = hasGpuPassData(frames);
 
     const overview_table = try std.fmt.allocPrint(allocator,
-        \\| Метрика | Значение | Метрика | Значение |
+        \\| Metric | Value | Metric | Value |
         \\| :--- | :--- | :--- | :--- |
-        \\| **Всего кадров** | {d} | **Длительность (сумма CPU-submit)** | {d:.2} с |
-        \\| **Средний FPS (wall, интервал)** | {d:.1} FPS | **1% Low FPS (wall)** | {d:.1} FPS |
-        \\| **Средний интервал (wall)** | {d:.2} мс | **P99 интервал (wall)** | {d:.2} мс |
-        \\| **Средний CPU-submit** | {d:.2} мс | **Макс. CPU-submit** | {d:.2} мс |
-        \\| **CPU-submit P50 / P95 / P99** | {d:.2} / {d:.2} / {d:.2} мс | **Просадки интервала > 33.3 мс (wall)** | {d} кадров (CPU-submit > 33.3: {d}) |
-        \\| **Средний Draw Calls** | {d} | **Макс. Draw Calls** | {d} |
-        \\| **Средний треугольников** | {d} | **Макс. треугольников** | {d} |
-        \\| **Суммарный VRAM** | {s} | **CPU геометрия** | {s} |
+        \\| **Total Frames** | {d} | **Duration (CPU-submit sum)** | {d:.2} s |
+        \\| **Average FPS (wall clock)** | {d:.1} FPS | **1% Low FPS (wall clock)** | {d:.1} FPS |
+        \\| **Average Interval (wall)** | {d:.2} ms | **P99 Interval (wall)** | {d:.2} ms |
+        \\| **Average CPU-submit** | {d:.2} ms | **Max CPU-submit** | {d:.2} ms |
+        \\| **CPU-submit P50 / P95 / P99** | {d:.2} / {d:.2} / {d:.2} ms | **Interval Hitches > 33.3 ms (wall)** | {d} frames (CPU-submit > 33.3: {d}) |
+        \\| **Average Draw Calls** | {d} | **Max Draw Calls** | {d} |
+        \\| **Average Triangles** | {d} | **Max Triangles** | {d} |
+        \\| **Total VRAM** | {s} | **CPU Geometry** | {s} |
         \\
-        \\### Фазы кадра в среднем (CPU-submit, не GPU-время)
-        \\- **Update (CPU логика/анимация):** {d:.2} мс
-        \\- **Physics (Box3D симуляция):** {d:.2} мс
-        \\- **Prepare (подготовка очередей):** {d:.2} мс
-        \\- **Shadow Pass (CPU submit, не GPU):** {d:.2} мс
-        \\- **Main Pass (CPU submit, не GPU):** {d:.2} мс
-        \\- **PostFX (CPU submit, не GPU):** {d:.2} мс
+        \\### Average Frame Phases (CPU-submit, not GPU time)
+        \\- **Update (CPU logic/animation):** {d:.2} ms
+        \\- **Physics (Box3D simulation):** {d:.2} ms
+        \\- **Prepare (queue preparation):** {d:.2} ms
+        \\- **Shadow Pass (CPU-submit, not GPU):** {d:.2} ms
+        \\- **Main Pass (CPU-submit, not GPU):** {d:.2} ms
+        \\- **PostFX (CPU-submit, not GPU):** {d:.2} ms
         \\
     , .{
         summary.frame_count,
@@ -910,23 +910,23 @@ pub fn generateReportMd(
     // per-pass samples are available.
     if (has_gpu) {
         const gpu_overview = try std.fmt.allocPrint(allocator,
-            \\| **Средний GPU frame (measured)** | {d:.2} мс | **Макс. GPU frame** | {d:.2} мс |
+            \\| **Average GPU frame (measured)** | {d:.2} ms | **Max GPU frame** | {d:.2} ms |
             \\
-            \\GPU-время — последний завершённый семпл, наблюдённый после
-            \\коммита (асинхронно, без фиксированного лага; скоуп зависит от
-            \\бэкенда и не взаимозаменяем с CPU-submit); фазы выше —
-            \\по-прежнему CPU-submit, не GPU.
+            \\GPU time is the last completed sample observed after
+            \\commit (async, without fixed lag; scope is backend-dependent
+            \\and not interchangeable with CPU submit); phases above
+            \\remain CPU submit, not GPU.
             \\
         , .{ summary.avg_gpu_frame_ms, summary.max_gpu_frame_ms });
         defer allocator.free(gpu_overview);
         try buf.appendSlice(allocator, gpu_overview);
         if (has_pass) {
             const pass_overview = try std.fmt.allocPrint(allocator,
-                \\| **Средний GPU per-pass (measured)** | shadow {d:.2} / main {d:.2} / post {d:.2} мс | **Макс. GPU per-pass** | {d:.2} / {d:.2} / {d:.2} мс |
+                \\| **Average GPU per-pass (measured)** | shadow {d:.2} / main {d:.2} / post {d:.2} ms | **Max GPU per-pass** | {d:.2} / {d:.2} / {d:.2} ms |
                 \\
-                \\Per-pass GPU-время — последние завершённые семплы каждого
-                \\прохода; значения разных submission id никогда не
-                \\суммируются в длительность кадра.
+                \\Per-pass GPU time is the last completed sample of each
+                \\pass; values from different submission IDs are never
+                \\summed into frame duration.
                 \\
             , .{
                 summary.avg_gpu_shadow_ms,
@@ -941,23 +941,23 @@ pub fn generateReportMd(
         }
     }
 
-    // Section: "Что не так"
+    // Section: Bottleneck diagnostics
     try buf.appendSlice(allocator,
-        \\## 2. Что не так / Автоматическая диагностика узких мест
+        \\## 2. Bottleneck Diagnostics
         \\
     );
 
     for (findings) |finding| {
         const badge = switch (finding.severity) {
-            .good => "🟢 [НОРМА]",
-            .info => "ℹ️ [ИНФО]",
-            .warning => "⚠️ [ВНИМАНИЕ]",
-            .critical => "🚨 [КРИТИЧНО]",
+            .good => "🟢 [OK]",
+            .info => "ℹ️ [INFO]",
+            .warning => "⚠️ [WARNING]",
+            .critical => "🚨 [CRITICAL]",
         };
         const f_md = try std.fmt.allocPrint(allocator,
             \\### {s} {s}
-            \\- **Описание:** {s}
-            \\- **Рекомендация:** {s}
+            \\- **Details:** {s}
+            \\- **Recommendation:** {s}
             \\
         , .{ badge, finding.title, finding.details, finding.recommendation });
         defer allocator.free(f_md);
@@ -969,17 +969,17 @@ pub fn generateReportMd(
     // GPU samples are available.
     if (has_gpu) {
         try buf.appendSlice(allocator,
-            \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\## 3. Spike Frames (CPU-submit time)
             \\
-            \\| Ранг | Кадр # | Время CPU-submit (мс) | GPU measured (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
+            \\| Rank | Frame # | CPU-submit (ms) | GPU measured (ms) | FPS (wall) | Dominant Phase (CPU) | Draw Calls | Triangles | Textures | Dynamic |
             \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
             \\
         );
     } else {
         try buf.appendSlice(allocator,
-            \\## 3. Топ пиковых кадров (Spike Frames, время CPU-submit)
+            \\## 3. Spike Frames (CPU-submit time)
             \\
-            \\| Ранг | Кадр # | Время CPU-submit (мс) | FPS (wall) | Главная причина (CPU-фаза) | Draw Calls | Треугольники | Текстуры | Динамика |
+            \\| Rank | Frame # | CPU-submit (ms) | FPS (wall) | Dominant Phase (CPU) | Draw Calls | Triangles | Textures | Dynamic |
             \\| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
             \\
         );
@@ -1001,7 +1001,7 @@ pub fn generateReportMd(
             const upload_kb: f32 = @as(f32, @floatFromInt(sf.uploaded_bytes)) / 1024.0;
             const update_kb: f32 = @as(f32, @floatFromInt(sf.updated_bytes)) / 1024.0;
             const row = if (has_gpu) try std.fmt.allocPrint(allocator,
-                \\| #{d} | {d} | **{d:.2} мс** | {d:.2} | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
+                \\| #{d} | {d} | **{d:.2} ms** | {d:.2} | {d:.1} | {s} ({d:.1} ms, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
             , .{
                 rank,
                 sf.frame_index,
@@ -1016,7 +1016,7 @@ pub fn generateReportMd(
                 upload_kb,
                 update_kb,
             }) else try std.fmt.allocPrint(allocator,
-                \\| #{d} | {d} | **{d:.2} мс** | {d:.1} | {s} ({d:.1} мс, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
+                \\| #{d} | {d} | **{d:.2} ms** | {d:.1} | {s} ({d:.1} ms, {d:.0}%) | {d} | {d} | {d:.1} KB | {d:.1} KB |
             , .{
                 rank,
                 sf.frame_index,
@@ -1040,7 +1040,7 @@ pub fn generateReportMd(
     // Section: Memory Breakdown
     if (memory_ptr) |mem| {
         try buf.appendSlice(allocator,
-            \\## 4. Использование памяти и VRAM
+            \\## 4. Memory & VRAM Breakdown
             \\
         );
 
@@ -1052,14 +1052,14 @@ pub fn generateReportMd(
         defer allocator.free(rt_vram_str);
 
         const mem_summary = try std.fmt.allocPrint(allocator,
-            \\- **Текстуры:** {s}
-            \\- **Меши (VBO / IBO):** {s}
-            \\- **Буферы кадра (Render Targets):** {s}
-            \\- **Суммарно VRAM:** {s}
-            \\- **CPU геометрия:** {s}
+            \\- **Textures:** {s}
+            \\- **Meshes (VBO / IBO):** {s}
+            \\- **Render Targets:** {s}
+            \\- **Total VRAM:** {s}
+            \\- **CPU Geometry:** {s}
             \\
-            \\### Топ тяжелых текстур
-            \\| Название | Разрешение | Тип | Mips | Формат | VRAM |
+            \\### Top Textures by Memory
+            \\| Name | Resolution | Type | Mips | Format | VRAM |
             \\| :--- | :--- | :--- | :--- | :--- | :--- |
         , .{ tex_vram_str, mesh_vram_str, rt_vram_str, vram_total_str, cpu_mesh_str });
         defer allocator.free(mem_summary);
@@ -1089,8 +1089,8 @@ pub fn generateReportMd(
 
         // Top Meshes
         try buf.appendSlice(allocator,
-            \\### Топ мешей по памяти
-            \\| Меш | Вершины | Индексы | Формат | VRAM | CPU |
+            \\### Top Meshes by Memory
+            \\| Mesh | Vertices | Indices | Format | VRAM | CPU |
             \\| :--- | :--- | :--- | :--- | :--- | :--- |
         );
         try buf.appendSlice(allocator, "\n");
@@ -1294,290 +1294,4 @@ pub fn generateTraceJson(frames: []const FrameRecord, allocator: std.mem.Allocat
 
     try buf.appendSlice(allocator, "  ],\n  \"displayTimeUnit\": \"ms\"\n}\n");
     return buf.toOwnedSlice(allocator);
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-test "Profiler report HTML, MD, and JSON generation" {
-    const ally = std.testing.allocator;
-    const frames = [_]FrameRecord{
-        .{
-            .frame_index = 1,
-            .timestamp_us = 0,
-            .dt_s = 0.011,
-            .fps = 90.9,
-            .frame_interval_ms = 11.0,
-            .total_frame_ms = 11.0,
-            .update_ms = 1.5,
-            .prepare_ms = 0.5,
-            .shadow_ms = 2.0,
-            .main_ms = 6.0,
-            .post_ms = 1.0,
-            .draw_calls = 25,
-            .triangles = 5000,
-            .pipeline_switches = 2,
-        },
-        .{
-            .frame_index = 2,
-            .timestamp_us = 11000,
-            .dt_s = 0.011,
-            .fps = 90.9,
-            .frame_interval_ms = 11.0,
-            .total_frame_ms = 11.0,
-            .update_ms = 1.5,
-            .prepare_ms = 0.5,
-            .shadow_ms = 2.0,
-            .main_ms = 6.0,
-            .post_ms = 1.0,
-            .draw_calls = 25,
-            .triangles = 5000,
-            .pipeline_switches = 2,
-        },
-    };
-    const summary: SessionSummary = .{
-        .frame_count = 2,
-        .total_time_ms = 22.0,
-        .avg_fps = 90.9,
-        .fps_1pct_low = 90.9,
-        .fps_01pct_low = 90.9,
-        .min_frame_ms = 11.0,
-        .avg_frame_ms = 11.0,
-        .max_frame_ms = 11.0,
-        .p50_frame_ms = 11.0,
-        .p95_frame_ms = 11.0,
-        .p99_frame_ms = 11.0,
-        .avg_update_ms = 1.5,
-        .avg_prepare_ms = 0.5,
-        .avg_shadow_ms = 2.0,
-        .avg_main_ms = 6.0,
-        .avg_post_ms = 1.0,
-        .avg_draw_calls = 25,
-        .max_draw_calls = 25,
-        .avg_triangles = 5000,
-        .max_triangles = 5000,
-        .avg_pipeline_switches = 2,
-        .avg_interval_ms = 11.0,
-        .p50_interval_ms = 11.0,
-        .p99_interval_ms = 11.0,
-        .max_interval_ms = 11.0,
-        .observed_avg_fps = 90.9,
-        .observed_fps_1pct_low = 90.9,
-        .observed_fps_01pct_low = 90.9,
-    };
-    const findings = [_]DiagnosticFinding{
-        .{
-            .severity = .good,
-            .title = "Все основные параметры в норме",
-            .details = "Критических задержек, перерасхода памяти или чрезмерного количества вызовов отрисовки не обнаружено.",
-            .recommendation = "Текущая конфигурация сцены работает оптимально.",
-        },
-    };
-
-    // HTML
-    const html = try generateReportHtml(&frames, summary, &findings, null, ally);
-    defer ally.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "<!DOCTYPE html>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "Performance & Memory Profile Report") != null);
-
-    // MD
-    const md = try generateReportMd(&frames, summary, &findings, null, ally);
-    defer ally.free(md);
-    try std.testing.expect(std.mem.indexOf(u8, md, "# Agate Engine - Отчет") != null);
-
-    // JSON
-    const json = try generateTraceJson(&frames, ally);
-    defer ally.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"traceEvents\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"Frame #1 (CPU submit)\"") != null);
-    // Submit times must never be presented as GPU time.
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"cat\": \"gpu\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"cat\": \"cpu\"") != null);
-
-    // Reports must label CPU-submit vs wall-clock pacing explicitly.
-    try std.testing.expect(std.mem.indexOf(u8, html, "wall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "CPU-submit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, md, "wall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, md, "CPU-submit") != null);
-
-    // Disabled GPU path (all zeros): no GPU-named output anywhere — the
-    // reports stay byte-identical to the pre-GPU generators.
-    try std.testing.expect(!hasGpuData(&frames));
-    try std.testing.expect(!hasGpuPassData(&frames));
-    try std.testing.expect(std.mem.indexOf(u8, html, "gpu_frame_ms") == null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "GPU Frame (measured)") == null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "GPU Shadow (measured)") == null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "Per-pass avg") == null);
-    try std.testing.expect(std.mem.indexOf(u8, md, "gpu_frame_ms") == null);
-    try std.testing.expect(std.mem.indexOf(u8, md, "GPU frame") == null);
-    try std.testing.expect(std.mem.indexOf(u8, md, "per-pass") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "gpu_frame_ms") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "GPU Shadow (measured)") == null);
-
-    // Enabled path: measured GPU samples are exported under explicit GPU
-    // names, never relabeled as CPU-submit phases.
-    var gpu_frames = frames;
-    gpu_frames[0].gpu_frame_ms = 2.5;
-    gpu_frames[0].gpu_frame_submit = 51;
-    gpu_frames[0].gpu_frame_scope = .command_buffer;
-    // Last frame intentionally left without a sample: exercises the
-    // no-GPU-event tail (PostFX of the final frame must carry no
-    // trailing comma).
-    try std.testing.expect(hasGpuData(&gpu_frames));
-
-    var gpu_summary = summary;
-    gpu_summary.avg_gpu_frame_ms = 1.25;
-    gpu_summary.max_gpu_frame_ms = 2.5;
-
-    const gpu_html = try generateReportHtml(&gpu_frames, gpu_summary, &findings, null, ally);
-    defer ally.free(gpu_html);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU Frame (measured)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU (measured)") != null);
-
-    const gpu_md = try generateReportMd(&gpu_frames, gpu_summary, &findings, null, ally);
-    defer ally.free(gpu_md);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_md, "GPU frame") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_md, "gpu_frame_ms") == null); // human prose, no raw field names
-
-    const gpu_json = try generateTraceJson(&gpu_frames, ally);
-    defer ally.free(gpu_json);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"cat\": \"gpu\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"name\": \"GPU Frame (measured)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_ms\": 2.500") != null);
-    // Trace args carry the submission identity and backend scope.
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_submit\": 51") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"gpu_frame_scope\": \"command_buffer\"") != null);
-    // CPU slices keep their submit labels; the stream has no trailing comma.
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "\"Main Pass (CPU submit)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, ",\n  ]") == null);
-    // Frame-scope-only session (no per-pass samples): no per-pass output anywhere.
-    try std.testing.expect(!hasGpuPassData(&gpu_frames));
-    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "Per-pass avg") == null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_html, "GPU shadow/main/post") == null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_md, "per-pass") == null);
-    try std.testing.expect(std.mem.indexOf(u8, gpu_json, "GPU Shadow (measured)") == null);
-
-    // Per-pass session: frame + per-pass samples flow through
-    // every export under explicit GPU names.
-    var pass_frames = frames;
-    pass_frames[0].gpu_frame_ms = 9.5;
-    pass_frames[0].gpu_frame_submit = 61;
-    pass_frames[0].gpu_frame_scope = .pass_sum;
-    pass_frames[0].gpu_shadow_ms = 0.5;
-    pass_frames[0].gpu_shadow_submit = 62;
-    pass_frames[0].gpu_main_ms = 8.0;
-    pass_frames[0].gpu_main_submit = 63;
-    pass_frames[0].gpu_post_ms = 1.0;
-    pass_frames[0].gpu_post_submit = 64;
-    // Second frame carries only a newer main sample: exercises per-frame
-    // gating (no shadow/post events) and the no-GPU-event tail stays
-    // on the LAST frame only when it has no samples at all.
-    pass_frames[1].gpu_main_ms = 7.0;
-    pass_frames[1].gpu_main_submit = 65;
-    try std.testing.expect(hasGpuPassData(&pass_frames));
-
-    var pass_summary = summary;
-    pass_summary.avg_gpu_frame_ms = 4.75;
-    pass_summary.max_gpu_frame_ms = 9.5;
-    pass_summary.avg_gpu_shadow_ms = 0.25;
-    pass_summary.max_gpu_shadow_ms = 0.5;
-    pass_summary.avg_gpu_main_ms = 7.5;
-    pass_summary.max_gpu_main_ms = 8.0;
-    pass_summary.avg_gpu_post_ms = 0.5;
-    pass_summary.max_gpu_post_ms = 1.0;
-
-    const pass_html = try generateReportHtml(&pass_frames, pass_summary, &findings, null, ally);
-    defer ally.free(pass_html);
-    try std.testing.expect(std.mem.indexOf(u8, pass_html, "Per-pass avg (available distinct samples)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_html, "GPU shadow/main/post (measured)") != null);
-
-    const pass_md = try generateReportMd(&pass_frames, pass_summary, &findings, null, ally);
-    defer ally.free(pass_md);
-    try std.testing.expect(std.mem.indexOf(u8, pass_md, "per-pass") != null);
-    // Still no raw field names in the human prose (frame-only rule holds
-    // for the new fields too).
-    try std.testing.expect(std.mem.indexOf(u8, pass_md, "gpu_shadow_ms") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_md, "gpu_main_ms") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_md, "gpu_post_ms") == null);
-
-    const pass_json = try generateTraceJson(&pass_frames, ally);
-    defer ally.free(pass_json);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"name\": \"GPU Shadow (measured)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"name\": \"GPU Main (measured)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"name\": \"GPU PostFX (measured)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_shadow_ms\": 0.500") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_main_ms\": 8.000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_post_ms\": 1.000") != null);
-    // CPU-submit labels are untouched by the new GPU events.
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"Shadow Pass (CPU submit)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"PostFX (CPU submit)\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, ",\n  ]") == null);
-    // Per-pass trace args carry submission ids; the frame event carries
-    // the frame submission id and scope.
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"submit\": 62") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_frame_submit\": 61") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass_json, "\"gpu_frame_scope\": \"pass_sum\"") != null);
-}
-
-test "Profiler reports treat valid GPU zeros as available and dedup repeats" {
-    const ally = std.testing.allocator;
-    // Availability is the submission id: a valid quantized zero (id != 0,
-    // ms == 0) gates GPU output ON, while bare zeros stay CPU-only.
-    var zero_frames = [_]FrameRecord{
-        .{ .frame_index = 1, .timestamp_us = 0, .total_frame_ms = 5.0 },
-        .{ .frame_index = 2, .timestamp_us = 5000, .total_frame_ms = 5.0 },
-    };
-    try std.testing.expect(!hasGpuData(&zero_frames));
-    try std.testing.expect(!hasGpuPassData(&zero_frames));
-
-    zero_frames[0].gpu_frame_submit = 71;
-    zero_frames[0].gpu_frame_scope = .native_pass_span;
-    zero_frames[0].gpu_main_submit = 72; // ms stays 0: valid zero
-    // Same submissions re-polled on the next CPU frame (async: no newer
-    // completion yet) — one measurement, not two.
-    zero_frames[1].gpu_frame_ms = 0;
-    zero_frames[1].gpu_frame_submit = 71;
-    zero_frames[1].gpu_frame_scope = .native_pass_span;
-    zero_frames[1].gpu_main_ms = 0;
-    zero_frames[1].gpu_main_submit = 72;
-    try std.testing.expect(hasGpuData(&zero_frames));
-    try std.testing.expect(hasGpuPassData(&zero_frames));
-
-    const findings = [_]DiagnosticFinding{};
-    const summary: SessionSummary = .{
-        .frame_count = 2,
-        .avg_gpu_frame_ms = 0,
-        .max_gpu_frame_ms = 0,
-        .gpu_frame_samples = 1,
-        .avg_gpu_main_ms = 0,
-        .max_gpu_main_ms = 0,
-        .gpu_main_samples = 1,
-    };
-    const html = try generateReportHtml(&zero_frames, summary, &findings, null, ally);
-    defer ally.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "GPU Frame (measured)") != null);
-
-    const json = try generateTraceJson(&zero_frames, ally);
-    defer ally.free(json);
-    // Exactly one GPU Frame event and one GPU Main event for the repeated
-    // submission id — including the zero duration.
-    var frame_events: usize = 0;
-    var main_events: usize = 0;
-    var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, json, cursor, "\"name\": \"GPU Frame (measured)\"")) |pos| {
-        frame_events += 1;
-        cursor = pos + 1;
-    }
-    cursor = 0;
-    while (std.mem.indexOfPos(u8, json, cursor, "\"name\": \"GPU Main (measured)\"")) |pos| {
-        main_events += 1;
-        cursor = pos + 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), frame_events);
-    try std.testing.expectEqual(@as(usize, 1), main_events);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_ms\": 0.000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_submit\": 71") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"gpu_frame_scope\": \"native_pass_span\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, ",\n  ]") == null);
 }

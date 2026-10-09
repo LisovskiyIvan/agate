@@ -275,7 +275,3 @@ pub fn lutParams(cfg: options.PostProcessOptions) [4]f32 {
 
 // Lut regression tests live in `lut_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("lut_tests.zig");
-}

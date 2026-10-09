@@ -395,7 +395,3 @@ pub fn takeGpuBuffersForRetire(self: anytype, out: []sg.Buffer) usize {
 // Stateful compute mode tests (v1; all headless — no sg.* below):
 // moved verbatim to `compute_mode_tests.zig`; the block below keeps them
 // reachable from this module (mesh.zig facade pattern).
-
-test {
-    _ = @import("compute_mode_tests.zig");
-}

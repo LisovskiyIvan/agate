@@ -308,3 +308,24 @@ test "capture feedback detects saved material and particle texture views" {
     const Particle = @import("scene/particle_layer.zig").ParticleDraw;
     try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
 }
+
+test "RenderTarget shape returns unified TargetShape" {
+    const t = RenderTarget{
+        .color_format = .RGBA16F,
+        .depth_format = .DEPTH,
+        .sample_count = 4,
+    };
+    const s = t.shape();
+    try testing.expectEqual(sg.PixelFormat.RGBA16F, s.color_format);
+    try testing.expectEqual(sg.PixelFormat.DEPTH, s.depth_format);
+    try testing.expectEqual(sg.PixelFormat.NONE, s.stencil_format);
+    try testing.expectEqual(@as(i32, 4), s.sample_count);
+
+    const t_stencil = RenderTarget{
+        .color_format = .RGBA16F,
+        .depth_format = .DEPTH_STENCIL,
+        .sample_count = 1,
+    };
+    const s_stencil = t_stencil.shape();
+    try testing.expectEqual(sg.PixelFormat.DEPTH_STENCIL, s_stencil.stencil_format);
+}

@@ -16,7 +16,7 @@ const material_mod = @import("../../material.zig");
 const Material = material_mod.Material;
 const MaterialDrawRecord = material_mod.MaterialDrawRecord;
 const skeleton_mod = @import("../../animation/skeleton.zig");
-/// Переэкспорт для потребителей снапшот-хранилищ (postfx/scene/outline).
+/// Re-export for snapshot storage consumers (postfx/scene/outline).
 pub const MAX_BONES = skeleton_mod.MAX_BONES;
 const morph_gpu = @import("../../mesh/morph_gpu.zig");
 const stats_mod = @import("../stats.zig");
@@ -62,10 +62,7 @@ pub const RenderMeshItem = struct {
     // eliminating depth-buffer z-fighting against the underlying surface.
     is_decal: bool = false,
     receive_shadows: bool = true,
-    /// Индекс копии скин-матриц в RenderQueues.skin_storage (null = не скин).
-    /// Указывает на render-owned снимок, а не на mutable-слоты скелета:
-    /// draw-путь резолвит его через хранилище той же очереди уже после всех
-    /// реаллокаций prepare-фазы, поэтому индекс стабилен при росте буфера.
+    /// Index of skin matrix copy in RenderQueues.skin_storage (null = non-skinned).
     skin_index: ?u32 = null,
     /// Staged generation that produced the `prev_skin_storage` slot
     /// (maxInt = none). Same draw-time match rule as `prev_frame`.
@@ -74,14 +71,9 @@ pub const RenderMeshItem = struct {
     /// LOD proxy, not necessarily the entity): the commit stamps that
     /// skeleton, never the entity's unrelated one. 0 = unassigned.
     skin_source_uid: u64 = 0,
-    /// Индекс ShaderDrawSnapshot в RenderQueues.shader_storage (null = не hook).
-    /// Draw-путь hook-материалов читает только этот снимок.
+    /// Index of ShaderDrawSnapshot in RenderQueues.shader_storage (null = non-shader).
     shader_index: ?u32 = null,
-    /// Индекс CoatParams в RenderQueues.coat_storage (null = слои выключены).
-    /// Только PBR-draws с включённым слоем (clearcoat/sheen/anisotropy/
-    /// transmission/subsurface) занимают слот; все остальные рисуют из
-    /// CoatParams.neutral. 8-байтовый индекс вместо факторов держит размер
-    /// item в P4-лимите.
+    /// Index of CoatParams in RenderQueues.coat_storage (null = layers disabled).
     coat_index: ?u32 = null,
     /// Per-mesh morph uniforms (weights and delta dimensions)
     morph_uniforms: morph_gpu.VsUniforms = .{
@@ -131,58 +123,44 @@ pub const RenderInstancedBatch = struct {
     draw_record: MaterialDrawRecord = .{},
     source_uid: u64 = 0,
     source_mesh: u32 = 0,
-    /// Как RenderMeshItem.coat_index, но для инстансированных групп.
+    /// Index of CoatParams in RenderQueues.coat_storage for instanced batches.
     coat_index: ?u32 = null,
-    /// Центр группы инстансов в мировых координатах для выбора reflection probes.
+    /// Center of instance group in world coordinates for reflection probe selection.
     world_center: Vec3 = Vec3.zero,
 };
 
-/// Render-owned хранилище копий скин-матриц: один слот на skinned-draw кадра
-/// (а не MAX_BONES на каждый item). Живёт в RenderQueues, переживает кадры
-/// (clearRetainingCapacity в reset — без per-frame churn). Элементы резолвятся
-/// по индексу уже на draw-фазе, поэтому реаллокации prepare-фазы безопасны.
+/// Render-owned storage for skin matrix copies: one slot per skinned draw per frame.
 pub const SkinStorage = std.ArrayListUnmanaged([MAX_BONES]Mat4);
-/// Render-owned снимки hook-материалов: один на shader-draw кадра.
+/// Render-owned snapshots of custom shader materials.
 pub const ShaderStorage = std.ArrayListUnmanaged(material_mod.ShaderDrawSnapshot);
-/// Render-owned снимки слоёв PBR (clearcoat/sheen/anisotropy/transmission/
-/// subsurface): один на layer-draw кадра (только PBR с включённым слоем; остальные draws хранят coat_index = null
-/// и рисуют из CoatParams.neutral — пустое хранилище ничего не стоит).
+/// Render-owned snapshots of PBR layers (clearcoat/sheen/anisotropy/transmission/subsurface).
 pub const CoatStorage = std.ArrayListUnmanaged(material_mod.CoatParams);
 
-/// Чистый резолв копии скина по индексу (draw-фаза): null/out-of-range дают
-/// null вместо чтения чужих данных. Skinned-вызывающий такой draw пропускает
-/// (stale GPU-униформа предыдущего draw исключена); через билдеры недостижимо.
+/// Resolves a skin matrix copy by index; returns null if index is null or out of range.
 pub fn skinAt(skins: []const [MAX_BONES]Mat4, index: ?u32) ?*const [MAX_BONES]Mat4 {
     const i = index orelse return null;
     if (i >= skins.len) return null;
     return &skins[i];
 }
 
-/// Чистый резолв CoatParams по индексу (draw-фаза): null/out-of-range дают
-/// null вместо чтения чужих данных; вызывающий подставляет
-/// CoatParams.neutral (lobe выключен — бит-идентично легаси).
+/// Resolves CoatParams by index; returns null if index is null or out of range.
 pub fn coatAt(coats: []const material_mod.CoatParams, index: ?u32) ?*const material_mod.CoatParams {
     const i = index orelse return null;
     if (i >= coats.len) return null;
     return &coats[i];
 }
 
-/// Prepare-локальный результат куллинга одного меша: готовый item плюс
-/// заимствования живых данных, которые appendRenderItem копирует в
-/// render-owned хранилища (и только потом кладёт item в очередь).
-/// skin_src/shader_snap никогда не попадают в очереди и не читаются на draw.
+/// Prepare-local culling result for a single mesh: prepared item plus borrowed data
+/// to be copied into render-owned storages upon appendRenderItem.
 pub const CulledMesh = struct {
     item: RenderMeshItem,
-    /// Заимствованный опубликованный слот скелета (prepare-время; фазовый
-    /// мьютекс держит update-поток вне prepare/render, слот стабилен до копии).
+    /// Borrowed skeleton matrix slot from prepare phase.
     skin_src: ?*const [MAX_BONES]Mat4 = null,
     /// Previous frame's skin matrices slot for velocity buffer
     prev_skin_src: ?*const [MAX_BONES]Mat4 = null,
-    /// Готовый снимок hook-материала (чистая копия, без живых указателей).
+    /// Snapshot of custom shader material (by-value copy).
     shader_snap: ?material_mod.ShaderDrawSnapshot = null,
-    /// Готовый снимок clearcoat/sheen-факторов (чистая копия 64 Б; в скретче
-    /// параллельного пути — только значение, в очередь попадает через копию
-    /// в appendRenderItem).
+    /// Snapshot of clearcoat/sheen factors.
     coat: ?material_mod.CoatParams = null,
 };
 
@@ -275,15 +253,11 @@ pub const RenderQueues = struct {
     // sorted by sortTransparentDrawOrder in renderSceneView. Retained
     // across frames (clearRetainingCapacity in reset: no per-frame churn).
     transparent_order: std.ArrayListUnmanaged(TransparentDrawEntry) = .empty,
-    // Render-owned копии скин-матриц skinned-draws (резолв по skin_index на
-    // draw-фазе) и снимки hook-материалов (резолв по shader_index). Рост
-    // буферов в prepare-фазе безопасен: очереди хранят индексы, а не указатели.
+    // Render-owned storage for skin matrices and shader material snapshots.
     skin_storage: SkinStorage = .empty,
     prev_skin_storage: SkinStorage = .empty,
     shader_storage: ShaderStorage = .empty,
-    // Render-owned снимки clearcoat/sheen-факторов (резолв по coat_index на
-    // draw-фазе). Рост буферов в prepare-фазе безопасен: очереди хранят
-    // индексы, а не указатели.
+    // Render-owned storage for clearcoat/sheen factors.
     coat_storage: CoatStorage = .empty,
     // Parallel-cull scratch (per-chunk record buffers + stats). Lives with
     // the view queues and is retained across frames (reset + ensure per
@@ -386,118 +360,4 @@ pub fn blendDescFor(base: sg.PipelineDesc) sg.PipelineDesc {
         .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
     };
     return desc;
-}
-
-test "cutout stays opaque, blend stays transparent" {
-    const material = @import("../../material.zig");
-
-    try std.testing.expect(!materialIsTransparent(null));
-    try std.testing.expect(!materialIsCutout(null));
-    try std.testing.expect(!materialIsDoubleSided(null));
-
-    var pbr_mat = material.PBRMaterial.init("p");
-
-    // Opaque default: opaque queue, not cutout, single-sided.
-    try std.testing.expect(!materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(!materialIsCutout(.{ .pbr = &pbr_mat }));
-
-    // Cutout: still NOT in the transparent queue, but flagged cutout.
-    pbr_mat.alpha_mode = .cutout;
-    try std.testing.expect(!materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(materialIsCutout(.{ .pbr = &pbr_mat }));
-
-    // Blend: transparent queue, never cutout.
-    pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(materialIsTransparent(.{ .pbr = &pbr_mat }));
-    try std.testing.expect(!materialIsCutout(.{ .pbr = &pbr_mat }));
-
-    // Double-sided is orthogonal to the alpha mode.
-    try std.testing.expect(!materialIsDoubleSided(.{ .pbr = &pbr_mat }));
-    pbr_mat.double_sided = true;
-    try std.testing.expect(materialIsDoubleSided(.{ .pbr = &pbr_mat }));
-}
-
-// ---- Ported from the legacy Scene inline suite. ----
-
-test "transparent classification follows material alpha mode" {
-    const material = @import("../../material.zig");
-
-    try std.testing.expect(!materialIsTransparent(null));
-    var pbr_mat = material.PBRMaterial.init("p");
-    try std.testing.expect(!materialIsTransparent(Material{ .pbr = &pbr_mat }));
-    pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(materialIsTransparent(Material{ .pbr = &pbr_mat }));
-}
-
-test "opaque sort unchanged: state groups, front-to-back" {
-    var items = [_]RenderMeshItem{
-        .{ .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
-        .{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 2 },
-        .{ .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
-        .{ .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
-    };
-    // Default transparent flag is false, so legacy items sort as before.
-    try std.testing.expect(!items[0].transparent);
-    std.mem.sort(RenderMeshItem, &items, {}, sortRenderItems);
-    // Standard before PBR, texture id ascending, front-to-back within a group.
-    try std.testing.expect(!items[0].is_pbr and items[0].texture_id == 1 and items[0].distance_sq == 3.0);
-    try std.testing.expect(!items[1].is_pbr and items[1].texture_id == 2 and items[1].distance_sq == 1.0);
-    try std.testing.expect(!items[2].is_pbr and items[2].texture_id == 2 and items[2].distance_sq == 9.0);
-    try std.testing.expect(items[3].is_pbr and items[3].distance_sq == 5.0);
-}
-
-test "blendDescFor enables alpha blending without depth write" {
-    const base = sg.PipelineDesc{
-        .shader = .{},
-        .index_type = .UINT32,
-        .depth = .{ .compare = .LESS_EQUAL, .write_enabled = true },
-        .cull_mode = .BACK,
-        .face_winding = .CCW,
-    };
-    const blended = blendDescFor(base);
-    try std.testing.expect(blended.colors[0].blend.enabled);
-    try std.testing.expect(blended.colors[0].blend.src_factor_rgb == .SRC_ALPHA);
-    try std.testing.expect(blended.colors[0].blend.dst_factor_rgb == .ONE_MINUS_SRC_ALPHA);
-    try std.testing.expect(!blended.depth.write_enabled);
-    try std.testing.expect(blended.depth.compare == .LESS_EQUAL);
-    try std.testing.expect(blended.index_type == .UINT32);
-    try std.testing.expect(blended.cull_mode == .BACK);
-    // Pure function: the base desc is left untouched.
-    try std.testing.expect(!base.colors[0].blend.enabled);
-    try std.testing.expect(base.depth.write_enabled);
-}
-
-// ---- P4 render-owned draw snapshot: регрессия владения. ----
-
-// Чистый селектор skinAt: null/out-of-range не читают чужое, валидный индекс
-// отдаёт именно свою копию (draw-пути main/shadow/outline на нём же).
-test "P4: skinAt resolves owned copies without stale reads" {
-    var empty: [0][MAX_BONES]Mat4 = .{};
-    try std.testing.expect(skinAt(&empty, null) == null);
-    try std.testing.expect(skinAt(&empty, 0) == null);
-    try std.testing.expect(skinAt(&empty, std.math.maxInt(u32)) == null);
-
-    var one: [1][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** MAX_BONES};
-    one[0][3] = Mat4.translation(Vec3.new(2, 0, 0));
-    const got = skinAt(&one, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), got[3].m[12], 1e-6);
-    try std.testing.expect(skinAt(&one, 1) == null);
-    try std.testing.expect(skinAt(&one, std.math.maxInt(u32)) == null);
-}
-
-test "coatAt resolves owned copies without stale reads" {
-    const CoatParams = material_mod.CoatParams;
-    var empty: [0]CoatParams = .{};
-    try std.testing.expect(coatAt(&empty, null) == null);
-    try std.testing.expect(coatAt(&empty, 0) == null);
-
-    var one = [_]CoatParams{.{ .clearcoat_factors = .{ 0.8, 0.12, 0, 0 } }};
-    const got = coatAt(&one, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualSlices(f32, &.{ 0.8, 0.12, 0, 0 }, &got.clearcoat_factors);
-    // Neutral fallback for every miss (disabled lobe path).
-    try std.testing.expect(coatAt(&one, 1) == null);
-    try std.testing.expect(coatAt(&one, null) == null);
-    const fallback = coatAt(&one, null) orelse &CoatParams.neutral;
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.clearcoat_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.sheen_factors[0]);
 }

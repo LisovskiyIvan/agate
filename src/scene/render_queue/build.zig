@@ -10,9 +10,9 @@
 //! - `build/parallel.zig` — `ParallelCull` + `buildFrameQueuesParallel`
 //!   (world-matrix warming, chunked parallel cull, deterministic merge,
 //!   serial instanced tail). Imports `items` + `cull` + `instances`.
-//! - `build/equivalence.zig` — serial/parallel equivalence + OOM-fallback
+//! - `build/equivalence_tests.zig` — serial/parallel equivalence + OOM-fallback
 //!   integration tests (`FailFirstN`). Test-only leaf importing `frame`.
-//! - `build/snapshots.zig` — snapshot-durability (P4) tests +
+//! - `build/snapshots_tests.zig` — snapshot-durability (P4) tests +
 //!   `expectP4QueueRefsValid`. Test-only leaf importing `frame`.
 //!
 //! Everything that was public before the split is re-exported here

@@ -38,26 +38,9 @@ pub const CameraSnapshot = struct {
     enabled: bool = true,
 };
 
-/// Frame-level camera/light/pass state published by the simulation side.
-/// Это frame mailbox (камеры/свет/конфиг проходов), а НЕ подготовленные
-/// per-view draw-записи: per-mesh очереди (RenderQueues), shadow-bins и
-/// outline-items строятся позже в staged begin/finish и живут отдельно — P7: в трёх
-/// retained-слотах Scene.draws (см. scene/frame_draws.zig: FrameDrawSlot),
-/// а не в этом snapshot.
-/// P4 покрывает только mesh-payload очередей; update-vs-prepare остаются
-/// исключены фазовым мьютексом (producer update, consumer prepare), а update
-/// CAN overlap render — поэтому saturated-фолбэк publishFrameSnapshot
-/// НИКОГДА не пишет consumed snapshot (только drop), иначе гонка с
-/// draw. GPU-ресурсы заимствуются под фазовым мьютексом/P3; UI покрыт P6
-/// (render-owned кадр в Scene), debug — prepared capture + committed upload,
-/// sky/defaults — копии в этом snapshot, light pack — snapshot-копия.
-/// Producer-билд (`buildPreparedFrame`) владеет отдельной копией этого же
-/// типа (`Scene.build_snapshot`): очереди строятся против неё, staged-копия
-/// замораживается в claim-слоте (`FrameDrawSlot.snapshot`), а latch
-/// потребляет STAGED-копию (staged wins над пост-билд мутацией
-/// `build_snapshot`; `frame_snapshot` зеркалит staged для совместимости) —
-/// build НИКОГДА не читает/пишет `frame_snapshot`, иначе гонка с draw при
-/// update||render.
+/// Frame-level camera, light, and pass state published by the simulation side.
+/// Holds configuration snapshots (cameras, sun, post-process parameters) for consumption
+/// by the render phase, decoupled from per-mesh draw queues and GPU resources.
 pub const SceneFrameSnapshot = struct {
     frame_id: u64 = 0,
     aspect: f32 = 1.0,

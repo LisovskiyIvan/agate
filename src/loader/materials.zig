@@ -15,14 +15,14 @@ const ktx2 = @import("../ktx2.zig");
 const assets = @import("../assets.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 
-/// Резолвинг рабочего изображения текстуры с учётом KHR_texture_basisu:
-/// при использовании расширения `textures[i].source` отсутствует, а
-/// изображение (обычно .ktx2) лежит в `basisu_image`. Без расширения —
-/// обычное `image`. Возвращает null, когда текстуры нет вообще.
+/// Resolves working image for a texture, handling KHR_texture_basisu:
+/// with the extension, `textures[i].source` is absent and the image
+/// (typically .ktx2) is stored in `basisu_image`. Without the extension,
+/// standard `image` is used. Returns null when no texture is present.
 pub fn textureImage(tex: [*c]const c.cgltf_texture) ?[*c]const c.cgltf_image {
     if (tex == null) return null;
-    // Явные сравнения с null: нулевой C-указатель при неявном приведении
-    // к ?[*c] дал бы ненулевой optional с нулевым payload.
+    // Explicit null comparisons: zero C pointer implicit cast to ?[*c]
+    // could yield non-null optional with zero payload.
     if (tex.*.image != null) return tex.*.image;
     if (tex.*.has_basisu != 0 and tex.*.basisu_image != null) return tex.*.basisu_image;
     return null;
@@ -36,7 +36,7 @@ const DecodeJob = struct {
     /// External URI path, owned by the job.
     path: ?[]const u8 = null,
     /// sRGB -> linear conversion before mip generation (color-slot images).
-    /// Действует только на .rgba: блочные уровни грузятся как в файле.
+    /// Applies only to .rgba; block levels load verbatim.
     srgb: bool = false,
     /// Backend-accurate Basis transcode target, snapshotted per load on the
     /// calling thread (null = desktop-first .bc7 default). Workers never
@@ -442,11 +442,10 @@ pub fn loadTextureFromView(
     const tex_options = textureOptionsFor(tex, srgb_to_linear, max_anisotropy);
 
     // Pre-decoded on worker threads: only the GPU upload runs here.
-    // .rgba идёт старым путём (декод чужого sRGB-варианта не трогаем);
-    // .block грузится через fromRawBlock: sRGB-ность уже в варианте
-    // GPU-формата, srgb_to_linear/gen_mipmaps к блочным уровням не
-    // применяются (цепочка — как в файле). Кэш общий с RGBA-веткой, но
-    // алиасинга нет: ячейка хранит готовый Texture, а не декод.
+    // .rgba uses the existing path (no modification to decoded variant);
+    // .block loads via fromRawBlock: sRGB is encoded in the GPU format variant,
+    // so srgb_to_linear/gen_mipmaps are bypassed for block mip chains.
+    // Cache is shared with RGBA without aliasing: stores ready Texture.
     if (img_idx) |idx| {
         if (idx < decoded.len and decoded[idx] != null) {
             const usable = switch (decoded[idx].?) {
@@ -468,10 +467,8 @@ pub fn loadTextureFromView(
                         return loaded;
                     },
                     .block => |*blk| {
-                        // Слот уже занулён выше, deinit — здесь: при
-                        // BlockFormatNotSupportedByBackend уходим в null
-                        // (дальше — async-регистрация или пустой слот),
-                        // как при любой другой ошибке декода.
+                        // Slot zeroed above; deinit here. On failure
+                        // returns null like any decode error.
                         defer owned.deinit(scene.allocator);
                         const loaded = Texture.fromRawBlock(blk, tex_options) catch return null;
                         if (cache_idx) |c_idx| {
@@ -534,14 +531,11 @@ pub fn loadTextureFromView(
     return null;
 }
 
-/// Синхронный decode+upload для фолбэка loadTextureFromView: декод через
-/// decodeImageMemory/File, загрузка — fromRaw (.rgba) или fromRawBlock
-/// (.block). Ошибки декода и BlockFormatNotSupportedByBackend глотаются в
-/// null — так же, как раньше глотались ошибки fromMemory/fromFile.
-/// Декод GPU-free, но fromRaw/fromRawBlock делают sg.makeImage: вызывать
-/// только на context-потоке.
-/// Для .block gen_mipmaps/srgb_to_linear не действуют: цепочка мипов — как
-/// в файле, а sRGB-ность несёт сам вариант GPU-формата.
+/// Synchronous decode+upload fallback for loadTextureFromView: decodes via
+/// decodeImageMemory/File, uploads via fromRaw (.rgba) or fromRawBlock (.block).
+/// Decode and backend-support errors return null.
+/// Decode is GPU-free; fromRaw/fromRawBlock call sg.makeImage (context thread only).
+/// For .block, gen_mipmaps/srgb_to_linear are bypassed (mip chain from file, format defines sRGB).
 fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Options) ?Texture {
     var dec = Texture.decodeImageMemory(scene.allocator, bytes, .{
         .gen_mipmaps = tex_options.mipmaps,
@@ -721,8 +715,4 @@ pub fn loadMaterials(
 
         materials[i] = .{ .pbr = pbr_mat };
     }
-}
-
-test {
-    _ = @import("materials_tests.zig");
 }

@@ -73,7 +73,7 @@ pub const AppConfig = struct {
     /// Disable display synchronization on Metal macOS backends.
     metal_disable_display_sync: bool = true,
     /// Custom sokol log callback.
-    logger: ?*const fn ([*c]const u8, u32, u32, [*c]const u8, u32, [*c]const u8, ?*anyopaque) callconv(.c) void = null,
+    logger: ?*const fn ([*c]const u8, u32, u32, [*c]const u8, u32, [*c]const u8, ?*anyopaque) callconv(.c) void = sokol.log.func,
 
     // Resource pool sizing for sokol-gfx setup:
     buffer_pool_size: i32 = 4096,
@@ -188,7 +188,7 @@ pub const App = struct {
     }
 
     /// sokol-app startup descriptor built from config.
-    fn sappDesc(self: *const App) sapp.Desc {
+    pub fn sappDesc(self: *const App) sapp.Desc {
         return .{
             .init_cb = appInitCb,
             .frame_cb = appFrameCb,
@@ -211,7 +211,7 @@ pub const App = struct {
     }
 
     /// sokol-gfx descriptor built from config (`env` supplied by the caller).
-    fn sgDesc(self: *const App, env: sg.Environment) sg.Desc {
+    pub fn sgDesc(self: *const App, env: sg.Environment) sg.Desc {
         return .{
             .environment = env,
             .logger = if (self.config.logger) |l| .{ .func = l } else .{},
@@ -418,17 +418,3 @@ pub const App = struct {
         return @ptrCast(@alignCast(self.user_data.?));
     }
 };
-
-test {
-    _ = @import("app_tests.zig");
-}
-
-test "App descriptor mapping covers every flag and pool" {
-    // Bridge only: the private builders are reachable here, while all
-    // config data and expectations live in the test sibling.
-    const t = @import("app_tests.zig");
-    const alloc = std.testing.allocator;
-    const app = App.init(alloc, t.configForMappingTest(), .{});
-    const def = App.init(alloc, .{}, .{});
-    try t.expectMappings(app.sappDesc(), app.sgDesc(.{}), def.sappDesc(), def.sgDesc(.{}));
-}

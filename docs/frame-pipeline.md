@@ -257,8 +257,8 @@ pub const Runtime = struct {
 
 - Насыщение (`claimBack → null`): пропуск кадра со счётчиком, latest-wins — никогда блокировка. Contention-yield (`concurrent_yield_ns != 0`): park перед reserve, если прошлый билд не потреблён.
 - `LeaseError`: `SlotBusy` (pin на пишущий слот — retry на новый front), `PinnedSlot` (publish в pinned — counted skip), `NotClaimed`/`NotPinned` — баги вызывающей стороны.
-- Потерянный begin-токен клинит все будущие begin (`prepare_claim_active`); каждый успех — ровно один `finish`/`cancel`, на всех путях включая ошибки.
-- Двойной `finish`/`publish`/`cancel` — debug-assert; несовпадение токена — assert + возврат.
+- Потерянный begin-токен НЕ клинит конвейер: несовпадение/двойной `finish`/`cancel` — лог err + защитный release активного claim (`prepare_claim_active` сбрасывается, кадр теряется). Контракт остаётся: каждый успех — ровно один `finish`/`cancel`, на всех путях включая ошибки.
+- Двойной `finish`/`publish`/`cancel` — идемпотентный лог (нет активного claim — no-op); несовпадение токена — release + возврат.
 - OOM в stage: пакет пропускается, флаг остаётся (следующий билд повторит); OOM в capture — staged-wins в coherent-empty.
 - Мутация mesh-листа между build и latch: latch не читает live-список; commit-guard следующего билда ловит по `token/index/uid`.
 - Повторный билд без промежуточного latch — commit пропускается (`last_upload_commit_frame`), исходы не двоятся.
@@ -270,7 +270,7 @@ pub const Runtime = struct {
 - Горячий путь аллокаций не делает: слоты reuse capacity, latch/patch поверх записей без live-чтений; `build_stats` мержится из immutable копии без общего аккумулятора.
 - Параллелизм: CPU-стейджинг инстансов через `jobs.global`; game-билд перекрывается с context-презентом предыдущего front (3-й слот — именно для этого).
 - `reuseIfConsumable`/`renderReuse`: без свежего билда — повтор front без prepare-стоимости; `reuse_streak × destroy-rate` ограничен `pending_cap` retire-очереди.
-- Наблюдаемость: `Metrics` фасада (builds/skips/begins/begin_empty/begin_busy/finishes/cancels/reuses), `SceneStats`, `cpuBytes()`, `pendingRetires()`, `reuseStreak()`, `host_bytes_oob_drops`.
+- Наблюдаемость: `Metrics` фасада (builds/skips/begins/begin_empty/begin_busy/finishes/cancels/reuses), `SceneStats`, `cpuBytes()`, `pendingRetires()`, `reuseStreak()`, `host_bytes_oob_drops`, `build_oom_drops` (дропы очередей/пакетов аплоадов при OOM).
 
 ## Смотрите также
 

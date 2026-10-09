@@ -329,7 +329,3 @@ pub const PostProcessOptions = struct {
 
 // Options regression tests live in `options_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("options_tests.zig");
-}

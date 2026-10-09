@@ -224,6 +224,9 @@ layout(binding = 1) uniform fs_params {
     vec4 refraction_capture;
     // APPENDED LAST (probe blending, wave C.2): secondary probe state for smooth transitions.
     vec4 probe2_params;
+    // APPENDED LAST (box projection, wave Q.2): probe parallax bounds.
+    // xyz = probe center, w = box_extent (0 = infinite / disabled).
+    vec4 probe_box[2];
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -362,6 +365,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // @include "common/hemi_pbr.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
+// @include "common/box_project.glsl"
 
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
@@ -808,14 +812,17 @@ void main() {
         float w1 = (probe2_params.x > 0.5) ? probe2_params.w : 0.0;
         float w_env = max(0.0, 1.0 - w0 - w1);
 
+        vec3 R0 = (w0 > 0.001) ? boxProjectReflection(R, v_world_pos, probe_box[0].xyz, probe_box[0].w) : R;
+        vec3 R1 = (w1 > 0.001) ? boxProjectReflection(R, v_world_pos, probe_box[1].xyz, probe_box[1].w) : R;
+
         if (w0 > 0.001) {
-            vec3 p0_spec = textureLod(samplerCube(probe_tex, probe_smp), R, clamp(lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y;
+            vec3 p0_spec = textureLod(samplerCube(probe_tex, probe_smp), R0, clamp(lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y;
             vec3 p0_irr = textureLod(samplerCube(probe_tex, probe_smp), N, probe_params.z).rgb * probe_params.y;
             prefiltered_spec += p0_spec * w0;
             irradiance += p0_irr * w0;
         }
         if (w1 > 0.001) {
-            vec3 p1_spec = textureLod(samplerCube(probe2_tex, probe_smp), R, clamp(lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y;
+            vec3 p1_spec = textureLod(samplerCube(probe2_tex, probe_smp), R1, clamp(lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y;
             vec3 p1_irr = textureLod(samplerCube(probe2_tex, probe_smp), N, probe2_params.z).rgb * probe2_params.y;
             prefiltered_spec += p1_spec * w1;
             irradiance += p1_irr * w1;
@@ -841,10 +848,10 @@ void main() {
             float cc_lod = cc_rough * spec_max_lod;
             vec3 cc_prefiltered = vec3(0.0);
             if (w0 > 0.001) {
-                cc_prefiltered += textureLod(samplerCube(probe_tex, probe_smp), R, clamp(cc_lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y * w0;
+                cc_prefiltered += textureLod(samplerCube(probe_tex, probe_smp), R0, clamp(cc_lod, 0.0, probe_params.z - 1.0)).rgb * probe_params.y * w0;
             }
             if (w1 > 0.001) {
-                cc_prefiltered += textureLod(samplerCube(probe2_tex, probe_smp), R, clamp(cc_lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y * w1;
+                cc_prefiltered += textureLod(samplerCube(probe2_tex, probe_smp), R1, clamp(cc_lod, 0.0, probe2_params.z - 1.0)).rgb * probe2_params.y * w1;
             }
             if (w_env > 0.001) {
                 cc_prefiltered += textureLod(samplerCube(env_tex, env_smp), R, cc_lod).rgb * w_env;

@@ -74,4 +74,24 @@ pub fn build(b: *std.Build) !void {
     const run_hdr = b.addRunArtifact(hdr_exe);
     if (b.args) |args| run_hdr.addArgs(args);
     b.step("run-hdr", "Run the HDR studio showcase").dependOn(&run_hdr.step);
+
+    // 4. Runtime Worker (threaded staged frame lifecycle; native only —
+    //    the worker degrades to an inline serial fallback on wasm)
+    const rw_mod = b.createModule(.{
+        .root_source_file = b.path("runtime_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const rw_exe = b.addExecutable(.{
+        .name = "runtime-worker",
+        .root_module = rw_mod,
+    });
+    b.installArtifact(rw_exe);
+    const run_rw = b.addRunArtifact(rw_exe);
+    if (b.args) |args| run_rw.addArgs(args);
+    b.step("run-runtime-worker", "Run the Runtime worker-thread smoke (needs GPU/display)").dependOn(&run_rw.step);
 }

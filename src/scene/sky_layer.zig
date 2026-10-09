@@ -104,20 +104,3 @@ pub const SkyboxLayer = struct {
         return &self.pass_msaa.?;
     }
 };
-
-// GPU-free state test; the pass itself is covered by passes/ tests.
-test "skybox layer state toggles with setSkybox" {
-    var sky: SkyboxLayer = .{ .pass = undefined };
-    try std.testing.expect(!sky.enabled);
-    try std.testing.expect(sky.texture == null);
-
-    const cube: CubeTexture = undefined;
-    sky.setSkybox(cube);
-    try std.testing.expect(sky.enabled);
-    try std.testing.expect(sky.texture != null);
-
-    sky.exposure = 2.5;
-    sky.ibl_intensity = 0.5;
-    try std.testing.expectEqual(@as(f32, 2.5), sky.exposure);
-    try std.testing.expectEqual(@as(f32, 0.5), sky.ibl_intensity);
-}

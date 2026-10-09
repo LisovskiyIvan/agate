@@ -400,10 +400,9 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
         return mix(scene_color, current_fog_color, sky_fog);
     }
 
-    // Distance attenuation
+    // Effective distance beyond start distance
     float fog_start = fog_params.w;
     float eff_dist = max(0.0, dist - fog_start);
-    float dist_factor = 1.0 - exp(-eff_dist * fog_params.y);
 
     // Exponential Height Falloff
     float falloff = fog_params.z;
@@ -413,7 +412,9 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
         : exp(-camera_pos.y * falloff);
     height_density = clamp(height_density, 0.0, 5.0);
 
-    float fog_amount = clamp(dist_factor * height_density, 0.0, 1.0);
+    // Beer-Lambert transmittance: extinction = 1.0 - exp(-optical_depth)
+    float optical_depth = eff_dist * fog_params.y * height_density;
+    float fog_amount = clamp(1.0 - exp(-optical_depth), 0.0, 1.0);
     return mix(scene_color, current_fog_color, fog_amount);
 }
 
@@ -617,23 +618,27 @@ vec3 sampleRadianceFast(vec2 uv) {
 }
 
 // TAA neighborhood: 3x3 box over linear radiance taps (values can exceed
-// 1, so no 0..1 clamp here). Mirrors taaNeighborhoodBounds/
+// 1, so no 0..1 clamp here) with variance bounding. Mirrors taaVarianceBounds/
 // taaNeighborhoodAvg in postprocess.zig.
 void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, out vec3 avg) {
     vec2 texel = resolution.zw;
     box_min = center;
     box_max = center;
     vec3 sum = center;
+    vec3 sum_sq = center * center;
     vec3 t;
-    t = sampleRadianceFast(uv + vec2(-texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(0.0, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(-texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(-texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(0.0, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
-    t = sampleRadianceFast(uv + vec2(texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(0.0, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(texel.x, -texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(texel.x, 0.0)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(-texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(0.0, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
+    t = sampleRadianceFast(uv + vec2(texel.x, texel.y)); box_min = min(box_min, t); box_max = max(box_max, t); sum += t; sum_sq += t * t;
     avg = sum / 9.0;
+    vec3 sigma = sqrt(max(sum_sq / 9.0 - avg * avg, vec3(0.0)));
+    box_min = max(box_min, avg - 1.25 * sigma);
+    box_max = min(box_max, avg + 1.25 * sigma);
 }
 
 // TAA resolve in pre-exposure radiance: per-object velocity buffer with
@@ -647,12 +652,26 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     float raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     if (raw_depth >= 0.9999) return current;
 
-    vec4 vel_sample = texture(sampler2D(velocity_tex, velocity_smp), uv);
+    // Closest depth search in 3x3 cross to prevent silhouette edge ghosting
+    vec2 texel = resolution.zw;
+    vec2 best_offset = vec2(0.0);
+    float best_depth = raw_depth;
+    float d;
+    d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(-texel.x, 0.0)).r;
+    if (d < best_depth) { best_depth = d; best_offset = vec2(-texel.x, 0.0); }
+    d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
+    if (d < best_depth) { best_depth = d; best_offset = vec2(texel.x, 0.0); }
+    d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, -texel.y)).r;
+    if (d < best_depth) { best_depth = d; best_offset = vec2(0.0, -texel.y); }
+    d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, texel.y)).r;
+    if (d < best_depth) { best_depth = d; best_offset = vec2(0.0, texel.y); }
+
+    vec4 vel_sample = texture(sampler2D(velocity_tex, velocity_smp), uv + best_offset);
     vec2 prev_uv;
     if (vel_sample.a > 0.5) {
         prev_uv = uv - vel_sample.xy;
     } else {
-        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
+        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, best_depth, 1.0);
         prev_uv = reprojectClipToPrevUv(clip);
     }
     if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
@@ -661,9 +680,17 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     vec3 box_max;
     vec3 avg;
     taaNeighborhood(uv, current, box_min, box_max, avg);
+
+    // Occlusion/disocclusion rejection: calculate divergence of history from variance box
+    vec3 span = max(box_max - box_min, vec3(1e-4));
+    vec3 dist_min = max(box_min - hist, vec3(0.0)) / span;
+    vec3 dist_max = max(hist - box_max, vec3(0.0)) / span;
+    float max_dist = max(max(dist_min.x, dist_max.x), max(max(dist_min.y, dist_max.y), max(dist_min.z, dist_max.z)));
+    float reject_weight = 1.0 / (1.0 + max_dist * max_dist * 4.0);
+
     float clamp_strength = clamp(taa_params.z, 0.0, 1.0);
     vec3 hist_clamped = mix(hist, clamp(hist, box_min, box_max), clamp_strength);
-    float blend = clamp(taa_params.y, 0.0, 1.0);
+    float blend = clamp(taa_params.y, 0.0, 1.0) * reject_weight;
     vec3 outc = mix(current, hist_clamped, blend);
     float sharp = clamp(taa_params.w, 0.0, 1.0);
     if (sharp > 0.0001) {

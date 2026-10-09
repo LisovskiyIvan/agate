@@ -327,28 +327,3 @@ pub const MsaaDepthPass = struct {
 pub fn itemContributesDepth(transparent: bool, is_decal: bool, has_hook: bool) bool {
     return !transparent and !is_decal and !has_hook;
 }
-
-const testing = std.testing;
-
-test "itemContributesDepth pins the prepass skip matrix" {
-    // Opaque regular geometry: the prepass payload.
-    try testing.expect(itemContributesDepth(false, false, false));
-    // Transparent/decal write no depth in the main pass: nothing to mirror.
-    try testing.expect(!itemContributesDepth(true, false, false));
-    try testing.expect(!itemContributesDepth(false, true, false));
-    // Hook materials need their custom vertex stage (v1 non-goal).
-    try testing.expect(!itemContributesDepth(false, false, true));
-    try testing.expect(!itemContributesDepth(true, true, true));
-}
-
-test "render is fail-closed without a GPU context" {
-    // Headless (no sg context): zeroed pass draws nothing, stats clean.
-    var pass = std.mem.zeroes(MsaaDepthPass);
-    var queues = RenderQueues{};
-    defer queues.deinit(std.testing.allocator);
-    var stats = SceneStats{};
-    pass.render(Mat4.identity, &queues, &.{}, &stats);
-    try testing.expectEqual(@as(u32, 0), stats.draw_calls);
-    try testing.expectEqual(@as(u32, 0), stats.main_draw_calls);
-    try testing.expect(pass.depthTexView().id == 0);
-}

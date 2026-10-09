@@ -77,24 +77,29 @@ pub fn createDefaultSkybox(self: anytype, config: SkyboxOptions) !void {
     try self.sky.createDefault(self.allocator, config);
 }
 
-/// Forward pipeline set matching the exact target shape (sample count +
-/// color format). Returns the base `forward` set when both match the base
-/// shape; otherwise returns the lazy `forward_msaa` slot, recreated when
-/// the requested shape differs (it can also hold a 1x different-format
-/// variant). Borrows the base family shaders. The returned pointer aliases
-/// Scene state; never call mid-pass (creation destroys the previous twin
-/// of that slot).
-pub fn forwardFor(self: anytype, samples: i32, color_format: sg.PixelFormat) *scene_forward.ForwardPipelines {
-    if (samples == self.forward.sample_count and color_format == self.forward.color_format) return &self.forward;
-    if (self.forward_msaa == null or self.forward_msaa.?.sample_count != samples or self.forward_msaa.?.color_format != color_format) {
+/// Forward pipeline set matching the exact target shape. Returns the base `forward`
+/// set when both match the base shape; otherwise returns the lazy `forward_msaa` slot,
+/// recreated when the requested shape differs.
+pub fn forwardForShape(self: anytype, shape: @import("../target_shape.zig").TargetShape) *scene_forward.ForwardPipelines {
+    const resolved = shape.resolveEnvironment();
+    if (resolved.eql(self.forward.shape)) return &self.forward;
+    if (self.forward_msaa == null or !resolved.eql(self.forward_msaa.?.shape)) {
         if (self.forward_msaa) |*fw| fw.deinit();
         if (self.forward.family_shaders) |fs| {
-            self.forward_msaa = scene_forward.ForwardPipelines.initWithShaders(samples, color_format, fs);
+            self.forward_msaa = scene_forward.ForwardPipelines.initWithShadersForShape(resolved, fs);
         } else {
-            self.forward_msaa = scene_forward.ForwardPipelines.init(samples, color_format);
+            self.forward_msaa = scene_forward.ForwardPipelines.initForShape(resolved);
         }
     }
     return &self.forward_msaa.?;
+}
+
+pub fn forwardFor(self: anytype, samples: i32, color_format: sg.PixelFormat) *scene_forward.ForwardPipelines {
+    return forwardForShape(self, .{
+        .sample_count = samples,
+        .color_format = color_format,
+        .depth_format = @import("../target_shape.zig").defaultDepthFormat(),
+    });
 }
 
 pub fn deinit(self: anytype) void {
@@ -133,8 +138,8 @@ pub fn deinit(self: anytype) void {
 
     // Deferred off-context destroys that never reached a render-start
     // flush (queued meshes are already unlinked from `meshes`, so this
-    // cannot double-free with deinitMeshes below). deinit забирает и
-    // незавершённые эпохи: приложения без render не оставляют хвостов.
+    // cannot double-free with deinitMeshes below). deinit clears all
+    // epochs so non-rendering teardown leaves no leaks.
     self.gpu_retire.deinit(self.allocator);
 
     // Physics before meshes: bodies keep raw `mesh` pointers and bulk

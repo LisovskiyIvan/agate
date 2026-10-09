@@ -1227,7 +1227,7 @@ test "Mesh decal manager lifecycle and fade" {
     mock_scene.highlights = .{};
     // destroyMesh now scans these referent registries: keep them zeroed
     // instead of 0xAA garbage (physics world absent, no decals, no queue).
-    // P3: очередь ретенции — штатным нулём (defer deinit ниже её освобождает).
+    // Retention queue initialized empty (freed by defer deinit below).
     mock_scene.gpu_retire = .{};
     mock_scene.physics = .{};
     mock_scene.decals = .{};

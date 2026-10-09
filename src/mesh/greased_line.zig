@@ -518,7 +518,7 @@ pub const GreasedLineMesh = struct {
                 .src = .{ .data = sg.asRange(self.vertices) },
             });
             if (self.gpu_dirty) {
-                // Учёт динамики: весь вершинный массив линии.
+                // Dynamic upload tracking: entire line vertex array.
                 upload_meter.record(self.vertices.len * @sizeOf(Vertex));
             }
         }
@@ -528,7 +528,7 @@ pub const GreasedLineMesh = struct {
                 .src = .{ .data = sg.asRange(self.indices) },
             });
             if (self.gpu_needs_full_upload) {
-                // Учёт динамики: индексный массив (полная заливка при создании).
+                // Dynamic upload tracking: index array on creation.
                 upload_meter.record(self.indices.len * @sizeOf(u32));
                 self.gpu_needs_full_upload = false;
             }

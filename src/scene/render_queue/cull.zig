@@ -112,7 +112,7 @@ pub fn commitPresentedVelocityQueue(
 /// Fast-hint + fallback mesh resolve: `meshes[hint]` when its uid matches,
 /// else a linear uid scan. Returns null on any mismatch (removed mesh,
 /// shuffled list, address reuse) — the caller keeps previous state.
-fn resolveMeshByUid(meshes: []const *Mesh, hint_index: usize, uid: u64) ?*Mesh {
+pub fn resolveMeshByUid(meshes: []const *Mesh, hint_index: usize, uid: u64) ?*Mesh {
     if (uid == 0) {
         if (hint_index >= meshes.len) return null;
         return meshes[hint_index];
@@ -243,18 +243,23 @@ pub const FrameCullContext = struct {
 /// queues.transparent); instanced transparents append theirs in
 /// submitInstancedMesh so both share one mesh-index sequence.
 ///
-/// Перед постановкой заимствования prepare-фазы копируются в render-owned
-/// хранилища и item получает только индексы: в очередях не остаётся живых
-/// указателей на Mesh/Material/Skeleton. OOM на копии роняет весь item
-/// (а не рисует его с живыми матрицами): контракт как у OOM очередей.
+/// Borrowed prepare-phase data is copied into render-owned storage
+/// before enqueueing so that items only retain indices (no live Mesh/Material/Skeleton pointers).
+/// OOM on copy drops the item cleanly.
 ///
 /// Internal to `render_queue/*` (used by `build`'s serial loop and parallel
 /// merge tail); not re-exported by the facade.
 pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
     var item = culled.item;
     if (culled.skin_src) |src| {
-        ctx.queues.skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
-        ctx.queues.prev_skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
+        ctx.queues.prev_skin_storage.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
         const idx: u32 = @intCast(ctx.queues.skin_storage.items.len);
         ctx.queues.skin_storage.appendAssumeCapacity(src.*);
         const prev_src = culled.prev_skin_src orelse src;
@@ -262,13 +267,19 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
         item.skin_index = idx;
     }
     if (culled.shader_snap) |snap| {
-        ctx.queues.shader_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.shader_storage.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
         const idx: u32 = @intCast(ctx.queues.shader_storage.items.len);
         ctx.queues.shader_storage.appendAssumeCapacity(snap);
         item.shader_index = idx;
     }
     if (culled.coat) |cp| {
-        ctx.queues.coat_storage.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.coat_storage.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
         const idx: u32 = @intCast(ctx.queues.coat_storage.items.len);
         ctx.queues.coat_storage.appendAssumeCapacity(cp);
         item.coat_index = idx;
@@ -276,8 +287,14 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
     if (item.transparent) {
         // Reserve both slots up front: if either allocation fails the item
         // is dropped entirely, never an undrawn orphan in one array.
-        ctx.queues.transparent.ensureUnusedCapacity(ctx.allocator, 1) catch return;
-        ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch return;
+        ctx.queues.transparent.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
+        ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, 1) catch {
+            ctx.stats.build_oom_drops += 1;
+            return;
+        };
         const idx: u32 = @intCast(ctx.queues.transparent.items.len);
         const seq: u32 = item.mesh_index;
         ctx.queues.transparent.appendAssumeCapacity(item);
@@ -289,7 +306,9 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
             .is_decal = item.is_decal,
         });
     } else {
-        ctx.queues.items.append(ctx.allocator, item) catch {};
+        ctx.queues.items.append(ctx.allocator, item) catch {
+            ctx.stats.build_oom_drops += 1;
+        };
     }
 }
 
@@ -423,12 +442,10 @@ pub fn cullNonInstancedMesh(
     // Instanced batches need no flag — the instanced shader family has no
     // morph block either, and the main pass draws them unmorphed too.
     const vel_fallback = morphNeedsDepthFallback(morph_u);
-    // Снимок hook-материала строится здесь же (prepare-фаза, живые данные
-    // ещё доступны); в очередь попадёт только после копии в appendRenderItem.
+    // Shader snapshot is built here while live data is available; enqueued via appendRenderItem copy.
     const dummy_white = Texture{ .image = .{}, .view = .{ .id = ctx.default_white_id }, .sampler = .{}, .width = 1, .height = 1 };
     const shader_snap = material_mod.buildShaderSnapshot(mat, ctx.default_white orelse &dummy_white);
-    // Снимок coat-факторов (null для всех draws без включённого lobe —
-    // такие draws рисуют из CoatParams.neutral без слота в хранилище).
+    // Coat factors snapshot (null if no active lobes; draws without active lobes use CoatParams.neutral).
     const coat = material_mod.coatParamsFor(mat);
     return .{
         .item = .{
@@ -462,103 +479,4 @@ pub fn cullNonInstancedMesh(
         .shader_snap = shader_snap,
         .coat = coat,
     };
-}
-
-test "worldMatrixCached caches per frame and resolves parents" {
-    var parent: Mesh = undefined;
-    var child: Mesh = undefined;
-
-    // TRS inputs must be fully defined: undefined garbage would poison the
-    // composed matrix (the fields have no defaults on a raw Mesh).
-    parent.position = Vec3.new(1.0, 0.0, 0.0);
-    parent.rotation = Vec3.zero;
-    parent.scaling = Vec3.new(1.0, 1.0, 1.0);
-    parent.base_matrix = Mat4.identity;
-    parent.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
-    parent.parent = null;
-    parent.attach_bone = null;
-    parent.cached_frame = 0;
-    child.position = Vec3.new(0.0, 1.0, 0.0);
-    child.rotation = Vec3.zero;
-    child.scaling = Vec3.new(1.0, 1.0, 1.0);
-    child.base_matrix = Mat4.identity;
-    child.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
-    child.parent = &parent;
-    child.attach_bone = null;
-    child.cached_frame = 0;
-
-    const world = worldMatrixCached(7, &child);
-    // Child = parent TRS composed with local TRS: translation (1, 1, 0).
-    try std.testing.expectEqual(@as(f32, 1.0), world.m[12]);
-    try std.testing.expectEqual(@as(f32, 1.0), world.m[13]);
-    try std.testing.expectEqual(@as(f32, 0.0), world.m[14]);
-    // Both nodes are tagged with the frame id now.
-    try std.testing.expectEqual(@as(u64, 7), child.cached_frame);
-    try std.testing.expectEqual(@as(u64, 7), parent.cached_frame);
-
-    // Same frame: cache hit returns the stored matrix without recomputing.
-    const cached = worldMatrixCached(7, &child);
-    try std.testing.expectEqual(world, cached);
-
-    // worldAABBCached derives the world-space AABB from the same cache.
-    const aabb = worldAABBCached(7, &child);
-    try std.testing.expect(aabb.isValid());
-}
-
-test "worldMatrixCached honors bone attachment like getWorldMatrix" {
-    const ally = std.testing.allocator;
-
-    // Host: identity TRS with a one-bone skeleton whose bone sits at (2,0,0).
-    var host: Mesh = undefined;
-    host.position = Vec3.zero;
-    host.rotation = Vec3.zero;
-    host.scaling = Vec3.new(1.0, 1.0, 1.0);
-    host.base_matrix = Mat4.identity;
-    host.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
-    host.parent = null;
-    host.cached_frame = 0;
-    host.attach_bone = null;
-    host.skeleton = null;
-
-    const skel = try Skeleton.init(ally, 1);
-    defer skel.deinit();
-    skel.bones[0].model_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
-    skel.bones[0].model_matrix.m[12] = 2.0; // bone at x=2
-    host.skeleton = skel;
-
-    // Attached mesh: offset (0,1,0) on the bone, local TRS at (0,0,3).
-    var attached: Mesh = undefined;
-    attached.position = Vec3.new(0.0, 0.0, 3.0);
-    attached.rotation = Vec3.zero;
-    attached.scaling = Vec3.new(1.0, 1.0, 1.0);
-    attached.base_matrix = Mat4.identity;
-    attached.local_bounding_box = BoundingBox.init(Vec3.zero, Vec3.new(1.0, 1.0, 1.0));
-    attached.parent = null;
-    attached.cached_frame = 0;
-    attached.skeleton = null;
-    attached.attach_bone = .{ .host_mesh = &host, .bone_index = 0, .offset_matrix = Mat4.fromRotationTranslationScale(Vec3.zero, Vec3.zero, Vec3.new(1.0, 1.0, 1.0)) };
-    attached.attach_bone.?.offset_matrix.m[13] = 1.0;
-
-    const cached = worldMatrixCached(5, &attached);
-    const direct = attached.getWorldMatrix();
-    // The cache must agree with the uncached bone-aware path everywhere:
-    // bone (x=2) + offset (y=1) + local (z=3).
-    try std.testing.expectEqual(direct, cached);
-    try std.testing.expectEqual(@as(f32, 2.0), cached.m[12]);
-    try std.testing.expectEqual(@as(f32, 1.0), cached.m[13]);
-    try std.testing.expectEqual(@as(f32, 3.0), cached.m[14]);
-    try std.testing.expectEqual(@as(u64, 5), attached.cached_frame);
-
-    // Dead-skeleton host: falls through to the plain parent-less matrix.
-    // Per getWorldMatrix semantics the offset applies only on the bone
-    // path, so the fallback is the bare local TRS (z=3).
-    host.skeleton = null;
-    const fallback = worldMatrixCached(6, &attached);
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[12]);
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.m[13]);
-    try std.testing.expectEqual(@as(f32, 3.0), fallback.m[14]);
-}
-
-test "uid resolve prefers the hint, scans on shuffle, skips unknown" {
-    try @import("cull_tests.zig").checkUidResolve(resolveMeshByUid);
 }

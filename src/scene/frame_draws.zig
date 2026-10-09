@@ -251,6 +251,7 @@ pub const MorphUpload = struct {
     buffer_id: u32 = 0,
     count: u32 = 0,
     data_lo: usize = 0,
+    dirty: bool = false,
     /// Lock-free publication outcome (phase 2, context-written): the staged
     /// flush sets true once the frozen bytes landed in `buffer_id` (or the
     /// packet was empty). The producer cleared `morph_upload_needed` at
@@ -275,6 +276,7 @@ pub const ParticleCpuUpload = struct {
     created_buffer_id: u32 = 0,
     /// Lock-free publication outcome (context-written, see MorphUpload).
     delivered: bool = false,
+    dirty: bool = false,
 };
 pub const ParticleGpuUpload = struct {
     token: usize = 0,
@@ -288,6 +290,7 @@ pub const ParticleGpuUpload = struct {
     created_buffer_id: u32 = 0,
     /// Lock-free publication outcome (context-written, see MorphUpload).
     delivered: bool = false,
+    dirty: bool = false,
 };
 pub const ParticleComputeUpload = struct {
     token: usize = 0,
@@ -382,6 +385,7 @@ pub const TrailUpload = struct {
     /// The frozen index_count/bounds are published by the game-side
     /// commit; the render path reads only the baked queue payload.
     delivered: bool = false,
+    dirty: bool = false,
 };
 pub const SoftUpload = struct {
     token: usize = 0,
@@ -402,6 +406,7 @@ pub const SoftUpload = struct {
     created_index_buffer_id: u32 = 0,
     /// Lock-free publication outcome (context-written, see MorphUpload).
     delivered: bool = false,
+    dirty: bool = false,
 };
 pub const GreasedUpload = struct {
     token: usize = 0,
@@ -425,6 +430,7 @@ pub const GreasedUpload = struct {
     full_delivered: bool = false,
     /// Lock-free publication outcome (context-written, see MorphUpload).
     delivered: bool = false,
+    dirty: bool = false,
 };
 pub const PendingMeshUpload = struct {
     token: usize = 0,
@@ -1160,7 +1166,3 @@ pub const FrameDraws = struct {
 
 // Lease-protocol regression tests live in `frame_draws_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("frame_draws_tests.zig");
-}

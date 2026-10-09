@@ -34,12 +34,3 @@ pub const MaterialDrawRecord = draw_record.MaterialDrawRecord;
 pub const ShaderDrawSnapshot = draw_record.ShaderDrawSnapshot;
 pub const buildShaderSnapshot = draw_record.buildShaderSnapshot;
 pub const buildDrawRecord = draw_record.buildDrawRecord;
-
-test {
-    _ = types;
-    _ = pbr;
-    _ = shader_mat;
-    _ = union_mod;
-    _ = draw_record;
-    _ = @import("material/tests.zig");
-}

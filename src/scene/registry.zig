@@ -182,7 +182,7 @@ pub fn destroyMesh(self: anytype, mesh: *Mesh) void {
     // Decal expiration calls this from Scene.update on the game thread,
     // where sg.destroyBuffer is illegal: unlink now, destroy the GPU
     // resources at the next render-start flush on the context thread
-    // (epoch-ретенция: запись ждёт завершения текущего кадра).
+    // (epoch retention: entry waits for the current frame to complete).
     if (!gpu_thread.isOnContextThread()) {
         self.gpu_retire.retireMesh(self.allocator, mesh);
         return;

@@ -59,7 +59,3 @@ pub fn bloomPyramidActive(post_enabled: bool, cfg: options.PostProcessOptions) b
 
 // Bloom regression tests live in `bloom_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("bloom_tests.zig");
-}

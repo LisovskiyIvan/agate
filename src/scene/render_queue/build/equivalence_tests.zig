@@ -385,8 +385,7 @@ test "parallel cull mixed scene matches serial on all queues" {
     var op_ptrs = [_]*InstancedMesh{ &inst_op_0, &inst_op_1 };
     var inst_opaque = Mesh{
         .name = "inst_opaque",
-        // Сентинел-хендлы батча: вместо живых указателей принадлежность
-        // доказывается снимками геометрии родителя.
+        // Batch sentinel handles: ownership verified through parent geometry snapshots.
         .vertex_buffer = .{ .id = 51 },
         .index_buffer = .{ .id = 52 },
         .index_count = 30,
@@ -527,8 +526,7 @@ test "parallel cull mixed scene matches serial on all queues" {
     }
 
     // Instanced groups: submitted once each, in mesh order, on both paths.
-    // P4: принадлежность и порядок — по сентинел-снимкам геометрии
-    // (inst_opaque → 51/52/30, tie → 61/62/33, far → 71/72/36), без указателей.
+    // Membership and ordering verified through sentinel geometry snapshots.
     try std.testing.expectEqual(queues_a.opaque_instanced.items.len, queues_b.opaque_instanced.items.len);
     try std.testing.expectEqual(@as(usize, 1), queues_a.opaque_instanced.items.len);
     for ([2]*const RenderQueues{ &queues_a, &queues_b }) |qs| {
@@ -591,8 +589,7 @@ test "parallel cull mixed scene matches serial on all queues" {
     }
 
     // Exact-distance tie (regular mesh 3 + instanced group 4 at 7^2 = 49):
-    // the entries are bit-identical distances and mesh-index order wins on
-    // both paths. Резолв order-записи ведёт ровно в tie-батч (61/62/33).
+    // the entries are bit-identical distances and mesh-index order wins on both paths.
     const ordered = queues_a.transparent_order.items;
     try std.testing.expect(ordered[1].distance_sq == ordered[2].distance_sq);
     try std.testing.expectEqual(@as(f32, 49.0), ordered[1].distance_sq);

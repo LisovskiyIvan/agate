@@ -6,23 +6,31 @@ const math = @import("math");
 const Mat4 = math.Mat4;
 const Camera = @import("../camera.zig").Camera;
 const CubeTexture = @import("../texture.zig").CubeTexture;
+pub const TargetShape = @import("../target_shape.zig").TargetShape;
+pub const defaultDepthFormat = @import("../target_shape.zig").defaultDepthFormat;
 
 pub const SkyboxPass = struct {
     pipeline: sg.Pipeline,
     mesh_vb: sg.Buffer,
     mesh_ib: sg.Buffer,
     sampler: sg.Sampler,
+    shape: TargetShape = .{},
     /// Main-target sample count the pipeline was built for.
     sample_count: i32 = 1,
     /// Main-target color format the pipeline was built for.
     color_format: sg.PixelFormat = .RGBA16F,
     shader: sg.Shader = .{},
 
-    /// Same pass for an explicit target shape (sample count + color
-    /// format): each main-target shape needs its own pipeline variant
-    /// because sokol requires pipeline.sample_count to match the
-    /// attachments of the pass it draws into.
     pub fn init(sample_count: i32, color_format: sg.PixelFormat) SkyboxPass {
+        return initForShape(.{
+            .sample_count = sample_count,
+            .color_format = color_format,
+            .depth_format = defaultDepthFormat(),
+        });
+    }
+
+    pub fn initForShape(target_shape: TargetShape) SkyboxPass {
+        const resolved = target_shape.resolveEnvironment();
         const skybox_positions = [_][3]f32{
             .{ -1.0, -1.0, -1.0 }, // 0
             .{ 1.0, -1.0, -1.0 }, // 1
@@ -70,13 +78,14 @@ pub const SkyboxPass = struct {
             .shader = shd,
             .index_type = .UINT16,
             .depth = .{
+                .pixel_format = resolved.depth_format,
                 .compare = .LESS_EQUAL, // Skybox rendered at maximum depth (depth = 1.0) behind scene geometry
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
-            .sample_count = sample_count,
+            .sample_count = resolved.sample_count,
         };
-        pip_desc.colors[0].pixel_format = color_format;
+        pip_desc.colors[0].pixel_format = resolved.color_format;
         pip_desc.layout.buffers[0] = .{ .stride = 3 * @sizeOf(f32) };
         pip_desc.layout.attrs[skybox_shd.ATTR_skybox_position] = .{
             .format = .FLOAT3,
@@ -90,9 +99,10 @@ pub const SkyboxPass = struct {
             .mesh_vb = vb,
             .mesh_ib = ib,
             .sampler = smp,
-            .sample_count = sample_count,
+            .shape = resolved,
+            .sample_count = resolved.sample_count,
             .shader = shd,
-            .color_format = color_format,
+            .color_format = resolved.color_format,
         };
     }
 

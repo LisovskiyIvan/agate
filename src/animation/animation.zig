@@ -27,7 +27,3 @@ pub const RetargetOptions = retarget.RetargetOptions;
 pub const retargetAnimationGroup = retarget.retargetAnimationGroup;
 pub const boneRestLength = retarget.boneRestLength;
 pub const translationScaleFactor = retarget.translationScaleFactor;
-
-test {
-    _ = @import("tests.zig");
-}

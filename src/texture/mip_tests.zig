@@ -391,3 +391,11 @@ test "buildRawSrgbFused rejects bad dimensions and short buffers like buildRaw" 
     try std.testing.expectError(error.InvalidDimensions, Texture.buildRawSrgbFused(allocator, 2, 2, &px, true));
     try std.testing.expectError(error.ImageTooLarge, Texture.buildRawSrgbFused(allocator, 100000, 100000, &px, true));
 }
+
+test "checkedFaceBytes rejects empty and overflowing sizes" {
+    try std.testing.expectError(error.InvalidDimensions, mip.checkedFaceBytes(0));
+    // 100000^2 overflows u32: old `size * size * 4` wrapped to a small
+    // alloc size; now ImageTooLarge before any allocation or GPU upload.
+    try std.testing.expectError(error.ImageTooLarge, mip.checkedFaceBytes(100000));
+    try std.testing.expectEqual(@as(usize, 2 * 2 * 4), try mip.checkedFaceBytes(2));
+}

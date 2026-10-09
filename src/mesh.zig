@@ -123,8 +123,3 @@ pub const LODLevelSpec = simplify.LODLevelSpec;
 pub const simplifyGeometry = simplify.simplifyGeometry;
 pub const simplifyMesh = simplify.simplifyMesh;
 pub const generateLODLevels = simplify.generateLODLevels;
-
-test {
-    _ = @import("mesh/tests.zig");
-    _ = @import("mesh/csg_tests.zig");
-}

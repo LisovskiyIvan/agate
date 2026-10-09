@@ -151,6 +151,8 @@ pub const RenderTarget = render_target.RenderTarget;
 pub const RenderTargetDesc = render_target.RenderTargetDesc;
 pub const RenderTargetCapabilities = render_target.Capabilities;
 pub const RenderTargetSceneOptions = render_target.SceneRenderOptions;
+pub const target_shape = @import("target_shape.zig");
+pub const TargetShape = target_shape.TargetShape;
 
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;
@@ -605,94 +607,4 @@ pub const sokol = @import("sokol");
 
 test {
     _ = @import("tests.zig");
-}
-
-// Every root re-export added for recent Scene APIs: reference each symbol
-// so future removals/renames break loudly here instead of downstream.
-test "root re-exports cover recent Scene APIs" {
-    _ = ClusteredPointLightOptions;
-    _ = ClusteredPointLight;
-    _ = max_clustered_lights;
-    _ = ClusteredSpotLightOptions;
-    _ = ClusteredSpotLight;
-    _ = max_clustered_spots;
-    _ = AreaLightOptions;
-    _ = AreaLight;
-    _ = max_area_lights;
-    _ = sunDirectionFromAngles;
-    _ = colorTemperatureToRgb;
-    _ = ReflectionProbe;
-    _ = ReflectionProbeOptions;
-    _ = Ui3dPanel;
-    _ = Ui3dPanelOptions;
-    _ = Ui3dFaceMode;
-    _ = Ui3dPickHit;
-    _ = HighlightLayer;
-    _ = HighlightEntry;
-    _ = HighlightOptions;
-    _ = HighlightPass;
-    _ = highlight_pass;
-    _ = SceneFrameSnapshot;
-    _ = CameraSnapshot;
-    _ = UpdateError;
-    _ = ComputeModeError;
-    _ = ComputeParticleState;
-    _ = SubEmitter;
-    _ = SubEmitterTrigger;
-    _ = FlowSpace;
-    _ = FlowWrap;
-    _ = CollisionMode;
-    _ = CollisionError;
-    _ = ParticleSphereCollider;
-    _ = ParticleBoxCollider;
-    _ = ParticlePlaneCollider;
-    _ = max_box_colliders;
-    _ = max_plane_colliders;
-    _ = GpuParticleSlot;
-    _ = TtfFont;
-    _ = TtfError;
-    _ = GlyphInfo;
-    _ = Ktx2DecodeError;
-    _ = Ktx2DecodeOptions;
-    _ = RawBlockTexture;
-    _ = DdsDecodeError;
-    _ = DdsDecodeOptions;
-    _ = TextureColorSpace;
-    _ = TextureSlot;
-    _ = ExrDecodeError;
-    _ = ExrDecoded;
-    _ = LutFormat;
-    _ = layoutAlignOffset;
-    _ = gridExtentSize;
-    _ = gridExtentOffset;
-    _ = GlbExportOptions;
-    _ = writeGlbAlloc;
-    _ = writeGlbMeshAlloc;
-    _ = AssetManager;
-    _ = AssetTask;
-    _ = AssetCache;
-    _ = Crowd;
-    _ = CrowdAgent;
-    _ = CrowdAgentParams;
-    _ = CameraRig;
-    _ = CameraRigMode;
-    _ = StereoConvergenceMode;
-    _ = CameraRigSlot;
-    _ = TagSet;
-    _ = TagQuery;
-    _ = Handoff;
-    _ = AllocatorConfig;
-    _ = RenderTarget;
-    _ = RenderTargetDesc;
-    _ = RenderTargetCapabilities;
-    _ = RenderTargetSceneOptions;
-}
-
-test "root re-exports cover the runtime frame facade" {
-    _ = Runtime;
-    _ = RuntimeMetrics;
-    _ = RuntimeBeginResult;
-    _ = RuntimeFrameResult;
-    _ = runtime.BeginResult;
-    _ = runtime.FrameResult;
 }

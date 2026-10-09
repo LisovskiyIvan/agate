@@ -34,10 +34,17 @@ pub inline fn lerp(a: f32, b: f32, t: f32) f32 {
 // reach the suite when tests.zig imports the module inside a test block.
 test {
     _ = @import("math/vec.zig");
+    _ = @import("math/vec_tests.zig");
     _ = @import("math/color.zig");
+    _ = @import("math/color_tests.zig");
     _ = @import("math/mat4.zig");
+    _ = @import("math/mat4_tests.zig");
     _ = @import("math/quat.zig");
+    _ = @import("math/quat_tests.zig");
     _ = @import("math/bounding_box.zig");
+    _ = @import("math/bounding_box_tests.zig");
     _ = @import("math/frustum.zig");
+    _ = @import("math/frustum_tests.zig");
     _ = @import("math/ray.zig");
+    _ = @import("math/ray_tests.zig");
 }

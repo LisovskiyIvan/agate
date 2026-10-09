@@ -13,7 +13,7 @@ fn makeMesh(allocator: std.mem.Allocator, name: []const u8) !*Mesh {
     return m;
 }
 
-test "retire ждёт complete своего epoch; flush идемпотентен" {
+test "retire waits for epoch completion; flush is idempotent" {
     const alloc = std.testing.allocator;
     var q: GpuRetireQueue = .{};
     defer q.deinit(alloc);
@@ -22,10 +22,10 @@ test "retire ждёт complete своего epoch; flush идемпотенте�
     const m = try makeMesh(alloc, "epoch_probe");
     q.retireMesh(alloc, m);
     try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
-    // Flush до complete(e): запись текущего незавершённого epoch ждёт.
+    // Flush before complete(e): current uncompleted epoch waits.
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
-    // После complete(e): ровно одно уничтожение; повторный flush — no-op.
+    // After complete(e): exactly one destruction; repeat flush is a no-op.
     q.complete(e);
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
@@ -33,7 +33,7 @@ test "retire ждёт complete своего epoch; flush идемпотенте�
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
 }
 
-test "несколько epoch: flush уничтожает только завершённые" {
+test "multiple epochs: flush destroys only completed" {
     const alloc = std.testing.allocator;
     var q: GpuRetireQueue = .{};
     defer q.deinit(alloc);
@@ -41,8 +41,7 @@ test "несколько epoch: flush уничтожает только заве
     const e1 = q.begin();
     const m1 = try makeMesh(alloc, "epoch_first");
     q.retireMesh(alloc, m1);
-    // begin(e2) закрывает e1 неявно, но complete(e1) здесь зовём явно —
-    // как это делает Scene.render в конце кадра.
+    // begin(e2) closes e1 implicitly, but complete(e1) is called explicitly.
     const e2 = q.begin();
     const m2 = try makeMesh(alloc, "epoch_second");
     q.retireMesh(alloc, m2);
@@ -50,7 +49,7 @@ test "несколько epoch: flush уничтожает только заве
 
     q.complete(e1);
     q.flush(alloc);
-    // m1 (epoch e1) уничтожен, m2 (текущий e2) ждёт.
+    // m1 (epoch e1) destroyed, m2 (current e2) still waiting.
     try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
 
     q.complete(e2);
@@ -58,7 +57,7 @@ test "несколько epoch: flush уничтожает только заве
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
 }
 
-test "retire из потоков: без гонок и потерь" {
+test "retire from threads: race-free without loss" {
     const alloc = std.testing.allocator;
     var q: GpuRetireQueue = .{};
     defer q.deinit(alloc);
@@ -71,8 +70,7 @@ test "retire из потоков: без гонок и потерь" {
     for (&meshes) |*slot| {
         slot.* = try makeMesh(alloc, "thread_retire");
     }
-    // Append в воркерах не должен аллоцировать: резервируем заранее на
-    // основном потоке, чтобы конкурентный путь был чистым lock+store.
+    // Worker appends do not allocate: reserve upfront on main thread.
     try q.pending.ensureTotalCapacity(alloc, total);
 
     const Worker = struct {
@@ -88,45 +86,38 @@ test "retire из потоков: без гонок и потерь" {
     }
     for (&threads) |*t| t.join();
 
-    // Ни одна запись не потеряна и не задвоена: все total на месте.
+    // No entries lost or duplicated.
     try std.testing.expectEqual(@as(usize, total), q.retainedCount());
     q.complete(e);
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
-    // Отсутствие утечек/двойных free проверяет сам testing.allocator.
 }
 
-test "deinit уничтожает хвосты, включая незавершённый epoch" {
+test "deinit cleans up remaining entries including open epochs" {
     const alloc = std.testing.allocator;
     var q: GpuRetireQueue = .{};
 
     _ = q.begin();
     const m1 = try makeMesh(alloc, "tail_done");
     q.retireMesh(alloc, m1);
-    // Второй epoch намеренно не завершаем: deinit обязан забрать и его.
+    // Second epoch left open intentionally: deinit must clean it up as well.
     _ = q.begin();
     const m2 = try makeMesh(alloc, "tail_open");
     q.retireMesh(alloc, m2);
-    // Overflow-хвост тоже: буфер-free меш, ни одного sg.* не будет.
+    // Overflow tail as well: buffer-free mesh, no sg.* called.
     const m3 = try makeMesh(alloc, "tail_overflow");
     q.overflow[0] = .{ .kind = .mesh, .mesh = m3, .epoch = q.current_epoch };
     q.overflow_len = 1;
     try std.testing.expectEqual(@as(usize, 3), q.retainedCount());
 
     q.deinit(alloc);
-    // После deinit поля очереди читать нельзя (ArrayListUnmanaged.deinit
-    // помечает self как undefined); что все три меша уничтожены ровно по
-    // разу и очередей не осталось, проверяет сам testing.allocator
-    // (утечка/двойной free уронили бы тест).
 }
 
-test "retireBuffer штампует текущий epoch; пустой handle — no-op" {
+test "retireBuffer stamps current epoch; empty handle is a no-op" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var q: GpuRetireQueue = .{};
-    // Ручная чистка вместо q.deinit: fake-хендлы буферов (id без живого
-    // GPU-контекста) нельзя прогонять через sg.destroyBuffer; за ними нет
-    // ни GPU-ресурса, ни CPU-памяти — достаточно освободить список.
+    // Manual cleanup instead of q.deinit since dummy handles have no real GPU resource.
     defer q.pending.deinit(alloc);
 
     const e = q.begin();
@@ -142,21 +133,17 @@ test "retireBuffer штампует текущий epoch; пустой handle �
     try std.testing.expectEqual(e, q.pending.items[1].epoch);
     try std.testing.expectEqual(@as(u32, 41), q.pending.items[1].buffer.id);
 
-    // Flush до complete(e): записи текущего незавершённого epoch ждут,
-    // sg.* не вызывается ни по одной из них.
+    // Flush before complete(e): uncompleted epoch waits.
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
 
-    // Ручная чистка в том же порядке, что drainLocked: меш — штатно
-    // (буферов у testMesh нет, sg.* не вызывается), fake-буфер — дроп
-    // записи без destroy (ресурса за id 41 не существует).
     m.deinit(alloc);
     alloc.destroy(m);
     q.pending.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
 }
 
-test "retireBuffer OOM уходит в overflow[8]" {
+test "retireBuffer OOM spills to overflow[8]" {
     const alloc = std.testing.allocator;
     var q: GpuRetireQueue = .{};
     defer q.pending.deinit(alloc);
@@ -166,11 +153,6 @@ test "retireBuffer OOM уходит в overflow[8]" {
     }
     _ = q.begin();
 
-    // Каждый append падает: все записи паркуются в безаллокационный
-    // overflow, thread-affinity не нарушается. (Полное переполнение
-    // overflow — лог+утечка — тестом не дёргается: кастомный test_runner
-    // считает любой std.log.err падением сборки; ветка — трёхстрочное
-    // зеркало давно существующего mesh-пути.)
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     var i: u32 = 0;
     while (i < 8) : (i += 1) {

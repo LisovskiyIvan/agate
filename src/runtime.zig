@@ -368,7 +368,3 @@ pub const Runtime = struct {
 
 // -- focused unit tests live in `runtime_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once). --
-
-test {
-    _ = @import("runtime_tests.zig");
-}

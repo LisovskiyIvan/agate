@@ -115,7 +115,3 @@ pub const Voice = types.Voice;
 
 // Audio engine owner (lives in audio/engine.zig).
 pub const AudioEngine = engine.AudioEngine;
-
-test {
-    _ = @import("audio/tests.zig");
-}

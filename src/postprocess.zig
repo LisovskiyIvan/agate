@@ -15,6 +15,7 @@ pub const hdr = @import("postprocess/hdr.zig");
 pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
 pub const contact_shadows = @import("postprocess/contact_shadows.zig");
+pub const fog = @import("postprocess/fog.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -125,6 +126,10 @@ pub const taaClampHistory = taa.taaClampHistory;
 pub const taaResolve = taa.taaResolve;
 pub const taaApplySharpen = taa.taaApplySharpen;
 pub const taaResolvePixel = taa.taaResolvePixel;
+pub const taaVarianceBounds = taa.taaVarianceBounds;
+pub const taaRejectionWeight = taa.taaRejectionWeight;
+pub const taaClosestDepthOffset = taa.taaClosestDepthOffset;
+pub const taaResolvePixelWithRejection = taa.taaResolvePixelWithRejection;
 pub const taaParams = taa.taaParams;
 pub const taaState = taa.taaState;
 
@@ -161,19 +166,9 @@ pub const contactShadowsActive = contact_shadows.contactShadowsActive;
 pub const contactShadowParams = contact_shadows.contactShadowParams;
 pub const calcContactShadowAttenuation = contact_shadows.calcContactShadowAttenuation;
 
-test {
-    _ = types;
-    _ = bloom;
-    _ = glow;
-    _ = highlight;
-    _ = dof;
-    _ = color_curves;
-    _ = lut;
-    _ = taa;
-    _ = shafts;
-    _ = options;
-    _ = hdr;
-    _ = auto_exposure;
-    _ = depth_pyramid;
-    _ = contact_shadows;
-}
+// --- Atmospheric Height Fog ---
+pub const heightDensity = fog.heightDensity;
+pub const opticalDepth = fog.opticalDepth;
+pub const fogExtinction = fog.fogExtinction;
+pub const sunInscatter = fog.sunInscatter;
+pub const skyHorizonHaze = fog.skyHorizonHaze;

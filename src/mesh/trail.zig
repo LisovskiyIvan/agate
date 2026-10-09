@@ -332,7 +332,7 @@ pub const TrailMesh = struct {
                 .src = .{ .data = sg.asRange(self.vertices[0..self.pending_vertex_count]) },
             });
             if (self.gpu_dirty) {
-                // Учёт динамики: только staged-префикс вершин.
+                // Dynamic upload tracking: only staged vertex prefix.
                 upload_meter.record(self.pending_vertex_count * @sizeOf(Vertex));
             }
         }
@@ -342,7 +342,7 @@ pub const TrailMesh = struct {
                 .src = .{ .data = sg.asRange(self.indices[0..self.pending_index_count]) },
             });
             if (self.gpu_dirty) {
-                // Учёт динамики: только staged-префикс индексов (u16).
+                // Dynamic upload tracking: only staged index prefix (u16).
                 upload_meter.record(self.pending_index_count * @sizeOf(u16));
             }
         }

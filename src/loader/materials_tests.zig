@@ -463,31 +463,30 @@ test "textureImage resolves basisu image when source is absent (GPU-free)" {
     var img = std.mem.zeroes(c.cgltf_image);
     var basisu_img = std.mem.zeroes(c.cgltf_image);
 
-    // Обычная текстура: рабочее изображение — image.
+    // Standard texture: working image is image.
     var plain = std.mem.zeroes(c.cgltf_texture);
     plain.image = &img;
     try std.testing.expect(@intFromPtr(textureImage(&plain).?) == @intFromPtr(&img));
 
-    // KHR_texture_basisu: source отсутствует, рабочее изображение —
-    // basisu_image (обычно .ktx2).
+    // KHR_texture_basisu: source is absent, working image is basisu_image (.ktx2).
     var basisu = std.mem.zeroes(c.cgltf_texture);
     basisu.has_basisu = 1;
     basisu.basisu_image = &basisu_img;
     try std.testing.expect(@intFromPtr(textureImage(&basisu).?) == @intFromPtr(&basisu_img));
 
-    // Ни source, ни basisu — null.
+    // Neither source nor basisu -> null.
     var empty = std.mem.zeroes(c.cgltf_texture);
     try std.testing.expect(textureImage(&empty) == null);
     try std.testing.expect(textureImage(null) == null);
 
-    // Оба заданы (не по спеке, но в терпимости): приоритет у source.
+    // Both present (tolerant parsing): priority to source.
     var both = std.mem.zeroes(c.cgltf_texture);
     both.image = &img;
     both.has_basisu = 1;
     both.basisu_image = &basisu_img;
     try std.testing.expect(@intFromPtr(textureImage(&both).?) == @intFromPtr(&img));
 
-    // Флаг без указателя — тоже null, а не висячий доступ.
+    // Flag without pointer -> null.
     var flag_only = std.mem.zeroes(c.cgltf_texture);
     flag_only.has_basisu = 1;
     try std.testing.expect(textureImage(&flag_only) == null);
@@ -499,9 +498,8 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
     const alloc = arena.allocator();
     var scene = testScene(alloc);
 
-    // Минимальный ASTC 4x4 UNORM контейнер (vkFormat 157): 80 байт
-    // header+index, одна 24-байтная level-запись, 16 байт блочного пейлоада —
-    // та же раскладка, что в assets.zig "requestMemory routes block KTX2".
+    // Minimal ASTC 4x4 UNORM container (vkFormat 157): 80-byte header+index,
+    // single 24-byte level entry, 16-byte block payload.
     var file: [80 + 24 + 16]u8 = [_]u8{0} ** (80 + 24 + 16);
     @memcpy(file[0..12], &[12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A });
     std.mem.writeInt(u32, file[12..16], 157, .little); // vkFormat ASTC_4x4_UNORM_BLOCK
@@ -550,8 +548,7 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
         }
     }
 
-    // [0]: блочный ASTC попал в .block как в файле (один уровень, без
-    // синтеза мипов и без sRGB-конверсии); RGBA8-сторона пуста.
+    // [0]: block ASTC in .block verbatim from file; RGBA8 side empty.
     try std.testing.expect(decoded[0] != null);
     switch (decoded[0].?) {
         .block => |b| {
@@ -566,6 +563,6 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
         .rgba => return error.TestUnexpectedResult,
     }
 
-    // [1]: битый декод — null, как раньше для RawTexture.
+    // [1]: corrupt decode yields null.
     try std.testing.expect(decoded[1] == null);
 }

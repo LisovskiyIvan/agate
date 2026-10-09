@@ -39,7 +39,7 @@ pub fn drawButton(canvas: anytype, text: []const u8, x: f32, y: f32, w: f32, h: 
 
     canvas.drawPanel(x, y, w, h, bg, border, 1.5);
 
-    const text_w = @as(f32, @floatFromInt(text.len)) * font_size * 0.5;
+    const text_w = text_mod.measureForCanvas(canvas, text, font_size).x;
     const tx = x + (w - text_w) * 0.5;
     const ty = y + (h - font_size) * 0.5;
     canvas.drawTextWithOutline(text, tx, ty, font_size, Color4.white, 0.16);
@@ -47,7 +47,7 @@ pub fn drawButton(canvas: anytype, text: []const u8, x: f32, y: f32, w: f32, h: 
 
 /// Draws a compact pill-shaped badge with text (e.g. status tags, FPS counter badge)
 pub fn drawBadge(canvas: anytype, text: []const u8, x: f32, y: f32, font_size: f32, bg_col: Color4, text_col: Color4) void {
-    const text_w = @as(f32, @floatFromInt(text.len)) * font_size * 0.5;
+    const text_w = text_mod.measureForCanvas(canvas, text, font_size).x;
     const pad_x = font_size * 0.4;
     const pad_y = font_size * 0.25;
     const w = text_w + pad_x * 2.0;

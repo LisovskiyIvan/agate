@@ -101,13 +101,36 @@ pub fn stageUploads(scene: anytype, slot: anytype) void {
 
 fn stageMorphs(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.meshes.items, 0..) |m, i| {
-        if (!m.morph_upload_needed) continue;
+        if (m.morph_mode == .gpu) continue;
+        if (!m.hasMorphTargets() and !m.morph_upload_needed) continue;
+        if (sg.isvalid() and m.vertex_buffer.id != 0 and !sg.queryBufferUsage(m.vertex_buffer).write_transient) continue;
         const n = @min(m.morph_base.len, m.morph_staging.len);
-        // Empty staging still freezes an empty packet: the quiesced drain
-        // clears the flag unconditionally, so the staged flush must observe
-        // it too instead of leaving a stale flag behind.
+        if (n == 0) {
+            if (m.morph_upload_needed) {
+                const data_lo = slot.morph_data.items.len;
+                slot.morph_uploads.append(allocator, .{
+                    .token = @intFromPtr(m),
+                    .uid = m.uid,
+                    .mesh_index = @intCast(i),
+                    .buffer_id = m.vertex_buffer.id,
+                    .count = 0,
+                    .data_lo = data_lo,
+                    .dirty = true,
+                }) catch {
+                    slot.build_stats.build_oom_drops += 1;
+                    continue;
+                };
+                m.morph_upload_needed = false;
+            }
+            continue;
+        }
+        if (m.vertex_buffer.id == 0) continue;
+        const is_dirty = m.morph_upload_needed;
         const data_lo = slot.morph_data.items.len;
-        if (n > 0) slot.morph_data.appendSlice(allocator, m.morph_staging[0..n]) catch continue;
+        slot.morph_data.appendSlice(allocator, m.morph_staging[0..n]) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         slot.morph_uploads.append(allocator, .{
             .token = @intFromPtr(m),
             .uid = m.uid,
@@ -115,27 +138,28 @@ fn stageMorphs(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
             .buffer_id = m.vertex_buffer.id,
             .count = @intCast(n),
             .data_lo = data_lo,
+            .dirty = is_dirty,
         }) catch {
             slot.morph_data.items.len = data_lo;
             continue;
         };
-        // Flag consumed AT STAGE TIME (phase 2 ownership transfer): the
-        // context never writes it. Cleared only on a successfully frozen
-        // packet (OOM above keeps the flag for the next build); a
-        // cancelled claim re-arms via restageDroppedSlot.
         m.morph_upload_needed = false;
     }
 }
 
 fn stageParticleCpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.particles.systems.items, 0..) |ps, i| {
-        if (!ps.instance_dirty) continue;
+        if (!ps.instance_dirty and ps.active_count == 0) continue;
         const count: usize = ps.active_count;
         if (count > ps.instances.len) continue;
         // Empty-but-dirty systems freeze an empty packet so the staged flush
         // consumes the flag without ever reading live state on the latch.
+        const is_dirty = ps.instance_dirty;
         const data_lo = slot.p_cpu_data.items.len;
-        if (count > 0) slot.p_cpu_data.appendSlice(allocator, ps.instances[0..count]) catch continue;
+        if (count > 0) slot.p_cpu_data.appendSlice(allocator, ps.instances[0..count]) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         slot.p_cpu_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
             .sys_index = @intCast(i),
@@ -143,6 +167,7 @@ fn stageParticleCpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator)
             .count = @intCast(count),
             .data_lo = data_lo,
             .capacity = ps.capacity,
+            .dirty = is_dirty,
         }) catch {
             slot.p_cpu_data.items.len = data_lo;
             continue;
@@ -157,19 +182,18 @@ fn stageParticleCpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator)
 
 fn stageParticleGpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.particles.systems.items, 0..) |ps, i| {
-        if (!ps.gpu_dirty and !ps.gpu_flush_pending) continue;
+        if (!ps.gpu_dirty and !ps.gpu_flush_pending and ps.gpu_high_water == 0) continue;
         if (ps.gpu_slots.len == 0) continue;
         // Freeze the exact upload range; a pending flag with an empty window
         // still freezes an empty packet so the latch consumes the flags
         // without live reads.
-        const range: []const @TypeOf(ps.gpu_slots[0]) = if (ps.gpu_dirty_wrapped)
-            ps.gpu_slots[0..ps.gpu_high_water]
-        else if (ps.gpu_dirty and ps.gpu_dirty_end > ps.gpu_dirty_start)
-            ps.gpu_slots[ps.gpu_dirty_start..ps.gpu_dirty_end]
-        else
-            ps.gpu_slots[0..0];
+        const is_dirty = ps.gpu_dirty or ps.gpu_flush_pending;
+        const range: []const @TypeOf(ps.gpu_slots[0]) = ps.gpu_slots[0..ps.gpu_high_water];
         const data_lo = slot.p_gpu_data.items.len;
-        if (range.len > 0) slot.p_gpu_data.appendSlice(allocator, range) catch continue;
+        if (range.len > 0) slot.p_gpu_data.appendSlice(allocator, range) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         slot.p_gpu_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
             .sys_index = @intCast(i),
@@ -177,6 +201,7 @@ fn stageParticleGpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator)
             .count = @intCast(range.len),
             .data_lo = data_lo,
             .capacity = ps.capacity,
+            .dirty = is_dirty,
         }) catch {
             slot.p_gpu_data.items.len = data_lo;
             continue;
@@ -197,7 +222,10 @@ fn stageParticleCompute(scene: anytype, slot: anytype, allocator: std.mem.Alloca
         if (staged > ps.compute_staging.len) continue;
         const data_lo = slot.p_compute_data.items.len;
         if (staged > 0) {
-            slot.p_compute_data.appendSlice(allocator, ps.compute_staging[0..staged]) catch continue;
+            slot.p_compute_data.appendSlice(allocator, ps.compute_staging[0..staged]) catch {
+                slot.build_stats.build_oom_drops += 1;
+                continue;
+            };
         }
         slot.p_compute_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
@@ -246,7 +274,8 @@ fn stageParticleCompute(scene: anytype, slot: anytype, allocator: std.mem.Alloca
 
 fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.trails.meshes.items, 0..) |tm, i| {
-        if (!tm.gpu_dirty) continue;
+        if (!tm.gpu_dirty and tm.pending_vertex_count == 0) continue;
+        const is_dirty = tm.gpu_dirty;
         const vc: usize = tm.pending_vertex_count;
         const ic: usize = tm.pending_index_count;
         if (vc > tm.vertices.len or ic > tm.indices.len) continue;
@@ -254,7 +283,10 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
         // the flag and publishes index_count/bounds unconditionally.
         const v_lo = slot.trail_verts.items.len;
         const i_lo = slot.trail_indices.items.len;
-        if (vc > 0) slot.trail_verts.appendSlice(allocator, tm.vertices[0..vc]) catch continue;
+        if (vc > 0) slot.trail_verts.appendSlice(allocator, tm.vertices[0..vc]) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         if (ic > 0) slot.trail_indices.appendSlice(allocator, tm.indices[0..ic]) catch {
             slot.trail_verts.items.len = v_lo;
             continue;
@@ -275,6 +307,7 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
             // sizes these, never the live slices.
             .vert_cap = tm.vertices.len,
             .index_cap = tm.indices.len,
+            .dirty = is_dirty,
         }) catch {
             slot.trail_verts.items.len = v_lo;
             slot.trail_indices.items.len = i_lo;
@@ -288,13 +321,17 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
 
 fn stageSoftbodies(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.softbodies.bodies.items, 0..) |b, i| {
-        if (!b.upload_pending) continue;
+        if (!b.upload_pending and b.vertices.len == 0) continue;
+        const is_dirty = b.upload_pending;
         // Empty verts still freeze an empty packet: the quiesced drain clears
         // the flag unconditionally. Indices are frozen alongside the verts
         // (grid topology is fixed at creation, but freezing keeps the staged
         // flush independent of every live array).
         const data_lo = slot.soft_data.items.len;
-        if (b.vertices.len > 0) slot.soft_data.appendSlice(allocator, b.vertices) catch continue;
+        if (b.vertices.len > 0) slot.soft_data.appendSlice(allocator, b.vertices) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         const i_lo = slot.soft_indices.items.len;
         if (b.indices.len > 0) slot.soft_indices.appendSlice(allocator, b.indices) catch {
             slot.soft_data.items.len = data_lo;
@@ -314,6 +351,7 @@ fn stageSoftbodies(scene: anytype, slot: anytype, allocator: std.mem.Allocator) 
             .buffers_pending = b.buffers_pending,
             // Frozen vertex allocation length (fixed grid at creation).
             .vert_cap = b.vertices.len,
+            .dirty = is_dirty,
         }) catch {
             slot.soft_data.items.len = data_lo;
             slot.soft_indices.items.len = i_lo;
@@ -327,18 +365,21 @@ fn stageSoftbodies(scene: anytype, slot: anytype, allocator: std.mem.Allocator) 
 
 fn stageGreased(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void {
     for (scene.greased_lines.items, 0..) |gl, i| {
-        if (!gl.gpu_dirty) continue;
+        if (!gl.gpu_dirty and gl.vertices.len == 0) continue;
+        const is_dirty = gl.gpu_dirty;
         // Empty verts still freeze an empty packet so a live context clears
         // the flag exactly like the quiesced drain. Indices are frozen
         // whenever a full upload may be needed: the staged full flag, or
         // missing live buffers (the flush will create them, which forces a
         // full index upload there).
         const v_lo = slot.greased_verts.items.len;
-        if (gl.vertices.len > 0) slot.greased_verts.appendSlice(allocator, gl.vertices) catch continue;
+        if (gl.vertices.len > 0) slot.greased_verts.appendSlice(allocator, gl.vertices) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         const full = gl.gpu_needs_full_upload;
-        const need_idx = full or gl.mesh.vertex_buffer.id == 0;
         const i_lo = slot.greased_indices.items.len;
-        if (need_idx and gl.indices.len > 0) {
+        if (gl.indices.len > 0) {
             slot.greased_indices.appendSlice(allocator, gl.indices) catch {
                 slot.greased_verts.items.len = v_lo;
                 continue;
@@ -350,7 +391,7 @@ fn stageGreased(scene: anytype, slot: anytype, allocator: std.mem.Allocator) voi
             .vertex_buffer_id = gl.mesh.vertex_buffer.id,
             .index_buffer_id = gl.mesh.index_buffer.id,
             .vert_count = gl.vertices.len,
-            .index_count = if (need_idx) gl.indices.len else 0,
+            .index_count = gl.indices.len,
             .vert_lo = v_lo,
             .index_lo = i_lo,
             .full_upload = full,
@@ -358,9 +399,10 @@ fn stageGreased(scene: anytype, slot: anytype, allocator: std.mem.Allocator) voi
             // these, never the live slices.
             .vert_cap = gl.vertices.len,
             .index_cap = gl.indices.len,
+            .dirty = is_dirty,
         }) catch {
             slot.greased_verts.items.len = v_lo;
-            if (need_idx) slot.greased_indices.items.len = i_lo;
+            if (gl.indices.len > 0) slot.greased_indices.items.len = i_lo;
             continue;
         };
         // Consumed at stage time (see stageMorphs). The full-upload flag
@@ -390,11 +432,17 @@ fn stagePendingMeshes(scene: anytype, slot: anytype, allocator: std.mem.Allocato
         var delta_size: morph_gpu.TextureSize = .{ .width = 0, .height = 0 };
         if (want_delta) {
             delta_size = morph_gpu.textureSizeFor(m.morph_base.len);
-            delta_pixels = morph_gpu.packDeltas(allocator, m.morph_targets, m.morph_base.len, delta_size) catch continue;
+            delta_pixels = morph_gpu.packDeltas(allocator, m.morph_targets, m.morph_base.len, delta_size) catch {
+                slot.build_stats.build_oom_drops += 1;
+                continue;
+            };
         }
         defer if (delta_pixels.len > 0) allocator.free(delta_pixels);
         const v_lo = slot.pending_verts.items.len;
-        if (m.pending_vertices.len > 0) slot.pending_verts.appendSlice(allocator, m.pending_vertices) catch continue;
+        if (m.pending_vertices.len > 0) slot.pending_verts.appendSlice(allocator, m.pending_vertices) catch {
+            slot.build_stats.build_oom_drops += 1;
+            continue;
+        };
         const i_lo = slot.pending_indices.items.len;
         if (m.cpu_indices.len > 0) slot.pending_indices.appendSlice(allocator, m.cpu_indices) catch {
             slot.pending_verts.items.len = v_lo;
@@ -555,6 +603,12 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
                 if (vbuf.id != 0) sg.destroyBuffer(vbuf);
                 continue;
             }
+            if (verts.len > 0) {
+                sg.writeBufferTransient(.{
+                    .dst = .{ .buffer = vbuf },
+                    .src = .{ .data = sg.asRange(verts) },
+                });
+            }
             if (up.index_type_is_u16) {
                 const tmp = scene.allocator.alloc(u16, idx32.len) catch {
                     sg.destroyBuffer(vbuf);
@@ -673,11 +727,17 @@ fn flushMorphs(scene: anytype, slot: anytype) void {
         }
         if (!sg.isvalid()) continue;
         if (up.buffer_id == 0) continue;
+        if (!sg.queryBufferUsage(.{ .id = up.buffer_id }).write_transient) {
+            up.delivered = true;
+            continue;
+        }
         sg.writeBufferTransient(.{
             .dst = .{ .buffer = .{ .id = up.buffer_id } },
             .src = .{ .data = sg.asRange(slot.morph_data.items[up.data_lo..end]) },
         });
-        upload_meter.record(up.count * @sizeOf(@TypeOf(slot.morph_data.items[0])));
+        if (up.dirty) {
+            upload_meter.record(up.count * @sizeOf(@TypeOf(slot.morph_data.items[0])));
+        }
         up.delivered = true;
     }
 }
@@ -720,7 +780,9 @@ fn flushParticleCpu(scene: anytype, slot: anytype) void {
             .dst = .{ .buffer = .{ .id = target_id } },
             .src = .{ .data = sg.asRange(slot.p_cpu_data.items[up.data_lo..end]) },
         });
-        upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_cpu_data.items[0])));
+        if (up.dirty) {
+            upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_cpu_data.items[0])));
+        }
         up.delivered = true;
     }
     _ = scene;
@@ -758,7 +820,9 @@ fn flushParticleGpu(scene: anytype, slot: anytype) void {
             .dst = .{ .buffer = .{ .id = target_id } },
             .src = .{ .data = sg.asRange(slot.p_gpu_data.items[up.data_lo..end]) },
         });
-        upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_gpu_data.items[0])));
+        if (up.dirty) {
+            upload_meter.record(up.count * @sizeOf(@TypeOf(slot.p_gpu_data.items[0])));
+        }
         up.delivered = true;
     }
     _ = scene;
@@ -805,7 +869,10 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
         var pipeline_id = up.pipeline_id;
         if (up.buffers_pending) {
             if (state_id == 0) {
-                const zeros = scene.allocator.alloc(u8, cap * @sizeOf(@import("../particles/types.zig").ComputeParticleState)) catch continue;
+                const zeros = scene.allocator.alloc(u8, cap * @sizeOf(@import("../particles/types.zig").ComputeParticleState)) catch {
+                    slot.build_stats.build_oom_drops += 1;
+                    continue;
+                };
                 defer scene.allocator.free(zeros);
                 @memset(zeros, 0);
                 const created = sg.makeBuffer(.{
@@ -898,7 +965,10 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
         }
         if (state_id == 0) continue;
         if (up.state_clear_pending) {
-            const zeros = scene.allocator.alloc(u8, cap * @sizeOf(@import("../particles/types.zig").ComputeParticleState)) catch continue;
+            const zeros = scene.allocator.alloc(u8, cap * @sizeOf(@import("../particles/types.zig").ComputeParticleState)) catch {
+                slot.build_stats.build_oom_drops += 1;
+                continue;
+            };
             defer scene.allocator.free(zeros);
             @memset(zeros, 0);
             const created_buf = sg.makeBuffer(.{
@@ -1034,14 +1104,18 @@ fn flushTrails(scene: anytype, slot: anytype) void {
                     .dst = .{ .buffer = .{ .id = vertex_id } },
                     .src = .{ .data = sg.asRange(slot.trail_verts.items[up.vert_lo..v_end]) },
                 });
-                upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.trail_verts.items[0])));
+                if (up.dirty) {
+                    upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.trail_verts.items[0])));
+                }
             }
             if (up.index_count > 0 and index_id != 0) {
                 sg.writeBufferTransient(.{
                     .dst = .{ .buffer = .{ .id = index_id } },
                     .src = .{ .data = sg.asRange(slot.trail_indices.items[up.index_lo..i_end]) },
                 });
-                upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.trail_indices.items[0])));
+                if (up.dirty) {
+                    upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.trail_indices.items[0])));
+                }
             }
             up.delivered = true;
         } else {
@@ -1108,7 +1182,9 @@ fn flushSoftbodies(scene: anytype, slot: anytype) void {
                 .dst = .{ .buffer = .{ .id = vertex_id } },
                 .src = .{ .data = sg.asRange(slot.soft_data.items[up.data_lo..end]) },
             });
-            upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.soft_data.items[0])));
+            if (up.dirty) {
+                upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.soft_data.items[0])));
+            }
             up.delivered = true;
         } else {
             // Headless rule (see flushTrails): empty + no creation still
@@ -1165,19 +1241,25 @@ fn flushGreased(scene: anytype, slot: anytype) void {
                 .dst = .{ .buffer = .{ .id = vertex_id } },
                 .src = .{ .data = sg.asRange(slot.greased_verts.items[up.vert_lo..v_end]) },
             });
-            upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.greased_verts.items[0])));
+            if (up.dirty) {
+                upload_meter.record(up.vert_count * @sizeOf(@TypeOf(slot.greased_verts.items[0])));
+            }
         }
         // A just-created index buffer is empty: it needs the full index
         // upload even when the frozen full flag was false (the stage
         // froze indices whenever live buffers were missing, precisely for
         // this case).
-        if ((up.full_upload or just_created) and up.index_count > 0 and index_id != 0) {
+        if (up.index_count > 0 and index_id != 0) {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = .{ .id = index_id } },
                 .src = .{ .data = sg.asRange(slot.greased_indices.items[up.index_lo..i_end]) },
             });
-            upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.greased_indices.items[0])));
-            up.full_delivered = true;
+            if (up.full_upload or just_created) {
+                if (up.dirty) {
+                    upload_meter.record(up.index_count * @sizeOf(@TypeOf(slot.greased_indices.items[0])));
+                }
+                up.full_delivered = true;
+            }
         } else if (up.full_upload and up.index_count == 0) {
             // Full requested but nothing frozen (degenerate): the full
             // requirement is satisfied vacuously.
@@ -1235,18 +1317,20 @@ pub fn commitSlotResults(scene: anytype, front: anytype) void {
 pub fn restageDroppedSlot(scene: anytype, slot: anytype) void {
     for (slot.morph_uploads.items) |up| {
         const m = commitMeshAt(scene, up.mesh_index, up.token, up.uid) orelse continue;
-        m.morph_upload_needed = true;
+        if (up.dirty) m.morph_upload_needed = true;
     }
     for (slot.p_cpu_uploads.items) |up| {
         const ps = commitParticleAt(scene, up.sys_index, up.token) orelse continue;
-        ps.instance_dirty = true;
+        if (up.dirty) ps.instance_dirty = true;
         if (ps.instance_buffer.id == 0) ps.instance_buffer_pending = true;
     }
     for (slot.p_gpu_uploads.items) |up| {
         const ps = commitParticleAt(scene, up.sys_index, up.token) orelse continue;
-        ps.gpu_dirty = true;
-        ps.gpu_dirty_wrapped = true;
-        ps.gpu_flush_pending = true;
+        if (up.dirty) {
+            ps.gpu_dirty = true;
+            ps.gpu_dirty_wrapped = true;
+            ps.gpu_flush_pending = true;
+        }
         if (ps.gpu_slot_buffer.id == 0) ps.gpu_slot_buffer_pending = true;
     }
     for (slot.p_compute_uploads.items) |up| {
@@ -1257,17 +1341,17 @@ pub fn restageDroppedSlot(scene: anytype, slot: anytype) void {
     }
     for (slot.trail_uploads.items) |up| {
         const tm = commitTrailAt(scene, up.trail_index, up.token) orelse continue;
-        tm.gpu_dirty = true;
+        if (up.dirty) tm.gpu_dirty = true;
         if (tm.mesh.vertex_buffer.id == 0 or tm.mesh.index_buffer.id == 0) tm.buffers_pending = true;
     }
     for (slot.soft_uploads.items) |up| {
         const b = commitSoftAt(scene, up.body_index, up.token) orelse continue;
-        b.upload_pending = true;
+        if (up.dirty) b.upload_pending = true;
         if (b.mesh.vertex_buffer.id == 0) b.buffers_pending = true;
     }
     for (slot.greased_uploads.items) |up| {
         const gl = commitGreasedAt(scene, up.line_index, up.token) orelse continue;
-        gl.gpu_dirty = true;
+        if (up.dirty) gl.gpu_dirty = true;
     }
     for (slot.pending_uploads.items) |up| {
         const m = commitMeshAt(scene, up.mesh_index, up.token, up.uid) orelse continue;
@@ -1329,7 +1413,7 @@ fn commitMorphs(scene: anytype, front: anytype) void {
     for (front.morph_uploads.items) |up| {
         if (up.delivered) continue;
         const m = commitMeshAt(scene, up.mesh_index, up.token, up.uid) orelse continue;
-        m.morph_upload_needed = true;
+        if (up.dirty) m.morph_upload_needed = true;
     }
 }
 
@@ -1341,7 +1425,7 @@ fn commitParticleCpu(scene: anytype, front: anytype) void {
             continue;
         };
         if (!up.delivered) {
-            ps.instance_dirty = true;
+            if (up.dirty) ps.instance_dirty = true;
             if (ps.instance_buffer.id == 0) ps.instance_buffer_pending = true;
             continue;
         }
@@ -1370,9 +1454,11 @@ fn commitParticleGpu(scene: anytype, front: anytype) void {
             continue;
         };
         if (!up.delivered) {
-            ps.gpu_dirty = true;
-            ps.gpu_dirty_wrapped = true;
-            ps.gpu_flush_pending = true;
+            if (up.dirty) {
+                ps.gpu_dirty = true;
+                ps.gpu_dirty_wrapped = true;
+                ps.gpu_flush_pending = true;
+            }
             if (ps.gpu_slot_buffer.id == 0) ps.gpu_slot_buffer_pending = true;
             continue;
         }
@@ -1659,7 +1745,7 @@ fn commitTrails(scene: anytype, front: anytype) void {
             continue;
         };
         if (!up.delivered) {
-            tm.gpu_dirty = true;
+            if (up.dirty) tm.gpu_dirty = true;
             if (tm.mesh.vertex_buffer.id == 0 or tm.mesh.index_buffer.id == 0) tm.buffers_pending = true;
             continue;
         }
@@ -1707,7 +1793,7 @@ fn commitSoftbodies(scene: anytype, front: anytype) void {
             continue;
         };
         if (!up.delivered) {
-            b.upload_pending = true;
+            if (up.dirty) b.upload_pending = true;
             if (b.mesh.vertex_buffer.id == 0) b.buffers_pending = true;
             continue;
         }
@@ -1740,7 +1826,7 @@ fn commitGreased(scene: anytype, front: anytype) void {
             continue;
         };
         if (!up.delivered) {
-            gl.gpu_dirty = true;
+            if (up.dirty) gl.gpu_dirty = true;
             continue;
         }
         if (up.created_vertex_buffer_id != 0 or up.created_index_buffer_id != 0) {
@@ -1871,7 +1957,3 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
 
 // Staged-upload regression tests live in `upload_packets_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("upload_packets_tests.zig");
-}

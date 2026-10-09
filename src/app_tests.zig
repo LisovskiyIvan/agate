@@ -92,6 +92,13 @@ pub fn expectMappings(sapp_desc: sapp.Desc, sg_desc: sg.Desc, def_sapp: sapp.Des
     try std.testing.expectEqual(@as(i32, 4096), def_sg.buffer_pool_size);
 }
 
+test "App descriptor mapping covers every flag and pool" {
+    const alloc = std.testing.allocator;
+    const app = App.init(alloc, configForMappingTest(), .{});
+    const def = App.init(alloc, .{}, .{});
+    try expectMappings(app.sappDesc(), app.sgDesc(.{}), def.sappDesc(), def.sgDesc(.{}));
+}
+
 test "App headless lifecycle: init, frame stepping, event dispatch, cleanup" {
     const alloc = std.testing.allocator;
     defer gpu_thread.resetContextThreadForTest();

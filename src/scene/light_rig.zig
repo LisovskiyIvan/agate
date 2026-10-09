@@ -81,6 +81,7 @@ pub const LightRig = struct {
 
     pub fn createPointLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: PointLightOptions) !*PointLight {
         const pl = try allocator.create(PointLight);
+        errdefer allocator.destroy(pl);
         pl.* = PointLight.init(name, options);
         try self.point_lights.append(allocator, pl);
         return pl;
@@ -88,6 +89,7 @@ pub const LightRig = struct {
 
     pub fn createSpotLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: SpotLightOptions) !*SpotLight {
         const sl = try allocator.create(SpotLight);
+        errdefer allocator.destroy(sl);
         sl.* = SpotLight.init(name, options);
         try self.spot_lights.append(allocator, sl);
         return sl;
@@ -116,6 +118,7 @@ pub const LightRig = struct {
     pub fn addDirectionalLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         if (self.extra_directionals.items.len >= lights.max_fill_directionals) return error.TooManyDirectionalLights;
         const dl = try allocator.create(DirectionalLight);
+        errdefer allocator.destroy(dl);
         dl.* = DirectionalLight.init(name, options);
         try self.extra_directionals.append(allocator, dl);
         return dl;
@@ -147,6 +150,7 @@ pub const LightRig = struct {
     pub fn addAreaLight(self: *LightRig, allocator: std.mem.Allocator, name: []const u8, options: AreaLightOptions) !*AreaLight {
         if (self.area_lights.items.len >= lights.max_area_lights) return error.TooManyAreaLights;
         const al = try allocator.create(AreaLight);
+        errdefer allocator.destroy(al);
         al.* = AreaLight.init(name, options);
         try self.area_lights.append(allocator, al);
         return al;

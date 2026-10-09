@@ -91,10 +91,8 @@ pub const Environment = struct {
 // resolve to the cull-off twins via pipelines.forRegularItem).
 // Cutout items ride the opaque pass; their alpha_cutoff uniform enables the
 // in-shader discard. Updates stats.
-//
-// P4: читает только render-owned данные item/draw_record плюс срезы хранилищ
-// той же очереди (skins/shaders уже после всех реаллокаций prepare-фазы).
-// Живые Mesh/Material/Skeleton здесь недоступны по построению.
+// Reads only render-owned item/draw_record data plus queue storage slices
+// (skins/shaders after all prepare allocations).
 pub fn drawRegularItem(
     env: *const Environment,
     item: RenderMeshItem,
@@ -193,8 +191,7 @@ pub fn drawRegularItem(
     sg.applyUniforms(pbr_shd.UB_vs_params, sg.asRange(&vs_params));
 
     const skel_bones: ?*const [MAX_BONES]Mat4 = if (item.is_skinned)
-        // Битый индекс skinned-записи (билдером недостижимо): пропуск draw
-        // вместо аплоада stale-униформы чужого draw.
+        // Corrupted skinned index: skip draw rather than upload stale bones.
         render_queue.skinAt(skins, item.skin_index) orelse return
     else
         null;
@@ -260,6 +257,7 @@ pub fn drawRegularItem(
         .directional_color_int = f.directional_color_int,
         .probe_params = prb.params,
         .probe2_params = prb.params2,
+        .probe_box = prb.box,
         .area_center_int = f.area_center_int,
         .area_right = f.area_right,
         .area_up = f.area_up,
@@ -305,8 +303,7 @@ fn drawShaderMaterialItem(
     const set = env.pipelines.shader_materials.getOrCreate(entry.key) orelse return;
 
     const is_u32 = item.is_u32;
-    // P4: sidedness hook-материала — из снимка (sm.double_sided), без
-    // decal-форсинга item.double_sided: поведение как до P4.
+    // Sidedness of hook material comes from snapshot (sm.double_sided) without decal forcing.
     const pip_id = set.pipelineFor(item.transparent, is_u32, snap.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
@@ -326,8 +323,7 @@ fn drawShaderMaterialItem(
         const morph_view = item.morph_view;
         const morph_uniforms = item.morph_uniforms;
         // PBR-base hook material: full PBR lighting with engine defaults
-        // for the maps the material does not override. Текстура — из
-        // prepare-снимка (дефолт уже подставлен при построении).
+        // for maps the material does not override. Texture is from prepare snapshot.
         bind.views[pbr_shd.VIEW_albedo_tex] = snap.tex_view;
         bind.views[pbr_shd.VIEW_normal_tex] = env.default_normal.view;
         bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
@@ -361,6 +357,11 @@ fn drawShaderMaterialItem(
         bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
         bind.views[pbr_shd.VIEW_probe2_tex] = prb_hook.view2;
         bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
+        // Babylon env-BRDF lookup: scales the analytic specular sum and the
+        // specular IBL (coloredEnergyConservationFactor).
+        const rec = item.draw_record;
+        bind.views[pbr_shd.VIEW_brdf_lut_tex] = if (rec.brdf_lut_view.id != 0) rec.brdf_lut_view else env.default_white.view;
+        bind.samplers[pbr_shd.SMP_brdf_lut_smp] = if (rec.brdf_lut_sampler.id != 0) rec.brdf_lut_sampler else env.default_white.sampler;
         // Clustered tile storage (wave 30): see the regular PBR branch.
         bindClusteredViews(&bind, pbr_shd, env);
         sg.applyBindings(bind);
@@ -422,6 +423,7 @@ fn drawShaderMaterialItem(
             .directional_color_int = f.directional_color_int,
             .probe_params = prb_hook.params,
             .probe2_params = prb_hook.params2,
+            .probe_box = prb_hook.box,
             .area_center_int = f.area_center_int,
             .area_right = f.area_right,
             .area_up = f.area_up,
@@ -436,9 +438,8 @@ fn drawShaderMaterialItem(
         // shader does not declare; shaders that declare nothing get white).
         // Contract: UB 0 carries {mat4 mvp, mat4 model} like every forward
         // shader (runtime sources must declare it, see registerRuntime docs).
-        // Текстура view slot 0 — из снимка; вторая (texture1) — view slot
-        // 1 (+ сэмплеры). Шейдеры, не объявляющие слот, получают белый
-        // дефолт снимка без валидационных ошибок.
+        // Texture view slot 0 is from snapshot; second (texture1) is view slot 1.
+        // Shaders not declaring the slot receive snapshot white default without errors.
         bind.views[0] = snap.tex_view;
         bind.samplers[0] = snap.tex_sampler;
         bind.views[1] = snap.tex1_view;
@@ -474,14 +475,15 @@ threadlocal var fallback_uniforms: uniforms.FrameUniforms = undefined;
 pub const ProbeDrawState = struct {
     params: [4]f32,
     params2: [4]f32,
+    box: [2][4]f32,
     view: sg.View,
     view2: sg.View,
     sampler: sg.Sampler,
 };
 
-/// Per-draw reflection-probe resolution (wave 25, wave C.2): selects up to
+/// Per-draw reflection-probe resolution (wave 25, wave C.2, wave Q.2): selects up to
 /// two overlapping enabled+captured probes containing the object's world
-/// position with smooth continuous falloff weights; otherwise the legacy path
+/// position with smooth continuous falloff weights and box bounds; otherwise the legacy path
 /// (zeroed params, so the shader takes its bit-identical no-probe branch).
 /// Pure (no GPU calls).
 fn probeForDrawPos(env: *const Environment, pos: Vec3) ProbeDrawState {
@@ -489,23 +491,29 @@ fn probeForDrawPos(env: *const Environment, pos: Vec3) ProbeDrawState {
     var out = ProbeDrawState{
         .params = .{ 0.0, 0.0, 0.0, 0.0 },
         .params2 = .{ 0.0, 0.0, 0.0, 0.0 },
+        .box = .{
+            .{ 0.0, 0.0, 0.0, 0.0 },
+            .{ 0.0, 0.0, 0.0, 0.0 },
+        },
         .view = env.default_cube.view,
         .view2 = env.default_cube.view,
         .sampler = env.default_cube.sampler,
     };
     if (sel.primary) |p0| {
         out.params = .{ 1.0, p0.probe.intensity, p0.probe.max_probe_lod, p0.weight };
+        out.box[0] = .{ p0.probe.position.x, p0.probe.position.y, p0.probe.position.z, p0.probe.box_extents };
         out.view = p0.probe.view;
         out.sampler = p0.probe.sampler;
     }
     if (sel.secondary) |p1| {
         out.params2 = .{ 1.0, p1.probe.intensity, p1.probe.max_probe_lod, p1.weight };
+        out.box[1] = .{ p1.probe.position.x, p1.probe.position.y, p1.probe.position.z, p1.probe.box_extents };
         out.view2 = p1.probe.view;
     }
     return out;
 }
 
-fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
+pub fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
     const pos = Vec3.new(model.m[12], model.m[13], model.m[14]);
     return probeForDrawPos(env, pos);
 }
@@ -538,7 +546,7 @@ fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_sha
 // Resolves the coat/fabric factors for a draw: the owned side-table copy by
 // index, CoatParams.neutral when the lobe is off (null) or the index is
 // stale (unreachable via the builders). Pure (no GPU calls).
-fn resolveCoat(coats: []const material_mod.CoatParams, index: ?u32) material_mod.CoatParams {
+pub fn resolveCoat(coats: []const material_mod.CoatParams, index: ?u32) material_mod.CoatParams {
     if (render_queue.coatAt(coats, index)) |cp| return cp.*;
     return material_mod.CoatParams.neutral;
 }
@@ -574,7 +582,7 @@ fn identityUvOffsets() [5][4]f32 {
 /// PBR slot order (must match the pbr.glsl texture bindings):
 /// 0 albedo, 1 normal, 2 metallic-roughness, 3 emissive, 4 occlusion.
 /// Null material = all identity.
-fn pbrUvMatrices(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
+pub fn pbrUvMatrices(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
     var rows: [5][4]f32 = identityUvMatrices();
     if (pbr_mat) |p| {
         rows[0] = p.albedo_uv_transform.matrixRows();
@@ -586,7 +594,7 @@ fn pbrUvMatrices(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
     return rows;
 }
 
-fn pbrUvOffsets(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
+pub fn pbrUvOffsets(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
     var offs: [5][4]f32 = identityUvOffsets();
     if (pbr_mat) |p| {
         offs[0] = p.albedo_uv_transform.offsetPacked();
@@ -600,7 +608,7 @@ fn pbrUvOffsets(pbr_mat: ?*const PBRMaterial) [5][4]f32 {
 
 /// Lane indices for occlusion/roughness/metallic; null material = glTF
 /// conventions (R, G, B).
-fn pbrChannelSelectors(pbr_mat: ?*const PBRMaterial) [4]f32 {
+pub fn pbrChannelSelectors(pbr_mat: ?*const PBRMaterial) [4]f32 {
     if (pbr_mat) |p| {
         return .{
             p.occlusion_channel.selector(),
@@ -737,6 +745,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         .directional_color_int = f.directional_color_int,
         .probe_params = prb.params,
         .probe2_params = prb.params2,
+        .probe_box = prb.box,
         .area_center_int = f.area_center_int,
         .area_right = f.area_right,
         .area_up = f.area_up,
@@ -771,262 +780,4 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     env.stats.main_draw_calls += 1;
     env.stats.draw_calls += 1;
     env.stats.triangles += (batch.index_count / 3) * batch.visible_instance_count;
-}
-
-// ---------------------------------------------------------------------------
-// Tests: the shader-facing contract of the wave/ktx2 uniforms. The generated
-// modules are build artifacts of sokol-shdc, so these comptime checks fail
-// at test time (GPU-free) if the .glsl templates and the packing helpers
-// ever drift apart.
-// ---------------------------------------------------------------------------
-
-test "forward shader FsParams carry the appended uv/channel uniforms" {
-    // PBR family: 5 slots + channel selectors, appended after normal_scale.
-    comptime {
-        for ([_]type{ pbr_shd.FsParams, skinned_pbr_shd.FsParams, inst_pbr_shd.FsParams }) |P| {
-            if (!@hasField(P, "uv_matrix")) @compileError("FsParams missing uv_matrix");
-            if (!@hasField(P, "uv_offset")) @compileError("FsParams missing uv_offset");
-            if (!@hasField(P, "channel_selectors")) @compileError("FsParams missing channel_selectors");
-            // Linear output contract: scene shaders take no output_params
-            // lane (see common/linear_output.glsl). Fails loudly while the
-            // generated slang modules are stale (parent rebuilds slang).
-            if (@hasField(P, "output_params")) @compileError("FsParams still carries output_params");
-            if (!@hasField(P, "clearcoat_factors")) @compileError("FsParams missing clearcoat_factors");
-            if (!@hasField(P, "clearcoat_color")) @compileError("FsParams missing clearcoat_color");
-            if (!@hasField(P, "sheen_factors")) @compileError("FsParams missing sheen_factors");
-            if (!@hasField(P, "sheen_color")) @compileError("FsParams missing sheen_color");
-            if (!@hasField(P, "anisotropy_factors")) @compileError("FsParams missing anisotropy_factors");
-            if (!@hasField(P, "transmission_factors")) @compileError("FsParams missing transmission_factors");
-            if (!@hasField(P, "transmission_color")) @compileError("FsParams missing transmission_color");
-            if (!@hasField(P, "sss_factors")) @compileError("FsParams missing sss_factors");
-            if (!@hasField(P, "sss_color")) @compileError("FsParams missing sss_color");
-            if (!@hasField(P, "directional_dir")) @compileError("FsParams missing directional_dir");
-            if (!@hasField(P, "directional_color_int")) @compileError("FsParams missing directional_color_int");
-            if (!@hasField(P, "probe_params")) @compileError("FsParams missing probe_params");
-            if (!@hasField(P, "probe2_params")) @compileError("FsParams missing probe2_params");
-            if (!@hasField(P, "area_center_int")) @compileError("FsParams missing area_center_int");
-            if (!@hasField(P, "area_right")) @compileError("FsParams missing area_right");
-            if (!@hasField(P, "area_up")) @compileError("FsParams missing area_up");
-            if (!@hasField(P, "area_color")) @compileError("FsParams missing area_color");
-            if (!@hasField(P, "clustered_params")) @compileError("FsParams missing clustered_params");
-            if (!@hasField(P, "clustered_viewport")) @compileError("FsParams missing clustered_viewport");
-        }
-    }
-    // All three forward modules expose the clustered storage-view slots
-    // (identical 12/13/14 in every shader; the draw binds through these).
-    comptime {
-        for ([_]type{ pbr_shd, skinned_pbr_shd, inst_pbr_shd }) |M| {
-            if (!@hasDecl(M, "VIEW_ssbo_cluster_lights")) @compileError("shader module missing VIEW_ssbo_cluster_lights");
-            if (!@hasDecl(M, "VIEW_ssbo_cluster_tiles")) @compileError("shader module missing VIEW_ssbo_cluster_tiles");
-            if (!@hasDecl(M, "VIEW_ssbo_cluster_indices")) @compileError("shader module missing VIEW_ssbo_cluster_indices");
-            if (!@hasDecl(M, "VIEW_probe_tex")) @compileError("shader module missing VIEW_probe_tex");
-            if (!@hasDecl(M, "VIEW_probe2_tex")) @compileError("shader module missing VIEW_probe2_tex");
-        }
-        if (pbr_shd.VIEW_ssbo_cluster_lights != 12) @compileError("clustered light slot moved");
-        if (pbr_shd.VIEW_ssbo_cluster_tiles != 13) @compileError("clustered tile slot moved");
-        if (inst_pbr_shd.VIEW_ssbo_cluster_indices != 14) @compileError("clustered index slot moved");
-        if (pbr_shd.VIEW_probe2_tex != 19) @compileError("probe2_tex slot moved");
-    }
-}
-
-test "pbr FsParams layouts stay identical across regular/skinned/instanced" {
-    // drawRegularItem builds one pbr_shd.FsParams value and uploads it to
-    // either UB_fs_params slot (regular or skinned); the structs must stay
-    // field- and size-identical or the skinned upload would misread.
-    try std.testing.expectEqual(@sizeOf(pbr_shd.FsParams), @sizeOf(skinned_pbr_shd.FsParams));
-    try std.testing.expectEqual(@sizeOf(pbr_shd.FsParams), @sizeOf(inst_pbr_shd.FsParams));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clearcoat_factors"), @offsetOf(skinned_pbr_shd.FsParams, "clearcoat_factors"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sheen_color"), @offsetOf(inst_pbr_shd.FsParams, "sheen_color"));
-    // The appended probe lane lands at the same offset in all three (the
-    // draw uploads one struct value to either UB slot).
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(skinned_pbr_shd.FsParams, "probe_params"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe_params"), @offsetOf(inst_pbr_shd.FsParams, "probe_params"));
-    // The appended area lanes land last and at the same offsets in all
-    // three (same one-struct-uploads-any-slot contract as probe_params).
-    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "area_center_int") > @offsetOf(pbr_shd.FsParams, "probe_params"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_center_int"), @offsetOf(skinned_pbr_shd.FsParams, "area_center_int"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_center_int"), @offsetOf(inst_pbr_shd.FsParams, "area_center_int"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(skinned_pbr_shd.FsParams, "area_color"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "area_color"), @offsetOf(inst_pbr_shd.FsParams, "area_color"));
-    // The clustered lanes are the new tail, at the same offsets in all
-    // three (the draw fills one struct value for every slot).
-    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "clustered_params") > @offsetOf(pbr_shd.FsParams, "area_color"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_params"), @offsetOf(skinned_pbr_shd.FsParams, "clustered_params"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_params"), @offsetOf(inst_pbr_shd.FsParams, "clustered_params"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(skinned_pbr_shd.FsParams, "clustered_viewport"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "clustered_viewport"), @offsetOf(inst_pbr_shd.FsParams, "clustered_viewport"));
-    // The pbr-layers v1 lanes are the newest tail, appended after the
-    // clustered lanes at the same offsets in all three (same one-struct
-    // contract; pre-existing lanes never shift).
-    try std.testing.expect(@offsetOf(pbr_shd.FsParams, "anisotropy_factors") > @offsetOf(pbr_shd.FsParams, "clustered_viewport"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "anisotropy_factors"), @offsetOf(skinned_pbr_shd.FsParams, "anisotropy_factors"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "anisotropy_factors"), @offsetOf(inst_pbr_shd.FsParams, "anisotropy_factors"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "transmission_factors"), @offsetOf(skinned_pbr_shd.FsParams, "transmission_factors"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "transmission_color"), @offsetOf(inst_pbr_shd.FsParams, "transmission_color"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_factors"), @offsetOf(skinned_pbr_shd.FsParams, "sss_factors"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "sss_color"), @offsetOf(inst_pbr_shd.FsParams, "sss_color"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe2_params"), @offsetOf(skinned_pbr_shd.FsParams, "probe2_params"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsParams, "probe2_params"), @offsetOf(inst_pbr_shd.FsParams, "probe2_params"));
-}
-
-test "pbr layer mask texture slots are pinned across the triple" {
-    // The draw binds coat/fabric masks through these generated slots;
-    // pinning them keeps the .glsl binding numbers and the draw in sync.
-    comptime {
-        for ([_]type{ pbr_shd, skinned_pbr_shd, inst_pbr_shd }) |M| {
-            if (!@hasDecl(M, "VIEW_clearcoat_tex")) @compileError("shader module missing VIEW_clearcoat_tex");
-            if (!@hasDecl(M, "VIEW_sheen_tex")) @compileError("shader module missing VIEW_sheen_tex");
-        }
-        if (pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
-        if (pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
-        if (skinned_pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
-        if (inst_pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
-    }
-}
-
-test "probeForDraw resolves the winning probe or the legacy fallback" {
-    // probeForDraw only reads env.probes + env.default_cube: every other
-    // Environment field stays undefined here (never dereferenced).
-    const empty_env = Environment{
-        .pipelines = undefined,
-        .stats = undefined,
-        .default_white = std.mem.zeroes(Texture),
-        .default_normal = std.mem.zeroes(Texture),
-        .default_cube = std.mem.zeroes(CubeTexture),
-        .sky_texture = null,
-        .ibl_intensity = 1.0,
-        .shadow_pass = undefined,
-        .shadow_uniforms = undefined,
-        .probes = &.{},
-    };
-    // No probe pack: zeroed params (the shader's bit-identical no-probe
-    // branch) with the default-cube binds keeping the slots valid.
-    const off = probeForDraw(&empty_env, Mat4.identity);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, off.params);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, off.params2);
-    try std.testing.expectEqual(@as(u32, 0), off.view.id);
-
-    // A covering probe: enabled lane with its intensity/lod/view/sampler and falloff weight 1.0 at center.
-    // The identity model sits at the origin, inside the radius-5 probe.
-    var entries = [_]probe_layer.ProbeFrameEntry{
-        .{
-            .position = Vec3.zero,
-            .radius = 5.0,
-            .enabled = true,
-            .captured = true,
-            .intensity = 0.5,
-            .max_probe_lod = 7.0,
-            .view = .{ .id = 31 },
-            .sampler = .{ .id = 32 },
-        },
-    };
-    var covered_env = empty_env;
-    covered_env.probes = &entries;
-    const on = probeForDraw(&covered_env, Mat4.identity);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 7.0, 1.0 }, on.params);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, on.params2);
-    try std.testing.expectEqual(@as(u32, 31), on.view.id);
-    try std.testing.expectEqual(@as(u32, 32), on.sampler.id);
-
-    // Multi-probe blending test: two overlapping probes at (-2, 0, 0) and (2, 0, 0)
-    var blend_entries = [_]probe_layer.ProbeFrameEntry{
-        .{
-            .position = Vec3.new(-2.0, 0, 0),
-            .radius = 4.0,
-            .enabled = true,
-            .captured = true,
-            .intensity = 1.0,
-            .max_probe_lod = 7.0,
-            .view = .{ .id = 41 },
-            .sampler = .{ .id = 42 },
-        },
-        .{
-            .position = Vec3.new(2.0, 0, 0),
-            .radius = 4.0,
-            .enabled = true,
-            .captured = true,
-            .intensity = 1.0,
-            .max_probe_lod = 7.0,
-            .view = .{ .id = 51 },
-            .sampler = .{ .id = 52 },
-        },
-    };
-    var blend_env = empty_env;
-    blend_env.probes = &blend_entries;
-    const blended = probeForDraw(&blend_env, Mat4.identity);
-    // At origin, both probes are at distance 2 (u = 0.5, smoothstep = 0.5)
-    // Normalized weights: 0.5 and 0.5, sum = 1.0
-    try std.testing.expectEqual(@as(f32, 1.0), blended.params[0]);
-    try std.testing.expectEqual(@as(f32, 1.0), blended.params2[0]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blended.params[3], 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), blended.params2[3], 0.01);
-    try std.testing.expect(blended.view.id != 0);
-    try std.testing.expect(blended.view2.id != 0);
-
-    // Same pack, object outside the radius: legacy fallback again.
-    const far_model = Mat4.translation(Vec3.new(100.0, 0.0, 0.0));
-    const far = probeForDraw(&covered_env, far_model);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, far.params);
-}
-
-test "resolveCoat falls back to neutral when the lobe is off" {
-    const CoatParams = material_mod.CoatParams;
-    // No entry (lobe off): neutral — intensities zero.
-    const neutral = resolveCoat(&.{}, null);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.clearcoat_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.sheen_factors[0]);
-    // PBR layers v1: new factors neutral too (off = legacy path).
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.anisotropy_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.transmission_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.sss_factors[0]);
-    try std.testing.expectEqual(CoatParams.neutral, neutral);
-
-    // Stale index (unreachable via builders): neutral as well.
-    try std.testing.expectEqual(CoatParams.neutral, resolveCoat(&.{}, 7));
-
-    // Owned entry: values flow through to the uniforms.
-    const owned = [_]CoatParams{.{ .sheen_factors = .{ 0.5, 0.35, 0, 0 } }};
-    const got = resolveCoat(&owned, 0);
-    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.35, 0, 0 }, &got.sheen_factors);
-    try std.testing.expectEqual(CoatParams.neutral, resolveCoat(&owned, 1));
-}
-
-test "pbr uniform packing defaults are identity and glTF conventions" {
-    const mats = pbrUvMatrices(null);
-    const offs = pbrUvOffsets(null);
-    for (0..5) |slot| {
-        try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &mats[slot]);
-        try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &offs[slot]);
-    }
-    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0 }, &pbrChannelSelectors(null));
-
-    var mat = PBRMaterial.init("m");
-    mat.albedo_uv_transform = .{ .offset = .{ 0.5, 0 }, .scale = .{ 2, 2 } };
-    mat.occlusion_channel = .a;
-    const packed_mats = pbrUvMatrices(&mat);
-    const packed_offs = pbrUvOffsets(&mat);
-    try std.testing.expectEqualSlices(f32, &.{ 2, 0, 0, 2 }, &packed_mats[0]);
-    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0 }, &packed_offs[0]);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &packed_mats[1]); // normal untouched
-    try std.testing.expectEqualSlices(f32, &.{ 3, 1, 2, 0 }, &pbrChannelSelectors(&mat));
-}
-
-test "instanced decal forces transparent + double-sided like regular decals" {
-    var opaque_mat = PBRMaterial.init("opaque");
-    const solid_mat: Material = .{ .pbr = &opaque_mat };
-    // No material, no decal: opaque single-sided (legacy behavior).
-    const plain = instancedDrawFlags(null, false);
-    try std.testing.expect(!plain.transparent and !plain.double_sided);
-    // Opaque material, no decal: stays opaque single-sided.
-    const solid = instancedDrawFlags(solid_mat, false);
-    try std.testing.expect(!solid.transparent and !solid.double_sided);
-    // The regression: opaque material + is_decal must draw as transparent
-    // double-sided, matching cullNonInstancedMesh for regular decals.
-    const decal = instancedDrawFlags(solid_mat, true);
-    try std.testing.expect(decal.transparent and decal.double_sided);
-    // Blend material is transparent without the decal flag; double-sided
-    // still follows the material alone here.
-    opaque_mat.alpha_mode = .blend;
-    const blended = instancedDrawFlags(solid_mat, false);
-    try std.testing.expect(blended.transparent and !blended.double_sided);
 }

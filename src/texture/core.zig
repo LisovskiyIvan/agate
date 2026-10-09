@@ -188,7 +188,7 @@ pub const Texture = struct {
     /// Box-filter downsample of one RGBA8 level. Dims floor at 1, source coords
     /// clamp at edges (handles NPOT). Thin wrapper over the shared
     /// file-private `boxDownsampleU8` so 2D and cube paths stay in sync.
-    fn downsampleLevel(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
+    pub fn downsampleLevel(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w: u32, dst_h: u32) void {
         mip.boxDownsampleU8(src, src_w, src_h, dst, dst_w, dst_h);
     }
 
@@ -1292,45 +1292,3 @@ pub const TestPng = struct {
         return out.toOwnedSlice();
     }
 };
-
-test "downsampleLevel handles odd dimensions and averages correctly" {
-    var src: [3 * 5 * 4]u8 = undefined;
-    for (&src, 0..) |*b, i| b.* = @intCast(i % 251);
-    var dst: [1 * 2 * 4]u8 = undefined;
-    Texture.downsampleLevel(&src, 3, 5, &dst, 1, 2);
-    // Top-left texel averages src bytes {0,4,12,16}: (0+4+12+16+2)/4 = 8.
-    try std.testing.expectEqual(@as(u8, 8), dst[0]);
-}
-
-// ---------------------------------------------------------------------------
-// Golden test: the 2D mip chain (levels, dimensions, averaged colors)
-// ---------------------------------------------------------------------------
-
-test "boxDownsampleU8 handles NPOT cube-face steps without OOB" {
-    // 3x3 -> 1x1 is the exact mip step of a size-3 NPOT cube face
-    // (cur = max(1, prev / 2)). R channel holds the texel index.
-    var src: [3 * 3 * 4]u8 = undefined;
-    for (0..9) |i| {
-        src[i * 4 + 0] = @intCast(i);
-        src[i * 4 + 1] = 0;
-        src[i * 4 + 2] = 0;
-        src[i * 4 + 3] = 255;
-    }
-    var dst: [1 * 1 * 4]u8 = undefined;
-    mip.boxDownsampleU8(&src, 3, 3, &dst, 1, 1);
-    // Averages top-left quad {0,1,3,4}: (0+1+3+4+2)>>2 = 2.
-    try std.testing.expectEqual(@as(u8, 2), dst[0]);
-    try std.testing.expectEqual(@as(u8, 255), dst[3]);
-    // Same dims through the 2D wrapper must agree (shared helper).
-    var dst2: [1 * 1 * 4]u8 = undefined;
-    Texture.downsampleLevel(&src, 3, 3, &dst2, 1, 1);
-    try std.testing.expectEqualSlices(u8, &dst, &dst2);
-
-    // 2x1 -> 1x1 exercises edge clamping (sy1 clamps to 0): the single
-    // source row is sampled twice, i.e. a plain average, no OOB read.
-    var edge_src: [2 * 1 * 4]u8 = .{ 10, 0, 0, 255, 20, 0, 0, 255 };
-    var edge_dst: [1 * 1 * 4]u8 = undefined;
-    mip.boxDownsampleU8(&edge_src, 2, 1, &edge_dst, 1, 1);
-    // (10+20+10+20+2)>>2 = 15.
-    try std.testing.expectEqual(@as(u8, 15), edge_dst[0]);
-}

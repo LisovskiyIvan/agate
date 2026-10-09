@@ -575,7 +575,7 @@ test "P4: buildShaderSnapshot copies hook material CPU state" {
     try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, snap.uniforms[0]);
     try std.testing.expect(snap.double_sided);
 
-    // Мутация живого материала после снимка: снимок неизменен.
+    // Mutation of live material after snapshot: snapshot remains immutable.
     sm.tint_color = Color3.new(9, 9, 9);
     sm.alpha = 0.0;
     sm.double_sided = false;
@@ -588,11 +588,11 @@ test "P4: buildShaderSnapshot copies hook material CPU state" {
     try std.testing.expectEqual(@as(u32, 3), snap.entry_index);
     try std.testing.expect(snap.double_sided);
 
-    // Без текстуры — дефолт из prepare-фазы, а не живой указатель.
+    // Without texture: fallback default from prepare phase, not a live pointer.
     const fallback = buildShaderSnapshot(.{ .shader_material = &sm }, &dummy_tex) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 7), fallback.tex_view.id);
 
-    // Не-hook материалы снимка не дают.
+    // Non-shader materials yield no snapshot.
     var pbr_mat = PBRMaterial.init("p");
     try std.testing.expect(buildShaderSnapshot(.{ .pbr = &pbr_mat }, &dummy_tex) == null);
     try std.testing.expect(buildShaderSnapshot(null, &dummy_tex) == null);

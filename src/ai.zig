@@ -17,7 +17,3 @@ pub const crowd = @import("ai/crowd.zig");
 pub const Crowd = crowd.Crowd;
 pub const CrowdAgent = crowd.CrowdAgent;
 pub const CrowdAgentParams = crowd.CrowdAgentParams;
-
-test {
-    _ = @import("ai/tests.zig");
-}

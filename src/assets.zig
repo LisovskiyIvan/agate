@@ -143,7 +143,12 @@ pub const PendingTexture = struct {
             slot.* = tex;
             return;
         }
-        self.targets.append(self.allocator, slot) catch {};
+        self.targets.append(self.allocator, slot) catch {
+            // Fail-closed OOM: the pending texture stays coherent, but this
+            // slot will never be patched — say so instead of dropping the
+            // handle delivery silently.
+            std.log.warn("agate PendingTexture.addTarget: target slot dropped on OOM; texture handle will not be delivered to this slot", .{});
+        };
         self.targets_pending.store(true, .release);
         self.targets_mutex.unlock();
     }

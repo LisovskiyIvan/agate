@@ -133,7 +133,9 @@ pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildP
             }
         }
         if (outline_pass.makeOutlineDrawItem(scene.allocator, &back.outline_skins, m, params.cache_key, src_idx, params.instance_source)) |it| {
-            back.outline_items.append(scene.allocator, it) catch {};
+            back.outline_items.append(scene.allocator, it) catch {
+                back.build_stats.build_oom_drops += 1;
+            };
         }
     }
 
@@ -160,7 +162,9 @@ pub fn buildQueuesInto(scene: anytype, back: *FrameDrawSlot, params: QueueBuildP
         }
         if (src_idx >= scene.meshes.items.len) continue;
         if (highlight_pass.makeHighlightDrawItem(e.mesh, e.options, src_idx)) |it| {
-            back.highlight_items.append(scene.allocator, it) catch {};
+            back.highlight_items.append(scene.allocator, it) catch {
+                back.build_stats.build_oom_drops += 1;
+            };
         }
     }
 

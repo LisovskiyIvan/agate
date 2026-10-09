@@ -5,7 +5,3 @@ pub const culler = @import("culler.zig");
 pub const HiZBuffer = hiz_buffer.HiZBuffer;
 pub const SoftwareRasterizer = rasterizer.SoftwareRasterizer;
 pub const OcclusionCuller = culler.OcclusionCuller;
-
-test {
-    _ = @import("tests.zig");
-}

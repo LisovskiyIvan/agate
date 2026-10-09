@@ -308,11 +308,12 @@ pub const PrepareClaim = scene_frame_prepare.PrepareClaim;
 ///
 /// Token contract: every successful begin MUST be paired with exactly one
 /// `finishStagedPrepare` or `cancelStagedPrepare` on the same thread, on
-/// every path including errors — a dropped claim wedges all future begins
-/// (they return null until the process resets). A `render` between begin
-/// and finish sees `frame_prepared == false` and drops the present, so
-/// keep the pair adjacent around the unlock window. Only the context
-/// thread may call any of the three.
+/// every path including errors. A violated pairing (stale/lost/double
+/// token) is logged and the active claim is released defensively — the
+/// frame is lost, but the pipeline keeps running instead of wedging.
+/// A `render` between begin and finish sees `frame_prepared == false` and
+/// drops the present, so keep the pair adjacent around the unlock window.
+/// Only the context thread may call any of the three.
 pub fn beginStagedPrepare(self: anytype) ?PrepareClaim {
     return scene_frame_prepare.beginPrepare(self);
 }

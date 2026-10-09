@@ -70,7 +70,3 @@ pub const resolveSunColor = sun.resolveSunColor;
 pub const resolveSunIntensity = sun.resolveSunIntensity;
 pub const sunDirectionFromAngles = sun.sunDirectionFromAngles;
 pub const colorTemperatureToRgb = sun.colorTemperatureToRgb;
-
-test {
-    _ = @import("lights/tests.zig");
-}

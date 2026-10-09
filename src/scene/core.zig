@@ -214,17 +214,13 @@ pub const Scene = struct {
 
     // ---- Content registries (kept flat: external code iterates them). ----
     meshes: std.ArrayListUnmanaged(*Mesh) = .empty,
-    /// Очередь ретенции GPU-мешей с epoch-семантикой
-    /// (scene/gpu_retire.zig). destroyMesh вне context-потока только отвязывает
-    /// меш и кладёт его сюда (retireMesh — с любого потока); уничтожает
-    /// (sg.* + free) только context-поток во flush (начало кадра) и в deinit.
-    /// Уже отвязанные меши невидимы для deinitMeshes — двойного free нет.
-    /// Новые kind'ы записей (не только меши/буферы) добавлять в
-    /// GpuRetireQueue, новых очередей в Scene не заводить.
+    /// GPU mesh retention queue with epoch semantics (scene/gpu_retire.zig).
+    /// Calling destroyMesh outside the context thread only unlinks the mesh
+    /// and enqueues it here; GPU resources are freed only on the context thread
+    /// during frame flush or deinit.
     gpu_retire: scene_retire.GpuRetireQueue = .{},
-    /// Epoch, начатый последним staged begin. render завершает его на ВСЕХ
-    /// выходах (включая ранний возврат без камеры), поэтому epoch — на кадр,
-    /// а не на камеру/view.
+    /// Epoch begun by the latest staged begin. Render finishes it on all exits
+    /// (including early return without camera), so epochs are per-frame.
     retire_epoch: scene_retire.Epoch = 0,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
@@ -1345,6 +1341,10 @@ pub const Scene = struct {
         return scene_lifecycle.forwardFor(self, samples, color_format);
     }
 
+    pub fn forwardForShape(self: *Scene, shape: @import("../target_shape.zig").TargetShape) *scene_forward.ForwardPipelines {
+        return scene_lifecycle.forwardForShape(self, shape);
+    }
+
     /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn prepareViewQueues(
         self: *Scene,
@@ -1406,15 +1406,14 @@ pub const Scene = struct {
     /// with render); update-vs-prepare stay excluded under phase_mutex, but
     /// update CAN overlap render. The draw phase
     /// therefore reads ONLY render-owned captures: mesh payload
-    /// (regular/instanced очереди, shadow-bins, outline-items — trails
-    /// included: Trail.update is CPU-only staging, the prepare flush
-    /// uploads it, and the slots bake handle/model/count values), UI frame,
-    /// physics-debug capture + committed upload, particle prepared frame,
-    /// sky params + default texture copies (snapshot), light pack
-    /// (snapshot). Живые Mesh/Material/Skeleton/мир физики/sky/системы
-    /// частиц во время отрисовки недоступны. Заимствованными остаются
-    /// только GPU-хендлы под фазовым мьютексом/epoch-ретайром
-    /// (буферы/вью/сэмплеры/пайплайны).
+    /// (regular/instanced queues, shadow bins, outline items, including trails:
+    /// Trail.update is CPU-only staging, prepare flushes and uploads it,
+    /// and slots bake handle/model/count values), UI frame, physics debug
+    /// capture + committed upload, particle prepared frame, sky parameters
+    /// + default texture copies (snapshot), and light pack (snapshot).
+    /// Live Mesh/Material/Skeleton/Physics/Sky/Particle data is inaccessible
+    /// during drawing. Only borrowed GPU handles remain valid under the phase
+    /// mutex and epoch retirement (buffers/views/samplers/pipelines).
     /// At most `upload_budget_per_frame` textures upload per call; leftover
     /// `.ready` slots ride to subsequent frames instead of stalling one frame.
     pub const upload_budget_per_frame: usize = 4;

@@ -40,9 +40,9 @@ pub fn capture(scene: anytype, draws: anytype, snap: *const snapshot.SceneFrameS
             rt.* = target.RenderTarget.create(.{ .width = width, .height = height, .color_format = .RGBA16F }) catch return;
         } else if (!rt.resize(width, height)) return;
         if (rt.queuesSampleSelf(&draws.primary, false)) return;
-        // Resolve the HDR forward set BEFORE opening the pass: forwardFor
-        // may recreate the twin, which must never happen mid-pass.
-        const fwd = scene.forwardFor(1, .RGBA16F);
+        // Resolve the forward set matching the exact target shape BEFORE opening the pass:
+        // forwardForShape may recreate the twin, which must never happen mid-pass.
+        const fwd = scene.forwardForShape(rt.shape());
         if (!rt.begin(snap.clear_color, 1)) return;
         var capture_env = env.*;
         capture_env.pipelines = fwd;
@@ -61,10 +61,4 @@ pub fn capture(scene: anytype, draws: anytype, snap: *const snapshot.SceneFrameS
     env.refraction_sampler = rt.sampleSampler();
     env.refraction_view_proj = cam.view_proj;
     env.refraction_capture = .{ 1, @floatFromInt(width), @floatFromInt(height), 0 };
-}
-
-test "refraction empty queues need no capture" {
-    const std = @import("std");
-    const queues = queues_mod.RenderQueues{};
-    try std.testing.expect(!needsCapture(&queues));
 }

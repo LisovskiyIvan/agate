@@ -191,10 +191,8 @@ test "configureOutlineCutoutDesc binds position and uv without culling" {
     );
 }
 
-// ---- P4 render-owned draw snapshot: регрессия владения. ----
-
-// Подготовленный outline-item не ссылается на живые данные: модель, копия
-// скина и cutout-снимок пережили мутацию TRS/материала и две публикации скелета.
+// Prepared outline item does not reference live data: model, bone copy,
+// and cutout snapshot survive mutation of TRS/material and skeleton republishing.
 test "P4: outline item owns model, skin and cutout snapshots" {
     const ally = std.testing.allocator;
     const skel = try Skeleton.init(ally, 1);
@@ -229,7 +227,7 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), it.model.m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), skins.items[it.skin_index.?][0].m[12], 1e-4);
 
-    // Cutout-снимок: вью/сэмплер/катoff скопированы, живой материал не читается.
+    // Cutout snapshot: view/sampler/cutoff are copied; live material is not read.
     const material_mod = @import("../material.zig");
     const texture_mod = @import("../texture.zig");
     var cut_mat = material_mod.PBRMaterial.init("outline_cut");
@@ -264,8 +262,8 @@ test "P4: outline item owns model, skin and cutout snapshots" {
     try std.testing.expectEqual(@as(u32, 78), cut.cutout_sampler.?.id);
 }
 
-// OOM копии скина: makeOutlineDrawItem возвращает null (вызывающий пропускает
-// item), нескinned-меш строится без аллокаций даже падающим аллокатором.
+// OOM of bone copy: makeOutlineDrawItem returns null (caller skips item);
+// unskinned mesh builds without allocations even under failing allocator.
 test "P4: outline skin OOM returns null, rigid build stays allocation-free" {
     const ally = std.testing.allocator;
     const skel = try Skeleton.init(ally, 1);
@@ -290,10 +288,10 @@ test "P4: outline skin OOM returns null, rigid build stays allocation-free" {
     var limited = FailNthP4Outline{ .backing = ally, .fail_on = 1 };
     var skins: scene_render_queue.SkinStorage = .empty;
     defer skins.deinit(limited.allocator());
-    // Первая же аллокация (копия скина) падает — item не строится.
+    // First allocation (bone copy) fails — item is not built.
     try std.testing.expect(makeOutlineDrawItem(limited.allocator(), &skins, &skinned, 0, 0, .published) == null);
     try std.testing.expectEqual(@as(usize, 0), skins.items.len);
-    // Rigid-путь аллокаций не делает — тем же падающим аллокатором строится.
+    // Rigid path makes no allocations — succeeds under failing allocator.
     const it = makeOutlineDrawItem(limited.allocator(), &skins, &rigid, 0, 1, .published) orelse return error.TestUnexpectedResult;
     try std.testing.expect(it.skin_index == null);
     try std.testing.expectEqual(@as(usize, 0), skins.items.len);

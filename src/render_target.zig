@@ -69,6 +69,8 @@ const mip = @import("texture/mip.zig");
 const Texture = @import("texture/core.zig").Texture;
 const scene_draw = @import("scene/draw.zig");
 const clustered_lights = @import("scene/clustered_lights.zig");
+pub const target_shape = @import("target_shape.zig");
+pub const TargetShape = target_shape.TargetShape;
 
 /// Absolute sanity cap for the pure dimension validation (before any live
 /// `sg.queryLimits` check). Well above every real `max_image_size_2d`
@@ -338,6 +340,16 @@ pub const RenderTarget = struct {
     /// proves the discipline by construction (separate capture/display
     /// scenes with plain materials on the captured side).
     pass_open: bool = false,
+
+    /// Concrete target shape metadata (color format, depth format, stencil format, sample count).
+    pub fn shape(self: *const RenderTarget) TargetShape {
+        return .{
+            .color_format = self.color_format,
+            .depth_format = self.depth_format,
+            .stencil_format = if (self.depth_format == .DEPTH_STENCIL) .DEPTH_STENCIL else .NONE,
+            .sample_count = self.sample_count,
+        };
+    }
 
     /// Creates the GPU target with `errdefer` rollback: any partial failure
     /// destroys the handles already made and returns an error — never a
@@ -696,7 +708,7 @@ pub const RenderTarget = struct {
         // precision/format drift). Blend is required: scene materials blend.
         if (self.color_format != .RGBA16F) return error.IncompatibleColorFormat;
         if (!self.hasDepth()) return error.DepthRequired;
-        if (self.depth_format != defaultDepthFormat()) return error.IncompatibleDepthFormat;
+        if (!isDepthFormat(self.depth_format)) return error.IncompatibleDepthFormat;
         {
             const caps = sg.queryPixelformat(self.color_format);
             if (!caps.render or !caps.sample or !caps.blend) return error.IncompatibleColorFormat;
@@ -704,12 +716,9 @@ pub const RenderTarget = struct {
                 return error.IncompatibleColorFormat;
         }
 
-        // Resolve the forward set BEFORE opening the pass: forwardFor may
-        // recreate the MSAA/format twin (destroying the previous one), which
-        // must never happen mid-pass. The pointer borrows Scene state and
-        // stays valid across the capture (no producer mutation mid-capture:
-        // the pin below holds the prepared slot).
-        const fwd_pipelines = scene.forwardFor(self.sample_count, self.color_format);
+        // Resolve the forward set matching the exact target shape BEFORE opening the pass:
+        // forwardForShape recreates the twin when target shape differs.
+        const fwd_pipelines = scene.forwardForShape(self.shape());
 
         // Consumer pin across the whole capture (render's own discipline):
         // the presenting capture holds the lease, so a concurrent producer
@@ -812,7 +821,3 @@ pub const RenderTarget = struct {
             image.id == self.resolve_image.id or image.id == self.depth_image.id);
     }
 };
-
-test {
-    _ = @import("render_target_tests.zig");
-}

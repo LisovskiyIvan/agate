@@ -137,7 +137,7 @@ pub fn uploadUiBuffers(
         .dst = .{ .buffer = index_buffer },
         .src = .{ .data = sg.asRange(indices) },
     });
-    // Учёт динамики: весь UI-батч кадра (вершины + u16-индексы).
+    // Dynamic upload tracking: full frame UI batch (vertices + u16 indices).
     upload_meter.record(ui_draw.batchUploadBytes(verts.len, indices.len));
 }
 

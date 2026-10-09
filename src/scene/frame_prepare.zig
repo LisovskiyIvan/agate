@@ -87,13 +87,42 @@ pub fn beginPrepare(scene: anytype) ?PrepareClaim {
     };
 }
 
+/// Contract-violation recovery for `finishPrepare`/`cancelPrepare`.
+///
+/// A mismatched claim means the caller violated the pairing contract
+/// (stale token, double finish/cancel, or lost token after a fresh begin).
+/// The historical `assert(false)` panicked in debug and — worse — silently
+/// WEDGED ReleaseFast: an unpaired begin leaves `prepare_claim_active`
+/// stuck, every future `beginPrepare` returns null at its active-claim
+/// guard, and the pipeline degrades to reuse-forever with no diagnostic.
+///
+/// Instead: log the violation and release the ACTIVE claim defensively
+/// (cancel semantics — slot lease released, begin-side retire epoch
+/// completed, `frame_prepared` cleared). The frame is lost either way;
+/// this only chooses a live pipeline with a visible error over a silent
+/// permanent wedge. A stale claim against NO active claim is a no-op log
+/// line (idempotent double release).
+fn recoverMismatchedClaim(scene: anytype, comptime action: []const u8, claim: PrepareClaim) void {
+    if (!scene.prepare_claim_active) {
+        std.log.warn("agate frame_prepare: {s} with stale claim (token {d}, build_seq {d}) but no active claim — already finished or cancelled?", .{ action, claim.token_id, claim.build_seq });
+        return;
+    }
+    std.log.warn("agate frame_prepare: {s} claim mismatch (got token {d}, active token {d}) — releasing the active claim to keep the frame pipeline running", .{ action, claim.token_id, scene.prepare_claim_generation });
+    const slot = scene.prepare_claim_slot;
+    const seq = scene.prepare_claim_seq;
+    scene.prepare_claim_active = false;
+    scene.draws.cancelHandoffClaim(slot, seq, &scene.build_slot, &scene.build_seq) catch {};
+    scene.frame_prepared = false;
+    scene.gpu_retire.complete(scene.retire_epoch);
+}
+
 /// Finishes staged preparation using the exact slot claimed by `beginPrepare`.
 /// The producer lock may be released before this call: a staged claim
 /// consumes only slot-owned and context-owned state, never live state.
 pub fn finishPrepare(scene: anytype, claim: PrepareClaim) void {
     gpu_thread.assertOnContextThread();
     if (!matchesPrepareClaim(scene, claim)) {
-        std.debug.assert(false);
+        recoverMismatchedClaim(scene, "finishPrepare", claim);
         return;
     }
     scene.prepare_claim_active = false;
@@ -151,7 +180,7 @@ pub fn finishPrepare(scene: anytype, claim: PrepareClaim) void {
 pub fn cancelPrepare(scene: anytype, claim: PrepareClaim) void {
     gpu_thread.assertOnContextThread();
     if (!matchesPrepareClaim(scene, claim)) {
-        std.debug.assert(false);
+        recoverMismatchedClaim(scene, "cancelPrepare", claim);
         return;
     }
     scene.prepare_claim_active = false;

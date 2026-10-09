@@ -6,6 +6,8 @@ const math = @import("math");
 const Mat4 = math.Mat4;
 const DebugLine = @import("../physics.zig").DebugLine;
 const upload_meter = @import("../gpu_upload_meter.zig");
+pub const TargetShape = @import("../target_shape.zig").TargetShape;
+pub const defaultDepthFormat = @import("../target_shape.zig").defaultDepthFormat;
 
 // Interleaved line-list vertex: position + unpacked linear-space RGBA.
 // RGBA8 packing (UBYTE4N) would halve vertex bandwidth, but debug overlays
@@ -81,6 +83,7 @@ pub const DebugPass = struct {
     vertex_buffer: sg.Buffer = .{},
     staging: std.ArrayListUnmanaged(Vertex) = .empty,
     capacity_lines: usize = 0,
+    shape: TargetShape = .{},
     /// Main-target sample count the pipeline was built for.
     sample_count: i32 = 1,
     /// Main-target color format the pipeline was built for.
@@ -98,9 +101,16 @@ pub const DebugPass = struct {
     upload_commit: u32 = 0,
     upload_armed: bool = false,
 
-    /// Same pass for an explicit target shape (sample count + color
-    /// format): each main-target shape needs its own pipeline variant.
     pub fn init(allocator: std.mem.Allocator, sample_count: i32, color_format: sg.PixelFormat) !DebugPass {
+        return initForShape(allocator, .{
+            .sample_count = sample_count,
+            .color_format = color_format,
+            .depth_format = defaultDepthFormat(),
+        });
+    }
+
+    pub fn initForShape(allocator: std.mem.Allocator, target_shape: TargetShape) !DebugPass {
+        const resolved = target_shape.resolveEnvironment();
         var staging: std.ArrayListUnmanaged(Vertex) = .empty;
         try staging.ensureTotalCapacity(allocator, verticesForLineCount(initial_capacity_lines));
 
@@ -115,13 +125,14 @@ pub const DebugPass = struct {
             .index_type = .NONE,
             .primitive_type = .LINES,
             .depth = .{
+                .pixel_format = resolved.depth_format,
                 .compare = .LESS_EQUAL,
                 .write_enabled = false,
             },
             .cull_mode = .NONE,
-            .sample_count = sample_count,
+            .sample_count = resolved.sample_count,
         };
-        pip_desc.colors[0].pixel_format = color_format;
+        pip_desc.colors[0].pixel_format = resolved.color_format;
         pip_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
         pip_desc.layout.attrs[debug_shd.ATTR_debug_position] = .{
             .format = .FLOAT3,
@@ -139,8 +150,9 @@ pub const DebugPass = struct {
             .vertex_buffer = vb,
             .staging = staging,
             .capacity_lines = initial_capacity_lines,
-            .sample_count = sample_count,
-            .color_format = color_format,
+            .shape = resolved,
+            .sample_count = resolved.sample_count,
+            .color_format = resolved.color_format,
             .shader = shd,
         };
     }
@@ -235,7 +247,7 @@ pub const DebugPass = struct {
             .dst = .{ .buffer = self.vertex_buffer },
             .src = .{ .data = sg.asRange(self.staging.items) },
         });
-        // Учёт динамики: все staged debug-вершины кадра.
+        // Account for dynamic upload: all staged debug vertices this frame.
         upload_meter.record(self.staging.items.len * @sizeOf(Vertex));
         self.markUploaded();
         return true;
@@ -292,128 +304,3 @@ pub const DebugPass = struct {
         self.* = undefined;
     }
 };
-
-test "debug Vertex layout is tightly packed pos + rgba" {
-    try std.testing.expectEqual(@as(usize, 28), @sizeOf(Vertex));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Vertex, "position"));
-    try std.testing.expectEqual(@as(usize, 12), @offsetOf(Vertex, "color"));
-}
-
-test "packDebugLine emits two verts with opaque color" {
-    const line = DebugLine{
-        .a = .{ .x = 1.0, .y = 2.0, .z = 3.0 },
-        .b = .{ .x = 4.0, .y = 5.0, .z = 6.0 },
-        .color = .{ 0.1, 0.9, 0.3 },
-    };
-    var pair: [2]Vertex = undefined;
-    packDebugLine(line, &pair);
-    try std.testing.expectEqual([3]f32{ 1.0, 2.0, 3.0 }, pair[0].position);
-    try std.testing.expectEqual([3]f32{ 4.0, 5.0, 6.0 }, pair[1].position);
-    try std.testing.expectEqual([4]f32{ 0.1, 0.9, 0.3, 1.0 }, pair[0].color);
-    try std.testing.expectEqual([4]f32{ 0.1, 0.9, 0.3, 1.0 }, pair[1].color);
-    try std.testing.expectEqual(@as(usize, 2), verticesForLineCount(1));
-    try std.testing.expectEqual(@as(usize, 0), verticesForLineCount(0));
-}
-
-test "packDebugLine sanitizes non-finite and out-of-range inputs" {
-    const nan = std.math.nan(f32);
-    const inf = std.math.inf(f32);
-    const line = DebugLine{
-        .a = .{ .x = nan, .y = 1.0, .z = inf },
-        .b = .{ .x = 0.0, .y = -inf, .z = 2.0 },
-        .color = .{ 2.0, -1.0, nan },
-    };
-    var pair: [2]Vertex = undefined;
-    packDebugLine(line, &pair);
-    try std.testing.expectEqual([3]f32{ 0.0, 1.0, 0.0 }, pair[0].position);
-    try std.testing.expectEqual([3]f32{ 0.0, 0.0, 2.0 }, pair[1].position);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 1.0 }, pair[0].color);
-}
-
-test "grownCapacity doubles and clamps at max" {
-    try std.testing.expectEqual(@as(usize, 4096), grownCapacity(4096, 100));
-    try std.testing.expectEqual(@as(usize, 4096), grownCapacity(4096, 4096));
-    try std.testing.expectEqual(@as(usize, 8192), grownCapacity(4096, 4097));
-    try std.testing.expectEqual(@as(usize, 16384), grownCapacity(4096, 16383));
-    try std.testing.expectEqual(max_capacity_lines, grownCapacity(4096, max_capacity_lines * 4));
-}
-
-test "upload stages once headless, drawPrepared is a safe no-op" {
-    const t = std.testing;
-    _ = upload_meter.takeAndReset();
-    // Fake handles, no sokol context: upload packs CPU-side only (no sg.*,
-    // no meter bytes); drawPrepared must never trap headless.
-    var pass = DebugPass{
-        .allocator = t.allocator,
-        .pipeline = .{ .id = 1 },
-        .vertex_buffer = .{ .id = 2 },
-        .capacity_lines = 1,
-    };
-    defer pass.staging.deinit(t.allocator);
-    try pass.staging.ensureTotalCapacity(t.allocator, verticesForLineCount(4));
-
-    const lines = [_]DebugLine{
-        .{ .a = .{ .x = 0, .y = 0, .z = 0 }, .b = .{ .x = 1, .y = 0, .z = 0 }, .color = .{ 1, 0, 0 } },
-        .{ .a = .{ .x = 0, .y = 1, .z = 0 }, .b = .{ .x = 0, .y = 2, .z = 0 }, .color = .{ 0, 1, 0 } },
-    };
-    // Headless growth (2 lines > capacity 1): CPU staging grows with no
-    // sg.makeBuffer (which traps without a context); clamping stays exact.
-    try t.expect(pass.upload(&lines));
-    try t.expectEqual(@as(usize, 2), pass.capacity_lines);
-    try t.expectEqual(@as(usize, 4), pass.prepared_verts);
-    try t.expectEqual(@as(usize, 4), pass.staging.items.len);
-    try t.expectEqual(@as(u64, 0), upload_meter.peek());
-
-    // Headless the same-frame window never opens (no commits exist): a
-    // repeated upload restages the newest lines instead of first-wins.
-    const moved = [_]DebugLine{
-        .{ .a = .{ .x = 9, .y = 0, .z = 0 }, .b = .{ .x = 10, .y = 0, .z = 0 }, .color = .{ 0, 0, 1 } },
-    };
-    try t.expect(pass.upload(&moved));
-    try t.expectEqual(@as(usize, 2), pass.prepared_verts);
-    try t.expectEqual(@as(f32, 9.0), pass.staging.items[0].position[0]);
-
-    // Empty input fail-closes the prepared count; draws stay safe no-ops.
-    try t.expect(!pass.upload(&.{}));
-    try t.expectEqual(@as(usize, 0), pass.prepared_verts);
-    try t.expect(!pass.drawPrepared(Mat4.identity));
-    try t.expectEqual(@as(u64, 0), upload_meter.peek());
-
-    // Zero handles fail close without touching staging.
-    var dead = DebugPass{ .allocator = t.allocator };
-    defer dead.staging.deinit(t.allocator);
-    try t.expect(!dead.upload(&lines));
-    try t.expectEqual(@as(usize, 0), dead.prepared_verts);
-}
-
-test "upload clamps at max capacity, oldest lines win" {
-    const t = std.testing;
-    var pass = DebugPass{
-        .allocator = t.allocator,
-        .pipeline = .{ .id = 1 },
-        .vertex_buffer = .{ .id = 2 },
-        .capacity_lines = max_capacity_lines,
-    };
-    defer pass.staging.deinit(t.allocator);
-    try pass.staging.ensureTotalCapacity(t.allocator, verticesForLineCount(max_capacity_lines));
-
-    // max + 2 lines: growth is capped, so the prefix draws, tail drops —
-    // same clamp as render().
-    const n = max_capacity_lines + 2;
-    const lines = try t.allocator.alloc(DebugLine, n);
-    defer t.allocator.free(lines);
-    for (lines, 0..) |*ln, i| {
-        const x: f32 = @floatFromInt(i);
-        ln.* = .{
-            .a = .{ .x = x, .y = 0, .z = 0 },
-            .b = .{ .x = x + 0.5, .y = 0, .z = 0 },
-            .color = .{ 1, 0, 0 },
-        };
-    }
-    try t.expect(pass.upload(lines));
-    try t.expectEqual(verticesForLineCount(max_capacity_lines), pass.prepared_verts);
-    try t.expectEqual(@as(f32, 0.0), pass.staging.items[0].position[0]);
-    const last: f32 = @floatFromInt(max_capacity_lines - 1);
-    try t.expectEqual(last, pass.staging.items[pass.staging.items.len - 2].position[0]);
-    try t.expectEqual(last + 0.5, pass.staging.items[pass.staging.items.len - 1].position[0]);
-}

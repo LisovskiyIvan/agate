@@ -12,6 +12,8 @@ const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const MAX_BONES = @import("../animation/skeleton.zig").MAX_BONES;
 const uniforms = @import("../scene/uniforms.zig");
 const scene_render_queue = @import("../scene/render_queue.zig");
+pub const TargetShape = @import("../target_shape.zig").TargetShape;
+pub const defaultDepthFormat = @import("../target_shape.zig").defaultDepthFormat;
 
 // Inverse-hull outline/highlight layer: highlighted meshes are redrawn with
 // front-face culling (the inflated "inside out" hull), LESS_EQUAL depth
@@ -216,9 +218,9 @@ pub fn configureOutlineSkinnedDesc(desc: *sg.PipelineDesc) void {
     };
 }
 
-/// Self-contained per-item payload for outline rendering. Хранит только
-/// render-owned снимки (модель, хендлы, индекс копии скина): живых указателей
-/// на Mesh/Skeleton здесь нет.
+/// Self-contained per-item payload for outline rendering. Holds only
+/// render-owned snapshots (model, handles, bone copy index); no live
+/// pointers to Mesh/Skeleton exist here.
 ///
 /// Identity (stage-2 increment A, refactor-only): `source_uid` is the source
 /// mesh's `Mesh.uid` (nonzero, stable for lifetime), `source_mesh` is the
@@ -233,8 +235,8 @@ pub const OutlineDrawItem = struct {
     instance_buffer: sg.Buffer = .{},
     visible_instance_count: u32 = 1,
     model: Mat4 = Mat4.identity,
-    /// Индекс копии скин-матриц во внешнем SkinStorage (null = не скин).
-    /// Хранилище переживает item и резолвится на draw-фазе.
+    /// Index of bone matrix copy in external SkinStorage (null if unskinned).
+    /// Storage lifetime exceeds item and resolves during draw phase.
     skin_index: ?u32 = null,
     cutout_view: ?sg.View = null,
     cutout_sampler: ?sg.Sampler = null,
@@ -250,15 +252,10 @@ pub const OutlineDrawItem = struct {
     source_mesh: u32 = 0,
 };
 
-/// Строит OutlineDrawItem из живого меша (только prepare-фаза). Скин
-/// копируется в render-owned хранилище; OOM возвращает null — вызывающий
-/// пропускает item, а не рисует с живыми матрицами.
-/// Матрица мира — через mesh.getWorldMatrix() (тот же расчёт, что и
-/// worldMatrixCached; поведение не менялось: Scene строит контур ДО очередей,
-/// так что «прогретый очередями кеш» здесь неверен — просто свежий пересчёт,
-/// контурный список короткий, значения идентичны кешированным).
-/// P4: сигнатура расширена хранилищем/аллокатором — осознанное изменение
-/// low-level API (см. passes/mod.zig); Scene и OutlinePass.render стабильны.
+/// Builds OutlineDrawItem from live mesh (prepare phase only). Bones are
+/// copied into render-owned storage; OOM returns null so caller skips item
+/// rather than drawing with live matrices. World matrix is computed via
+/// mesh.getWorldMatrix().
 /// Stage-2B: `instance_source` selects the staged state (`.published` =
 /// fallback's `instance_render`, `.build_view` = game-frozen provisional);
 /// `cache_key` still tags nothing here (regular-center source stays
@@ -331,17 +328,23 @@ pub const OutlinePass = struct {
     shader_skin: sg.Shader = .{},
     shader_cutout: sg.Shader = .{},
 
+    shape: TargetShape = .{},
     /// Sample count the pipelines were built for. Draw calls into the main
     /// pass must use the variant matching the target shape.
     sample_count: i32 = 1,
     /// Main-target color format the pipelines were built for.
     color_format: sg.PixelFormat = .RGBA16F,
 
-    /// Same pass for an explicit target shape (sample count + color
-    /// format): each main-target shape needs its own pipeline variant
-    /// (sokol requires pipeline.sample_count to equal the attachment's on
-    /// every draw).
     pub fn init(sample_count: i32, color_format: sg.PixelFormat) OutlinePass {
+        return initForShape(.{
+            .sample_count = sample_count,
+            .color_format = color_format,
+            .depth_format = defaultDepthFormat(),
+        });
+    }
+
+    pub fn initForShape(target_shape: TargetShape) OutlinePass {
+        const resolved = target_shape.resolveEnvironment();
         // One shader object per program family: the @program entries in
         // outline.glsl generate separate desc functions, each with its own
         // uniform block table (only the skinned program declares vs_skin,
@@ -351,44 +354,52 @@ pub const OutlinePass = struct {
         const shd_skin = sg.makeShader(outline_shd.outlineSkinnedShaderDesc(sg.queryBackend()));
         const shd_cutout = sg.makeShader(outline_shd.outlineCutoutShaderDesc(sg.queryBackend()));
 
-        var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16, .sample_count = sample_count };
-        desc_u16.colors[0].pixel_format = color_format;
+        var desc_u16 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT16, .sample_count = resolved.sample_count };
+        desc_u16.colors[0].pixel_format = resolved.color_format;
         configureOutlineDesc(&desc_u16);
+        desc_u16.depth.pixel_format = resolved.depth_format;
         const pip_u16 = sg.makePipeline(desc_u16);
 
-        var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32, .sample_count = sample_count };
-        desc_u32.colors[0].pixel_format = color_format;
+        var desc_u32 = sg.PipelineDesc{ .shader = shd_rigid, .index_type = .UINT32, .sample_count = resolved.sample_count };
+        desc_u32.colors[0].pixel_format = resolved.color_format;
         configureOutlineDesc(&desc_u32);
+        desc_u32.depth.pixel_format = resolved.depth_format;
         const pip_u32 = sg.makePipeline(desc_u32);
 
-        var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16, .sample_count = sample_count };
-        desc_inst_u16.colors[0].pixel_format = color_format;
+        var desc_inst_u16 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT16, .sample_count = resolved.sample_count };
+        desc_inst_u16.colors[0].pixel_format = resolved.color_format;
         configureOutlineInstDesc(&desc_inst_u16);
+        desc_inst_u16.depth.pixel_format = resolved.depth_format;
         const pip_inst_u16 = sg.makePipeline(desc_inst_u16);
 
-        var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32, .sample_count = sample_count };
-        desc_inst_u32.colors[0].pixel_format = color_format;
+        var desc_inst_u32 = sg.PipelineDesc{ .shader = shd_inst, .index_type = .UINT32, .sample_count = resolved.sample_count };
+        desc_inst_u32.colors[0].pixel_format = resolved.color_format;
         configureOutlineInstDesc(&desc_inst_u32);
+        desc_inst_u32.depth.pixel_format = resolved.depth_format;
         const pip_inst_u32 = sg.makePipeline(desc_inst_u32);
 
-        var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16, .sample_count = sample_count };
-        desc_skin_u16.colors[0].pixel_format = color_format;
+        var desc_skin_u16 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT16, .sample_count = resolved.sample_count };
+        desc_skin_u16.colors[0].pixel_format = resolved.color_format;
         configureOutlineSkinnedDesc(&desc_skin_u16);
+        desc_skin_u16.depth.pixel_format = resolved.depth_format;
         const pip_skin_u16 = sg.makePipeline(desc_skin_u16);
 
-        var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32, .sample_count = sample_count };
-        desc_skin_u32.colors[0].pixel_format = color_format;
+        var desc_skin_u32 = sg.PipelineDesc{ .shader = shd_skin, .index_type = .UINT32, .sample_count = resolved.sample_count };
+        desc_skin_u32.colors[0].pixel_format = resolved.color_format;
         configureOutlineSkinnedDesc(&desc_skin_u32);
+        desc_skin_u32.depth.pixel_format = resolved.depth_format;
         const pip_skin_u32 = sg.makePipeline(desc_skin_u32);
 
-        var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16, .sample_count = sample_count };
-        desc_cut_u16.colors[0].pixel_format = color_format;
+        var desc_cut_u16 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT16, .sample_count = resolved.sample_count };
+        desc_cut_u16.colors[0].pixel_format = resolved.color_format;
         configureOutlineCutoutDesc(&desc_cut_u16);
+        desc_cut_u16.depth.pixel_format = resolved.depth_format;
         const pip_cut_u16 = sg.makePipeline(desc_cut_u16);
 
-        var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32, .sample_count = sample_count };
-        desc_cut_u32.colors[0].pixel_format = color_format;
+        var desc_cut_u32 = sg.PipelineDesc{ .shader = shd_cutout, .index_type = .UINT32, .sample_count = resolved.sample_count };
+        desc_cut_u32.colors[0].pixel_format = resolved.color_format;
         configureOutlineCutoutDesc(&desc_cut_u32);
+        desc_cut_u32.depth.pixel_format = resolved.depth_format;
         const pip_cut_u32 = sg.makePipeline(desc_cut_u32);
 
         return .{
@@ -404,8 +415,9 @@ pub const OutlinePass = struct {
             .shader_inst = shd_inst,
             .shader_skin = shd_skin,
             .shader_cutout = shd_cutout,
-            .sample_count = sample_count,
-            .color_format = color_format,
+            .shape = resolved,
+            .sample_count = resolved.sample_count,
+            .color_format = resolved.color_format,
         };
     }
 
@@ -417,8 +429,8 @@ pub const OutlinePass = struct {
     }
 
     /// Renders immutable outline items into the currently open main pass.
-    /// skins — то же хранилище, в которое makeOutlineDrawItem складывал копии
-    /// (резолв по skin_index уже после всех реаллокаций prepare-фазы).
+    /// skins is the storage where makeOutlineDrawItem placed bone copies
+    /// (resolved via skin_index after all prepare-phase allocations).
     pub fn renderItems(
         self: *OutlinePass,
         view_proj: Mat4,
@@ -487,7 +499,7 @@ pub const OutlinePass = struct {
             };
             sg.applyUniforms(outline_shd.UB_vs_params, sg.asRange(&vs_params));
             if (skinned) {
-                // Битый индекс (билдером недостижимо): пропуск вместо stale-униформы.
+                // Invalid skin index: skip rather than upload stale uniform.
                 const bones = scene_render_queue.skinAt(skins, item.skin_index) orelse continue;
                 const vs_skin = outline_shd.VsSkin{
                     .bones = bones.*,
@@ -518,9 +530,8 @@ pub const OutlinePass = struct {
     /// Each mesh routes to its pipeline family (rigid / instanced / skinned /
     /// alpha-cutout); meshes failing shouldOutlineMesh are skipped silently.
     /// Empty list and zero width are GPU-free no-ops.
-    /// Immediate-режим: снимки (включая копии скинов) строятся здесь же во
-    /// временное хранилище и рисуются синхронно до возврата — за пределы
-    /// вызова живые указатели не утекают.
+    /// Immediate mode: snapshots (including bone copies) are built into scratch
+    /// storage and drawn synchronously before returning.
     pub fn render(self: *OutlinePass, view_proj: Mat4, camera_pos: Vec3, meshes: []const *Mesh, color: Color4, width_px: f32) void {
         if (meshes.len == 0) return;
         var stack_items: [32]OutlineDrawItem = undefined;
@@ -564,7 +575,3 @@ pub const OutlinePass = struct {
 
 // Outline regression tests live in `outline_pass_tests.zig` (same directory,
 // imported below so the test registry picks them up exactly once).
-
-test {
-    _ = @import("outline_pass_tests.zig");
-}

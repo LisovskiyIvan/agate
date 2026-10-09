@@ -126,8 +126,7 @@ test "material alpha modes route regular and instanced draws with frozen cutoffs
     }
 }
 
-// Очереди не хранят живых указателей: скриншот пережил мутацию TRS/
-// материала и две публикации скелета, перезаписавшие исходный слот.
+// Queues do not retain live pointers: snapshot survives TRS/material mutation and skeleton updates.
 test "P4: queued snapshot survives source mutation and skeleton republication" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
@@ -197,8 +196,7 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     const tq = queues.transparent.items[0];
     try std.testing.expect(oq.skin_index != null and tq.skin_index != null);
 
-    // Мутация источников: TRS, материал, две публикации скелета (вторая
-    // перезаписывает исходный слот новым значением x=5).
+    // Mutation of sources: TRS, material, and two skeleton updates (second rewrites slot to x=5).
     opaque_mesh.position = Vec3.new(99, 99, 99);
     trans_mesh.position = Vec3.new(99, 99, 99);
     std_mat.albedo_color = math.Color3.new(9, 9, 9);
@@ -208,7 +206,7 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     skel.update();
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), skel.getRenderSkinMatrices()[0].m[12], 1e-4);
 
-    // Снимки неизменны: модель, draw_record и копии скинов.
+    // Snapshots remain immutable: model, draw_record, and skin copies.
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), queues.items.items[0].model.m[12], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), queues.items.items[0].draw_record.base_color[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), queues.transparent.items[0].draw_record.base_color[2], 1e-6);
@@ -218,8 +216,7 @@ test "P4: queued snapshot survives source mutation and skeleton republication" {
     }
 }
 
-// Instanced-запись тоже snapshot: мутация материала/TRS после prepare
-// не меняет draw_record батча.
+// Instanced batch is also a snapshot: source mutation after prepare does not affect draw_record.
 test "P4: instanced batch record survives source mutation" {
     const ally = std.testing.allocator;
 
@@ -272,8 +269,7 @@ test "P4: instanced batch record survives source mutation" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.125), batch.draw_record.base_color[2], 1e-6);
 }
 
-// Копии скинов масштабируются числом skinned-draws (а не MAX_BONES на item),
-// индексы стабильны при росте хранилища и независимы между видами.
+// Skin copies scale with number of skinned draws; indices remain stable across storage growth.
 test "P4: skin storage scales with skinned draws and stays stable across growth" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
@@ -308,7 +304,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     var qb = RenderQueues{};
     defer qb.deinit(ally);
 
-    // Два вида (multi-camera): у каждой очереди своё хранилище.
+    // Two views (multi-camera): each queue maintains its own storage.
     var sa = SceneStats{};
     buildFrameQueues(.{
         .allocator = ally,
@@ -341,8 +337,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     try std.testing.expectEqual(@as(usize, count), qa.items.items.len);
     try std.testing.expectEqual(@as(usize, count), qa.skin_storage.items.len);
     try std.testing.expectEqual(@as(usize, count), qb.skin_storage.items.len);
-    // Хранилище пережило несколько реаллокаций: каждый индекс резолвится
-    // в копию своего скелета (x == номер меша).
+    // Storage survived multiple reallocations: each index resolves to its skeleton copy.
     for (qa.items.items, qb.items.items) |a, b| {
         const ea: f32 = @floatFromInt(a.mesh_index);
         const eb: f32 = @floatFromInt(b.mesh_index);
@@ -350,7 +345,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
         try std.testing.expectApproxEqAbs(eb, qb.skin_storage.items[b.skin_index.?][0].m[12], 1e-4);
     }
 
-    // Мутация всех скелетов (x=1000+i, две публикации) — снимки целы.
+    // Mutation of all skeletons: snapshots remain intact.
     for (skels, 0..) |sk, i| {
         sk.bones[0].local_position = Vec3.new(1000.0 + @as(f32, @floatFromInt(i)), 0, 0);
         sk.update();
@@ -361,7 +356,7 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
         try std.testing.expectApproxEqAbs(ea, qa.skin_storage.items[a.skin_index.?][0].m[12], 1e-4);
     }
 
-    // Reset/reuse: ёмкости retained, содержимое пересобрано корректно.
+    // Reset/reuse: capacities retained, contents rebuilt cleanly.
     const cap = qa.skin_storage.capacity;
     try std.testing.expect(cap >= count);
     qa.reset();
@@ -389,12 +384,11 @@ test "P4: skin storage scales with skinned draws and stays stable across growth"
     }
 }
 
-// Фиксированная цена item не содержит MAX_BONES-матриц; пустые хранилища
-// ничего не стоят, когда skinned/shader-draws отсутствуют.
+// Fixed item size has no MAX_BONES overhead; empty storages are zero-cost.
 test "P4: no fixed huge per-item skin cost" {
     try std.testing.expect(@sizeOf(RenderMeshItem) < 1024);
     try std.testing.expect(@sizeOf(RenderInstancedBatch) < 1024);
-    // Один MAX_BONES-слот — 4 КиБ: item обязан быть кратно меньше.
+    // RenderMeshItem must be significantly smaller than a full MAX_BONES slot.
     try std.testing.expect(@sizeOf(RenderMeshItem) * 7 < @sizeOf([MAX_BONES]Mat4));
 
     const ally = std.testing.allocator;
@@ -449,7 +443,7 @@ fn expectP4QueueRefsValid(queues: *const RenderQueues) !void {
         }
         if (it.shader_index) |s| try std.testing.expect(s < queues.shader_storage.items.len);
     }
-    // Нет orphan-ссылок порядка: каждая запись указывает в существующий слот.
+    // No orphan order refs: every entry points to an existing slot.
     for (queues.transparent_order.items) |e| {
         if (e.kind == .regular) {
             try std.testing.expect(e.index < queues.transparent.items.len);
@@ -459,10 +453,7 @@ fn expectP4QueueRefsValid(queues: *const RenderQueues) !void {
     }
 }
 
-// OOM в любой точке prepare-фазы: item либо целиком в очереди с валидными
-// индексами, либо отсутствует. Тихого отката к живым матрицам нет.
-// std.testing.FailingAllocator роняет ровно n-ю аллокацию при прочих успешных —
-// так достигаются и поздние отказы (transparent/skin/shader) после ранних успехов.
+// OOM during prepare: item is either fully enqueued with valid indices or omitted.
 test "P4: OOM never leaves items with dangling or live skin refs" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
@@ -550,7 +541,7 @@ test "P4: OOM never leaves items with dangling or live skin refs" {
     try std.testing.expectEqual(@as(usize, 2), full.shader_storage.items.len);
     try expectP4QueueRefsValid(&full);
 
-    // Прогон по каждому n-му отказу отдельно: ранние успехи + поздний отказ.
+    // Test each n-th failure separately: early successes + late failure.
     var saw_induced = false;
     var saw_partial = false;
     var n: usize = 0;
@@ -578,14 +569,14 @@ test "P4: OOM never leaves items with dangling or live skin refs" {
         if (failing.has_induced_failure) saw_induced = true;
         if (q.items.items.len < full.items.items.len or q.transparent.items.len < full.transparent.items.len) saw_partial = true;
     }
-    // Хотя бы один отказ реально сработал и хотя бы один уронил item.
+    // At least one failure was induced and dropped an item.
     try std.testing.expect(saw_induced);
     try std.testing.expect(saw_partial);
 }
 
-// Hook-снимки на уровне очередей: opaque/transparent записи несут точные копии
-// tint/uniforms/texture/entry, мутация источника их не меняет; parallel-merge
-// копирует shader-значения эквивалентно серийному пути.
+// Queue shader snapshots: opaque/transparent entries carry exact copies of
+// tint/uniforms/texture/entry; source mutation does not change them; parallel
+// merge copies shader values equivalent to the serial path.
 test "P4: queue shader snapshots are exact and merge-equivalent" {
     const ally = std.testing.allocator;
 
@@ -644,8 +635,8 @@ test "P4: queue shader snapshots are exact and merge-equivalent" {
     try std.testing.expectEqual(@as(usize, 1), qs.transparent.items.len);
     try std.testing.expectEqual(@as(usize, 2), qs.shader_storage.items.len);
 
-    // Parallel-merge копирует shader-значения эквивалентно серийному пути
-    // (те же снимки в том же порядке).
+    // Parallel merge copies shader values equivalent to serial path
+    // (same snapshots in the same order).
     const pool = try jobs.Pool.init(ally, 2);
     defer pool.deinit();
     var qp = RenderQueues{};
@@ -683,7 +674,7 @@ test "P4: queue shader snapshots are exact and merge-equivalent" {
         qp.transparent.items[0].shader_index,
     );
 
-    // Мутация источников после prepare: обе очереди хранят точные копии.
+    // Mutation of sources after prepare: both queues retain exact copies.
     hook_opaque.tint_color = math.Color3.new(9, 9, 9);
     hook_opaque.alpha = 0.0;
     hook_opaque.texture = null;
@@ -709,10 +700,9 @@ test "P4: queue shader snapshots are exact and merge-equivalent" {
     }
 }
 
-// Hook-sidedness как до P4: draw-путь hook-материалов использует собственный
-// double_sided снимка, а не item.double_sided (куда decal- meshes форсят true
-// для regular-пути). Decal с single-sided hook-материалом: item — double-sided
-// (regular-контракт), снимок — single-sided (hook-контракт).
+// Hook sidedness: draw path for hook materials uses snapshot's own double_sided
+// flag rather than item.double_sided (which decal meshes force to true for the regular path).
+// Decal with single-sided hook material: item is double-sided, snapshot is single-sided.
 test "P4: hook shader snapshot preserves material sidedness without decal forcing" {
     const ally = std.testing.allocator;
 
@@ -747,21 +737,21 @@ test "P4: hook shader snapshot preserves material sidedness without decal forcin
         .default_white_id = 1,
     });
 
-    // Decal едет в transparent-очередь с форсированным double_sided (regular).
+    // Decal goes to transparent queue with forced double_sided.
     try std.testing.expectEqual(@as(usize, 1), queues.transparent.items.len);
     const it = queues.transparent.items[0];
     try std.testing.expect(it.transparent and it.is_decal and it.double_sided);
-    // А hook-снимок — single-sided, как sm.double_sided материала.
+    // Hook snapshot remains single-sided, matching sm.double_sided.
     const snap = queues.shader_storage.items[it.shader_index.?];
     try std.testing.expect(!snap.double_sided);
 
-    // Мутация материала после prepare снимок не меняет.
+    // Mutation of material after prepare does not change the snapshot.
     hook_single.double_sided = true;
     try std.testing.expect(!queues.shader_storage.items[it.shader_index.?].double_sided);
 }
 
-// Серийный и параллельный пути дают идентичные очереди включая копии скинов:
-// воркеры только заимствуют слоты в скретч, копии делаются серийно в merge.
+// Serial and parallel paths produce identical queues including skin copies:
+// workers borrow slots in scratch; copies are performed serially during merge.
 test "P4: parallel cull matches serial on skinned snapshots" {
     const ally = std.testing.allocator;
     const Skeleton = skeleton_mod.Skeleton;
