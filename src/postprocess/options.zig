@@ -7,12 +7,86 @@ const color_curves = @import("color_curves.zig");
 const lut = @import("lut.zig");
 const shafts = @import("shafts.zig");
 const ssgi_mod = @import("ssgi.zig");
+const contact_shadows_mod = @import("contact_shadows.zig");
 const auto_exposure = @import("auto_exposure.zig");
 
 pub const TonemappingType = types.TonemappingType;
 pub const LutFormat = types.LutFormat;
 pub const ShaftResolution = types.ShaftResolution;
 pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
+
+/// One row of the clamped() policy table: the exact sanitize op for a field.
+/// The op kinds reproduce the historical per-field behavior verbatim:
+/// "guarded" lanes map non-finite floats to the spec default, "raw" lanes
+/// keep the historical no-guard @max/clamp pass-through (NaN sorts low,
+/// +Inf clamps to the bound — probed, not assumed).
+const ClampSpec = union(enum) {
+    /// finite? clamp(v, min, max) else default.
+    guarded_clamp: struct { min: f32, max: f32, default: f32 },
+    /// finite? max(v, min) else default.
+    guarded_floor: struct { min: f32, default: f32 },
+    /// @max(v, min), no finite guard.
+    raw_floor: struct { min: f32 },
+    /// std.math.clamp(v, min, max), no finite guard.
+    raw_clamp: struct { min: f32, max: f32 },
+    /// std.math.clamp(v, min, max) on a u32 count.
+    uint_clamp: struct { min: u32, max: u32 },
+    /// color_curves.clampGrade triplet.
+    grade_triplet,
+    /// glow.clampTint triplet.
+    tint_triplet,
+    /// bloom.clampBloomMips.
+    bloom_mips,
+};
+
+const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
+    .{ .name = "exposure", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 65504.0, .default = 1.0 } } },
+    .{ .name = "auto_exposure_min", .spec = .{ .guarded_floor = .{ .min = 0.0, .default = 0.01 } } },
+    .{ .name = "auto_exposure_key_value", .spec = .{ .guarded_floor = .{ .min = 0.001, .default = 0.18 } } },
+    .{ .name = "auto_exposure_speed_up", .spec = .{ .guarded_floor = .{ .min = 0.0, .default = 3.0 } } },
+    .{ .name = "auto_exposure_speed_down", .spec = .{ .guarded_floor = .{ .min = 0.0, .default = 1.0 } } },
+    .{ .name = "auto_exposure_low_percentile", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.10 } } },
+    .{ .name = "bloom_threshold", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "bloom_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "bloom_radius", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 16.0, .default = 2.0 } } },
+    .{ .name = "bloom_pyramid_mips", .spec = .bloom_mips },
+    .{ .name = "glow_threshold", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "glow_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "glow_radius", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "glow_tint", .spec = .tint_triplet },
+    .{ .name = "dof_focus_distance", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "dof_focus_range", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "dof_max_blur", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "grade_shadows", .spec = .grade_triplet },
+    .{ .name = "grade_midtones", .spec = .grade_triplet },
+    .{ .name = "grade_highlights", .spec = .grade_triplet },
+    .{ .name = "lut_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "render_scale", .spec = .{ .guarded_clamp = .{ .min = min_render_scale, .max = 1.0, .default = 1.0 } } },
+    .{ .name = "ssr_steps", .spec = .{ .uint_clamp = .{ .min = 4, .max = 64 } } },
+    .{ .name = "ssgi_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
+    .{ .name = "ssgi_radius", .spec = .{ .guarded_clamp = .{ .min = ssgi_mod.SSGI_RADIUS_MIN, .max = ssgi_mod.SSGI_RADIUS_MAX, .default = 1.5 } } },
+    .{ .name = "ssgi_steps", .spec = .{ .uint_clamp = .{ .min = ssgi_mod.SSGI_STEPS_MIN, .max = ssgi_mod.SSGI_STEPS_MAX } } },
+    .{ .name = "contact_shadows_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
+    .{ .name = "contact_shadows_distance", .spec = .{ .guarded_floor = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_DISTANCE_MIN, .default = 0.3 } } },
+    .{ .name = "contact_shadows_thickness", .spec = .{ .guarded_floor = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_THICKNESS_MIN, .default = 0.05 } } },
+    .{ .name = "contact_shadows_steps", .spec = .{ .uint_clamp = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_STEPS_MIN, .max = contact_shadows_mod.CONTACT_SHADOWS_STEPS_MAX } } },
+    .{ .name = "local_tonemapping_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
+    .{ .name = "local_tonemapping_contrast", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.3 } } },
+    .{ .name = "motion_blur_intensity", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 3.0 } } },
+    .{ .name = "motion_blur_max_blur_px", .spec = .{ .raw_clamp = .{ .min = 1.0, .max = 128.0 } } },
+    .{ .name = "motion_blur_samples", .spec = .{ .uint_clamp = .{ .min = 2, .max = 32 } } },
+    .{ .name = "taa_blend", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "taa_jitter_scale", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 4.0 } } },
+    .{ .name = "taa_sharpness", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "taa_clamp_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "shaft_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "shaft_steps", .spec = .{ .uint_clamp = .{ .min = shafts.SHAFT_STEPS_MIN, .max = shafts.SHAFT_STEPS_MAX } } },
+    .{ .name = "shaft_density", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "shaft_anisotropy", .spec = .{ .raw_clamp = .{ .min = -shafts.SHAFT_ANISOTROPY_MAX, .max = shafts.SHAFT_ANISOTROPY_MAX } } },
+    .{ .name = "shaft_max_distance", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "shaft_blur_sigma", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .name = "shaft_edge_sigma", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+};
 
 /// Post-processing chain knobs (exposure, tonemapping, SSAO/bloom/DOF
 /// toggles and their parameters). A flat config read/written by tooling;
@@ -221,56 +295,48 @@ pub const PostProcessOptions = struct {
 
     // Return a copy with out-of-range values pulled into valid ranges.
     // Never fails; safe to apply on load or before uploading uniforms.
+    // Table-driven: one row per clamped field (see clamp_table above the
+    // struct); a newly added field without a row, a manual handler, or an
+    // exemption is a compile error (exhaustiveness check below the struct).
     pub fn clamped(self: PostProcessOptions) PostProcessOptions {
         var out = self;
-        out.render_scale = if (std.math.isFinite(self.render_scale)) std.math.clamp(self.render_scale, min_render_scale, 1.0) else 1.0;
-        out.exposure = if (std.math.isFinite(self.exposure)) std.math.clamp(self.exposure, 0.0, 65504.0) else 1.0;
-        out.auto_exposure_min = if (std.math.isFinite(self.auto_exposure_min)) @max(self.auto_exposure_min, 0.0) else 0.01;
+        inline for (clamp_table) |row| {
+            if (row.spec == .guarded_clamp) {
+                const s = row.spec.guarded_clamp;
+                const v: f32 = @field(self, row.name);
+                @field(out, row.name) = if (std.math.isFinite(v)) std.math.clamp(v, s.min, s.max) else s.default;
+            } else if (row.spec == .guarded_floor) {
+                const s = row.spec.guarded_floor;
+                const v: f32 = @field(self, row.name);
+                @field(out, row.name) = if (std.math.isFinite(v)) @max(v, s.min) else s.default;
+            } else if (row.spec == .raw_floor) {
+                const s = row.spec.raw_floor;
+                const v: f32 = @field(self, row.name);
+                @field(out, row.name) = @max(v, s.min);
+            } else if (row.spec == .raw_clamp) {
+                const s = row.spec.raw_clamp;
+                const v: f32 = @field(self, row.name);
+                @field(out, row.name) = std.math.clamp(v, s.min, s.max);
+            } else if (row.spec == .uint_clamp) {
+                const s = row.spec.uint_clamp;
+                const v: u32 = @field(self, row.name);
+                @field(out, row.name) = std.math.clamp(v, s.min, s.max);
+            } else if (row.spec == .grade_triplet) {
+                const v: [3]f32 = @field(self, row.name);
+                @field(out, row.name) = color_curves.clampGrade(v);
+            } else if (row.spec == .tint_triplet) {
+                const v: [3]f32 = @field(self, row.name);
+                @field(out, row.name) = glow.clampTint(v);
+            } else if (row.spec == .bloom_mips) {
+                const v: u32 = @field(self, row.name);
+                @field(out, row.name) = bloom.clampBloomMips(v);
+            } else {
+                @compileError("clamped() has no handler for clamp spec kind on field " ++ row.name);
+            }
+        }
+        // Order-dependent leftovers (floor at the already-clamped neighbor).
         out.auto_exposure_max = if (std.math.isFinite(self.auto_exposure_max)) @max(self.auto_exposure_max, out.auto_exposure_min) else 16.0;
-        out.auto_exposure_key_value = if (std.math.isFinite(self.auto_exposure_key_value)) @max(self.auto_exposure_key_value, 0.001) else 0.18;
-        out.auto_exposure_speed_up = if (std.math.isFinite(self.auto_exposure_speed_up)) @max(self.auto_exposure_speed_up, 0.0) else 3.0;
-        out.auto_exposure_speed_down = if (std.math.isFinite(self.auto_exposure_speed_down)) @max(self.auto_exposure_speed_down, 0.0) else 1.0;
-        out.auto_exposure_low_percentile = if (std.math.isFinite(self.auto_exposure_low_percentile)) std.math.clamp(self.auto_exposure_low_percentile, 0.0, 1.0) else 0.10;
         out.auto_exposure_high_percentile = if (std.math.isFinite(self.auto_exposure_high_percentile)) std.math.clamp(self.auto_exposure_high_percentile, out.auto_exposure_low_percentile, 1.0) else 0.90;
-        out.bloom_threshold = @max(self.bloom_threshold, 0.0);
-        out.bloom_intensity = @max(self.bloom_intensity, 0.0);
-        out.bloom_radius = if (std.math.isFinite(self.bloom_radius)) std.math.clamp(self.bloom_radius, 0.0, 16.0) else 2.0;
-        out.bloom_pyramid_mips = bloom.clampBloomMips(self.bloom_pyramid_mips);
-        out.glow_threshold = @max(self.glow_threshold, 0.0);
-        out.glow_intensity = @max(self.glow_intensity, 0.0);
-        out.glow_radius = @max(self.glow_radius, 0.0);
-        out.glow_tint = glow.clampTint(self.glow_tint);
-        out.dof_focus_distance = @max(self.dof_focus_distance, 0.0);
-        out.dof_focus_range = @max(self.dof_focus_range, 0.0);
-        out.dof_max_blur = @max(self.dof_max_blur, 0.0);
-        out.ssr_steps = std.math.clamp(self.ssr_steps, 4, 64);
-        out.contact_shadows_intensity = if (std.math.isFinite(self.contact_shadows_intensity)) std.math.clamp(self.contact_shadows_intensity, 0.0, 1.0) else 0.5;
-        out.ssgi_intensity = if (std.math.isFinite(self.ssgi_intensity)) std.math.clamp(self.ssgi_intensity, 0.0, 1.0) else 0.5;
-        out.ssgi_radius = if (std.math.isFinite(self.ssgi_radius)) std.math.clamp(self.ssgi_radius, ssgi_mod.SSGI_RADIUS_MIN, ssgi_mod.SSGI_RADIUS_MAX) else 1.5;
-        out.ssgi_steps = std.math.clamp(self.ssgi_steps, ssgi_mod.SSGI_STEPS_MIN, ssgi_mod.SSGI_STEPS_MAX);
-        out.contact_shadows_distance = if (std.math.isFinite(self.contact_shadows_distance)) @max(self.contact_shadows_distance, 0.01) else 0.3;
-        out.contact_shadows_thickness = if (std.math.isFinite(self.contact_shadows_thickness)) @max(self.contact_shadows_thickness, 0.001) else 0.05;
-        out.contact_shadows_steps = std.math.clamp(self.contact_shadows_steps, 4, 32);
-        out.local_tonemapping_intensity = if (std.math.isFinite(self.local_tonemapping_intensity)) std.math.clamp(self.local_tonemapping_intensity, 0.0, 1.0) else 0.5;
-        out.local_tonemapping_contrast = if (std.math.isFinite(self.local_tonemapping_contrast)) std.math.clamp(self.local_tonemapping_contrast, 0.0, 1.0) else 0.3;
-        out.motion_blur_samples = std.math.clamp(self.motion_blur_samples, 2, 32);
-        out.motion_blur_intensity = std.math.clamp(self.motion_blur_intensity, 0.0, 3.0);
-        out.motion_blur_max_blur_px = std.math.clamp(self.motion_blur_max_blur_px, 1.0, 128.0);
-        out.taa_blend = std.math.clamp(self.taa_blend, 0.0, 1.0);
-        out.taa_jitter_scale = std.math.clamp(self.taa_jitter_scale, 0.0, 4.0);
-        out.taa_sharpness = std.math.clamp(self.taa_sharpness, 0.0, 1.0);
-        out.taa_clamp_strength = std.math.clamp(self.taa_clamp_strength, 0.0, 1.0);
-        out.shaft_intensity = @max(self.shaft_intensity, 0.0);
-        out.shaft_steps = std.math.clamp(self.shaft_steps, shafts.SHAFT_STEPS_MIN, shafts.SHAFT_STEPS_MAX);
-        out.shaft_density = @max(self.shaft_density, 0.0);
-        out.shaft_anisotropy = std.math.clamp(self.shaft_anisotropy, -shafts.SHAFT_ANISOTROPY_MAX, shafts.SHAFT_ANISOTROPY_MAX);
-        out.shaft_max_distance = @max(self.shaft_max_distance, 0.0);
-        out.shaft_blur_sigma = @max(self.shaft_blur_sigma, 0.0);
-        out.shaft_edge_sigma = @max(self.shaft_edge_sigma, 0.0);
-        out.grade_shadows = color_curves.clampGrade(self.grade_shadows);
-        out.grade_midtones = color_curves.clampGrade(self.grade_midtones);
-        out.grade_highlights = color_curves.clampGrade(self.grade_highlights);
-        out.lut_strength = std.math.clamp(self.lut_strength, 0.0, 1.0);
         // A binding without a live view, a supported size, or matching
         // strip dims can never be sampled; drop it so the pass keeps its
         // no-LUT path instead of binding a dead handle.
@@ -284,30 +350,17 @@ pub const PostProcessOptions = struct {
     pub fn forFrame(self: PostProcessOptions) PostProcessOptions {
         var out = self.clamped();
         if (out.enabled) return out;
-        out.bloom_enabled = false;
-        out.glow_enabled = false;
-        out.vignette_enabled = false;
+        inline for (frame_disable_flags) |name| {
+            @field(out, name) = false;
+        }
         out.chromatic_aberration = 0;
         out.saturation = 1;
         out.contrast = 1;
-        out.dof_enabled = false;
         out.grade_shadows = .{ 0, 0, 0 };
         out.grade_midtones = .{ 0, 0, 0 };
         out.grade_highlights = .{ 0, 0, 0 };
-        out.lut_enabled = false;
-        out.fxaa_enabled = false;
-        out.fog_enabled = false;
-        out.ssr_enabled = false;
-        out.contact_shadows_enabled = false;
-        out.ssgi_enabled = false;
-        out.local_tonemapping_enabled = false;
-        out.sharpen_enabled = false;
-        out.grain_enabled = false;
         out.temperature = 0;
         out.tint = 0;
-        out.motion_blur_enabled = false;
-        out.taa_enabled = false;
-        out.shaft_enabled = false;
         return out;
     }
 
@@ -353,6 +406,134 @@ pub const PostProcessOptions = struct {
         self.lut_enabled = false;
     }
 };
+
+/// Fields clamped() handles outside the table (order-dependent or special):
+/// auto_exposure_max floors at the already-clamped min, high_percentile at
+/// the already-clamped low, and lut_texture is a handle-validity check.
+const manual_clamp_fields = [_][]const u8{
+    "auto_exposure_max",
+    "auto_exposure_high_percentile",
+    "lut_texture",
+};
+
+/// Fields clamped() intentionally leaves untouched: master/enable bools,
+/// enums, the u8 LUT edge length (validated with the texture binding), and
+/// floats the downstream shader math already handles over any value
+/// (vignette/saturation/optics, fog + ssr shape knobs, sharpen/grain
+/// amounts, white-balance gains).
+const exempt_clamp_fields = [_][]const u8{
+    "enabled",
+    "tonemapping",
+    "auto_exposure_enabled",
+    "auto_exposure_camera_cut",
+    "bloom_enabled",
+    "glow_enabled",
+    "vignette_enabled",
+    "vignette_intensity",
+    "vignette_radius",
+    "saturation",
+    "contrast",
+    "chromatic_aberration",
+    "dof_enabled",
+    "lut_enabled",
+    "lut_size",
+    "lut_format",
+    "fxaa_enabled",
+    "fog_enabled",
+    "fog_density",
+    "fog_height_falloff",
+    "fog_start_distance",
+    "fog_color",
+    "fog_sun_scattering",
+    "ssr_enabled",
+    "ssr_intensity",
+    "ssr_max_distance",
+    "ssr_thickness",
+    "depth_pyramid_enabled",
+    "ssgi_enabled",
+    "contact_shadows_enabled",
+    "local_tonemapping_enabled",
+    "sharpen_enabled",
+    "sharpen_amount",
+    "grain_enabled",
+    "grain_intensity",
+    "temperature",
+    "tint",
+    "motion_blur_enabled",
+    "taa_enabled",
+    "taa_camera_cut",
+    "shaft_enabled",
+    "shaft_resolution",
+};
+
+/// Effect-enable flags forFrame() clears when the master `enabled` is off.
+/// Typo-safe: @field on an unknown name is a compile error. Deliberately
+/// NOT exhaustive over all bools: exposure/tonemapping/render_scale,
+/// auto-exposure, the depth pyramid, and the LUT binding are render-owned
+/// state, not artistic effects, and survive the master switch (as before).
+const frame_disable_flags = [_][]const u8{
+    "bloom_enabled",
+    "glow_enabled",
+    "vignette_enabled",
+    "dof_enabled",
+    "lut_enabled",
+    "fxaa_enabled",
+    "fog_enabled",
+    "ssr_enabled",
+    "contact_shadows_enabled",
+    "ssgi_enabled",
+    "local_tonemapping_enabled",
+    "sharpen_enabled",
+    "grain_enabled",
+    "motion_blur_enabled",
+    "taa_enabled",
+    "shaft_enabled",
+};
+
+comptime {
+    @setEvalBranchQuota(20000);
+    const option_fields = @typeInfo(PostProcessOptions).@"struct".fields;
+    for (option_fields) |f| {
+        var covered = false;
+        for (clamp_table) |row| {
+            if (std.mem.eql(u8, row.name, f.name)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) {
+            for (manual_clamp_fields) |m| {
+                if (std.mem.eql(u8, m, f.name)) {
+                    covered = true;
+                    break;
+                }
+            }
+        }
+        if (!covered) {
+            for (exempt_clamp_fields) |e| {
+                if (std.mem.eql(u8, e, f.name)) {
+                    covered = true;
+                    break;
+                }
+            }
+        }
+        if (!covered) @compileError("PostProcessOptions." ++ f.name ++ " needs a clamp-table row, a manual handler, or an exemption.");
+    }
+    // Reverse direction: every listed name must be a real field, so a
+    // rename/typo fails here instead of silently dropping coverage.
+    for (clamp_table) |row| {
+        if (!@hasField(PostProcessOptions, row.name)) @compileError("clamp-table row for unknown field: " ++ row.name);
+    }
+    for (manual_clamp_fields) |m| {
+        if (!@hasField(PostProcessOptions, m)) @compileError("manual clamp handler for unknown field: " ++ m);
+    }
+    for (exempt_clamp_fields) |e| {
+        if (!@hasField(PostProcessOptions, e)) @compileError("clamp exemption for unknown field: " ++ e);
+    }
+    for (frame_disable_flags) |n| {
+        if (!@hasField(PostProcessOptions, n)) @compileError("forFrame disable flag for unknown field: " ++ n);
+    }
+}
 
 /// Lowest accepted `render_scale` (below this the upscale is mush and the
 /// TAA reconstruction cannot keep up; raise the floor before lowering it).

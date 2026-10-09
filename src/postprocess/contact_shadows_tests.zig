@@ -35,6 +35,21 @@ test "contactShadowParams packs uniforms or zeros when disabled" {
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, disabled_params);
 }
 
+test "contactShadowStepsParams packs steps or zeros when disabled" {
+    const cfg = PostProcessOptions{
+        .contact_shadows_enabled = true,
+        .contact_shadows_intensity = 0.5,
+        .contact_shadows_steps = 20,
+    };
+    try std.testing.expectEqual([4]f32{ 20.0, 0.0, 0.0, 0.0 }, cs.contactShadowStepsParams(cfg));
+
+    // Disabled or ~zero intensity: all-zero lane (composite bit-identical).
+    const off = PostProcessOptions{ .contact_shadows_enabled = false, .contact_shadows_steps = 20 };
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, cs.contactShadowStepsParams(off));
+    const quiet = PostProcessOptions{ .contact_shadows_enabled = true, .contact_shadows_intensity = 0.0 };
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, cs.contactShadowStepsParams(quiet));
+}
+
 test "calcContactShadowAttenuation scales by n_dot_l and intensity" {
     // Surface facing away from light receives no contact shadow darkening
     try std.testing.expectEqual(@as(f32, 1.0), calcContactShadowAttenuation(1.0, 1.0, 0.0));

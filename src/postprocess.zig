@@ -115,6 +115,24 @@ pub fn localTonemapParams(cfg: PostProcessOptions) [4]f32 {
     };
 }
 
+// --- SSAO / FXAA composite lanes (named split of the former params4 lane) ---
+/// Pack the composite ssao_params vec4: (enabled 1/0, debug 1/0, intensity,
+/// spare 0). Intensity rides through raw (the shader gates on x/y before
+/// reading z), exactly like the former params4 lane.
+pub fn ssaoParams(enabled: bool, debug_mode: bool, intensity: f32) [4]f32 {
+    return .{
+        if (enabled) 1.0 else 0.0,
+        if (debug_mode) 1.0 else 0.0,
+        intensity,
+        0.0,
+    };
+}
+
+/// Pack the composite fxaa_params vec4: (enabled 1/0, 0, 0, 0).
+pub fn fxaaParams(enabled: bool) [4]f32 {
+    return .{ if (enabled) 1.0 else 0.0, 0.0, 0.0, 0.0 };
+}
+
 // --- Temporal Anti-Aliasing (TAA) ---
 pub const TAA_JITTER_PERIOD = taa.TAA_JITTER_PERIOD;
 pub const halton = taa.halton;
@@ -167,6 +185,7 @@ pub const CONTACT_SHADOWS_DISTANCE_MIN = contact_shadows.CONTACT_SHADOWS_DISTANC
 pub const CONTACT_SHADOWS_THICKNESS_MIN = contact_shadows.CONTACT_SHADOWS_THICKNESS_MIN;
 pub const contactShadowsActive = contact_shadows.contactShadowsActive;
 pub const contactShadowParams = contact_shadows.contactShadowParams;
+pub const contactShadowStepsParams = contact_shadows.contactShadowStepsParams;
 pub const SSGI_STEPS_MIN = ssgi.SSGI_STEPS_MIN;
 pub const SSGI_STEPS_MAX = ssgi.SSGI_STEPS_MAX;
 pub const SSGI_RADIUS_MIN = ssgi.SSGI_RADIUS_MIN;

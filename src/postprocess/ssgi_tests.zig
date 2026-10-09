@@ -51,3 +51,12 @@ test "ssgiParams packs the lane and zeros when inactive" {
     try testing.expect(!ssgi.ssgiActive(off));
     try testing.expect(ssgi.ssgiActive(on));
 }
+
+test "ssgiActive gates on the 0.001 intensity floor" {
+    // At/below the floor the lane packs zeros (composite bit-identical).
+    const floor_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.001 };
+    try testing.expect(!ssgi.ssgiActive(floor_cfg));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(floor_cfg));
+    const above = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.002 };
+    try testing.expect(ssgi.ssgiActive(above));
+}

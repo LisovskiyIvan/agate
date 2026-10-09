@@ -154,3 +154,40 @@ test "ssgi clamps intensity, radius and steps" {
     try std.testing.expect(!dead.forFrame().ssgi_enabled);
     try std.testing.expect(!(PostProcessOptions{}).ssgi_enabled);
 }
+
+test "table-driven clamps map non-finite guarded floats to spec defaults" {
+    const nan = std.math.nan(f32);
+    // Guarded lanes fall back to their defaults.
+    try std.testing.expectEqual(@as(f32, 0.5), (PostProcessOptions{ .ssgi_intensity = nan }).clamped().ssgi_intensity);
+    try std.testing.expectEqual(@as(f32, 1.5), (PostProcessOptions{ .ssgi_radius = nan }).clamped().ssgi_radius);
+    try std.testing.expectEqual(@as(f32, 0.5), (PostProcessOptions{ .contact_shadows_intensity = nan }).clamped().contact_shadows_intensity);
+    try std.testing.expectEqual(@as(f32, 0.3), (PostProcessOptions{ .contact_shadows_distance = nan }).clamped().contact_shadows_distance);
+    try std.testing.expectEqual(@as(f32, 2.0), (PostProcessOptions{ .bloom_radius = nan }).clamped().bloom_radius);
+    try std.testing.expectEqual(@as(f32, 3.0), (PostProcessOptions{ .auto_exposure_speed_up = nan }).clamped().auto_exposure_speed_up);
+    // Order-dependent leftovers still floor at the clamped neighbor.
+    const dep = (PostProcessOptions{ .auto_exposure_min = 5.0, .auto_exposure_max = 2.0 }).clamped();
+    try std.testing.expectEqual(@as(f32, 5.0), dep.auto_exposure_max);
+    // Raw lanes keep the historical no-guard pass-through: NaN sorts low
+    // (@max -> min), +Inf clamps to the bound.
+    try std.testing.expectEqual(@as(f32, 0.0), (PostProcessOptions{ .bloom_threshold = nan }).clamped().bloom_threshold);
+    try std.testing.expectEqual(@as(f32, 0.0), (PostProcessOptions{ .glow_intensity = nan }).clamped().glow_intensity);
+    try std.testing.expectEqual(@as(f32, 1.0), (PostProcessOptions{ .lut_strength = nan }).clamped().lut_strength);
+    try std.testing.expectEqual(@as(f32, 128.0), (PostProcessOptions{ .motion_blur_max_blur_px = std.math.inf(f32) }).clamped().motion_blur_max_blur_px);
+    try std.testing.expectEqual(@as(f32, 0.9), (PostProcessOptions{ .shaft_anisotropy = std.math.inf(f32) }).clamped().shaft_anisotropy);
+}
+
+test "forFrame clears effect flags but keeps render-owned state" {
+    const cfg = PostProcessOptions{
+        .auto_exposure_enabled = true,
+        .depth_pyramid_enabled = true,
+        .taa_camera_cut = true,
+        .render_scale = 0.5,
+        .fxaa_enabled = true,
+        .shaft_enabled = true,
+    };
+    const frame = cfg.forFrame();
+    try std.testing.expect(!frame.fxaa_enabled and !frame.shaft_enabled);
+    // Render-owned state (not artistic effects) survives the master switch.
+    try std.testing.expect(frame.auto_exposure_enabled and frame.depth_pyramid_enabled and frame.taa_camera_cut);
+    try std.testing.expectEqual(@as(f32, 0.5), frame.render_scale);
+}

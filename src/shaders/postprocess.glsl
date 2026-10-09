@@ -17,9 +17,10 @@ layout(binding = 0) uniform fs_params {
     vec4 params1; // x: exposure, y: bloom_threshold (pyramid prefilter; composite ignores), z: bloom_intensity, w: unused (parent sets 0)
     vec4 params2; // x: vignette_intensity, y: vignette_radius, z: saturation, w: contrast
     vec4 params3; // x: tonemapping (0=none, 1=ACES, 2=Reinhard), y: chromatic_aberration, z: bloom_available (1/0, parent packs enabled && view valid), w: vignette_enabled (1/0)
-    vec4 params4; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: fxaa_enabled (1/0)
+    vec4 ssao_params; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: spare
+    vec4 fxaa_params; // x: fxaa_enabled (1/0), yzw: spare
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
-    vec4 camera_params; // x: near_z, y: far_z, z: ssr_steps, w: unused
+    vec4 camera_params; // x: near_z, y: far_z, z: ssr_steps, w: unused (0)
     vec4 camera_pos; // xyz: camera world pos, w: unused
     vec4 sun_dir; // xyz: sun direction (normalized), w: unused
     vec4 sun_color; // xyz: sun color, w: unused
@@ -43,6 +44,7 @@ layout(binding = 0) uniform fs_params {
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
+    vec4 contact_shadow_params2; // x: raymarch steps, yzw: spare
     vec4 ssgi_params; // x: enabled (1/0), y: intensity [0,1], z: radius (m), w: gather steps
     vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
     // APPENDED LAST (display transfer): x = manual display encode needed
@@ -322,7 +324,7 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
 
     float max_dist = contact_shadow_params.z;
     float thickness = contact_shadow_params.w;
-    int steps = int(camera_params.w);
+    int steps = int(contact_shadow_params2.x);
     if (steps < 4) steps = 12;
 
     float step_size = max_dist / float(steps);
@@ -564,9 +566,9 @@ vec3 sampleScene(vec2 uv) {
     }
 
     // SSAO Occlusion: applied to the resolved scene color so motion blur never washes out or erases AO
-    if (params4.x > 0.5) {
+    if (ssao_params.x > 0.5) {
         float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
-        float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
+        float ao_factor = clamp(1.0 - (1.0 - ao) * ssao_params.z, 0.0, 1.0);
         color *= ao_factor;
     }
 
@@ -773,7 +775,7 @@ vec3 sampleRadiance(vec2 uv) {
     return boundRadiance(addShaftRadiance(sampleScene(uv), uv));
 }
 
-// FXAA 3.11 resolve in linear radiance (honors params4.w). Edge
+// FXAA 3.11 resolve in linear radiance (honors fxaa_params.x). Edge
 // classification reuses the exact FXAA math, offsets and weights with the
 // cheap clamped-tonemapped-luma proxy taps (sampleLumaFast, no per-tap SSR
 // cost); the actual filter resolves LINEAR radiance at the walked uv, so
@@ -934,12 +936,12 @@ vec3 applyDoF(vec3 color, vec2 uv) {
     return boundRadiance(acc / wsum);
 }
 
-// Pre-tonemap radiance: FXAA when params4.w is on (flag honored,
+// Pre-tonemap radiance: FXAA when fxaa_params.x is on (flag honored,
 // never silently off), then TAA. Chromatic/SSR/fog reuse their existing
 // math in this linear space via sampleScene.
 vec3 resolveRadiance(vec2 uv) {
     vec3 hdr;
-    if (params4.w > 0.5) {
+    if (fxaa_params.x > 0.5) {
         hdr = applyFXAA(uv, resolution.zw);
     } else {
         hdr = sampleRadiance(uv);
@@ -964,7 +966,7 @@ void main() {
     // SSAO debug: diagnostic gray, no exposure/tonemap/encode. A
     // capture-only re-entry stores this gray (history then reprojects gray;
     // acceptable for a diagnostic view).
-    if (params4.y > 0.5) {
+    if (ssao_params.y > 0.5) {
         float ao_dbg = texture(sampler2D(ssao_tex, smp), uv).r;
         frag_color = vec4(ao_dbg, ao_dbg, ao_dbg, 1.0);
         return;

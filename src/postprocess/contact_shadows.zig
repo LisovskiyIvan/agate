@@ -22,6 +22,16 @@ pub fn contactShadowParams(config: PostProcessOptions) [4]f32 {
     };
 }
 
+/// Packed second uniform lane: (steps, 0, 0, 0). Zeros when inactive, so the
+/// composite stays bit-identical to the no-contact-shadow path (the shader
+/// early-outs on contactShadowParams.x before reading the steps lane).
+pub fn contactShadowStepsParams(config: PostProcessOptions) [4]f32 {
+    if (!contactShadowsActive(config)) {
+        return .{ 0.0, 0.0, 0.0, 0.0 };
+    }
+    return .{ @floatFromInt(config.contact_shadows_steps), 0.0, 0.0, 0.0 };
+}
+
 /// Compute shadow attenuation factor: 1.0 = fully lit, 0.0 = fully in shadow.
 pub fn calcContactShadowAttenuation(occlusion: f32, intensity: f32, n_dot_l: f32) f32 {
     if (n_dot_l <= 0.0) return 1.0;

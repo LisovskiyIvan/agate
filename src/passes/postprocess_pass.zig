@@ -700,12 +700,8 @@ pub const PostProcessPass = struct {
                 if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
                 if (config.vignette_enabled) 1.0 else 0.0,
             },
-            .params4 = .{
-                if (ssao_enabled) 1.0 else 0.0,
-                if (ssao_debug) 1.0 else 0.0,
-                ssao_intensity,
-                if (config.fxaa_enabled) 1.0 else 0.0,
-            },
+            .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_debug, ssao_intensity),
+            .fxaa_params = postprocess.fxaaParams(config.fxaa_enabled),
             .resolution = .{
                 @floatFromInt(cur_w),
                 @floatFromInt(cur_h),
@@ -716,7 +712,9 @@ pub const PostProcessPass = struct {
                 near_z,
                 far_z,
                 @floatFromInt(config.ssr_steps),
-                @floatFromInt(config.contact_shadows_steps),
+                // w is unused (0): contact-shadow steps used to ride here
+                // and now have their own contact_shadow_params2 lane.
+                0.0,
             },
             .camera_pos = .{
                 camera_pos.x,
@@ -780,6 +778,9 @@ pub const PostProcessPass = struct {
             .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
             // (enabled 1/0, intensity, distance, thickness); zeros when off
             .contact_shadow_params = postprocess.contactShadowParams(config),
+            // (steps, 0, 0, 0); zeros when off, which keeps the composite
+            // identical to the pre-contact-shadow path.
+            .contact_shadow_params2 = postprocess.contactShadowStepsParams(config),
             // (enabled 1/0, intensity, radius, steps); zeros when off,
             // which keeps the composite identical to the pre-SSGI path.
             .ssgi_params = postprocess.ssgiParams(config),
