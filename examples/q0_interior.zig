@@ -180,6 +180,12 @@ fn setupScene() void {
     scene.post_process.shaft_intensity = 0.5;
     scene.post_process.shaft_steps = 32;
     scene.post_process.local_tonemapping_enabled = true;
+    // SSGI v1 color bleed: the calibration scene carries it by default —
+    // AGATE_Q0_NO_SSGI=1 isolates the pre-SSGI baseline.
+    scene.post_process.ssgi_enabled = !envFlag("AGATE_Q0_NO_SSGI");
+    scene.post_process.ssgi_intensity = 0.55;
+    scene.post_process.ssgi_radius = 1.6;
+    scene.post_process.ssgi_steps = 16;
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
     scene.post_process.fog_enabled = false;

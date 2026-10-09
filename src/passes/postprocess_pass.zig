@@ -780,6 +780,9 @@ pub const PostProcessPass = struct {
             .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
             // (enabled 1/0, intensity, distance, thickness); zeros when off
             .contact_shadow_params = postprocess.contactShadowParams(config),
+            // (enabled 1/0, intensity, radius, steps); zeros when off,
+            // which keeps the composite identical to the pre-SSGI path.
+            .ssgi_params = postprocess.ssgiParams(config),
             // (enabled 1/0, intensity, contrast, 0); zeros when off
             .local_tonemap_params = postprocess.localTonemapParams(config),
             .grade_shadows = .{

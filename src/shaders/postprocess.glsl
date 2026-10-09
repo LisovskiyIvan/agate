@@ -43,6 +43,7 @@ layout(binding = 0) uniform fs_params {
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
+    vec4 ssgi_params; // x: enabled (1/0), y: intensity [0,1], z: radius (m), w: gather steps
     vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
     // APPENDED LAST (display transfer): x = manual display encode needed
     // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
@@ -380,6 +381,66 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
     return scene_color;
 }
 
+// Screen-space one-bounce diffuse GI (v1 color bleed): jittered disk
+// gather; each depth-hit neighbor inside the world-space influence radius
+// contributes its HDR radiance weighted by hemisphere cosine and squared
+// linear falloff (CPU mirror: postprocess/ssgi.zig ssgiWeight). The
+// weighted sum normalizes into a bleed color scaled by gather coverage
+// and intensity, then ADDS to the lit color (forward composite carries no
+// albedo GBuffer — the lit color already encodes it). Per-pixel jitter
+// hands the denoise to TAA; a per-sample luma cap keeps HDR fireflies
+// out. Sensitive to depth-only neighbors: thin geometry without radiance
+// data contributes nothing (depth-gated like SSR).
+const float SSGI_LUMA_CAP = 8.0; // per-sample HDR firefly cap (CPU mirror: ssgi.SSGI_LUMA_CAP)
+
+vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
+    if (raw_depth >= 0.9999) return scene_color;
+    float intensity = ssgi_params.y;
+    if (intensity <= 0.001) return scene_color;
+    float radius = max(ssgi_params.z, 0.05);
+    int steps = int(ssgi_params.w);
+    if (steps < 4) steps = 8;
+
+    vec3 world_pos = reconstructWorldPos(uv, raw_depth);
+    vec3 N = reconstructWorldNormal(uv, world_pos);
+
+    // Roughly constant WORLD radius: scale the pixel disk by camera
+    // distance; clamp so the gather stays local (2..48 px).
+    float cam_dist = max(length(world_pos - camera_pos.xyz), 0.05);
+    float px_radius = clamp((radius / cam_dist) * resolution.y * 0.25, 2.0, 48.0);
+
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    vec3 bleed = vec3(0.0);
+    float total_w = 0.0;
+    for (int i = 0; i < steps; i++) {
+        float fi = float(i);
+        float ang = 6.2831853 * (fi + jitter) / float(steps);
+        float r = px_radius * sqrt((fi + 0.5) / float(steps));
+        vec2 s_uv = uv + vec2(cos(ang), sin(ang)) * r * resolution.zw;
+        if (s_uv.x <= 0.002 || s_uv.x >= 0.998 || s_uv.y <= 0.002 || s_uv.y >= 0.998) continue;
+
+        float s_d = texture(sampler2D(depth_tex, depth_smp), s_uv).r;
+        if (s_d >= 0.9999) continue;
+        vec3 s_pos = reconstructWorldPos(s_uv, s_d);
+        vec3 to_s = s_pos - world_pos;
+        float dist = length(to_s);
+        if (dist >= radius) continue;
+        float cos_nd = dot(N, to_s / max(dist, 1e-4));
+        if (cos_nd <= 0.0) continue;
+
+        vec3 s_col = texture(sampler2D(scene_tex, smp), s_uv).rgb;
+        float falloff = 1.0 - dist / radius;
+        float w = cos_nd * falloff * falloff;
+        bleed += min(s_col, vec3(SSGI_LUMA_CAP)) * w;
+        total_w += w;
+    }
+    if (total_w <= 0.0001) return scene_color;
+
+    vec3 bleed_color = bleed / total_w;
+    float coverage = clamp(total_w / float(steps) * 3.0, 0.0, 1.0);
+    return scene_color + bleed_color * (coverage * intensity);
+}
+
 vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
     if (fog_params.x < 0.5) return scene_color;
 
@@ -482,7 +543,7 @@ vec3 sampleScene(vec2 uv) {
 
     // Depth-dependent passes: Motion Blur, Contact Shadows, SSR, SSAO, and Atmospheric Fog
     float raw_depth = 0.0;
-    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5);
+    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5 || ssgi_params.x > 0.5);
     if (needs_depth) {
         raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     }
@@ -507,6 +568,12 @@ vec3 sampleScene(vec2 uv) {
         float ao = clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0);
         float ao_factor = clamp(1.0 - (1.0 - ao) * params4.z, 0.0, 1.0);
         color *= ao_factor;
+    }
+
+    // Screen-Space GI (v1 color bleed): additive one-bounce indirect
+    // before fog so aerial perspective covers it like direct light.
+    if (ssgi_params.x > 0.5) {
+        color = applySSGI(color, uv, raw_depth);
     }
 
     // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)

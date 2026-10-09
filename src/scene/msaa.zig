@@ -113,8 +113,8 @@ pub fn effectiveSampleCount(requested: i32, in: Inputs) i32 {
 
 /// True when any depth-texture-consuming post effect would run this frame.
 /// While the main target is MSAA these are suppressed (see module docs).
-pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool, motion_blur_enabled: bool) bool {
-    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled or motion_blur_enabled);
+pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool, motion_blur_enabled: bool, ssgi_enabled: bool) bool {
+    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled or motion_blur_enabled or ssgi_enabled);
 }
 
 /// Single-sample depth-prepass gate (MSAA depth-resolve design v1).

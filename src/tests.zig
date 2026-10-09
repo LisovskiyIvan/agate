@@ -264,6 +264,8 @@ test {
     _ = @import("postprocess/options_tests.zig");
     _ = @import("postprocess/shafts.zig");
     _ = @import("postprocess/shafts_tests.zig");
+    _ = @import("postprocess/ssgi.zig");
+    _ = @import("postprocess/ssgi_tests.zig");
     _ = @import("postprocess/taa.zig");
     _ = @import("postprocess/taa_tests.zig");
     _ = @import("postprocess/types.zig");

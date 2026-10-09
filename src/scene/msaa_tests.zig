@@ -55,17 +55,18 @@ test "effectiveSampleCount gates only on target format support" {
     try testing.expectEqual(@as(i32, 8), effectiveSampleCount(8, base));
 }
 
-test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog/MotionBlur)" {
+test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog/MotionBlur/SSGI)" {
     // SSAO defaults on in this engine: that alone counts as active.
-    try testing.expect(depthEffectsActive(true, true, false, false, false, false, false));
-    try testing.expect(depthEffectsActive(true, false, true, false, false, false, false)); // debug
-    try testing.expect(depthEffectsActive(true, false, false, true, false, false, false)); // SSR
-    try testing.expect(depthEffectsActive(true, false, false, false, true, false, false)); // DoF
-    try testing.expect(depthEffectsActive(true, false, false, false, false, true, false)); // Fog
-    try testing.expect(depthEffectsActive(true, false, false, false, false, false, true)); // MotionBlur
-    try testing.expect(!depthEffectsActive(true, false, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, true, false, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, false, true, false, false, false, false, false)); // debug
+    try testing.expect(depthEffectsActive(true, false, false, true, false, false, false, false)); // SSR
+    try testing.expect(depthEffectsActive(true, false, false, false, true, false, false, false)); // DoF
+    try testing.expect(depthEffectsActive(true, false, false, false, false, true, false, false)); // Fog
+    try testing.expect(depthEffectsActive(true, false, false, false, false, false, true, false)); // MotionBlur
+    try testing.expect(depthEffectsActive(true, false, false, false, false, false, false, true)); // SSGI; // MotionBlur
+    try testing.expect(!depthEffectsActive(true, false, false, false, false, false, false, false));
     // Without the post chain nothing runs at all.
-    try testing.expect(!depthEffectsActive(false, true, true, true, true, true, true));
+    try testing.expect(!depthEffectsActive(false, true, true, true, true, true, true, true));
 }
 
 test "needsResolveAttachment follows the sokol resolve contract" {

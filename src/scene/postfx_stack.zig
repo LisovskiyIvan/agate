@@ -334,9 +334,9 @@ pub const PostFXStack = struct {
         const msaa_active = params.main_samples > 1;
         const depth_prepass = msaa.depthPrepassActive(post.enabled, params.msaa_depth_prepass, params.main_samples);
         if (msaa.suppressDepthEffects(params.main_samples, params.msaa_depth_prepass)) {
-            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled, post.motion_blur_enabled) or post.shaft_enabled) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled, post.motion_blur_enabled, post.ssgi_enabled) or post.shaft_enabled) {
                 _ = self.warn_depth_effects.warn(
-                    "msaa: SSAO/SSR/DoF/Fog/MotionBlur/Shaft disabled this session: MSAA x{} main target has no depth resolve",
+                    "msaa: SSAO/SSR/DoF/Fog/MotionBlur/SSGI/Shaft disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},
                 );
             }
@@ -348,6 +348,7 @@ pub const PostFXStack = struct {
             post.motion_blur_enabled = false;
             post.fxaa_enabled = false;
             post.shaft_enabled = false;
+            post.ssgi_enabled = false;
         }
         if (msaa_active and post.taa_enabled) {
             _ = self.warn_taa_msaa.warn(

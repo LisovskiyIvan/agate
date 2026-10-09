@@ -6,6 +6,7 @@ const glow = @import("glow.zig");
 const color_curves = @import("color_curves.zig");
 const lut = @import("lut.zig");
 const shafts = @import("shafts.zig");
+const ssgi_mod = @import("ssgi.zig");
 const auto_exposure = @import("auto_exposure.zig");
 
 pub const TonemappingType = types.TonemappingType;
@@ -126,6 +127,17 @@ pub const PostProcessOptions = struct {
     // Hierarchical GPU Depth Pyramid (Hi-Z downsample mips for SSR, contact shadows, occlusion)
     depth_pyramid_enabled: bool = false,
 
+    // Screen-Space Global Illumination (v1 color bleed; mirrors in
+    // postprocess/ssgi.zig, gather in postprocess.glsl applySSGI). Default
+    // OFF: the disabled lane is zeros and the composite stays bit-identical
+    // to the pre-SSGI path.
+    ssgi_enabled: bool = false,
+    ssgi_intensity: f32 = 0.5,
+    // World-space influence radius in meters (pixel disk scales by camera
+    // distance; clamped [0.1, 8]).
+    ssgi_radius: f32 = 1.5,
+    ssgi_steps: u32 = 12,
+
     // Screen-Space Contact Shadows & Local Ambient Occlusion (short-range sun raymarch)
     contact_shadows_enabled: bool = false,
     contact_shadows_intensity: f32 = 0.5,
@@ -233,6 +245,9 @@ pub const PostProcessOptions = struct {
         out.dof_max_blur = @max(self.dof_max_blur, 0.0);
         out.ssr_steps = std.math.clamp(self.ssr_steps, 4, 64);
         out.contact_shadows_intensity = if (std.math.isFinite(self.contact_shadows_intensity)) std.math.clamp(self.contact_shadows_intensity, 0.0, 1.0) else 0.5;
+        out.ssgi_intensity = if (std.math.isFinite(self.ssgi_intensity)) std.math.clamp(self.ssgi_intensity, 0.0, 1.0) else 0.5;
+        out.ssgi_radius = if (std.math.isFinite(self.ssgi_radius)) std.math.clamp(self.ssgi_radius, ssgi_mod.SSGI_RADIUS_MIN, ssgi_mod.SSGI_RADIUS_MAX) else 1.5;
+        out.ssgi_steps = std.math.clamp(self.ssgi_steps, ssgi_mod.SSGI_STEPS_MIN, ssgi_mod.SSGI_STEPS_MAX);
         out.contact_shadows_distance = if (std.math.isFinite(self.contact_shadows_distance)) @max(self.contact_shadows_distance, 0.01) else 0.3;
         out.contact_shadows_thickness = if (std.math.isFinite(self.contact_shadows_thickness)) @max(self.contact_shadows_thickness, 0.001) else 0.05;
         out.contact_shadows_steps = std.math.clamp(self.contact_shadows_steps, 4, 32);
@@ -284,6 +299,7 @@ pub const PostProcessOptions = struct {
         out.fog_enabled = false;
         out.ssr_enabled = false;
         out.contact_shadows_enabled = false;
+        out.ssgi_enabled = false;
         out.local_tonemapping_enabled = false;
         out.sharpen_enabled = false;
         out.grain_enabled = false;

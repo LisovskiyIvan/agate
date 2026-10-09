@@ -16,6 +16,7 @@ pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
 pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 pub const fog = @import("postprocess/fog.zig");
+pub const ssgi = @import("postprocess/ssgi.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
@@ -166,6 +167,13 @@ pub const CONTACT_SHADOWS_DISTANCE_MIN = contact_shadows.CONTACT_SHADOWS_DISTANC
 pub const CONTACT_SHADOWS_THICKNESS_MIN = contact_shadows.CONTACT_SHADOWS_THICKNESS_MIN;
 pub const contactShadowsActive = contact_shadows.contactShadowsActive;
 pub const contactShadowParams = contact_shadows.contactShadowParams;
+pub const SSGI_STEPS_MIN = ssgi.SSGI_STEPS_MIN;
+pub const SSGI_STEPS_MAX = ssgi.SSGI_STEPS_MAX;
+pub const SSGI_RADIUS_MIN = ssgi.SSGI_RADIUS_MIN;
+pub const SSGI_RADIUS_MAX = ssgi.SSGI_RADIUS_MAX;
+pub const SSGI_LUMA_CAP = ssgi.SSGI_LUMA_CAP;
+pub const ssgiParams = ssgi.ssgiParams;
+pub const ssgiActive = ssgi.ssgiActive;
 pub const calcContactShadowAttenuation = contact_shadows.calcContactShadowAttenuation;
 
 // --- Atmospheric Height Fog ---

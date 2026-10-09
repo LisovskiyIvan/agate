@@ -1,6 +1,7 @@
 //! Tests for `postprocess/options.zig` (moved verbatim from inline blocks; production code unchanged).
 const std = @import("std");
 const prod = @import("options.zig");
+const ssgi = @import("ssgi.zig");
 const PostProcessOptions = prod.PostProcessOptions;
 const TonemappingType = prod.TonemappingType;
 
@@ -134,4 +135,22 @@ test "scaledRenderSize rounds, keeps aspect, and never collapses a dimension" {
     const zero = prod.scaledRenderSize(0, 1080, 0.5);
     try std.testing.expectEqual(@as(i32, 0), zero.w);
     try std.testing.expectEqual(@as(i32, 1080), zero.h);
+}
+
+test "ssgi clamps intensity, radius and steps" {
+    var cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 2.0, .ssgi_radius = 50.0, .ssgi_steps = 99 };
+    var c = cfg.clamped();
+    try std.testing.expectEqual(@as(f32, 1.0), c.ssgi_intensity);
+    try std.testing.expectEqual(ssgi.SSGI_RADIUS_MAX, c.ssgi_radius);
+    try std.testing.expectEqual(ssgi.SSGI_STEPS_MAX, c.ssgi_steps);
+    cfg = .{ .ssgi_enabled = true, .ssgi_intensity = -1.0, .ssgi_radius = 0.0, .ssgi_steps = 1 };
+    c = cfg.clamped();
+    try std.testing.expectEqual(@as(f32, 0.0), c.ssgi_intensity);
+    try std.testing.expectEqual(ssgi.SSGI_RADIUS_MIN, c.ssgi_radius);
+    try std.testing.expectEqual(ssgi.SSGI_STEPS_MIN, c.ssgi_steps);
+    // master switch off zeroes the family (forFrame path); default stays off.
+    var dead = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.8 };
+    dead.enabled = false;
+    try std.testing.expect(!dead.forFrame().ssgi_enabled);
+    try std.testing.expect(!(PostProcessOptions{}).ssgi_enabled);
 }
