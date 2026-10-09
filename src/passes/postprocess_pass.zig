@@ -611,6 +611,48 @@ pub const PostProcessPass = struct {
         } else {
             sg.applyPipeline(self.postprocess_pipeline);
         }
+        sg.applyBindings(self.buildCompositeBindings(config, ssao_tex, depth_view, taa_history_view, velocity_view));
+        const pp_params = self.packCompositeParams(
+            config,
+            ssao_enabled,
+            ssao_debug,
+            ssao_intensity,
+            cur_w,
+            cur_h,
+            view_proj,
+            inv_view_proj,
+            prev_view_proj,
+            camera_pos,
+            sun_dir,
+            sun_color,
+            near_z,
+            far_z,
+            taa_history_valid,
+            taa_capture_only,
+            // Display-transfer lane input: the swapchain default color
+            // format (UNORM needs the manual shader encode, sRGB targets
+            // encode in hardware). Queried here so packCompositeParams
+            // stays a pure, headless-testable pack with no sg calls.
+            sg.queryDesc().environment.defaults.color_format,
+        );
+        sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
+        sg.draw(0, 6, 1);
+    }
+
+    /// View/texture binding assembly for the composite (pure: fills an
+    /// sg.Bindings struct, no sg calls). Every optional effect view falls
+    /// back to a valid placeholder the shader never samples while its lane
+    /// gates the block off, so the off paths stay bit-identical to their
+    /// pre-effect composites; the velocity slot falls back to the zero
+    /// mask so the shader takes the depth-reprojection path.
+    pub fn buildCompositeBindings(
+        self: *const PostProcessPass,
+        config: PostProcessOptions,
+        ssao_tex: sg.View,
+        depth_view: sg.View,
+        taa_history_view: sg.View,
+        velocity_view: sg.View,
+    ) sg.Bindings {
         var post_bind = sg.Bindings{};
         post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
         post_bind.index_buffer = self.postprocess_quad_ib;
@@ -679,9 +721,35 @@ pub const PostProcessPass = struct {
         post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
         post_bind.samplers[post_shd.SMP_velocity_smp] = self.velocity_sampler;
         post_bind.samplers[post_shd.SMP_lut_smp] = self.lut_sampler;
-        sg.applyBindings(post_bind);
+        return post_bind;
+    }
 
-        const pp_params = post_shd.FsParams{
+    /// Composite uniform packing (pure: no sg calls — the caller passes the
+    /// swapchain default color format in, see render()). Builds the exact
+    /// FsParams literal render() used to inline: option lanes via the
+    /// postprocess named-lane helpers, camera/SSR lanes, matrices, and the
+    /// TAA/output state.
+    pub fn packCompositeParams(
+        self: *const PostProcessPass,
+        config: PostProcessOptions,
+        ssao_enabled: bool,
+        ssao_debug: bool,
+        ssao_intensity: f32,
+        cur_w: i32,
+        cur_h: i32,
+        view_proj: Mat4,
+        inv_view_proj: Mat4,
+        prev_view_proj: Mat4,
+        camera_pos: Vec3,
+        sun_dir: Vec3,
+        sun_color: Color3,
+        near_z: f32,
+        far_z: f32,
+        taa_history_valid: bool,
+        taa_capture_only: bool,
+        backbuffer_fmt: sg.PixelFormat,
+    ) post_shd.FsParams {
+        return post_shd.FsParams{
             .params1 = .{
                 config.exposure,
                 config.bloom_threshold,
@@ -708,12 +776,12 @@ pub const PostProcessPass = struct {
                 1.0 / @as(f32, @floatFromInt(cur_w)),
                 1.0 / @as(f32, @floatFromInt(cur_h)),
             },
+            // (near_z, far_z, 0, 0): the SSR step count used to ride in z
+            // and now has its own ssr_params2 lane below.
             .camera_params = .{
                 near_z,
                 far_z,
-                @floatFromInt(config.ssr_steps),
-                // w is unused (0): contact-shadow steps used to ride here
-                // and now have their own contact_shadow_params2 lane.
+                0.0,
                 0.0,
             },
             .camera_pos = .{
@@ -752,6 +820,10 @@ pub const PostProcessPass = struct {
                 config.ssr_thickness,
                 config.ssr_max_distance,
             },
+            // (steps, 0, 0, 0); zeros when SSR is off, which keeps the
+            // composite identical to the SSR-off path (the shader
+            // early-outs on ssr_params.x before reading this lane).
+            .ssr_params2 = postprocess.ssrStepsParams(config),
             .params5 = .{
                 if (config.sharpen_enabled) config.sharpen_amount else 0.0,
                 if (config.grain_enabled) config.grain_intensity else 0.0,
@@ -825,12 +897,8 @@ pub const PostProcessPass = struct {
             // iff the backbuffer default is NOT sRGB (UNORM encodes the
             // exact piecewise sRGB once at the end; sRGB targets encode in
             // hardware); y/z/w = 0. The main target is always RGBA16F.
-            .output_params = outputParamsFor(
-                sg.queryDesc().environment.defaults.color_format,
-            ),
+            .output_params = outputParamsFor(backbuffer_fmt),
         };
-        sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
-        sg.draw(0, 6, 1);
     }
 
     // Feed the BloomPass pyramid result into the composite. Call every frame

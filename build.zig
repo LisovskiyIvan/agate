@@ -186,9 +186,10 @@ pub fn sokolShellPath(dep_agate: *Build.Dependency) Build.LazyPath {
 //
 // Explicit workflow (run from an agate checkout, then commit the result):
 //   zig build update-tests   # regenerate src/tests.zig from the tree
-//   zig build test           # fails via CheckFile while the registry is stale
+//   zig build test           # fails with the regen command below while the
+//                            # registry is stale (check_test_registry Run step)
 //
-// Ordinary library/exe builds never run the CheckFile step, and the vendored
+// Ordinary library/exe builds never run the registry check step, and the vendored
 // test runner (tools/test_runner.zig) is only referenced by the `test` step,
 // so dependency users building the library do not need it.
 // ---------------------------------------------------------------------------
@@ -600,12 +601,28 @@ pub fn build(b: *Build) !void {
         .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .server },
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
-    // Stale-registry gate: runs only for `zig build test` (make phase via
-    // CheckFile), leaving ordinary library/exe builds untouched. The vendored
+    // Stale-registry gate: runs only for `zig build test` (a Run step over a
+    // WriteFiles snapshot plus the tracked src/tests.zig), leaving ordinary
+    // library/exe builds untouched. The checker only READS both files and
+    // fails with the regeneration command — it never mutates the source
+    // tree, so a test run cannot dirty the working tree. The vendored
     // runner stays lazy: `b.path("tools/test_runner.zig")` above only
     // materializes when this test compile actually builds.
-    const check_test_registry = b.addCheckFile(b.path("src/tests.zig"), .{ .expected_exact = expected_test_registry });
-    run_lib_tests.step.dependOn(&check_test_registry.step);
+    const check_tool = b.addExecutable(.{
+        .name = "check_test_registry",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/check_test_registry.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const expected_registry_file = b.addWriteFiles().add("expected_tests.zig", expected_test_registry);
+    const run_check_registry = b.addRunArtifact(check_tool);
+    run_check_registry.addArg("--expected");
+    run_check_registry.addFileArg(expected_registry_file);
+    run_check_registry.addArg("--actual");
+    run_check_registry.addFileArg(b.path("src/tests.zig"));
+    run_lib_tests.step.dependOn(&run_check_registry.step);
     const test_step = b.step("test", "Run library tests (fails while src/tests.zig is stale; run `zig build update-tests`)");
     test_step.dependOn(&run_lib_tests.step);
 

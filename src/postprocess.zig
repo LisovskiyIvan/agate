@@ -133,6 +133,15 @@ pub fn fxaaParams(enabled: bool) [4]f32 {
     return .{ if (enabled) 1.0 else 0.0, 0.0, 0.0, 0.0 };
 }
 
+/// Pack the composite ssr_params2 vec4: (steps, 0, 0, 0). Zeros when SSR is
+/// off (the shader early-outs on ssr_params.x before reading the steps
+/// lane), which keeps the composite identical to the SSR-off path. The
+/// steps count used to ride in camera_params.z and now has its own lane.
+pub fn ssrStepsParams(cfg: PostProcessOptions) [4]f32 {
+    if (!cfg.ssr_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    return .{ @floatFromInt(cfg.ssr_steps), 0.0, 0.0, 0.0 };
+}
+
 // --- Temporal Anti-Aliasing (TAA) ---
 pub const TAA_JITTER_PERIOD = taa.TAA_JITTER_PERIOD;
 pub const halton = taa.halton;

@@ -20,13 +20,14 @@ layout(binding = 0) uniform fs_params {
     vec4 ssao_params; // x: ssao_enabled (1/0), y: ssao_debug (1/0), z: ssao_intensity, w: spare
     vec4 fxaa_params; // x: fxaa_enabled (1/0), yzw: spare
     vec4 resolution; // xy: resolution, zw: texel size (1.0/width, 1.0/height)
-    vec4 camera_params; // x: near_z, y: far_z, z: ssr_steps, w: unused (0)
+    vec4 camera_params; // x: near_z, y: far_z, zw: unused (0, 0)
     vec4 camera_pos; // xyz: camera world pos, w: unused
     vec4 sun_dir; // xyz: sun direction (normalized), w: unused
     vec4 sun_color; // xyz: sun color, w: unused
     vec4 fog_params; // x: fog_enabled (1/0), y: fog_density, z: fog_height_falloff, w: fog_start_distance
     vec4 fog_color; // xyz: fog_color, w: fog_sun_scattering
     vec4 ssr_params; // x: ssr_enabled (1/0), y: ssr_intensity, z: ssr_thickness, w: ssr_max_distance
+    vec4 ssr_params2; // x: raymarch steps, yzw: spare (0)
     vec4 params5; // x: sharpen_amount (0=off), y: grain_intensity (0=off), z: temperature [-1,1], w: tint [-1,1]
     vec4 dof_params; // x: dof_enabled (1/0), y: focus_distance, z: focus_range, w: max_blur_px
     vec4 glow_params; // x: glow_enabled (1/0), y: intensity, z/w: unused
@@ -254,7 +255,7 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
 
     float max_dist = ssr_params.w;
     float thickness = ssr_params.z;
-    int ssr_steps = int(camera_params.z);
+    int ssr_steps = int(ssr_params2.x);
     if (ssr_steps < 4) ssr_steps = 16;
     float step_size = max_dist / float(ssr_steps);
 
