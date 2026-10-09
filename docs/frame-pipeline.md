@@ -265,20 +265,13 @@ pub const Runtime = struct {
 - `render` между `begin` и `finish` видит `frame_prepared == false` и роняет present — держать пару смежно.
 - Отмена prepare закрывает epoch паринга (`complete`), иначе эпоха повиснет до следующего begin (авто-закрытие там же).
 
-## Известная проблема: transient-буферы в reuse-кадре
+## Transient-буферы в reuse-кадре (решено)
 
-**Симптом.** `renderReuse` перепрезентирует front-слот БЕЗ staged prepare: `flushSlotUploads` не выполняется, а draw-records всё равно биндят буферы с `usage.write_transient` (morph-дельты, particle instance payloads, трейлы/softbody/greased, отложенные mesh-вершины; см. `upload_packets.zig`). sokol валидатор ловит `VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING` («bound usage.write_transient buffer hasn't been written this frame»).
+**Симптом (был).** `renderReuse` перепрезентирует front-слот БЕЗ staged prepare: `flushSlotUploads` не выполнялся, а draw-records биндили буферы с `usage.write_transient` (instance-матрицы, morph-дельты, particle cpu/gpu payloads, трейлы/softbody/greased). sokol валидатор ловил `VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING`, а в non-`SOKOL_VALIDATE_NON_FATAL` сборках — паника (`VALIDATION_FAILED`). Гейт-воспроизведение: `hdr-showcase --frames >= 400` (reuse-проба на кадре 200).
 
-**Воспроизведение.** `examples/hdr_showcase.zig`: прогон с `--frames >= 400` (reuse-проба в кадрах ~200-250) валит sokol-валидацию и в non-`SOKOL_VALIDATE_NON_FATAL` сборках паникует (`VALIDATION_FAILED`). Проверено на baseline до всех текущих правок (worktree HEAD): баг пре-существующий, не регрессия.
+**Фикс.** Reuse-кадр переподаёт staged payload'ы фрот-лота в те же transient-буферы ДО любых draw'ов: `upload_packets.rewriteTransientWrites` (morph / particle cpu+gpu / trails / softbodies / greased) и `instance_staging.rewriteSlotInstanceBuffers` (cur в bound-буфер; парный prev — тем же payload'ом, повтор кадра = нулевая instance-моушн-семантика). Вызов из `frame_render.render()` под `if (scene.rendering_reuse)`. Write-only по контракту: без upload-meter, без delivered/outcome-мутаций, без создания буферов и без particle-compute state clear (это семантика — состояние симуляции переживает повтор).
 
-**Почему это не «просто переписать флаш».** Наивный повтор `flushSlotUploads(front)` на reuse-кадре небезопасен: `flushParticleCompute` в повторном прогоне заново обнуляет `state_clear_pending` буферы (сброс состояния частиц на повторном кадре — семантическая ошибка), плюс двойной учёт в `upload_meter`/`delivered`/outcome-полях. Метаданные (`commitSlotResults`) рассчитаны на «один flush на слот».
-
-**Кандидаты фикса (требуют отдельного гейта).**
-1. Выделить `rewriteTransientWrites(scene, slot)`: только `sg_write_buffer_transient` по staged payload'ам без meter/delivered/outcome/creation — write-only семантика; particle-compute clear исключить (он идёт на render-пути).
-2. Запретить reuse, когда во front-слоте есть недоставленные transient-записи (coherent skip вместо риска валидации).
-3. Перевести персистентные vertex/index буферы с `write_transient` на `dynamic_update`+`sg_update_buffer` (шире по bandwidth, но переносимо на все бэкенды).
-
-Статус: открыто (не в шипе). Q4 render-scale меряется после выбора варианта — длинные прогоны сейчас упираются в этот баг.
+**Гейт.** `hdr-showcase --frames 400`: 0 ошибок валидации, 0 паник (было 1 + panic на baseline). Известные непокрытые corner'ы (осознанно, не в шипе): pending-mesh создания (their ids съедены commit'ом) и compute-particle state буферы (пишутся на render-time compute-пути, который reuse-кадр перепрогоняет).
 
 ## Производительность
 

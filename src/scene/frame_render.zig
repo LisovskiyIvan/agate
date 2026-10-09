@@ -177,6 +177,17 @@ pub fn render(scene: anytype) void {
     // pin only extends CPU-slot reuse exclusion, never GPU consumability
     // — see scene/frame_draws.zig).
     const draws = scene.preparedDraws();
+    // REUSE frames redraw the frozen front without a staged prepare, so
+    // none of this sokol frame's transient writes happened. Re-deliver
+    // them from the slot's frozen payloads BEFORE any draw: sokol allows
+    // one sg_write_buffer_transient per buffer per frame and validates
+    // that every bound write_transient buffer was written (a reuse frame
+    // otherwise trips VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING).
+    // Write-only: no meter/outcome/history mutation.
+    if (scene.rendering_reuse) {
+        @import("upload_packets.zig").rewriteTransientWrites(scene, draws);
+        @import("instance_staging.zig").rewriteSlotInstanceBuffers(scene, draws);
+    }
     // Slot-owned snapshot: the whole draw below reads the front
     // slot's staged copy — never the live `frame_snapshot` — so a
     // concurrent game-side mutation cannot tear the in-flight frame.

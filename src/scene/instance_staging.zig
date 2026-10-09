@@ -761,6 +761,40 @@ pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq:
     }
 }
 
+/// Re-delivers the slot's staged instance payloads for a REUSE frame
+/// (`renderReuse` runs no latch, so the one-per-frame transient writes
+/// never happened; sokol validates every bound `write_transient` buffer).
+/// Cur matrices go into the bound buffer; when the record pairs a distinct
+/// prev buffer, the SAME payload lands there too — a replayed frame shows
+/// no instance motion, which is exactly what its frozen content means.
+/// Write-only: no meter, no pairing/history mutation, no buffer creation
+/// (a grown buffer from a later generation is simply skipped when it no
+/// longer matches the frozen id).
+pub fn rewriteSlotInstanceBuffers(scene: anytype, slot: anytype) void {
+    _ = scene;
+    if (!sg.isvalid()) return;
+    const scratch = slot.primary.instance_matrices.items;
+    for (slot.staged_instances.items) |rec| {
+        if (rec.count == 0) continue;
+        const end = rec.scratch_lo + rec.count;
+        if (end > scratch.len) continue;
+        const payload = scratch[rec.scratch_lo..end];
+        if (rec.buffer.id != 0 and sg.queryBufferState(rec.buffer) == .VALID and sg.queryBufferUsage(rec.buffer).write_transient) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = rec.buffer },
+                .src = .{ .data = sg.asRange(payload) },
+            });
+        }
+        const prev = rec.prev_buffer;
+        if (prev.id != 0 and prev.id != rec.buffer.id and sg.queryBufferState(prev) == .VALID and sg.queryBufferUsage(prev).write_transient) {
+            sg.writeBufferTransient(.{
+                .dst = .{ .buffer = prev },
+                .src = .{ .data = sg.asRange(payload) },
+            });
+        }
+    }
+}
+
 /// Freeze the slot-owned staged records for one build (stage 1, game side):
 /// for every instance-bearing mesh with a fresh preview (`build_seq` from
 /// the `stageInstancesCpu` pass just above), appends a `StagedInstanceRecord`
