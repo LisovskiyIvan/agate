@@ -79,6 +79,7 @@ const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
     .{ .name = "taa_jitter_scale", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 4.0 } } },
     .{ .name = "taa_sharpness", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "taa_clamp_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
+    .{ .name = "taa_reactive_strength", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "shaft_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .name = "shaft_steps", .spec = .{ .uint_clamp = .{ .min = shafts.SHAFT_STEPS_MIN, .max = shafts.SHAFT_STEPS_MAX } } },
     .{ .name = "shaft_density", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
@@ -258,6 +259,13 @@ pub const PostProcessOptions = struct {
     // Neighborhood-clamp strength for ghosting control (1 = full clamp of
     // the reprojected history into the 3x3 current-frame box, 0 = raw).
     taa_clamp_strength: f32 = 1.0,
+    // Reactive treatment for velocity-less content (particles, glass,
+    // disocclusion over background): fallback-path pixels over an
+    // inconsistent depth neighborhood shed history proportionally to
+    // strength (0 = off). Default OFF: the packed lane is zeros and the
+    // composite stays bit-identical to the pre-reactive path.
+    taa_reactive_enabled: bool = false,
+    taa_reactive_strength: f32 = 0.5,
     // One-frame history reset request (camera teleport/cut/cinematic).
     // Snapshot-carried, so the update thread sets it safely for one frame.
     taa_camera_cut: bool = false,
@@ -461,6 +469,7 @@ const exempt_clamp_fields = [_][]const u8{
     "tint",
     "motion_blur_enabled",
     "taa_enabled",
+    "taa_reactive_enabled",
     "taa_camera_cut",
     "shaft_enabled",
     "shaft_resolution",
@@ -487,6 +496,7 @@ const frame_disable_flags = [_][]const u8{
     "grain_enabled",
     "motion_blur_enabled",
     "taa_enabled",
+    "taa_reactive_enabled",
     "shaft_enabled",
 };
 

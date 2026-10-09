@@ -43,6 +43,7 @@ layout(binding = 0) uniform fs_params {
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
     vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
+    vec4 taa_reactive_params; // x: reactive_enabled (1/0), y: strength [0,1], zw: unused (0)
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
     vec4 contact_shadow_params2; // x: raymarch steps, yzw: spare
@@ -726,15 +727,20 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     vec2 texel = resolution.zw;
     vec2 best_offset = vec2(0.0);
     float best_depth = raw_depth;
+    float worst_depth = raw_depth;
     float d;
     d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(-texel.x, 0.0)).r;
     if (d < best_depth) { best_depth = d; best_offset = vec2(-texel.x, 0.0); }
+    worst_depth = max(worst_depth, d);
     d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
     if (d < best_depth) { best_depth = d; best_offset = vec2(texel.x, 0.0); }
+    worst_depth = max(worst_depth, d);
     d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, -texel.y)).r;
     if (d < best_depth) { best_depth = d; best_offset = vec2(0.0, -texel.y); }
+    worst_depth = max(worst_depth, d);
     d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, texel.y)).r;
     if (d < best_depth) { best_depth = d; best_offset = vec2(0.0, texel.y); }
+    worst_depth = max(worst_depth, d);
 
     vec4 vel_sample = texture(sampler2D(velocity_tex, velocity_smp), uv + best_offset);
     vec2 prev_uv;
@@ -758,9 +764,25 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     float max_dist = max(max(dist_min.x, dist_max.x), max(max(dist_min.y, dist_max.y), max(dist_min.z, dist_max.z)));
     float reject_weight = 1.0 / (1.0 + max_dist * max_dist * 4.0);
 
+    // Reactive treatment for velocity-less content (particles, glass,
+    // disocclusion over background): those pixels carry the background
+    // depth AND the background velocity, so their true motion is invisible
+    // to the resolve. The structurally unsafe class is the camera-fallback
+    // path (velocity mask < 0.5) over an inconsistent cross-depth
+    // neighborhood: shed history there, bounded by the strength lane.
+    // Static flat pixels (zero depth spread) and per-object-velocity
+    // pixels get exactly zero boost. Mirrors taaReactiveBoost in
+    // postprocess/taa.zig (knees 0.0001/0.002 raw-depth units).
+    float reactive = 0.0;
+    if (taa_reactive_params.x > 0.5 && vel_sample.a < 0.5) {
+        float d_spread = worst_depth - best_depth;
+        float edge = clamp((d_spread - 0.0001) / (0.002 - 0.0001), 0.0, 1.0);
+        reactive = clamp(taa_reactive_params.y, 0.0, 1.0) * edge;
+    }
+
     float clamp_strength = clamp(taa_params.z, 0.0, 1.0);
     vec3 hist_clamped = mix(hist, clamp(hist, box_min, box_max), clamp_strength);
-    float blend = clamp(taa_params.y, 0.0, 1.0) * reject_weight;
+    float blend = clamp(taa_params.y, 0.0, 1.0) * reject_weight * (1.0 - reactive);
     vec3 outc = mix(current, hist_clamped, blend);
     float sharp = clamp(taa_params.w, 0.0, 1.0);
     if (sharp > 0.0001) {

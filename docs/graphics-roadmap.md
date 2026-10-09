@@ -16,8 +16,10 @@
 - **C.3. Pixel-level temporal quality gate для TAA / Velocity** (M):
   Пайплайн rigid/skinned/instanced velocity и temporal lifecycle реализованы. Открыт гейт:
   - Количественные метрики качества на уровне пикселей: измерение ghosting/blur при движении.
-  - Variance clipping и reactive treatment для стекла, частиц и областей disocclusion.
+  - Variance clipping — сделано (variance box + rejection weight в TAA-резолве); reactive treatment v1 — сделано (см. ниже).
   - Сравнение нативного разрешения с render scale + reconstruction.
+
+  - *Статус reactive v1 (09.10.2026):* расследование показало, что частицы (`particle_pass.zig`: depth write OFF) и стекло/прозрачность (прозрачный twin пайплайна: depth write OFF; `itemContributesDepth` исключает transparent/decal/hook из depth prepass и velocity pass) НЕ пишут глубину и НЕ попадают в velocity-буфер — пиксель под частицей несёт глубину и скорость фона, и resolve-side маска не может отличить его по depth/velocity. Поэтому v1 — честный консервативный механизм на сигналах, которые реально есть: fallback-путь (маска velocity < 0.5) + неконсистентная глубина 3×3-креста (колени 0.0001/0.002 raw depth) гасят вес истории (`taa_reactive_params`, `taa_reactive_enabled`/`taa_reactive_strength`, default OFF — бит-идентично; CPU-зеркало `taaReactiveBoost`/`taaResolvePixelReactive`, калибровочная сцена q0 включает через `AGATE_Q0_NO_REACTIVE=1` для baseline). Статичные плоские пиксели и пиксели с per-object velocity получают ровно нулевой буст. Открыто для v2 (нужна MRT/attachment-разводка — территория frame_draws/refactor arc, НЕ делать здесь): запись per-object velocity для частиц/стекла (velocity pass должен перерисовывать их билиборды/прозрачные меши; цена — один дополнительный draw-поток в velocity-таргет) либо отдельный reactive/stencil-таргет из главного прохода.
 
 - **C.8. Global Illumination (GI)** (L):
   - Выбор и реализация одного продуктового сценария: DDGI (Dynamic Diffuse Global Illumination) либо baked lightmaps / irradiance probes (только после полноценного IBL).
@@ -61,7 +63,7 @@
 
 ### Q4. Стабильная temporal-основа → Render Scale / Upscale
 
-- Variance clipping / reactive mask для полупрозрачности, частиц и зон disocclusion (variance box + rejection weight в TAA-резолве — сделано).
+- Variance clipping / reactive mask для полупрозрачности, частиц и зон disocclusion (variance box + rejection weight в TAA-резолве — сделано; reactive v1 для velocity-less контента — сделано, см. C.3; per-object velocity для частиц/стекла отложено — нужна attachment-разводка).
 - **Render scale — сделано (Q4-1):** `PostProcessOptions.render_scale` (1.0 = native bit-identical, кламп `[0.25, 1]`). Main HDR-таргет, TAA-история, velocity, SSAO/bloom/glow/shafts/highlight считаются в масштабе; джиттер TAA — в пикселях таргета; композит/UI презентятся в натуральном разрешении (UI остаётся резким). Механика проверена на hdr-showcase (`AGATE_HDR_RENDER_SCALE`, веб: `?rscale=`): таргет 960×600 → 720×450 (0.75) → 634×396 (0.66), кадр презентится, новых валидационных ошибок нет. CPU-гейт: `postprocess/options_tests.zig`.
 - **Гейт производительности — отложен (Q4-2):** 60-кадровый прогон в окне даёт mean 10.1 / 8.6 / 9.5 мс (1.0 / 0.75 / 0.66) — шум харнесса (их же раздел «Harness» в `../MEASUREMENTS.md`), не сигнал. Настоящий A/B — на sandbox bench (bench-threads + gpu-timing), и он упирается в известный баг reuse-пути с transient-буферами (`./frame-pipeline.md` → «Известная проблема: transient-буферы в reuse-кадре»). Первый блокер снят: transient-rewrite для reuse-кадров (см. `./frame-pipeline.md`), длинные прогоны hdr-showcase теперь чистые — замер переносится на sandbox bench.
 - Сравнение качества и производительности: native resolution vs render scale (0.5x–0.75x) + пространственный/временной апскейл (сейчас — билинейный upscale композита; TAA-реконструкция — следующий слой).

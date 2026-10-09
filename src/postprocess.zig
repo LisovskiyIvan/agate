@@ -160,6 +160,12 @@ pub const taaVarianceBounds = taa.taaVarianceBounds;
 pub const taaRejectionWeight = taa.taaRejectionWeight;
 pub const taaClosestDepthOffset = taa.taaClosestDepthOffset;
 pub const taaResolvePixelWithRejection = taa.taaResolvePixelWithRejection;
+pub const taaResolvePixelReactive = taa.taaResolvePixelReactive;
+pub const taaReactiveBoost = taa.taaReactiveBoost;
+pub const taaReactiveActive = taa.taaReactiveActive;
+pub const taaReactiveParams = taa.taaReactiveParams;
+pub const TAA_REACTIVE_DEPTH_LO = taa.TAA_REACTIVE_DEPTH_LO;
+pub const TAA_REACTIVE_DEPTH_HI = taa.TAA_REACTIVE_DEPTH_HI;
 pub const taaParams = taa.taaParams;
 pub const taaState = taa.taaState;
 

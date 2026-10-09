@@ -893,6 +893,10 @@ pub const PostProcessPass = struct {
             .taa_params = postprocess.taaParams(config),
             // (history_valid 1/0, capture_only 1/0).
             .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
+            // (reactive_enabled 1/0, strength, 0, 0); zeros when off, which
+            // keeps the composite identical to the pre-reactive path (the
+            // shader multiplies a zero boost into the blend).
+            .taa_reactive_params = postprocess.taaReactiveParams(config),
             // Output lane (appended last): x = manual display-encode flag
             // iff the backbuffer default is NOT sRGB (UNORM encodes the
             // exact piecewise sRGB once at the end; sRGB targets encode in

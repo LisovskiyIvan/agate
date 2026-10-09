@@ -21,6 +21,10 @@ const taaVarianceBounds = taa.taaVarianceBounds;
 const taaRejectionWeight = taa.taaRejectionWeight;
 const taaClosestDepthOffset = taa.taaClosestDepthOffset;
 const taaResolvePixelWithRejection = taa.taaResolvePixelWithRejection;
+const taaResolvePixelReactive = taa.taaResolvePixelReactive;
+const taaReactiveBoost = taa.taaReactiveBoost;
+const taaReactiveParams = taa.taaReactiveParams;
+const taaReactiveActive = taa.taaReactiveActive;
 const taaResolvePixel = taa.taaResolvePixel;
 const taaParams = taa.taaParams;
 const taaState = taa.taaState;
@@ -43,6 +47,12 @@ test "taa clamps" {
 
     bad.taa_blend = -0.5;
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_blend, 1e-6);
+
+    // Reactive strength clamps to [0, 1] like the other TAA knobs.
+    bad.taa_reactive_strength = 2.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa_reactive_strength, 1e-6);
+    bad.taa_reactive_strength = -1.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_reactive_strength, 1e-6);
 }
 
 test "taa halton jitter sequence, wrap, and scale" {
@@ -341,4 +351,97 @@ test "taa edge contrast quality gate: unsharp preserves high-frequency detail" {
     const r_sharp = taaResolvePixelWithRejection(edge_center, edge_neighbors, blurred_hist, 0.5, 1.0, 0.5, 2.0);
     try std.testing.expect(r_sharp[0] > r_nosharp[0]);
     try std.testing.expect(r_sharp[0] <= 1.0);
+}
+
+test "taa reactive boost is zero for static and velocity-carrying pixels" {
+    // Per-object-velocity pixels never boost, whatever the depth spread.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(false, 0.1, 0.9, 1.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(false, 0.5, 0.5, 1.0), 1e-7);
+    // Fallback path over flat depth (static reprojection-exact pixels).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.5, 0.5, 1.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.5, 0.50005, 1.0), 1e-7);
+    // Zero strength never boosts, even on a hard edge.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.1, 0.9, 0.0), 1e-7);
+    // Non-finite depths fail closed (no boost on garbage).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, std.math.nan(f32), 0.9, 1.0), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.1, std.math.inf(f32), 1.0), 1e-7);
+}
+
+test "taa reactive boost ramps monotonically to full strength on edges" {
+    // Below the LO knee: zero. Above the HI knee: exactly strength.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.5, 0.50009, 0.7), 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), taaReactiveBoost(true, 0.2, 0.8, 0.7), 1e-6);
+    // Mid-ramp is strictly partial and monotonic in spread.
+    const b1 = taaReactiveBoost(true, 0.5, 0.5006, 1.0);
+    const b2 = taaReactiveBoost(true, 0.5, 0.5011, 1.0);
+    try std.testing.expect(b1 > 0.0 and b1 < 1.0);
+    try std.testing.expect(b2 > b1 and b2 < 1.0);
+    // Strength scales linearly and clamps to [0, 1].
+    try std.testing.expectApproxEqAbs(b2 * 0.5, taaReactiveBoost(true, 0.5, 0.5011, 0.5), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), taaReactiveBoost(true, 0.2, 0.8, 2.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveBoost(true, 0.2, 0.8, -1.0), 1e-7);
+    // Depth order does not matter (min/max normalized).
+    try std.testing.expectApproxEqAbs(
+        taaReactiveBoost(true, 0.2, 0.8, 0.6),
+        taaReactiveBoost(true, 0.8, 0.2, 0.6),
+        1e-7,
+    );
+}
+
+test "taa reactive lane packs zeros when inactive" {
+    // Default (off) and TAA-off configs pack the zero lane.
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(options.PostProcessOptions{}));
+    try std.testing.expect(!taaReactiveActive(options.PostProcessOptions{}));
+    var off = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_strength = 0.5 };
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(off));
+    // Zero strength is inactive even when enabled.
+    off.taa_reactive_enabled = true;
+    off.taa_reactive_strength = 0.0;
+    try std.testing.expect(!taaReactiveActive(off));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(off));
+    // Enabled packs (1, strength-clamped, 0, 0).
+    var on = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_enabled = true, .taa_reactive_strength = 0.5 };
+    try std.testing.expect(taaReactiveActive(on));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.0, 0.0 }, taaReactiveParams(on));
+    on.taa_reactive_strength = 3.0;
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaReactiveParams(on));
+}
+
+test "taa reactive resolve keeps static pixels bit-identical" {
+    const current = [3]f32{ 0.6, 0.6, 0.6 };
+    const neighbors = [_][3]f32{current} ** 8;
+    const history = [3]f32{ 0.6, 0.6, 0.6 };
+    const plain = taaResolvePixelWithRejection(current, neighbors, history, 0.9, 1.0, 0.0, 1.25);
+    // Flat fallback (static pixel): zero boost, identical output.
+    const flat = taaResolvePixelReactive(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.5, 0.5, 1.0);
+    try std.testing.expectEqual(plain, flat);
+    // Per-object-velocity path: zero boost even on a depth edge.
+    const vel = taaResolvePixelReactive(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, false, 0.1, 0.9, 1.0);
+    try std.testing.expectEqual(plain, vel);
+    // Disabled strength: zero boost even on fallback + edge.
+    const off = taaResolvePixelReactive(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.1, 0.9, 0.0);
+    try std.testing.expectEqual(plain, off);
+}
+
+test "taa reactive resolve sheds history on fallback edges, monotonic in strength" {
+    // Slow-moving large translucent object: history color still sits inside
+    // the variance box, so divergence rejection alone keeps 90% of it.
+    const current = [3]f32{ 0.55, 0.55, 0.55 };
+    const neighbors = [8][3]f32{
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+        .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 }, .{ 0.5, 0.5, 0.5 }, .{ 0.6, 0.6, 0.6 },
+    };
+    const history = [3]f32{ 0.52, 0.52, 0.52 };
+    const plain = taaResolvePixelWithRejection(current, neighbors, history, 0.9, 1.0, 0.0, 1.25);
+    const err_plain = @abs(plain[0] - current[0]);
+    try std.testing.expect(err_plain > 0.0);
+    // Fallback + hard depth edge: stronger treatment lands closer to current.
+    const r_half = taaResolvePixelReactive(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.2, 0.8, 0.5);
+    const r_full = taaResolvePixelReactive(current, neighbors, history, 0.9, 1.0, 0.0, 1.25, true, 0.2, 0.8, 1.0);
+    const err_half = @abs(r_half[0] - current[0]);
+    const err_full = @abs(r_full[0] - current[0]);
+    try std.testing.expect(err_half < err_plain);
+    try std.testing.expect(err_full < err_half);
+    // Full strength on a hard edge sheds the stale history almost entirely.
+    try std.testing.expect(err_full < err_plain * 0.6);
 }

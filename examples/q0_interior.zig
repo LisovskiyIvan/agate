@@ -188,6 +188,10 @@ fn setupScene() void {
     scene.post_process.ssgi_steps = 16;
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
+    // TAA reactive v1 for velocity-less content (particles/glass): on in the
+    // calibration scene — AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive
+    // baseline.
+    scene.post_process.taa_reactive_enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
     scene.post_process.fog_enabled = false;
     // Single-scale runs keep the env selection via overrideScale; full
     // 3-phase A/B runs start at the bench schedule's phase 0 (which a

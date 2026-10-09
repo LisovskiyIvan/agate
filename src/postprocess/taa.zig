@@ -263,6 +263,82 @@ pub fn taaResolvePixel(
     return hdr.boundHdr3(taaApplySharpen(r, c, avg, sharpness, box.min, box.max));
 }
 
+/// Reactive-treatment depth knees (raw-depth units over the 3x3 cross
+/// used by the closest-depth search): below LO the neighborhood counts as
+/// flat (exactly zero boost), above HI as a hard edge (full strength).
+/// Raw depths on flat surfaces agree to ~1e-6; real silhouette edges
+/// differ by 0.01+, so the ramp sits two decades above quantization noise
+/// and an order below real edges. Mirrors the GLSL edge ramp in applyTAA.
+pub const TAA_REACTIVE_DEPTH_LO: f32 = 0.0001;
+pub const TAA_REACTIVE_DEPTH_HI: f32 = 0.002;
+
+/// Reactive history-shed weight in [0, strength] for velocity-less content
+/// (particles, glass, disocclusion over background): those pixels carry the
+/// background depth AND the background velocity, so their true motion is
+/// invisible to the resolve. The structurally unsafe class is the
+/// camera-fallback path (velocity mask < 0.5) over an inconsistent depth
+/// neighborhood. Static flat pixels (exact reprojection match, zero depth
+/// spread) and per-object-velocity pixels get exactly zero boost.
+pub fn taaReactiveBoost(is_fallback: bool, depth_min: f32, depth_max: f32, strength: f32) f32 {
+    if (!is_fallback) return 0.0;
+    const s = std.math.clamp(strength, 0.0, 1.0);
+    if (s <= 0.0) return 0.0;
+    if (!std.math.isFinite(depth_min) or !std.math.isFinite(depth_max)) return 0.0;
+    const spread = @max(depth_min, depth_max) - @min(depth_min, depth_max);
+    const edge = std.math.clamp(
+        (spread - TAA_REACTIVE_DEPTH_LO) / (TAA_REACTIVE_DEPTH_HI - TAA_REACTIVE_DEPTH_LO),
+        0.0,
+        1.0,
+    );
+    return s * edge;
+}
+
+/// Reactive activity gate: enabled AND a non-zero strength (the composite
+/// early-outs on the same test through the packed lane).
+pub fn taaReactiveActive(cfg: options.PostProcessOptions) bool {
+    return cfg.taa_reactive_enabled and cfg.taa_reactive_strength > 0.001;
+}
+
+/// Pack the shader taa_reactive_params vec4: (enabled 1/0, strength, 0, 0).
+/// Zeros when inactive, which keeps the composite bit-identical to the
+/// pre-reactive path (the shader multiplies a zero boost into the blend).
+pub fn taaReactiveParams(cfg: options.PostProcessOptions) [4]f32 {
+    if (!taaReactiveActive(cfg)) return .{ 0.0, 0.0, 0.0, 0.0 };
+    const c = cfg.clamped();
+    return .{ 1.0, c.taa_reactive_strength, 0.0, 0.0 };
+}
+
+/// Full pixel resolve with variance clipping, history rejection, AND the
+/// reactive treatment: on fallback-path pixels over inconsistent depth the
+/// history weight sheds by the reactive boost (multiplicative with the
+/// rejection weight, so already-rejected history stays rejected).
+/// Headless golden tests pin it.
+pub fn taaResolvePixelReactive(
+    current: [3]f32,
+    neighbors: [8][3]f32,
+    history: [3]f32,
+    blend: f32,
+    clamp_strength: f32,
+    sharpness: f32,
+    gamma: f32,
+    is_fallback: bool,
+    depth_min: f32,
+    depth_max: f32,
+    reactive_strength: f32,
+) [3]f32 {
+    const c = hdr.boundHdr3(current);
+    var ns: [8][3]f32 = undefined;
+    for (neighbors, 0..) |n, i| ns[i] = hdr.boundHdr3(n);
+    const h = hdr.boundHdr3(history);
+    const box = taaVarianceBounds(c, ns, gamma);
+    const avg = taaNeighborhoodAvg(c, ns);
+    const reject = taaRejectionWeight(h, box.min, box.max);
+    const rb = taaReactiveBoost(is_fallback, depth_min, depth_max, reactive_strength);
+    const hc = taaClampHistory(h, box.min, box.max, clamp_strength);
+    const r = taaResolve(c, hc, blend * reject * (1.0 - rb));
+    return hdr.boundHdr3(taaApplySharpen(r, c, avg, sharpness, box.min, box.max));
+}
+
 /// Pack the shader taa_params vec4: (enabled 1/0, blend, clamp, sharpness).
 /// Disabled packs all zeros, which keeps the composite bit-identical to the
 /// pre-TAA path (the shader early-outs before any history/depth sampling).
