@@ -3,11 +3,11 @@ const std = @import("std");
 const ktx2 = @import("ktx2.zig");
 
 // ---------------------------------------------------------------------------
-// DDS container reader — the block-compressed subset only (BC1/BC2/BC3/BC7).
+// DDS container reader — the block-compressed subset (BC1/BC2/BC3/BC4/BC5/BC6H/BC7).
 //
 // Supports (all little-endian):
 //   - magic "DDS " plus the 124-byte DDS_HEADER.
-//   - DX10 extended header (fourCC "DX10") only: BC1, BC2, BC3, BC7.
+//   - DX10 extended header (fourCC "DX10") only: BC1..BC7 incl. BC4/BC5/BC6H.
 //     The DXGI format tag is authoritative and carries unambiguous sRGB semantics.
 //     Legacy FourCC DXT1/DXT2/DXT3/DXT4/DXT5 headers are rejected as part of
 //     modernization (audit item 12).
@@ -118,13 +118,19 @@ pub const fourcc_dxt4: u32 = 0x34545844;
 pub const fourcc_dxt5: u32 = 0x35545844;
 pub const fourcc_dx10: u32 = 0x30315844;
 
-// DXGI_FORMAT codes (DXGI 1.0) understood by the DX10 path.
+// DXGI_FORMAT codes (DXGI 1.0/1.1) understood by the DX10 path.
 pub const dxgi_bc1_unorm: u32 = 71;
 pub const dxgi_bc1_unorm_srgb: u32 = 72;
 pub const dxgi_bc2_unorm: u32 = 74;
 pub const dxgi_bc2_unorm_srgb: u32 = 75;
 pub const dxgi_bc3_unorm: u32 = 77;
 pub const dxgi_bc3_unorm_srgb: u32 = 78;
+pub const dxgi_bc4_unorm: u32 = 80;
+pub const dxgi_bc4_snorm: u32 = 81;
+pub const dxgi_bc5_unorm: u32 = 83;
+pub const dxgi_bc5_snorm: u32 = 84;
+pub const dxgi_bc6h_uf16: u32 = 95;
+pub const dxgi_bc6h_sf16: u32 = 96;
 pub const dxgi_bc7_unorm: u32 = 98;
 pub const dxgi_bc7_unorm_srgb: u32 = 99;
 
@@ -178,6 +184,12 @@ fn blockFormatFromDxgi(dxgi_format: u32) DecodeError!ktx2.BlockFormat {
         dxgi_bc2_unorm, dxgi_bc2_unorm_srgb => .bc2_unorm,
         dxgi_bc3_unorm => .bc3_unorm,
         dxgi_bc3_unorm_srgb => .bc3_srgb,
+        dxgi_bc4_unorm => .bc4_unorm,
+        dxgi_bc4_snorm => .bc4_snorm,
+        dxgi_bc5_unorm => .bc5_unorm,
+        dxgi_bc5_snorm => .bc5_snorm,
+        dxgi_bc6h_uf16 => .bc6h_uf16,
+        dxgi_bc6h_sf16 => .bc6h_sf16,
         dxgi_bc7_unorm => .bc7_unorm,
         dxgi_bc7_unorm_srgb => .bc7_srgb,
         else => error.UnsupportedDdsFormat,

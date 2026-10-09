@@ -25,6 +25,14 @@ test "mipLevelCount covers powers of two and minimums" {
 
 test "sgPixelFormatForBlock maps UNORM/SRGB variants exactly" {
     try std.testing.expectEqual(sg.PixelFormat.BC1_RGBA, Texture.sgPixelFormatForBlock(.bc1_unorm));
+    // Single/dual-channel and HDR block families map to their exact sokol
+    // formats (SNORM variants included; BC6H UF16/SF16 split by sign).
+    try std.testing.expectEqual(sg.PixelFormat.BC4_R, Texture.sgPixelFormatForBlock(.bc4_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC4_RSN, Texture.sgPixelFormatForBlock(.bc4_snorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC5_RG, Texture.sgPixelFormatForBlock(.bc5_unorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC5_RGSN, Texture.sgPixelFormatForBlock(.bc5_snorm));
+    try std.testing.expectEqual(sg.PixelFormat.BC6H_RGBUF, Texture.sgPixelFormatForBlock(.bc6h_uf16));
+    try std.testing.expectEqual(sg.PixelFormat.BC6H_RGBF, Texture.sgPixelFormatForBlock(.bc6h_sf16));
     try std.testing.expectEqual(sg.PixelFormat.BC2_RGBA, Texture.sgPixelFormatForBlock(.bc2_unorm));
     try std.testing.expectEqual(sg.PixelFormat.BC3_RGBA, Texture.sgPixelFormatForBlock(.bc3_unorm));
     try std.testing.expectEqual(sg.PixelFormat.BC3_SRGBA, Texture.sgPixelFormatForBlock(.bc3_srgb));
@@ -37,10 +45,19 @@ test "sgPixelFormatForBlock maps UNORM/SRGB variants exactly" {
 }
 
 test "BlockSupport gates exact variants and prefers BC7 over ASTC and ETC2" {
-    const full: Texture.BlockSupport = .{ .bc7_sample = true, .bc7_filter = true, .etc2_sample = true, .etc2_filter = true, .astc_sample = true, .astc_filter = true };
+    const full: Texture.BlockSupport = .{ .bc7_sample = true, .bc7_filter = true, .etc2_sample = true, .etc2_filter = true, .astc_sample = true, .astc_filter = true, .bc45_sample = true, .bc6_sample = true };
     try std.testing.expect(full.supportsFormat(.BC7_RGBA));
     try std.testing.expect(full.supportsFormat(.BC7_SRGBA));
     try std.testing.expect(full.supportsFormat(.ASTC_4x4_RGBA));
+    // BC4/BC5 share one family bit (desktop GL exposes them together);
+    // BC6H is its own family. SNORM variants gate through the same bit.
+    try std.testing.expect(full.supportsFormat(.BC4_R));
+    try std.testing.expect(full.supportsFormat(.BC4_RSN));
+    try std.testing.expect(full.supportsFormat(.BC5_RG));
+    try std.testing.expect(full.supportsFormat(.BC5_RGSN));
+    try std.testing.expect(full.supportsFormat(.BC6H_RGBF));
+    try std.testing.expect(full.supportsFormat(.BC6H_RGBUF));
+    try std.testing.expect(!full.supportsFormat(.BC1_RGBA));
     try std.testing.expect(full.supportsFormat(.ASTC_4x4_SRGBA));
     try std.testing.expect(full.supportsFormat(.ETC2_RGBA8));
     try std.testing.expect(full.supportsFormat(.ETC2_SRGB8A8));

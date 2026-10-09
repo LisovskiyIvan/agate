@@ -146,18 +146,28 @@ pub fn formatFromVk(vk_format: u32) ?Format {
 ///   133 = VK_FORMAT_BC1_RGBA_UNORM_BLOCK (DXT1, 4x4, 8 B/block),
 ///   135 = VK_FORMAT_BC2_UNORM_BLOCK (DXT3, 4x4, 16 B/block),
 ///   137/138 = VK_FORMAT_BC3_UNORM_BLOCK / _SRGB_BLOCK (DXT5, 4x4, 16 B/block),
+///   139/140 = VK_FORMAT_BC4_UNORM/_SNORM_BLOCK (3Dc+, 4x4, 8 B/block: R),
+///   141/142 = VK_FORMAT_BC5_UNORM/_SNORM_BLOCK (two-channel RG, 16 B/block),
+///   143/144 = VK_FORMAT_BC6H_UF16/_SF16_BLOCK (HDR RGB half, 16 B/block),
 ///   145/146 = VK_FORMAT_BC7_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
 ///   151/152 = VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block),
 ///   157/158 = VK_FORMAT_ASTC_4x4_UNORM_BLOCK / _SRGB_BLOCK (4x4, 16 B/block).
 /// BC1/BC2 have no sRGB GPU variant in this sokol checkout (only BC3_SRGBA
 /// and BC7_SRGBA exist), so their _SRGB Vulkan/DXGI counterparts upload as
 /// UNORM — documented on the DDS side (dds.zig), which shares this enum.
-/// BC4/BC5/BC6 stay out of scope (no engine use case yet).
+/// BC4/BC5/BC6H have no sRGB variants in Vulkan at all (data is linear by
+/// definition); SNORM BC4/BC5 upload to the sokol _SN formats.
 pub const BlockFormat = enum(u32) {
     bc1_unorm = 133,
     bc2_unorm = 135,
     bc3_unorm = 137,
     bc3_srgb = 138,
+    bc4_unorm = 139,
+    bc4_snorm = 140,
+    bc5_unorm = 141,
+    bc5_snorm = 142,
+    bc6h_uf16 = 143,
+    bc6h_sf16 = 144,
     bc7_unorm = 145,
     bc7_srgb = 146,
     etc2_rgba8_unorm = 151,
@@ -175,7 +185,7 @@ pub const BlockFormat = enum(u32) {
     /// byte: 8 B; every other family is 16 B).
     pub fn blockByteSize(self: BlockFormat) usize {
         return switch (self) {
-            .bc1_unorm => 8,
+            .bc1_unorm, .bc4_unorm, .bc4_snorm => 8,
             else => 16,
         };
     }

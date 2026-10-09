@@ -22,7 +22,7 @@
 | **Свет и тени** | Hemispheric, Directional (CSM до 4 каскадов), Point (до 2 с тенями в атласе), Spot (до 2 с тенями), RectArea (до 2, closest-point без теней), clustered storage до 64 источников | Кластерное освещение сверх 64 источников; тени от всех источников в кластере; ESM; каскадные настройки per-light |
 | **PBR и материалы** | Metallic-roughness, LUT IBL, clearcoat/sheen с независимыми UV, anisotropy v1, screen-space refraction (IOR/thickness), SSS v1 | OpenPBR, объёмное/raymarched refraction, transparent recursion/offscreen recovery, физическая SSS/BSSRDF, анизотропные roughness-карты |
 | **Прозрачность** | Opaque/cutout/blend, double-sided, `two_sided_lighting`, единый depth-sort обычных и инстансированных мешей | Пиксельный WBOIT (Order-Independent Transparency) |
-| **Текстуры** | PNG/JPEG, HDR Radiance, EXR (HALF/FLOAT scanline), DDS (BC1/BC2/BC3/BC7), KTX2 LDR, Basis транскодинг (ETC1S/UASTC $\to$ BC7/ASTC/RGBA32), мипмапы | BC4/BC5/BC6, HDR-16F в KTX2, видеотекстуры, refraction probes |
+| **Текстуры** | PNG/JPEG, HDR Radiance, EXR (HALF/FLOAT scanline), DDS (BC1/BC2/BC3/BC4/BC5/BC6H/BC7), KTX2 LDR, Basis транскодинг (ETC1S/UASTC $\to$ BC7/ASTC/RGBA32), мипмапы | HDR-16F в KTX2, видеотекстуры, refraction probes |
 | **Постобработка** | Linear-HDR pipeline, auto-exposure, tonemapping (ACES, Reinhard, Filmic, AgX, Neutral), film LUTs, bloom pyramid, DoF, motion blur, contact shadows, depth pyramid, SSAO, SSR, TAA (jitter+reprojection+clamp) | TAA под MSAA (сейчас TAA при MSAA отключается); расширенные reactive masks / variance clipping для TAA |
 | **Анимация** | Скелетная (до 64 костей, GPU skinning), glTF node TRS-анимации, morph targets (CPU + GPU delta-texture), cubic-spline (Hermite), easing, ретаргетинг | Редактор анимаций |
 | **Частицы** | CPU-симуляция + GPU-инстансы, спрайт-листы, sub-emitters, flow maps, CPU-коллизии (сферы cap 8 + ground plane), stateful GPU compute-симуляция | Коллизии частиц с мешами / rigid-body coupling, CCD, нодовый визуальный редактор |
@@ -54,7 +54,6 @@
 - Объёмное / raymarched преломление (refraction), прозрачная рекурсия, offscreen recovery.
 - Физический подповерхностный рассеиватель (SSS / BSSRDF).
 - Анизотропные карты шероховатости (roughness maps).
-- Форматы сжатия BC4, BC5, BC6.
 - 16-битный float HDR в KTX2 контейнерах.
 - Видеотекстуры.
 - Refraction probes.

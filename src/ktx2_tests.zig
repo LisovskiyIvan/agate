@@ -396,7 +396,7 @@ test "blockFormatFromVk covers the BC, ETC2 RGBA8, and ASTC 4x4 subsets" {
     try testing.expect(blockFormatFromVk(0) == null); // UNDEFINED
     try testing.expect(blockFormatFromVk(37) == null); // RGBA8 is NOT a block format
     try testing.expect(blockFormatFromVk(131) == null); // BC1_RGB_UNORM (no-alpha flavor, out of scope)
-    try testing.expect(blockFormatFromVk(139) == null); // BC4: single-channel, out of scope
+    try testing.expect(blockFormatFromVk(134) == null); // BC1_RGB vs BC1_RGBA gap: not a listed variant
     try testing.expect(blockFormatFromVk(159) == null); // ASTC 5x4: neighboring footprint, unsupported
     try testing.expect(blockFormatFromVk(110) == null); // RGBA16F
     try testing.expect(BlockFormat.bc1_unorm.isSrgb() == false);
@@ -1041,4 +1041,24 @@ test "decodeBlock2D rejects level offset+length addition overflow without panick
     std.mem.writeInt(u32, ktx[12..16], 145, .little); // BC7_UNORM_BLOCK
     const expected = if (@bitSizeOf(usize) < 64) error.InvalidLevelData else error.Truncated;
     try testing.expectError(expected, decodeBlock2D(allocator, ktx));
+}
+
+test "blockFormatFromVk accepts BC4/BC5/BC6H with exact block sizes" {
+    const cases = [_]struct { vk: u32, fmt: ktx2.BlockFormat, block_bytes: usize }{
+        .{ .vk = 139, .fmt = .bc4_unorm, .block_bytes = 8 },
+        .{ .vk = 140, .fmt = .bc4_snorm, .block_bytes = 8 },
+        .{ .vk = 141, .fmt = .bc5_unorm, .block_bytes = 16 },
+        .{ .vk = 142, .fmt = .bc5_snorm, .block_bytes = 16 },
+        .{ .vk = 143, .fmt = .bc6h_uf16, .block_bytes = 16 },
+        .{ .vk = 144, .fmt = .bc6h_sf16, .block_bytes = 16 },
+    };
+    for (cases) |c| {
+        const got = ktx2.blockFormatFromVk(c.vk) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(c.fmt, got);
+        try std.testing.expectEqual(c.block_bytes, got.blockByteSize());
+        try std.testing.expect(!got.isSrgb()); // BC4/5/6H are linear by definition
+    }
+    try std.testing.expectEqual(@as(?ktx2.BlockFormat, null), ktx2.blockFormatFromVk(0));
+    // Level math: an 8x8 BC4 level is 2x2 blocks x 8 B = 32 bytes.
+    try std.testing.expectEqual(@as(u64, 32), ktx2.BlockFormat.bc4_unorm.levelByteSize(8, 8).?);
 }

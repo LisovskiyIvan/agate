@@ -68,7 +68,7 @@ pub const DecodeOptions = struct {
 | PNG / JPEG (stb) | сигнатура | CPU RGBA8 | `fromFile/fromMemory`, `decodeMemory/decodeFile`, `decodeImageMemory/decodeImageFile` |
 | Radiance HDR (.hdr) | сигнатура | CPU RGBE→f16 | `decodeHDRMemory/decodeHDRFile`, `fromHDRMemory/loadHDRFile`, `initRawHdr/fromRawHdr` |
 | OpenEXR (none/RLE/ZIP/ZIPS) | `exr.sniff` (magic `76 2f 31 01`) | CPU half/float | `fromExrMemory/fromExrFile` (`decodeHDRMemory` роутит по sniff) |
-| DDS BC1/BC2/BC3/BC7 | `dds.sniff` | Нет (прямая загрузка блоков) | `fromDdsMemory/fromDdsFile` (обёртки над `dds.decodeBlock2D`) |
+| DDS BC1/BC2/BC3/BC4/BC5/BC6H/BC7 | `dds.sniff` | Нет (прямая загрузка блоков) | `fromDdsMemory/fromDdsFile` (обёртки над `dds.decodeBlock2D`); BC4/BC5 (UNORM+SNORM) и BC6H (UF16/SF16) — для normal-map и HDR-панорам |
 | KTX2 блочные (BC1–BC3/BC7, ETC2 RGBA8, ASTC 4x4) | `ktx2.sniff`/`isBlockKtx2` | Нет | `decodeImageMemory` роутит автоматически |
 | KTX2 Basis (ETC1S/UASTC) | `isBasisKtx2` + `basisInfo` | Транскод в `basis_target` | `decodeBasis2D`, `preferredBasisTarget(support)`, `basisTargetForCurrentThread()` |
 | Сырые RGBA8 / RGBA f16 | — | — | `initRaw/initRawMipped/fromRaw/buildRaw`, `initRawHdr/fromRawHdr` |

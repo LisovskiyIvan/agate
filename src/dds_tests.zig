@@ -281,7 +281,7 @@ test "decodeBlock2D rejects unsupported pixel formats with a clear error" {
         .{ .name = "DXT4", .spec = .{ .fourcc = dds.fourcc_dxt4, .level_payloads = &.{&payload} } },
         .{ .name = "DXGI R8G8B8A8_UNORM", .spec = .{ .fourcc = dds.fourcc_dx10, .dxgi = 28, .level_payloads = &.{&payload} } },
         .{ .name = "DXGI R16G16B16A16_FLOAT", .spec = .{ .fourcc = dds.fourcc_dx10, .dxgi = 10, .level_payloads = &.{&payload} } },
-        .{ .name = "DXGI BC6H_UF16", .spec = .{ .fourcc = dds.fourcc_dx10, .dxgi = 95, .level_payloads = &.{&payload} } },
+        .{ .name = "DXGI R9G9B9E5_SHAREDEXP", .spec = .{ .fourcc = dds.fourcc_dx10, .dxgi = 67, .level_payloads = &.{&payload} } },
     };
     for (bad_formats) |c| {
         const file = try c.spec.build(allocator);
@@ -376,4 +376,60 @@ test "Texture.decodeImageMemory routes DDS payloads to the block path" {
     }).build(allocator);
     defer allocator.free(short);
     try testing.expectError(error.InvalidMipData, Texture.decodeMemory(allocator, short, .{}));
+}
+
+test "decodeBlock2D reads DX10 BC4/BC5/BC6H files exactly as authored" {
+    const allocator = testing.allocator;
+
+    // BC4: 4x4 -> one 8-byte block (single-channel R).
+    var bc4: [8]u8 = undefined;
+    for (&bc4, 0..) |*b, i| b.* = @intCast(0x40 + i);
+    const f4 = try (TestDds{
+        .dxgi = dds.dxgi_bc4_unorm,
+        .level_payloads = &.{&bc4},
+    }).build(allocator);
+    defer allocator.free(f4);
+    var t4 = try dds.decodeBlock2D(allocator, f4, .{});
+    defer t4.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc4_unorm, t4.format);
+    try testing.expectEqualSlices(u8, &bc4, t4.levels[0].?);
+
+    // BC5 SNORM: 8x8 -> 2x2 blocks of 16 bytes = 64 bytes (two-channel RG).
+    var bc5: [64]u8 = undefined;
+    @memset(&bc5, 0x5A);
+    const f5 = try (TestDds{
+        .dxgi = dds.dxgi_bc5_snorm,
+        .width = 8,
+        .height = 8,
+        .level_payloads = &.{&bc5},
+    }).build(allocator);
+    defer allocator.free(f5);
+    var t5 = try dds.decodeBlock2D(allocator, f5, .{});
+    defer t5.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc5_snorm, t5.format);
+    try testing.expectEqualSlices(u8, &bc5, t5.levels[0].?);
+
+    // BC6H SF16: 4x4 -> one 16-byte block (HDR RGB half float).
+    var bc6: [16]u8 = undefined;
+    @memset(&bc6, 0x6B);
+    const f6 = try (TestDds{
+        .dxgi = dds.dxgi_bc6h_sf16,
+        .level_payloads = &.{&bc6},
+    }).build(allocator);
+    defer allocator.free(f6);
+    var t6 = try dds.decodeBlock2D(allocator, f6, .{});
+    defer t6.deinit(allocator);
+    try testing.expectEqual(ktx2.BlockFormat.bc6h_sf16, t6.format);
+    try testing.expectEqualSlices(u8, &bc6, t6.levels[0].?);
+
+    // Overlong payload (BC4 level must be exactly 8 bytes for 4x4):
+    // trailing bytes are garbage, not truncation.
+    var bad: [16]u8 = undefined;
+    @memset(&bad, 1);
+    const fbad = try (TestDds{
+        .dxgi = dds.dxgi_bc4_unorm,
+        .level_payloads = &.{&bad},
+    }).build(allocator);
+    defer allocator.free(fbad);
+    try testing.expectError(error.InvalidMipData, dds.decodeBlock2D(allocator, fbad, .{}));
 }
