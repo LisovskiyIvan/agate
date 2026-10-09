@@ -28,6 +28,42 @@ float pcssPenumbraRadius(float receiver_depth, float blocker_avg, float light_si
     return clamp(penumbra, min_penumbra, max_penumbra);
 }
 
+// Fixed 90-degree dither rotation keyed by screen hash: same dithering as a
+// random rotation, zero trig per fragment. Spot-PCSS-only helper (the sun
+// path keeps its inline rotation above untouched).
+mat2 pcssDitherRotation(vec2 frag_coord) {
+    float h = hash01(frag_coord);
+    mat2 rot = mat2(1.0, 0.0, 0.0, 1.0);
+    if (h > 0.75) {
+        rot = mat2(0.0, 1.0, -1.0, 0.0);
+    } else if (h > 0.5) {
+        rot = mat2(-1.0, 0.0, 0.0, -1.0);
+    } else if (h > 0.25) {
+        rot = mat2(0.0, -1.0, 1.0, 0.0);
+    }
+    return rot;
+}
+
+// Spot-light PCSS blocker search: same math as pcssBlockerAverage above,
+// but bounded by the spot tap budget (SPOT_PCSS_BLOCKER_SAMPLES) and
+// clamped to the spot's own atlas page. Kept as a separate function so
+// the sun path stays byte-identical. Returns the average blocker depth,
+// or -1.0 when nothing blocks (caller early-outs to fully lit).
+float pcssSpotBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius, vec2 quad_min, vec2 quad_max) {
+    float blocker_sum = 0.0;
+    int blocker_count = 0;
+    for (int i = 0; i < SPOT_PCSS_BLOCKER_SAMPLES; i++) {
+        vec2 tap_uv = clamp(atlas_uv + rot * POISSON_DISK[i] * search_radius, quad_min, quad_max);
+        float tap_depth = texture(sampler2D(depth_tex, depth_smp), tap_uv).r;
+        if (tap_depth < receiver_depth) {
+            blocker_sum += tap_depth;
+            blocker_count += 1;
+        }
+    }
+    if (blocker_count == 0) return -1.0;
+    return blocker_sum / float(blocker_count);
+}
+
 float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     float cos_theta = max(dot(N, L), 0.0);
     float depth_bias = max(shadow_params.x * (1.0 - cos_theta), shadow_params.x * 0.2);
@@ -143,6 +179,31 @@ float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
     vec2 clamped_uv = clamp(local_uv, 0.002, 0.998);
     vec2 atlas_uv = vec2(clamped_uv.x * 0.5 + float(spot_idx) * 0.5, clamped_uv.y);
     float depth = proj.z - depth_bias;
+
+    // Spot PCSS (source_radius > SPOT_PCSS_EPSILON): blocker search over the
+    // spot's own atlas page -> average blocker depth -> variable penumbra via
+    // the same formula as the sun path (pcssPenumbraRadius mirrors
+    // penumbraRadius in scene/shadow_pcss.zig) -> variable-radius PCF.
+    // Tap budgets (compile-time bounded): SPOT_PCSS_BLOCKER_SAMPLES blocker
+    // taps + SPOT_PCSS_PCF_TAPS filter taps. source_radius at or below the
+    // epsilon falls through to the legacy fixed 4-tap PCF bit-identically.
+    float source_radius = spot_shadow_params[spot_idx].w;
+    if (source_radius > SPOT_PCSS_EPSILON) {
+        vec2 quad_min = vec2(float(spot_idx) * 0.5 + 0.002, 0.002);
+        vec2 quad_max = vec2(float(spot_idx) * 0.5 + 0.498, 0.998);
+        mat2 rot = pcssDitherRotation(gl_FragCoord.xy);
+        float blocker_avg = pcssSpotBlockerAverage(spot_shadow_depth_tex, depth_smp, atlas_uv, depth, rot, SPOT_PCSS_BLOCKER_RADIUS, quad_min, quad_max);
+        if (blocker_avg < 0.0) return 0.0;
+        float filter_radius = pcssPenumbraRadius(depth, blocker_avg, source_radius, SPOT_PCSS_MIN_PENUMBRA, SPOT_PCSS_MAX_PENUMBRA);
+        float pcss_lit = 0.0;
+        for (int i = 0; i < SPOT_PCSS_PCF_TAPS; i++) {
+            vec2 offset = rot * POISSON_DISK[i] * filter_radius;
+            vec2 sample_uv = clamp(atlas_uv + offset, quad_min, quad_max);
+            pcss_lit += texture(sampler2DShadow(spot_shadow_tex, shadow_smp), vec3(sample_uv, depth));
+        }
+        pcss_lit /= float(SPOT_PCSS_PCF_TAPS);
+        return (1.0 - pcss_lit) * shadow_params.y;
+    }
 
     vec2 texel = vec2(1.0 / 1024.0, 1.0 / 512.0);
     float lit = 0.0;

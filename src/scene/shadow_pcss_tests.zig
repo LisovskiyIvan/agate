@@ -67,3 +67,27 @@ test "isEnabled thresholds the packed flag at one half" {
     try std.testing.expect(pcss.isEnabled(0.5001));
     try std.testing.expect(pcss.isEnabled(1.0));
 }
+
+test "spotPcssEnabled thresholds source_radius at epsilon" {
+    try std.testing.expect(!pcss.spotPcssEnabled(0.0));
+    try std.testing.expect(!pcss.spotPcssEnabled(pcss.spot_pcss_epsilon));
+    try std.testing.expect(pcss.spotPcssEnabled(pcss.spot_pcss_epsilon + 1e-6));
+    try std.testing.expect(pcss.spotPcssEnabled(0.02));
+}
+
+test "spot PCSS constants match the shader tap budgets" {
+    try std.testing.expectEqual(@as(u32, 8), pcss.spot_blocker_sample_count);
+    try std.testing.expectEqual(@as(u32, 8), pcss.spot_pcf_tap_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), pcss.spot_blocker_radius, 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0005), pcss.spot_min_penumbra, 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), pcss.spot_max_penumbra, 1e-7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0001), pcss.spot_pcss_epsilon, 1e-8);
+}
+
+test "penumbraRadius covers the spot golden values" {
+    // Mid-range blocker with a sun-scale emitter: (0.6 - 0.5) * 0.02 = 0.002.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.002), pcss.penumbraRadius(0.6, 0.5, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra), 1e-6);
+    // Contact -> min penumbra, distant blocker -> max penumbra.
+    try std.testing.expectEqual(pcss.spot_min_penumbra, pcss.penumbraRadius(0.5001, 0.5, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra));
+    try std.testing.expectEqual(pcss.spot_max_penumbra, pcss.penumbraRadius(0.9, 0.1, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra));
+}

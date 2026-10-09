@@ -1,5 +1,5 @@
-// PCSS (percentage-closer soft shadows) CPU-side math for the cascaded sun shadow atlas.
-// GPU-free: pure formulas mirrored by the forward shaders
+// PCSS (percentage-closer soft shadows) CPU-side math for the cascaded sun shadow atlas
+// and the spot-light shadow atlas. GPU-free: pure formulas mirrored by the forward shaders
 // (shaders/{standard,pbr,skinned_pbr,instanced}.glsl), which run the same
 // blocker search -> penumbra -> PCF pipeline on the GPU. No GPU imports here,
 // so `zig build test` covers this file without a graphics context.
@@ -64,4 +64,35 @@ pub fn penumbraRadius(receiver_depth: f32, blocker_avg: f32, light_size: f32, mi
 pub fn resolveLit(blocker_avg: ?f32, pcf_lit: f32) f32 {
     if (blocker_avg != null) return pcf_lit;
     return 1.0;
+}
+
+// Spot-light PCSS (local emitters): mirrors the spot branch of
+// calculateSpotShadow in shaders/common/shadow_pcf.glsl. The penumbra
+// formula is shared with the sun (penumbraRadius above); only the tap
+// budgets and the search geometry differ (one 1024x512 atlas page per
+// spot slot instead of the 4-cascade sun atlas).
+
+// Fixed spot blocker-search tap count. Must match SPOT_PCSS_BLOCKER_SAMPLES
+// in the shaders (pbr/instanced_pbr/skinned_pbr.glsl).
+pub const spot_blocker_sample_count: u32 = 8;
+// Fixed spot variable-radius PCF tap count. Must match SPOT_PCSS_PCF_TAPS
+// in the shaders.
+pub const spot_pcf_tap_count: u32 = 8;
+
+// Spot blocker-search radius in atlas UV. Must match
+// SPOT_PCSS_BLOCKER_RADIUS in the shaders.
+pub const spot_blocker_radius: f32 = 0.01;
+// Spot penumbra clamp range in atlas UV. Must match
+// SPOT_PCSS_MIN_PENUMBRA / SPOT_PCSS_MAX_PENUMBRA in the shaders.
+pub const spot_min_penumbra: f32 = 0.0005;
+pub const spot_max_penumbra: f32 = 0.01;
+
+// Thresholds the packed source_radius lane (spot_shadow_params[i].w) at
+// this epsilon, mirroring the `source_radius > SPOT_PCSS_EPSILON` shader
+// branch. Zero (the default) keeps the legacy fixed 4-tap PCF bit-identical.
+pub const spot_pcss_epsilon: f32 = 0.0001;
+
+// Whether a spot light runs the PCSS path: source_radius above epsilon.
+pub fn spotPcssEnabled(source_radius: f32) bool {
+    return source_radius > spot_pcss_epsilon;
 }

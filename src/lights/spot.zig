@@ -28,6 +28,13 @@ pub const SpotLightOptions = struct {
     shadow_bias: f32 = 0.002,
     shadow_normal_bias: f32 = 0.005,
     shadow_near: f32 = 0.1,
+    /// Emitter radius for spot PCSS (percentage-closer soft shadows):
+    /// doubles as the light_size of the sun-style penumbra formula
+    /// (see scene/shadow_pcss.zig penumbraRadius). 0.0 (default) disables
+    /// PCSS and keeps the legacy fixed 4-tap PCF bit-identical; any value
+    /// above the epsilon enables the blocker search + variable penumbra.
+    /// Rides the `spot_shadow_params[i].w` lane (packed in light_rig.zig).
+    source_radius: f32 = 0.0,
 };
 
 pub const SpotLight = struct {
@@ -48,6 +55,8 @@ pub const SpotLight = struct {
     shadow_bias: f32 = 0.002,
     shadow_normal_bias: f32 = 0.005,
     shadow_near: f32 = 0.1,
+    /// See SpotLightOptions.source_radius.
+    source_radius: f32 = 0.0,
 
     pub fn init(name: []const u8, options: SpotLightOptions) SpotLight {
         return .{
@@ -64,6 +73,7 @@ pub const SpotLight = struct {
             .shadow_bias = options.shadow_bias,
             .shadow_normal_bias = options.shadow_normal_bias,
             .shadow_near = options.shadow_near,
+            .source_radius = options.source_radius,
         };
     }
 

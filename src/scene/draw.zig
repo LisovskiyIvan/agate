@@ -165,6 +165,7 @@ pub fn drawRegularItem(
     bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
     bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
     bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+    bind.views[pbr_shd.VIEW_spot_shadow_depth_tex] = env.shadow_pass.spot_texture_view;
     bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
     bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
     bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
@@ -343,6 +344,7 @@ fn drawShaderMaterialItem(
         bind.views[pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
         bind.views[pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+        bind.views[pbr_shd.VIEW_spot_shadow_depth_tex] = env.shadow_pass.spot_texture_view;
         bind.views[pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
         bind.samplers[pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
         bind.samplers[pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;
@@ -693,6 +695,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     bind.views[inst_pbr_shd.VIEW_shadow_tex] = env.shadow_pass.texture_view;
     bind.views[inst_pbr_shd.VIEW_shadow_depth_tex] = env.shadow_pass.texture_view;
     bind.views[inst_pbr_shd.VIEW_spot_shadow_tex] = env.shadow_pass.spot_texture_view;
+    bind.views[inst_pbr_shd.VIEW_spot_shadow_depth_tex] = env.shadow_pass.spot_texture_view;
     bind.views[inst_pbr_shd.VIEW_point_shadow_tex] = env.shadow_pass.point_texture_view;
     bind.samplers[inst_pbr_shd.SMP_shadow_smp] = env.shadow_pass.sampler;
     bind.samplers[inst_pbr_shd.SMP_depth_smp] = env.shadow_pass.depth_sampler;

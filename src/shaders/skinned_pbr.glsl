@@ -146,7 +146,7 @@ layout(binding = 2) uniform fs_params {
     vec4 spot_color_outer[2];
     vec4 spot_intensity[2];
     mat4 spot_view_proj[2];
-    vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: unused
+    vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: source_radius (0 = legacy 4-tap PCF, > epsilon = spot PCSS)
     // APPENDED LAST: existing offsets above must not shift for existing bindings.
     float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
     float normal_scale; // normal map xy scale (glTF normalTexture.scale)
@@ -242,6 +242,8 @@ layout(binding = 5) uniform texture2D shadow_tex;
 layout(binding = 7) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
 layout(binding = 6) uniform textureCube env_tex;
 layout(binding = 8) uniform texture2D spot_shadow_tex;
+@image_sample_type spot_shadow_depth_tex unfilterable_float
+layout(binding = 20) uniform texture2D spot_shadow_depth_tex; // same atlas view as spot_shadow_tex, raw-depth reads for spot PCSS
 // Point shadow atlas (passes/shadow_pass.zig POINT_SHADOW_* layout).
 // Binding 10: vs uses texture 9 (morph), fs uses 0..8 — next free slot in
 // the shared pool. Sampled through the shared shadow_smp compare sampler.
@@ -341,6 +343,21 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // Disabled (y <= 0.5): fixed-radius 16x/8x Poisson PCF, bit-identical.
 // Counts mirror scene/shadow_pcss.zig (blocker_sample_count).
 #define PCSS_BLOCKER_SAMPLES 12
+
+// Spot-light PCSS (local emitters): blocker search + variable penumbra for
+// the spot atlas pages. source_radius rides spot_shadow_params[i].w
+// (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
+// calculateSpotShadow). Blocker search reads raw depths from
+// spot_shadow_depth_tex (same atlas view as spot_shadow_tex) through the
+// shared depth_smp; the penumbra reuses pcssPenumbraRadius (same formula as
+// the sun path, see scene/shadow_pcss.zig). Tap budgets mirror
+// scene/shadow_pcss.zig (spot_blocker_sample_count, spot_pcf_tap_count).
+#define SPOT_PCSS_BLOCKER_SAMPLES 8
+#define SPOT_PCSS_PCF_TAPS 8
+#define SPOT_PCSS_EPSILON 0.0001
+#define SPOT_PCSS_BLOCKER_RADIUS 0.01
+#define SPOT_PCSS_MIN_PENUMBRA 0.0005
+#define SPOT_PCSS_MAX_PENUMBRA 0.01
 
 // @include "common/shadow_pcf.glsl"
 

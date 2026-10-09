@@ -356,12 +356,16 @@ pub const LightRig = struct {
         spot_color_outer: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_intensity: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_view_proj: [2]Mat4 = [_]Mat4{Mat4.identity} ** 2,
+        // Per packed spot slot: x cast flag (1 = shadow), y/z the light's
+        // bias/normal-bias knobs, w source_radius (0 = legacy fixed PCF,
+        // > epsilon enables spot PCSS; see scene/shadow_pcss.zig).
         spot_shadow_params: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_shadows: [2]passes.SpotShadowRenderInfo = [_]passes.SpotShadowRenderInfo{.{}} ** 2,
         num_spot_shadows: usize = 0,
         // Point-light shadows, keyed by PACKED point slot (the shader light
         // loop index): x carries shadow_slot + 1 (0 = no shadow), y/z the
-        // light's bias/normal-bias knobs. The 6 face matrices of shadow slot
+        // light's bias/normal-bias knobs, w is reserved (always 0: point
+        // PCSS is deferred, see docs/graphics-roadmap.md). The 6 face matrices of shadow slot
         // s live in point_view_proj[s * 6 .. s * 6 + 6]; the depth pass tiles
         // come from point_shadows (6 entries per slot). All zeroed when no
         // point light casts shadows, so the shaders early-out with zero cost.
@@ -536,7 +540,9 @@ pub const LightRig = struct {
 
     /// Picks up to spot_shadow_slots shadow casters among the candidate spot
     /// lights by raw significance (atlas page caster selection), and fills
-    /// the spot shadow uniforms + depth-pass atlas page tiles.
+    /// the spot shadow uniforms + depth-pass atlas page tiles. The w lane
+    /// of spot_shadow_params carries the light's source_radius (0 keeps the
+    /// legacy fixed PCF bit-identical, > epsilon enables spot PCSS).
     /// Returns the selected shadow casters (up to 2).
     fn packSpotShadows(pack: *FramePack, in_lights: []const *SpotLight, eye: Vec3, shadows_enabled: bool) [spot_shadow_slots]?*SpotLight {
         var casters: [spot_shadow_slots]?*SpotLight = [_]?*SpotLight{null} ** spot_shadow_slots;
@@ -570,10 +576,10 @@ pub const LightRig = struct {
             casters[slot] = sl;
             const svp = sl.getShadowViewProj();
             pack.spot_view_proj[slot] = svp;
-            pack.spot_shadow_params[slot] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
+            pack.spot_shadow_params[slot] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, sl.source_radius };
             if (pack_i != slot and pack_i < 2) {
                 pack.spot_view_proj[pack_i] = svp;
-                pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.0 };
+                pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, sl.source_radius };
             }
             const origin = passes.spotTileOrigin(slot);
             pack.spot_shadows[pack.num_spot_shadows] = .{

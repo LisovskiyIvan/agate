@@ -286,7 +286,7 @@ pub fn penumbraRadius(receiver_depth: f32, blocker_avg: f32, light_size: f32, mi
 pub fn resolveLit(blocker_avg: ?f32, pcf_lit: f32) f32
 ```
 
-Солнце: CSM-атлас из 4 каскадов (`computeCascades` с фиксированными сплитами внутри `ShadowSystem`); споты — до 2 теневых (view-proj + bias в `FramePack`); поинты — до 2 теневых слотов по 6 граней (`point_view_proj[12]`). PCSS: поиск блокеров (12 сэмплов) → средний блокер → радиус полутени → PCF (16 тапов вблизи, 8 вдали); нет блокеров — чистый PCF. Важно для порядка: стейджинг инстансов идёт до `ShadowPass.prepare`, иначе тени отстают на кадр.
+Солнце: CSM-атлас из 4 каскадов (`computeCascades` с фиксированными сплитами внутри `ShadowSystem`); споты — до 2 теневых (view-proj + bias в `FramePack`); поинты — до 2 теневых слотов по 6 граней (`point_view_proj[12]`). PCSS солнца: поиск блокеров (12 сэмплов) → средний блокер → радиус полутени → PCF (16 тапов вблизи, 8 вдали); нет блокеров — чистый PCF. PCSS спотов: `source_radius` в w-лейне `spot_shadow_params` (0 = legacy фиксированный PCF бит-в-бит, > эпсилон = поиск блокеров (8 сэмплов) → полутень по той же формуле → переменный PCF (8 тапов)); поинты остаются на legacy PCF (поиск блокеров отложен — см. `graphics-roadmap.md`). Важно для порядка: стейджинг инстансов идёт до `ShadowPass.prepare`, иначе тени отстают на кадр.
 
 ### Зонды в кадре (`probe_render.zig`)
 

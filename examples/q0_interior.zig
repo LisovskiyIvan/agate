@@ -105,6 +105,23 @@ fn setupScene() void {
     }) catch @panic("q0: sun failed");
     scene.shadows.enabled = true;
 
+    // Spot PCSS calibration light: a small shadow-casting spot over the
+    // content cluster. source_radius > 0 runs the spot PCSS path (blocker
+    // search + variable penumbra); AGATE_Q0_NO_SPOT_PCSS=1 falls back to
+    // the legacy fixed PCF bit-identically (0.0 disables).
+    const spot_pcss_off = envFlag("AGATE_Q0_NO_SPOT_PCSS");
+    _ = scene.createSpotLight("q0_key_spot", .{
+        .position = z.Vec3.new(0.6, 3.6, 0.6),
+        .direction = z.Vec3.new(-0.2, -1.0, -0.4),
+        .color = z.Color3.new(1.0, 0.85, 0.7),
+        .intensity = 6.0,
+        .range = 12.0,
+        .inner_angle_deg = 18.0,
+        .outer_angle_deg = 32.0,
+        .cast_shadows = true,
+        .source_radius = if (spot_pcss_off) 0.0 else 0.02,
+    }) catch @panic("q0: spot failed");
+
     // Warm ceiling area panel + emissive quad (bloom picks the emitter up).
     _ = scene.addAreaLight("area_panel", .{
         .center = z.Vec3.new(0.0, 3.85, -0.8),
