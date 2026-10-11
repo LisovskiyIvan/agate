@@ -103,6 +103,10 @@ pub fn forwardFor(self: anytype, samples: i32, color_format: sg.PixelFormat) *sc
 }
 
 pub fn deinit(self: anytype) void {
+    // Teardown starts here: async asset drains must treat this scene as
+    // stale from this point on (best-effort tripwire while mapped; the
+    // binding contract is `clearSceneRefs` before the storage is freed).
+    self.scene_alive = false;
     // Live GPU teardown requires the registered context owner in every build
     // mode. Unregistered headless tools may perform CPU-only cleanup.
     gpu_thread.assertOnContextThread();

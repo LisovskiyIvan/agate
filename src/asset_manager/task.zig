@@ -66,6 +66,13 @@ pub const AssetTask = struct {
 
     // Task-specific context
     scene: ?*Scene = null,
+    /// Scene lifetime generation captured at submit time (`addMeshTask` /
+    /// `addMeshTaskAsync`): the drain/execute paths fail closed when the
+    /// live scene no longer reports this generation (or reports teardown),
+    /// instead of appending into a recycled or torn-down scene. 0 =
+    /// uncaptured (legacy/test scenes): the generation check is skipped
+    /// but the teardown flag still applies.
+    scene_uid: u64 = 0,
     texture_options: Texture.Options = .{},
     custom_run: ?*const fn (*AssetTask, std.mem.Allocator) anyerror!void = null,
     user_ctx: ?*anyopaque = null,

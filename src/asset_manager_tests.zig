@@ -639,3 +639,151 @@ test "AssetManager onFinish enqueue defers done until next batch drains" {
     try testing.expectEqual(@as(usize, 2), mgr.totalCount());
     try testing.expectEqual(@as(usize, 2), mgr.completed_count);
 }
+
+// --- H1 async-scene lifetime: stale targets are skipped, counted, freed ---
+
+test "AssetManager async mesh drops stale scene target after scene death" {
+    // Audit scenario: the scene is torn down while a worker parses. The
+    // drain must not touch the dead scene: fail closed + count + free.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const obj_path = "test_async_stale_scene.obj";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.enableMeshAsync(1);
+
+    const testScene = @import("testing.zig").testScene;
+    var scene = testScene(allocator);
+    defer {
+        for (scene.meshes.items) |m| {
+            m.deinit(allocator);
+            allocator.destroy(m);
+        }
+        scene.meshes.deinit(allocator);
+        scene.profiler.deinit();
+    }
+    _ = scene.ensureLifetimeUid();
+
+    async_test_hold.store(true, .release);
+    defer async_test_hold.store(false, .release);
+    const t = try mgr.addMeshTaskAsync("tri_stale", obj_path, &scene);
+    _ = mgr.loadStep(1);
+    try testing.expectEqual(TaskState.running, t.state);
+
+    const job = t.async_job.?;
+    var spins: usize = 0;
+    while (!job.started.load(.acquire)) : (spins += 1) {
+        if (spins > 100_000) return error.AsyncWorkerNeverStarted;
+        jobs.sleepNs(50_000);
+    }
+
+    // Simulate Scene.deinit's first step: teardown began, storage mapped
+    // (the drain's best-effort read stays sound; the use-after-free the
+    // audit describes would be a freed/reused backing store).
+    scene.scene_alive = false;
+
+    async_test_hold.store(false, .release);
+    mgr.loadSync();
+
+    try testing.expect(t.isFailed());
+    try testing.expectEqual(error.StaleScene, t.error_result.?);
+    try testing.expectEqual(@as(usize, 1), mgr.failed_count);
+    try testing.expectEqual(@as(usize, 1), mgr.stale_scene_drops);
+    // Untouched: no mesh appended into the dead scene, no leak (the worker
+    // geometry was freed by the stale drain).
+    try testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "AssetManager clearSceneRefs detaches targets before teardown" {
+    // Binding contract: detach before deinit, then drains complete
+    // scene-less (owned geometry) instead of failing or touching freed
+    // storage. Detaches are counted in stale_scene_drops.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const obj_path = "test_async_detach_scene.obj";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, obj_path, .{});
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.enableMeshAsync(1);
+
+    const testScene = @import("testing.zig").testScene;
+    var scene = testScene(allocator);
+    defer {
+        for (scene.meshes.items) |m| {
+            m.deinit(allocator);
+            allocator.destroy(m);
+        }
+        scene.meshes.deinit(allocator);
+        scene.profiler.deinit();
+    }
+    _ = scene.ensureLifetimeUid();
+
+    async_test_hold.store(true, .release);
+    defer async_test_hold.store(false, .release);
+    const t = try mgr.addMeshTaskAsync("tri_detach", obj_path, &scene);
+    _ = mgr.loadStep(1);
+    try testing.expectEqual(TaskState.running, t.state);
+
+    const detached = mgr.clearSceneRefs(&scene);
+    try testing.expectEqual(@as(usize, 1), detached);
+    try testing.expectEqual(@as(usize, 1), mgr.stale_scene_drops);
+    try testing.expect(t.scene == null);
+
+    async_test_hold.store(false, .release);
+    mgr.loadSync();
+
+    // Scene-less success: geometry published owned, scene untouched.
+    try testing.expect(t.isSuccess());
+    try testing.expect(t.owned_mesh);
+    try testing.expect(t.mesh_result != null);
+    try testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}
+
+test "AssetManager sync mesh skips recycled scene generation" {
+    // Same-address reuse: the scene storage was freed and now holds a NEW
+    // scene generation. The captured uid no longer matches, so the sync
+    // execute must fail closed without touching the scene.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+
+    const testScene = @import("testing.zig").testScene;
+    var scene = testScene(allocator);
+    defer {
+        for (scene.meshes.items) |m| {
+            m.deinit(allocator);
+            allocator.destroy(m);
+        }
+        scene.meshes.deinit(allocator);
+        scene.profiler.deinit();
+    }
+    scene.lifetime_uid = 7;
+    // Never read: the stale check runs before any file access.
+    const t = try mgr.addMeshTask("tri_recycled", "no_such_recycled_scene.obj", &scene);
+    try testing.expectEqual(@as(u64, 7), t.scene_uid);
+    scene.lifetime_uid = 8;
+
+    mgr.loadSync();
+
+    try testing.expect(t.isFailed());
+    try testing.expectEqual(error.StaleScene, t.error_result.?);
+    try testing.expectEqual(@as(usize, 1), mgr.stale_scene_drops);
+    try testing.expectEqual(@as(usize, 0), scene.meshes.items.len);
+}

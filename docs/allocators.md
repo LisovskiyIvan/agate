@@ -79,3 +79,27 @@ stored allocator are routed. Everything else stays on `core`.
 5. **Failure**: `UploadQueue.init` / `TaskRunner.init` failures degrade to
    null (`catch null`, sync fallbacks) — a failing `io` allocator still
    initializes the scene and `deinit` succeeds.
+
+## Время жизни сцены для асинхронных задач AssetManager
+
+Асинхронные mesh-задачи (`addMeshTaskAsync`) держат сырой указатель
+`task.scene`, а воркер в это время парсит файл. Если сцена освобождена
+раньше, чем отработал drain, запись по указателю — use-after-free.
+Контракт (см. шапку `src/asset_manager.zig`):
+
+1. **Обязательно**: перед `deinit`/освобождением сцены, на которую ещё
+   ссылаются живые задачи, вызвать `manager.clearSceneRefs(&scene)`.
+   Откреплённые задачи сцену больше не трогают: асинхронные завершаются
+   как scene-less (владение геометрией в `mesh_result`), синхронные идут
+   по scene-less CPU-пути. Вызов возвращает число откреплённых задач и
+   добавляет его в `stale_scene_drops`. Это единственная проверка,
+   корректная и после unmap памяти сцены.
+2. **Страховка**: задачи запоминают поколение сцены (`scene_uid`,
+   `Scene.lifetime_uid`, назначается в init и никогда не переиспользуется),
+   а `Scene.deinit` первым делом снимает флаг `scene_alive`. Drain/execute,
+   заставший чужое поколение или снятый флаг, пропускает цель, считает
+   `stale_scene_drops`, освобождает ресурсы задачи и закрывается с
+   `error.StaleScene` — но чтение этих полей через хранимый указатель
+   корректно, только пока память сцены ещё отображена.
+3. Счётчик `stale_scene_drops` монотонен (не сбрасывается `reset`):
+   каждый пропуск виден в диагностике.

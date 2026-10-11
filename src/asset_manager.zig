@@ -60,6 +60,21 @@
 //!   (freed by `reset`, or moved out via `takeMeshGeometry` and freed with
 //!   the manager's allocator). Reset/cache teardown of GPU textures is
 //!   context-thread only, after prepared frames stop borrowing their handles.
+//! - Scene lifetime (async tasks hold a raw `task.scene` while a worker
+//!   parses — the scene may die before the drain runs):
+//!   - Capture: `addMeshTask`/`addMeshTaskAsync` freeze the scene's
+//!     `lifetime_uid` (never-reused generation, assigned by `Scene.init`)
+//!     into `task.scene_uid`; `Scene.deinit` clears `scene_alive` first.
+//!   - Drain/execute fail closed on a stale target (teardown seen, or a
+//!     different live generation at the stored address): the scene is
+//!     never touched, worker geometry is freed, the task lands `.failed`
+//!     with `error.StaleScene`, and `stale_scene_drops` increments.
+//!   - Binding rule: call `manager.clearSceneRefs(&scene)` BEFORE
+//!     deiniting/freeing a Scene that live tasks still target — detached
+//!     tasks complete scene-less (`mesh_result` owned geometry / CPU path)
+//!     instead of failing. It is the only check that stays sound once the
+//!     scene storage is unmapped; the uid/flag read is best-effort while
+//!     mapped. See `docs/allocators.md` (RU) for the full contract.
 //! - Async mesh tasks (`is_async`): `name`/`path` stay BORROWED with the same
 //!   lifetime rule. The worker never touches the `AssetTask` or the `Scene`:
 //!   it owns a heap `AsyncMeshJob` (borrowed `path` bytes, manager

@@ -81,6 +81,13 @@ pub const AssetManager = struct {
     completed_count: usize = 0,
     failed_count: usize = 0,
     current_index: usize = 0,
+    /// Stale scene targets skipped without touching the scene: async drains
+    /// plus sync executes that found their `task.scene` torn down (or from
+    /// a recycled generation), plus targets detached by `clearSceneRefs`.
+    /// Monotonic diagnostic; never resets the task outcome by itself (each
+    /// stale task still lands `.failed` with `error.StaleScene`, or
+    /// completes scene-less after an explicit detach).
+    stale_scene_drops: usize = 0,
 
     // Callbacks
     onTaskSuccess: ?TaskSuccessFn = null,
@@ -197,6 +204,7 @@ pub const AssetManager = struct {
             .path = path,
             .task_type = .mesh,
             .scene = scene,
+            .scene_uid = if (scene) |sc| sc.lifetime_uid else 0,
         };
         try self.tasks.append(self.allocator, task);
         return task;
@@ -221,6 +229,7 @@ pub const AssetManager = struct {
             .path = path,
             .task_type = .mesh,
             .scene = scene,
+            .scene_uid = if (scene) |sc| sc.lifetime_uid else 0,
             .is_async = true,
         };
         try self.tasks.append(self.allocator, task);
@@ -254,6 +263,42 @@ pub const AssetManager = struct {
         try self.enableMeshAsync(1);
     }
 
+    /// True when a scene target must not be touched: teardown began
+    /// (`scene_alive` cleared by `Scene.deinit`) or the live scene reports
+    /// a different lifetime generation than the one captured at submit time
+    /// (storage freed and recycled for a new scene). Best effort: reading
+    /// these two fields through the stored pointer is only sound while the
+    /// storage is still mapped — the binding contract is `clearSceneRefs`
+    /// before the Scene storage is freed.
+    fn sceneTargetStale(sc: *const Scene, scene_uid: u64) bool {
+        if (!sc.scene_alive) return true;
+        if (scene_uid != 0 and sc.lifetime_uid != scene_uid) return true;
+        return false;
+    }
+
+    /// Detaches every task targeting `scene` (sync and async, any state):
+    /// their scene pointer is cleared so later drains/executes never touch
+    /// the scene, even after it is deinited and its storage freed or
+    /// recycled. Detached async mesh tasks complete as scene-less
+    /// owned-geometry publishes (`mesh_result`); detached sync mesh tasks
+    /// take the scene-less CPU path. Returns the detached count and bumps
+    /// `stale_scene_drops` by the same amount. CALL THIS before
+    /// deiniting/freeing a Scene that any live task still targets — it is
+    /// the only check that stays sound once the storage is unmapped.
+    /// Caller thread only.
+    pub fn clearSceneRefs(self: *AssetManager, scene: *Scene) usize {
+        var detached: usize = 0;
+        for (self.tasks.items) |task| {
+            if (task.scene == scene) {
+                task.scene = null;
+                task.scene_uid = 0;
+                detached += 1;
+            }
+        }
+        self.stale_scene_drops += detached;
+        return detached;
+    }
+
     /// Posts a pending async mesh task to the runner (caller thread).
     /// Sets `.running`; completion (or failure) is published later by
     /// `drainAsyncMesh` on the caller thread. Never touches the Scene.
@@ -279,6 +324,23 @@ pub const AssetManager = struct {
     /// Precondition: `job.done.load(.acquire) == true`.
     fn drainAsyncMesh(self: *AssetManager, task: *AssetTask, job: *AsyncMeshJob) void {
         task.async_worker_id = job.worker_id;
+        if (task.scene) |sc| {
+            if (sceneTargetStale(sc, task.scene_uid)) {
+                // The scene died (or its storage was recycled for a new
+                // scene) while the worker parsed: never touch it. Free the
+                // worker geometry and fail closed.
+                if (job.result) |*g| g.deinit(self.allocator);
+                task.state = .failed;
+                task.error_result = error.StaleScene;
+                self.failed_count += 1;
+                self.stale_scene_drops += 1;
+                self.allocator.destroy(job);
+                task.async_job = null;
+                if (self.onTaskError) |cb| cb(self, task, error.StaleScene);
+                if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
+                return;
+            }
+        }
         if (job.err) |e| {
             task.state = .failed;
             task.error_result = e;
@@ -486,6 +548,14 @@ pub const AssetManager = struct {
                 const is_stl = std.mem.endsWith(u8, task.path, ".stl");
                 const is_ply = std.mem.endsWith(u8, task.path, ".ply");
                 if (task.scene) |sc| {
+                    if (sceneTargetStale(sc, task.scene_uid)) {
+                        // Sync mirror of the async-drain guard above: the
+                        // scene died (or was recycled) between submit and
+                        // execute. Count it and fail closed without touching
+                        // the scene; `loadStep` records the failure.
+                        self.stale_scene_drops += 1;
+                        return error.StaleScene;
+                    }
                     if (is_glb) {
                         const spawned = try SceneLoader.appendGlb(sc, task.path);
                         defer sc.allocator.free(spawned);

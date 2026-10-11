@@ -177,6 +177,12 @@ fn msSince(t0: u64) f32 {
     return @floatCast(sokol.time.ms(sokol.time.now() -% t0));
 }
 
+/// Scene lifetime-generation counter for `Scene.ensureLifetimeUid` (same
+/// never-reuse discipline as Mesh.ensureUid: starts at 1, 0 is never
+/// assigned, wraps with +% and skips 0). Module-level (not per-allocator)
+/// so two scenes never share a generation even across allocators.
+var scene_lifetime_next: u64 = 1;
+
 /// The scene: content registries (flat, iterated directly by loaders,
 /// tooling and serialization), a handful of cross-cutting config flags, and
 /// one field per render subsystem. New features should add state to the
@@ -267,6 +273,20 @@ pub const Scene = struct {
     pending_physics_ms: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
     // Bumped once per finished prepared generation, never by renderReuse.
     frame_id: u64 = 0,
+    /// Lifetime generation for async asset-task ownership (never reused,
+    /// 0 = unassigned): `AssetManager` mesh tasks capture this at submit
+    /// time and the drain/execute paths fail closed (`stale_scene_drops`)
+    /// when the target generation no longer matches — the fail-closed half
+    /// of the async-scene contract (see `asset_manager.zig` header and
+    /// `docs/allocators.md`). Assigned by `ensureLifetimeUid` on every
+    /// init path; plain struct copies carry it unchanged.
+    lifetime_uid: u64 = 0,
+    /// False once teardown begins (`deinit` clears it first, while the
+    /// struct is still mapped): async drains treat a cleared flag as a
+    /// stale target and skip it without touching the scene. Best-effort
+    /// tripwire only — the binding contract is `clearSceneRefs` before
+    /// the storage is freed (a dangling pointer cannot be checked safely).
+    scene_alive: bool = true,
 
     // ---- Render subsystems. ----
     // All lights: hemispheric sun, optional directional sun, point/spot lists.
@@ -615,6 +635,9 @@ pub const Scene = struct {
         // deinit via the stored allocator. (Task BODIES keep their
         // call-site allocator — core — only runner internals use io.)
         self.io_runner = jobs.TaskRunner.init(io, 1) catch null;
+        // Lifetime generation for async asset tasks (see the field docs):
+        // assigned once per init, never reused, survives struct copies.
+        _ = self.ensureLifetimeUid();
     }
 
     pub fn init(allocator: std.mem.Allocator) Scene {
@@ -630,6 +653,25 @@ pub const Scene = struct {
         var self: Scene = undefined;
         self.initIntoWithAllocators(cfg);
         return self;
+    }
+
+    /// Lazily assigns a nonzero lifetime generation (0 = unassigned),
+    /// stable for the scene value and never reused by another scene.
+    /// Idempotent: a second call returns the same value. Called by every
+    /// init path; test fixtures with a literal scene stay 0 (async tasks
+    /// against them skip the generation check but still honor
+    /// `scene_alive`).
+    pub fn ensureLifetimeUid(self: *Scene) u64 {
+        if (self.lifetime_uid != 0) return self.lifetime_uid;
+        var id: u64 = scene_lifetime_next;
+        if (id == 0) {
+            id = 1;
+            scene_lifetime_next = 1;
+        }
+        scene_lifetime_next +%= 1;
+        if (scene_lifetime_next == 0) scene_lifetime_next = 1;
+        self.lifetime_uid = id;
+        return id;
     }
 
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
