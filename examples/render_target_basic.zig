@@ -522,10 +522,12 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .width = 800,
         .height = 600,
         .sample_count = 1,
-        .gl_major = 4,
-        .gl_minor = 3,
-        .logger = rttLogger,
-        .shader_pool_size = 128,
+        .advanced = .{
+            .gl_major = 4,
+            .gl_minor = 3,
+            .logger = rttLogger,
+            .shader_pool_size = 128,
+        },
     }, .{
         .init = appInit,
         .frame = appFrame,

@@ -48,7 +48,9 @@ const Runtime = runtime_mod.Runtime;
 const FrameResult = runtime_mod.FrameResult;
 const gpu_thread = @import("gpu_thread.zig");
 
-/// Explicit window and graphics backend configuration.
+/// Explicit window and graphics backend configuration. The top level
+/// keeps the common window knobs; backend floors, pool sizes, and logging
+/// live in `advanced` (defaults verbatim, zero behavior change).
 pub const AppConfig = struct {
     /// Window title shown in window decorations.
     title: [:0]const u8 = "Agate Application",
@@ -64,6 +66,16 @@ pub const AppConfig = struct {
     disable_vsync: bool = true,
     /// Request hardware sRGB format for the default swapchain backbuffer.
     srgb_backbuffer: bool = false,
+    /// When true, runs in CPU-only headless mode without calling `sapp.run`.
+    headless: bool = false,
+    /// Backend floors, sokol pool sizes, and logging (see AppAdvancedConfig).
+    advanced: AppAdvancedConfig = .{},
+};
+
+/// Advanced App tuning: desktop GL floor, WebGPU/Metal backend trivia,
+/// sokol-gfx pool sizes, and the log callback. Defaults are verbatim
+/// the former flat AppConfig values.
+pub const AppAdvancedConfig = struct {
     /// Desktop OpenGL major floor (4.3 required for clustered compute/storage).
     gl_major: i32 = 4,
     /// Desktop OpenGL minor floor.
@@ -83,9 +95,6 @@ pub const AppConfig = struct {
     pipeline_pool_size: i32 = 256,
     shader_pool_size: i32 = 64,
     uniform_buffer_size: i32 = 16 * 1024 * 1024,
-
-    /// When true, runs in CPU-only headless mode without calling `sapp.run`.
-    headless: bool = false,
 };
 
 /// High-level user callbacks (event-routing contract: see module docs).
@@ -199,14 +208,14 @@ pub const App = struct {
             .height = self.config.height,
             .sample_count = self.config.sample_count,
             .srgb = self.config.srgb_backbuffer,
-            .gl = .{ .major_version = self.config.gl_major, .minor_version = self.config.gl_minor },
+            .gl = .{ .major_version = self.config.advanced.gl_major, .minor_version = self.config.advanced.gl_minor },
             .high_dpi = self.config.high_dpi,
             .disable_vsync = self.config.disable_vsync,
-            .wgpu_gpu_timing_enabled = self.config.wgpu_gpu_timing_enabled,
+            .wgpu_gpu_timing_enabled = self.config.advanced.wgpu_gpu_timing_enabled,
             .metal = .{
-                .disable_display_sync = self.config.metal_disable_display_sync,
+                .disable_display_sync = self.config.advanced.metal_disable_display_sync,
             },
-            .logger = if (self.config.logger) |l| .{ .func = l } else .{},
+            .logger = if (self.config.advanced.logger) |l| .{ .func = l } else .{},
         };
     }
 
@@ -214,14 +223,14 @@ pub const App = struct {
     pub fn sgDesc(self: *const App, env: sg.Environment) sg.Desc {
         return .{
             .environment = env,
-            .logger = if (self.config.logger) |l| .{ .func = l } else .{},
-            .buffer_pool_size = self.config.buffer_pool_size,
-            .image_pool_size = self.config.image_pool_size,
-            .sampler_pool_size = self.config.sampler_pool_size,
-            .view_pool_size = self.config.view_pool_size,
-            .pipeline_pool_size = self.config.pipeline_pool_size,
-            .shader_pool_size = self.config.shader_pool_size,
-            .uniform_buffer_size = self.config.uniform_buffer_size,
+            .logger = if (self.config.advanced.logger) |l| .{ .func = l } else .{},
+            .buffer_pool_size = self.config.advanced.buffer_pool_size,
+            .image_pool_size = self.config.advanced.image_pool_size,
+            .sampler_pool_size = self.config.advanced.sampler_pool_size,
+            .view_pool_size = self.config.advanced.view_pool_size,
+            .pipeline_pool_size = self.config.advanced.pipeline_pool_size,
+            .shader_pool_size = self.config.advanced.shader_pool_size,
+            .uniform_buffer_size = self.config.advanced.uniform_buffer_size,
         };
     }
 
