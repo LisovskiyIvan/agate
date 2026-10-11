@@ -53,10 +53,10 @@
 //! b.installArtifact(rtt_smoke);
 //! const run_rtt = b.addRunArtifact(rtt_smoke);
 //! if (b.args) |args| run_rtt.addArgs(args);
-//! b.step("example-rtt", "Run the RTT capture/sample smoke (needs GPU/display)")
+//! b.step("run-rtt", "Run the RTT capture/sample smoke (needs GPU/display)")
 //!     .dependOn(&run_rtt.step);
 //! ```
-//! Run: `zig build example-rtt -- --frames 120 --refraction --ior 1.5`
+//! Run (in examples/): `zig build run-rtt -- --frames 120 --refraction --ior 1.5`
 //! Expected: `verdict=PASS` with `log_errors=0`.
 //! Compare: `--freeze --refraction --ior 1.0` vs `--freeze --refraction
 //! --ior 1.5` (deterministic scenes; capture this program's window only).

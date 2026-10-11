@@ -187,9 +187,9 @@ Smoke проверяет реальные ненулевые draws и GPU-вал
 
 Попиксельная проверка собственного окна, фиксированные камера/IOR=1.5: `--thickness 0` против `0.7` меняет 32 380 пикселей (31 288 с |Δ|>8), **все внутри сферы**, вне неё — ноль отличий. При толщине 0.7 изменение IOR 1→1.5 меняет 115 788 пикселей (30 956 с |Δ|>8), также только в сфере. Артефакты сохранены в `bench/screenshots/rtt_*`, метрики — `bench/rtt_pixel_proof.json`, логи — `bench/native_reports/rtt_*`. Это подтверждает работу выборки фона/оптических параметров в rigid PBR на Metal, не физическую точность или cross-backend parity.
 
-Запуск: `zig build example-rtt -- --frames 120 --refraction --ior 1.5 --thickness 0.7`. Флаги: `--frames N`, `--rtt-size N`, `--rtt-msaa 1|2|4`, `--refraction`, `--ior F`, `--thickness F`, `--freeze`.
+Запуск (в `examples/`): `zig build run-rtt -- --frames 120 --refraction --ior 1.5 --thickness 0.7`. Флаги: `--frames N`, `--rtt-size N`, `--rtt-msaa 1|2|4`, `--refraction`, `--ior F`, `--thickness F`, `--freeze`.
 
-Шаг `example-rtt` уже подключён в `build.zig`:
+Шаг `run-rtt` уже подключён в `build.zig`:
 
 ```zig
 const rtt_smoke = b.addExecutable(.{
@@ -207,7 +207,7 @@ const rtt_smoke = b.addExecutable(.{
 b.installArtifact(rtt_smoke);
 const run_rtt = b.addRunArtifact(rtt_smoke);
 if (b.args) |args| run_rtt.addArgs(args);
-b.step("example-rtt", "Run the RTT capture/sample smoke (needs GPU/display)").dependOn(&run_rtt.step);
+b.step("run-rtt", "Run the RTT capture/sample smoke (needs GPU/display)").dependOn(&run_rtt.step);
 ```
 
 Шаг — только run (GPU), никогда часть `test`: smoke требует дисплея/контекста и конечного verdict-лога, а не pass/fail юнит-раннера.

@@ -113,10 +113,11 @@ capture, prepare-side compute и другие unbracketed passes не автом
 ## Проверка на живом GPU
 
 ```sh
-zig build example-gpu-timing -Doptimize=ReleaseSafe
-AGATE_GPU_TIMING_SMOKE_OFF=1 zig build example-gpu-timing -Doptimize=ReleaseSafe
-zig build install-emsdk -Dtarget=wasm32-emscripten # один раз, если SDK ещё не установлен
-zig build gpu-timing -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast
+# в examples/:
+zig build run-gpu-timing -Doptimize=ReleaseSafe
+AGATE_GPU_TIMING_SMOKE_OFF=1 zig build run-gpu-timing -Doptimize=ReleaseSafe
+zig build install-emsdk -Dtarget=wasm32-emscripten # один раз, если SDK ещё не установлен (в корне)
+zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast # в examples/: *_web.zig варианты
 ```
 
 Готовый package cache можно переиспользовать через `--system /path/to/zig-pkg`,

@@ -99,7 +99,7 @@ pub const ShaftResolution = enum { half, quarter };
 | Shafts v1 | `shaft_enabled`, `shaft_intensity`, `shaft_steps`, `shaft_density`, `shaft_anisotropy`, `shaft_max_distance`, `shaft_resolution`, `shaft_blur_sigma`, `shaft_edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
 | DOF | `dof_enabled`, `dof_focus_distance`, `dof_focus_range`, `dof_max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
 
-Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom-pyramid → glow → highlight → shafts → grading/LUT → vignette → exposure/tonemap → display transfer → FXAA/TAA-resolve → sharpen/grain. Exposure ручной (`exposure`); auto-exposure — будущее. Output gamma-флаги удалены: один IEC display transfer, ручной UNORM / hw-sRGB путь.
+Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom-pyramid → glow → highlight → shafts → grading/LUT → vignette → exposure/tonemap → display transfer → FXAA/TAA-resolve → sharpen/grain. Exposure ручной (`exposure`); auto-exposure — адаптивная выдержка (`auto_exposure_*`, `Scene.updateAutoExposure*` + гистограммный метринг). Output gamma-флаги удалены: один IEC display transfer, ручной UNORM / hw-sRGB путь.
 
 ### Bloom (`postprocess/bloom.zig`)
 
@@ -237,7 +237,7 @@ pub fn shaftKernelSum(...) f32
 - CPU-математика модуля — O(1) на вызов (веса, UV, джиттер); исключение — `buildIdentityLutStrip` O(size³) однократно при создании LUT.
 - TAA держит два history-таргета полного разрешения (`ensureTaaHistory`) — самая заметная видеопамять модуля; `taaReset` при ресайзе обязателен (иначе репроекция из чужого разрешения).
 - `clamped()` — дешёвый (скаляры), вызывайте без страха каждый кадр после твиков UI; кэшировать не нужно.
-- HDR-showcase: `zig build hdr-showcase` / `run-hdr-showcase`, сцены Studio B/E/Space; конечный прогон `AGATE_HDR_FRAMES=240`, `MSAA4`, `SRGB1`; browser-кадры — query-параметром. Скриншоты — визуальные, не числовая radiance-метрика.
+- HDR-showcase: `zig build run-hdr` (в `examples/`), тёмная студия + клавиши B/E/Space (bloom toggle, exposure cycle, effects master); конечный прогон `AGATE_HDR_FRAMES=240`, `MSAA4`, `SRGB1`; browser-кадры — query-параметром. Скриншоты — визуальные, не числовая radiance-метрика.
 
 ## Смотрите также
 
