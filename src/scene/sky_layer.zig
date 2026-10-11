@@ -1,6 +1,9 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const math = @import("math");
+const Vec3 = math.Vec3;
+const Color3 = math.Color3;
 const Camera = @import("../camera.zig").Camera;
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const SkyboxOptions = @import("../texture.zig").SkyboxOptions;
@@ -77,6 +80,33 @@ pub const SkyboxLayer = struct {
         // there, so check first to keep counters exact.
         if (sg.queryPipelineState(pass.pipeline) != .VALID) return;
         pass.render(camera, aspect, cube_tex, @import("../postprocess/hdr.zig").sanitizeExposure(exposure));
+        stats.main_draw_calls += 1;
+        stats.draw_calls += 1;
+        stats.triangles += 12;
+    }
+
+    /// Analytic-dome variant of `renderPrepared`: same guards and counters,
+    /// but the pass evaluates the physical sky instead of the cubemap.
+    /// `sun_dir`/`sun_color`/`sun_intensity` arrive model-resolved from the
+    /// frame snapshot (never live light state).
+    pub fn renderAnalyticPrepared(
+        self: *SkyboxLayer,
+        camera: Camera,
+        aspect: f32,
+        cube_tex: CubeTexture,
+        exposure: f32,
+        sun_dir: Vec3,
+        turbidity: f32,
+        sun_color: Color3,
+        sun_intensity: f32,
+        samples: i32,
+        color_format: sg.PixelFormat,
+        stats: *SceneStats,
+    ) void {
+        if (!sg.isvalid()) return;
+        const pass = self.passFor(samples, color_format);
+        if (sg.queryPipelineState(pass.pipeline) != .VALID) return;
+        pass.renderAnalytic(camera, aspect, cube_tex, @import("../postprocess/hdr.zig").sanitizeExposure(exposure), sun_dir, turbidity, sun_color, sun_intensity);
         stats.main_draw_calls += 1;
         stats.draw_calls += 1;
         stats.triangles += 12;

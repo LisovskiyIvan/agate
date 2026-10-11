@@ -214,16 +214,34 @@ pub fn renderSceneView(
     // Skybox Pass: captured enabled/texture/exposure only. The cube is
     // the snapshot sky texture orelse the snapshot's render-owned
     // default copy — never self.sky.* / self.default_cube_texture live.
-    scene.sky.renderPrepared(
-        snap.sky_enabled,
-        cam_snap.camera,
-        cam_snap.aspect,
-        snap.sky_texture orelse snap.default_cube,
-        snap.sky_exposure,
-        samples,
-        env.pipelines.color_format,
-        &scene.stats,
-    );
+    // With the analytic dome on (opt-in physical sky) the pass evaluates
+    // the model sky from the snapshot sun instead of sampling the cube.
+    if (snap.sky_analytic) {
+        scene.sky.renderAnalyticPrepared(
+            cam_snap.camera,
+            cam_snap.aspect,
+            snap.sky_texture orelse snap.default_cube,
+            snap.sky_exposure,
+            snap.sun_dir,
+            snap.sky_turbidity,
+            snap.sun_color,
+            snap.sun_intensity,
+            samples,
+            env.pipelines.color_format,
+            &scene.stats,
+        );
+    } else {
+        scene.sky.renderPrepared(
+            snap.sky_enabled,
+            cam_snap.camera,
+            cam_snap.aspect,
+            snap.sky_texture orelse snap.default_cube,
+            snap.sky_exposure,
+            samples,
+            env.pipelines.color_format,
+            &scene.stats,
+        );
+    }
 
     // Particle Pass: prepared frame only — no live ParticleSystem reads
     // at draw time (the update side may step systems concurrently).

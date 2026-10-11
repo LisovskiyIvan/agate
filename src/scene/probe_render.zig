@@ -201,8 +201,15 @@ pub fn renderProbeFace(
 
     // Sky last (depth LESS_EQUAL behind geometry), snapshot switch +
     // exposure; disabled sky leaves the clear color. Translation-free
-    // view, like SkyboxPass.render.
-    if (snap.sky_enabled) {
+    // view, like SkyboxPass.render. The analytic dome (opt-in physical
+    // sky) captures the model sky so probes stay consistent with it.
+    if (snap.sky_analytic) {
+        var rot_view = view;
+        rot_view.m[12] = 0.0;
+        rot_view.m[13] = 0.0;
+        rot_view.m[14] = 0.0;
+        scene.sky.pass.renderMatricesAnalytic(rot_view, proj, snap.sky_texture orelse snap.default_cube, snap.sky_exposure, snap.sun_dir, snap.sky_turbidity, snap.sun_color, snap.sun_intensity);
+    } else if (snap.sky_enabled) {
         var rot_view = view;
         rot_view.m[12] = 0.0;
         rot_view.m[13] = 0.0;

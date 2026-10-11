@@ -88,6 +88,11 @@ pub const SceneFrameSnapshot = struct {
     /// render once update||render overlap is real).
     sky_enabled: bool = false,
     sky_exposure: f32 = 1.0,
+    /// Analytic-dome switch + turbidity captured from Scene.phys_sky (both
+    /// false/default with the model off): the skybox pass renders the
+    /// analytic dome instead of the cubemap when sky_analytic is set.
+    sky_analytic: bool = false,
+    sky_turbidity: f32 = 2.6,
     /// Render-owned copies of the shared default textures, captured at
     /// prepare. The draw path (scene/draw.zig Environment) binds these
     /// values — never the game-mutatable Scene.default_*_texture fields —
@@ -188,6 +193,12 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
     snap.sun_dir = scene.lights.sunDirection();
     snap.sun_color = scene.lights.sunColor();
     snap.sun_intensity = scene.lights.sunIntensity();
+    // Analytic physical sky (opt-in): an elevation/azimuth override moves
+    // the sun BEFORE cascades, so CSM follows the model sun. Disabled:
+    // this block runs nothing and every lane below keeps its legacy value.
+    if (scene.phys_sky.enabled) {
+        snap.sun_dir = postprocess.sky.modelSunDir(scene.phys_sky, snap.sun_dir);
+    }
     snap.cascades = scene.shadows.computeCascades(snap.primary_cam.camera, snap.primary_cam.aspect, snap.sun_dir);
 
     var lp = scene.light_pack;
@@ -219,6 +230,38 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
     snap.msaa_depth_prepass = scene.msaa_depth_prepass;
     snap.post_process = scene.post_process;
     snap.ssao = scene.ssao;
+    // Analytic triple (opt-in, post-copy so the fog tint lands on the
+    // snapshot copy, never on live scene state): model-driven sun
+    // color/intensity, hemispheric sky/ground ambient, and fog tint ride
+    // the EXISTING lanes (no layout change); per-output drive_* flags
+    // keep manual values where the artist wants them. Disabled:
+    // resolveFrame returns the manual values verbatim, so every
+    // assignment below is a no-op and the frame stays bit-identical.
+    {
+        const m = postprocess.sky.ManualFrame{
+            .sun_color = .{ snap.sun_color.r, snap.sun_color.g, snap.sun_color.b },
+            .sun_intensity = snap.sun_intensity,
+            .hemi_diffuse = .{ snap.shadow_uniforms.hemi_diffuse.r, snap.shadow_uniforms.hemi_diffuse.g, snap.shadow_uniforms.hemi_diffuse.b },
+            .hemi_ground = .{ snap.shadow_uniforms.ground_color.r, snap.shadow_uniforms.ground_color.g, snap.shadow_uniforms.ground_color.b },
+            .hemi_intensity = snap.shadow_uniforms.hemi_intensity,
+            .fog_color = .{ snap.post_process.fog_color[0], snap.post_process.fog_color[1], snap.post_process.fog_color[2] },
+        };
+        const r = postprocess.sky.resolveFrame(scene.phys_sky, snap.sun_dir, m);
+        snap.sun_color = Color3.new(r.sun_color[0], r.sun_color[1], r.sun_color[2]);
+        snap.sun_intensity = r.sun_intensity;
+        // Slot 0 mirrors the primary shadow-caster: keep it consistent
+        // with the model sun, but never conjure a sun that is absent
+        // (zero intensity = no primary directional, stays zeroed).
+        if (scene.phys_sky.enabled and scene.phys_sky.drive_sun and snap.light_pack.directional_color_int[0][3] != 0.0) {
+            snap.light_pack.directional_dir[0] = .{ snap.sun_dir.x, snap.sun_dir.y, snap.sun_dir.z, 0.0 };
+            snap.light_pack.directional_color_int[0] = .{ r.sun_color[0], r.sun_color[1], r.sun_color[2], r.sun_intensity };
+        }
+        snap.shadow_uniforms.hemi_diffuse = Color3.new(r.hemi_sky[0], r.hemi_sky[1], r.hemi_sky[2]);
+        snap.shadow_uniforms.ground_color = Color3.new(r.hemi_ground[0], r.hemi_ground[1], r.hemi_ground[2]);
+        snap.post_process.fog_color = r.fog_tint;
+        snap.sky_analytic = r.analytic;
+        snap.sky_turbidity = r.turbidity;
+    }
     snap.outline_enabled = scene.postfx.outline_enabled;
     snap.outline_color = scene.postfx.outline_color;
     snap.outline_width_px = scene.postfx.outline_width_px;

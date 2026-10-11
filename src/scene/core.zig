@@ -347,6 +347,11 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    // Opt-in analytic physical sky (postprocess/sky.zig): when enabled the
+    // frame snapshot derives a consistent sun/ambient/fog triple from sun
+    // elevation + turbidity. Default OFF: every manual value passes
+    // through bit-identically (session-local, never serialized).
+    phys_sky: postprocess.SkyOptions = .{},
 
     // Requested MSAA sample count for the offscreen main render target
     // (PASS 2). 1 = off (default). Effective count = scene/msaa.zig policy:

@@ -113,6 +113,20 @@ fn setupScene() void {
     }) catch @panic("q0: sun failed");
     scene.shadows.enabled = true;
 
+    // Analytic physical sky (opt-in, atmosphere consistency arc):
+    // AGATE_Q0_PHYS_SKY=1 derives a consistent sun color/intensity,
+    // hemispheric ambient and fog tint from elevation + turbidity instead
+    // of the hand-tuned manual values above (which stay the default).
+    // AGATE_Q0_SKY_TURBIDITY sets haze; AGATE_Q0_SUN_ELEV/AGATE_Q0_SUN_AZIM
+    // (degrees) optionally move the sun for time-of-day iteration.
+    if (envFlag("AGATE_Q0_PHYS_SKY")) {
+        scene.phys_sky.enabled = true;
+        scene.phys_sky.dome_enabled = true;
+        scene.phys_sky.turbidity = envF32("AGATE_Q0_SKY_TURBIDITY", 2.6);
+        if (std.c.getenv("AGATE_Q0_SUN_ELEV") != null) scene.phys_sky.sun_elevation_deg = envF32("AGATE_Q0_SUN_ELEV", 49.0);
+        if (std.c.getenv("AGATE_Q0_SUN_AZIM") != null) scene.phys_sky.sun_azimuth_deg = envF32("AGATE_Q0_SUN_AZIM", 0.0);
+    }
+
     // Spot PCSS calibration light: a small shadow-casting spot over the
     // content cluster. source_radius > 0 runs the spot PCSS path (blocker
     // search + variable penumbra); AGATE_Q0_NO_SPOT_PCSS=1 falls back to

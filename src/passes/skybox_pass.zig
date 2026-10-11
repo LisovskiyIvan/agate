@@ -117,6 +117,21 @@ pub const SkyboxPass = struct {
         self.renderMatrices(rot_view, proj, cube_tex, exposure);
     }
 
+    /// Analytic-dome variant of `render`: same varyings, but the fragment
+    /// shader evaluates the physical sky (skybox.glsl analytic path)
+    /// instead of sampling the cubemap. The cube binding still rides a
+    /// valid view (never sampled while sky_ctrl.x = 1).
+    pub fn renderAnalytic(self: *SkyboxPass, camera: Camera, aspect: f32, cube_tex: CubeTexture, exposure: f32, sun_dir: math.Vec3, turbidity: f32, sun_color: math.Color3, sun_intensity: f32) void {
+        const view = camera.getViewMatrix();
+        var rot_view = view;
+        rot_view.m[12] = 0.0;
+        rot_view.m[13] = 0.0;
+        rot_view.m[14] = 0.0;
+
+        const proj = camera.getProjectionMatrix(aspect);
+        self.renderMatricesAnalytic(rot_view, proj, cube_tex, exposure, sun_dir, turbidity, sun_color, sun_intensity);
+    }
+
     /// Matrix variant of `render`: draws the skybox from an explicit
     /// rotation-only view + projection (no camera needed). Used by the
     /// reflection-probe capture (wave 25), which renders the sky into each
@@ -144,6 +159,51 @@ pub const SkyboxPass = struct {
             .params = .{ exposure, 0.0, 0.0, 0.0 },
         };
         sg.applyUniforms(skybox_shd.UB_fs_params, sg.asRange(&fs_params));
+
+        // Analytic lane parked OFF: the shader takes the legacy texture
+        // branch bit-identically; every backend sees a bound block.
+        const sky_params = skybox_shd.SkyParams{
+            .sky_sun = .{ 0.0, 1.0, 0.0, 2.6 },
+            .sky_ctrl = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_sun_color = .{ 0.0, 0.0, 0.0, 0.0 },
+        };
+        sg.applyUniforms(skybox_shd.UB_sky_params, sg.asRange(&sky_params));
+
+        sg.draw(0, 36, 1);
+    }
+
+    /// Matrix variant of `renderAnalytic` for probe captures: the analytic
+    /// dome from an explicit rotation-only view + projection.
+    pub fn renderMatricesAnalytic(self: *SkyboxPass, rot_view: Mat4, proj: Mat4, cube_tex: CubeTexture, exposure: f32, sun_dir: math.Vec3, turbidity: f32, sun_color: math.Color3, sun_intensity: f32) void {
+        const view_proj = Mat4.mul(proj, rot_view);
+
+        if (!sg.isvalid() or sg.queryPipelineState(self.pipeline) != .VALID) return;
+        sg.applyPipeline(self.pipeline);
+
+        var bind = sg.Bindings{};
+        bind.vertex_buffers[0] = self.mesh_vb;
+        bind.index_buffer = self.mesh_ib;
+        bind.views[skybox_shd.VIEW_sky_tex] = cube_tex.view;
+        bind.samplers[skybox_shd.SMP_smp] = self.sampler;
+        sg.applyBindings(bind);
+
+        const vs_params = skybox_shd.VsParams{
+            .view_proj = view_proj,
+        };
+        sg.applyUniforms(skybox_shd.UB_vs_params, sg.asRange(&vs_params));
+
+        const fs_params = skybox_shd.FsParams{
+            .params = .{ exposure, 0.0, 0.0, 0.0 },
+        };
+        sg.applyUniforms(skybox_shd.UB_fs_params, sg.asRange(&fs_params));
+
+        const p = @import("../postprocess/sky.zig").analyticParams(sun_dir, turbidity, sun_color, sun_intensity, true);
+        const sky_params = skybox_shd.SkyParams{
+            .sky_sun = p.sky_sun,
+            .sky_ctrl = p.sky_ctrl,
+            .sky_sun_color = p.sky_sun_color,
+        };
+        sg.applyUniforms(skybox_shd.UB_sky_params, sg.asRange(&sky_params));
 
         sg.draw(0, 36, 1);
     }

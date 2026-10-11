@@ -228,6 +228,23 @@ pub const ssgiTargetSize = ssgi.ssgiTargetSize;
 pub const ssgiTargetBytes = ssgi.ssgiTargetBytes;
 pub const calcContactShadowAttenuation = contact_shadows.calcContactShadowAttenuation;
 
+// --- Analytic Physical Sky (opt-in, Preetham-class) ---
+pub const sky = @import("postprocess/sky.zig");
+pub const SkyOptions = sky.SkyOptions;
+pub const SkyFrame = sky.SkyFrame;
+pub const TURBIDITY_DEFAULT = sky.TURBIDITY_DEFAULT;
+pub const sanitizeTurbidity = sky.sanitizeTurbidity;
+pub const airMass = sky.airMass;
+pub const sunAttenuation = sky.sunAttenuation;
+pub const sunLight = sky.sunLight;
+pub const perezCoeffs = sky.perezCoeffs;
+pub const perez = sky.perez;
+pub const zenithState = sky.zenithState;
+pub const horizonState = sky.horizonState;
+pub const skyRadiance = sky.skyRadiance;
+pub const resolveSkyFrame = sky.resolveFrame;
+pub const analyticSkyParams = sky.analyticParams;
+
 // --- Atmospheric Height Fog ---
 pub const heightDensity = fog.heightDensity;
 pub const opticalDepth = fog.opticalDepth;
