@@ -107,7 +107,7 @@ fn setupScene() void {
 
     // Sun through the open front side: drives CSM + volumetric shafts.
     _ = scene.createDirectionalLight("sun", .{
-        .direction = z.Vec3.new(0.25, 0.55, 1.0),
+        .direction = z.Vec3.new(0.25, 1.2, 1.0),
         .diffuse = z.Color3.new(1.0, 0.92, 0.8),
         .intensity = 2.6,
     }) catch @panic("q0: sun failed");
@@ -264,7 +264,7 @@ fn setupScene() void {
     // Lighting isolation: shafts off leaves the actual sunlit opening
     // footprint intact; DoF off + a still camera make shadow A/Bs readable.
     scene.post_process.shaft_enabled = !envFlag("AGATE_Q0_NO_SHAFTS");
-    scene.post_process.shaft_intensity = 0.5;
+    scene.post_process.shaft_intensity = 0.35;
     scene.post_process.shaft_steps = 32;
     scene.post_process.local_tonemapping_enabled = true;
     // SSGI v1 color bleed: the calibration scene carries it by default —
