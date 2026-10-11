@@ -47,6 +47,7 @@ const runtime_mod = @import("runtime.zig");
 const Runtime = runtime_mod.Runtime;
 const FrameResult = runtime_mod.FrameResult;
 const gpu_thread = @import("gpu_thread.zig");
+const ztracy = @import("ztracy");
 
 /// Explicit window and graphics backend configuration. The top level
 /// keeps the common window knobs; backend floors, pool sizes, and logging
@@ -306,14 +307,19 @@ pub const App = struct {
             self.time_seconds += self.delta_time;
         }
 
-        if (self.callbacks.frame) |cb| {
-            cb(self);
-        } else {
-            // Default frame behaviour: advance staged frame if runtime/scene are available.
-            _ = self.renderStagedFrame();
+        {
+            const frame_zone = ztracy.ZoneN(@src(), "frame");
+            defer frame_zone.End();
+            if (self.callbacks.frame) |cb| {
+                cb(self);
+            } else {
+                // Default frame behaviour: advance staged frame if runtime/scene are available.
+                _ = self.renderStagedFrame();
+            }
         }
 
         self.frame_count += 1;
+        ztracy.FrameMark();
     }
 
     /// Lifecycle hook: event handling.

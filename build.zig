@@ -257,6 +257,10 @@ fn excludedFromTestRegistry(path: []const u8) bool {
     if (std.mem.eql(u8, path, "tests.zig")) return true;
     // Separate build module, emitted as the literal `@import("math")`.
     if (std.mem.eql(u8, path, "math.zig")) return true;
+    // Tracy stub: root of the "ztracy" build module wired by build.zig
+    // (real client when `-Dtracy=true`, no-op stub otherwise). Importing it
+    // here by path would put one file in two modules (0.16 error).
+    if (std.mem.eql(u8, path, "profiler/ztracy_stub.zig")) return true;
     // Aggregated by math.zig's own test block under the "math" module.
     if (std.mem.startsWith(u8, path, "math/")) return true;
     // Host CLI for the build-time shader merge; compiled by build.zig as
@@ -284,12 +288,19 @@ pub fn build(b: *Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     const is_web = target.result.cpu.arch.isWasm();
+    // Opt-in Tracy profiler zones (native only; see docs/profiling.md).
+    // Forwarded as a dependency option, so downstream builds (examples,
+    // sandbox) enable it with the same `-Dtracy=true` flag.
+    const opt_tracy = b.option(bool, "tracy", "Enable Tracy profiler zones") orelse false;
     // No `-Dwgpu` option: WebGPU is forced on web (`.wgpu = is_web`),
     // native targets use the sokol auto backend (macOS Metal, Windows
     // D3D11, Linux GL). A stray `-Dwgpu=...` is an unknown-option error,
     // never a silent reroute; native WebGPU is unsupported.
     const opt_wgpu = is_web;
     if (is_web and !opt_wgpu) return error.WebGPURequired;
+    // Tracy has no wasm support (client needs sockets/threads); enabling it
+    // for a wasm target is a build error, never a silent force-off.
+    if (is_web and opt_tracy) return error.TracyUnsupportedOnWasm;
 
     const dep_sokol = b.dependency("sokol", .{
         .target = target,
@@ -445,6 +456,27 @@ pub fn build(b: *Build) !void {
         if (opt_wgpu) {
             mod_agate.addSystemIncludePath(dep_emsdk.path("upstream/emscripten/cache/ports/emdawnwebgpu/emdawnwebgpu_pkg/webgpu/include"));
         }
+    }
+    // Tracy wiring (see docs/profiling.md). Flag ON: the real ztracy module
+    // is imported as "ztracy" and its static client library links into every
+    // artifact whose module graph includes agate (transitively, like sokol).
+    // Flag OFF (default): a no-op stub module keeps the same import name, so
+    // engine code calls one surface unconditionally and no fetch happens.
+    const mod_ztracy_stub = b.createModule(.{
+        .root_source_file = b.path("src/profiler/ztracy_stub.zig"),
+    });
+    if (opt_tracy) {
+        if (b.lazyDependency("ztracy", .{ .enable_ztracy = true, .on_demand = true })) |dep_ztracy| {
+            mod_agate.addImport("ztracy", dep_ztracy.module("root"));
+            mod_agate.linkLibrary(dep_ztracy.artifact("tracy"));
+        } else {
+            // First configure pass while the lazy dep fetches; the runner
+            // re-runs configure, where the branch above wins. The make phase
+            // never runs for this pass, so the stub is a graph placeholder.
+            mod_agate.addImport("ztracy", mod_ztracy_stub);
+        }
+    } else {
+        mod_agate.addImport("ztracy", mod_ztracy_stub);
     }
     mod_agate.addIncludePath(b.path("src/c"));
     mod_agate.addIncludePath(b.path("src/c/box3d/include"));

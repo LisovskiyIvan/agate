@@ -46,6 +46,7 @@ const sumSpawned = mesh_cpu.sumSpawned;
 const buildCpuGeometry = mesh_cpu.buildCpuGeometry;
 const asyncKindForPath = async_mesh.asyncKindForPath;
 const asyncMeshRun = facade.asyncMeshRun;
+const ztracy = @import("ztracy");
 
 pub const TaskSuccessFn = *const fn (manager: *AssetManager, task: *AssetTask) void;
 pub const TaskErrorFn = *const fn (manager: *AssetManager, task: *AssetTask, err: anyerror) void;
@@ -410,6 +411,8 @@ pub const AssetManager = struct {
     }
 
     fn executeTask(self: *AssetManager, task: *AssetTask) anyerror!void {
+        const load_zone = ztracy.ZoneN(@src(), "asset.load");
+        defer load_zone.End();
         switch (task.task_type) {
             .text => {
                 if (task.use_cache and self.cache.hasText(task.path)) {

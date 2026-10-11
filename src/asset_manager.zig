@@ -101,6 +101,7 @@ const async_mesh = @import("asset_manager/async_mesh.zig");
 const AsyncMeshJob = async_mesh.AsyncMeshJob;
 const readFileBytesAlloc = mesh_cpu.readFileBytesAlloc;
 const parseMeshBytesToGeometry = async_mesh.parseMeshBytesToGeometry;
+const ztracy = @import("ztracy");
 
 pub const AssetManager = core.AssetManager;
 pub const AssetTask = task.AssetTask;
@@ -116,6 +117,8 @@ pub var async_test_hold: std.atomic.Value(bool) = std.atomic.Value(bool).init(fa
 /// `jobs.TaskRunner` entry: file read + parse + CPU geometry build. No
 /// `sg.*`, no Scene mutation, no callbacks, no task-state writes.
 pub fn asyncMeshRun(ctx: *anyopaque) void {
+    const load_zone = ztracy.ZoneN(@src(), "asset.load");
+    defer load_zone.End();
     const job: *AsyncMeshJob = @ptrCast(@alignCast(ctx));
     job.worker_id = std.Thread.getCurrentId();
     job.started.store(true, .release);

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ztracy = @import("ztracy");
 
 const windows = std.os.windows;
 
@@ -222,15 +223,19 @@ pub const Pool = struct {
             .cursor = std.atomic.Value(usize).init(0),
             .pending = std.atomic.Value(usize).init(self.workers.len + 1),
         };
-        // Publish before waking: the mailbox stores happen-before this
-        // thread's wakeWorkers handshake, and workers only read the mailbox
-        // after passing the same mutex, so their acquire loads always
-        // observe a fully initialized job.
-        for (self.mailbox) |*m| m.store(&job, .release);
-        self.wakeWorkers();
-        forage(&job);
-        _ = job.pending.fetchSub(1, .acq_rel);
-        while (job.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        {
+            const dispatch_zone = ztracy.ZoneN(@src(), "jobs.dispatch");
+            defer dispatch_zone.End();
+            // Publish before waking: the mailbox stores happen-before this
+            // thread's wakeWorkers handshake, and workers only read the mailbox
+            // after passing the same mutex, so their acquire loads always
+            // observe a fully initialized job.
+            for (self.mailbox) |*m| m.store(&job, .release);
+            self.wakeWorkers();
+            forage(&job);
+            _ = job.pending.fetchSub(1, .acq_rel);
+            while (job.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        }
     }
 
     /// Mutex handshake with every parked worker: taking and releasing the
@@ -243,6 +248,8 @@ pub const Pool = struct {
     }
 
     fn forage(job: *Job) void {
+        const job_zone = ztracy.ZoneN(@src(), "job");
+        defer job_zone.End();
         while (true) {
             const c = job.cursor.fetchAdd(job.chunk, .acq_rel);
             if (c >= job.len) return;
