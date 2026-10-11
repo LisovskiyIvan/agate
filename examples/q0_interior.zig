@@ -123,9 +123,10 @@ fn setupScene() void {
     }) catch @panic("q0: spot failed");
 
     // Point PCSS calibration light: a small shadow-casting point near the
-    // content cluster. source_radius > 0 runs the point PCSS path (blocker
-    // search + variable penumbra, taps clamped to the fragment's own
-    // cube-face tile); AGATE_Q0_NO_POINT_PCSS=1 falls back to the legacy
+    // content cluster. source_radius > 0 runs the border-correct point PCSS
+    // path (world-space disk taps, per-tap face projection + cross-face
+    // normalization, then blocker search + variable penumbra);
+    // AGATE_Q0_NO_POINT_PCSS=1 falls back to the legacy
     // fixed PCF bit-identically (0.0 disables).
     const point_pcss_off = envFlag("AGATE_Q0_NO_POINT_PCSS");
     _ = scene.createPointLight("q0_key_point", .{

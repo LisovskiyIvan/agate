@@ -64,28 +64,6 @@ float pcssSpotBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_
     return blocker_sum / float(blocker_count);
 }
 
-// Point-light PCSS blocker search: same math as pcssSpotBlockerAverage
-// above, but bounded by the point tap budget (POINT_PCSS_BLOCKER_SAMPLES)
-// and clamped to the fragment's own cube-face tile — v1 does NOT traverse
-// into neighboring faces (see the face-clamping note in
-// calculatePointShadowSlot). Kept as a separate function so the sun and
-// spot paths stay byte-identical. Returns the average blocker depth, or
-// -1.0 when nothing blocks (caller early-outs to fully lit).
-float pcssPointBlockerAverage(texture2D depth_tex, sampler depth_smp, vec2 atlas_uv, float receiver_depth, mat2 rot, float search_radius, vec2 tile_min, vec2 tile_max) {
-    float blocker_sum = 0.0;
-    int blocker_count = 0;
-    for (int i = 0; i < POINT_PCSS_BLOCKER_SAMPLES; i++) {
-        vec2 tap_uv = clamp(atlas_uv + rot * POISSON_DISK[i] * search_radius, tile_min, tile_max);
-        float tap_depth = texture(sampler2D(depth_tex, depth_smp), tap_uv).r;
-        if (tap_depth < receiver_depth) {
-            blocker_sum += tap_depth;
-            blocker_count += 1;
-        }
-    }
-    if (blocker_count == 0) return -1.0;
-    return blocker_sum / float(blocker_count);
-}
-
 float sampleCascade(int cascade_idx, vec3 world_pos, vec3 N, vec3 L) {
     float cos_theta = max(dot(N, L), 0.0);
     float depth_bias = max(shadow_params.x * (1.0 - cos_theta), shadow_params.x * 0.2);
@@ -245,6 +223,60 @@ int pointFaceIndex(vec3 d) {
     return d.z >= 0.0 ? 4 : 5;
 }
 
+// Point-light PCSS v2 (border-correct) helpers. Taps are world-space disk
+// offsets around the receiver; each tap selects its own cube face by
+// dominant axis and projects through that face's matrix (all 12 face
+// matrices are already fragment-shader uniforms, so no new uniforms were
+// added — derived route, see calculatePointShadowSlot). Comparisons happen
+// in the TAP's face depth space (the receiver is re-projected through the
+// same face matrix), which is the cross-face depth normalization: view-space
+// z differs per face orientation, so raw atlas depths from different faces
+// are never compared directly.
+
+// Projects a world point through one point-shadow face matrix, using the
+// same SOKOL_GLSL y-flip convention as the receiver path. The caller
+// checks .w > 0 before dividing.
+vec4 pointPcssFaceProject(int proj_idx, vec3 world_pos) {
+    vec4 lp = point_view_proj[proj_idx] * vec4(world_pos, 1.0);
+    #if !SOKOL_GLSL
+        lp.y = -lp.y;
+    #endif
+    return lp;
+}
+
+// Per-tap face selection + projection: picks the cube face from the tap
+// direction, projects the tap through that face's matrix, and reports the
+// atlas UV. Returns false (skip: the tap contributes nothing, it is never
+// clamped into a neighboring texel) when the tap lands behind the tap-face
+// camera, outside the shadow near/far range, or off the tap tile.
+bool pointPcssTapAtlas(int slot, vec3 light_pos, vec3 tap_world, out int tap_face, out vec2 tap_atlas_uv) {
+    tap_face = pointFaceIndex(tap_world - light_pos);
+    vec4 lp = pointPcssFaceProject(slot * 6 + tap_face, tap_world);
+    if (lp.w <= 0.0) return false;
+    vec3 tp = lp.xyz / lp.w;
+    if (tp.z > 1.0 || tp.z < 0.0) return false;
+    vec2 tl = (tp.xy + 1.0) * 0.5;
+    if (tl.x < 0.0 || tl.x > 1.0 || tl.y < 0.0 || tl.y > 1.0) return false;
+    tap_atlas_uv = vec2((float(tap_face) + tl.x) / 6.0, float(slot) * 0.5 + tl.y * 0.5);
+    return true;
+}
+
+// Receiver depth as seen by the tap's face (bias included), with validity.
+// Comparing the stored tap depth against this value keeps both sides in one
+// face space no matter which face the tap landed on. Returns false when the
+// receiver itself falls outside the tap face frustum (comparison would be
+// meaningless) — the tap is skipped.
+bool pointPcssReceiverDepth(int slot, int tap_face, vec3 recv_world, float depth_bias, out float recv_depth) {
+    vec4 lp = pointPcssFaceProject(slot * 6 + tap_face, recv_world);
+    if (lp.w <= 0.0) return false;
+    vec3 rp = lp.xyz / lp.w;
+    if (rp.z > 1.0 || rp.z < 0.0) return false;
+    vec2 rl = (rp.xy + 1.0) * 0.5;
+    if (rl.x < 0.0 || rl.x > 1.0 || rl.y < 0.0 || rl.y > 1.0) return false;
+    recv_depth = rp.z - depth_bias;
+    return true;
+}
+
 // Point-light shadows: each shadow-casting point light owns 6 cube-face
 // tiles (one atlas row, 256px tiles in the 1536x512 point atlas). The face
 // is picked from the world-space direction to the light, then the fragment
@@ -279,43 +311,80 @@ float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N,
     vec2 atlas_uv = vec2((float(face) + clamped_uv.x) / 6.0, float(slot) * 0.5 + clamped_uv.y * 0.5);
     float depth = proj.z - depth_bias;
 
-    // Point PCSS (source_radius > POINT_PCSS_EPSILON): blocker search over
-    // the fragment's own cube-face tile -> average blocker depth ->
-    // variable penumbra via the same formula as the sun/spot paths
-    // (pcssPenumbraRadius mirrors penumbraRadius in
-    // scene/shadow_pcss.zig) -> variable-radius PCF.
+    // Point PCSS v2 (source_radius > POINT_PCSS_EPSILON, border-correct):
+    // world-space disk taps around the receiver, per-tap face selection +
+    // projection through that face's matrix, per-tap comparison in the tap
+    // face's depth space (the cross-face normalization), blocker gaps
+    // averaged as dimensionless (receiver - blocker) / receiver ratios and
+    // anchored back at the receiver's own-face depth (identical to the v1
+    // mean when every tap lands in one face — see pointEffectiveBlocker in
+    // scene/shadow_pcss.zig), then the shared variable-penumbra formula and
+    // a world-space PCF disk. No new uniforms: the 12 face matrices and the
+    // light position were already available; tile UVs derive arithmetically
+    // from the known atlas layout.
     // Tap budgets (compile-time bounded): POINT_PCSS_BLOCKER_SAMPLES
-    // blocker taps + POINT_PCSS_PCF_TAPS filter taps. source_radius at or
-    // below the epsilon falls through to the legacy fixed 4-tap PCF
-    // bit-identically.
+    // blocker taps + POINT_PCSS_PCF_TAPS filter taps, each doing 2 extra
+    // mat4 x vec4 projections (tap + receiver-through-tap-face) and one
+    // texture fetch. source_radius at or below the epsilon falls through
+    // to the legacy fixed 4-tap PCF bit-identically.
     //
-    // v1 face clamping (documented heuristic, NOT silent breakage): every
-    // tap clamps to the fragment's own face tile. Blocker/PCF taps whose
-    // disk reaches across a cube-face boundary sample the clamped edge
-    // texel instead of the neighboring face, so occluders sitting just
-    // across the boundary are missed and the penumbra near the 12 cube
-    // edges smears along the edge. Visible only when a shadow-casting edge
-    // falls within ~filter radius of a face-boundary direction from the
-    // light — narrow bands along projected cube edges, worst with large
-    // source_radius. A full fix needs world-space disk offsets around the
-    // receiver, per-tap face selection + projection through that face's
-    // matrix, and cross-face depth normalization (view-space z differs per
-    // face orientation, so raw depths are not directly comparable).
+    // World-radius derivation (mirrors pointWorldRadiusFromUv): one tile
+    // spans 1/6 of the atlas width and covers 2 x receiver_dist world units
+    // at the receiver (90-degree cube faces), so one atlas-UV unit is
+    // 12 x receiver_dist world units. The v1 calibration is preserved by
+    // matching the tile-x texel footprint.
+    //
+    // Border correctness is NOT proven by screenshots — the q0/hdr gates
+    // below only prove no-crash/no-validation-error. The correctness
+    // evidence is the CPU mirror suite in scene/shadow_pcss_tests.zig
+    // (face selection incl. ties, all-faces UV round-trip, skip predicate,
+    // single-face mean reconstruction, cross-face edge equality).
     float source_radius = point_shadow_params[slot].w;
     if (source_radius > POINT_PCSS_EPSILON) {
-        vec2 tile_min = vec2((float(face) + 0.002) / 6.0, float(slot) * 0.5 + 0.001);
-        vec2 tile_max = vec2((float(face) + 0.998) / 6.0, float(slot) * 0.5 + 0.499);
+        vec3 recv_world = world_pos + normal_offset;
+        vec3 to_recv = recv_world - light_pos;
+        float recv_dist = max(length(to_recv), 1e-4);
+        vec3 fwd = to_recv / recv_dist;
+        vec3 up_ref = abs(fwd.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+        vec3 disk_t = normalize(cross(up_ref, fwd));
+        vec3 disk_b = cross(fwd, disk_t);
         mat2 rot = pcssDitherRotation(gl_FragCoord.xy);
-        float blocker_avg = pcssPointBlockerAverage(point_shadow_depth_tex, depth_smp, atlas_uv, depth, rot, POINT_PCSS_BLOCKER_RADIUS, tile_min, tile_max);
-        if (blocker_avg < 0.0) return 0.0;
-        float filter_radius = pcssPenumbraRadius(depth, blocker_avg, source_radius, POINT_PCSS_MIN_PENUMBRA, POINT_PCSS_MAX_PENUMBRA);
-        float pcss_lit = 0.0;
-        for (int i = 0; i < POINT_PCSS_PCF_TAPS; i++) {
-            vec2 offset = rot * POISSON_DISK[i] * filter_radius;
-            vec2 sample_uv = clamp(atlas_uv + offset, tile_min, tile_max);
-            pcss_lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(sample_uv, depth));
+        float world_search = POINT_PCSS_BLOCKER_RADIUS * 12.0 * recv_dist;
+        float gap_sum = 0.0;
+        int gap_count = 0;
+        for (int i = 0; i < POINT_PCSS_BLOCKER_SAMPLES; i++) {
+            vec2 disk_uv = rot * POISSON_DISK[i];
+            vec3 tap_world = recv_world + (disk_t * disk_uv.x + disk_b * disk_uv.y) * world_search;
+            int tap_face;
+            vec2 tap_atlas_uv;
+            if (!pointPcssTapAtlas(slot, light_pos, tap_world, tap_face, tap_atlas_uv)) continue;
+            float tap_depth = texture(sampler2D(point_shadow_depth_tex, depth_smp), tap_atlas_uv).r;
+            float tap_recv_depth;
+            if (!pointPcssReceiverDepth(slot, tap_face, recv_world, depth_bias, tap_recv_depth)) continue;
+            if (tap_depth < tap_recv_depth) {
+                gap_sum += (tap_recv_depth - tap_depth) / max(tap_recv_depth, 1e-4);
+                gap_count += 1;
+            }
         }
-        pcss_lit /= float(POINT_PCSS_PCF_TAPS);
+        if (gap_count == 0) return 0.0;
+        float blocker_eff = depth * (1.0 - gap_sum / float(gap_count));
+        float filter_radius = pcssPenumbraRadius(depth, blocker_eff, source_radius, POINT_PCSS_MIN_PENUMBRA, POINT_PCSS_MAX_PENUMBRA);
+        float world_filter = filter_radius * 12.0 * recv_dist;
+        float pcss_lit = 0.0;
+        int pcss_valid = 0;
+        for (int i = 0; i < POINT_PCSS_PCF_TAPS; i++) {
+            vec2 disk_uv = rot * POISSON_DISK[i];
+            vec3 tap_world = recv_world + (disk_t * disk_uv.x + disk_b * disk_uv.y) * world_filter;
+            int tap_face;
+            vec2 tap_atlas_uv;
+            if (!pointPcssTapAtlas(slot, light_pos, tap_world, tap_face, tap_atlas_uv)) continue;
+            float tap_recv_depth;
+            if (!pointPcssReceiverDepth(slot, tap_face, recv_world, depth_bias, tap_recv_depth)) continue;
+            pcss_lit += texture(sampler2DShadow(point_shadow_tex, shadow_smp), vec3(tap_atlas_uv, tap_recv_depth));
+            pcss_valid += 1;
+        }
+        if (pcss_valid == 0) return 0.0;
+        pcss_lit /= float(pcss_valid);
         return (1.0 - pcss_lit) * shadow_params.y;
     }
 

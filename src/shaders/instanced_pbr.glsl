@@ -303,8 +303,8 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // shared depth_smp; the penumbra reuses pcssPenumbraRadius (same formula as
 // the sun/spot paths, see scene/shadow_pcss.zig). Tap budgets mirror
 // scene/shadow_pcss.zig (point_blocker_sample_count, point_pcf_tap_count).
-// v1 clamps every tap to the fragment's own face tile (no neighbor-face
-// traversal — see the face-clamping note in shadow_pcf.glsl).
+// v2 is border-correct (world-space disk taps, per-tap face projection —
+// see the v2 note in shadow_pcf.glsl).
 #define POINT_PCSS_BLOCKER_SAMPLES 8
 #define POINT_PCSS_PCF_TAPS 8
 #define POINT_PCSS_EPSILON 0.0001
