@@ -138,6 +138,9 @@ pub const AssetManager = struct {
                 self.allocator.free(task.binary_result.?);
             }
             if (task.owned_texture and task.texture_result != null) {
+                // Owned-texture teardown routes through the guarded
+                // Texture.deinit (context-thread debug tripwire when live
+                // handles are destroyed); no separate assert here.
                 task.texture_result.?.deinit();
             }
             if (task.owned_mesh and task.mesh_result != null) {

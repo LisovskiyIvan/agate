@@ -186,3 +186,12 @@ test "LIVE audit: FAILED instance creation destroys, retains pending and old VAL
     if (!sg.isvalid()) return error.SkipZigTest;
     try liveAuditFailedInstanceRejection(std.testing.allocator);
 }
+
+test "debug tripwire: CPU-only ParticleSystem deinit stays legal headless" {
+    // Zero GPU handles, no sg context: the context-thread debug assert in
+    // deinit must not fire — headless CPU cleanup stays legal. (Firing
+    // needs a marked foreign thread or a live context, neither of which
+    // exists here; live misuse still trips in Debug, unchanged Release.)
+    var ps = try makeTestSystem(std.testing.allocator, 4);
+    ps.deinit();
+}

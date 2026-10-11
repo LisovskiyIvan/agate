@@ -22,6 +22,7 @@ const dds = @import("../dds.zig");
 const exr = @import("../exr.zig");
 const color = @import("color.zig");
 const mip = @import("mip.zig");
+const gpu_thread = @import("../gpu_thread.zig");
 const sampler_mod = @import("core_sampler.zig");
 const raw_mod = @import("core_raw.zig");
 const block_mod = @import("core_block.zig");
@@ -594,6 +595,13 @@ pub const Texture = struct {
 
     pub fn deinit(self: *Texture) void {
         if (!self.owns_handles) return;
+        // Context-thread only when a destroy will fire (debug tripwire;
+        // release unchanged): handle-less cleanup stays legal off-context.
+        // Legal destroys additionally require prepared frames to have
+        // stopped borrowing these handles (same rule as Scene.deinit).
+        if (self.image.id != 0 or self.view.id != 0 or self.sampler.id != 0) {
+            gpu_thread.assertOnContextThreadDebug();
+        }
         sg.destroyView(self.view);
         sg.destroyImage(self.image);
         sg.destroySampler(self.sampler);

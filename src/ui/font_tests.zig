@@ -53,3 +53,13 @@ test "setFontTtf switches text drawing and measurement, clear restores legacy" {
     try t.expectApproxEqAbs(@as(f32, 1.0), canvas.vertices.items[0].mode_params[0], 1e-6);
     try t.expectApproxEqAbs(@as(f32, 10.0), canvas.vertices.items[4].position[0], 1e-6);
 }
+
+test "UICanvas CPU-only deinit stays legal headless (no context tripwire)" {
+    // A canvas that never acquired GPU handles owns nothing to destroy:
+    // headless teardown must not trip the context-thread debug assert.
+    // Guards CPU cleanup (initCpuOnly flows) against tripwire overreach.
+    const t = std.testing;
+    const Tex = @import("../texture.zig").Texture;
+    var canvas: UICanvas = .{ .allocator = t.allocator, .font_texture = std.mem.zeroes(Tex) };
+    canvas.deinit();
+}

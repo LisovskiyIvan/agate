@@ -50,6 +50,18 @@ pub fn assertOnContextThread() void {
     if (!isOnContextThread()) @panic("gpu_thread: sg-context owner thread required");
 }
 
+/// Debug-only context-thread tripwire for teardown paths
+/// (`Texture.deinit`, `UICanvas.deinit`, `ParticleSystem.deinit`,
+/// `AssetManager.reset` texture teardown): panics off-context in Debug
+/// builds only. Release behavior is unchanged (no check, same as before).
+/// Use this (not `assertOnContextThread`) where the documented contract is
+/// context-thread-only destruction but headless CPU cleanup must stay
+/// legal in shipped builds.
+pub fn assertOnContextThreadDebug() void {
+    if (@import("builtin").mode != .Debug) return;
+    assertOnContextThread();
+}
+
 /// VALID-only adoption predicate (Sokol audit fix, single source of truth):
 /// a just-created handle is adoptable iff its id is nonzero AND its resource
 /// state is VALID. Pool exhaustion is id 0; a nonzero FAILED id (creation

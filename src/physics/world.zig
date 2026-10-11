@@ -127,6 +127,28 @@ pub const PhysicsWorld = struct {
     sensor_events: std.ArrayListUnmanaged(SensorEvent) = .empty,
     contact_events: std.ArrayListUnmanaged(ContactEvent) = .empty,
     contact_hit_events: std.ArrayListUnmanaged(ContactHitEvent) = .empty,
+    /// Reentrancy guard: true while `step` iterates bodies and substeps.
+    /// Structural calls (`removeBody`/`destroyJoint`) made inside the
+    /// window do NOT mutate the iterated lists: they queue into
+    /// `pending_removals`/`pending_joints` (deduped) and are applied at the
+    /// end of the step, in order. Test seam: tests may hold it open to
+    /// simulate the destroy-during-step window. Never set it manually in
+    /// production code.
+    stepping: bool = false,
+    /// Bodies queued for removal by `removeBody` during `step` (drained at
+    /// end of step). Entries alias `bodies` members; `deinit` clears the
+    /// queue without freeing (members free through `bodies`).
+    pending_removals: std.ArrayListUnmanaged(*RigidBody) = .empty,
+    /// Joints queued for destruction by `destroyJoint` during `step`
+    /// (drained at end of step, validity-checked). `deinit` clears without
+    /// destroying (live joints destroy through `joints`).
+    pending_joints: std.ArrayListUnmanaged(JointId) = .empty,
+    /// Diagnostic count of structural calls deferred out of `step` (all
+    /// builds, monotonic). Nonzero means a caller mutated structure from
+    /// inside the step window: legal (deferred, applied at step end) but
+    /// worth knowing — Mesh teardown must still be deferred by the caller
+    /// itself (see `removeBody`), only the body/joint unlink defers here.
+    reentrant_defers: usize = 0,
 
     world_id: c.b3WorldId,
     ground_body: ?c.b3BodyId = null,
@@ -168,6 +190,8 @@ pub const PhysicsWorld = struct {
         }
         self.bodies.deinit(self.allocator);
         self.shape_index.deinit(self.allocator);
+        self.pending_removals.deinit(self.allocator);
+        self.pending_joints.deinit(self.allocator);
         self.sensor_events.deinit(self.allocator);
         self.contact_events.deinit(self.allocator);
         self.contact_hit_events.deinit(self.allocator);
@@ -717,7 +741,33 @@ pub const PhysicsWorld = struct {
         return physics_events.clearEvents(self);
     }
 
+    /// Removes a body immediately, or defers to end-of-step when called
+    /// inside the `step` window (`stepping`): mutating `bodies` while `step`
+    /// iterates it (push/pull loops) would skip bodies or alias freed
+    /// storage, so the removal queues into `pending_removals` (deduped,
+    /// counted in `reentrant_defers`) and applies after the pull loop, in
+    /// order. Deferred removal only covers the body unlink + native destroy:
+    /// callers tearing down a Mesh around the body (e.g. `destroyMesh` from
+    /// a collision callback) must THEMSELVES defer the whole destroy until
+    /// after `step` returns — a body unlinked at step end still points at
+    /// its mesh for the rest of the step. The supported pattern is polling
+    /// `contact_events`/`sensor_events` after `step` and acting then.
+    /// OOM while queueing falls back to immediate removal (today's
+    /// behavior, never a lost removal).
     pub fn removeBody(self: *PhysicsWorld, body: *RigidBody) void {
+        if (self.stepping) {
+            for (self.pending_removals.items) |p| if (p == body) return;
+            self.pending_removals.append(self.allocator, body) catch {
+                self.removeBodyImmediate(body);
+                return;
+            };
+            self.reentrant_defers += 1;
+            return;
+        }
+        self.removeBodyImmediate(body);
+    }
+
+    fn removeBodyImmediate(self: *PhysicsWorld, body: *RigidBody) void {
         for (self.bodies.items, 0..) |b, idx| {
             if (b == body) {
                 self.unindexBodyShapes(b);
@@ -740,11 +790,38 @@ pub const PhysicsWorld = struct {
         return null;
     }
 
+    /// Applies every structural change deferred during `step`, in order
+    /// (bodies first, then joints — a queued joint on a queued body dies
+    /// with the body and drains as a validity-checked no-op). Runs with
+    /// `stepping == false`, so each entry takes the immediate path.
+    /// Queue entries that no longer resolve (already removed directly, or a
+    /// dangling body pointer) are safe no-ops: removal matches by pointer
+    /// without dereferencing, joints re-check validity.
+    fn drainPendingStructural(self: *PhysicsWorld) void {
+        if (self.pending_removals.items.len == 0 and self.pending_joints.items.len == 0) return;
+        const removals = self.pending_removals.toOwnedSlice(self.allocator) catch &.{};
+        defer if (removals.len > 0) self.allocator.free(removals);
+        const joints = self.pending_joints.toOwnedSlice(self.allocator) catch &.{};
+        defer if (joints.len > 0) self.allocator.free(joints);
+        for (removals) |b| self.removeBodyImmediate(b);
+        for (joints) |j| if (self.isJointValid(j)) physics_joints.destroyJoint(self, j);
+    }
+
     pub fn step(self: *PhysicsWorld, dt: f32) void {
         self.clearEvents();
+        // Leftover deferred work (a step that never reached its drain, or a
+        // test-held window): apply now that no iteration is in progress.
+        if (!self.stepping) self.drainPendingStructural();
         if (dt <= 0.0001) return;
         self.syncWorldParams();
         if (self.bodies.items.len == 0) return;
+
+        // Iteration window: structural calls defer (see `removeBody`).
+        self.stepping = true;
+        defer {
+            self.stepping = false;
+            self.drainPendingStructural();
+        }
 
         for (self.bodies.items) |b| {
             self.pushBody(b);
@@ -1391,7 +1468,23 @@ pub const PhysicsWorld = struct {
         return physics_joints.isJointValid(joint_id);
     }
 
+    /// Destroys a joint immediately, or defers to end-of-step when called
+    /// inside the `step` window (same contract as `removeBody`: `joints`
+    /// is swept by `pruneDeadJoints` during removals, so mutating it
+    /// mid-step races the sweep). Queued destroys drain validity-checked
+    /// at step end; OOM while queueing falls back to immediate destroy.
     pub fn destroyJoint(self: *PhysicsWorld, joint_id: JointId) void {
+        if (self.stepping) {
+            for (self.pending_joints.items) |j| {
+                if (j.index1 == joint_id.index1 and j.generation == joint_id.generation) return;
+            }
+            self.pending_joints.append(self.allocator, joint_id) catch {
+                physics_joints.destroyJoint(self, joint_id);
+                return;
+            };
+            self.reentrant_defers += 1;
+            return;
+        }
         return physics_joints.destroyJoint(self, joint_id);
     }
 

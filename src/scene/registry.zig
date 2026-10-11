@@ -91,6 +91,11 @@ pub fn removeMesh(self: anytype, mesh: *Mesh) bool {
 }
 
 pub fn destroyMesh(self: anytype, mesh: *Mesh) void {
+    // NOT safe inside `PhysicsWorld.step`: the body unlink below defers to
+    // end-of-step, but the mesh storage is freed synchronously here — a
+    // body still pointing at it for the rest of the step would read freed
+    // memory in push/pull. Poll physics events after `step` and destroy
+    // then; never from a callback running inside the step window.
     _ = self.removeMesh(mesh);
     for (self.outline_meshes.items, 0..) |m, i| {
         if (m == mesh) {

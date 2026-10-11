@@ -29,6 +29,7 @@ const Mat4 = math.Mat4;
 const Color4 = math.Color4;
 
 const Texture = @import("../texture.zig").Texture;
+const gpu_thread = @import("../gpu_thread.zig");
 const ui_shd = @import("ui_shader");
 
 const ui_types = @import("types.zig");
@@ -216,6 +217,13 @@ pub const UICanvas = struct {
     }
 
     pub fn deinit(self: *UICanvas) void {
+        // Context-thread only when a destroy will fire (debug tripwire;
+        // release unchanged): CPU-only teardown (zero handles) stays legal
+        // off-context. Owned font textures trip inside their own deinit
+        // when they hold live handles.
+        if (self.vertex_buffer.id != 0 or self.index_buffer.id != 0 or self.pipeline.id != 0) {
+            gpu_thread.assertOnContextThreadDebug();
+        }
         self.vertices.deinit(self.allocator);
         self.indices.deinit(self.allocator);
         if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);

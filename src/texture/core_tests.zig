@@ -545,3 +545,12 @@ test "boxDownsampleU8 handles NPOT cube-face steps without OOB" {
     // (10+20+10+20+2)>>2 = 15.
     try std.testing.expectEqual(@as(u8, 15), edge_dst[0]);
 }
+
+test "deinit of a borrowed texture is a headless no-op (no context tripwire)" {
+    // Borrowed handle views never destroy their owner: deinit returns
+    // before the context-thread tripwire. Guards the early-return order —
+    // moving the tripwire above it would break headless CPU cleanup.
+    var tex = std.mem.zeroes(Texture);
+    tex.owns_handles = false;
+    tex.deinit();
+}

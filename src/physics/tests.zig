@@ -1657,3 +1657,45 @@ test "PhysicsWorld shape index covers every live shape" {
     pw.step(0.016);
     try expectIndexCoversWorld(&pw);
 }
+
+test "PhysicsWorld defers removeBody/destroyJoint requested during step" {
+    // Destroy-during-step path: with the step window held open (exactly as
+    // `step` holds it while iterating), structural calls must NOT mutate
+    // the iterated lists — they queue (deduped, counted) and apply at end
+    // of step, in order. Without the deferral the in-step swapRemove would
+    // skip bodies or alias freed storage.
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var anchor_mesh = testMesh("anchor", Vec3.new(0.0, 5.0, 0.0));
+    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0); // static
+    var bob_mesh = testMesh("bob", Vec3.new(0.0, 3.0, 0.0));
+    const bob = try pw.createBody(&bob_mesh, .sphere, 2.0); // dynamic
+    var extra_mesh = testMesh("extra", Vec3.new(2.0, 3.0, 0.0));
+    const extra = try pw.createBody(&extra_mesh, .sphere, 1.0); // dynamic
+    const jid = try pw.createDistanceJoint(anchor, bob, Vec3.zero, Vec3.zero, .{ .length = 2.0 });
+
+    // Hold the window open: the same flag `step` sets around its loops.
+    pw.stepping = true;
+    pw.removeBody(extra);
+    pw.destroyJoint(jid);
+    // Deferred, not applied: iterated lists untouched, both counted.
+    try std.testing.expectEqual(@as(usize, 3), pw.bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), pw.joints.items.len);
+    try std.testing.expectEqual(@as(usize, 2), pw.reentrant_defers);
+    try std.testing.expect(pw.findBody(&extra_mesh) != null);
+    // Repeat calls collapse (no double queue, no double count).
+    pw.removeBody(extra);
+    pw.destroyJoint(jid);
+    try std.testing.expectEqual(@as(usize, 2), pw.reentrant_defers);
+
+    pw.stepping = false;
+    pw.step(0.016);
+    // Applied at end of step: body unlinked, joint destroyed.
+    try std.testing.expectEqual(@as(usize, 2), pw.bodies.items.len);
+    try std.testing.expect(pw.findBody(&extra_mesh) == null);
+    try std.testing.expectEqual(@as(usize, 0), pw.joints.items.len);
+    // Survivors keep stepping normally afterwards.
+    pw.step(0.016);
+    try std.testing.expectEqual(@as(usize, 2), pw.bodies.items.len);
+}

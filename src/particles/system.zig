@@ -410,6 +410,19 @@ pub const ParticleSystem = struct {
     }
 
     pub fn deinit(self: *ParticleSystem) void {
+        // Context-thread only when a destroy will fire (debug tripwire;
+        // release unchanged): CPU-only teardown (zero handles — e.g.
+        // worker-thread sim-domain cleanup, see the allocator routing
+        // test) stays legal off-context. Owned textures trip inside
+        // their own deinit below when they hold live handles.
+        if (self.instance_buffer.id != 0 or self.gpu_slot_buffer.id != 0 or
+            self.compute_state_buffer.id != 0 or self.compute_spawn_buffer.id != 0 or
+            self.compute_draw_buffer.id != 0 or self.compute_state_view.id != 0 or
+            self.compute_spawn_view.id != 0 or self.compute_draw_view.id != 0 or
+            self.compute_shader.id != 0 or self.compute_pipeline.id != 0)
+        {
+            gpu_thread.assertOnContextThreadDebug();
+        }
         if (self.instance_buffer.id != 0) {
             sg.destroyBuffer(self.instance_buffer);
             self.instance_buffer = .{};
