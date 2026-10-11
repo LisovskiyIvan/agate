@@ -520,6 +520,9 @@ pub const obj_loader = @import("loader/obj.zig");
 pub const stl_loader = @import("loader/stl.zig");
 pub const ObjData = obj_loader.ObjData;
 pub const StlData = stl_loader.StlData;
+pub const parseObj = obj_loader.parse;
+pub const parseStl = stl_loader.parse;
+pub const parsePly = ply_loader.parse;
 pub const appendObjToScene = obj_loader.appendToScene;
 pub const appendStlToScene = stl_loader.appendToScene;
 

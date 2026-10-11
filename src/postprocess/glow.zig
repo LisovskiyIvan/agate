@@ -11,6 +11,7 @@ const options = @import("options.zig");
 // duplicate: own toggle, own RTs (GlowPass), own composite block, and valid
 // while bloom is on or off without changing bloom's output.
 // Half-width of the blur kernel: tap offsets run -GLOW_HALF_TAPS..GLOW_HALF_TAPS.
+pub const GLOW_BLUR_TAPS: u32 = 9;
 pub const GLOW_HALF_TAPS: i32 = 4;
 // Fullscreen draws one glow frame issues: extract + horizontal + vertical.
 pub const GLOW_PASS_DRAWS: u32 = 3;

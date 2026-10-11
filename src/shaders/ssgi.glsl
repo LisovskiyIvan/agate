@@ -8,7 +8,7 @@
 //   carries the FULL effective size so the world-space disk footprint is
 //   identical to v1 (2..48 full-res px clamp unchanged).
 // - Tap budget is compile-time bounded: the loop runs to
-//   SSGI_GATHER_TAPS_MAX (32, == SSGI_STEPS_MAX) with an early break at
+//   SSGI_STEPS_MAX (32) with an early break at
 //   the configured steps, mirroring the volumetric raymarch pattern.
 // - Jitter is the same IGN hash on gl_FragCoord (now half-res pixels).
 // - Output is normalized bleed * coverage with NO intensity baked in
@@ -42,9 +42,8 @@ layout(binding = 1) uniform sampler depth_smp;
 in vec2 v_uv;
 out vec4 frag_color;
 
-// SSGI tap budget: the loop bound below. Mirrors SSGI_GATHER_TAPS_MAX in
-// postprocess/ssgi.zig (== SSGI_STEPS_MAX, so a clamped config never
-// overruns the loop).
+// SSGI tap budget: the loop bound below. Mirrors SSGI_STEPS_MAX in
+// postprocess/ssgi.zig, so a clamped config never overruns the loop.
 const int SSGI_TAPS_MAX = 32;
 // Per-sample HDR firefly cap (CPU mirror: ssgi.SSGI_LUMA_CAP, v1 value).
 const float SSGI_LUMA_CAP = 8.0;

@@ -192,7 +192,6 @@ pub const Face = enum(u3) { pos_x, neg_x, pos_y, neg_y, pos_z, neg_z };
 pub fn faceDir(face: Face) Vec3
 pub fn faceUp(face: Face) Vec3
 pub fn faceView(face: Face, eye: Vec3) Mat4
-pub fn faceViewProj(face: Face, eye: Vec3, near: f32, far: f32) Mat4
 pub fn captureFar(radius: f32) f32
 pub fn mipSize(mip: u32) i32
 pub const ReflectionProbeOptions = struct { radius, ... };
@@ -251,7 +250,6 @@ pub const TrailLayer = struct {
 ```zig
 pub const MAX_VIEW_SLOTS: usize = snapshot.MAX_CAMERAS;
 pub const tile_size_px: u32 = 64;
-pub const ClusteredLightStage = struct { ... };
 pub const ClusterLightGpu = struct { ... };
 pub const ClusterTileGpu = struct { ... };
 pub const TileGrid = struct { tiles_x, tiles_y, ... };

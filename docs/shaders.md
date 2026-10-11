@@ -149,7 +149,7 @@ pub const Param = struct { ... };
 pub const vs_params_ub: u32 = 0; // {mat4 mvp, mat4 model}
 pub const fs_params_ub: u32 = 1; // engine frame VIEW uniforms (fs_view)
 pub const fs_mat_ub: u32 = 5; // engine per-material uniforms (fs_mat)
-pub const vs_morph_ub: u32 = 2;  // GPU morphs (только engine-шаблоны)
+// vs_morph UB — binding 2: GPU morphs (только engine-шаблоны)
 pub const Entry = struct { ... };
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const max_runtime_entries = 16;
