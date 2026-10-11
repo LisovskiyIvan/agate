@@ -158,14 +158,37 @@ fn sineI16(allocator: std.mem.Allocator, frames: usize, sample_rate: u32, freq: 
     return pcm;
 }
 
+// Bundled 16-bit mono sine fixture (pcm -> raw bytes -> WAV container):
+// the mono playClip/streaming/rejection tests all build the same sine
+// through the same three steps, so the triple alloc/defer collapses to
+// one builder + one defer. Stereo/interleaved constructions stay inline.
+const MonoSineWav = struct {
+    pcm: []i16,
+    raw: []u8,
+    wav: []u8,
+    fn deinit(self: MonoSineWav, allocator: std.mem.Allocator) void {
+        allocator.free(self.wav);
+        allocator.free(self.raw);
+        allocator.free(self.pcm);
+    }
+};
+
+fn monoSineWav(allocator: std.mem.Allocator, frames: usize, sample_rate: u32, freq: f32, amp: f32) !MonoSineWav {
+    const pcm = try sineI16(allocator, frames, sample_rate, freq, amp);
+    errdefer allocator.free(pcm);
+    const raw = try encodeI16(allocator, pcm);
+    errdefer allocator.free(raw);
+    const wav = try buildWav(allocator, true, 1, 1, sample_rate, 16, raw);
+    errdefer allocator.free(wav);
+    return .{ .pcm = pcm, .raw = raw, .wav = wav };
+}
+
 test "AudioClip decodes 16-bit mono WAV" {
     const alloc = std.testing.allocator;
-    const pcm = try sineI16(alloc, 4410, 44100, 440.0, 20000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
+    const built = try monoSineWav(alloc, 4410, 44100, 440.0, 20000.0);
+    defer built.deinit(alloc);
+    const pcm = built.pcm;
+    const wav = built.wav;
 
     var clip = try AudioClip.fromWavMemory(alloc, wav);
     defer clip.deinit(alloc);
@@ -263,13 +286,9 @@ test "AudioClip handles unordered chunks, pad byte, and 8-bit samples" {
 
 test "AudioEngine playClip renders audible audio and loops past the end" {
     const alloc = std.testing.allocator;
-    const pcm = try sineI16(alloc, 4410, 44100, 440.0, 20000.0); // 0.1 s
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
-    var clip = try AudioClip.fromWavMemory(alloc, wav);
+    const built = try monoSineWav(alloc, 4410, 44100, 440.0, 20000.0); // 0.1 s
+    defer built.deinit(alloc);
+    var clip = try AudioClip.fromWavMemory(alloc, built.wav);
     defer clip.deinit(alloc);
 
     // One-shot: audible head, silence after the clip ends.
@@ -299,13 +318,9 @@ test "AudioEngine playClip renders audible audio and loops past the end" {
 
 test "AudioEngine playClip resamples clips with other sample rates" {
     const alloc = std.testing.allocator;
-    const pcm = try sineI16(alloc, 2205, 22050, 440.0, 20000.0); // 0.1 s at 22050 Hz
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 22050, 16, raw);
-    defer alloc.free(wav);
-    var clip = try AudioClip.fromWavMemory(alloc, wav);
+    const built = try monoSineWav(alloc, 2205, 22050, 440.0, 20000.0); // 0.1 s at 22050 Hz
+    defer built.deinit(alloc);
+    var clip = try AudioClip.fromWavMemory(alloc, built.wav);
     defer clip.deinit(alloc);
 
     var eng = AudioEngine{}; // 44100 Hz engine plays the 22050 Hz clip upsampled
@@ -359,13 +374,9 @@ test "AudioEngine playClip step-one fast path matches interpolated path" {
 
 test "AudioEngine playClip far position and zero volume yield silence" {
     const alloc = std.testing.allocator;
-    const pcm = try sineI16(alloc, 4410, 44100, 440.0, 20000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
-    var clip = try AudioClip.fromWavMemory(alloc, wav);
+    const built = try monoSineWav(alloc, 4410, 44100, 440.0, 20000.0);
+    defer built.deinit(alloc);
+    var clip = try AudioClip.fromWavMemory(alloc, built.wav);
     defer clip.deinit(alloc);
 
     var eng = AudioEngine{};
@@ -387,12 +398,9 @@ test "AudioClip rejects invalid and unsupported WAV data" {
     // Too short for a header.
     try std.testing.expectError(error.InvalidWav, AudioClip.fromWavMemory(alloc, "RIFF"));
     // Truncated chunk.
-    const pcm = try sineI16(alloc, 100, 44100, 440.0, 10000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
+    const built = try monoSineWav(alloc, 100, 44100, 440.0, 10000.0);
+    defer built.deinit(alloc);
+    const wav = built.wav;
     try std.testing.expectError(error.InvalidWav, AudioClip.fromWavMemory(alloc, wav[0 .. wav.len / 2]));
     // Header only, no data chunk.
     try std.testing.expectError(error.InvalidWav, AudioClip.fromWavMemory(alloc, wav[0..36]));
@@ -594,20 +602,22 @@ fn expectStereoTone(clip: *const AudioClip, want_frames: usize) !void {
     try std.testing.expect(differ > want_frames / 4);
 }
 
-test "AudioClip decodes MP3 from memory with expected duration, channels and RMS" {
+test "AudioClip decodes MP3 and OGG Vorbis from memory with expected duration, channels and RMS" {
     const alloc = std.testing.allocator;
-    const bytes = @embedFile("fixtures/tone_440_880.mp3");
-    var clip = try AudioClip.fromMp3Memory(alloc, bytes);
-    defer clip.deinit(alloc);
-    try expectStereoTone(&clip, 2646);
-}
-
-test "AudioClip decodes OGG Vorbis from memory with expected duration, channels and RMS" {
-    const alloc = std.testing.allocator;
-    const bytes = @embedFile("fixtures/tone_440_880.ogg");
-    var clip = try AudioClip.fromOggMemory(alloc, bytes);
-    defer clip.deinit(alloc);
-    try expectStereoTone(&clip, 2646);
+    const Case = struct {
+        name: []const u8,
+        bytes: []const u8,
+        decode: @TypeOf(AudioClip.fromMp3Memory),
+    };
+    const cases = [_]Case{
+        .{ .name = "mp3", .bytes = @embedFile("fixtures/tone_440_880.mp3"), .decode = AudioClip.fromMp3Memory },
+        .{ .name = "ogg", .bytes = @embedFile("fixtures/tone_440_880.ogg"), .decode = AudioClip.fromOggMemory },
+    };
+    inline for (cases) |case| {
+        var clip = try case.decode(alloc, case.bytes);
+        defer clip.deinit(alloc);
+        try expectStereoTone(&clip, 2646);
+    }
 }
 
 test "AudioClip MP3 and OGG file decodes match the memory decodes exactly" {
@@ -1216,20 +1226,26 @@ test "AudioEngine bus audio presets underwater, muffled, telephone, cave, room" 
     var eng = AudioEngine{};
     const b = eng.createNonSpatialBus("fx_bus", 1.0) orelse return error.BusCreationFailed;
 
-    eng.setBusUnderwater(b);
-    var filter_cfg = eng.getBusFilter(b);
-    try std.testing.expectEqual(BiquadFilterType.lowpass, filter_cfg.filter_type);
-    try std.testing.expectApproxEqAbs(@as(f32, 600.0), filter_cfg.cutoff, 0.1);
-
-    eng.setBusMuffled(b);
-    filter_cfg = eng.getBusFilter(b);
-    try std.testing.expectEqual(BiquadFilterType.lowpass, filter_cfg.filter_type);
-    try std.testing.expectApproxEqAbs(@as(f32, 1200.0), filter_cfg.cutoff, 0.1);
-
-    eng.setBusTelephone(b);
-    filter_cfg = eng.getBusFilter(b);
-    try std.testing.expectEqual(BiquadFilterType.bandpass, filter_cfg.filter_type);
-    try std.testing.expectApproxEqAbs(@as(f32, 1800.0), filter_cfg.cutoff, 0.1);
+    // One row per filter preset: the setter, the expected filter shape, and
+    // the expected cutoff. Reverb presets below take different setters and
+    // assert different fields, so they stay inline.
+    const FilterCase = struct {
+        name: []const u8,
+        apply: *const fn (*AudioEngine, BusId) void,
+        want_type: BiquadFilterType,
+        want_cutoff: f32,
+    };
+    const filter_cases = [_]FilterCase{
+        .{ .name = "underwater", .apply = AudioEngine.setBusUnderwater, .want_type = .lowpass, .want_cutoff = 600.0 },
+        .{ .name = "muffled", .apply = AudioEngine.setBusMuffled, .want_type = .lowpass, .want_cutoff = 1200.0 },
+        .{ .name = "telephone", .apply = AudioEngine.setBusTelephone, .want_type = .bandpass, .want_cutoff = 1800.0 },
+    };
+    for (filter_cases) |case| {
+        case.apply(&eng, b);
+        const filter_cfg = eng.getBusFilter(b);
+        try std.testing.expectEqual(case.want_type, filter_cfg.filter_type);
+        try std.testing.expectApproxEqAbs(case.want_cutoff, filter_cfg.cutoff, 0.1);
+    }
 
     try std.testing.expect(eng.setBusCaveReverb(b));
     try std.testing.expect(eng.isBusReverbEnabled(b));
@@ -1316,14 +1332,10 @@ test "AudioEngine play procedural voice with occlusion attenuates energy and cut
 test "AudioEngine playClip with occlusion attenuates volume and lowpass filters WAV audio" {
     const alloc = std.testing.allocator;
     // Generate 3000 Hz sine wave (2205 frames = 0.05s at 44.1 kHz, 4410 stereo samples)
-    const pcm = try sineI16(alloc, 2205, 44100, 3000.0, 20000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
+    const built = try monoSineWav(alloc, 2205, 44100, 3000.0, 20000.0);
+    defer built.deinit(alloc);
 
-    var clip = try AudioClip.fromWavMemory(alloc, wav);
+    var clip = try AudioClip.fromWavMemory(alloc, built.wav);
     defer clip.deinit(alloc);
 
     var eng = AudioEngine{};
@@ -1446,79 +1458,70 @@ test "PhysicsWorld audio occlusion raycast integration" {
     try std.testing.expectEqual(@as(f32, 0.0), occ_clear);
 }
 
-test "AudioStream OGG Vorbis streaming from memory" {
+test "AudioStream compressed streaming from memory with pause, resume, and stop" {
     const alloc = std.testing.allocator;
-    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+    // One row per compressed codec: the full open/render/pause/resume/stop
+    // lifecycle from the old OGG-only test now runs for both, so the MP3
+    // path gains the lifecycle assertions (same AudioStream API).
+    const Case = struct {
+        name: []const u8,
+        bytes: []const u8,
+        format: audio.StreamFormat,
+        volume: f32,
+    };
+    const cases = [_]Case{
+        .{ .name = "ogg", .bytes = @embedFile("fixtures/tone_440_880.ogg"), .format = .ogg, .volume = 0.75 },
+        .{ .name = "mp3", .bytes = @embedFile("fixtures/tone_440_880.mp3"), .format = .mp3, .volume = 0.9 },
+    };
+    for (cases) |case| {
+        var stream = try audio.AudioStream.openMemory(alloc, case.bytes, case.format, 44100.0, .{
+            .volume = case.volume,
+            .pan = 0.0,
+            .loop = true,
+            .buffer_frames = 4096,
+        });
+        defer stream.deinit();
 
-    var stream = try audio.AudioStream.openMemory(alloc, ogg_bytes, .ogg, 44100.0, .{
-        .volume = 0.75,
-        .pan = 0.0,
-        .loop = true,
-        .buffer_frames = 4096,
-    });
-    defer stream.deinit();
+        try std.testing.expect(stream.isPlaying());
+        try std.testing.expect(!stream.isPaused());
+        try std.testing.expect(!stream.isStopped());
+        try std.testing.expectApproxEqAbs(case.volume, stream.getVolume(), 1e-4);
+        try std.testing.expect(stream.getDurationSeconds() > 0.0);
 
-    try std.testing.expect(stream.isPlaying());
-    try std.testing.expect(!stream.isPaused());
-    try std.testing.expect(!stream.isStopped());
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), stream.getVolume(), 1e-4);
-    try std.testing.expect(stream.getDurationSeconds() > 0.0);
+        var buf: [2048]f32 = [_]f32{0.0} ** 2048;
+        const rendered = stream.renderToBuffer(&buf);
+        try std.testing.expectEqual(@as(usize, 1024), rendered);
+        try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
 
-    var buf: [2048]f32 = [_]f32{0.0} ** 2048;
-    const rendered = stream.renderToBuffer(&buf);
-    try std.testing.expectEqual(@as(usize, 1024), rendered);
-    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+        // Pause
+        stream.pause();
+        try std.testing.expect(stream.isPaused());
+        try std.testing.expect(!stream.isPlaying());
 
-    // Pause
-    stream.pause();
-    try std.testing.expect(stream.isPaused());
-    try std.testing.expect(!stream.isPlaying());
+        // Resume
+        stream.unpause();
+        try std.testing.expect(stream.isPlaying());
 
-    // Resume
-    stream.unpause();
-    try std.testing.expect(stream.isPlaying());
+        // Refill and render again
+        stream.update(0.05);
+        @memset(&buf, 0.0);
+        const rendered2 = stream.renderToBuffer(&buf);
+        try std.testing.expect(rendered2 > 0);
+        try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
 
-    // Refill and render again
-    stream.update(0.05);
-    @memset(&buf, 0.0);
-    const rendered2 = stream.renderToBuffer(&buf);
-    try std.testing.expect(rendered2 > 0);
-    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
-
-    // Stop
-    stream.stop();
-    try std.testing.expect(stream.isStopped());
-    try std.testing.expectEqual(@as(f32, 0.0), stream.getPositionSeconds());
-}
-
-test "AudioStream MP3 streaming from memory" {
-    const alloc = std.testing.allocator;
-    const mp3_bytes = @embedFile("fixtures/tone_440_880.mp3");
-
-    var stream = try audio.AudioStream.openMemory(alloc, mp3_bytes, .mp3, 44100.0, .{
-        .volume = 0.9,
-        .loop = true,
-        .buffer_frames = 4096,
-    });
-    defer stream.deinit();
-
-    try std.testing.expect(stream.isPlaying());
-
-    var buf: [2048]f32 = [_]f32{0.0} ** 2048;
-    const rendered = stream.renderToBuffer(&buf);
-    try std.testing.expectEqual(@as(usize, 1024), rendered);
-    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+        // Stop
+        stream.stop();
+        try std.testing.expect(stream.isStopped());
+        try std.testing.expectEqual(@as(f32, 0.0), stream.getPositionSeconds());
+    }
 }
 
 test "AudioStream WAV streaming from memory and auto-stop when loop is false" {
     const alloc = std.testing.allocator;
     // 2205 frames of 440 Hz sine = 0.05s
-    const pcm = try sineI16(alloc, 2205, 44100, 440.0, 20000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
+    const built = try monoSineWav(alloc, 2205, 44100, 440.0, 20000.0);
+    defer built.deinit(alloc);
+    const wav = built.wav;
 
     var stream = try audio.AudioStream.openMemory(alloc, wav, .wav, 44100.0, .{
         .volume = 0.8,
@@ -1678,12 +1681,9 @@ test "AudioEngine playSound and sound management: volume, pause, resume, stop" {
 
 test "AudioEngine playSoundOnce auto-destroys on stream completion" {
     const alloc = std.testing.allocator;
-    const pcm = try sineI16(alloc, 50, 44100, 440.0, 20000.0);
-    defer alloc.free(pcm);
-    const raw = try encodeI16(alloc, pcm);
-    defer alloc.free(raw);
-    const wav = try buildWav(alloc, true, 1, 1, 44100, 16, raw);
-    defer alloc.free(wav);
+    const built = try monoSineWav(alloc, 50, 44100, 440.0, 20000.0);
+    defer built.deinit(alloc);
+    const wav = built.wav;
 
     var eng = AudioEngine{};
 
@@ -1829,28 +1829,21 @@ fn firstPlaySeed() u32 {
     return ns *% 2654435761 +% 97;
 }
 
-test "noise static cutoff above clamp matches legacy reference exactly" {
-    var eng = AudioEngine{};
-    eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 5000.0, .cutoff_end = 5000.0 });
-    var buf: [8820]f32 = [_]f32{0.0} ** 8820; // 4410 frames = 0.1 s; voice lasts 0.05 s
-    eng.renderFrames(&buf);
+test "noise static cutoff matches legacy reference exactly above and below the clamp" {
+    // One row per clamp side: 5000 Hz exercises the normal path, 10 Hz the
+    // 30 Hz floor. Both must match the per-sample legacy loop bit-exactly.
+    const cutoffs = [_]f32{ 5000.0, 10.0 };
+    for (cutoffs) |cutoff| {
+        var eng = AudioEngine{};
+        eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = cutoff, .cutoff_end = cutoff });
+        var buf: [8820]f32 = [_]f32{0.0} ** 8820; // 4410 frames = 0.1 s; voice lasts 0.05 s
+        eng.renderFrames(&buf);
 
-    var want: [8820]f32 = undefined;
-    legacyNoiseBurst(&want, 4410, 44100.0, 5000.0, 5000.0, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
-    try std.testing.expectEqualSlices(f32, &want, &buf);
-    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
-}
-
-test "noise static cutoff below clamp matches legacy reference exactly" {
-    var eng = AudioEngine{};
-    eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 10.0, .cutoff_end = 10.0 });
-    var buf: [8820]f32 = [_]f32{0.0} ** 8820;
-    eng.renderFrames(&buf);
-
-    var want: [8820]f32 = undefined;
-    legacyNoiseBurst(&want, 4410, 44100.0, 10.0, 10.0, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
-    try std.testing.expectEqualSlices(f32, &want, &buf);
-    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+        var want: [8820]f32 = undefined;
+        legacyNoiseBurst(&want, 4410, 44100.0, cutoff, cutoff, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
+        try std.testing.expectEqualSlices(f32, &want, &buf);
+        try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+    }
 }
 
 test "noise ramped cutoff matches legacy reference and expires to silence" {

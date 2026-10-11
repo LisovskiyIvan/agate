@@ -32,10 +32,15 @@ const buildForTest = tu.buildForTest;
 const finishForTest = tu.finishForTest;
 const stageAndPrepareForTest = tu.stageAndPrepareForTest;
 const p7CpuShadowPass = tu.p7CpuShadowPass;
-const p7ShadowTotal = tu.p7ShadowTotal;
 const p7FindByMeshIndex = tu.p7FindByMeshIndex;
 const stage1FillInstances = tu.stage1FillInstances;
 const stage1Scene = tu.stage1Scene;
+const stage1Deinit = tu.stage1Deinit;
+const stage1Prepare = tu.stage1Prepare;
+const stage1SrcMesh = tu.stage1SrcMesh;
+const stage1ParentMesh = tu.stage1ParentMesh;
+const stage1RegularMesh = tu.stage1RegularMesh;
+const stage1Instances = tu.stage1Instances;
 const wave32PushTestSystem = tu.wave32PushTestSystem;
 const wave32FreeTestSystems = tu.wave32FreeTestSystems;
 
@@ -46,22 +51,8 @@ test "stage-2A: buildQueuesInto with staged params equals two runs" {
     defer scene.outline_meshes.deinit(alloc);
     defer scene.draws.deinit(alloc);
 
-    var m0 = Mesh{
-        .name = "bq0",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    var m1 = Mesh{
-        .name = "bq1",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var m0 = stage1RegularMesh("bq0", Vec3.zero);
+    var m1 = stage1RegularMesh("bq1", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &m0);
     try scene.meshes.append(alloc, &m1);
     try scene.outline_meshes.append(alloc, &m0);
@@ -135,51 +126,19 @@ test "stage-2A: buildQueuesInto with staged params equals two runs" {
 // ---- Stage-2 increment B: game-side queue build + latch patch. ----
 
 test "stage-2B(a): build+latch finalizes handles and freezes sets" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2a_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2a_src");
     const n: usize = 4;
-    const mem = try alloc.alloc(InstancedMesh, n);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, n);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
-    var parent = Mesh{
-        .name = "b2a_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = n },
-    };
-    var regular = Mesh{
-        .name = "b2a_reg",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    const inst = try stage1Instances(alloc, &src, n, 0);
+    defer inst.deinit(alloc);
+    const mem = inst.mem;
+    const ptrs = inst.ptrs;
+    var parent = stage1ParentMesh("b2a_parent", ptrs, n);
+    var regular = stage1RegularMesh("b2a_reg", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &parent);
     try scene.meshes.append(alloc, &regular);
     try scene.outline_meshes.append(alloc, &parent);
@@ -260,43 +219,17 @@ test "stage-2B(a): build+latch finalizes handles and freezes sets" {
 }
 
 test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2b_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2b_src");
     const n: usize = 4;
-    const mem = try alloc.alloc(InstancedMesh, n);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, n);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
-    var parent = Mesh{
-        .name = "b2b_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = n },
-    };
+    const inst = try stage1Instances(alloc, &src, n, 0);
+    defer inst.deinit(alloc);
+    const ptrs = inst.ptrs;
+    var parent = stage1ParentMesh("b2b_parent", ptrs, n);
     // Prime a prior handle (provisional at build time).
     parent.instance_render.buffer = .{ .id = 100 };
     parent.instance_render.capacity = 2;
@@ -369,54 +302,20 @@ test "stage-2B(b): patch carries grown handle, old retires VALID until flush" {
 }
 
 test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2c_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const ma = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(ma);
-    const pa = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pa);
-    stage1FillInstances(&src, ma, pa, 0);
-    var mesh_a = Mesh{
-        .name = "b2c_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pa, .capacity = 2 },
-    };
-    const mb = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(mb);
-    const pb = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pb);
-    stage1FillInstances(&src, mb, pb, 50);
-    var mesh_b = Mesh{
-        .name = "b2c_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pb, .capacity = 2 },
-    };
+    var src = stage1SrcMesh("b2c_src");
+    const ia = try stage1Instances(alloc, &src, 2, 0);
+    defer ia.deinit(alloc);
+    const pa = ia.ptrs;
+    var mesh_a = stage1ParentMesh("b2c_a", pa, 2);
+    const ib = try stage1Instances(alloc, &src, 2, 50);
+    defer ib.deinit(alloc);
+    const pb = ib.ptrs;
+    var mesh_b = stage1ParentMesh("b2c_b", pb, 2);
     try scene.meshes.append(alloc, &mesh_a);
     try scene.meshes.append(alloc, &mesh_b);
     try scene.outline_meshes.append(alloc, &mesh_a);
@@ -472,62 +371,21 @@ test "stage-2B(c): stale latch entry neutralizes, others intact, retry recovers"
 }
 
 test "stage-2B(d): mesh-list change stages through, commit skips by uid, no OOB/UAF" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2d_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const ma = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(ma);
-    const pa = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pa);
-    stage1FillInstances(&src, ma, pa, 0);
-    var mesh_a = Mesh{
-        .name = "b2d_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pa, .capacity = 2 },
-    };
-    const mb = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(mb);
-    const pb = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pb);
-    stage1FillInstances(&src, mb, pb, 50);
-    var mesh_b = Mesh{
-        .name = "b2d_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pb, .capacity = 2 },
-    };
-    var mesh_c = Mesh{
-        .name = "b2d_c",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(9, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2d_src");
+    const ia = try stage1Instances(alloc, &src, 2, 0);
+    defer ia.deinit(alloc);
+    const pa = ia.ptrs;
+    var mesh_a = stage1ParentMesh("b2d_a", pa, 2);
+    const ib = try stage1Instances(alloc, &src, 2, 50);
+    defer ib.deinit(alloc);
+    const pb = ib.ptrs;
+    var mesh_b = stage1ParentMesh("b2d_b", pb, 2);
+    var mesh_c = stage1RegularMesh("b2d_c", Vec3.new(9, 0, 0));
     try scene.meshes.append(alloc, &mesh_a);
     try scene.meshes.append(alloc, &mesh_b);
     try scene.meshes.append(alloc, &mesh_c);
@@ -654,18 +512,8 @@ test "stage-2B(e): serial producer equals concurrent producer" {
 
     // Path 1: serial producer (same-thread build + finish).
     var scene_b = stage1Scene(alloc);
-    defer scene_b.lights.deinit(alloc);
-    defer scene_b.cameras.deinit(alloc);
-    defer scene_b.meshes.deinit(alloc);
-    defer scene_b.outline_meshes.deinit(alloc);
-    defer scene_b.draws.deinit(alloc);
-    defer scene_b.gpu_retire.deinit(alloc);
-    defer scene_b.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene_b.shadows.pass.binned_source.deinit(alloc);
-    defer scene_b.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene_b, alloc);
-    const cam_b = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene_b.addCamera(.{ .name = "Cam1", .camera = cam_b });
+    defer stage1Deinit(&scene_b, alloc);
+    try stage1Prepare(&scene_b, alloc);
     var fix_b = try Fixture.init(alloc);
     defer fix_b.deinit(alloc);
     stage1FillInstances(&fix_b.src, fix_b.mem, fix_b.ptrs, 0);
@@ -681,18 +529,8 @@ test "stage-2B(e): serial producer equals concurrent producer" {
     // Path 2: concurrent producer (worker-thread build + main finish) —
     // same staged protocol, whole payload identity preserved.
     var scene_f = stage1Scene(alloc);
-    defer scene_f.lights.deinit(alloc);
-    defer scene_f.cameras.deinit(alloc);
-    defer scene_f.meshes.deinit(alloc);
-    defer scene_f.outline_meshes.deinit(alloc);
-    defer scene_f.draws.deinit(alloc);
-    defer scene_f.gpu_retire.deinit(alloc);
-    defer scene_f.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene_f.shadows.pass.binned_source.deinit(alloc);
-    defer scene_f.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene_f, alloc);
-    const cam_f = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene_f.addCamera(.{ .name = "Cam1", .camera = cam_f });
+    defer stage1Deinit(&scene_f, alloc);
+    try stage1Prepare(&scene_f, alloc);
     var fix_f = try Fixture.init(alloc);
     defer fix_f.deinit(alloc);
     stage1FillInstances(&fix_f.src, fix_f.mem, fix_f.ptrs, 0);
@@ -832,35 +670,10 @@ test "stage-2B(e): serial producer equals concurrent producer" {
 test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    var m0 = Mesh{
-        .name = "b2f_0",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    var m1 = Mesh{
-        .name = "b2f_1",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
+    var m0 = stage1RegularMesh("b2f_0", Vec3.zero);
+    var m1 = stage1RegularMesh("b2f_1", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &m0);
     try scene.meshes.append(alloc, &m1);
     try scene.outline_meshes.append(alloc, &m0);
@@ -901,7 +714,6 @@ test "stage-2B(f): warm build+latch pump stays zero-alloc under refusal" {
 }
 
 test "stage-2B(g): serial build+latch equals worker-build parity" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
 
     const Builder = struct {
@@ -913,37 +725,13 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
 
     // Serial path.
     var serial = stage1Scene(alloc);
-    defer serial.lights.deinit(alloc);
-    defer serial.cameras.deinit(alloc);
-    defer serial.meshes.deinit(alloc);
-    defer serial.outline_meshes.deinit(alloc);
-    defer serial.draws.deinit(alloc);
-    defer serial.gpu_retire.deinit(alloc);
-    defer serial.shadows.pass.binned_meshes.deinit(alloc);
-    defer serial.shadows.pass.binned_source.deinit(alloc);
-    defer serial.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&serial, alloc);
-    const cam_s = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try serial.addCamera(.{ .name = "Cam1", .camera = cam_s });
-    var src_s = Mesh{
-        .name = "b2g_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const mem_s = try alloc.alloc(InstancedMesh, 3);
-    defer alloc.free(mem_s);
-    const ptrs_s = try alloc.alloc(*InstancedMesh, 3);
-    defer alloc.free(ptrs_s);
-    stage1FillInstances(&src_s, mem_s, ptrs_s, 0);
-    var parent_s = Mesh{
-        .name = "b2g_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs_s, .capacity = 3 },
-    };
+    defer stage1Deinit(&serial, alloc);
+    try stage1Prepare(&serial, alloc);
+    var src_s = stage1SrcMesh("b2g_src");
+    const is_ = try stage1Instances(alloc, &src_s, 3, 0);
+    defer is_.deinit(alloc);
+    const ptrs_s = is_.ptrs;
+    var parent_s = stage1ParentMesh("b2g_parent", ptrs_s, 3);
     try serial.meshes.append(alloc, &parent_s);
     try serial.outline_meshes.append(alloc, &parent_s);
     serial.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -953,37 +741,13 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
 
     // Worker-build path (same live state, build on a spawned thread).
     var threaded = stage1Scene(alloc);
-    defer threaded.lights.deinit(alloc);
-    defer threaded.cameras.deinit(alloc);
-    defer threaded.meshes.deinit(alloc);
-    defer threaded.outline_meshes.deinit(alloc);
-    defer threaded.draws.deinit(alloc);
-    defer threaded.gpu_retire.deinit(alloc);
-    defer threaded.shadows.pass.binned_meshes.deinit(alloc);
-    defer threaded.shadows.pass.binned_source.deinit(alloc);
-    defer threaded.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&threaded, alloc);
-    const cam_t = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try threaded.addCamera(.{ .name = "Cam1", .camera = cam_t });
-    var src_t = Mesh{
-        .name = "b2g_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const mem_t = try alloc.alloc(InstancedMesh, 3);
-    defer alloc.free(mem_t);
-    const ptrs_t = try alloc.alloc(*InstancedMesh, 3);
-    defer alloc.free(ptrs_t);
-    stage1FillInstances(&src_t, mem_t, ptrs_t, 0);
-    var parent_t = Mesh{
-        .name = "b2g_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs_t, .capacity = 3 },
-    };
+    defer stage1Deinit(&threaded, alloc);
+    try stage1Prepare(&threaded, alloc);
+    var src_t = stage1SrcMesh("b2g_src");
+    const it_ = try stage1Instances(alloc, &src_t, 3, 0);
+    defer it_.deinit(alloc);
+    const ptrs_t = it_.ptrs;
+    var parent_t = stage1ParentMesh("b2g_parent", ptrs_t, 3);
     try threaded.meshes.append(alloc, &parent_t);
     try threaded.outline_meshes.append(alloc, &parent_t);
     threaded.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1020,62 +784,21 @@ test "stage-2B(g): serial build+latch equals worker-build parity" {
 }
 
 test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2h_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const ma = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(ma);
-    const pa = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pa);
-    stage1FillInstances(&src, ma, pa, 0);
-    var mesh_a = Mesh{
-        .name = "b2h_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pa, .capacity = 2 },
-    };
-    const mb = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(mb);
-    const pb = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(pb);
-    stage1FillInstances(&src, mb, pb, 50);
-    var mesh_b = Mesh{
-        .name = "b2h_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = pb, .capacity = 2 },
-    };
-    var mesh_c = Mesh{
-        .name = "b2h_c",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(9, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2h_src");
+    const ia = try stage1Instances(alloc, &src, 2, 0);
+    defer ia.deinit(alloc);
+    const pa = ia.ptrs;
+    var mesh_a = stage1ParentMesh("b2h_a", pa, 2);
+    const ib = try stage1Instances(alloc, &src, 2, 50);
+    defer ib.deinit(alloc);
+    const pb = ib.ptrs;
+    var mesh_b = stage1ParentMesh("b2h_b", pb, 2);
+    var mesh_c = stage1RegularMesh("b2h_c", Vec3.new(9, 0, 0));
     try scene.meshes.append(alloc, &mesh_a); // mesh-list 0
     try scene.meshes.append(alloc, &mesh_b); // mesh-list 1
     try scene.meshes.append(alloc, &mesh_c); // mesh-list 2
@@ -1126,18 +849,9 @@ test "stage-2B(h): outline subset order maps to mesh-list index, reorder safe" {
 }
 
 test "stage-2B(i): PIP views patch each built view" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
+    defer stage1Deinit(&scene, alloc);
     p7CpuShadowPass(&scene, alloc);
 
     const cam0 = Camera{ .free = camera_mod.FreeCamera.init("Main", .{}) };
@@ -1147,26 +861,12 @@ test "stage-2B(i): PIP views patch each built view" {
     scene.enable_multi_camera = true;
     scene.active_camera_index = 0;
 
-    var src = Mesh{
-        .name = "b2i_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2i_src");
     const n: usize = 3;
-    const mem = try alloc.alloc(InstancedMesh, n);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, n);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
-    var parent = Mesh{
-        .name = "b2i_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = n },
-    };
+    const inst = try stage1Instances(alloc, &src, n, 0);
+    defer inst.deinit(alloc);
+    const ptrs = inst.ptrs;
+    var parent = stage1ParentMesh("b2i_parent", ptrs, n);
     try scene.meshes.append(alloc, &parent);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1189,38 +889,18 @@ test "stage-2B(i): PIP views patch each built view" {
 }
 
 test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const material_mod = @import("../material.zig");
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
     var blend_mat = material_mod.PBRMaterial.init("b2j_blend");
     blend_mat.alpha_mode = .blend;
-    var src = Mesh{
-        .name = "b2j_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const mem = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
+    var src = stage1SrcMesh("b2j_src");
+    const inst = try stage1Instances(alloc, &src, 2, 0);
+    defer inst.deinit(alloc);
+    const ptrs = inst.ptrs;
     var parent = Mesh{
         .name = "b2j_parent",
         .vertex_buffer = .{},
@@ -1263,50 +943,17 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
 }
 
 test "stage-2B(k): same-scene staged builds keep cache-key isolation" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "b2k_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    const mem = try alloc.alloc(InstancedMesh, 2);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, 2);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
-    var parent = Mesh{
-        .name = "b2k_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = 2 },
-    };
-    var regular = Mesh{
-        .name = "b2k_reg",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("b2k_src");
+    const inst = try stage1Instances(alloc, &src, 2, 0);
+    defer inst.deinit(alloc);
+    const ptrs = inst.ptrs;
+    var parent = stage1ParentMesh("b2k_parent", ptrs, 2);
+    var regular = stage1RegularMesh("b2k_reg", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &parent);
     try scene.meshes.append(alloc, &regular);
 
@@ -1343,29 +990,11 @@ test "stage-2B(k): same-scene staged builds keep cache-key isolation" {
 test "stage-2B(l): cancelled build leaves no stale world cache; next publish sees the mutation" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer stage1Deinit(&scene, alloc);
     defer scene.ui_frame.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var regular = Mesh{
-        .name = "b2l_reg",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var regular = stage1RegularMesh("b2l_reg", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &regular);
 
     // Prime: staged build + latch publishes generation 1 (world cache tagged).
@@ -1408,29 +1037,11 @@ test "stage-2B(l): cancelled build leaves no stale world cache; next publish see
 test "stage-2B(m): repeat build on the same claim wins newest despite identical seq" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer stage1Deinit(&scene, alloc);
     defer scene.ui_frame.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var regular = Mesh{
-        .name = "b2m_reg",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.new(5, 0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var regular = stage1RegularMesh("b2m_reg", Vec3.new(5, 0, 0));
     try scene.meshes.append(alloc, &regular);
 
     // One claim, two builds, one publish: the repeat build runs under the

@@ -127,6 +127,103 @@ pub fn stage1Scene(alloc: std.mem.Allocator) Scene {
     return scene;
 }
 
+// Stage-1 instanced fixture builders (dumb construction, no assertions):
+// nearly every stage-1/stage-2B/wave test builds the same camera-bearing
+// headless scene, the same unit-box source mesh, and the same N-instance
+// parent, so the ~30-line fixture collapses to ~10 lines with the live
+// `mem`/`ptrs` names kept (bodies stay bit-identical). Per-test quirks —
+// sliced items, custom capacities, blend materials, multi-camera rigs —
+// stay inline in the tests.
+pub fn stage1Deinit(scene: *Scene, alloc: std.mem.Allocator) void {
+    scene.shadows.pass.prepared.deinit(alloc);
+    scene.shadows.pass.binned_source.deinit(alloc);
+    scene.shadows.pass.binned_meshes.deinit(alloc);
+    scene.gpu_retire.deinit(alloc);
+    scene.draws.deinit(alloc);
+    scene.outline_meshes.deinit(alloc);
+    scene.meshes.deinit(alloc);
+    scene.cameras.deinit(alloc);
+    scene.lights.deinit(alloc);
+}
+
+pub fn stage1Prepare(scene: *Scene, alloc: std.mem.Allocator) !void {
+    p7CpuShadowPass(scene, alloc);
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+}
+
+pub fn stage1SrcMesh(name: []const u8) Mesh {
+    return .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+}
+
+pub fn stage1ParentMesh(name: []const u8, ptrs: []*InstancedMesh, n: usize) Mesh {
+    return .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .instances = .{ .items = ptrs, .capacity = n },
+    };
+}
+
+pub fn stage1RegularMesh(name: []const u8, position: Vec3) Mesh {
+    return .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = position,
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+}
+
+const InstancedMesh = @import("../mesh.zig").InstancedMesh;
+
+pub const Stage1Instances = struct {
+    mem: []InstancedMesh,
+    ptrs: []*InstancedMesh,
+    pub fn deinit(self: Stage1Instances, alloc: std.mem.Allocator) void {
+        alloc.free(self.ptrs);
+        alloc.free(self.mem);
+    }
+};
+
+pub fn stage1Instances(alloc: std.mem.Allocator, src: *Mesh, n: usize, x0: f32) !Stage1Instances {
+    const mem = try alloc.alloc(InstancedMesh, n);
+    errdefer alloc.free(mem);
+    const ptrs = try alloc.alloc(*InstancedMesh, n);
+    errdefer alloc.free(ptrs);
+    stage1FillInstances(src, mem, ptrs, x0);
+    return .{ .mem = mem, .ptrs = ptrs };
+}
+
+// Minimal testScene teardown (lights/cameras/draws/gpu_retire): wave
+// fixtures with extra lists (profiler, ui_frame, meshes, shadows) keep
+// those defers inline.
+pub fn basicSceneDeinit(scene: *Scene, alloc: std.mem.Allocator) void {
+    scene.gpu_retire.deinit(alloc);
+    scene.draws.deinit(alloc);
+    scene.cameras.deinit(alloc);
+    scene.lights.deinit(alloc);
+}
+
+// Wave-32 freeze-fixture body: standalone physics body mesh whose debug
+// capture the staged build freezes into the slot. The caller owns the
+// mesh (`defer alloc.destroy(m)`) and the physics deinit.
+pub fn wave32BodyMesh(scene: *Scene, alloc: std.mem.Allocator) !*Mesh {
+    const m = try alloc.create(Mesh);
+    m.* = @import("../testing.zig").testMesh("box");
+    _ = try scene.createRigidBody(m, .box, 1.0);
+    scene.physics.show_debug = true;
+    return m;
+}
+
 // CPU-only particle system for scene-level freeze/latch tests: built with
 // the shared headless helper (no sg.* anywhere — the init defers buffer
 // creation off-context, and here construction itself is plain CPU allocs),

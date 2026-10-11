@@ -32,10 +32,16 @@ const buildForTest = tu.buildForTest;
 const finishForTest = tu.finishForTest;
 const stageAndPrepareForTest = tu.stageAndPrepareForTest;
 const p7CpuShadowPass = tu.p7CpuShadowPass;
-const p7ShadowTotal = tu.p7ShadowTotal;
 const p7FindByMeshIndex = tu.p7FindByMeshIndex;
-const stage1FillInstances = tu.stage1FillInstances;
 const stage1Scene = tu.stage1Scene;
+const stage1Deinit = tu.stage1Deinit;
+const stage1Prepare = tu.stage1Prepare;
+const stage1SrcMesh = tu.stage1SrcMesh;
+const stage1ParentMesh = tu.stage1ParentMesh;
+const stage1RegularMesh = tu.stage1RegularMesh;
+const stage1Instances = tu.stage1Instances;
+const basicSceneDeinit = tu.basicSceneDeinit;
+const wave32BodyMesh = tu.wave32BodyMesh;
 const wave32PushTestSystem = tu.wave32PushTestSystem;
 const wave32FreeTestSystems = tu.wave32FreeTestSystems;
 
@@ -95,44 +101,19 @@ test "wave26: 3-slot prepare rotation visits every slot, newest wins" {
 }
 
 test "wave26: staged records + UI packet latch correctly across all three slots" {
-    const InstancedMesh = @import("../mesh.zig").InstancedMesh;
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
+    defer stage1Deinit(&scene, alloc);
     defer scene.ui_frame.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-
-    var src = Mesh{
-        .name = "rot_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var src = stage1SrcMesh("rot_src");
     const n: usize = 4;
-    const mem = try alloc.alloc(InstancedMesh, n);
-    defer alloc.free(mem);
-    const ptrs = try alloc.alloc(*InstancedMesh, n);
-    defer alloc.free(ptrs);
-    stage1FillInstances(&src, mem, ptrs, 0);
-    var parent = Mesh{
-        .name = "rot_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = n },
-    };
+    const inst = try stage1Instances(alloc, &src, n, 0);
+    defer inst.deinit(alloc);
+    const mem = inst.mem;
+    const ptrs = inst.ptrs;
+    var parent = stage1ParentMesh("rot_parent", ptrs, n);
     try scene.meshes.append(alloc, &parent);
 
     scene.ui_canvas = UICanvas{
@@ -204,10 +185,7 @@ test "wave26: render pins/unpins the front; prepare rotates under a held pin" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // Camera-less headless fixture: prepare publishes, render consumes via
@@ -253,10 +231,7 @@ test "wave27: build stages the slot snapshot equal to the published generation" 
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -287,10 +262,7 @@ test "wave27: post-build live mutation does not change the prepared frame" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
 
     const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
     _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
@@ -331,10 +303,7 @@ test "wave27: staged build freezes the slot snapshot; render+reuse present it" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
 
     // Camera-less headless fixture: dims latch before the no-camera
     // early-out; render consumes via the no-camera return (no sg.*).
@@ -371,10 +340,7 @@ test "wave27: UI latch reads the staged snapshot dims" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.ui_frame.deinit(alloc);
 
     scene.ui_canvas = UICanvas{
@@ -419,10 +385,7 @@ test "wave27: 3-slot rotation keeps per-slot snapshots distinct" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
 
     // Camera-less: dims latch before the no-camera early-out, so the
     // rotation is observable without any GPU init.
@@ -450,10 +413,7 @@ test "wave29: claim build+stageUi+publish latches the claimed slot, counters san
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -491,10 +451,7 @@ test "wave29: cancelled claim commits nothing, rotation unaffected" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -524,10 +481,7 @@ test "wave38: concurrent_yield_ns publish keeps handoff semantics, default 0" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // Default OFF: the phase-locked path never sets the knob.
@@ -561,10 +515,7 @@ test "wave29: build path never begins/completes retire epochs" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // Camera-less headless fixture: prepare opens an epoch, the no-camera
@@ -604,10 +555,7 @@ test "wave30: concurrent claim/stageUi/publish vs latch — no stale seq, exact 
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     const total_publishes: u64 = 5000;
@@ -708,10 +656,7 @@ test "wave32: adopted build freezes particle+physics into the slot; prepare latc
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
     defer scene.meshes.deinit(alloc);
     defer wave32FreeTestSystems(&scene);
@@ -722,11 +667,8 @@ test "wave32: adopted build freezes particle+physics into the slot; prepare latc
 
     // Standalone body mesh (not registered: the build stages zero scene
     // meshes while the debug capture still observes the world).
-    const m = try alloc.create(Mesh);
-    m.* = @import("../testing.zig").testMesh("box");
+    const m = try wave32BodyMesh(&scene, alloc);
     defer alloc.destroy(m);
-    _ = try scene.createRigidBody(m, .box, 1.0);
-    scene.physics.show_debug = true;
     defer scene.physics.deinit(alloc);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -781,10 +723,7 @@ test "wave32: staged build freezes particle+physics slot copies" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
     defer scene.meshes.deinit(alloc);
     defer wave32FreeTestSystems(&scene);
@@ -793,11 +732,8 @@ test "wave32: staged build freezes particle+physics slot copies" {
     ps.active_count = 2;
     ps.instance_buffer = .{ .id = 11 };
 
-    const m = try alloc.create(Mesh);
-    m.* = @import("../testing.zig").testMesh("box");
+    const m = try wave32BodyMesh(&scene, alloc);
     defer alloc.destroy(m);
-    _ = try scene.createRigidBody(m, .box, 1.0);
-    scene.physics.show_debug = true;
     defer scene.physics.deinit(alloc);
 
     // Staged build freezes the particle/physics copies into the claimed
@@ -834,19 +770,14 @@ test "wave32: concurrent claim/build/publish vs slot-latch — no torn records, 
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
     defer scene.meshes.deinit(alloc);
     defer wave32FreeTestSystems(&scene);
 
     const ps = try wave32PushTestSystem(&scene, 4);
-    const m = try alloc.create(Mesh);
-    m.* = @import("../testing.zig").testMesh("box");
+    const m = try wave32BodyMesh(&scene, alloc);
     defer alloc.destroy(m);
-    _ = try scene.createRigidBody(m, .box, 1.0);
     defer scene.physics.deinit(alloc);
 
     const total_gens: u64 = 5000;
@@ -1017,10 +948,7 @@ test "wave31: prepare publishes under a concurrent pinned front (stress), no lea
     const LeaseError = @import("frame_draws.zig").LeaseError;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     const total: usize = 500;
@@ -1104,16 +1032,8 @@ test "wave31: prepare publishes under a concurrent pinned front (stress), no lea
 test "wave31: prepare claim accounting — no leaks across exits incl. early returns" {
     const alloc = std.testing.allocator;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
     const expectClean = struct {
         fn run(s: *Scene) !void {
@@ -1124,9 +1044,6 @@ test "wave31: prepare claim accounting — no leaks across exits incl. early ret
             }
         }
     }.run;
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
 
     // Baseline: the staged begin/finish exits pair every claim.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1228,10 +1145,7 @@ test "wave31: skip with nothing pending leaves nothing consumable; render drops 
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // Fresh scene: saturate every non-front slot. The staged build
@@ -1274,27 +1188,9 @@ test "wave31: concurrent game claim can never target prepare's slot (steering + 
     const alloc = std.testing.allocator;
     const LeaseError = @import("frame_draws.zig").LeaseError;
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    var regular = Mesh{
-        .name = "w31_reg",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
+    var regular = stage1RegularMesh("w31_reg", Vec3.zero);
     try scene.meshes.append(alloc, &regular);
 
     // Prime one staged frame so the rotation is warm.
@@ -1355,10 +1251,7 @@ test "wave31: concurrent stageUi/publish vs real prepare — exact skip counters
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     const total_claims: u64 = 2000;
@@ -1485,27 +1378,9 @@ test "wave31b: build stages slot build_stats; post-build accumulation never leak
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    var m0 = Mesh{
-        .name = "bstats_0",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
+    var m0 = stage1RegularMesh("bstats_0", Vec3.zero);
     try scene.meshes.append(alloc, &m0);
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1540,16 +1415,8 @@ test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stal
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = stage1Scene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.meshes.deinit(alloc);
-    defer scene.outline_meshes.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.shadows.pass.binned_meshes.deinit(alloc);
-    defer scene.shadows.pass.binned_source.deinit(alloc);
-    defer scene.shadows.pass.prepared.deinit(alloc);
-    p7CpuShadowPass(&scene, alloc);
+    defer stage1Deinit(&scene, alloc);
+    try stage1Prepare(&scene, alloc);
 
     // Reset semantics: a nonzero staged copy never survives `reset`.
     scene.draws.slots[1].build_stats.total_meshes = 7;
@@ -1557,16 +1424,7 @@ test "wave31b: slot reset zeroes staged build_stats; reuse never resurfaces stal
     scene.draws.slots[1].reset();
     try std.testing.expectEqual(SceneStats{}, scene.draws.slots[1].build_stats);
 
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    var m0 = Mesh{
-        .name = "bstats_reuse",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
+    var m0 = stage1RegularMesh("bstats_reuse", Vec3.zero);
     try scene.meshes.append(alloc, &m0);
 
     // Round 1 (meshes present): the latch merges nonzero staged stats.
@@ -1595,10 +1453,7 @@ test "wave39: split prepare consumes its claimed generation, not a newer publica
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1640,10 +1495,7 @@ test "wave39: cancelled split prepare releases its slot and closes its epoch" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1665,10 +1517,7 @@ test "wave39: no fresh staged build begins null, front stays reusable" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // No fresh producer build: staged begin returns null and touches
@@ -1700,10 +1549,7 @@ test "wave39: staged build consumes the exact generation; empty stays null" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     // Full staged build consumes the exact generation; afterwards no
@@ -1728,10 +1574,7 @@ test "wave39: cancel restores the handoff; a newer publish keeps newest-wins" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
@@ -1783,10 +1626,7 @@ test "wave39: pinned handoff refuses the staged begin, counted, stamp untouched"
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
     var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
+    defer basicSceneDeinit(&scene, alloc);
     defer scene.profiler.deinit();
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
