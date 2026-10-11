@@ -484,12 +484,16 @@ vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
     float fog_start = fog_params.w;
     float eff_dist = max(0.0, dist - fog_start);
 
-    // Exponential Height Falloff
+    // Exponential Height Falloff (CPU mirror: postprocess/fog.zig
+    // heightDensity). Exact-zero falloff (either sign) is the
+    // uniform-atmosphere limit 1.0; without the branch the sloped path
+    // computes 0/0 = NaN.
     float falloff = fog_params.z;
     float delta_y = world_pos.y - camera_pos.y;
-    float height_density = (abs(delta_y) > 0.001)
-        ? (exp(-camera_pos.y * falloff) - exp(-world_pos.y * falloff)) / (delta_y * falloff)
-        : exp(-camera_pos.y * falloff);
+    float height_density = (falloff == 0.0) ? 1.0
+        : ((abs(delta_y) > 0.001)
+            ? (exp(-camera_pos.y * falloff) - exp(-world_pos.y * falloff)) / (delta_y * falloff)
+            : exp(-camera_pos.y * falloff));
     height_density = clamp(height_density, 0.0, 5.0);
 
     // Beer-Lambert transmittance: extinction = 1.0 - exp(-optical_depth)
@@ -524,8 +528,17 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     int samples = int(motion_blur_params.w);
     if (samples < 2) samples = 8;
 
-    vec3 acc = color;
-    for (int i = 1; i < samples; ++i) {
+    // Centered box gather over the full [-0.5, +0.5] span: the loop covers
+    // BOTH endpoints (N taps, i = 0..N-1) so the kernel mean is exactly zero
+    // for every configured sample count (2..32). Starting at i = 1 dropped
+    // the -0.5 endpoint and biased the blur toward +velocity (fully
+    // one-sided at N = 2). The center correction preserves the sampleScene
+    // chromatic-aberration delta: `color` already carries the CA-shifted
+    // center while the taps gather raw scene radiance, so acc starts as
+    // that delta and the /N normalize keeps exactly delta/N — the same CA
+    // contribution as the old acc = color shape. Costs one extra center tap.
+    vec3 acc = color - texture(sampler2D(scene_tex, smp), uv).rgb;
+    for (int i = 0; i < samples; ++i) {
         float t = float(i) / float(samples - 1) - 0.5;
         vec2 sample_uv = clamp(uv + velocity * t, vec2(0.001), vec2(0.999));
         acc += texture(sampler2D(scene_tex, smp), sample_uv).rgb;

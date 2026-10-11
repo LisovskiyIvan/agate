@@ -103,7 +103,7 @@ pub const AssetManager = struct {
     pub fn addCustomTask(self, ...) !*AssetTask;
     pub fn getTaskByName(self: *AssetManager, name: []const u8) ?*AssetTask;
     pub fn remainingCount/totalCount/progress/isDone/hasErrors(...) ...;
-    pub fn loadStep(self: *AssetManager, max_tasks: usize) bool; // один шаг; true = ещё осталось
+    pub fn loadStep(self: *AssetManager, max_tasks: usize) bool; // один шаг; true = все задачи завершены
     pub fn loadSync(self: *AssetManager) void;                    // всё сразу (блокирует)
 };
 ```
@@ -119,7 +119,7 @@ while (!mgr.loadStep(4)) {
 if (mgr.hasErrors()) ui.showError();
 ```
 
-`progress()` возвращает долю 0..1, `isDone()` — ноль оставшихся, `getTaskByName` — доступ к задаче по имени для `takeMeshGeometry`/инспекции состояния.
+`progress()` возвращает долю 0..1, `isDone()` — ноль оставшихся, `getTaskByName` — доступ к задаче по имени для `takeMeshGeometry`/инспекции состояния. `onFinish` срабатывает один раз на каждый завершённый батч: хендлер сохраняется между батчами и `reset`, повторные опросы завершённого менеджера не дублируют вызов, сброс в null отключает.
 
 ## Потоки и владение
 

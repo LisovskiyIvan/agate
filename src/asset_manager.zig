@@ -43,6 +43,9 @@
 //!   async worker result is drained. See `AssetManager` docs.
 //! - Event Callbacks:
 //!   - `onTaskSuccess`, `onTaskError`, `onProgress`, `onFinish`
+//!   - `onFinish` fires once per completed batch: it stays installed across
+//!     batches and `reset`, polls while already done do not re-fire, and
+//!     setting it to null disables it.
 //!
 //! Ownership + lifetime:
 //! - `AssetTask.name`/`path` are BORROWED: the caller must keep them alive
@@ -525,6 +528,10 @@ pub const AssetManager = struct {
     onProgress: ?ProgressFn = null,
     onFinish: ?FinishFn = null,
     user_data: ?*anyopaque = null,
+    /// Latch: `onFinish` already fired for the current done-generation.
+    /// Rearmed whenever not done (at `loadStep` entry, covering every `add*`
+    /// path) and by `reset`; set BEFORE invoking `onFinish`.
+    finish_notified: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) AssetManager {
         return .{
@@ -576,6 +583,7 @@ pub const AssetManager = struct {
         self.completed_count = 0;
         self.failed_count = 0;
         self.current_index = 0;
+        self.finish_notified = false;
     }
 
     /// Resets both the task list and the underlying asset cache.
@@ -998,7 +1006,15 @@ pub const AssetManager = struct {
     /// the caller thread). A task never reports success before its result
     /// is available. Callbacks may enqueue via `add*` (pointers stable);
     /// they must not call `reset`/`resetAll`/`deinit`.
+    /// Returns true once every task has completed or failed. `onFinish`
+    /// fires once per completed batch (stays installed across batches and
+    /// `reset`; polls while already done do not re-fire; clearing it to
+    /// null disables). A task enqueued from `onFinish` makes the return
+    /// re-evaluate to false so `loadSync` keeps draining.
     pub fn loadStep(self: *AssetManager, max_tasks: usize) bool {
+        // Rearm: any pending work (including tasks appended after a prior
+        // completion) starts a new generation that may fire `onFinish` again.
+        if (!self.isDone()) self.finish_notified = false;
         var executed: usize = 0;
         // Phase 1: drain worker-finished async tasks (non-blocking poll).
         // Scan the whole list: submitted tasks sit behind `current_index`.
@@ -1056,11 +1072,15 @@ pub const AssetManager = struct {
             if (self.onProgress) |cb| cb(self, self.remainingCount(), self.tasks.items.len, task);
         }
 
-        const done = self.isDone();
-        if (done and self.onFinish != null) {
-            const cb = self.onFinish.?;
-            self.onFinish = null; // Fire once
-            cb(self);
+        var done = self.isDone();
+        if (done and !self.finish_notified) {
+            if (self.onFinish) |cb| {
+                self.finish_notified = true; // Before callback (reentrancy).
+                cb(self);
+                // The callback may have enqueued: report the post-callback
+                // state so `loadSync` does not exit with pending tasks.
+                done = self.isDone();
+            }
         }
         return done;
     }

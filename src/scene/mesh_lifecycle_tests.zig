@@ -278,6 +278,72 @@ test "Scene tag queries and tag-filtered raycasting" {
     try std.testing.expect(!hit_hero.hit);
 }
 
+test "pickWithRayTag skips invisible meshes" {
+    const alloc = std.testing.allocator;
+    var scene: Scene = undefined;
+    scene.allocator = alloc;
+    scene.meshes = .empty;
+    scene.frame_id = 0;
+    defer scene.meshes.deinit(alloc);
+
+    // Local boxes stay around the origin; world placement comes from
+    // `position` only (no double-offset like the legacy tag fixture).
+    var near_hidden = Mesh{
+        .name = "near_hidden",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 2),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+        .is_visible = false,
+    };
+    defer near_hidden.deinit(alloc);
+    _ = try near_hidden.addTags(alloc, "enemy");
+    try scene.meshes.append(alloc, &near_hidden);
+
+    var mid_other = Mesh{
+        .name = "mid_other",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 5),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    defer mid_other.deinit(alloc);
+    _ = try mid_other.addTags(alloc, "player");
+    try scene.meshes.append(alloc, &mid_other);
+
+    var far_visible = Mesh{
+        .name = "far_visible",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 9),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    defer far_visible.deinit(alloc);
+    _ = try far_visible.addTags(alloc, "enemy");
+    try scene.meshes.append(alloc, &far_visible);
+
+    const ray = Ray.new(Vec3.new(0, 0, 0), Vec3.new(0, 0, 1));
+
+    // Nearer matching mesh is hidden, so the farther visible match wins;
+    // the visible non-matching mesh in between stays excluded by the tag.
+    const hit_far = scene.pickWithRayTag(ray, "enemy");
+    try std.testing.expect(hit_far.hit);
+    try std.testing.expectEqual(&far_visible, hit_far.picked_mesh.?);
+
+    // All matching meshes hidden => clean miss (visible non-match excluded).
+    far_visible.is_visible = false;
+    try std.testing.expect(!scene.pickWithRayTag(ray, "enemy").hit);
+
+    // Re-showing restores the normal closest-hit order.
+    near_hidden.is_visible = true;
+    const hit_near = scene.pickWithRayTag(ray, "enemy");
+    try std.testing.expect(hit_near.hit);
+    try std.testing.expectEqual(&near_hidden, hit_near.picked_mesh.?);
+}
+
 test "renameMesh adopts an owned copy and repeated renames leak nothing" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);

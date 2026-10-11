@@ -201,6 +201,10 @@ test {
     _ = @import("passes/outline_pass_tests.zig");
     _ = @import("passes/particle_pass.zig");
     _ = @import("passes/particle_pass_tests.zig");
+    _ = @import("passes/postprocess/composite.zig");
+    _ = @import("passes/postprocess/composite_tests.zig");
+    _ = @import("passes/postprocess/targets.zig");
+    _ = @import("passes/postprocess/targets_tests.zig");
     _ = @import("passes/postprocess_pass.zig");
     _ = @import("passes/postprocess_pass_tests.zig");
     _ = @import("passes/shadow/binning.zig");
@@ -218,6 +222,8 @@ test {
     _ = @import("passes/shadow_pass.zig");
     _ = @import("passes/skybox_pass.zig");
     _ = @import("passes/ssao_pass.zig");
+    _ = @import("passes/velocity/pipelines.zig");
+    _ = @import("passes/velocity/pipelines_tests.zig");
     _ = @import("passes/velocity_pass.zig");
     _ = @import("passes/velocity_pass_tests.zig");
     _ = @import("passes/volumetric_pass.zig");
@@ -262,6 +268,7 @@ test {
     _ = @import("postprocess/highlight_tests.zig");
     _ = @import("postprocess/lut.zig");
     _ = @import("postprocess/lut_tests.zig");
+    _ = @import("postprocess/motion_blur_tests.zig");
     _ = @import("postprocess/options.zig");
     _ = @import("postprocess/options_tests.zig");
     _ = @import("postprocess/shafts.zig");

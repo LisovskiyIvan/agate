@@ -13,6 +13,11 @@
 //! camera-cut phases, draws every frame even with the master off).
 //! `AGATE_HDR_MSAA` / `?msaa=4` (default 1), `AGATE_HDR_SRGB=1` / `?srgb=1`
 //! single-encode proof via `sapp_desc.srgb`.
+//! `AGATE_HDR_FOG=1` (native) enables height fog (default off);
+//! `AGATE_HDR_FOG_FALLOFF=<f32>` overrides fog_height_falloff (default 0.08,
+//! exact 0 selects the uniform-atmosphere limit).
+//! `AGATE_HDR_MOTION_BLUR_SAMPLES=<u32>` overrides motion_blur_samples
+//! (default 8, clamped 2..32) for the min-samples blur-shape check.
 //! Finite runs also draw animated rigid/skinned/instanced geometry, exercise
 //! instance membership/growth, and capture/recapture a GGX reflection probe.
 //! These are live pipeline/lifetime checks, not velocity pixel readback.
@@ -273,11 +278,20 @@ fn setupScene() void {
     // A/B gate (native vs 0.66/0.75, same scene, same TAA).
     bench.overrideScale(render_scale);
     scene.post_process.render_scale = render_scale;
-    scene.post_process.fog_enabled = false;
+    scene.post_process.fog_enabled = envFlag("AGATE_HDR_FOG");
+    scene.post_process.fog_height_falloff = envF32("AGATE_HDR_FOG_FALLOFF", scene.post_process.fog_height_falloff);
     scene.post_process.contact_shadows_enabled = true;
     scene.post_process.local_tonemapping_enabled = true;
     scene.post_process.local_tonemapping_intensity = 0.4;
     if (frame_limit > 0) setupFiniteFixtures();
+    // Min-samples motion-blur debug knob (default 8 preserved when unset);
+    // applied after fixtures so the override wins. clamped() guards [2,32]
+    // again downstream; no effect toggles change here.
+    scene.post_process.motion_blur_samples = std.math.clamp(
+        envU32("AGATE_HDR_MOTION_BLUR_SAMPLES", scene.post_process.motion_blur_samples),
+        2,
+        32,
+    );
     std.debug.print("hdr-showcase: setup backend={s} msaa={} srgb={} env_color_fmt={s} swapchain_fmt={s} hdr_caps_sample={} hdr_caps_filter={} hdr_caps_render={} hdr_caps_blend={} hdr_caps_msaa={}\n", .{
         @tagName(sg.queryBackend()),
         msaa_count,
@@ -347,7 +361,8 @@ export fn frame() callconv(.c) void {
         if (f == 130) {
             scene.resizeOffscreen(320, 180);
             const pp = &scene.postfx.postprocess_pass;
-            check("resize-shape", pp.width == 320 and pp.height == 180);
+            const exp_resize = z.postprocess.scaledRenderSize(320, 180, scene.post_process.render_scale);
+            check("resize-shape", pp.width == exp_resize.w and pp.height == exp_resize.h);
             check("resize-targets", pp.targetsValid());
             check("resize-format", pp.color_format == .RGBA16F);
         }
@@ -402,7 +417,7 @@ export fn frame() callconv(.c) void {
         check("taa-history-available", pp.taaAvailable());
         check("taa-history-hdr", pp.taa_format == .RGBA16F);
         const vp = &scene.postfx.velocity_pass;
-        check("velocity-target", vp.width == w and vp.height == h and sg.queryImageState(vp.image) == .VALID);
+        check("velocity-target", vp.width == scene.postfx.renderWidth() and vp.height == scene.postfx.renderHeight() and sg.queryImageState(vp.image) == .VALID);
         check("velocity-rigid-pipeline", sg.queryPipelineState(vp.pip_rigid_u16) == .VALID);
         check("velocity-skinned-pipeline", sg.queryPipelineState(vp.pip_skin_u16) == .VALID);
         check("velocity-instanced-pipeline", sg.queryPipelineState(vp.pip_inst_u16) == .VALID);
@@ -419,7 +434,10 @@ export fn frame() callconv(.c) void {
         if (f == 61) check("exposure-61", scene.post_process.exposure == exposures[2]);
         if (f == 91) check("master-off", !scene.post_process.enabled);
         if (f == 111) check("master-on", scene.post_process.enabled);
-        if (f == 130) check("resize-reverted", pp.width == w and pp.height == h);
+        if (f == 130) {
+            const exp_win = z.postprocess.scaledRenderSize(w, h, scene.post_process.render_scale);
+            check("resize-reverted", pp.width == exp_win.w and pp.height == exp_win.h);
+        }
         if (f == 160) check("cut-160", scene.post_process.taa_camera_cut);
         if (f == 161) check("cut-cleared", !scene.post_process.taa_camera_cut);
         if (f == 170) check("explicit-reset-consumed", !scene.taa_reset_requested.load(.acquire));

@@ -64,3 +64,25 @@ test "skyHorizonHaze peaks at horizon and vanishes at zenith" {
     const h_high = fog.skyHorizonHaze(0.3, density);
     try std.testing.expectEqual(@as(f32, 0.0), h_high);
 }
+
+test "heightDensity with zero falloff is uniform density 1.0" {
+    // Zero falloff is the uniform-atmosphere limit: the analytic mean of
+    // exp(-lambda*y) tends to 1.0. Without the guard the sloped branch
+    // computes 0/0, which the CPU clamp maps to 5 (5x over-fog on slopes).
+    const zeros = [_]f32{ 0.0, -0.0 };
+    for (zeros) |zero| {
+        // Rising ray.
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), fog.heightDensity(0.0, 10.0, zero), 1e-6);
+        // Falling ray.
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), fog.heightDensity(10.0, 0.0, zero), 1e-6);
+        // Equal-height ray (delta_y == 0 branch).
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), fog.heightDensity(5.0, 5.0, zero), 1e-6);
+        // Full Beer-Lambert chain stays finite: tau = (20-5)*0.015*1.0 = 0.225.
+        const tau = fog.opticalDepth(20.0, 5.0, 0.015, fog.heightDensity(0.0, 10.0, zero));
+        try std.testing.expect(std.math.isFinite(tau));
+        try std.testing.expectApproxEqAbs(@as(f32, 0.225), tau, 1e-6);
+        const ext = fog.fogExtinction(tau);
+        try std.testing.expect(std.math.isFinite(ext));
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0 - @exp(-@as(f32, 0.225))), ext, 1e-6);
+    }
+}

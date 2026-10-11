@@ -16,7 +16,10 @@ const Vec3 = math.Vec3;
 /// Computes the average height density along the ray from `cam_y` to `world_y`
 /// under an exponential atmosphere with falloff factor lambda (`falloff`).
 /// Integral: (1 / dy) * integral(exp(-lambda * y) dy) = (exp(-lambda*y0) - exp(-lambda*y1)) / (lambda * dy).
+/// Exact-zero falloff (either sign) is the uniform-atmosphere limit 1.0;
+/// without the branch the sloped path computes 0/0 = NaN.
 pub fn heightDensity(cam_y: f32, world_y: f32, falloff: f32) f32 {
+    if (falloff == 0.0) return 1.0;
     const delta_y = world_y - cam_y;
     const density = if (@abs(delta_y) > 0.001)
         (@exp(-cam_y * falloff) - @exp(-world_y * falloff)) / (delta_y * falloff)

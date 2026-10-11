@@ -1,0 +1,279 @@
+//! Pure composite bindings and uniform packing. GPU resources remain owned by
+//! PostProcessPass; the pass is passed as anytype to avoid a leaf-to-owner import.
+const builtin = @import("builtin");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
+const post_shd = @import("postprocess_shader");
+const postprocess = @import("../../postprocess.zig");
+const PostProcessOptions = postprocess.PostProcessOptions;
+const math = @import("math");
+const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
+const Color3 = math.Color3;
+
+pub fn isSrgbBackbuffer(fmt: sg.PixelFormat) bool {
+    return fmt == .SRGB8A8 or fmt == .SBGR8A8;
+}
+
+pub fn outputParamsFor(backbuffer_fmt: sg.PixelFormat) [4]f32 {
+    // On WebGPU, the canvas compositor expects linear output and applies
+    // display transfer automatically; manual shader encode causes double gamma / washed out screen.
+    if (builtin.cpu.arch.isWasm()) return .{ 0.0, 0.0, 0.0, 0.0 };
+    const x: f32 = if (isSrgbBackbuffer(backbuffer_fmt)) 0.0 else 1.0;
+    return .{ x, 0.0, 0.0, 0.0 };
+}
+
+pub fn buildCompositeBindings(
+    self: anytype,
+    config: PostProcessOptions,
+    ssao_tex: sg.View,
+    depth_view: sg.View,
+    taa_history_view: sg.View,
+    velocity_view: sg.View,
+) sg.Bindings {
+    var post_bind = sg.Bindings{};
+    post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
+    post_bind.index_buffer = self.postprocess_quad_ib;
+    post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
+    post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
+    post_bind.views[post_shd.VIEW_depth_tex] = depth_view;
+    // Pyramid glow when the parent fed a BloomPass result; otherwise a
+    // valid placeholder the shader never samples (params3.z = 0 gates
+    // the bloom block off).
+    post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)
+        self.bloom_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // Glow halo when the parent fed a GlowPass result; otherwise a valid
+    // placeholder the shader never samples (glow_params.x = 0 gates the
+    // glow block off, so the off path is bit-identical to pre-glow).
+    post_bind.views[post_shd.VIEW_glow_tex] = if (self.glow_tex_view.id != 0)
+        self.glow_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // Highlight halo when the parent fed a HighlightPass result;
+    // otherwise a valid placeholder the shader never samples
+    // (highlight_params.x = 0 gates the highlight block off, so the
+    // off path is bit-identical to pre-highlight).
+    post_bind.views[post_shd.VIEW_highlight_tex] = if (self.highlight_tex_view.id != 0)
+        self.highlight_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // Highlight raw mask (inner-glow minuend) when the parent fed it;
+    // otherwise the same harmless placeholder (unread while gated off).
+    post_bind.views[post_shd.VIEW_highlight_mask_tex] = if (self.highlight_mask_tex_view.id != 0)
+        self.highlight_mask_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // Shaft radiance when the parent fed a VolumetricPass result;
+    // otherwise a valid placeholder the shader never samples
+    // (shaft_params.x = 0 gates the shaft block off, so the off path
+    // is bit-identical to pre-shaft).
+    post_bind.views[post_shd.VIEW_shaft_tex] = if (self.shaft_tex_view.id != 0)
+        self.shaft_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // LUT when the config carries a live binding; otherwise the resolved
+    // scene view as a valid placeholder the shader never samples
+    // (lut_params.x = 0 gates the LUT branch off).
+    const lut_view: sg.View = if (config.lut_texture) |t| t.view else .{};
+    post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
+        lut_view
+    else
+        self.offscreen_resolve_tex_view;
+    // TAA history (bilinear smp in-shader); a valid placeholder the
+    // shader never samples while history is invalid or TAA is off
+    // (taa_params.x/taa_state.x gate the branch off).
+    post_bind.views[post_shd.VIEW_history_tex] = if (taa_history_view.id != 0)
+        taa_history_view
+    else
+        self.offscreen_resolve_tex_view;
+    // Screen-space velocity buffer: per-object motion vector + alpha mask;
+    // binds default_zero_view when no velocity view was fed so the shader
+    // falls back to depth reprojection cleanly.
+    post_bind.views[post_shd.VIEW_velocity_tex] = if (velocity_view.id != 0)
+        velocity_view
+    else
+        self.default_zero_view;
+    post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
+    post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
+    post_bind.samplers[post_shd.SMP_velocity_smp] = self.velocity_sampler;
+    post_bind.samplers[post_shd.SMP_lut_smp] = self.lut_sampler;
+    return post_bind;
+}
+
+pub fn packCompositeParams(
+    self: anytype,
+    config: PostProcessOptions,
+    ssao_enabled: bool,
+    ssao_debug: bool,
+    ssao_intensity: f32,
+    cur_w: i32,
+    cur_h: i32,
+    view_proj: Mat4,
+    inv_view_proj: Mat4,
+    prev_view_proj: Mat4,
+    camera_pos: Vec3,
+    sun_dir: Vec3,
+    sun_color: Color3,
+    near_z: f32,
+    far_z: f32,
+    taa_history_valid: bool,
+    taa_capture_only: bool,
+    backbuffer_fmt: sg.PixelFormat,
+) post_shd.FsParams {
+    return post_shd.FsParams{
+        .params1 = .{
+            config.exposure,
+            config.bloom_threshold,
+            config.bloom_intensity,
+            0.0,
+        },
+        .params2 = .{
+            config.vignette_intensity,
+            config.vignette_radius,
+            config.saturation,
+            config.contrast,
+        },
+        .params3 = .{
+            @floatFromInt(@intFromEnum(config.tonemapping)),
+            config.chromatic_aberration,
+            if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
+            if (config.vignette_enabled) 1.0 else 0.0,
+        },
+        .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_debug, ssao_intensity),
+        .fxaa_params = postprocess.fxaaParams(config.fxaa_enabled),
+        .resolution = .{
+            @floatFromInt(cur_w),
+            @floatFromInt(cur_h),
+            1.0 / @as(f32, @floatFromInt(cur_w)),
+            1.0 / @as(f32, @floatFromInt(cur_h)),
+        },
+        // (near_z, far_z, 0, 0): the SSR step count used to ride in z
+        // and now has its own ssr_params2 lane below.
+        .camera_params = .{
+            near_z,
+            far_z,
+            0.0,
+            0.0,
+        },
+        .camera_pos = .{
+            camera_pos.x,
+            camera_pos.y,
+            camera_pos.z,
+            0.0,
+        },
+        .sun_dir = .{
+            sun_dir.x,
+            sun_dir.y,
+            sun_dir.z,
+            0.0,
+        },
+        .sun_color = .{
+            sun_color.r,
+            sun_color.g,
+            sun_color.b,
+            0.0,
+        },
+        .fog_params = .{
+            if (config.fog_enabled) 1.0 else 0.0,
+            config.fog_density,
+            config.fog_height_falloff,
+            config.fog_start_distance,
+        },
+        .fog_color = .{
+            config.fog_color[0],
+            config.fog_color[1],
+            config.fog_color[2],
+            config.fog_sun_scattering,
+        },
+        .ssr_params = .{
+            if (config.ssr_enabled) 1.0 else 0.0,
+            config.ssr_intensity,
+            config.ssr_thickness,
+            config.ssr_max_distance,
+        },
+        // (steps, 0, 0, 0); zeros when SSR is off, which keeps the
+        // composite identical to the SSR-off path (the shader
+        // early-outs on ssr_params.x before reading this lane).
+        .ssr_params2 = postprocess.ssrStepsParams(config),
+        .params5 = .{
+            if (config.sharpen_enabled) config.sharpen_amount else 0.0,
+            if (config.grain_enabled) config.grain_intensity else 0.0,
+            config.temperature,
+            config.tint,
+        },
+        .dof_params = .{
+            if (config.dof_enabled) 1.0 else 0.0,
+            config.dof_focus_distance,
+            config.dof_focus_range,
+            config.dof_max_blur,
+        },
+        // (enabled 1/0, intensity, 0, 0); zeros when glow is off, which
+        // keeps the composite identical to the pre-glow path.
+        .glow_params = postprocess.glowParams(config),
+        // (tint rgb, 0); zeros when glow is off (unread while disabled).
+        .glow_tint = postprocess.glowTintParams(config),
+        // (enabled 1/0, baked global scale 1.0, 0, 0); zeros when the
+        // parent fed no highlight view, which keeps the composite
+        // identical to the pre-highlight path.
+        .highlight_params = postprocess.highlightParams(self.highlight_tex_view.id != 0),
+        // (enabled 1/0, intensity, 0, 0); zeros when the shaft is off,
+        // which keeps the composite identical to the pre-shaft path.
+        .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
+        // (enabled 1/0, intensity, distance, thickness); zeros when off
+        .contact_shadow_params = postprocess.contactShadowParams(config),
+        // (steps, 0, 0, 0); zeros when off, which keeps the composite
+        // identical to the pre-contact-shadow path.
+        .contact_shadow_params2 = postprocess.contactShadowStepsParams(config),
+        // (enabled 1/0, intensity, radius, steps); zeros when off,
+        // which keeps the composite identical to the pre-SSGI path.
+        .ssgi_params = postprocess.ssgiParams(config),
+        // (enabled 1/0, intensity, contrast, 0); zeros when off
+        .local_tonemap_params = postprocess.localTonemapParams(config),
+        .grade_shadows = .{
+            config.grade_shadows[0],
+            config.grade_shadows[1],
+            config.grade_shadows[2],
+            0.0,
+        },
+        .grade_midtones = .{
+            config.grade_midtones[0],
+            config.grade_midtones[1],
+            config.grade_midtones[2],
+            0.0,
+        },
+        .grade_highlights = .{
+            config.grade_highlights[0],
+            config.grade_highlights[1],
+            config.grade_highlights[2],
+            0.0,
+        },
+        // (enabled 1/0, intensity, size N, 0); zeros when no LUT, which
+        // keeps the composite identical to the pre-LUT path.
+        .lut_params = postprocess.lutParams(config),
+        .view_proj = view_proj,
+        .inv_view_proj = inv_view_proj,
+        .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
+        .motion_blur_params = .{
+            if (config.motion_blur_enabled) 1.0 else 0.0,
+            config.motion_blur_intensity,
+            config.motion_blur_max_blur_px,
+            @floatFromInt(config.motion_blur_samples),
+        },
+        // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
+        // which keeps the composite identical to the pre-TAA path.
+        .taa_params = postprocess.taaParams(config),
+        // (history_valid 1/0, capture_only 1/0).
+        .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
+        // (reactive_enabled 1/0, strength, 0, 0); zeros when off, which
+        // keeps the composite identical to the pre-reactive path (the
+        // shader multiplies a zero boost into the blend).
+        .taa_reactive_params = postprocess.taaReactiveParams(config),
+        // Output lane (appended last): x = manual display-encode flag
+        // iff the backbuffer default is NOT sRGB (UNORM encodes the
+        // exact piecewise sRGB once at the end; sRGB targets encode in
+        // hardware); y/z/w = 0. The main target is always RGBA16F.
+        .output_params = outputParamsFor(backbuffer_fmt),
+    };
+}

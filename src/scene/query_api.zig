@@ -69,7 +69,7 @@ pub fn pickWithRayTag(self: anytype, r: Ray, query_str: []const u8) PickingInfo 
 
     for (self.meshes.items) |mesh| {
         if (!mesh.matchesTagQuery(query_str)) continue;
-        if (mesh.is_lod_child or mesh.is_decal or mesh.gpu_pending) continue;
+        if (!mesh.is_visible or mesh.is_lod_child or mesh.is_decal or mesh.gpu_pending) continue;
 
         const box = if (mesh.cached_frame == self.frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
         if (r.intersectsAABBNormal(box)) |hit| {

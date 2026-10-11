@@ -1,5 +1,8 @@
+//! Owns main HDR targets, TAA history and GPU submission. Pure composite
+//! bindings/uniform packing live in postprocess/composite.zig and main
+//! target/TAA lifecycle in postprocess/targets.zig; public methods forward
+//! there without changing resource ownership or the pass API.
 const std = @import("std");
-const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sglue = sokol.glue;
@@ -10,6 +13,8 @@ const math = @import("math");
 const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
 const Color3 = math.Color3;
+const composite = @import("postprocess/composite.zig");
+const targets = @import("postprocess/targets.zig");
 
 pub const PostProcessPass = struct {
     offscreen_color_image: sg.Image = .{},
@@ -109,43 +114,21 @@ pub const PostProcessPass = struct {
         sample_count: i32,
         depth_fmt: sg.PixelFormat,
     ) sg.PipelineDesc {
-        var desc = sg.PipelineDesc{
-            .shader = shader,
-            .index_type = .UINT16,
-            .depth = .{
-                .pixel_format = depth_fmt,
-                .compare = .ALWAYS,
-                .write_enabled = false,
-            },
-            .cull_mode = .NONE,
-            .sample_count = sample_count,
-        };
-        desc.colors[0].pixel_format = color_fmt;
-        desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
-        desc.layout.attrs[post_shd.ATTR_postprocess_position] = .{
-            .format = .FLOAT2,
-            .offset = 0,
-        };
-        desc.layout.attrs[post_shd.ATTR_postprocess_texcoord0] = .{
-            .format = .FLOAT2,
-            .offset = 2 * @sizeOf(f32),
-        };
-        return desc;
+        return targets.fullscreenPipelineDesc(shader, color_fmt, sample_count, depth_fmt);
     }
 
     pub fn fullscreenPipelineDescForShape(
         shader: sg.Shader,
         shape: @import("../target_shape.zig").TargetShape,
     ) sg.PipelineDesc {
-        const resolved = shape.resolveEnvironment();
-        return fullscreenPipelineDesc(shader, resolved.color_format, resolved.sample_count, resolved.depth_format);
+        return targets.fullscreenPipelineDescForShape(shader, shape);
     }
 
     /// Tiny backbuffer sRGB predicate (local: render_target imports would
     /// cycle here, and postprocess/hdr.zig owns capability math, not target
     /// shape). True exactly for the hardware-sRGB swapchain variants.
     pub fn isSrgbBackbuffer(fmt: sg.PixelFormat) bool {
-        return fmt == .SRGB8A8 or fmt == .SBGR8A8;
+        return composite.isSrgbBackbuffer(fmt);
     }
 
     /// Pure output-params packing (no sg calls): x = 1 iff the backbuffer
@@ -154,11 +137,7 @@ pub const PostProcessPass = struct {
     /// hardware); y/z/w = 0. The main target is always RGBA16F, so no
     /// target-format lane exists.
     pub fn outputParamsFor(backbuffer_fmt: sg.PixelFormat) [4]f32 {
-        // On WebGPU, the canvas compositor expects linear output and applies
-        // display transfer automatically; manual shader encode causes double gamma / washed out screen.
-        if (builtin.cpu.arch.isWasm()) return .{ 0.0, 0.0, 0.0, 0.0 };
-        const x: f32 = if (isSrgbBackbuffer(backbuffer_fmt)) 0.0 else 1.0;
-        return .{ x, 0.0, 0.0, 0.0 };
+        return composite.outputParamsFor(backbuffer_fmt);
     }
     pub fn init() PostProcessPass {
         // Fullscreen Quad (XY, UV)
@@ -254,45 +233,11 @@ pub const PostProcessPass = struct {
     /// is not samplable as a plain texture). 1x shape: plain color+depth,
     /// "resolve" views alias the color image.
     fn destroyTargets(self: *PostProcessPass) void {
-        if (self.offscreen_color_att_view.id != 0) sg.destroyView(self.offscreen_color_att_view);
-        if (self.offscreen_resolve_att_view.id != 0) sg.destroyView(self.offscreen_resolve_att_view);
-        if (self.offscreen_resolve_tex_view.id != 0) sg.destroyView(self.offscreen_resolve_tex_view);
-        if (self.offscreen_depth_att_view.id != 0) sg.destroyView(self.offscreen_depth_att_view);
-        if (self.offscreen_depth_tex_view.id != 0) sg.destroyView(self.offscreen_depth_tex_view);
-        if (self.offscreen_color_image.id != 0) sg.destroyImage(self.offscreen_color_image);
-        if (self.offscreen_resolve_image.id != 0) sg.destroyImage(self.offscreen_resolve_image);
-        if (self.offscreen_depth_image.id != 0) sg.destroyImage(self.offscreen_depth_image);
-        self.offscreen_color_image = .{};
-        self.offscreen_color_att_view = .{};
-        self.offscreen_resolve_image = .{};
-        self.offscreen_resolve_att_view = .{};
-        self.offscreen_resolve_tex_view = .{};
-        self.offscreen_depth_image = .{};
-        self.offscreen_depth_att_view = .{};
-        self.offscreen_depth_tex_view = .{};
-        self.width = 0;
-        self.height = 0;
-        self.sample_count = 1;
-        self.color_format = .DEFAULT;
-        self.depth_format = .DEFAULT;
-        self.destroyTaaHistory();
+        targets.destroyTargets(self);
     }
 
     fn destroyTaaHistory(self: *PostProcessPass) void {
-        for (0..2) |i| {
-            if (self.taa_att_views[i].id != 0) sg.destroyView(self.taa_att_views[i]);
-            if (self.taa_tex_views[i].id != 0) sg.destroyView(self.taa_tex_views[i]);
-            if (self.taa_images[i].id != 0) sg.destroyImage(self.taa_images[i]);
-            self.taa_images[i] = .{};
-            self.taa_att_views[i] = .{};
-            self.taa_tex_views[i] = .{};
-        }
-        if (self.taa_pipeline.id != 0) sg.destroyPipeline(self.taa_pipeline);
-        self.taa_pipeline = .{};
-        self.taa_width = 0;
-        self.taa_height = 0;
-        self.taa_format = .DEFAULT;
-        self.taa_read = 0;
+        targets.destroyTaaHistory(self);
     }
 
     /// Explicit TAA history reset. Context thread only (destroys GPU
@@ -300,7 +245,7 @@ pub const PostProcessPass = struct {
     /// allocated). The update-thread reset path is the snapshot-carried
     /// PostProcessOptions.taa_camera_cut flag (one frame).
     pub fn taaReset(self: *PostProcessPass) void {
-        self.destroyTaaHistory();
+        targets.taaReset(self);
     }
 
     /// Ensures both history slots exist at `width`x`height` in RGBA16F
@@ -313,58 +258,7 @@ pub const PostProcessPass = struct {
     /// all TAA handles and returns false (disable TAA for the frame — see
     /// taaAvailable). No sg calls outside a valid context.
     pub fn ensureTaaHistory(self: *PostProcessPass, width: i32, height: i32) bool {
-        if (width <= 0 or height <= 0) return false;
-        if (!sg.isvalid()) return false;
-        const hist_fmt: sg.PixelFormat = .RGBA16F;
-        if (self.taa_width == width and self.taa_height == height and self.taa_format == hist_fmt and
-            self.taa_images[0].id != 0 and self.taa_images[1].id != 0 and self.taa_pipeline.id != 0) return false;
-
-        self.destroyTaaHistory();
-
-        // Store-first rollback: sokol make* returns nonzero FAILED handles,
-        // so every handle lands in the struct before its state check and a
-        // single destroyTaaHistory frees the failed handle plus all partial
-        // handles. Views are destroyed before images.
-        for (0..2) |i| {
-            self.taa_images[i] = sg.makeImage(.{
-                .usage = .{ .color_attachment = true },
-                .width = width,
-                .height = height,
-                .pixel_format = hist_fmt,
-                .sample_count = 1,
-            });
-            if (sg.queryImageState(self.taa_images[i]) != .VALID) {
-                self.destroyTaaHistory();
-                return false;
-            }
-            self.taa_att_views[i] = sg.makeView(.{
-                .color_attachment = .{ .image = self.taa_images[i] },
-            });
-            if (sg.queryViewState(self.taa_att_views[i]) != .VALID) {
-                self.destroyTaaHistory();
-                return false;
-            }
-            self.taa_tex_views[i] = sg.makeView(.{
-                .texture = .{ .image = self.taa_images[i] },
-            });
-            if (sg.queryViewState(self.taa_tex_views[i]) != .VALID) {
-                self.destroyTaaHistory();
-                return false;
-            }
-        }
-        // Explicit 1x capture shape matched to the history format. The
-        // display pipeline targets the swapchain shape and must not render
-        // into the history targets.
-        self.taa_pipeline = sg.makePipeline(fullscreenPipelineDesc(self.postprocess_shader, hist_fmt, 1, .NONE));
-        if (sg.queryPipelineState(self.taa_pipeline) != .VALID) {
-            self.destroyTaaHistory();
-            return false;
-        }
-        self.taa_width = width;
-        self.taa_height = height;
-        self.taa_format = hist_fmt;
-        self.taa_read = 0;
-        return true;
+        return targets.ensureTaaHistory(self, width, height);
     }
 
     /// True when both history slots plus the capture pipeline are fully
@@ -372,47 +266,26 @@ pub const PostProcessPass = struct {
     /// frame when this is false; an empty read view then means the caller
     /// binds its dummy placeholder, never a dead handle.
     pub fn taaAvailable(self: *const PostProcessPass) bool {
-        if (self.taa_width <= 0 or self.taa_height <= 0) return false;
-        if (!sg.isvalid()) return false;
-        if (sg.queryPipelineState(self.taa_pipeline) != .VALID) return false;
-        for (0..2) |i| {
-            if (sg.queryImageState(self.taa_images[i]) != .VALID) return false;
-            if (sg.queryViewState(self.taa_att_views[i]) != .VALID) return false;
-            if (sg.queryViewState(self.taa_tex_views[i]) != .VALID) return false;
-        }
-        return true;
+        return targets.taaAvailable(self);
     }
 
     /// History texture view the composite samples (slot taa_read). Empty
     /// until ensureTaaHistory succeeds; callers fall back to a valid
     /// placeholder view when it is empty.
     pub fn taaReadView(self: *const PostProcessPass) sg.View {
-        return self.taa_tex_views[self.taa_read];
+        return targets.taaReadView(self);
     }
 
     /// History color-attachment view the capture draw renders into (the
     /// slot the composite does NOT sample this frame).
     pub fn taaWriteAttView(self: *const PostProcessPass) sg.View {
-        return self.taa_att_views[1 - self.taa_read];
+        return targets.taaWriteAttView(self);
     }
 
     /// True when every main-target image/view is VALID (state queries, not
     /// id-only). No sg calls outside a valid context (reports false).
     pub fn targetsValid(self: *const PostProcessPass) bool {
-        if (self.width <= 0 or self.height <= 0) return false;
-        if (!sg.isvalid()) return false;
-        if (sg.queryImageState(self.offscreen_color_image) != .VALID) return false;
-        if (sg.queryViewState(self.offscreen_color_att_view) != .VALID) return false;
-        if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) return false;
-        if (sg.queryImageState(self.offscreen_depth_image) != .VALID) return false;
-        if (sg.queryViewState(self.offscreen_depth_att_view) != .VALID) return false;
-        if (self.sample_count > 1) {
-            if (sg.queryImageState(self.offscreen_resolve_image) != .VALID) return false;
-            if (sg.queryViewState(self.offscreen_resolve_att_view) != .VALID) return false;
-        } else {
-            if (sg.queryViewState(self.offscreen_depth_tex_view) != .VALID) return false;
-        }
-        return true;
+        return targets.targetsValid(self);
     }
 
     /// Rebuilds the main target at `width`x`height` in the sole contract
@@ -431,124 +304,7 @@ pub const PostProcessPass = struct {
         height: i32,
         sample_count: i32,
     ) bool {
-        if (width <= 0 or height <= 0) return false;
-        if (!sg.isvalid()) return false;
-        const samples: i32 = if (sample_count < 1) 1 else sample_count;
-        const env_def = sg.queryDesc().environment.defaults;
-        const actual_fmt: sg.PixelFormat = .RGBA16F;
-        if (self.width == width and self.height == height and
-            self.sample_count == samples and self.color_format == actual_fmt) return self.targetsValid();
-
-        self.destroyTargets();
-
-        const depth_fmt: sg.PixelFormat = if (env_def.depth_format != .DEFAULT and env_def.depth_format != .NONE) env_def.depth_format else .DEPTH;
-        self.depth_format = depth_fmt;
-
-        // Store-first rollback throughout: sokol make* returns nonzero
-        // FAILED handles, so every handle lands in the struct before its
-        // state check and a single destroyTargets frees the failed handle
-        // plus all partial handles. Views are destroyed before images.
-        //
-        // Color: attachment at the full sample count; when resolving, a
-        // separate 1x resolve image (usage.resolve_attachment) receives the
-        // MSAA resolve at end of pass and carries the texture view.
-        self.offscreen_color_image = sg.makeImage(.{
-            .usage = .{ .color_attachment = true },
-            .width = width,
-            .height = height,
-            .pixel_format = actual_fmt,
-            .sample_count = samples,
-        });
-        if (sg.queryImageState(self.offscreen_color_image) != .VALID) {
-            self.destroyTargets();
-            return false;
-        }
-        self.offscreen_color_att_view = sg.makeView(.{
-            .color_attachment = .{ .image = self.offscreen_color_image },
-        });
-        if (sg.queryViewState(self.offscreen_color_att_view) != .VALID) {
-            self.destroyTargets();
-            return false;
-        }
-
-        if (samples > 1) {
-            self.offscreen_resolve_image = sg.makeImage(.{
-                .usage = .{ .resolve_attachment = true },
-                .width = width,
-                .height = height,
-                .pixel_format = actual_fmt,
-                .sample_count = 1,
-            });
-            if (sg.queryImageState(self.offscreen_resolve_image) != .VALID) {
-                self.destroyTargets();
-                return false;
-            }
-            self.offscreen_resolve_att_view = sg.makeView(.{
-                .resolve_attachment = .{ .image = self.offscreen_resolve_image },
-            });
-            if (sg.queryViewState(self.offscreen_resolve_att_view) != .VALID) {
-                self.destroyTargets();
-                return false;
-            }
-            self.offscreen_resolve_tex_view = sg.makeView(.{
-                .texture = .{ .image = self.offscreen_resolve_image },
-            });
-            if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) {
-                self.destroyTargets();
-                return false;
-            }
-        } else {
-            // 1x shape: postfx samples the color image directly.
-            self.offscreen_resolve_tex_view = sg.makeView(.{
-                .texture = .{ .image = self.offscreen_color_image },
-            });
-            if (sg.queryViewState(self.offscreen_resolve_tex_view) != .VALID) {
-                self.destroyTargets();
-                return false;
-            }
-        }
-
-        // Depth: same sample count as color (sokol validation requires the
-        // match). Only the 1x depth gets a texture view; MSAA depth is
-        // write-only for the post chain (depth-consuming effects stay gated
-        // off while MSAA is active).
-        self.offscreen_depth_image = sg.makeImage(.{
-            .usage = .{ .depth_stencil_attachment = true },
-            .width = width,
-            .height = height,
-            .pixel_format = depth_fmt,
-            .sample_count = samples,
-        });
-        if (sg.queryImageState(self.offscreen_depth_image) != .VALID) {
-            self.destroyTargets();
-            return false;
-        }
-        self.offscreen_depth_att_view = sg.makeView(.{
-            .depth_stencil_attachment = .{ .image = self.offscreen_depth_image },
-        });
-        if (sg.queryViewState(self.offscreen_depth_att_view) != .VALID) {
-            self.destroyTargets();
-            return false;
-        }
-        if (samples == 1) {
-            self.offscreen_depth_tex_view = sg.makeView(.{
-                .texture = .{ .image = self.offscreen_depth_image },
-            });
-            if (sg.queryViewState(self.offscreen_depth_tex_view) != .VALID) {
-                self.destroyTargets();
-                return false;
-            }
-        }
-
-        self.width = width;
-        self.height = height;
-        self.sample_count = samples;
-        self.color_format = actual_fmt;
-        if (!self.targetsValid()) {
-            self.destroyTargets();
-            return false;
-        }
-        return true;
+        return targets.resize(self, width, height, sample_count);
     }
 
     /// Valid texture view for slots that semantically want scene depth.
@@ -558,8 +314,7 @@ pub const PostProcessPass = struct {
     /// while MSAA is active (scene/postfx_stack.zig), the binding only has
     /// to exist for sokol's apply-bindings validation.
     pub fn depthSampleView(self: *const PostProcessPass) sg.View {
-        if (self.offscreen_depth_tex_view.id != 0) return self.offscreen_depth_tex_view;
-        return self.offscreen_resolve_tex_view;
+        return targets.depthSampleView(self);
     }
 
     pub fn render(
@@ -653,75 +408,7 @@ pub const PostProcessPass = struct {
         taa_history_view: sg.View,
         velocity_view: sg.View,
     ) sg.Bindings {
-        var post_bind = sg.Bindings{};
-        post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
-        post_bind.index_buffer = self.postprocess_quad_ib;
-        post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
-        post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
-        post_bind.views[post_shd.VIEW_depth_tex] = depth_view;
-        // Pyramid glow when the parent fed a BloomPass result; otherwise a
-        // valid placeholder the shader never samples (params3.z = 0 gates
-        // the bloom block off).
-        post_bind.views[post_shd.VIEW_bloom_tex] = if (self.bloom_tex_view.id != 0)
-            self.bloom_tex_view
-        else
-            self.offscreen_resolve_tex_view;
-        // Glow halo when the parent fed a GlowPass result; otherwise a valid
-        // placeholder the shader never samples (glow_params.x = 0 gates the
-        // glow block off, so the off path is bit-identical to pre-glow).
-        post_bind.views[post_shd.VIEW_glow_tex] = if (self.glow_tex_view.id != 0)
-            self.glow_tex_view
-        else
-            self.offscreen_resolve_tex_view;
-        // Highlight halo when the parent fed a HighlightPass result;
-        // otherwise a valid placeholder the shader never samples
-        // (highlight_params.x = 0 gates the highlight block off, so the
-        // off path is bit-identical to pre-highlight).
-        post_bind.views[post_shd.VIEW_highlight_tex] = if (self.highlight_tex_view.id != 0)
-            self.highlight_tex_view
-        else
-            self.offscreen_resolve_tex_view;
-        // Highlight raw mask (inner-glow minuend) when the parent fed it;
-        // otherwise the same harmless placeholder (unread while gated off).
-        post_bind.views[post_shd.VIEW_highlight_mask_tex] = if (self.highlight_mask_tex_view.id != 0)
-            self.highlight_mask_tex_view
-        else
-            self.offscreen_resolve_tex_view;
-        // Shaft radiance when the parent fed a VolumetricPass result;
-        // otherwise a valid placeholder the shader never samples
-        // (shaft_params.x = 0 gates the shaft block off, so the off path
-        // is bit-identical to pre-shaft).
-        post_bind.views[post_shd.VIEW_shaft_tex] = if (self.shaft_tex_view.id != 0)
-            self.shaft_tex_view
-        else
-            self.offscreen_resolve_tex_view;
-        // LUT when the config carries a live binding; otherwise the resolved
-        // scene view as a valid placeholder the shader never samples
-        // (lut_params.x = 0 gates the LUT branch off).
-        const lut_view: sg.View = if (config.lut_texture) |t| t.view else .{};
-        post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
-            lut_view
-        else
-            self.offscreen_resolve_tex_view;
-        // TAA history (bilinear smp in-shader); a valid placeholder the
-        // shader never samples while history is invalid or TAA is off
-        // (taa_params.x/taa_state.x gate the branch off).
-        post_bind.views[post_shd.VIEW_history_tex] = if (taa_history_view.id != 0)
-            taa_history_view
-        else
-            self.offscreen_resolve_tex_view;
-        // Screen-space velocity buffer: per-object motion vector + alpha mask;
-        // binds default_zero_view when no velocity view was fed so the shader
-        // falls back to depth reprojection cleanly.
-        post_bind.views[post_shd.VIEW_velocity_tex] = if (velocity_view.id != 0)
-            velocity_view
-        else
-            self.default_zero_view;
-        post_bind.samplers[post_shd.SMP_smp] = self.postprocess_sampler;
-        post_bind.samplers[post_shd.SMP_depth_smp] = self.depth_sampler;
-        post_bind.samplers[post_shd.SMP_velocity_smp] = self.velocity_sampler;
-        post_bind.samplers[post_shd.SMP_lut_smp] = self.lut_sampler;
-        return post_bind;
+        return composite.buildCompositeBindings(self, config, ssao_tex, depth_view, taa_history_view, velocity_view);
     }
 
     /// Composite uniform packing (pure: no sg calls — the caller passes the
@@ -749,160 +436,26 @@ pub const PostProcessPass = struct {
         taa_capture_only: bool,
         backbuffer_fmt: sg.PixelFormat,
     ) post_shd.FsParams {
-        return post_shd.FsParams{
-            .params1 = .{
-                config.exposure,
-                config.bloom_threshold,
-                config.bloom_intensity,
-                0.0,
-            },
-            .params2 = .{
-                config.vignette_intensity,
-                config.vignette_radius,
-                config.saturation,
-                config.contrast,
-            },
-            .params3 = .{
-                @floatFromInt(@intFromEnum(config.tonemapping)),
-                config.chromatic_aberration,
-                if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
-                if (config.vignette_enabled) 1.0 else 0.0,
-            },
-            .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_debug, ssao_intensity),
-            .fxaa_params = postprocess.fxaaParams(config.fxaa_enabled),
-            .resolution = .{
-                @floatFromInt(cur_w),
-                @floatFromInt(cur_h),
-                1.0 / @as(f32, @floatFromInt(cur_w)),
-                1.0 / @as(f32, @floatFromInt(cur_h)),
-            },
-            // (near_z, far_z, 0, 0): the SSR step count used to ride in z
-            // and now has its own ssr_params2 lane below.
-            .camera_params = .{
-                near_z,
-                far_z,
-                0.0,
-                0.0,
-            },
-            .camera_pos = .{
-                camera_pos.x,
-                camera_pos.y,
-                camera_pos.z,
-                0.0,
-            },
-            .sun_dir = .{
-                sun_dir.x,
-                sun_dir.y,
-                sun_dir.z,
-                0.0,
-            },
-            .sun_color = .{
-                sun_color.r,
-                sun_color.g,
-                sun_color.b,
-                0.0,
-            },
-            .fog_params = .{
-                if (config.fog_enabled) 1.0 else 0.0,
-                config.fog_density,
-                config.fog_height_falloff,
-                config.fog_start_distance,
-            },
-            .fog_color = .{
-                config.fog_color[0],
-                config.fog_color[1],
-                config.fog_color[2],
-                config.fog_sun_scattering,
-            },
-            .ssr_params = .{
-                if (config.ssr_enabled) 1.0 else 0.0,
-                config.ssr_intensity,
-                config.ssr_thickness,
-                config.ssr_max_distance,
-            },
-            // (steps, 0, 0, 0); zeros when SSR is off, which keeps the
-            // composite identical to the SSR-off path (the shader
-            // early-outs on ssr_params.x before reading this lane).
-            .ssr_params2 = postprocess.ssrStepsParams(config),
-            .params5 = .{
-                if (config.sharpen_enabled) config.sharpen_amount else 0.0,
-                if (config.grain_enabled) config.grain_intensity else 0.0,
-                config.temperature,
-                config.tint,
-            },
-            .dof_params = .{
-                if (config.dof_enabled) 1.0 else 0.0,
-                config.dof_focus_distance,
-                config.dof_focus_range,
-                config.dof_max_blur,
-            },
-            // (enabled 1/0, intensity, 0, 0); zeros when glow is off, which
-            // keeps the composite identical to the pre-glow path.
-            .glow_params = postprocess.glowParams(config),
-            // (tint rgb, 0); zeros when glow is off (unread while disabled).
-            .glow_tint = postprocess.glowTintParams(config),
-            // (enabled 1/0, baked global scale 1.0, 0, 0); zeros when the
-            // parent fed no highlight view, which keeps the composite
-            // identical to the pre-highlight path.
-            .highlight_params = postprocess.highlightParams(self.highlight_tex_view.id != 0),
-            // (enabled 1/0, intensity, 0, 0); zeros when the shaft is off,
-            // which keeps the composite identical to the pre-shaft path.
-            .shaft_params = postprocess.shaftParams(config, self.shaft_tex_view.id != 0),
-            // (enabled 1/0, intensity, distance, thickness); zeros when off
-            .contact_shadow_params = postprocess.contactShadowParams(config),
-            // (steps, 0, 0, 0); zeros when off, which keeps the composite
-            // identical to the pre-contact-shadow path.
-            .contact_shadow_params2 = postprocess.contactShadowStepsParams(config),
-            // (enabled 1/0, intensity, radius, steps); zeros when off,
-            // which keeps the composite identical to the pre-SSGI path.
-            .ssgi_params = postprocess.ssgiParams(config),
-            // (enabled 1/0, intensity, contrast, 0); zeros when off
-            .local_tonemap_params = postprocess.localTonemapParams(config),
-            .grade_shadows = .{
-                config.grade_shadows[0],
-                config.grade_shadows[1],
-                config.grade_shadows[2],
-                0.0,
-            },
-            .grade_midtones = .{
-                config.grade_midtones[0],
-                config.grade_midtones[1],
-                config.grade_midtones[2],
-                0.0,
-            },
-            .grade_highlights = .{
-                config.grade_highlights[0],
-                config.grade_highlights[1],
-                config.grade_highlights[2],
-                0.0,
-            },
-            // (enabled 1/0, intensity, size N, 0); zeros when no LUT, which
-            // keeps the composite identical to the pre-LUT path.
-            .lut_params = postprocess.lutParams(config),
-            .view_proj = view_proj,
-            .inv_view_proj = inv_view_proj,
-            .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
-            .motion_blur_params = .{
-                if (config.motion_blur_enabled) 1.0 else 0.0,
-                config.motion_blur_intensity,
-                config.motion_blur_max_blur_px,
-                @floatFromInt(config.motion_blur_samples),
-            },
-            // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
-            // which keeps the composite identical to the pre-TAA path.
-            .taa_params = postprocess.taaParams(config),
-            // (history_valid 1/0, capture_only 1/0).
-            .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
-            // (reactive_enabled 1/0, strength, 0, 0); zeros when off, which
-            // keeps the composite identical to the pre-reactive path (the
-            // shader multiplies a zero boost into the blend).
-            .taa_reactive_params = postprocess.taaReactiveParams(config),
-            // Output lane (appended last): x = manual display-encode flag
-            // iff the backbuffer default is NOT sRGB (UNORM encodes the
-            // exact piecewise sRGB once at the end; sRGB targets encode in
-            // hardware); y/z/w = 0. The main target is always RGBA16F.
-            .output_params = outputParamsFor(backbuffer_fmt),
-        };
+        return composite.packCompositeParams(
+            self,
+            config,
+            ssao_enabled,
+            ssao_debug,
+            ssao_intensity,
+            cur_w,
+            cur_h,
+            view_proj,
+            inv_view_proj,
+            prev_view_proj,
+            camera_pos,
+            sun_dir,
+            sun_color,
+            near_z,
+            far_z,
+            taa_history_valid,
+            taa_capture_only,
+            backbuffer_fmt,
+        );
     }
 
     // Feed the BloomPass pyramid result into the composite. Call every frame

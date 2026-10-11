@@ -511,3 +511,130 @@ test "AssetManager async mesh scene load + failures drain on caller" {
     try testing.expectEqual(@as(usize, 0), mgr.totalCount());
     try testing.expect(mgr.async_runner != null);
 }
+
+test "AssetManager onFinish fires once per batch across append and reset" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+
+    var fires: usize = 0;
+    mgr.user_data = &fires;
+    mgr.onFinish = struct {
+        fn cb(m: *AssetManager) void {
+            const c: *usize = @ptrCast(@alignCast(m.user_data.?));
+            c.* += 1;
+        }
+    }.cb;
+
+    const noop = struct {
+        fn run(_: *AssetTask, _: std.mem.Allocator) !void {}
+    }.run;
+    const fail = struct {
+        fn run(_: *AssetTask, _: std.mem.Allocator) !void {
+            return error.SimulatedFailure;
+        }
+    }.run;
+
+    // Batch 1 fires once.
+    _ = try mgr.addCustomTask("b1", noop, null);
+    mgr.loadSync();
+    try testing.expect(mgr.isDone());
+    try testing.expectEqual(@as(usize, 1), fires);
+
+    // Polls while already done must not re-fire with the handler unchanged.
+    try testing.expect(mgr.loadStep(1));
+    try testing.expect(mgr.loadStep(0));
+    mgr.loadSync();
+    try testing.expectEqual(@as(usize, 1), fires);
+
+    // Batch 2 appended after completion (mixed success/failure) fires again.
+    _ = try mgr.addCustomTask("b2a", noop, null);
+    _ = try mgr.addCustomTask("b2b", fail, null);
+    mgr.loadSync();
+    try testing.expect(mgr.isDone());
+    try testing.expect(mgr.hasErrors());
+    try testing.expectEqual(@as(usize, 2), fires);
+    try testing.expectEqual(@as(usize, 2), mgr.completed_count);
+    try testing.expectEqual(@as(usize, 1), mgr.failed_count);
+
+    // Reset rearms with the same handler still installed.
+    mgr.reset();
+    _ = try mgr.addCustomTask("b3", noop, null);
+    mgr.loadSync();
+    try testing.expectEqual(@as(usize, 3), fires);
+
+    // Intentional clear disables.
+    mgr.onFinish = null;
+    mgr.reset();
+    _ = try mgr.addCustomTask("b4", noop, null);
+    mgr.loadSync();
+    try testing.expectEqual(@as(usize, 3), fires);
+}
+
+test "AssetManager empty queue fires onFinish once, polls dedupe" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+
+    var fires: usize = 0;
+    mgr.user_data = &fires;
+    mgr.onFinish = struct {
+        fn cb(m: *AssetManager) void {
+            const c: *usize = @ptrCast(@alignCast(m.user_data.?));
+            c.* += 1;
+        }
+    }.cb;
+
+    try testing.expect(mgr.loadStep(1));
+    try testing.expectEqual(@as(usize, 1), fires);
+    try testing.expect(mgr.loadStep(1));
+    try testing.expect(mgr.loadStep(0));
+    mgr.loadSync();
+    try testing.expectEqual(@as(usize, 1), fires);
+}
+
+test "AssetManager onFinish enqueue defers done until next batch drains" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const Ctx = struct {
+        fires: usize = 0,
+        enqueued: bool = false,
+    };
+    var ctx = Ctx{};
+    var mgr = AssetManager.init(allocator);
+    defer mgr.deinit();
+    mgr.user_data = &ctx;
+    mgr.onFinish = struct {
+        fn cb(m: *AssetManager) void {
+            const c: *Ctx = @ptrCast(@alignCast(m.user_data.?));
+            c.fires += 1;
+            if (!c.enqueued) {
+                c.enqueued = true;
+                _ = m.addCustomTask("late", struct {
+                    fn run(_: *AssetTask, _: std.mem.Allocator) !void {}
+                }.run, null) catch return;
+            }
+        }
+    }.cb;
+
+    const noop = struct {
+        fn run(_: *AssetTask, _: std.mem.Allocator) !void {}
+    }.run;
+    _ = try mgr.addCustomTask("first", noop, null);
+
+    // The callback enqueues a pending task, so this step must report
+    // not-done (a stale pre-callback value would wrongly return true).
+    try testing.expect(!mgr.loadStep(std.math.maxInt(usize)));
+    try testing.expect(!mgr.isDone());
+
+    mgr.loadSync();
+    try testing.expect(mgr.isDone());
+    try testing.expectEqual(@as(usize, 2), ctx.fires);
+    try testing.expectEqual(@as(usize, 2), mgr.totalCount());
+    try testing.expectEqual(@as(usize, 2), mgr.completed_count);
+}
