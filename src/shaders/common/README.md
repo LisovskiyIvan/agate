@@ -22,6 +22,11 @@ materials).
 | `channel_select.glsl` | 6 | same 3 |
 | `refraction.glsl` | 25 | same 3 (screen-space refraction) |
 | `hemi.glsl` | 24 | same 5 (`standard`, `pbr`, `instanced`, `instanced_pbr`, `skinned_pbr`) |
+| `frame_view.glsl` | 57 | `pbr`, `instanced_pbr`, `skinned_pbr` fs view-global block (legacy slot per shader) |
+| `frame_mat.glsl` | 46 | same 3 (per-material/object block, UB 5) |
+| `pbr_fs_bindings.glsl` | 79 | same 3 (fs texture/sampler view bindings, merged slot-pool docs) |
+| `pbr_shadow_consts.glsl` | 91 | same 3 (Poisson disk, cascade offsets, PCSS budgets) |
+| `morph_helpers.glsl` | 53 | `pbr`, `skinned_pbr` vs (`morphTexel`/`morphWeight`/`applyMorphDeltas`) |
 
 Rules: chunk files are pure code spans with NO provenance header (any
 header would break the byte-identical expansion guarantee — expansion
@@ -38,13 +43,16 @@ Includes are small versioned files; map back by inspection.
 
 ## Deliberately NOT shared (do not "fix" without review)
 
-- `fs_params` uniform blocks (5 forward shaders): same field order by
-  convention, but probe-lane comments/semantics differ and any reorder
-  shifts every uniform offset. Pinned by the `fs_params probe lane
-  parity` drift test in `../shader_material/include.zig`.
-- Morph vertex helpers (`morphTexel`/`morphWeight`/`applyMorphDeltas`):
-  arity differs (`tan_xyz` only in PBR variants). Pinned by the
-  `morph arity` drift test.
+- `fs_params` uniform blocks: the three PBR variants share theirs via
+  `frame_view`/`frame_mat` (pinned by the `fs_view/fs_mat parity` drift
+  test in `../shader_material/include_tests.zig`); any reorder shifts
+  every uniform offset, so new lanes go through the shared chunks.
+- Morph vertex BLOCKS (`vs_morph` declarations: UB 2 in pbr vs UB 3 in
+  skinned_pbr) and the skin variant (`vs_skin`, joints/weights
+  attributes): different slots by construction, stay per-shader. Only the
+  pure helpers (`morphTexel`/`morphWeight`/`applyMorphDeltas`) are shared
+  (common/morph_helpers.glsl); arity is pinned by the `morph helpers live
+  once in common` drift test.
 - `shadow.glsl` vs `msaa_depth.glsl` (depth-only twins): must rasterize
   identically but upload different matrices (light vs camera) and
   different bias. Pinned by the `depth twin programs` drift test.

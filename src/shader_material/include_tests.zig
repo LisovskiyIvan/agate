@@ -99,6 +99,9 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/box_project.glsl", .text = @embedFile("../shaders/common/box_project.glsl") },
         .{ .name = "shaders/common/frame_view.glsl", .text = @embedFile("../shaders/common/frame_view.glsl") },
         .{ .name = "shaders/common/frame_mat.glsl", .text = @embedFile("../shaders/common/frame_mat.glsl") },
+        .{ .name = "shaders/common/morph_helpers.glsl", .text = @embedFile("../shaders/common/morph_helpers.glsl") },
+        .{ .name = "shaders/common/pbr_fs_bindings.glsl", .text = @embedFile("../shaders/common/pbr_fs_bindings.glsl") },
+        .{ .name = "shaders/common/pbr_shadow_consts.glsl", .text = @embedFile("../shaders/common/pbr_shadow_consts.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{
@@ -192,11 +195,55 @@ test "drift: depth-only twin programs (shadow vs msaa_depth)" {
     try std.testing.expect(std.mem.indexOf(u8, msaa, "in vec3 position;") != null);
 }
 
-test "drift: morph helper arity (PBR variants)" {
+test "drift: morph helpers live once in common (PBR variants)" {
+    // Post-dedup invariant: the GPU-morph helpers (morphTexel /
+    // morphWeight / applyMorphDeltas) are defined exactly once, in
+    // common/morph_helpers.glsl, and both morph-capable vertex shaders
+    // include that chunk instead of carrying inline copies. The arity
+    // (tan_xyz lane) is pinned on the single definition; a signature
+    // change without updating both call sites fails loudly here.
+    // instanced_pbr has no morph path and must not include the chunk.
     const pbr = @embedFile("../shaders/pbr.glsl");
     const skinned = @embedFile("../shaders/skinned_pbr.glsl");
-    try std.testing.expect(std.mem.indexOf(u8, pbr, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skinned, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id)") != null);
+    const instanced = @embedFile("../shaders/instanced_pbr.glsl");
+    const chunk = @embedFile("../shaders/common/morph_helpers.glsl");
+    for ([2][]const u8{ pbr, skinned }) |src| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/morph_helpers.glsl\""));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "vec3 morphTexel(float idx) {"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "float morphWeight(int t) {"));
+    }
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(instanced, "morph_helpers"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(chunk, "void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id) {"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(chunk, "vec3 morphTexel(float idx) {"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(chunk, "float morphWeight(int t) {"));
+}
+
+test "drift: PBR fs bindings and shadow consts live once in common" {
+    // Post-dedup invariant: the three PBR forward fragment shaders share
+    // their texture/sampler view bindings (common/pbr_fs_bindings.glsl)
+    // and their shadow-sampling constants (common/pbr_shadow_consts.glsl)
+    // by include. No variant declares a conflicting inline copy: the
+    // sampler/view layout is load-bearing (see scene/draw.zig), so a
+    // binding added to one variant but not the chunk fails loudly here.
+    const shaders = [_][]const u8{
+        @embedFile("../shaders/pbr.glsl"),
+        @embedFile("../shaders/instanced_pbr.glsl"),
+        @embedFile("../shaders/skinned_pbr.glsl"),
+    };
+    for (shaders) |src| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/pbr_fs_bindings.glsl\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/pbr_shadow_consts.glsl\""));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "uniform texture2D albedo_tex;"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "const vec2 POISSON_DISK[16]"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "const vec2 CASCADE_OFFSETS[4]"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "#define PCSS_BLOCKER_SAMPLES"));
+    }
+    const bindings = @embedFile("../shaders/common/pbr_fs_bindings.glsl");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bindings, "layout(binding = 10) uniform texture2D point_shadow_tex;"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bindings, "layout(binding = 21) uniform texture2D point_shadow_depth_tex;"));
+    const consts = @embedFile("../shaders/common/pbr_shadow_consts.glsl");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(consts, "const vec2 POISSON_DISK[16]"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(consts, "#define POINT_PCSS_MAX_PENUMBRA 0.01"));
 }
 
 test "drift: probe_mip stays excluded from the fullscreen include" {

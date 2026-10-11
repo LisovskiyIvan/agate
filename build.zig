@@ -325,14 +325,17 @@ pub fn build(b: *Build) !void {
     };
     const default_slang = engine_shader_slang;
     const shader_specs = [_]ShaderSpec{
-        // Increment 2 of the shader-include refactor: the five forward
-        // shaders share cluster structs, the shadow/PCF block,
-        // areaLightFactor and uvApply (common/*.glsl); the three PBR
-        // variants additionally share the BRDF math + channelSelect.
-        // The three PBR fs wire blocks are shared too (common/frame_view
-        // + common/frame_mat: view-global vs per-material split, wrapped
-        // per shader with its legacy view slot). Deliberately NOT shared:
-        // morph/skin vertex variants.
+        // Increment 3 of the shader-include refactor: the three PBR
+        // variants additionally share their fs texture/sampler view
+        // bindings (common/pbr_fs_bindings), shadow-sampling constants
+        // (common/pbr_shadow_consts: Poisson disk, cascade offsets, PCSS
+        // budgets), and — pbr/skinned only — the vertex morph helpers
+        // (common/morph_helpers). The three PBR fs wire blocks were
+        // already shared (common/frame_view + common/frame_mat:
+        // view-global vs per-material split, wrapped per shader with its
+        // legacy view slot). Deliberately NOT shared: morph/skin vertex
+        // variant blocks (different UB slots/attributes) and the lighting
+        // main bodies (pbr-only shader-material hooks).
         .{ .name = "pbr_shader", .input = "src/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
         .{ .name = "skinned_pbr_shader", .input = "src/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
         .{ .name = "instanced_pbr_shader", .input = "src/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },

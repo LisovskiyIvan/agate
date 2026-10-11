@@ -64,62 +64,7 @@ layout(binding = 5) uniform fs_mat {
 // @include "common/frame_mat.glsl"
 };
 
-layout(binding = 0) uniform texture2D albedo_tex;
-layout(binding = 1) uniform texture2D normal_tex;
-layout(binding = 2) uniform texture2D metallic_roughness_tex;
-layout(binding = 3) uniform texture2D emissive_tex;
-layout(binding = 4) uniform texture2D occlusion_tex;
-layout(binding = 5) uniform texture2D shadow_tex;
-@image_sample_type shadow_depth_tex unfilterable_float
-layout(binding = 7) uniform texture2D shadow_depth_tex; // same atlas view as shadow_tex, raw-depth reads for PCSS
-layout(binding = 6) uniform textureCube env_tex;
-layout(binding = 8) uniform texture2D spot_shadow_tex;
-@image_sample_type spot_shadow_depth_tex unfilterable_float
-layout(binding = 20) uniform texture2D spot_shadow_depth_tex; // same atlas view as spot_shadow_tex, raw-depth reads for spot PCSS
-// Point shadow atlas (passes/shadow_pass.zig POINT_SHADOW_* layout).
-// Binding 10: fs uses 0..8, the instanced vs uses no textures — same slot
-// as the other PBR-family shaders. Sampled through shadow_smp.
-layout(binding = 10) uniform texture2D point_shadow_tex;
-@image_sample_type point_shadow_depth_tex unfilterable_float
-layout(binding = 21) uniform texture2D point_shadow_depth_tex; // same atlas view as point_shadow_tex, raw-depth reads for point PCSS (binding 21: next free view slot — fs uses 0..8, 10, 11, 15..20, storage uses 12..14)
-layout(binding = 17) uniform texture2D brdf_lut_tex; // Babylon env-BRDF lookup (coloredEnergyConservationFactor)
-layout(binding = 0) uniform sampler smp; // color slot: albedo (its own sampler)
-// Data slots (normal / metallic-roughness / occlusion / emissive) sample
-// through data_smp so their textures keep their OWN filter/wrap settings
-// instead of inheriting the albedo sampler.
-layout(binding = 5) uniform sampler data_smp;
-layout(binding = 1) uniform sampler shadow_smp;
-layout(binding = 2) uniform sampler env_smp;
-@sampler_type depth_smp nonfiltering
-layout(binding = 3) uniform sampler depth_smp;
-// Reflection probe cube (wave 25): binding 11 is the next free texture
-// slot in the shared pool (fs uses 0..8 and 10, the instanced vs uses no
-// textures), binding 6 the next free sampler slot. Instanced draws bind
-// the default cube with zeroed params (no-probe path); the slots must still
-// exist for layout parity with the regular PBR family.
-layout(binding = 11) uniform textureCube probe_tex;
-layout(binding = 19) uniform textureCube probe2_tex;
-layout(binding = 6) uniform sampler probe_smp;
-layout(binding = 7) uniform sampler brdf_lut_smp;
-// PBR layers v1: coat/fabric masks sampled through data_smp (each texture
-// keeps its own filter/wrap, like the other data slots — no new sampler).
-// Unset slots bind the default white texture: mask 1 / tint 1 = identity,
-// so the scalar path stays bit-identical. Bindings 15/16 are free view
-// slots in the shared pool (fs uses 0..8, 10, 11; vs uses 9 for morph;
-// 12..14 are storage buffers, a separate array).
-layout(binding = 15) uniform texture2D clearcoat_tex;
-layout(binding = 16) uniform texture2D sheen_tex;
-layout(binding = 18) uniform texture2D refraction_tex;
-layout(binding = 8) uniform sampler refraction_smp;
-// Clustered forward lights (wave 30, v1): storage buffers for the tile
-// walk. Bindings 12..14 are free view slots in the shared pool of every
-// forward shader (this family uses fs 0..8, 10, 11, vs no textures).
-// Layouts mirror scene/clustered_lights.zig (ClusterLightGpu = 4x vec4,
-// ClusterTileGpu = uvec2, indices = u32); every buffer block holds exactly
-// one flexible array of a struct (sokol-shdc requirement). The draw always
-// binds something valid here (real tile buffers when a GPU upload landed,
-// the shared 16-byte dummy otherwise); the loop below only reads them when
-// clustered_params gates it on.
+// @include "common/pbr_fs_bindings.glsl"
 // @include "common/cluster.glsl"
 
 in vec3 v_world_pos;
@@ -133,82 +78,7 @@ in vec2 v_uv1;
 out vec4 frag_color;
 // @include "common/refraction.glsl"
 
-// PI comes from common/pbr_brdf.glsl (single source for the BRDF chunk).
-
-const vec2 POISSON_DISK[16] = vec2[](
-    vec2(-0.94201624, -0.39906216),
-    vec2( 0.94558609, -0.76890725),
-    vec2(-0.09418410, -0.92938870),
-    vec2( 0.34495938,  0.29387760),
-    vec2(-0.91588581,  0.45771432),
-    vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277543,  0.27676845),
-    vec2( 0.97484398,  0.75648379),
-    vec2( 0.44323325, -0.97511554),
-    vec2( 0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023),
-    vec2( 0.79197514,  0.19090188),
-    vec2(-0.24188840,  0.99706507),
-    vec2(-0.81409955,  0.91437590),
-    vec2( 0.19984126,  0.78641367),
-    vec2( 0.14383161, -0.14100790)
-);
-
-const vec2 CASCADE_OFFSETS[4] = vec2[](
-    vec2(0.0, 0.0),
-    vec2(0.5, 0.0),
-    vec2(0.0, 0.5),
-    vec2(0.5, 0.5)
-);
-
-// PCSS (percentage-closer soft shadows) for the 4-cascade sun atlas.
-// Blocker search reads raw depths from shadow_depth_tex (same atlas view as
-// shadow_tex, regular sampler): PCSS_BLOCKER_SAMPLES Poisson taps inside
-// pcss_blocker_radius, average blocker depth -> penumbra ->
-// (d_receiver - d_blocker) / d_blocker * light_size, clamped to
-// [min_penumbra, max_penumbra]; the fixed-radius Poisson PCF then runs with the
-// penumbra as its disk radius. Params ride free uniform lanes (fs_view
-// layout unchanged):
-//   cascade_debug.y = pcss_enabled (0.0/1.0)
-//   cascade_debug.z = pcss_light_size
-//   cascade_debug.w = pcss_blocker_radius (atlas-UV search radius)
-//   light_counts.z  = pcss_min_penumbra (atlas-UV clamp)
-//   light_counts.w  = pcss_max_penumbra (atlas-UV clamp)
-// Disabled (y <= 0.5): fixed-radius 16x/8x Poisson PCF, bit-identical.
-// Counts mirror scene/shadow_pcss.zig (blocker_sample_count).
-#define PCSS_BLOCKER_SAMPLES 12
-
-// Spot-light PCSS (local emitters): blocker search + variable penumbra for
-// the spot atlas pages. source_radius rides spot_shadow_params[i].w
-// (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
-// calculateSpotShadow). Blocker search reads raw depths from
-// spot_shadow_depth_tex (same atlas view as spot_shadow_tex) through the
-// shared depth_smp; the penumbra reuses pcssPenumbraRadius (same formula as
-// the sun path, see scene/shadow_pcss.zig). Tap budgets mirror
-// scene/shadow_pcss.zig (spot_blocker_sample_count, spot_pcf_tap_count).
-#define SPOT_PCSS_BLOCKER_SAMPLES 8
-#define SPOT_PCSS_PCF_TAPS 8
-#define SPOT_PCSS_EPSILON 0.0001
-#define SPOT_PCSS_BLOCKER_RADIUS 0.01
-#define SPOT_PCSS_MIN_PENUMBRA 0.0005
-#define SPOT_PCSS_MAX_PENUMBRA 0.01
-
-// Point-light PCSS (cube-face atlas): blocker search + variable penumbra
-// per face tile. source_radius rides point_shadow_params[slot].w
-// (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
-// calculatePointShadowSlot). Blocker search reads raw depths from
-// point_shadow_depth_tex (same atlas view as point_shadow_tex) through the
-// shared depth_smp; the penumbra reuses pcssPenumbraRadius (same formula as
-// the sun/spot paths, see scene/shadow_pcss.zig). Tap budgets mirror
-// scene/shadow_pcss.zig (point_blocker_sample_count, point_pcf_tap_count).
-// v2 is border-correct (world-space disk taps, per-tap face projection —
-// see the v2 note in shadow_pcf.glsl).
-#define POINT_PCSS_BLOCKER_SAMPLES 8
-#define POINT_PCSS_PCF_TAPS 8
-#define POINT_PCSS_EPSILON 0.0001
-#define POINT_PCSS_BLOCKER_RADIUS 0.01
-#define POINT_PCSS_MIN_PENUMBRA 0.0005
-#define POINT_PCSS_MAX_PENUMBRA 0.01
+// @include "common/pbr_shadow_consts.glsl"
 
 // @include "common/shadow_pcf.glsl"
 
@@ -315,8 +185,8 @@ void main() {
     float sheen_rough = max(clamp(sheen_factors.y, 0.07, 1.0), aa_rough);
     float sheen_intensity = clamp(sheen_factors.x, 0.0, 1.0);
 
-    // PBR layers v1: coat/fabric masks sampled with the ALBEDO uv transform
-    // (no per-slot coat transform yet — v1 scope). White fallback = 1, so
+    // Coat/fabric masks have independent coordinate sets and transforms.
+    // White fallback = 1, so
     // unset slots keep the scalar path exact; the branch only skips the
     // fetch when the lobe is off (mask * 0 == 0 either way).
     vec2 coat_uv = uvApply(clearcoat_uv_matrix, clearcoat_uv_offset, v_uv);
@@ -533,7 +403,7 @@ void main() {
         Lo += (a_kD * diffuse_albedo / PI + a_spec * a_atten * spec_ec + a_additive) * a_rad * a_NdotL;
     }
 
-    // Clustered forward point lights (up to 64, no shadows): pixel -> tile
+    // Clustered forward point lights (up to 64, with shadows): pixel -> tile
     // -> tile light indices -> the same Cook-Torrance lobe as the direct
     // lanes above (coat + sheen included, no shadow term). Gated on a live
     // tile grid (tiles_x/y > 0), a non-empty staged pool (count > 0) and a
@@ -541,9 +411,10 @@ void main() {
     // pool shades bit-identically. Tile id follows the CPU build
     // (scene/clustered_lights.zig tileNdcRect, bottom-left origin); Metal
     // and D3D run window-y down, hence the !SOKOL_GLSL flip. The tile
-    // lookup is byte-identical in all five forward shaders (only the lobe
-    // tail mirrors the host shader); sokol-shdc has no include mechanism,
-    // so the duplication is deliberate and documented.
+    // lookup is byte-identical in all three PBR forward shaders (only the
+    // lobe tail mirrors the host shader); the loop stays inline per shader
+    // (declaration-level dedup scope — the shared structs come from
+    // common/cluster.glsl, included above).
     // Clustered forward lights (up to 64 local lights, points and spots, with shadows):
     if (clustered_params.x > 0.5 && clustered_params.y > 0.5 && clustered_params.z > 0.5 && clustered_params.w > 0.5) {
         vec2 c_px = gl_FragCoord.xy;
