@@ -351,3 +351,31 @@ A/B; фичи мерялись независимо, каждая со свои�
 облака/ночь — skybox-путь, off = пин-тест `analyticParamsFull == analyticParams`.
 Урок волны для будущих суб-мс фич: solo-прогон без разделения — уже не
 доказательство; либо выделять фазу/сцену, либо честно писать INCONCLUSIVE.
+
+## Волна 9 (11.10.2026): W1 базовая линия (после M/E/H/T-волн) — Tracy + q0-фазы + gpu-timing
+
+Роль: точка отсчёта для P4 (оптимизации только из измерений) и будущих
+сравнений. Машина тихая (конкурирующих прогонов нет), q0 solo.
+
+q0 (`AGATE_Q0_TIMINGS=1`, 200 кадров, 720×540, scale 1.0, Metal, M4):
+mean 10.942 / median 11.303 / p95 13.691 / min 7.381 / max 14.511 (n=148).
+Phase 1 (render_scale 0.75) в этом прогоне сэмплов не набрала (occl=0) —
+для сравнения scale нужен отдельный прогон. Кросс-проверка с волной 7:
+median ≈ 10.2 (off-режим SSGI) тогда против 11.3 сейчас — разница на
+уровне сцены/ревизий (M-фичи выключены по умолчанию), сравнивать только
+same-revision back-to-back.
+
+gpu-timing гейт: 270 кадров, timer-waves unique/positive 80/79/79,
+compute_dispatches=268, failures=0, log_errors=0, sokol_live_allocations=0,
+PASS. Это lifecycle-гейт, не метрика throughput целевой сцены.
+
+Tracy (P1) — готов к интерактивному профилированию:
+- sandbox: `cd sandbox && zig build run -Dtracy=true -- --zone=game-demo`
+  (815 tracy-символов в бинаре, статический клиент; дефолтная сборка
+  ztracy не качает — ленивый деп + стаб-модуль).
+- Зоны: app `frame`, runtime `waitc/holdc/prepare/gpusubmit`,
+  `scene.update`/`scene.render`, `jobs.dispatch`/`job`, `asset.load`.
+- GPU-зон Tracy на Metal нет (поддержаны D3D/Vulkan/GL/CL) — GPU-время
+  остаётся на gpu-timing/phase-метриках; Tracy закрывает CPU.
+- Протокол для будущих P4-сравнений: solo-прогоны, p95 — канонический
+  сигнал; суб-мс — только interleaved A/B или отказ от вердикта.
