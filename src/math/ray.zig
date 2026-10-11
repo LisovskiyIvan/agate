@@ -169,19 +169,26 @@ pub const Ray = struct {
         };
     }
 
-    /// Analytic Ray-Sphere intersection. Returns distance t >= 0 or null.
+    /// Analytic Ray-Sphere intersection. Returns ray parameter t >= 0 or null.
+    /// Supports explicit non-unit directions via a*t^2 + 2*b*t + c = 0 with
+    /// a = dot(direction, direction): t is the ray parameter, so the hit
+    /// point is getPoint(t); only for unit directions does t equal the
+    /// Euclidean distance.
     pub fn intersectsSphere(self: Ray, center: Vec3, radius: f32) ?f32 {
         const oc = self.origin.sub(center);
+        const a = self.direction.dot(self.direction);
+        if (!(a > 0.0)) return null;
         const b = oc.dot(self.direction);
         const c = oc.dot(oc) - radius * radius;
 
         if (c > 0.0 and b > 0.0) return null;
 
-        const discr = b * b - c;
+        const discr = b * b - a * c;
         if (discr < 0.0) return null;
 
-        var t = -b - @sqrt(discr);
-        if (t < 0.0) t = -b + @sqrt(discr);
+        const sq = @sqrt(discr);
+        var t = (-b - sq) / a;
+        if (t < 0.0) t = (-b + sq) / a;
         if (t < 0.0) return null;
 
         return t;
