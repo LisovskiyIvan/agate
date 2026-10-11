@@ -379,3 +379,24 @@ Tracy (P1) — готов к интерактивному профилирова
   остаётся на gpu-timing/phase-метриках; Tracy закрывает CPU.
 - Протокол для будущих P4-сравнений: solo-прогоны, p95 — канонический
   сигнал; суб-мс — только interleaved A/B или отказ от вердикта.
+
+### Addendum: первый CPU-профиль sandbox через Tracy (демо-зона)
+
+Захват 10.06 с (Tracy 0.13.0 — `tracy-capture`/`tracy-csvexport` собраны
+локально; brew-версия 0.14.x несовместима по протоколу с вендоренным в
+ztracy клиентом 0.13.0). 56 544 зоны, 608 кадров (~60 fps), demo-зона:
+
+| зона | counts | mean | max |
+|---|---|---|---|
+| frame (app.zig:311, весь per-frame главного потока) | 608 | 5.98 мс | 7.12 |
+| scene.update | 608 | 1.50 | 1.80 |
+| scene.render | 608 | 2.00 | 2.49 |
+| job (jobs.zig:251) | 49 248 | 4.6 µs | 88 µs |
+
+Вывод: главный поток тратит ~6 мс/кадр в App.frame; движковые
+update+render — 3.5 мс, остальное — sandbox-специфика (UI/звук/
+интерактив). Runtime-фасады (prepare/gpusubmit) в трейсе не видны:
+sandbox водит собственный цикл через App+Scene API — это и есть место,
+куда добавлять зоны, если понадобится их разложение. Воспроизведение:
+`cd sandbox && zig build run -Dtracy=true -- --zone=game-demo`, затем
+`tracy-capture -o trace.tracy -s 10` и `tracy-csvexport trace.tracy`.
