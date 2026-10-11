@@ -106,6 +106,7 @@ test {
     _ = @import("lights/directional.zig");
     _ = @import("lights/hemispheric.zig");
     _ = @import("lights/point.zig");
+    _ = @import("lights/shadow_options.zig");
     _ = @import("lights/spot.zig");
     _ = @import("lights/sun.zig");
     _ = @import("lights/tests.zig");

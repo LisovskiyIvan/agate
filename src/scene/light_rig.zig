@@ -479,7 +479,7 @@ pub const LightRig = struct {
         var best_score: [point_shadow_slots]f32 = undefined;
         var n: usize = 0;
         for (in_lights, 0..) |pl, i| {
-            if (!(pl.cast_shadows and shadows_enabled and pl.is_enabled)) continue;
+            if (!(pl.shadow.cast_shadows and shadows_enabled and pl.is_enabled)) continue;
             const s = light_selection.scorePoint(pl, eye);
             var pos: usize = n;
             for (0..n) |j| {
@@ -503,9 +503,9 @@ pub const LightRig = struct {
         for (best_idx[0..n], 0..) |pack_i, slot| {
             const pl = in_lights[pack_i];
             casters[slot] = pl;
-            pack.point_shadow_params[slot] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, pl.source_radius };
+            pack.point_shadow_params[slot] = .{ @floatFromInt(slot + 1), pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, pl.shadow.source_radius };
             if (pack_i != slot and pack_i < 4) {
-                pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow_bias, pl.shadow_normal_bias, pl.source_radius };
+                pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, pl.shadow.source_radius };
             }
             for (0..passes.POINT_SHADOW_FACES) |f| {
                 const vp = pl.getShadowFaceViewProj(f);
@@ -551,7 +551,7 @@ pub const LightRig = struct {
         var best_score: [spot_shadow_slots]f32 = undefined;
         var n: usize = 0;
         for (in_lights, 0..) |sl, i| {
-            if (!(sl.cast_shadows and shadows_enabled and sl.is_enabled)) continue;
+            if (!(sl.shadow.cast_shadows and shadows_enabled and sl.is_enabled)) continue;
             const s = light_selection.scoreSpot(sl, eye);
             var pos: usize = n;
             for (0..n) |j| {
@@ -577,10 +577,10 @@ pub const LightRig = struct {
             casters[slot] = sl;
             const svp = sl.getShadowViewProj();
             pack.spot_view_proj[slot] = svp;
-            pack.spot_shadow_params[slot] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, sl.source_radius };
+            pack.spot_shadow_params[slot] = .{ 1.0, sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, sl.shadow.source_radius };
             if (pack_i != slot and pack_i < 2) {
                 pack.spot_view_proj[pack_i] = svp;
-                pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, sl.source_radius };
+                pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, sl.shadow.source_radius };
             }
             const origin = passes.spotTileOrigin(slot);
             pack.spot_shadows[pack.num_spot_shadows] = .{
@@ -645,11 +645,11 @@ pub const LightRig = struct {
             if (pl == point_casters[0]) {
                 shadow_type = 1.0;
                 shadow_slot = 0.0;
-                shadow_bias = pl.shadow_bias;
+                shadow_bias = pl.shadow.shadow_bias;
             } else if (pl == point_casters[1]) {
                 shadow_type = 1.0;
                 shadow_slot = 1.0;
-                shadow_bias = pl.shadow_bias;
+                shadow_bias = pl.shadow.shadow_bias;
             }
             pack.clustered_lights[count] = .{
                 .pos_range = .{ pl.position.x, pl.position.y, pl.position.z, pl.range },
@@ -672,11 +672,11 @@ pub const LightRig = struct {
             if (sl == spot_casters[0]) {
                 shadow_type = 2.0;
                 shadow_slot = 0.0;
-                shadow_bias = sl.shadow_bias;
+                shadow_bias = sl.shadow.shadow_bias;
             } else if (sl == spot_casters[1]) {
                 shadow_type = 2.0;
                 shadow_slot = 1.0;
-                shadow_bias = sl.shadow_bias;
+                shadow_bias = sl.shadow.shadow_bias;
             }
             pack.clustered_lights[count] = .{
                 .pos_range = .{ sl.position.x, sl.position.y, sl.position.z, sl.range },

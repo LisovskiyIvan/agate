@@ -147,8 +147,10 @@ fn setupScene() void {
         .range = 12.0,
         .inner_angle_deg = 18.0,
         .outer_angle_deg = 32.0,
-        .cast_shadows = true,
-        .source_radius = if (spot_pcss_off) 0.0 else 0.02,
+        .shadow = .{
+            .cast_shadows = true,
+            .source_radius = if (spot_pcss_off) 0.0 else 0.02,
+        },
     }) catch @panic("q0: spot failed");
 
     // Point PCSS calibration light: a small shadow-casting point near the
@@ -163,8 +165,10 @@ fn setupScene() void {
         .color = z.Color3.new(1.0, 0.8, 0.6),
         .intensity = 8.0,
         .range = 10.0,
-        .cast_shadows = true,
-        .source_radius = if (point_pcss_off) 0.0 else 0.02,
+        .shadow = .{
+            .cast_shadows = true,
+            .source_radius = if (point_pcss_off) 0.0 else 0.02,
+        },
     }) catch @panic("q0: point failed");
 
     // Warm ceiling area panel + emissive quad (bloom picks the emitter up).

@@ -155,10 +155,12 @@ test "SpotLight.init carries every option" {
         .range = 22.0,
         .inner_angle_deg = 12.0,
         .outer_angle_deg = 34.0,
-        .cast_shadows = true,
-        .shadow_bias = 0.003,
-        .shadow_normal_bias = 0.007,
-        .shadow_near = 0.2,
+        .shadow = .{
+            .cast_shadows = true,
+            .shadow_bias = 0.003,
+            .shadow_normal_bias = 0.007,
+            .shadow_near = 0.2,
+        },
     };
     const spot = SpotLight.init("spot_opts", opts);
     try std.testing.expectEqualStrings("spot_opts", spot.name);
@@ -168,10 +170,10 @@ test "SpotLight.init carries every option" {
     try std.testing.expectEqual(opts.range, spot.range);
     try std.testing.expectEqual(opts.inner_angle_deg, spot.inner_angle_deg);
     try std.testing.expectEqual(opts.outer_angle_deg, spot.outer_angle_deg);
-    try std.testing.expectEqual(opts.cast_shadows, spot.cast_shadows);
-    try std.testing.expectEqual(opts.shadow_bias, spot.shadow_bias);
-    try std.testing.expectEqual(opts.shadow_normal_bias, spot.shadow_normal_bias);
-    try std.testing.expectEqual(opts.shadow_near, spot.shadow_near);
+    try std.testing.expectEqual(opts.shadow.cast_shadows, spot.shadow.cast_shadows);
+    try std.testing.expectEqual(opts.shadow.shadow_bias, spot.shadow.shadow_bias);
+    try std.testing.expectEqual(opts.shadow.shadow_normal_bias, spot.shadow.shadow_normal_bias);
+    try std.testing.expectEqual(opts.shadow.shadow_near, spot.shadow.shadow_near);
     // Direction is normalized on the way in (documented behaviour).
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), spot.direction.length(), 1e-5);
 }
@@ -183,7 +185,7 @@ test "SpotLight.getShadowViewProj transforms points in front of spotlight" {
         .range = 20.0,
         .inner_angle_deg = 20.0,
         .outer_angle_deg = 45.0,
-        .cast_shadows = true,
+        .shadow = .{ .cast_shadows = true },
     });
     const vp = spot.getShadowViewProj();
     // A point at (0, 0, 0) is 10 units directly in front of the spotlight along -Y.
@@ -207,13 +209,13 @@ test "SpotLight.getShadowViewProj transforms points in front of spotlight" {
 
 test "PointLight shadows are off by default" {
     const pl = PointLight.init("lamp", .{});
-    try std.testing.expect(!pl.cast_shadows);
-    try std.testing.expectEqual(@as(f32, 0.002), pl.shadow_bias);
-    try std.testing.expectEqual(@as(f32, 0.005), pl.shadow_normal_bias);
-    try std.testing.expectEqual(@as(f32, 0.1), pl.shadow_near);
+    try std.testing.expect(!pl.shadow.cast_shadows);
+    try std.testing.expectEqual(@as(f32, 0.002), pl.shadow.shadow_bias);
+    try std.testing.expectEqual(@as(f32, 0.005), pl.shadow.shadow_normal_bias);
+    try std.testing.expectEqual(@as(f32, 0.1), pl.shadow.shadow_near);
     // A literal without the new fields keeps the same defaults.
     const bare = PointLight{};
-    try std.testing.expect(!bare.cast_shadows);
+    try std.testing.expect(!bare.shadow.cast_shadows);
 }
 
 test "AreaLight normal and area follow the right/up half-extents" {
@@ -242,7 +244,7 @@ test "PointLight.getShadowFaceViewProj centers each axis on its face" {
     const pl = PointLight.init("lamp", .{
         .position = Vec3.new(1, 2, 3),
         .range = 10.0,
-        .cast_shadows = true,
+        .shadow = .{ .cast_shadows = true },
     });
     const targets = [_]Vec3{
         Vec3.new(2, 2, 3), // +X

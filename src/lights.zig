@@ -16,6 +16,8 @@
 //!   incl. the rect normal/area helpers). Imports `math` only.
 //! - `lights/spot.zig` — `SpotLightOptions` + `SpotLight` (incl. the shadow
 //!   view-projection). Imports `std` + `math`.
+//! - `lights/shadow_options.zig` — `LightShadowOptions` (shared
+//!   point/spot shadow knobs, nested as `shadow`). Imports nothing.
 //! - `lights/sun.zig` — active-sun resolvers (`resolveSunDirection`,
 //!   `resolveSunColor`, `resolveSunIntensity`), `sunDirectionFromAngles`,
 //!   `colorTemperatureToRgb`. Imports `std` + `math` + the `directional` +
@@ -63,6 +65,9 @@ pub const AreaLight = area.AreaLight;
 const spot = @import("lights/spot.zig");
 pub const SpotLightOptions = spot.SpotLightOptions;
 pub const SpotLight = spot.SpotLight;
+
+const shadow_options = @import("lights/shadow_options.zig");
+pub const LightShadowOptions = shadow_options.LightShadowOptions;
 
 const sun = @import("lights/sun.zig");
 pub const resolveSunDirection = sun.resolveSunDirection;

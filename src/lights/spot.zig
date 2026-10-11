@@ -6,6 +6,7 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Color3 = math.Color3;
+const LightShadowOptions = @import("shadow_options.zig").LightShadowOptions;
 
 pub const SpotLightOptions = struct {
     position: Vec3 = Vec3.zero,
@@ -15,17 +16,10 @@ pub const SpotLightOptions = struct {
     range: f32 = 15.0,
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
-    cast_shadows: bool = false,
-    shadow_bias: f32 = 0.002,
-    shadow_normal_bias: f32 = 0.005,
-    shadow_near: f32 = 0.1,
-    /// Emitter radius for spot PCSS (percentage-closer soft shadows):
-    /// doubles as the light_size of the sun-style penumbra formula
-    /// (see scene/shadow_pcss.zig penumbraRadius). 0.0 (default) disables
-    /// PCSS and keeps the legacy fixed 4-tap PCF bit-identical; any value
-    /// above the epsilon enables the blocker search + variable penumbra.
-    /// Rides the `spot_shadow_params[i].w` lane (packed in light_rig.zig).
-    source_radius: f32 = 0.0,
+    /// Shadow-casting knobs for this light's own shadow-map draws.
+    /// Precedence: these apply only to this light; the scene-level
+    /// ShadowSystem.bias/normal_bias drive the CSM sun, not spot lights.
+    shadow: LightShadowOptions = .{},
 };
 
 pub const SpotLight = struct {
@@ -40,12 +34,10 @@ pub const SpotLight = struct {
     inner_angle_deg: f32 = 15.0,
     outer_angle_deg: f32 = 30.0,
     is_enabled: bool = true,
-    cast_shadows: bool = false,
-    shadow_bias: f32 = 0.002,
-    shadow_normal_bias: f32 = 0.005,
-    shadow_near: f32 = 0.1,
-    /// See SpotLightOptions.source_radius.
-    source_radius: f32 = 0.0,
+    /// Shadow-casting knobs for this light's own shadow-map draws.
+    /// Precedence: these apply only to this light; the scene-level
+    /// ShadowSystem.bias/normal_bias drive the CSM sun, not spot lights.
+    shadow: LightShadowOptions = .{},
 
     pub fn init(name: []const u8, options: SpotLightOptions) SpotLight {
         return .{
@@ -57,11 +49,7 @@ pub const SpotLight = struct {
             .range = options.range,
             .inner_angle_deg = options.inner_angle_deg,
             .outer_angle_deg = options.outer_angle_deg,
-            .cast_shadows = options.cast_shadows,
-            .shadow_bias = options.shadow_bias,
-            .shadow_normal_bias = options.shadow_normal_bias,
-            .shadow_near = options.shadow_near,
-            .source_radius = options.source_radius,
+            .shadow = options.shadow,
         };
     }
 
@@ -73,7 +61,7 @@ pub const SpotLight = struct {
         const up = if (@abs(dir.y) > 0.99) Vec3.new(0, 0, 1) else Vec3.up;
         const view = Mat4.lookAt(eye, target, up);
         const fov_deg = std.math.clamp(self.outer_angle_deg * 2.0 * 1.15, 1.0, 175.0);
-        const near = @max(self.shadow_near, 0.05);
+        const near = @max(self.shadow.shadow_near, 0.05);
         const far = @max(self.range, near + 0.1);
         const proj = Mat4.perspective(fov_deg, 1.0, near, far);
         return Mat4.mul(proj, view);

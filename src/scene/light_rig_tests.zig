@@ -194,9 +194,9 @@ test "packFrame packs selected point and spot lights into uniform arrays" {
         .range = 20.0,
         .intensity = 4.0,
     });
-    sl.cast_shadows = true;
-    sl.shadow_bias = 0.25;
-    sl.shadow_normal_bias = 0.5;
+    sl.shadow.cast_shadows = true;
+    sl.shadow.shadow_bias = 0.25;
+    sl.shadow.shadow_normal_bias = 0.5;
 
     pack = rig.packFrame(eye, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(f32, 1.0), pack.counts[0]);
@@ -226,14 +226,13 @@ test "packFrame packs spot source_radius into the shadow params w lane" {
         .direction = Vec3.new(0, -1, 0),
         .range = 20.0,
         .intensity = 4.0,
-        .cast_shadows = true,
-        .source_radius = 0.02,
+        .shadow = .{ .cast_shadows = true, .source_radius = 0.02 },
     });
 
     const pack = rig.packFrame(eye, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 1), pack.num_spot_shadows);
     // x cast flag, y/z bias knobs, w source_radius (spot PCSS emitter size).
-    try std.testing.expectEqual([4]f32{ 1.0, sl.shadow_bias, sl.shadow_normal_bias, 0.02 }, pack.spot_shadow_params[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, 0.02 }, pack.spot_shadow_params[0]);
 }
 
 test "packFrame packs point source_radius into the shadow params w lane" {
@@ -247,14 +246,13 @@ test "packFrame packs point source_radius into the shadow params w lane" {
         .position = Vec3.new(1, 2, 3),
         .range = 10.0,
         .intensity = 2.0,
-        .cast_shadows = true,
-        .source_radius = 0.02,
+        .shadow = .{ .cast_shadows = true, .source_radius = 0.02 },
     });
 
     const pack = rig.packFrame(eye, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 6), pack.num_point_shadows);
     // x shadow slot + 1, y/z bias knobs, w source_radius (point PCSS emitter size).
-    try std.testing.expectEqual([4]f32{ 1.0, pl.shadow_bias, pl.shadow_normal_bias, 0.02 }, pack.point_shadow_params[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, 0.02 }, pack.point_shadow_params[0]);
 }
 
 test "packFrame scales intensity by the slot fade factor" {
@@ -326,11 +324,11 @@ test "packFrame caps point shadow casters at two by significance" {
     // Scores at the eye (intensity * range / (1 + dist^2)):
     // c0 at (1,0,0): 1*10/2 = 5; c1 at origin: 3*10/1 = 30;
     // c2 at (3,0,0): 4*10/10 = 4. Pack order (instant): c1, c0, c2.
-    _ = try rig.createPointLight(allocator, "c0", .{ .position = Vec3.new(1, 0, 0), .intensity = 1.0, .range = 10.0, .cast_shadows = true });
-    const c1 = try rig.createPointLight(allocator, "c1", .{ .position = Vec3.zero, .intensity = 3.0, .range = 10.0, .cast_shadows = true });
-    _ = try rig.createPointLight(allocator, "c2", .{ .position = Vec3.new(3, 0, 0), .intensity = 4.0, .range = 10.0, .cast_shadows = true });
-    c1.shadow_bias = 0.25;
-    c1.shadow_normal_bias = 0.5;
+    _ = try rig.createPointLight(allocator, "c0", .{ .position = Vec3.new(1, 0, 0), .intensity = 1.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    const c1 = try rig.createPointLight(allocator, "c1", .{ .position = Vec3.zero, .intensity = 3.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    _ = try rig.createPointLight(allocator, "c2", .{ .position = Vec3.new(3, 0, 0), .intensity = 4.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    c1.shadow.shadow_bias = 0.25;
+    c1.shadow.shadow_normal_bias = 0.5;
 
     const pack = rig.packFrame(eye, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(f32, 3.0), pack.counts[0]);
@@ -462,7 +460,7 @@ test "packFrame gates point shadows on enabled lights and global shadows" {
         .position = Vec3.zero,
         .intensity = 5.0,
         .range = 10.0,
-        .cast_shadows = true,
+        .shadow = .{ .cast_shadows = true },
     });
 
     // Global shadows off: no tiles, zeroed params, light still packs.
@@ -671,18 +669,14 @@ test "packSpotShadows selects up to 2 casters by significance with atlas page ti
         .direction = Vec3.new(0, -1, 0),
         .range = 20.0,
         .intensity = 10.0,
-        .cast_shadows = true,
-        .shadow_bias = 0.003,
-        .shadow_normal_bias = 0.006,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.003, .shadow_normal_bias = 0.006 },
     });
     _ = try rig.createSpotLight(allocator, "mid", .{
         .position = Vec3.new(0, 5, 0),
         .direction = Vec3.new(0, -1, 0),
         .range = 20.0,
         .intensity = 5.0,
-        .cast_shadows = true,
-        .shadow_bias = 0.002,
-        .shadow_normal_bias = 0.004,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.002, .shadow_normal_bias = 0.004 },
     });
 
     const eye = Vec3.zero;
@@ -710,8 +704,7 @@ test "packFrame consolidates local points and spots into unified clustered pool 
         .position = Vec3.new(1, 2, 3),
         .range = 10.0,
         .intensity = 5.0,
-        .cast_shadows = true,
-        .shadow_bias = 0.005,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.005 },
     });
     _ = try rig.createPointLight(allocator, "p1", .{
         .position = Vec3.new(4, 5, 6),
@@ -727,8 +720,7 @@ test "packFrame consolidates local points and spots into unified clustered pool 
         .intensity = 4.0,
         .inner_angle_deg = 20.0,
         .outer_angle_deg = 35.0,
-        .cast_shadows = true,
-        .shadow_bias = 0.004,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.004 },
     });
     _ = try rig.createSpotLight(allocator, "s1", .{
         .position = Vec3.new(1, 1, 1),
