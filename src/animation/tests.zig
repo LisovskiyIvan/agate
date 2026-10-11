@@ -36,24 +36,15 @@ test "AnimationSampler linear interpolation" {
 
 test "AnimationGroup playRange, speed, and reverse looping" {
     const allocator = std.testing.allocator;
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 4.0;
-    const outputs = try allocator.alloc(f32, 6);
-    outputs[0] = 0.0;
-    outputs[1] = 0.0;
-    outputs[2] = 0.0;
-    outputs[3] = 4.0;
-    outputs[4] = 8.0;
-    outputs[5] = 12.0;
+    const track = try allocVec3Track(allocator, 0.0, 4.0, Vec3.zero, Vec3.new(4.0, 8.0, 12.0));
 
     const channels = try allocator.alloc(AnimationChannel, 1);
     channels[0] = .{
         .bone_index = 0,
         .target_path = .translation,
         .sampler = .{
-            .timestamps = times,
-            .outputs = outputs,
+            .timestamps = track.t,
+            .outputs = track.o,
         },
     };
 
@@ -86,28 +77,12 @@ test "evaluateSkeleton blending and additive layer" {
     skel.bones[0].bind_scale = Vec3.one;
 
     // Clip 1: Walk (pos: 0, 0, 10)
-    const times1 = try allocator.alloc(f32, 1);
-    times1[0] = 0.0;
-    const out1 = try allocator.alloc(f32, 3);
-    out1[0] = 0.0;
-    out1[1] = 0.0;
-    out1[2] = 10.0;
-    const ch1 = try allocator.alloc(AnimationChannel, 1);
-    ch1[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times1, .outputs = out1 } };
-    const ag1 = try AnimationGroup.init(allocator, "walk", ch1, 1.0);
+    const ag1 = try makeBoneClip(allocator, "walk", Vec3.new(0.0, 0.0, 10.0));
     defer ag1.deinit();
     ag1.play(true);
 
     // Clip 2: Run (pos: 0, 0, 20)
-    const times2 = try allocator.alloc(f32, 1);
-    times2[0] = 0.0;
-    const out2 = try allocator.alloc(f32, 3);
-    out2[0] = 0.0;
-    out2[1] = 0.0;
-    out2[2] = 20.0;
-    const ch2 = try allocator.alloc(AnimationChannel, 1);
-    ch2[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times2, .outputs = out2 } };
-    const ag2 = try AnimationGroup.init(allocator, "run", ch2, 1.0);
+    const ag2 = try makeBoneClip(allocator, "run", Vec3.new(0.0, 0.0, 20.0));
     defer ag2.deinit();
     ag2.play(true);
 
@@ -119,15 +94,7 @@ test "evaluateSkeleton blending and additive layer" {
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), skel.bones[0].local_position.z, 1e-4);
 
     // Test Additive: Add layer (pos: 0, 5, 0)
-    const times3 = try allocator.alloc(f32, 1);
-    times3[0] = 0.0;
-    const out3 = try allocator.alloc(f32, 3);
-    out3[0] = 0.0;
-    out3[1] = 5.0;
-    out3[2] = 0.0;
-    const ch3 = try allocator.alloc(AnimationChannel, 1);
-    ch3[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times3, .outputs = out3 } };
-    const ag3 = try AnimationGroup.init(allocator, "jump_add", ch3, 1.0);
+    const ag3 = try makeBoneClip(allocator, "jump_add", Vec3.new(0.0, 5.0, 0.0));
     defer ag3.deinit();
     ag3.setAdditive(true);
     ag3.setWeight(1.0);
@@ -144,26 +111,10 @@ test "evaluateSkeleton blending and additive layer" {
 test "AnimationGroup crossFadeTo, fadeIn, and fadeOut" {
     const allocator = std.testing.allocator;
 
-    const times1 = try allocator.alloc(f32, 1);
-    times1[0] = 0.0;
-    const out1 = try allocator.alloc(f32, 3);
-    out1[0] = 0;
-    out1[1] = 0;
-    out1[2] = 0;
-    const ch1 = try allocator.alloc(AnimationChannel, 1);
-    ch1[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times1, .outputs = out1 } };
-    const ag1 = try AnimationGroup.init(allocator, "clip1", ch1, 1.0);
+    const ag1 = try makeBoneClip(allocator, "clip1", Vec3.zero);
     defer ag1.deinit();
 
-    const times2 = try allocator.alloc(f32, 1);
-    times2[0] = 0.0;
-    const out2 = try allocator.alloc(f32, 3);
-    out2[0] = 0;
-    out2[1] = 0;
-    out2[2] = 0;
-    const ch2 = try allocator.alloc(AnimationChannel, 1);
-    ch2[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times2, .outputs = out2 } };
-    const ag2 = try AnimationGroup.init(allocator, "clip2", ch2, 1.0);
+    const ag2 = try makeBoneClip(allocator, "clip2", Vec3.zero);
     defer ag2.deinit();
 
     ag1.play(true);
@@ -204,20 +155,127 @@ fn makeNodeGroup(allocator: std.mem.Allocator, name: []const u8, duration: f32) 
     return AnimationGroup.init(allocator, name, &[_]AnimationChannel{}, duration);
 }
 
+// Two-key vec3 track (t0 -> from, t1 -> to); buffers transfer to the
+// AnimationGroup that adopts them via addNodeChannel.
+fn allocVec3Track(allocator: std.mem.Allocator, t0: f32, t1: f32, from: Vec3, to: Vec3) !struct { t: []f32, o: []f32 } {
+    const t = try allocator.alloc(f32, 2);
+    errdefer allocator.free(t);
+    const o = try allocator.alloc(f32, 6);
+    errdefer allocator.free(o);
+    t[0] = t0;
+    t[1] = t1;
+    o[0] = from.x;
+    o[1] = from.y;
+    o[2] = from.z;
+    o[3] = to.x;
+    o[4] = to.y;
+    o[5] = to.z;
+    return .{ .t = t, .o = o };
+}
+
+// Morph-weights track copied from literals; buffers transfer to the
+// AnimationGroup that adopts them via addNodeChannel.
+fn allocWeightsTrack(allocator: std.mem.Allocator, times_vals: []const f32, outs_vals: []const f32) !struct { t: []f32, o: []f32 } {
+    const t = try allocator.dupe(f32, times_vals);
+    errdefer allocator.free(t);
+    const o = try allocator.dupe(f32, outs_vals);
+    return .{ .t = t, .o = o };
+}
+
+// One-bone translation clip; all buffers transfer to the returned group.
+fn makeBoneClip(allocator: std.mem.Allocator, name: []const u8, pos: Vec3) !*AnimationGroup {
+    const times = try allocator.alloc(f32, 1);
+    errdefer allocator.free(times);
+    times[0] = 0.0;
+    const outs = try allocator.alloc(f32, 3);
+    errdefer allocator.free(outs);
+    outs[0] = pos.x;
+    outs[1] = pos.y;
+    outs[2] = pos.z;
+    const channels = try allocator.alloc(AnimationChannel, 1);
+    errdefer allocator.free(channels);
+    channels[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times, .outputs = outs } };
+    return AnimationGroup.init(allocator, name, channels, 1.0);
+}
+
+// One-bone translation + rotation clip (1 key each); all buffers transfer
+// to the returned group.
+fn makeBoneClipTR(allocator: std.mem.Allocator, name: []const u8, pos: Vec3, rot: Quat) !*AnimationGroup {
+    const t_times = try allocator.alloc(f32, 1);
+    errdefer allocator.free(t_times);
+    t_times[0] = 0.0;
+    const t_out = try allocator.alloc(f32, 3);
+    errdefer allocator.free(t_out);
+    t_out[0] = pos.x;
+    t_out[1] = pos.y;
+    t_out[2] = pos.z;
+    const r_times = try allocator.alloc(f32, 1);
+    errdefer allocator.free(r_times);
+    r_times[0] = 0.0;
+    const r_out = try allocator.alloc(f32, 4);
+    errdefer allocator.free(r_out);
+    r_out[0] = rot.x;
+    r_out[1] = rot.y;
+    r_out[2] = rot.z;
+    r_out[3] = rot.w;
+    const channels = try allocator.alloc(AnimationChannel, 2);
+    errdefer allocator.free(channels);
+    channels[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = t_times, .outputs = t_out } };
+    channels[1] = .{ .bone_index = 0, .target_path = .rotation, .sampler = .{ .timestamps = r_times, .outputs = r_out } };
+    return AnimationGroup.init(allocator, name, channels, 1.0);
+}
+
+// Node group preloaded with events for the event-firing tests.
+fn makeEventGroup(allocator: std.mem.Allocator, name: []const u8, events: []const AnimationEvent) !*AnimationGroup {
+    const ag = try makeNodeGroup(allocator, name, 2.0);
+    errdefer ag.deinit();
+    try ag.setEvents(allocator, events);
+    return ag;
+}
+
+// Truncated LINEAR translation (2 keys, 1 frame of 99s) + truncated STEP
+// rotation (2 keys, 1 identity frame): every sampler must skip these
+// tracks, so the shared fixture pins the guard values in one place.
+fn allocTruncatedBonePair(allocator: std.mem.Allocator) ![]AnimationChannel {
+    const t_times = try allocator.alloc(f32, 2);
+    errdefer allocator.free(t_times);
+    t_times[0] = 0.0;
+    t_times[1] = 1.0;
+    const t_out = try allocator.alloc(f32, 3);
+    errdefer allocator.free(t_out);
+    t_out[0] = 99.0;
+    t_out[1] = 99.0;
+    t_out[2] = 99.0;
+    const r_times = try allocator.alloc(f32, 2);
+    errdefer allocator.free(r_times);
+    r_times[0] = 0.0;
+    r_times[1] = 1.0;
+    const r_out = try allocator.alloc(f32, 4);
+    errdefer allocator.free(r_out);
+    r_out[0] = 0.0;
+    r_out[1] = 0.0;
+    r_out[2] = 0.0;
+    r_out[3] = 1.0;
+    const channels = try allocator.alloc(AnimationChannel, 2);
+    errdefer allocator.free(channels);
+    channels[0] = .{
+        .bone_index = 0,
+        .target_path = .translation,
+        .sampler = .{ .timestamps = t_times, .outputs = t_out, .interpolation = .linear },
+    };
+    channels[1] = .{
+        .bone_index = 0,
+        .target_path = .rotation,
+        .sampler = .{ .timestamps = r_times, .outputs = r_out, .interpolation = .step },
+    };
+    return channels;
+}
+
 test "NodeChannel translation applies over time with loop" {
     const allocator = std.testing.allocator;
     var node = TestNode{};
 
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 2.0;
-    const outputs = try allocator.alloc(f32, 6);
-    outputs[0] = 0.0;
-    outputs[1] = 0.0;
-    outputs[2] = 0.0;
-    outputs[3] = 10.0;
-    outputs[4] = 0.0;
-    outputs[5] = 0.0;
+    const track = try allocVec3Track(allocator, 0.0, 2.0, Vec3.zero, Vec3.new(10.0, 0.0, 0.0));
 
     const ag = try makeNodeGroup(allocator, "node_move", 2.0);
     defer ag.deinit();
@@ -225,7 +283,7 @@ test "NodeChannel translation applies over time with loop" {
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .translation,
-        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .linear },
     });
 
     ag.play(true);
@@ -298,23 +356,7 @@ test "NodeChannel STEP holds keyframe while LINEAR blends" {
     var step_node = TestNode{};
     var linear_node = TestNode{};
 
-    const mk_track = struct {
-        fn mk(alloc: std.mem.Allocator) !struct { t: []f32, o: []f32 } {
-            const t = try alloc.alloc(f32, 2);
-            t[0] = 0.0;
-            t[1] = 1.0;
-            const o = try alloc.alloc(f32, 6);
-            o[0] = 0.0;
-            o[1] = 0.0;
-            o[2] = 0.0;
-            o[3] = 10.0;
-            o[4] = 0.0;
-            o[5] = 0.0;
-            return .{ .t = t, .o = o };
-        }
-    }.mk;
-
-    const step_track = try mk_track(allocator);
+    const step_track = try allocVec3Track(allocator, 0.0, 1.0, Vec3.zero, Vec3.new(10.0, 0.0, 0.0));
     const ag_step = try makeNodeGroup(allocator, "node_step", 1.0);
     defer ag_step.deinit();
     const step_target = try ag_step.bindNodeTarget(&step_node.position, &step_node.rotation, &step_node.scaling, false);
@@ -324,7 +366,7 @@ test "NodeChannel STEP holds keyframe while LINEAR blends" {
         .sampler = .{ .timestamps = step_track.t, .outputs = step_track.o, .interpolation = .step },
     });
 
-    const lin_track = try mk_track(allocator);
+    const lin_track = try allocVec3Track(allocator, 0.0, 1.0, Vec3.zero, Vec3.new(10.0, 0.0, 0.0));
     const ag_lin = try makeNodeGroup(allocator, "node_lin", 1.0);
     defer ag_lin.deinit();
     const lin_target = try ag_lin.bindNodeTarget(&linear_node.position, &linear_node.rotation, &linear_node.scaling, false);
@@ -350,17 +392,7 @@ test "NodeChannel weight blends sample with rest pose" {
         .position = Vec3.new(0.0, 10.0, 0.0),
     };
 
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 1.0;
-    const outputs = try allocator.alloc(f32, 6);
-    outputs[0] = 0.0;
-    outputs[1] = 0.0;
-    outputs[2] = 0.0;
-    outputs[3] = 0.0;
-    outputs[4] = 0.0;
-    outputs[5] = 20.0;
-
+    const track = try allocVec3Track(allocator, 0.0, 1.0, Vec3.zero, Vec3.new(0.0, 0.0, 20.0));
     const ag = try makeNodeGroup(allocator, "node_weight", 1.0);
     defer ag.deinit();
     // Rest pose (0, 10, 0) is captured at bind time.
@@ -368,7 +400,7 @@ test "NodeChannel weight blends sample with rest pose" {
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .translation,
-        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .linear },
     });
 
     ag.play(true);
@@ -486,24 +518,14 @@ test "NodeChannel easing warps interpolation and stop restores rest" {
     const allocator = std.testing.allocator;
     var node = TestNode{};
 
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 1.0;
-    const outputs = try allocator.alloc(f32, 6);
-    outputs[0] = 0.0;
-    outputs[1] = 0.0;
-    outputs[2] = 0.0;
-    outputs[3] = 10.0;
-    outputs[4] = 0.0;
-    outputs[5] = 0.0;
-
+    const track = try allocVec3Track(allocator, 0.0, 1.0, Vec3.zero, Vec3.new(10.0, 0.0, 0.0));
     const ag = try makeNodeGroup(allocator, "node_ease", 1.0);
     defer ag.deinit();
     const target = try ag.bindNodeTarget(&node.position, &node.rotation, &node.scaling, false);
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .translation,
-        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .linear },
         .easing = .ease_in_quad,
     });
 
@@ -528,22 +550,14 @@ test "Morph weights channel samples N values per key" {
     var weights = [_]f32{ 0.0, 0.0 };
     var dirty = false;
 
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 1.0;
-    const outputs = try allocator.alloc(f32, 4);
-    outputs[0] = 0.0;
-    outputs[1] = 0.0;
-    outputs[2] = 1.0;
-    outputs[3] = 0.5;
-
+    const track = try allocWeightsTrack(allocator, &.{ 0.0, 1.0 }, &.{ 0.0, 0.0, 1.0, 0.5 });
     const ag = try makeNodeGroup(allocator, "morph_weights", 1.0);
     defer ag.deinit();
     const target = try ag.bindMorphTarget(&weights, &dirty);
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .weights,
-        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .linear },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .linear },
     });
 
     ag.play(true);
@@ -574,12 +588,7 @@ test "Morph weights channel with truncated outputs is skipped" {
     var dirty = false;
 
     // 2 keys but only 2 outputs for 2 targets (needs 4): skipped entirely.
-    const bad_times = try allocator.alloc(f32, 2);
-    bad_times[0] = 0.0;
-    bad_times[1] = 1.0;
-    const bad_out = try allocator.alloc(f32, 2);
-    bad_out[0] = 0.9;
-    bad_out[1] = 0.9;
+    const track = try allocWeightsTrack(allocator, &.{ 0.0, 1.0 }, &.{ 0.9, 0.9 });
 
     const ag = try makeNodeGroup(allocator, "morph_guard", 1.0);
     defer ag.deinit();
@@ -587,7 +596,7 @@ test "Morph weights channel with truncated outputs is skipped" {
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .weights,
-        .sampler = .{ .timestamps = bad_times, .outputs = bad_out, .interpolation = .linear },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .linear },
     });
 
     ag.play(true);
@@ -614,27 +623,24 @@ test "Cubic spline vec3 hits keyframe values exactly and clamps" {
         .interpolation = .cubic_spline,
     };
 
-    const v0 = sampler.sampleVec3(0.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.x, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.y, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), v0.z, 1e-6);
-
-    const v1 = sampler.sampleVec3(1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v1.x, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), v1.y, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), v1.z, 1e-6);
-
-    // Zero tangents on both sides of the segment -> smoothstep midpoint.
-    const mid = sampler.sampleVec3(0.5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mid.x, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), mid.y, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), mid.z, 1e-5);
-
-    const clo = sampler.sampleVec3(-5.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), clo.x, 1e-6);
-    const chi = sampler.sampleVec3(99.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), chi.x, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), chi.z, 1e-6);
+    // Rows: sample time -> expected value. Endpoints hit keyframes exactly
+    // (in/out tangents of the far keys are ignored), zero tangents on both
+    // sides of the segment give the smoothstep midpoint, and out-of-range
+    // times clamp to the edge keys.
+    const Case = struct { t: f32, want: Vec3 };
+    const cases = [_]Case{
+        .{ .t = 0.0, .want = Vec3.new(0.0, 0.0, 0.0) },
+        .{ .t = 1.0, .want = Vec3.new(1.0, 2.0, 3.0) },
+        .{ .t = 0.5, .want = Vec3.new(0.5, 1.0, 1.5) },
+        .{ .t = -5.0, .want = Vec3.new(0.0, 0.0, 0.0) },
+        .{ .t = 99.0, .want = Vec3.new(1.0, 2.0, 3.0) },
+    };
+    for (cases) |c| {
+        const v = sampler.sampleVec3(c.t);
+        try std.testing.expectApproxEqAbs(c.want.x, v.x, 1e-5);
+        try std.testing.expectApproxEqAbs(c.want.y, v.y, 1e-5);
+        try std.testing.expectApproxEqAbs(c.want.z, v.z, 1e-5);
+    }
 }
 
 test "Cubic spline midpoint follows Hermite basis with dt-scaled tangents" {
@@ -691,23 +697,8 @@ test "Cubic spline morph weights interpolate per target" {
     var weights = [_]f32{ 0.0, 0.0 };
     var dirty = false;
 
-    const times = try allocator.alloc(f32, 2);
-    times[0] = 0.0;
-    times[1] = 1.0;
     // n=2: k0 in=[9,9] val=[0,0] out=[3,0]; k1 in=[0,0] val=[1,0.5] out=[9,9].
-    const outputs = try allocator.alloc(f32, 12);
-    outputs[0] = 9.0;
-    outputs[1] = 9.0;
-    outputs[2] = 0.0;
-    outputs[3] = 0.0;
-    outputs[4] = 3.0;
-    outputs[5] = 0.0;
-    outputs[6] = 0.0;
-    outputs[7] = 0.0;
-    outputs[8] = 1.0;
-    outputs[9] = 0.5;
-    outputs[10] = 9.0;
-    outputs[11] = 9.0;
+    const track = try allocWeightsTrack(allocator, &.{ 0.0, 1.0 }, &.{ 9.0, 9.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0, 0.5, 9.0, 9.0 });
 
     const ag = try makeNodeGroup(allocator, "morph_cubic", 1.0);
     defer ag.deinit();
@@ -715,7 +706,7 @@ test "Cubic spline morph weights interpolate per target" {
     try ag.addNodeChannel(.{
         .target = target,
         .target_path = .weights,
-        .sampler = .{ .timestamps = times, .outputs = outputs, .interpolation = .cubic_spline },
+        .sampler = .{ .timestamps = track.t, .outputs = track.o, .interpolation = .cubic_spline },
     });
 
     ag.play(true);
@@ -853,9 +844,8 @@ const EventCounter = struct {
 
 test "Animation events fire once on crossing and drain clears" {
     const allocator = std.testing.allocator;
-    const ag = try makeNodeGroup(allocator, "ev_once", 2.0);
+    const ag = try makeEventGroup(allocator, "ev_once", &.{.{ .time = 1.0, .name = "hit" }});
     defer ag.deinit();
-    try ag.setEvents(allocator, &.{.{ .time = 1.0, .name = "hit" }});
     var counter = EventCounter{};
     ag.on_event = &EventCounter.handler;
     ag.event_context = &counter;
@@ -881,13 +871,12 @@ test "Animation events fire once on crossing and drain clears" {
 
 test "Animation events fire across a loop wraparound" {
     const allocator = std.testing.allocator;
-    const ag = try makeNodeGroup(allocator, "ev_loop", 2.0);
-    defer ag.deinit();
-    try ag.setEvents(allocator, &.{
+    const ag = try makeEventGroup(allocator, "ev_loop", &.{
         .{ .time = 0.25, .name = "wrapped" },
         .{ .time = 1.5, .name = "end" },
         .{ .time = 0.0, .name = "start" },
     });
+    defer ag.deinit();
 
     ag.play(true);
     // Window (0, 1] crosses "wrapped"@0.25: prev_time starts at from=0, so
@@ -914,9 +903,8 @@ test "Animation events fire across a loop wraparound" {
 
 test "Animation events fire when playing backward" {
     const allocator = std.testing.allocator;
-    const ag = try makeNodeGroup(allocator, "ev_back", 2.0);
+    const ag = try makeEventGroup(allocator, "ev_back", &.{.{ .time = 1.0, .name = "hit" }});
     defer ag.deinit();
-    try ag.setEvents(allocator, &.{.{ .time = 1.0, .name = "hit" }});
 
     ag.play(true);
     ag.setSpeed(-1.0);
@@ -936,9 +924,8 @@ test "Animation events fire when playing backward" {
 
 test "Animation events fire on the duration boundary" {
     const allocator = std.testing.allocator;
-    const ag = try makeNodeGroup(allocator, "ev_edge", 2.0);
+    const ag = try makeEventGroup(allocator, "ev_edge", &.{.{ .time = 2.0, .name = "end" }});
     defer ag.deinit();
-    try ag.setEvents(allocator, &.{.{ .time = 2.0, .name = "end" }});
 
     ag.play(false);
     ag.update(2.5); // overshoots to == 2.0, non-loop stops and still fires
@@ -953,12 +940,11 @@ test "Animation events fire on the duration boundary" {
 
 test "stop and fade-out never fire events" {
     const allocator = std.testing.allocator;
-    const ag = try makeNodeGroup(allocator, "ev_nofire", 2.0);
-    defer ag.deinit();
-    try ag.setEvents(allocator, &.{
+    const ag = try makeEventGroup(allocator, "ev_nofire", &.{
         .{ .time = 0.5, .name = "early" },
         .{ .time = 1.0, .name = "late" },
     });
+    defer ag.deinit();
 
     ag.play(true);
     ag.update(0.4); // t = 0.4, no crossing yet
@@ -986,35 +972,9 @@ test "Truncated LINEAR/STEP bone tracks are skipped, preserving pose" {
     skel.bones[0].local_rotation = Quat.identity;
     skel.bones[0].local_scale = Vec3.one;
 
-    // 2 keys but only 1 frame of outputs: truncated LINEAR translation.
-    const t_times = try allocator.alloc(f32, 2);
-    t_times[0] = 0.0;
-    t_times[1] = 1.0;
-    const t_out = try allocator.alloc(f32, 3);
-    t_out[0] = 99.0;
-    t_out[1] = 99.0;
-    t_out[2] = 99.0;
-    // 2 keys but only 1 frame of outputs: truncated STEP rotation.
-    const r_times = try allocator.alloc(f32, 2);
-    r_times[0] = 0.0;
-    r_times[1] = 1.0;
-    const r_out = try allocator.alloc(f32, 4);
-    r_out[0] = 0.0;
-    r_out[1] = 0.0;
-    r_out[2] = 0.0;
-    r_out[3] = 1.0;
-
-    const channels = try allocator.alloc(AnimationChannel, 2);
-    channels[0] = .{
-        .bone_index = 0,
-        .target_path = .translation,
-        .sampler = .{ .timestamps = t_times, .outputs = t_out, .interpolation = .linear },
-    };
-    channels[1] = .{
-        .bone_index = 0,
-        .target_path = .rotation,
-        .sampler = .{ .timestamps = r_times, .outputs = r_out, .interpolation = .step },
-    };
+    // 2 keys but only 1 frame of outputs: truncated LINEAR translation
+    // and truncated STEP rotation (shared guard fixture, 99s + identity).
+    const channels = try allocTruncatedBonePair(allocator);
 
     const ag = try AnimationGroup.init(allocator, "bone_truncated", channels, 1.0);
     defer ag.deinit();
@@ -1079,63 +1039,14 @@ test "Truncated bone tracks fall back to bind pose in skeleton blending" {
     skel.bones[0].bind_scale = Vec3.one;
 
     // Bad clip: truncated LINEAR translation + truncated STEP rotation.
-    const bad_t = try allocator.alloc(f32, 2);
-    bad_t[0] = 0.0;
-    bad_t[1] = 1.0;
-    const bad_t_out = try allocator.alloc(f32, 3);
-    bad_t_out[0] = 99.0;
-    bad_t_out[1] = 99.0;
-    bad_t_out[2] = 99.0;
-    const bad_r = try allocator.alloc(f32, 2);
-    bad_r[0] = 0.0;
-    bad_r[1] = 1.0;
-    const bad_r_out = try allocator.alloc(f32, 4);
-    bad_r_out[0] = 0.0;
-    bad_r_out[1] = 0.0;
-    bad_r_out[2] = 0.0;
-    bad_r_out[3] = 1.0;
-    const bad_ch = try allocator.alloc(AnimationChannel, 2);
-    bad_ch[0] = .{
-        .bone_index = 0,
-        .target_path = .translation,
-        .sampler = .{ .timestamps = bad_t, .outputs = bad_t_out, .interpolation = .linear },
-    };
-    bad_ch[1] = .{
-        .bone_index = 0,
-        .target_path = .rotation,
-        .sampler = .{ .timestamps = bad_r, .outputs = bad_r_out, .interpolation = .step },
-    };
+    const bad_ch = try allocTruncatedBonePair(allocator);
     const ag_bad = try AnimationGroup.init(allocator, "bad", bad_ch, 1.0);
     defer ag_bad.deinit();
     ag_bad.play(true);
 
     // Good clip: valid translation (z=20) + valid 90deg Y rotation.
     const q1 = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
-    const good_t = try allocator.alloc(f32, 1);
-    good_t[0] = 0.0;
-    const good_t_out = try allocator.alloc(f32, 3);
-    good_t_out[0] = 0.0;
-    good_t_out[1] = 0.0;
-    good_t_out[2] = 20.0;
-    const good_r = try allocator.alloc(f32, 1);
-    good_r[0] = 0.0;
-    const good_r_out = try allocator.alloc(f32, 4);
-    good_r_out[0] = q1.x;
-    good_r_out[1] = q1.y;
-    good_r_out[2] = q1.z;
-    good_r_out[3] = q1.w;
-    const good_ch = try allocator.alloc(AnimationChannel, 2);
-    good_ch[0] = .{
-        .bone_index = 0,
-        .target_path = .translation,
-        .sampler = .{ .timestamps = good_t, .outputs = good_t_out },
-    };
-    good_ch[1] = .{
-        .bone_index = 0,
-        .target_path = .rotation,
-        .sampler = .{ .timestamps = good_r, .outputs = good_r_out },
-    };
-    const ag_good = try AnimationGroup.init(allocator, "good", good_ch, 1.0);
+    const ag_good = try makeBoneClipTR(allocator, "good", Vec3.new(0.0, 0.0, 20.0), q1);
     defer ag_good.deinit();
     ag_good.play(true);
 
@@ -1361,18 +1272,6 @@ test "updateAnimations serial vs pool is bit-identical (node writers stay serial
     }
 }
 
-fn fadeMakeBoneClip(allocator: std.mem.Allocator, name: []const u8, z: f32) !*AnimationGroup {
-    const times = try allocator.alloc(f32, 1);
-    times[0] = 0.0;
-    const outs = try allocator.alloc(f32, 3);
-    outs[0] = 0.0;
-    outs[1] = 0.0;
-    outs[2] = z;
-    const channels = try allocator.alloc(AnimationChannel, 1);
-    channels[0] = .{ .bone_index = 0, .target_path = .translation, .sampler = .{ .timestamps = times, .outputs = outs } };
-    return AnimationGroup.init(allocator, name, channels, 1.0);
-}
-
 test "fadeOut completion resets skeleton to bind pose (single clip)" {
     const runtime = @import("../scene/animation_runtime.zig");
     const allocator = std.testing.allocator;
@@ -1383,7 +1282,7 @@ test "fadeOut completion resets skeleton to bind pose (single clip)" {
     skel.bones[0].bind_scale = Vec3.one;
     skel.resetToBindPose();
 
-    const ag = try fadeMakeBoneClip(allocator, "fade Solo", 10.0);
+    const ag = try makeBoneClip(allocator, "fade Solo", Vec3.new(0.0, 0.0, 10.0));
     defer ag.deinit();
     ag.skeleton = skel;
     ag.play(true);
@@ -1417,13 +1316,13 @@ test "crossFade source reset does not disturb remaining target" {
     skel.bones[0].bind_scale = Vec3.one;
     skel.resetToBindPose();
 
-    const src = try fadeMakeBoneClip(allocator, "fade_src", 10.0);
+    const src = try makeBoneClip(allocator, "fade_src", Vec3.new(0.0, 0.0, 10.0));
     defer src.deinit();
     src.skeleton = skel;
     src.play(true);
     src.setWeight(1.0);
 
-    const dst = try fadeMakeBoneClip(allocator, "fade_dst", 20.0);
+    const dst = try makeBoneClip(allocator, "fade_dst", Vec3.new(0.0, 0.0, 20.0));
     defer dst.deinit();
     dst.skeleton = skel;
 

@@ -105,6 +105,23 @@ fn expectIndicesInBounds(indices: []const u32, vertex_count: usize) !void {
     }
 }
 
+// Plane target for decal-projection tests: builds WxH plane geometry,
+// retains it as CPU geometry, and hands ownership to the caller
+// (deinit with the test allocator).
+fn makePlaneTarget(ally: std.mem.Allocator, w: f32, h: f32) !Mesh {
+    var plane_data = try buildPlaneData(ally, .{ .width = w, .height = h });
+    defer plane_data.deinit(ally);
+
+    var m: Mesh = .{
+        .name = "target_plane",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = @intCast(plane_data.indices.len),
+    };
+    try m.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    return m;
+}
+
 test "MeshBuilder torus geometry" {
     const ally = std.testing.allocator;
     var data = try buildTorusData(ally, .{ .diameter = 2.0, .thickness = 0.5, .tessellation = 8 });
@@ -217,20 +234,41 @@ test "MeshBuilder ribbon geometry" {
     try std.testing.expectEqual(@as(usize, 36), closed_both.indices.len);
 }
 
-test "MeshBuilder ribbon rejects invalid paths" {
+test "MeshBuilder builders reject invalid input" {
     const ally = std.testing.allocator;
-    const short = [_]Vec3{Vec3.new(0, 0, 0)};
-    const ok_path = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0) };
 
-    const single = [_][]const Vec3{&ok_path};
-    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &single }));
+    // Ribbon: fewer than 2 paths, a short path, and mismatched lengths.
+    const ribbon_ok = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0) };
+    const ribbon_short = [_]Vec3{Vec3.new(0, 0, 0)};
+    const ribbon_long = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0), Vec3.new(2, 0, 0) };
+    const ribbon_single = [_][]const Vec3{&ribbon_ok};
+    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &ribbon_single }));
+    const ribbon_one_short = [_][]const Vec3{ &ribbon_ok, &ribbon_short };
+    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &ribbon_one_short }));
+    const ribbon_mismatched = [_][]const Vec3{ &ribbon_ok, &ribbon_long };
+    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &ribbon_mismatched }));
 
-    const one_short = [_][]const Vec3{ &ok_path, &short };
-    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &one_short }));
+    // Tube: a single-point path and a radii/path length mismatch.
+    const tube_single = [_]Vec3{Vec3.new(0, 0, 0)};
+    try std.testing.expectError(error.InvalidTube, buildTubeData(ally, .{ .path = &tube_single }));
+    const tube_ok = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(0, 1, 0) };
+    const tube_bad_radii = [_]f32{0.1};
+    try std.testing.expectError(error.InvalidTube, buildTubeData(ally, .{ .path = &tube_ok, .radii = &tube_bad_radii }));
 
-    const longer = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0), Vec3.new(2, 0, 0) };
-    const mismatched = [_][]const Vec3{ &ok_path, &longer };
-    try std.testing.expectError(error.InvalidRibbon, buildRibbonData(ally, .{ .paths = &mismatched }));
+    // Lines: a single point and a colors/points length mismatch.
+    const lines_single = [_]Vec3{Vec3.new(0, 0, 0)};
+    try std.testing.expectError(error.InvalidLines, buildLinesData(ally, .{ .points = &lines_single }));
+    const lines_ok = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0) };
+    const lines_bad_colors = [_]Color4{Color4.white};
+    try std.testing.expectError(error.InvalidLines, buildLinesData(ally, .{ .points = &lines_ok, .colors = &lines_bad_colors }));
+
+    // Extrude: fewer than 3 points, zero area, and a self-intersecting bow-tie.
+    const extrude_two = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 0) };
+    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &extrude_two }));
+    const extrude_collinear = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 0), Vec2.new(2, 0) };
+    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &extrude_collinear }));
+    const extrude_bowtie = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 1), Vec2.new(1, 0), Vec2.new(0, 1) };
+    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &extrude_bowtie }));
 }
 
 test "MeshBuilder lathe geometry" {
@@ -396,16 +434,6 @@ test "MeshBuilder tube capped closed radii" {
     try expectIndicesInBounds(capped.indices, capped.vertices.len);
 }
 
-test "MeshBuilder tube rejects invalid input" {
-    const ally = std.testing.allocator;
-    const single = [_]Vec3{Vec3.new(0, 0, 0)};
-    try std.testing.expectError(error.InvalidTube, buildTubeData(ally, .{ .path = &single }));
-
-    const ok_path = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(0, 1, 0) };
-    const bad_radii = [_]f32{0.1};
-    try std.testing.expectError(error.InvalidTube, buildTubeData(ally, .{ .path = &ok_path, .radii = &bad_radii }));
-}
-
 test "MeshBuilder lines geometry" {
     const ally = std.testing.allocator;
     const points = [_]Vec3{
@@ -448,16 +476,6 @@ test "MeshBuilder lines geometry" {
     try std.testing.expectEqual(@as(usize, 18), closed.indices.len);
     try expectNormalsNormalized(closed.vertices);
     try expectIndicesInBounds(closed.indices, closed.vertices.len);
-}
-
-test "MeshBuilder lines rejects invalid input" {
-    const ally = std.testing.allocator;
-    const single = [_]Vec3{Vec3.new(0, 0, 0)};
-    try std.testing.expectError(error.InvalidLines, buildLinesData(ally, .{ .points = &single }));
-
-    const ok_points = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0) };
-    const bad_colors = [_]Color4{Color4.white};
-    try std.testing.expectError(error.InvalidLines, buildLinesData(ally, .{ .points = &ok_points, .colors = &bad_colors }));
 }
 
 test "MeshBuilder extrude convex geometry" {
@@ -580,20 +598,6 @@ test "grid quad helpers preserve winding" {
     // Seed reference keeps a clear hint and replaces a parallel one.
     try std.testing.expectEqual(Vec3.up, resolveFrameSeed(Vec3.forward, Vec3.up));
     try std.testing.expectEqual(Vec3.right, resolveFrameSeed(Vec3.up, Vec3.up));
-}
-
-test "MeshBuilder extrude rejects invalid input" {
-    const ally = std.testing.allocator;
-    const two = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 0) };
-    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &two }));
-
-    // Collinear points have zero area.
-    const collinear = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 0), Vec2.new(2, 0) };
-    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &collinear }));
-
-    // Bow-tie outline self-intersects.
-    const bowtie = [_]Vec2{ Vec2.new(0, 0), Vec2.new(1, 1), Vec2.new(1, 0), Vec2.new(0, 1) };
-    try std.testing.expectError(error.InvalidExtrude, buildExtrudeData(ally, .{ .profile = &bowtie }));
 }
 
 // CPU morph-target tests run without GPU: vertex_buffer.id == 0, so
@@ -870,16 +874,7 @@ test "Mesh LOD levels selection, sorting and culling" {
 
 test "Mesh decal projection onto planar mesh" {
     const ally = std.testing.allocator;
-    var plane_data = try buildPlaneData(ally, .{ .width = 10.0, .height = 10.0 });
-    defer plane_data.deinit(ally);
-
-    var target_mesh: Mesh = .{
-        .name = "target_plane",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = @intCast(plane_data.indices.len),
-    };
-    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    var target_mesh = try makePlaneTarget(ally, 10.0, 10.0);
     defer target_mesh.deinit(ally);
 
     var decal_data = try buildDecalData(ally, &target_mesh, .{
@@ -915,16 +910,7 @@ test "Mesh decal projection onto planar mesh" {
 
 test "Mesh decal backface culling and pass-through" {
     const ally = std.testing.allocator;
-    var plane_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
-    defer plane_data.deinit(ally);
-
-    var target_mesh: Mesh = .{
-        .name = "target_plane",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = @intCast(plane_data.indices.len),
-    };
-    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    var target_mesh = try makePlaneTarget(ally, 4.0, 4.0);
     defer target_mesh.deinit(ally);
 
     // Projector facing backwards relative to surface normal
@@ -954,16 +940,7 @@ test "Mesh decal backface culling and pass-through" {
 
 test "Mesh decal off-target returns empty geometry" {
     const ally = std.testing.allocator;
-    var plane_data = try buildPlaneData(ally, .{ .width = 2.0, .height = 2.0 });
-    defer plane_data.deinit(ally);
-
-    var target_mesh: Mesh = .{
-        .name = "target_plane",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = @intCast(plane_data.indices.len),
-    };
-    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    var target_mesh = try makePlaneTarget(ally, 2.0, 2.0);
     defer target_mesh.deinit(ally);
 
     // Completely outside the bounds of the target plane (plane is at Z=0, [-1, 1]^2)
@@ -980,19 +957,10 @@ test "Mesh decal off-target returns empty geometry" {
 
 test "Mesh decal rotation angle and transformation" {
     const ally = std.testing.allocator;
-    var plane_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
-    defer plane_data.deinit(ally);
-
-    var target_mesh: Mesh = .{
-        .name = "target_plane",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = @intCast(plane_data.indices.len),
-        // Target mesh with translation and scale
-        .position = Vec3.new(5.0, 0.0, 0.0),
-        .scaling = Vec3.new(2.0, 2.0, 1.0),
-    };
-    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    var target_mesh = try makePlaneTarget(ally, 4.0, 4.0);
+    // Target mesh with translation and scale
+    target_mesh.position = Vec3.new(5.0, 0.0, 0.0);
+    target_mesh.scaling = Vec3.new(2.0, 2.0, 1.0);
     defer target_mesh.deinit(ally);
 
     var decal_data = try buildDecalData(ally, &target_mesh, .{
@@ -1031,16 +999,7 @@ fn decalProjectionUnderOom(ally: std.mem.Allocator, target_mesh: *const Mesh) !v
 
 test "Mesh decal projection frees everything under allocation failure" {
     const ally = std.testing.allocator;
-    var plane_data = try buildPlaneData(ally, .{ .width = 10.0, .height = 10.0 });
-    defer plane_data.deinit(ally);
-
-    var target_mesh: Mesh = .{
-        .name = "target_plane",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = @intCast(plane_data.indices.len),
-    };
-    try target_mesh.retainCpuGeometryU32(ally, plane_data.vertices, plane_data.indices);
+    var target_mesh = try makePlaneTarget(ally, 10.0, 10.0);
     defer target_mesh.deinit(ally);
 
     try std.testing.checkAllAllocationFailures(ally, decalProjectionUnderOom, .{&target_mesh});
@@ -1074,31 +1033,21 @@ test "Mesh decal barycentric coordinates" {
     const b = Vec3.new(1.0, 0.0, 0.0);
     const c = Vec3.new(0.0, 1.0, 0.0);
 
-    // At vertex A
-    const bary_a = barycentric(a, a, b, c);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bary_a[0], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_a[1], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_a[2], 1e-4);
-
-    // At vertex B
-    const bary_b = barycentric(b, a, b, c);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_b[0], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bary_b[1], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_b[2], 1e-4);
-
-    // Midpoint of AB
-    const mid_ab = Vec3.new(0.5, 0.0, 0.0);
-    const bary_ab = barycentric(mid_ab, a, b, c);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bary_ab[0], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bary_ab[1], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bary_ab[2], 1e-4);
-
-    // Triangle centroid
-    const centroid = Vec3.new(1.0 / 3.0, 1.0 / 3.0, 0.0);
-    const bary_c = barycentric(centroid, a, b, c);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[0], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[1], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), bary_c[2], 1e-4);
+    // Rows: sample point -> barycentric weights (corners, edge midpoint, centroid).
+    const Case = struct { p: Vec3, want: [3]f32 };
+    const third: f32 = 1.0 / 3.0;
+    const cases = [_]Case{
+        .{ .p = a, .want = .{ 1.0, 0.0, 0.0 } },
+        .{ .p = b, .want = .{ 0.0, 1.0, 0.0 } },
+        .{ .p = Vec3.new(0.5, 0.0, 0.0), .want = .{ 0.5, 0.5, 0.0 } },
+        .{ .p = Vec3.new(third, third, 0.0), .want = .{ third, third, third } },
+    };
+    for (cases) |case| {
+        const w = barycentric(case.p, a, b, c);
+        try std.testing.expectApproxEqAbs(case.want[0], w[0], 1e-4);
+        try std.testing.expectApproxEqAbs(case.want[1], w[1], 1e-4);
+        try std.testing.expectApproxEqAbs(case.want[2], w[2], 1e-4);
+    }
 }
 
 test "Mesh decal blend skin weights" {
@@ -1279,41 +1228,20 @@ test "Mesh decal manager lifecycle and fade" {
     try std.testing.expectEqual(@as(usize, 0), mock_scene.pbr_materials.items.len);
 }
 
-test "buildPolygonData: flat 2D triangle, quad, and concave polygon" {
+test "buildPolygonData: shapes, holes, and extrusion" {
     const ally = std.testing.allocator;
 
-    // 1. Triangle
     const tri_shape = [_]Vec2{
         Vec2.new(0.0, 0.0),
         Vec2.new(2.0, 0.0),
         Vec2.new(1.0, 2.0),
     };
-    var tri_data = try mesh_mod.buildPolygonData(ally, .{
-        .shape = &tri_shape,
-        .depth = 0.0,
-        .plane = .xz,
-    });
-    defer tri_data.deinit(ally);
-    try std.testing.expectEqual(@as(usize, 3), tri_data.vertices.len);
-    try std.testing.expectEqual(@as(usize, 3), tri_data.indices.len);
-
-    // 2. Convex quad
     const quad_shape = [_]Vec2{
         Vec2.new(0.0, 0.0),
         Vec2.new(4.0, 0.0),
         Vec2.new(4.0, 4.0),
         Vec2.new(0.0, 4.0),
     };
-    var quad_data = try mesh_mod.buildPolygonData(ally, .{
-        .shape = &quad_shape,
-        .depth = 0.0,
-        .plane = .xz,
-    });
-    defer quad_data.deinit(ally);
-    try std.testing.expectEqual(@as(usize, 4), quad_data.vertices.len);
-    try std.testing.expectEqual(@as(usize, 6), quad_data.indices.len);
-
-    // 3. Concave L-shape
     const l_shape = [_]Vec2{
         Vec2.new(0.0, 0.0),
         Vec2.new(4.0, 0.0),
@@ -1322,27 +1250,12 @@ test "buildPolygonData: flat 2D triangle, quad, and concave polygon" {
         Vec2.new(2.0, 4.0),
         Vec2.new(0.0, 4.0),
     };
-    var l_data = try mesh_mod.buildPolygonData(ally, .{
-        .shape = &l_shape,
-        .depth = 0.0,
-        .plane = .xz,
-    });
-    defer l_data.deinit(ally);
-    try std.testing.expectEqual(@as(usize, 6), l_data.vertices.len);
-    try std.testing.expectEqual(@as(usize, 12), l_data.indices.len); // (6 - 2) * 3 = 12
-}
-
-test "buildPolygonData: polygon with hole" {
-    const ally = std.testing.allocator;
-
-    // Outer square: [0, 10] x [0, 10]
     const outer = [_]Vec2{
         Vec2.new(0.0, 0.0),
         Vec2.new(10.0, 0.0),
         Vec2.new(10.0, 10.0),
         Vec2.new(0.0, 10.0),
     };
-    // Inner hole: [3, 7] x [3, 7]
     const hole = [_]Vec2{
         Vec2.new(3.0, 3.0),
         Vec2.new(7.0, 3.0),
@@ -1350,63 +1263,65 @@ test "buildPolygonData: polygon with hole" {
         Vec2.new(3.0, 7.0),
     };
     const holes = [_][]const Vec2{&hole};
-
-    var data = try mesh_mod.buildPolygonData(ally, .{
-        .shape = &outer,
-        .holes = &holes,
-        .depth = 0.0,
-        .plane = .xz,
-    });
-    defer data.deinit(ally);
-
-    // Merged contour has 4 (outer) + 4 (hole) + 2 (bridge) = 10 vertices
-    try std.testing.expectEqual(@as(usize, 10), data.vertices.len);
-    // (10 - 2) * 3 = 24 indices (8 triangles)
-    try std.testing.expectEqual(@as(usize, 24), data.indices.len);
-}
-
-test "buildPolygonData: extruded 3D polygon with depth" {
-    const ally = std.testing.allocator;
-
-    const quad = [_]Vec2{
+    const big_quad = [_]Vec2{
         Vec2.new(0.0, 0.0),
         Vec2.new(5.0, 0.0),
         Vec2.new(5.0, 5.0),
         Vec2.new(0.0, 5.0),
     };
 
-    var data = try mesh_mod.buildPolygonData(ally, .{
-        .shape = &quad,
-        .depth = 3.0,
-        .plane = .xz,
-    });
-    defer data.deinit(ally);
+    // Rows: flat triangle/quad/concave L, holed square (4 outer + 4 hole
+    // + 2 bridge verts, (10-2)*3 indices), and the extruded prism
+    // (2 caps x 4 + 16 wall verts, 12 cap + 24 wall indices).
+    const Case = struct {
+        shape: []const Vec2,
+        holes: []const []const Vec2,
+        depth: f32,
+        want_v: usize,
+        want_i: usize,
+        check_solid: bool,
+    };
+    const cases = [_]Case{
+        .{ .shape = &tri_shape, .holes = &.{}, .depth = 0.0, .want_v = 3, .want_i = 3, .check_solid = false },
+        .{ .shape = &quad_shape, .holes = &.{}, .depth = 0.0, .want_v = 4, .want_i = 6, .check_solid = false },
+        .{ .shape = &l_shape, .holes = &.{}, .depth = 0.0, .want_v = 6, .want_i = 12, .check_solid = false },
+        .{ .shape = &outer, .holes = &holes, .depth = 0.0, .want_v = 10, .want_i = 24, .check_solid = false },
+        .{ .shape = &big_quad, .holes = &.{}, .depth = 3.0, .want_v = 24, .want_i = 36, .check_solid = true },
+    };
+    for (cases) |c| {
+        var data = try mesh_mod.buildPolygonData(ally, .{
+            .shape = c.shape,
+            .holes = c.holes,
+            .depth = c.depth,
+            .plane = .xz,
+        });
+        defer data.deinit(ally);
+        try std.testing.expectEqual(c.want_v, data.vertices.len);
+        try std.testing.expectEqual(c.want_i, data.indices.len);
 
-    // 2 caps * 4 vertices = 8; 4 side walls * 4 vertices = 16. Total = 24 vertices.
-    try std.testing.expectEqual(@as(usize, 24), data.vertices.len);
-    // 2 caps * 6 indices = 12; 4 side walls * 6 indices = 24. Total = 36 indices.
-    try std.testing.expectEqual(@as(usize, 36), data.indices.len);
+        if (c.check_solid) {
+            try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.bounds.min.y, 1e-4);
+            try std.testing.expectApproxEqAbs(@as(f32, 3.0), data.bounds.max.y, 1e-4);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data.bounds.min.y, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), data.bounds.max.y, 1e-4);
-
-    // Verify all triangle geometric face normals align with vertex normals (dot product > 0)
-    var ti: usize = 0;
-    while (ti < data.indices.len) : (ti += 3) {
-        const idx0 = data.indices[ti + 0];
-        const idx1 = data.indices[ti + 1];
-        const idx2 = data.indices[ti + 2];
-        const p0 = data.vertices[idx0].position;
-        const p1 = data.vertices[idx1].position;
-        const p2 = data.vertices[idx2].position;
-        const v0 = Vec3.new(p0[0], p0[1], p0[2]);
-        const v1 = Vec3.new(p1[0], p1[1], p1[2]);
-        const v2 = Vec3.new(p2[0], p2[1], p2[2]);
-        const geom_n = Vec3.cross(v1.sub(v0), v2.sub(v0));
-        const n0 = data.vertices[idx0].normal;
-        const vert_n = Vec3.new(n0[0], n0[1], n0[2]);
-        const dot = geom_n.dot(vert_n);
-        try std.testing.expect(dot > 0.0);
+            // Every triangle's geometric face normal aligns with its vertex
+            // normals (dot product > 0).
+            var ti: usize = 0;
+            while (ti < data.indices.len) : (ti += 3) {
+                const idx0 = data.indices[ti + 0];
+                const idx1 = data.indices[ti + 1];
+                const idx2 = data.indices[ti + 2];
+                const p0 = data.vertices[idx0].position;
+                const p1 = data.vertices[idx1].position;
+                const p2 = data.vertices[idx2].position;
+                const v0 = Vec3.new(p0[0], p0[1], p0[2]);
+                const v1 = Vec3.new(p1[0], p1[1], p1[2]);
+                const v2 = Vec3.new(p2[0], p2[1], p2[2]);
+                const geom_n = Vec3.cross(v1.sub(v0), v2.sub(v0));
+                const n0 = data.vertices[idx0].normal;
+                const vert_n = Vec3.new(n0[0], n0[1], n0[2]);
+                try std.testing.expect(geom_n.dot(vert_n) > 0.0);
+            }
+        }
     }
 }
 
@@ -1447,31 +1362,34 @@ const morph_gpu = mesh_mod.morph_gpu;
 const MAX_MORPH_TARGETS = mesh_mod.MAX_MORPH_TARGETS;
 
 test "MorphGpu strip layout: texture size and texel index golden values" {
-    // Degenerate mesh still gets a bindable 1x1 texture.
-    const empty = morph_gpu.textureSizeFor(0);
-    try std.testing.expectEqual(@as(u32, 1), empty.width);
-    try std.testing.expectEqual(@as(u32, 1), empty.height);
+    // Rows: vertex count -> texture dims. 170 vertices fit one 4080-wide
+    // row; 171 wrap into two rows; degenerate mesh gets a bindable 1x1.
+    const SizeCase = struct { n: u32, w: u32, h: u32 };
+    const size_cases = [_]SizeCase{
+        .{ .n = 0, .w = 1, .h = 1 },
+        .{ .n = 1, .w = morph_gpu.TEXELS_PER_VERTEX, .h = 1 },
+        .{ .n = 170, .w = 4080, .h = 1 },
+        .{ .n = 171, .w = morph_gpu.TEXTURE_MAX_WIDTH, .h = 2 },
+    };
+    for (size_cases) |c| {
+        const size = morph_gpu.textureSizeFor(c.n);
+        try std.testing.expectEqual(c.w, size.width);
+        try std.testing.expectEqual(c.h, size.height);
+    }
 
-    // One vertex = 24 texels (8 targets x 3 slots), one row.
-    const one = morph_gpu.textureSizeFor(1);
-    try std.testing.expectEqual(@as(u32, morph_gpu.TEXELS_PER_VERTEX), one.width);
-    try std.testing.expectEqual(@as(u32, 1), one.height);
-
-    // 170 vertices fit one 4080-wide row; 171 wrap into two rows.
-    const fit = morph_gpu.textureSizeFor(170);
-    try std.testing.expectEqual(@as(u32, 4080), fit.width);
-    try std.testing.expectEqual(@as(u32, 1), fit.height);
-    const wrap = morph_gpu.textureSizeFor(171);
-    try std.testing.expectEqual(@as(u32, morph_gpu.TEXTURE_MAX_WIDTH), wrap.width);
-    try std.testing.expectEqual(@as(u32, 2), wrap.height);
-
-    // Texel index: vertex * 24 + target * 3 + slot.
-    try std.testing.expectEqual(@as(u32, 0), morph_gpu.texelIndex(0, 0, .position));
-    try std.testing.expectEqual(@as(u32, 1), morph_gpu.texelIndex(0, 0, .normal));
-    try std.testing.expectEqual(@as(u32, 2), morph_gpu.texelIndex(0, 0, .tangent));
-    try std.testing.expectEqual(@as(u32, 3), morph_gpu.texelIndex(0, 1, .position));
-    try std.testing.expectEqual(@as(u32, 24), morph_gpu.texelIndex(1, 0, .position));
-    try std.testing.expectEqual(@as(u32, 58), morph_gpu.texelIndex(2, 3, .normal));
+    // Rows: (vertex, target, slot) -> texel index (vertex * 24 + target * 3 + slot).
+    const TexelCase = struct { v: usize, t: usize, slot: morph_gpu.MorphSlot, want: u32 };
+    const texel_cases = [_]TexelCase{
+        .{ .v = 0, .t = 0, .slot = .position, .want = 0 },
+        .{ .v = 0, .t = 0, .slot = .normal, .want = 1 },
+        .{ .v = 0, .t = 0, .slot = .tangent, .want = 2 },
+        .{ .v = 0, .t = 1, .slot = .position, .want = 3 },
+        .{ .v = 1, .t = 0, .slot = .position, .want = 24 },
+        .{ .v = 2, .t = 3, .slot = .normal, .want = 58 },
+    };
+    for (texel_cases) |c| {
+        try std.testing.expectEqual(c.want, morph_gpu.texelIndex(c.v, c.t, c.slot));
+    }
 }
 
 test "MorphGpu packDeltas: RGBA layout golden values" {

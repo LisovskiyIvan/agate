@@ -25,37 +25,71 @@ const HeightFieldOptions = physics.HeightFieldOptions;
 const DistanceJointOptions = physics.DistanceJointOptions;
 const SphericalJointOptions = physics.SphericalJointOptions;
 const RevoluteJointOptions = physics.RevoluteJointOptions;
-const WheelJointOptions = physics.WheelJointOptions;
 const MotorJointOptions = physics.MotorJointOptions;
 const WeldJointOptions = physics.WeldJointOptions;
 const ParallelJointOptions = physics.ParallelJointOptions;
 const PrismaticJointOptions = physics.PrismaticJointOptions;
+const WheelJointOptions = physics.WheelJointOptions;
 const ShapeKey = physics.ShapeKey;
+
+// Shared per-suite builders: every test needs a bare Mesh at a position
+// (Box3D derives sphere/capsule extents from the mesh), so the 7-line
+// literal collapses to one call. stepN covers the sleep-settling loops
+// whose only body is a fixed-dt step.
+fn testMesh(name: []const u8, pos: Vec3) Mesh {
+    return .{
+        .name = name,
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = pos,
+    };
+}
+
+fn boxMesh(name: []const u8, pos: Vec3, box_min: Vec3, box_max: Vec3) Mesh {
+    var m = testMesh(name, pos);
+    m.local_bounding_box = BoundingBox.init(box_min, box_max);
+    return m;
+}
+
+fn tiltBoxMesh(name: []const u8, pos: Vec3, rot_deg: Vec3, box_min: Vec3, box_max: Vec3) Mesh {
+    var m = boxMesh(name, pos, box_min, box_max);
+    m.rotation = rot_deg;
+    return m;
+}
+
+fn stepN(pw: *PhysicsWorld, n: usize) void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) pw.step(0.016);
+}
+
+// Vertical rope-segment stack: bodies keep `mesh` pointers alive across
+// steps, so storage stays caller-owned and only positions reset here.
+fn initRopeSegs(storage: []Mesh, ptrs: []*Mesh, name: []const u8, top_y: f32, dy: f32) void {
+    for (storage, 0..) |*m, i| {
+        m.* = boxMesh(
+            name,
+            Vec3.new(0.0, top_y - @as(f32, @floatFromInt(i)) * dy, 0.0),
+            Vec3.new(-0.1, -0.1, -0.1),
+            Vec3.new(0.1, 0.1, 0.1),
+        );
+        ptrs[i] = m;
+    }
+}
 
 test "PhysicsWorld ground collision and step" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dummy",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0, 2.0, 0),
-    };
+    var m = testMesh("dummy", Vec3.new(0, 2.0, 0));
     const body = try pw.createBody(&m, .sphere, 2.0);
     body.restitution = 0.5;
 
-    // Simulate free fall
     pw.step(0.1);
     try std.testing.expect(body.velocity.y < 0.0);
     try std.testing.expect(m.position.y < 2.0);
 
-    // Simulate until it lands on ground (-1.2)
-    var step_i: usize = 0;
-    while (step_i < 120) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 120);
     // Ground is at -1.2, bottom of sphere is position.y - radius
     const bottom_y = m.position.y - body.sphere_radius;
     try std.testing.expect(bottom_y >= -1.25);
@@ -65,21 +99,11 @@ test "PhysicsWorld capsule collision and landing" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "capsule_dummy",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0, 3.0, 0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
-    };
+    var m = boxMesh("capsule_dummy", Vec3.new(0, 3.0, 0), Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5));
     const cap_body = try pw.createBody(&m, .capsule, 1.5);
     cap_body.restitution = 0.2;
 
-    var step_i: usize = 0;
-    while (step_i < 150) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 150);
     // Ground is at -1.2, bottom of vertical capsule (half-height 1.0) is position.y - 1.0
     try std.testing.expect(m.position.y >= -0.25);
 }
@@ -88,37 +112,20 @@ test "PhysicsWorld distance joint suspension" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var anchor_mesh = testMesh("anchor", Vec3.new(0.0, 5.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0); // static
 
-    var bob_mesh = Mesh{
-        .name = "bob",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
+    var bob_mesh = testMesh("bob", Vec3.new(0.0, 3.0, 0.0));
     const bob = try pw.createBody(&bob_mesh, .sphere, 2.0); // dynamic
 
     const jid = try pw.createDistanceJoint(anchor, bob, Vec3.zero, Vec3.zero, .{ .length = 2.0 });
     try std.testing.expect(jid.index1 > 0);
 
-    // Step physics under gravity
-    var step_i: usize = 0;
-    while (step_i < 60) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 60);
 
     // Bob should hang around y = 3.0 (length 2.0 from anchor at 5.0), not fall to the ground (-1.2)
     try std.testing.expect(bob_mesh.position.y >= 2.8 and bob_mesh.position.y <= 3.2);
 
-    // Destroy joint
     pw.destroyJoint(jid);
     try std.testing.expectEqual(@as(usize, 0), pw.joints.items.len);
 }
@@ -127,25 +134,12 @@ test "PhysicsWorld radial explosion impulse" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var close_mesh = Mesh{
-        .name = "close",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(1.0, 0.0, 0.0),
-    };
+    var close_mesh = testMesh("close", Vec3.new(1.0, 0.0, 0.0));
     const close_body = try pw.createBody(&close_mesh, .box, 1.0);
 
-    var far_mesh = Mesh{
-        .name = "far",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(20.0, 0.0, 0.0),
-    };
+    var far_mesh = testMesh("far", Vec3.new(20.0, 0.0, 0.0));
     const far_body = try pw.createBody(&far_mesh, .box, 1.0);
 
-    // Epicenter at origin, radius 5.0
     pw.applyExplosion(Vec3.zero, 5.0, 50.0, 0.5);
 
     // Close body must receive linear velocity and upward boost
@@ -157,68 +151,59 @@ test "PhysicsWorld radial explosion impulse" {
     try std.testing.expectEqual(@as(f32, 0.0), far_body.velocity.y);
 }
 
-test "PhysicsWorld revolute motor spins hinged bar" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var anchor_mesh = Mesh{
-        .name = "hinge_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
+test "PhysicsWorld revolute motor spins around the frame axis" {
+    // Same hinge rig under two frame inputs: identity (hinge around Z) and
+    // a Y-90 frame (hinge rotated onto X). angular_velocity is stored in
+    // deg/s (3 rad/s ~= 172 deg/s); explicit identity frames equal the
+    // struct defaults.
+    const Case = struct {
+        frame: Quat,
+        spin_axis: enum { z, x },
     };
-    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0); // static
-
-    var rotor_mesh = Mesh{
-        .name = "hinge_rotor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.125, -0.125), Vec3.new(1.0, 0.125, 0.125)),
+    const cases = [_]Case{
+        .{ .frame = Quat.identity, .spin_axis = .z },
+        .{ .frame = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0)), .spin_axis = .x },
     };
-    const rotor = try pw.createBody(&rotor_mesh, .box, 2.0);
+    for (cases) |case| {
+        var pw = PhysicsWorld.init(std.testing.allocator);
+        defer pw.deinit();
 
-    const jid = try pw.createRevoluteJointWorld(anchor, rotor, Vec3.new(0.0, 3.0, 0.0), .{
-        .enable_motor = true,
-        .motor_speed_rad = 3.0,
-        .max_motor_torque = 200.0,
-    });
-    try std.testing.expect(jid.index1 > 0);
+        var anchor_mesh = testMesh("hinge_anchor", Vec3.new(0.0, 3.0, 0.0));
+        const anchor = try pw.createBody(&anchor_mesh, .box, 0.0); // static
 
-    var step_i: usize = 0;
-    while (step_i < 30) : (step_i += 1) {
-        pw.step(0.016);
+        var rotor_mesh = boxMesh("hinge_rotor", Vec3.new(0.0, 3.0, 0.0), Vec3.new(-1.0, -0.125, -0.125), Vec3.new(1.0, 0.125, 0.125));
+        const rotor = try pw.createBody(&rotor_mesh, .box, 2.0);
+
+        const jid = try pw.createRevoluteJointWorld(anchor, rotor, Vec3.new(0.0, 3.0, 0.0), .{
+            .frame_a = case.frame,
+            .frame_b = case.frame,
+            .enable_motor = true,
+            .motor_speed_rad = 3.0,
+            .max_motor_torque = 200.0,
+        });
+        try std.testing.expect(jid.index1 > 0);
+
+        stepN(&pw, 30);
+
+        switch (case.spin_axis) {
+            .z => try std.testing.expect(@abs(rotor.angular_velocity.z) > 60.0),
+            .x => {
+                try std.testing.expect(@abs(rotor.angular_velocity.x) > 60.0);
+                try std.testing.expect(@abs(rotor.angular_velocity.z) < 20.0);
+            },
+        }
+        try std.testing.expect(@abs(pw.revoluteAngleRad(jid)) > 0.2);
     }
-
-    // The bar should be spinning around the hinge axis (z) near motor speed.
-    // angular_velocity is stored in deg/s (3 rad/s ~= 172 deg/s).
-    try std.testing.expect(@abs(rotor.angular_velocity.z) > 60.0);
-    try std.testing.expect(@abs(pw.revoluteAngleRad(jid)) > 0.2);
 }
 
 test "PhysicsWorld revolute limits constrain hinge angle" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "limit_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
+    var anchor_mesh = testMesh("limit_anchor", Vec3.new(0.0, 3.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var rotor_mesh = Mesh{
-        .name = "limit_rotor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.125, -0.125), Vec3.new(1.0, 0.125, 0.125)),
-    };
+    var rotor_mesh = boxMesh("limit_rotor", Vec3.new(0.0, 3.0, 0.0), Vec3.new(-1.0, -0.125, -0.125), Vec3.new(1.0, 0.125, 0.125));
     const rotor = try pw.createBody(&rotor_mesh, .box, 2.0);
 
     const jid = try pw.createRevoluteJointWorld(anchor, rotor, Vec3.new(0.0, 3.0, 0.0), .{
@@ -230,21 +215,14 @@ test "PhysicsWorld revolute limits constrain hinge angle" {
         .max_motor_torque = 30.0,
     });
 
-    // Drive the motor into the upper limit and hold it there.
-    var step_i: usize = 0;
-    while (step_i < 120) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 120);
 
     const angle = pw.revoluteAngleRad(jid);
     try std.testing.expect(angle >= 0.35 and angle <= 0.6);
 
     // Runtime direction control should push the bar back toward the lower limit.
     pw.setRevoluteMotor(jid, true, -3.0, 30.0);
-    step_i = 0;
-    while (step_i < 120) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 120);
     const reversed = pw.revoluteAngleRad(jid);
     try std.testing.expect(reversed <= -0.35 and reversed >= -0.6);
 }
@@ -264,23 +242,13 @@ test "PhysicsWorld convex hull collider from mesh points" {
     };
     var indices = [_]u32{ 0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4, 0, 2, 5, 2, 1, 5, 1, 3, 5, 3, 0, 5 };
 
-    var mesh = Mesh{
-        .name = "octa",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-        .cpu_positions = &positions,
-        .cpu_indices = &indices,
-    };
+    var mesh = boxMesh("octa", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
+    mesh.cpu_positions = &positions;
+    mesh.cpu_indices = &indices;
     const body = try pw.createBody(&mesh, .hull, 2.0);
     try std.testing.expect(c.b3Shape_GetHull(body.shape_id) != null);
 
-    var step_i: usize = 0;
-    while (step_i < 180) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
 
     // Bottom vertex should rest on the ground plane at y = -1.2.
     try std.testing.expect(mesh.position.y > -0.35 and mesh.position.y < 0.15);
@@ -301,44 +269,23 @@ test "PhysicsWorld static mesh collider" {
     };
     var indices = [_]u32{ 0, 2, 1, 0, 3, 2 };
 
-    var floor_mesh = Mesh{
-        .name = "tri_floor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-5.0, 0.0, -5.0), Vec3.new(5.0, 0.0, 5.0)),
-        .cpu_positions = &positions,
-        .cpu_indices = &indices,
-    };
+    var floor_mesh = boxMesh("tri_floor", Vec3.zero, Vec3.new(-5.0, 0.0, -5.0), Vec3.new(5.0, 0.0, 5.0));
+    floor_mesh.cpu_positions = &positions;
+    floor_mesh.cpu_indices = &indices;
     _ = try pw.createBody(&floor_mesh, .mesh, 0.0);
 
-    var ball_mesh = Mesh{
-        .name = "mesh_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-    };
+    var ball_mesh = testMesh("mesh_ball", Vec3.new(0.0, 2.0, 0.0));
     const ball = try pw.createBody(&ball_mesh, .sphere, 1.0);
     try std.testing.expectEqual(@as(f32, 0.5), ball.sphere_radius);
 
-    var step_i: usize = 0;
-    while (step_i < 180) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
 
     // Sphere radius is 0.5, so it should rest around y = 0.5, well above ground.
     try std.testing.expect(ball_mesh.position.y > 0.3 and ball_mesh.position.y < 0.8);
 
-    // Dynamic mesh colliders are rejected.
-    var dyn_mesh = Mesh{
-        .name = "dyn_tri",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .cpu_positions = &positions,
-        .cpu_indices = &indices,
-    };
+    var dyn_mesh = testMesh("dyn_tri", Vec3.zero);
+    dyn_mesh.cpu_positions = &positions;
+    dyn_mesh.cpu_indices = &indices;
     try std.testing.expectError(error.StaticColliderRequiresZeroMass, pw.createBody(&dyn_mesh, .mesh, 1.0));
 }
 
@@ -348,34 +295,19 @@ test "PhysicsWorld height field terrain" {
 
     // Flat plateau at height 0.5, 5x5 grid, 1 unit cells.
     var heights = [_]f32{0.5} ** 25;
-    var terrain_mesh = Mesh{
-        .name = "terrain",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
+    var terrain_mesh = testMesh("terrain", Vec3.zero);
     _ = try pw.createHeightField(&terrain_mesh, &heights, 5, 5, .{
         .scale = Vec3.new(1.0, 1.0, 1.0),
     });
 
-    var ball_mesh = Mesh{
-        .name = "terrain_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 3.0, 2.0),
-    };
+    var ball_mesh = testMesh("terrain_ball", Vec3.new(2.0, 3.0, 2.0));
     _ = try pw.createBody(&ball_mesh, .sphere, 1.0);
 
-    var step_i: usize = 0;
-    while (step_i < 180) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
 
     // Ball radius 0.5 resting on a 0.5 high surface: center around y = 1.0.
     try std.testing.expect(ball_mesh.position.y > 0.7 and ball_mesh.position.y < 1.4);
 
-    // Invalid dimensions are rejected.
     try std.testing.expectError(error.InvalidHeightFieldDimensions, pw.createHeightField(&terrain_mesh, &heights, 5, 6, .{}));
 }
 
@@ -384,21 +316,10 @@ test "PhysicsWorld raycast hits hulls and height fields" {
     defer pw.deinit();
 
     var heights = [_]f32{0.0} ** 25;
-    var terrain_mesh = Mesh{
-        .name = "ray_terrain",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
+    var terrain_mesh = testMesh("ray_terrain", Vec3.zero);
     _ = try pw.createHeightField(&terrain_mesh, &heights, 5, 5, .{});
 
-    var ball_mesh = Mesh{
-        .name = "ray_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 2.0, 2.0),
-    };
+    var ball_mesh = testMesh("ray_ball", Vec3.new(2.0, 2.0, 2.0));
     const ball = try pw.createBody(&ball_mesh, .sphere, 1.0);
 
     // Downward ray from above the ball.
@@ -437,31 +358,16 @@ test "PhysicsWorld collision filters disable and enable contacts" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var platform_mesh = Mesh{
-        .name = "filter_platform",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-2.0, -0.1, -2.0), Vec3.new(2.0, 0.1, 2.0)),
-    };
+    var platform_mesh = boxMesh("filter_platform", Vec3.zero, Vec3.new(-2.0, -0.1, -2.0), Vec3.new(2.0, 0.1, 2.0));
     const platform = try pw.createBody(&platform_mesh, .box, 0.0);
     platform.filter = .{ .category_bits = 0b10, .mask_bits = 0b01 }; // accepts layer 1 only
 
-    var orb_mesh = Mesh{
-        .name = "filter_orb",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-    };
+    var orb_mesh = testMesh("filter_orb", Vec3.new(0.0, 2.0, 0.0));
     const orb = try pw.createBody(&orb_mesh, .sphere, 1.0);
     orb.filter = .{ .category_bits = 0b100, .mask_bits = 0xFFFFFFFFFFFFFFFF };
 
     // Layer 4 is not in the platform mask: the orb falls through to the ground.
-    var step_i: usize = 0;
-    while (step_i < 90) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
     try std.testing.expect(orb_mesh.position.y < -0.4);
 
     // Add the orb layer to the platform mask, reset, and land on the platform.
@@ -469,10 +375,7 @@ test "PhysicsWorld collision filters disable and enable contacts" {
     orb_mesh.position = Vec3.new(0.0, 2.0, 0.0);
     orb.velocity = Vec3.zero;
     orb.angular_velocity = Vec3.zero;
-    step_i = 0;
-    while (step_i < 150) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 150);
     try std.testing.expect(orb_mesh.position.y > 0.3 and orb_mesh.position.y < 0.9);
 }
 
@@ -480,23 +383,10 @@ test "PhysicsWorld sensor overlap events" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var sensor_mesh = Mesh{
-        .name = "sensor_pad",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 1.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var sensor_mesh = boxMesh("sensor_pad", Vec3.new(0.0, 1.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const sensor = try pw.createBodyWith(&sensor_mesh, .box, 0.0, .{ .is_sensor = true });
 
-    var orb_mesh = Mesh{
-        .name = "sensor_orb",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 4.0, 0.0),
-    };
+    var orb_mesh = testMesh("sensor_orb", Vec3.new(0.0, 4.0, 0.0));
     // Visitors must also enable sensor events; set after creation to exercise
     // the runtime change-detection path.
     const orb = try pw.createBody(&orb_mesh, .sphere, 1.0);
@@ -521,24 +411,12 @@ test "PhysicsWorld contact and hit events" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var platform_mesh = Mesh{
-        .name = "event_platform",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-2.0, -0.1, -2.0), Vec3.new(2.0, 0.1, 2.0)),
-    };
+    var platform_mesh = boxMesh("event_platform", Vec3.zero, Vec3.new(-2.0, -0.1, -2.0), Vec3.new(2.0, 0.1, 2.0));
     const platform = try pw.createBody(&platform_mesh, .box, 0.0);
     platform.enable_contact_events = true;
     platform.enable_hit_events = true;
 
-    var orb_mesh = Mesh{
-        .name = "event_orb",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
+    var orb_mesh = testMesh("event_orb", Vec3.new(0.0, 3.0, 0.0));
     const orb = try pw.createBody(&orb_mesh, .sphere, 1.0);
 
     var saw_begin_contact = false;
@@ -580,31 +458,16 @@ test "PhysicsWorld compound body rests on an extra box shape" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var base_mesh = Mesh{
-        .name = "compound_base",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-2.0, -0.5, -2.0), Vec3.new(2.0, 0.5, 2.0)),
-    };
+    var base_mesh = boxMesh("compound_base", Vec3.zero, Vec3.new(-2.0, -0.5, -2.0), Vec3.new(2.0, 0.5, 2.0));
     const base = try pw.createBody(&base_mesh, .box, 0.0);
     // Child occupies y 0.5..1.5 above the base.
     try pw.addBoxShape(base, Vec3.new(1.0, 0.5, 1.0), .{ .offset = Vec3.new(0.0, 1.0, 0.0) });
     try std.testing.expectEqual(@as(usize, 1), base.child_shapes.items.len);
 
-    var orb_mesh = Mesh{
-        .name = "compound_orb",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var orb_mesh = testMesh("compound_orb", Vec3.new(0.0, 5.0, 0.0));
     _ = try pw.createBody(&orb_mesh, .sphere, 1.0);
 
-    var step_i: usize = 0;
-    while (step_i < 180) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
 
     // Sphere radius 0.5 resting on child top (y = 1.5): center around 2.0.
     try std.testing.expect(orb_mesh.position.y > 1.7 and orb_mesh.position.y < 2.3);
@@ -614,14 +477,7 @@ test "PhysicsWorld compound body preserves total mass" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var car_mesh = Mesh{
-        .name = "compound_car",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5)),
-    };
+    var car_mesh = boxMesh("compound_car", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5));
     const car = try pw.createBody(&car_mesh, .box, 3.0);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.b3Body_GetMass(car.body_id), 0.05);
 
@@ -635,10 +491,7 @@ test "PhysicsWorld compound body preserves total mass" {
 
     // Scaling the mesh rebuilds every shape and keeps the mass.
     car_mesh.scaling = Vec3.new(2.0, 2.0, 2.0);
-    var step_i: usize = 0;
-    while (step_i < 60) : (step_i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 60);
     try std.testing.expect(car.child_shapes.items.len == 4);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.b3Body_GetMass(car.body_id), 0.1);
 }
@@ -662,14 +515,7 @@ test "CharacterController walks into a wall and stays grounded" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var wall_mesh = Mesh{
-        .name = "cc_wall",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 0.3, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.1, -1.5, -2.0), Vec3.new(0.1, 1.5, 2.0)),
-    };
+    var wall_mesh = boxMesh("cc_wall", Vec3.new(2.0, 0.3, 0.0), Vec3.new(-0.1, -1.5, -2.0), Vec3.new(0.1, 1.5, 2.0));
     _ = try pw.createBody(&wall_mesh, .box, 0.0);
 
     var cc = CharacterController.init(Vec3.new(0.0, -1.0, 0.0), 0.3, 1.5);
@@ -721,38 +567,18 @@ test "PhysicsWorld rope hangs from a pin" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "rope_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var anchor_mesh = boxMesh("rope_anchor", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
     var seg_storage: [6]Mesh = undefined;
     var seg_ptrs: [6]*Mesh = undefined;
-    for (0..6) |i| {
-        seg_storage[i] = .{
-            .name = "rope_seg",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = Vec3.new(0.0, 4.5 - @as(f32, @floatFromInt(i)) * 0.4, 0.0),
-            .local_bounding_box = BoundingBox.init(Vec3.new(-0.1, -0.1, -0.1), Vec3.new(0.1, 0.1, 0.1)),
-        };
-        seg_ptrs[i] = &seg_storage[i];
-    }
+    initRopeSegs(&seg_storage, &seg_ptrs, "rope_seg", 4.5, 0.4);
     var rope = try pw.createRope(&seg_ptrs, .{ .collider = .box, .pin_start = anchor });
     defer rope.deinit(&pw);
     try std.testing.expectEqual(@as(usize, 6), rope.bodies.items.len);
     try std.testing.expectEqual(@as(usize, 5), rope.joints.items.len);
 
-    var i: usize = 0;
-    while (i < 150) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 150);
 
     // Free end hangs below the anchor instead of falling to the ground.
     try std.testing.expect(seg_storage[5].position.y < 2.8);
@@ -766,23 +592,9 @@ test "PhysicsWorld rope bridge sags but holds" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_a_mesh = Mesh{
-        .name = "bridge_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(-2.5, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var anchor_a_mesh = boxMesh("bridge_a", Vec3.new(-2.5, 3.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const anchor_a = try pw.createBody(&anchor_a_mesh, .box, 0.0);
-    var anchor_b_mesh = Mesh{
-        .name = "bridge_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.5, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var anchor_b_mesh = boxMesh("bridge_b", Vec3.new(2.5, 3.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const anchor_b = try pw.createBody(&anchor_b_mesh, .box, 0.0);
 
     // Rope laid wider than the anchor span so it must sag.
@@ -807,10 +619,7 @@ test "PhysicsWorld rope bridge sags but holds" {
     });
     defer rope.deinit(&pw);
 
-    var i: usize = 0;
-    while (i < 240) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 240);
 
     // Middle sags clearly below the anchor line but stays well above ground.
     try std.testing.expect(seg_storage[4].position.y < 2.4);
@@ -825,53 +634,27 @@ test "PhysicsWorld rope detach drops the tail and repair restores it" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "cut_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var anchor_mesh = boxMesh("cut_anchor", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
     var seg_storage: [6]Mesh = undefined;
     var seg_ptrs: [6]*Mesh = undefined;
-    for (0..6) |i| {
-        seg_storage[i] = .{
-            .name = "cut_seg",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = Vec3.new(0.0, 4.5 - @as(f32, @floatFromInt(i)) * 0.4, 0.0),
-            .local_bounding_box = BoundingBox.init(Vec3.new(-0.1, -0.1, -0.1), Vec3.new(0.1, 0.1, 0.1)),
-        };
-        seg_ptrs[i] = &seg_storage[i];
-    }
+    initRopeSegs(&seg_storage, &seg_ptrs, "cut_seg", 4.5, 0.4);
     var rope = try pw.createRope(&seg_ptrs, .{ .collider = .box, .pin_start = anchor });
     defer rope.deinit(&pw);
 
-    var i: usize = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
 
     rope.detachAt(&pw, 2);
     try std.testing.expect(!c.b3Joint_IsValid(rope.joints.items[2]));
-    i = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
 
     // Severed tail fell to the ground while the top still hangs.
     try std.testing.expect(seg_storage[5].position.y < 0.5);
     try std.testing.expect(seg_storage[0].position.y > 4.0);
 
     rope.reset(&pw);
-    i = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
     try std.testing.expect(c.b3Joint_IsValid(rope.joints.items[2]));
     try std.testing.expect(seg_storage[5].position.y > 1.8 and seg_storage[5].position.y < 2.8);
 }
@@ -880,29 +663,12 @@ test "Rope deinit releases lists after a severed link" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "deinit_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var anchor_mesh = boxMesh("deinit_anchor", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
     var seg_storage: [6]Mesh = undefined;
     var seg_ptrs: [6]*Mesh = undefined;
-    for (0..6) |i| {
-        seg_storage[i] = .{
-            .name = "deinit_seg",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = Vec3.new(0.0, 4.5 - @as(f32, @floatFromInt(i)) * 0.4, 0.0),
-            .local_bounding_box = BoundingBox.init(Vec3.new(-0.1, -0.1, -0.1), Vec3.new(0.1, 0.1, 0.1)),
-        };
-        seg_ptrs[i] = &seg_storage[i];
-    }
+    initRopeSegs(&seg_storage, &seg_ptrs, "deinit_seg", 4.5, 0.4);
     var rope = try pw.createRope(&seg_ptrs, .{ .collider = .box, .pin_start = anchor });
     rope.detachAt(&pw, 2);
     // The severed link stays in rope.joints; deinit must skip it instead of
@@ -945,13 +711,7 @@ fn makeWheelTestRig(
         Vec3.new(0.7, 0.0, -0.4),
     };
     for (0..4) |i| {
-        wheel_meshes[i] = .{
-            .name = "wheel_test",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = wheel_offsets[i],
-        };
+        wheel_meshes[i] = testMesh("wheel_test", wheel_offsets[i]);
         wheels[i] = try pw.createBody(&wheel_meshes[i], .sphere, 0.8);
         joints[i] = try pw.createWheelJointWorld(chassis, wheels[i], wheel_offsets[i], .{
             .frame_a = frame_a,
@@ -964,6 +724,23 @@ fn makeWheelTestRig(
     return .{ .chassis = chassis, .wheels = wheels, .joints = joints };
 }
 
+// One static chassis + one dynamic wheel for the spin/steering probes.
+// Mesh storage is caller-owned like in makeWheelTestRig.
+fn makeSingleWheelRig(
+    pw: *PhysicsWorld,
+    chassis_mesh: *Mesh,
+    wheel_mesh: *Mesh,
+    opts: WheelJointOptions,
+) !JointId {
+    chassis_mesh.* = boxMesh("sw_chassis", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5));
+    const chassis = try pw.createBody(chassis_mesh, .box, 0.0);
+
+    wheel_mesh.* = testMesh("sw_wheel", Vec3.new(0.7, 1.5, 0.0));
+    const wheel = try pw.createBody(wheel_mesh, .sphere, 1.0);
+
+    return pw.createWheelJointWorld(chassis, wheel, Vec3.new(0.7, 1.5, 0.0), opts);
+}
+
 test "PhysicsWorld wheel suspension holds the chassis" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
@@ -973,10 +750,7 @@ test "PhysicsWorld wheel suspension holds the chassis" {
     const rig = try makeWheelTestRig(&pw, &chassis_mesh, &wheel_meshes);
     _ = rig.wheels;
 
-    var i: usize = 0;
-    while (i < 180) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
 
     // Wheels (r = 0.5) rest on the ground plane at y = -1.2.
     const wheel_y = rig.wheels[0].mesh.position.y;
@@ -990,34 +764,14 @@ test "PhysicsWorld wheel spin motor spins up" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var chassis_mesh = Mesh{
-        .name = "spin_chassis",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5)),
-    };
-    const chassis = try pw.createBody(&chassis_mesh, .box, 0.0);
-
-    var wheel_mesh = Mesh{
-        .name = "spin_wheel",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.7, 1.5, 0.0),
-    };
-    const wheel = try pw.createBody(&wheel_mesh, .sphere, 1.0);
-
-    const jid = try pw.createWheelJointWorld(chassis, wheel, Vec3.new(0.7, 1.5, 0.0), .{
+    var chassis_mesh: Mesh = undefined;
+    var wheel_mesh: Mesh = undefined;
+    const jid = try makeSingleWheelRig(&pw, &chassis_mesh, &wheel_mesh, .{
         .frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0)),
     });
     pw.setWheelSpin(jid, true, 10.0, 50.0);
 
-    var i: usize = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
     try std.testing.expect(pw.wheelSpinSpeed(jid) > 5.0);
 }
 
@@ -1025,103 +779,27 @@ test "PhysicsWorld wheel steering reaches the target angle" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var chassis_mesh = Mesh{
-        .name = "steer_chassis",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.25, -0.5), Vec3.new(1.0, 0.25, 0.5)),
-    };
-    const chassis = try pw.createBody(&chassis_mesh, .box, 0.0);
-
-    var wheel_mesh = Mesh{
-        .name = "steer_wheel",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.7, 1.5, 0.0),
-    };
-    const wheel = try pw.createBody(&wheel_mesh, .sphere, 1.0);
-
-    const jid = try pw.createWheelJointWorld(chassis, wheel, Vec3.new(0.7, 1.5, 0.0), .{
+    var chassis_mesh: Mesh = undefined;
+    var wheel_mesh: Mesh = undefined;
+    const jid = try makeSingleWheelRig(&pw, &chassis_mesh, &wheel_mesh, .{
         .frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0)),
         .enable_steering = true,
         .target_steering_angle_rad = 0.5,
         .max_steering_torque = 30.0,
     });
 
-    var i: usize = 0;
-    while (i < 120) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 120);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), pw.wheelSteeringAngle(jid), 0.15);
-}
-
-test "PhysicsWorld revolute joint rotates around a custom frame axis" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var anchor_mesh = Mesh{
-        .name = "frame_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
-    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
-
-    var rotor_mesh = Mesh{
-        .name = "frame_rotor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -0.125, -0.125), Vec3.new(1.0, 0.125, 0.125)),
-    };
-    const rotor = try pw.createBody(&rotor_mesh, .box, 2.0);
-
-    // Rotate the hinge axis from Z onto X.
-    const frame = Quat.fromEulerDeg(Vec3.new(0.0, 90.0, 0.0));
-    const jid = try pw.createRevoluteJointWorld(anchor, rotor, Vec3.new(0.0, 3.0, 0.0), .{
-        .frame_a = frame,
-        .frame_b = frame,
-        .enable_motor = true,
-        .motor_speed_rad = 3.0,
-        .max_motor_torque = 200.0,
-    });
-
-    var i: usize = 0;
-    while (i < 30) : (i += 1) {
-        pw.step(0.016);
-    }
-
-    // Spin happens around X now (deg/s), not Z.
-    try std.testing.expect(@abs(rotor.angular_velocity.x) > 60.0);
-    try std.testing.expect(@abs(rotor.angular_velocity.z) < 20.0);
-    try std.testing.expect(@abs(pw.revoluteAngleRad(jid)) > 0.2);
 }
 
 test "PhysicsWorld spherical twist limits are plumbed through" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "twist_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
+    var anchor_mesh = testMesh("twist_anchor", Vec3.new(0.0, 3.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var ball_mesh = Mesh{
-        .name = "twist_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-    };
+    var ball_mesh = testMesh("twist_ball", Vec3.new(0.0, 2.0, 0.0));
     const ball = try pw.createBody(&ball_mesh, .sphere, 1.0);
 
     const jid = try pw.createSphericalJointWorld(anchor, ball, Vec3.new(0.0, 2.5, 0.0), .{
@@ -1139,121 +817,57 @@ test "PhysicsWorld spherical twist limits are plumbed through" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), c.b3SphericalJoint_GetUpperTwistLimit(jid), 1e-4);
 
     // Settles hanging straight down without exploding.
-    var i: usize = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
     try std.testing.expect(ball_mesh.position.y > 1.0 and ball_mesh.position.y < 2.2);
 }
 
-test "PhysicsWorld prismatic motor slides along the frame axis" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var anchor_mesh = Mesh{
-        .name = "prism_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
-    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
-
-    var slider_mesh = Mesh{
-        .name = "prism_slider",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
-    const slider = try pw.createBody(&slider_mesh, .box, 1.0);
-
+test "PhysicsWorld prismatic motor slides and limits clamp travel" {
     // Slide axis = frame A x-axis rotated onto world -Y (down positive).
-    const jid = try pw.createPrismaticJointWorld(anchor, slider, Vec3.new(0.0, 3.0, 0.0), .{
-        .frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0)),
-        .enable_motor = true,
-        .motor_speed = 2.0,
-        .max_motor_force = 100.0,
-    });
+    // Same rig with limits off (free run: ~2 m/s for ~1 s straight down)
+    // and on (travel clamps instead of running away).
+    for ([_]bool{ false, true }) |limited| {
+        var pw = PhysicsWorld.init(std.testing.allocator);
+        defer pw.deinit();
 
-    var i: usize = 0;
-    while (i < 60) : (i += 1) {
-        pw.step(0.016);
+        var anchor_mesh = testMesh("prism_anchor", Vec3.new(0.0, 3.0, 0.0));
+        const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
+
+        var slider_mesh = boxMesh("prism_slider", Vec3.new(0.0, 3.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
+        const slider = try pw.createBody(&slider_mesh, .box, 1.0);
+
+        const jid = try pw.createPrismaticJointWorld(anchor, slider, Vec3.new(0.0, 3.0, 0.0), .{
+            .frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0)),
+            .enable_limit = limited,
+            .lower_translation = -0.5,
+            .upper_translation = 0.5,
+            .enable_motor = true,
+            .motor_speed = 2.0,
+            .max_motor_force = 100.0,
+        });
+
+        stepN(&pw, if (limited) 180 else 60);
+
+        if (limited) {
+            const travel = pw.prismaticTranslation(jid);
+            try std.testing.expect(travel >= -0.05 and travel <= 0.6);
+            try std.testing.expect(slider_mesh.position.y > 2.0 and slider_mesh.position.y < 3.2);
+        } else {
+            try std.testing.expect(slider_mesh.position.y < 1.5);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.0), slider_mesh.position.x, 0.05);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.0), slider_mesh.position.z, 0.05);
+            try std.testing.expect(pw.prismaticTranslation(jid) > 1.0);
+        }
     }
-
-    // ~2 m/s for ~1 s straight down, no sideways drift, no rotation.
-    try std.testing.expect(slider_mesh.position.y < 1.5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), slider_mesh.position.x, 0.05);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), slider_mesh.position.z, 0.05);
-    try std.testing.expect(pw.prismaticTranslation(jid) > 1.0);
-}
-
-test "PhysicsWorld prismatic limits clamp travel" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var anchor_mesh = Mesh{
-        .name = "prism_lim_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
-    const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
-
-    var slider_mesh = Mesh{
-        .name = "prism_lim_slider",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
-    const slider = try pw.createBody(&slider_mesh, .box, 1.0);
-
-    const jid = try pw.createPrismaticJointWorld(anchor, slider, Vec3.new(0.0, 3.0, 0.0), .{
-        .frame_a = Quat.fromEulerDeg(Vec3.new(0.0, 0.0, -90.0)),
-        .enable_limit = true,
-        .lower_translation = -0.5,
-        .upper_translation = 0.5,
-        .enable_motor = true,
-        .motor_speed = 2.0,
-        .max_motor_force = 100.0,
-    });
-
-    var i: usize = 0;
-    while (i < 180) : (i += 1) {
-        pw.step(0.016);
-    }
-
-    const travel = pw.prismaticTranslation(jid);
-    try std.testing.expect(travel >= -0.05 and travel <= 0.6);
-    // Clamped near the lower... upper end instead of running away.
-    try std.testing.expect(slider_mesh.position.y > 2.0 and slider_mesh.position.y < 3.2);
 }
 
 test "PhysicsWorld motor joint velocity drive lifts a body" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "motor_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-    };
+    var anchor_mesh = testMesh("motor_anchor", Vec3.new(0.0, 0.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var box_mesh = Mesh{
-        .name = "motor_box",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var box_mesh = boxMesh("motor_box", Vec3.new(0.0, 0.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const cargo = try pw.createBody(&box_mesh, .box, 2.0);
 
     const jid = try pw.createMotorJointWorld(anchor, cargo, Vec3.new(0.0, 0.0, 0.0), .{
@@ -1261,10 +875,7 @@ test "PhysicsWorld motor joint velocity drive lifts a body" {
     });
     pw.setMotorLinearVelocity(jid, Vec3.new(0.0, 3.0, 0.0));
 
-    var i: usize = 0;
-    while (i < 60) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 60);
 
     try std.testing.expect(box_mesh.position.y > 1.0);
     try std.testing.expect(cargo.velocity.y > 1.0);
@@ -1274,23 +885,10 @@ test "PhysicsWorld motor joint drag pattern reaches a target" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "drag_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-    };
+    var anchor_mesh = testMesh("drag_anchor", Vec3.new(0.0, 2.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var box_mesh = Mesh{
-        .name = "drag_box",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var box_mesh = boxMesh("drag_box", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const cargo = try pw.createBody(&box_mesh, .box, 2.0);
 
     const jid = try pw.createMotorJointWorld(anchor, cargo, Vec3.new(0.0, 2.0, 0.0), .{
@@ -1317,31 +915,15 @@ test "PhysicsWorld weld joint holds a body against gravity" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "weld_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 3.0, 0.0),
-    };
+    var anchor_mesh = testMesh("weld_anchor", Vec3.new(0.0, 3.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var box_mesh = Mesh{
-        .name = "weld_box",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var box_mesh = boxMesh("weld_box", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const cargo = try pw.createBody(&box_mesh, .box, 2.0);
 
     const jid = try pw.createWeldJointWorld(anchor, cargo, Vec3.new(0.0, 2.5, 0.0), .{});
 
-    var i: usize = 0;
-    while (i < 90) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 90);
 
     // Rigid weld: the box hangs where it was built instead of falling.
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), box_mesh.position.y, 0.1);
@@ -1353,10 +935,7 @@ test "PhysicsWorld weld joint holds a body against gravity" {
 
     // Breaking the weld drops the box to the ground.
     pw.destroyJoint(jid);
-    i = 0;
-    while (i < 120) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 120);
     try std.testing.expect(box_mesh.position.y < -0.5);
 }
 
@@ -1364,14 +943,7 @@ test "PhysicsWorld child shape overrides survive body changes" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var base_mesh = Mesh{
-        .name = "override_base",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5)),
-    };
+    var base_mesh = boxMesh("override_base", Vec3.new(0.0, 2.0, 0.0), Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
     const body = try pw.createBody(&base_mesh, .box, 2.0);
     try pw.addBoxShape(body, Vec3.new(0.2, 0.2, 0.2), .{
         .offset = Vec3.new(0.7, 0.0, 0.0),
@@ -1394,14 +966,7 @@ test "PhysicsWorld sensor child reports overlaps" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var base_mesh = Mesh{
-        .name = "sensor_child_base",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 1.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25)),
-    };
+    var base_mesh = boxMesh("sensor_child_base", Vec3.new(0.0, 1.0, 0.0), Vec3.new(-0.25, -0.25, -0.25), Vec3.new(0.25, 0.25, 0.25));
     const base = try pw.createBody(&base_mesh, .box, 0.0);
     try pw.addBoxShape(base, Vec3.new(1.0, 0.5, 1.0), .{
         .offset = Vec3.new(0.0, 1.5, 0.0),
@@ -1409,13 +974,7 @@ test "PhysicsWorld sensor child reports overlaps" {
     });
     try std.testing.expect(c.b3Shape_IsSensor(base.child_shapes.items[0].shape_id));
 
-    var orb_mesh = Mesh{
-        .name = "sensor_child_orb",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 4.5, 0.0),
-    };
+    var orb_mesh = testMesh("sensor_child_orb", Vec3.new(0.0, 4.5, 0.0));
     const orb = try pw.createBodyWith(&orb_mesh, .sphere, 1.0, .{ .enable_sensor_events = true });
 
     var saw_begin = false;
@@ -1433,24 +992,10 @@ test "PhysicsWorld parallel joint keeps a body upright" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "parallel_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-    };
+    var anchor_mesh = testMesh("parallel_anchor", Vec3.new(0.0, 0.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var weeble_mesh = Mesh{
-        .name = "weeble",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 2.0, 0.0),
-        .rotation = Vec3.new(20.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2)),
-    };
+    var weeble_mesh = tiltBoxMesh("weeble", Vec3.new(2.0, 2.0, 0.0), Vec3.new(20.0, 0.0, 0.0), Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2));
     const weeble = try pw.createBody(&weeble_mesh, .box, 2.0);
     _ = try pw.createParallelJointWorld(anchor, weeble, Vec3.new(2.0, 2.0, 0.0), .{
         .hertz = 3.0,
@@ -1458,21 +1003,10 @@ test "PhysicsWorld parallel joint keeps a body upright" {
         .max_torque = 300.0,
     });
 
-    var free_mesh = Mesh{
-        .name = "free_topple",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(-2.0, 2.0, 0.0),
-        .rotation = Vec3.new(20.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2)),
-    };
+    var free_mesh = tiltBoxMesh("free_topple", Vec3.new(-2.0, 2.0, 0.0), Vec3.new(20.0, 0.0, 0.0), Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2));
     _ = try pw.createBody(&free_mesh, .box, 2.0);
 
-    var i: usize = 0;
-    while (i < 240) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 240);
 
     // Spring joint stands back up; the free box topples onto its side.
     try std.testing.expect(@abs(weeble_mesh.rotation.x) < 10.0);
@@ -1483,41 +1017,21 @@ test "PhysicsWorld parallel spring retunes at runtime" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var anchor_mesh = Mesh{
-        .name = "retune_anchor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-    };
+    var anchor_mesh = testMesh("retune_anchor", Vec3.new(0.0, 0.0, 0.0));
     const anchor = try pw.createBody(&anchor_mesh, .box, 0.0);
 
-    var tilt_mesh = Mesh{
-        .name = "retune_tilt",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 3.0, 0.0),
-        .rotation = Vec3.new(25.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2)),
-    };
+    var tilt_mesh = tiltBoxMesh("retune_tilt", Vec3.new(2.0, 3.0, 0.0), Vec3.new(25.0, 0.0, 0.0), Vec3.new(-0.2, -1.0, -0.2), Vec3.new(0.2, 1.0, 0.2));
     const tilt = try pw.createBody(&tilt_mesh, .box, 2.0);
     const jid = try pw.createParallelJointWorld(anchor, tilt, Vec3.new(2.0, 3.0, 0.0), .{
         .max_torque = 0.0,
     });
 
-    var i: usize = 0;
-    while (i < 60) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 60);
     // Dead spring: still tilted.
     try std.testing.expect(@abs(tilt_mesh.rotation.x) > 12.0);
 
     pw.setParallelSpring(jid, 4.0, 0.7, 300.0);
-    i = 0;
-    while (i < 180) : (i += 1) {
-        pw.step(0.016);
-    }
+    stepN(&pw, 180);
     try std.testing.expect(@abs(tilt_mesh.rotation.x) < 10.0);
 }
 
@@ -1525,24 +1039,10 @@ test "PhysicsWorld queryAABB finds bodies in box" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var mesh_a = Mesh{
-        .name = "qa_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var mesh_a = boxMesh("qa_a", Vec3.new(0.0, 0.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const body_a = try pw.createBody(&mesh_a, .box, 0.0);
 
-    var mesh_b = Mesh{
-        .name = "qa_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(10.0, 0.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var mesh_b = boxMesh("qa_b", Vec3.new(10.0, 0.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const body_b = try pw.createBody(&mesh_b, .box, 0.0);
 
     var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
@@ -1583,13 +1083,7 @@ test "PhysicsWorld querySphere finds bodies by distance" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var mesh = Mesh{
-        .name = "qs_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.zero,
-    };
+    var mesh = testMesh("qs_ball", Vec3.zero);
     const body = try pw.createBody(&mesh, .sphere, 0.0);
 
     var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
@@ -1610,14 +1104,7 @@ test "PhysicsWorld queryPoint finds bodies by containment" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var mesh = Mesh{
-        .name = "qp_box",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.zero,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var mesh = boxMesh("qp_box", Vec3.zero, Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const body = try pw.createBody(&mesh, .box, 0.0);
 
     var results: std.ArrayListUnmanaged(*RigidBody) = .empty;
@@ -1636,22 +1123,10 @@ test "PhysicsWorld spatial queries honor collision filters" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var mesh_a = Mesh{
-        .name = "qf_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 0.0, 0.0),
-    };
+    var mesh_a = testMesh("qf_a", Vec3.new(0.0, 0.0, 0.0));
     _ = try pw.createBody(&mesh_a, .box, 0.0); // default: category 1
 
-    var mesh_b = Mesh{
-        .name = "qf_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(5.0, 0.0, 0.0),
-    };
+    var mesh_b = testMesh("qf_b", Vec3.new(5.0, 0.0, 0.0));
     _ = try pw.createBodyWith(&mesh_b, .box, 0.0, .{ .filter = .{ .category_bits = 0b10 } });
     pw.step(0.016); // push the baked-in filters through change detection
 
@@ -1687,13 +1162,7 @@ test "PhysicsWorld spherecast hits and misses" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var mesh = Mesh{
-        .name = "sc_ball",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.zero,
-    };
+    var mesh = testMesh("sc_ball", Vec3.zero);
     const body = try pw.createBody(&mesh, .sphere, 0.0); // radius 0.5
 
     // Cast sphere (r=0.25) from x=5 toward -x: contact at x=0.75, travel 4.25.
@@ -1711,14 +1180,7 @@ test "PhysicsWorld debug box lines match the collider AABB" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_box",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(1.0, 2.0, 3.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.25), Vec3.new(0.5, 1.0, 0.25)),
-    };
+    var m = boxMesh("dbg_box", Vec3.new(1.0, 2.0, 3.0), Vec3.new(-0.5, -1.0, -0.25), Vec3.new(0.5, 1.0, 0.25));
     _ = try pw.createBody(&m, .box, 0.0);
 
     var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
@@ -1744,12 +1206,7 @@ test "PhysicsWorld debug sensor lines use the sensor color" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_sensor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
+    var m = testMesh("dbg_sensor", Vec3.zero);
     _ = try pw.createBodyWith(&m, .box, 0.0, .{ .is_sensor = true });
 
     var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
@@ -1769,12 +1226,7 @@ test "PhysicsWorld debug lines include compound children" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_compound",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
+    var m = testMesh("dbg_compound", Vec3.zero);
     const body = try pw.createBody(&m, .box, 1.0);
     const base_count = pw.debugLineCount();
     try std.testing.expectEqual(@as(usize, 12), base_count);
@@ -1793,12 +1245,7 @@ test "PhysicsWorld debug lines skip disabled bodies" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_disabled",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
+    var m = testMesh("dbg_disabled", Vec3.zero);
     const body = try pw.createBody(&m, .sphere, 1.0);
     body.enabled = false;
 
@@ -1813,13 +1260,7 @@ test "PhysicsWorld debug sphere lines trace the surface" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_sphere",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 3.0, 4.0),
-    };
+    var m = testMesh("dbg_sphere", Vec3.new(2.0, 3.0, 4.0));
     const body = try pw.createBody(&m, .sphere, 1.0);
 
     var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
@@ -1842,13 +1283,7 @@ test "PhysicsWorld debug default ring counts stay 72 and 52" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var sm = Mesh{
-        .name = "dbg_def_sphere",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(2.0, 3.0, 4.0),
-    };
+    var sm = testMesh("dbg_def_sphere", Vec3.new(2.0, 3.0, 4.0));
     const sbody = try pw.createBody(&sm, .sphere, 1.0);
     try std.testing.expectEqual(@as(usize, 24), pw.debugCircleSegments());
     try std.testing.expectEqual(@as(usize, 72), pw.debugLineCount());
@@ -1870,77 +1305,54 @@ test "PhysicsWorld debug default ring counts stay 72 and 52" {
 
     var pw2 = PhysicsWorld.init(std.testing.allocator);
     defer pw2.deinit();
-    var cm = Mesh{
-        .name = "dbg_def_capsule",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
-    };
+    var cm = boxMesh("dbg_def_capsule", Vec3.zero, Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5));
     _ = try pw2.createBody(&cm, .capsule, 1.0);
     try std.testing.expectEqual(@as(usize, 52), pw2.debugLineCount());
 }
 
 test "PhysicsWorld debug circle segments are configurable" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-    pw.debug_circle_segments = 8;
-
-    var sm = Mesh{
-        .name = "dbg_cfg_sphere",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
+    // Sphere and capsule rings both follow debug_circle_segments; only the
+    // per-shape line counts differ (sphere 3 rings, capsule body + caps).
+    const Case = struct {
+        collider: ColliderType,
+        expected_at_8: usize,
+        check_clamp: bool,
     };
-    _ = try pw.createBody(&sm, .sphere, 1.0);
-    try std.testing.expectEqual(@as(usize, 24), pw.debugLineCount());
-
-    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    try pw.appendDebugLines(std.testing.allocator, &lines);
-    try std.testing.expectEqual(@as(usize, 24), lines.items.len);
-
-    // Below-minimum settings clamp to 4 segments (sphere: 12 lines).
-    pw.debug_circle_segments = 0;
-    try std.testing.expectEqual(@as(usize, 4), pw.debugCircleSegments());
-    try std.testing.expectEqual(@as(usize, 12), pw.debugLineCount());
-    lines.clearRetainingCapacity();
-    try pw.appendDebugLines(std.testing.allocator, &lines);
-    try std.testing.expectEqual(@as(usize, 12), lines.items.len);
-}
-
-test "PhysicsWorld debug capsule segments are configurable" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-    pw.debug_circle_segments = 8;
-
-    var cm = Mesh{
-        .name = "dbg_cfg_capsule",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5)),
+    const cases = [_]Case{
+        .{ .collider = .sphere, .expected_at_8 = 24, .check_clamp = true },
+        .{ .collider = .capsule, .expected_at_8 = 20, .check_clamp = false },
     };
-    _ = try pw.createBody(&cm, .capsule, 1.0);
-    try std.testing.expectEqual(@as(usize, 20), pw.debugLineCount());
+    for (cases) |case| {
+        var pw = PhysicsWorld.init(std.testing.allocator);
+        defer pw.deinit();
+        pw.debug_circle_segments = 8;
 
-    var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    try pw.appendDebugLines(std.testing.allocator, &lines);
-    try std.testing.expectEqual(@as(usize, 20), lines.items.len);
+        var m = boxMesh("dbg_cfg", Vec3.zero, Vec3.new(-0.5, -1.0, -0.5), Vec3.new(0.5, 1.0, 0.5));
+        _ = try pw.createBody(&m, case.collider, 1.0);
+        try std.testing.expectEqual(case.expected_at_8, pw.debugLineCount());
+
+        var lines: std.ArrayListUnmanaged(DebugLine) = .empty;
+        defer lines.deinit(std.testing.allocator);
+        try pw.appendDebugLines(std.testing.allocator, &lines);
+        try std.testing.expectEqual(case.expected_at_8, lines.items.len);
+
+        // Below-minimum settings clamp to 4 segments (sphere: 12 lines).
+        if (case.check_clamp) {
+            pw.debug_circle_segments = 0;
+            try std.testing.expectEqual(@as(usize, 4), pw.debugCircleSegments());
+            try std.testing.expectEqual(@as(usize, 12), pw.debugLineCount());
+            lines.clearRetainingCapacity();
+            try pw.appendDebugLines(std.testing.allocator, &lines);
+            try std.testing.expectEqual(@as(usize, 12), lines.items.len);
+        }
+    }
 }
 
 test "PhysicsWorld debug lines reserve once and repeat identically" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "dbg_reserve",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(1.0, 2.0, 3.0),
-    };
+    var m = testMesh("dbg_reserve", Vec3.new(1.0, 2.0, 3.0));
     _ = try pw.createBody(&m, .sphere, 1.0);
     const n = pw.debugLineCount();
 
@@ -1963,20 +1375,13 @@ test "PhysicsWorld continuous collision detection and bullet flags" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    // Default CCD state
     try std.testing.expect(pw.isContinuousEnabled());
     pw.enableContinuous(false);
     try std.testing.expect(!pw.isContinuousEnabled());
     pw.enableContinuous(true);
     try std.testing.expect(pw.isContinuousEnabled());
 
-    var m = Mesh{
-        .name = "bullet_mesh",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var m = testMesh("bullet_mesh", Vec3.new(0.0, 5.0, 0.0));
     const b = try pw.createBodyWith(&m, .sphere, 1.0, .{ .is_bullet = true });
     try std.testing.expect(b.isBullet());
     b.setBullet(false);
@@ -1994,7 +1399,6 @@ test "CharacterController push dynamic bodies and step climbing options" {
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), ctrl.push_strength, 1e-4);
     try std.testing.expect(ctrl.push_dynamic_bodies);
 
-    // Mover advances without error
     ctrl.move(&pw, Vec3.new(1.0, 0.0, 0.0), false, 1.0 / 60.0);
     try std.testing.expect(ctrl.position.x > 0.0);
 }
@@ -2003,34 +1407,19 @@ test "PhysicsWorld getProfile and getCounters" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m1 = Mesh{
-        .name = "b1",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
-    var m2 = Mesh{
-        .name = "b2",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 0.0),
-    };
+    var m1 = testMesh("b1", Vec3.new(0.0, 5.0, 0.0));
+    var m2 = testMesh("b2", Vec3.new(0.0, 2.0, 0.0));
 
     _ = try pw.createBody(&m1, .sphere, 1.0);
     _ = try pw.createBody(&m2, .box, 0.0); // static ground block
 
-    // Before step, counters reflect created bodies
     const cnt_before = pw.getCounters();
     try std.testing.expect(cnt_before.body_count >= 2);
     try std.testing.expect(cnt_before.shape_count >= 2);
 
-    // Step physics
     pw.step(1.0 / 60.0);
 
     const prof = pw.getProfile();
-    // Step time should be non-negative
     try std.testing.expect(prof.step_ms >= 0.0);
     try std.testing.expect(prof.collide_ms >= 0.0);
     try std.testing.expect(prof.solve_ms >= 0.0);
@@ -2065,23 +1454,10 @@ test "PhysicsWorld shape lookup resolves primary, child, and misses" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m1 = Mesh{
-        .name = "lookup_plain",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var m1 = testMesh("lookup_plain", Vec3.new(0.0, 5.0, 0.0));
     const plain = try pw.createBody(&m1, .sphere, 1.0);
 
-    var m2 = Mesh{
-        .name = "lookup_compound",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(5.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var m2 = boxMesh("lookup_compound", Vec3.new(5.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const compound = try pw.createBody(&m2, .box, 1.0);
     try pw.addBoxShape(compound, Vec3.new(0.5, 0.5, 0.5), .{ .offset = Vec3.new(0.0, 1.5, 0.0) });
     try pw.addSphereShape(compound, 0.3, .{ .offset = Vec3.new(0.0, -1.5, 0.0) });
@@ -2108,14 +1484,7 @@ test "PhysicsWorld shape lookup survives remove and recreate" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m1 = Mesh{
-        .name = "lookup_doomed",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var m1 = boxMesh("lookup_doomed", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const doomed = try pw.createBody(&m1, .box, 1.0);
     try pw.addBoxShape(doomed, Vec3.new(0.4, 0.4, 0.4), .{ .offset = Vec3.new(0.0, 1.0, 0.0) });
     const old_primary = doomed.shape_id;
@@ -2129,13 +1498,7 @@ test "PhysicsWorld shape lookup survives remove and recreate" {
     try expectLookupEquiv(&pw, old_primary);
     try expectLookupEquiv(&pw, old_child);
 
-    var m2 = Mesh{
-        .name = "lookup_fresh",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 8.0, 0.0),
-    };
+    var m2 = testMesh("lookup_fresh", Vec3.new(0.0, 8.0, 0.0));
     const fresh = try pw.createBody(&m2, .sphere, 1.0);
     try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_primary));
     try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_child));
@@ -2148,14 +1511,7 @@ test "PhysicsWorld shape lookup survives compound change and scale rebuild" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "lookup_rebuild",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var m = boxMesh("lookup_rebuild", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const body = try pw.createBody(&m, .box, 1.0);
     // Late compound addition resolves immediately.
     try pw.addSphereShape(body, 0.4, .{ .offset = Vec3.new(0.0, 1.5, 0.0) });
@@ -2186,22 +1542,10 @@ test "PhysicsWorld shape lookup is world-independent" {
     var pw_b = PhysicsWorld.init(std.testing.allocator);
     defer pw_b.deinit();
 
-    var ma = Mesh{
-        .name = "lookup_world_a",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var ma = testMesh("lookup_world_a", Vec3.new(0.0, 5.0, 0.0));
     const a = try pw_a.createBody(&ma, .sphere, 1.0);
 
-    var mb = Mesh{
-        .name = "lookup_world_b",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-    };
+    var mb = testMesh("lookup_world_b", Vec3.new(0.0, 5.0, 0.0));
     const b = try pw_b.createBody(&mb, .sphere, 1.0);
 
     try std.testing.expectEqual(a, pw_a.findBodyByShape(a.shape_id));
@@ -2222,14 +1566,7 @@ test "PhysicsWorld shape lookup matches linear reference over many bodies" {
     var meshes: [24]Mesh = undefined;
     var i: usize = 0;
     while (i < meshes.len) : (i += 1) {
-        meshes[i] = Mesh{
-            .name = "lookup_many",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = Vec3.new(@as(f32, @floatFromInt(i)) * 3.0, 5.0, 0.0),
-            .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-        };
+        meshes[i] = boxMesh("lookup_many", Vec3.new(@as(f32, @floatFromInt(i)) * 3.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
         const body = try pw.createBody(&meshes[i], .box, 1.0);
         // Vary the compound width so ownsShape scans differ per body.
         var k: usize = 0;
@@ -2253,14 +1590,7 @@ test "PhysicsWorld failed child attach leaves shape lookups intact" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var m = Mesh{
-        .name = "lookup_bad_child",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 5.0, 0.0),
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-    };
+    var m = boxMesh("lookup_bad_child", Vec3.new(0.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
     const body = try pw.createBody(&m, .box, 1.0);
 
     // Fewer than 4 hull points is an explicit error; nothing is attached.
@@ -2300,14 +1630,7 @@ test "PhysicsWorld shape index covers every live shape" {
     var meshes: [3]Mesh = undefined;
     var i: usize = 0;
     while (i < meshes.len) : (i += 1) {
-        meshes[i] = Mesh{
-            .name = "lookup_indexed",
-            .vertex_buffer = .{},
-            .index_buffer = .{},
-            .index_count = 0,
-            .position = Vec3.new(@as(f32, @floatFromInt(i)) * 4.0, 5.0, 0.0),
-            .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
-        };
+        meshes[i] = boxMesh("lookup_indexed", Vec3.new(@as(f32, @floatFromInt(i)) * 4.0, 5.0, 0.0), Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0));
         const body = try pw.createBody(&meshes[i], .box, 1.0);
         var k: usize = 0;
         while (k <= i) : (k += 1) {
