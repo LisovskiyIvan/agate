@@ -440,7 +440,14 @@ test {
     _ = @import("texture/color.zig");
     _ = @import("texture/color_tests.zig");
     _ = @import("texture/core.zig");
+    _ = @import("texture/core_block.zig");
+    _ = @import("texture/core_decode.zig");
+    _ = @import("texture/core_hdr.zig");
+    _ = @import("texture/core_raw.zig");
+    _ = @import("texture/core_sampler.zig");
+    _ = @import("texture/core_testpng.zig");
     _ = @import("texture/core_tests.zig");
+    _ = @import("texture/core_texture.zig");
     _ = @import("texture/cube.zig");
     _ = @import("texture/cube_tests.zig");
     _ = @import("texture/ibl_prefilter.zig");

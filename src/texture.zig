@@ -10,11 +10,15 @@
 //! - `texture/mip.zig` — downsample/size helpers (`boxDownsampleU8`,
 //!   `boxDownsampleF16`, `checkedFaceBytes`, `pixelFormatBytes`). Imports
 //!   `color` only.
-//! - `texture/core.zig` — owns the `Texture` type: 2D upload paths, the CPU
-//!   decode/routing entries (`decodeMemory`/`decodeImageMemory`/HDR/DDS,
-//!   incl. the KTX2/DDS/EXR readers, which stay top-level modules), the raw
-//!   pixel containers, and thin forwarders to the helpers above. Imports
-//!   `color` + `mip` (+ `ktx2`/`dds`/`exr`, as before the split).
+//! - `texture/core.zig` — facade re-exporting the 2D `Texture` API (callers
+//!   unchanged). The owner is `texture/core_texture.zig` (the `Texture`
+//!   type: fields, lifecycle, GPU upload entries, leaf re-exports); the
+//!   CPU-side leaves are `core_sampler.zig` (`Options` + sampler helpers),
+//!   `core_raw.zig` (`RawTexture` + mip-chain builders), `core_block.zig`
+//!   (`BlockSupport` + format mapping), `core_decode.zig` (LDR decode
+//!   routing), `core_hdr.zig` (HDR decode), `core_testpng.zig` (`TestPng`
+//!   fixture). Imports `color` + `mip` (+ `ktx2`/`dds`/`exr`, as before
+//!   the split).
 //! - `texture/cube.zig` — owns `SkyboxOptions` and the `CubeTexture` type
 //!   (faces, equirectangular + HDR converters, procedural skybox). Imports
 //!   `core` (for `Texture.mipLevelCount` and the half-float conversions,
@@ -36,7 +40,7 @@ const mip = @import("texture/mip.zig");
 const core = @import("texture/core.zig");
 const cube = @import("texture/cube.zig");
 
-// 2D texture (lives in texture/core.zig).
+// 2D texture (owner lives in texture/core_texture.zig, via the core.zig facade).
 pub const Texture = core.Texture;
 pub const TextureColorSpace = core.TextureColorSpace;
 pub const TextureSlot = core.TextureSlot;

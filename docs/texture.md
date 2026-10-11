@@ -4,7 +4,7 @@
 
 ## Что это
 
-Текстуры 2D (`Texture`) и кубические (`CubeTexture`): CPU-декодирование популярных форматов, генерация мип-цепочек box-фильтром, sRGB→linear конвертация до фильтрации, блочные форматы без декодирования (DDS BC1–BC7, KTX2 + Basis-транскод), HDR-пути (Radiance HDR, OpenEXR), процедурные скайбоксы и equirect→cube конвертеры. Листья: `color.zig` (sRGB, half-float), `mip.zig` (даунсемпл, размеры), `core.zig` (тип `Texture` + все пути загрузки), `cube.zig` (`CubeTexture`); читатели контейнеров `dds.zig`/`exr.zig`/`ktx2.zig` — топ-модули.
+Текстуры 2D (`Texture`) и кубические (`CubeTexture`): CPU-декодирование популярных форматов, генерация мип-цепочек box-фильтром, sRGB→linear конвертация до фильтрации, блочные форматы без декодирования (DDS BC1–BC7, KTX2 + Basis-транскод), HDR-пути (Radiance HDR, OpenEXR), процедурные скайбоксы и equirect→cube конвертеры. Листья: `color.zig` (sRGB, half-float), `mip.zig` (даунсемпл, размеры), `core.zig` (фасад 2D API), `core_texture.zig` (владелец типа `Texture`: жизненный цикл, GPU-загрузка), `core_sampler.zig` (`Options` + сэмплер), `core_raw.zig` (`RawTexture` + мип-цепочки), `core_block.zig` (блочные форматы), `core_decode.zig` (LDR-роутинг), `core_hdr.zig` (HDR-декод), `core_testpng.zig` (PNG-фикстуры тестов), `cube.zig` (`CubeTexture`); читатели контейнеров `dds.zig`/`exr.zig`/`ktx2.zig` — топ-модули.
 
 ## Быстрый старт
 
@@ -37,7 +37,7 @@ const white = agate.Texture.createWhite1x1();
 
 ## API
 
-### `Texture.Options` и `DecodeOptions` (`texture/core.zig`)
+### `Texture.Options` и `DecodeOptions` (`texture/core_sampler.zig`, `texture/core_decode.zig`; доступ — через фасад `texture/core.zig`)
 
 ```zig
 pub const Options = struct {

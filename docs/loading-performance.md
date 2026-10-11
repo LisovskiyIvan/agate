@@ -46,7 +46,7 @@ mip chain (`buildRaw` L0 + `boxDownsampleU8` per level). That is why this
 round only touched the texture seam:
 
 1. Fused L0 sRGB convert-copy (`buildRawSrgbFused` in
-   `texture/core.zig`): one pass over level 0 instead of
+   `texture/core_raw.zig`): one pass over level 0 instead of
    convert-in-place + memcpy. Bit-identical bytes (same
    `color.srgbToLinearU8` LUT, alpha verbatim, same box chain).
 2. Stride-4 convert loop (no per-byte `i % 4`).
