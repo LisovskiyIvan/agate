@@ -10,6 +10,7 @@ const stageUploads = prod.stageUploads;
 const flushSlotUploads = prod.flushSlotUploads;
 const commitSlotResults = prod.commitSlotResults;
 const restageDroppedSlot = prod.restageDroppedSlot;
+const tu = @import("tests_util.zig");
 
 // --- Focused regression tests (headless, sg-free assertions on packets) ---
 
@@ -54,21 +55,7 @@ test "upload packets: morph freeze survives live mutation, slot reuse retains ca
     };
     _ = mesh.ensureUid();
     var meshes = [_]*@TypeOf(mesh){&mesh};
-    const MeshType = @TypeOf(mesh);
-    var no_systems: []*@import("../particles/system.zig").ParticleSystem = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
-    const empty_meshes: []*MeshType = &.{};
-    _ = empty_meshes;
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 1 },
-        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-    };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .meshes = meshes[0..] });
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.morph_uploads.items.len);
     try t.expectEqual(@as(u32, 5), slot.morph_uploads.items[0].buffer_id);
@@ -106,13 +93,7 @@ test "upload packets: particle cpu freeze survives count/handle mutation" {
     ps.instances[1].pos_size[0] = 2.0;
     ps.instance_dirty = true;
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    const layer = .{ .systems = .{ .items = systems[0..], .capacity = 1 } };
-    const MeshType2 = @import("../mesh/mesh.zig").Mesh;
-    var no_meshes2: []*MeshType2 = &.{};
-    var no_trails2: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies2: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines2: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
-    var fake_scene = .{ .allocator = t.allocator, .particles = layer, .meshes = .{ .items = no_meshes2[0..], .capacity = 0 }, .trails = .{ .meshes = .{ .items = no_trails2[0..], .capacity = 0 } }, .softbodies = .{ .bodies = .{ .items = no_bodies2[0..], .capacity = 0 } }, .greased_lines = .{ .items = no_lines2[0..], .capacity = 0 } };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .systems = systems[0..] });
     // Stage only the particle path via the shared entry (other lists empty).
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.p_cpu_uploads.items.len);
@@ -151,20 +132,7 @@ test "upload packets: trail freeze survives live vertex mutation" {
         .pending_max_pt = math.Vec3.new(1, 1, 1),
     };
     var list = [_]*@TypeOf(tm){&tm};
-    const MeshType3 = @import("../mesh/mesh.zig").Mesh;
-    var no_meshes3: []*MeshType3 = &.{};
-    const SysType3 = @import("../particles/system.zig").ParticleSystem;
-    var no_systems3: []*SysType3 = &.{};
-    var no_bodies3: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines3: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes3[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = no_systems3[0..], .capacity = 0 } },
-        .trails = .{ .meshes = .{ .items = list[0..], .capacity = 1 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies3[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines3[0..], .capacity = 0 },
-    };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .trails = list[0..] });
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.trail_uploads.items.len);
     verts[0].position = .{ 50, 50, 50 };
@@ -193,13 +161,7 @@ test "upload packets: gpu range freeze captures the wrapped prefix" {
     ps.gpu_flush_pending = true;
     ps.gpu_slot_buffer = .{ .id = 22 };
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    const layer = .{ .systems = .{ .items = systems[0..], .capacity = 1 } };
-    const MeshType = @import("../mesh/mesh.zig").Mesh;
-    var no_meshes: []*MeshType = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
-    var fake_scene = .{ .allocator = t.allocator, .particles = layer, .meshes = .{ .items = no_meshes[0..], .capacity = 0 }, .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } }, .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } }, .greased_lines = .{ .items = no_lines[0..], .capacity = 0 } };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .systems = systems[0..] });
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.p_gpu_uploads.items.len);
     try t.expectEqual(@as(u32, 4), slot.p_gpu_uploads.items[0].count);
@@ -232,20 +194,7 @@ test "upload packets: greased freeze captures verts and indices" {
         .gpu_needs_full_upload = true,
     };
     var list = [_]*@TypeOf(gl){&gl};
-    const MeshType = @import("../mesh/mesh.zig").Mesh;
-    var no_meshes: []*MeshType = &.{};
-    const SysType = @import("../particles/system.zig").ParticleSystem;
-    var no_systems: []*SysType = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = list[0..], .capacity = 1 },
-    };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .lines = list[0..] });
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.greased_uploads.items.len);
     try t.expect(slot.greased_uploads.items[0].full_upload);
@@ -291,23 +240,9 @@ test "upload packets: staged flush re-arms undeliverable buffer-pending particle
     ps.gpu_slot_buffer_pending = true;
     ps.gpu_flush_pending = true;
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    const MeshType = @import("../mesh/mesh.zig").Mesh;
-    var no_meshes: []*MeshType = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.p_cpu_uploads.items.len);
     try t.expectEqual(@as(usize, 1), slot.p_gpu_uploads.items.len);
@@ -365,21 +300,9 @@ test "upload packets: token mismatch fail-closes, previous state stands" {
     ps.instance_dirty = true;
     var meshes = [_]*@TypeOf(mesh){&mesh};
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 1 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .meshes = meshes[0..], .systems = systems[0..] }, &retire);
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.morph_uploads.items.len);
     try t.expectEqual(@as(usize, 1), slot.p_cpu_uploads.items.len);
@@ -418,10 +341,6 @@ test "upload packets: duplicate compute creation retires the loser, winner insta
     defer sys_mod.freeTestSystem(&ps);
     ps.compute_buffers_pending = true;
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     // Teardown for fake-id outcomes (no GPU resource behind handles):
     // entries verified below are cleared manually without calling sg.destroy*.
@@ -431,16 +350,7 @@ test "upload packets: duplicate compute creation retires the loser, winner insta
         retire.overflow_len = 0;
         retire.pending.deinit(t.allocator);
     }
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
     const token = @intFromPtr(&ps);
     try slot.p_compute_uploads.append(t.allocator, .{
         .token = token,
@@ -526,10 +436,6 @@ test "upload packets: stale compute views lose with their buffers, never dangle"
     ps.compute_draw_buffer = .{ .id = 13 };
     ps.compute_buffers_pending = true;
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     // Teardown for fake-id outcomes (no GPU resource behind handles):
     // entries verified below are cleared manually without calling sg.destroy*.
@@ -539,16 +445,7 @@ test "upload packets: stale compute views lose with their buffers, never dangle"
         retire.overflow_len = 0;
         retire.pending.deinit(t.allocator);
     }
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
     try slot.p_compute_uploads.append(t.allocator, .{
         .token = @intFromPtr(&ps),
         .sys_index = 0,
@@ -609,10 +506,6 @@ test "upload packets: owner-gone compute outcome retires whole, live stands" {
     defer sys_mod.freeTestSystem(&ps);
     ps.compute_buffers_pending = true;
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     // Teardown for fake-id outcomes (no GPU resource behind handles):
     // entries verified below are cleared manually without calling sg.destroy*.
@@ -622,16 +515,7 @@ test "upload packets: owner-gone compute outcome retires whole, live stands" {
         retire.overflow_len = 0;
         retire.pending.deinit(t.allocator);
     }
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
     try slot.p_compute_uploads.append(t.allocator, .{
         .token = @intFromPtr(&ps) +% 1, // owner replaced: pointer mismatch
         .sys_index = 0,
@@ -648,11 +532,9 @@ test "upload packets: owner-gone compute outcome retires whole, live stands" {
 
     commitSlotResults(&fake_scene, &slot);
 
-    // Nothing installed on the unrelated live owner; flags untouched.
     try t.expectEqual(@as(u32, 0), ps.compute_state_buffer.id);
     try t.expectEqual(@as(u32, 0), ps.compute_shader.id);
     try t.expect(ps.compute_buffers_pending);
-    // All eight handles queued as one bundle.
     try t.expectEqual(@as(usize, 1), retire.retainedCount());
     try t.expectEqual(retire_mod.Kind.compute, retire.pending.items[0].kind);
     const lost = retire.pending.items[0].compute;
@@ -814,16 +696,13 @@ test "upload packets: lock-free ownership audit — flush writes no live state, 
     var lines = [_]*@TypeOf(gl2){&gl2};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 2 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 3 } },
-        .trails = .{ .meshes = .{ .items = trails[0..], .capacity = 1 } },
-        .softbodies = .{ .bodies = .{ .items = bodies[0..], .capacity = 1 } },
-        .greased_lines = .{ .items = lines[0..], .capacity = 1 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{
+        .meshes = meshes[0..],
+        .systems = systems[0..],
+        .trails = trails[0..],
+        .bodies = bodies[0..],
+        .lines = lines[0..],
+    }, &retire);
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.morph_uploads.items.len);
     try t.expectEqual(@as(usize, 1), slot.p_cpu_uploads.items.len);
@@ -1017,7 +896,6 @@ test "upload packets: lock-free ownership audit — flush writes no live state, 
     try t.expectEqual(@as(usize, 0), cps.compute_staged);
     try t.expectEqual(@as(f32, 0.0), cps.compute_dt_accum);
     try t.expect(!cps.compute_flush_pending);
-    // GPU-range delivered: nothing to install, flags stay cleared.
     try t.expect(!ps2.gpu_dirty);
     try t.expect(!ps2.gpu_flush_pending);
     try t.expectEqual(@as(u32, 22), ps2.gpu_slot_buffer.id);
@@ -1026,7 +904,6 @@ test "upload packets: lock-free ownership audit — flush writes no live state, 
     try t.expect(!gl2.gpu_dirty);
     try t.expect(!gl2.gpu_needs_full_upload);
     try t.expectEqual(@as(u32, 31), gmesh.vertex_buffer.id);
-    // Softbody delivered: generation consumed, handles kept.
     try t.expect(!body.upload_pending);
     try t.expectEqual(@as(u32, 41), smesh.vertex_buffer.id);
     // Pending delivered with created handles: installed over the zero
@@ -1111,21 +988,9 @@ test "upload packets: lock-free stress — mutating producer vs unlocked staged 
     ps.instance_buffer = .{ .id = 11 };
     var meshes = [_]*@TypeOf(mesh){&mesh};
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 1 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .meshes = meshes[0..], .systems = systems[0..] }, &retire);
 
     const total_gens: u32 = 300;
     const Mailbox = struct {
@@ -1314,19 +1179,7 @@ test "upload packets: pending gpu-morph freeze packs delta bytes, survives live 
     };
     _ = mesh.ensureUid();
     var meshes = [_]*mesh_mod.Mesh{&mesh};
-    const SysType = @import("../particles/system.zig").ParticleSystem;
-    var no_systems: []*SysType = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 1 },
-        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-    };
+    var fake_scene = tu.uploadStageScene(t.allocator, .{ .meshes = meshes[0..] });
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.pending_uploads.items.len);
     const up = slot.pending_uploads.items[0];
@@ -1391,23 +1244,9 @@ test "upload packets: pending delta undelivered re-arms both flags, bytes intact
     };
     _ = mesh.ensureUid();
     var meshes = [_]*mesh_mod.Mesh{&mesh};
-    const SysType = @import("../particles/system.zig").ParticleSystem;
-    var no_systems: []*SysType = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = meshes[0..], .capacity = 1 },
-        .particles = .{ .systems = .{ .items = no_systems[0..], .capacity = 0 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .meshes = meshes[0..] }, &retire);
     stageUploads(&fake_scene, &slot);
     try t.expectEqual(@as(usize, 1), slot.pending_uploads.items.len);
     try t.expect(slot.pending_uploads.items[0].morph_delta_pending);
@@ -1455,22 +1294,9 @@ test "upload packets: compute dispatch count transfers exactly once, survives re
     var ps = try sys_mod.makeComputeSystem(t.allocator, 4);
     defer sys_mod.freeTestSystem(&ps);
     var systems = [_]*sys_mod.ParticleSystem{&ps};
-    var no_meshes: []*@import("../mesh/mesh.zig").Mesh = &.{};
-    var no_trails: []*@import("../mesh/trail.zig").TrailMesh = &.{};
-    var no_bodies: []*@import("../softbody.zig").SoftBody = &.{};
-    var no_lines: []*@import("../mesh/greased_line.zig").GreasedLineMesh = &.{};
     var retire: retire_mod.GpuRetireQueue = .{};
     defer retire.deinit(t.allocator);
-    var fake_scene = .{
-        .allocator = t.allocator,
-        .meshes = .{ .items = no_meshes[0..], .capacity = 0 },
-        .particles = .{ .systems = .{ .items = systems[0..], .capacity = 1 } },
-        .trails = .{ .meshes = .{ .items = no_trails[0..], .capacity = 0 } },
-        .softbodies = .{ .bodies = .{ .items = no_bodies[0..], .capacity = 0 } },
-        .greased_lines = .{ .items = no_lines[0..], .capacity = 0 },
-        .gpu_retire = &retire,
-        .flush_in_prepare = true,
-    };
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
     const token = @intFromPtr(&ps);
     try slot.p_compute_uploads.append(t.allocator, .{
         .token = token,

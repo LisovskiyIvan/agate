@@ -154,3 +154,76 @@ pub fn wave32FreeTestSystems(scene: *Scene) void {
     scene.particles.frame.deinit(scene.allocator);
     scene.particles.build_frame.deinit(scene.allocator);
 }
+
+// Upload-packet fake scenes (headless stage/flush/commit tests in
+// upload_packets_tests.zig and upload_packets_reuse_tests.zig): dumb
+// construction of the duck-typed scene surface stageUploads/flush/commit
+// read (allocator + owner lists). Every list defaults to empty and every
+// capacity mirrors its items length, exactly like the hand-rolled literals
+// these replace. No assertions here; per-test quirks stay inline in tests.
+// Two shapes because the flush/commit surface needs more fields than the
+// stage surface: stage-only tests use uploadStageScene, tests driving
+// flushSlotUploads/commitSlotResults/restageDroppedSlot use uploadFullScene
+// (which always sets flush_in_prepare, the only value those tests used).
+const TrailMesh = @import("../mesh/trail.zig").TrailMesh;
+const SoftBody = @import("../softbody.zig").SoftBody;
+const GreasedLineMesh = @import("../mesh/greased_line.zig").GreasedLineMesh;
+const GpuRetireQueue = @import("gpu_retire.zig").GpuRetireQueue;
+
+pub const UploadLists = struct {
+    meshes: []*Mesh = &.{},
+    systems: []*ParticleSystem = &.{},
+    trails: []*TrailMesh = &.{},
+    bodies: []*SoftBody = &.{},
+    lines: []*GreasedLineMesh = &.{},
+};
+
+const UploadMeshList = struct { items: []*Mesh, capacity: usize };
+const UploadSystemList = struct { items: []*ParticleSystem, capacity: usize };
+const UploadTrailList = struct { items: []*TrailMesh, capacity: usize };
+const UploadBodyList = struct { items: []*SoftBody, capacity: usize };
+const UploadLineList = struct { items: []*GreasedLineMesh, capacity: usize };
+
+pub const UploadStageScene = struct {
+    allocator: std.mem.Allocator,
+    meshes: UploadMeshList,
+    particles: struct { systems: UploadSystemList },
+    trails: struct { meshes: UploadTrailList },
+    softbodies: struct { bodies: UploadBodyList },
+    greased_lines: UploadLineList,
+};
+
+pub const UploadFullScene = struct {
+    allocator: std.mem.Allocator,
+    meshes: UploadMeshList,
+    particles: struct { systems: UploadSystemList },
+    trails: struct { meshes: UploadTrailList },
+    softbodies: struct { bodies: UploadBodyList },
+    greased_lines: UploadLineList,
+    gpu_retire: *GpuRetireQueue,
+    flush_in_prepare: bool,
+};
+
+pub fn uploadStageScene(alloc: std.mem.Allocator, lists: UploadLists) UploadStageScene {
+    return .{
+        .allocator = alloc,
+        .meshes = .{ .items = lists.meshes, .capacity = lists.meshes.len },
+        .particles = .{ .systems = .{ .items = lists.systems, .capacity = lists.systems.len } },
+        .trails = .{ .meshes = .{ .items = lists.trails, .capacity = lists.trails.len } },
+        .softbodies = .{ .bodies = .{ .items = lists.bodies, .capacity = lists.bodies.len } },
+        .greased_lines = .{ .items = lists.lines, .capacity = lists.lines.len },
+    };
+}
+
+pub fn uploadFullScene(alloc: std.mem.Allocator, lists: UploadLists, retire: *GpuRetireQueue) UploadFullScene {
+    return .{
+        .allocator = alloc,
+        .meshes = .{ .items = lists.meshes, .capacity = lists.meshes.len },
+        .particles = .{ .systems = .{ .items = lists.systems, .capacity = lists.systems.len } },
+        .trails = .{ .meshes = .{ .items = lists.trails, .capacity = lists.trails.len } },
+        .softbodies = .{ .bodies = .{ .items = lists.bodies, .capacity = lists.bodies.len } },
+        .greased_lines = .{ .items = lists.lines, .capacity = lists.lines.len },
+        .gpu_retire = retire,
+        .flush_in_prepare = true,
+    };
+}
