@@ -959,7 +959,7 @@ test "game properties set and get roundtrip" {
 test "serialization v3 split preserves byte-identical output" {
     // Split-guard: the move into serialization/* must not change a single
     // byte. Builds the same representative v3 snapshot the pre-split code
-    // produced (len 466, fnv1a64 0xc250f36ab4430269, magic AGSC, version 3,
+    // produced (len 458, fnv1a64 0xd95d600060e7af1d, magic AGSC, version 3,
     // mesh_count 2), then requires header invariants, a golden checksum,
     // deterministic re-encoding, and field-by-field equivalence.
     const alloc = std.testing.allocator;
@@ -1029,14 +1029,15 @@ test "serialization v3 split preserves byte-identical output" {
     try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[4..8], .little));
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[8..12], .little));
 
-    // Golden checksum/length from the pre-split encoder (/tmp/serial_golden_pre.bin).
-    try std.testing.expectEqual(@as(usize, 466), bytes.len);
+    // Golden checksum/length from the pre-split encoder (/tmp/serial_golden_pre.bin),
+    // minus 8 bytes for the two dropped SSR knobs (ssr_max_distance/thickness).
+    try std.testing.expectEqual(@as(usize, 458), bytes.len);
     var h: u64 = 14695981039346656037;
     for (bytes) |b| {
         h ^= b;
         h = h *% 1099511628211;
     }
-    try std.testing.expectEqual(@as(u64, 0xc250f36ab4430269), h);
+    try std.testing.expectEqual(@as(u64, 0xd95d600060e7af1d), h);
 
     // Round-trip: field equivalence plus deterministic re-encoding.
     var parsed = try deserializeAlloc(alloc, bytes);

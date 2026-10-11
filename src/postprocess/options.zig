@@ -43,7 +43,6 @@ const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
     .{ .name = "auto_exposure_key_value", .spec = .{ .guarded_floor = .{ .min = 0.001, .default = 0.18 } } },
     .{ .name = "auto_exposure_speed_up", .spec = .{ .guarded_floor = .{ .min = 0.0, .default = 3.0 } } },
     .{ .name = "auto_exposure_speed_down", .spec = .{ .guarded_floor = .{ .min = 0.0, .default = 1.0 } } },
-    .{ .name = "auto_exposure_low_percentile", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.10 } } },
     .{ .name = "bloom_threshold", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .name = "bloom_intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .name = "bloom_radius", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 16.0, .default = 2.0 } } },
@@ -70,8 +69,6 @@ const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
     .{ .name = "contact_shadows_thickness", .spec = .{ .guarded_floor = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_THICKNESS_MIN, .default = 0.05 } } },
     .{ .name = "contact_shadows_steps", .spec = .{ .uint_clamp = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_STEPS_MIN, .max = contact_shadows_mod.CONTACT_SHADOWS_STEPS_MAX } } },
     .{ .name = "local_tonemapping_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
-    .{ .name = "local_tonemapping_contrast", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.3 } } },
-    .{ .name = "motion_blur_intensity", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 3.0 } } },
     .{ .name = "motion_blur_max_blur_px", .spec = .{ .raw_clamp = .{ .min = 1.0, .max = 128.0 } } },
     .{ .name = "motion_blur_samples", .spec = .{ .uint_clamp = .{ .min = 2, .max = 32 } } },
     .{ .name = "taa_blend", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
@@ -106,8 +103,6 @@ pub const PostProcessOptions = struct {
     auto_exposure_key_value: f32 = 0.18,
     auto_exposure_speed_up: f32 = 3.0,
     auto_exposure_speed_down: f32 = 1.0,
-    auto_exposure_low_percentile: f32 = 0.10,
-    auto_exposure_high_percentile: f32 = 0.90,
     auto_exposure_camera_cut: bool = false,
 
     // HDR bloom: Karis downsample + tent upsample pyramid.
@@ -194,8 +189,6 @@ pub const PostProcessOptions = struct {
     // Screen-Space Reflections (SSR)
     ssr_enabled: bool = true,
     ssr_intensity: f32 = 0.55,
-    ssr_max_distance: f32 = 25.0,
-    ssr_thickness: f32 = 0.4,
     ssr_steps: u32 = 16,
 
     // Hierarchical GPU Depth Pyramid (Hi-Z downsample mips for SSR, contact shadows, occlusion)
@@ -238,7 +231,6 @@ pub const PostProcessOptions = struct {
     // Local Tonemapping & Contrast Adaptation (compresses wide dynamic range while preserving local details)
     local_tonemapping_enabled: bool = false,
     local_tonemapping_intensity: f32 = 0.5,
-    local_tonemapping_contrast: f32 = 0.3,
 
     // Sharpen (post-tonemap unsharp mask)
     sharpen_enabled: bool = false,
@@ -254,7 +246,6 @@ pub const PostProcessOptions = struct {
 
     // Camera Motion Blur (screen velocity gather blur)
     motion_blur_enabled: bool = false,
-    motion_blur_intensity: f32 = 0.5,
     motion_blur_max_blur_px: f32 = 32.0,
     motion_blur_samples: u32 = 8,
 
@@ -365,9 +356,8 @@ pub const PostProcessOptions = struct {
                 @compileError("clamped() has no handler for clamp spec kind on field " ++ row.name);
             }
         }
-        // Order-dependent leftovers (floor at the already-clamped neighbor).
+        // Order-dependent leftover (floor at the already-clamped neighbor).
         out.auto_exposure_max = if (std.math.isFinite(self.auto_exposure_max)) @max(self.auto_exposure_max, out.auto_exposure_min) else 16.0;
-        out.auto_exposure_high_percentile = if (std.math.isFinite(self.auto_exposure_high_percentile)) std.math.clamp(self.auto_exposure_high_percentile, out.auto_exposure_low_percentile, 1.0) else 0.90;
         // A binding without a live view, a supported size, or matching
         // strip dims can never be sampled; drop it so the pass keeps its
         // no-LUT path instead of binding a dead handle.
@@ -396,6 +386,9 @@ pub const PostProcessOptions = struct {
     }
 
     /// Extract validated auto-exposure options for evaluation/adaptation.
+    /// The histogram metering percentiles are fixed internal constants
+    /// (0.10/0.90 — the historical defaults): zero non-default setters
+    /// existed, so the knobs were dropped instead of nested.
     pub fn autoExposureOptions(self: PostProcessOptions) auto_exposure.AutoExposureOptions {
         const c = self.clamped();
         return .{
@@ -405,8 +398,8 @@ pub const PostProcessOptions = struct {
             .key_value = c.auto_exposure_key_value,
             .speed_up = c.auto_exposure_speed_up,
             .speed_down = c.auto_exposure_speed_down,
-            .low_percentile = c.auto_exposure_low_percentile,
-            .high_percentile = c.auto_exposure_high_percentile,
+            .low_percentile = 0.10,
+            .high_percentile = 0.90,
             .camera_cut = c.auto_exposure_camera_cut,
         };
     }
@@ -439,11 +432,10 @@ pub const PostProcessOptions = struct {
 };
 
 /// Fields clamped() handles outside the table (order-dependent or special):
-/// auto_exposure_max floors at the already-clamped min, high_percentile at
-/// the already-clamped low, and lut_texture is a handle-validity check.
+/// auto_exposure_max floors at the already-clamped min, and lut_texture
+/// is a handle-validity check.
 const manual_clamp_fields = [_][]const u8{
     "auto_exposure_max",
-    "auto_exposure_high_percentile",
     "lut_texture",
 };
 
@@ -477,8 +469,6 @@ const exempt_clamp_fields = [_][]const u8{
     "fog_sun_scattering",
     "ssr_enabled",
     "ssr_intensity",
-    "ssr_max_distance",
-    "ssr_thickness",
     "depth_pyramid_enabled",
     "ssgi_enabled",
     "ssgi_mode",

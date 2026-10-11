@@ -197,8 +197,10 @@ pub fn packCompositeParams(
         .ssr_params = .{
             if (config.ssr_enabled) 1.0 else 0.0,
             config.ssr_intensity,
-            config.ssr_thickness,
-            config.ssr_max_distance,
+            // Former ssr_thickness / ssr_max_distance knobs (dropped: zero
+            // non-default setters): the historical defaults, hardcoded.
+            0.4,
+            25.0,
         },
         // (steps, 0, 0, 0); zeros when SSR is off, which keeps the
         // composite identical to the SSR-off path (the shader
@@ -270,7 +272,9 @@ pub fn packCompositeParams(
         .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
         .motion_blur_params = .{
             if (config.motion_blur_enabled) 1.0 else 0.0,
-            config.motion_blur_intensity,
+            // Former motion_blur_intensity knob (dropped: zero non-default
+            // setters): the historical default, hardcoded.
+            0.5,
             config.motion_blur_max_blur_px,
             @floatFromInt(config.motion_blur_samples),
         },

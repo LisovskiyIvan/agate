@@ -87,11 +87,11 @@ pub const ShaftResolution = enum { half, quarter };
 | LUT текстурный | `lut_enabled`, `lut_strength`, `lut_size`, `lut_texture` | off, 1.0, 16, null | strength [0,1]; размер `validLutSize` |
 | FXAA 3.11 | `fxaa_enabled` | on | — |
 | Fog (density+height) | `fog_enabled`, `fog_density`, `fog_height_falloff`, `fog_start_distance`, `fog_color`, `fog_sun_scattering` | on, 0.015, 0.08, 5.0, светло-голубой, 0.8 | — |
-| SSR | `ssr_enabled`, `ssr_intensity`, `ssr_max_distance`, `ssr_thickness`, `ssr_steps` | on, 0.55, 25.0, 0.4, 16 | steps [4,64] |
+| SSR | `ssr_enabled`, `ssr_intensity`, `ssr_steps` | on, 0.55, 16 | steps [4,64] |
 | Sharpen (unsharp) | `sharpen_enabled`, `sharpen_amount` | off, 0.3 | — |
 | Grain | `grain_enabled`, `grain_intensity` | off, 0.05 | — |
 | White balance | `temperature`, `tint` | 0, 0 (нейтрально) | — |
-| Motion blur | `motion_blur_enabled`, `motion_blur_intensity`, `motion_blur_max_blur_px`, `motion_blur_samples` | off, 0.5, 32.0, 8 | intensity [0,3], max [1,128], samples [2,32] |
+| Motion blur | `motion_blur_enabled`, `motion_blur_max_blur_px`, `motion_blur_samples` | off, 32.0, 8 | max [1,128], samples [2,32] |
 | TAA | `taa_enabled`, `taa_blend`, `taa_jitter_scale`, `taa_sharpness`, `taa_clamp_strength`, `taa_camera_cut` | off, 0.9, 1.0, 0.0, 1.0, false | blend/sharp/clamp [0,1], jitter [0,4] |
 | Render scale | `render_scale` | 1.0 (native) | [0.25, 1]; main HDR-таргет/TAA-история/velocity/эффекты считаются в масштабе, композит+UI — в натуральном разрешении |
 | SSGI v1 (color bleed) | `ssgi_enabled`, `ssgi_intensity`, `ssgi_radius`, `ssgi_steps`, `ssgi_mode`, `ssgi_temporal_enabled`, `ssgi_temporal_blend` | off, 0.5, 1.5, 12, `inline_gather`, off, 0.9 | intensity [0,1], radius [0.1, 8] м, steps [4,32]; `ssgi_mode`: `inline_gather` (v1 gather в композите) / `half_res_pass` (v2: отдельный half-res gather + билатеральный денойз, `SsgiPass`); `ssgi_temporal_enabled` — temporal аккумуляция gather-выхода (v2.1, только `half_res_pass`, default OFF — в inline-режиме предупреждает и игнорируется); `ssgi_temporal_blend` — вес истории [0,1], свит-спот [0.85, 0.95]; one-bounce экранное цветовое кровотечение (radiance+depth), TAA денойзит |

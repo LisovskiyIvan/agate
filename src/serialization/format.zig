@@ -198,9 +198,9 @@ pub const postprocess_persisted = [_][]const u8{
     "chromatic_aberration", "fxaa_enabled",       "fog_enabled",
     "fog_density",          "fog_height_falloff", "fog_start_distance",
     "fog_color",            "fog_sun_scattering", "ssr_enabled",
-    "ssr_intensity",        "ssr_max_distance",   "ssr_thickness",
-    "sharpen_enabled",      "sharpen_amount",     "grain_enabled",
-    "grain_intensity",      "temperature",        "tint",
+    "ssr_intensity",        "sharpen_enabled",    "sharpen_amount",
+    "grain_enabled",        "grain_intensity",    "temperature",
+    "tint",
 };
 
 pub fn writePostProcess(w: *Writer, pp: *const PostProcessOptions) !void {

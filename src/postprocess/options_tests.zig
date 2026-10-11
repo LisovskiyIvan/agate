@@ -82,18 +82,14 @@ test "contact shadows options clamp and validate correctly" {
 test "local tonemapping options clamp and validate correctly" {
     var custom = PostProcessOptions{
         .local_tonemapping_intensity = 3.0,
-        .local_tonemapping_contrast = -2.0,
     };
     const c = custom.clamped();
     try std.testing.expectEqual(@as(f32, 1.0), c.local_tonemapping_intensity);
-    try std.testing.expectEqual(@as(f32, 0.0), c.local_tonemapping_contrast);
 
     const nan_cfg = (PostProcessOptions{
         .local_tonemapping_intensity = std.math.nan(f32),
-        .local_tonemapping_contrast = std.math.inf(f32),
     }).clamped();
     try std.testing.expectEqual(@as(f32, 0.5), nan_cfg.local_tonemapping_intensity);
-    try std.testing.expectEqual(@as(f32, 0.3), nan_cfg.local_tonemapping_contrast);
 }
 
 test "render scale clamps to [min, 1] with a finite default" {

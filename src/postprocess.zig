@@ -59,7 +59,9 @@ pub fn localTonemapParams(cfg: PostProcessOptions) [4]f32 {
     return .{
         1.0,
         cfg.local_tonemapping_intensity,
-        cfg.local_tonemapping_contrast,
+        // Former local_tonemapping_contrast knob (dropped: zero non-default
+        // setters): the historical default, hardcoded.
+        0.3,
         0.0,
     };
 }
