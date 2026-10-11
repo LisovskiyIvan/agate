@@ -658,26 +658,23 @@ pub const Mesh = struct {
     /// or the LOD mesh for the matched distance bracket,
     /// or null if the matched bracket specifies a culled mesh (null).
     pub fn getLOD(self: *const Mesh, distance: f32) ?*Mesh {
-        if (self.lod_levels.items.len == 0) return @constCast(self);
-        var active: ?*Mesh = @constCast(self);
-        for (self.lod_levels.items) |lvl| {
-            if (distance >= lvl.distance) {
-                active = lvl.mesh;
-            } else {
-                break;
-            }
-        }
-        return active;
+        return self.selectLOD(distance, false);
     }
 
     /// Selects the appropriate active LOD mesh for a given squared distance from camera,
     /// avoiding floating-point sqrt in hot culling passes.
     pub fn getLODSq(self: *const Mesh, distance_sq: f32) ?*Mesh {
+        return self.selectLOD(distance_sq, true);
+    }
+
+    /// Shared LOD bracket walk. `squared` compares against the squared
+    /// threshold (same ops as the old inline loop, bit-identical results).
+    fn selectLOD(self: *const Mesh, d: f32, squared: bool) ?*Mesh {
         if (self.lod_levels.items.len == 0) return @constCast(self);
         var active: ?*Mesh = @constCast(self);
         for (self.lod_levels.items) |lvl| {
-            const thresh_sq = lvl.distance * lvl.distance;
-            if (distance_sq >= thresh_sq) {
+            const hit = if (squared) d >= lvl.distance * lvl.distance else d >= lvl.distance;
+            if (hit) {
                 active = lvl.mesh;
             } else {
                 break;
@@ -714,14 +711,22 @@ pub const Mesh = struct {
         return self.local_bounding_box.transform(self.getWorldMatrix());
     }
 
-    /// Retains a CPU copy of the geometry so physics colliders (convex hull,
-    /// triangle mesh) can be built from it later. Owned by the allocator.
-    pub fn retainCpuGeometry(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex, indices: []const u16) !void {
+    /// Copies vertex positions out of an interleaved vertex array (shared
+    /// by the u16/u32 geometry retention paths below).
+    fn copyVertexPositions(allocator: std.mem.Allocator, vertices: []const Vertex) ![]Vec3 {
         const positions = try allocator.alloc(Vec3, vertices.len);
         errdefer allocator.free(positions);
         for (vertices, 0..) |v, i| {
             positions[i] = @bitCast(v.position);
         }
+        return positions;
+    }
+
+    /// Retains a CPU copy of the geometry so physics colliders (convex hull,
+    /// triangle mesh) can be built from it later. Owned by the allocator.
+    pub fn retainCpuGeometry(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex, indices: []const u16) !void {
+        const positions = try copyVertexPositions(allocator, vertices);
+        errdefer allocator.free(positions);
 
         const index_u32 = try allocator.alloc(u32, indices.len);
         var i: usize = 0;
@@ -741,11 +746,8 @@ pub const Mesh = struct {
 
     /// Same as retainCpuGeometry but for sources that are already 32-bit indexed.
     pub fn retainCpuGeometryU32(self: *Mesh, allocator: std.mem.Allocator, vertices: []const Vertex, indices: []const u32) !void {
-        const positions = try allocator.alloc(Vec3, vertices.len);
+        const positions = try copyVertexPositions(allocator, vertices);
         errdefer allocator.free(positions);
-        for (vertices, 0..) |v, i| {
-            positions[i] = @bitCast(v.position);
-        }
 
         const index_copy = try allocator.alloc(u32, indices.len);
         @memcpy(index_copy, indices);
@@ -770,27 +772,26 @@ pub const Mesh = struct {
 
     /// Reconstructs GeometryData from retained CPU vertices, morph base, or cpu_positions/indices.
     pub fn toGeometryData(self: *const Mesh, allocator: std.mem.Allocator) !GeometryData {
-        if (self.pending_vertices.len > 0 and self.cpu_indices.len > 0) {
-            const verts = try allocator.dupe(Vertex, self.pending_vertices);
-            errdefer allocator.free(verts);
-            const idxs = try allocator.dupe(u32, self.cpu_indices);
-            errdefer allocator.free(idxs);
-            return .{
-                .vertices = verts,
-                .indices = idxs,
-                .bounds = self.local_bounding_box,
-            };
-        }
-        if (self.morph_base.len > 0 and self.cpu_indices.len > 0) {
-            const verts = try allocator.dupe(Vertex, self.morph_base);
-            errdefer allocator.free(verts);
-            const idxs = try allocator.dupe(u32, self.cpu_indices);
-            errdefer allocator.free(idxs);
-            return .{
-                .vertices = verts,
-                .indices = idxs,
-                .bounds = self.local_bounding_box,
-            };
+        // Vertex-major sources in priority order; both share the retained
+        // u32 index copy below.
+        const vert_src: ?[]const Vertex = if (self.pending_vertices.len > 0)
+            self.pending_vertices
+        else if (self.morph_base.len > 0)
+            self.morph_base
+        else
+            null;
+        if (vert_src) |verts_in| {
+            if (self.cpu_indices.len > 0) {
+                const verts = try allocator.dupe(Vertex, verts_in);
+                errdefer allocator.free(verts);
+                const idxs = try allocator.dupe(u32, self.cpu_indices);
+                errdefer allocator.free(idxs);
+                return .{
+                    .vertices = verts,
+                    .indices = idxs,
+                    .bounds = self.local_bounding_box,
+                };
+            }
         }
         if (self.cpu_positions.len > 0 and self.cpu_indices.len > 0) {
             const verts = try allocator.alloc(Vertex, self.cpu_positions.len);
@@ -995,51 +996,42 @@ pub const Mesh = struct {
                 .src = .{ .data = sg.asRange(self.pending_vertices) },
             });
         }
-        if (self.index_type == .UINT16) {
-            const indices16 = allocator.alloc(u16, self.cpu_indices.len) catch {
-                sg.destroyBuffer(vbuf);
-                return;
-            };
-            defer allocator.free(indices16);
+        // Narrow on demand: the u16 path stages a temp copy, the u32 path
+        // uploads the retained indices directly; both share the single
+        // makeBuffer + VALID check below.
+        const indices16: ?[]u16 = if (self.index_type == .UINT16) allocator.alloc(u16, self.cpu_indices.len) catch {
+            sg.destroyBuffer(vbuf);
+            return;
+        } else null;
+        defer if (indices16) |tmp| allocator.free(tmp);
+        if (indices16) |tmp| {
             for (self.cpu_indices, 0..) |idx, k| {
-                indices16[k] = @intCast(idx);
+                tmp[k] = @intCast(idx);
             }
-            const ibuf = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true },
-                .data = sg.asRange(indices16),
-            });
-            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
-                if (ibuf.id != 0) sg.destroyBuffer(ibuf);
-                sg.destroyBuffer(vbuf);
-                return;
-            }
-            self.index_buffer = ibuf;
-        } else {
-            const ibuf = sg.makeBuffer(.{
-                .usage = .{ .index_buffer = true },
-                .data = sg.asRange(self.cpu_indices),
-            });
-            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
-                if (ibuf.id != 0) sg.destroyBuffer(ibuf);
-                sg.destroyBuffer(vbuf);
-                return;
-            }
-            self.index_buffer = ibuf;
         }
+        const ibuf = sg.makeBuffer(.{
+            .usage = .{ .index_buffer = true },
+            .data = if (indices16) |tmp| sg.asRange(tmp) else sg.asRange(self.cpu_indices),
+        });
+        if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+            if (ibuf.id != 0) sg.destroyBuffer(ibuf);
+            sg.destroyBuffer(vbuf);
+            return;
+        }
+        self.index_buffer = ibuf;
         // Deferred GPU-morph delta texture: upload on the context thread now
         // that the base buffers exist. On failure (OOM) or pool exhaustion
         // (dead view handle) tear the fresh buffers back down and keep every
         // pending flag, so the next flush retries the whole finish
         // atomically and the mesh stays skipped by the queue meanwhile.
         if (self.morph_upload_pending) {
-            morph_gpu.uploadMorphDeltas(self, allocator) catch {
-                self.logMorphUploadFailure();
-                sg.destroyBuffer(vbuf);
-                sg.destroyBuffer(self.index_buffer);
-                self.index_buffer = .{};
-                return;
+            // Either failure tears the fresh buffers down and retries the
+            // whole finish atomically (same contract as the doc above).
+            const morph_ok: bool = blk: {
+                morph_gpu.uploadMorphDeltas(self, allocator) catch break :blk false;
+                break :blk self.morph_delta_view.id != 0;
             };
-            if (self.morph_delta_view.id == 0) {
+            if (!morph_ok) {
                 self.logMorphUploadFailure();
                 sg.destroyBuffer(vbuf);
                 sg.destroyBuffer(self.index_buffer);
@@ -1281,38 +1273,29 @@ pub fn uploadGeometry(scene: *Scene, name: []const u8, data: GeometryData) !*Mes
     }
     mesh.vertex_buffer = vbuf;
 
-    if (index_type == .UINT16) {
-        // CPU copy first: it needs the original u32 indices.
-        try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
-        const indices16 = try scene.allocator.alloc(u16, data.indices.len);
-        defer scene.allocator.free(indices16);
+    // CPU mirrors first (physics colliders/decal projection read them);
+    // independent of the narrowing below, so shared by both index paths.
+    try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
+    // Narrow on demand: the u16 path stages a temp copy, the u32 path
+    // uploads the source indices directly; both share the single
+    // VALID-only check below (same contract as above: the local is not
+    // yet assigned, so destroy the failed slot inline).
+    const narrow16: ?[]u16 = if (index_type == .UINT16) try scene.allocator.alloc(u16, data.indices.len) else null;
+    defer if (narrow16) |tmp| scene.allocator.free(tmp);
+    if (narrow16) |tmp| {
         for (data.indices, 0..) |idx, k| {
-            indices16[k] = @intCast(idx);
+            tmp[k] = @intCast(idx);
         }
-        const ibuf = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true },
-            .data = sg.asRange(indices16),
-        });
-        // Same VALID-only contract as above: the local is not yet
-        // assigned, so destroy the failed slot inline; the already
-        // installed vertex_buffer is reclaimed by the errdefer.
-        if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
-            if (ibuf.id != 0) sg.destroyBuffer(ibuf);
-            return error.GpuBufferAllocationFailed;
-        }
-        mesh.index_buffer = ibuf;
-    } else {
-        const ibuf = sg.makeBuffer(.{
-            .usage = .{ .index_buffer = true },
-            .data = sg.asRange(data.indices),
-        });
-        if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
-            if (ibuf.id != 0) sg.destroyBuffer(ibuf);
-            return error.GpuBufferAllocationFailed;
-        }
-        mesh.index_buffer = ibuf;
-        try mesh.retainCpuGeometryU32(scene.allocator, data.vertices, data.indices);
     }
+    const ibuf = sg.makeBuffer(.{
+        .usage = .{ .index_buffer = true },
+        .data = if (narrow16) |tmp| sg.asRange(tmp) else sg.asRange(data.indices),
+    });
+    if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+        if (ibuf.id != 0) sg.destroyBuffer(ibuf);
+        return error.GpuBufferAllocationFailed;
+    }
+    mesh.index_buffer = ibuf;
 
     try scene.meshes.append(scene.allocator, mesh);
     return mesh;

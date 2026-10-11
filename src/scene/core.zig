@@ -4,7 +4,8 @@
 //!
 //! Method bodies live in focused leaves (`scene/<leaf>.zig`, each taking
 //! the scene as `anytype`); this file keeps the public `Scene` API
-//! identical so every call site keeps working unchanged.
+//! identical so every call site keeps working unchanged. A method's leaf
+//! home is its call target, so no per-method pointer comments are kept.
 //!
 //! Anti-cycle rule: leaves never import `core.zig` or the facade.
 const std = @import("std");
@@ -658,12 +659,10 @@ pub const Scene = struct {
         return self;
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn resizeOffscreen(self: *Scene, width: i32, height: i32) void {
         scene_lifecycle.resizeOffscreen(self, width, height);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn setPostProcess(self: *Scene, config: PostProcessOptions) void {
         scene_lifecycle.setPostProcess(self, config);
     }
@@ -698,6 +697,23 @@ pub const Scene = struct {
         return self.postfx.depthPyramidMip(level);
     }
 
+    /// One directional sun's contribution (primary + fills share this shape).
+    fn addSunLuminance(illuminance: *f32, sun: *const DirectionalLight) void {
+        if (!sun.is_enabled or sun.intensity <= 0.001) return;
+        const sun_luma = postprocess.calcLuminance(.{ sun.diffuse.r, sun.diffuse.g, sun.diffuse.b }) * sun.intensity;
+        illuminance.* += sun_luma * @max(-sun.direction.y, 0.2);
+    }
+
+    /// One local light's contribution (point + spot share these fields).
+    fn addLocalLuminance(illuminance: *f32, eye: Vec3, light: anytype) void {
+        if (!light.is_enabled or light.intensity <= 0.001) return;
+        const d2 = light.position.sub(eye).lengthSq();
+        const r2 = light.range * light.range;
+        if (d2 >= r2 * 4.0) return;
+        const att = 1.0 / (1.0 + d2 / @max(r2, 1.0));
+        illuminance.* += postprocess.calcLuminance(.{ light.color.r, light.color.g, light.color.b }) * light.intensity * att * 0.25;
+    }
+
     /// Estimates scene illuminance/luminance at the active camera for automatic auto-exposure metering.
     pub fn estimateSceneLuminance(self: *const Scene) f32 {
         var illuminance: f32 = 0.0;
@@ -715,110 +731,68 @@ pub const Scene = struct {
             illuminance += self.sky.exposure * 0.25;
         }
 
-        // Directional sun contribution
-        if (self.lights.directional) |sun| {
-            if (sun.is_enabled and sun.intensity > 0.001) {
-                const sun_luma = postprocess.calcLuminance(.{ sun.diffuse.r, sun.diffuse.g, sun.diffuse.b }) * sun.intensity;
-                const inc = @max(-sun.direction.y, 0.2);
-                illuminance += sun_luma * inc;
-            }
-        }
-        for (self.lights.extra_directionals.items) |sun| {
-            if (sun.is_enabled and sun.intensity > 0.001) {
-                const sun_luma = postprocess.calcLuminance(.{ sun.diffuse.r, sun.diffuse.g, sun.diffuse.b }) * sun.intensity;
-                const inc = @max(-sun.direction.y, 0.2);
-                illuminance += sun_luma * inc;
-            }
-        }
+        // Directional sun contribution (primary + fill lights share one shape).
+        if (self.lights.directional) |sun| addSunLuminance(&illuminance, sun);
+        for (self.lights.extra_directionals.items) |sun| addSunLuminance(&illuminance, sun);
 
-        // Local point/spot lights near active camera eye
+        // Local point/spot lights near active camera eye (same fields, one helper).
         const eye = if (self.active_camera) |cam| cam.getPosition() else Vec3.zero;
-
-        for (self.lights.point_lights.items) |pt| {
-            if (!pt.is_enabled or pt.intensity <= 0.001) continue;
-            const d2 = pt.position.sub(eye).lengthSq();
-            const r2 = pt.range * pt.range;
-            if (d2 < r2 * 4.0) {
-                const att = 1.0 / (1.0 + d2 / @max(r2, 1.0));
-                illuminance += postprocess.calcLuminance(.{ pt.color.r, pt.color.g, pt.color.b }) * pt.intensity * att * 0.25;
-            }
-        }
-        for (self.lights.spot_lights.items) |sp| {
-            if (!sp.is_enabled or sp.intensity <= 0.001) continue;
-            const d2 = sp.position.sub(eye).lengthSq();
-            const r2 = sp.range * sp.range;
-            if (d2 < r2 * 4.0) {
-                const att = 1.0 / (1.0 + d2 / @max(r2, 1.0));
-                illuminance += postprocess.calcLuminance(.{ sp.color.r, sp.color.g, sp.color.b }) * sp.intensity * att * 0.25;
-            }
-        }
+        for (self.lights.point_lights.items) |pt| addLocalLuminance(&illuminance, eye, pt);
+        for (self.lights.spot_lights.items) |sp| addLocalLuminance(&illuminance, eye, sp);
 
         // Calibrated 18% middle-gray average reflectance
         const avg_luminance = illuminance * 0.18;
         return @max(avg_luminance, postprocess.auto_exposure.LUMA_EPSILON);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn setSSAO(self: *Scene, config: SSAOOptions) void {
         scene_lifecycle.setSSAO(self, config);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn saveStateFileAsync(self: *Scene, path: []const u8) !*serialization.AsyncSaveTask {
         return scene_lifecycle.saveStateFileAsync(self, path);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn loadStateFileAsync(self: *Scene, path: []const u8) !*serialization.AsyncLoadTask {
         return scene_lifecycle.loadStateFileAsync(self, path);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn setSkybox(self: *Scene, cube: CubeTexture) void {
         scene_lifecycle.setSkybox(self, cube);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn createDefaultSkybox(self: *Scene, config: SkyboxOptions) !void {
         return scene_lifecycle.createDefaultSkybox(self, config);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn addReflectionProbe(self: *Scene, position: Vec3, options: ReflectionProbeOptions) error{TooManyReflectionProbes}!usize {
         return scene_attachments.addReflectionProbe(self, position, options);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn removeReflectionProbe(self: *Scene, index: usize) void {
         scene_attachments.removeReflectionProbe(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getReflectionProbe(self: *Scene, index: usize) ?*ReflectionProbe {
         return scene_attachments.getReflectionProbe(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn reflectionProbeCount(self: *const Scene) usize {
         return scene_attachments.reflectionProbeCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn captureReflectionProbe(self: *Scene, index: usize) void {
         scene_attachments.captureReflectionProbe(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn captureDirtyReflectionProbes(self: *Scene) void {
         scene_attachments.captureDirtyReflectionProbes(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn probeDirtyCount(self: *const Scene) usize {
         return scene_attachments.probeDirtyCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn addUi3dPanel(
         self: *Scene,
         name: []const u8,
@@ -828,332 +802,266 @@ pub const Scene = struct {
         return scene_attachments.addUi3dPanel(self, name, position, options);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn removeUi3dPanel(self: *Scene, index: usize) void {
         scene_attachments.removeUi3dPanel(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getUi3dPanel(self: *Scene, index: usize) ?*Ui3dPanel {
         return scene_attachments.getUi3dPanel(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getUi3dPanelByName(self: *Scene, name: []const u8) ?*Ui3dPanel {
         return scene_attachments.getUi3dPanelByName(self, name);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn ui3dPanelCount(self: *const Scene) usize {
         return scene_attachments.ui3dPanelCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn markUi3dPanelDirty(self: *Scene, index: usize) void {
         scene_attachments.markUi3dPanelDirty(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn markAllUi3dPanelsDirty(self: *Scene) void {
         scene_attachments.markAllUi3dPanelsDirty(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn ui3dDirtyCount(self: *const Scene) usize {
         return scene_attachments.ui3dDirtyCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn pickUi3dPanel(self: *Scene, mouse_x: f32, mouse_y: f32) ?Ui3dPickHit {
         return scene_attachments.pickUi3dPanel(self, mouse_x, mouse_y);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn addHighlightMesh(self: *Scene, mesh: *Mesh, options: HighlightOptions) error{ TooManyHighlights, InvalidHighlightOptions }!usize {
         return scene_attachments.addHighlightMesh(self, mesh, options);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn removeHighlightMesh(self: *Scene, index: usize) void {
         scene_attachments.removeHighlightMesh(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn clearHighlights(self: *Scene) void {
         scene_attachments.clearHighlights(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getHighlightMesh(self: *Scene, index: usize) ?*HighlightEntry {
         return scene_attachments.getHighlightMesh(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn highlightCount(self: *const Scene) usize {
         return scene_attachments.highlightCount(self);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn createHemisphericLight(self: *Scene, name: []const u8, options: lights.HemisphericLightOptions) HemisphericLight {
         return scene_lights_api.createHemisphericLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn createPointLight(self: *Scene, name: []const u8, options: PointLightOptions) !*PointLight {
         return scene_lights_api.createPointLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn createSpotLight(self: *Scene, name: []const u8, options: SpotLightOptions) !*SpotLight {
         return scene_lights_api.createSpotLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn createDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         return scene_lights_api.createDirectionalLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn addDirectionalLight(self: *Scene, name: []const u8, options: DirectionalLightOptions) !*DirectionalLight {
         return scene_lights_api.addDirectionalLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn setSunAngles(self: *Scene, azimuth_rad: f32, elevation_rad: f32) void {
         scene_lights_api.setSunAngles(self, azimuth_rad, elevation_rad);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn setSunColorTemperature(self: *Scene, kelvin: f32) void {
         scene_lights_api.setSunColorTemperature(self, kelvin);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn addAreaLight(self: *Scene, name: []const u8, options: AreaLightOptions) !*AreaLight {
         return scene_lights_api.addAreaLight(self, name, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn removeAreaLight(self: *Scene, index: usize) void {
         scene_lights_api.removeAreaLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn getAreaLight(self: *Scene, index: usize) ?*AreaLight {
         return scene_lights_api.getAreaLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn areaLightCount(self: *const Scene) usize {
         return scene_lights_api.areaLightCount(self);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn addClusteredPointLight(self: *Scene, position: Vec3, options: ClusteredPointLightOptions) error{TooManyClusteredLights}!usize {
         return scene_lights_api.addClusteredPointLight(self, position, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn removeClusteredPointLight(self: *Scene, index: usize) void {
         scene_lights_api.removeClusteredPointLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn getClusteredPointLight(self: *Scene, index: usize) ?*ClusteredPointLight {
         return scene_lights_api.getClusteredPointLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn clusteredPointLightCount(self: *const Scene) usize {
         return scene_lights_api.clusteredPointLightCount(self);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn addClusteredSpotLight(self: *Scene, position: Vec3, options: ClusteredSpotLightOptions) error{TooManyClusteredLights}!usize {
         return scene_lights_api.addClusteredSpotLight(self, position, options);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn removeClusteredSpotLight(self: *Scene, index: usize) void {
         scene_lights_api.removeClusteredSpotLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn getClusteredSpotLight(self: *Scene, index: usize) ?*ClusteredSpotLight {
         return scene_lights_api.getClusteredSpotLight(self, index);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn clusteredSpotLightCount(self: *const Scene) usize {
         return scene_lights_api.clusteredSpotLightCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn addSoftBodyCloth(self: *Scene, name: []const u8, options: ClothOptions) softbody_mod.SoftBodyError!*SoftBody {
         return scene_attachments.addSoftBodyCloth(self, name, options);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn removeSoftBodyCloth(self: *Scene, index: usize) softbody_mod.SoftBodyError!void {
         return scene_attachments.removeSoftBodyCloth(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getSoftBody(self: *Scene, index: usize) ?*SoftBody {
         return scene_attachments.getSoftBody(self, index);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn getSoftBodyByName(self: *Scene, name: []const u8) ?*SoftBody {
         return scene_attachments.getSoftBodyByName(self, name);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn softBodyCount(self: *const Scene) usize {
         return scene_attachments.softBodyCount(self);
     }
 
-    /// See `scene/attachments.zig` (owns the body + docs).
     pub fn updateSoftBodies(self: *Scene, dt: f32) void {
         scene_attachments.updateSoftBodies(self, dt);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn createPBRMaterial(self: *Scene, name: []const u8) !*PBRMaterial {
         return scene_registry.createPBRMaterial(self, name);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn createShaderMaterial(self: *Scene, name: []const u8, shader_name: []const u8) ?*ShaderMaterial {
         return scene_registry.createShaderMaterial(self, name, shader_name);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn recordUpdateTime(self: *Scene, ms: f32) void {
         scene_frame.recordUpdateTime(self, ms);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn recordPhysicsTime(self: *Scene, ms: f32) void {
         scene_frame.recordPhysicsTime(self, ms);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn destroyPBRMaterial(self: *Scene, mat: *PBRMaterial) void {
         scene_registry.destroyPBRMaterial(self, mat);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn removeMesh(self: *Scene, mesh: *Mesh) bool {
         return scene_registry.removeMesh(self, mesh);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn destroyMesh(self: *Scene, mesh: *Mesh) void {
         scene_registry.destroyMesh(self, mesh);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn renameMesh(self: *Scene, mesh: *Mesh, new_name: []const u8) !void {
         return scene_registry.renameMesh(self, mesh, new_name);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn destroyTrailMesh(self: *Scene, trail: *TrailMesh) void {
         scene_registry.destroyTrailMesh(self, trail);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn getMeshByName(self: *Scene, name: []const u8) ?*Mesh {
         return scene_registry.getMeshByName(self, name);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn getMeshesByTag(self: *Scene, allocator: std.mem.Allocator, tag_str: []const u8) !std.ArrayListUnmanaged(*Mesh) {
         return scene_registry.getMeshesByTag(self, allocator, tag_str);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn getMeshesByQuery(self: *Scene, allocator: std.mem.Allocator, query_str: []const u8) !std.ArrayListUnmanaged(*Mesh) {
         return scene_registry.getMeshesByQuery(self, allocator, query_str);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn countMeshesByTag(self: *Scene, tag_str: []const u8) usize {
         return scene_registry.countMeshesByTag(self, tag_str);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn countMeshesByQuery(self: *Scene, query_str: []const u8) usize {
         return scene_registry.countMeshesByQuery(self, query_str);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn findFirstMeshByTag(self: *Scene, tag_str: []const u8) ?*Mesh {
         return scene_registry.findFirstMeshByTag(self, tag_str);
     }
 
-    /// See `scene/registry.zig` (owns the body + docs).
     pub fn findFirstMeshByQuery(self: *Scene, query_str: []const u8) ?*Mesh {
         return scene_registry.findFirstMeshByQuery(self, query_str);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn getOrCreateDecalManager(self: *Scene, max_decals: usize) *DecalManager {
         return scene_sim.getOrCreateDecalManager(self, max_decals);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updateDecals(self: *Scene, dt: f32) void {
         scene_sim.updateDecals(self, dt);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createParticleSystem(self: *Scene, name: []const u8, capacity: usize) !*ParticleSystem {
         return scene_sim.createParticleSystem(self, name, capacity);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updateParticles(self: *Scene, dt: f32) particles.UpdateError!void {
         return scene_sim.updateParticles(self, dt);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createTrailMesh(self: *Scene, name: []const u8, options: TrailOptions) !*TrailMesh {
         return scene_sim.createTrailMesh(self, name, options);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updateTrails(self: *Scene, dt: f32) void {
         scene_sim.updateTrails(self, dt);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createCSGMesh(self: *Scene, name: []const u8, csg_solid: *const csg_mod.CSG) !*Mesh {
         return scene_sim.createCSGMesh(self, name, csg_solid);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createGreasedLine(self: *Scene, name: []const u8, options: GreasedLineOptions) !*Mesh {
         return scene_sim.createGreasedLine(self, name, options);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createGreasedLineMesh(self: *Scene, name: []const u8, options: GreasedLineOptions) !*GreasedLineMesh {
         return scene_sim.createGreasedLineMesh(self, name, options);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn simplifyMesh(self: *Scene, name: []const u8, source_mesh: *Mesh, options: SimplifyOptions) !*Mesh {
         return scene_sim.simplifyMesh(self, name, source_mesh, options);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn generateLODLevels(self: *Scene, source_mesh: *Mesh, specs: []const LODLevelSpec) !void {
         return scene_sim.generateLODLevels(self, source_mesh, specs);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createNavMeshFromTriangles(
         self: *Scene,
         positions: []const [3]f32,
@@ -1163,7 +1071,6 @@ pub const Scene = struct {
         return scene_sim.createNavMeshFromTriangles(self, positions, indices, max_slope_rad);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createNavMeshGrid(
         self: *Scene,
         min_x: f32,
@@ -1178,122 +1085,98 @@ pub const Scene = struct {
         return scene_sim.createNavMeshGrid(self, min_x, max_x, min_z, max_z, elevation_y, subdiv_x, subdiv_z, obstacles);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createNavAgent(self: *Scene, nav_mesh: *const ai_mod.NavMesh, start_pos: Vec3) !*ai_mod.NavAgent {
         return scene_sim.createNavAgent(self, nav_mesh, start_pos);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updateNavAgents(self: *Scene, dt: f32) void {
         scene_sim.updateNavAgents(self, dt);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updateAnimations(self: *Scene, dt: f32) void {
         scene_sim.updateAnimations(self, dt);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn enablePhysics(self: *Scene, gravity: ?Vec3) *PhysicsWorld {
         return scene_sim.enablePhysics(self, gravity);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn getRigidBody(self: *Scene, mesh: *const Mesh) ?*RigidBody {
         return scene_sim.getRigidBody(self, mesh);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createRigidBody(self: *Scene, mesh: *Mesh, collider: ColliderType, mass: f32) !*RigidBody {
         return scene_sim.createRigidBody(self, mesh, collider, mass);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn createRigidBodyWith(self: *Scene, mesh: *Mesh, collider: ColliderType, mass: f32, options: physics.BodyOptions) !*RigidBody {
         return scene_sim.createRigidBodyWith(self, mesh, collider, mass, options);
     }
 
-    /// See `scene/sim_api.zig` (owns the body + docs).
     pub fn updatePhysics(self: *Scene, dt: f32) void {
         scene_sim.updatePhysics(self, dt);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn addCamera(self: *Scene, entry: CameraEntry) !usize {
         return scene_cameras.addCamera(self, entry);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn removeCamera(self: *Scene, index: usize) void {
         scene_cameras.removeCamera(self, index);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn getCamera(self: *Scene, index: usize) ?*CameraEntry {
         return scene_cameras.getCamera(self, index);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn getCameraByName(self: *Scene, name: []const u8) ?*CameraEntry {
         return scene_cameras.getCameraByName(self, name);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn switchCamera(self: *Scene, index: usize) void {
         scene_cameras.switchCamera(self, index);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn switchCameraByName(self: *Scene, name: []const u8) bool {
         return scene_cameras.switchCameraByName(self, name);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn nextCamera(self: *Scene) void {
         scene_cameras.nextCamera(self);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn prevCamera(self: *Scene) void {
         scene_cameras.prevCamera(self);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn getActiveCameraIndex(self: Scene) ?usize {
         return scene_cameras.getActiveCameraIndex(self);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn getActiveCameraName(self: Scene) ?[]const u8 {
         return scene_cameras.getActiveCameraName(self);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn getCameraCount(self: Scene) usize {
         return scene_cameras.getCameraCount(self);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn setActiveCamera(self: *Scene, cam: ?Camera, owned_name: ?[]const u8) void {
         scene_cameras.setActiveCamera(self, cam, owned_name);
     }
 
-    /// See `scene/cameras.zig` (owns the body + docs).
     pub fn updateCamera(self: *Scene, dt: f32) void {
         scene_cameras.updateCamera(self, dt);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn createPickingRay(self: *Scene, screen_x: f32, screen_y: f32) Ray {
         return scene_query.createPickingRay(self, screen_x, screen_y);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn pickWithRay(self: *Scene, r: Ray) PickingInfo {
         return scene_query.pickWithRay(self, r);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn pickWithRayTag(self: *Scene, r: Ray, query_str: []const u8) PickingInfo {
         return scene_query.pickWithRayTag(self, r, query_str);
     }
@@ -1316,32 +1199,26 @@ pub const Scene = struct {
         return audio.evaluateRaycastOcclusion(listener_pos, emitter_pos, config, audioRaycastAdapter, self);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn pick(self: *Scene, screen_x: f32, screen_y: f32) PickingInfo {
         return scene_query.pick(self, screen_x, screen_y);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn createUI(self: *Scene) !*UICanvas {
         return scene_query.createUI(self);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn getUI(self: *Scene) ?*UICanvas {
         return scene_query.getUI(self);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn projectPoint(self: *Scene, world_pos: Vec3) ?math.Vec2 {
         return scene_query.projectPoint(self, world_pos);
     }
 
-    /// See `scene/query_api.zig` (owns the body + docs).
     pub fn handleEvent(self: *Scene, ev: [*c]const sapp.Event) void {
         scene_query.handleEvent(self, ev);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn forwardFor(self: *Scene, samples: i32, color_format: sokol.gfx.PixelFormat) *scene_forward.ForwardPipelines {
         return scene_lifecycle.forwardFor(self, samples, color_format);
     }
@@ -1350,7 +1227,6 @@ pub const Scene = struct {
         return scene_lifecycle.forwardForShape(self, shape);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn prepareViewQueues(
         self: *Scene,
         queues: *scene_render_queue.RenderQueues,
@@ -1365,12 +1241,10 @@ pub const Scene = struct {
         scene_frame.prepareViewQueues(self, queues, cam_snap, sky_texture, ibl_intensity, cache_key, stats, instances_prepared, instance_source);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn buildQueuesInto(self: *Scene, back: *FrameDrawSlot, params: QueueBuildParams) void {
         scene_frame.buildQueuesInto(self, back, params);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn renderSceneView(
         self: *Scene,
         cam_snap: scene_snapshot.CameraSnapshot,
@@ -1385,22 +1259,18 @@ pub const Scene = struct {
         scene_frame.renderSceneView(self, cam_snap, queues, outline_items, outline_skins, samples, snap, env, view_slot);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn captureDirtyProbes(self: *Scene, snap: *const SceneFrameSnapshot) void {
         scene_frame.captureDirtyProbes(self, snap);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn captureDirtyUi3dPanels(self: *Scene) void {
         scene_frame.captureDirtyUi3dPanels(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn packFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) scene_snapshot.SceneFrameSnapshot {
         return scene_frame.packFrameSnapshot(self, aspect, cur_w, cur_h);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn publishFrameSnapshot(self: *Scene, aspect: f32, cur_w: i32, cur_h: i32) void {
         scene_frame.publishFrameSnapshot(self, aspect, cur_w, cur_h);
     }
@@ -1430,22 +1300,18 @@ pub const Scene = struct {
     /// uploads at least one texture per call so a lone oversized texture
     /// still makes progress. Tune only with a profiled reason.
     pub const upload_byte_budget_per_frame: usize = 8 * 1024 * 1024;
-    /// See `scene/frame_api.zig` (owns the body + docs).
     fn stageUiPacketInto(self: *Scene, slot: usize) void {
         scene_frame.stageUiPacketInto(self, slot);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn captureUiFrame(self: *Scene, snap: *const SceneFrameSnapshot, back: *FrameDrawSlot) void {
         scene_frame.captureUiFrame(self, snap, back);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn preparedDraws(self: *const Scene) *const FrameDrawSlot {
         return scene_frame.preparedDraws(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn patchInstanceRefs(self: *Scene, back: *FrameDrawSlot) void {
         scene_frame.patchInstanceRefs(self, back);
     }
@@ -1581,12 +1447,10 @@ pub const Scene = struct {
         }
     };
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn buildPreparedFrame(self: *Scene) bool {
         return scene_frame.buildPreparedFrame(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     fn buildIntoClaimedSlot(self: *Scene, slot: usize, seq: usize) void {
         scene_frame.buildIntoClaimedSlot(self, slot, seq);
     }
@@ -1607,22 +1471,18 @@ pub const Scene = struct {
         scene_frame.cancelStagedPrepare(self, claim);
     }
 
-    /// See `scene/lights_api.zig` (owns the body + docs).
     pub fn updateLights(self: *Scene, dt: f32) void {
         scene_lights_api.updateLights(self, dt);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn update(self: *Scene, dt: f32) particles.UpdateError!void {
         return scene_frame.update(self, dt);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn flushPendingGpuUploads(self: *Scene) void {
         scene_frame.flushPendingGpuUploads(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn render(self: *Scene) void {
         scene_frame.render(self);
     }
@@ -1632,82 +1492,66 @@ pub const Scene = struct {
         self.taa_reset_requested.store(true, .release);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn hasConsumableFrame(self: *const Scene) bool {
         return scene_frame.hasConsumableFrame(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn reuseStreak(self: *const Scene) u64 {
         return scene_frame.reuseStreak(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn uiPacketLatchedCount(self: *const Scene) u64 {
         return scene_frame.uiPacketLatchedCount(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn pendingRetires(self: *Scene) usize {
         return scene_frame.pendingRetires(self);
     }
 
-    /// See `scene/frame_api.zig` (owns the body + docs).
     pub fn renderReuse(self: *Scene) void {
         scene_frame.renderReuse(self);
     }
 
-    /// See `scene/lifecycle.zig` (owns the body + docs).
     pub fn deinit(self: *Scene) void {
         scene_lifecycle.deinit(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn startProfiling(self: *Scene) void {
         scene_profile.startProfiling(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn stopProfiling(self: *Scene) void {
         scene_profile.stopProfiling(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn resetProfiling(self: *Scene) void {
         scene_profile.resetProfiling(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn isProfiling(self: *const Scene) bool {
         return scene_profile.isProfiling(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn captureMemorySnapshot(self: *Scene) !*const profiler_mod.MemorySnapshot {
         return scene_profile.captureMemorySnapshot(self);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn saveProfileReportHtml(self: *Scene, path: []const u8) !void {
         return scene_profile.saveProfileReportHtml(self, path);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn saveProfileReportMd(self: *Scene, path: []const u8) !void {
         return scene_profile.saveProfileReportMd(self, path);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn saveProfileTraceJson(self: *Scene, path: []const u8) !void {
         return scene_profile.saveProfileTraceJson(self, path);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn saveProfileReports(self: *Scene, base_path: []const u8) !void {
         return scene_profile.saveProfileReports(self, base_path);
     }
 
-    /// See `scene/profile_api.zig` (owns the body + docs).
     pub fn saveProfileReportsAsync(
         self: *Scene,
         base_path: []const u8,

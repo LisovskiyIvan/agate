@@ -144,6 +144,17 @@ pub const PhysicsWorld = struct {
         };
     }
 
+    /// Frees a body's owned CPU-side resources. Shared by `deinit` and
+    /// `removeBody` (which adds unindex + native destroy + list unlink).
+    fn destroyBodyResources(self: *PhysicsWorld, b: *RigidBody) void {
+        if (b.mesh_data) |md| c.b3DestroyMesh(md);
+        if (b.heightfield_data) |hf| c.b3DestroyHeightField(hf);
+        for (b.child_shapes.items) |*ch| {
+            ch.freeOwned(self.allocator);
+        }
+        b.child_shapes.deinit(self.allocator);
+    }
+
     pub fn deinit(self: *PhysicsWorld) void {
         for (self.joints.items) |j| {
             if (c.b3Joint_IsValid(j)) {
@@ -152,12 +163,7 @@ pub const PhysicsWorld = struct {
         }
         self.joints.deinit(self.allocator);
         for (self.bodies.items) |b| {
-            if (b.mesh_data) |md| c.b3DestroyMesh(md);
-            if (b.heightfield_data) |hf| c.b3DestroyHeightField(hf);
-            for (b.child_shapes.items) |*ch| {
-                ch.freeOwned(self.allocator);
-            }
-            b.child_shapes.deinit(self.allocator);
+            self.destroyBodyResources(b);
             self.allocator.destroy(b);
         }
         self.bodies.deinit(self.allocator);
@@ -276,6 +282,18 @@ pub const PhysicsWorld = struct {
         }
     }
 
+    /// Drops joint handles Box3D destroyed implicitly with a removed body.
+    fn pruneDeadJoints(self: *PhysicsWorld) void {
+        var ji: usize = 0;
+        while (ji < self.joints.items.len) {
+            if (!c.b3Joint_IsValid(self.joints.items[ji])) {
+                _ = self.joints.swapRemove(ji);
+            } else {
+                ji += 1;
+            }
+        }
+    }
+
     /// Creates a static terrain body from a regular height grid.
     /// `heights` is row-major: index = row * count_x + column, where column
     /// maps to local x and row maps to local z (matching Box3D's convention).
@@ -299,7 +317,7 @@ pub const PhysicsWorld = struct {
 
         var min_h = heights[0];
         var max_h = heights[0];
-        for (heights) |h| {
+        for (heights[1..]) |h| {
             min_h = @min(min_h, h);
             max_h = @max(max_h, h);
         }
@@ -410,9 +428,11 @@ pub const PhysicsWorld = struct {
     /// Attaches an extra box shape to a body (compound collider).
     /// Dimensions are in the body's local (unscaled) units.
     /// Density is redistributed across all shapes to preserve the body mass.
-    pub fn addBoxShape(self: *PhysicsWorld, body: *RigidBody, half_extents: Vec3, options: ChildShapeOptions) !void {
+    /// Shared constructor for the scalar child shapes (box/sphere/capsule).
+    /// The hull path keeps its own body (it owns a point copy).
+    fn attachChildKind(self: *PhysicsWorld, body: *RigidBody, kind: ChildShape.Kind, options: ChildShapeOptions) !void {
         try self.attachChild(body, .{
-            .kind = .{ .box = half_extents },
+            .kind = kind,
             .offset = options.offset,
             .friction = options.friction,
             .restitution = options.restitution,
@@ -424,37 +444,21 @@ pub const PhysicsWorld = struct {
         });
     }
 
+    pub fn addBoxShape(self: *PhysicsWorld, body: *RigidBody, half_extents: Vec3, options: ChildShapeOptions) !void {
+        try self.attachChildKind(body, .{ .box = half_extents }, options);
+    }
+
     /// Attaches an extra sphere shape to a body (compound collider).
     /// The center comes from `options.offset`.
     pub fn addSphereShape(self: *PhysicsWorld, body: *RigidBody, radius: f32, options: ChildShapeOptions) !void {
-        try self.attachChild(body, .{
-            .kind = .{ .sphere = radius },
-            .offset = options.offset,
-            .friction = options.friction,
-            .restitution = options.restitution,
-            .filter = options.filter,
-            .is_sensor = options.is_sensor,
-            .sensor_events = options.enable_sensor_events,
-            .contact_events = options.enable_contact_events,
-            .hit_events = options.enable_hit_events,
-        });
+        try self.attachChildKind(body, .{ .sphere = radius }, options);
     }
 
     /// Attaches an extra Y-axis capsule shape to a body (compound collider).
     /// `half_height` is the distance from the midpoint (`options.offset`) to
     /// each cap sphere center.
     pub fn addCapsuleShape(self: *PhysicsWorld, body: *RigidBody, half_height: f32, radius: f32, options: ChildShapeOptions) !void {
-        try self.attachChild(body, .{
-            .kind = .{ .capsule = .{ .half_height = half_height, .radius = radius } },
-            .offset = options.offset,
-            .friction = options.friction,
-            .restitution = options.restitution,
-            .filter = options.filter,
-            .is_sensor = options.is_sensor,
-            .sensor_events = options.enable_sensor_events,
-            .contact_events = options.enable_contact_events,
-            .hit_events = options.enable_hit_events,
-        });
+        try self.attachChildKind(body, .{ .capsule = .{ .half_height = half_height, .radius = radius } }, options);
     }
 
     /// Attaches an extra convex hull shape to a body (compound collider),
@@ -493,37 +497,33 @@ pub const PhysicsWorld = struct {
 
     /// Applies the resolved material/filter/event state to a child shape and
     /// records it for change detection.
+    /// Applies a resolved scalar child property through its native setter
+    /// only when it moved since the last sync. Covers friction/restitution
+    /// (f32) and the three bool event toggles; the filter path keeps its
+    /// own block (struct compare + 3-arg setter).
+    fn syncScalarProperty(comptime T: type, shape_id: c.b3ShapeId, cur: T, last: *T, set: fn (c.b3ShapeId, T) callconv(.c) void) void {
+        if (cur == last.*) return;
+        set(shape_id, cur);
+        last.* = cur;
+    }
+
     fn syncChildState(_: *PhysicsWorld, body: *RigidBody, child: *ChildShape) void {
-        const f = child.resolvedFriction(body);
-        if (f != child.last_friction) {
-            c.b3Shape_SetFriction(child.shape_id, f);
-            child.last_friction = f;
-        }
-        const r = child.resolvedRestitution(body);
-        if (r != child.last_restitution) {
-            c.b3Shape_SetRestitution(child.shape_id, r);
-            child.last_restitution = r;
-        }
+        syncScalarProperty(f32, child.shape_id, child.resolvedFriction(body), &child.last_friction, c.b3Shape_SetFriction);
+        syncScalarProperty(f32, child.shape_id, child.resolvedRestitution(body), &child.last_restitution, c.b3Shape_SetRestitution);
         const flt = child.resolvedFilter(body);
         if (!sameFilter(flt, child.last_filter)) {
             c.b3Shape_SetFilter(child.shape_id, toB3Filter(flt), true);
             child.last_filter = flt;
         }
-        const se = child.resolvedSensorEvents(body);
-        if (se != child.last_sensor_events) {
-            c.b3Shape_EnableSensorEvents(child.shape_id, se);
-            child.last_sensor_events = se;
-        }
-        const ce = child.resolvedContactEvents(body);
-        if (ce != child.last_contact_events) {
-            c.b3Shape_EnableContactEvents(child.shape_id, ce);
-            child.last_contact_events = ce;
-        }
-        const he = child.resolvedHitEvents(body);
-        if (he != child.last_hit_events) {
-            c.b3Shape_EnableHitEvents(child.shape_id, he);
-            child.last_hit_events = he;
-        }
+        syncScalarProperty(bool, child.shape_id, child.resolvedSensorEvents(body), &child.last_sensor_events, c.b3Shape_EnableSensorEvents);
+        syncScalarProperty(bool, child.shape_id, child.resolvedContactEvents(body), &child.last_contact_events, c.b3Shape_EnableContactEvents);
+        syncScalarProperty(bool, child.shape_id, child.resolvedHitEvents(body), &child.last_hit_events, c.b3Shape_EnableHitEvents);
+    }
+
+    /// Rejects a failed child-shape creation (id 0).
+    fn checkedShape(shape: c.b3ShapeId) !c.b3ShapeId {
+        if (shape.index1 == 0) return error.PhysicsShapeCreationFailed;
+        return shape;
     }
 
     fn buildChildShape(self: *PhysicsWorld, body: *RigidBody, child: *ChildShape) !c.b3ShapeId {
@@ -546,17 +546,13 @@ pub const PhysicsWorld = struct {
                 const hz = @max(he.z * scale.z, min_half_extent);
                 var hull = c.b3MakeOffsetBoxHull(hx, hy, hz, toB3Vec(off));
                 child.scaled_volume = 8.0 * hx * hy * hz;
-                const shape = c.b3CreateHullShape(body.body_id, &sdef, &hull.base);
-                if (shape.index1 == 0) return error.PhysicsShapeCreationFailed;
-                return shape;
+                return try checkedShape(c.b3CreateHullShape(body.body_id, &sdef, &hull.base));
             },
             .sphere => |r| {
                 const rs = @max(r * scale.x, min_half_extent);
                 const sph = c.b3Sphere{ .center = toB3Vec(off), .radius = rs };
                 child.scaled_volume = 4.1887902 * rs * rs * rs;
-                const shape = c.b3CreateSphereShape(body.body_id, &sdef, &sph);
-                if (shape.index1 == 0) return error.PhysicsShapeCreationFailed;
-                return shape;
+                return try checkedShape(c.b3CreateSphereShape(body.body_id, &sdef, &sph));
             },
             .capsule => |cp| {
                 const r = @max(cp.radius * scale.x, min_half_extent);
@@ -567,9 +563,7 @@ pub const PhysicsWorld = struct {
                     .radius = r,
                 };
                 child.scaled_volume = 4.1887902 * r * r * r + 6.2831853 * r * r * hh;
-                const shape = c.b3CreateCapsuleShape(body.body_id, &sdef, &cap);
-                if (shape.index1 == 0) return error.PhysicsShapeCreationFailed;
-                return shape;
+                return try checkedShape(c.b3CreateCapsuleShape(body.body_id, &sdef, &cap));
             },
             .hull => |pts| {
                 const points = try self.allocator.alloc(c.b3Vec3, pts.len);
@@ -728,24 +722,12 @@ pub const PhysicsWorld = struct {
             if (b == body) {
                 self.unindexBodyShapes(b);
                 c.b3DestroyBody(b.body_id);
-                if (b.mesh_data) |md| c.b3DestroyMesh(md);
-                if (b.heightfield_data) |hf| c.b3DestroyHeightField(hf);
-                for (b.child_shapes.items) |*ch| {
-                    ch.freeOwned(self.allocator);
-                }
-                b.child_shapes.deinit(self.allocator);
+                self.destroyBodyResources(b);
                 _ = self.bodies.swapRemove(idx);
                 self.allocator.destroy(body);
 
                 // Prune any joints that Box3D destroyed when body was destroyed
-                var ji: usize = 0;
-                while (ji < self.joints.items.len) {
-                    if (!c.b3Joint_IsValid(self.joints.items[ji])) {
-                        _ = self.joints.swapRemove(ji);
-                    } else {
-                        ji += 1;
-                    }
-                }
+                self.pruneDeadJoints();
                 return;
             }
         }
@@ -955,6 +937,51 @@ pub const PhysicsWorld = struct {
             m.rotation.x != b.last_rot.x or m.rotation.y != b.last_rot.y or m.rotation.z != b.last_rot.z;
     }
 
+    /// Reconciles the primary shape's material/filter/event state, then
+    /// re-resolves every child in one pass (`syncChildState` diffs
+    /// internally, so the end state matches six per-property passes).
+    fn syncShapeProps(self: *PhysicsWorld, b: *RigidBody) void {
+        var touched = false;
+        if (b.restitution != b.last_rest) {
+            c.b3Shape_SetRestitution(b.shape_id, b.restitution);
+            b.last_rest = b.restitution;
+            touched = true;
+        }
+        if (b.friction != b.last_fric) {
+            c.b3Shape_SetFriction(b.shape_id, b.friction);
+            b.last_fric = b.friction;
+            touched = true;
+        }
+        if (!sameFilter(b.filter, b.last_filter)) {
+            // invokeContacts=true re-evaluates existing contacts immediately,
+            // so a mask change starts/stops collisions on the next step.
+            c.b3Shape_SetFilter(b.shape_id, toB3Filter(b.filter), true);
+            b.last_filter = b.filter;
+            touched = true;
+        }
+        const want_sensor_events = b.is_sensor or b.enable_sensor_events;
+        if (want_sensor_events != b.last_sensor_events) {
+            c.b3Shape_EnableSensorEvents(b.shape_id, want_sensor_events);
+            b.last_sensor_events = want_sensor_events;
+            touched = true;
+        }
+        if (b.enable_contact_events != b.last_contact_events) {
+            c.b3Shape_EnableContactEvents(b.shape_id, b.enable_contact_events);
+            b.last_contact_events = b.enable_contact_events;
+            touched = true;
+        }
+        if (b.enable_hit_events != b.last_hit_events) {
+            c.b3Shape_EnableHitEvents(b.shape_id, b.enable_hit_events);
+            b.last_hit_events = b.enable_hit_events;
+            touched = true;
+        }
+        if (touched) {
+            for (b.child_shapes.items) |*ch| {
+                self.syncChildState(b, ch);
+            }
+        }
+    }
+
     fn pushBody(self: *PhysicsWorld, b: *RigidBody) void {
         if (b.enabled != b.last_enabled) {
             if (b.enabled) c.b3Body_Enable(b.body_id) else c.b3Body_Disable(b.body_id);
@@ -993,52 +1020,7 @@ pub const PhysicsWorld = struct {
             b.last_rot = e;
         }
 
-        if (b.restitution != b.last_rest) {
-            c.b3Shape_SetRestitution(b.shape_id, b.restitution);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_rest = b.restitution;
-        }
-        if (b.friction != b.last_fric) {
-            c.b3Shape_SetFriction(b.shape_id, b.friction);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_fric = b.friction;
-        }
-        if (!sameFilter(b.filter, b.last_filter)) {
-            // invokeContacts=true re-evaluates existing contacts immediately,
-            // so a mask change starts/stops collisions on the next step.
-            c.b3Shape_SetFilter(b.shape_id, toB3Filter(b.filter), true);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_filter = b.filter;
-        }
-
-        const want_sensor_events = b.is_sensor or b.enable_sensor_events;
-        if (want_sensor_events != b.last_sensor_events) {
-            c.b3Shape_EnableSensorEvents(b.shape_id, want_sensor_events);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_sensor_events = want_sensor_events;
-        }
-        if (b.enable_contact_events != b.last_contact_events) {
-            c.b3Shape_EnableContactEvents(b.shape_id, b.enable_contact_events);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_contact_events = b.enable_contact_events;
-        }
-        if (b.enable_hit_events != b.last_hit_events) {
-            c.b3Shape_EnableHitEvents(b.shape_id, b.enable_hit_events);
-            for (b.child_shapes.items) |*ch| {
-                self.syncChildState(b, ch);
-            }
-            b.last_hit_events = b.enable_hit_events;
-        }
+        self.syncShapeProps(b);
         if (b.linear_damping != b.last_damp_l) {
             c.b3Body_SetLinearDamping(b.body_id, b.linear_damping * damp_scale);
             b.last_damp_l = b.linear_damping;
