@@ -48,6 +48,7 @@ layout(binding = 0) uniform fs_params {
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
     vec4 contact_shadow_params2; // x: raymarch steps, yzw: spare
     vec4 ssgi_params; // x: enabled (1/0), y: intensity [0,1], z: radius (m), w: gather steps
+    vec4 ssgi_pass_params; // x: v2 pass-sample active (1/0), y: intensity, zw: unused (0)
     vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
     // APPENDED LAST (display transfer): x = manual display encode needed
     // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
@@ -68,6 +69,10 @@ layout(binding = 7) uniform texture2D highlight_tex;
 layout(binding = 8) uniform texture2D highlight_mask_tex;
 layout(binding = 9) uniform texture2D shaft_tex;
 layout(binding = 10) uniform texture2D velocity_tex;
+// SSGI v2 denoised bleed (half-res RGBA16F, bilinear-upsampled here);
+// bound to the scene-view placeholder the branch never samples while
+// ssgi_pass_params.x gates it off (bit-identical off path).
+layout(binding = 11) uniform texture2D ssgi_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -604,8 +609,19 @@ vec3 sampleScene(vec2 uv) {
 
     // Screen-Space GI (v1 color bleed): additive one-bounce indirect
     // before fog so aerial perspective covers it like direct light.
+    // Bit-identical inline block: in v2 pass mode ssgi_params.x packs 0
+    // and this branch is skipped.
     if (ssgi_params.x > 0.5) {
         color = applySSGI(color, uv, raw_depth);
+    }
+
+    // Screen-Space GI v2 (half-res pass): the SsgiPass gathered +
+    // bilaterally denoised the bleed into ssgi_tex (normalized bleed *
+    // coverage, no intensity); scale by intensity and add at the same
+    // stack position as v1. Temporal accumulation is a documented v2.1
+    // item, not part of this branch.
+    if (ssgi_pass_params.x > 0.5) {
+        color += texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y;
     }
 
     // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)

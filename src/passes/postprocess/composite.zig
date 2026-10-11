@@ -73,6 +73,14 @@ pub fn buildCompositeBindings(
         self.shaft_tex_view
     else
         self.offscreen_resolve_tex_view;
+    // SSGI v2 denoised bleed when the parent fed an SsgiPass result;
+    // otherwise a valid placeholder the shader never samples
+    // (ssgi_pass_params.x = 0 gates the branch off, so the off path is
+    // bit-identical to pre-SSGI-pass).
+    post_bind.views[post_shd.VIEW_ssgi_tex] = if (self.ssgi_tex_view.id != 0)
+        self.ssgi_tex_view
+    else
+        self.offscreen_resolve_tex_view;
     // LUT when the config carries a live binding; otherwise the resolved
     // scene view as a valid placeholder the shader never samples
     // (lut_params.x = 0 gates the LUT branch off).
@@ -226,9 +234,15 @@ pub fn packCompositeParams(
         // (steps, 0, 0, 0); zeros when off, which keeps the composite
         // identical to the pre-contact-shadow path.
         .contact_shadow_params2 = postprocess.contactShadowStepsParams(config),
-        // (enabled 1/0, intensity, radius, steps); zeros when off,
-        // which keeps the composite identical to the pre-SSGI path.
+        // (enabled 1/0, intensity, radius, steps); zeros when off OR in
+        // v2 pass mode, which keeps the composite identical to the
+        // pre-SSGI path (the inline gather branch never runs alongside
+        // the pass-sample branch).
         .ssgi_params = postprocess.ssgiParams(config),
+        // (pass-sample active 1/0, intensity, 0, 0); zeros unless the
+        // parent fed a denoised SsgiPass view this frame, which keeps
+        // the off path bit-identical.
+        .ssgi_pass_params = postprocess.ssgiPassParams(config, self.ssgi_tex_view.id != 0),
         // (enabled 1/0, intensity, contrast, 0); zeros when off
         .local_tonemap_params = postprocess.localTonemapParams(config),
         .grade_shadows = .{

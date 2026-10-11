@@ -273,6 +273,10 @@ fn setupScene() void {
     scene.post_process.ssgi_intensity = 0.55;
     scene.post_process.ssgi_radius = 1.6;
     scene.post_process.ssgi_steps = 16;
+    // SSGI v2 half-res pass (opt-in): AGATE_Q0_SSGI_PASS=1 runs the
+    // dedicated gather + bilateral denoise instead of the inline
+    // composite gather (same steps); default stays v1 inline.
+    if (envFlag("AGATE_Q0_SSGI_PASS")) scene.post_process.ssgi_mode = .half_res_pass;
     scene.post_process.taa_enabled = true;
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the

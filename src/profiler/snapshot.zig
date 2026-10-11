@@ -19,6 +19,7 @@ const shadow_pass = @import("../passes/shadow_pass.zig");
 const glow_pass_mod = @import("../passes/glow_pass.zig");
 const highlight_pass_mod = @import("../passes/highlight_pass.zig");
 const volumetric_pass_mod = @import("../passes/volumetric_pass.zig");
+const ssgi_pass_mod = @import("../passes/ssgi_pass.zig");
 const bloom_mod = @import("../postprocess/bloom.zig");
 
 const Scene = scene_mod.Scene;
@@ -387,6 +388,17 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         if (shaft.base_width > 0 and shaft.base_height > 0) {
             const shaft_bytes = volumetric_pass_mod.VolumetricPass.targetBytes(shaft.base_width, shaft.base_height, volumetric_pass_mod.VolumetricPass.shaftBytesPerPixel(), shaft.resolution);
             try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "Volumetric Shaft Targets (Raymarch + Blur Ping-Pong)", @intCast(shaft.base_width), @intCast(shaft.base_height), .RGBA16F, 1, shaft_bytes);
+        }
+
+        // SSGI v2 targets (gather + denoised, half res): pass-owned like
+        // the layers above (pure byte math via SsgiPass.targetBytes, no
+        // GPU calls; an unsized pass contributes nothing). The targets
+        // are LAZY (allocated on the first active render), so this gate
+        // keeps the census honest: inline/off frames report no SSGI VRAM.
+        const ssgi_pass = &scene.postfx.ssgi_pass;
+        if (ssgi_pass.width > 0 and ssgi_pass.height > 0) {
+            const ssgi_bytes = ssgi_pass_mod.SsgiPass.targetBytes(ssgi_pass.width, ssgi_pass.height, ssgi_pass_mod.SsgiPass.ssgiBytesPerPixel());
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSGI Targets (Gather + Denoised)", @intCast(ssgi_pass.width), @intCast(ssgi_pass.height), .RGBA16F, 1, ssgi_bytes);
         }
 
         // Shadow Atlas

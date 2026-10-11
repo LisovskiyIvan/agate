@@ -60,3 +60,43 @@ test "ssgiActive gates on the 0.001 intensity floor" {
     const above = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.002 };
     try testing.expect(ssgi.ssgiActive(above));
 }
+
+test "ssgi mode splits the inline and pass lanes without double-add" {
+    // Default mode is inline: the v1 lane packs, the pass lane is zeros.
+    const on = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.7, .ssgi_radius = 2.0, .ssgi_steps = 16 };
+    try testing.expect(on.ssgi_mode == .inline_gather);
+    try testing.expect(ssgi.ssgiInlineActive(on));
+    try testing.expect(!ssgi.ssgiPassActive(on));
+    try testing.expectEqual([4]f32{ 1.0, 0.7, 2.0, 16.0 }, ssgi.ssgiParams(on));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(on, true));
+    // Pass mode: the inline lane zeros (no double-add), the pass gate opens.
+    var pass_cfg = on;
+    pass_cfg.ssgi_mode = .half_res_pass;
+    try testing.expect(!ssgi.ssgiInlineActive(pass_cfg));
+    try testing.expect(ssgi.ssgiPassActive(pass_cfg));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(pass_cfg));
+    // The pass-sample lane additionally needs a live denoised view.
+    try testing.expectEqual([4]f32{ 1.0, 0.7, 0.0, 0.0 }, ssgi.ssgiPassParams(pass_cfg, true));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(pass_cfg, false));
+    // Master off or intensity floor kills both lanes in both modes.
+    const off = PostProcessOptions{ .ssgi_enabled = false, .ssgi_intensity = 1.0, .ssgi_mode = .half_res_pass };
+    try testing.expect(!ssgi.ssgiPassActive(off));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(off, true));
+    const floor_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.001, .ssgi_mode = .half_res_pass };
+    try testing.expect(!ssgi.ssgiPassActive(floor_cfg));
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(floor_cfg, true));
+}
+
+test "ssgiTargetSize is ceil-half of the effective size" {
+    // Even sizes halve exactly; odd sizes round up (SSAO raw-target rule).
+    try testing.expectEqual(ssgi.SsgiTargetSize{ .w = 640, .h = 360 }, ssgi.ssgiTargetSize(1280, 720));
+    try testing.expectEqual(ssgi.SsgiTargetSize{ .w = 641, .h = 361 }, ssgi.ssgiTargetSize(1281, 721));
+    try testing.expectEqual(ssgi.SsgiTargetSize{ .w = 1, .h = 1 }, ssgi.ssgiTargetSize(1, 1));
+    // Degenerate inputs pass through (the caller guards, never allocates).
+    try testing.expectEqual(ssgi.SsgiTargetSize{ .w = 0, .h = 720 }, ssgi.ssgiTargetSize(0, 720));
+    // Two half-res targets (gather + denoised) at 8 Bpp RGBA16F.
+    try testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), ssgi.ssgiTargetBytes(1280, 720, 8));
+    // Odd sizes use the rounded-up halves; degenerate sizes census zero.
+    try testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), ssgi.ssgiTargetBytes(1281, 721, 8));
+    try testing.expectEqual(@as(usize, 0), ssgi.ssgiTargetBytes(0, 0, 8));
+}

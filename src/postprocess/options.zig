@@ -208,6 +208,13 @@ pub const PostProcessOptions = struct {
     // OFF: the disabled lane is zeros and the composite stays bit-identical
     // to the pre-SSGI path.
     ssgi_enabled: bool = false,
+    // Execution mode: .inline_gather runs the v1 gather inside the
+    // composite; .half_res_pass runs the v2 dedicated half-res gather +
+    // bilateral denoise (SsgiPass) and samples the denoised texture
+    // instead. Default inline (bit-identical). An enum like
+    // shaft_resolution: no clamp row, survives forFrame() untouched (the
+    // ssgi_enabled flag still gates both lanes).
+    ssgi_mode: ssgi_mod.SsgiMode = .inline_gather,
     ssgi_intensity: f32 = 0.5,
     // World-space influence radius in meters (pixel disk scales by camera
     // distance; clamped [0.1, 8]).
@@ -468,6 +475,7 @@ const exempt_clamp_fields = [_][]const u8{
     "ssr_thickness",
     "depth_pyramid_enabled",
     "ssgi_enabled",
+    "ssgi_mode",
     "contact_shadows_enabled",
     "local_tonemapping_enabled",
     "sharpen_enabled",

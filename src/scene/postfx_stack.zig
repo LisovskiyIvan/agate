@@ -31,6 +31,7 @@ const SceneStats = stats_mod.SceneStats;
 pub const PostFXStack = struct {
     postprocess_pass: passes.PostProcessPass,
     ssao_pass: passes.SSAOPass,
+    ssgi_pass: passes.SsgiPass,
     bloom_pass: passes.BloomPass,
     glow_pass: passes.GlowPass,
     highlight_pass: passes.HighlightPass,
@@ -74,6 +75,7 @@ pub const PostFXStack = struct {
         return .{
             .postprocess_pass = passes.PostProcessPass.init(),
             .ssao_pass = passes.SSAOPass.init(),
+            .ssgi_pass = passes.SsgiPass.init(),
             .bloom_pass = passes.BloomPass.init(),
             .glow_pass = passes.GlowPass.init(),
             .highlight_pass = passes.HighlightPass.init(),
@@ -87,6 +89,7 @@ pub const PostFXStack = struct {
     pub fn deinit(self: *PostFXStack) void {
         self.postprocess_pass.deinit();
         self.ssao_pass.deinit();
+        self.ssgi_pass.deinit();
         self.bloom_pass.deinit();
         self.glow_pass.deinit();
         self.highlight_pass.deinit();
@@ -110,6 +113,7 @@ pub const PostFXStack = struct {
         const size = postprocess.scaledRenderSize(width, height, self.render_scale);
         _ = self.postprocess_pass.resize(size.w, size.h, self.main_samples);
         if (self.ssao_pass.width != 0) self.ssao_pass.resize(size.w, size.h);
+        if (self.ssgi_pass.width != 0) self.ssgi_pass.resize(size.w, size.h);
         if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(size.w, size.h);
         if (self.glow_pass.base_width != 0) self.glow_pass.resize(size.w, size.h);
         if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(size.w, size.h);
@@ -487,6 +491,37 @@ pub const PostFXStack = struct {
 
         const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
         const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
+
+        // SSGI v2 (half-res pass): gather + bilateral denoise before the
+        // composite, mirroring the SSAO stage above. Runs only in pass
+        // mode (ssgiPassActive: master gate + half_res_pass); the inline
+        // v1 lane packs zeros in this mode so the effect never
+        // double-adds. Sizing is render-scale-aware: the pass derives
+        // half of the EFFECTIVE size (fx_*, never the swapchain size).
+        // MSAA suppression clears ssgi_enabled upstream, so pass mode
+        // joins the existing suppression with no extra branch here.
+        var ssgi_view: sg.View = .{};
+        if (post.enabled and postprocess.ssgiPassActive(post)) {
+            const v = self.ssgi_pass.render(.{
+                .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
+                .depth_view = self.depthSampleView(depth_prepass),
+                .view_proj = params.view_proj,
+                .inv_view_proj = inv_view_proj,
+                .camera_pos = params.eye,
+                .config = post,
+                .near_z = params.camera.getNear(),
+                .far_z = params.camera.getFar(),
+                .base_w = fx_w,
+                .base_h = fx_h,
+            });
+            if (v.id != 0) {
+                ssgi_view = v;
+                params.stats.post_draw_calls += 2;
+                params.stats.draw_calls += 2;
+                params.stats.triangles += 4;
+            }
+        }
+        self.postprocess_pass.setSsgiTexture(ssgi_view);
 
         var taa_history_view = self.postprocess_pass.offscreen_resolve_tex_view;
         var taa_history_valid = false;

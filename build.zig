@@ -357,6 +357,10 @@ pub fn build(b: *Build) !void {
         .{ .name = "ui_shader", .input = "src/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
         .{ .name = "ssao_blur_shader", .input = "src/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig", .includes = true },
+        // SSGI v2 (half-res gather + bilateral denoise): same fullscreen-vs
+        // include shape as the SSAO pair above.
+        .{ .name = "ssgi_shader", .input = "src/shaders/ssgi.glsl", .output = "ssgi_shader.zig", .includes = true },
+        .{ .name = "ssgi_blur_shader", .input = "src/shaders/ssgi_blur.glsl", .output = "ssgi_blur_shader.zig", .includes = true },
         .{ .name = "debug_shader", .input = "src/shaders/debug.glsl", .output = "debug_shader.zig" },
         .{ .name = "bloom_down_shader", .input = "src/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
         .{ .name = "bloom_up_shader", .input = "src/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },

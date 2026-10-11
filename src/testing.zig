@@ -41,6 +41,9 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
         .postfx = .{
             .postprocess_pass = undefined,
             .ssao_pass = undefined,
+            // Zero (not undefined): the SSGI pass default is pinned
+            // structurally (no gather/blur pipelines, no targets).
+            .ssgi_pass = .{},
             .bloom_pass = undefined,
             .glow_pass = undefined,
             // Zero (not undefined): the highlight layer's bit-identical

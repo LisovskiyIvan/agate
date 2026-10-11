@@ -256,7 +256,7 @@ pub const WarnOnce = struct { pub fn warn(self: *WarnOnce, comptime fmt: []const
 pub fn mainTargetFormatsMsaaCapable() bool
 ```
 
-Проходы: 1.7 MSAA depth-prepass → main → 2.5 SSAO → 2.75 bloom → 2.8 glow → 2.85 highlight → 2.9 volumetric shafts → 3 composite + UI overlay. Depth-эффекты несовместимы с MSAA-main и подавляются (one-shot warning), если не активен prepass-gate (`Scene.msaa_depth_prepass`). MSAA-twin outline-пасса создаётся лениво; TAA хранит `prev_view_proj` для репроекции. Композит работает только при включённом посте; остальные проходы тогда лишь обновляют входы.
+Проходы: 1.7 MSAA depth-prepass → main → 2.5 SSAO → 2.75 bloom → 2.8 glow → 2.85 highlight → 2.9 volumetric shafts → 2.95 SSGI-pass (только `ssgi_mode = .half_res_pass`) → 3 composite + UI overlay. Depth-эффекты несовместимы с MSAA-main и подавляются (one-shot warning), если не активен prepass-gate (`Scene.msaa_depth_prepass`). MSAA-twin outline-пасса создаётся лениво; TAA хранит `prev_view_proj` для репроекции. Композит работает только при включённом посте; остальные проходы тогда лишь обновляют входы.
 
 ### Тени (`shadow_system.zig`, `cascades.zig`, `shadow_pcss.zig`)
 

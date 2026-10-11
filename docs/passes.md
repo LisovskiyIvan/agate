@@ -6,7 +6,7 @@
 
 Каталог `passes/` — отдельные GPU-пассы движка: каждый пасс владеет своими таргетами/пайплайнами и умеет `init` / `resize` / `render` / `deinit`. Оркестрацией занимается сцена/`PostFXStack` (см. `./frame-pipeline.md`): тени → сцена → SSAO → bloom/glow/highlight/volumetric → composite-постпроцесс → outline → частицы → skybox/debug. Здесь — что делает каждый пасс, какие ресурсы держит и как включается.
 
-Фасад `passes/mod.zig` реэкспортирует все пассы и хелперы (`ShadowPass`, `BloomPass`, `GlowPass`, `HighlightPass` + `HighlightDrawItem/Result`, `OutlinePass` + `OutlineDrawItem`, `SSAOPass`, `PostProcessPass`, `ParticlePass`, `SkyboxPass`, `VolumetricPass`, `DebugPass`, `MsaaDepthPass`, point/spot-инфо теней). Теневой пасс сам — фасад над `passes/shadow/` (types/core/binning/prepare/buckets/csm/spot/point). Velocity-пасс — владелец `VelocityPass` в `passes/velocity_pass.zig` + механический лист `passes/velocity/pipelines.zig` (фабрика/уничтожение 14 пайплайнов через `anytype`, без обратного импорта).
+Фасад `passes/mod.zig` реэкспортирует все пассы и хелперы (`ShadowPass`, `BloomPass`, `GlowPass`, `HighlightPass` + `HighlightDrawItem/Result`, `OutlinePass` + `OutlineDrawItem`, `SSAOPass`, `SsgiPass`, `PostProcessPass`, `ParticlePass`, `SkyboxPass`, `VolumetricPass`, `DebugPass`, `MsaaDepthPass`, point/spot-инфо теней). Теневой пасс сам — фасад над `passes/shadow/` (types/core/binning/prepare/buckets/csm/spot/point). Velocity-пасс — владелец `VelocityPass` в `passes/velocity_pass.zig` + механический лист `passes/velocity/pipelines.zig` (фабрика/уничтожение 14 пайплайнов через `anytype`, без обратного импорта).
 
 Общий контракт пасса: `init()` (дефолтные таргеты нулевые, пайплайны создаются лениво или сразу), `resize(w, h)` перед первым `render` нового разрешения, `render(...)` открывает свои sg-пассы и не трогает чужие, `deinit()` освобождает GPU-ресурсы. Все `render` — no-op с нулевым результатом при неинициализированных пайплайнах/нулевых вьюхах (защиты `if (...id == 0) return`), а не assert'ы.
 
@@ -177,6 +177,23 @@ pub const SSAOPass = struct {
 ```
 
 Что рендерит: raw AO по глубине/нормалям (`ssao.glsl`) + blur (`ssao_blur.glsl`), возврат view AO для forward/composite. Таргеты — half-res внутри; ресайз пересоздаёт. Включение: флаг SSAO сцены (конфиг — см. `./render-pipeline.md`; в `PostProcessOptions` не входит осознанно).
+
+### SsgiPass (`passes/ssgi_pass.zig`)
+
+```zig
+pub const SsgiPass = struct {
+    pub fn ssgiPixelFormat() sg.PixelFormat
+    pub fn ssgiBytesPerPixel() usize
+    pub fn targetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize
+    pub fn init() SsgiPass
+    pub fn resize(self: *SsgiPass, base_w: i32, base_h: i32) void
+    pub const RenderArgs = struct { ... }; // scene/depth views, матрицы, камера, конфиг, near/far, effective-размер
+    pub fn render(self: *SsgiPass, args: RenderArgs) sg.View
+    pub fn deinit(self: *SsgiPass) void
+};
+```
+
+Что рендерит: SSGI v2 — half-res jittered-disk gather (`ssgi.glsl`, порт v1-математики: тот же мировой диск, веса cos×falloff², luma-кэп, покрытие) + билатеральный (depth-aware) денойз (`ssgi_blur.glsl`) по `RenderArgs`. Таргеты — два half-res RGBA16F (gather + denoised) от EFFECTIVE (render-scale) размера; intensity в composite, не в пассе. Результат — в `PostProcessPass.setSsgiTexture`. Включение: `ssgiPassActive` (ssgi enabled + intensity floor + `ssgi_mode = .half_res_pass`); MSAA-подавление — через общий `ssgi_enabled`. Temporal аккумуляция — открыта как v2.1.
 
 ### MsaaDepthPass (`passes/msaa_depth_pass.zig`)
 

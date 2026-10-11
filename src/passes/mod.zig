@@ -26,6 +26,7 @@ pub const OutlineDrawItem = @import("outline_pass.zig").OutlineDrawItem;
 // Outline helpers carry render-owned indices rather than live pointers.
 pub const makeOutlineDrawItem = @import("outline_pass.zig").makeOutlineDrawItem;
 pub const SSAOPass = @import("ssao_pass.zig").SSAOPass;
+pub const SsgiPass = @import("ssgi_pass.zig").SsgiPass;
 pub const outline_pass = @import("outline_pass.zig");
 pub const DebugPass = @import("debug_pass.zig").DebugPass;
 pub const MsaaDepthPass = @import("msaa_depth_pass.zig").MsaaDepthPass;

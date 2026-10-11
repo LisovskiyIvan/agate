@@ -216,8 +216,16 @@ pub const SSGI_STEPS_MAX = ssgi.SSGI_STEPS_MAX;
 pub const SSGI_RADIUS_MIN = ssgi.SSGI_RADIUS_MIN;
 pub const SSGI_RADIUS_MAX = ssgi.SSGI_RADIUS_MAX;
 pub const SSGI_LUMA_CAP = ssgi.SSGI_LUMA_CAP;
+pub const SSGI_GATHER_TAPS_MAX = ssgi.SSGI_GATHER_TAPS_MAX;
+pub const SsgiMode = ssgi.SsgiMode;
+pub const SsgiTargetSize = ssgi.SsgiTargetSize;
 pub const ssgiParams = ssgi.ssgiParams;
 pub const ssgiActive = ssgi.ssgiActive;
+pub const ssgiInlineActive = ssgi.ssgiInlineActive;
+pub const ssgiPassActive = ssgi.ssgiPassActive;
+pub const ssgiPassParams = ssgi.ssgiPassParams;
+pub const ssgiTargetSize = ssgi.ssgiTargetSize;
+pub const ssgiTargetBytes = ssgi.ssgiTargetBytes;
 pub const calcContactShadowAttenuation = contact_shadows.calcContactShadowAttenuation;
 
 // --- Atmospheric Height Fog ---
