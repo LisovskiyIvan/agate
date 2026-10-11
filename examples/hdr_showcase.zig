@@ -34,6 +34,9 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const timing = z.gpu_timing;
 const bench_mod = @import("gpu_phase_bench.zig");
+const env_mod = @import("env.zig");
+const envFlag = env_mod.envFlag;
+const envF32 = env_mod.envF32;
 var bench: bench_mod.Bench = .{};
 
 const exposures = [_]f32{ 1.0, 0.6, 1.6, 2.5 };
@@ -490,17 +493,6 @@ fn envU32(name: [*:0]const u8, fallback: u32) u32 {
 fn envI32(name: [*:0]const u8, fallback: i32) i32 {
     const value = std.c.getenv(name) orelse return fallback;
     return std.fmt.parseInt(i32, std.mem.span(value), 10) catch fallback;
-}
-
-fn envF32(name: [*:0]const u8, fallback: f32) f32 {
-    const value = std.c.getenv(name) orelse return fallback;
-    return std.fmt.parseFloat(f32, std.mem.span(value)) catch fallback;
-}
-
-fn envFlag(name: [*:0]const u8) bool {
-    const value = std.c.getenv(name) orelse return false;
-    const s = std.mem.span(value);
-    return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
 }
 
 pub fn startApp() void {

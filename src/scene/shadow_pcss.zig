@@ -4,8 +4,6 @@
 // blocker search -> penumbra -> PCF pipeline on the GPU. No GPU imports here,
 // so `zig build test` covers this file without a graphics context.
 
-// Fixed blocker-search tap count. Must match PCSS_BLOCKER_SAMPLES in the shaders.
-pub const blocker_sample_count: u32 = 12;
 // Fixed PCF tap counts per cascade. Must match the taps logic in sampleCascade:
 // cascade 0 keeps the legacy 16-tap Poisson PCF, cascades 1-3 keep 8 taps.
 pub const pcf_taps_near: u32 = 16;
@@ -16,10 +14,6 @@ pub const default_light_size: f32 = 0.02;
 pub const default_blocker_radius: f32 = 0.01;
 pub const default_min_penumbra: f32 = 0.0005;
 pub const default_max_penumbra: f32 = 0.01;
-
-// Sentinel for "no blocker found". The shaders return it from the blocker
-// search (blocker_count == 0) and early-out to fully lit (see resolveLit).
-pub const no_blockers: f32 = -1.0;
 
 // Guards the (receiver - blocker) / blocker division on both sides.
 pub const min_blocker_depth: f32 = 0.0001;

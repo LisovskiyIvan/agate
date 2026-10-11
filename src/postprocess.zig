@@ -52,7 +52,6 @@ pub const bloomTentWeight = bloom.bloomTentWeight;
 pub const bloomPyramidActive = bloom.bloomPyramidActive;
 
 // --- Glow ---
-pub const GLOW_BLUR_TAPS = glow.GLOW_BLUR_TAPS;
 pub const GLOW_HALF_TAPS = glow.GLOW_HALF_TAPS;
 pub const GLOW_PASS_DRAWS = glow.GLOW_PASS_DRAWS;
 pub const GLOW_THRESHOLD_DEFAULT = glow.GLOW_THRESHOLD_DEFAULT;
@@ -100,7 +99,6 @@ pub const FilmLutPreset = lut.FilmLutPreset;
 pub const applyFilmLutPreset = lut.applyFilmLutPreset;
 pub const writeFilmLutStrip = lut.writeFilmLutStrip;
 pub const buildFilmLutStrip = lut.buildFilmLutStrip;
-pub const createFilmLutTexture = lut.createFilmLutTexture;
 pub const lutParams = lut.lutParams;
 
 // --- Local Tonemapping ---
@@ -184,7 +182,6 @@ pub const SHAFT_STEPS_MAX = shafts.SHAFT_STEPS_MAX;
 pub const SHAFT_MARCH_MAX = shafts.SHAFT_MARCH_MAX;
 pub const SHAFT_PASS_DRAWS = shafts.SHAFT_PASS_DRAWS;
 pub const SHAFT_ANISOTROPY_MAX = shafts.SHAFT_ANISOTROPY_MAX;
-pub const SHAFT_BLUR_TAPS = shafts.SHAFT_BLUR_TAPS;
 pub const SHAFT_BLUR_HALF_TAPS = shafts.SHAFT_BLUR_HALF_TAPS;
 pub const shaftTargetSize = shafts.shaftTargetSize;
 pub const shaftActive = shafts.shaftActive;
@@ -216,7 +213,6 @@ pub const SSGI_STEPS_MAX = ssgi.SSGI_STEPS_MAX;
 pub const SSGI_RADIUS_MIN = ssgi.SSGI_RADIUS_MIN;
 pub const SSGI_RADIUS_MAX = ssgi.SSGI_RADIUS_MAX;
 pub const SSGI_LUMA_CAP = ssgi.SSGI_LUMA_CAP;
-pub const SSGI_GATHER_TAPS_MAX = ssgi.SSGI_GATHER_TAPS_MAX;
 pub const SsgiMode = ssgi.SsgiMode;
 pub const SsgiTargetSize = ssgi.SsgiTargetSize;
 pub const ssgiParams = ssgi.ssgiParams;
@@ -242,8 +238,6 @@ pub const perez = sky.perez;
 pub const zenithState = sky.zenithState;
 pub const horizonState = sky.horizonState;
 pub const skyRadiance = sky.skyRadiance;
-pub const resolveSkyFrame = sky.resolveFrame;
-pub const analyticSkyParams = sky.analyticParams;
 
 // --- Atmospheric Height Fog ---
 pub const heightDensity = fog.heightDensity;

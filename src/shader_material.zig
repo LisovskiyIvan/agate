@@ -65,7 +65,6 @@ pub const Param = struct {
 pub const vs_params_ub: u32 = 0; // {mat4 mvp, mat4 model}
 pub const fs_params_ub: u32 = 1; // engine frame VIEW uniforms (engine templates)
 pub const fs_mat_ub: u32 = 5; // engine per-material uniforms (engine templates)
-pub const vs_morph_ub: u32 = 2; // GPU morphs (engine templates only)
 
 /// Runtime view of one registered shader material (static or runtime).
 pub const Entry = struct {

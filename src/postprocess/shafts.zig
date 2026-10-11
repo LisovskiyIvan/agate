@@ -16,9 +16,6 @@ pub const SHAFT_MARCH_MAX: u32 = 32;
 pub const SHAFT_PASS_DRAWS: u32 = 3;
 /// Anisotropy clamp (|g| < 1 keeps the HG denominator nonzero).
 pub const SHAFT_ANISOTROPY_MAX: f32 = 0.9;
-/// Bilateral blur taps per axis (mirrors volumetric_blur.glsl, same 9-tap
-/// shape as the glow blur so the kernel sum helper stays shared).
-pub const SHAFT_BLUR_TAPS: u32 = 9;
 pub const SHAFT_BLUR_HALF_TAPS: i32 = 4;
 
 /// Shaft target size for a base framebuffer: half is bloomMipSize level 0,

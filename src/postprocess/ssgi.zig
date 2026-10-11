@@ -10,11 +10,6 @@ pub const SSGI_STEPS_MIN: u32 = 4;
 pub const SSGI_STEPS_MAX: u32 = 32;
 pub const SSGI_RADIUS_MIN: f32 = 0.1;
 pub const SSGI_RADIUS_MAX: f32 = 8.0;
-/// Compile-time tap budget of the v2 half-res gather shader (ssgi.glsl):
-/// the loop runs `for (i < 32) break at steps`, so a clamped steps count
-/// can never overrun the loop. Equals SSGI_STEPS_MAX by construction.
-pub const SSGI_GATHER_TAPS_MAX: u32 = 32;
-
 /// SSGI execution mode. `inline_gather` runs the v1 gather inside the
 /// composite (default, bit-identical); `half_res_pass` runs the v2
 /// dedicated half-res gather + bilateral denoise (SsgiPass) and samples

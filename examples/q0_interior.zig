@@ -28,6 +28,9 @@ const slog = sokol.log;
 const sg = sokol.gfx;
 const timing = z.gpu_timing;
 const bench_mod = @import("gpu_phase_bench.zig");
+const env_mod = @import("env.zig");
+const envFlag = env_mod.envFlag;
+const envF32 = env_mod.envF32;
 
 var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
 var scene: z.Scene = undefined;
@@ -56,17 +59,6 @@ fn fail(comptime fmt: []const u8, args: anytype) void {
 fn envU32(name: [*:0]const u8, fallback: u32) u32 {
     const value = std.c.getenv(name) orelse return fallback;
     return std.fmt.parseInt(u32, std.mem.span(value), 10) catch fallback;
-}
-
-fn envF32(name: [*:0]const u8, fallback: f32) f32 {
-    const value = std.c.getenv(name) orelse return fallback;
-    return std.fmt.parseFloat(f32, std.mem.span(value)) catch fallback;
-}
-
-fn envFlag(name: [*:0]const u8) bool {
-    const value = std.c.getenv(name) orelse return false;
-    const s = std.mem.span(value);
-    return std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true");
 }
 
 fn qLogger(tag: [*c]const u8, level: u32, item: u32, msg: [*c]const u8, line: u32, file: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {

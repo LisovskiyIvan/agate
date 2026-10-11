@@ -243,18 +243,6 @@ pub fn buildFilmLutStrip(allocator: std.mem.Allocator, size: u32, preset: FilmLu
     return buf;
 }
 
-pub fn createFilmLutTexture(allocator: std.mem.Allocator, size: u32, preset: FilmLutPreset) !texture_mod.Texture {
-    const bytes = try buildFilmLutStrip(allocator, size, preset);
-    defer allocator.free(bytes);
-    return texture_mod.Texture.initRaw(size * size, size, bytes, .{
-        .generate_mips = false,
-        .wrap_u = .clamp_to_edge,
-        .wrap_v = .clamp_to_edge,
-        .min_filter = .linear,
-        .mag_filter = .linear,
-    });
-}
-
 /// Pack the shader lut_params vec4: (enabled 1/0, strength, size N, 0).
 /// Anything that cannot sample — no binding, dead view, bad size,
 /// mismatched strip dims, disabled flag — packs all zeros, which is exactly

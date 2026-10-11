@@ -107,11 +107,6 @@ pub fn faceView(face: Face, eye: Vec3) Mat4 {
     return Mat4.lookAt(eye, eye.add(faceDir(face)), faceUp(face));
 }
 
-/// Combined view-projection for one capture face (90-degree cube frustum).
-pub fn faceViewProj(face: Face, eye: Vec3, near: f32, far: f32) Mat4 {
-    return Mat4.mul(Mat4.perspective(90.0, 1.0, near, far), faceView(face, eye));
-}
-
 /// Far clip for a capture at a probe of `radius`: the probe sees its whole
 /// influence sphere plus surroundings. Floor keeps tiny radii usable.
 pub fn captureFar(radius: f32) f32 {

@@ -31,10 +31,6 @@ pub fn readU16At(bytes: []const u8, off: usize) TtfError!u16 {
     return std.mem.readInt(u16, bytes[off..][0..2], .big);
 }
 
-pub fn readI16At(bytes: []const u8, off: usize) TtfError!i16 {
-    return @bitCast(try readU16At(bytes, off));
-}
-
 pub fn readU32At(bytes: []const u8, off: usize) TtfError!u32 {
     if (off > bytes.len or 4 > bytes.len - off) return error.Truncated;
     return std.mem.readInt(u32, bytes[off..][0..4], .big);

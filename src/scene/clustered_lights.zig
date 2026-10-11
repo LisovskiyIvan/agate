@@ -90,13 +90,6 @@ pub const MAX_VIEW_SLOTS: usize = snapshot.MAX_CAMERAS + 2;
 /// divisor, and the header sizing on one constant.
 pub const tile_size_px: u32 = 64;
 
-/// Staging copy of one clustered light for the tile build: position +
-/// radius (w) and color + intensity (w). Mirrors the FramePack lanes.
-pub const ClusteredLightStage = struct {
-    pos_range: [4]f32,
-    color_int: [4]f32,
-};
-
 /// GPU mirror of one clustered light (std430: four vec4, 64 bytes).
 /// Uploaded verbatim from the staged pack; the shader indexes it by the tile index list.
 pub const ClusterLightGpu = extern struct {
@@ -112,24 +105,6 @@ pub const ClusterLightGpu = extern struct {
 pub const ClusterTileGpu = struct {
     offset: u32 = 0,
     count: u32 = 0,
-};
-
-/// Staging copy of one clustered spot light for the tile build:
-/// position + range (w), direction + cos_inner (w),
-/// color + cos_outer (w), intensity.
-pub const ClusteredSpotStage = struct {
-    pos_range: [4]f32,
-    dir_inner: [4]f32,
-    color_outer: [4]f32,
-    intensity: [4]f32,
-};
-
-/// GPU mirror of one clustered spot light (std430: four vec4, 64 bytes).
-pub const ClusterSpotGpu = struct {
-    pos_range: [4]f32 = .{ 0, 0, 0, 0 },
-    dir_inner: [4]f32 = .{ 0, 0, 0, 0 },
-    color_outer: [4]f32 = .{ 0, 0, 0, 0 },
-    intensity: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 /// Grid dimensions for a viewport, in tiles (ceiling division). Zero in a
@@ -215,11 +190,6 @@ fn sphereOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, radius: f32) b
         if (!(dist >= -radius)) return false;
     }
     return true;
-}
-
-/// True when the cone bounded by the sphere (center, range) overlaps the tile column.
-pub fn spotOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, range: f32) bool {
-    return sphereOverlapsTileColumn(vp, rect, center, range);
 }
 
 /// Builds per-tile clustered-light index lists from ClusterLightGpu slice.

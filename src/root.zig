@@ -127,10 +127,6 @@ pub const GlyphInfo = ttf.GlyphInfo;
 /// here automatically; these names cover standalone use.
 pub const Ktx2DecodeError = ktx2.DecodeError;
 pub const Ktx2DecodeOptions = ktx2.DecodeOptions;
-pub const Ktx2BasisDecodeOptions = ktx2.BasisDecodeOptions;
-pub const Ktx2BasisInfo = ktx2.BasisInfo;
-pub const Ktx2BasisKind = ktx2.BasisKind;
-pub const Ktx2BasisTarget = ktx2.BasisTarget;
 pub const RawBlockTexture = ktx2.RawBlockTexture;
 /// DDS decode companions (Texture.fromDdsMemory wraps decodeBlock2D).
 pub const DdsDecodeError = dds.DecodeError;
@@ -517,28 +513,18 @@ pub const captureSceneState = serialization.capture;
 pub const restoreSceneState = serialization.restore;
 pub const serializeSceneState = serialization.serializeAlloc;
 pub const deserializeSceneState = serialization.deserializeAlloc;
-pub const saveSceneStateFile = serialization.saveFile;
-pub const loadSceneStateFile = serialization.loadFile;
-pub const saveSceneStateFileAsync = serialization.saveFileAsync;
-pub const loadSceneStateFileAsync = serialization.loadFileAsync;
 pub const AsyncSaveTask = serialization.AsyncSaveTask;
 pub const AsyncLoadTask = serialization.AsyncLoadTask;
 
-pub const loader_lights = @import("loader/lights.zig");
 pub const obj_loader = @import("loader/obj.zig");
 pub const stl_loader = @import("loader/stl.zig");
 pub const ObjData = obj_loader.ObjData;
 pub const StlData = stl_loader.StlData;
-pub const parseObj = obj_loader.parse;
-pub const parseStl = stl_loader.parse;
 pub const appendObjToScene = obj_loader.appendToScene;
 pub const appendStlToScene = stl_loader.appendToScene;
-pub const loadGltfLights = loader_lights.loadLights;
-pub const loadGltfCameras = loader_lights.loadCameras;
 
 pub const ply_loader = @import("loader/ply.zig");
 pub const PlyData = ply_loader.PlyData;
-pub const parsePly = ply_loader.parse;
 pub const appendPlyToScene = ply_loader.appendToScene;
 
 pub const export_obj = @import("export/obj.zig");
@@ -556,7 +542,6 @@ pub const writeGlbAlloc = export_glb.writeGlbAlloc;
 pub const writeGlbMeshAlloc = export_glb.writeGlbMeshAlloc;
 
 pub const assets = @import("assets.zig");
-pub const AsyncTexturePipeline = assets.AsyncTexturePipeline;
 pub const asset_manager = @import("asset_manager.zig");
 pub const AssetManager = asset_manager.AssetManager;
 pub const AssetTask = asset_manager.AssetTask;

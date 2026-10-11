@@ -8,6 +8,9 @@ const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const timing = z.gpu_timing;
+const env_mod = @import("env.zig");
+// gpu-timing accepts the wider "1/true/on/yes" spelling set (engine rule).
+const envFlag = env_mod.envFlagAny;
 
 const frame_limit = 270;
 const phases = [_]timing.Pass{ .shadow, .main, .post };
@@ -206,11 +209,6 @@ export fn cleanup() callconv(.c) void {
 }
 
 extern fn emscripten_run_script_int(script: [*:0]const u8) c_int;
-
-fn envFlag(name: [*:0]const u8) bool {
-    const value = std.c.getenv(name) orelse return false;
-    return timing.parseEnvFlag(std.mem.span(value));
-}
 
 pub fn startApp() void {
     off = envFlag("AGATE_GPU_TIMING_SMOKE_OFF");

@@ -86,16 +86,6 @@ pub fn distributionGGX(n_dot_h: f32, roughness: f32) f32 {
     return a2 / (PI * denom * denom);
 }
 
-/// Solid-angle based mip level selection for importance-sampled cubemap filter.
-/// Avoids aliasing and undersampling noise.
-pub fn sampleLodFromPdf(pdf: f32, num_samples: u32, face_size: u32, max_lod: f32) f32 {
-    if (pdf <= 0.00001) return max_lod;
-    const omega_s = 1.0 / (@as(f32, @floatFromInt(num_samples)) * pdf);
-    const omega_p = (4.0 * PI) / (6.0 * @as(f32, @floatFromInt(face_size * face_size)));
-    const mip = 0.5 * std.math.log2(std.math.clamp(omega_s / omega_p, 0.0001, 65504.0));
-    return std.math.clamp(mip, 0.0, max_lod);
-}
-
 /// Order-2 Spherical Harmonics (9 coefficients) for RGB irradiance.
 pub const IrradianceSH = struct {
     coeffs: [9]Vec3 = [_]Vec3{Vec3.zero} ** 9,

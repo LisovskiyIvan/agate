@@ -108,13 +108,6 @@ pub fn flips(comptime s: []const u8, comptime offsets: []const usize) Corpus {
     return &frozen;
 }
 
-/// `magic ++ garbage`: header-valid garbage, the class most likely to slip
-/// past early validation and reach the payload decoder.
-pub fn magicGarbage(comptime magic: []const u8, comptime garbage: []const u8) Corpus {
-    const entry = magic ++ garbage;
-    return &[_][]const u8{entry};
-}
-
 /// Concatenates corpus groups into one.
 pub fn join(a: Corpus, b: Corpus) Corpus {
     comptime var out: [a.len + b.len][]const u8 = undefined;
