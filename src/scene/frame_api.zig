@@ -40,7 +40,6 @@ const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
 const SceneStats = @import("stats.zig").SceneStats;
 const CubeTexture = @import("../texture.zig").CubeTexture;
-const ztracy = @import("ztracy");
 
 /// Stages the update-phase wall time measured by the app around
 /// Scene.update. Update-side write (game thread, under update-vs-prepare
@@ -364,8 +363,6 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
 /// Without a fresh build the staged begin returns null and the context
 /// reuses the last front or skips the present.
 pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
-    const update_zone = ztracy.ZoneN(@src(), "scene.update");
-    defer update_zone.End();
     self.updateCamera(dt);
     self.updateLights(dt);
     self.updatePhysics(dt);
@@ -437,8 +434,6 @@ pub fn flushPendingGpuUploads(self: anytype) void {
 /// `renderReuse` wrapper records the re-presented frame after restoring
 /// them. Every presented frame is recorded once, including reuses.
 pub fn render(self: anytype) void {
-    const render_zone = ztracy.ZoneN(@src(), "scene.render");
-    defer render_zone.End();
     scene_frame_render.render(self);
 }
 
@@ -524,7 +519,5 @@ pub fn pendingRetires(self: anytype) usize {
 /// (identical draws; wall pacing/timestamps are real). The inner render's
 /// own tail stays suppressed via `rendering_reuse`, so no double record.
 pub fn renderReuse(self: anytype) void {
-    const render_zone = ztracy.ZoneN(@src(), "scene.render");
-    defer render_zone.End();
     scene_frame_render.renderReuse(self);
 }

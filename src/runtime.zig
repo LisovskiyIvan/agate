@@ -17,7 +17,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const jobs = @import("jobs.zig");
 const Scene = @import("scene.zig").Scene;
-const ztracy = @import("ztracy");
 
 /// Result of a `beginPrepare*` call: the staged claim (null when no fresh
 /// producer frame is ready — never a live-read fallback), whether the
@@ -206,8 +205,6 @@ pub const Runtime = struct {
     /// when the diagnostic exclusion is enabled. Returns whether a build
     /// published. Single-threaded hosts call this inline.
     pub fn update(self: *Runtime, scene: *Scene, ctx: anytype, comptime tick: fn (@TypeOf(ctx)) void) bool {
-        const update_zone = ztracy.ZoneN(@src(), "update");
-        defer update_zone.End();
         if (self.producer_exclusion) {
             self.gameLock();
             defer self.gameUnlock();
@@ -227,19 +224,11 @@ pub const Runtime = struct {
         const t0 = jobs.monoNs();
         const begun = self.beginPrepare(scene);
         if (begun.claim) |c| {
-            {
-                const prepare_zone = ztracy.ZoneN(@src(), "prepare");
-                defer prepare_zone.End();
-                self.finishPrepare(scene, c);
-            }
+            self.finishPrepare(scene, c);
             const elapsed_ns = jobs.monoNs() -% t0;
             const net_ns = if (elapsed_ns > begun.wait_ns) elapsed_ns - begun.wait_ns else 0;
             scene.stats.prepare_ms = @as(f32, @floatCast(@as(f64, @floatFromInt(net_ns)) / 1_000_000.0));
-            {
-                const submit_zone = ztracy.ZoneN(@src(), "gpusubmit");
-                defer submit_zone.End();
-                scene.render();
-            }
+            scene.render();
             return .prepared;
         }
         if (self.reuseIfConsumable(scene)) return if (begun.busy) .busy else .reused;
@@ -290,21 +279,13 @@ pub const Runtime = struct {
             }
             return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
         }
-        const acq = blk: {
-            const wait_zone = ztracy.ZoneN(@src(), "waitc");
-            defer wait_zone.End();
-            break :blk self.acquireContext();
-        };
+        const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
         const t1 = jobs.monoNs();
-        const claim = blk: {
-            const hold_zone = ztracy.ZoneN(@src(), "holdc");
-            defer hold_zone.End();
-            break :blk scene.beginStagedPrepare();
-        };
+        const claim = scene.beginStagedPrepare();
         const t2 = jobs.monoNs();
         self.mutex.unlock();
         if (claim != null) {
@@ -337,22 +318,14 @@ pub const Runtime = struct {
             }
             return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
         }
-        const acq = blk: {
-            const wait_zone = ztracy.ZoneN(@src(), "waitc");
-            defer wait_zone.End();
-            break :blk self.acquireContext();
-        };
+        const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
         const t1 = jobs.monoNs();
-        const claim = blk: {
-            const hold_zone = ztracy.ZoneN(@src(), "holdc");
-            defer hold_zone.End();
-            work();
-            break :blk scene.beginStagedPrepare();
-        };
+        work();
+        const claim = scene.beginStagedPrepare();
         const t2 = jobs.monoNs();
         self.mutex.unlock();
         if (claim != null) {
@@ -387,11 +360,7 @@ pub const Runtime = struct {
             self.metrics.skipped_presents += 1;
             return false;
         }
-        {
-            const submit_zone = ztracy.ZoneN(@src(), "gpusubmit");
-            defer submit_zone.End();
-            scene.renderReuse();
-        }
+        scene.renderReuse();
         self.metrics.reuses += 1;
         return true;
     }

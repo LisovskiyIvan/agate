@@ -5,15 +5,9 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const is_web = target.result.cpu.arch.isWasm();
 
-    // Same flag as the engine (`agate` build.zig): forwarded as a dependency
-    // option so `zig build -Dtracy=true` enables real Tracy zones end to end
-    // (native only; wasm + tracy is a build error inside agate).
-    const opt_tracy = b.option(bool, "tracy", "Enable Tracy profiler zones") orelse false;
-
     const dep_agate = b.dependency("agate", .{
         .target = target,
         .optimize = optimize,
-        .tracy = opt_tracy,
     });
     const mod_agate = dep_agate.module("agate");
 
