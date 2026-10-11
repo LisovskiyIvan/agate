@@ -145,10 +145,8 @@ test "disabled directional falls back to hemispheric sun" {
     try std.testing.expectApproxEqAbs(resolveSunIntensity(&sun, hemi), 0.75, 1e-6);
 }
 
-test "SpotLight.init carries every option (exponent included)" {
-    // Regression guard: `exponent` was added to the API but `init` dropped it,
-    // so a bench probe asking for `exponent = 4` silently rendered the
-    // exponent-0 lobe. Every option must survive the options -> light copy.
+test "SpotLight.init carries every option" {
+    // Every option must survive the options -> light copy.
     const opts = lights_mod.SpotLightOptions{
         .position = Vec3.new(1, 2, 3),
         .direction = Vec3.new(0, -1, 0.5),
@@ -157,7 +155,6 @@ test "SpotLight.init carries every option (exponent included)" {
         .range = 22.0,
         .inner_angle_deg = 12.0,
         .outer_angle_deg = 34.0,
-        .exponent = 4.0,
         .cast_shadows = true,
         .shadow_bias = 0.003,
         .shadow_normal_bias = 0.007,
@@ -171,7 +168,6 @@ test "SpotLight.init carries every option (exponent included)" {
     try std.testing.expectEqual(opts.range, spot.range);
     try std.testing.expectEqual(opts.inner_angle_deg, spot.inner_angle_deg);
     try std.testing.expectEqual(opts.outer_angle_deg, spot.outer_angle_deg);
-    try std.testing.expectEqual(opts.exponent, spot.exponent);
     try std.testing.expectEqual(opts.cast_shadows, spot.cast_shadows);
     try std.testing.expectEqual(opts.shadow_bias, spot.shadow_bias);
     try std.testing.expectEqual(opts.shadow_normal_bias, spot.shadow_normal_bias);

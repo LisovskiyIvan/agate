@@ -9,7 +9,7 @@
 // postprocess.zig, which pin the exact formulas for CPU tests.
 //
 // Cascade selection, tile layout, and the non-GL NDC-Y flip mirror the
-// forward shaders (standard.glsl sampleCascade/calculateShadow) exactly,
+// forward shaders (common/shadow_pcf.glsl sampleCascade/calculateShadow) exactly,
 // so the march taps the same tile the surface shader uses. Compare depths
 // before bilinear interpolation: filtering raw depth invents occluders.
 // outside all tiles or past the shadow range the sample reads lit (the

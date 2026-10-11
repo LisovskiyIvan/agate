@@ -6,7 +6,7 @@
 
 Материал описывает, как поверхность меша взаимодействует со светом. Все стандартные и glTF поверхности используют единую модель `PBRMaterial` (металлик-рафнесс PBR с расширениями glTF и слоями clearcoat/sheen/anisotropy/transmission/subsurface; дешёвый matte-диэлектрик получается установкой `metallic = 0.0, roughness = 0.5..1.0`). Для кастомных эффектов используется `ShaderMaterial` (пользовательский шейдер, см. `./shaders.md`). Полиморфная обёртка `Material` — union указателей (`pbr | shader_material`), хранимый в `Mesh.material`. Рендер-данные кадра готовит `buildDrawRecord`/`buildShaderSnapshot` (`draw_record.zig`); процедурные графы компилирует `node_material.zig`; готовые пресеты шейдерных материалов даёт `material_library.zig`.
 
-Исторические бинарные AGSC v3 ассеты со `standard` материалами автоматически десериализуются в эквивалентный matte `PBRMaterial` с вычислением шероховатости через `PBRMaterial.roughnessFromSpecularPower`.
+Исторические бинарные AGSC v3 ассеты со `standard` материалами автоматически десериализуются в эквивалентный matte `PBRMaterial` (неметаллик с шероховатостью 0.5).
 
 ## Быстрый старт
 

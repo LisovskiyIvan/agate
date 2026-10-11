@@ -19,7 +19,7 @@ const mesh_mod = @import("../../mesh.zig");
 const Mesh = mesh_mod.Mesh;
 
 // Resolution of the shadow atlas texture (square). Must match the
-// SHADOW_ATLAS_SIZE fallback in shaders/{standard,pbr,instanced,skinned_pbr}.glsl:
+// SHADOW_ATLAS_SIZE fallback in shaders/{pbr,instanced,skinned_pbr}.glsl:
 // sokol-shdc --defines only supports valueless macros, so the value cannot be
 // injected from the build and lives in these two places by convention.
 pub const SHADOW_ATLAS_SIZE: u32 = 2048;

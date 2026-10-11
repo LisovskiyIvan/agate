@@ -42,13 +42,11 @@ pub const MaterialDrawRecord = struct {
     // Factors & params
     base_color: [4]f32 = .{ 1, 1, 1, 1 },
     // PBR family: metallic, roughness, occlusion_strength, env_intensity.
-    // STANDARD family: (specularColor.rgb, specularPower) — the standard shader
-    // has no metallic/roughness lanes at all, so this vec4 is dead for a
-    // standard draw and carries its Blinn-Phong specular instead (Babylon
-    // uploads the power verbatim as the exponent: `vSpecularColor.a`). Sharing
-    // the lane keeps the per-item record — which `RenderMeshItem` embeds by
-    // value and the P4 size guard watches — exactly as small as before; a draw
-    // is either PBR or standard, never both.
+    // Hook (shader-material) draws keep the defaults: the shared base-shader
+    // lanes still read this vec4, so the record stays one shape for every
+    // draw. Sharing the lane keeps the per-item record — which
+    // `RenderMeshItem` embeds by value and the P4 size guard watches —
+    // exactly as small as before; a draw is either PBR or hook, never both.
     pbr_factors: [4]f32 = .{ 0, 0.5, 1.0, 1.0 },
     // rgb = emissive colour. w = the two-sided-lighting flag (0/1): Babylon's
     // `TWOSIDEDLIGHTING` normal flip on back faces. Babylon's own emissive
