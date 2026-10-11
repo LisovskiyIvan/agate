@@ -233,8 +233,17 @@ vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {
     vec3 p_u = reconstructWorldPos(uv - vec2(0.0, texel.y), d_u);
     vec3 p_d = reconstructWorldPos(uv + vec2(0.0, texel.y), d_d);
 
-    vec3 dx = (abs(p_r.z - world_pos.z) < abs(p_l.z - world_pos.z)) ? (p_r - world_pos) : (world_pos - p_l);
-    vec3 dy = (abs(p_u.z - world_pos.z) < abs(p_d.z - world_pos.z)) ? (p_u - world_pos) : (world_pos - p_d);
+    // Choose the continuous side by VIEW depth, not world Z. For the
+    // perspective cameras clip.w is view depth; VP's fourth row gives its
+    // world-space axis without another reconstruction or any new uniform.
+    // CPU mirror: postprocess/depth_normal.zig depthNormalFromNeighbors.
+    vec3 view_forward = vec3(view_proj[0].w, view_proj[1].w, view_proj[2].w);
+    vec3 dr = p_r - world_pos;
+    vec3 dl = world_pos - p_l;
+    vec3 du = p_u - world_pos;
+    vec3 dd = world_pos - p_d;
+    vec3 dx = (abs(dot(dr, view_forward)) < abs(dot(dl, view_forward))) ? dr : dl;
+    vec3 dy = (abs(dot(du, view_forward)) < abs(dot(dd, view_forward))) ? du : dd;
     vec3 n = cross(dx, dy);
     float len_sq = dot(n, n);
     // Test the gradient angle, not the pixel footprint in world units.
