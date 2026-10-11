@@ -173,24 +173,8 @@ const packets_mod = @import("frame_draws_packets.zig");
 const slot_mod = @import("frame_draws_slot.zig");
 const lease_mod = @import("frame_draws_lease.zig");
 
-pub const RenderQueues = slot_mod.RenderQueues;
-pub const SkinStorage = slot_mod.SkinStorage;
-pub const OutlineDrawItem = slot_mod.OutlineDrawItem;
-pub const HighlightDrawItem = slot_mod.HighlightDrawItem;
-pub const PreparedShadowDraws = slot_mod.PreparedShadowDraws;
-pub const Epoch = slot_mod.Epoch;
 pub const SLOT_COUNT = lease_mod.SLOT_COUNT;
 pub const LeaseError = lease_mod.LeaseError;
-pub const HandoffClaim = lease_mod.HandoffClaim;
-pub const StagedInstanceRecord = packets_mod.StagedInstanceRecord;
-pub const MorphUpload = packets_mod.MorphUpload;
-pub const ParticleCpuUpload = packets_mod.ParticleCpuUpload;
-pub const ParticleGpuUpload = packets_mod.ParticleGpuUpload;
-pub const ParticleComputeUpload = packets_mod.ParticleComputeUpload;
-pub const TrailUpload = packets_mod.TrailUpload;
-pub const SoftUpload = packets_mod.SoftUpload;
-pub const GreasedUpload = packets_mod.GreasedUpload;
-pub const PendingMeshUpload = packets_mod.PendingMeshUpload;
 pub const FrameDrawSlot = slot_mod.FrameDrawSlot;
 pub const FrameDraws = lease_mod.FrameDraws;
 

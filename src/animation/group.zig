@@ -5,13 +5,9 @@ const Quat = math.Quat;
 const Skeleton = @import("skeleton.zig").Skeleton;
 const MAX_BONES = @import("skeleton.zig").MAX_BONES;
 const easing_mod = @import("easing.zig");
-pub const EasingType = easing_mod.EasingType;
 
 const sampler_mod = @import("sampler.zig");
-pub const AnimationPath = sampler_mod.AnimationPath;
-pub const AnimationInterpolation = sampler_mod.AnimationInterpolation;
 pub const AnimationEvent = sampler_mod.AnimationEvent;
-pub const AnimationSampler = sampler_mod.AnimationSampler;
 
 const channels_mod = @import("channels.zig");
 pub const AnimationChannel = channels_mod.AnimationChannel;

@@ -38,18 +38,9 @@ pub const Profiler = core.Profiler;
 // Re-exported so `@import("profiler.zig").FrameRecord` and every existing
 // caller keep working; the data types live in profiler/types.zig.
 pub const FrameRecord = types.FrameRecord;
-pub const TextureMemoryRecord = types.TextureMemoryRecord;
-pub const MeshMemoryRecord = types.MeshMemoryRecord;
-pub const RenderTargetRecord = types.RenderTargetRecord;
 pub const MemorySnapshot = types.MemorySnapshot;
-pub const SessionSummary = types.SessionSummary;
-pub const DiagnosticSeverity = types.DiagnosticSeverity;
-pub const DiagnosticFinding = types.DiagnosticFinding;
-pub const PhaseCulprit = types.PhaseCulprit;
-pub const dominantPhase = types.dominantPhase;
 
 // Async report file writes over `Scene.io_runner` (see report_queue.zig):
 // the enqueue-only half of the lock-free profiler window.
 pub const ReportWriteTask = report_queue.ReportWriteTask;
 pub const ReportFiles = core.Profiler.ReportFiles;
-pub const ReportBundle = core.Profiler.ReportBundle;

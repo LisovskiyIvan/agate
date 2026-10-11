@@ -12,7 +12,6 @@ const auto_exposure = @import("auto_exposure.zig");
 
 pub const TonemappingType = types.TonemappingType;
 pub const ShaftResolution = types.ShaftResolution;
-pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
 
 /// One row of the clamped() policy table: the exact sanitize op for a field.
 /// The op kinds reproduce the historical per-field behavior verbatim:

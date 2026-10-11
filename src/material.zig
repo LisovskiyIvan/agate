@@ -11,14 +11,7 @@ pub const draw_record = @import("material/draw_record.zig");
 pub const AlphaMode = types.AlphaMode;
 pub const Channel = types.Channel;
 pub const UvTransform = types.UvTransform;
-pub const Clearcoat = types.Clearcoat;
-pub const Sheen = types.Sheen;
-pub const Anisotropy = types.Anisotropy;
-pub const Transmission = types.Transmission;
-pub const Subsurface = types.Subsurface;
 pub const CoatParams = types.CoatParams;
-pub const anisotropyAxes = types.anisotropyAxes;
-pub const wrapNdotL = types.wrapNdotL;
 
 // Concrete Materials
 pub const PBRMaterial = pbr.PBRMaterial;

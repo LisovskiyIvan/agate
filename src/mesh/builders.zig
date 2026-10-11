@@ -41,11 +41,7 @@ const extrude = @import("builders/extrude.zig");
 const polygon = @import("builders/polygon.zig");
 
 // Shared trig/index/frame helpers (live in builders/common.zig).
-pub const TrigEntry = common.TrigEntry;
-pub const trigEntry = common.trigEntry;
-pub const buildTrigTable = common.buildTrigTable;
 pub const storeQuad = common.storeQuad;
-pub const storeQuadFlipped = common.storeQuadFlipped;
 pub const appendGridQuad = common.appendGridQuad;
 pub const appendGridQuadFlipped = common.appendGridQuadFlipped;
 pub const resolveFrameSeed = common.resolveFrameSeed;
@@ -89,7 +85,5 @@ pub const ExtrudeOptions = extrude.ExtrudeOptions;
 pub const buildExtrudeData = extrude.buildExtrudeData;
 
 // 2D shape triangulation (lives in builders/polygon.zig).
-pub const PolygonSideOrientation = polygon.PolygonSideOrientation;
-pub const PolygonPlane = polygon.PolygonPlane;
 pub const PolygonOptions = polygon.PolygonOptions;
 pub const buildPolygonData = polygon.buildPolygonData;

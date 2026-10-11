@@ -56,49 +56,18 @@ const collisions = @import("particles/collisions.zig");
 
 // Shared vocabulary (lives in particles/types.zig).
 pub const ParticleBlendMode = types.ParticleBlendMode;
-pub const FlowSpace = types.FlowSpace;
-pub const FlowWrap = types.FlowWrap;
 pub const SimulationMode = types.SimulationMode;
 pub const UpdateError = types.UpdateError;
-pub const ComputeModeError = types.ComputeModeError;
-pub const ComputeParticleState = types.ComputeParticleState;
-pub const compute_workgroup_size = types.compute_workgroup_size;
 pub const GpuParticleSlot = types.GpuParticleSlot;
-pub const SlotAge = types.SlotAge;
-pub const slotAge = types.slotAge;
-pub const DragSpans = types.DragSpans;
-pub const analyticDragSpans = types.analyticDragSpans;
-pub const analyticPosition = types.analyticPosition;
 pub const Particle = types.Particle;
 pub const ParticleInstanceData = types.ParticleInstanceData;
-pub const max_sub_emitters = types.max_sub_emitters;
-pub const max_sub_emitter_depth = types.max_sub_emitter_depth;
-pub const max_sub_emitter_spawns_per_tick = types.max_sub_emitter_spawns_per_tick;
 
 // Spawn sampler and pure visual helpers (live in particles/sampling.zig).
-pub const normalizeAngleDeg = sampling.normalizeAngleDeg;
-pub const rotationToRadians = sampling.rotationToRadians;
-pub const spritesheetFrameCount = sampling.spritesheetFrameCount;
-pub const spritesheetFrameForAge = sampling.spritesheetFrameForAge;
-pub const spritesheetUvRect = sampling.spritesheetUvRect;
-pub const localToWorld = sampling.localToWorld;
-pub const worldScaleFactor = sampling.worldScaleFactor;
 
 // Particle system owner (lives in particles/system.zig).
-pub const SubEmitterTrigger = system.SubEmitterTrigger;
-pub const SubEmitter = system.SubEmitter;
 pub const ParticleSystem = system.ParticleSystem;
 
 // Flow-field sampling (lives in particles/flow.zig).
-pub const flowUvForPosition = flow.flowUvForPosition;
-pub const sampleFlowPixels = flow.sampleFlowPixels;
 
 // CPU-only collisions (live in particles/collisions.zig).
 pub const CollisionMode = collisions.CollisionMode;
-pub const CollisionError = collisions.CollisionError;
-pub const ParticleSphereCollider = collisions.ParticleSphereCollider;
-pub const max_sphere_colliders = collisions.max_sphere_colliders;
-pub const ParticleBoxCollider = collisions.ParticleBoxCollider;
-pub const max_box_colliders = collisions.max_box_colliders;
-pub const ParticlePlaneCollider = collisions.ParticlePlaneCollider;
-pub const max_plane_colliders = collisions.max_plane_colliders;

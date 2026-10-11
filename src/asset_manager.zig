@@ -105,12 +105,6 @@ const parseMeshBytesToGeometry = async_mesh.parseMeshBytesToGeometry;
 pub const AssetManager = core.AssetManager;
 pub const AssetTask = task.AssetTask;
 pub const AssetCache = cache.AssetCache;
-pub const TaskState = task.TaskState;
-pub const TaskType = task.TaskType;
-pub const TaskSuccessFn = core.TaskSuccessFn;
-pub const TaskErrorFn = core.TaskErrorFn;
-pub const ProgressFn = core.ProgressFn;
-pub const FinishFn = core.FinishFn;
 pub const textureHandlesEqual = cache.textureHandlesEqual;
 
 /// Test-only hold gate: while true, async workers spin after publishing

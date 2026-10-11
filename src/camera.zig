@@ -42,31 +42,22 @@ const rig_mod = @import("camera/rig.zig");
 pub const Viewport = viewport_mod.Viewport;
 
 // Orbit camera (lives in camera/arc_rotate.zig).
-pub const ArcRotateCameraOptions = arc_rotate_mod.ArcRotateCameraOptions;
 pub const ArcRotateCamera = arc_rotate_mod.ArcRotateCamera;
 
 // WASD + drag camera (lives in camera/free.zig).
-pub const FreeCameraOptions = free_mod.FreeCameraOptions;
 pub const FreeCamera = free_mod.FreeCamera;
 
 // Chase camera (lives in camera/follow.zig).
-pub const FollowCameraOptions = follow_mod.FollowCameraOptions;
 pub const FollowCamera = follow_mod.FollowCamera;
 
 // Observer camera (lives in camera/target.zig).
-pub const TargetCameraOptions = target_mod.TargetCameraOptions;
 pub const TargetCamera = target_mod.TargetCamera;
 
 // 6-DOF flight camera (lives in camera/fly.zig).
-pub const FlyCameraOptions = fly_mod.FlyCameraOptions;
 pub const FlyCamera = fly_mod.FlyCamera;
 
 // Polymorphic union (lives in camera/union.zig).
 pub const Camera = union_mod.Camera;
 
 // Multi-camera rig and viewports (lives in camera/rig.zig).
-pub const MAX_RIG_SLOTS = rig_mod.MAX_RIG_SLOTS;
-pub const CameraRigMode = rig_mod.CameraRigMode;
-pub const StereoConvergenceMode = rig_mod.StereoConvergenceMode;
-pub const CameraRigSlot = rig_mod.CameraRigSlot;
 pub const CameraRig = rig_mod.CameraRig;

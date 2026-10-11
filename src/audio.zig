@@ -80,36 +80,21 @@ const dsp = @import("audio/dsp.zig");
 pub const BiquadFilterType = dsp.BiquadFilterType;
 pub const BusFilterConfig = dsp.BusFilterConfig;
 pub const BusReverbConfig = dsp.BusReverbConfig;
-pub const BiquadFilter = dsp.BiquadFilter;
-pub const ReverbProcessor = dsp.ReverbProcessor;
 
 const occlusion_mod = @import("audio/occlusion.zig");
 pub const AudioOcclusionConfig = occlusion_mod.AudioOcclusionConfig;
 pub const RaycastFn = occlusion_mod.RaycastFn;
 pub const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
-pub const AudioOcclusionTracker = occlusion_mod.AudioOcclusionTracker;
-pub const AudioEmitter = occlusion_mod.AudioEmitter;
 
 const stream_mod = @import("audio/stream.zig");
 pub const StreamFormat = stream_mod.StreamFormat;
-pub const StreamState = stream_mod.StreamState;
-pub const StreamError = stream_mod.StreamError;
-pub const StreamOptions = stream_mod.StreamOptions;
 pub const PlaySoundOptions = stream_mod.PlaySoundOptions;
 pub const AudioStream = stream_mod.AudioStream;
 
 // Shared vocabulary (lives in audio/types.zig).
 pub const BusId = types.BusId;
 pub const AudioBus = types.AudioBus;
-pub const default_max_buses = types.default_max_buses;
-pub const max_bus_capacity = types.max_bus_capacity;
-pub const max_buses = types.max_buses;
 pub const invalid_bus = types.invalid_bus;
-pub const AudioConfig = types.AudioConfig;
-pub const AudioEngineConfig = types.AudioEngineConfig;
-pub const AttenuationModel = types.AttenuationModel;
-pub const BusAttenuation = types.BusAttenuation;
-pub const BusConfig = types.BusConfig;
 pub const VoiceKind = types.VoiceKind;
 pub const Voice = types.Voice;
 

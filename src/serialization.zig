@@ -40,41 +40,22 @@ const MaterialModule = @import("material.zig");
 // Format re-exports (header/version constants, caps, decode errors).
 pub const MAGIC = format_mod.MAGIC;
 pub const VERSION = format_mod.VERSION;
-pub const MAX_ENTRIES = format_mod.MAX_ENTRIES;
-pub const MAX_STRING_BYTES = format_mod.MAX_STRING_BYTES;
-pub const MAX_FILE_BYTES = format_mod.MAX_FILE_BYTES;
-pub const DecodeError = format_mod.DecodeError;
 
 // Snapshot-type re-exports (props.zig owns them).
-pub const StandardEntry = props_mod.StandardEntry;
-pub const PbrEntry = props_mod.PbrEntry;
-pub const MaterialEntry = props_mod.MaterialEntry;
 pub const MeshEntry = props_mod.MeshEntry;
-pub const HemiEntry = props_mod.HemiEntry;
-pub const DirectionalEntry = props_mod.DirectionalEntry;
 pub const PointEntry = props_mod.PointEntry;
 pub const SpotEntry = props_mod.SpotEntry;
-pub const ArcRotateEntry = props_mod.ArcRotateEntry;
-pub const FreeEntry = props_mod.FreeEntry;
-pub const FollowEntry = props_mod.FollowEntry;
-pub const TargetEntry = props_mod.TargetEntry;
-pub const FlyEntry = props_mod.FlyEntry;
-pub const CameraEntry = props_mod.CameraEntry;
-pub const RenderEntry = props_mod.RenderEntry;
-pub const GameProperty = props_mod.GameProperty;
 pub const SceneState = props_mod.SceneState;
 
 // Scene -> bytes (writer.zig).
 pub const capture = writer_mod.capture;
 pub const serializeAlloc = writer_mod.serializeAlloc;
-pub const saveFile = writer_mod.saveFile;
 pub const AsyncSaveTask = writer_mod.AsyncSaveTask;
 pub const saveFileAsync = writer_mod.saveFileAsync;
 
 // Bytes -> scene (reader.zig).
 pub const restore = reader_mod.restore;
 pub const deserializeAlloc = reader_mod.deserializeAlloc;
-pub const loadFile = reader_mod.loadFile;
 pub const AsyncLoadTask = reader_mod.AsyncLoadTask;
 pub const loadFileAsync = reader_mod.loadFileAsync;
 

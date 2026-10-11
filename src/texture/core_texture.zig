@@ -28,9 +28,6 @@ const block_mod = @import("core_block.zig");
 const decode_mod = @import("core_decode.zig");
 const hdr_mod = @import("core_hdr.zig");
 
-pub const TextureColorSpace = dds.TextureColorSpace;
-pub const TextureSlot = dds.TextureSlot;
-
 pub const Texture = struct {
     pub const TextureColorSpace = dds.TextureColorSpace;
     pub const TextureSlot = dds.TextureSlot;

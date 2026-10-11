@@ -7,8 +7,6 @@ pub const EasingType = easing_mod.EasingType;
 
 const sampler_mod = @import("sampler.zig");
 pub const AnimationPath = sampler_mod.AnimationPath;
-pub const AnimationInterpolation = sampler_mod.AnimationInterpolation;
-pub const AnimationEvent = sampler_mod.AnimationEvent;
 pub const AnimationSampler = sampler_mod.AnimationSampler;
 
 pub const AnimationChannel = struct {

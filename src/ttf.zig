@@ -119,7 +119,6 @@ const atlas = @import("ttf/atlas.zig");
 const fixture = @import("ttf/fixture.zig");
 
 // Shared vocabulary (lives in ttf/types.zig).
-pub const TtfError = types.TtfError;
 pub const atlas_size: u32 = types.atlas_size;
 
 // sfnt container (lives in ttf/font.zig).
@@ -127,15 +126,12 @@ pub const sniff = font_mod.sniff;
 pub const Font = font_mod.Font;
 
 // Outlines (live in ttf/outline.zig).
-pub const OutlinePoint = outline.OutlinePoint;
-pub const Contour = outline.Contour;
 pub const extractOutline = outline.extractOutline;
 
 // Private for the tests below (NOT part of the public surface).
 const freeContours = outline.freeContours;
 
 // Flattening + rasterization (live in ttf/raster.zig).
-pub const Segment = raster.Segment;
 pub const flattenContours = raster.flattenContours;
 pub const rasterizeSegments = raster.rasterizeSegments;
 
@@ -144,10 +140,6 @@ pub const GlyphInfo = atlas.GlyphInfo;
 pub const TtfFont = atlas.TtfFont;
 
 // Fixture writer (lives in ttf/fixture.zig).
-pub const FixtureCmap = fixture.FixtureCmap;
-pub const FixtureComposite = fixture.FixtureComposite;
-pub const FixtureLoca = fixture.FixtureLoca;
-pub const FixtureOptions = fixture.FixtureOptions;
 pub const buildFixture = fixture.buildFixture;
 
 // ---------------------------------------------------------------------------

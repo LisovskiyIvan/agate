@@ -42,8 +42,6 @@ const cube = @import("texture/cube.zig");
 
 // 2D texture (owner lives in texture/core_texture.zig, via the core.zig facade).
 pub const Texture = core.Texture;
-pub const TextureColorSpace = core.TextureColorSpace;
-pub const TextureSlot = core.TextureSlot;
 
 // Cube texture and its gradient options (live in texture/cube.zig).
 pub const CubeTexture = cube.CubeTexture;
@@ -54,4 +52,3 @@ pub const srgbToLinearU8 = color.srgbToLinearU8;
 
 // Approximate bytes per pixel for a Sokol pixel format (lives in
 // texture/mip.zig).
-pub const pixelFormatBytes = mip.pixelFormatBytes;

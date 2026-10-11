@@ -14,6 +14,4 @@ const texture_mod = @import("core_texture.zig");
 const testpng_mod = @import("core_testpng.zig");
 
 pub const Texture = texture_mod.Texture;
-pub const TextureColorSpace = texture_mod.TextureColorSpace;
-pub const TextureSlot = texture_mod.TextureSlot;
 pub const TestPng = testpng_mod.TestPng;

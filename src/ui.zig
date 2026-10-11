@@ -49,45 +49,13 @@ pub const UICanvas = ui_canvas.UICanvas;
 
 // Re-exports from the split leaf modules (public API unchanged).
 pub const UIVertex = ui_draw.UIVertex;
-pub const GlyphUV = ui_text.GlyphUV;
-pub const getGlyphUV = ui_text.getGlyphUV;
 pub const ScrollState = ui_input.ScrollState;
 pub const TextInputState = ui_input.TextInputState;
-pub const TtfFont = ui_font.TtfFont;
 
 // Re-exports from layout module
-pub const UISize = ui_layout.UISize;
 pub const UIEdges = ui_layout.UIEdges;
-pub const UIAnchor = ui_layout.UIAnchor;
-pub const UIDock = ui_layout.UIDock;
-pub const anchorRect = ui_layout.anchorRect;
-pub const dockRect = ui_layout.dockRect;
-pub const FlexDirection = ui_layout.FlexDirection;
-pub const JustifyContent = ui_layout.JustifyContent;
-pub const AlignItems = ui_layout.AlignItems;
-pub const LayoutItem = ui_layout.LayoutItem;
-pub const solveFlex = ui_layout.solveFlex;
-pub const GridTrack = ui_layout.GridTrack;
-pub const solveGridTracks = ui_layout.solveGridTracks;
-pub const AdvancedGridSpec = ui_layout.AdvancedGridSpec;
 
 // Re-exports from the layout container module (ui/stack.zig)
-pub const LayoutAlign = ui_stack.LayoutAlign;
-pub const LayoutAlignCross = ui_stack.LayoutAlignCross;
-pub const layoutAlignOffset = ui_stack.layoutAlignOffset;
-pub const gridExtentSize = ui_stack.gridExtentSize;
-pub const gridExtentOffset = ui_stack.gridExtentOffset;
-pub const LayoutGridSpec = ui_stack.LayoutGridSpec;
-pub const LayoutFlowOptions = ui_stack.LayoutFlowOptions;
-pub const LayoutGridOptions = ui_stack.LayoutGridOptions;
-pub const LayoutFlexOptions = ui_stack.LayoutFlexOptions;
-pub const LayoutLabelOptions = ui_stack.LayoutLabelOptions;
-pub const LayoutButtonOptions = ui_stack.LayoutButtonOptions;
-pub const LayoutCheckboxOptions = ui_stack.LayoutCheckboxOptions;
-pub const LayoutSliderOptions = ui_stack.LayoutSliderOptions;
-pub const LayoutProgressOptions = ui_stack.LayoutProgressOptions;
-pub const LayoutDividerOptions = ui_stack.LayoutDividerOptions;
-pub const LayoutBadgeOptions = ui_stack.LayoutBadgeOptions;
 // LayoutStack is generic over the canvas pointer; the facade pins the
 // production instantiation so `LayoutStack.init(&canvas)` keeps working.
 pub const LayoutStack = ui_stack.LayoutStack(ui_canvas.UICanvas);
@@ -96,11 +64,7 @@ pub const LayoutStack = ui_stack.LayoutStack(ui_canvas.UICanvas);
 // the same parser as a method on the theme type; install a parsed theme on
 // a canvas with UICanvas.applyCssTheme.
 pub const CssTheme = css_parser.CssTheme;
-pub const CssClass = css_parser.CssClass;
-pub const CssDiag = css_parser.CssDiag;
-pub const CssDiagKind = css_parser.CssDiagKind;
 pub const parseCss = css_parser.parseCss;
-pub const loadThemeFile = css_parser.loadThemeFile;
 
 // ---------------------------------------------------------------------
 // Styling (CSS-like, immediate-mode; no string parsing, no allocation)
@@ -123,21 +87,3 @@ pub const loadThemeFile = css_parser.loadThemeFile;
 // The style value types live in ui/types.zig, the theme in ui/theme.zig and
 // the transition math in ui/transition.zig; the facade re-exports them under
 // their historical names so callers keep one import path.
-pub const UIState = ui_types.UIState;
-pub const UIGradient = ui_types.UIGradient;
-pub const UIShadow = ui_types.UIShadow;
-pub const UIStyle = ui_types.UIStyle;
-pub const UIStyleOverride = ui_types.UIStyleOverride;
-pub const UIStyleSet = ui_types.UIStyleSet;
-pub const TransitionOptions = ui_types.TransitionOptions;
-pub const UIStyleKind = ui_types.UIStyleKind;
-pub const UIStyledOptions = ui_types.UIStyledOptions;
-pub const UIStyleRequest = ui_types.UIStyleRequest;
-pub const UIStyleClass = ui_types.UIStyleClass;
-pub const UIBoxStyle = ui_types.UIBoxStyle;
-pub const max_style_classes = ui_types.max_style_classes;
-pub const UITheme = ui_theme_mod.UITheme;
-pub const UIStyleTransition = ui_transition.UIStyleTransition;
-pub const max_style_transitions = ui_transition.max_style_transitions;
-pub const lerpStyle = ui_transition.lerpStyle;
-pub const styleEql = ui_transition.styleEql;

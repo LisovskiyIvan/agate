@@ -2,7 +2,6 @@ const std = @import("std");
 
 pub const types = @import("mesh/types.zig");
 pub const Vertex = types.Vertex;
-pub const CullingStrategy = types.CullingStrategy;
 pub const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 pub const MorphTarget = types.MorphTarget;
 pub const MorphMode = types.MorphMode;
@@ -19,7 +18,6 @@ pub const Mesh = mesh_impl.Mesh;
 pub const InstanceRenderState = mesh_impl.InstanceRenderState;
 pub const InstancePreviewState = mesh_impl.InstancePreviewState;
 pub const InstanceSource = mesh_impl.InstanceSource;
-pub const InstancePairMode = mesh_impl.InstancePairMode;
 pub const instancePairMode = mesh_impl.instancePairMode;
 pub const normalizeInstancePingPong = mesh_impl.normalizeInstancePingPong;
 pub const StagedInstanceRecord = mesh_impl.StagedInstanceRecord;
@@ -27,8 +25,6 @@ pub const uploadGeometry = mesh_impl.uploadGeometry;
 // Mesh-referencing instance vocabulary (lives in mesh/mesh.zig with the
 // Mesh owner; see the note there).
 pub const InstancedMesh = mesh_impl.InstancedMesh;
-pub const BoneAttachment = mesh_impl.BoneAttachment;
-pub const LODLevel = mesh_impl.LODLevel;
 
 /// GPU morph blending: delta-texture packing plus the pure Zig mirror of
 /// the vertex-shader blend (opt-in via Mesh.morph_mode == .gpu).
@@ -39,29 +35,8 @@ pub const vat = @import("mesh/vat.zig");
 pub const VatData = vat.VatData;
 pub const VatBaker = vat.VatBaker;
 pub const VatPlayer = vat.VatPlayer;
-pub const VatConfig = vat.VatConfig;
-pub const VatLayout = vat.VatLayout;
-pub const VatSampleParams = vat.VatSampleParams;
 
 pub const builders = @import("mesh/builders.zig");
-pub const BoxOptions = builders.BoxOptions;
-pub const SphereOptions = builders.SphereOptions;
-pub const GroundOptions = builders.GroundOptions;
-pub const TerrainOptions = builders.TerrainOptions;
-pub const CylinderOptions = builders.CylinderOptions;
-pub const CapsuleOptions = builders.CapsuleOptions;
-pub const TorusOptions = builders.TorusOptions;
-pub const TorusKnotOptions = builders.TorusKnotOptions;
-pub const DiscOptions = builders.DiscOptions;
-pub const RibbonOptions = builders.RibbonOptions;
-pub const LatheOptions = builders.LatheOptions;
-pub const PlaneOptions = builders.PlaneOptions;
-pub const TubeOptions = builders.TubeOptions;
-pub const LinesOptions = builders.LinesOptions;
-pub const ExtrudeOptions = builders.ExtrudeOptions;
-pub const PolygonSideOrientation = builders.PolygonSideOrientation;
-pub const PolygonPlane = builders.PolygonPlane;
-pub const PolygonOptions = builders.PolygonOptions;
 
 // Quad/seed helpers shared by the builders and used by mesh tests.
 pub const storeQuad = builders.storeQuad;
@@ -89,30 +64,21 @@ pub const MeshBuilder = builder.MeshBuilder;
 pub const decal = @import("mesh/decal.zig");
 pub const DecalOptions = decal.DecalOptions;
 pub const buildDecalData = decal.buildDecalData;
-pub const createDecal = decal.createDecal;
 pub const DecalProjector = decal.DecalProjector;
 pub const DecalSpawnOptions = decal.DecalSpawnOptions;
-pub const DecalInstance = decal.DecalInstance;
 pub const DecalManager = decal.DecalManager;
 pub const barycentric = decal.barycentric;
 pub const blendSkinWeights = decal.blendSkinWeights;
 
 pub const trail = @import("mesh/trail.zig");
-pub const TrailOptions = trail.TrailOptions;
 pub const TrailMesh = trail.TrailMesh;
 pub const TrailNode = trail.TrailNode;
 
 pub const csg = @import("mesh/csg.zig");
 pub const CSG = csg.CSG;
-pub const CSGVertex = csg.CSGVertex;
-pub const CSGPlane = csg.CSGPlane;
-pub const CSGPolygon = csg.CSGPolygon;
-pub const CSGNode = csg.CSGNode;
 
 pub const greased_line = @import("mesh/greased_line.zig");
 pub const GreasedLineOptions = greased_line.GreasedLineOptions;
-pub const GreasedLineUVMode = greased_line.GreasedLineUVMode;
-pub const GreasedLineColorMode = greased_line.GreasedLineColorMode;
 pub const GreasedLineMesh = greased_line.GreasedLineMesh;
 pub const buildGreasedLineData = greased_line.buildGreasedLineData;
 
