@@ -1,6 +1,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const outline_shd = @import("outline_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -465,16 +466,13 @@ pub const OutlinePass = struct {
             if (sg.queryPipelineState(pip) != .VALID) continue;
 
             if (item.vertex_buffer.id == 0) continue;
-            if (sg.isvalid()) {
-                if (sg.queryBufferState(item.vertex_buffer) != .VALID) continue;
-                if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) continue;
-            }
+            if (sg.isvalid() and !gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) continue;
 
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = item.vertex_buffer;
             if (instanced) {
                 if (item.instance_buffer.id == 0 or item.visible_instance_count == 0) continue;
-                if (sg.isvalid() and sg.queryBufferState(item.instance_buffer) != .VALID) continue;
+                if (sg.isvalid() and !gpu_thread.createdBufferIsValid(item.instance_buffer)) continue;
                 bind.vertex_buffers[1] = item.instance_buffer;
             }
             if (is_cutout and item.cutout_view != null and item.cutout_sampler != null) {

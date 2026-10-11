@@ -34,6 +34,7 @@ const ParticleDraw = particle_pass_mod.ParticlePass.ParticleDraw;
 const particles_mod = @import("../particles.zig");
 const taa_mod = @import("../postprocess/taa.zig");
 const pipelines = @import("velocity/pipelines.zig");
+const gpu_thread = @import("../gpu_thread.zig");
 
 /// Packs the FS alpha-test uniforms from a frozen draw record (the actual
 /// mapping the draws use — never hand-rolled per call): slot-0 albedo UV
@@ -461,7 +462,7 @@ pub const VelocityPass = struct {
         const tex_view = sg.makeView(.{
             .texture = .{ .image = img },
         });
-        if (sg.queryViewState(att_view) != .VALID or sg.queryViewState(tex_view) != .VALID) {
+        if (!gpu_thread.createdViewIsValid(att_view) or !gpu_thread.createdViewIsValid(tex_view)) {
             if (tex_view.id != 0) sg.destroyView(tex_view);
             if (att_view.id != 0) sg.destroyView(att_view);
             sg.destroyImage(img);
@@ -499,9 +500,7 @@ pub const VelocityPass = struct {
         // Own color target plus the BORROWED main depth attachment (never
         // owned or destroyed here): every handle revalidated, since a
         // failed ensure must never leave a stale-sized target samplable.
-        if (self.att_view.id == 0 or main_depth_att_view.id == 0) return;
-        if (sg.queryViewState(self.att_view) != .VALID) return;
-        if (sg.queryViewState(main_depth_att_view) != .VALID) return;
+        if (!gpu_thread.createdViewIsValid(self.att_view) or !gpu_thread.createdViewIsValid(main_depth_att_view)) return;
         if (!self.ensurePipelinesFor(main_depth_format)) return;
 
         // Shared-depth plan (see velocityDepthPassAction): own color is
@@ -547,15 +546,13 @@ pub const VelocityPass = struct {
     /// validation, then draws. Returns the issued draw count for stats.
     fn drawParticleMarkers(self: *VelocityPass, view_proj: Mat4, markers: MarkerArgs) u32 {
         if (markers.draws.len == 0) return 0;
-        if (self.marker_quad_vb.id == 0 or sg.queryBufferState(self.marker_quad_vb) != .VALID) return 0;
-        if (self.marker_quad_ib.id == 0 or sg.queryBufferState(self.marker_quad_ib) != .VALID) return 0;
-        if (sg.queryPipelineState(self.pip_marker_cpu) != .VALID) return 0;
-        if (sg.queryPipelineState(self.pip_marker_gpu) != .VALID) return 0;
+        if (!gpu_thread.createdBufferIsValid(self.marker_quad_vb) or !gpu_thread.createdBufferIsValid(self.marker_quad_ib)) return 0;
+        if (!gpu_thread.createdPipelineIsValid(self.pip_marker_cpu) or !gpu_thread.createdPipelineIsValid(self.pip_marker_gpu)) return 0;
         var draws: u32 = 0;
         for (markers.draws) |draw| {
             const instance_buf = draw.drawBuffer();
             if (!particleMarkerDrawDecision(draw.active_count, instance_buf.id != 0)) continue;
-            if (sg.queryBufferState(instance_buf) != .VALID) continue;
+            if (!gpu_thread.createdBufferIsValid(instance_buf)) continue;
             const gpu = draw.simulation_mode == .gpu;
             sg.applyPipeline(if (gpu) self.pip_marker_gpu else self.pip_marker_cpu);
             var bind = sg.Bindings{};
@@ -620,8 +617,7 @@ pub const VelocityPass = struct {
                 .morph_fallback = item.velocity_depth_fallback,
                 .index_count = item.index_count,
             })) continue;
-            if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) continue;
-            if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) continue;
+            if (!gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) continue;
             const cur_mvp = Mat4.mul(view_proj, item.model);
             if (item.is_skinned) {
                 const bones = scene_render_queue.skinAt(skins, item.skin_index) orelse continue;
@@ -657,9 +653,7 @@ pub const VelocityPass = struct {
                 .index_count = batch.index_count,
             })) continue;
             if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) continue;
-            if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) continue;
-            if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) continue;
-            if (sg.queryBufferState(batch.instance_buffer) != .VALID) continue;
+            if (!gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) continue;
             const pip = if (batch.index_type == .UINT32) self.pip_marker_glass_inst_u32 else self.pip_marker_glass_inst_u16;
             if (sg.queryPipelineState(pip) != .VALID) continue;
             sg.applyPipeline(pip);
@@ -694,8 +688,7 @@ pub const VelocityPass = struct {
             .morph_fallback = item.velocity_depth_fallback,
             .index_count = item.index_count,
         }) != .draw) return false;
-        if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) return false;
-        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return false;
+        if (!gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) return false;
 
         // Generation gate: frozen prev state is usable only when it comes
         // from the last actually rendered frame. Anything staged but never
@@ -779,15 +772,12 @@ pub const VelocityPass = struct {
             .index_count = batch.index_count,
         }) != .draw) return false;
         if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return false;
-        if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) return false;
-        if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) return false;
-        if (sg.queryBufferState(batch.instance_buffer) != .VALID) return false;
+        if (!gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) return false;
 
         // Same generation gate as regular draws: an unmatched prev buffer
         // aliases cur (zero motion) instead of pairing unrendered history.
         const prev_buf = if (usePresentedPrev(batch.prev_frame, last_rendered) and
-            batch.prev_instance_buffer.id != 0 and
-            sg.queryBufferState(batch.prev_instance_buffer) == .VALID)
+            gpu_thread.createdBufferIsValid(batch.prev_instance_buffer))
             batch.prev_instance_buffer
         else
             batch.instance_buffer;

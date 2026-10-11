@@ -81,6 +81,12 @@ pub fn createdViewIsValid(view: sg.View) bool {
     return sg.queryViewState(view) == .VALID;
 }
 
+/// Live image adoption check (same contract as buffers).
+pub fn createdImageIsValid(img: sg.Image) bool {
+    if (img.id == 0) return false;
+    return sg.queryImageState(img) == .VALID;
+}
+
 /// Live shader adoption check (same contract as buffers).
 pub fn createdShaderIsValid(shd: sg.Shader) bool {
     if (shd.id == 0) return false;
@@ -91,4 +97,27 @@ pub fn createdShaderIsValid(shd: sg.Shader) bool {
 pub fn createdPipelineIsValid(pip: sg.Pipeline) bool {
     if (pip.id == 0) return false;
     return sg.queryPipelineState(pip) == .VALID;
+}
+
+/// Required-vertex + optional-index geometry gate for draw sites. True iff
+/// `vb` is adoptable (nonzero id AND VALID state) and `ib` is either unbound
+/// (id 0, non-indexed draw) or adoptable. Collapses the two-line
+/// `vb.id == 0 or query != VALID` + `ib.id != 0 and query != VALID` chain
+/// repeated at every forward/depth/velocity/marker draw site into one call.
+/// Live context only: nonzero handles are queried, so callers must hold the
+/// same `sg.isvalid()` gate the raw chains held (headless paths keep their
+/// own skip/branch before reaching here).
+pub fn geometryValid(vb: sg.Buffer, ib: sg.Buffer) bool {
+    if (!createdBufferIsValid(vb)) return false;
+    if (ib.id != 0 and !createdBufferIsValid(ib)) return false;
+    return true;
+}
+
+/// Instanced-batch geometry gate: geometryValid plus the required instance
+/// buffer (nonzero id AND VALID). Collapses the three-line
+/// vertex/index/instance chain at the instanced draw sites (forward, depth
+/// prepass, velocity). Same live-context contract as geometryValid.
+pub fn instancedGeometryValid(vb: sg.Buffer, ib: sg.Buffer, inst: sg.Buffer) bool {
+    if (!geometryValid(vb, ib)) return false;
+    return createdBufferIsValid(inst);
 }

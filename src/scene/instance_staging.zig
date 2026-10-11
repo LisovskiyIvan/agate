@@ -636,10 +636,8 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                     .size = new_cap * @sizeOf(Mat4),
                 });
             }
-            // A failed makeBuffer may still hand out a nonzero id in
-            // FAILED resource state (id == 0 means pool exhaustion only),
-            // so validity is checked via queryBufferState, not the id.
-            if (new_buf.id == 0 or sg.queryBufferState(new_buf) != .VALID) {
+            // VALID-only adoption (see gpu_thread.createdBufferIsValid).
+            if (!gpu_thread.createdBufferIsValid(new_buf)) {
                 // Coherent failure: keep the previous complete published
                 // state (new bounds/count never mix with old geometry),
                 // release the failed pool slot, publish nothing — a later
@@ -698,7 +696,7 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                         // Ensure the other slot (rollback-safe create;
                         // FAILED ids are destroyed, never adopted).
                         var other = st.buffers[st.active_slot ^ 1];
-                        if (other.id != 0 and sg.queryBufferState(other) != .VALID) {
+                        if (other.id != 0 and !gpu_thread.createdBufferIsValid(other)) {
                             sg.destroyBuffer(other);
                             other = .{};
                         }
@@ -707,7 +705,7 @@ pub fn stageInstancesGpuState(gctx: GpuStageContext, st: *InstanceRenderState, m
                                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                                 .size = st.capacity * @sizeOf(Mat4),
                             });
-                            if (other.id == 0 or sg.queryBufferState(other) != .VALID) {
+                            if (!gpu_thread.createdBufferIsValid(other)) {
                                 if (other.id != 0) sg.destroyBuffer(other);
                                 other = .{};
                             }

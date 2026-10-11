@@ -1,6 +1,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const math = @import("math");
 const Mat4 = math.Mat4;
 const Color4 = math.Color4;
@@ -69,7 +70,7 @@ pub const ViewportClearPass = struct {
                 .offset = @offsetOf(debug_pass.Vertex, "color"),
             };
             const pip = sg.makePipeline(pip_desc);
-            if (sg.queryPipelineState(pip) != .VALID) {
+            if (!gpu_thread.createdPipelineIsValid(pip)) {
                 std.debug.print("[CLEAR PIPELINE FAILED]: shader_state={}, pip_state={}\n", .{
                     sg.queryShaderState(self.shader),
                     sg.queryPipelineState(pip),
@@ -89,7 +90,7 @@ pub const ViewportClearPass = struct {
     pub fn clear(self: *ViewportClearPass, color: Color4, samples: i32, color_format: sg.PixelFormat) void {
         self.ensureResources(samples, color_format);
         const pip = self.pipeline;
-        if (pip.id == 0 or self.vbs[0].id == 0 or sg.queryPipelineState(pip) != .VALID) return;
+        if (!gpu_thread.createdPipelineIsValid(pip) or self.vbs[0].id == 0) return;
         const clear_verts = [_]debug_pass.Vertex{
             .{ .position = .{ -1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
             .{ .position = .{ 1.0, -1.0, 1.0 }, .color = .{ color.r, color.g, color.b, color.a } },
@@ -100,7 +101,7 @@ pub const ViewportClearPass = struct {
         };
         const vb = self.vbs[self.cur_vb % self.vbs.len];
         self.cur_vb +%= 1;
-        if (vb.id == 0 or sg.queryBufferState(vb) != .VALID) return;
+        if (!gpu_thread.createdBufferIsValid(vb)) return;
 
         sg.writeBufferTransient(.{
             .dst = .{ .buffer = vb },

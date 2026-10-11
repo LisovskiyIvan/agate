@@ -1,6 +1,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const outline_shd = @import("outline_shader");
 const blur_shd = @import("glow_blur_shader");
 const pp = @import("../postprocess.zig");
@@ -430,10 +431,7 @@ pub const HighlightPass = struct {
             if (item.vertex_buffer.id == 0 or item.index_buffer.id == 0) continue;
             const pip = if (item.is_u32) self.mask_pipeline_u32 else self.mask_pipeline_u16;
             if (pip.id == 0) continue;
-            if (sg.isvalid()) {
-                if (sg.queryBufferState(item.vertex_buffer) != .VALID) continue;
-                if (sg.queryBufferState(item.index_buffer) != .VALID) continue;
-            }
+            if (sg.isvalid() and !gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) continue;
 
             var bind = sg.Bindings{};
             bind.vertex_buffers[0] = item.vertex_buffer;

@@ -116,11 +116,8 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = verts.len * @sizeOf(@TypeOf(verts[0])),
             });
-            // Nonzero id may still be FAILED state (pool exhaustion is id 0
-            // only); draw rejects FAILED permanently, so release the failed
-            // slot and stay undelivered for retry. Same contract as the
-            // instance-staging growth path.
-            if (vbuf.id == 0 or sg.queryBufferState(vbuf) != .VALID) {
+            // VALID-only adoption (see gpu_thread.createdBufferIsValid).
+            if (!gpu_thread.createdBufferIsValid(vbuf)) {
                 if (vbuf.id != 0) sg.destroyBuffer(vbuf);
                 continue;
             }
@@ -141,7 +138,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             } else {
                 ibuf = sg.makeBuffer(.{ .usage = .{ .index_buffer = true }, .data = sg.asRange(idx32) });
             }
-            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(ibuf)) {
                 if (ibuf.id != 0) sg.destroyBuffer(ibuf);
                 sg.destroyBuffer(vbuf);
                 continue;
@@ -150,7 +147,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             up.created_index_buffer_id = ibuf.id;
         } else {
             vbuf = mesh_deferred.makeDeferredMeshVertexBuffer(.{ .data = sg.asRange(verts) });
-            if (vbuf.id == 0 or sg.queryBufferState(vbuf) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(vbuf)) {
                 if (vbuf.id != 0) sg.destroyBuffer(vbuf);
                 continue;
             }
@@ -165,7 +162,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             } else {
                 ibuf = sg.makeBuffer(.{ .usage = .{ .index_buffer = true }, .data = sg.asRange(idx32) });
             }
-            if (ibuf.id == 0 or sg.queryBufferState(ibuf) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(ibuf)) {
                 if (ibuf.id != 0) sg.destroyBuffer(ibuf);
                 sg.destroyBuffer(vbuf);
                 continue;
@@ -200,10 +197,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
             };
             img_desc.data.mip_levels[0] = sg.asRange(slot.pending_delta_data.items[up.delta_lo..d_end]);
             const img = sg.makeImage(img_desc);
-            // Nonzero id may still be FAILED state (same contract as the
-            // buffer creations above): tear everything down inline and stay
-            // undelivered so the commit re-arms both flags atomically.
-            if (img.id == 0 or sg.queryImageState(img) != .VALID) {
+            if (!gpu_thread.createdImageIsValid(img)) {
                 if (img.id != 0) sg.destroyImage(img);
                 sg.destroyBuffer(vbuf);
                 sg.destroyBuffer(ibuf);
@@ -213,7 +207,7 @@ fn flushPendingCreations(scene: anytype, slot: anytype) void {
                 continue;
             }
             const view = sg.makeView(.{ .texture = .{ .image = img } });
-            if (view.id == 0 or sg.queryViewState(view) != .VALID) {
+            if (!gpu_thread.createdViewIsValid(view)) {
                 if (view.id != 0) sg.destroyView(view);
                 sg.destroyImage(img);
                 sg.destroyBuffer(vbuf);
@@ -282,10 +276,7 @@ fn flushParticleCpu(scene: anytype, slot: anytype) void {
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.capacity * @sizeOf(@TypeOf(slot.p_cpu_data.items[0])),
             });
-            // Nonzero id may still be FAILED state (same contract as
-            // flushPendingCreations): release the failed slot and stay
-            // undelivered; the commit re-arms for retry.
-            if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(created)) {
                 if (created.id != 0) sg.destroyBuffer(created);
                 continue;
             }
@@ -322,10 +313,7 @@ fn flushParticleGpu(scene: anytype, slot: anytype) void {
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = up.capacity * @sizeOf(@TypeOf(slot.p_gpu_data.items[0])),
             });
-            // Nonzero id may still be FAILED state (same contract as
-            // flushPendingCreations): release the failed slot and stay
-            // undelivered; the commit re-arms for retry.
-            if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(created)) {
                 if (created.id != 0) sg.destroyBuffer(created);
                 continue;
             }
@@ -400,11 +388,10 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                     .usage = .{ .storage_buffer = true },
                     .data = sg.Range{ .ptr = zeros.ptr, .size = zeros.len },
                 });
-                // FAILED-state guard (same contract as the buffer sites
-                // above): destroy the failed slot inline and keep the
-                // partial-progress semantics below (already-recorded
-                // handles ride the outcome for the commit to install).
-                if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+                // Destroy FAILED slots inline, never adopt them (see
+                // gpu_thread.createdBufferIsValid); partial handles recorded
+                // below still ride the outcome for the commit to install.
+                if (!gpu_thread.createdBufferIsValid(created)) {
                     if (created.id != 0) sg.destroyBuffer(created);
                     continue;
                 }
@@ -416,7 +403,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                     .usage = .{ .storage_buffer = true, .write_transient = true },
                     .size = cap * @sizeOf(@import("../particles/types.zig").GpuParticleSlot),
                 });
-                if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+                if (!gpu_thread.createdBufferIsValid(created)) {
                     if (created.id != 0) sg.destroyBuffer(created);
                     continue;
                 }
@@ -428,7 +415,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                     .usage = .{ .vertex_buffer = true, .storage_buffer = true },
                     .size = cap * @sizeOf(@import("../particles/types.zig").ParticleInstanceData),
                 });
-                if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+                if (!gpu_thread.createdBufferIsValid(created)) {
                     if (created.id != 0) sg.destroyBuffer(created);
                     continue;
                 }
@@ -440,7 +427,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                 // FAILED views are destroyed inline: this flush runs on the
                 // context thread (same-thread teardown precedent as
                 // deinitComputeGpuObjects), so no retire queue is needed.
-                if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+                if (!gpu_thread.createdViewIsValid(created)) {
                     if (created.id != 0) sg.destroyView(created);
                     continue;
                 }
@@ -449,7 +436,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             }
             if (spawn_view == 0 and spawn_id != 0) {
                 const created = compute.makeStorageView(.{ .id = spawn_id }, "compute-particles-spawn");
-                if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+                if (!gpu_thread.createdViewIsValid(created)) {
                     if (created.id != 0) sg.destroyView(created);
                     continue;
                 }
@@ -458,7 +445,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             }
             if (draw_view == 0 and draw_id != 0) {
                 const created = compute.makeStorageView(.{ .id = draw_id }, "compute-particles-draw");
-                if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+                if (!gpu_thread.createdViewIsValid(created)) {
                     if (created.id != 0) sg.destroyView(created);
                     continue;
                 }
@@ -467,7 +454,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             }
             if (shader_id == 0) {
                 const created = sg.makeShader(pc_shd.particleComputeShaderDesc(sg.queryBackend()));
-                if (created.id == 0 or sg.queryShaderState(created) != .VALID) {
+                if (!gpu_thread.createdShaderIsValid(created)) {
                     if (created.id != 0) sg.destroyShader(created);
                     continue;
                 }
@@ -476,7 +463,7 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
             }
             if (pipeline_id == 0 and shader_id != 0) {
                 const created = compute.makePipeline(.{ .id = shader_id }, "compute-particles");
-                if (created.id == 0 or sg.queryPipelineState(created) != .VALID) {
+                if (!gpu_thread.createdPipelineIsValid(created)) {
                     if (created.id != 0) sg.destroyPipeline(created);
                     continue;
                 }
@@ -496,9 +483,9 @@ fn flushParticleCompute(scene: anytype, slot: anytype) void {
                 .usage = .{ .storage_buffer = true },
                 .data = sg.Range{ .ptr = zeros.ptr, .size = zeros.len },
             });
-            if (created_buf.id != 0 and sg.queryBufferState(created_buf) == .VALID) {
+            if (gpu_thread.createdBufferIsValid(created_buf)) {
                 const created_view = compute.makeStorageView(created_buf, "compute-particles-state");
-                if (created_view.id != 0 and sg.queryViewState(created_view) == .VALID) {
+                if (gpu_thread.createdViewIsValid(created_view)) {
                     up.created_state_buffer_id = created_buf.id;
                     up.created_state_view_id = created_view.id;
                     state_id = created_buf.id;
@@ -608,7 +595,7 @@ fn flushTrails(scene: anytype, slot: anytype) void {
             // reach the commit (it would strand a dead live handle with the
             // pending flags cleared). The else arm already destroys any
             // nonzero handle, so FAILED follows the pool-exhaustion path.
-            if (vb.id != 0 and ib.id != 0 and sg.queryBufferState(vb) == .VALID and sg.queryBufferState(ib) == .VALID) {
+            if (gpu_thread.createdBufferIsValid(vb) and gpu_thread.createdBufferIsValid(ib)) {
                 up.created_vertex_buffer_id = vb.id;
                 up.created_index_buffer_id = ib.id;
                 vertex_id = vb.id;
@@ -683,7 +670,7 @@ fn flushSoftbodies(scene: anytype, slot: anytype) void {
             });
             // Pair-atomic VALID-only creation (see flushTrails): a nonzero
             // FAILED id follows the pool-exhaustion path via the else arm.
-            if (vb.id != 0 and ib.id != 0 and sg.queryBufferState(vb) == .VALID and sg.queryBufferState(ib) == .VALID) {
+            if (gpu_thread.createdBufferIsValid(vb) and gpu_thread.createdBufferIsValid(ib)) {
                 up.created_vertex_buffer_id = vb.id;
                 up.created_index_buffer_id = ib.id;
                 vertex_id = vb.id;
@@ -743,7 +730,7 @@ fn flushGreased(scene: anytype, slot: anytype) void {
                 .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = up.index_cap * @sizeOf(@TypeOf(slot.greased_indices.items[0])),
             });
-            if (vb.id == 0 or ib.id == 0 or sg.queryBufferState(vb) != .VALID or sg.queryBufferState(ib) != .VALID) {
+            if (!gpu_thread.createdBufferIsValid(vb) or !gpu_thread.createdBufferIsValid(ib)) {
                 if (vb.id != 0) sg.destroyBuffer(vb);
                 if (ib.id != 0) sg.destroyBuffer(ib);
                 // Creation failed (pool exhaustion or FAILED state):

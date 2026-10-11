@@ -27,6 +27,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const depth_shd = @import("msaa_depth_shader");
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -265,8 +266,7 @@ pub const MsaaDepthPass = struct {
     ) bool {
         if (!itemContributesDepth(item.transparent, item.is_decal, item.shader_index != null)) return false;
         if (item.index_count == 0) return false;
-        if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) return false;
-        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return false;
+        if (!gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) return false;
 
         const mvp = Mat4.mul(view_proj, item.model);
         if (item.is_skinned) {
@@ -303,9 +303,7 @@ pub const MsaaDepthPass = struct {
     ) bool {
         if (!itemContributesDepth(batch.transparent, batch.is_decal, false)) return false;
         if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return false;
-        if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) return false;
-        if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) return false;
-        if (sg.queryBufferState(batch.instance_buffer) != .VALID) return false;
+        if (!gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) return false;
 
         sg.applyPipeline(if (batch.index_type == .UINT32) self.inst_pip_u32 else self.inst_pip_u16);
         var bind = sg.Bindings{};

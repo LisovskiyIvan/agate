@@ -1,6 +1,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
+const gpu_thread = @import("../gpu_thread.zig");
 const pbr_shd = @import("pbr_shader");
 const skinned_pbr_shd = @import("skinned_pbr_shader");
 const inst_pbr_shd = @import("instanced_pbr_shader");
@@ -103,10 +104,7 @@ pub fn drawRegularItem(
     coats: []const material_mod.CoatParams,
 ) void {
     if (item.index_count == 0) return;
-    if (sg.isvalid()) {
-        if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) return;
-        if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) return;
-    }
+    if (sg.isvalid() and !gpu_thread.geometryValid(item.vertex_buffer, item.index_buffer)) return;
 
     const model = item.model;
     const mvp = Mat4.mul(ctx.view_proj, model);
@@ -693,11 +691,7 @@ pub fn instancedDrawFlags(material: ?Material, is_decal: bool) struct { transpar
 // meshes share the already-blended dynamic vertex buffer.
 pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, ctx: *const FrameContext, current_pipeline_id: *u32, coats: []const material_mod.CoatParams) void {
     if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return;
-    if (sg.isvalid()) {
-        if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) return;
-        if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) return;
-        if (sg.queryBufferState(batch.instance_buffer) != .VALID) return;
-    }
+    if (sg.isvalid() and !gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) return;
 
     const is_pbr = batch.is_pbr;
     const is_u32 = batch.index_type == .UINT32;
