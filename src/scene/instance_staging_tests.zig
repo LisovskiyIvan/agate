@@ -665,12 +665,289 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
     try std.testing.expectApproxEqAbs(@as(f32, -10.0), scratch_inline.items[0].m[12], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scratch_inline.items[1].m[12], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), scratch_inline.items[2].m[12], 1e-6);
+}
 
-    // Farthest-first check per eye (strict distances, no tiebreak needed).
-    const d_live_0 = Vec3.new(scratch_build.items[0].m[12], 0, 0).sub(eye_live).lengthSq();
-    const d_live_1 = Vec3.new(scratch_build.items[1].m[12], 0, 0).sub(eye_live).lengthSq();
-    try std.testing.expect(d_live_0 > d_live_1);
-    const d_snap_0 = Vec3.new(scratch_inline.items[0].m[12], 0, 0).sub(eye_snap).lengthSq();
-    const d_snap_1 = Vec3.new(scratch_inline.items[1].m[12], 0, 0).sub(eye_snap).lengthSq();
-    try std.testing.expect(d_snap_0 > d_snap_1);
+// ---- PERF characterization: warm steady-state CPU staging alloc churn. ----
+
+const CountingBacking = struct {
+    backing: std.mem.Allocator,
+    alloc_calls: usize = 0,
+    remap_calls: usize = 0,
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocFn(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingBacking = @ptrCast(@alignCast(ptr));
+        self.alloc_calls += 1;
+        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
+    }
+
+    fn resizeFn(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingBacking = @ptrCast(@alignCast(ptr));
+        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remapFn(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingBacking = @ptrCast(@alignCast(ptr));
+        self.remap_calls += 1;
+        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingBacking = @ptrCast(@alignCast(ptr));
+        return self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
+    }
+
+    fn allocator(self: *CountingBacking) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "PERF: retained CpuScratch removes warm-run allocs, identical staging" {
+    var backing = CountingBacking{ .backing = std.testing.allocator };
+    const ally = backing.allocator();
+    const eye = Vec3.new(0, 0, 100);
+
+    var src_a = splitSrcMesh();
+    var fa = try StageSplitFixture.init(ally, &src_a, 10, 0);
+    defer fa.deinit(ally);
+    var src_b = splitSrcMesh();
+    var fb = try StageSplitFixture.init(ally, &src_b, 12, 0);
+    defer fb.deinit(ally);
+    // Force the transparent pair-sort path on the second mesh.
+    fb.mesh.is_decal = true;
+    const meshes = [_]*Mesh{ &fa.mesh, &fb.mesh };
+
+    // Legacy path (no scratch): warm steady-state build still allocates
+    // per mesh (uid trail alloc/free + pair alloc/free). Sensitivity
+    // control: proves this test can see the churn it guards against.
+    var scratch_legacy: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch_legacy.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_legacy, .thread_pool = null, .eye = eye }, &meshes, 201);
+    try std.testing.expectEqual(@as(usize, 24), scratch_legacy.items.len);
+    scratch_legacy.clearRetainingCapacity();
+    backing.alloc_calls = 0;
+    backing.remap_calls = 0;
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_legacy, .thread_pool = null, .eye = eye }, &meshes, 202);
+    try std.testing.expectEqual(@as(usize, 24), scratch_legacy.items.len);
+    const legacy_allocs = backing.alloc_calls + backing.remap_calls;
+    try std.testing.expect(legacy_allocs > 0);
+    const legacy_a = fa.mesh.instance_preview;
+    const legacy_b = fb.mesh.instance_preview;
+
+    // Retained-scratch path: cold build grows, warm rebuild allocates nothing.
+    var cs: staging.CpuScratch = .{};
+    defer cs.deinit(ally);
+    var scratch_new: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch_new.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_new, .thread_pool = null, .eye = eye, .cpu_scratch = &cs }, &meshes, 203);
+    try std.testing.expectEqual(@as(usize, 24), scratch_new.items.len);
+    scratch_new.clearRetainingCapacity();
+    backing.alloc_calls = 0;
+    backing.remap_calls = 0;
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_new, .thread_pool = null, .eye = eye, .cpu_scratch = &cs }, &meshes, 204);
+    try std.testing.expectEqual(@as(usize, 24), scratch_new.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backing.alloc_calls + backing.remap_calls);
+
+    // Identical staging: same counts/offsets/hashes/bounds/matrix bytes
+    // (uid order, source-mesh entry, transparent permutation preserved).
+    try std.testing.expectEqual(legacy_a.count, fa.mesh.instance_preview.count);
+    try std.testing.expectEqual(legacy_a.hash, fa.mesh.instance_preview.hash);
+    try std.testing.expectEqual(legacy_a.layout_hash, fa.mesh.instance_preview.layout_hash);
+    try std.testing.expectEqual(legacy_a.bounds, fa.mesh.instance_preview.bounds);
+    try std.testing.expectEqual(legacy_b.count, fb.mesh.instance_preview.count);
+    try std.testing.expectEqual(legacy_b.hash, fb.mesh.instance_preview.hash);
+    try std.testing.expectEqual(legacy_b.layout_hash, fb.mesh.instance_preview.layout_hash);
+    try std.testing.expectEqual(legacy_b.bounds, fb.mesh.instance_preview.bounds);
+    try std.testing.expectEqual(scratch_legacy.items.len, scratch_new.items.len);
+    for (scratch_legacy.items, scratch_new.items) |m_a, m_b| {
+        try std.testing.expectEqual(m_a, m_b);
+    }
+}
+
+test "PERF: CpuScratch parallel staging matches serial, OOM keeps rollback" {
+    const ally = std.testing.allocator;
+    const eye = Vec3.new(0, 0, 100);
+
+    const pool = try jobs.Pool.init(ally, 2);
+    defer pool.deinit();
+
+    var src_a = splitSrcMesh();
+    var fa = try StageSplitFixture.init(ally, &src_a, 300, 7);
+    defer fa.deinit(ally);
+    var src_b = splitSrcMesh();
+    var fb = try StageSplitFixture.init(ally, &src_b, 300, 7);
+    defer fb.deinit(ally);
+    fb.mesh.is_decal = true;
+    const meshes = [_]*Mesh{ &fa.mesh, &fb.mesh };
+
+    var scratch_serial: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch_serial.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_serial, .thread_pool = null, .eye = eye }, &meshes, 301);
+    const serial_a = fa.mesh.instance_preview;
+    const serial_b = fb.mesh.instance_preview;
+
+    // Parallel (>=256 instances) with retained scratch: same result.
+    var cs: staging.CpuScratch = .{};
+    defer cs.deinit(ally);
+    var scratch_par: std.ArrayListUnmanaged(Mat4) = .empty;
+    defer scratch_par.deinit(ally);
+    stageInstancesCpu(.{ .allocator = ally, .scratch = &scratch_par, .thread_pool = pool, .eye = eye, .cpu_scratch = &cs }, &meshes, 302);
+    try std.testing.expectEqual(serial_a.count, fa.mesh.instance_preview.count);
+    try std.testing.expectEqual(serial_a.hash, fa.mesh.instance_preview.hash);
+    try std.testing.expectEqual(serial_a.layout_hash, fa.mesh.instance_preview.layout_hash);
+    try std.testing.expectEqual(serial_b.layout_hash, fb.mesh.instance_preview.layout_hash);
+    try std.testing.expectEqual(scratch_serial.items.len, scratch_par.items.len);
+
+    // OOM through the public path: warm matrix scratch but a fresh uid
+    // trail under a failing allocator fails the first mesh's uid growth —
+    // previews untouched, scratch intact for earlier meshes.
+    var cs_fresh: staging.CpuScratch = .{};
+    defer cs_fresh.deinit(ally);
+    var failing = std.testing.FailingAllocator.init(ally, .{ .fail_index = 0 });
+    scratch_par.clearRetainingCapacity();
+    stageInstancesCpu(.{ .allocator = failing.allocator(), .scratch = &scratch_par, .thread_pool = null, .eye = eye, .cpu_scratch = &cs_fresh }, &meshes, 303);
+    try std.testing.expectEqual(@as(u64, 302), fa.mesh.instance_preview.build_seq);
+    try std.testing.expectEqual(@as(u64, 302), fb.mesh.instance_preview.build_seq);
+    try std.testing.expectEqual(@as(usize, 0), scratch_par.items.len);
+}
+
+// ---- PERF: patchInstanceRefs record lookup via the public slot API. ----
+// (No private access: exercises staged-record resolution end to end —
+// hits adopt handles/counts, gaps/uid mismatches/stale generations
+// fail closed. Fully-initialized records; headless (no sg context) so
+// no GPU validity queries run.)
+
+fn makePatchRecord(
+    mesh: *Mesh,
+    mesh_index: u32,
+    uid: u64,
+    staged_frame: u64,
+    buf_id: u32,
+    prev_frame: u64,
+    count: u32,
+) StagedInstanceRecord {
+    return .{
+        .mesh = mesh,
+        .uid = uid,
+        .mesh_index = mesh_index,
+        .scratch_lo = 0,
+        .count = count,
+        .bounds = BoundingBox.zero,
+        .hash = 0,
+        .layout_hash = 0,
+        .uploaded_hash = 0,
+        .uploaded_layout = 0,
+        .mesh_position = Vec3.zero,
+        .buffer = .{ .id = buf_id },
+        .prev_buffer = .{},
+        .buffers = .{ .{}, .{} },
+        .active_slot = 0,
+        .capacity = 0,
+        .uploaded_count = 0,
+        .prev_frame = prev_frame,
+        .latch_created = .{ .{}, .{} },
+        .staged_frame = staged_frame,
+    };
+}
+
+test "PERF: patchInstanceRefs resolves ends, zeroes gaps and mismatches" {
+    const ally = std.testing.allocator;
+    const FrameDrawSlot = @import("frame_draws.zig").FrameDrawSlot;
+    const patchInstanceRefs = @import("patch_instance_refs.zig").patchInstanceRefs;
+    const fid: u64 = 77;
+
+    var slot = FrameDrawSlot{};
+    defer slot.deinit(ally);
+    slot.frame_id = fid;
+
+    var dummy = splitSrcMesh();
+    const present = [_]u32{ 0, 2, 3, 7, 40, 41 };
+    for (present) |mi| {
+        try slot.staged_instances.append(ally, makePatchRecord(&dummy, mi, 1000 + mi, fid, 500 + mi, fid - 1, mi + 1));
+    }
+    // Stale generation: same identity shape, never adopts.
+    try slot.staged_instances.append(ally, makePatchRecord(&dummy, 50, 1050, fid + 1, 550, fid, 51));
+
+    // Hits, gaps, above-range probes, plus a stale-generation probe.
+    const probes = [_]u32{ 0, 1, 2, 3, 4, 7, 39, 40, 41, 42, 50, 1000 };
+    for (probes) |mi| {
+        try slot.primary.opaque_instanced.append(ally, .{
+            .source_mesh = mi,
+            .source_uid = 1000 + mi,
+        });
+    }
+    // Present index but wrong uid → fail-closed zero.
+    try slot.primary.opaque_instanced.append(ally, .{ .source_mesh = 3, .source_uid = 9999 });
+
+    patchInstanceRefs(&slot);
+
+    for (probes, 0..) |mi, k| {
+        const b = slot.primary.opaque_instanced.items[k];
+        switch (mi) {
+            0, 2, 3, 7, 40, 41 => {
+                try std.testing.expectEqual(@as(u32, 500 + mi), b.instance_buffer.id);
+                try std.testing.expectEqual(mi + 1, b.visible_instance_count);
+                try std.testing.expectEqual(@as(u64, fid - 1), b.prev_frame);
+            },
+            else => {
+                try std.testing.expectEqual(@as(u32, 0), b.instance_buffer.id);
+                try std.testing.expectEqual(@as(u32, 0), b.visible_instance_count);
+            },
+        }
+    }
+    const bad = slot.primary.opaque_instanced.items[probes.len];
+    try std.testing.expectEqual(@as(u32, 0), bad.instance_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), bad.visible_instance_count);
+}
+
+test "PERF: patchInstanceRefs resolves 200-record gapped range" {
+    const ally = std.testing.allocator;
+    const FrameDrawSlot = @import("frame_draws.zig").FrameDrawSlot;
+    const patchInstanceRefs = @import("patch_instance_refs.zig").patchInstanceRefs;
+    const fid: u64 = 78;
+
+    var slot = FrameDrawSlot{};
+    defer slot.deinit(ally);
+    slot.frame_id = fid;
+
+    var dummy = splitSrcMesh();
+    // 200 mesh indices with every 3rd record missing (OOM-skipped gaps).
+    for (0..200) |i| {
+        if (i % 3 == 2) continue;
+        try slot.staged_instances.append(ally, makePatchRecord(
+            &dummy,
+            @intCast(i),
+            7000 + @as(u64, @intCast(i)),
+            fid,
+            @intCast(8000 + i),
+            fid,
+            @intCast(i + 1),
+        ));
+    }
+    for (0..201) |i| {
+        try slot.primary.opaque_instanced.append(ally, .{
+            .source_mesh = @intCast(i),
+            .source_uid = 7000 + @as(u64, @intCast(i)),
+        });
+    }
+
+    patchInstanceRefs(&slot);
+
+    try std.testing.expectEqual(@as(usize, 201), slot.primary.opaque_instanced.items.len);
+    for (0..201) |i| {
+        const b = slot.primary.opaque_instanced.items[i];
+        if (i < 200 and i % 3 != 2) {
+            try std.testing.expectEqual(@as(u32, @intCast(8000 + i)), b.instance_buffer.id);
+            try std.testing.expectEqual(@as(u32, @intCast(i + 1)), b.visible_instance_count);
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), b.instance_buffer.id);
+            try std.testing.expectEqual(@as(u32, 0), b.visible_instance_count);
+        }
+    }
 }

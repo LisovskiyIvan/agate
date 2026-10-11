@@ -272,6 +272,36 @@ pub fn layoutHashFor(uids: []const u64) u64 {
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(uids));
 }
 
+/// One transparent-sort record: an instance matrix traveling with its
+/// stable uid so the layout hash always describes the exact upload order.
+pub const SortPair = struct {
+    m: Mat4,
+    u: u64,
+};
+
+/// Retained per-build CPU scratch for `stageSegmentCpu`: the uid trail and
+/// the transparent pair-sort buffer, reused across meshes within one build
+/// (and across builds via the slot) instead of alloc/free per mesh.
+/// Owned by the BUILD (slot-owned `FrameDrawSlot` field for the producer
+/// build, stack-local for standalone callers/tests). Never shared across
+/// concurrent builds: `stageInstancesCpu` drives meshes serially, and the
+/// intra-mesh parallel workers only touch disjoint slices of these buffers
+/// during `forkJoin` (no realloc happens mid-join).
+pub const CpuScratch = struct {
+    uids: std.ArrayListUnmanaged(u64) = .empty,
+    pairs: std.ArrayListUnmanaged(SortPair) = .empty,
+
+    pub fn clearRetainingCapacity(self: *CpuScratch) void {
+        self.uids.clearRetainingCapacity();
+        self.pairs.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *CpuScratch, allocator: std.mem.Allocator) void {
+        self.uids.deinit(allocator);
+        self.pairs.deinit(allocator);
+    }
+};
+
 pub fn stageSegmentCpu(
     allocator: std.mem.Allocator,
     scratch: *std.ArrayListUnmanaged(Mat4),
@@ -279,6 +309,18 @@ pub fn stageSegmentCpu(
     thread_pool: ?*jobs.Pool,
     eye: Vec3,
     mesh: *Mesh,
+) std.mem.Allocator.Error!CpuStageResult {
+    return stageSegmentCpuScratch(allocator, scratch, lo, thread_pool, eye, mesh, null);
+}
+
+pub fn stageSegmentCpuScratch(
+    allocator: std.mem.Allocator,
+    scratch: *std.ArrayListUnmanaged(Mat4),
+    lo: usize,
+    thread_pool: ?*jobs.Pool,
+    eye: Vec3,
+    mesh: *Mesh,
+    cpu_scratch: ?*CpuScratch,
 ) std.mem.Allocator.Error!CpuStageResult {
     std.debug.assert(lo <= scratch.items.len);
     var combined_aabb = BoundingBox.zero;
@@ -288,10 +330,20 @@ pub fn stageSegmentCpu(
     _ = mesh.ensureUid();
     for (mesh.instances.items) |inst| _ = inst.ensureUid();
     // Parallel uid trail: uids[i] is the identity of scratch.items[lo + i].
-    // Allocated/freed here (one temp per mesh build); OOM restores the
-    // scratch to `lo` and propagates, like every other staging OOM.
-    var uids: std.ArrayListUnmanaged(u64) = .empty;
-    defer uids.deinit(allocator);
+    // Retained in `cpu_scratch` when provided (slot-owned across meshes and
+    // builds; cleared per mesh below), otherwise a one-mesh local exactly
+    // like before. OOM restores the scratch to `lo` and propagates, like
+    // every other staging OOM.
+    var local_uids: std.ArrayListUnmanaged(u64) = .empty;
+    defer {
+        if (cpu_scratch == null) local_uids.deinit(allocator);
+    }
+    var local_pairs: std.ArrayListUnmanaged(SortPair) = .empty;
+    defer {
+        if (cpu_scratch == null) local_pairs.deinit(allocator);
+    }
+    const uid_list = if (cpu_scratch) |cs| &cs.uids else &local_uids;
+    uid_list.clearRetainingCapacity();
     // Babylon semantics (`Mesh._renderWithInstances`): the instanced batch is
     // the visible instances PLUS one entry for the source mesh's own world
     // matrix (its instance buffer is sized `(visible + 1) * 16` floats), so a
@@ -315,11 +367,11 @@ pub fn stageSegmentCpu(
         // unchanged — resize fails before mutating) and a later call may
         // retry. The uid trail resizes in lockstep (same OOM contract).
         try scratch.resize(allocator, lo + self_count + mesh.instances.items.len);
-        try uids.resize(allocator, self_count + mesh.instances.items.len);
+        try uid_list.resize(allocator, self_count + mesh.instances.items.len);
         errdefer scratch.items.len = lo;
         if (self_visible) {
             scratch.items[lo] = self_world;
-            uids.items[0] = mesh.uid;
+            uid_list.items[0] = mesh.uid;
         }
 
         var chunk_aabbs_buf: [64]BoundingBox = undefined;
@@ -332,7 +384,7 @@ pub fn stageSegmentCpu(
             .chunk_visible_counts = chunk_visible_buf[0..chunk_count],
             .out_matrices = scratch.items,
             .out_base = lo + self_count,
-            .out_uids = uids.items,
+            .out_uids = uid_list.items,
             .uid_base = self_count,
         };
 
@@ -359,8 +411,8 @@ pub fn stageSegmentCpu(
                 );
                 std.mem.copyForwards(
                     u64,
-                    uids.items[total_visible .. total_visible + count],
-                    uids.items[self_count + c * span .. self_count + c * span + count],
+                    uid_list.items[total_visible .. total_visible + count],
+                    uid_list.items[self_count + c * span .. self_count + c * span + count],
                 );
                 total_visible += count;
             }
@@ -375,16 +427,16 @@ pub fn stageSegmentCpu(
         scratch.items.len = lo + total_visible;
     } else {
         try scratch.ensureUnusedCapacity(allocator, self_count + mesh.instances.items.len);
-        try uids.ensureTotalCapacity(allocator, self_count + mesh.instances.items.len);
+        try uid_list.ensureTotalCapacity(allocator, self_count + mesh.instances.items.len);
         if (self_visible) {
             scratch.appendAssumeCapacity(self_world);
-            uids.appendAssumeCapacity(mesh.uid);
+            uid_list.appendAssumeCapacity(mesh.uid);
         }
         for (mesh.instances.items) |inst| {
             if (!inst.is_visible) continue;
             const world = instanceWorldMatrix(inst);
             scratch.appendAssumeCapacity(world);
-            uids.appendAssumeCapacity(inst.uid);
+            uid_list.appendAssumeCapacity(inst.uid);
             const box = instanceWorldAABB(inst, world);
             if (combined_aabb.isValid()) {
                 combined_aabb = combined_aabb.merge(box);
@@ -394,7 +446,7 @@ pub fn stageSegmentCpu(
         }
     }
     const segment = scratch.items[lo..];
-    const uid_segment = uids.items[0..segment.len];
+    const uid_segment = uid_list.items[0..segment.len];
     std.debug.assert(uid_segment.len == segment.len);
 
     // Per-instance transparency sorting (OIT):
@@ -405,13 +457,9 @@ pub fn stageSegmentCpu(
     // layout hash below always describes the exact upload order — a re-sort
     // changes the layout and zeroes the batch instead of mispairing.
     if (segment.len > 1 and (isTransparentMaterial(mesh.material) or mesh.is_decal)) {
-        const Pair = struct {
-            m: Mat4,
-            u: u64,
-        };
         const Ctx = struct {
             eye: Vec3,
-            pub fn less(c: @This(), a: Pair, b: Pair) bool {
+            pub fn less(c: @This(), a: SortPair, b: SortPair) bool {
                 const pos_a = Vec3.new(a.m.m[12], a.m.m[13], a.m.m[14]);
                 const pos_b = Vec3.new(b.m.m[12], b.m.m[13], b.m.m[14]);
                 const dist_a = pos_a.sub(c.eye).lengthSq();
@@ -427,16 +475,19 @@ pub fn stageSegmentCpu(
                 return a.u < b.u;
             }
         };
-        // Pair sort (fallible alloc, same OOM contract): matrices and uids
-        // travel as one record, so the uid trail always describes the exact
-        // upload order — never matrices alone.
-        const pairs = allocator.alloc(Pair, segment.len) catch {
+        // Pair sort (retained in `cpu_scratch` when provided, otherwise a
+        // one-mesh fallible alloc with the same OOM contract): matrices and
+        // uids travel as one record, so the uid trail always describes the
+        // exact upload order — never matrices alone.
+        const pair_list = if (cpu_scratch) |cs| &cs.pairs else &local_pairs;
+        pair_list.clearRetainingCapacity();
+        pair_list.resize(allocator, segment.len) catch {
             scratch.items.len = lo;
             return error.OutOfMemory;
         };
-        defer allocator.free(pairs);
+        const pairs = pair_list.items;
         for (pairs, segment, uid_segment) |*p, m, u| p.* = .{ .m = m, .u = u };
-        std.mem.sort(Pair, pairs, Ctx{ .eye = eye }, Ctx.less);
+        std.mem.sort(SortPair, pairs, Ctx{ .eye = eye }, Ctx.less);
         for (pairs, segment, uid_segment) |p, *m, *u| {
             m.* = p.m;
             u.* = p.u;
@@ -740,6 +791,9 @@ pub const CpuStageContext = struct {
     scratch: *std.ArrayListUnmanaged(Mat4),
     thread_pool: ?*jobs.Pool,
     eye: Vec3,
+    /// Retained uid/pair scratch (slot-owned for the producer build).
+    /// Null keeps the legacy per-mesh temps (standalone callers/tests).
+    cpu_scratch: ?*CpuScratch = null,
 };
 
 pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq: u64) void {
@@ -749,7 +803,7 @@ pub fn stageInstancesCpu(ctx: CpuStageContext, meshes: []const *Mesh, build_seq:
         if (mesh.gpu_pending) continue;
         if (mesh.instances.items.len == 0) continue;
         const lo = ctx.scratch.items.len;
-        const cpu = stageSegmentCpu(ctx.allocator, ctx.scratch, lo, ctx.thread_pool, ctx.eye, mesh) catch continue;
+        const cpu = stageSegmentCpuScratch(ctx.allocator, ctx.scratch, lo, ctx.thread_pool, ctx.eye, mesh, ctx.cpu_scratch) catch continue;
         mesh.instance_preview = InstancePreviewState{
             .bounds = cpu.bounds,
             .count = @intCast(ctx.scratch.items.len - lo),

@@ -15,6 +15,7 @@ test {
     _ = @import("ai/pathfinding.zig");
     _ = @import("ai/tests.zig");
     _ = @import("animation/animation.zig");
+    _ = @import("animation/channel_index_tests.zig");
     _ = @import("animation/channels.zig");
     _ = @import("animation/easing.zig");
     _ = @import("animation/easing_tests.zig");

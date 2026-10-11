@@ -17,6 +17,7 @@ const max_glyph_bitmap: u32 = types.max_glyph_bitmap;
 const atlas_size: u32 = types.atlas_size;
 const atlas_pad: u32 = types.atlas_pad;
 const Font = font_mod.Font;
+const KernEntry = font_mod.KernEntry;
 
 /// One baked glyph: atlas rect + font-pixel metrics (bake scale applied).
 pub const GlyphInfo = struct {
@@ -47,6 +48,7 @@ pub const TtfFont = struct {
     glyphs: []GlyphInfo,
     notdef: ?GlyphInfo,
     atlas_pixels: []u8, // RGBA8, atlas_size^2 * 4
+    kern_index: []KernEntry, // baked kern pairs, sorted by key (see buildKernIndex)
     shelf_x: u32 = 0,
     shelf_y: u32 = 0,
     shelf_h: u32 = 0,
@@ -77,6 +79,7 @@ pub const TtfFont = struct {
                 @as(f32, @floatFromInt(font.line_gap))) * scale,
             .glyphs = &.{},
             .notdef = null,
+            .kern_index = &.{},
             .atlas_pixels = allocator.alloc(u8, @as(usize, atlas_size) * atlas_size * 4) catch return error.OutOfMemory,
         };
         errdefer self.deinit();
@@ -133,6 +136,13 @@ pub const TtfFont = struct {
             }
         }
         self.glyphs = try list.toOwnedSlice(allocator);
+        // Per-frame lookups binary-search by codepoint, so bake order is
+        // normalized here (entries for one codepoint are identical, which
+        // keeps duplicate-charsets first-match equivalent).
+        std.mem.sort(GlyphInfo, self.glyphs, {}, glyphInfoLess);
+        // Kern pairs are indexed once: per-frame kernPx then binary-searches
+        // instead of walking every subtable/pair per glyph pair.
+        self.kern_index = try font_mod.buildKernIndex(allocator, font.kern);
         for (baked) |b| {
             if (b.gid == 0) {
                 self.notdef = GlyphInfo{
@@ -155,22 +165,41 @@ pub const TtfFont = struct {
     pub fn deinit(self: *TtfFont) void {
         if (self.atlas_pixels.len > 0) self.allocator.free(self.atlas_pixels);
         if (self.glyphs.len > 0) self.allocator.free(self.glyphs);
+        if (self.kern_index.len > 0) self.allocator.free(self.kern_index);
         self.* = undefined;
+    }
+
+    fn glyphInfoLess(_: void, lhs: GlyphInfo, rhs: GlyphInfo) bool {
+        return lhs.codepoint < rhs.codepoint;
+    }
+
+    fn glyphOrderByCodepoint(codepoint: u21, g: GlyphInfo) std.math.Order {
+        return std.math.order(codepoint, g.codepoint);
+    }
+
+    fn kernOrderByKey(key: u32, e: KernEntry) std.math.Order {
+        return std.math.order(key, e.key);
     }
 
     /// Codepoint lookup within the baked set; unmapped codepoints fall
     /// back to .notdef, unknown-to-the-set returns null (caller skips).
+    /// The baked set is sorted at init, so this is a binary search.
     pub fn lookup(self: *const TtfFont, codepoint: u21) ?GlyphInfo {
-        for (self.glyphs) |g| {
-            if (g.codepoint == codepoint) return g;
+        if (std.sort.binarySearch(GlyphInfo, self.glyphs, codepoint, glyphOrderByCodepoint)) |i| {
+            return self.glyphs[i];
         }
         return self.notdef;
     }
 
     /// Kerning between two baked glyphs in bake px (0 without kern data).
+    /// Queries the bake-time index (same first-match values as
+    /// `Font.kernUnits`, without its per-pair table walk).
     pub fn kernPx(self: *const TtfFont, left: GlyphInfo, right: GlyphInfo) f32 {
-        const k = self.font.kernUnits(left.gid, right.gid) catch 0;
-        return @as(f32, @floatFromInt(k)) * self.scale;
+        const key = (@as(u32, left.gid) << 16) | right.gid;
+        if (std.sort.binarySearch(KernEntry, self.kern_index, key, kernOrderByKey)) |i| {
+            return @as(f32, @floatFromInt(self.kern_index[i].value)) * self.scale;
+        }
+        return 0;
     }
 
     /// Normalized atlas UVs for a baked glyph (content rect, no gutter).

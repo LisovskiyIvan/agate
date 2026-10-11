@@ -9,13 +9,16 @@ const StagedInstanceRecord = @import("../mesh.zig").StagedInstanceRecord;
 const scene_render_queue = @import("render_queue.zig");
 const FrameDrawSlot = @import("frame_draws.zig").FrameDrawSlot;
 
+fn orderRecordByMeshIndex(context: usize, rec: StagedInstanceRecord) std.math.Order {
+    return std.math.order(context, @as(usize, rec.mesh_index));
+}
+
 fn findStagedRecord(records: []const StagedInstanceRecord, idx: usize) ?*const StagedInstanceRecord {
-    for (records) |*rec| {
-        const ri: usize = rec.mesh_index;
-        if (ri == idx) return rec;
-        if (ri > idx) break;
-    }
-    return null;
+    // Records freeze in mesh-list order (strictly increasing mesh_index),
+    // so lookup is binary search; misses (OOM-skipped gaps, post-build
+    // meshes, out-of-range) return null exactly like the old linear scan.
+    const at = std.sort.binarySearch(StagedInstanceRecord, records, idx, orderRecordByMeshIndex) orelse return null;
+    return &records[at];
 }
 
 fn patchBatchList(

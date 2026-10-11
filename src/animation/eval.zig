@@ -26,6 +26,20 @@ pub fn evaluateSkeletonPoseOnly(skel: *Skeleton, active_base: []const *Animation
     evaluateSkeletonInner(skel, active_base, active_additive, true);
 }
 
+/// Per-eval validation slots per side; active groups past the cap sample
+/// the exact legacy scan for the eval. The runtime caps at 16 per side;
+/// direct-API callers past 64 per side still evaluate exactly, only slower.
+const max_indexed_groups: usize = 64;
+
+/// Once-per-group exact route validation (read-only O(C) u32/usize
+/// compares, no allocation, no mutation — safe inside evaluation). A group
+/// failing validation (mutated since update(), or never updated) samples
+/// legacy for this eval; validity is re-proven every eval, never assumed.
+fn validateChannelRoutes(groups: []const *AnimationGroup, flags: *[max_indexed_groups]bool) void {
+    const n = @min(groups.len, max_indexed_groups);
+    for (groups[0..n], 0..) |ag, i| flags[i] = ag.validateChannelRoute();
+}
+
 fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, active_additive: []const *AnimationGroup, comptime pose_only: bool) void {
     if (active_base.len == 0 and active_additive.len == 0) return;
 
@@ -58,6 +72,11 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
         }
     }
 
+    var base_indexed: [max_indexed_groups]bool = undefined;
+    validateChannelRoutes(active_base, &base_indexed);
+    var add_indexed: [max_indexed_groups]bool = undefined;
+    validateChannelRoutes(active_additive, &add_indexed);
+
     for (skel.bones, 0..) |*bone, b_idx| {
         var blended_pos = bone.bind_position;
         var blended_rot = bone.bind_rotation;
@@ -69,7 +88,11 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
                 var p: ?Vec3 = null;
                 var r: ?Quat = null;
                 var s: ?Vec3 = null;
-                ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+                if (base_indexed[0]) {
+                    ag.sampleBoneIndexed(b_idx, ag.current_time, &p, &r, &s);
+                } else {
+                    ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+                }
                 const bp = p orelse bone.bind_position;
                 const br = r orelse bone.bind_rotation;
                 const bs = s orelse bone.bind_scale;
@@ -92,8 +115,16 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
                 var p1: ?Vec3 = null;
                 var r1: ?Quat = null;
                 var s1: ?Vec3 = null;
-                ag0.sampleBoneAtTime(b_idx, ag0.current_time, &p0, &r0, &s0);
-                ag1.sampleBoneAtTime(b_idx, ag1.current_time, &p1, &r1, &s1);
+                if (base_indexed[0]) {
+                    ag0.sampleBoneIndexed(b_idx, ag0.current_time, &p0, &r0, &s0);
+                } else {
+                    ag0.sampleBoneAtTime(b_idx, ag0.current_time, &p0, &r0, &s0);
+                }
+                if (base_indexed[1]) {
+                    ag1.sampleBoneIndexed(b_idx, ag1.current_time, &p1, &r1, &s1);
+                } else {
+                    ag1.sampleBoneAtTime(b_idx, ag1.current_time, &p1, &r1, &s1);
+                }
 
                 const bp0 = p0 orelse bone.bind_position;
                 const br0 = r0 orelse bone.bind_rotation;
@@ -114,10 +145,15 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
 
                 for (active_base, 0..) |ag, ag_idx| {
                     const norm_w = if (ag_idx < 16) norm_weights_buf[ag_idx] else ag.weight / total_base_w;
+                    const use_indexed = ag_idx < max_indexed_groups and base_indexed[ag_idx];
                     var p: ?Vec3 = null;
                     var r: ?Quat = null;
                     var s: ?Vec3 = null;
-                    ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+                    if (use_indexed) {
+                        ag.sampleBoneIndexed(b_idx, ag.current_time, &p, &r, &s);
+                    } else {
+                        ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+                    }
                     const bp = p orelse bone.bind_position;
                     const br = r orelse bone.bind_rotation;
                     const bs = s orelse bone.bind_scale;
@@ -146,12 +182,17 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
         }
 
         // Apply additive layers on top of blended pose
-        for (active_additive) |ag| {
+        for (active_additive, 0..) |ag, ag_idx| {
             if (ag.weight <= 0.0001) continue;
+            const use_indexed = ag_idx < max_indexed_groups and add_indexed[ag_idx];
             var p: ?Vec3 = null;
             var r: ?Quat = null;
             var s: ?Vec3 = null;
-            ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+            if (use_indexed) {
+                ag.sampleBoneIndexed(b_idx, ag.current_time, &p, &r, &s);
+            } else {
+                ag.sampleBoneAtTime(b_idx, ag.current_time, &p, &r, &s);
+            }
 
             if (p) |add_p| {
                 const delta_p = add_p.sub(bone.bind_position);

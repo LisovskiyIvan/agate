@@ -30,6 +30,7 @@ const MotorJointOptions = physics.MotorJointOptions;
 const WeldJointOptions = physics.WeldJointOptions;
 const ParallelJointOptions = physics.ParallelJointOptions;
 const PrismaticJointOptions = physics.PrismaticJointOptions;
+const ShapeKey = physics.ShapeKey;
 
 test "PhysicsWorld ground collision and step" {
     var pw = PhysicsWorld.init(std.testing.allocator);
@@ -2036,4 +2037,300 @@ test "PhysicsWorld getProfile and getCounters" {
 
     const cnt_after = pw.getCounters();
     try std.testing.expect(cnt_after.body_count >= 2);
+}
+
+// --- findBodyByShape characterization (shape->body index work) ---
+//
+// Reference linear scan replicating the pre-index lookup semantics: every
+// `findBodyByShape` result below must equal this reference, both before and
+// after the index lands. These tests pin behavior, not performance.
+
+fn linearFindBodyByShape(pw: *PhysicsWorld, shape_id: c.b3ShapeId) ?*RigidBody {
+    for (pw.bodies.items) |b| {
+        if (b.shape_id.index1 == shape_id.index1 and b.shape_id.generation == shape_id.generation) return b;
+        for (b.child_shapes.items) |ch| {
+            if (ch.shape_id.index1 == shape_id.index1 and ch.shape_id.generation == shape_id.generation) return b;
+        }
+    }
+    return null;
+}
+
+fn expectLookupEquiv(pw: *PhysicsWorld, shape_id: c.b3ShapeId) !void {
+    const got = pw.findBodyByShape(shape_id);
+    const want = linearFindBodyByShape(pw, shape_id);
+    try std.testing.expectEqual(want, got);
+}
+
+test "PhysicsWorld shape lookup resolves primary, child, and misses" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m1 = Mesh{
+        .name = "lookup_plain",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    const plain = try pw.createBody(&m1, .sphere, 1.0);
+
+    var m2 = Mesh{
+        .name = "lookup_compound",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(5.0, 5.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const compound = try pw.createBody(&m2, .box, 1.0);
+    try pw.addBoxShape(compound, Vec3.new(0.5, 0.5, 0.5), .{ .offset = Vec3.new(0.0, 1.5, 0.0) });
+    try pw.addSphereShape(compound, 0.3, .{ .offset = Vec3.new(0.0, -1.5, 0.0) });
+
+    try std.testing.expectEqual(plain, pw.findBodyByShape(plain.shape_id));
+    try std.testing.expectEqual(compound, pw.findBodyByShape(compound.shape_id));
+    for (compound.child_shapes.items) |ch| {
+        try std.testing.expectEqual(compound, pw.findBodyByShape(ch.shape_id));
+    }
+
+    try expectLookupEquiv(&pw, plain.shape_id);
+    try expectLookupEquiv(&pw, compound.shape_id);
+    for (compound.child_shapes.items) |ch| {
+        try expectLookupEquiv(&pw, ch.shape_id);
+    }
+    // Misses: zero id, never-issued id. Both stay null (unknown/deleted rule).
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(.{ .index1 = 0, .world0 = 0, .generation = 0 }));
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(.{ .index1 = 1234567, .world0 = 0, .generation = 42 }));
+    try expectLookupEquiv(&pw, .{ .index1 = 0, .world0 = 0, .generation = 0 });
+    try expectLookupEquiv(&pw, .{ .index1 = 1234567, .world0 = 0, .generation = 42 });
+}
+
+test "PhysicsWorld shape lookup survives remove and recreate" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m1 = Mesh{
+        .name = "lookup_doomed",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const doomed = try pw.createBody(&m1, .box, 1.0);
+    try pw.addBoxShape(doomed, Vec3.new(0.4, 0.4, 0.4), .{ .offset = Vec3.new(0.0, 1.0, 0.0) });
+    const old_primary = doomed.shape_id;
+    const old_child = doomed.child_shapes.items[0].shape_id;
+
+    pw.removeBody(doomed);
+    // Deleted shapes resolve to null even if Box3D later recycles the slot:
+    // identity includes the generation, so a reused index never aliases.
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_primary));
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_child));
+    try expectLookupEquiv(&pw, old_primary);
+    try expectLookupEquiv(&pw, old_child);
+
+    var m2 = Mesh{
+        .name = "lookup_fresh",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 8.0, 0.0),
+    };
+    const fresh = try pw.createBody(&m2, .sphere, 1.0);
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_primary));
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(old_child));
+    try std.testing.expectEqual(fresh, pw.findBodyByShape(fresh.shape_id));
+    try expectLookupEquiv(&pw, old_primary);
+    try expectLookupEquiv(&pw, fresh.shape_id);
+}
+
+test "PhysicsWorld shape lookup survives compound change and scale rebuild" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "lookup_rebuild",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const body = try pw.createBody(&m, .box, 1.0);
+    // Late compound addition resolves immediately.
+    try pw.addSphereShape(body, 0.4, .{ .offset = Vec3.new(0.0, 1.5, 0.0) });
+    const late_child = body.child_shapes.items[0].shape_id;
+    try std.testing.expectEqual(body, pw.findBodyByShape(late_child));
+
+    const pre_primary = body.shape_id;
+    const pre_child = late_child;
+    // A scale change rebuilds every native shape on the next push (see
+    // `recreateShape`): old ids must die, new ids must resolve to the body.
+    m.scaling = Vec3.new(2.0, 2.0, 2.0);
+    pw.step(0.016);
+    pw.step(0.016);
+    try std.testing.expectEqual(@as(usize, 1), body.child_shapes.items.len);
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(pre_primary));
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.findBodyByShape(pre_child));
+    try std.testing.expectEqual(body, pw.findBodyByShape(body.shape_id));
+    try std.testing.expectEqual(body, pw.findBodyByShape(body.child_shapes.items[0].shape_id));
+    try expectLookupEquiv(&pw, pre_primary);
+    try expectLookupEquiv(&pw, pre_child);
+    try expectLookupEquiv(&pw, body.shape_id);
+    try expectLookupEquiv(&pw, body.child_shapes.items[0].shape_id);
+}
+
+test "PhysicsWorld shape lookup is world-independent" {
+    var pw_a = PhysicsWorld.init(std.testing.allocator);
+    defer pw_a.deinit();
+    var pw_b = PhysicsWorld.init(std.testing.allocator);
+    defer pw_b.deinit();
+
+    var ma = Mesh{
+        .name = "lookup_world_a",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    const a = try pw_a.createBody(&ma, .sphere, 1.0);
+
+    var mb = Mesh{
+        .name = "lookup_world_b",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+    };
+    const b = try pw_b.createBody(&mb, .sphere, 1.0);
+
+    try std.testing.expectEqual(a, pw_a.findBodyByShape(a.shape_id));
+    try std.testing.expectEqual(b, pw_b.findBodyByShape(b.shape_id));
+    // Each world owns its index: teardown of one never disturbs the other,
+    // and whatever a foreign id resolves to (Box3D slots alias across
+    // worlds by design) the indexed lookup must match the linear reference.
+    try expectLookupEquiv(&pw_a, b.shape_id);
+    try expectLookupEquiv(&pw_b, a.shape_id);
+    try expectLookupEquiv(&pw_a, a.shape_id);
+    try expectLookupEquiv(&pw_b, b.shape_id);
+}
+
+test "PhysicsWorld shape lookup matches linear reference over many bodies" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var meshes: [24]Mesh = undefined;
+    var i: usize = 0;
+    while (i < meshes.len) : (i += 1) {
+        meshes[i] = Mesh{
+            .name = "lookup_many",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 0,
+            .position = Vec3.new(@as(f32, @floatFromInt(i)) * 3.0, 5.0, 0.0),
+            .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+        };
+        const body = try pw.createBody(&meshes[i], .box, 1.0);
+        // Vary the compound width so ownsShape scans differ per body.
+        var k: usize = 0;
+        while (k < i % 3) : (k += 1) {
+            try pw.addBoxShape(body, Vec3.new(0.3, 0.3, 0.3), .{
+                .offset = Vec3.new(0.0, 1.0 + @as(f32, @floatFromInt(k)), 0.0),
+            });
+        }
+    }
+
+    for (pw.bodies.items) |b| {
+        try expectLookupEquiv(&pw, b.shape_id);
+        for (b.child_shapes.items) |ch| {
+            try expectLookupEquiv(&pw, ch.shape_id);
+        }
+    }
+    try expectLookupEquiv(&pw, .{ .index1 = 999999, .world0 = 0, .generation = 7 });
+}
+
+test "PhysicsWorld failed child attach leaves shape lookups intact" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var m = Mesh{
+        .name = "lookup_bad_child",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .position = Vec3.new(0.0, 5.0, 0.0),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+    };
+    const body = try pw.createBody(&m, .box, 1.0);
+
+    // Fewer than 4 hull points is an explicit error; nothing is attached.
+    var pts = [_]Vec3{ Vec3.zero, Vec3.new(1, 0, 0), Vec3.new(0, 1, 0) };
+    try std.testing.expectError(error.MissingCollisionGeometry, pw.addHullShape(body, &pts, .{}));
+    try std.testing.expectEqual(@as(usize, 0), body.child_shapes.items.len);
+    try std.testing.expectEqual(body, pw.findBodyByShape(body.shape_id));
+    try expectLookupEquiv(&pw, body.shape_id);
+
+    // A later successful attach still resolves.
+    try pw.addBoxShape(body, Vec3.new(0.4, 0.4, 0.4), .{});
+    try std.testing.expectEqual(body, pw.findBodyByShape(body.child_shapes.items[0].shape_id));
+}
+
+fn shapeKeyOfId(id: c.b3ShapeId) ShapeKey {
+    return .{ .index1 = id.index1, .world0 = id.world0, .generation = id.generation };
+}
+
+fn expectIndexCoversWorld(pw: *PhysicsWorld) !void {
+    var live: usize = 0;
+    for (pw.bodies.items) |b| {
+        try std.testing.expectEqual(b, pw.shape_index.get(shapeKeyOfId(b.shape_id)));
+        live += 1;
+        for (b.child_shapes.items) |ch| {
+            try std.testing.expectEqual(b, pw.shape_index.get(shapeKeyOfId(ch.shape_id)));
+            live += 1;
+        }
+    }
+    // Exact coverage: every entry maps a live shape, no stale entries linger.
+    try std.testing.expectEqual(live, pw.shape_index.count());
+}
+
+test "PhysicsWorld shape index covers every live shape" {
+    var pw = PhysicsWorld.init(std.testing.allocator);
+    defer pw.deinit();
+
+    var meshes: [3]Mesh = undefined;
+    var i: usize = 0;
+    while (i < meshes.len) : (i += 1) {
+        meshes[i] = Mesh{
+            .name = "lookup_indexed",
+            .vertex_buffer = .{},
+            .index_buffer = .{},
+            .index_count = 0,
+            .position = Vec3.new(@as(f32, @floatFromInt(i)) * 4.0, 5.0, 0.0),
+            .local_bounding_box = BoundingBox.init(Vec3.new(-1.0, -1.0, -1.0), Vec3.new(1.0, 1.0, 1.0)),
+        };
+        const body = try pw.createBody(&meshes[i], .box, 1.0);
+        var k: usize = 0;
+        while (k <= i) : (k += 1) {
+            try pw.addBoxShape(body, Vec3.new(0.3, 0.3, 0.3), .{
+                .offset = Vec3.new(0.0, 1.0 + @as(f32, @floatFromInt(k)), 0.0),
+            });
+        }
+    }
+    // Exercise event drains and push/pull paths; lookups below must stay
+    // index-backed throughout.
+    pw.step(0.016);
+    try expectIndexCoversWorld(&pw);
+
+    // Removal prunes exactly the body's shapes.
+    const doomed_primary = pw.bodies.items[1].shape_id;
+    const doomed_child = pw.bodies.items[1].child_shapes.items[0].shape_id;
+    pw.removeBody(pw.bodies.items[1]);
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.shape_index.get(shapeKeyOfId(doomed_primary)));
+    try std.testing.expectEqual(@as(?*RigidBody, null), pw.shape_index.get(shapeKeyOfId(doomed_child)));
+    try expectIndexCoversWorld(&pw);
+
+    // A scale rebuild re-registers the replacements without leftovers.
+    meshes[0].scaling = Vec3.new(1.5, 1.5, 1.5);
+    pw.step(0.016);
+    try expectIndexCoversWorld(&pw);
 }

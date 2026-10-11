@@ -3,6 +3,7 @@ const math = @import("math");
 const Vec3 = math.Vec3;
 const Quat = math.Quat;
 const Skeleton = @import("skeleton.zig").Skeleton;
+const MAX_BONES = @import("skeleton.zig").MAX_BONES;
 const easing_mod = @import("easing.zig");
 pub const EasingType = easing_mod.EasingType;
 
@@ -25,6 +26,27 @@ pub const AnimationGroup = struct {
     channels: []AnimationChannel,
     skeleton: ?*Skeleton = null,
     duration: f32 = 0.0,
+    /// Per-bone routing over `channels`, built serially by update().
+    /// `chan_route` packs channel indices grouped by bone_index (< MAX_BONES)
+    /// in original channel order; `chan_head`/`chan_count` delimit each
+    /// bone's run. Channels with bone_index >= MAX_BONES are not routed and
+    /// keep the legacy scan (see sampleBoneIndexed). Rebuilds allocate only
+    /// when the channel set actually changes, so steady-state frames
+    /// allocate nothing.
+    chan_route: []u32 = &.{},
+    chan_head: [MAX_BONES]u32 = [_]u32{0} ** MAX_BONES,
+    chan_count: [MAX_BONES]u32 = [_]u32{0} ** MAX_BONES,
+    /// Exact bone_index per channel position at route-build time. The route
+    /// depends only on the bone sequence (bucket assignment) and channel
+    /// order (duplicate LAST-wins): target_path, interpolation and sampler
+    /// contents are read live per sample, so only bone changes can stale it.
+    /// validateChannelRoute() compares this against the live channels —
+    /// an exact O(C) check, not a hash — so same-ptr/len in-place edits
+    /// (bone moves, cross-bone swaps, slice replacement) fail validation
+    /// and fall back to the exact legacy scan. No caller ever needs to
+    /// invalidate: currency is re-proven, never assumed.
+    chan_route_bones: []usize = &.{},
+    chan_route_valid: bool = false,
     /// Plain-node (non-skeleton) tracks. update() applies them directly to the
     /// bound mesh transforms, so Scene.updateAnimations needs no changes.
     /// Limitation: node tracks are NOT cross-group blended. Every playing
@@ -92,6 +114,8 @@ pub const AnimationGroup = struct {
             if (ch.sampler.outputs.len > 0) self.allocator.free(ch.sampler.outputs);
         }
         if (self.channels.len > 0) self.allocator.free(self.channels);
+        if (self.chan_route.len > 0) self.allocator.free(self.chan_route);
+        if (self.chan_route_bones.len > 0) self.allocator.free(self.chan_route_bones);
         for (self.node_channels) |ch| {
             if (ch.sampler.timestamps.len > 0) self.allocator.free(ch.sampler.timestamps);
             if (ch.sampler.outputs.len > 0) self.allocator.free(ch.sampler.outputs);
@@ -327,6 +351,12 @@ pub const AnimationGroup = struct {
     pub fn update(self: *AnimationGroup, dt: f32) void {
         if (!self.is_playing) return;
 
+        // Serial-only: (re)build the per-bone channel route before any
+        // concurrent pose evaluation can read it (see sampleBoneAtTime).
+        // update() callers are serial by contract — animation_runtime runs
+        // this loop before the parallel eval, and it never runs in workers.
+        self.refreshChannelIndex();
+
         // Process weight fading
         if (self.fade_duration > 0.00001) {
             self.fade_timer += dt;
@@ -522,11 +552,14 @@ pub const AnimationGroup = struct {
                 },
                 .rotation => {
                     const sampled = ch.sampler.sampleQuatEased(time, ch.easing);
+                    // sampleQuatEased and slerp already return unit quats,
+                    // and toEulerDeg normalizes internally: no extra
+                    // normalize pass needed (it only burned a sqrt).
                     if (w >= 0.999) {
-                        t.rotation_euler.* = sampled.normalize().toEulerDeg();
+                        t.rotation_euler.* = sampled.toEulerDeg();
                     } else {
                         const blended = Quat.slerp(t.rest_rotation, sampled, w);
-                        t.rotation_euler.* = blended.normalize().toEulerDeg();
+                        t.rotation_euler.* = blended.toEulerDeg();
                     }
                 },
                 // Handled above; kept for exhaustiveness.
@@ -535,19 +568,135 @@ pub const AnimationGroup = struct {
         }
     }
 
-    pub fn sampleBoneAtTime(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+    /// True while the per-bone channel route matches the live channels
+    /// (exact bone-sequence check, see validateChannelRoute). Introspection
+    /// for tests and diagnostics; evaluation consults it once per group.
+    pub fn hasValidChannelIndex(self: *const AnimationGroup) bool {
+        return self.validateChannelRoute();
+    }
+
+    /// Exact O(C) route-currency check: stored bone sequence vs live
+    /// channels. Read-only (no allocation, no mutation): safe to call from
+    /// anywhere, including once per group per evaluation before taking the
+    /// indexed path. This is a full comparison, not a hash — same-ptr/len
+    /// in-place edits are always detected.
+    pub fn validateChannelRoute(self: *const AnimationGroup) bool {
+        if (!self.chan_route_valid) return false;
+        if (self.chan_route_bones.len != self.channels.len) return false;
+        for (self.chan_route_bones, 0..) |want, i| {
+            if (want != self.channels[i].bone_index) return false;
+        }
+        return true;
+    }
+
+    /// Serial-only route maintenance; see the chan_route field docs. Keeps
+    /// the current route when the bone sequence still matches (O(C) reads,
+    /// no writes, no allocs), otherwise rebuilds exactly. OOM leaves the
+    /// route invalid and every sampler keeps the exact legacy scan —
+    /// behavior never changes, only speed. Must never run concurrently
+    /// (no group mutation during parallel pose evaluation); update() is
+    /// the caller.
+    fn refreshChannelIndex(self: *AnimationGroup) void {
+        if (self.chan_route_valid and self.validateChannelRoute()) return;
+        self.chan_route_valid = false;
+        self.chan_head = [_]u32{0} ** MAX_BONES;
+        self.chan_count = [_]u32{0} ** MAX_BONES;
+        // u32 indices below are provably in range only past this guard.
+        if (self.channels.len > std.math.maxInt(u32)) return;
+        var routable: usize = 0;
         for (self.channels) |ch| {
-            if (ch.bone_index == bone_idx) {
-                // Skip malformed/truncated LINEAR/STEP tracks: preserve pose, outputs stay null.
-                // CUBICSPLINE keeps its sampler fallback (usable frame/zero), so it is not guarded.
-                if (ch.sampler.interpolation != .cubic_spline and !samplerHasFrames(ch.sampler, ch.target_path, 0)) continue;
-                switch (ch.target_path) {
-                    .translation => out_pos.* = ch.sampler.sampleVec3(time),
-                    .rotation => out_rot.* = ch.sampler.sampleQuat(time),
-                    .scale => out_scale.* = ch.sampler.sampleVec3(time),
-                    .weights => {},
-                }
+            if (ch.bone_index < MAX_BONES) {
+                self.chan_count[ch.bone_index] += 1;
+                routable += 1;
             }
+        }
+        // Exact-size (re)allocation: rebuilds run only when the channel set
+        // actually changed, so steady-state frames allocate nothing.
+        if (self.chan_route.len > 0) self.allocator.free(self.chan_route);
+        if (self.chan_route_bones.len > 0) self.allocator.free(self.chan_route_bones);
+        self.chan_route = &.{};
+        self.chan_route_bones = &.{};
+        if (routable > 0) {
+            self.chan_route = self.allocator.alloc(u32, routable) catch return;
+        }
+        if (self.channels.len > 0) {
+            self.chan_route_bones = self.allocator.alloc(usize, self.channels.len) catch {
+                // Keep the pair consistent: a half-built route is invalid.
+                if (self.chan_route.len > 0) self.allocator.free(self.chan_route);
+                self.chan_route = &.{};
+                return;
+            };
+        }
+        var cursor: [MAX_BONES]u32 = undefined;
+        var off: u32 = 0;
+        for (0..MAX_BONES) |b| {
+            self.chan_head[b] = off;
+            cursor[b] = off;
+            off += self.chan_count[b];
+        }
+        for (self.channels, 0..) |ch, i| {
+            self.chan_route_bones[i] = ch.bone_index;
+            if (ch.bone_index < MAX_BONES) {
+                const b = ch.bone_index;
+                self.chan_route[cursor[b]] = @intCast(i);
+                cursor[b] += 1;
+            }
+        }
+        self.chan_route_valid = true;
+    }
+
+    /// One channel's contribution to a bone sample: malformed/truncated
+    /// LINEAR/STEP tracks are skipped (outputs stay null), CUBICSPLINE keeps
+    /// its sampler fallback. Shared verbatim by the legacy scan and the
+    /// routed path so both visit identical channels with identical guards.
+    inline fn sampleChannelBone(ch: *const AnimationChannel, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+        if (ch.sampler.interpolation != .cubic_spline and !samplerHasFrames(ch.sampler, ch.target_path, 0)) return;
+        switch (ch.target_path) {
+            .translation => out_pos.* = ch.sampler.sampleVec3(time),
+            .rotation => out_rot.* = ch.sampler.sampleQuat(time),
+            .scale => out_scale.* = ch.sampler.sampleVec3(time),
+            .weights => {},
+        }
+    }
+
+    /// Legacy scan over the live channels: always current, before or after
+    /// any update(), under any mutation. This is the behavior-preserving
+    /// default for direct callers; the indexed path is taken only inside
+    /// evaluated skeletons after once-per-eval validation (see
+    /// sampleBoneIndexed), so public sampling honors current channels
+    /// immediately, even before the next update().
+    pub fn sampleBoneAtTime(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+        self.sampleBoneAtTimeLegacy(bone_idx, time, out_pos, out_rot, out_scale);
+    }
+
+    /// Trusted indexed sampler: the bone's routed run, no currency check.
+    /// Call only when validateChannelRoute() is true and no channel
+    /// mutation intervenes — evaluateSkeletonInner upholds this with a
+    /// once-per-group-per-eval validation and no group writes during the
+    /// eval. Oversized bones fall back to the legacy scan internally
+    /// (single branch, always correct), so evaluated skeletons past
+    /// MAX_BONES stay exact.
+    pub fn sampleBoneIndexed(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+        if (bone_idx >= MAX_BONES) {
+            self.sampleBoneAtTimeLegacy(bone_idx, time, out_pos, out_rot, out_scale);
+            return;
+        }
+        // Bounds hold exactly when the route is current (trusted caller):
+        // head+count <= routable <= chan_route.len by rebuild construction.
+        const h: usize = self.chan_head[bone_idx];
+        const e: usize = h + self.chan_count[bone_idx];
+        for (self.chan_route[h..e]) |ci| {
+            sampleChannelBone(&self.channels[ci], time, out_pos, out_rot, out_scale);
+        }
+    }
+
+    /// Explicit legacy scan: every channel in order, bone filter inline.
+    /// Bit-identical to the pre-index sampler; kept for direct callers that
+    /// need index-independent behavior and as the parity baseline in tests.
+    pub fn sampleBoneAtTimeLegacy(self: *const AnimationGroup, bone_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void {
+        for (self.channels) |ch| {
+            if (ch.bone_index != bone_idx) continue;
+            sampleChannelBone(&ch, time, out_pos, out_rot, out_scale);
         }
     }
 

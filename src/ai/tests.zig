@@ -10,6 +10,269 @@ const Portal = funnel.Portal;
 const Pathfinding = @import("pathfinding.zig").Pathfinding;
 const NavAgent = @import("agent.zig").NavAgent;
 
+fn refFindNode(nodes: []const NavNode, pt: Vec3) ?u32 {
+    // Independent reference specification of findNode/findClosestNode semantics.
+    for (nodes, 0..) |node, i| {
+        if (node.containsPointXZ(pt)) {
+            const y = node.getYAtXZ(pt);
+            if (@abs(y - pt.y) < 3.0) return @intCast(i);
+        }
+    }
+    return null;
+}
+
+fn refFindClosestNode(nodes: []const NavNode, pt: Vec3) ?u32 {
+    if (refFindNode(nodes, pt)) |idx| return idx;
+    if (nodes.len == 0) return null;
+    var best_idx: u32 = 0;
+    var best_dist_sq: f32 = std.math.inf(f32);
+    for (nodes, 0..) |node, i| {
+        const dx = node.centroid.x - pt.x;
+        const dy = node.centroid.y - pt.y;
+        const dz = node.centroid.z - pt.z;
+        const dist_sq = dx * dx + dy * dy + dz * dz;
+        if (dist_sq < best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best_idx = @intCast(i);
+        }
+    }
+    return best_idx;
+}
+
+fn flatTri(x0: f32, z0: f32, x1: f32, z1: f32, x2: f32, z2: f32, y: f32) NavNode {
+    return .{
+        .vertices = .{
+            Vec3.new(x0, y, z0),
+            Vec3.new(x1, y, z1),
+            Vec3.new(x2, y, z2),
+        },
+        .centroid = Vec3.new(
+            (x0 + x1 + x2) / 3.0,
+            y,
+            (z0 + z1 + z2) / 3.0,
+        ),
+        .normal = Vec3.new(0.0, 1.0, 0.0),
+    };
+}
+
+test "NavMesh findNode: first-match parity on random grid queries" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var nav = try NavMesh.buildGrid(allocator, 0.0, 100.0, 0.0, 100.0, 0.0, 20, 20, &.{});
+    defer nav.deinit();
+    try testing.expect(nav.nodes.len == 800);
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const pt = Vec3.new(
+            rand.float(f32) * 120.0 - 10.0,
+            rand.float(f32) * 10.0 - 5.0,
+            rand.float(f32) * 120.0 - 10.0,
+        );
+        try testing.expectEqual(refFindNode(nav.nodes, pt), nav.findNode(pt));
+        try testing.expectEqual(refFindClosestNode(nav.nodes, pt), nav.findClosestNode(pt));
+    }
+}
+
+test "NavMesh findNode: parity on negative-coordinate grid" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var nav = try NavMesh.buildGrid(allocator, -60.0, -10.0, -60.0, -10.0, 2.0, 12, 12, &.{});
+    defer nav.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x9E61);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const pt = Vec3.new(
+            rand.float(f32) * 70.0 - 70.0,
+            rand.float(f32) * 10.0 - 3.0,
+            rand.float(f32) * 70.0 - 70.0,
+        );
+        try testing.expectEqual(refFindNode(nav.nodes, pt), nav.findNode(pt));
+        try testing.expectEqual(refFindClosestNode(nav.nodes, pt), nav.findClosestNode(pt));
+    }
+}
+
+test "NavMesh findNode: overlapping layers keep lowest qualifying index" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // 40 quads x 2 tris x 2 layers (y=0 and y=1) = 160 nodes, index active.
+    // Layer 0 owns even pairs, layer 1 the same footprint shifted by +80.
+    var list = std.ArrayList(NavNode).empty;
+    defer list.deinit(allocator);
+    var q: usize = 0;
+    while (q < 40) : (q += 1) {
+        const x0: f32 = @floatFromInt(q * 2);
+        try list.append(allocator, flatTri(x0, 0, x0 + 2, 0, x0 + 2, 2, 0.0));
+        try list.append(allocator, flatTri(x0, 0, x0 + 2, 2, x0, 2, 0.0));
+        try list.append(allocator, flatTri(x0, 0, x0 + 2, 0, x0 + 2, 2, 1.0));
+        try list.append(allocator, flatTri(x0, 0, x0 + 2, 2, x0, 2, 1.0));
+    }
+    const owned = try list.toOwnedSlice(allocator);
+    var nav = NavMesh.init(allocator, owned, BoundingBox.zero);
+    defer nav.deinit();
+    try testing.expect(nav.nodes.len == 160);
+
+    // Quad centers: both layers within <3m elevation -> first-layer index wins.
+    var k: usize = 0;
+    while (k < 40) : (k += 1) {
+        const cx: f32 = @as(f32, @floatFromInt(k * 2)) + 1.0;
+        const pt = Vec3.new(cx, 0.5, 1.0);
+        try testing.expectEqual(refFindNode(nav.nodes, pt), nav.findNode(pt));
+        try testing.expectEqual(@as(u32, @intCast(k * 4)), nav.findNode(pt).?);
+        // y=2: layer 0 diff 2 accepted, still first.
+        try testing.expectEqual(@as(u32, @intCast(k * 4)), nav.findNode(Vec3.new(cx, 2.0, 1.0)).?);
+        // y=3.5: layer 0 diff 3.5 rejected, layer 1 diff 2.5 accepted.
+        try testing.expectEqual(@as(u32, @intCast(k * 4 + 2)), nav.findNode(Vec3.new(cx, 3.5, 1.0)).?);
+        // y=4.5: both rejected.
+        try testing.expectEqual(@as(?u32, null), nav.findNode(Vec3.new(cx, 4.5, 1.0)));
+    }
+
+    // Degenerate node appended manually: parity must hold on the grown slice.
+    const degen = flatTri(500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 0.0);
+    const grown = try allocator.realloc(owned, owned.len + 1);
+    grown[grown.len - 1] = degen;
+    nav.nodes = grown;
+    try testing.expectEqual(refFindNode(nav.nodes, Vec3.new(500.0, 0.0, 500.0)), nav.findNode(Vec3.new(500.0, 0.0, 500.0)));
+    try testing.expectEqual(refFindClosestNode(nav.nodes, Vec3.new(500.0, 0.0, 500.0)), nav.findClosestNode(Vec3.new(500.0, 0.0, 500.0)));
+}
+
+test "NavMesh findNode: empty/degen/outside/fallback ties/non-finite" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Empty mesh stays null everywhere.
+    var empty = NavMesh.init(allocator, &.{}, BoundingBox.zero);
+    defer empty.deinit();
+    try testing.expectEqual(@as(?u32, null), empty.findNode(Vec3.zero));
+    try testing.expectEqual(@as(?u32, null), empty.findClosestNode(Vec3.zero));
+
+    // Symmetric pair: midpoint query misses both, centroid fallback ties -> index 0.
+    const pair = try allocator.dupe(NavNode, &[_]NavNode{
+        flatTri(-4.0, -1.0, -2.0, -1.0, -2.0, 1.0, 0.0),
+        flatTri(2.0, -1.0, 4.0, -1.0, 4.0, 1.0, 0.0),
+    });
+    var nav = NavMesh.init(allocator, pair, BoundingBox.zero);
+    defer nav.deinit();
+    const mid = Vec3.new(0.0, 0.0, 0.0);
+    try testing.expectEqual(@as(?u32, null), nav.findNode(mid));
+    try testing.expectEqual(@as(?u32, 0), nav.findClosestNode(mid));
+
+    // Far-outside point: findNode null, closest matches brute force.
+    var grid = try NavMesh.buildGrid(allocator, 0.0, 40.0, 0.0, 40.0, 0.0, 10, 10, &.{});
+    defer grid.deinit();
+    const far = Vec3.new(500.0, 0.0, -300.0);
+    try testing.expectEqual(@as(?u32, null), grid.findNode(far));
+    try testing.expectEqual(refFindClosestNode(grid.nodes, far), grid.findClosestNode(far));
+
+    // Non-finite inputs fail safe (no trap, legacy-equivalent results).
+    const inf_pt = Vec3.new(std.math.inf(f32), 0.0, 0.0);
+    try testing.expectEqual(refFindNode(grid.nodes, inf_pt), grid.findNode(inf_pt));
+    try testing.expectEqual(refFindClosestNode(grid.nodes, inf_pt), grid.findClosestNode(inf_pt));
+    const nan_pt = Vec3.new(std.math.nan(f32), 0.0, std.math.nan(f32));
+    try testing.expectEqual(refFindNode(grid.nodes, nan_pt), grid.findNode(nan_pt));
+    try testing.expectEqual(refFindClosestNode(grid.nodes, nan_pt), grid.findClosestNode(nan_pt));
+
+    // Boundary points exactly on shared triangle edges stay deterministic.
+    const edge_pt = Vec3.new(4.0, 0.0, 4.0);
+    try testing.expectEqual(refFindNode(grid.nodes, edge_pt), grid.findNode(edge_pt));
+}
+
+test "NavMesh findNode: exact after in-place geometry mutation" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var nav = try NavMesh.buildGrid(allocator, 0.0, 100.0, 0.0, 100.0, 0.0, 20, 20, &.{});
+    defer nav.deinit();
+
+    // Drag node 5 far away in place. Parity must hold with no refresh call.
+    for (&nav.nodes[5].vertices) |*v| {
+        v.x += 1000.0;
+        v.z += 1000.0;
+    }
+    nav.nodes[5].centroid.x += 1000.0;
+    nav.nodes[5].centroid.z += 1000.0;
+
+    var prng = std.Random.DefaultPrng.init(0xBEA7);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const pt = Vec3.new(
+            rand.float(f32) * 120.0 - 10.0,
+            rand.float(f32) * 6.0 - 3.0,
+            rand.float(f32) * 120.0 - 10.0,
+        );
+        try testing.expectEqual(refFindNode(nav.nodes, pt), nav.findNode(pt));
+        try testing.expectEqual(refFindClosestNode(nav.nodes, pt), nav.findClosestNode(pt));
+    }
+}
+
+test "NavMesh findNode: parity at large coordinate offsets" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // +/-1e6 offsets, 1e6 spans: f32 ulp (~0.06) dwarfs the 1e-4 tolerances.
+    // 10x10 subdivisions over a 1e6 span: all grid coordinates are f32-exact.
+    var pos = try NavMesh.buildGrid(allocator, 1.0e6, 2.0e6, 1.0e6, 2.0e6, 0.0, 10, 10, &.{});
+    defer pos.deinit();
+    var neg = try NavMesh.buildGrid(allocator, -2.0e6, -1.0e6, -2.0e6, -1.0e6, 5.0, 10, 10, &.{});
+    defer neg.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xB16_0FF5);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const px = 1.0e6 + rand.float(f32) * 1.0e6;
+        const pz = 1.0e6 + rand.float(f32) * 1.0e6;
+        const pt = Vec3.new(px, rand.float(f32) * 6.0 - 3.0, pz);
+        try testing.expectEqual(refFindNode(pos.nodes, pt), pos.findNode(pt));
+        const npt = Vec3.new(-px, 5.0, -pz);
+        try testing.expectEqual(refFindNode(neg.nodes, npt), neg.findNode(npt));
+    }
+
+    // Exact cell/quad boundaries (shared edges): lowest index must win.
+    var k: u32 = 0;
+    while (k <= 10) : (k += 1) {
+        const e: f32 = 1.0e6 + @as(f32, @floatFromInt(k)) * 1.0e5;
+        const pt = Vec3.new(e, 0.0, e);
+        try testing.expectEqual(refFindNode(pos.nodes, pt), pos.findNode(pt));
+    }
+}
+
+test "NavMesh findNode: same-slice geometry edit stays exact" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // 10x10 grid over (0,0)-(50,50): 200 nodes, index active.
+    var nav = try NavMesh.buildGrid(allocator, 0.0, 50.0, 0.0, 50.0, 0.0, 10, 10, &.{});
+    defer nav.deinit();
+
+    // Point deep in the last quad; answered by a high node index.
+    const pt = Vec3.new(47.5, 0.0, 47.5);
+    const before = nav.findNode(pt);
+    try testing.expect(before != null and before.? != 0);
+
+    // Public in-place mutation on the SAME slice (ptr+len unchanged):
+    // drag node 0 (a non-candidate for pt's cell) so it covers pt.
+    // The historical mutable contract holds automatically;
+    // the earlier index must now win.
+    nav.nodes[0].vertices = .{
+        Vec3.new(46.0, 0.0, 46.0),
+        Vec3.new(49.0, 0.0, 46.0),
+        Vec3.new(47.5, 0.0, 49.0),
+    };
+    nav.nodes[0].centroid = Vec3.new(47.5, 0.0, 47.33);
+    try testing.expectEqual(@as(u32, 0), nav.findNode(pt).?);
+    try testing.expectEqual(refFindNode(nav.nodes, pt), nav.findNode(pt));
+    try testing.expectEqual(refFindClosestNode(nav.nodes, pt), nav.findClosestNode(pt));
+}
+
 test "NavMesh: build from simple 2-triangle quad with edge connection" {
     const testing = std.testing;
     const allocator = testing.allocator;

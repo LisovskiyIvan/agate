@@ -309,3 +309,350 @@ test "deeply nested composites hit CompositeTooDeep" {
     const font = try Font.parse(deep);
     try testing.expectError(error.CompositeTooDeep, extractOutline(testing.allocator, &font, 3));
 }
+
+test "lookup resolves every baked codepoint, misses fall back to .notdef" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    const font = try Font.parse(file);
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &ascii_set);
+    defer ttf.deinit();
+    for (ascii_set) |cp| {
+        const g = ttf.lookup(cp).?;
+        try testing.expectEqual(cp, g.codepoint);
+        try testing.expectEqual(try font.glyphIndex(cp), g.gid);
+    }
+    // Unrequested codepoints (mapped or not) fall back to .notdef.
+    const missing = ttf.lookup('Z').?;
+    try testing.expectEqual(@as(u16, 0), missing.gid);
+    try testing.expectEqual(@as(u21, 0xFFFD), missing.codepoint);
+    const missing_uni = ttf.lookup(0x4E2D).?;
+    try testing.expectEqual(@as(u16, 0), missing_uni.gid);
+}
+
+test "lookup with duplicate and empty charsets keeps first-match entries" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    const dupes = [_]u21{ 'A', 'B', 'A', 'C', 'B' };
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &dupes);
+    defer ttf.deinit();
+    try testing.expectEqual(dupes.len, ttf.glyphs.len);
+    // Duplicate codepoints bake identical entries, so lookup must match
+    // every same-codepoint slot (positions are normalized by the sort).
+    for ([_]u21{ 'A', 'B' }) |cp| {
+        const got = ttf.lookup(cp).?;
+        try testing.expectEqual(cp, got.codepoint);
+        for (ttf.glyphs) |g| {
+            if (g.codepoint == cp) try testing.expectEqual(g, got);
+        }
+    }
+
+    var empty = try TtfFont.init(testing.allocator, file, 20.0, &.{});
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.glyphs.len);
+    const fallback = empty.lookup('A').?;
+    try testing.expectEqual(@as(u16, 0), fallback.gid);
+}
+
+test "lookup of a requested-but-unmapped codepoint keeps its codepoint" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    const set = [_]u21{ 'A', 'Z' };
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &set);
+    defer ttf.deinit();
+    const z = ttf.lookup('Z').?;
+    try testing.expectEqual(@as(u16, 0), z.gid);
+    try testing.expectEqual(@as(u21, 'Z'), z.codepoint);
+}
+
+test "lookup over a fmt12 mixed-unicode set resolves BMP and supplementary" {
+    const file = try buildFixture(testing.allocator, .{ .cmap = .fmt12 });
+    defer testing.allocator.free(file);
+    const set = [_]u21{ 0x4E2D, 0x10437 };
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &set);
+    defer ttf.deinit();
+    try testing.expectEqual(@as(u16, 1), ttf.lookup(0x4E2D).?.gid);
+    try testing.expectEqual(@as(u16, 3), ttf.lookup(0x10437).?.gid);
+    try testing.expectEqual(@as(u16, 0), ttf.lookup('A').?.gid);
+}
+
+test "kernPx matches kernUnits on known, reversed and missing pairs" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &ascii_set);
+    defer ttf.deinit();
+    const scale = ttf.scale;
+    const ga = ttf.lookup('A').?;
+    const gb = ttf.lookup('B').?;
+    const gc = ttf.lookup('C').?;
+    const gz = ttf.lookup('Z').?; // .notdef fallback, gid 0
+    try testing.expectApproxEqAbs(@as(f32, -80) * scale, ttf.kernPx(ga, gb), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), ttf.kernPx(gb, ga), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), ttf.kernPx(ga, gc), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), ttf.kernPx(gz, ga), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), ttf.kernPx(ga, gz), 1e-6);
+}
+
+const KernPairSpec = struct { left: u16, right: u16, value: i16 };
+
+fn kernFmt0Subtable(
+    allocator: std.mem.Allocator,
+    format: u8,
+    pairs: []const KernPairSpec,
+    declared_pairs: ?u16,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeInt(u16, 0, .big); // subtable version
+    const len: u16 = @intCast(14 + pairs.len * 6);
+    try w.writeInt(u16, len, .big);
+    try w.writeByte(format);
+    try w.writeByte(0); // coverage
+    try w.writeInt(u16, declared_pairs orelse @intCast(pairs.len), .big);
+    try w.writeInt(u16, 2, .big); // searchRange (unused by the parser)
+    try w.writeInt(u16, 0, .big); // entrySelector
+    try w.writeInt(u16, 2, .big); // rangeShift
+    for (pairs) |p| {
+        try w.writeInt(u16, p.left, .big);
+        try w.writeInt(u16, p.right, .big);
+        try w.writeInt(i16, p.value, .big);
+    }
+    return out.toOwnedSlice();
+}
+
+fn kernTable(allocator: std.mem.Allocator, subtables: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeInt(u16, 0, .big); // version
+    try w.writeInt(u16, @intCast(subtables.len), .big);
+    for (subtables) |s| try w.writeAll(s);
+    return out.toOwnedSlice();
+}
+
+fn kernFontWith(kern: ?[]const u8) Font {
+    var f: Font = undefined;
+    f.kern = kern;
+    return f;
+}
+
+test "kernUnits finds unsorted pairs and lets the first match win" {
+    // Unsorted pairs are all found regardless of table order.
+    const s0 = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 3, .right = 4, .value = 10 },
+        .{ .left = 1, .right = 2, .value = -80 },
+        .{ .left = 2, .right = 1, .value = 5 },
+    }, null);
+    defer testing.allocator.free(s0);
+    const t0 = try kernTable(testing.allocator, &.{s0});
+    defer testing.allocator.free(t0);
+    try testing.expectEqual(@as(i16, 10), try kernFontWith(t0).kernUnits(3, 4));
+    try testing.expectEqual(@as(i16, -80), try kernFontWith(t0).kernUnits(1, 2));
+    try testing.expectEqual(@as(i16, 5), try kernFontWith(t0).kernUnits(2, 1));
+    try testing.expectEqual(@as(i16, 0), try kernFontWith(t0).kernUnits(9, 9));
+
+    // Duplicate pairs within one subtable: the first entry wins.
+    const s1 = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+        .{ .left = 1, .right = 2, .value = 99 },
+    }, null);
+    defer testing.allocator.free(s1);
+    const t1 = try kernTable(testing.allocator, &.{s1});
+    defer testing.allocator.free(t1);
+    try testing.expectEqual(@as(i16, -80), try kernFontWith(t1).kernUnits(1, 2));
+
+    // Across subtables the earlier subtable wins; later pairs still apply.
+    const s2a = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, null);
+    defer testing.allocator.free(s2a);
+    const s2b = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = 7 },
+        .{ .left = 5, .right = 6, .value = 3 },
+    }, null);
+    defer testing.allocator.free(s2b);
+    const t2 = try kernTable(testing.allocator, &.{ s2a, s2b });
+    defer testing.allocator.free(t2);
+    try testing.expectEqual(@as(i16, -80), try kernFontWith(t2).kernUnits(1, 2));
+    try testing.expectEqual(@as(i16, 3), try kernFontWith(t2).kernUnits(5, 6));
+
+    // Non-zero-format subtables are skipped by length, never misread.
+    const s3a = try kernFmt0Subtable(testing.allocator, 1, &.{
+        .{ .left = 1, .right = 2, .value = 42 },
+    }, null);
+    defer testing.allocator.free(s3a);
+    const s3b = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, null);
+    defer testing.allocator.free(s3b);
+    const t3 = try kernTable(testing.allocator, &.{ s3a, s3b });
+    defer testing.allocator.free(t3);
+    try testing.expectEqual(@as(i16, -80), try kernFontWith(t3).kernUnits(1, 2));
+
+    // A truncated pair array is BadTable, and a missing table is 0.
+    const s4 = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, 2);
+    defer testing.allocator.free(s4);
+    const t4 = try kernTable(testing.allocator, &.{s4});
+    defer testing.allocator.free(t4);
+    try testing.expectError(error.BadTable, kernFontWith(t4).kernUnits(1, 2));
+    try testing.expectEqual(@as(i16, 0), try kernFontWith(null).kernUnits(1, 2));
+}
+
+test "TtfFont init propagates allocator OOM" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, TtfFont.init(fa.allocator(), file, 20.0, &ascii_set));
+}
+
+fn kernIndexValue(index: []const font_mod.KernEntry, left: u16, right: u16) ?i16 {
+    const key = (@as(u32, left) << 16) | right;
+    const S = struct {
+        fn order(key_: u32, e: font_mod.KernEntry) std.math.Order {
+            return std.math.order(key_, e.key);
+        }
+    };
+    if (std.sort.binarySearch(font_mod.KernEntry, index, key, S.order)) |i| return index[i].value;
+    return null;
+}
+
+test "kern index agrees with kernUnits on synthetic tables" {
+    const queries = [_][2]u16{ .{ 1, 2 }, .{ 2, 1 }, .{ 3, 4 }, .{ 5, 6 }, .{ 9, 9 } };
+    // Same shapes as the kernUnits first-match test: unsorted, duplicate,
+    // multi-subtable and format-skipped tables must read back identically.
+    const s_unsorted = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 3, .right = 4, .value = 10 },
+        .{ .left = 1, .right = 2, .value = -80 },
+        .{ .left = 2, .right = 1, .value = 5 },
+    }, null);
+    defer testing.allocator.free(s_unsorted);
+    const t_unsorted = try kernTable(testing.allocator, &.{s_unsorted});
+    defer testing.allocator.free(t_unsorted);
+
+    const s_dup = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+        .{ .left = 1, .right = 2, .value = 99 },
+    }, null);
+    defer testing.allocator.free(s_dup);
+    const t_dup = try kernTable(testing.allocator, &.{s_dup});
+    defer testing.allocator.free(t_dup);
+
+    const s_m0 = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, null);
+    defer testing.allocator.free(s_m0);
+    const s_m1 = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = 7 },
+        .{ .left = 5, .right = 6, .value = 3 },
+    }, null);
+    defer testing.allocator.free(s_m1);
+    const t_multi = try kernTable(testing.allocator, &.{ s_m0, s_m1 });
+    defer testing.allocator.free(t_multi);
+
+    const s_skip = try kernFmt0Subtable(testing.allocator, 1, &.{
+        .{ .left = 1, .right = 2, .value = 42 },
+    }, null);
+    defer testing.allocator.free(s_skip);
+    const s_after = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, null);
+    defer testing.allocator.free(s_after);
+    const t_skip = try kernTable(testing.allocator, &.{ s_skip, s_after });
+    defer testing.allocator.free(t_skip);
+
+    for ([_][]const u8{ t_unsorted, t_dup, t_multi, t_skip }) |blob| {
+        const index = try font_mod.buildKernIndex(testing.allocator, blob);
+        defer testing.allocator.free(index);
+        // Sorted, unique keys.
+        for (index, 0..) |e, k| {
+            if (k > 0) try testing.expect(index[k - 1].key < e.key);
+        }
+        for (queries) |q| {
+            const want = try kernFontWith(blob).kernUnits(q[0], q[1]);
+            const got = kernIndexValue(index, q[0], q[1]) orelse 0;
+            try testing.expectEqual(want, got);
+        }
+    }
+
+    // Truncated tables fail identically; a missing table indexes empty.
+    const s_trunc = try kernFmt0Subtable(testing.allocator, 0, &.{
+        .{ .left = 1, .right = 2, .value = -80 },
+    }, 2);
+    defer testing.allocator.free(s_trunc);
+    const t_trunc = try kernTable(testing.allocator, &.{s_trunc});
+    defer testing.allocator.free(t_trunc);
+    try testing.expectError(error.BadTable, font_mod.buildKernIndex(testing.allocator, t_trunc));
+    // Short header is BadTable in both paths.
+    try testing.expectError(error.BadTable, font_mod.buildKernIndex(testing.allocator, &.{ 0, 0 }));
+    const empty_index = try font_mod.buildKernIndex(testing.allocator, null);
+    try testing.expectEqual(@as(usize, 0), empty_index.len);
+}
+
+test "lookup is order-independent over shuffled charsets" {
+    const file = try buildFixture(testing.allocator, .{});
+    defer testing.allocator.free(file);
+    const font = try Font.parse(file);
+    const shuffled = [_]u21{ 'C', 'A', 'B' };
+    var ttf = try TtfFont.init(testing.allocator, file, 20.0, &shuffled);
+    defer ttf.deinit();
+    // Baked set is sorted ascending by codepoint.
+    for (ttf.glyphs, 0..) |g, k| {
+        if (k > 0) try testing.expect(ttf.glyphs[k - 1].codepoint < g.codepoint);
+    }
+    for (shuffled) |cp| {
+        const g = ttf.lookup(cp).?;
+        try testing.expectEqual(cp, g.codepoint);
+        try testing.expectEqual(try font.glyphIndex(cp), g.gid);
+    }
+}
+
+test "kern index keeps first-match over many duplicate keys and subtables" {
+    // 3 subtables x 24 pairs over 4 shared keys (72 entries, far above
+    // any small-sort fast path). Every occurrence carries a distinct
+    // value encoding its global file order, so any stability slip in the
+    // bake-time sort surfaces as a wrong first-match value.
+    const shared = [_][2]u16{ .{ 1, 2 }, .{ 3, 4 }, .{ 5, 6 }, .{ 7, 8 } };
+    var subs: [3][]u8 = undefined;
+    var s: usize = 0;
+    while (s < 3) : (s += 1) {
+        var pairs: [24]KernPairSpec = undefined;
+        var j: usize = 0;
+        while (j < 24) : (j += 1) {
+            const k = shared[(j + s) % shared.len];
+            pairs[j] = .{
+                .left = k[0],
+                .right = k[1],
+                .value = @intCast(@as(i32, @intCast(s * 100 + j)) - 200),
+            };
+        }
+        subs[s] = try kernFmt0Subtable(testing.allocator, 0, &pairs, null);
+    }
+    defer for (subs) |sub| testing.allocator.free(sub);
+    const blob = try kernTable(testing.allocator, &subs);
+    defer testing.allocator.free(blob);
+
+    // Hardcoded anchors: key (2s+1, 2s+2) first occurs at subtable 0,
+    // position s, i.e. value s - 200.
+    const anchors = [_]i16{ -200, -199, -198, -197 };
+    for (shared, 0..) |k, i| {
+        try testing.expectEqual(anchors[i], try kernFontWith(blob).kernUnits(k[0], k[1]));
+    }
+
+    const index = try font_mod.buildKernIndex(testing.allocator, blob);
+    defer testing.allocator.free(index);
+    try testing.expectEqual(shared.len, index.len);
+    for (shared, 0..) |k, i| {
+        try testing.expectEqual(anchors[i], kernIndexValue(index, k[0], k[1]).?);
+    }
+    // Every indexed lookup (hits and misses) agrees with legacy kernUnits.
+    for (shared) |k| {
+        const want = try kernFontWith(blob).kernUnits(k[0], k[1]);
+        try testing.expectEqual(want, kernIndexValue(index, k[0], k[1]).?);
+    }
+    for ([_][2]u16{ .{ 9, 9 }, .{ 1, 3 }, .{ 8, 7 } }) |k| {
+        try testing.expectEqual(@as(i16, 0), try kernFontWith(blob).kernUnits(k[0], k[1]));
+        try testing.expect(kernIndexValue(index, k[0], k[1]) == null);
+    }
+}

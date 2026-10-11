@@ -281,8 +281,19 @@ pub fn spherecastWithFilter(
 }
 
 pub fn findBodyByShape(world: *PhysicsWorld, shape_id: c.b3ShapeId) ?*RigidBody {
+    // Steady-state fast path: one hash lookup, no body scan. The stored
+    // pointer is verified against the live shape (index AND generation),
+    // so a stale entry can never return the wrong body — it falls through
+    // to the reference scan below.
+    if (world.shape_index.get(world_mod.shapeKeyOf(shape_id))) |body| {
+        if (ownsShape(body, shape_id)) return body;
+    }
     for (world.bodies.items) |b| {
         if (ownsShape(b, shape_id)) {
+            // Self-heal: a shape missing from the index (e.g. an insert
+            // dropped for OOM in a void repair path) is re-registered, so
+            // later queries for it stay on the fast path.
+            world.shape_index.put(world.allocator, world_mod.shapeKeyOf(shape_id), b) catch {};
             return b;
         }
     }

@@ -1760,3 +1760,136 @@ test "AudioEngine crossfadeSound and stopAllSounds" {
     }
     try std.testing.expectEqual(@as(usize, 0), count);
 }
+
+// --- perf/audio-tag-query characterization: noise cutoff-constant hoist ---
+//
+// Test-only legacy reference: the pre-hoist per-sample `renderNoise` loop
+// (cutoff + `alpha` recomputed every sample) fused with the production
+// master-gain + soft-clip output stage. Engine output through the public
+// `play`/`renderFrames` API must match it sample-for-sample, proving the
+// constant-cutoff hoist changes no signal, seed/LP/time progression,
+// expiry, or clamping.
+fn legacyNoiseBurst(
+    out: []f32,
+    frames: usize,
+    sample_rate: f32,
+    cutoff0: f32,
+    cutoff_end: f32,
+    duration: f32,
+    seed0: u32,
+    volume: f32,
+    pan: f32,
+    master: f32,
+) void {
+    std.debug.assert(out.len >= frames * 2);
+    // NOTE: every input arrives as a runtime parameter, so all float
+    // math below evaluates at runtime exactly like the mixer kernel.
+    // Folding any of these from literals would let comptime arithmetic
+    // round differently (1-ulp) and break the bit-exact comparison.
+    const dt: f32 = 1.0 / sample_rate;
+    const omega: f32 = 2.0 * std.math.pi * dt;
+    const dur = @max(duration, 1e-6);
+    const inv_duration: f32 = 1.0 / dur;
+    const slope: f32 = (cutoff_end - cutoff0) / dur;
+    const gl: f32 = volume * @sqrt(0.5 * (1.0 - pan));
+    const gr: f32 = volume * @sqrt(0.5 * (1.0 + pan));
+    var t: f32 = 0.0;
+    var seed: u32 = seed0;
+    var lp: f32 = 0.0;
+    var j: usize = 0;
+    while (j < frames) : (j += 1) {
+        var vl: f32 = 0.0;
+        var vr: f32 = 0.0;
+        t += dt;
+        if (t < duration) {
+            const k = t * inv_duration;
+            const env = (1.0 - k) * (1.0 - k);
+            const cutoff = @max(cutoff0 + slope * t, 30.0);
+            const alpha = 1.0 - @exp(-omega * cutoff);
+            seed = seed *% 1664525 +% 1013904223;
+            const u: f32 = @floatFromInt(seed >> 9);
+            const n = u * (2.0 / 8388608.0) - 1.0;
+            lp += alpha * (n - lp);
+            const s = lp * 1.6 * env;
+            vl = s * gl;
+            vr = s * gr;
+        }
+        const l = vl * master;
+        const r = vr * master;
+        out[j * 2] = l / (1.0 + @abs(l));
+        out[j * 2 + 1] = r / (1.0 + @abs(r));
+    }
+}
+
+/// First `play()` seed on a fresh engine: `next_seed` starts at
+/// 0x12345678 and `play` bumps it before deriving the voice seed.
+fn firstPlaySeed() u32 {
+    var ns: u32 = 0x12345678;
+    ns +%= 1;
+    return ns *% 2654435761 +% 97;
+}
+
+test "noise static cutoff above clamp matches legacy reference exactly" {
+    var eng = AudioEngine{};
+    eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 5000.0, .cutoff_end = 5000.0 });
+    var buf: [8820]f32 = [_]f32{0.0} ** 8820; // 4410 frames = 0.1 s; voice lasts 0.05 s
+    eng.renderFrames(&buf);
+
+    var want: [8820]f32 = undefined;
+    legacyNoiseBurst(&want, 4410, 44100.0, 5000.0, 5000.0, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
+    try std.testing.expectEqualSlices(f32, &want, &buf);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+}
+
+test "noise static cutoff below clamp matches legacy reference exactly" {
+    var eng = AudioEngine{};
+    eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 10.0, .cutoff_end = 10.0 });
+    var buf: [8820]f32 = [_]f32{0.0} ** 8820;
+    eng.renderFrames(&buf);
+
+    var want: [8820]f32 = undefined;
+    legacyNoiseBurst(&want, 4410, 44100.0, 10.0, 10.0, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
+    try std.testing.expectEqualSlices(f32, &want, &buf);
+    try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
+}
+
+test "noise ramped cutoff matches legacy reference and expires to silence" {
+    var eng = AudioEngine{};
+    eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 6000.0, .cutoff_end = 300.0 });
+    var buf: [8820]f32 = [_]f32{0.0} ** 8820;
+    eng.renderFrames(&buf);
+
+    var want: [8820]f32 = undefined;
+    legacyNoiseBurst(&want, 4410, 44100.0, 6000.0, 300.0, 0.05, firstPlaySeed(), 0.9, 0.0, 0.8);
+    try std.testing.expectEqualSlices(f32, &want, &buf);
+
+    // Past the duration the voice is done: exact silence and slot released.
+    for (buf[4410..]) |s| try std.testing.expectEqual(@as(f32, 0.0), s);
+    try std.testing.expect(!eng.voices[0].active);
+}
+
+test "noise split-buffer rendering matches single render" {
+    const opts = AudioEngine.PlayOptions{
+        .kind = .noise_burst,
+        .volume = 0.9,
+        .duration = 0.08,
+        .cutoff = 2000.0,
+        .cutoff_end = 2000.0,
+    };
+    var e1 = AudioEngine{};
+    e1.play(opts);
+    var full: [8820]f32 = [_]f32{0.0} ** 8820;
+    e1.renderFrames(&full);
+
+    // Split at 2000 frames (not a 64-frame chunk multiple) to stress
+    // voice-state carry (t/seed/LP) across render calls and chunk edges.
+    var e2 = AudioEngine{};
+    e2.play(opts);
+    var part1: [4000]f32 = [_]f32{0.0} ** 4000;
+    e2.renderFrames(&part1);
+    var part2: [4820]f32 = [_]f32{0.0} ** 4820;
+    e2.renderFrames(&part2);
+
+    try std.testing.expectEqualSlices(f32, full[0..4000], &part1);
+    try std.testing.expectEqualSlices(f32, full[4000..], &part2);
+}

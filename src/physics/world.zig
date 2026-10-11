@@ -83,6 +83,26 @@ pub const PhysicsCounters = struct {
     island_count: i32 = 0,
 };
 
+/// Identity of one native shape incarnation: the slot index plus the
+/// generation, so a recycled slot never aliases a destroyed shape.
+/// `world0` namespaces live worlds (each world owns its map; see
+/// `PhysicsWorld.shape_index`).
+pub const ShapeKey = struct {
+    index1: i32,
+    world0: u16,
+    generation: u16,
+};
+
+/// Engine-owned shape -> body index backing `findBodyByShape` (see
+/// `queries.zig`). Keyed by full incarnation identity; values are live
+/// body pointers (each body is individually allocated, so the pointers
+/// stay valid until `removeBody`). Never touches native shape user data.
+pub const ShapeIndex = std.AutoHashMapUnmanaged(ShapeKey, *RigidBody);
+
+pub fn shapeKeyOf(id: c.b3ShapeId) ShapeKey {
+    return .{ .index1 = id.index1, .world0 = id.world0, .generation = id.generation };
+}
+
 pub const PhysicsWorld = struct {
     allocator: std.mem.Allocator,
     gravity: Vec3 = Vec3.new(0.0, -9.81, 0.0),
@@ -96,6 +116,12 @@ pub const PhysicsWorld = struct {
     debug_circle_segments: usize = default_debug_circle_segments,
     bodies: std.ArrayListUnmanaged(*RigidBody) = .empty,
     joints: std.ArrayListUnmanaged(c.b3JointId) = .empty,
+    /// Shape -> body index for `findBodyByShape`. Maintained on every
+    /// shape create/destroy path below (primary + child shapes); entries
+    /// are removed before the native shape dies, so the map never holds a
+    /// dangling pointer. Untracked native shapes (the internal ground
+    /// plane) stay absent and resolve to null, as before.
+    shape_index: ShapeIndex = .empty,
 
     // Events collected from the most recent step() call.
     sensor_events: std.ArrayListUnmanaged(SensorEvent) = .empty,
@@ -135,6 +161,7 @@ pub const PhysicsWorld = struct {
             self.allocator.destroy(b);
         }
         self.bodies.deinit(self.allocator);
+        self.shape_index.deinit(self.allocator);
         self.sensor_events.deinit(self.allocator);
         self.contact_events.deinit(self.allocator);
         self.contact_hit_events.deinit(self.allocator);
@@ -206,6 +233,7 @@ pub const PhysicsWorld = struct {
         }
 
         body.shape_id = try self.createShapeOnBody(body);
+        try self.indexShape(body, body.shape_id);
         return body;
     }
 
@@ -225,6 +253,27 @@ pub const PhysicsWorld = struct {
 
         try self.bodies.append(self.allocator, body);
         return body;
+    }
+
+    /// Registers one native shape incarnation in the lookup index. On OOM
+    /// the caller must roll back the native shape (see the call sites:
+    /// fallible creators propagate the error into a `removeBody` cleanup;
+    /// the void `recreateShape` keeps the linear fallback instead).
+    fn indexShape(self: *PhysicsWorld, body: *RigidBody, shape_id: c.b3ShapeId) !void {
+        try self.shape_index.put(self.allocator, shapeKeyOf(shape_id), body);
+    }
+
+    fn unindexShape(self: *PhysicsWorld, shape_id: c.b3ShapeId) void {
+        _ = self.shape_index.remove(shapeKeyOf(shape_id));
+    }
+
+    /// Drops every index entry owned by `body`. Must run before the native
+    /// shapes die so the map never references a destroyed body.
+    fn unindexBodyShapes(self: *PhysicsWorld, body: *RigidBody) void {
+        self.unindexShape(body.shape_id);
+        for (body.child_shapes.items) |ch| {
+            self.unindexShape(ch.shape_id);
+        }
     }
 
     /// Creates a static terrain body from a regular height grid.
@@ -276,6 +325,7 @@ pub const PhysicsWorld = struct {
         sdef.filter = toB3Filter(body.filter);
         body.shape_id = c.b3CreateHeightFieldShape(body.body_id, &sdef, heightfield);
         if (body.shape_id.index1 == 0) return error.PhysicsShapeCreationFailed;
+        try self.indexShape(body, body.shape_id);
         return body;
     }
 
@@ -432,6 +482,11 @@ pub const PhysicsWorld = struct {
         pending.shape_id = try self.buildChildShape(body, &pending);
         errdefer c.b3DestroyShape(pending.shape_id, false);
         self.syncChildState(body, &pending);
+        // Index before the list append so an OOM here still unwinds through
+        // the shape-destroying errdefer above (the entry is absent, so the
+        // unindex below never fires for it).
+        try self.indexShape(body, pending.shape_id);
+        errdefer self.unindexShape(pending.shape_id);
         try body.child_shapes.append(self.allocator, pending);
         self.syncShapeDensities(body);
     }
@@ -671,6 +726,7 @@ pub const PhysicsWorld = struct {
     pub fn removeBody(self: *PhysicsWorld, body: *RigidBody) void {
         for (self.bodies.items, 0..) |b, idx| {
             if (b == body) {
+                self.unindexBodyShapes(b);
                 c.b3DestroyBody(b.body_id);
                 if (b.mesh_data) |md| c.b3DestroyMesh(md);
                 if (b.heightfield_data) |hf| c.b3DestroyHeightField(hf);
@@ -874,14 +930,21 @@ pub const PhysicsWorld = struct {
 
     /// Replaces a body's shapes after a scale change. Each replacement is built
     /// before the old shape is destroyed, so failures keep the old collider.
+    /// The index follows the same order (unindex only what was destroyed,
+    /// register only what was created); a dropped insert here (OOM in a void
+    /// repair path) merely falls back to the linear scan for that shape.
     fn recreateShape(self: *PhysicsWorld, b: *RigidBody) void {
         const new_shape = self.createShapeOnBody(b) catch return;
+        self.unindexShape(b.shape_id);
         c.b3DestroyShape(b.shape_id, false);
         b.shape_id = new_shape;
+        self.indexShape(b, new_shape) catch {};
         for (b.child_shapes.items) |*ch| {
             const new_child = self.buildChildShape(b, ch) catch continue;
+            self.unindexShape(ch.shape_id);
             c.b3DestroyShape(ch.shape_id, false);
             ch.shape_id = new_child;
+            self.indexShape(b, new_child) catch {};
         }
         self.syncShapeDensities(b);
     }

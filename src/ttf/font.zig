@@ -264,6 +264,70 @@ pub const Font = struct {
     }
 };
 
+/// One kern pair for the baked lookup index: combined gid key plus the
+/// format-0 adjustment. Built once by `buildKernIndex`; queried with
+/// `std.sort.binarySearch` (no hashing, no per-query allocation).
+pub const KernEntry = struct {
+    key: u32, // (@as(u32, left_gid) << 16) | right_gid
+    value: i16,
+};
+
+fn kernEntryLess(_: void, lhs: KernEntry, rhs: KernEntry) bool {
+    return lhs.key < rhs.key;
+}
+
+/// Collects every format-0 kern pair (all subtables, file order) into a
+/// caller-owned slice sorted by key. Semantics match `kernUnits` exactly:
+/// the first matching pair in file order wins (duplicates collapse to
+/// their first occurrence), non-format-0 subtables are skipped by length,
+/// and malformed tables surface the same `BadTable` errors. A missing
+/// table yields an empty (non-null, zero-length) slice. `std.sort.block`
+/// is a stable sort (verified in the installed 0.16 std source) and the
+/// comparator is a strict key less-than, so equal keys keep file order
+/// and the in-place dedupe below keeps the first occurrence.
+pub fn buildKernIndex(allocator: std.mem.Allocator, kern: ?[]const u8) TtfError![]KernEntry {
+    const k = kern orelse return &.{};
+    if (k.len < 4) return error.BadTable;
+    const n_tables = std.mem.readInt(u16, k[2..][0..2], .big);
+    var list: std.ArrayListUnmanaged(KernEntry) = .empty;
+    errdefer list.deinit(allocator);
+    var pos: usize = 4;
+    var t: usize = 0;
+    while (t < n_tables) : (t += 1) {
+        if (pos + 6 > k.len) return error.BadTable;
+        const version = std.mem.readInt(u16, k[pos..][0..2], .big);
+        const length = std.mem.readInt(u16, k[pos + 2 ..][0..2], .big);
+        const format = k[pos + 4];
+        if (length < 6 or pos + length > k.len) return error.BadTable;
+        if (version == 0 and format == 0) {
+            const sub = k[pos..][0..length];
+            if (sub.len < 14) return error.BadTable;
+            const n_pairs = std.mem.readInt(u16, sub[6..][0..2], .big);
+            if (sub.len < 14 + @as(usize, n_pairs) * 6) return error.BadTable;
+            var p: usize = 0;
+            while (p < n_pairs) : (p += 1) {
+                const l = std.mem.readInt(u16, sub[14 + p * 6 ..][0..2], .big);
+                const r = std.mem.readInt(u16, sub[14 + p * 6 + 2 ..][0..2], .big);
+                const v = std.mem.readInt(i16, sub[14 + p * 6 + 4 ..][0..2], .big);
+                try list.append(allocator, .{
+                    .key = (@as(u32, l) << 16) | r,
+                    .value = v,
+                });
+            }
+        }
+        pos += length;
+    }
+    std.sort.block(KernEntry, list.items, {}, kernEntryLess);
+    var unique: usize = 0;
+    for (list.items) |e| {
+        if (unique > 0 and list.items[unique - 1].key == e.key) continue;
+        list.items[unique] = e;
+        unique += 1;
+    }
+    list.shrinkRetainingCapacity(unique);
+    return list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
 const CmapPair = struct { fmt4: ?[]const u8, fmt12: ?[]const u8 };
 
 /// Validates the kern table directory at parse time (lengths fit, format

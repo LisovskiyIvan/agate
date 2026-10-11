@@ -36,6 +36,8 @@ pub const DebugLine = types.DebugLine;
 pub const PhysicsWorld = world_mod.PhysicsWorld;
 pub const PhysicsProfile = world_mod.PhysicsProfile;
 pub const PhysicsCounters = world_mod.PhysicsCounters;
+// Identity type for `PhysicsWorld.shape_index` entries (shape -> body map).
+pub const ShapeKey = world_mod.ShapeKey;
 
 const character_mod = @import("physics/character.zig");
 pub const CharacterController = character_mod.CharacterController;

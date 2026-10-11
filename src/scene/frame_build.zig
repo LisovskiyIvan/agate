@@ -130,6 +130,7 @@ pub fn buildIntoClaimedSlot(scene: anytype, slot: usize, seq: usize) void {
         .scratch = &back.primary.instance_matrices,
         .thread_pool = jobs.global,
         .eye = eye,
+        .cpu_scratch = &back.instance_cpu_scratch,
     }, scene.meshes.items, seq);
     // Freeze the provisional build view for the queue build below.
     for (scene.meshes.items) |m| {

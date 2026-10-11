@@ -323,8 +323,9 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
 }
 
 /// Noise burst core: per-sample LCG noise + one-pole lowpass. The
-/// cutoff ramp slope and filter constant are hoisted; `alpha` stays
-/// per-sample since the filter state integrates every sample.
+/// cutoff ramp slope and filter constant are hoisted; constant-cutoff
+/// voices (`cutoff_slope == 0`) hoist `alpha` once per buffer, while the
+/// ramped path keeps the per-sample cutoff/alpha evaluation.
 inline fn renderNoise(a: ActiveVoice, dt: f32, buffer: []f32) void {
     const v = a.v;
     const omega: f32 = 2.0 * std.math.pi * dt; // hoisted filter constant
@@ -332,21 +333,40 @@ inline fn renderNoise(a: ActiveVoice, dt: f32, buffer: []f32) void {
     var seed = v.seed;
     var lp = v.lp;
     const total: usize = buffer.len / 2;
-    var j: usize = 0;
-    while (j < total) : (j += 1) {
-        t += dt;
-        if (t >= a.duration) break;
-        const k = t * a.inv_duration;
-        const env = (1.0 - k) * (1.0 - k);
-        const cutoff = @max(a.cutoff0 + a.cutoff_slope * t, 30.0);
+    if (a.cutoff_slope == 0.0) {
+        const cutoff = @max(a.cutoff0, 30.0);
         const alpha = 1.0 - @exp(-omega * cutoff);
-        seed = seed *% 1664525 +% 1013904223;
-        const u: f32 = @floatFromInt(seed >> 9); // 0..2^23-1
-        const n = u * (2.0 / 8388608.0) - 1.0;
-        lp += alpha * (n - lp);
-        const s = lp * 1.6 * env;
-        buffer[j * 2] += s * a.gl;
-        buffer[j * 2 + 1] += s * a.gr;
+        var j: usize = 0;
+        while (j < total) : (j += 1) {
+            t += dt;
+            if (t >= a.duration) break;
+            const k = t * a.inv_duration;
+            const env = (1.0 - k) * (1.0 - k);
+            seed = seed *% 1664525 +% 1013904223;
+            const u: f32 = @floatFromInt(seed >> 9); // 0..2^23-1
+            const n = u * (2.0 / 8388608.0) - 1.0;
+            lp += alpha * (n - lp);
+            const s = lp * 1.6 * env;
+            buffer[j * 2] += s * a.gl;
+            buffer[j * 2 + 1] += s * a.gr;
+        }
+    } else {
+        var j: usize = 0;
+        while (j < total) : (j += 1) {
+            t += dt;
+            if (t >= a.duration) break;
+            const k = t * a.inv_duration;
+            const env = (1.0 - k) * (1.0 - k);
+            const cutoff = @max(a.cutoff0 + a.cutoff_slope * t, 30.0);
+            const alpha = 1.0 - @exp(-omega * cutoff);
+            seed = seed *% 1664525 +% 1013904223;
+            const u: f32 = @floatFromInt(seed >> 9); // 0..2^23-1
+            const n = u * (2.0 / 8388608.0) - 1.0;
+            lp += alpha * (n - lp);
+            const s = lp * 1.6 * env;
+            buffer[j * 2] += s * a.gl;
+            buffer[j * 2 + 1] += s * a.gr;
+        }
     }
     v.t = t;
     v.seed = seed;

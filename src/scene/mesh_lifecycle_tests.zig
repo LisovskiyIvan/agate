@@ -574,3 +574,97 @@ test "destroyMesh off-context clears trail targets; destroyTrailMesh retires" {
     scene.flushPendingGpuUploads();
     try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
 }
+
+test "pickWithRayTag characterization: empty, invalid, logic, large query, hidden-near" {
+    const alloc = std.testing.allocator;
+    var scene: Scene = undefined;
+    scene.allocator = alloc;
+    scene.meshes = .empty;
+    scene.frame_id = 0;
+    defer scene.meshes.deinit(alloc);
+
+    var near_hidden = Mesh{
+        .name = "near_hidden",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 2),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+        .is_visible = false,
+    };
+    defer near_hidden.deinit(alloc);
+    _ = try near_hidden.addTags(alloc, "enemy");
+    try scene.meshes.append(alloc, &near_hidden);
+
+    var mid_other = Mesh{
+        .name = "mid_other",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 5),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    defer mid_other.deinit(alloc);
+    _ = try mid_other.addTags(alloc, "player");
+    try scene.meshes.append(alloc, &mid_other);
+
+    var far_visible = Mesh{
+        .name = "far_visible",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 3,
+        .position = Vec3.new(0, 0, 9),
+        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
+    };
+    defer far_visible.deinit(alloc);
+    _ = try far_visible.addTags(alloc, "enemy, boss");
+    try scene.meshes.append(alloc, &far_visible);
+
+    const ray = Ray.new(Vec3.new(0, 0, 0), Vec3.new(0, 0, 1));
+
+    // Empty query matches all: nearest visible mesh wins regardless of tags.
+    const hit_empty = scene.pickWithRayTag(ray, "");
+    try std.testing.expect(hit_empty.hit);
+    try std.testing.expectEqual(&mid_other, hit_empty.picked_mesh.?);
+
+    // Invalid queries are a clean miss on both the stack and fallback parse.
+    try std.testing.expect(!scene.pickWithRayTag(ray, "enemy &&").hit);
+    var bad: [1500]u8 = [_]u8{'!'} ** 1500; // >1KB invalid: fallback parse fails too
+    try std.testing.expect(!scene.pickWithRayTag(ray, &bad).hit);
+
+    // Boolean logic over the same ray.
+    const hit_boss = scene.pickWithRayTag(ray, "enemy && boss");
+    try std.testing.expect(hit_boss.hit);
+    try std.testing.expectEqual(&far_visible, hit_boss.picked_mesh.?);
+    // Near match is hidden and far match has boss: no result.
+    try std.testing.expect(!scene.pickWithRayTag(ray, "enemy && !boss").hit);
+
+    // >1KB valid query: stack parse overflows, page-allocator fallback
+    // parses once and still resolves to the far visible match.
+    var long: [3000]u8 = undefined;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const chunk = try std.fmt.bufPrint(long[pos..], "nope{d} || ", .{i});
+        pos += chunk.len;
+    }
+    @memcpy(long[pos..][0..5], "enemy");
+    pos += 5;
+    const big_query = long[0..pos];
+    try std.testing.expect(pos > 1024);
+    const hit_big = scene.pickWithRayTag(ray, big_query);
+    try std.testing.expect(hit_big.hit);
+    try std.testing.expectEqual(&far_visible, hit_big.picked_mesh.?);
+
+    // Non-matching tag along the same ray is a miss.
+    try std.testing.expect(!scene.pickWithRayTag(ray, "dragon").hit);
+
+    // Unhiding the near match restores closest-hit order for "enemy".
+    const hit_far = scene.pickWithRayTag(ray, "enemy");
+    try std.testing.expect(hit_far.hit);
+    try std.testing.expectEqual(&far_visible, hit_far.picked_mesh.?);
+    near_hidden.is_visible = true;
+    const hit_near = scene.pickWithRayTag(ray, "enemy");
+    try std.testing.expect(hit_near.hit);
+    try std.testing.expectEqual(&near_hidden, hit_near.picked_mesh.?);
+}

@@ -21,6 +21,7 @@ const UICanvas = @import("../ui.zig").UICanvas;
 const scene_picking = @import("picking.zig");
 const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
+const TagQuery = @import("../tags.zig").TagQuery;
 
 /// Viewport-aware picking ray. In multi-camera mode the visually relevant
 /// enabled camera under the cursor wins (draw overlay order: active first,
@@ -62,14 +63,36 @@ pub fn pickWithRay(self: anytype, r: Ray) PickingInfo {
 }
 
 /// Raycasts into the scene and returns the closest hit mesh that matches the tag query.
+/// The query parses once up front (stack 1KB + page-allocator fallback, same
+/// as `TagSet.matchesQuery`; empty matches all, invalid is a clean miss) and
+/// the parsed query is reused per mesh via `TagSet.matches`.
 pub fn pickWithRayTag(self: anytype, r: Ray, query_str: []const u8) PickingInfo {
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var q = TagQuery.parse(fba.allocator(), query_str) catch {
+        var fallback = TagQuery.parse(std.heap.page_allocator, query_str) catch return .{
+            .hit = false,
+            .distance = 0.0,
+            .picked_mesh = null,
+            .picked_point = Vec3.zero,
+            .picked_normal = Vec3.up,
+            .picked_instance = null,
+        };
+        defer fallback.deinit();
+        return pickWithParsedTag(self, r, &fallback);
+    };
+    defer q.deinit();
+    return pickWithParsedTag(self, r, &q);
+}
+
+fn pickWithParsedTag(self: anytype, r: Ray, q: *const TagQuery) PickingInfo {
     var closest_dist: f32 = std.math.inf(f32);
     var best_hit: ?RayHit = null;
     var best_mesh: ?*Mesh = null;
 
     for (self.meshes.items) |mesh| {
-        if (!mesh.matchesTagQuery(query_str)) continue;
         if (!mesh.is_visible or mesh.is_lod_child or mesh.is_decal or mesh.gpu_pending) continue;
+        if (!mesh.tags.matches(q)) continue;
 
         const box = if (mesh.cached_frame == self.frame_id) mesh.cached_aabb else mesh.getWorldBoundingBox();
         if (r.intersectsAABBNormal(box)) |hit| {

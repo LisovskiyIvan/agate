@@ -20,6 +20,7 @@ const shadow_pass = @import("../passes/shadow_pass.zig");
 const mesh_mod = @import("../mesh.zig");
 const ui_mod = @import("../ui.zig");
 const packets_mod = @import("frame_draws_packets.zig");
+const instance_staging_mod = @import("instance_staging.zig");
 
 pub const RenderQueues = render_queue.RenderQueues;
 pub const SkinStorage = render_queue.SkinStorage;
@@ -80,6 +81,15 @@ pub const FrameDrawSlot = struct {
     /// the latch/patch allocate nothing. Record `buffer` copies are borrowed
     /// read handles (never destroyed/retired through the record).
     staged_instances: std.ArrayListUnmanaged(StagedInstanceRecord) = .empty,
+    /// Slot-owned retained CPU scratch for instance staging (uid trail +
+    /// transparent pair-sort buffer): reused across meshes within one build
+    /// and across builds via the slot, so warm steady-state builds perform
+    /// no uid/pair allocations. Touched only by the game-side
+    /// `stageInstancesCpu` in the producer build (serial per mesh; the
+    /// intra-mesh parallel workers use disjoint slices) — never by the
+    /// latch, patch, or queue build. `reset` retains capacity, `deinit`
+    /// frees, `cpuBytes` counts the retained capacities.
+    instance_cpu_scratch: instance_staging_mod.CpuScratch = .{},
     /// Slot-owned UI CPU packet: the
     /// game side (`BuildClaim.stageUi`) records live canvas CPU geometry
     /// into these back-slot lists and stamps `ui_packet` (presence + staged
@@ -206,6 +216,7 @@ pub const FrameDrawSlot = struct {
         self.highlight_items.clearRetainingCapacity();
         self.shadow.reset();
         self.staged_instances.clearRetainingCapacity();
+        self.instance_cpu_scratch.clearRetainingCapacity();
         self.ui_vertices.clearRetainingCapacity();
         self.ui_indices.clearRetainingCapacity();
         self.ui_packet = .{};
@@ -250,6 +261,7 @@ pub const FrameDrawSlot = struct {
         self.highlight_items.deinit(allocator);
         self.shadow.deinit(allocator);
         self.staged_instances.deinit(allocator);
+        self.instance_cpu_scratch.deinit(allocator);
         self.ui_vertices.deinit(allocator);
         self.ui_indices.deinit(allocator);
         self.particle_draws.deinit(allocator);
@@ -294,6 +306,8 @@ pub const FrameDrawSlot = struct {
         b += listBytes(self.shadow.items);
         b += listBytes(self.shadow.skins);
         b += listBytes(self.staged_instances);
+        b += listBytes(self.instance_cpu_scratch.uids);
+        b += listBytes(self.instance_cpu_scratch.pairs);
         b += listBytes(self.ui_vertices);
         b += listBytes(self.ui_indices);
         b += listBytes(self.particle_draws);
