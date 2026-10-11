@@ -120,8 +120,9 @@ pub const SkyboxPass = struct {
     /// Analytic-dome variant of `render`: same varyings, but the fragment
     /// shader evaluates the physical sky (skybox.glsl analytic path)
     /// instead of sampling the cubemap. The cube binding still rides a
-    /// valid view (never sampled while sky_ctrl.x = 1).
-    pub fn renderAnalytic(self: *SkyboxPass, camera: Camera, aspect: f32, cube_tex: CubeTexture, exposure: f32, sun_dir: math.Vec3, turbidity: f32, sun_color: math.Color3, sun_intensity: f32) void {
+    /// valid view (never sampled while sky_ctrl.x = 1). Cloud/night extras
+    /// arrive pre-resolved in `params` (zeros = day dome bit-identical).
+    pub fn renderAnalytic(self: *SkyboxPass, camera: Camera, aspect: f32, cube_tex: CubeTexture, exposure: f32, params: @import("../postprocess/sky.zig").AnalyticParams) void {
         const view = camera.getViewMatrix();
         var rot_view = view;
         rot_view.m[12] = 0.0;
@@ -129,7 +130,7 @@ pub const SkyboxPass = struct {
         rot_view.m[14] = 0.0;
 
         const proj = camera.getProjectionMatrix(aspect);
-        self.renderMatricesAnalytic(rot_view, proj, cube_tex, exposure, sun_dir, turbidity, sun_color, sun_intensity);
+        self.renderMatricesAnalytic(rot_view, proj, cube_tex, exposure, params);
     }
 
     /// Matrix variant of `render`: draws the skybox from an explicit
@@ -162,10 +163,16 @@ pub const SkyboxPass = struct {
 
         // Analytic lane parked OFF: the shader takes the legacy texture
         // branch bit-identically; every backend sees a bound block.
+        // (Cloud/night extras zeroed: the day dome would match exactly too.)
         const sky_params = skybox_shd.SkyParams{
             .sky_sun = .{ 0.0, 1.0, 0.0, 2.6 },
             .sky_ctrl = .{ 0.0, 0.0, 0.0, 0.0 },
             .sky_sun_color = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_cloud = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_cloud2 = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_night = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_night2 = .{ 0.0, 0.0, 0.0, 0.0 },
+            .sky_moon = .{ 0.0, 1.0, 0.0, 1.0 },
         };
         sg.applyUniforms(skybox_shd.UB_sky_params, sg.asRange(&sky_params));
 
@@ -174,7 +181,7 @@ pub const SkyboxPass = struct {
 
     /// Matrix variant of `renderAnalytic` for probe captures: the analytic
     /// dome from an explicit rotation-only view + projection.
-    pub fn renderMatricesAnalytic(self: *SkyboxPass, rot_view: Mat4, proj: Mat4, cube_tex: CubeTexture, exposure: f32, sun_dir: math.Vec3, turbidity: f32, sun_color: math.Color3, sun_intensity: f32) void {
+    pub fn renderMatricesAnalytic(self: *SkyboxPass, rot_view: Mat4, proj: Mat4, cube_tex: CubeTexture, exposure: f32, params: @import("../postprocess/sky.zig").AnalyticParams) void {
         const view_proj = Mat4.mul(proj, rot_view);
 
         if (!sg.isvalid() or sg.queryPipelineState(self.pipeline) != .VALID) return;
@@ -197,11 +204,16 @@ pub const SkyboxPass = struct {
         };
         sg.applyUniforms(skybox_shd.UB_fs_params, sg.asRange(&fs_params));
 
-        const p = @import("../postprocess/sky.zig").analyticParams(sun_dir, turbidity, sun_color, sun_intensity, true);
+        const p = params;
         const sky_params = skybox_shd.SkyParams{
             .sky_sun = p.sky_sun,
             .sky_ctrl = p.sky_ctrl,
             .sky_sun_color = p.sky_sun_color,
+            .sky_cloud = p.sky_cloud,
+            .sky_cloud2 = p.sky_cloud2,
+            .sky_night = p.sky_night,
+            .sky_night2 = p.sky_night2,
+            .sky_moon = p.sky_moon,
         };
         sg.applyUniforms(skybox_shd.UB_sky_params, sg.asRange(&sky_params));
 

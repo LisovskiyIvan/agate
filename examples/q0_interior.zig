@@ -117,6 +117,18 @@ fn setupScene() void {
         scene.phys_sky.turbidity = envF32("AGATE_Q0_SKY_TURBIDITY", 2.6);
         if (std.c.getenv("AGATE_Q0_SUN_ELEV") != null) scene.phys_sky.sun_elevation_deg = envF32("AGATE_Q0_SUN_ELEV", 49.0);
         if (std.c.getenv("AGATE_Q0_SUN_AZIM") != null) scene.phys_sky.sun_azimuth_deg = envF32("AGATE_Q0_SUN_AZIM", 0.0);
+        // Sky v2 (opt-in inside the analytic dome): AGATE_Q0_CLOUDS=1 adds
+        // the 2D FBM dome layer (coverage/scale/wind tunable); AGATE_Q0_NIGHT=1
+        // forces full night (stars + moon) for day iteration — otherwise
+        // night fades in automatically once the sun drops below ~+2 deg.
+        if (envFlag("AGATE_Q0_CLOUDS")) {
+            scene.phys_sky.clouds.enabled = true;
+            scene.phys_sky.clouds.coverage = envF32("AGATE_Q0_CLOUD_COVERAGE", 0.45);
+            scene.phys_sky.clouds.scale = envF32("AGATE_Q0_CLOUD_SCALE", 3.0);
+            scene.phys_sky.clouds.wind_speed = envF32("AGATE_Q0_WIND", 0.02);
+            scene.phys_sky.clouds.wind_dir_deg = envF32("AGATE_Q0_WIND_DIR", 45.0);
+        }
+        if (envFlag("AGATE_Q0_NIGHT")) scene.phys_sky.night.enabled = true;
     }
 
     // Spot PCSS calibration light: a small shadow-casting spot over the
@@ -348,6 +360,12 @@ export fn frame() callconv(.c) void {
         camera.beta = std.math.pi / 2.75 + @sin(@as(f32, @floatFromInt(f)) * 0.008) * 0.12;
     }
     scene.active_camera = .{ .arc_rotate = camera };
+
+    // Sky clock for cloud wind advection (deterministic under the gate:
+    // fixed dt accumulates identically every run; live mode uses wall dt).
+    if (scene.phys_sky.enabled and (scene.phys_sky.clouds.enabled or scene.phys_sky.night.enabled)) {
+        scene.phys_sky.time_sec += dt;
+    }
 
     scene.update(dt) catch |err| fail("update: {s}", .{@errorName(err)});
     const w: i32 = @max(2, sapp.width());

@@ -208,7 +208,7 @@ pub fn renderProbeFace(
         rot_view.m[12] = 0.0;
         rot_view.m[13] = 0.0;
         rot_view.m[14] = 0.0;
-        scene.sky.pass.renderMatricesAnalytic(rot_view, proj, snap.sky_texture orelse snap.default_cube, snap.sky_exposure, snap.sun_dir, snap.sky_turbidity, snap.sun_color, snap.sun_intensity);
+        scene.sky.pass.renderMatricesAnalytic(rot_view, proj, snap.sky_texture orelse snap.default_cube, snap.sky_exposure, snap.sky_params);
     } else if (snap.sky_enabled) {
         var rot_view = view;
         rot_view.m[12] = 0.0;

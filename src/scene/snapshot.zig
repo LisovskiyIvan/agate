@@ -93,6 +93,14 @@ pub const SceneFrameSnapshot = struct {
     /// analytic dome instead of the cubemap when sky_analytic is set.
     sky_analytic: bool = false,
     sky_turbidity: f32 = 2.6,
+    /// Pre-resolved skybox uniforms (sun + cloud/night extras), captured
+    /// from Scene.phys_sky alongside the triple below. Off-valued unless
+    /// the analytic dome is live; the draw binds it verbatim.
+    sky_params: postprocess.sky.AnalyticParams = .{
+        .sky_sun = .{ 0.0, 1.0, 0.0, 2.6 },
+        .sky_ctrl = .{ 0.0, 0.0, 0.0, 0.0 },
+        .sky_sun_color = .{ 0.0, 0.0, 0.0, 0.0 },
+    },
     /// Render-owned copies of the shared default textures, captured at
     /// prepare. The draw path (scene/draw.zig Environment) binds these
     /// values — never the game-mutatable Scene.default_*_texture fields —
@@ -261,6 +269,21 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
         snap.post_process.fog_color = r.fog_tint;
         snap.sky_analytic = r.analytic;
         snap.sky_turbidity = r.turbidity;
+        // Skybox uniforms (dome path only; the default above already parks
+        // the off state). Resolved from the MODEL sun: clouds/night ride
+        // the appended lanes, sun color/intensity mirror the triple.
+        if (r.analytic) {
+            const se = std.math.clamp(snap.sun_dir.y, -1.0, 1.0);
+            snap.sky_params = postprocess.sky.analyticParamsFull(
+                snap.sun_dir,
+                r.turbidity,
+                Color3.new(r.sun_color[0], r.sun_color[1], r.sun_color[2]),
+                r.sun_intensity,
+                true,
+                scene.phys_sky,
+                se,
+            );
+        }
     }
     snap.outline_enabled = scene.postfx.outline_enabled;
     snap.outline_color = scene.postfx.outline_color;

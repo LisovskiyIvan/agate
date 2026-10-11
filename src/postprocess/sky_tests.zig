@@ -172,3 +172,177 @@ test "analyticParams packs the skybox lane and zeros when off" {
     try std.testing.expectApproxEqAbs(on.sky_sun[3], 4.0, 1e-6);
     try std.testing.expectEqual([4]f32{ 1.0, 0.9, 0.8, 2.0 }, on.sky_sun_color);
 }
+
+// --- Sky v2: clouds + night golden tests (table-driven house style) ---
+
+test "cloud/night sanitizers clamp and fall back" {
+    const cases = [_]struct { got: f32, want: f32 }{
+        .{ .got = sky.sanitizeCoverage(0.45), .want = 0.45 },
+        .{ .got = sky.sanitizeCoverage(-1.0), .want = 0.0 },
+        .{ .got = sky.sanitizeCoverage(2.0), .want = 1.0 },
+        .{ .got = sky.sanitizeCoverage(std.math.nan(f32)), .want = sky.CLOUD_COVERAGE_DEFAULT },
+        .{ .got = sky.sanitizeCloudScale(4.0), .want = 4.0 },
+        .{ .got = sky.sanitizeCloudScale(0.1), .want = sky.CLOUD_SCALE_MIN },
+        .{ .got = sky.sanitizeCloudScale(99.0), .want = sky.CLOUD_SCALE_MAX },
+        .{ .got = sky.sanitizeCloudScale(std.math.inf(f32)), .want = sky.CLOUD_SCALE_DEFAULT },
+        .{ .got = sky.sanitizeWindSpeed(0.1), .want = 0.1 },
+        .{ .got = sky.sanitizeWindSpeed(-9.0), .want = -sky.WIND_SPEED_MAX },
+        .{ .got = sky.sanitizeWindSpeed(std.math.nan(f32)), .want = 0.0 },
+        .{ .got = sky.sanitizeStrength(1.5, 1.0), .want = 1.5 },
+        .{ .got = sky.sanitizeStrength(-2.0, 1.0), .want = 0.0 },
+        .{ .got = sky.sanitizeStrength(99.0, 1.0), .want = 8.0 },
+        .{ .got = sky.sanitizeStrength(std.math.nan(f32), 0.6), .want = 0.6 },
+    };
+    for (cases) |c| try std.testing.expectApproxEqAbs(c.got, c.want, 1e-6);
+}
+
+test "cloudMask pins clear, ramps, and stays monotone" {
+    // Coverage 0: clear for every noise value (low edge sits at 1.0).
+    for ([_]f32{ 0.0, 0.25, 0.5, 0.75, 1.0 }) |n| {
+        try std.testing.expectApproxEqAbs(sky.cloudMask(n, 0.0), 0.0, 1e-6);
+    }
+    // Golden: (0.6 - 0.55) / 0.25 = 0.2 -> smoothstep 0.104.
+    try std.testing.expectApproxEqAbs(sky.cloudMask(0.6, 0.45), 0.104, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.cloudMask(1.0, 0.45), 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.cloudMask(0.5, 1.0), 1.0, 1e-6);
+    // Monotone in noise (fixed coverage) and in coverage (fixed noise).
+    var prev: f32 = 0.0;
+    for ([_]f32{ 0.0, 0.3, 0.55, 0.7, 0.9, 1.0 }) |n| {
+        const m = sky.cloudMask(n, 0.45);
+        try std.testing.expect(m >= prev);
+        prev = m;
+    }
+    prev = 0.0;
+    for ([_]f32{ 0.0, 0.2, 0.45, 0.7, 1.0 }) |c| {
+        const m = sky.cloudMask(0.7, c);
+        try std.testing.expect(m >= prev);
+        prev = m;
+    }
+}
+
+test "cloudWindOffset matches dir*speed*time" {
+    const w = sky.cloudWindOffset(45.0, 0.02, 10.0);
+    try std.testing.expectApproxEqAbs(w[0], 0.14142136, 1e-6);
+    try std.testing.expectApproxEqAbs(w[1], 0.14142136, 1e-6);
+    const zero = sky.cloudWindOffset(45.0, 0.02, 0.0);
+    try std.testing.expectApproxEqAbs(zero[0], 0.0, 1e-7);
+    try std.testing.expectApproxEqAbs(zero[1], 0.0, 1e-7);
+    const east = sky.cloudWindOffset(0.0, 0.1, 5.0);
+    try std.testing.expectApproxEqAbs(east[0], 0.5, 1e-6);
+    try std.testing.expectApproxEqAbs(east[1], 0.0, 1e-6);
+    // Non-finite time parks the offset at zero (never NaN downstream).
+    const bad = sky.cloudWindOffset(45.0, 0.02, std.math.nan(f32));
+    try std.testing.expectApproxEqAbs(bad[0], 0.0, 1e-7);
+    try std.testing.expectApproxEqAbs(bad[1], 0.0, 1e-7);
+}
+
+test "cloudHorizonFade keeps zenith, kills the horizon band" {
+    try std.testing.expectApproxEqAbs(sky.cloudHorizonFade(1.0, 1.0), 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.cloudHorizonFade(0.0, 1.0), 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.cloudHorizonFade(-1.0, 1.0), 0.0, 1e-6);
+    // Fade 0 disables: clouds reach the horizon.
+    for ([_]f32{ -1.0, 0.0, 0.1, 1.0 }) |y| {
+        try std.testing.expectApproxEqAbs(sky.cloudHorizonFade(y, 0.0), 1.0, 1e-6);
+    }
+    // Monotone in view height at full fade.
+    var prev: f32 = 0.0;
+    for ([_]f32{ -0.5, 0.0, 0.1, 0.2, 0.3, 1.0 }) |y| {
+        const m = sky.cloudHorizonFade(y, 1.0);
+        try std.testing.expect(m >= prev);
+        prev = m;
+    }
+}
+
+test "nightAmount follows the sun unless forced or disabled" {
+    const auto = sky.NightOptions{ .auto = true };
+    try std.testing.expectApproxEqAbs(sky.nightAmount(1.0, auto), 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.nightAmount(0.035, auto), 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.nightAmount(-0.105, auto), 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.nightAmount(-1.0, auto), 1.0, 1e-6);
+    // Forced night ignores the sun; disabled auto stays 0 even at midnight.
+    try std.testing.expectApproxEqAbs(sky.nightAmount(1.0, .{ .enabled = true }), 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(sky.nightAmount(-1.0, .{ .auto = false }), 0.0, 1e-6);
+    // Monotone as the sun sinks.
+    var prev: f32 = 0.0;
+    for ([_]f32{ 0.5, 0.1, 0.0, -0.05, -0.1, -0.5 }) |s| {
+        const a = sky.nightAmount(s, auto);
+        try std.testing.expect(a >= prev);
+        prev = a;
+    }
+}
+
+test "moonDir defaults aloft and honors overrides" {
+    const d = sky.moonDir(.{});
+    try std.testing.expectApproxEqAbs(d[0] * d[0] + d[1] * d[1] + d[2] * d[2], 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(d[0], -0.2802, 1e-3);
+    try std.testing.expectApproxEqAbs(d[1], 0.5736, 1e-3);
+    try std.testing.expectApproxEqAbs(d[2], -0.7698, 1e-3);
+    const up = sky.moonDir(.{ .moon_elevation_deg = 90.0, .moon_azimuth_deg = 0.0 });
+    try std.testing.expectApproxEqAbs(up[1], 1.0, 1e-5);
+}
+
+test "moonDiscCos matches the angular radius" {
+    try std.testing.expectApproxEqAbs(sky.moonDiscCos(0.26), 0.9999897, 1e-6);
+    try std.testing.expect(sky.moonDiscCos(3.0) < sky.moonDiscCos(0.26));
+    // Clamps hold: huge radii pin to the max, NaN to the default.
+    try std.testing.expectApproxEqAbs(sky.moonDiscCos(90.0), sky.moonDiscCos(sky.MOON_RADIUS_DEG_MAX), 1e-7);
+    try std.testing.expectApproxEqAbs(sky.moonDiscCos(std.math.nan(f32)), sky.moonDiscCos(sky.MOON_RADIUS_DEG_DEFAULT), 1e-7);
+}
+
+test "analyticParamsFull matches analyticParams with features off" {
+    const sun = sunDirElev(49.0);
+    const base = sky.analyticParams(sun, 2.6, Color3.new(1, 0.9, 0.8), 2.0, true);
+    const full = sky.analyticParamsFull(sun, 2.6, Color3.new(1, 0.9, 0.8), 2.0, true, .{}, @sin(49.0 * std.math.pi / 180.0));
+    try std.testing.expectEqual(base.sky_sun, full.sky_sun);
+    try std.testing.expectEqual(base.sky_ctrl, full.sky_ctrl);
+    try std.testing.expectEqual(base.sky_sun_color, full.sky_sun_color);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, full.sky_cloud);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, full.sky_cloud2);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, full.sky_night);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, full.sky_night2);
+    // Disabled packs off bit-identically too.
+    const off = sky.analyticParamsFull(sun, 2.6, Color3.white, 1.0, false, .{ .clouds = .{ .enabled = true } }, 1.0);
+    try std.testing.expectEqual(sky.analyticParams(sun, 2.6, Color3.white, 1.0, false).sky_ctrl, off.sky_ctrl);
+}
+
+test "analyticParamsFull packs cloud and night lanes" {
+    const sun = sunDirElev(49.0);
+    var opt = sky.SkyOptions{
+        .enabled = true,
+        .clouds = .{ .enabled = true, .coverage = 0.5, .scale = 4.0, .wind_dir_deg = 90.0, .wind_speed = 0.1 },
+        .night = .{ .enabled = true, .star_density = 0.4 },
+        .time_sec = 5.0,
+    };
+    const p = sky.analyticParamsFull(sun, 2.6, Color3.new(1, 0.9, 0.8), 2.0, true, opt, 1.0);
+    try std.testing.expectApproxEqAbs(p.sky_cloud[0], 0.5, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_cloud[1], 4.0, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_cloud[2], 5.0, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_cloud[3], 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_cloud2[0], 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_cloud2[1], 0.5, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_night[0], 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(p.sky_night[2], 0.4, 1e-6);
+    try std.testing.expect(p.sky_moon[3] > 0.999 and p.sky_moon[3] < 1.0);
+    // Auto night at noon stays dark-lane zero even with clouds on.
+    opt.night.enabled = false;
+    const day = sky.analyticParamsFull(sun, 2.6, Color3.new(1, 0.9, 0.8), 2.0, true, opt, 1.0);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, day.sky_night);
+    try std.testing.expectApproxEqAbs(day.sky_cloud[3], 1.0, 1e-6);
+}
+
+test "cloud/night sweep stays finite under hostile inputs" {
+    const hostile = [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32), -9.0, 0.0, 9.0 };
+    for (hostile) |h| {
+        try std.testing.expect(sky.sanitizeCoverage(h) >= 0.0 and sky.sanitizeCoverage(h) <= 1.0);
+        try std.testing.expect(std.math.isFinite(sky.sanitizeCloudScale(h)));
+        try std.testing.expect(std.math.isFinite(sky.sanitizeWindSpeed(h)));
+        try std.testing.expect(std.math.isFinite(sky.cloudMask(h, h)));
+        try std.testing.expect(std.math.isFinite(sky.cloudHorizonFade(h, h)));
+        try std.testing.expect(sky.nightAmount(h, .{}) >= 0.0 and sky.nightAmount(h, .{}) <= 1.0);
+        try std.testing.expect(std.math.isFinite(sky.moonDiscCos(h)));
+        const w = sky.cloudWindOffset(h, h, h);
+        try std.testing.expect(std.math.isFinite(w[0]) and std.math.isFinite(w[1]));
+        const md = sky.moonDir(.{ .moon_elevation_deg = h, .moon_azimuth_deg = h });
+        for (md) |c| try std.testing.expect(std.math.isFinite(c));
+    }
+}
