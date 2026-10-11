@@ -21,7 +21,6 @@ pub const ssgi = @import("postprocess/ssgi.zig");
 
 // --- Core Types ---
 pub const TonemappingType = types.TonemappingType;
-pub const LutFormat = types.LutFormat;
 pub const ShaftResolution = types.ShaftResolution;
 pub const BloomMipSize = types.BloomMipSize;
 pub const ShaftTargetSize = types.ShaftTargetSize;

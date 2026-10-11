@@ -3,7 +3,6 @@ const texture_mod = @import("../texture.zig");
 const types = @import("types.zig");
 const options = @import("options.zig");
 
-pub const LutFormat = types.LutFormat;
 pub const LutStripLayout = types.LutStripLayout;
 pub const LutStripSample = types.LutStripSample;
 
@@ -99,7 +98,7 @@ fn quantizeLutChannel(v: u32, denom: f32) u8 {
 /// (column b*size + r, row g) stores the lattice color
 /// (r/(size-1), g/(size-1), b/(size-1), opaque). CPU-side helper for tests
 /// and the sandbox; GPU upload stays with Texture.initRaw using
-/// mipmaps=false and CLAMP_TO_EDGE wraps (see the LutFormat note above).
+/// mipmaps=false and CLAMP_TO_EDGE wraps (only the 2D strip packing).
 pub fn writeIdentityLutStrip(buf: []u8, size: u32) !void {
     if (!validLutSize(size)) return error.InvalidLutStrip;
     const n: usize = @as(usize, size);

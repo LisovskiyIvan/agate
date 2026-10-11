@@ -9,14 +9,6 @@ pub const TonemappingType = enum(u32) {
     neutral = 5,
 };
 
-/// LUT texture packing. Only the 2D strip is supported (an N*N x N RGBA8
-/// image uploaded with mipmaps=false and CLAMP_TO_EDGE wraps); the enum
-/// exists so future packings (3D texture, .cube decode) extend here rather
-/// than in PostProcessOptions.
-pub const LutFormat = enum(u8) {
-    strip_2d = 0,
-};
-
 /// Raymarch target resolution: half or quarter of the base size.
 pub const ShaftResolution = enum(u8) {
     half = 0,

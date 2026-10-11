@@ -253,7 +253,6 @@ pub const c = @import("c.zig").c;
 pub const postprocess = @import("postprocess.zig");
 pub const PostProcessOptions = postprocess.PostProcessOptions;
 pub const TonemappingType = postprocess.TonemappingType;
-pub const LutFormat = postprocess.LutFormat;
 pub const ShaftResolution = postprocess.ShaftResolution;
 
 pub const ssao = @import("ssao.zig");

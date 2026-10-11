@@ -53,7 +53,6 @@ test "root re-exports cover recent Scene APIs" {
     _ = agate.TextureSlot;
     _ = agate.ExrDecodeError;
     _ = agate.ExrDecoded;
-    _ = agate.LutFormat;
     _ = agate.layoutAlignOffset;
     _ = agate.gridExtentSize;
     _ = agate.gridExtentOffset;

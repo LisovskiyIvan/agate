@@ -1,6 +1,6 @@
 # Постпроцессинг
 
-> Путь: src/agate/postprocess.zig + src/agate/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, LutFormat, ShaftResolution) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
+> Путь: src/agate/postprocess.zig + src/agate/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, ShaftResolution) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
 
 ## Что это
 
@@ -10,7 +10,7 @@
 
 | Лист | Ответственность |
 |---|---|
-| `types.zig` | `TonemappingType`, `LutFormat`, `ShaftResolution`, `BloomMipSize`, `ShaftTargetSize`, `TaaReset/Bounds`, `LutStripLayout/Sample` |
+| `types.zig` | `TonemappingType`, `ShaftResolution`, `BloomMipSize`, `ShaftTargetSize`, `TaaReset/Bounds`, `LutStripLayout/Sample` |
 | `options.zig` | `PostProcessOptions` + `clamped()` + `setColorGradingLut`/`clearColorGradingLut` |
 | `bloom.zig` | пирамида, Karis, tent-веса |
 | `glow.zig` | глобальный halo-слой (порог, ядро, тинт) |
@@ -70,7 +70,6 @@ pub const PostProcessOptions = struct {
     pub fn clearColorGradingLut(self: *PostProcessOptions) void
 };
 pub const TonemappingType = enum { ... }; // none/aces/filmic/reinhard/... (см. types.zig)
-pub const LutFormat = enum { ... };       // strip_2d (+ будущие)
 pub const ShaftResolution = enum { half, quarter };
 ```
 
@@ -85,7 +84,7 @@ pub const ShaftResolution = enum { half, quarter };
 | Glow v1 (global halo) | `glow_enabled`, `glow_threshold`, `glow_intensity`, `glow_radius`, `glow_tint` | off, const-дефолты, тинт {1,1,1} | ≥ 0; тинт `clampTint` в [0,1] |
 | Vignette | `vignette_enabled`, `vignette_intensity`, `vignette_radius` | on, 0.35, 0.8 | — |
 | Grading (параметрический) | `saturation`, `contrast`, `grade_shadows/midtones/highlights` | 1.05, 1.05, нули | грейды `clampGrade` в [-1,1] |
-| LUT текстурный | `lut_enabled`, `lut_strength`, `lut_size`, `lut_format`, `lut_texture` | off, 1.0, 16, strip_2d, null | strength [0,1]; размер `validLutSize` |
+| LUT текстурный | `lut_enabled`, `lut_strength`, `lut_size`, `lut_texture` | off, 1.0, 16, null | strength [0,1]; размер `validLutSize` |
 | FXAA 3.11 | `fxaa_enabled` | on | — |
 | Fog (density+height) | `fog_enabled`, `fog_density`, `fog_height_falloff`, `fog_start_distance`, `fog_color`, `fog_sun_scattering` | on, 0.015, 0.08, 5.0, светло-голубой, 0.8 | — |
 | SSR | `ssr_enabled`, `ssr_intensity`, `ssr_max_distance`, `ssr_thickness`, `ssr_steps` | on, 0.55, 25.0, 0.4, 16 | steps [4,64] |

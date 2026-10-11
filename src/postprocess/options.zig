@@ -11,7 +11,6 @@ const contact_shadows_mod = @import("contact_shadows.zig");
 const auto_exposure = @import("auto_exposure.zig");
 
 pub const TonemappingType = types.TonemappingType;
-pub const LutFormat = types.LutFormat;
 pub const ShaftResolution = types.ShaftResolution;
 pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
 
@@ -169,7 +168,6 @@ pub const PostProcessOptions = struct {
     lut_enabled: bool = false,
     lut_strength: f32 = 1.0,
     lut_size: u8 = 16,
-    lut_format: LutFormat = .strip_2d,
     lut_texture: ?texture_mod.Texture = null,
 
     // Anti-Aliasing (FXAA 3.11 Sub-Pixel Edge Smoothing)
@@ -461,7 +459,6 @@ const exempt_clamp_fields = [_][]const u8{
     "dof_enabled",
     "lut_enabled",
     "lut_size",
-    "lut_format",
     "fxaa_enabled",
     "fog_enabled",
     "fog_density",

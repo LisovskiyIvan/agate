@@ -3,7 +3,6 @@ const std = @import("std");
 const texture_mod = @import("../texture.zig");
 const options = @import("options.zig");
 const prod = @import("lut.zig");
-const LutFormat = prod.LutFormat;
 const LutStripSample = prod.LutStripSample;
 const validLutSize = prod.validLutSize;
 const lutStripLayout = prod.lutStripLayout;
@@ -174,7 +173,6 @@ test "color grading LUT setter, clear, and defaults" {
     try std.testing.expect(!cfg.lut_enabled);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.lut_strength, 1e-6);
     try std.testing.expectEqual(@as(u8, 16), cfg.lut_size);
-    try std.testing.expectEqual(LutFormat.strip_2d, cfg.lut_format);
     try std.testing.expect(cfg.lut_texture == null);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
 
