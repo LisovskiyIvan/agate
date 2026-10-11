@@ -272,6 +272,7 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 ## Смотрите также
 
 - `./frame-pipeline.md` — слоты, freeze→commit, host_bytes, staged prepare детально
+- `./threading.md` — оси трединга симуляции (`ThreadingOptions.physics`: dedicated-степ физики, fork-join в `Scene.update`)
 - `./architecture.md` — карта модулей и слоёв движка
 - `./scene.md` — `Scene.BuildClaim`/`PrepareClaim` со стороны сцены
 - `./profiler.md` — `Profiler.recordFrame` в хвосте `render`

@@ -283,6 +283,7 @@ pub const Runtime = struct {
 ## Смотрите также
 
 - `./architecture.md` — место кадра в устройстве движка.
+- `./threading.md` — dedicated-степ физики (`Scene.update` держит кик после lights и джойн после decals; перекрываются animations/soft bodies/particles/decals).
 - `./runtime.md` — жизненный цикл приложения и `Runtime` целиком.
 - `./render-pipeline.md` — что происходит внутри построенных очередей.
 - `./scene.md` — `Scene.update`, снимки, mailbox'ы.
