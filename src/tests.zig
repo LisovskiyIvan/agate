@@ -30,6 +30,11 @@ test {
     _ = @import("app.zig");
     _ = @import("app_tests.zig");
     _ = @import("asset_manager.zig");
+    _ = @import("asset_manager/async_mesh.zig");
+    _ = @import("asset_manager/cache.zig");
+    _ = @import("asset_manager/core.zig");
+    _ = @import("asset_manager/mesh_cpu.zig");
+    _ = @import("asset_manager/task.zig");
     _ = @import("asset_manager_tests.zig");
     _ = @import("assets.zig");
     _ = @import("assets_tests.zig");
