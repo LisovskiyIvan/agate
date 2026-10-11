@@ -89,7 +89,7 @@ pub fn sampleBoneAtTime(self: *const AnimationGroup, bone_idx: usize, time: f32,
 pub fn sampleNodeAtTime(self: *const AnimationGroup, target_idx: usize, time: f32, out_pos: *?Vec3, out_rot: *?Quat, out_scale: *?Vec3) void
 ```
 
-Поля: `duration/from/to/current_time`, `speed_ratio` (отрицательный — реверс), `weight` (clamp [0,1]), `is_additive`, `is_playing`, `loop`. `play` сбрасывает диапазон на `[0, duration]`; `playRange` клампит и ставит курсор внутрь; `goToFrame` — сик без событий. `update` двигает время (`dt * speed_ratio`, wrap по модулю при loop), применяет нодовые треки, собирает события; нулевая длина клипа всё равно драйвит ноды. `stop` возвращает bind-позу скелета и rest-позы нод/морфов. Фейды линейны по весу; `fadeOut` останавливает в конце; `crossFadeTo(self == target)` — no-op.
+Поля: `duration/from/to/current_time`, `speed_ratio` (отрицательный — реверс), `weight` (clamp [0,1]), `is_additive`, `is_playing`, `loop`. `play` сбрасывает диапазон на `[0, duration]` и перезапускает завершённый клип с начальной границы по направлению (0 вперёд, duration назад); курсор внутри диапазона сохраняется для продолжения после `pause`/сика. `playRange` клампит и ставит курсор внутрь; `goToFrame` — сик без событий. `update` двигает время (`dt * speed_ratio`, wrap по модулю при loop), применяет нодовые треки, собирает события; нулевая длина клипа всё равно драйвит ноды. `stop` возвращает bind-позу скелета и rest-позы нод/морфов. Фейды линейны по весу; `fadeOut` останавливает в конце; `crossFadeTo(self == target)` — no-op.
 
 События:
 

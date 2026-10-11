@@ -220,6 +220,19 @@ pub const AnimationGroup = struct {
         self.is_playing = true;
         self.fade_duration = 0.0;
         self.fired_len = 0;
+        // Finished one-shots replay: reseat only an endpoint cursor, so a
+        // mid-range pause()/goToFrame() cursor keeps resuming. Forward
+        // restarts when at/past to, reverse when at/below from (mirrors the
+        // playRange out-of-range seating, but play() always owns [0, to]).
+        if (self.speed_ratio >= 0.0) {
+            if (self.current_time < self.from or self.current_time >= self.to) {
+                self.current_time = self.from;
+            }
+        } else {
+            if (self.current_time <= self.from or self.current_time > self.to) {
+                self.current_time = self.to;
+            }
+        }
     }
 
     pub fn playRange(self: *AnimationGroup, from: f32, to: f32, loop: bool, speed: ?f32) void {

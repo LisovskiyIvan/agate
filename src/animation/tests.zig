@@ -1441,3 +1441,83 @@ test "crossFade source reset does not disturb remaining target" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), dst.weight, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0), skel.bones[0].local_position.z, 1e-4);
 }
+
+test "play reseats finished endpoint cursors and replays terminal events" {
+    const allocator = std.testing.allocator;
+    // Forward one-shot with a terminal event. Steps stay below the range so
+    // the advance>=range fire-all shortcut cannot mask an empty window.
+    const ag = try makeNodeGroup(allocator, "play_replay_fwd", 2.0);
+    defer ag.deinit();
+    try ag.setEvents(allocator, &.{.{ .time = 2.0, .name = "end" }});
+    ag.play(false);
+    ag.update(1.0);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+    ag.update(1.1); // overshoots to, clamps, stops, fires "end"
+    try std.testing.expect(!ag.is_playing);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), ag.current_time, 1e-6);
+    {
+        const f = ag.drainFiredEvents();
+        try std.testing.expectEqual(@as(usize, 1), f.len);
+        try std.testing.expectEqualStrings("end", f[0]);
+    }
+    ag.play(false); // cursor at/past to (forward) must reseat to from
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ag.current_time, 1e-6);
+    try std.testing.expect(ag.is_playing);
+    ag.update(1.0);
+    try std.testing.expectEqual(@as(usize, 0), ag.drainFiredEvents().len);
+    ag.update(1.1);
+    try std.testing.expect(!ag.is_playing);
+    {
+        const f = ag.drainFiredEvents();
+        try std.testing.expectEqual(@as(usize, 1), f.len);
+        try std.testing.expectEqualStrings("end", f[0]);
+    }
+
+    // Reverse one-shot with a terminal event at from.
+    const agr = try makeNodeGroup(allocator, "play_replay_rev", 2.0);
+    defer agr.deinit();
+    try agr.setEvents(allocator, &.{.{ .time = 0.0, .name = "start" }});
+    agr.setSpeed(-1.0);
+    agr.play(false); // initial reverse: 0 is at/below from, must start at to
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), agr.current_time, 1e-6);
+    agr.update(1.0);
+    try std.testing.expectEqual(@as(usize, 0), agr.drainFiredEvents().len);
+    agr.update(1.1); // overshoots from, clamps, stops, fires "start"
+    try std.testing.expect(!agr.is_playing);
+    {
+        const f = agr.drainFiredEvents();
+        try std.testing.expectEqual(@as(usize, 1), f.len);
+        try std.testing.expectEqualStrings("start", f[0]);
+    }
+    agr.play(false); // cursor at/below from (reverse) must reseat to to
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), agr.current_time, 1e-6);
+    agr.update(1.0);
+    try std.testing.expectEqual(@as(usize, 0), agr.drainFiredEvents().len);
+    agr.update(1.1);
+    {
+        const f = agr.drainFiredEvents();
+        try std.testing.expectEqual(@as(usize, 1), f.len);
+        try std.testing.expectEqualStrings("start", f[0]);
+    }
+}
+
+test "play preserves mid-range pause and seek cursors" {
+    const allocator = std.testing.allocator;
+    const ag = try makeNodeGroup(allocator, "play_resume", 2.0);
+    defer ag.deinit();
+    ag.play(true);
+    ag.update(0.5);
+    ag.pause();
+    const paused = ag.current_time;
+    try std.testing.expect(paused > 0.0 and paused < 2.0);
+    ag.play(true); // in-range resume, must not reseat
+    try std.testing.expectApproxEqAbs(paused, ag.current_time, 1e-6);
+    ag.goToFrame(1.25);
+    ag.play(true);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), ag.current_time, 1e-6);
+    // Reverse in-range resume is preserved too.
+    ag.setSpeed(-1.0);
+    ag.goToFrame(1.5);
+    ag.play(true);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), ag.current_time, 1e-6);
+}
