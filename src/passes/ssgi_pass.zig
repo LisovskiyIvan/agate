@@ -14,13 +14,13 @@ const PostProcessOptions = pp.PostProcessOptions;
 //
 // Per active frame (parent gates on postprocess.ssgiPassActive, which is
 // the master enabled + intensity floor + half_res_pass mode; MSAA
-// suppression clears ssgi_enabled so pass mode joins it for free):
+// suppression clears ssgi.enabled so pass mode joins it for free):
 //  1. Gather: fullscreen gather at half of the EFFECTIVE (render-scale)
 //     size over the HDR scene color + full-res depth (world-space disk,
 //     v1-identical footprint: `resolution` carries the full effective
 //     size). Outputs normalized bleed * coverage with NO intensity baked
 //     in; intensity scaling stays in the postprocess composite.
-//  2. Temporal (opt-in via ssgi_temporal_enabled, default OFF): reproject
+//  2. Temporal (opt-in via ssgi.temporal.enabled, default OFF): reproject
 //     the gather output against the velocity buffer (camera-depth fallback
 //     without velocity) into the history ping-pong pair, with variance
 //     clipping + depth/normal/reactive-marker rejection. History holds the
@@ -48,7 +48,7 @@ const PostProcessOptions = pp.PostProcessOptions;
 //           .prev_view_proj = ..., // camera-fallback reprojection
 //           .camera_pos = ...,
 //           .config = post,
-//           .camera_cut = post.taa_camera_cut, // shared one-frame cut flag
+//           .camera_cut = post.taa.camera_cut, // shared one-frame cut flag
 //           .near_z = ...,
 //           .far_z = ...,
 //           .base_w = fx_w,
@@ -336,7 +336,7 @@ pub const SsgiPass = struct {
     /// temporal stage additionally consumes the frame velocity view
     /// (render-scale, may be empty: the shader falls back to camera-depth
     /// reprojection), the previous view-projection for that fallback, and
-    /// the shared one-frame camera-cut flag (taa_camera_cut doubles as
+    /// the shared one-frame camera-cut flag (taa.camera_cut doubles as
     /// the SSGI history reset).
     pub const RenderArgs = struct {
         scene_view: sg.View = .{},
@@ -488,7 +488,7 @@ pub const SsgiPass = struct {
             .view_proj = args.view_proj,
             .camera_pos = .{ args.camera_pos.x, args.camera_pos.y, args.camera_pos.z, 0.0 },
             .resolution = .{ fw, fh, 1.0 / fw, 1.0 / fh },
-            .ssgi_params = .{ 1.0, cfg.ssgi_intensity, cfg.ssgi_radius, @floatFromInt(cfg.ssgi_steps) },
+            .ssgi_params = .{ 1.0, cfg.ssgi.intensity, cfg.ssgi.radius, @floatFromInt(cfg.ssgi.steps) },
         };
         sg.applyUniforms(gather_shd.UB_fs_params, sg.asRange(&gather_params));
         sg.draw(0, 6, 1);
@@ -548,7 +548,7 @@ pub const SsgiPass = struct {
                         .prev_view_proj = args.prev_view_proj,
                         .resolution = .{ hw, hh, 1.0 / hw, 1.0 / hh },
                         .full_resolution = .{ fw, fh, 1.0 / fw, 1.0 / fh },
-                        .camera_params = .{ args.near_z, args.far_z, cfg.ssgi_radius, 0.0 },
+                        .camera_params = .{ args.near_z, args.far_z, cfg.ssgi.radius, 0.0 },
                         .temporal_params = .{
                             if (history_valid) 1.0 else 0.0,
                             if (velocity_live) 1.0 else 0.0,
@@ -601,7 +601,7 @@ pub const SsgiPass = struct {
         const hh: f32 = @floatFromInt(size.h);
         const blur_params = blur_shd.FsParams{
             .resolution = .{ hw, hh, 1.0 / hw, 1.0 / hh },
-            .camera_params = .{ args.near_z, args.far_z, cfg.ssgi_radius, 0.0 },
+            .camera_params = .{ args.near_z, args.far_z, cfg.ssgi.radius, 0.0 },
         };
         sg.applyUniforms(blur_shd.UB_fs_params, sg.asRange(&blur_params));
         sg.draw(0, 6, 1);

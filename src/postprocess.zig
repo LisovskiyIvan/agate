@@ -25,6 +25,33 @@ pub const AutoExposureState = auto_exposure.AutoExposureState;
 pub const LuminanceHistogram = auto_exposure.LuminanceHistogram;
 pub const calcLuminance = auto_exposure.calcLuminance;
 
+// --- Per-effect option groups (nested leaves of PostProcessOptions) ---
+// NOTE: options.AutoExposureOptions (the nested config struct) keeps its
+// spec name but is NOT re-exported here: the top-level AutoExposureOptions
+// above is the long-standing histogram-evaluation struct consumed by
+// Scene.updateAutoExposure*. The nested config stays reachable as
+// postprocess.options.AutoExposureOptions.
+pub const BloomOptions = options.BloomOptions;
+pub const GlowOptions = options.GlowOptions;
+pub const VignetteOptions = options.VignetteOptions;
+pub const GradeOptions = options.GradeOptions;
+pub const DofOptions = options.DofOptions;
+pub const LutOptions = options.LutOptions;
+pub const FxaaOptions = options.FxaaOptions;
+pub const FogOptions = options.FogOptions;
+pub const SsrOptions = options.SsrOptions;
+pub const SsgiTemporalOptions = options.SsgiTemporalOptions;
+pub const SsgiOptions = options.SsgiOptions;
+pub const ContactShadowsOptions = options.ContactShadowsOptions;
+pub const LocalTonemapOptions = options.LocalTonemapOptions;
+pub const SharpenOptions = options.SharpenOptions;
+pub const GrainOptions = options.GrainOptions;
+pub const WhiteBalanceOptions = options.WhiteBalanceOptions;
+pub const MotionBlurOptions = options.MotionBlurOptions;
+pub const TaaReactiveOptions = options.TaaReactiveOptions;
+pub const TaaOptions = options.TaaOptions;
+pub const ShaftsOptions = options.ShaftsOptions;
+
 // --- Bloom ---
 pub const BLOOM_MAX_MIPS = bloom.BLOOM_MAX_MIPS;
 pub const clampBloomMips = bloom.clampBloomMips;
@@ -53,12 +80,12 @@ pub const lutParams = lut.lutParams;
 
 // --- Local Tonemapping ---
 pub fn localTonemapParams(cfg: PostProcessOptions) [4]f32 {
-    if (!cfg.local_tonemapping_enabled or cfg.local_tonemapping_intensity <= 0.001) {
+    if (!cfg.local_tonemapping.enabled or cfg.local_tonemapping.intensity <= 0.001) {
         return .{ 0.0, 0.0, 0.0, 0.0 };
     }
     return .{
         1.0,
-        cfg.local_tonemapping_intensity,
+        cfg.local_tonemapping.intensity,
         // Former local_tonemapping_contrast knob (dropped: zero non-default
         // setters): the historical default, hardcoded.
         0.3,
@@ -89,8 +116,8 @@ pub fn fxaaParams(enabled: bool) [4]f32 {
 /// lane), which keeps the composite identical to the SSR-off path. The
 /// steps count used to ride in camera_params.z and now has its own lane.
 pub fn ssrStepsParams(cfg: PostProcessOptions) [4]f32 {
-    if (!cfg.ssr_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
-    return .{ @floatFromInt(cfg.ssr_steps), 0.0, 0.0, 0.0 };
+    if (!cfg.ssr.enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    return .{ @floatFromInt(cfg.ssr.steps), 0.0, 0.0, 0.0 };
 }
 
 // --- Temporal Anti-Aliasing (TAA) ---

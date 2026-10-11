@@ -274,11 +274,19 @@ test "shaft defaults are off with zero GPU state (bit-identical)" {
     // Fresh scene (and every load — shafts are transient, never
     // serialized): disabled by default, and the gate needs post + shaft
     // + live CSM data, so the default fixture keeps PASS 2.9 closed.
-    try std.testing.expect(!scene.post_process.shaft_enabled);
+    try std.testing.expect(!scene.post_process.shafts.enabled);
     try std.testing.expect(!postprocess.shaftActive(scene.post_process.enabled, scene.post_process, true));
     try std.testing.expect(!postprocess.shaftActive(true, scene.post_process, true));
-    try std.testing.expect(!postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, false));
-    try std.testing.expect(postprocess.shaftActive(true, postprocess.PostProcessOptions{ .shaft_enabled = true }, true));
+    try std.testing.expect(!postprocess.shaftActive(true, postprocess.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    }, false));
+    try std.testing.expect(postprocess.shaftActive(true, postprocess.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    }, true));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.shaftParams(scene.post_process, false));
     // Headless fixture owns no shaft GPU state: no raymarch/blur pass
     // can run, no targets exist for the census (which gates on base

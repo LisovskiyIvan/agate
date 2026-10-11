@@ -248,7 +248,7 @@ pub const PostProcessPass = struct {
     /// Explicit TAA history reset. Context thread only (destroys GPU
     /// targets immediately); headless-safe (no-ops when nothing is
     /// allocated). The update-thread reset path is the snapshot-carried
-    /// PostProcessOptions.taa_camera_cut flag (one frame).
+    /// PostProcessOptions.taa.camera_cut flag (one frame).
     pub fn taaReset(self: *PostProcessPass) void {
         targets.taaReset(self);
     }

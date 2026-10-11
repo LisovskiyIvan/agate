@@ -51,5 +51,5 @@ pub fn reduceConservativeDepth(d00: f32, d10: f32, d01: f32, d11: f32) f32 {
 
 /// Pass-construction decision (pure; PostFXStack gates the GPU pass on this).
 pub fn depthPyramidActive(post_enabled: bool, cfg: options.PostProcessOptions) bool {
-    return post_enabled and (cfg.depth_pyramid_enabled or cfg.ssr_enabled);
+    return post_enabled and (cfg.depth_pyramid_enabled or cfg.ssr.enabled);
 }

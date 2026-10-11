@@ -371,10 +371,10 @@ pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     try self.updateParticles(dt);
     self.updateDecals(dt);
 
-    if (self.post_process.auto_exposure_enabled) {
+    if (self.post_process.auto_exposure.enabled) {
         const est_lum = self.estimateSceneLuminance();
         _ = self.updateAutoExposure(est_lum, dt);
-        self.post_process.auto_exposure_camera_cut = false;
+        self.post_process.auto_exposure.camera_cut = false;
     }
 
     const cur_w = sapp.width();

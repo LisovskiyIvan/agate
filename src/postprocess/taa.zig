@@ -296,7 +296,7 @@ pub fn taaReactiveBoost(is_fallback: bool, depth_min: f32, depth_max: f32, stren
 /// Reactive activity gate: enabled AND a non-zero strength (the composite
 /// early-outs on the same test through the packed lane).
 pub fn taaReactiveActive(cfg: options.PostProcessOptions) bool {
-    return cfg.taa_reactive_enabled and cfg.taa_reactive_strength > 0.001;
+    return cfg.taa.reactive.enabled and cfg.taa.reactive.intensity > 0.001;
 }
 
 /// True-reactive marker band (C.3 v2): the velocity pass stamps particle
@@ -350,7 +350,7 @@ pub fn taaReactiveMarkersActive(taa_on: bool, cfg: options.PostProcessOptions) b
 pub fn taaReactiveParams(cfg: options.PostProcessOptions) [4]f32 {
     if (!taaReactiveActive(cfg)) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ 1.0, c.taa_reactive_strength, c.taa_reactive_marker_strength, 0.0 };
+    return .{ 1.0, c.taa.reactive.intensity, c.taa.reactive.marker_intensity, 0.0 };
 }
 
 /// Full pixel resolve with variance clipping, history rejection, AND the
@@ -419,9 +419,9 @@ pub fn taaResolvePixelMarker(
 /// Disabled packs all zeros, which keeps the composite bit-identical to the
 /// pre-TAA path (the shader early-outs before any history/depth sampling).
 pub fn taaParams(cfg: options.PostProcessOptions) [4]f32 {
-    if (!cfg.taa_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.taa.enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ 1.0, c.taa_blend, c.taa_clamp_strength, c.taa_sharpness };
+    return .{ 1.0, c.taa.blend, c.taa.clamp_intensity, c.taa.sharpness };
 }
 
 /// Pack the shader taa_state vec4: (history_valid 1/0, capture_only 1/0).

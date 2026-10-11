@@ -39,30 +39,32 @@ const TAA_JITTER_PERIOD = taa.TAA_JITTER_PERIOD;
 
 test "taa clamps" {
     var bad = options.PostProcessOptions{
-        .taa_blend = 2.0,
-        .taa_jitter_scale = -1.0,
-        .taa_sharpness = 5.0,
-        .taa_clamp_strength = -2.0,
+        .taa = .{
+            .blend = 2.0,
+            .jitter_scale = -1.0,
+            .sharpness = 5.0,
+            .clamp_intensity = -2.0,
+        },
     };
     const out = bad.clamped();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out.taa_blend, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.taa_jitter_scale, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out.taa_sharpness, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.taa_clamp_strength, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out.taa.blend, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.taa.jitter_scale, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out.taa.sharpness, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.taa.clamp_intensity, 1e-6);
 
-    bad.taa_blend = -0.5;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_blend, 1e-6);
+    bad.taa.blend = -0.5;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa.blend, 1e-6);
 
     // Reactive strength clamps to [0, 1] like the other TAA knobs.
-    bad.taa_reactive_strength = 2.0;
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa_reactive_strength, 1e-6);
-    bad.taa_reactive_strength = -1.0;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_reactive_strength, 1e-6);
+    bad.taa.reactive.intensity = 2.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa.reactive.intensity, 1e-6);
+    bad.taa.reactive.intensity = -1.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa.reactive.intensity, 1e-6);
     // Marker strength clamps to [0, 1] on the same raw lane.
-    bad.taa_reactive_marker_strength = 2.0;
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa_reactive_marker_strength, 1e-6);
-    bad.taa_reactive_marker_strength = -1.0;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa_reactive_marker_strength, 1e-6);
+    bad.taa.reactive.marker_intensity = 2.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bad.clamped().taa.reactive.marker_intensity, 1e-6);
+    bad.taa.reactive.marker_intensity = -1.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bad.clamped().taa.reactive.marker_intensity, 1e-6);
 }
 
 test "taa halton jitter sequence, wrap, and scale" {
@@ -258,11 +260,15 @@ test "taa params and state packing" {
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaParams(def));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaParams(def.clamped()));
 
-    var on = options.PostProcessOptions{ .taa_enabled = true };
+    var on = options.PostProcessOptions{
+        .taa = .{
+            .enabled = true,
+        },
+    };
     try std.testing.expectEqual([4]f32{ 1.0, 0.9, 1.0, 0.0 }, taaParams(on));
     // Out-of-range values pack clamped.
-    on.taa_blend = 3.0;
-    on.taa_sharpness = -1.0;
+    on.taa.blend = 3.0;
+    on.taa.sharpness = -1.0;
     const got = taaParams(on);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), got[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), got[3], 1e-6);
@@ -402,21 +408,36 @@ test "taa reactive lane packs zeros when inactive" {
     // Default (off) and TAA-off configs pack the zero lane.
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(options.PostProcessOptions{}));
     try std.testing.expect(!taaReactiveActive(options.PostProcessOptions{}));
-    var off = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_strength = 0.5 };
+    var off = options.PostProcessOptions{
+        .taa = .{
+            .enabled = true,
+            .reactive = .{
+                .intensity = 0.5,
+            },
+        },
+    };
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(off));
     // Zero strength is inactive even when enabled.
-    off.taa_reactive_enabled = true;
-    off.taa_reactive_strength = 0.0;
+    off.taa.reactive.enabled = true;
+    off.taa.reactive.intensity = 0.0;
     try std.testing.expect(!taaReactiveActive(off));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, taaReactiveParams(off));
     // Enabled packs (1, strength-clamped, marker-clamped, 0).
-    var on = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_enabled = true, .taa_reactive_strength = 0.5 };
+    var on = options.PostProcessOptions{
+        .taa = .{
+            .enabled = true,
+            .reactive = .{
+                .enabled = true,
+                .intensity = 0.5,
+            },
+        },
+    };
     try std.testing.expect(taaReactiveActive(on));
     try std.testing.expectEqual([4]f32{ 1.0, 0.5, 1.0, 0.0 }, taaReactiveParams(on));
-    on.taa_reactive_strength = 3.0;
-    on.taa_reactive_marker_strength = 3.0;
+    on.taa.reactive.intensity = 3.0;
+    on.taa.reactive.marker_intensity = 3.0;
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 0.0 }, taaReactiveParams(on));
-    on.taa_reactive_marker_strength = 0.25;
+    on.taa.reactive.marker_intensity = 0.25;
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.25, 0.0 }, taaReactiveParams(on));
 }
 
@@ -447,7 +468,15 @@ test "taa reactive marker boost is the clamped strength, no edge ramp" {
 }
 
 test "taa reactive markers render only for an active TAA resolve" {
-    const on = options.PostProcessOptions{ .taa_enabled = true, .taa_reactive_enabled = true, .taa_reactive_strength = 0.5 };
+    const on = options.PostProcessOptions{
+        .taa = .{
+            .enabled = true,
+            .reactive = .{
+                .enabled = true,
+                .intensity = 0.5,
+            },
+        },
+    };
     const off = options.PostProcessOptions{};
     // TAA resolve active + reactive on: markers drawn.
     try std.testing.expect(taaReactiveMarkersActive(true, on));
@@ -456,7 +485,7 @@ test "taa reactive markers render only for an active TAA resolve" {
     // Reactive off: no markers even under TAA.
     try std.testing.expect(!taaReactiveMarkersActive(true, off));
     var weak = on;
-    weak.taa_reactive_strength = 0.0;
+    weak.taa.reactive.intensity = 0.0;
     try std.testing.expect(!taaReactiveMarkersActive(true, weak));
 }
 

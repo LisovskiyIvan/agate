@@ -21,76 +21,103 @@ const shaftKernelSum = shafts.shaftKernelSum;
 
 test "shaft defaults are off and bit-identical" {
     const cfg = options.PostProcessOptions{};
-    try std.testing.expect(!cfg.shaft_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.shaft_intensity, 1e-6);
-    try std.testing.expectEqual(@as(u32, 12), cfg.shaft_steps);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.05), cfg.shaft_density, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.shaft_anisotropy, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 60.0), cfg.shaft_max_distance, 1e-6);
-    try std.testing.expectEqual(ShaftResolution.quarter, cfg.shaft_resolution);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg.shaft_blur_sigma, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.02), cfg.shaft_edge_sigma, 1e-6);
+    try std.testing.expect(!cfg.shafts.enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.shafts.intensity, 1e-6);
+    try std.testing.expectEqual(@as(u32, 12), cfg.shafts.steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), cfg.shafts.density, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.shafts.anisotropy, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 60.0), cfg.shafts.max_distance, 1e-6);
+    try std.testing.expectEqual(ShaftResolution.quarter, cfg.shafts.resolution);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg.shafts.blur_sigma, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02), cfg.shafts.edge_sigma, 1e-6);
     // Off packs zeros: the composite never samples the shaft texture.
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, shaftParams(cfg, true));
     try std.testing.expect(!shaftActive(true, cfg, true));
-    try std.testing.expect(!shaftActive(false, options.PostProcessOptions{ .shaft_enabled = true }, true));
-    try std.testing.expect(!shaftActive(true, options.PostProcessOptions{ .shaft_enabled = true }, false));
-    try std.testing.expect(shaftActive(true, options.PostProcessOptions{ .shaft_enabled = true }, true));
+    try std.testing.expect(!shaftActive(false, options.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    }, true));
+    try std.testing.expect(!shaftActive(true, options.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    }, false));
+    try std.testing.expect(shaftActive(true, options.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    }, true));
     // A configured effect without a successful CSM-backed result must not
     // sample the scene-view placeholder as if it were shaft radiance.
     try std.testing.expectEqual(
         [4]f32{ 0.0, 0.0, 0.0, 0.0 },
-        shaftParams(options.PostProcessOptions{ .shaft_enabled = true }, false),
+        shaftParams(options.PostProcessOptions{
+            .shafts = .{
+                .enabled = true,
+            },
+        }, false),
     );
 }
 
 test "shaft config clamped sanitizes ranges" {
     var cfg = options.PostProcessOptions{
-        .shaft_intensity = -1.0,
-        .shaft_steps = 100,
-        .shaft_density = -0.5,
-        .shaft_anisotropy = 2.0,
-        .shaft_max_distance = -10.0,
-        .shaft_blur_sigma = -3.0,
-        .shaft_edge_sigma = -0.1,
+        .shafts = .{
+            .intensity = -1.0,
+            .steps = 100,
+            .density = -0.5,
+            .anisotropy = 2.0,
+            .max_distance = -10.0,
+            .blur_sigma = -3.0,
+            .edge_sigma = -0.1,
+        },
     };
     const out = cfg.clamped();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_intensity, 1e-6);
-    try std.testing.expectEqual(SHAFT_STEPS_MAX, out.shaft_steps);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_density, 1e-6);
-    try std.testing.expectApproxEqAbs(SHAFT_ANISOTROPY_MAX, out.shaft_anisotropy, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_max_distance, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_blur_sigma, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shaft_edge_sigma, 1e-6);
-    cfg.shaft_steps = 0;
-    try std.testing.expectEqual(SHAFT_STEPS_MIN, cfg.clamped().shaft_steps);
-    cfg.shaft_anisotropy = -2.0;
-    try std.testing.expectApproxEqAbs(-SHAFT_ANISOTROPY_MAX, cfg.clamped().shaft_anisotropy, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.intensity, 1e-6);
+    try std.testing.expectEqual(SHAFT_STEPS_MAX, out.shafts.steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.density, 1e-6);
+    try std.testing.expectApproxEqAbs(SHAFT_ANISOTROPY_MAX, out.shafts.anisotropy, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.max_distance, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.blur_sigma, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.edge_sigma, 1e-6);
+    cfg.shafts.steps = 0;
+    try std.testing.expectEqual(SHAFT_STEPS_MIN, cfg.clamped().shafts.steps);
+    cfg.shafts.anisotropy = -2.0;
+    try std.testing.expectApproxEqAbs(-SHAFT_ANISOTROPY_MAX, cfg.clamped().shafts.anisotropy, 1e-6);
     // Enabled packs the clamped intensity.
-    const on = options.PostProcessOptions{ .shaft_enabled = true, .shaft_intensity = 2.5 };
+    const on = options.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+            .intensity = 2.5,
+        },
+    };
     try std.testing.expectEqual([4]f32{ 1.0, 2.5, 0.0, 0.0 }, shaftParams(on, true));
 }
 
 test "shaft validation rejects non-finite and out-of-range" {
-    const ok = options.PostProcessOptions{ .shaft_enabled = true };
+    const ok = options.PostProcessOptions{
+        .shafts = .{
+            .enabled = true,
+        },
+    };
     try validateShaft(ok);
     var bad = ok;
-    bad.shaft_intensity = std.math.nan(f32);
+    bad.shafts.intensity = std.math.nan(f32);
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
     bad = ok;
-    bad.shaft_anisotropy = 1.0;
+    bad.shafts.anisotropy = 1.0;
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
     bad = ok;
-    bad.shaft_steps = 3;
+    bad.shafts.steps = 3;
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
     bad = ok;
-    bad.shaft_steps = 33;
+    bad.shafts.steps = 33;
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
     bad = ok;
-    bad.shaft_density = -1.0;
+    bad.shafts.density = -1.0;
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
     bad = ok;
-    bad.shaft_edge_sigma = std.math.inf(f32);
+    bad.shafts.edge_sigma = std.math.inf(f32);
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
 }
 

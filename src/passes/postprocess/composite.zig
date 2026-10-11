@@ -84,7 +84,7 @@ pub fn buildCompositeBindings(
     // LUT when the config carries a live binding; otherwise the resolved
     // scene view as a valid placeholder the shader never samples
     // (lut_params.x = 0 gates the LUT branch off).
-    const lut_view: sg.View = if (config.lut_texture) |t| t.view else .{};
+    const lut_view: sg.View = if (config.lut.texture) |t| t.view else .{};
     post_bind.views[post_shd.VIEW_lut_tex] = if (lut_view.id != 0)
         lut_view
     else
@@ -132,24 +132,24 @@ pub fn packCompositeParams(
     return post_shd.FsParams{
         .params1 = .{
             config.exposure,
-            config.bloom_threshold,
-            config.bloom_intensity,
+            config.bloom.threshold,
+            config.bloom.intensity,
             0.0,
         },
         .params2 = .{
-            config.vignette_intensity,
-            config.vignette_radius,
-            config.saturation,
-            config.contrast,
+            config.vignette.intensity,
+            config.vignette.radius,
+            config.grade.saturation,
+            config.grade.contrast,
         },
         .params3 = .{
             @floatFromInt(@intFromEnum(config.tonemapping)),
-            config.chromatic_aberration,
-            if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
-            if (config.vignette_enabled) 1.0 else 0.0,
+            config.grade.chromatic_aberration,
+            if (config.bloom.enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
+            if (config.vignette.enabled) 1.0 else 0.0,
         },
         .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_intensity),
-        .fxaa_params = postprocess.fxaaParams(config.fxaa_enabled),
+        .fxaa_params = postprocess.fxaaParams(config.fxaa.enabled),
         .resolution = .{
             @floatFromInt(cur_w),
             @floatFromInt(cur_h),
@@ -183,20 +183,20 @@ pub fn packCompositeParams(
             0.0,
         },
         .fog_params = .{
-            if (config.fog_enabled) 1.0 else 0.0,
-            config.fog_density,
-            config.fog_height_falloff,
-            config.fog_start_distance,
+            if (config.fog.enabled) 1.0 else 0.0,
+            config.fog.density,
+            config.fog.height_falloff,
+            config.fog.start_distance,
         },
         .fog_color = .{
-            config.fog_color[0],
-            config.fog_color[1],
-            config.fog_color[2],
-            config.fog_sun_scattering,
+            config.fog.color[0],
+            config.fog.color[1],
+            config.fog.color[2],
+            config.fog.sun_scattering,
         },
         .ssr_params = .{
-            if (config.ssr_enabled) 1.0 else 0.0,
-            config.ssr_intensity,
+            if (config.ssr.enabled) 1.0 else 0.0,
+            config.ssr.intensity,
             // Former ssr_thickness / ssr_max_distance knobs (dropped: zero
             // non-default setters): the historical defaults, hardcoded.
             0.4,
@@ -207,16 +207,16 @@ pub fn packCompositeParams(
         // early-outs on ssr_params.x before reading this lane).
         .ssr_params2 = postprocess.ssrStepsParams(config),
         .params5 = .{
-            if (config.sharpen_enabled) config.sharpen_amount else 0.0,
-            if (config.grain_enabled) config.grain_intensity else 0.0,
-            config.temperature,
-            config.tint,
+            if (config.sharpen.enabled) config.sharpen.intensity else 0.0,
+            if (config.grain.enabled) config.grain.intensity else 0.0,
+            config.white_balance.temperature,
+            config.white_balance.tint,
         },
         .dof_params = .{
-            if (config.dof_enabled) 1.0 else 0.0,
-            config.dof_focus_distance,
-            config.dof_focus_range,
-            config.dof_max_blur,
+            if (config.dof.enabled) 1.0 else 0.0,
+            config.dof.focus_distance,
+            config.dof.focus_range,
+            config.dof.max_blur,
         },
         // (enabled 1/0, intensity, 0, 0); zeros when glow is off, which
         // keeps the composite identical to the pre-glow path.
@@ -247,21 +247,21 @@ pub fn packCompositeParams(
         // (enabled 1/0, intensity, contrast, 0); zeros when off
         .local_tonemap_params = postprocess.localTonemapParams(config),
         .grade_shadows = .{
-            config.grade_shadows[0],
-            config.grade_shadows[1],
-            config.grade_shadows[2],
+            config.grade.shadows[0],
+            config.grade.shadows[1],
+            config.grade.shadows[2],
             0.0,
         },
         .grade_midtones = .{
-            config.grade_midtones[0],
-            config.grade_midtones[1],
-            config.grade_midtones[2],
+            config.grade.midtones[0],
+            config.grade.midtones[1],
+            config.grade.midtones[2],
             0.0,
         },
         .grade_highlights = .{
-            config.grade_highlights[0],
-            config.grade_highlights[1],
-            config.grade_highlights[2],
+            config.grade.highlights[0],
+            config.grade.highlights[1],
+            config.grade.highlights[2],
             0.0,
         },
         // (enabled 1/0, intensity, size N, 0); zeros when no LUT, which
@@ -271,12 +271,12 @@ pub fn packCompositeParams(
         .inv_view_proj = inv_view_proj,
         .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
         .motion_blur_params = .{
-            if (config.motion_blur_enabled) 1.0 else 0.0,
+            if (config.motion_blur.enabled) 1.0 else 0.0,
             // Former motion_blur_intensity knob (dropped: zero non-default
             // setters): the historical default, hardcoded.
             0.5,
-            config.motion_blur_max_blur_px,
-            @floatFromInt(config.motion_blur_samples),
+            config.motion_blur.max_blur_px,
+            @floatFromInt(config.motion_blur.steps),
         },
         // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
         // which keeps the composite identical to the pre-TAA path.

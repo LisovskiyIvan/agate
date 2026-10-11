@@ -8,15 +8,15 @@ test "glow defaults are off and neutral" {
     const cfg = options.PostProcessOptions{};
     // Default OFF: disabled glow runs zero passes and packs zero uniforms,
     // so the composite stays bit-identical to the pre-glow path.
-    try std.testing.expect(!cfg.glow_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.glow_threshold, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cfg.glow_intensity, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), cfg.glow_radius, 1e-6);
-    try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, cfg.glow_tint);
+    try std.testing.expect(!cfg.glow.enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.glow.threshold, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cfg.glow.intensity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), cfg.glow.radius, 1e-6);
+    try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, cfg.glow.tint);
     // Distinct from bloom: threshold above bloom's 0.8, radius wider than
     // bloom's 2.0.
-    try std.testing.expect(cfg.glow_threshold > 0.8);
-    try std.testing.expect(cfg.glow_radius > 2.0);
+    try std.testing.expect(cfg.glow.threshold > 0.8);
+    try std.testing.expect(cfg.glow.radius > 2.0);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowParams(cfg));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowTintParams(cfg));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowParams(cfg.clamped()));
@@ -26,41 +26,47 @@ test "glow defaults are off and neutral" {
 
 test "glow clamped sanitizes ranges like bloom" {
     var cfg = options.PostProcessOptions{
-        .glow_threshold = -1.0,
-        .glow_intensity = -0.5,
-        .glow_radius = -4.0,
-        .glow_tint = .{ 2.0, -1.0, 0.5 },
+        .glow = .{
+            .threshold = -1.0,
+            .intensity = -0.5,
+            .radius = -4.0,
+            .tint = .{ 2.0, -1.0, 0.5 },
+        },
     };
     const out = cfg.clamped();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow_threshold, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow_intensity, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow_radius, 1e-6);
-    try std.testing.expectEqual([3]f32{ 1.0, 0.0, 0.5 }, out.glow_tint);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow.threshold, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow.intensity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.glow.radius, 1e-6);
+    try std.testing.expectEqual([3]f32{ 1.0, 0.0, 0.5 }, out.glow.tint);
     // Bloom's own sanitization is untouched by the glow fields.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8), out.bloom_threshold, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out.bloom_intensity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), out.bloom.threshold, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out.bloom.intensity, 1e-6);
 }
 
 test "glow validate rejects non-finite and out-of-range" {
     // Defaults validate clean.
     try glow.validateGlow(options.PostProcessOptions{});
-    try glow.validateGlow(options.PostProcessOptions{ .glow_enabled = true });
+    try glow.validateGlow(options.PostProcessOptions{
+        .glow = .{
+            .enabled = true,
+        },
+    });
 
     // NaN/Inf can never sanitize: hard errors, never silent clamps.
     const nan = std.math.nan(f32);
     const inf = std.math.inf(f32);
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_threshold = nan }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_intensity = inf }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_radius = nan }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_tint = .{ 1.0, nan, 1.0 } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .threshold = nan } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .intensity = inf } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .radius = nan } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .tint = .{ 1.0, nan, 1.0 } } }));
 
     // Finite out-of-range values are rejected here (clamped() is the
     // sanitizing path for those, mirroring bloom).
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_threshold = -0.1 }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_intensity = -1.0 }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_radius = -2.0 }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_tint = .{ 1.0, 1.0, 1.5 } }));
-    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow_tint = .{ -0.1, 0.0, 0.0 } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .threshold = -0.1 } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .intensity = -1.0 } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .radius = -2.0 } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .tint = .{ 1.0, 1.0, 1.5 } } }));
+    try std.testing.expectError(error.InvalidGlowOptions, glow.validateGlow(.{ .glow = .{ .tint = .{ -0.1, 0.0, 0.0 } } }));
 }
 
 test "glow extract and gaussian kernel math" {
@@ -97,23 +103,38 @@ test "glow extract and gaussian kernel math" {
 
 test "glow params and tint packing, independent of bloom" {
     // Enabled packs the clamped intensity and tint.
-    const on = options.PostProcessOptions{ .glow_enabled = true };
+    const on = options.PostProcessOptions{
+        .glow = .{
+            .enabled = true,
+        },
+    };
     try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.0, 0.0 }, glow.glowParams(on));
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 0.0 }, glow.glowTintParams(on));
 
     // Out-of-range packs clamped (the shader additionally gates on
     // intensity > 0.001, so zero intensity is a no-op even when enabled).
-    var hot = options.PostProcessOptions{ .glow_enabled = true, .glow_intensity = 9.0, .glow_tint = .{ 3.0, -2.0, 0.25 } };
+    var hot = options.PostProcessOptions{
+        .glow = .{
+            .enabled = true,
+            .intensity = 9.0,
+            .tint = .{ 3.0, -2.0, 0.25 },
+        },
+    };
     const hp = glow.glowParams(hot);
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), hp[1], 1e-6);
     const ht = glow.glowTintParams(hot);
     try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.25, 0.0 }, ht);
-    hot.glow_intensity = -4.0;
+    hot.glow.intensity = -4.0;
     try std.testing.expectEqual(@as(f32, 0.0), glow.glowParams(hot)[1]);
 
     // Bloom knobs never leak into the glow uniforms and vice versa: the two
     // effects stay independently toggleable.
-    const bloom_only = options.PostProcessOptions{ .bloom_enabled = true, .bloom_intensity = 0.9 };
+    const bloom_only = options.PostProcessOptions{
+        .bloom = .{
+            .enabled = true,
+            .intensity = 0.9,
+        },
+    };
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowParams(bloom_only));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowTintParams(bloom_only));
     try std.testing.expect(bloom.bloomPyramidActive(true, bloom_only));
@@ -127,7 +148,11 @@ test "glow and bloom pass decisions are independent" {
     try std.testing.expect(!bloom.bloomPyramidActive(false, def));
     try std.testing.expect(!glow.glowActive(true, def));
     // Post off disables both regardless of their own toggles.
-    const both_on = options.PostProcessOptions{ .glow_enabled = true };
+    const both_on = options.PostProcessOptions{
+        .glow = .{
+            .enabled = true,
+        },
+    };
     try std.testing.expect(!bloom.bloomPyramidActive(false, both_on));
     try std.testing.expect(!glow.glowActive(false, both_on));
     try std.testing.expect(bloom.bloomPyramidActive(true, both_on));
@@ -136,13 +161,13 @@ test "glow and bloom pass decisions are independent" {
     // Toggling glow never changes the bloom decision (and vice versa).
     var cfg = options.PostProcessOptions{};
     const bloom_before = bloom.bloomPyramidActive(true, cfg);
-    cfg.glow_enabled = true;
+    cfg.glow.enabled = true;
     try std.testing.expectEqual(bloom_before, bloom.bloomPyramidActive(true, cfg));
     try std.testing.expect(glow.glowActive(true, cfg));
-    cfg.glow_enabled = false;
+    cfg.glow.enabled = false;
     try std.testing.expect(!glow.glowActive(true, cfg));
     try std.testing.expectEqual(bloom_before, bloom.bloomPyramidActive(true, cfg));
-    cfg.bloom_enabled = false;
+    cfg.bloom.enabled = false;
     try std.testing.expect(!bloom.bloomPyramidActive(true, cfg));
     try std.testing.expect(!glow.glowActive(true, cfg));
 

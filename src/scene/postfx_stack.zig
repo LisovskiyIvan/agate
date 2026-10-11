@@ -179,12 +179,12 @@ pub const PostFXStack = struct {
         if (!self.postprocess_pass.resize(size.w, size.h, samples)) return error.TargetAllocationFailed;
         self.main_samples = samples;
         self.main_color_format = .RGBA16F;
-        if (config.taa_enabled and samples == 1) {
+        if (config.taa.enabled and samples == 1) {
             if (self.postprocess_pass.ensureTaaHistory(size.w, size.h)) self.taa_explicit_reset = true;
             if (!self.postprocess_pass.taaAvailable()) {
                 _ = self.warn_taa_target.warn("TAA: history allocation failed; continuing with spatial AA", .{});
-                config.taa_enabled = false;
-                config.fxaa_enabled = true;
+                config.taa.enabled = false;
+                config.fxaa.enabled = true;
                 self.taa_has_history = false;
             }
         } else if (samples > 1) {
@@ -299,7 +299,7 @@ pub const PostFXStack = struct {
         var post = params.post.forFrame();
         const fx_w = if (self.postprocess_pass.width > 0) self.postprocess_pass.width else cur_w;
         const fx_h = if (self.postprocess_pass.height > 0) self.postprocess_pass.height else cur_h;
-        if (post.auto_exposure_enabled) {
+        if (post.auto_exposure.enabled) {
             post.exposure = self.auto_exposure.adapted_exposure;
         }
         var ssao = params.ssao;
@@ -308,29 +308,29 @@ pub const PostFXStack = struct {
         }
         const msaa_active = params.main_samples > 1;
         if (msaa.suppressDepthEffects(params.main_samples)) {
-            if (msaa.depthEffectsActive(true, ssao.enabled, post.ssr_enabled, post.dof_enabled, post.fog_enabled, post.motion_blur_enabled, post.ssgi_enabled) or post.shaft_enabled) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, post.ssr.enabled, post.dof.enabled, post.fog.enabled, post.motion_blur.enabled, post.ssgi.enabled) or post.shafts.enabled) {
                 _ = self.warn_depth_effects.warn(
                     "msaa: SSAO/SSR/DoF/Fog/MotionBlur/SSGI/Shaft disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},
                 );
             }
             ssao.enabled = false;
-            post.ssr_enabled = false;
-            post.dof_enabled = false;
-            post.fog_enabled = false;
-            post.motion_blur_enabled = false;
-            post.fxaa_enabled = false;
-            post.shaft_enabled = false;
-            post.ssgi_enabled = false;
+            post.ssr.enabled = false;
+            post.dof.enabled = false;
+            post.fog.enabled = false;
+            post.motion_blur.enabled = false;
+            post.fxaa.enabled = false;
+            post.shafts.enabled = false;
+            post.ssgi.enabled = false;
         }
-        if (msaa_active and post.taa_enabled) {
+        if (msaa_active and post.taa.enabled) {
             _ = self.warn_taa_msaa.warn(
                 "msaa: TAA disabled this session: MSAA x{} main target has no depth resolve",
                 .{params.main_samples},
             );
-            post.taa_enabled = false;
+            post.taa.enabled = false;
         }
-        const taa_active = post.taa_enabled;
+        const taa_active = post.taa.enabled;
         if (!taa_active) {
             self.taa_has_history = false;
             self.taa_enabled_prev = false;
@@ -376,15 +376,15 @@ pub const PostFXStack = struct {
         if (postprocess.bloomPyramidActive(post.enabled, post)) {
             const v = self.bloom_pass.render(
                 self.postprocess_pass.offscreen_resolve_tex_view,
-                post.bloom_threshold,
-                post.bloom_pyramid_mips,
-                post.bloom_radius,
+                post.bloom.threshold,
+                post.bloom.mips,
+                post.bloom.radius,
                 fx_w,
                 fx_h,
             );
             if (v.id != 0) {
                 bloom_view = v;
-                const mips = postprocess.clampBloomMips(post.bloom_pyramid_mips);
+                const mips = postprocess.clampBloomMips(post.bloom.mips);
                 const bloom_draws = 2 * @as(u32, mips) - 1;
                 params.stats.post_draw_calls += bloom_draws;
                 params.stats.draw_calls += bloom_draws;
@@ -396,8 +396,8 @@ pub const PostFXStack = struct {
         if (postprocess.glowActive(post.enabled, post)) {
             const v = self.glow_pass.render(
                 self.postprocess_pass.offscreen_resolve_tex_view,
-                post.glow_threshold,
-                post.glow_radius,
+                post.glow.threshold,
+                post.glow.radius,
                 fx_w,
                 fx_h,
             );
@@ -485,7 +485,7 @@ pub const PostFXStack = struct {
         // (ssgiTemporalActive gates the pass stage itself).
         var ssgi_view: sg.View = .{};
         if (post.enabled and postprocess.ssgiPassActive(post)) {
-            if (post.ssgi_temporal_enabled and post.ssgi_mode != .half_res_pass) {
+            if (post.ssgi.temporal.enabled and post.ssgi.mode != .half_res_pass) {
                 _ = self.warn_ssgi_temporal.warn("ssgi: ssgi_temporal_enabled needs ssgi_mode=half_res_pass; ignoring temporal", .{});
             }
             const v = self.ssgi_pass.render(.{
@@ -498,7 +498,7 @@ pub const PostFXStack = struct {
                 .prev_view_proj = prev_vp,
                 .camera_pos = params.eye,
                 .config = post,
-                .camera_cut = post.taa_camera_cut,
+                .camera_cut = post.taa.camera_cut,
                 .near_z = params.camera.getNear(),
                 .far_z = params.camera.getFar(),
                 .base_w = fx_w,
@@ -525,7 +525,7 @@ pub const PostFXStack = struct {
                 .first_frame = !self.taa_has_history,
                 .toggled_on = !self.taa_enabled_prev,
                 .resized = recreated,
-                .camera_cut = post.taa_camera_cut,
+                .camera_cut = post.taa.camera_cut,
                 .explicit_reset = self.taa_explicit_reset,
             });
             taa_reset_now = reset;
@@ -546,10 +546,10 @@ pub const PostFXStack = struct {
         // way. Steady frames are untouched (no per-frame reset).
         const suppress_velocity = passes.velocity_pass.cutSuppressesVelocity(
             taa_reset_now,
-            post.motion_blur_enabled,
-            post.taa_camera_cut,
+            post.motion_blur.enabled,
+            post.taa.camera_cut,
         );
-        if (suppress_velocity) post.motion_blur_enabled = false;
+        if (suppress_velocity) post.motion_blur.enabled = false;
         // Cut-frame gate over the hoisted velocity view (see above): a TAA
         // reset or a blur-only camera cut binds the zero fallback and skips
         // the blur gather for exactly this composite.

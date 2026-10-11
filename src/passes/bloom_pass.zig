@@ -15,12 +15,12 @@ const pp = @import("../postprocess.zig");
 // fullscreen postprocess pass:
 //
 //   var bloom_view = empty_view; // e.g. default white texture view
-//   if (self.post_process.enabled and self.post_process.bloom_enabled) {
+//   if (self.post_process.enabled and self.post_process.bloom.enabled) {
 //       bloom_view = self.bloom_pass.render(
 //           self.postprocess_pass.offscreen_resolve_tex_view,
-//           self.post_process.bloom_threshold,
-//           self.post_process.bloom_pyramid_mips,
-//           self.post_process.bloom_radius,
+//           self.post_process.bloom.threshold,
+//           self.post_process.bloom.mips,
+//           self.post_process.bloom.radius,
 //           cur_w, cur_h,
 //       );
 //       self.stats.draw_calls += ...;

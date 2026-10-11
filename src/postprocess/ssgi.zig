@@ -29,20 +29,20 @@ pub const SSGI_LUMA_CAP: f32 = 8.0;
 /// Activity gate: enabled AND a non-zero intensity (the composite early-outs
 /// on the same test through the packed lane).
 pub fn ssgiActive(config: PostProcessOptions) bool {
-    return config.ssgi_enabled and config.ssgi_intensity > 0.001;
+    return config.ssgi.enabled and config.ssgi.intensity > 0.001;
 }
 
 /// Inline (v1) activity: the master gate plus inline mode. The composite
 /// gather branch keys off this lane, so pass mode never double-adds.
 pub fn ssgiInlineActive(config: PostProcessOptions) bool {
-    return ssgiActive(config) and config.ssgi_mode == .inline_gather;
+    return ssgiActive(config) and config.ssgi.mode == .inline_gather;
 }
 
 /// Pass (v2) activity: the master gate plus pass mode. The chain keys the
-/// SsgiPass render off this; MSAA suppression clears ssgi_enabled, so
+/// SsgiPass render off this; MSAA suppression clears ssgi.enabled, so
 /// pass mode joins the existing suppression with no extra plumbing.
 pub fn ssgiPassActive(config: PostProcessOptions) bool {
-    return ssgiActive(config) and config.ssgi_mode == .half_res_pass;
+    return ssgiActive(config) and config.ssgi.mode == .half_res_pass;
 }
 
 /// Packed INLINE uniform lane: (enabled, intensity, radius, steps). Zeros
@@ -52,9 +52,9 @@ pub fn ssgiParams(config: PostProcessOptions) [4]f32 {
     if (!ssgiInlineActive(config)) return .{ 0.0, 0.0, 0.0, 0.0 };
     return .{
         1.0,
-        config.ssgi_intensity,
-        config.ssgi_radius,
-        @floatFromInt(config.ssgi_steps),
+        config.ssgi.intensity,
+        config.ssgi.radius,
+        @floatFromInt(config.ssgi.steps),
     };
 }
 
@@ -65,7 +65,7 @@ pub fn ssgiParams(config: PostProcessOptions) [4]f32 {
 /// carries normalized bleed * coverage with no intensity baked in.
 pub fn ssgiPassParams(config: PostProcessOptions, tex_valid: bool) [4]f32 {
     if (!ssgiPassActive(config) or !tex_valid) return .{ 0.0, 0.0, 0.0, 0.0 };
-    return .{ 1.0, config.ssgi_intensity, 0.0, 0.0 };
+    return .{ 1.0, config.ssgi.intensity, 0.0, 0.0 };
 }
 
 /// Half-res pass target size for a full EFFECTIVE (render-scale) base
@@ -165,13 +165,13 @@ pub const SSGI_TEMPORAL_MARKER_HI: f32 = 0.35;
 /// the flag set warns (orchestrator, WarnOnce) and stays bit-identical to
 /// the untemporal pass path — this gate is what enforces it.
 pub fn ssgiTemporalActive(config: PostProcessOptions) bool {
-    return ssgiPassActive(config) and config.ssgi_temporal_enabled;
+    return ssgiPassActive(config) and config.ssgi.temporal.enabled;
 }
 
 /// History blend weight in [0, 1] after clamped(). Raw config outside the
 /// range clamps; the documented sweet spot is [0.85, 0.95].
 pub fn ssgiTemporalBlend(config: PostProcessOptions) f32 {
-    return std.math.clamp(config.ssgi_temporal_blend, 0.0, 1.0);
+    return std.math.clamp(config.ssgi.temporal.blend, 0.0, 1.0);
 }
 
 /// Reset conditions mirror taaShouldReset (same TaaReset shape): first

@@ -150,7 +150,7 @@ fn setupFiniteFixtures() void {
     cutout_mesh.culling_strategy = .always_render;
     cutout_mesh.setPBRMaterial(cutout);
     temporal_probe = scene.addReflectionProbe(z.Vec3.new(0, 1.5, 0), .{ .radius = 11 }) catch @panic("hdr-showcase: probe failed");
-    scene.post_process.motion_blur_enabled = true;
+    scene.post_process.motion_blur.enabled = true;
 }
 
 fn updateFiniteFixtures(f: u32, dt: f32) void {
@@ -270,28 +270,28 @@ fn setupScene() void {
     scene.post_process.enabled = true;
     scene.post_process.exposure = exposures[0];
     scene.post_process.tonemapping = .aces;
-    scene.post_process.bloom_enabled = true;
-    scene.post_process.bloom_threshold = 1.0;
-    scene.post_process.bloom_intensity = 0.7;
-    scene.post_process.bloom_pyramid_mips = 5;
-    scene.post_process.taa_enabled = true;
-    scene.post_process.taa_camera_cut = true;
+    scene.post_process.bloom.enabled = true;
+    scene.post_process.bloom.threshold = 1.0;
+    scene.post_process.bloom.intensity = 0.7;
+    scene.post_process.bloom.mips = 5;
+    scene.post_process.taa.enabled = true;
+    scene.post_process.taa.camera_cut = true;
     // Render scale (Q4): scene+effects render at scale x swapchain size,
     // the composite/UI present at full res. 1.0 = native baseline for the
     // A/B gate (native vs 0.66/0.75, same scene, same TAA).
     bench.overrideScale(render_scale);
     scene.post_process.render_scale = render_scale;
-    scene.post_process.fog_enabled = envFlag("AGATE_HDR_FOG");
-    scene.post_process.fog_height_falloff = envF32("AGATE_HDR_FOG_FALLOFF", scene.post_process.fog_height_falloff);
-    scene.post_process.contact_shadows_enabled = true;
-    scene.post_process.local_tonemapping_enabled = true;
-    scene.post_process.local_tonemapping_intensity = 0.4;
+    scene.post_process.fog.enabled = envFlag("AGATE_HDR_FOG");
+    scene.post_process.fog.height_falloff = envF32("AGATE_HDR_FOG_FALLOFF", scene.post_process.fog.height_falloff);
+    scene.post_process.contact_shadows.enabled = true;
+    scene.post_process.local_tonemapping.enabled = true;
+    scene.post_process.local_tonemapping.intensity = 0.4;
     if (frame_limit > 0) setupFiniteFixtures();
     // Min-samples motion-blur debug knob (default 8 preserved when unset);
     // applied after fixtures so the override wins. clamped() guards [2,32]
     // again downstream; no effect toggles change here.
-    scene.post_process.motion_blur_samples = std.math.clamp(
-        envU32("AGATE_HDR_MOTION_BLUR_SAMPLES", scene.post_process.motion_blur_samples),
+    scene.post_process.motion_blur.steps = std.math.clamp(
+        envU32("AGATE_HDR_MOTION_BLUR_SAMPLES", scene.post_process.motion_blur.steps),
         2,
         32,
     );
@@ -345,7 +345,7 @@ export fn frame() callconv(.c) void {
     // (same jitter/animation frame); interactive mode keeps live timing.
     const dt: f32 = if (gate) 1.0 / 60.0 else @floatCast(sapp.frameDuration());
 
-    if (f == 2) scene.post_process.taa_camera_cut = false;
+    if (f == 2) scene.post_process.taa.camera_cut = false;
 
     if (gate) {
         if (f == 20) scene.post_process.tonemapping = .filmic;
@@ -358,8 +358,8 @@ export fn frame() callconv(.c) void {
         if (f == 80) scene.post_process.tonemapping = .aces;
         if (f == 91) scene.post_process.enabled = false;
         if (f == 111) scene.post_process.enabled = true;
-        if (f == 160) scene.post_process.taa_camera_cut = true;
-        if (f == 161) scene.post_process.taa_camera_cut = false;
+        if (f == 160) scene.post_process.taa.camera_cut = true;
+        if (f == 161) scene.post_process.taa.camera_cut = false;
         if (f == 170) scene.resetTaa();
         if (f == 130) {
             scene.resizeOffscreen(320, 180);
@@ -416,7 +416,7 @@ export fn frame() callconv(.c) void {
     check("hdr-target", pp.color_format == .RGBA16F);
     check("targets-valid", pp.targetsValid());
     check("draws", scene.stats.draw_calls > 0);
-    if (scene.post_process.enabled and scene.post_process.taa_enabled and scene.postfx.main_samples == 1) {
+    if (scene.post_process.enabled and scene.post_process.taa.enabled and scene.postfx.main_samples == 1) {
         check("taa-history-available", pp.taaAvailable());
         check("taa-history-hdr", pp.taa_format == .RGBA16F);
         const vp = &scene.postfx.velocity_pass;
@@ -433,7 +433,7 @@ export fn frame() callconv(.c) void {
             const bake = sg.queryViewDesc(probe.gpu.bake_view);
             check("probe-source-mip0-only", bake.texture.mip_levels.base == 0 and bake.texture.mip_levels.count == 1);
         }
-        if (f == 1) check("initial-cut", scene.post_process.taa_camera_cut);
+        if (f == 1) check("initial-cut", scene.post_process.taa.camera_cut);
         if (f == 61) check("exposure-61", scene.post_process.exposure == exposures[2]);
         if (f == 91) check("master-off", !scene.post_process.enabled);
         if (f == 111) check("master-on", scene.post_process.enabled);
@@ -441,13 +441,13 @@ export fn frame() callconv(.c) void {
             const exp_win = z.postprocess.scaledRenderSize(w, h, scene.post_process.render_scale);
             check("resize-reverted", pp.width == exp_win.w and pp.height == exp_win.h);
         }
-        if (f == 160) check("cut-160", scene.post_process.taa_camera_cut);
-        if (f == 161) check("cut-cleared", !scene.post_process.taa_camera_cut);
+        if (f == 160) check("cut-160", scene.post_process.taa.camera_cut);
+        if (f == 161) check("cut-cleared", !scene.post_process.taa.camera_cut);
         if (f == 170) check("explicit-reset-consumed", !scene.taa_reset_requested.load(.acquire));
     }
     if (f % 60 == 0) {
         std.debug.print("hdr-showcase: frame {} draws={} exposure={d:.2} master={} bloom={} samples={} srgb={} size={}x{}\n", .{
-            f, scene.stats.draw_calls, scene.post_process.exposure, scene.post_process.enabled, scene.post_process.bloom_enabled, scene.postfx.main_samples, want_srgb, w, h,
+            f, scene.stats.draw_calls, scene.post_process.exposure, scene.post_process.enabled, scene.post_process.bloom.enabled, scene.postfx.main_samples, want_srgb, w, h,
         });
     }
 }
@@ -471,7 +471,7 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     switch (ev.*.type) {
         .KEY_DOWN => switch (ev.*.key_code) {
             .ESCAPE => sapp.quit(),
-            .B => scene.post_process.bloom_enabled = !scene.post_process.bloom_enabled,
+            .B => scene.post_process.bloom.enabled = !scene.post_process.bloom.enabled,
             .SPACE => scene.post_process.enabled = !scene.post_process.enabled,
             .E => {
                 exposure_idx = (exposure_idx + 1) % exposures.len;

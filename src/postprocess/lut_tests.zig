@@ -114,54 +114,56 @@ test "lut intensity mix" {
 test "lut params packing and default path" {
     // Defaults: no LUT, disabled — the pre-LUT composite path.
     const def = options.PostProcessOptions{};
-    try std.testing.expect(def.lut_texture == null);
-    try std.testing.expect(!def.lut_enabled);
+    try std.testing.expect(def.lut.texture == null);
+    try std.testing.expect(!def.lut.enabled);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def.clamped()));
 
     // A live binding enables the uniform triplet.
     var live = options.PostProcessOptions{
-        .lut_texture = .{
-            .image = .{ .id = 1 },
-            .view = .{ .id = 7 },
-            .sampler = .{ .id = 3 },
-            .width = 1024,
-            .height = 32,
+        .lut = .{
+            .texture = .{
+                .image = .{ .id = 1 },
+                .view = .{ .id = 7 },
+                .sampler = .{ .id = 3 },
+                .width = 1024,
+                .height = 32,
+            },
+            .enabled = true,
+            .size = 32,
+            .intensity = 1.0,
         },
-        .lut_enabled = true,
-        .lut_size = 32,
-        .lut_strength = 1.0,
     };
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 32.0, 0.0 }, lutParams(live));
 
     // Strength packs clamped.
-    live.lut_strength = 3.0;
-    try std.testing.expectEqual(@as(f32, 1.0), live.clamped().lut_strength);
-    live.lut_strength = -0.5;
-    try std.testing.expectEqual(@as(f32, 0.0), live.clamped().lut_strength);
+    live.lut.intensity = 3.0;
+    try std.testing.expectEqual(@as(f32, 1.0), live.clamped().lut.intensity);
+    live.lut.intensity = -0.5;
+    try std.testing.expectEqual(@as(f32, 0.0), live.clamped().lut.intensity);
 
     // clamped() drops bindings that can never sample: dead view, or strip
     // dims that do not match the cube edge.
     var dead = live;
-    dead.lut_texture.?.view.id = 0;
-    try std.testing.expect(dead.clamped().lut_texture == null);
+    dead.lut.texture.?.view.id = 0;
+    try std.testing.expect(dead.clamped().lut.texture == null);
     var dim_mismatch = live;
-    dim_mismatch.lut_texture.?.width = 100;
-    try std.testing.expect(dim_mismatch.clamped().lut_texture == null);
+    dim_mismatch.lut.texture.?.width = 100;
+    try std.testing.expect(dim_mismatch.clamped().lut.texture == null);
     // Any N inside [2, 64] with matching strip dims stays (33 is legal,
     // the strip math is generic); only out-of-range sizes are dropped.
     var keep = live;
-    keep.lut_size = 33;
-    keep.lut_texture.?.width = 33 * 33;
-    keep.lut_texture.?.height = 33;
-    try std.testing.expect(keep.clamped().lut_texture != null);
+    keep.lut.size = 33;
+    keep.lut.texture.?.width = 33 * 33;
+    keep.lut.texture.?.height = 33;
+    try std.testing.expect(keep.clamped().lut.texture != null);
     var bogus = live;
-    bogus.lut_size = 100;
-    try std.testing.expect(bogus.clamped().lut_texture == null);
+    bogus.lut.size = 100;
+    try std.testing.expect(bogus.clamped().lut.texture == null);
 
     // Present but disabled still packs zeros.
     var idle = live;
-    idle.lut_enabled = false;
+    idle.lut.enabled = false;
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(idle));
 }
 
@@ -170,16 +172,16 @@ test "color grading LUT setter, clear, and defaults" {
     var cfg = options.PostProcessOptions{};
     // Defaults: OFF, full strength, 16-edge strip format, no texture —
     // the pre-LUT composite path.
-    try std.testing.expect(!cfg.lut_enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.lut_strength, 1e-6);
-    try std.testing.expectEqual(@as(u8, 16), cfg.lut_size);
-    try std.testing.expect(cfg.lut_texture == null);
+    try std.testing.expect(!cfg.lut.enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.lut.intensity, 1e-6);
+    try std.testing.expectEqual(@as(u8, 16), cfg.lut.size);
+    try std.testing.expect(cfg.lut.texture == null);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
 
     // Null and dead bindings clear instead of binding garbage (no GPU
     // touched here — the setter only copies handles).
-    cfg.setColorGradingLut(null, 16);
-    try std.testing.expect(!cfg.lut_enabled);
+    cfg.lut.setColorGradingLut(null, 16);
+    try std.testing.expect(!cfg.lut.enabled);
     const dead = T{
         .image = .{ .id = 1 },
         .view = .{},
@@ -187,9 +189,9 @@ test "color grading LUT setter, clear, and defaults" {
         .width = 256,
         .height = 16,
     };
-    cfg.setColorGradingLut(dead, 16);
-    try std.testing.expect(cfg.lut_texture == null);
-    try std.testing.expect(!cfg.lut_enabled);
+    cfg.lut.setColorGradingLut(dead, 16);
+    try std.testing.expect(cfg.lut.texture == null);
+    try std.testing.expect(!cfg.lut.enabled);
 
     // Wrong strip dims for the size are rejected too.
     const wrong = T{
@@ -199,9 +201,9 @@ test "color grading LUT setter, clear, and defaults" {
         .width = 100,
         .height = 16,
     };
-    cfg.setColorGradingLut(wrong, 16);
-    try std.testing.expect(cfg.lut_texture == null);
-    try std.testing.expect(!cfg.lut_enabled);
+    cfg.lut.setColorGradingLut(wrong, 16);
+    try std.testing.expect(cfg.lut.texture == null);
+    try std.testing.expect(!cfg.lut.enabled);
 
     // Live 16-strip binds and enables; strength 0 still packs enabled
     // (the shader-side mix is the no-op) while disabled packs zeros.
@@ -212,22 +214,22 @@ test "color grading LUT setter, clear, and defaults" {
         .width = 256,
         .height = 16,
     };
-    cfg.setColorGradingLut(tex, 16);
-    try std.testing.expect(cfg.lut_enabled);
-    try std.testing.expectEqual(@as(u8, 16), cfg.lut_size);
+    cfg.lut.setColorGradingLut(tex, 16);
+    try std.testing.expect(cfg.lut.enabled);
+    try std.testing.expectEqual(@as(u8, 16), cfg.lut.size);
     try std.testing.expectEqual([4]f32{ 1.0, 1.0, 16.0, 0.0 }, lutParams(cfg));
-    cfg.lut_strength = 0.0;
+    cfg.lut.intensity = 0.0;
     try std.testing.expectEqual([4]f32{ 1.0, 0.0, 16.0, 0.0 }, lutParams(cfg));
-    cfg.clearColorGradingLut();
-    try std.testing.expect(cfg.lut_texture == null);
-    try std.testing.expect(!cfg.lut_enabled);
+    cfg.lut.clearColorGradingLut();
+    try std.testing.expect(cfg.lut.texture == null);
+    try std.testing.expect(!cfg.lut.enabled);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
 
     // 32-strip binds the same way.
     tex.width = 1024;
     tex.height = 32;
-    cfg.setColorGradingLut(tex, 32);
-    try std.testing.expect(cfg.lut_enabled);
+    cfg.lut.setColorGradingLut(tex, 32);
+    try std.testing.expect(cfg.lut.enabled);
     try std.testing.expectEqual([4]f32{ 1.0, 0.0, 32.0, 0.0 }, lutParams(cfg));
 }
 

@@ -38,7 +38,7 @@ pub fn shaftTargetSize(base_w: i32, base_h: i32, res: ShaftResolution) ShaftTarg
 /// on this). Post off, shaft off, or no rendered CSM atlas (shadows off)
 /// runs zero passes and binds the placeholder (bit-identical composite).
 pub fn shaftActive(post_enabled: bool, cfg: options.PostProcessOptions, shadows_enabled: bool) bool {
-    return post_enabled and cfg.shaft_enabled and shadows_enabled;
+    return post_enabled and cfg.shafts.enabled and shadows_enabled;
 }
 
 /// Pack the composite shaft_params vec4: (enabled 1/0, intensity, 0, 0).
@@ -46,9 +46,9 @@ pub fn shaftActive(post_enabled: bool, cfg: options.PostProcessOptions, shadows_
 /// config packs zeros; the scene-texture binding used as a placeholder must
 /// never be mistaken for shaft radiance.
 pub fn shaftParams(cfg: options.PostProcessOptions, result_available: bool) [4]f32 {
-    if (!cfg.shaft_enabled or !result_available) return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.shafts.enabled or !result_available) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ 1.0, c.shaft_intensity, 0.0, 0.0 };
+    return .{ 1.0, c.shafts.intensity, 0.0, 0.0 };
 }
 
 /// Strict range check for the shaft knobs. Finite out-of-range values are
@@ -56,19 +56,19 @@ pub fn shaftParams(cfg: options.PostProcessOptions, result_available: bool) [4]f
 /// non-finite values (NaN/Inf) can never sanitize meaningfully, so they
 /// are a hard InvalidShaftOptions error here instead of a silent clamp.
 pub fn validateShaft(cfg: options.PostProcessOptions) !void {
-    if (!std.math.isFinite(cfg.shaft_intensity)) return error.InvalidShaftOptions;
-    if (!std.math.isFinite(cfg.shaft_density)) return error.InvalidShaftOptions;
-    if (!std.math.isFinite(cfg.shaft_anisotropy)) return error.InvalidShaftOptions;
-    if (!std.math.isFinite(cfg.shaft_max_distance)) return error.InvalidShaftOptions;
-    if (!std.math.isFinite(cfg.shaft_blur_sigma)) return error.InvalidShaftOptions;
-    if (!std.math.isFinite(cfg.shaft_edge_sigma)) return error.InvalidShaftOptions;
-    if (cfg.shaft_intensity < 0.0) return error.InvalidShaftOptions;
-    if (cfg.shaft_density < 0.0) return error.InvalidShaftOptions;
-    if (@abs(cfg.shaft_anisotropy) > SHAFT_ANISOTROPY_MAX) return error.InvalidShaftOptions;
-    if (cfg.shaft_max_distance < 0.0) return error.InvalidShaftOptions;
-    if (cfg.shaft_blur_sigma < 0.0) return error.InvalidShaftOptions;
-    if (cfg.shaft_edge_sigma < 0.0) return error.InvalidShaftOptions;
-    if (cfg.shaft_steps < SHAFT_STEPS_MIN or cfg.shaft_steps > SHAFT_MARCH_MAX) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.intensity)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.density)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.anisotropy)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.max_distance)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.blur_sigma)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.edge_sigma)) return error.InvalidShaftOptions;
+    if (cfg.shafts.intensity < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.density < 0.0) return error.InvalidShaftOptions;
+    if (@abs(cfg.shafts.anisotropy) > SHAFT_ANISOTROPY_MAX) return error.InvalidShaftOptions;
+    if (cfg.shafts.max_distance < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.blur_sigma < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.edge_sigma < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.steps < SHAFT_STEPS_MIN or cfg.shafts.steps > SHAFT_MARCH_MAX) return error.InvalidShaftOptions;
 }
 
 /// Henyey-Greenstein phase term for cos_theta = dot(view_ray, sun_dir)

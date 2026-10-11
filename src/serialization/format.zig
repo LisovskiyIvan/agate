@@ -173,34 +173,55 @@ pub fn readFieldAs(comptime T: type, r: *Reader) DecodeError!T {
     @compileError("serialization: unsupported options field type " ++ @typeName(T));
 }
 
+/// Split a persisted path into an optional group plus the leaf.
+/// Flat names ("exposure") address the struct directly; dotted names
+/// ("bloom.threshold") descend one group level (the postprocess nesting).
+fn splitPersistedPath(comptime path: []const u8) struct { group: ?[]const u8, leaf: []const u8 } {
+    if (std.mem.indexOfScalar(u8, path, '.')) |idx| {
+        return .{ .group = path[0..idx], .leaf = path[idx + 1 ..] };
+    }
+    return .{ .group = null, .leaf = path };
+}
+
 pub fn writeOptions(w: *Writer, options: anytype, comptime persisted: []const []const u8) !void {
     inline for (persisted) |name| {
-        try writeField(w, @field(options, name));
+        const p = comptime splitPersistedPath(name);
+        if (p.group) |g| {
+            try writeField(w, @field(@field(options, g), p.leaf));
+        } else {
+            try writeField(w, @field(options, p.leaf));
+        }
     }
 }
 
 pub fn readOptions(comptime T: type, r: *Reader, comptime persisted: []const []const u8) DecodeError!T {
     var out: T = .{};
     inline for (persisted) |name| {
-        @field(out, name) = try readFieldAs(@TypeOf(@field(out, name)), r);
+        const p = comptime splitPersistedPath(name);
+        if (p.group) |g| {
+            @field(@field(out, g), p.leaf) = try readFieldAs(@FieldType(@FieldType(T, g), p.leaf), r);
+        } else {
+            @field(out, p.leaf) = try readFieldAs(@TypeOf(@field(out, p.leaf)), r);
+        }
     }
     return out;
 }
 
-/// PostProcessOptions fields persisted in save states, in byte order.
-/// Anything not listed here (transient knobs like bloom_pyramid_mips, dof_*,
-/// grade_*) is rebuilt from defaults on load.
+/// PostProcessOptions leaves persisted in save states, in byte order.
+/// Dotted keys address nested effect groups. Anything not listed here
+/// (transient knobs like bloom.mips, dof_*, grade_*) is rebuilt from
+/// defaults on load.
 pub const postprocess_persisted = [_][]const u8{
-    "enabled",              "exposure",           "tonemapping",
-    "bloom_enabled",        "bloom_threshold",    "bloom_intensity",
-    "bloom_radius",         "vignette_enabled",   "vignette_intensity",
-    "vignette_radius",      "saturation",         "contrast",
-    "chromatic_aberration", "fxaa_enabled",       "fog_enabled",
-    "fog_density",          "fog_height_falloff", "fog_start_distance",
-    "fog_color",            "fog_sun_scattering", "ssr_enabled",
-    "ssr_intensity",        "sharpen_enabled",    "sharpen_amount",
-    "grain_enabled",        "grain_intensity",    "temperature",
-    "tint",
+    "enabled",                    "exposure",           "tonemapping",
+    "bloom.enabled",              "bloom.threshold",    "bloom.intensity",
+    "bloom.radius",               "vignette.enabled",   "vignette.intensity",
+    "vignette.radius",            "grade.saturation",   "grade.contrast",
+    "grade.chromatic_aberration", "fxaa.enabled",       "fog.enabled",
+    "fog.density",                "fog.height_falloff", "fog.start_distance",
+    "fog.color",                  "fog.sun_scattering", "ssr.enabled",
+    "ssr.intensity",              "sharpen.enabled",    "sharpen.intensity",
+    "grain.enabled",              "grain.intensity",    "white_balance.temperature",
+    "white_balance.tint",
 };
 
 pub fn writePostProcess(w: *Writer, pp: *const PostProcessOptions) !void {

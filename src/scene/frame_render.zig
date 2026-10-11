@@ -246,10 +246,10 @@ pub fn render(scene: anytype) void {
     // advancing history against identical content. Forced off under MSAA
     // (no depth resolve for the velocity term; PostFXStack forces the
     // composite side off the same way).
-    const taa_on = post_config.taa_enabled and samples == 1;
+    const taa_on = post_config.taa.enabled and samples == 1;
     var taa_view_proj = snap.primary_cam.view_proj;
     if (taa_on) {
-        const jpx = postprocess.taaJitter(snap.frame_id, post_config.taa_jitter_scale);
+        const jpx = postprocess.taaJitter(snap.frame_id, post_config.taa.jitter_scale);
         taa_view_proj = postprocess.applyTaaJitterToViewProj(snap.primary_cam.view_proj, jpx, tgt_w, tgt_h);
     }
 
@@ -468,7 +468,7 @@ pub fn render(scene: anytype) void {
     // frame, so a staged-but-unrendered prev collapses to zero motion here.
     const velocity_needed = @import("../passes/velocity_pass.zig").velocityNeeded(
         taa_on,
-        post_config.motion_blur_enabled,
+        post_config.motion_blur.enabled,
         samples,
     ) and cur_w > 0 and cur_h > 0 and sg.isvalid();
     // Primary view rect (same mapping the main pass drew under, both

@@ -24,7 +24,11 @@ test "highlight active gating and params packing" {
 
     // Independent of glow/bloom: toggling those never changes the
     // highlight decision (and vice versa).
-    const glow_on = options.PostProcessOptions{ .glow_enabled = true };
+    const glow_on = options.PostProcessOptions{
+        .glow = .{
+            .enabled = true,
+        },
+    };
     try std.testing.expect(!highlightActive(true, 0));
     try std.testing.expect(glow.glowActive(true, glow_on));
     try std.testing.expect(highlightActive(true, 3));

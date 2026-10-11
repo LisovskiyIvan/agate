@@ -54,7 +54,7 @@ pub fn bloomTentWeight(ix: i32, iy: i32) f32 {
 /// Pass-construction decision (pure; PostFXStack.renderChain gates the GPU
 /// passes on this).
 pub fn bloomPyramidActive(post_enabled: bool, cfg: options.PostProcessOptions) bool {
-    return post_enabled and cfg.bloom_enabled and cfg.bloom_intensity > 0;
+    return post_enabled and cfg.bloom.enabled and cfg.bloom.intensity > 0;
 }
 
 // Bloom regression tests live in `bloom_tests.zig` (same directory,

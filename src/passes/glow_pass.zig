@@ -20,8 +20,8 @@ const pp = @import("../postprocess.zig");
 //   if (postprocess.glowActive(post.enabled, post)) {
 //       glow_view = self.glow_pass.render(
 //           self.postprocess_pass.offscreen_resolve_tex_view,
-//           post.glow_threshold,
-//           post.glow_radius,
+//           post.glow.threshold,
+//           post.glow.radius,
 //           cur_w, cur_h,
 //       );
 //       self.stats.draw_calls += postprocess.GLOW_PASS_DRAWS;

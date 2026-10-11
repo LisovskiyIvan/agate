@@ -1,6 +1,6 @@
 # Постпроцессинг
 
-> Путь: src/agate/postprocess.zig + src/agate/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, ShaftResolution) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
+> Путь: src/agate/postprocess.zig + src/agate/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, ShaftResolution + per-эффект листья: BloomOptions, GlowOptions, VignetteOptions, GradeOptions, DofOptions, LutOptions, FxaaOptions, FogOptions, SsrOptions, SsgiOptions (+SsgiTemporalOptions), ContactShadowsOptions, LocalTonemapOptions, SharpenOptions, GrainOptions, WhiteBalanceOptions, MotionBlurOptions, TaaOptions (+TaaReactiveOptions), ShaftsOptions, AutoExposureOptions — через postprocess.options) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
 
 ## Что это
 
@@ -11,7 +11,7 @@
 | Лист | Ответственность |
 |---|---|
 | `types.zig` | `TonemappingType`, `ShaftResolution`, `BloomMipSize`, `ShaftTargetSize`, `TaaReset/Bounds`, `LutStripLayout/Sample` |
-| `options.zig` | `PostProcessOptions` + `clamped()` + `setColorGradingLut`/`clearColorGradingLut` |
+| `options.zig` | `PostProcessOptions` + per-эффект листья + `clamped()` + `LutOptions.setColorGradingLut`/`clearColorGradingLut` |
 | `bloom.zig` | пирамида, Karis, tent-веса |
 | `glow.zig` | глобальный halo-слой (порог, ядро, тинт) |
 | `highlight.zig` | подсветка выбранного (маска, inner glow, composite) |
@@ -33,25 +33,23 @@ var pp = agate.postprocess.PostProcessOptions{
     .enabled = true,
     .exposure = 1.1,
     .tonemapping = .aces,
-    .bloom_enabled = true,
-    .bloom_threshold = 0.8,
-    .bloom_intensity = 0.5,
-    .vignette_enabled = true,
+    .bloom = .{ .enabled = true, .threshold = 0.8, .intensity = 0.5 },
+    .vignette = .{ .enabled = true },
 };
 // Санитизация перед заливкой в юниформы / после загрузки из файла:
 pp = pp.clamped();
 scene.post_process = pp;
 
 // TAA с одноразовым сбросом истории (телепорт камеры):
-scene.post_process.taa_enabled = true;
-scene.post_process.taa_camera_cut = true; // сбросится после одного кадра
+scene.post_process.taa.enabled = true;
+scene.post_process.taa.camera_cut = true; // сбросится после одного кадра
 
 // LUT-грейдинг из 2D-strip текстуры (валидация внутри):
-scene.post_process.setColorGradingLut(lut_tex, 16);
+scene.post_process.lut.setColorGradingLut(lut_tex, 16);
 
 // Джиттер TAA для jittered view-proj (каждый кадр):
-const j = agate.postprocess.taaJitter(frame_index, screen_w, screen_h, 1.0);
-view_proj = agate.postprocess.applyTaaJitterToViewProj(view_proj, j);
+const j = agate.postprocess.taaJitter(frame_index, 1.0);
+view_proj = agate.postprocess.applyTaaJitterToViewProj(view_proj, j, screen_w, screen_h);
 ```
 
 ## API
@@ -62,43 +60,66 @@ view_proj = agate.postprocess.applyTaaJitterToViewProj(view_proj, j);
 pub const PostProcessOptions = struct {
     enabled: bool = false,
     exposure: f32 = 1.0, tonemapping: TonemappingType = .aces,
-    // Bloom / bloom-пирамида / glow / vignette / grading / LUT / FXAA /
-    // fog / SSR / sharpen / grain / white balance / motion blur /
-    // TAA / shafts — см. таблицу эффектов ниже
+    render_scale: f32 = 1.0, depth_pyramid_enabled: bool = false,
+    auto_exposure: AutoExposureOptions = .{},
+    bloom: BloomOptions = .{}, // enabled/threshold/intensity/radius/mips
+    glow: GlowOptions = .{}, // enabled/threshold/intensity/radius/tint
+    vignette: VignetteOptions = .{}, // enabled/intensity/radius
+    grade: GradeOptions = .{}, // saturation/contrast/chromatic_aberration/shadows/midtones/highlights
+    dof: DofOptions = .{}, // enabled/focus_distance/focus_range/max_blur
+    lut: LutOptions = .{}, // enabled/intensity/size/texture
+    fxaa: FxaaOptions = .{}, // enabled
+    fog: FogOptions = .{}, // enabled/density/height_falloff/start_distance/color/sun_scattering
+    ssr: SsrOptions = .{}, // enabled/intensity/steps
+    ssgi: SsgiOptions = .{}, // enabled/mode/intensity/radius/steps/temporal.*
+    contact_shadows: ContactShadowsOptions = .{}, // enabled/intensity/distance/thickness/steps
+    local_tonemapping: LocalTonemapOptions = .{}, // enabled/intensity
+    sharpen: SharpenOptions = .{}, // enabled/intensity
+    grain: GrainOptions = .{}, // enabled/intensity
+    white_balance: WhiteBalanceOptions = .{}, // temperature/tint
+    motion_blur: MotionBlurOptions = .{}, // enabled/max_blur_px/steps
+    taa: TaaOptions = .{}, // enabled/blend/jitter_scale/sharpness/clamp_intensity/reactive.*/camera_cut
+    shafts: ShaftsOptions = .{}, // enabled/intensity/steps/density/anisotropy/max_distance/resolution/blur_sigma/edge_sigma
     pub fn clamped(self: PostProcessOptions) PostProcessOptions
-    pub fn setColorGradingLut(self: *PostProcessOptions, tex: ?texture_mod.Texture, size: u8) void
-    pub fn clearColorGradingLut(self: *PostProcessOptions) void
+    pub fn forFrame(self: PostProcessOptions) PostProcessOptions
+    pub fn autoExposureOptions(self: PostProcessOptions) auto_exposure.AutoExposureOptions
+};
+pub const LutOptions = struct {
+    pub fn setColorGradingLut(self: *LutOptions, tex: ?texture_mod.Texture, size: u8) void
+    pub fn clearColorGradingLut(self: *LutOptions) void
 };
 pub const TonemappingType = enum { ... }; // none/aces/filmic/reinhard/... (см. types.zig)
 pub const ShaftResolution = enum { half, quarter };
 ```
 
-`clamped()` никогда не падает: тянет out-of-range в валидные (экспозиция/интенсивности — `max(0)`, шаги/сэмплы — в `[min, max]`, анизотропия — в `[-0.9, 0.9]`, грейды — в `[-1, 1]`, `lut_strength` — в `[0, 1]`), а битую LUT-привязку (нет live view, неверный размер strip) сбрасывает в `null`. Безопасно применять при загрузке и перед заливкой юниформ. `setColorGradingLut` с невалидным входом (включая `null`) — тоже сброс (шейдер никогда не сэмплит мусор).
+Кламп-машинерия — одна центральная таблица (`clamp_table`: dotted-путь → sanitize-op) + exemption-список + `frame_disable_flags` + comptime-проверка полноты: новый лист без строки таблицы/обработчика/exemption — ошибка компиляции. Depth-2 листья (`ssgi.temporal.*`, `taa.reactive.*`) клампятся прямыми строками (generic `@field` второго уровня не вычисляется в comptime).
 
-Полный список эффектов и параметров:
+`clamped()` никогда не падает: тянет out-of-range в валидные (экспозиция/интенсивности — `max(0)`, шаги/сэмплы — в `[min, max]`, анизотропия — в `[-0.9, 0.9]`, грейды — в `[-1, 1]`, `lut.intensity` — в `[0, 1]`), а битую LUT-привязку (нет live view, неверный размер strip) сбрасывает в `null`. Безопасно применять при загрузке и перед заливкой юниформ. `lut.setColorGradingLut` с невалидным входом (включая `null`) — тоже сброс (шейдер никогда не сэмплит мусор).
+
+Полный список эффектов и параметров (дефолты — verbatim из старой плоской структуры):
 
 | Эффект | Поля | Дефолт | Клампы |
 |---|---|---|---|
 | Master | `enabled`, `exposure`, `tonemapping` | off, 1.0, aces | exposure ≥ 0 |
-| Bloom (HDR pyramid, одна реализация) | `bloom_enabled`, `bloom_threshold`, `bloom_intensity`, `bloom_radius`, `bloom_pyramid_mips` | on, 0.8, 0.5, 2.0, 5 | threshold/intensity ≥ 0; `bloom_radius` — quality upsample-tent по coarse-мипам в текселях [0,16]; mips → `clampBloomMips` [3,7] |
-| Glow v1 (global halo) | `glow_enabled`, `glow_threshold`, `glow_intensity`, `glow_radius`, `glow_tint` | off, const-дефолты, тинт {1,1,1} | ≥ 0; тинт `clampTint` в [0,1] |
-| Vignette | `vignette_enabled`, `vignette_intensity`, `vignette_radius` | on, 0.35, 0.8 | — |
-| Grading (параметрический) | `saturation`, `contrast`, `grade_shadows/midtones/highlights` | 1.05, 1.05, нули | грейды `clampGrade` в [-1,1] |
-| LUT текстурный | `lut_enabled`, `lut_strength`, `lut_size`, `lut_texture` | off, 1.0, 16, null | strength [0,1]; размер `validLutSize` |
-| FXAA 3.11 | `fxaa_enabled` | on | — |
-| Fog (density+height) | `fog_enabled`, `fog_density`, `fog_height_falloff`, `fog_start_distance`, `fog_color`, `fog_sun_scattering` | on, 0.015, 0.08, 5.0, светло-голубой, 0.8 | — |
-| SSR | `ssr_enabled`, `ssr_intensity`, `ssr_steps` | on, 0.55, 16 | steps [4,64] |
-| Sharpen (unsharp) | `sharpen_enabled`, `sharpen_amount` | off, 0.3 | — |
-| Grain | `grain_enabled`, `grain_intensity` | off, 0.05 | — |
-| White balance | `temperature`, `tint` | 0, 0 (нейтрально) | — |
-| Motion blur | `motion_blur_enabled`, `motion_blur_max_blur_px`, `motion_blur_samples` | off, 32.0, 8 | max [1,128], samples [2,32] |
-| TAA | `taa_enabled`, `taa_blend`, `taa_jitter_scale`, `taa_sharpness`, `taa_clamp_strength`, `taa_camera_cut` | off, 0.9, 1.0, 0.0, 1.0, false | blend/sharp/clamp [0,1], jitter [0,4] |
+| Bloom (HDR pyramid, одна реализация) | `bloom.enabled`, `bloom.threshold`, `bloom.intensity`, `bloom.radius`, `bloom.mips` | on, 0.8, 0.5, 2.0, 5 | threshold/intensity ≥ 0; `bloom.radius` — quality upsample-tent по coarse-мипам в текселях [0,16]; mips → `clampBloomMips` [3,7] |
+| Glow v1 (global halo) | `glow.enabled`, `glow.threshold`, `glow.intensity`, `glow.radius`, `glow.tint` | off, const-дефолты, тинт {1,1,1} | ≥ 0; тинт `clampTint` в [0,1] |
+| Vignette | `vignette.enabled`, `vignette.intensity`, `vignette.radius` | on, 0.35, 0.8 | — |
+| Grading (параметрический) | `grade.saturation`, `grade.contrast`, `grade.chromatic_aberration`, `grade.shadows/midtones/highlights` | 1.05, 1.05, 0.0, нули | грейды `clampGrade` в [-1,1] |
+| LUT текстурный | `lut.enabled`, `lut.intensity`, `lut.size`, `lut.texture` | off, 1.0, 16, null | intensity [0,1]; размер `validLutSize` |
+| FXAA 3.11 | `fxaa.enabled` | on | — |
+| Fog (density+height) | `fog.enabled`, `fog.density`, `fog.height_falloff`, `fog.start_distance`, `fog.color`, `fog.sun_scattering` | on, 0.015, 0.08, 5.0, светло-голубой, 0.8 | — |
+| SSR | `ssr.enabled`, `ssr.intensity`, `ssr.steps` | on, 0.55, 16 | steps [4,64] |
+| Sharpen (unsharp) | `sharpen.enabled`, `sharpen.intensity` | off, 0.3 | — |
+| Grain | `grain.enabled`, `grain.intensity` | off, 0.05 | — |
+| White balance | `white_balance.temperature`, `white_balance.tint` | 0, 0 (нейтрально) | — |
+| Motion blur | `motion_blur.enabled`, `motion_blur.max_blur_px`, `motion_blur.steps` | off, 32.0, 8 | max [1,128], steps [2,32] |
+| TAA (+reactive) | `taa.enabled`, `taa.blend`, `taa.jitter_scale`, `taa.sharpness`, `taa.clamp_intensity`, `taa.reactive.enabled/intensity/marker_intensity`, `taa.camera_cut` | off, 0.9, 1.0, 0.0, 1.0, off/0.5/1.0, false | blend/sharp/clamp/reactive [0,1], jitter [0,4] |
 | Render scale | `render_scale` | 1.0 (native) | [0.25, 1]; main HDR-таргет/TAA-история/velocity/эффекты считаются в масштабе, композит+UI — в натуральном разрешении |
-| SSGI v1 (color bleed) | `ssgi_enabled`, `ssgi_intensity`, `ssgi_radius`, `ssgi_steps`, `ssgi_mode`, `ssgi_temporal_enabled`, `ssgi_temporal_blend` | off, 0.5, 1.5, 12, `inline_gather`, off, 0.9 | intensity [0,1], radius [0.1, 8] м, steps [4,32]; `ssgi_mode`: `inline_gather` (v1 gather в композите) / `half_res_pass` (v2: отдельный half-res gather + билатеральный денойз, `SsgiPass`); `ssgi_temporal_enabled` — temporal аккумуляция gather-выхода (v2.1, только `half_res_pass`, default OFF — в inline-режиме предупреждает и игнорируется); `ssgi_temporal_blend` — вес истории [0,1], свит-спот [0.85, 0.95]; one-bounce экранное цветовое кровотечение (radiance+depth), TAA денойзит |
-| Shafts v1 | `shaft_enabled`, `shaft_intensity`, `shaft_steps`, `shaft_density`, `shaft_anisotropy`, `shaft_max_distance`, `shaft_resolution`, `shaft_blur_sigma`, `shaft_edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
-| DOF | `dof_enabled`, `dof_focus_distance`, `dof_focus_range`, `dof_max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
+| SSGI v1 (color bleed) | `ssgi.enabled`, `ssgi.intensity`, `ssgi.radius`, `ssgi.steps`, `ssgi.mode`, `ssgi.temporal.enabled`, `ssgi.temporal.blend` | off, 0.5, 1.5, 12, `inline_gather`, off, 0.9 | intensity [0,1], radius [0.1, 8] м, steps [4,32]; `ssgi.mode`: `inline_gather` (v1 gather в композите) / `half_res_pass` (v2: отдельный half-res gather + билатеральный денойз, `SsgiPass`); `ssgi.temporal.enabled` — temporal аккумуляция gather-выхода (v2.1, только `half_res_pass`, default OFF — в inline-режиме предупреждает и игнорируется); `ssgi.temporal.blend` — вес истории [0,1], свит-спот [0.85, 0.95]; one-bounce экранное цветовое кровотечение (radiance+depth), TAA денойзит |
+| Shafts v1 | `shafts.enabled`, `shafts.intensity`, `shafts.steps`, `shafts.density`, `shafts.anisotropy`, `shafts.max_distance`, `shafts.resolution`, `shafts.blur_sigma`, `shafts.edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
+| DOF | `dof.enabled`, `dof.focus_distance`, `dof.focus_range`, `dof.max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
 
-Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom-pyramid → glow → highlight → shafts → grading/LUT → vignette → exposure/tonemap → display transfer → FXAA/TAA-resolve → sharpen/grain. Exposure ручной (`exposure`); auto-exposure — адаптивная выдержка (`auto_exposure_*`, `Scene.updateAutoExposure*` + гистограммный метринг). Output gamma-флаги удалены: один IEC display transfer, ручной UNORM / hw-sRGB путь.
+Порядок стека в composite-шейдере (`postprocess.glsl`, реализован `PostProcessPass`): bloom-pyramid → glow → highlight → shafts → grading/LUT → vignette → exposure/tonemap → display transfer → FXAA/TAA-resolve → sharpen/grain. Exposure ручной (`exposure`); auto-exposure — адаптивная выдержка (`auto_exposure.*`, `Scene.updateAutoExposure*` + гистограммный метринг). Output gamma-флаги удалены: один IEC display transfer, ручной UNORM / hw-sRGB путь.
 
 ### Bloom (`postprocess/bloom.zig`)
 
@@ -112,7 +133,7 @@ pub fn tentWeight1D(x: f32) f32
 pub fn bloomTentWeight(x: f32, y: f32) f32
 ```
 
-Одна реализация — HDR bloom-pyramid (`BloomPass`: Karis-down + tent-up); `bloom_pyramid` удалён, inline-gather пути нет. `bloomMipSize` — геометрия мипа для аллокации таргетов; `karisWeight`/`tentWeight` — CPU-зеркала шейдерных весов (для тестов паритета и тулзов). Сложность O(пиксели × mips). `bloom_radius` — quality радиуса upsample-tent по coarse-мипам в текселях [0,16]; `bloom_pyramid_mips` — quality-бюджет [3,7].
+Одна реализация — HDR bloom-pyramid (`BloomPass`: Karis-down + tent-up); `bloom_pyramid` удалён, inline-gather пути нет. `bloomMipSize` — геометрия мипа для аллокации таргетов; `karisWeight`/`tentWeight` — CPU-зеркала шейдерных весов (для тестов паритета и тулзов). Сложность O(пиксели × mips). `bloom.radius` — quality радиуса upsample-tent по coarse-мипам в текселях [0,16]; `bloom.mips` — quality-бюджет [3,7].
 
 ### Glow (`postprocess/glow.zig`)
 
@@ -176,8 +197,8 @@ pub fn lutParams(...) ...
 ```zig
 pub const TAA_JITTER_PERIOD: u32 = ...; // период последовательности Halton
 pub fn halton(index: u32, base: u32) f32
-pub fn taaJitter(frame_index: u64, width: i32, height: i32, scale: f32) [2]f32
-pub fn applyTaaJitterToViewProj(view_proj: Mat4, jitter: [2]f32) Mat4
+pub fn taaJitter(frame_index: u64, scale: f32) [2]f32
+pub fn applyTaaJitterToViewProj(view_proj: Mat4, jitter: [2]f32, width: i32, height: i32) Mat4
 pub fn taaReadIndex / taaWriteIndex(...) ...  // ping-pong истории в PostProcessPass
 pub fn taaShouldReset(camera_cut: bool, ...) bool
 pub fn taaNeighborhoodBounds(...) TaaBounds
@@ -188,7 +209,7 @@ pub fn taaApplySharpen(...) ...
 pub fn taaParams(...) ... / pub fn taaState(...) ...
 ```
 
-Субпиксельный Halton-джиттер (±0.5px × `taa_jitter_scale`) с jittered view-proj от сцены; history ping-pong в `PostProcessPass` (`ensureTaaHistory`, `taaReadView`/`taaWriteAttView`); neighborhood-clamp против гостинга (`taa_clamp_strength = 1` — полный кламп); пост-unsharp с ре-клампом (`taa_sharpness`). `taa_camera_cut` — одноразовый сброс истории (телепорт/монтаж; флаг несётся снапшотом кадра, потокобезопасно между update и render). Выключенный TAA — early-out до сэмплов истории/глубины (bit-identical).
+Субпиксельный Halton-джиттер (±0.5px × `taa.jitter_scale`) с jittered view-proj от сцены; history ping-pong в `PostProcessPass` (`ensureTaaHistory`, `taaReadView`/`taaWriteAttView`); neighborhood-clamp против гостинга (`taa.clamp_intensity = 1` — полный кламп); пост-unsharp с ре-клампом (`taa.sharpness`). `taa.camera_cut` — одноразовый сброс истории (телепорт/монтаж; флаг несётся снапшотом кадра, потокобезопасно между update и render). Выключенный TAA — early-out до сэмплов истории/глубины (bit-identical).
 
 ### Shafts (`postprocess/shafts.zig`)
 
@@ -228,20 +249,20 @@ pub fn ssgiTemporalShouldReset(TaaReset) bool
 
 - `PostProcessOptions` — plain value-struct, копируется присвоением (включая LUT: хэндл `Texture` — plain GPU-хэндлы без CPU-рефов, поэтому структура целиком копируется в `SceneFrameSnapshot.post_process`). Снапшот несёт конфиг из update-потока в render без синхронизации.
 - Все функции листьев — чистые (конфиг/геометрия in → числа out), без аллокаций, кроме LUT-билдеров (`buildIdentityLutStrip` аллоцирует через переданный аллокатор) и `lutParams` (возвращает структуры, не память).
-- `taa_camera_cut`: ставит update-поток, читает/сбрасывает render — через снапшот, гонок нет.
-- `setColorGradingLut`/`clearColorGradingLut` — методы конфига (не пасса): вызываются из главного потока до упаковки снапшота.
+- `taa.camera_cut`: ставит update-поток, читает/сбрасывает render — через снапшот, гонок нет.
+- `LutOptions.setColorGradingLut`/`clearColorGradingLut` — методы конфига (не пасса): вызываются из главного потока до упаковки снапшота. `lut.enabled` — обычный bool (не derived от `texture != null`): `forFrame()` гасит флаг эффекта, а привязка переживает master-выключатель, как раньше.
 - `PostProcessPass` (см. `./passes.md`) держит все GPU-хэндлы сам; операции разделены по листьям в `src/passes/postprocess/`: `composite.zig` — чистый (binding/uniform-упаковка без sg-вызовов), `targets.zig` — GPU-жизненный цикл main-таргета и TAA-истории (`resize`/`ensureTaaHistory`/`taaReset` + `*Valid`/`*View`-запросы, с sg create/destroy/query внутри). Методы пасса — тонкие форвардеры, порядок create/destroy и fail-closed поведение без изменений.
 
 ## Ошибки и краевые случаи
 
-- Ошибок как значений почти нет: все клампы total (`clamped()` не падает). Единственный fallible путь — LUT-билдеры (`OutOfMemory`) и `setColorGradingLut` с невалидной текстурой (не ошибка — тихий сброс в `null` + `lut_enabled = false`).
-- `bloom_pyramid_mips` вне `[3, 7]` — кламп, а не игнор: эффект остаётся включённым с ближайшим валидным числом мипов.
-- `shaft_steps` клампится к [4,32] (граница шейдерного цикла); `shaft_anisotropy` — к ±0.9 (сингулярность HG-фазы при |g|→1).
-- `motion_blur_samples`/`ssr_steps` клампятся к своим диапазонам; нулевые значения невозможны после `clamped()`.
+- Ошибок как значений почти нет: все клампы total (`clamped()` не падает). Единственный fallible путь — LUT-билдеры (`OutOfMemory`) и `setColorGradingLut` с невалидной текстурой (не ошибка — тихий сброс в `null` + `lut.enabled = false`).
+- `bloom.mips` вне `[3, 7]` — кламп, а не игнор: эффект остаётся включённым с ближайшим валидным числом мипов.
+- `shafts.steps` клампится к [4,32] (граница шейдерного цикла); `shafts.anisotropy` — к ±0.9 (сингулярность HG-фазы при |g|→1).
+- `motion_blur.steps`/`ssr.steps` клампятся к своим диапазонам; нулевые значения невозможны после `clamped()`.
 - Motion blur собирает центрированное box-ядро по полному отрезку `[-0.5, +0.5]` (N тапов, `i = 0..N-1`, формула `t = i/(N-1) - 0.5`): нулевое среднее при любом `samples` 2..32, при минимуме 2 тапы `{-0.5, +0.5}`. Центральная поправка сохраняет CA-дельту `sampleScene` (`delta/N`). Стоимость: N gather-чтений сцены в цикле плюс 1 чтение сырого центра для поправки (раньше: N-1 чтений в цикле плюс готовый `color`); без предположений о CSE компилятора. Паритет ядра пинится `src/postprocess/motion_blur_tests.zig`.
-- LUT с `lut_size`, не прошедшим `validLutSize`, или с геометрией strip, не совпадающей с размером, — сброс привязки (шейдер идёт по no-LUT пути, а не сэмплит мусор).
-- `taa_camera_cut = true` при выключенном TAA — безвреден (истории нет, сбрасывать нечего).
-- Все `*Active` гейты (`glowActive`, `highlightActive`, `shaftActive`) — единственный источник правды для `PostProcessPass` о том, запускать ли пассы; bloom идёт единой пирамидой при `bloom_enabled`.
+- LUT с `lut.size`, не прошедшим `validLutSize`, или с геометрией strip, не совпадающей с размером, — сброс привязки (шейдер идёт по no-LUT пути, а не сэмплит мусор).
+- `taa.camera_cut = true` при выключенном TAA — безвреден (истории нет, сбрасывать нечего).
+- Все `*Active` гейты (`glowActive`, `highlightActive`, `shaftActive`) — единственный источник правды для `PostProcessPass` о том, запускать ли пассы; bloom идёт единой пирамидой при `bloom.enabled`.
 
 ## Производительность
 

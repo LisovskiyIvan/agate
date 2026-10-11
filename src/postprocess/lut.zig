@@ -248,14 +248,14 @@ pub fn buildFilmLutStrip(allocator: std.mem.Allocator, size: u32, preset: FilmLu
 /// the pre-LUT uniform state, so the no-LUT path stays unchanged. Kept
 /// beside the Zig LUT math so tests pin what postprocess_pass uploads.
 pub fn lutParams(cfg: options.PostProcessOptions) [4]f32 {
-    const tex = cfg.lut_texture orelse return .{ 0.0, 0.0, 0.0, 0.0 };
-    if (!cfg.lut_enabled or !lutTextureValid(tex, cfg.lut_size)) {
+    const tex = cfg.lut.texture orelse return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.lut.enabled or !lutTextureValid(tex, cfg.lut.size)) {
         return .{ 0.0, 0.0, 0.0, 0.0 };
     }
     return .{
         1.0,
-        std.math.clamp(cfg.lut_strength, 0.0, 1.0),
-        @floatFromInt(cfg.lut_size),
+        std.math.clamp(cfg.lut.intensity, 0.0, 1.0),
+        @floatFromInt(cfg.lut.size),
         0.0,
     };
 }

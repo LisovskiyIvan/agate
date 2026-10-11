@@ -41,12 +41,29 @@ test "ssgiBleedAdd caps fireflies and scales by coverage and intensity" {
 }
 
 test "ssgiParams packs the lane and zeros when inactive" {
-    const on = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.7, .ssgi_radius = 2.0, .ssgi_steps = 16 };
+    const on = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.7,
+            .radius = 2.0,
+            .steps = 16,
+        },
+    };
     try testing.expectEqual([4]f32{ 1.0, 0.7, 2.0, 16.0 }, ssgi.ssgiParams(on));
     // Zero intensity or disabled: all-zero lane (composite bit-identical).
-    const quiet = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.0 };
+    const quiet = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.0,
+        },
+    };
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(quiet));
-    const off = PostProcessOptions{ .ssgi_enabled = false, .ssgi_intensity = 1.0 };
+    const off = PostProcessOptions{
+        .ssgi = .{
+            .enabled = false,
+            .intensity = 1.0,
+        },
+    };
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(off));
     try testing.expect(!ssgi.ssgiActive(off));
     try testing.expect(ssgi.ssgiActive(on));
@@ -54,24 +71,41 @@ test "ssgiParams packs the lane and zeros when inactive" {
 
 test "ssgiActive gates on the 0.001 intensity floor" {
     // At/below the floor the lane packs zeros (composite bit-identical).
-    const floor_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.001 };
+    const floor_cfg = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.001,
+        },
+    };
     try testing.expect(!ssgi.ssgiActive(floor_cfg));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(floor_cfg));
-    const above = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.002 };
+    const above = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.002,
+        },
+    };
     try testing.expect(ssgi.ssgiActive(above));
 }
 
 test "ssgi mode splits the inline and pass lanes without double-add" {
     // Default mode is inline: the v1 lane packs, the pass lane is zeros.
-    const on = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.7, .ssgi_radius = 2.0, .ssgi_steps = 16 };
-    try testing.expect(on.ssgi_mode == .inline_gather);
+    const on = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.7,
+            .radius = 2.0,
+            .steps = 16,
+        },
+    };
+    try testing.expect(on.ssgi.mode == .inline_gather);
     try testing.expect(ssgi.ssgiInlineActive(on));
     try testing.expect(!ssgi.ssgiPassActive(on));
     try testing.expectEqual([4]f32{ 1.0, 0.7, 2.0, 16.0 }, ssgi.ssgiParams(on));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(on, true));
     // Pass mode: the inline lane zeros (no double-add), the pass gate opens.
     var pass_cfg = on;
-    pass_cfg.ssgi_mode = .half_res_pass;
+    pass_cfg.ssgi.mode = .half_res_pass;
     try testing.expect(!ssgi.ssgiInlineActive(pass_cfg));
     try testing.expect(ssgi.ssgiPassActive(pass_cfg));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(pass_cfg));
@@ -79,10 +113,22 @@ test "ssgi mode splits the inline and pass lanes without double-add" {
     try testing.expectEqual([4]f32{ 1.0, 0.7, 0.0, 0.0 }, ssgi.ssgiPassParams(pass_cfg, true));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(pass_cfg, false));
     // Master off or intensity floor kills both lanes in both modes.
-    const off = PostProcessOptions{ .ssgi_enabled = false, .ssgi_intensity = 1.0, .ssgi_mode = .half_res_pass };
+    const off = PostProcessOptions{
+        .ssgi = .{
+            .enabled = false,
+            .intensity = 1.0,
+            .mode = .half_res_pass,
+        },
+    };
     try testing.expect(!ssgi.ssgiPassActive(off));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(off, true));
-    const floor_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.001, .ssgi_mode = .half_res_pass };
+    const floor_cfg = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.001,
+            .mode = .half_res_pass,
+        },
+    };
     try testing.expect(!ssgi.ssgiPassActive(floor_cfg));
     try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiPassParams(floor_cfg, true));
 }
@@ -103,28 +149,42 @@ test "ssgiTargetSize is ceil-half of the effective size" {
 
 test "ssgiTemporalActive needs pass mode plus the opt-in flag" {
     // Default: temporal off in both modes (bit-identical to pre-temporal).
-    const inline_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.5 };
+    const inline_cfg = PostProcessOptions{
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.5,
+        },
+    };
     try testing.expect(!ssgi.ssgiTemporalActive(inline_cfg));
     var pass_cfg = inline_cfg;
-    pass_cfg.ssgi_mode = .half_res_pass;
+    pass_cfg.ssgi.mode = .half_res_pass;
     try testing.expect(!ssgi.ssgiTemporalActive(pass_cfg));
     // Flag on in pass mode: active. Flag on in inline mode: gated off
     // (the orchestrator warns once and the pass stays bit-identical).
-    pass_cfg.ssgi_temporal_enabled = true;
+    pass_cfg.ssgi.temporal.enabled = true;
     try testing.expect(ssgi.ssgiTemporalActive(pass_cfg));
     var inline_temporal = inline_cfg;
-    inline_temporal.ssgi_temporal_enabled = true;
+    inline_temporal.ssgi.temporal.enabled = true;
     try testing.expect(!ssgi.ssgiTemporalActive(inline_temporal));
     // Master off or intensity floor kills temporal with the pass gate.
-    const off = PostProcessOptions{ .ssgi_enabled = false, .ssgi_intensity = 1.0, .ssgi_mode = .half_res_pass, .ssgi_temporal_enabled = true };
+    const off = PostProcessOptions{
+        .ssgi = .{
+            .enabled = false,
+            .intensity = 1.0,
+            .mode = .half_res_pass,
+            .temporal = .{
+                .enabled = true,
+            },
+        },
+    };
     try testing.expect(!ssgi.ssgiTemporalActive(off));
 }
 
 test "ssgiTemporalBlend clamps and documents the sweet spot" {
     try testing.expectEqual(@as(f32, 0.9), ssgi.ssgiTemporalBlend(.{}));
-    try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = -1.0 }));
-    try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = 2.0 }));
-    try testing.expectEqual(@as(f32, 0.87), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = 0.87 }));
+    try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiTemporalBlend(.{ .ssgi = .{ .temporal = .{ .blend = -1.0 } } }));
+    try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiTemporalBlend(.{ .ssgi = .{ .temporal = .{ .blend = 2.0 } } }));
+    try testing.expectEqual(@as(f32, 0.87), ssgi.ssgiTemporalBlend(.{ .ssgi = .{ .temporal = .{ .blend = 0.87 } } }));
     // The recommended window sits strictly inside (0, 1).
     try testing.expect(ssgi.SSGI_TEMPORAL_BLEND_MIN > 0.0 and ssgi.SSGI_TEMPORAL_BLEND_MAX < 1.0);
     try testing.expect(ssgi.SSGI_TEMPORAL_BLEND_MIN < ssgi.SSGI_TEMPORAL_BLEND_DEFAULT and ssgi.SSGI_TEMPORAL_BLEND_DEFAULT < ssgi.SSGI_TEMPORAL_BLEND_MAX);

@@ -7,7 +7,7 @@ pub const CONTACT_SHADOWS_DISTANCE_MIN: f32 = 0.01;
 pub const CONTACT_SHADOWS_THICKNESS_MIN: f32 = 0.001;
 
 pub fn contactShadowsActive(config: PostProcessOptions) bool {
-    return config.contact_shadows_enabled and config.contact_shadows_intensity > 0.001;
+    return config.contact_shadows.enabled and config.contact_shadows.intensity > 0.001;
 }
 
 pub fn contactShadowParams(config: PostProcessOptions) [4]f32 {
@@ -16,9 +16,9 @@ pub fn contactShadowParams(config: PostProcessOptions) [4]f32 {
     }
     return .{
         1.0,
-        config.contact_shadows_intensity,
-        config.contact_shadows_distance,
-        config.contact_shadows_thickness,
+        config.contact_shadows.intensity,
+        config.contact_shadows.distance,
+        config.contact_shadows.thickness,
     };
 }
 
@@ -29,7 +29,7 @@ pub fn contactShadowStepsParams(config: PostProcessOptions) [4]f32 {
     if (!contactShadowsActive(config)) {
         return .{ 0.0, 0.0, 0.0, 0.0 };
     }
-    return .{ @floatFromInt(config.contact_shadows_steps), 0.0, 0.0, 0.0 };
+    return .{ @floatFromInt(config.contact_shadows.steps), 0.0, 0.0, 0.0 };
 }
 
 /// Compute shadow attenuation factor: 1.0 = fully lit, 0.0 = fully in shadow.

@@ -21,7 +21,13 @@ test "ssgi pass fail-closes headless with no state touched" {
     try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .base_w = 1280, .base_h = 720 }).id);
     try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .base_w = 0, .base_h = 720 }).id);
     // Inline mode never runs the pass even with live-looking inputs.
-    const inline_cfg = pp.PostProcessOptions{ .enabled = true, .ssgi_enabled = true, .ssgi_intensity = 0.5 };
+    const inline_cfg = pp.PostProcessOptions{
+        .enabled = true,
+        .ssgi = .{
+            .enabled = true,
+            .intensity = 0.5,
+        },
+    };
     try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .config = inline_cfg, .base_w = 1280, .base_h = 720 }).id);
     // Fail-closed render records no GPU uploads (uniform-only pass: replay
     // in renderReuse stays upload-free by construction).

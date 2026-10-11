@@ -267,7 +267,7 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
             .hemi_diffuse = .{ snap.shadow_uniforms.hemi_diffuse.r, snap.shadow_uniforms.hemi_diffuse.g, snap.shadow_uniforms.hemi_diffuse.b },
             .hemi_ground = .{ snap.shadow_uniforms.ground_color.r, snap.shadow_uniforms.ground_color.g, snap.shadow_uniforms.ground_color.b },
             .hemi_intensity = snap.shadow_uniforms.hemi_intensity,
-            .fog_color = .{ snap.post_process.fog_color[0], snap.post_process.fog_color[1], snap.post_process.fog_color[2] },
+            .fog_color = .{ snap.post_process.fog.color[0], snap.post_process.fog.color[1], snap.post_process.fog.color[2] },
         };
         const r = postprocess.sky.resolveFrame(scene.phys_sky, snap.sun_dir, m);
         snap.sun_color = Color3.new(r.sun_color[0], r.sun_color[1], r.sun_color[2]);
@@ -281,7 +281,7 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
         }
         snap.shadow_uniforms.hemi_diffuse = Color3.new(r.hemi_sky[0], r.hemi_sky[1], r.hemi_sky[2]);
         snap.shadow_uniforms.ground_color = Color3.new(r.hemi_ground[0], r.hemi_ground[1], r.hemi_ground[2]);
-        snap.post_process.fog_color = r.fog_tint;
+        snap.post_process.fog.color = r.fog_tint;
         snap.sky_analytic = r.analytic;
         snap.sky_turbidity = r.turbidity;
         // Skybox uniforms (dome path only; the default above already parks

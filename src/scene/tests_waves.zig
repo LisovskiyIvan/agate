@@ -1789,12 +1789,14 @@ test "auto-exposure: Scene.update automatic luminance metering and temporal life
     // Enable auto-exposure with calibrated middle-gray 0.18
     var post = postprocess.PostProcessOptions{
         .enabled = true,
-        .auto_exposure_enabled = true,
-        .auto_exposure_key_value = 0.18,
-        .auto_exposure_speed_up = 3.0,
-        .auto_exposure_speed_down = 3.0,
-        .auto_exposure_min = 0.01,
-        .auto_exposure_max = 16.0,
+        .auto_exposure = .{
+            .enabled = true,
+            .key_value = 0.18,
+            .speed_up = 3.0,
+            .speed_down = 3.0,
+            .min = 0.01,
+            .max = 16.0,
+        },
     };
     scene.lights.hemi.intensity = 0.0;
     scene.setPostProcess(post);
@@ -1823,17 +1825,17 @@ test "auto-exposure: Scene.update automatic luminance metering and temporal life
     try std.testing.expect(scene.getAdaptedExposure() < 0.15);
 
     // 3. Camera cut test: when cut flag is set, adaptation snaps instantly in 1 tick
-    scene.post_process.auto_exposure_camera_cut = true;
+    scene.post_process.auto_exposure.camera_cut = true;
     // Set sun to pitch black
     scene.lights.directional.?.intensity = 0.0;
     try scene.update(0.016);
     // Instant snap to near max exposure (pitch black scene)
     try std.testing.expect(scene.getAdaptedExposure() > 10.0);
     // Camera cut flag was cleared after consumption
-    try std.testing.expect(!scene.post_process.auto_exposure_camera_cut);
+    try std.testing.expect(!scene.post_process.auto_exposure.camera_cut);
 
     // 4. Disabling auto-exposure resets exposure to 1.0
-    post.auto_exposure_enabled = false;
+    post.auto_exposure.enabled = false;
     scene.setPostProcess(post);
     try std.testing.expectEqual(@as(f32, 1.0), scene.getAdaptedExposure());
 }

@@ -16,10 +16,14 @@ test "bloom mips clamp" {
     try std.testing.expectEqual(@as(u32, 7), clampBloomMips(7));
     try std.testing.expectEqual(@as(u32, 7), clampBloomMips(42));
 
-    var cfg = options.PostProcessOptions{ .bloom_pyramid_mips = 99 };
-    try std.testing.expectEqual(@as(u32, 7), cfg.clamped().bloom_pyramid_mips);
-    cfg.bloom_pyramid_mips = 1;
-    try std.testing.expectEqual(@as(u32, 3), cfg.clamped().bloom_pyramid_mips);
+    var cfg = options.PostProcessOptions{
+        .bloom = .{
+            .mips = 99,
+        },
+    };
+    try std.testing.expectEqual(@as(u32, 7), cfg.clamped().bloom.mips);
+    cfg.bloom.mips = 1;
+    try std.testing.expectEqual(@as(u32, 3), cfg.clamped().bloom.mips);
 }
 
 test "bloom mip sizes" {

@@ -335,7 +335,7 @@ pub const VolumetricPass = struct {
         // default is 0.0012, so this only bites degenerate configs).
         const bias = @max(args.shadow_bias, 0.0002);
 
-        self.resize(args.base_w, args.base_h, cfg.shaft_resolution);
+        self.resize(args.base_w, args.base_h, cfg.shafts.resolution);
         if (self.base_width != args.base_w or self.base_height != args.base_h) return .{};
         if (self.raymarch_image.id == 0) return .{};
 
@@ -367,10 +367,10 @@ pub const VolumetricPass = struct {
             .sun_color = .{ args.sun_color.r, args.sun_color.g, args.sun_color.b, 0.0 },
             .splits = .{ args.splits[0], args.splits[1], args.splits[2], args.splits[3] },
             .march_a = .{
-                @floatFromInt(cfg.shaft_steps),
-                cfg.shaft_density,
-                cfg.shaft_max_distance,
-                cfg.shaft_anisotropy,
+                @floatFromInt(cfg.shafts.steps),
+                cfg.shafts.density,
+                cfg.shafts.max_distance,
+                cfg.shafts.anisotropy,
             },
             .march_b = .{ bias, 0.0, 0.0, 0.0 },
         };
@@ -380,11 +380,11 @@ pub const VolumetricPass = struct {
 
         // Stages 2-3: bilateral blur, H into slot 0 then V into slot 1.
         // Intensity scaling stays in the postprocess composite.
-        const size = pp.shaftTargetSize(args.base_w, args.base_h, cfg.shaft_resolution);
+        const size = pp.shaftTargetSize(args.base_w, args.base_h, cfg.shafts.resolution);
         const texel_w: f32 = 1.0 / @as(f32, @floatFromInt(size.w));
         const texel_h: f32 = 1.0 / @as(f32, @floatFromInt(size.h));
-        self.blurStage(self.raymarch_tex_view, args.depth_view, 0.0, cfg.shaft_blur_sigma, cfg.shaft_edge_sigma, texel_w, texel_h, 0);
-        self.blurStage(self.blur_tex_views[0], args.depth_view, 1.0, cfg.shaft_blur_sigma, cfg.shaft_edge_sigma, texel_w, texel_h, 1);
+        self.blurStage(self.raymarch_tex_view, args.depth_view, 0.0, cfg.shafts.blur_sigma, cfg.shafts.edge_sigma, texel_w, texel_h, 0);
+        self.blurStage(self.blur_tex_views[0], args.depth_view, 1.0, cfg.shafts.blur_sigma, cfg.shafts.edge_sigma, texel_w, texel_h, 1);
 
         return self.blur_tex_views[1];
     }

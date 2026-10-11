@@ -82,7 +82,7 @@ fn setupScene() void {
     _ = scene.createHemisphericLight("sky", .{ .intensity = 0.6 });
     box = z.MeshBuilder.createBox(&scene, "box", .{ .size = 2 }) catch @panic("box creation failed");
     scene.post_process.enabled = true;
-    scene.post_process.ssr_enabled = false;
+    scene.post_process.ssr.enabled = false;
     particles = null;
     if (z.compute.supported()) {
         const ps = scene.createParticleSystem("compute", 1024) catch @panic("particle creation failed");

@@ -55,7 +55,7 @@ fn packRepresentative(pass: *const PostProcessPass, config: PostProcessOptions) 
 
 test "packCompositeParams carries camera range with zeroed zw and ssr steps in its own lane" {
     const pass = PostProcessPass{};
-    const params = packRepresentative(&pass, .{ .ssr_enabled = true, .ssr_steps = 24 });
+    const params = packRepresentative(&pass, .{ .ssr = .{ .enabled = true, .steps = 24 } });
     // camera_params is (near_z, far_z, 0, 0): no smuggled step count.
     try testing.expectEqual([4]f32{ 0.1, 100.0, 0.0, 0.0 }, params.camera_params);
     // The step count reaches the shader via the dedicated lane instead.
@@ -68,7 +68,7 @@ test "packCompositeParams carries camera range with zeroed zw and ssr steps in i
 
 test "packCompositeParams zeroes the ssr steps lane while keeping camera range when ssr is off" {
     const pass = PostProcessPass{};
-    const params = packRepresentative(&pass, .{ .ssr_enabled = false, .ssr_steps = 24 });
+    const params = packRepresentative(&pass, .{ .ssr = .{ .enabled = false, .steps = 24 } });
     try testing.expectEqual([4]f32{ 0.1, 100.0, 0.0, 0.0 }, params.camera_params);
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, params.ssr_params2);
     try testing.expectEqual([4]f32{ 0.0, 0.55, 0.4, 25.0 }, params.ssr_params);

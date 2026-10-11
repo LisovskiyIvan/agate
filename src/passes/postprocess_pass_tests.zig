@@ -62,9 +62,14 @@ test "fxaaParams packs the named lane with zero spares" {
 
 test "ssrStepsParams packs the dedicated steps lane with zero spares" {
     // Enabled: the step count rides in x.
-    var cfg = PostProcessOptions{ .ssr_enabled = true, .ssr_steps = 24 };
+    var cfg = PostProcessOptions{
+        .ssr = .{
+            .enabled = true,
+            .steps = 24,
+        },
+    };
     try testing.expectEqual([4]f32{ 24.0, 0.0, 0.0, 0.0 }, postprocess.ssrStepsParams(cfg));
     // Disabled: zeros (the shader early-outs on ssr_params.x first).
-    cfg.ssr_enabled = false;
+    cfg.ssr.enabled = false;
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.ssrStepsParams(cfg));
 }

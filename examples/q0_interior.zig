@@ -274,50 +274,50 @@ fn setupScene() void {
     scene.post_process.enabled = true;
     scene.post_process.exposure = 1.1;
     scene.post_process.tonemapping = .agx;
-    scene.post_process.bloom_enabled = true;
-    scene.post_process.bloom_threshold = 1.0;
-    scene.post_process.bloom_intensity = 0.55;
-    scene.post_process.bloom_pyramid_mips = 7;
-    scene.post_process.ssr_enabled = !envFlag("AGATE_Q0_NO_SSR");
-    scene.post_process.ssr_intensity = 0.6;
-    scene.post_process.ssr_steps = 32;
+    scene.post_process.bloom.enabled = true;
+    scene.post_process.bloom.threshold = 1.0;
+    scene.post_process.bloom.intensity = 0.55;
+    scene.post_process.bloom.mips = 7;
+    scene.post_process.ssr.enabled = !envFlag("AGATE_Q0_NO_SSR");
+    scene.post_process.ssr.intensity = 0.6;
+    scene.post_process.ssr.steps = 32;
     scene.post_process.depth_pyramid_enabled = true;
-    scene.post_process.dof_enabled = !envFlag("AGATE_Q0_NO_DOF");
-    scene.post_process.dof_focus_distance = 4.6;
-    scene.post_process.dof_focus_range = 2.2;
-    scene.post_process.dof_max_blur = 5.0;
+    scene.post_process.dof.enabled = !envFlag("AGATE_Q0_NO_DOF");
+    scene.post_process.dof.focus_distance = 4.6;
+    scene.post_process.dof.focus_range = 2.2;
+    scene.post_process.dof.max_blur = 5.0;
     // Lighting isolation: shafts off leaves the actual sunlit opening
     // footprint intact; DoF off + a still camera make shadow A/Bs readable.
-    scene.post_process.shaft_enabled = !envFlag("AGATE_Q0_NO_SHAFTS");
-    scene.post_process.shaft_intensity = 0.35;
-    scene.post_process.shaft_steps = 32;
-    scene.post_process.local_tonemapping_enabled = true;
+    scene.post_process.shafts.enabled = !envFlag("AGATE_Q0_NO_SHAFTS");
+    scene.post_process.shafts.intensity = 0.35;
+    scene.post_process.shafts.steps = 32;
+    scene.post_process.local_tonemapping.enabled = true;
     // SSGI v1 color bleed: the calibration scene carries it by default —
     // AGATE_Q0_NO_SSGI=1 isolates the pre-SSGI baseline.
-    scene.post_process.ssgi_enabled = !envFlag("AGATE_Q0_NO_SSGI");
-    scene.post_process.ssgi_intensity = 0.55;
-    scene.post_process.ssgi_radius = 1.6;
-    scene.post_process.ssgi_steps = 16;
+    scene.post_process.ssgi.enabled = !envFlag("AGATE_Q0_NO_SSGI");
+    scene.post_process.ssgi.intensity = 0.55;
+    scene.post_process.ssgi.radius = 1.6;
+    scene.post_process.ssgi.steps = 16;
     // SSGI v2 half-res pass (opt-in): AGATE_Q0_SSGI_PASS=1 runs the
     // dedicated gather + bilateral denoise instead of the inline
     // composite gather (same steps); default stays v1 inline.
-    if (envFlag("AGATE_Q0_SSGI_PASS")) scene.post_process.ssgi_mode = .half_res_pass;
+    if (envFlag("AGATE_Q0_SSGI_PASS")) scene.post_process.ssgi.mode = .half_res_pass;
     // SSGI v2.1 temporal accumulation (opt-in): AGATE_Q0_SSGI_TEMPORAL=1
     // enables history accumulation inside the half-res pass; requires
     // AGATE_Q0_SSGI_PASS=1 (inline mode warns once and ignores it).
     if (envFlag("AGATE_Q0_SSGI_TEMPORAL")) {
-        if (scene.post_process.ssgi_mode != .half_res_pass) {
+        if (scene.post_process.ssgi.mode != .half_res_pass) {
             std.debug.print("q0-interior: AGATE_Q0_SSGI_TEMPORAL=1 needs AGATE_Q0_SSGI_PASS=1; temporal ignored\n", .{});
         }
-        scene.post_process.ssgi_temporal_enabled = true;
+        scene.post_process.ssgi.temporal.enabled = true;
     }
-    scene.post_process.taa_enabled = true;
+    scene.post_process.taa.enabled = true;
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the
     // documented gaps): on in the calibration scene —
     // AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive baseline.
-    scene.post_process.taa_reactive_enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
-    scene.post_process.fog_enabled = false;
+    scene.post_process.taa.reactive.enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
+    scene.post_process.fog.enabled = false;
     // DDGI v1 spike (opt-in): AGATE_Q0_DDGI=1 enables the proxy-grid
     // diffuse bounce over the room volume (floor y=0, ceiling y=4, open
     // front +z; whole-grid refresh). Intensity 0.35 ~= 1/pi: the v1
@@ -374,13 +374,13 @@ export fn frame() callconv(.c) void {
                 if (ab_ddgi) {
                     scene.ddgi.enabled = ev.arm == .A;
                 } else {
-                    scene.post_process.ssgi_enabled = ev.arm == .A;
+                    scene.post_process.ssgi.enabled = ev.arm == .A;
                 }
                 if (ev.index > 0) scene.resetTaa();
                 // draws = previous frame's draw calls (stats reset at the
                 // next staged begin): the DDGI on/off delta is the update
                 // pass (+1 when the arm is on).
-                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi_enabled, scene.ddgi.enabled, scene.stats.draw_calls });
+                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi.enabled, scene.ddgi.enabled, scene.stats.draw_calls });
             }
         } else {
             if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);

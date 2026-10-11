@@ -37,16 +37,16 @@ pub fn clampTint(v: [3]f32) [3]f32 {
 /// values (NaN/Inf) can never sanitize meaningfully, so they are a hard
 /// InvalidGlowOptions error here instead of a silent clamp.
 pub fn validateGlow(cfg: options.PostProcessOptions) !void {
-    if (!std.math.isFinite(cfg.glow_threshold)) return error.InvalidGlowOptions;
-    if (!std.math.isFinite(cfg.glow_intensity)) return error.InvalidGlowOptions;
-    if (!std.math.isFinite(cfg.glow_radius)) return error.InvalidGlowOptions;
-    for (cfg.glow_tint) |c| {
+    if (!std.math.isFinite(cfg.glow.threshold)) return error.InvalidGlowOptions;
+    if (!std.math.isFinite(cfg.glow.intensity)) return error.InvalidGlowOptions;
+    if (!std.math.isFinite(cfg.glow.radius)) return error.InvalidGlowOptions;
+    for (cfg.glow.tint) |c| {
         if (!std.math.isFinite(c)) return error.InvalidGlowOptions;
     }
-    if (cfg.glow_threshold < 0.0) return error.InvalidGlowOptions;
-    if (cfg.glow_intensity < 0.0) return error.InvalidGlowOptions;
-    if (cfg.glow_radius < 0.0) return error.InvalidGlowOptions;
-    for (cfg.glow_tint) |c| {
+    if (cfg.glow.threshold < 0.0) return error.InvalidGlowOptions;
+    if (cfg.glow.intensity < 0.0) return error.InvalidGlowOptions;
+    if (cfg.glow.radius < 0.0) return error.InvalidGlowOptions;
+    for (cfg.glow.tint) |c| {
         if (c < 0.0 or c > 1.0) return error.InvalidGlowOptions;
     }
 }
@@ -54,7 +54,7 @@ pub fn validateGlow(cfg: options.PostProcessOptions) !void {
 /// Pass-construction decisions (pure; PostFXStack.renderChain gates the GPU
 /// passes on these).
 pub fn glowActive(post_enabled: bool, cfg: options.PostProcessOptions) bool {
-    return post_enabled and cfg.glow_enabled;
+    return post_enabled and cfg.glow.enabled;
 }
 
 /// Bright-pass extract. Mirrors extractBright in postprocess.glsl and the
@@ -67,7 +67,7 @@ pub fn glowExtract(color: [3]f32, threshold: f32) [3]f32 {
 }
 
 /// 1D Gaussian tap weight for integer `offset` at `sigma`. Mirrors
-/// glow_blur.glsl (sigma is glow_radius in glow-target texels, floored at
+/// glow_blur.glsl (sigma is glow.radius in glow-target texels, floored at
 /// 0.5 exactly like the shader). Raw (unnormalized): both sides divide by
 /// the kernel sum over -GLOW_HALF_TAPS..GLOW_HALF_TAPS.
 pub fn glowGaussianWeight(offset: f32, sigma: f32) f32 {
@@ -91,15 +91,15 @@ pub fn glowKernelSum(sigma: f32) f32 {
 /// Disabled packs all zeros, which keeps the composite bit-identical to the
 /// pre-glow path (the shader returns before sampling glow_tex).
 pub fn glowParams(cfg: options.PostProcessOptions) [4]f32 {
-    if (!cfg.glow_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.glow.enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ 1.0, c.glow_intensity, 0.0, 0.0 };
+    return .{ 1.0, c.glow.intensity, 0.0, 0.0 };
 }
 
 /// Pack the composite glow_tint vec4: (tint rgb, 0). Disabled packs zeros
 /// (harmless: the shader never reads tint while glow_params.x is 0).
 pub fn glowTintParams(cfg: options.PostProcessOptions) [4]f32 {
-    if (!cfg.glow_enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
+    if (!cfg.glow.enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
     const c = cfg.clamped();
-    return .{ c.glow_tint[0], c.glow_tint[1], c.glow_tint[2], 0.0 };
+    return .{ c.glow.tint[0], c.glow.tint[1], c.glow.tint[2], 0.0 };
 }

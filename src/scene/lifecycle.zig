@@ -34,9 +34,9 @@ pub fn resizeOffscreen(self: anytype, width: i32, height: i32) void {
 }
 
 pub fn setPostProcess(self: anytype, config: PostProcessOptions) void {
-    const was_enabled = self.post_process.auto_exposure_enabled;
+    const was_enabled = self.post_process.auto_exposure.enabled;
     self.post_process = config;
-    if (was_enabled and !config.auto_exposure_enabled) {
+    if (was_enabled and !config.auto_exposure.enabled) {
         self.postfx.resetAutoExposure();
     }
 }

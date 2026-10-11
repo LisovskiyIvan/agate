@@ -151,10 +151,10 @@ fn makeFullState(allocator: std.mem.Allocator) !SceneState {
     s.postprocess.enabled = true;
     s.postprocess.exposure = 1.1;
     s.postprocess.tonemapping = .reinhard;
-    s.postprocess.bloom_threshold = 0.9;
-    s.postprocess.fog_color = .{ 0.1, 0.2, 0.3 };
-    s.postprocess.temperature = 0.5;
-    s.postprocess.tint = -0.25;
+    s.postprocess.bloom.threshold = 0.9;
+    s.postprocess.fog.color = .{ 0.1, 0.2, 0.3 };
+    s.postprocess.white_balance.temperature = 0.5;
+    s.postprocess.white_balance.tint = -0.25;
 
     try s.setGameProperty(allocator, "quest_stage", "3");
     try s.setGameProperty(allocator, "difficulty", "hard");
