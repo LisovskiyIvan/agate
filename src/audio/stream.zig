@@ -54,8 +54,6 @@ pub const StreamOptions = struct {
     auto_destroy: bool = false,
 };
 
-pub const PlaySoundOptions = StreamOptions;
-
 /// Internal decoder backend abstraction.
 const Decoder = union(enum) {
     ogg: OggDecoder,

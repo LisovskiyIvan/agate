@@ -213,7 +213,7 @@ pub const AudioEngine = audio.AudioEngine;
 pub const AudioClip = audio.AudioClip;
 pub const BusId = audio.BusId;
 pub const invalid_bus = audio.invalid_bus;
-pub const PlaySoundOptions = audio.PlaySoundOptions;
+pub const StreamOptions = audio.StreamOptions;
 pub const AudioStream = audio.AudioStream;
 
 pub const serialization = @import("serialization.zig");

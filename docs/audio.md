@@ -17,7 +17,7 @@
 | `buses.zig` | реестр шин и DAG маршрутизации (до 128 шин) |
 | `effects.zig` | DSP фильтров шин, пул ревербераторов, окклюзия |
 | `mixer.zig` | `renderFrames` + ядра синтеза, приватное состояние `ActiveVoice` |
-| `streams.zig` | слоты стримов, `playSound*`/`playMusic*`, `MusicPlayOptions` |
+| `streams.zig` | слоты стримов, `playSound*`/`playMusic*` |
 | `clip.zig` | `AudioClip` + WAV-декодирование |
 | `decode.zig` | MP3/Ogg декодеры (`DecodedAudio`, `DecodeError`) |
 | `dsp.zig` | biquad + реверберация (`BiquadFilter`, `ReverbProcessor`) |
@@ -50,7 +50,7 @@ engine.playClip(&clip, .{ .volume = 1.0 });
 
 // Длинный файл — стриминг без загрузки целиком: gapless loop музыки.
 engine.playMusic(.{
-    // PlaySoundOptions: путь, громкость, loop, шина
+    // StreamOptions: путь, громкость, loop, шина
     .loop = true,
     .volume = 0.7,
 }, "assets/music/theme.ogg");
@@ -289,7 +289,6 @@ pub const StreamOptions = struct {
     start_paused: bool = false, format: StreamFormat = .auto,
     fade_in_time: f32 = 0.0, auto_destroy: bool = false,
 };
-pub const PlaySoundOptions = StreamOptions;
 pub const AudioStream = struct {
     pub const default_buffer_frames: usize = 65536; // ~1.48 c при 44.1 кГц
     pub fn openFile(allocator: std.mem.Allocator, path: []const u8, engine_sample_rate: f32, options: StreamOptions) StreamError!*AudioStream
@@ -321,11 +320,9 @@ pub fn playMusic / pub fn playMusicFromMemory / pub fn crossfadeMusic(...)
 pub fn stopMusic(self: *AudioEngine, fade_duration: f32) void
 pub fn pauseMusic / pub fn resumeMusic / pub fn setMusicVolume
 pub fn getMusicStream(self: *const AudioEngine) ?*AudioStream
-pub const MusicPlayOptions = struct { bus: ?BusId = null, volume: f32 = 1.0, loop: bool = true, rate: f32 = 1.0 };
-pub fn playMusicClip(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void
 ```
 
-Стрим: декодер (Ogg/MP3/WAV, формат резолвится по пути или задан явно) пишет в SPSC ring (`capacity` — степень двойки, branchless-индексы через маску), аудиопоток только читает. `refill` (докачка) вызывается из `updateStreams` в главном потоке. `fadeTo` с `stop_on_fade_out = true` даёт `stopSound(fade)` и `crossfade*` без кликов. `playSoundOnce*` ставит `auto_destroy` — стрим освобождается сам по EOF. `playMusicClip` останавливает шину и запускает клип как музыку (удобно для зацикленных тем, уже лежащих в памяти).
+Стрим: декодер (Ogg/MP3/WAV, формат резолвится по пути или задан явно) пишет в SPSC ring (`capacity` — степень двойки, branchless-индексы через маску), аудиопоток только читает. `refill` (докачка) вызывается из `updateStreams` в главном потоке. `fadeTo` с `stop_on_fade_out = true` даёт `stopSound(fade)` и `crossfade*` без кликов. `playSoundOnce*` ставит `auto_destroy` — стрим освобождается сам по EOF. Зацикленная тема из памяти: остановить шину (`stopBus`) и запустить `playClip` с `.loop = true`.
 
 ### Миксер (`audio/mixer.zig`)
 

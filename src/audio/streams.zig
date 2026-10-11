@@ -9,34 +9,25 @@
 //! `resumeSound`, `setSoundVolume`, `stopAllSounds`, `crossfadeSound`,
 //! `crossfadeSoundFromMemory`), and the dedicated music slot
 //! (`playMusic`, `playMusicFromMemory`, `crossfadeMusic`, `stopMusic`,
-//! `pauseMusic`, `resumeMusic`, `setMusicVolume`, `getMusicStream`,
-//! `MusicPlayOptions`, `playMusicClip`). Decoding/streaming itself lives
+//! `pauseMusic`, `resumeMusic`, `setMusicVolume`, `getMusicStream`).
+//! Decoding/streaming itself lives
 //! in the pre-existing `stream.zig` leaf; this module only manages slots.
 //!
 //! Anti-cycle rule (same as `profiler/*`, `particles/*`): every function
 //! takes the engine as `anytype` (a `*AudioEngine` from `engine.zig` in
 //! practice) and this module never imports `engine.zig` or the `audio.zig`
-//! facade back. `playMusicClip` reaches the `buses.zig` (`stopBus`) and
-//! `playback.zig` (`playClip`) siblings directly (documented in the
-//! facade); everything else is fields or the `stream.zig` leaf.
+//! facade back; everything else is fields or the `stream.zig` leaf.
 
 const std = @import("std");
 const clip_mod = @import("clip.zig");
 const stream_mod = @import("stream.zig");
 const types = @import("types.zig");
-const buses = @import("buses.zig");
-const playback = @import("playback.zig");
 
 const BusId = types.BusId;
 const AudioClip = clip_mod.AudioClip;
 const StreamFormat = stream_mod.StreamFormat;
 const StreamOptions = stream_mod.StreamOptions;
-const PlaySoundOptions = stream_mod.PlaySoundOptions;
 const AudioStream = stream_mod.AudioStream;
-
-// Local aliases so the moved bodies stay byte-identical.
-const stopBus = buses.stopBus;
-const playClip = playback.playClip;
 
 pub fn registerStream(self: anytype, stream: *AudioStream) !void {
     for (&self.streams) |*slot| {
@@ -119,7 +110,7 @@ pub fn playSound(
     self: anytype,
     allocator: std.mem.Allocator,
     path: []const u8,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     return createStreamFromFile(self, allocator, path, options);
 }
@@ -130,7 +121,7 @@ pub fn playSoundFromMemory(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     format: StreamFormat,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     return createStreamFromMemory(self, allocator, bytes, format, options);
 }
@@ -141,7 +132,7 @@ pub fn playSoundOnce(
     self: anytype,
     allocator: std.mem.Allocator,
     path: []const u8,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !void {
     var opt = options;
     opt.loop = false;
@@ -155,7 +146,7 @@ pub fn playSoundOnceFromMemory(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     format: StreamFormat,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !void {
     var opt = options;
     opt.loop = false;
@@ -210,7 +201,7 @@ pub fn crossfadeSound(
     allocator: std.mem.Allocator,
     path: []const u8,
     fade_duration: f32,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     if (old_stream) |s| {
         s.fadeTo(0.0, fade_duration, true);
@@ -232,7 +223,7 @@ pub fn crossfadeSoundFromMemory(
     bytes: []const u8,
     format: StreamFormat,
     fade_duration: f32,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     if (old_stream) |s| {
         s.fadeTo(0.0, fade_duration, true);
@@ -255,7 +246,7 @@ pub fn playMusic(
     self: anytype,
     allocator: std.mem.Allocator,
     path: []const u8,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     if (self.music_stream) |old_s| {
         destroyStream(self, old_s);
@@ -273,7 +264,7 @@ pub fn playMusicFromMemory(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     format: StreamFormat,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     if (self.music_stream) |old_s| {
         destroyStream(self, old_s);
@@ -291,7 +282,7 @@ pub fn crossfadeMusic(
     allocator: std.mem.Allocator,
     path: []const u8,
     fade_duration: f32,
-    options: PlaySoundOptions,
+    options: StreamOptions,
 ) !*AudioStream {
     const old_s = self.music_stream;
     self.music_stream = null;
@@ -323,24 +314,4 @@ pub fn setMusicVolume(self: anytype, vol: f32) void {
 
 pub fn getMusicStream(self: anytype) ?*AudioStream {
     return self.music_stream;
-}
-
-pub const MusicPlayOptions = struct {
-    bus: ?BusId = null,
-    volume: f32 = 1.0,
-    loop: bool = true,
-    rate: f32 = 1.0,
-};
-
-pub fn playMusicClip(self: anytype, clip: *const AudioClip, options: MusicPlayOptions) void {
-    if (options.bus) |b| {
-        stopBus(self, b);
-    }
-    playClip(self, clip, .{
-        .bus = options.bus,
-        .volume = options.volume,
-        .loop = options.loop,
-        .rate = options.rate,
-        .position = null,
-    });
 }

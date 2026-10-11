@@ -29,9 +29,8 @@
 //!   `renderTone`, `renderSample`) and the private `ActiveVoice` state.
 //!   The real-time callback path stays 0-allocation and lock-free.
 //!   Imports `types` + `dsp` + the `commands` sibling.
-//! - `audio/streams.zig` — stream slots, the sound/music playback API,
-//!   `MusicPlayOptions`, `playMusicClip`. Imports `stream` + `clip` +
-//!   `types` + the `buses` + `playback` siblings.
+//! - `audio/streams.zig` — stream slots and the sound/music playback API.
+//!   Imports `stream` + `clip` + `types`.
 //! - Pre-existing leaves, untouched apart from the import repoint noted
 //!   below: `audio/clip.zig` (`AudioClip` + WAV decode), `audio/decode.zig`
 //!   (MP3/Ogg decoders), `audio/dsp.zig` (biquad + reverb),
@@ -88,7 +87,7 @@ pub const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
 
 const stream_mod = @import("audio/stream.zig");
 pub const StreamFormat = stream_mod.StreamFormat;
-pub const PlaySoundOptions = stream_mod.PlaySoundOptions;
+pub const StreamOptions = stream_mod.StreamOptions;
 pub const AudioStream = stream_mod.AudioStream;
 
 // Shared vocabulary (lives in audio/types.zig).

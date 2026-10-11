@@ -68,7 +68,6 @@ const StreamFormat = stream_mod.StreamFormat;
 const StreamState = stream_mod.StreamState;
 const StreamError = stream_mod.StreamError;
 const StreamOptions = stream_mod.StreamOptions;
-const PlaySoundOptions = stream_mod.PlaySoundOptions;
 const AudioStream = stream_mod.AudioStream;
 
 const BusId = types.BusId;
@@ -99,7 +98,6 @@ pub const AudioEngine = struct {
     pub const PlayOptions = playback.PlayOptions;
     pub const SpatializeResult = playback.SpatializeResult;
     pub const ClipPlayOptions = playback.ClipPlayOptions;
-    pub const MusicPlayOptions = streams.MusicPlayOptions;
 
     // Lock-free single-producer single-consumer ring buffer for voice triggers.
     cmd_ring: [max_commands]Command = undefined,
@@ -538,7 +536,7 @@ pub const AudioEngine = struct {
         self: *AudioEngine,
         allocator: std.mem.Allocator,
         path: []const u8,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.playSound(self, allocator, path, options);
     }
@@ -550,7 +548,7 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         bytes: []const u8,
         format: StreamFormat,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.playSoundFromMemory(self, allocator, bytes, format, options);
     }
@@ -560,7 +558,7 @@ pub const AudioEngine = struct {
         self: *AudioEngine,
         allocator: std.mem.Allocator,
         path: []const u8,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !void {
         return streams.playSoundOnce(self, allocator, path, options);
     }
@@ -571,7 +569,7 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         bytes: []const u8,
         format: StreamFormat,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !void {
         return streams.playSoundOnceFromMemory(self, allocator, bytes, format, options);
     }
@@ -610,7 +608,7 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         fade_duration: f32,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.crossfadeSound(self, old_stream, allocator, path, fade_duration, options);
     }
@@ -624,7 +622,7 @@ pub const AudioEngine = struct {
         bytes: []const u8,
         format: StreamFormat,
         fade_duration: f32,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.crossfadeSoundFromMemory(self, old_stream, allocator, bytes, format, fade_duration, options);
     }
@@ -639,7 +637,7 @@ pub const AudioEngine = struct {
         self: *AudioEngine,
         allocator: std.mem.Allocator,
         path: []const u8,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.playMusic(self, allocator, path, options);
     }
@@ -649,7 +647,7 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         bytes: []const u8,
         format: StreamFormat,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.playMusicFromMemory(self, allocator, bytes, format, options);
     }
@@ -659,7 +657,7 @@ pub const AudioEngine = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         fade_duration: f32,
-        options: PlaySoundOptions,
+        options: StreamOptions,
     ) !*AudioStream {
         return streams.crossfadeMusic(self, allocator, path, fade_duration, options);
     }
@@ -682,10 +680,6 @@ pub const AudioEngine = struct {
 
     pub fn getMusicStream(self: *const AudioEngine) ?*AudioStream {
         return streams.getMusicStream(self);
-    }
-
-    pub fn playMusicClip(self: *AudioEngine, clip: *const AudioClip, options: MusicPlayOptions) void {
-        streams.playMusicClip(self, clip, options);
     }
 
     pub fn setMuted(self: *AudioEngine, muted_val: bool) void {
