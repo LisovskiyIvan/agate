@@ -174,26 +174,18 @@ test "drift: fs_view/fs_mat parity across the three forward shaders" {
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(view, "mat4 refraction_view_proj;"));
 }
 
-test "drift: depth-only twin programs (shadow vs msaa_depth)" {
-    // shadow.glsl and msaa_depth.glsl are documented twins (same
-    // attribute layout, same rigid/instanced/skinned entry points, same
-    // depth LESS_EQUAL/write pipelines). Adding an entry point to one
-    // but not the other is drift: pin the @program sets equal.
+test "drift: shadow depth-only programs keep their entry points" {
+    // shadow.glsl keeps the rigid/instanced/skinned depth-only entry
+    // points (the MSAA depth-prepass twin was removed with the gate).
     const shadow = @embedFile("../shaders/shadow.glsl");
-    const msaa = @embedFile("../shaders/msaa_depth.glsl");
     const programs = [_][]const u8{
         "@program shadow vs fs",
         "@program shadow_instanced vs_inst fs",
         "@program shadow_skinned vs_skinned fs",
-        "@program msaa_depth vs fs",
-        "@program msaa_depth_instanced vs_inst fs",
-        "@program msaa_depth_skinned vs_skinned fs",
     };
-    for (programs[0..3]) |p| try std.testing.expect(std.mem.indexOf(u8, shadow, p) != null);
-    for (programs[3..]) |p| try std.testing.expect(std.mem.indexOf(u8, msaa, p) != null);
-    // Twin invariant: position-only vertex input on both rigid stages.
+    for (programs) |p| try std.testing.expect(std.mem.indexOf(u8, shadow, p) != null);
+    // Rigid stage stays position-only.
     try std.testing.expect(std.mem.indexOf(u8, shadow, "in vec3 position;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msaa, "in vec3 position;") != null);
 }
 
 test "drift: morph helpers live once in common (PBR variants)" {

@@ -7,7 +7,6 @@ const Inputs = msaa.Inputs;
 const effectiveSampleCount = msaa.effectiveSampleCount;
 const clampSampleCount = msaa.clampSampleCount;
 const depthEffectsActive = msaa.depthEffectsActive;
-const depthPrepassActive = msaa.depthPrepassActive;
 const suppressDepthEffects = msaa.suppressDepthEffects;
 const needsResolveAttachment = msaa.needsResolveAttachment;
 const WarnOnce = msaa.WarnOnce;
@@ -57,16 +56,15 @@ test "effectiveSampleCount gates only on target format support" {
 
 test "depthEffectsActive matches the suppressed set (SSAO/SSR/DoF/Fog/MotionBlur/SSGI)" {
     // SSAO defaults on in this engine: that alone counts as active.
-    try testing.expect(depthEffectsActive(true, true, false, false, false, false, false, false));
-    try testing.expect(depthEffectsActive(true, false, true, false, false, false, false, false)); // debug
-    try testing.expect(depthEffectsActive(true, false, false, true, false, false, false, false)); // SSR
-    try testing.expect(depthEffectsActive(true, false, false, false, true, false, false, false)); // DoF
-    try testing.expect(depthEffectsActive(true, false, false, false, false, true, false, false)); // Fog
-    try testing.expect(depthEffectsActive(true, false, false, false, false, false, true, false)); // MotionBlur
-    try testing.expect(depthEffectsActive(true, false, false, false, false, false, false, true)); // SSGI; // MotionBlur
-    try testing.expect(!depthEffectsActive(true, false, false, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, true, false, false, false, false, false));
+    try testing.expect(depthEffectsActive(true, false, true, false, false, false, false)); // SSR
+    try testing.expect(depthEffectsActive(true, false, false, true, false, false, false)); // DoF
+    try testing.expect(depthEffectsActive(true, false, false, false, true, false, false)); // Fog
+    try testing.expect(depthEffectsActive(true, false, false, false, false, true, false)); // MotionBlur
+    try testing.expect(depthEffectsActive(true, false, false, false, false, false, true)); // SSGI
+    try testing.expect(!depthEffectsActive(true, false, false, false, false, false, false));
     // Without the post chain nothing runs at all.
-    try testing.expect(!depthEffectsActive(false, true, true, true, true, true, true, true));
+    try testing.expect(!depthEffectsActive(false, true, true, true, true, true, true));
 }
 
 test "needsResolveAttachment follows the sokol resolve contract" {
@@ -81,25 +79,10 @@ test "WarnOnce fires exactly once" {
     try testing.expect(!w.warn("msaa: {}", .{2}));
 }
 
-test "depthPrepassActive needs post, gate, and MSAA samples" {
-    try testing.expect(depthPrepassActive(true, true, 4));
-    try testing.expect(depthPrepassActive(true, true, 2));
-    // Gate off (default): never runs — the off path stays bit-identical.
-    try testing.expect(!depthPrepassActive(true, false, 4));
-    // Post off: no post chain to feed.
-    try testing.expect(!depthPrepassActive(false, true, 4));
-    // 1x target: the main depth texture already exists, no prepass needed.
-    try testing.expect(!depthPrepassActive(true, true, 1));
-    try testing.expect(!depthPrepassActive(true, true, 0));
-}
-
-test "suppressDepthEffects lifts only under the prepass gate" {
+test "suppressDepthEffects applies whenever MSAA is active" {
     // 1x: nothing is ever suppressed.
-    try testing.expect(!suppressDepthEffects(1, false));
-    try testing.expect(!suppressDepthEffects(1, true));
-    // MSAA without the gate: suppression applies (legacy behavior).
-    try testing.expect(suppressDepthEffects(4, false));
-    try testing.expect(suppressDepthEffects(2, false));
-    // MSAA with the gate: the prepass feeds depth, suppression lifts.
-    try testing.expect(!suppressDepthEffects(4, true));
+    try testing.expect(!suppressDepthEffects(1));
+    // MSAA: suppression applies (sokol has no depth resolve).
+    try testing.expect(suppressDepthEffects(4));
+    try testing.expect(suppressDepthEffects(2));
 }

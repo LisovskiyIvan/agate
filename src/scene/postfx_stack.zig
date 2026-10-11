@@ -45,7 +45,6 @@ pub const PostFXStack = struct {
     outline_pass: passes.OutlinePass,
 
     outline_msaa: ?passes.OutlinePass = null,
-    msaa_depth: ?passes.MsaaDepthPass = null,
 
     main_samples: i32 = 1,
     main_color_format: sg.PixelFormat = .RGBA16F,
@@ -106,7 +105,6 @@ pub const PostFXStack = struct {
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
-        self.destroyMsaaDepth();
     }
 
     /// Window-resize path: the main target is mandatory, auxiliary targets
@@ -141,39 +139,7 @@ pub const PostFXStack = struct {
         return self.postprocess_pass.height;
     }
 
-    pub fn destroyMsaaDepth(self: *PostFXStack) void {
-        if (self.msaa_depth) |*md| md.deinit();
-        self.msaa_depth = null;
-    }
-
-    pub fn renderMsaaDepthPrepass(
-        self: *PostFXStack,
-        view_proj: Mat4,
-        queues: *const scene_render_queue.RenderQueues,
-        skins: []const [scene_render_queue.MAX_BONES]Mat4,
-        viewport: Viewport,
-        cur_w: i32,
-        cur_h: i32,
-        stats: *SceneStats,
-    ) void {
-        if (!sg.isvalid()) return;
-        if (self.msaa_depth == null) self.msaa_depth = passes.MsaaDepthPass.init();
-        const md = &self.msaa_depth.?;
-        _ = md.ensure(cur_w, cur_h);
-        const rect = viewport.toPixelRect(cur_w, cur_h);
-        sg.applyViewport(rect.x, rect.y, rect.width, rect.height, true);
-        sg.applyScissorRect(rect.x, rect.y, rect.width, rect.height, true);
-        md.render(view_proj, queues, skins, stats);
-        sg.applyViewport(0, 0, cur_w, cur_h, true);
-        sg.applyScissorRect(0, 0, cur_w, cur_h, true);
-    }
-
-    pub fn depthSampleView(self: *const PostFXStack, prepass_active: bool) sg.View {
-        if (prepass_active) {
-            if (self.msaa_depth) |*md| {
-                if (md.depthTexView().id != 0) return md.depthTexView();
-            }
-        }
+    pub fn depthSampleView(self: *const PostFXStack) sg.View {
         return self.postprocess_pass.depthSampleView();
     }
 
@@ -302,7 +268,6 @@ pub const PostFXStack = struct {
         default_white_view: sg.View,
         stats: *SceneStats,
         main_samples: i32 = 1,
-        msaa_depth_prepass: bool = false,
         highlight_items: []const passes.HighlightDrawItem = &.{},
         highlight_viewport: Viewport = .{},
         shaft_shadow_view: sg.View = .{},
@@ -340,19 +305,16 @@ pub const PostFXStack = struct {
         var ssao = params.ssao;
         if (!params.post.enabled) {
             ssao.enabled = false;
-            ssao.debug_mode = false;
         }
         const msaa_active = params.main_samples > 1;
-        const depth_prepass = msaa.depthPrepassActive(post.enabled, params.msaa_depth_prepass, params.main_samples);
-        if (msaa.suppressDepthEffects(params.main_samples, params.msaa_depth_prepass)) {
-            if (msaa.depthEffectsActive(true, ssao.enabled, ssao.debug_mode, post.ssr_enabled, post.dof_enabled, post.fog_enabled, post.motion_blur_enabled, post.ssgi_enabled) or post.shaft_enabled) {
+        if (msaa.suppressDepthEffects(params.main_samples)) {
+            if (msaa.depthEffectsActive(true, ssao.enabled, post.ssr_enabled, post.dof_enabled, post.fog_enabled, post.motion_blur_enabled, post.ssgi_enabled) or post.shaft_enabled) {
                 _ = self.warn_depth_effects.warn(
                     "msaa: SSAO/SSR/DoF/Fog/MotionBlur/SSGI/Shaft disabled this session: MSAA x{} main target has no depth resolve",
                     .{params.main_samples},
                 );
             }
             ssao.enabled = false;
-            ssao.debug_mode = false;
             post.ssr_enabled = false;
             post.dof_enabled = false;
             post.fog_enabled = false;
@@ -376,12 +338,12 @@ pub const PostFXStack = struct {
         }
 
         var ssao_view = params.default_white_view;
-        const ssao_active = ssao.enabled or ssao.debug_mode;
+        const ssao_active = ssao.enabled;
         if (post.enabled and ssao_active) {
             self.ssao_pass.render(
                 params.camera,
                 params.aspect,
-                self.depthSampleView(depth_prepass),
+                self.depthSampleView(),
                 ssao,
                 fx_w,
                 fx_h,
@@ -398,7 +360,7 @@ pub const PostFXStack = struct {
         var depth_pyramid_view: sg.View = .{};
         if (postprocess.depthPyramidActive(post.enabled, post)) {
             const v = self.depth_pyramid_pass.render(
-                self.depthSampleView(depth_prepass),
+                self.depthSampleView(),
                 fx_w,
                 fx_h,
             );
@@ -474,7 +436,7 @@ pub const PostFXStack = struct {
         if (postprocess.shaftActive(post.enabled, post, params.shadows_enabled)) {
             const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
             const v = self.volumetric_pass.render(.{
-                .depth_view = self.depthSampleView(depth_prepass),
+                .depth_view = self.depthSampleView(),
                 .shadow_view = params.shaft_shadow_view,
                 .inv_view_proj = inv_view_proj,
                 .camera_pos = params.eye,
@@ -528,7 +490,7 @@ pub const PostFXStack = struct {
             }
             const v = self.ssgi_pass.render(.{
                 .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
-                .depth_view = self.depthSampleView(depth_prepass),
+                .depth_view = self.depthSampleView(),
                 .velocity_view = vel_view_in,
                 .velocity_valid = vel_view_in.id != 0,
                 .view_proj = params.view_proj,
@@ -604,7 +566,6 @@ pub const PostFXStack = struct {
             post,
             ssao_view,
             ssao.enabled,
-            ssao.debug_mode,
             ssao.intensity,
             fx_w,
             fx_h,
@@ -616,7 +577,7 @@ pub const PostFXStack = struct {
             params.sun_color,
             params.camera.getNear(),
             params.camera.getFar(),
-            self.depthSampleView(depth_prepass),
+            self.depthSampleView(),
             taa_history_view,
             taa_history_valid,
             false,
@@ -646,7 +607,6 @@ pub const PostFXStack = struct {
                 post,
                 ssao_view,
                 ssao.enabled,
-                ssao.debug_mode,
                 ssao.intensity,
                 fx_w,
                 fx_h,
@@ -658,7 +618,7 @@ pub const PostFXStack = struct {
                 params.sun_color,
                 params.camera.getNear(),
                 params.camera.getFar(),
-                self.depthSampleView(depth_prepass),
+                self.depthSampleView(),
                 taa_history_view,
                 taa_history_valid,
                 true,

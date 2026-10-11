@@ -204,7 +204,7 @@ pub const ViewportClearPass = struct {
 
 `drawRegularItem`: ранний выход при `index_count == 0` или невалидных буферах; hook-материалы (`shader_index`) — отдельный путь через `ShaderMaterialCache`; пайплайн — `forRegularItem(item)`, биндинги из item'а, скин — по `skin_index`, слои PBR — по `coat_index`. Каждый вид (`view_slot`: 0 = primary, 1+ = вторичные) перестраивает кластерные тайлы под свой слот (sokol one-update rule) и биндит свой слот (или общий dummy).
 
-После shadow/probe/UI3D capture, до depth-prepass/main, opt-in refraction
+После shadow/probe/UI3D capture, до main, opt-in refraction
 снимает opaque-фон в half-resolution RT. Его clustered-слот (8) не пересекается
 с камерами (0…7) или ручным RTT (9). Capture читает prepared queues под
 consumer pin, исключает transparent/UI/outline/particles и использует linear
@@ -231,15 +231,13 @@ pub const PostFXStack = struct {
     pub fn init() PostFXStack
     pub fn deinit(self: *PostFXStack) void
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void
-    pub fn destroyMsaaDepth(self: *PostFXStack) void
-    pub fn renderMsaaDepthPrepass(...) void
-    pub fn depthSampleView(self: *const PostFXStack, prepass_active: bool) sg.View
+    pub fn depthSampleView(self: *const PostFXStack) sg.View
     pub fn taaReset(self: *PostFXStack) void
     pub fn beginMainPass(self: *PostFXStack, main_pass_action: sg.PassAction, post_enabled: bool, samples: i32, width: i32, height: i32) void
     pub fn renderOutline(...) void
     pub fn renderOutlineExplicit(...) void
     pub fn renderOutlineItems(...) void
-    pub const ChainParams = struct { post, ssao, camera, aspect, view_proj, eye, sun_dir, sun_color, default_white_view, stats, main_samples: i32 = 1, msaa_depth_prepass: bool = false, highlight_items, highlight_viewport, shaft_shadow_view, shaft_cascades, shaft_splits, shaft_shadow_bias, shadows_enabled, ui: ?*const UiFrame };
+    pub const ChainParams = struct { post, ssao, camera, aspect, view_proj, eye, sun_dir, sun_color, default_white_view, stats, main_samples: i32 = 1, highlight_items, highlight_viewport, shaft_shadow_view, shaft_cascades, shaft_splits, shaft_shadow_bias, shadows_enabled, ui: ?*const UiFrame };
     pub fn renderChain(self: *PostFXStack, params: ChainParams, cur_w: i32, cur_h: i32) void
 };
 // msaa.zig:
@@ -256,7 +254,7 @@ pub const WarnOnce = struct { pub fn warn(self: *WarnOnce, comptime fmt: []const
 pub fn mainTargetFormatsMsaaCapable() bool
 ```
 
-Проходы: 1.7 MSAA depth-prepass → main → 2.5 SSAO → 2.75 bloom → 2.8 glow → 2.85 highlight → 2.9 volumetric shafts → 2.95 SSGI-pass (только `ssgi_mode = .half_res_pass`) → 3 composite + UI overlay. Depth-эффекты несовместимы с MSAA-main и подавляются (one-shot warning), если не активен prepass-gate (`Scene.msaa_depth_prepass`). MSAA-twin outline-пасса создаётся лениво; TAA хранит `prev_view_proj` для репроекции. Композит работает только при включённом посте; остальные проходы тогда лишь обновляют входы.
+Проходы: main → 2.5 SSAO → 2.75 bloom → 2.8 glow → 2.85 highlight → 2.9 volumetric shafts → 2.95 SSGI-pass (только `ssgi_mode = .half_res_pass`) → 3 composite + UI overlay. Depth-эффекты несовместимы с MSAA-main и подавляются (one-shot warning). MSAA-twin outline-пасса создаётся лениво; TAA хранит `prev_view_proj` для репроекции. Композит работает только при включённом посте; остальные проходы тогда лишь обновляют входы.
 
 ### Тени (`shadow_system.zig`, `cascades.zig`, `shadow_pcss.zig`)
 

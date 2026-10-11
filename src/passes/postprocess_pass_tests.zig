@@ -49,12 +49,10 @@ test "zero pass reports no valid targets and default shape metadata" {
 }
 
 test "ssaoParams packs the named lane with a zero spare" {
-    // Enabled: flags on, intensity rides through raw (shader gates on x/y).
-    try testing.expectEqual([4]f32{ 1.0, 0.0, 1.1, 0.0 }, postprocess.ssaoParams(true, false, 1.1));
-    // Debug view without the AO multiply: y on, x off.
-    try testing.expectEqual([4]f32{ 0.0, 1.0, 0.5, 0.0 }, postprocess.ssaoParams(false, true, 0.5));
-    // Both off: flags zero, intensity still rides raw (unread while gated).
-    try testing.expectEqual([4]f32{ 0.0, 0.0, 1.1, 0.0 }, postprocess.ssaoParams(false, false, 1.1));
+    // Enabled: flags on, intensity rides through raw (shader gates on x).
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 1.1, 0.0 }, postprocess.ssaoParams(true, 1.1));
+    // Off: flags zero, intensity still rides raw (unread while gated).
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 1.1, 0.0 }, postprocess.ssaoParams(false, 1.1));
 }
 
 test "fxaaParams packs the named lane with zero spares" {

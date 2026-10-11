@@ -453,17 +453,6 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 }
             }
         }
-
-        // MSAA depth prepass target (1x depth, 4 B/px): only when really
-        // allocated (VALID image, no other new resources).
-        if (scene.postfx.msaa_depth) |*md| {
-            if (md.width > 0 and md.height > 0 and sg.queryImageState(md.image) == .VALID) {
-                const mw: u32 = @intCast(md.width);
-                const mh: u32 = @intCast(md.height);
-                const md_bytes = @as(usize, mw) * mh * 4;
-                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "MSAA Depth Prepass Target", mw, mh, .DEPTH, 1, md_bytes);
-            }
-        }
     }
 
     snap.render_targets = try rt_list.toOwnedSlice(self.allocator);

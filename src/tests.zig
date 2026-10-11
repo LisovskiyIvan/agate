@@ -204,8 +204,6 @@ test {
     _ = @import("passes/highlight_pass.zig");
     _ = @import("passes/highlight_pass_tests.zig");
     _ = @import("passes/mod.zig");
-    _ = @import("passes/msaa_depth_pass.zig");
-    _ = @import("passes/msaa_depth_pass_tests.zig");
     _ = @import("passes/outline_pass.zig");
     _ = @import("passes/outline_pass_tests.zig");
     _ = @import("passes/particle_pass.zig");

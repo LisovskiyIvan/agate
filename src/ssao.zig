@@ -9,7 +9,6 @@ pub const SSAOOptions = struct {
     intensity: f32 = 1.1,
     power: f32 = 1.2,
     sample_count: u32 = 24,
-    debug_mode: bool = false,
 
     pub fn clamped(self: SSAOOptions) SSAOOptions {
         var out = self;

@@ -251,7 +251,7 @@ pub const SSAOPass = struct {
         cur_w: i32,
         cur_h: i32,
     ) void {
-        if (!config.enabled and !config.debug_mode) return;
+        if (!config.enabled) return;
         if (cur_w <= 0 or cur_h <= 0) return;
         if (self.ssao_pipeline.id == 0 or self.ssao_blur_pipeline.id == 0) return;
         if (depth_tex_view.id == 0) return;

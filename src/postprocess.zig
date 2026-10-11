@@ -65,13 +65,13 @@ pub fn localTonemapParams(cfg: PostProcessOptions) [4]f32 {
 }
 
 // --- SSAO / FXAA composite lanes (named split of the former params4 lane) ---
-/// Pack the composite ssao_params vec4: (enabled 1/0, debug 1/0, intensity,
-/// spare 0). Intensity rides through raw (the shader gates on x/y before
+/// Pack the composite ssao_params vec4: (enabled 1/0, 0, intensity,
+/// spare 0). Intensity rides through raw (the shader gates on x before
 /// reading z), exactly like the former params4 lane.
-pub fn ssaoParams(enabled: bool, debug_mode: bool, intensity: f32) [4]f32 {
+pub fn ssaoParams(enabled: bool, intensity: f32) [4]f32 {
     return .{
         if (enabled) 1.0 else 0.0,
-        if (debug_mode) 1.0 else 0.0,
+        0.0,
         intensity,
         0.0,
     };

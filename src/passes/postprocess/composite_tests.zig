@@ -36,7 +36,6 @@ fn packRepresentative(pass: *const PostProcessPass, config: PostProcessOptions) 
     return pass.packCompositeParams(
         config,
         false,
-        false,
         1.0,
         160,
         90,

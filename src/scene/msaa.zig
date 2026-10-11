@@ -113,33 +113,15 @@ pub fn effectiveSampleCount(requested: i32, in: Inputs) i32 {
 
 /// True when any depth-texture-consuming post effect would run this frame.
 /// While the main target is MSAA these are suppressed (see module docs).
-pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssao_debug: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool, motion_blur_enabled: bool, ssgi_enabled: bool) bool {
-    return post_enabled and (ssao_enabled or ssao_debug or ssr_enabled or dof_enabled or fog_enabled or motion_blur_enabled or ssgi_enabled);
-}
-
-/// Single-sample depth-prepass gate (MSAA depth-resolve design v1).
-///
-/// sokol has no depth resolve on any backend (see module docs), so an MSAA
-/// main target cannot feed a depth texture to the post chain by itself.
-/// When `gate` (Scene.msaa_depth_prepass) is on, the renderer draws the
-/// opaque primary-view geometry a second time with depth-only pipelines
-/// into a 1x depth texture (PASS 1.7, before the main pass); the post chain
-/// then reads that texture instead of the write-only MSAA depth.
-///
-/// Pure so the toggle matrix stays unit-testable without a GPU. The gate
-/// applies only on top of an MSAA main target: with samples <= 1 the 1x
-/// main depth texture already exists and no prepass is needed; with post
-/// off there is no post chain to feed.
-pub fn depthPrepassActive(post_enabled: bool, gate: bool, main_samples: i32) bool {
-    return post_enabled and gate and main_samples > 1;
+pub fn depthEffectsActive(post_enabled: bool, ssao_enabled: bool, ssr_enabled: bool, dof_enabled: bool, fog_enabled: bool, motion_blur_enabled: bool, ssgi_enabled: bool) bool {
+    return post_enabled and (ssao_enabled or ssr_enabled or dof_enabled or fog_enabled or motion_blur_enabled or ssgi_enabled);
 }
 
 /// True when the MSAA depth-effect suppression applies this frame: MSAA is
-/// active but no 1x depth is available (prepass gate off). With the prepass
-/// on, SSAO/SSR/DoF/Fog/MotionBlur read the prepass texture and run
-/// normally; TAA stays suppressed regardless (non-goal v1: TAA under MSAA).
-pub fn suppressDepthEffects(main_samples: i32, gate: bool) bool {
-    return main_samples > 1 and !gate;
+/// active, so no 1x depth texture exists for the depth-consuming effects
+/// (sokol has no depth resolve; see module docs).
+pub fn suppressDepthEffects(main_samples: i32) bool {
+    return main_samples > 1;
 }
 
 /// True when a resolve attachment must exist for the main color target.

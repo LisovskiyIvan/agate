@@ -114,7 +114,6 @@ pub fn packCompositeParams(
     self: anytype,
     config: PostProcessOptions,
     ssao_enabled: bool,
-    ssao_debug: bool,
     ssao_intensity: f32,
     cur_w: i32,
     cur_h: i32,
@@ -149,7 +148,7 @@ pub fn packCompositeParams(
             if (config.bloom_enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
             if (config.vignette_enabled) 1.0 else 0.0,
         },
-        .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_debug, ssao_intensity),
+        .ssao_params = postprocess.ssaoParams(ssao_enabled, ssao_intensity),
         .fxaa_params = postprocess.fxaaParams(config.fxaa_enabled),
         .resolution = .{
             @floatFromInt(cur_w),

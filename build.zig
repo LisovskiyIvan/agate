@@ -340,7 +340,6 @@ pub fn build(b: *Build) !void {
         .{ .name = "skinned_pbr_shader", .input = "src/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
         .{ .name = "instanced_pbr_shader", .input = "src/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
         .{ .name = "shadow_shader", .input = "src/shaders/shadow.glsl", .output = "shadow_shader.zig" },
-        .{ .name = "msaa_depth_shader", .input = "src/shaders/msaa_depth.glsl", .output = "msaa_depth_shader.zig" },
         .{ .name = "velocity_shader", .input = "src/shaders/velocity.glsl", .output = "velocity_shader.zig" },
         .{ .name = "skybox_shader", .input = "src/shaders/skybox.glsl", .output = "skybox_shader.zig", .includes = true },
         // Increment 1 of the shader-include refactor: these nine share the

@@ -20,7 +20,6 @@ pub const SsgiPass = @import("ssgi_pass.zig").SsgiPass;
 pub const DdgiPass = @import("ddgi_pass.zig").DdgiPass;
 pub const outline_pass = @import("outline_pass.zig");
 pub const DebugPass = @import("debug_pass.zig").DebugPass;
-pub const MsaaDepthPass = @import("msaa_depth_pass.zig").MsaaDepthPass;
 pub const VelocityPass = @import("velocity_pass.zig").VelocityPass;
 pub const velocity_pass = @import("velocity_pass.zig");
 pub const DepthPyramidPass = @import("depth_pyramid_pass.zig").DepthPyramidPass;

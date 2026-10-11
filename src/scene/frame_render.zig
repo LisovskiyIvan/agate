@@ -8,7 +8,6 @@ const postprocess = @import("../postprocess.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 const gpu_timing = @import("../gpu_timing.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
-const scene_msaa = @import("msaa.zig");
 const scene_draw = @import("draw.zig");
 const gi = @import("../gi/ddgi.zig");
 
@@ -302,16 +301,6 @@ pub fn render(scene: anytype) void {
     }
 
     // ==============================================
-    // PASS 1.7: MSAA DEPTH PREPASS (gated, default off)
-    // ==============================================
-    // Single-sample depth for the post chain under MSAA (sokol has no
-    // depth resolve — see scene/msaa.zig): redraws the opaque
-    // primary-view queues with depth-only pipelines into a 1x depth
-    // texture BEFORE the main pass. Skipped on renderReuse replays (the
-    // persisted texture still matches the replayed snapshot); the gate
-    // going idle frees the target so the off shape holds no prepass
-    // VRAM. Cost is attributed to the main phase below.
-    // ==============================================
     // PASS 1.75: DDGI PROBE-ATLAS UPDATE (v1 spike, opt-in)
     // ==============================================
     // Fragment-based ray march over the proxy AABB scene into the
@@ -384,20 +373,6 @@ pub fn render(scene: anytype) void {
     prewarmMainShaderMaterials(env.pipelines, draws, snap);
     @import("refraction.zig").capture(scene, draws, snap, &env);
     gpu_timing.beginPass(.main);
-    const depth_prepass = scene_msaa.depthPrepassActive(post_config.enabled, snap.msaa_depth_prepass, samples);
-    if (depth_prepass and !scene.rendering_reuse) {
-        scene.postfx.renderMsaaDepthPrepass(
-            snap.primary_cam.view_proj,
-            &draws.primary,
-            draws.primary.skin_storage.items,
-            snap.primary_cam.viewport,
-            tgt_w,
-            tgt_h,
-            &scene.stats,
-        );
-    } else if (!depth_prepass) {
-        scene.postfx.destroyMsaaDepth();
-    }
 
     // ==============================================
     // PASS 2: MAIN SCENE RENDER PASS
@@ -419,8 +394,6 @@ pub fn render(scene: anytype) void {
     };
 
     // Linear HDR is the sole scene target; display conversion runs afterwards.
-    // (The .main GPU-timer bracket opened above at PASS 1.7, so the
-    // prepass cost attributes to the main phase.)
     if (!scene.postfx.beginMainPass(main_pass_action, samples, tgt_w, tgt_h)) {
         gpu_timing.endPass(.main);
         sg.commit();
@@ -585,8 +558,6 @@ pub fn render(scene: anytype) void {
         .sun_color = snap.sun_color,
         .default_white_view = snap.default_white.view,
         .main_samples = samples,
-        // PASS 1.7 depth-prepass gate (snapshot-carried Scene flag).
-        .msaa_depth_prepass = snap.msaa_depth_prepass,
         // P7 staged highlight items from the pinned front slot (never live
         // Scene fields): the render below dereferences no mesh.
         .highlight_items = draws.highlight_items.items,

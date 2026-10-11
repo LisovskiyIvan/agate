@@ -130,9 +130,6 @@ pub const SceneFrameSnapshot = struct {
     ibl_intensity: f32 = 1.0,
     clear_color: Color4 = Color4.new(0, 0, 0, 1),
     msaa_sample_count: i32 = 1,
-    // Carried for the PASS 1.7 depth-prepass decision (render thread reads
-    // only the snapshot, never live Scene fields). Default off.
-    msaa_depth_prepass: bool = false,
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
     // DDGI v1 spike: grid options + proxy AABB scene frozen at snapshot
@@ -247,7 +244,6 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
     snap.default_cube = scene.default_cube_texture;
     snap.clear_color = scene.clear_color;
     snap.msaa_sample_count = scene.msaa_sample_count;
-    snap.msaa_depth_prepass = scene.msaa_depth_prepass;
     snap.post_process = scene.post_process;
     snap.ssao = scene.ssao;
     // DDGI proxy scene (v1 spike): collected under the snapshot/build

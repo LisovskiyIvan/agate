@@ -327,7 +327,6 @@ pub const PostProcessPass = struct {
         config: PostProcessOptions,
         ssao_tex: sg.View,
         ssao_enabled: bool,
-        ssao_debug: bool,
         ssao_intensity: f32,
         cur_w: i32,
         cur_h: i32,
@@ -341,10 +340,9 @@ pub const PostProcessPass = struct {
         far_z: f32,
         // Scene-depth texture sampled by the SSR/fog/motion-blur/DoF/TAA
         // blocks (BIND depth_tex). The caller resolves it (PostFXStack
-        // depthSampleView): the 1x main depth, the PASS 1.7 prepass depth
-        // under MSAA + gate, or the resolve-color placeholder while the
-        // depth branches are flag-gated off (the binding only has to
-        // exist for sokol's apply-bindings validation).
+        // depthSampleView): the 1x main depth, or the resolve-color
+        // placeholder while the depth branches are flag-gated off (the
+        // binding only has to exist for sokol's apply-bindings validation).
         depth_view: sg.View,
         // TAA resolve inputs: history texture sampled reprojected (bilinear
         // smp) plus the validity latch. Empty view + false keeps the
@@ -375,7 +373,6 @@ pub const PostProcessPass = struct {
         const pp_params = self.packCompositeParams(
             config,
             ssao_enabled,
-            ssao_debug,
             ssao_intensity,
             cur_w,
             cur_h,
@@ -425,7 +422,6 @@ pub const PostProcessPass = struct {
         self: *const PostProcessPass,
         config: PostProcessOptions,
         ssao_enabled: bool,
-        ssao_debug: bool,
         ssao_intensity: f32,
         cur_w: i32,
         cur_h: i32,
@@ -445,7 +441,6 @@ pub const PostProcessPass = struct {
             self,
             config,
             ssao_enabled,
-            ssao_debug,
             ssao_intensity,
             cur_w,
             cur_h,

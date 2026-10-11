@@ -232,6 +232,7 @@ pub const Scene = struct {
     // ---- Camera management ----
     cameras: std.ArrayListUnmanaged(CameraEntry) = .empty,
     active_camera_index: ?usize = null,
+    /// Engine-owned (set from CameraRig mode by applyToScene); do not set directly.
     enable_multi_camera: bool = false,
     viewport_clear: scene_viewport_clear.ViewportClearPass = .{},
 
@@ -369,22 +370,6 @@ pub const Scene = struct {
     // pipeline/target twins on the next MSAA frame.
     msaa_sample_count: i32 = 1,
 
-    // MSAA depth-prepass gate (default OFF): when true AND the effective
-    // main-target sample count is > 1, opaque primary-view geometry is
-    // drawn a second time with depth-only pipelines into a 1x depth
-    // texture (PASS 1.7, before the main pass), so the depth-consuming
-    // post effects (SSAO/SSR/DoF/Fog/MotionBlur) keep running under MSAA
-    // instead of being suppressed. Off path is bit-identical (no extra
-    // pass, no extra VRAM, suppression as before). TAA stays suppressed
-    // under MSAA regardless (v1 non-goal). Known approximations, see
-    // passes/msaa_depth_pass.zig: 1x depth vs MSAA color can differ by a
-    // pixel at geometric edges; cutout renders opaque and GPU morphs
-    // contribute base positions (shadow-map precedent); hook-material,
-    // transparent, decal, particle and secondary-view geometry is skipped
-    // (primary view only, v1 non-goal). Set before the first render();
-    // toggling later allocates/frees the 1x target on the next frame.
-    msaa_depth_prepass: bool = false,
-
     // Forward pipeline twin built for the effective MSAA sample count
     // (sokol requires pipeline.sample_count to match every main-target
     // attachment). Null until the first MSAA frame.
@@ -519,29 +504,12 @@ pub const Scene = struct {
     /// it after observing a fresh seq and asserts it still is the back index
     /// (no intervening publish).
     build_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// Cooperative game-side yield for the concurrent-build path
-    /// (contention-yield): nanoseconds the game thread parks inside
-    /// `tryClaimBuildSlot` — but ONLY when the previous build is still
-    /// unconsumed (`build_seq != last_latched_seq`) — when nonzero.
-    /// Default 0 = OFF: the default (phase-locked) path never sets it, so
-    /// it stays behavior-identical (one predictable not-taken branch, no
-    /// syscall, no atomics beyond the existing handoff words). Under
-    /// EXPERIMENTAL `--concurrent-build` the app may set it (startup only,
-    /// before the game thread spawns; game-side read): the game is then
-    /// overproducing (hundreds of builds/s vs 60 latched frames/s), so
-    /// parking before reserving the next slot donates its core to the
-    /// context thread's prepare/render + pool workers instead of burning
-    /// CPU on builds the latch will supersede. Backpressure, not a flat tax: when the consumer
-    /// is caught up the claim proceeds immediately (freshness preserved,
-    /// zero added latency); the park also runs BEFORE the lease reserve,
-    /// so no WRITING slot is ever held while parked. Overhead when
-    /// enabled and behind: exactly one nanosleep per skipped-ahead tick;
-    /// when 0 or caught up: a single branch. Plain u64, stays plain:
-    /// written once by the app at startup, read only by the game-side
-    /// claim — never across the handoff edge. Tune only with wall numbers
-    /// (dips / 1% low at fixed prepared=100% + waitC=0), never blindly:
-    /// too small changes nothing, too large slows the sim tick rate
-    /// (ticks/s floor: the latch needs one fresh build per 16.7 ms frame).
+    /// Engine-owned contention-yield for the experimental concurrent-build
+    /// path: nanoseconds the game thread parks in `tryClaimBuildSlot` when
+    /// the previous build is still unconsumed. Default 0 = OFF (the claim
+    /// never sleeps). Written once at startup before the game thread
+    /// spawns, read only by the game-side claim; tune only with wall
+    /// numbers, never blindly. Do not set from gameplay/tooling code.
     concurrent_yield_ns: u64 = 0,
     /// Last published frame whose staged-upload outcomes were committed
     /// (`commitSlotResults` at the next build). Game side only (written

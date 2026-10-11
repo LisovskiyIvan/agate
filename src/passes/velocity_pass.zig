@@ -25,8 +25,13 @@ const scene_render_queue = @import("../scene/render_queue.zig");
 const RenderQueues = scene_render_queue.RenderQueues;
 const stats_mod = @import("../scene/stats.zig");
 const SceneStats = stats_mod.SceneStats;
-const msaa_depth = @import("msaa_depth_pass.zig");
-pub const itemContributesDepth = msaa_depth.itemContributesDepth;
+
+/// Pure skip-matrix for depth-contributing draws (unit-testable without a
+/// GPU): transparent and decal meshes write no depth in the main pass
+/// either, and hook-material meshes need their custom vertex stage.
+pub fn itemContributesDepth(transparent: bool, is_decal: bool, has_hook: bool) bool {
+    return !transparent and !is_decal and !has_hook;
+}
 const material_mod = @import("../material.zig");
 const MaterialDrawRecord = material_mod.MaterialDrawRecord;
 const particle_pass_mod = @import("particle_pass.zig");

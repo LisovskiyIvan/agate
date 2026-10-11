@@ -53,9 +53,9 @@ Includes are small versioned files; map back by inspection.
   pure helpers (`morphTexel`/`morphWeight`/`applyMorphDeltas`) are shared
   (common/morph_helpers.glsl); arity is pinned by the `morph helpers live
   once in common` drift test.
-- `shadow.glsl` vs `msaa_depth.glsl` (depth-only twins): must rasterize
-  identically but upload different matrices (light vs camera) and
-  different bias. Pinned by the `depth twin programs` drift test.
+- `shadow.glsl` depth-only programs (rigid/instanced/skinned entry
+  points, position-only vertex input). Pinned by the `shadow depth-only
+  programs` drift test.
 - `probe_mip.glsl` fullscreen vs: NO Y-flip (`v_uv = texcoord0`
   unconditionally) — excluded from `fullscreen_vs.glsl` on purpose.
 - `particle.glsl`, `outline.glsl`, `skybox/debug/ui/ui3d_panel.glsl`,
