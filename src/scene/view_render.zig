@@ -8,6 +8,7 @@ const outline_pass = @import("../passes/outline_pass.zig");
 const scene_draw = @import("draw.zig");
 const scene_clustered = @import("clustered_lights.zig");
 const scene_uniforms = @import("uniforms.zig");
+const gi = @import("../gi/ddgi.zig");
 const FrameContext = scene_uniforms.FrameContext;
 
 pub fn renderSceneView(
@@ -110,6 +111,9 @@ pub fn renderSceneView(
         scene.clustered.ensureDummyViews();
     }
 
+    // DDGI sample lanes (v1 spike): static grid config, zeroed when
+    // disabled (gridLanes gates on enabled) — same every view this frame.
+    const ddgi_lanes = gi.gridLanes(snap.ddgi);
     var frame_ctx = FrameContext{
         .view_proj = view_proj,
         .eye = eye,
@@ -136,6 +140,10 @@ pub fn renderSceneView(
         .area_color = snap.light_pack.area_color,
         .clustered_params = cl_params,
         .clustered_viewport = cl_viewport,
+        .ddgi_grid_origin = ddgi_lanes[0],
+        .ddgi_grid_counts = ddgi_lanes[1],
+        .ddgi_grid_step = ddgi_lanes[2],
+        .ddgi_atlas = ddgi_lanes[3],
     };
 
     var shadow_state_with = env.shadow_uniforms;

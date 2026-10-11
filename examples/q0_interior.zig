@@ -43,6 +43,9 @@ var ab: bench_mod.AbBench = .{};
 /// target rebuild, so it is safe to toggle per block; a render_scale pair
 /// would realloc targets every block and must stay in the phase bench.
 var ab_mode: bool = false;
+/// Interleaved A/B target: false = SSGI (AGATE_Q0_AB=ssgi), true = DDGI
+/// (AGATE_Q0_AB=ddgi, toggles scene.ddgi.enabled per block).
+var ab_ddgi: bool = false;
 var frame_limit: u32 = 0;
 var frames: u32 = 0;
 var log_errors: u32 = 0;
@@ -311,6 +314,21 @@ fn setupScene() void {
     // AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive baseline.
     scene.post_process.taa_reactive_enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
     scene.post_process.fog_enabled = false;
+    // DDGI v1 spike (opt-in): AGATE_Q0_DDGI=1 enables the proxy-grid
+    // diffuse bounce over the room volume (floor y=0, ceiling y=4, open
+    // front +z; whole-grid refresh). Intensity 0.35 ~= 1/pi: the v1
+    // single-tap sample adds probe outgoing radiance as if it were
+    // irradiance, overreading by ~pi (see docs/gi.md); the atlas stays
+    // raw and intensity stays live. The AB ddgi arm below needs the same
+    // calibration, so it shares this gate.
+    if (envFlag("AGATE_Q0_DDGI") or ab_ddgi) {
+        scene.ddgi.enabled = true;
+        scene.ddgi.origin = .{ -3.0, 0.05, -3.0 };
+        scene.ddgi.extent = .{ 6.0, 3.9, 6.0 };
+        scene.ddgi.counts = .{ 6, 4, 6 };
+        scene.ddgi.intensity = 0.35;
+        scene.ddgi.probes_per_frame = 0;
+    }
     // Single-scale runs keep the env selection via overrideScale; full
     // 3-phase A/B runs start at the bench schedule's phase 0 (which a
     // reversed order sets to 0.66 — the env default must not clobber it).
@@ -349,9 +367,16 @@ export fn frame() callconv(.c) void {
     if (gate) {
         if (ab_mode) {
             if (ab.beginBlock(f, frame_limit)) |ev| {
-                scene.post_process.ssgi_enabled = ev.arm == .A;
+                if (ab_ddgi) {
+                    scene.ddgi.enabled = ev.arm == .A;
+                } else {
+                    scene.post_process.ssgi_enabled = ev.arm == .A;
+                }
                 if (ev.index > 0) scene.resetTaa();
-                std.debug.print("q0-interior ab: block {} arm={s} ssgi={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi_enabled });
+                // draws = previous frame's draw calls (stats reset at the
+                // next staged begin): the DDGI on/off delta is the update
+                // pass (+1 when the arm is on).
+                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi_enabled, scene.ddgi.enabled, scene.stats.draw_calls });
             }
         } else {
             if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
@@ -421,7 +446,7 @@ export fn frame() callconv(.c) void {
 export fn cleanup() callconv(.c) void {
     if (timing.isEnabled()) {
         if (ab_mode) {
-            const s = ab.finalSummary("ssgi_on", "ssgi_off");
+            const s = ab.finalSummary(if (ab_ddgi) "ddgi_on" else "ssgi_on", if (ab_ddgi) "ddgi_off" else "ssgi_off");
             ab.printBlocks();
             bench_mod.AbBench.printSummary(s);
         } else bench_mod.Bench.printPhase(bench.report(bench.index));
@@ -454,6 +479,10 @@ pub fn main() void {
     // this mode; everything else keeps its meaning.
     if (std.c.getenv("AGATE_Q0_AB")) |sel| {
         if (std.mem.eql(u8, std.mem.span(sel), "ssgi")) ab_mode = true;
+        if (std.mem.eql(u8, std.mem.span(sel), "ddgi")) {
+            ab_mode = true;
+            ab_ddgi = true;
+        }
     }
     if (ab_mode) {
         ab.block_frames = @min(@max(envU32("AGATE_Q0_AB_BLOCK", 60), 16), bench_mod.ab_max_block_frames);

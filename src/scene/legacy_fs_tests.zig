@@ -89,6 +89,12 @@ test "legacy wire: pack preserves view, material, and explicit refraction" {
         // explicit pair (hook legacy uses identity/disabled).
         .refraction_view_proj = Mat4.translation(Vec3.new(9, 9, 9)),
         .refraction_capture = .{ 1, 99, 99, 0 },
+        // Legacy wire predates DDGI (zeros: the legacy block has no
+        // ddgi lanes and the legacy shaders never sample the atlas).
+        .ddgi_grid_origin = .{ 0, 0, 0, 0 },
+        .ddgi_grid_counts = .{ 0, 0, 0, 0 },
+        .ddgi_grid_step = .{ 0, 0, 0, 0 },
+        .ddgi_atlas = .{ 0, 0, 0, 0 },
     };
     const in: uniforms.MaterialUniformInputs = .{
         .base_color = .{ 0.5, 0.5, 0.5, 1 },

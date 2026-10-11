@@ -116,6 +116,9 @@ pub const SceneLoader = loader.SceneLoader;
 
 pub const postprocess = @import("postprocess.zig");
 
+pub const gi = @import("gi.zig");
+pub const DdgiOptions = gi.DdgiOptions;
+
 pub const jobs = @import("jobs.zig");
 /// Thin engine-owned frame lifecycle facade (update-vs-begin phase mutex,
 /// worker start/stop, producer claim->build->stageUi->publish one-liner,

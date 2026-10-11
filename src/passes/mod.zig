@@ -17,6 +17,7 @@ pub const OutlinePass = @import("outline_pass.zig").OutlinePass;
 pub const OutlineDrawItem = @import("outline_pass.zig").OutlineDrawItem;
 pub const SSAOPass = @import("ssao_pass.zig").SSAOPass;
 pub const SsgiPass = @import("ssgi_pass.zig").SsgiPass;
+pub const DdgiPass = @import("ddgi_pass.zig").DdgiPass;
 pub const outline_pass = @import("outline_pass.zig");
 pub const DebugPass = @import("debug_pass.zig").DebugPass;
 pub const MsaaDepthPass = @import("msaa_depth_pass.zig").MsaaDepthPass;

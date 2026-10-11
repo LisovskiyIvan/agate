@@ -15,6 +15,7 @@ const gpu_thread = @import("../gpu_thread.zig");
 const sapp = sokol.app;
 const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
+const gi = @import("../gi.zig");
 const ssao = @import("../ssao.zig");
 const SSAOOptions = ssao.SSAOOptions;
 const particles = @import("../particles.zig");
@@ -348,6 +349,10 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    // DDGI v1 spike (gi/ddgi.zig): probe-grid diffuse GI over the proxy
+    // AABB scene. Default OFF: no atlas VRAM, no update draws, zeroed
+    // sample lanes (the forward path renders bit-identically).
+    ddgi: gi.DdgiOptions = .{},
     // Opt-in analytic physical sky (postprocess/sky.zig): when enabled the
     // frame snapshot derives a consistent sun/ambient/fog triple from sun
     // elevation + turbidity. Default OFF: every manual value passes

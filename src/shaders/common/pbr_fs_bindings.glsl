@@ -67,6 +67,18 @@ layout(binding = 15) uniform texture2D clearcoat_tex;
 layout(binding = 16) uniform texture2D sheen_tex;
 layout(binding = 18) uniform texture2D refraction_tex;
 layout(binding = 8) uniform sampler refraction_smp;
+// DDGI probe atlas (v1 spike, opt-in): binding 22 is the next free view
+// slot in the shared pool (fs uses 0..8, 10, 11, 15..21; rigid/skinned
+// vs uses 9 for morph, instanced vs uses no textures; 12..14 are
+// storage buffers, a separate array). Binding 9 the next free sampler
+// slot (fs uses 0..8; rigid/skinned vs uses 4). The draw always binds
+// something valid here (atlas view when the update pass ran, default
+// white otherwise); the shader only samples it when the ddgi_grid_origin
+// enabled lane is set. Instanced draws bind the same placeholders (no
+// per-instance probe state in v1); the slots must still exist for layout
+// parity across the PBR family.
+layout(binding = 22) uniform texture2D ddgi_tex;
+layout(binding = 9) uniform sampler ddgi_smp;
 // Clustered forward lights (wave 30, v1): storage buffers for the tile
 // walk. Bindings 12..14 are free view slots in the shared pool of every
 // forward shader (this family uses fs 0..8, 10, 11; rigid/skinned vs uses

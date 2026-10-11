@@ -10,6 +10,7 @@ const gpu_timing = @import("../gpu_timing.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const scene_msaa = @import("msaa.zig");
 const scene_draw = @import("draw.zig");
+const gi = @import("../gi/ddgi.zig");
 
 fn msSince(t0: u64) f32 {
     return @floatCast(sokol.time.ms(sokol.time.since(t0)));
@@ -310,6 +311,55 @@ pub fn render(scene: anytype) void {
     // persisted texture still matches the replayed snapshot); the gate
     // going idle frees the target so the off shape holds no prepass
     // VRAM. Cost is attributed to the main phase below.
+    // ==============================================
+    // PASS 1.75: DDGI PROBE-ATLAS UPDATE (v1 spike, opt-in)
+    // ==============================================
+    // Fragment-based ray march over the proxy AABB scene into the
+    // grid-sized RGBA16F atlas, BEFORE the main pass (the forward draws
+    // sample the atlas through the PBR ddgi chunk). Default off: no
+    // draws, no VRAM, placeholder binds downstream. renderReuse replays
+    // skip the refresh (the persisted atlas still matches the replayed
+    // snapshot) but keep serving the current view. Cost attributes to
+    // the main phase below (same convention as the MSAA prepass).
+    var ddgi_view: sg.View = .{};
+    if (snap.ddgi.enabled and !scene.rendering_reuse) {
+        const ddgi_probes = gi.probeCount(snap.ddgi.counts);
+        const ddgi_win = gi.budgetWindow(snap.frame_id, ddgi_probes, snap.ddgi.probes_per_frame);
+        if (ddgi_win.count > 0) {
+            const updated = scene.postfx.ddgi_pass.render(.{
+                .opts = snap.ddgi,
+                .window_start = ddgi_win.start,
+                .window_count = ddgi_win.count,
+                .sun_dir = snap.sun_dir,
+                .sun_color = snap.sun_color,
+                .sun_intensity = snap.sun_intensity,
+                .hemi_dir = snap.shadow_uniforms.hemi_dir,
+                .hemi_diffuse = snap.shadow_uniforms.hemi_diffuse,
+                .hemi_ground = snap.shadow_uniforms.ground_color,
+                .hemi_intensity = snap.shadow_uniforms.hemi_intensity,
+                .proxies = snap.ddgi_proxies[0..snap.ddgi_proxy_count],
+            });
+            if (updated.id != 0) {
+                ddgi_view = updated;
+                scene.stats.draw_calls += 1;
+                scene.stats.triangles += 2;
+            }
+        }
+    }
+    if (ddgi_view.id == 0) {
+        // Reuse replays (and resize races) keep serving the persisted
+        // atlas; only the never-allocated shape falls to placeholders.
+        ddgi_view = scene.postfx.ddgi_pass.atlasTexView();
+    }
+    if (ddgi_view.id == 0) {
+        // Placeholder binds (off path / no atlas yet):
+        // valid views the shader never samples (enabled lane gates the
+        // fetch), so the default path renders bit-identically.
+        ddgi_view = snap.default_white.view;
+    }
+    var ddgi_sampler: sg.Sampler = scene.postfx.ddgi_pass.sampler;
+    if (ddgi_sampler.id == 0) ddgi_sampler = snap.default_white.sampler;
+
     const t_main = sokol.time.now();
     var env = scene_draw.Environment{
         .pipelines = scene.forwardFor(samples, color_format),
@@ -323,6 +373,8 @@ pub fn render(scene: anytype) void {
         .shadow_pass = &scene.shadows.pass,
         .shadow_uniforms = snap.shadow_uniforms,
         .clustered = &scene.clustered,
+        .ddgi_view = ddgi_view,
+        .ddgi_sampler = ddgi_sampler,
     };
     // Shader-material prewarm (context thread, serial): create ONLY the
     // eligible pipelines from the frozen prepared queues AFTER the forward
