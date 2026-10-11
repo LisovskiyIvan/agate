@@ -39,6 +39,50 @@ test "computeCascades stores matrices and follows splits" {
     try std.testing.expect(!matEq(cascades[3], cascades_b[3]));
 }
 
+test "computeCascades covers radial splits and their blend overlap" {
+    const Vec3 = math.Vec3;
+    var camera: Camera = .{ .target = .{
+        .position = Vec3.new(2.3, 3.7, 8.1),
+        .target = Vec3.new(2.3, 3.7, 7.1),
+        .fov_deg = 90.0,
+    } };
+    const splits = [4]f32{ 10.0, 26.0, 65.0, 150.0 };
+    const forward = camera.getForward().normalize();
+    const right = forward.cross(Vec3.up).normalize();
+    const up = right.cross(forward).normalize();
+    const directions = [_]Vec3{
+        Vec3.new(0.25, 0.55, 1.0).normalize(),
+        Vec3.new(1.0, 0.01, 0.01).normalize(),
+        Vec3.up,
+    };
+    for ([_]f32{ 10.0, 60.0, 90.0 }) |fov| {
+        camera.target.fov_deg = fov;
+        const tan_half_fov = @tan(fov * std.math.pi / 360.0);
+        for ([_]f32{ 4.0 / 3.0, 32.0 / 9.0 }) |aspect| {
+            for (directions) |sun| {
+                const cascades = scene_cascades.computeCascades(camera, aspect, sun, splits);
+                for (cascades, 0..) |cascade, ci| {
+                    const start = if (ci == 0) 0.0 else splits[ci - 1] * 0.88;
+                    for ([_]f32{ start, (start + splits[ci]) * 0.5, splits[ci] }) |distance| {
+                        for ([_]f32{ -1.0, 0.0, 1.0 }) |x| {
+                            for ([_]f32{ -1.0, 0.0, 1.0 }) |y| {
+                                const ray = forward.add(right.scale(x * tan_half_fov * aspect)).add(up.scale(y * tan_half_fov)).normalize();
+                                const p = camera.getPosition().add(ray.scale(distance));
+                                const clip = cascade.transformPoint(p);
+                                // Include the shader's 0.003 atlas-UV inset, not
+                                // just the nominal tile: snapping must not crop it.
+                                try std.testing.expect(@abs(clip.x) <= 0.988);
+                                try std.testing.expect(@abs(clip.y) <= 0.988);
+                                try std.testing.expect(clip.z >= 0.0 and clip.z <= 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "frameUniforms packs shared lighting state verbatim" {
     const uniforms = scene_uniforms;
     const FrameContext = uniforms.FrameContext;

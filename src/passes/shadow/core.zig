@@ -179,7 +179,7 @@ pub const ShadowPass = struct {
                 .bias = 1.0,
                 .bias_slope_scale = 1.0,
             },
-            .cull_mode = .BACK,
+            .cull_mode = .NONE,
             .face_winding = .CCW,
         };
         shadow_pip_desc.colors[0].pixel_format = .NONE;
@@ -206,7 +206,7 @@ pub const ShadowPass = struct {
                 .bias = 1.0,
                 .bias_slope_scale = 1.0,
             },
-            .cull_mode = .BACK,
+            .cull_mode = .NONE,
             .face_winding = .CCW,
         };
         shadow_inst_desc.colors[0].pixel_format = .NONE;
@@ -243,7 +243,7 @@ pub const ShadowPass = struct {
                 .bias = 1.0,
                 .bias_slope_scale = 1.0,
             },
-            .cull_mode = .BACK,
+            .cull_mode = .NONE,
             .face_winding = .CCW,
         };
         shadow_skinned_desc.colors[0].pixel_format = .NONE;

@@ -81,6 +81,13 @@ pub fn hgPhase(cos_theta: f32, g: f32) f32 {
     return (1.0 - gg) / (4.0 * std.math.pi * denom * @sqrt(@max(denom, 1e-6)));
 }
 
+/// Integrated scattering weight of one homogeneous march segment.
+/// Mirrors step_scatter in volumetric_raymarch.glsl. Unlike density*dt,
+/// Beer-Lambert integration is bounded and independent of the step budget.
+pub fn shaftStepOpacity(density: f32, distance: f32) f32 {
+    return 1.0 - @exp(-@max(density, 0.0) * @max(distance, 0.0));
+}
+
 /// CSM cascade index for a camera-distance sample. Mirrors
 /// calculateShadow in the forward shaders (and shaftCascade in
 /// volumetric_raymarch.glsl): distance-ordered splits, cascade 3 past

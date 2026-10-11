@@ -328,8 +328,9 @@ export fn frame() callconv(.c) void {
     // (same jitter/animation frame); interactive mode keeps live timing.
     const dt: f32 = if (gate) 1.0 / 60.0 else @floatCast(sapp.frameDuration());
 
+    if (f == 2) scene.post_process.taa_camera_cut = false;
+
     if (gate) {
-        if (f == 2) scene.post_process.taa_camera_cut = false;
         if (f == 20) scene.post_process.tonemapping = .filmic;
         if (f == 40) scene.post_process.tonemapping = .agx;
         if (f == 60) scene.post_process.tonemapping = .neutral;

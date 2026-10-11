@@ -46,6 +46,7 @@ var log_errors: u32 = 0;
 var failures: u32 = 0;
 var render_scale: f32 = 1.0;
 var camera: z.ArcRotateCamera = undefined;
+var still_camera: bool = false;
 
 fn fail(comptime fmt: []const u8, args: anytype) void {
     failures += 1;
@@ -106,7 +107,7 @@ fn setupScene() void {
 
     // Sun through the open front side: drives CSM + volumetric shafts.
     _ = scene.createDirectionalLight("sun", .{
-        .direction = z.Vec3.new(0.25, 1.4, 1.0),
+        .direction = z.Vec3.new(0.25, 0.55, 1.0),
         .diffuse = z.Color3.new(1.0, 0.92, 0.8),
         .intensity = 2.6,
     }) catch @panic("q0: sun failed");
@@ -184,9 +185,11 @@ fn setupScene() void {
     right.setPBRMaterial(pbr("wall_right_pbr", .{ 0.34, 0.40, 0.55 }, 0.0, 0.85));
     const ceiling = wall("ceiling", 6.0, 6.0);
     ceiling.position = z.Vec3.new(0.0, 4.0, 0.0);
-    ceiling.rotation.x = 90.0;
-    ceiling.cast_shadows = false;
-    ceiling.setPBRMaterial(pbr("ceiling_pbr", .{ 0.9, 0.88, 0.85 }, 0.0, 0.9));
+    ceiling.rotation.x = -90.0;
+    ceiling.cast_shadows = true;
+    const ceiling_mat = pbr("ceiling_pbr", .{ 0.9, 0.88, 0.85 }, 0.0, 0.9);
+    ceiling_mat.double_sided = true;
+    ceiling.setPBRMaterial(ceiling_mat);
 
     // Content: tall red box, white sphere, mirror sphere (SSR showpiece).
     const tall = z.MeshBuilder.createBox(&scene, "tall_box", .{ .width = 1.5, .height = 2.4, .depth = 1.5 }) catch @panic("q0: box failed");
@@ -250,15 +253,17 @@ fn setupScene() void {
     scene.post_process.bloom_threshold = 1.0;
     scene.post_process.bloom_intensity = 0.55;
     scene.post_process.bloom_pyramid_mips = 7;
-    scene.post_process.ssr_enabled = true;
+    scene.post_process.ssr_enabled = !envFlag("AGATE_Q0_NO_SSR");
     scene.post_process.ssr_intensity = 0.6;
     scene.post_process.ssr_steps = 32;
     scene.post_process.depth_pyramid_enabled = true;
-    scene.post_process.dof_enabled = true;
+    scene.post_process.dof_enabled = !envFlag("AGATE_Q0_NO_DOF");
     scene.post_process.dof_focus_distance = 4.6;
     scene.post_process.dof_focus_range = 2.2;
     scene.post_process.dof_max_blur = 5.0;
-    scene.post_process.shaft_enabled = true;
+    // Lighting isolation: shafts off leaves the actual sunlit opening
+    // footprint intact; DoF off + a still camera make shadow A/Bs readable.
+    scene.post_process.shaft_enabled = !envFlag("AGATE_Q0_NO_SHAFTS");
     scene.post_process.shaft_intensity = 0.5;
     scene.post_process.shaft_steps = 32;
     scene.post_process.local_tonemapping_enabled = true;
@@ -269,7 +274,6 @@ fn setupScene() void {
     scene.post_process.ssgi_radius = 1.6;
     scene.post_process.ssgi_steps = 16;
     scene.post_process.taa_enabled = true;
-    scene.post_process.taa_camera_cut = true;
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the
     // documented gaps): on in the calibration scene —
@@ -329,9 +333,10 @@ export fn frame() callconv(.c) void {
     // Deterministic motion under the gate: same jitter/animation frame for
     // cross-run compare; slow drift keeps TAA/SSR/DoF genuinely working.
     const dt: f32 = if (gate) 1.0 / 60.0 else @floatCast(sapp.frameDuration());
-    if (f == 2) scene.post_process.taa_camera_cut = false;
-    camera.alpha += 0.045 * dt;
-    camera.beta = std.math.pi / 2.75 + @sin(@as(f32, @floatFromInt(f)) * 0.008) * 0.12;
+    if (!still_camera) {
+        camera.alpha += 0.045 * dt;
+        camera.beta = std.math.pi / 2.75 + @sin(@as(f32, @floatFromInt(f)) * 0.008) * 0.12;
+    }
     scene.active_camera = .{ .arc_rotate = camera };
 
     scene.update(dt) catch |err| fail("update: {s}", .{@errorName(err)});
@@ -400,6 +405,7 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
 
 pub fn main() void {
     frame_limit = envU32("AGATE_Q0_FRAMES", 0);
+    still_camera = envFlag("AGATE_Q0_STILL");
     render_scale = envF32("AGATE_Q0_RENDER_SCALE", 1.0);
     bench.phase_frames = @max(30, envU32("AGATE_Q0_PHASE_FRAMES", 180));
     if (envFlag("AGATE_Q0_PHASES_REVERSED")) bench.scales = .{ 0.66, 0.75, 1.0 };

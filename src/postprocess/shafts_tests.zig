@@ -116,6 +116,24 @@ test "hg phase golden values" {
     }
 }
 
+test "shaft march preserves Beer-Lambert energy at every step budget" {
+    for ([_]f32{ 0.0, 0.05, 1.0 }) |density| {
+        const distance: f32 = 20.0;
+        const expected = 1.0 - @exp(-density * distance);
+        for ([_]u32{ 4, 12, 32 }) |steps| {
+            const opacity = shafts.shaftStepOpacity(density, distance / @as(f32, @floatFromInt(steps)));
+            var transmit: f32 = 1.0;
+            var scatter: f32 = 0.0;
+            for (0..steps) |_| {
+                scatter += transmit * opacity;
+                transmit *= 1.0 - opacity;
+            }
+            try std.testing.expect(scatter >= 0.0 and scatter <= 1.0 + 1e-6);
+            try std.testing.expectApproxEqAbs(expected, scatter, 2e-6);
+        }
+    }
+}
+
 test "shaft cascade index mirrors the forward splits" {
     const splits = [4]f32{ 10.0, 26.0, 65.0, 150.0 };
     try std.testing.expectEqual(@as(usize, 0), shaftCascadeIndex(5.0, splits));

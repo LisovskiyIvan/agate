@@ -116,6 +116,10 @@ pub const ArcRotateCamera = struct {
 
     pub fn update(self: *ArcRotateCamera, dt: f32) void {
         if (self.inertia <= 0.0) return;
+        // No (or negative) time elapsed: stay put. Without this, dt == 0
+        // applies the full offsets (pow(i, 0) == 1) and dt < 0 amplifies
+        // them (pow(i, negative) > 1). `!(dt > 0)` also catches NaN.
+        if (!(dt > 0.0)) return;
         if (self.inertial_alpha_offset == 0.0 and self.inertial_beta_offset == 0.0 and self.inertial_radius_offset == 0.0) return;
 
         self.alpha -= self.inertial_alpha_offset;

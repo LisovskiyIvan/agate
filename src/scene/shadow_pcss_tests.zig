@@ -118,6 +118,52 @@ test "penumbraRadius covers the point golden values" {
 
 const math = @import("math");
 
+test "receiver plane gradient predicts depth for sun spot and point atlas scales" {
+    const Vec3 = math.Vec3;
+    const receiver = Vec3.new(0.4, 0.5, -5.0);
+    const projections = [_]math.Mat4{
+        math.Mat4.orthographic(-10, 10, -10, 10, 0.1, 150),
+        math.Mat4.perspective(60, 1, 0.1, 15),
+        math.Mat4.perspective(90, 1, 0.1, 10),
+    };
+    const scales = [_][2]f32{ .{ 0.25, 0.25 }, .{ 0.25, 0.5 }, .{ 1.0 / 12.0, 0.25 } };
+    for (projections, scales) |vp, scale| {
+        for ([_]Vec3{ Vec3.new(0.2, 0.9, 0.5).normalize(), Vec3.new(0.99, 0, 0.01).normalize() }) |normal| {
+            const up_ref = if (@abs(normal.y) > 0.9) Vec3.new(1, 0, 0) else Vec3.up;
+            const tangent = up_ref.cross(normal).normalize();
+            const bitangent = normal.cross(tangent);
+            const tap = receiver.add(tangent.scale(0.8)).add(bitangent.scale(0.6));
+            const center_proj = vp.transformPoint(receiver);
+            const tap_proj = vp.transformPoint(tap);
+            for ([_]bool{ false, true }) |flip_y| {
+                const grad = pcss.receiverPlaneGradient(vp, receiver, normal, scale, flip_y);
+                const du = (tap_proj.x - center_proj.x) * scale[0];
+                const dv = (tap_proj.y - center_proj.y) * scale[1] * @as(f32, if (flip_y) -1.0 else 1.0);
+                try std.testing.expectApproxEqAbs(tap_proj.z, center_proj.z + grad[0] * du + grad[1] * dv, 1e-5);
+            }
+        }
+    }
+    const ortho = projections[0];
+    // Plane edge-on to the light has no single-valued depth over UV.
+    try std.testing.expectEqual([2]f32{ 0, 0 }, pcss.receiverPlaneGradient(ortho, receiver, Vec3.new(1, 0, 0), scales[0], false));
+}
+
+test "point edge taps stay valid and their filter cannot reach adjacent faces" {
+    for (0..2) |slot| {
+        for (0..6) |face| {
+            const bounds = pcss.pointTileBounds(slot, face);
+            for ([_][2]f32{ .{ 0, 0 }, .{ 1, 1 }, .{ 0.003, 0.997 } }) |local| {
+                try std.testing.expect(!pcss.pointTapSkipped(1.0, 0.5, local));
+                const uv = pcss.pointSampleAtlasUv(slot, face, local);
+                try std.testing.expect(uv[0] >= bounds.min[0] + 0.5 / 1536.0 - 1e-7);
+                try std.testing.expect(uv[0] <= bounds.max[0] - 0.5 / 1536.0 + 1e-7);
+                try std.testing.expect(uv[1] >= bounds.min[1] + 0.5 / 512.0 - 1e-7);
+                try std.testing.expect(uv[1] <= bounds.max[1] - 0.5 / 512.0 + 1e-7);
+            }
+        }
+    }
+}
+
 test "pointFaceIndex selects the major-axis face with X>Y>Z tie-break" {
     const V = math.Vec3.new;
     try std.testing.expectEqual(@as(usize, 0), pcss.pointFaceIndex(V(1, 0, 0)));

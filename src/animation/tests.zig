@@ -789,6 +789,57 @@ test "Truncated cubic sampler never crashes and degrades gracefully" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), node.position.z, 1e-6);
 }
 
+test "Truncated LINEAR/STEP sampler degrades gracefully instead of crashing" {
+    const times = [_]f32{ 0.0, 1.0 };
+    // 2 keys but only 1 frame of vec3 outputs: every sample clamps to the
+    // single usable frame (previously an index-out-of-bounds panic).
+    const tiny = [_]f32{ 7.0, 8.0, 9.0 };
+    const lin = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &tiny,
+        .interpolation = .linear,
+    };
+    for ([_]f32{ -1.0, 0.0, 0.5, 1.0, 2.0 }) |t| {
+        const v = lin.sampleVec3(t);
+        try std.testing.expectApproxEqAbs(@as(f32, 7.0), v.x, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 8.0), v.y, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.0), v.z, 1e-6);
+    }
+
+    // STEP holds the same single usable keyframe.
+    const stp = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &tiny,
+        .interpolation = .step,
+    };
+    const sv = stp.sampleVec3(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), sv.x, 1e-6);
+
+    // 2 keys but only 1 frame of quat outputs: clamps to identity frame.
+    const qtiny = [_]f32{ 0.0, 0.0, 0.0, 1.0 };
+    const lq = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &qtiny,
+        .interpolation = .linear,
+    };
+    for ([_]f32{ -1.0, 0.5, 2.0 }) |t| {
+        const q = lq.sampleQuat(t);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), q.x, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), q.w, 1e-6);
+    }
+
+    // Zero usable frames: vec3 degrades to zero, quat to identity.
+    const empty = AnimationSampler{
+        .timestamps = &times,
+        .outputs = &.{},
+        .interpolation = .linear,
+    };
+    const ev = empty.sampleVec3(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ev.x, 1e-6);
+    const eq = empty.sampleQuat(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), eq.w, 1e-6);
+}
+
 // Event tests: counts callback invocations alongside drainFiredEvents().
 const EventCounter = struct {
     count: usize = 0,

@@ -5,8 +5,8 @@ const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 const Camera = @import("../camera.zig").Camera;
 
-// Pure cascade solver: identical math to the legacy Scene method, with the
-// split distances passed explicitly. `norm_light_dir` must be the
+// Pure cascade solver, with split distances passed explicitly.
+// `norm_light_dir` must be the
 // resolveSunDirection output (normalized sun direction).
 pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits: [4]f32) [4]Mat4 {
     var result: [4]Mat4 = undefined;
@@ -32,10 +32,16 @@ pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits
     const fov_rad = camera.getFovDeg() * (std.math.pi / 180.0);
     const tan_half_fov = @tan(fov_rad * 0.5);
 
-    var z_near = camera.getNear();
+    // Shaders select cascades by radial camera distance, not view-axis z.
+    // At the screen corner z = distance / ray_stretch. Include the 12%
+    // pre-split blend region in the next cascade as well; a depth slice
+    // beginning at the split leaves a rectangular unshadowed gap there.
+    const ray_stretch = @sqrt(1.0 + tan_half_fov * tan_half_fov * (1.0 + aspect * aspect));
+    var split_near: f32 = 0.0;
     const cascade_res: f32 = 1024.0;
 
     for (0..4) |i| {
+        const z_near = split_near * 0.88 / ray_stretch;
         const z_far = splits[i];
 
         const h_near = 2.0 * tan_half_fov * z_near;
@@ -70,6 +76,9 @@ pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits
             if (d > radius) radius = d;
         }
         radius = @ceil(radius * 16.0) / 16.0;
+        // Reserve 8 texels per edge: 6 for the atlas sampling inset and
+        // 2 for the worst-case xy texel-snap displacement.
+        radius *= cascade_res / (cascade_res - 16.0);
 
         const texel_size = (2.0 * radius) / cascade_res;
 
@@ -88,7 +97,7 @@ pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits
         const light_proj = Mat4.orthographic(-radius, radius, -radius, radius, 1.0, 2.0 * radius + 120.0);
 
         result[i] = Mat4.mul(light_proj, light_view);
-        z_near = z_far;
+        split_near = z_far;
     }
 
     return result;

@@ -71,3 +71,51 @@ test "ArcRotateCamera inertia enables smooth damping across update ticks" {
     try std.testing.expect(cam.alpha < alpha_step1);
     try std.testing.expect(cam.inertial_alpha_offset < offset_step1);
 }
+
+test "ArcRotateCamera update with non-positive dt is a no-op" {
+    var cam = ArcRotateCamera.init("orbit", .{
+        .alpha = 0.0,
+        .beta = std.math.pi / 2.0,
+        .radius = 10.0,
+        .inertia = 0.9,
+    });
+    var down_ev = sokol.app.Event{
+        .type = .MOUSE_DOWN,
+        .mouse_button = .LEFT,
+        .mouse_x = 100.0,
+        .mouse_y = 100.0,
+    };
+    cam.handleEvent(&down_ev);
+
+    var move_ev = sokol.app.Event{
+        .type = .MOUSE_MOVE,
+        .mouse_x = 120.0,
+        .mouse_y = 110.0,
+    };
+    cam.handleEvent(&move_ev);
+
+    const alpha_before = cam.alpha;
+    const beta_before = cam.beta;
+    const radius_before = cam.radius;
+    const aoff_before = cam.inertial_alpha_offset;
+    const boff_before = cam.inertial_beta_offset;
+    const roff_before = cam.inertial_radius_offset;
+
+    // Zero elapsed time must not move the camera nor decay the offsets.
+    cam.update(0.0);
+    try std.testing.expectEqual(alpha_before, cam.alpha);
+    try std.testing.expectEqual(beta_before, cam.beta);
+    try std.testing.expectEqual(radius_before, cam.radius);
+    try std.testing.expectEqual(aoff_before, cam.inertial_alpha_offset);
+    try std.testing.expectEqual(boff_before, cam.inertial_beta_offset);
+    try std.testing.expectEqual(roff_before, cam.inertial_radius_offset);
+
+    // Negative dt must not move the camera nor amplify the offsets.
+    cam.update(-1.0 / 60.0);
+    try std.testing.expectEqual(alpha_before, cam.alpha);
+    try std.testing.expectEqual(beta_before, cam.beta);
+    try std.testing.expectEqual(radius_before, cam.radius);
+    try std.testing.expectEqual(aoff_before, cam.inertial_alpha_offset);
+    try std.testing.expectEqual(boff_before, cam.inertial_beta_offset);
+    try std.testing.expectEqual(roff_before, cam.inertial_radius_offset);
+}

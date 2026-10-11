@@ -14,6 +14,7 @@ pub const options = @import("postprocess/options.zig");
 pub const hdr = @import("postprocess/hdr.zig");
 pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
+pub const depth_normal = @import("postprocess/depth_normal.zig");
 pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 pub const fog = @import("postprocess/fog.zig");
 pub const ssgi = @import("postprocess/ssgi.zig");
@@ -201,6 +202,7 @@ pub const depthPyramidMipSize = depth_pyramid.depthPyramidMipSize;
 pub const computeMipCount = depth_pyramid.computeMipCount;
 pub const reduceConservativeDepth = depth_pyramid.reduceConservativeDepth;
 pub const depthPyramidActive = depth_pyramid.depthPyramidActive;
+pub const depthNormalFromGradients = depth_normal.depthNormalFromGradients;
 // --- Contact Shadows ---
 pub const CONTACT_SHADOWS_STEPS_MIN = contact_shadows.CONTACT_SHADOWS_STEPS_MIN;
 pub const CONTACT_SHADOWS_STEPS_MAX = contact_shadows.CONTACT_SHADOWS_STEPS_MAX;

@@ -17,7 +17,7 @@ const Color3 = math.Color3;
 // additionally requires shadows_enabled — without a rendered CSM atlas
 // there is no real data to march against):
 //  1. Raymarch: fullscreen march at half/quarter resolution over the
-//     scene depth (reconstructed to world space), one raw CSM tap per
+//     scene depth (reconstructed to world space), bilinear 2x2 CSM PCF per
 //     step, HG phase + Beer-Lambert accumulation. Outputs unscaled
 //     shaft radiance; intensity scaling stays in the postprocess
 //     composite (after the highlight block).

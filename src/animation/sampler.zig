@@ -44,6 +44,15 @@ pub const AnimationSampler = struct {
     outputs: []const f32,
     interpolation: AnimationInterpolation = .linear,
 
+    /// LINEAR/STEP layout: outputs hold stride floats per key, so a valid
+    /// track needs at least keys * stride floats. Returns the number of
+    /// keyframes that can actually be sampled (timestamps capped by the
+    /// outputs capacity). CUBICSPLINE tracks do not use this helper.
+    fn linearFrames(self: AnimationSampler, stride: usize) usize {
+        if (self.timestamps.len == 0 or stride == 0) return 0;
+        return @min(self.timestamps.len, self.outputs.len / stride);
+    }
+
     /// Cubic (glTF CUBICSPLINE) layout: outputs hold stride*3 floats per key
     /// in (in-tangent, value, out-tangent) order, so a valid track needs at
     /// least keys * stride * 3 floats. Returns the number of keyframes that
@@ -134,20 +143,24 @@ pub const AnimationSampler = struct {
     /// Samples a vec3 track, warping the intra-keyframe factor with an easing
     /// curve. STEP ignores easing. CUBICSPLINE evaluates the true Hermite
     /// spline (easing intentionally ignored: it only warps the linear
-    /// factor, never the Hermite shape).
+    /// factor, never the Hermite shape). Short/truncated buffers never
+    /// crash: sampling degrades to the closest usable keyframe value
+    /// (or zero when nothing is usable).
     pub fn sampleVec3Eased(self: AnimationSampler, time: f32, easing: EasingType) Vec3 {
-        if (self.timestamps.len == 0) return Vec3.zero;
+        const usable = self.linearFrames(3);
+        if (usable == 0) return Vec3.zero;
         if (self.interpolation == .cubic_spline) return self.sampleVec3Cubic(time);
-        if (time <= self.timestamps[0]) {
+        if (usable == 1 or time <= self.timestamps[0]) {
             return Vec3.new(self.outputs[0], self.outputs[1], self.outputs[2]);
         }
-        const last_idx = self.timestamps.len - 1;
+        const last_idx = usable - 1;
         if (time >= self.timestamps[last_idx]) {
             const base = last_idx * 3;
             return Vec3.new(self.outputs[base], self.outputs[base + 1], self.outputs[base + 2]);
         }
 
-        const idx = self.findKeyframeIndex(time);
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= last_idx) idx = last_idx - 1;
         const t0 = self.timestamps[idx];
         const t1 = self.timestamps[idx + 1];
         const raw = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;
@@ -169,11 +182,14 @@ pub const AnimationSampler = struct {
 
     /// Quaternion variant of sampleVec3Eased: slerp factor is eased, STEP
     /// ignores easing, CUBICSPLINE evaluates component-wise Hermite plus
-    /// normalize (easing ignored, same rule as for vec3).
+    /// normalize (easing ignored, same rule as for vec3). Short/truncated
+    /// buffers never crash: sampling degrades to the closest usable
+    /// keyframe value (or identity when nothing is usable).
     pub fn sampleQuatEased(self: AnimationSampler, time: f32, easing: EasingType) Quat {
-        if (self.timestamps.len == 0) return Quat.identity;
+        const usable = self.linearFrames(4);
+        if (usable == 0) return Quat.identity;
         if (self.interpolation == .cubic_spline) return self.sampleQuatCubic(time);
-        if (time <= self.timestamps[0]) {
+        if (usable == 1 or time <= self.timestamps[0]) {
             const q = Quat{
                 .x = self.outputs[0],
                 .y = self.outputs[1],
@@ -182,7 +198,7 @@ pub const AnimationSampler = struct {
             };
             return q.normalize();
         }
-        const last_idx = self.timestamps.len - 1;
+        const last_idx = usable - 1;
         if (time >= self.timestamps[last_idx]) {
             const base = last_idx * 4;
             const q = Quat{
@@ -194,7 +210,8 @@ pub const AnimationSampler = struct {
             return q.normalize();
         }
 
-        const idx = self.findKeyframeIndex(time);
+        var idx = self.findKeyframeIndex(time);
+        if (idx >= last_idx) idx = last_idx - 1;
         const t0 = self.timestamps[idx];
         const t1 = self.timestamps[idx + 1];
         const raw = if (t1 > t0) (time - t0) / (t1 - t0) else 0.0;

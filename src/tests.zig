@@ -246,6 +246,8 @@ test {
     _ = @import("postprocess/color_curves_tests.zig");
     _ = @import("postprocess/contact_shadows.zig");
     _ = @import("postprocess/contact_shadows_tests.zig");
+    _ = @import("postprocess/depth_normal.zig");
+    _ = @import("postprocess/depth_normal_tests.zig");
     _ = @import("postprocess/depth_pyramid.zig");
     _ = @import("postprocess/depth_pyramid_tests.zig");
     _ = @import("postprocess/dof.zig");

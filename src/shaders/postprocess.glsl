@@ -237,7 +237,13 @@ vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {
     vec3 dy = (abs(p_u.z - world_pos.z) < abs(p_d.z - world_pos.z)) ? (p_u - world_pos) : (world_pos - p_d);
     vec3 n = cross(dx, dy);
     float len_sq = dot(n, n);
-    return (len_sq > 1e-6) ? (n * inversesqrt(len_sq)) : vec3(0.0, 1.0, 0.0);
+    // Test the gradient angle, not the pixel footprint in world units.
+    // The old absolute 1e-6 cutoff replaced ordinary wall normals with up,
+    // allowing SSR to paint rectangular reflection bands onto verticals.
+    // Invalid normals contribute no SSR/contact/SSGI, not a fictitious floor.
+    // CPU mirror: postprocess/depth_normal.zig depthNormalFromGradients.
+    float scale = dot(dx, dx) * dot(dy, dy);
+    return (len_sq > max(scale * 1e-8, 1e-30)) ? (n * inversesqrt(len_sq)) : vec3(0.0);
 }
 
 vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {

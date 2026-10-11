@@ -150,6 +150,38 @@ pub fn pointPcssEnabled(source_radius: f32) bool {
 
 const math = @import("math");
 
+fn shadowClip(vp: math.Mat4, p: math.Vec3, w: f32, flip_y: bool) [4]f32 {
+    var clip: [4]f32 = undefined;
+    for (0..4) |row| {
+        clip[row] = vp.m[row] * p.x + vp.m[4 + row] * p.y + vp.m[8 + row] * p.z + vp.m[12 + row] * w;
+    }
+    if (flip_y) clip[1] = -clip[1];
+    return clip;
+}
+
+/// Analytic dz/d(atlas UV) of a receiver plane, for orthographic or
+/// perspective shadow projections. No screen derivatives or pixel-size
+/// threshold: the result stays valid across cascade/face branches.
+/// Mirrors computeShadowPlaneGradient in common/shadow_pcf.glsl.
+pub fn receiverPlaneGradient(vp: math.Mat4, receiver: math.Vec3, normal: math.Vec3, atlas_scale: [2]f32, flip_y: bool) [2]f32 {
+    const up_ref = if (@abs(normal.y) > 0.9) math.Vec3.new(1, 0, 0) else math.Vec3.up;
+    const tangent = up_ref.cross(normal).normalize();
+    const bitangent = normal.cross(tangent);
+    const pos = shadowClip(vp, receiver, 1.0, flip_y);
+    if (pos[3] <= 0.0) return .{ 0.0, 0.0 };
+    const ct = shadowClip(vp, tangent, 0.0, flip_y);
+    const cb = shadowClip(vp, bitangent, 0.0, flip_y);
+    const proj = math.Vec3.new(pos[0], pos[1], pos[2]).scale(1.0 / pos[3]);
+    const dt = math.Vec3.new(ct[0], ct[1], ct[2]).sub(proj.scale(ct[3]));
+    const db = math.Vec3.new(cb[0], cb[1], cb[2]).sub(proj.scale(cb[3]));
+    const plane = math.Vec3.new(dt.x * atlas_scale[0], dt.y * atlas_scale[1], dt.z).cross(
+        math.Vec3.new(db.x * atlas_scale[0], db.y * atlas_scale[1], db.z),
+    );
+    const scale = @max(@max(@abs(plane.x), @abs(plane.y)), 1e-20);
+    if (@abs(plane.z) <= scale * 1e-5) return .{ 0.0, 0.0 };
+    return .{ -plane.x / plane.z, -plane.y / plane.z };
+}
+
 // Cube-face index for a light-space direction. Mirrors the GLSL
 // pointFaceIndex in the forward shaders (and passes/shadow
 // pointFaceForDir): the major axis wins, ties prefer X over Y over Z, the
@@ -174,6 +206,17 @@ pub fn pointAtlasUv(slot: usize, face: usize, local_uv: [2]f32) [2]f32 {
         (@as(f32, @floatFromInt(face)) + local_uv[0]) / 6.0,
         @as(f32, @floatFromInt(slot)) * 0.5 + local_uv[1] * 0.5,
     };
+}
+
+/// Fetch UV keeps the whole bilinear comparison footprint inside the face.
+/// Valid edge taps are retained, not discarded as a fully-lit seam strip.
+/// Mirrors pointPcssTapAtlas and fixed point PCF tile bounds in the shader.
+pub fn pointSampleAtlasUv(slot: usize, face: usize, local_uv: [2]f32) [2]f32 {
+    const inset = 0.5 / 256.0;
+    return pointAtlasUv(slot, face, .{
+        @min(@max(local_uv[0], inset), 1.0 - inset),
+        @min(@max(local_uv[1], inset), 1.0 - inset),
+    });
 }
 
 // Inclusive atlas-UV bounds of a (slot, face) tile: taps strictly outside
