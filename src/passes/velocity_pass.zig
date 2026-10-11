@@ -128,11 +128,39 @@ pub fn particleMarkerDrawDecision(active_count: usize, has_instance_buffer: bool
     return active_count > 0 and has_instance_buffer;
 }
 
+/// Glass reactive-marker draw decision (pure, no sg calls): the inverse of
+/// velocityDrawDecision for the transparent queue. Transparent items carry
+/// no velocity (skipped upstream by itemContributesDepth), so they need a
+/// marker iff the main pass actually blended them AND the marker vertex
+/// stage can reproduce their coverage:
+/// - opaque items need none (the opaque EQUAL path already wrote velocity);
+/// - decals ride their receiver's velocity (the opaque path wrote the
+///   receiver's vector at that pixel — stamping reactive would shed valid
+///   history), so they stay on the v1 heuristic;
+/// - hook materials may displace vertices in ways the marker VS cannot
+///   reproduce (custom shader stage), so they stay on v1;
+/// - morph-displaced draws have no morph path here (same as the opaque
+///   velocity path), so they stay on v1 (mask 0 fallback).
+/// Skinned vs rigid vs instanced is a pipeline selection, not a decision:
+/// all three shapes draw when this returns true (skin/instance-buffer
+/// validity is rechecked sg-side, fail-closed like the particle path).
+pub fn glassMarkerDrawDecision(in: VelocityDrawInput) bool {
+    if (in.index_count == 0) return false;
+    if (!in.transparent) return false;
+    if (in.is_decal) return false;
+    if (in.has_hook) return false;
+    if (in.morph_fallback) return false;
+    return true;
+}
+
 /// Marker-draw arguments for VelocityPass.render: prepared particle records
 /// (borrowed values from the consumed front slot, same records the main
 /// pass drew), the camera basis for billboarding, and the master enable.
-/// Disabled (or empty) renders zero marker draws and leaves the velocity
-/// buffer bit-identical to the pre-marker path.
+/// The same flag gates BOTH marker families (particles + transparent
+/// glass): the transparent draws ride the already-passed queues object, so
+/// no extra payload is needed. Disabled (or empty) renders zero marker
+/// draws and leaves the velocity buffer bit-identical to the pre-marker
+/// path.
 pub const MarkerArgs = struct {
     enabled: bool = false,
     draws: []const ParticleDraw = &.{},
@@ -144,7 +172,9 @@ pub const MarkerArgs = struct {
 // postprocess/taa.zig): the stamped band value must sit strictly inside the
 // classify-reactive band and below the per-object gate, or marked pixels
 // would misclassify on the resolve side. Fails at compile time, not as a
-// silent ghosting regression.
+// silent ghosting regression. One stamped value serves both marker families
+// (particles and glass share fs_marker), so this single pin covers every
+// marker write site.
 comptime {
     if (!(taa_mod.TAA_REACTIVE_MARKER_LO < taa_mod.TAA_REACTIVE_MARKER_ALPHA and
         taa_mod.TAA_REACTIVE_MARKER_ALPHA < taa_mod.TAA_REACTIVE_MARKER_HI)) @compileError("marker alpha outside the reactive band");
@@ -176,9 +206,35 @@ pub const VelocityPass = struct {
     /// main particle pipelines).
     pip_marker_cpu: sg.Pipeline = .{},
     pip_marker_gpu: sg.Pipeline = .{},
+    /// Glass reactive-marker pipelines (C.3 v2 glass half): transparent
+    /// redraw coverage with the constant band-alpha FS (LESS_EQUAL against
+    /// the borrowed main depth — glass writes no depth, so its fragments
+    /// sit IN FRONT of the stored background depth exactly like particle
+    /// billboards). Rigid/skinned share the Vertex-stride buffer 0 (the
+    /// marker VS reads position only for rigid, position+joints+weights
+    /// for skinned); instanced adds the single CURRENT instance buffer
+    /// (no prev pairing — coverage needs no history, which also halves the
+    /// per-batch binding vs the opaque velocity path). BACK cull like the
+    /// opaque path: a single-sided pane seen from behind draws nothing in
+    /// the main pass, so the marker must draw nothing either (cull NONE
+    /// would stamp reactive on background pixels); double-sided glass is
+    /// still covered via its front faces. Single cost note: one extra
+    /// geometry pass over the transparent queue per TAA frame (vertex
+    /// work only — constant FS, no texture taps, no loops).
+    pip_marker_glass_rigid_u16: sg.Pipeline = .{},
+    pip_marker_glass_rigid_u32: sg.Pipeline = .{},
+    pip_marker_glass_inst_u16: sg.Pipeline = .{},
+    pip_marker_glass_inst_u32: sg.Pipeline = .{},
+    pip_marker_glass_skin_u16: sg.Pipeline = .{},
+    pip_marker_glass_skin_u32: sg.Pipeline = .{},
     /// Marker shader (reactive_marker + reactive_marker_gpu programs).
     marker_shader: sg.Shader = .{},
     marker_gpu_shader: sg.Shader = .{},
+    /// Glass marker shaders (glass_marker + glass_marker_inst +
+    /// glass_marker_skin programs, all sharing fs_marker).
+    glass_marker_shader: sg.Shader = .{},
+    glass_marker_inst_shader: sg.Shader = .{},
+    glass_marker_skin_shader: sg.Shader = .{},
     /// Unit-quad geometry for marker billboards (same shape as the particle
     /// pass quad; owned here so marker draws never borrow pass state).
     marker_quad_vb: sg.Buffer = .{},
@@ -262,6 +318,21 @@ pub const VelocityPass = struct {
             out.deinit();
             return .{};
         }
+        out.glass_marker_shader = sg.makeShader(velocity_shd.glassMarkerShaderDesc(backend));
+        if (sg.queryShaderState(out.glass_marker_shader) != .VALID) {
+            out.deinit();
+            return .{};
+        }
+        out.glass_marker_inst_shader = sg.makeShader(velocity_shd.glassMarkerInstShaderDesc(backend));
+        if (sg.queryShaderState(out.glass_marker_inst_shader) != .VALID) {
+            out.deinit();
+            return .{};
+        }
+        out.glass_marker_skin_shader = sg.makeShader(velocity_shd.glassMarkerSkinShaderDesc(backend));
+        if (sg.queryShaderState(out.glass_marker_skin_shader) != .VALID) {
+            out.deinit();
+            return .{};
+        }
         // The marker quad is format-free static geometry, so it is created
         // now under the same rollback (pipelines stay unbuilt: their depth
         // format must match the borrowed main depth attachment, which is
@@ -290,15 +361,17 @@ pub const VelocityPass = struct {
         return out;
     }
 
-    /// Builds (or rebuilds on format change) the six opaque pipelines plus
-    /// the two reactive-marker pipelines for the borrowed main-depth
-    /// format. Locals-first like everywhere else: the working set is
+    /// Builds (or rebuilds on format change) the six opaque pipelines, the
+    /// two particle reactive-marker pipelines, plus the six glass
+    /// reactive-marker pipelines for the borrowed main-depth format.
+    /// Locals-first like everywhere else: the working set is
     /// preserved when a rebuild fails. Opaque pipelines share the
     /// shared-depth plan (writes off, EQUAL compare — see
-    /// velocityDepthState); marker pipelines share the marker plan (writes
-    /// off, LESS_EQUAL compare — see reactiveMarkerDepthState). All eight
-    /// are all-or-nothing: a failed build skips the whole pass for the
-    /// frame (fail-closed to the zero-mask fallback, never a half pass).
+    /// velocityDepthState); all eight marker pipelines share the marker
+    /// plan (writes off, LESS_EQUAL compare — see reactiveMarkerDepthState).
+    /// All fourteen are all-or-nothing: a failed build skips the whole pass
+    /// for the frame (fail-closed to the zero-mask fallback, never a half
+    /// pass).
     fn ensurePipelinesFor(self: *VelocityPass, depth_fmt: sg.PixelFormat) bool {
         if (!sg.isvalid()) return false;
         if (depth_fmt == .DEFAULT or depth_fmt == .NONE) return false;
@@ -310,12 +383,19 @@ pub const VelocityPass = struct {
             sg.queryPipelineState(self.pip_skin_u16) == .VALID and
             sg.queryPipelineState(self.pip_skin_u32) == .VALID and
             sg.queryPipelineState(self.pip_marker_cpu) == .VALID and
-            sg.queryPipelineState(self.pip_marker_gpu) == .VALID)
+            sg.queryPipelineState(self.pip_marker_gpu) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_rigid_u16) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_rigid_u32) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_inst_u16) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_inst_u32) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_skin_u16) == .VALID and
+            sg.queryPipelineState(self.pip_marker_glass_skin_u32) == .VALID)
         {
             return true;
         }
         if (self.rigid_shader.id == 0 or self.inst_shader.id == 0 or self.skin_shader.id == 0) return false;
         if (self.marker_shader.id == 0 or self.marker_gpu_shader.id == 0) return false;
+        if (self.glass_marker_shader.id == 0 or self.glass_marker_inst_shader.id == 0 or self.glass_marker_skin_shader.id == 0) return false;
 
         var r_desc = sg.PipelineDesc{
             .shader = self.rigid_shader,
@@ -521,6 +601,97 @@ pub const VelocityPass = struct {
         mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_gpu_slot4] = .{ .buffer_index = 1, .offset = 64, .format = .FLOAT4 };
         const pip_m_gpu = sg.makePipeline(mg_desc);
 
+        // Glass reactive-marker pipelines (C.3 v2 glass half): transparent
+        // redraw coverage with the constant band-alpha FS. Rigid/skinned
+        // share the Vertex-stride buffer 0 (position only for rigid,
+        // position+joints+weights for skinned); instanced adds the single
+        // CURRENT instance buffer (no prev — coverage needs no history).
+        // BACK cull like the opaque path (see the field docs); u16/u32
+        // index-type pairs per shape like everywhere else.
+        var gr_desc = sg.PipelineDesc{
+            .shader = self.glass_marker_shader,
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        gr_desc.colors[0].pixel_format = .RGBA16F;
+        gr_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        gr_desc.layout.attrs[velocity_shd.ATTR_glass_marker_position] = .{
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        const pip_g_rigid_u16 = sg.makePipeline(gr_desc);
+        gr_desc.index_type = .UINT32;
+        const pip_g_rigid_u32 = sg.makePipeline(gr_desc);
+
+        var gi_desc = sg.PipelineDesc{
+            .shader = self.glass_marker_inst_shader,
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        gi_desc.colors[0].pixel_format = .RGBA16F;
+        gi_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        gi_desc.layout.attrs[velocity_shd.ATTR_glass_marker_inst_position] = .{
+            .buffer_index = 0,
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        gi_desc.layout.buffers[1] = .{
+            .step_func = .PER_INSTANCE,
+            .step_rate = 1,
+            .stride = @sizeOf(Mat4),
+        };
+        gi_desc.layout.attrs[velocity_shd.ATTR_glass_marker_inst_inst_mat0] = .{ .buffer_index = 1, .offset = 0, .format = .FLOAT4 };
+        gi_desc.layout.attrs[velocity_shd.ATTR_glass_marker_inst_inst_mat1] = .{ .buffer_index = 1, .offset = 16, .format = .FLOAT4 };
+        gi_desc.layout.attrs[velocity_shd.ATTR_glass_marker_inst_inst_mat2] = .{ .buffer_index = 1, .offset = 32, .format = .FLOAT4 };
+        gi_desc.layout.attrs[velocity_shd.ATTR_glass_marker_inst_inst_mat3] = .{ .buffer_index = 1, .offset = 48, .format = .FLOAT4 };
+        const pip_g_inst_u16 = sg.makePipeline(gi_desc);
+        gi_desc.index_type = .UINT32;
+        const pip_g_inst_u32 = sg.makePipeline(gi_desc);
+
+        var gs_desc = sg.PipelineDesc{
+            .shader = self.glass_marker_skin_shader,
+            .index_type = .UINT16,
+            .sample_count = 1,
+            .depth = .{
+                .pixel_format = depth_fmt,
+                .compare = .LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = .BACK,
+            .face_winding = .CCW,
+        };
+        gs_desc.colors[0].pixel_format = .RGBA16F;
+        gs_desc.layout.buffers[0] = .{ .stride = @sizeOf(Vertex) };
+        gs_desc.layout.attrs[velocity_shd.ATTR_glass_marker_skin_position] = .{
+            .format = .FLOAT3,
+            .offset = @offsetOf(Vertex, "position"),
+        };
+        gs_desc.layout.attrs[velocity_shd.ATTR_glass_marker_skin_joints] = .{
+            .format = .FLOAT4,
+            .offset = @offsetOf(Vertex, "joints"),
+        };
+        gs_desc.layout.attrs[velocity_shd.ATTR_glass_marker_skin_weights] = .{
+            .format = .FLOAT4,
+            .offset = @offsetOf(Vertex, "weights"),
+        };
+        const pip_g_skin_u16 = sg.makePipeline(gs_desc);
+        gs_desc.index_type = .UINT32;
+        const pip_g_skin_u32 = sg.makePipeline(gs_desc);
+
         if (sg.queryPipelineState(pip_r_u16) != .VALID or
             sg.queryPipelineState(pip_r_u32) != .VALID or
             sg.queryPipelineState(pip_i_u16) != .VALID or
@@ -528,7 +699,13 @@ pub const VelocityPass = struct {
             sg.queryPipelineState(pip_s_u16) != .VALID or
             sg.queryPipelineState(pip_s_u32) != .VALID or
             sg.queryPipelineState(pip_m_cpu) != .VALID or
-            sg.queryPipelineState(pip_m_gpu) != .VALID)
+            sg.queryPipelineState(pip_m_gpu) != .VALID or
+            sg.queryPipelineState(pip_g_rigid_u16) != .VALID or
+            sg.queryPipelineState(pip_g_rigid_u32) != .VALID or
+            sg.queryPipelineState(pip_g_inst_u16) != .VALID or
+            sg.queryPipelineState(pip_g_inst_u32) != .VALID or
+            sg.queryPipelineState(pip_g_skin_u16) != .VALID or
+            sg.queryPipelineState(pip_g_skin_u32) != .VALID)
         {
             // Roll back every partial handle; the previous working set
             // (if any) stays installed for the next attempt.
@@ -540,6 +717,12 @@ pub const VelocityPass = struct {
             if (pip_s_u32.id != 0) sg.destroyPipeline(pip_s_u32);
             if (pip_m_cpu.id != 0) sg.destroyPipeline(pip_m_cpu);
             if (pip_m_gpu.id != 0) sg.destroyPipeline(pip_m_gpu);
+            if (pip_g_rigid_u16.id != 0) sg.destroyPipeline(pip_g_rigid_u16);
+            if (pip_g_rigid_u32.id != 0) sg.destroyPipeline(pip_g_rigid_u32);
+            if (pip_g_inst_u16.id != 0) sg.destroyPipeline(pip_g_inst_u16);
+            if (pip_g_inst_u32.id != 0) sg.destroyPipeline(pip_g_inst_u32);
+            if (pip_g_skin_u16.id != 0) sg.destroyPipeline(pip_g_skin_u16);
+            if (pip_g_skin_u32.id != 0) sg.destroyPipeline(pip_g_skin_u32);
             return false;
         }
         self.destroyPipelines();
@@ -551,6 +734,12 @@ pub const VelocityPass = struct {
         self.pip_skin_u32 = pip_s_u32;
         self.pip_marker_cpu = pip_m_cpu;
         self.pip_marker_gpu = pip_m_gpu;
+        self.pip_marker_glass_rigid_u16 = pip_g_rigid_u16;
+        self.pip_marker_glass_rigid_u32 = pip_g_rigid_u32;
+        self.pip_marker_glass_inst_u16 = pip_g_inst_u16;
+        self.pip_marker_glass_inst_u32 = pip_g_inst_u32;
+        self.pip_marker_glass_skin_u16 = pip_g_skin_u16;
+        self.pip_marker_glass_skin_u32 = pip_g_skin_u32;
         self.depth_format = depth_fmt;
         return true;
     }
@@ -564,6 +753,12 @@ pub const VelocityPass = struct {
         if (self.pip_skin_u32.id != 0) sg.destroyPipeline(self.pip_skin_u32);
         if (self.pip_marker_cpu.id != 0) sg.destroyPipeline(self.pip_marker_cpu);
         if (self.pip_marker_gpu.id != 0) sg.destroyPipeline(self.pip_marker_gpu);
+        if (self.pip_marker_glass_rigid_u16.id != 0) sg.destroyPipeline(self.pip_marker_glass_rigid_u16);
+        if (self.pip_marker_glass_rigid_u32.id != 0) sg.destroyPipeline(self.pip_marker_glass_rigid_u32);
+        if (self.pip_marker_glass_inst_u16.id != 0) sg.destroyPipeline(self.pip_marker_glass_inst_u16);
+        if (self.pip_marker_glass_inst_u32.id != 0) sg.destroyPipeline(self.pip_marker_glass_inst_u32);
+        if (self.pip_marker_glass_skin_u16.id != 0) sg.destroyPipeline(self.pip_marker_glass_skin_u16);
+        if (self.pip_marker_glass_skin_u32.id != 0) sg.destroyPipeline(self.pip_marker_glass_skin_u32);
         self.pip_rigid_u16 = .{};
         self.pip_rigid_u32 = .{};
         self.pip_inst_u16 = .{};
@@ -572,6 +767,12 @@ pub const VelocityPass = struct {
         self.pip_skin_u32 = .{};
         self.pip_marker_cpu = .{};
         self.pip_marker_gpu = .{};
+        self.pip_marker_glass_rigid_u16 = .{};
+        self.pip_marker_glass_rigid_u32 = .{};
+        self.pip_marker_glass_inst_u16 = .{};
+        self.pip_marker_glass_inst_u32 = .{};
+        self.pip_marker_glass_skin_u16 = .{};
+        self.pip_marker_glass_skin_u32 = .{};
         self.depth_format = .DEFAULT;
     }
 
@@ -586,8 +787,14 @@ pub const VelocityPass = struct {
         if (self.skin_shader.id != 0) sg.destroyShader(self.skin_shader);
         if (self.marker_shader.id != 0) sg.destroyShader(self.marker_shader);
         if (self.marker_gpu_shader.id != 0) sg.destroyShader(self.marker_gpu_shader);
+        if (self.glass_marker_shader.id != 0) sg.destroyShader(self.glass_marker_shader);
+        if (self.glass_marker_inst_shader.id != 0) sg.destroyShader(self.glass_marker_inst_shader);
+        if (self.glass_marker_skin_shader.id != 0) sg.destroyShader(self.glass_marker_skin_shader);
         self.marker_shader = .{};
         self.marker_gpu_shader = .{};
+        self.glass_marker_shader = .{};
+        self.glass_marker_inst_shader = .{};
+        self.glass_marker_skin_shader = .{};
         if (self.marker_quad_ib.id != 0) sg.destroyBuffer(self.marker_quad_ib);
         if (self.marker_quad_vb.id != 0) sg.destroyBuffer(self.marker_quad_vb);
         self.marker_quad_ib = .{};
@@ -713,10 +920,14 @@ pub const VelocityPass = struct {
         // Reactive markers (C.3 v2) stamp AFTER the opaque velocity draws:
         // marker coverage overwrites the background motion underneath with
         // the reactive band value (the blended pixel's history is wrong
-        // either way). Disabled or empty draws nothing — the buffer stays
-        // bit-identical to the pre-marker path.
+        // either way). Particle billboards first, then the transparent
+        // glass redraw — both stamp the same constant, so overlap order is
+        // irrelevant (any marked pixel is reactive). Disabled or empty
+        // draws nothing — the buffer stays bit-identical to the pre-marker
+        // path.
         if (markers.enabled) {
             draws += self.drawParticleMarkers(cur_view_proj, markers);
+            draws += self.drawGlassMarkers(cur_view_proj, queues, skins);
         }
 
         sg.endPass();
@@ -766,6 +977,94 @@ pub const VelocityPass = struct {
                 sg.applyUniforms(velocity_shd.UB_marker_gpu_params, sg.asRange(&gpu_params));
             }
             sg.draw(0, 6, @intCast(draw.active_count));
+            draws += 1;
+        }
+        return draws;
+    }
+
+    /// Glass reactive-marker draws (C.3 v2 glass half): one redraw per
+    /// transparent main-pass draw through the LESS_EQUAL marker pipelines
+    /// (rigid / instanced / skinned by shape). Sg-free decision first
+    /// (glassMarkerDrawDecision shape), then handle validation, then
+    /// draws. Coverage-only: the CURRENT transform feeds cur_mvp (no prev
+    /// pairing — the instanced path binds the single current buffer, the
+    /// skinned path the current bones). Returns the issued draw count for
+    /// stats. Cost: one extra vertex pass over the transparent queue per
+    /// TAA frame (constant FS, no texture taps); overlapping glass layers
+    /// all stamp the same value, so overdraw only costs fill, never
+    /// correctness.
+    fn drawGlassMarkers(
+        self: *VelocityPass,
+        view_proj: Mat4,
+        queues: *const RenderQueues,
+        skins: []const [scene_render_queue.MAX_BONES]Mat4,
+    ) u32 {
+        if (sg.queryPipelineState(self.pip_marker_glass_rigid_u16) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_rigid_u32) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_inst_u16) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_inst_u32) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_skin_u16) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_skin_u32) != .VALID) return 0;
+        var draws: u32 = 0;
+        for (queues.transparent.items) |item| {
+            if (!glassMarkerDrawDecision(.{
+                .transparent = item.transparent,
+                .is_decal = item.is_decal,
+                .has_hook = item.shader_index != null,
+                .morph_fallback = item.velocity_depth_fallback,
+                .index_count = item.index_count,
+            })) continue;
+            if (item.vertex_buffer.id == 0 or sg.queryBufferState(item.vertex_buffer) != .VALID) continue;
+            if (item.index_buffer.id != 0 and sg.queryBufferState(item.index_buffer) != .VALID) continue;
+            const cur_mvp = Mat4.mul(view_proj, item.model);
+            if (item.is_skinned) {
+                const bones = scene_render_queue.skinAt(skins, item.skin_index) orelse continue;
+                const pip = if (item.is_u32) self.pip_marker_glass_skin_u32 else self.pip_marker_glass_skin_u16;
+                if (sg.queryPipelineState(pip) != .VALID) continue;
+                sg.applyPipeline(pip);
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = item.vertex_buffer;
+                bind.index_buffer = item.index_buffer;
+                sg.applyBindings(bind);
+                const vs_params = velocity_shd.VsGlassParams{ .cur_mvp = cur_mvp };
+                sg.applyUniforms(velocity_shd.UB_vs_glass_params, sg.asRange(&vs_params));
+                const vs_skin = velocity_shd.VsGlassSkin{ .bones = bones.* };
+                sg.applyUniforms(velocity_shd.UB_vs_glass_skin, sg.asRange(&vs_skin));
+            } else {
+                const pip = if (item.is_u32) self.pip_marker_glass_rigid_u32 else self.pip_marker_glass_rigid_u16;
+                if (sg.queryPipelineState(pip) != .VALID) continue;
+                sg.applyPipeline(pip);
+                var bind = sg.Bindings{};
+                bind.vertex_buffers[0] = item.vertex_buffer;
+                bind.index_buffer = item.index_buffer;
+                sg.applyBindings(bind);
+                const vs_params = velocity_shd.VsGlassParams{ .cur_mvp = cur_mvp };
+                sg.applyUniforms(velocity_shd.UB_vs_glass_params, sg.asRange(&vs_params));
+            }
+            sg.draw(item.base_vertex, item.index_count, 1);
+            draws += 1;
+        }
+        for (queues.transparent_instanced.items) |batch| {
+            if (!glassMarkerDrawDecision(.{
+                .transparent = batch.transparent,
+                .is_decal = batch.is_decal,
+                .index_count = batch.index_count,
+            })) continue;
+            if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) continue;
+            if (batch.vertex_buffer.id == 0 or sg.queryBufferState(batch.vertex_buffer) != .VALID) continue;
+            if (batch.index_buffer.id != 0 and sg.queryBufferState(batch.index_buffer) != .VALID) continue;
+            if (sg.queryBufferState(batch.instance_buffer) != .VALID) continue;
+            const pip = if (batch.index_type == .UINT32) self.pip_marker_glass_inst_u32 else self.pip_marker_glass_inst_u16;
+            if (sg.queryPipelineState(pip) != .VALID) continue;
+            sg.applyPipeline(pip);
+            var bind = sg.Bindings{};
+            bind.vertex_buffers[0] = batch.vertex_buffer;
+            bind.vertex_buffers[1] = batch.instance_buffer;
+            bind.index_buffer = batch.index_buffer;
+            sg.applyBindings(bind);
+            const vs_params = velocity_shd.VsGlassInstParams{ .cur_view_proj = view_proj };
+            sg.applyUniforms(velocity_shd.UB_vs_glass_inst_params, sg.asRange(&vs_params));
+            sg.draw(0, batch.index_count, batch.visible_instance_count);
             draws += 1;
         }
         return draws;

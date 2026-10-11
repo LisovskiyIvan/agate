@@ -300,3 +300,81 @@ void main() {
 
 @program reactive_marker vs_marker_cpu fs_marker
 @program reactive_marker_gpu vs_marker_gpu fs_marker
+
+// Glass reactive-marker writers (C.3 v2 glass half): transparent meshes
+// (blend twins, depth write OFF) redrawn as pure coverage into the velocity
+// buffer alpha. Dedicated minimal vertex stages (current transform only —
+// no prev state: coverage needs no history) sharing the SAME constant
+// fs_marker as the particle programs, so the write/read contract (band
+// 0.15..0.35, per-object gate 0.5, see velocity_pass.zig) holds for both
+// families with one stamped value. No texture sample and no alpha test:
+// full-triangle cover can only over-mark (bounded extra history shed,
+// never a missed ghost); textured/alpha-varying glass inherits the same
+// honest over-mark class as the particle quad corners. One draw per
+// transparent draw in the main pass (cost note in velocity_pass.zig).
+@vs vs_glass_rigid
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_glass_params {
+    mat4 cur_mvp;
+};
+
+in vec3 position;
+
+out vec4 v_clip;
+
+void main() {
+    v_clip = cur_mvp * vec4(position, 1.0);
+    gl_Position = v_clip;
+}
+@end
+
+@vs vs_glass_inst
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_glass_inst_params {
+    mat4 cur_view_proj;
+};
+
+in vec3 position;
+in vec4 inst_mat0;
+in vec4 inst_mat1;
+in vec4 inst_mat2;
+in vec4 inst_mat3;
+
+out vec4 v_clip;
+
+void main() {
+    mat4 cur_model = mat4(inst_mat0, inst_mat1, inst_mat2, inst_mat3);
+    v_clip = cur_view_proj * (cur_model * vec4(position, 1.0));
+    gl_Position = v_clip;
+}
+@end
+
+@vs vs_glass_skin
+@glsl_options fixup_clipspace
+layout(binding = 0) uniform vs_glass_params {
+    mat4 cur_mvp;
+};
+layout(binding = 1) uniform vs_glass_skin {
+    mat4 bones[64];
+};
+
+in vec3 position;
+in vec4 joints;
+in vec4 weights;
+
+out vec4 v_clip;
+
+void main() {
+    ivec4 j = ivec4(joints);
+    mat4 cur_skin = weights.x * bones[j.x] +
+                    weights.y * bones[j.y] +
+                    weights.z * bones[j.z] +
+                    weights.w * bones[j.w];
+    v_clip = cur_mvp * (cur_skin * vec4(position, 1.0));
+    gl_Position = v_clip;
+}
+@end
+
+@program glass_marker vs_glass_rigid fs_marker
+@program glass_marker_inst vs_glass_inst fs_marker
+@program glass_marker_skin vs_glass_skin fs_marker

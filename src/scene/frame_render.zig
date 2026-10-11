@@ -464,13 +464,15 @@ pub fn render(scene: anytype) void {
             const main_depth_fmt = scene.postfx.postprocess_pass.depth_format;
             if (main_depth_view.id != 0 and main_depth_fmt != .DEFAULT and main_depth_fmt != .NONE) {
                 const prev_vp = if (scene.postfx.has_prev_view_proj) scene.postfx.prev_view_proj else taa_view_proj;
-                // Reactive particle markers (C.3 v2): drawn only when the TAA
-                // resolve consumes them (taa_on implies samples == 1) and
-                // the reactive family is on. The camera basis comes from the
-                // unjittered view matrix (jitter is translation-only, so the
-                // rotation basis is exact); the marker view_proj is the
+                // Reactive particle + glass markers (C.3 v2): drawn only when
+                // the TAA resolve consumes them (taa_on implies samples == 1)
+                // and the reactive family is on. The camera basis comes from
+                // the unjittered view matrix (jitter is translation-only, so
+                // the rotation basis is exact); the marker view_proj is the
                 // jittered matrix the main pass drew with, so coverage lands
-                // on the exact blended pixels.
+                // on the exact blended pixels. The transparent glass redraw
+                // rides the already-passed primary queues (no extra payload);
+                // the same master flag gates both families.
                 const velocity_pass_mod = @import("../passes/velocity_pass.zig");
                 var markers = velocity_pass_mod.MarkerArgs{};
                 if (postprocess.taaReactiveMarkersActive(taa_on, post_config)) {

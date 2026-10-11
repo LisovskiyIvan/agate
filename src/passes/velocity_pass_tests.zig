@@ -13,6 +13,7 @@ const velocityDepthPassAction = velocity_pass.velocityDepthPassAction;
 const velocityDrawDecision = velocity_pass.velocityDrawDecision;
 const reactiveMarkerDepthState = velocity_pass.reactiveMarkerDepthState;
 const particleMarkerDrawDecision = velocity_pass.particleMarkerDrawDecision;
+const glassMarkerDrawDecision = velocity_pass.glassMarkerDrawDecision;
 const MarkerArgs = velocity_pass.MarkerArgs;
 const taa_mod = @import("../postprocess/taa.zig");
 const scene_render_queue = @import("../scene/render_queue.zig");
@@ -167,4 +168,29 @@ test "particle marker draw decision fires only on live buffered records" {
     const off = MarkerArgs{};
     try std.testing.expect(!off.enabled);
     try std.testing.expectEqual(@as(usize, 0), off.draws.len);
+}
+
+test "glass marker draw decision marks exactly the velocity-less blends" {
+    // Plain transparent regular/instanced draws mark: the main pass
+    // blended them with no depth write and no velocity.
+    try std.testing.expect(glassMarkerDrawDecision(.{ .transparent = true, .index_count = 36 }));
+    // Opaque draws already carry velocity via the EQUAL path — no marker.
+    try std.testing.expect(!glassMarkerDrawDecision(.{ .transparent = false, .index_count = 36 }));
+    // Empty draws mark nothing (no pixels blended).
+    try std.testing.expect(!glassMarkerDrawDecision(.{ .transparent = true, .index_count = 0 }));
+    // Decals ride their receiver's velocity (the opaque path wrote the
+    // receiver's vector at that pixel) — marking would shed valid history.
+    try std.testing.expect(!glassMarkerDrawDecision(.{ .transparent = true, .is_decal = true, .index_count = 36 }));
+    // Hook materials may displace vertices in a custom stage the marker
+    // VS cannot reproduce — coverage would mis-stamp.
+    try std.testing.expect(!glassMarkerDrawDecision(.{ .transparent = true, .has_hook = true, .index_count = 36 }));
+    // Morph-displaced draws have no morph path here (same skip as the
+    // opaque velocity path) — v1 heuristic stays their only treatment.
+    try std.testing.expect(!glassMarkerDrawDecision(.{ .transparent = true, .morph_fallback = true, .index_count = 36 }));
+    // The stamped value classifies reactive on the resolve side for every
+    // shape that passes the decision above (single FS, single value).
+    try std.testing.expectEqual(
+        taa_mod.TaaVelocityKind.reactive,
+        taa_mod.taaVelocityKind(taa_mod.TAA_REACTIVE_MARKER_ALPHA),
+    );
 }

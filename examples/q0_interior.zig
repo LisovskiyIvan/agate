@@ -216,6 +216,25 @@ fn setupScene() void {
         dust.start();
     }
 
+    // Tinted glass pane (TAA reactive-marker glass half, C.3 v2): a blended
+    // PBR quad standing in the open-front view axis, so the orbiting camera
+    // sweeps it across the background every frame — its pixels carry the
+    // background depth+velocity with no signal of their own, and only the
+    // velocity-pass glass marker can shed their history. AGATE_Q0_NO_GLASS=1
+    // isolates the glass-free baseline bit-identically (no draw, and the
+    // marker loop over the empty transparent queue issues nothing).
+    if (!envFlag("AGATE_Q0_NO_GLASS")) {
+        const pane = z.MeshBuilder.createPlane(&scene, "q0_glass_pane", .{ .width = 1.4, .height = 2.0 }) catch @panic("q0: glass failed");
+        pane.position = z.Vec3.new(-0.5, 1.5, 0.6);
+        pane.rotation = z.Vec3.new(0.0, -18.0, 0.0);
+        pane.cast_shadows = false;
+        const glass_mat = pbr("q0_glass_pbr", .{ 0.65, 0.85, 0.95 }, 0.0, 0.08);
+        glass_mat.alpha_mode = .blend;
+        glass_mat.alpha = 0.35;
+        glass_mat.double_sided = true;
+        pane.setPBRMaterial(glass_mat);
+    }
+
     // Fill-bound by design: the heaviest legal per-pixel chain.
     scene.post_process.enabled = true;
     scene.post_process.exposure = 1.1;
@@ -244,9 +263,10 @@ fn setupScene() void {
     scene.post_process.ssgi_steps = 16;
     scene.post_process.taa_enabled = true;
     scene.post_process.taa_camera_cut = true;
-    // TAA reactive v1 for velocity-less content (particles/glass): on in the
-    // calibration scene — AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive
-    // baseline.
+    // TAA reactive treatment for velocity-less content (particles + glass
+    // via the v2 velocity-alpha marker, v1 heuristic underneath for the
+    // documented gaps): on in the calibration scene —
+    // AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive baseline.
     scene.post_process.taa_reactive_enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
     scene.post_process.fog_enabled = false;
     // Single-scale runs keep the env selection via overrideScale; full
