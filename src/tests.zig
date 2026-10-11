@@ -370,6 +370,8 @@ test {
     _ = @import("scene/patch_instance_refs.zig");
     _ = @import("scene/physics_layer.zig");
     _ = @import("scene/physics_layer_tests.zig");
+    _ = @import("scene/physics_thread_tests.zig");
+    _ = @import("scene/physics_worker.zig");
     _ = @import("scene/picking.zig");
     _ = @import("scene/picking_tests.zig");
     _ = @import("scene/pipelines.zig");
@@ -479,6 +481,7 @@ test {
     _ = @import("texture/ibl_prefilter_tests.zig");
     _ = @import("texture/mip.zig");
     _ = @import("texture/mip_tests.zig");
+    _ = @import("threading.zig");
     _ = @import("ttf.zig");
     _ = @import("ttf/atlas.zig");
     _ = @import("ttf/fixture.zig");

@@ -22,8 +22,17 @@
 //! context must have prepared and presented frames, and the log must stay
 //! error-free. `--frames N` (default 240) auto-quits; ESC quits.
 //!
+//! Physics gate: the scene carries a small fallen stack (24 boxes +
+//! ground, `scene.enablePhysics`) stepped every tick through
+//! `Scene.update`. `--physics=inline|dedicated` (default inline) selects
+//! `ThreadingOptions.physics`; dedicated overlaps the step with the
+//! physics-independent phases on the Scene-owned worker and the verdict
+//! additionally requires `physics_kicks > 0`.
+//!
 //! Run: `zig build run-runtime-worker -- --frames 240`
 //! Expected: `verdict=PASS producer_builds>0 prepared>0 log_errors=0`.
+//! Dedicated: `zig build run-runtime-worker -- --frames 120 --physics=dedicated`
+//! Expected: `verdict=PASS ... physics_kicks>0`.
 
 const std = @import("std");
 const z = @import("agate");
@@ -48,6 +57,10 @@ var busy_frames: u32 = 0;
 var log_errors: u32 = 0;
 var verdict_pass = false;
 var worker_running = false;
+/// `--physics=inline|dedicated` (default inline): selects
+/// `ThreadingOptions.physics` for the scene's fallen stack.
+var physics_dedicated = false;
+var physics_kicks: u64 = 0;
 
 /// Window size cache: the context thread writes it on init/resize, the
 /// game thread reads it for `publishFrameSnapshot` (relaxed atomics — a
@@ -138,6 +151,31 @@ fn appInitCb(_: *z.App) void {
 
     // Spawn the game worker. Single-threaded/wasm builds return false: the
     // frame callback then runs the same facade inline (serial fallback).
+    //
+    // Physics stack for the threading gate: 24 dynamic boxes over the
+    // default ground plane, stepped every tick through Scene.update (inline
+    // or overlapped on the Scene-owned worker per --physics).
+    _ = scene.enablePhysics(null);
+    if (physics_dedicated) scene.threading.physics = .dedicated;
+    var pi: usize = 0;
+    while (pi < 24) : (pi += 1) {
+        const fi: f32 = @floatFromInt(pi);
+        const col: usize = pi % 4;
+        const row: usize = (pi / 4) % 3;
+        const lvl: usize = pi / 12;
+        const pbox = z.MeshBuilder.createBox(&scene, "pbox", .{ .size = 0.6 }) catch |err| {
+            std.debug.panic("runtime-worker: physics box creation failed: {}", .{err});
+        };
+        pbox.position = z.Vec3.new(
+            @as(f32, @floatFromInt(col)) * 0.8 - 1.2,
+            1.0 + @as(f32, @floatFromInt(lvl)) * 2.2 + @as(f32, @floatFromInt(row)) * 0.05,
+            @as(f32, @floatFromInt(row)) * 0.8 - 0.8 + fi * 0.001,
+        );
+        _ = scene.createRigidBody(pbox, .box, 1.0) catch |err| {
+            std.debug.panic("runtime-worker: rigid body creation failed: {}", .{err});
+        };
+    }
+
     sim.last_ns = 0;
     worker_running = runtime.spawnWorker(gameLoop);
     std.debug.print("runtime-worker: game worker {s}\n", .{if (worker_running) "spawned (threaded staged path)" else "spawn failed (inline serial fallback)"});
@@ -167,17 +205,23 @@ fn appCleanupCb(_: *z.App) void {
     // Join the game thread BEFORE tearing down the scene it writes to.
     runtime.deinit();
 
+    // Dedicated-physics handoff tally (read before scene.deinit joins the
+    // worker): dedicated mode must have overlapped steps.
+    physics_kicks = scene.physics.workerCounters().kicks;
+
     const m = runtime.metrics;
     verdict_pass = worker_running and
         m.producer_builds > 0 and
         m.begins > 0 and
         m.finishes > 0 and
         prepared_frames > 0 and
-        log_errors == 0;
+        log_errors == 0 and
+        (!physics_dedicated or physics_kicks > 0);
 
     std.debug.print(
         "runtime-worker: frames={} prepared={} reused={} skipped={} busy={}\n" ++
             "runtime-worker: producer_builds={} producer_skips={} begins={} begin_empty={} finishes={} reuses={}\n" ++
+            "runtime-worker: physics={s} physics_kicks={}\n" ++
             "verdict={s} log_errors={}\n",
         .{
             frame_count,      prepared_frames,
@@ -185,7 +229,8 @@ fn appCleanupCb(_: *z.App) void {
             busy_frames,      m.producer_builds,
             m.producer_skips, m.begins,
             m.begin_empty,    m.finishes,
-            m.reuses,         if (verdict_pass) "PASS" else "FAIL",
+            m.reuses,         if (physics_dedicated) "dedicated" else "inline",
+            physics_kicks,    if (verdict_pass) "PASS" else "FAIL",
             log_errors,
         },
     );
@@ -223,6 +268,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) void {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--frames")) {
             if (it.next()) |n| frame_limit = std.fmt.parseInt(u32, n, 10) catch 240;
+        } else if (std.mem.eql(u8, arg, "--physics")) {
+            if (it.next()) |mode| physics_dedicated = std.mem.eql(u8, mode, "dedicated");
+        } else if (std.mem.startsWith(u8, arg, "--physics=")) {
+            physics_dedicated = std.mem.eql(u8, arg["--physics=".len..], "dedicated");
         }
     }
     if (frame_limit == 0) frame_limit = 240;

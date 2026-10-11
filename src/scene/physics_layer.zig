@@ -11,6 +11,7 @@ const passes = @import("../passes/mod.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 const stats_mod = @import("stats.zig");
 const SceneStats = stats_mod.SceneStats;
+const physics_worker = @import("physics_worker.zig");
 
 /// Physics integration for the scene: the optional physics world, its
 /// per-frame step, and the 3D debug wireframe overlay (lazily created GPU
@@ -43,6 +44,11 @@ const SceneStats = stats_mod.SceneStats;
 /// direct/tooling use.
 pub const PhysicsIntegration = struct {
     world: ?PhysicsWorld = null,
+    // Dedicated-step worker (ThreadingOptions.physics == .dedicated):
+    // fork-joined inside Scene.update around the physics-independent
+    // phases. Idle unless dedicated mode kicked it at least once; parked
+    // (not destroyed) when the user switches back to inline.
+    worker: physics_worker.PhysicsWorker = .{},
     // Toggles the physics debug wireframe rendering in the main pass.
     show_debug: bool = false,
     debug_lines: std.ArrayListUnmanaged(physics.DebugLine) = .empty,
@@ -81,6 +87,10 @@ pub const PhysicsIntegration = struct {
     prepared_upload_valid: bool = false,
 
     pub fn deinit(self: *PhysicsIntegration, allocator: std.mem.Allocator) void {
+        // Join the dedicated worker BEFORE destroying the world it steps:
+        // shutdown drains an in-flight step (defensive; update always joins)
+        // and is a no-op when the worker never spawned.
+        self.worker.shutdown();
         if (self.world) |*pw| {
             pw.deinit();
             self.world = null;
@@ -117,6 +127,29 @@ pub const PhysicsIntegration = struct {
         if (self.world) |*pw| {
             pw.step(dt);
         }
+    }
+
+    /// Fork half of the dedicated-physics overlap: hands `step(dt)` to the
+    /// worker (spawning it lazily on first use). Returns true when the
+    /// worker owns the step — the caller MUST `joinWorker` before touching
+    /// the world again. Returns false when the caller must step inline
+    /// instead (spawn impossible or permanently degraded: fallback counted,
+    /// nothing posted). Game (scene-update) thread only.
+    pub fn kickWorker(self: *PhysicsIntegration, world: *PhysicsWorld, dt: f32) bool {
+        return self.worker.kick(world, dt);
+    }
+
+    /// Join half of the dedicated-physics overlap: waits for the kicked
+    /// step. No-op without a pending step, so deinit-right-after-update
+    /// and repeated calls stay safe. Game (scene-update) thread only.
+    pub fn joinWorker(self: *PhysicsIntegration) void {
+        self.worker.join();
+    }
+
+    /// Handoff counters for tests/UI (`kicks`, `joins`, `fallbacks`).
+    /// Game-thread-read; the worker never touches them.
+    pub fn workerCounters(self: *const PhysicsIntegration) physics_worker.WorkerCounters {
+        return self.worker.counters;
     }
 
     /// Captures the debug wireframe into the render-owned `prepared_lines`.

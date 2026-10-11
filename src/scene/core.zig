@@ -86,6 +86,8 @@ const scene_stats = @import("stats.zig");
 const SceneStats = scene_stats.SceneStats;
 const scene_render_queue = @import("render_queue.zig");
 const jobs = @import("../jobs.zig");
+const threading_mod = @import("../threading.zig");
+const ThreadingOptions = threading_mod.ThreadingOptions;
 const assets_mod = @import("../assets.zig");
 const handoff_mod = @import("../handoff.zig");
 const scene_lights = @import("light_rig.zig");
@@ -370,6 +372,16 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    // Simulation threading placement (phase 1: physics stepping). Flat like
+    // the post configs: the user writes `scene.threading.physics =
+    // .dedicated` to overlap the physics step with the physics-independent
+    // update phases on a Scene-owned worker (fork-join inside
+    // `Scene.update`; see docs/threading.md). Default `.inline` is
+    // bit-identical to all prior behavior: no thread is spawned.
+    // Runtime toggling works both ways: dedicated→inline parks the worker
+    // (no work posted, thread kept until deinit), inline→dedicated spawns
+    // lazily on the first needed update.
+    threading: ThreadingOptions = .{},
     // DDGI v1 spike (gi/ddgi.zig): probe-grid diffuse GI over the proxy
     // AABB scene. Default OFF: no atlas VRAM, no update draws, zeroed
     // sample lanes (the forward path renders bit-identically).
@@ -1130,6 +1142,22 @@ pub const Scene = struct {
 
     pub fn updatePhysics(self: *Scene, dt: f32) void {
         scene_sim.updatePhysics(self, dt);
+    }
+
+    /// Fork half of the dedicated-physics overlap (see `Scene.update` in
+    /// frame_api.zig): hands the step to the Scene-owned worker. Returns
+    /// true when the worker owns the step (exactly one `joinPhysics` must
+    /// follow before the world is touched again); false when the step
+    /// already ran inline (no world, tiny dt, or worker fallback) with
+    /// `pending_physics_ms` stored exactly as `updatePhysics` stores it.
+    pub fn kickPhysics(self: *Scene, dt: f32) bool {
+        return scene_sim.kickPhysics(self, dt);
+    }
+
+    /// Join half of the dedicated-physics overlap: waits for the kicked
+    /// step and stores its profile time into `pending_physics_ms`.
+    pub fn joinPhysics(self: *Scene) void {
+        scene_sim.joinPhysics(self);
     }
 
     pub fn addCamera(self: *Scene, entry: CameraEntry) !usize {

@@ -341,6 +341,21 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
 /// staged slot snapshot, prepared draws/UI/debug/sky/particles) without
 /// simulating anything itself.
 ///
+/// When `threading.physics == .dedicated` the physics phase is fork-joined
+/// around the physics-independent middle phases instead: camera ->
+/// lights -> [kick physics worker] -> animations -> soft bodies ->
+/// particles -> decals -> [join] -> auto-exposure -> snapshot. Kick and
+/// join run on the scene-update (game) thread; the worker only runs
+/// `PhysicsWorld.step(dt)` bracketed by `begin/endParallelWindow`. Same
+/// dt + same world state at kick as the inline call, and the overlapped
+/// phases touch no `PhysicsWorld` state (particles use their own static
+/// colliders, soft bodies and animations write unrelated data — see
+/// docs/threading.md for the verified independence argument and the
+/// window contract), so the final state matches the inline order.
+/// World-absent and tiny-dt updates keep today's exact semantics (store
+/// 0 / inline early-return, no thread roundtrip), and a worker that
+/// cannot spawn degrades permanently to inline (fallback counted).
+///
 /// Runs on the game side and MAY overlap render (update||render): it must
 /// touch ONLY update-owned state (live cameras/lights/world/meshes/
 /// materials/canvas/particles/trails/nav + the mailboxes +
@@ -365,11 +380,20 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
 pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     self.updateCamera(dt);
     self.updateLights(dt);
-    self.updatePhysics(dt);
+    // Dedicated physics (threading.physics == .dedicated): the worker owns
+    // the step while the game thread runs the physics-independent phases.
+    // Inline (default) keeps today's exact call order and behavior.
+    var physics_overlap = false;
+    if (self.threading.physics == .dedicated) {
+        physics_overlap = self.kickPhysics(dt);
+    } else {
+        self.updatePhysics(dt);
+    }
     self.updateAnimations(dt);
     self.updateSoftBodies(dt);
     try self.updateParticles(dt);
     self.updateDecals(dt);
+    if (physics_overlap) self.joinPhysics();
 
     if (self.post_process.auto_exposure.enabled) {
         const est_lum = self.estimateSceneLuminance();

@@ -120,6 +120,11 @@ pub const gi = @import("gi.zig");
 pub const DdgiOptions = gi.DdgiOptions;
 
 pub const jobs = @import("jobs.zig");
+// User-configurable simulation threading (phase 1: dedicated physics
+// stepping via ThreadingOptions; see docs/threading.md).
+pub const threading = @import("threading.zig");
+pub const ThreadingOptions = threading.ThreadingOptions;
+
 /// Thin engine-owned frame lifecycle facade (update-vs-begin phase mutex,
 /// worker start/stop, producer claim->build->stageUi->publish one-liner,
 /// staged begin/finish/cancel with the smallest safe exclusion boundary,

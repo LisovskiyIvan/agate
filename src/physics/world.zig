@@ -7,6 +7,7 @@
 //! analysis is lazy: the struct fields never depend on the siblings, only
 //! method bodies do, so no comptime "depends on itself" loop exists.
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const Quat = math.Quat;
@@ -149,6 +150,15 @@ pub const PhysicsWorld = struct {
     /// worth knowing — Mesh teardown must still be deferred by the caller
     /// itself (see `removeBody`), only the body/joint unlink defers here.
     reentrant_defers: usize = 0,
+    /// Dedicated-physics parallel window (see `docs/threading.md`): true
+    /// while the Scene-owned physics worker runs `step` on its thread.
+    /// Game-thread world mutators/queries assert it closed (Debug +
+    /// ReleaseSafe; no-op in ReleaseFast/Small — the gpu_thread.zig
+    /// tripwire philosophy). `gravity` is a plain field the guard cannot
+    /// intercept: writing it during the window is a contract violation
+    /// (the worker's `syncWorldParams` applies whatever is current when
+    /// the step starts; write it outside `Scene.update` instead).
+    parallel_window: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     world_id: c.b3WorldId,
     ground_body: ?c.b3BodyId = null,
@@ -199,15 +209,40 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn enableContinuous(self: *PhysicsWorld, flag: bool) void {
+        self.assertNoParallelWindow();
         c.b3World_EnableContinuous(self.world_id, flag);
     }
 
     pub fn isContinuousEnabled(self: *const PhysicsWorld) bool {
+        self.assertNoParallelWindow();
         return c.b3World_IsContinuousEnabled(self.world_id);
+    }
+
+    /// Opens the dedicated-physics parallel window. Called by the physics
+    /// worker around `step`, never by app code (see `docs/threading.md`).
+    pub fn beginParallelWindow(self: *PhysicsWorld) void {
+        self.parallel_window.store(true, .release);
+    }
+
+    /// Closes the dedicated-physics parallel window. Called by the physics
+    /// worker after `step`, never by app code.
+    pub fn endParallelWindow(self: *PhysicsWorld) void {
+        self.parallel_window.store(false, .release);
+    }
+
+    /// Game-thread tripwire for the dedicated-physics window: panics when
+    /// app code touches the world while the worker owns `step`. Called at
+    /// the entry of every public world mutator/query below (`step` itself
+    /// is exempt — it runs inside the window on the worker). Debug +
+    /// ReleaseSafe only; no-op in ReleaseFast/Small.
+    pub fn assertNoParallelWindow(self: *const PhysicsWorld) void {
+        if (comptime builtin.mode != .Debug and builtin.mode != .ReleaseSafe) return;
+        if (self.parallel_window.load(.acquire)) @panic("physics: game-thread PhysicsWorld call during the dedicated physics window (see ThreadingOptions.physics / docs/threading.md)");
     }
 
     /// Queries the detailed performance profile of the most recent physics step from Box3D.
     pub fn getProfile(self: *const PhysicsWorld) PhysicsProfile {
+        self.assertNoParallelWindow();
         const p = c.b3World_GetProfile(self.world_id);
         return .{
             .step_ms = p.step,
@@ -222,6 +257,7 @@ pub const PhysicsWorld = struct {
 
     /// Queries simulation counters and entity counts from Box3D.
     pub fn getCounters(self: *const PhysicsWorld) PhysicsCounters {
+        self.assertNoParallelWindow();
         const cnt = c.b3World_GetCounters(self.world_id);
         return .{
             .body_count = cnt.bodyCount,
@@ -245,6 +281,7 @@ pub const PhysicsWorld = struct {
         mass: f32,
         options: BodyOptions,
     ) !*RigidBody {
+        self.assertNoParallelWindow();
         const body = try self.createBodyRaw(mesh, collider, mass);
         errdefer self.removeBody(body);
 
@@ -329,6 +366,7 @@ pub const PhysicsWorld = struct {
         count_z: u32,
         options: HeightFieldOptions,
     ) !*RigidBody {
+        self.assertNoParallelWindow();
         if (count_x < 2 or count_z < 2 or heights.len != @as(usize, count_x) * count_z) {
             return error.InvalidHeightFieldDimensions;
         }
@@ -376,6 +414,7 @@ pub const PhysicsWorld = struct {
     /// to its neighbors by distance joints; the ends can be pinned to other
     /// bodies. Segment bodies are owned by the rope (see Rope.deinit).
     pub fn createRope(self: *PhysicsWorld, segment_meshes: []*Mesh, options: RopeOptions) !Rope {
+        self.assertNoParallelWindow();
         if (segment_meshes.len == 0) return error.EmptyRope;
 
         var rope = Rope{
@@ -469,12 +508,14 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn addBoxShape(self: *PhysicsWorld, body: *RigidBody, half_extents: Vec3, options: ChildShapeOptions) !void {
+        self.assertNoParallelWindow();
         try self.attachChildKind(body, .{ .box = half_extents }, options);
     }
 
     /// Attaches an extra sphere shape to a body (compound collider).
     /// The center comes from `options.offset`.
     pub fn addSphereShape(self: *PhysicsWorld, body: *RigidBody, radius: f32, options: ChildShapeOptions) !void {
+        self.assertNoParallelWindow();
         try self.attachChildKind(body, .{ .sphere = radius }, options);
     }
 
@@ -482,12 +523,14 @@ pub const PhysicsWorld = struct {
     /// `half_height` is the distance from the midpoint (`options.offset`) to
     /// each cap sphere center.
     pub fn addCapsuleShape(self: *PhysicsWorld, body: *RigidBody, half_height: f32, radius: f32, options: ChildShapeOptions) !void {
+        self.assertNoParallelWindow();
         try self.attachChildKind(body, .{ .capsule = .{ .half_height = half_height, .radius = radius } }, options);
     }
 
     /// Attaches an extra convex hull shape to a body (compound collider),
     /// built from local points shifted by `options.offset`.
     pub fn addHullShape(self: *PhysicsWorld, body: *RigidBody, points: []const Vec3, options: ChildShapeOptions) !void {
+        self.assertNoParallelWindow();
         if (points.len < 4) return error.MissingCollisionGeometry;
         const owned = try self.allocator.dupe(Vec3, points);
         errdefer self.allocator.free(owned);
@@ -630,6 +673,7 @@ pub const PhysicsWorld = struct {
     /// Casts a ray through the physics world and returns the closest hit.
     /// Unlike mesh picking this also hits hull, mesh and height-field colliders.
     pub fn raycast(self: *PhysicsWorld, origin: Vec3, direction: Vec3, max_distance: f32) PhysicsRayHit {
+        self.assertNoParallelWindow();
         return physics_queries.raycast(self, origin, direction, max_distance);
     }
 
@@ -640,6 +684,7 @@ pub const PhysicsWorld = struct {
         max_distance: f32,
         filter: CollisionFilter,
     ) PhysicsRayHit {
+        self.assertNoParallelWindow();
         return physics_queries.raycastWithFilter(self, origin, direction, max_distance, filter);
     }
 
@@ -657,6 +702,7 @@ pub const PhysicsWorld = struct {
         emitter_pos: Vec3,
         config: audio.AudioOcclusionConfig,
     ) f32 {
+        self.assertNoParallelWindow();
         return audio.evaluateRaycastOcclusion(listener_pos, emitter_pos, config, audioRaycastAdapter, self);
     }
 
@@ -666,6 +712,7 @@ pub const PhysicsWorld = struct {
         max: Vec3,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.queryAABB(self, min, max, results);
     }
 
@@ -676,6 +723,7 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.queryAABBWithFilter(self, min, max, filter, results);
     }
 
@@ -685,6 +733,7 @@ pub const PhysicsWorld = struct {
         radius: f32,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.querySphere(self, center, radius, results);
     }
 
@@ -695,6 +744,7 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.querySphereWithFilter(self, center, radius, filter, results);
     }
 
@@ -703,6 +753,7 @@ pub const PhysicsWorld = struct {
         point: Vec3,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.queryPoint(self, point, results);
     }
 
@@ -712,10 +763,12 @@ pub const PhysicsWorld = struct {
         filter: CollisionFilter,
         results: *std.ArrayListUnmanaged(*RigidBody),
     ) !void {
+        self.assertNoParallelWindow();
         return physics_queries.queryPointWithFilter(self, point, filter, results);
     }
 
     pub fn spherecast(self: *PhysicsWorld, origin: Vec3, radius: f32, translation: Vec3) ?PhysicsRayHit {
+        self.assertNoParallelWindow();
         return physics_queries.spherecast(self, origin, radius, translation);
     }
 
@@ -726,10 +779,12 @@ pub const PhysicsWorld = struct {
         translation: Vec3,
         filter: CollisionFilter,
     ) ?PhysicsRayHit {
+        self.assertNoParallelWindow();
         return physics_queries.spherecastWithFilter(self, origin, radius, translation, filter);
     }
 
     pub fn findBodyByShape(self: *PhysicsWorld, shape_id: c.b3ShapeId) ?*RigidBody {
+        self.assertNoParallelWindow();
         return physics_queries.findBodyByShape(self, shape_id);
     }
 
@@ -738,6 +793,7 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn clearEvents(self: *PhysicsWorld) void {
+        self.assertNoParallelWindow();
         return physics_events.clearEvents(self);
     }
 
@@ -755,6 +811,7 @@ pub const PhysicsWorld = struct {
     /// OOM while queueing falls back to immediate removal (today's
     /// behavior, never a lost removal).
     pub fn removeBody(self: *PhysicsWorld, body: *RigidBody) void {
+        self.assertNoParallelWindow();
         if (self.stepping) {
             for (self.pending_removals.items) |p| if (p == body) return;
             self.pending_removals.append(self.allocator, body) catch {
@@ -784,6 +841,7 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn findBody(self: *PhysicsWorld, mesh: *const Mesh) ?*RigidBody {
+        self.assertNoParallelWindow();
         for (self.bodies.items) |b| {
             if (b.mesh == mesh) return b;
         }
@@ -804,16 +862,20 @@ pub const PhysicsWorld = struct {
         const joints = self.pending_joints.toOwnedSlice(self.allocator) catch &.{};
         defer if (joints.len > 0) self.allocator.free(joints);
         for (removals) |b| self.removeBodyImmediate(b);
-        for (joints) |j| if (self.isJointValid(j)) physics_joints.destroyJoint(self, j);
+        for (joints) |j| if (physics_joints.isJointValid(j)) physics_joints.destroyJoint(self, j);
     }
 
     pub fn step(self: *PhysicsWorld, dt: f32) void {
-        self.clearEvents();
+        // Exempt from the parallel-window tripwire: this IS the windowed
+        // call on the worker (or the plain inline call on the game thread
+        // with the window closed). Internal helpers are reached directly
+        // so the public guarded wrappers never see the open window.
+        physics_events.clearEvents(self);
         // Leftover deferred work (a step that never reached its drain, or a
         // test-held window): apply now that no iteration is in progress.
         if (!self.stepping) self.drainPendingStructural();
         if (dt <= 0.0001) return;
-        self.syncWorldParams();
+        self.syncWorldParamsInner();
         if (self.bodies.items.len == 0) return;
 
         // Iteration window: structural calls defer (see `removeBody`).
@@ -843,6 +905,11 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn syncWorldParams(self: *PhysicsWorld) void {
+        self.assertNoParallelWindow();
+        self.syncWorldParamsInner();
+    }
+
+    fn syncWorldParamsInner(self: *PhysicsWorld) void {
         if (self.hit_event_threshold != self.last_hit_threshold) {
             c.b3World_SetHitEventThreshold(self.world_id, self.hit_event_threshold);
             self.last_hit_threshold = self.hit_event_threshold;
@@ -1187,6 +1254,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: DistanceJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createDistanceJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1198,6 +1266,7 @@ pub const PhysicsWorld = struct {
         world_anchor_b: Vec3,
         options: DistanceJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createDistanceJointWorld(self, body_a, body_b, world_anchor_a, world_anchor_b, options);
     }
 
@@ -1209,6 +1278,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: SphericalJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createSphericalJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1219,6 +1289,7 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: SphericalJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createSphericalJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
@@ -1230,6 +1301,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: RevoluteJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createRevoluteJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1240,6 +1312,7 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: RevoluteJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createRevoluteJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
@@ -1250,6 +1323,7 @@ pub const PhysicsWorld = struct {
         motor_speed_rad: f32,
         max_motor_torque: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setRevoluteMotor(self, joint_id, enabled, motor_speed_rad, max_motor_torque);
     }
 
@@ -1259,14 +1333,17 @@ pub const PhysicsWorld = struct {
         lower_angle_rad: f32,
         upper_angle_rad: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setRevoluteLimits(self, joint_id, lower_angle_rad, upper_angle_rad);
     }
 
     pub fn revoluteAngleRad(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.revoluteAngleRad(self, joint_id);
     }
 
     pub fn revoluteAngleDeg(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.revoluteAngleDeg(self, joint_id);
     }
 
@@ -1278,6 +1355,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: WheelJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createWheelJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1288,6 +1366,7 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: WheelJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createWheelJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
@@ -1298,6 +1377,7 @@ pub const PhysicsWorld = struct {
         spin_speed_rad: f32,
         max_spin_torque: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setWheelSpin(self, joint_id, enabled, spin_speed_rad, max_spin_torque);
     }
 
@@ -1308,14 +1388,17 @@ pub const PhysicsWorld = struct {
         target_angle_rad: f32,
         max_steering_torque: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setWheelSteering(self, joint_id, enabled, target_angle_rad, max_steering_torque);
     }
 
     pub fn wheelSpinSpeed(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.wheelSpinSpeed(self, joint_id);
     }
 
     pub fn wheelSteeringAngle(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.wheelSteeringAngle(self, joint_id);
     }
 
@@ -1327,6 +1410,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: PrismaticJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createPrismaticJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1337,6 +1421,7 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: PrismaticJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createPrismaticJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
@@ -1347,6 +1432,7 @@ pub const PhysicsWorld = struct {
         motor_speed: f32,
         max_motor_force: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setPrismaticMotor(self, joint_id, enabled, motor_speed, max_motor_force);
     }
 
@@ -1356,14 +1442,17 @@ pub const PhysicsWorld = struct {
         lower_translation: f32,
         upper_translation: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setPrismaticLimits(self, joint_id, lower_translation, upper_translation);
     }
 
     pub fn prismaticTranslation(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.prismaticTranslation(self, joint_id);
     }
 
     pub fn prismaticSpeed(self: *PhysicsWorld, joint_id: JointId) f32 {
+        self.assertNoParallelWindow();
         return physics_joints.prismaticSpeed(self, joint_id);
     }
 
@@ -1375,6 +1464,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: MotorJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createMotorJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1385,22 +1475,27 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: MotorJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createMotorJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
     pub fn setMotorLinearVelocity(self: *PhysicsWorld, joint_id: JointId, velocity: Vec3) void {
+        self.assertNoParallelWindow();
         return physics_joints.setMotorLinearVelocity(self, joint_id, velocity);
     }
 
     pub fn setMotorAngularVelocity(self: *PhysicsWorld, joint_id: JointId, velocity_rad: Vec3) void {
+        self.assertNoParallelWindow();
         return physics_joints.setMotorAngularVelocity(self, joint_id, velocity_rad);
     }
 
     pub fn setMotorMaxVelocityForce(self: *PhysicsWorld, joint_id: JointId, max_force: f32) void {
+        self.assertNoParallelWindow();
         return physics_joints.setMotorMaxVelocityForce(self, joint_id, max_force);
     }
 
     pub fn setMotorMaxVelocityTorque(self: *PhysicsWorld, joint_id: JointId, max_torque: f32) void {
+        self.assertNoParallelWindow();
         return physics_joints.setMotorMaxVelocityTorque(self, joint_id, max_torque);
     }
 
@@ -1412,6 +1507,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: WeldJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createWeldJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1422,14 +1518,17 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: WeldJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createWeldJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
     pub fn jointConstraintForce(self: *PhysicsWorld, joint_id: JointId) Vec3 {
+        self.assertNoParallelWindow();
         return physics_joints.jointConstraintForce(self, joint_id);
     }
 
     pub fn jointConstraintTorque(self: *PhysicsWorld, joint_id: JointId) Vec3 {
+        self.assertNoParallelWindow();
         return physics_joints.jointConstraintTorque(self, joint_id);
     }
 
@@ -1441,6 +1540,7 @@ pub const PhysicsWorld = struct {
         local_anchor_b: Vec3,
         options: ParallelJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createParallelJoint(self, body_a, body_b, local_anchor_a, local_anchor_b, options);
     }
 
@@ -1451,6 +1551,7 @@ pub const PhysicsWorld = struct {
         world_anchor: Vec3,
         options: ParallelJointOptions,
     ) !JointId {
+        self.assertNoParallelWindow();
         return physics_joints.createParallelJointWorld(self, body_a, body_b, world_anchor, options);
     }
 
@@ -1461,10 +1562,12 @@ pub const PhysicsWorld = struct {
         damping_ratio: f32,
         max_torque: f32,
     ) void {
+        self.assertNoParallelWindow();
         return physics_joints.setParallelSpring(self, joint_id, hertz, damping_ratio, max_torque);
     }
 
-    pub fn isJointValid(_: *PhysicsWorld, joint_id: JointId) bool {
+    pub fn isJointValid(self: *PhysicsWorld, joint_id: JointId) bool {
+        self.assertNoParallelWindow();
         return physics_joints.isJointValid(joint_id);
     }
 
@@ -1474,6 +1577,7 @@ pub const PhysicsWorld = struct {
     /// mid-step races the sweep). Queued destroys drain validity-checked
     /// at step end; OOM while queueing falls back to immediate destroy.
     pub fn destroyJoint(self: *PhysicsWorld, joint_id: JointId) void {
+        self.assertNoParallelWindow();
         if (self.stepping) {
             for (self.pending_joints.items) |j| {
                 if (j.index1 == joint_id.index1 and j.generation == joint_id.generation) return;
@@ -1495,6 +1599,7 @@ pub const PhysicsWorld = struct {
         max_impulse: f32,
         upward_modifier: f32,
     ) void {
+        self.assertNoParallelWindow();
         if (radius <= 0.0 or max_impulse <= 0.0) return;
         for (self.bodies.items) |b| {
             if (!b.enabled or b.mass <= 0.0) continue;
@@ -1524,14 +1629,17 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn debugCircleSegments(self: *const PhysicsWorld) usize {
+        self.assertNoParallelWindow();
         return physics_debug.debugCircleSegments(self);
     }
 
     pub fn appendDebugLines(self: *PhysicsWorld, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DebugLine)) !void {
+        self.assertNoParallelWindow();
         return physics_debug.appendDebugLines(self, allocator, out);
     }
 
     pub fn debugLineCount(self: *PhysicsWorld) usize {
+        self.assertNoParallelWindow();
         return physics_debug.debugLineCount(self);
     }
 };

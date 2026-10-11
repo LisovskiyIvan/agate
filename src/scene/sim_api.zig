@@ -166,3 +166,42 @@ pub fn updatePhysics(self: anytype, dt: f32) void {
         self.pending_physics_ms.store(0, .release);
     }
 }
+
+/// Fork half of the dedicated-physics overlap (called from
+/// `frame_api.update` when `threading.physics == .dedicated`). Hands
+/// `step(dt)` to the Scene-owned worker and returns true — the caller MUST
+/// `joinPhysics` before touching the world again. Returns false when the
+/// step already ran inline with `pending_physics_ms` stored exactly as
+/// `updatePhysics` stores it: no world (store 0), tiny dt (step
+/// early-returns, no pointless thread roundtrip), or worker fallback
+/// (spawn impossible or permanently degraded: step inline, fallback
+/// counted). Same dt + same world state at kick as the inline call, so the
+/// step result matches the inline one (see docs/threading.md).
+pub fn kickPhysics(self: anytype, dt: f32) bool {
+    const pw = self.physics.getWorld() orelse {
+        self.pending_physics_ms.store(0, .release);
+        return false;
+    };
+    if (dt <= 0.0001) {
+        pw.step(dt);
+        self.pending_physics_ms.store(pw.getProfile().step_ms, .release);
+        return false;
+    }
+    if (!self.physics.kickWorker(pw, dt)) {
+        pw.step(dt);
+        self.pending_physics_ms.store(pw.getProfile().step_ms, .release);
+        return false;
+    }
+    return true;
+}
+
+/// Join half of the dedicated-physics overlap: waits for the kicked step,
+/// then stores its profile time exactly as `updatePhysics` does.
+pub fn joinPhysics(self: anytype) void {
+    self.physics.joinWorker();
+    if (self.physics.world) |*pw| {
+        self.pending_physics_ms.store(pw.getProfile().step_ms, .release);
+    } else {
+        self.pending_physics_ms.store(0, .release);
+    }
+}
