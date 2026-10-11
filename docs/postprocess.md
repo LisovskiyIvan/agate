@@ -94,7 +94,7 @@ pub const ShaftResolution = enum { half, quarter };
 | Motion blur | `motion_blur_enabled`, `motion_blur_intensity`, `motion_blur_max_blur_px`, `motion_blur_samples` | off, 0.5, 32.0, 8 | intensity [0,3], max [1,128], samples [2,32] |
 | TAA | `taa_enabled`, `taa_blend`, `taa_jitter_scale`, `taa_sharpness`, `taa_clamp_strength`, `taa_camera_cut` | off, 0.9, 1.0, 0.0, 1.0, false | blend/sharp/clamp [0,1], jitter [0,4] |
 | Render scale | `render_scale` | 1.0 (native) | [0.25, 1]; main HDR-таргет/TAA-история/velocity/эффекты считаются в масштабе, композит+UI — в натуральном разрешении |
-| SSGI v1 (color bleed) | `ssgi_enabled`, `ssgi_intensity`, `ssgi_radius`, `ssgi_steps`, `ssgi_mode` | off, 0.5, 1.5, 12, `inline_gather` | intensity [0,1], radius [0.1, 8] м, steps [4,32]; `ssgi_mode`: `inline_gather` (v1 gather в композите) / `half_res_pass` (v2: отдельный half-res gather + билатеральный денойз, `SsgiPass`); one-bounce экранное цветовое кровотечение (radiance+depth), TAA денойзит; temporal аккумуляция — открыта (v2.1) |
+| SSGI v1 (color bleed) | `ssgi_enabled`, `ssgi_intensity`, `ssgi_radius`, `ssgi_steps`, `ssgi_mode`, `ssgi_temporal_enabled`, `ssgi_temporal_blend` | off, 0.5, 1.5, 12, `inline_gather`, off, 0.9 | intensity [0,1], radius [0.1, 8] м, steps [4,32]; `ssgi_mode`: `inline_gather` (v1 gather в композите) / `half_res_pass` (v2: отдельный half-res gather + билатеральный денойз, `SsgiPass`); `ssgi_temporal_enabled` — temporal аккумуляция gather-выхода (v2.1, только `half_res_pass`, default OFF — в inline-режиме предупреждает и игнорируется); `ssgi_temporal_blend` — вес истории [0,1], свит-спот [0.85, 0.95]; one-bounce экранное цветовое кровотечение (radiance+depth), TAA денойзит |
 | Shafts v1 | `shaft_enabled`, `shaft_intensity`, `shaft_steps`, `shaft_density`, `shaft_anisotropy`, `shaft_max_distance`, `shaft_resolution`, `shaft_blur_sigma`, `shaft_edge_sigma` | off, 1.0, 12, 0.05, 0.4, 60.0, quarter, 2.0, 0.02 | steps [4,32], anisotropy ±0.9, остальное ≥ 0 |
 | DOF | `dof_enabled`, `dof_focus_distance`, `dof_focus_range`, `dof_max_blur` | off, 10.0, 5.0, 8.0 | все ≥ 0 |
 
@@ -205,6 +205,20 @@ pub fn shaftKernelSum(...) f32
 ```
 
 Шафты v1: скринспейс-реймарш от камеры до поверхности глубины в low-res (`half`/`quarter`), на каждом шаге — bilinear 2×2 PCF в CSM-атлас солнца (интерполируются результаты сравнения, не raw-depth; фильтр не выходит в соседний тайл), single-scatter с фазой Хеньи–Гринштейна (`hgPhase`) и точным интегралом Бера–Ламберта по сегменту; bilateral (depth-aware) H/V-blur; аддитивный composite после highlight-блока. Энергия полностью освещённого луча не зависит от числа шагов. Требует живой CSM (`shaftActive` гейтится на `shadows_enabled` — без отрендеренного атласа маршировать не против чего, v1 отказывается «фейкать»). Небесные пиксели маршируют полный `shaft_max_distance`.
+
+### SSGI (`postprocess/ssgi.zig`, `passes/ssgi_pass.zig`, `shaders/ssgi*.glsl`)
+
+```zig
+pub const SsgiMode = enum { inline_gather, half_res_pass };
+pub fn ssgiActive / ssgiInlineActive / ssgiPassActive(config: PostProcessOptions) bool
+pub fn ssgiParams(config: PostProcessOptions) [4]f32        // inline-лейн
+pub fn ssgiPassParams(config: PostProcessOptions, tex_valid: bool) [4]f32 // pass-лейн
+pub fn ssgiTemporalActive(config: PostProcessOptions) bool  // pass + temporal-флаг
+pub fn ssgiTemporalBlend(config: PostProcessOptions) f32
+pub fn ssgiTemporalShouldReset(TaaReset) bool
+```
+
+Режимы: `inline_gather` (default, бит-в-бит v1 — gather внутри композита) / `half_res_pass` (v2: `SsgiPass` — half-res RGBA16F gather-порт v1-математики с тем же мировым диском + билатеральный depth-aware денойз 3×3; intensity применяется в композите после денойза; sizing — половина EFFECTIVE-размера; MSAA-подавление — через общий `ssgi_enabled`, temporal присоединяется бесплатно). Temporal аккумуляция (v2.1, `ssgi_temporal_enabled`, default OFF — выключенная ветвь пропускает стадию, денойз сэмплит gather напрямую, бит-в-бит): порядок gather → temporal → denoise → composite (история хранит сырой накопленный сигнал, денойз — последний чистильщик перед композитом). Репроекция — по velocity-буферу (uv_curr − uv_prev; живёт в render-scale разрешении, сэмплится в том же UV), без velocity — камерная depth-репроекция через `prev_view_proj`. Реджект: variance-расхождение истории от текущего 3×3 gather-окна (mean ± `SSGI_TEMPORAL_GAMMA=1.0`·σ, фоллофф `1/(1+4d²)` как в TAA), консистентность глубины против хранимой в альфе линеаризованной глубины (билатеральный гейт `max(0.001, radius·0.2)`), консистентность нормалей (house depth-normal реконструкция с обоих концов, косинус ≥ 0.9), reactive-маркеры (альфа velocity 0.15–0.35 = партикли/стекло → ноль истории без рампы). Сброс истории: первый кадр / toggle флага / ресайз (пересоздание таргетов) / camera cut (общий снапшот-флаг `taa_camera_cut`) — зеркало `taaShouldReset`; константы гейтов документированы в `ssgi.zig`. В inline-режиме флаг предупреждает один раз (WarnOnce) и игнорируется. q0: `AGATE_Q0_SSGI_PASS=1`, `AGATE_Q0_SSGI_TEMPORAL=1` (требует PASS=1, иначе варнинг).
 
 Для визуального A/B света в `examples/q0_interior.zig`: `AGATE_Q0_STILL=1` фиксирует камеру, `AGATE_Q0_NO_DOF=1` убирает размытие, `AGATE_Q0_NO_SHAFTS=1` отключает только объёмные лучи, `AGATE_Q0_NO_SSR=1` изолирует отражения. Прямоугольное солнечное пятно от открытого фасада комнаты при этом остаётся — это геометрия проёма, а не граница атласа теней.
 

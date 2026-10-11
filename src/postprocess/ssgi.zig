@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const PostProcessOptions = @import("options.zig").PostProcessOptions;
+const TaaReset = @import("types.zig").TaaReset;
+const TaaBounds = @import("types.zig").TaaBounds;
 
 pub const SSGI_STEPS_MIN: u32 = 4;
 pub const SSGI_STEPS_MAX: u32 = 32;
@@ -121,4 +123,202 @@ pub fn ssgiBleedAdd(bleed_sum: [3]f32, total_w: f32, steps: u32, intensity: f32)
         out[c] = capped * coverage * intensity;
     }
     return out;
+}
+
+// --- SSGI v2.1 temporal accumulation (opt-in, half_res_pass only) ---
+//
+// The temporal stage sits between the gather and the bilateral denoise:
+// gather -> temporal -> denoise -> composite. History holds the RAW
+// accumulated bleed signal (normalized bleed * coverage, no intensity),
+// exactly the gather lane; the bilateral denoise stays the final cleaner
+// before the composite, so the composite still scales one denoised signal
+// by intensity after all temporal work.
+
+/// Recommended history-weight window. The option clamps to [0, 1]; below
+/// the window the accumulation converges too slowly to matter, above it
+/// disocclusion trails survive the rejection gates.
+pub const SSGI_TEMPORAL_BLEND_MIN: f32 = 0.85;
+pub const SSGI_TEMPORAL_BLEND_MAX: f32 = 0.95;
+/// Default history weight (same compromise class as taa_blend 0.9).
+pub const SSGI_TEMPORAL_BLEND_DEFAULT: f32 = 0.9;
+
+/// Variance-clip tightness: history must survive mean +/- gamma * stddev
+/// of the current 3x3 gather neighborhood (TAA uses 1.25 on radiance; the
+/// low-frequency bleed signal tolerates a tighter box).
+pub const SSGI_TEMPORAL_GAMMA: f32 = 1.0;
+
+/// Normal-consistency gate: history survives only when the current surface
+/// normal and the normal reconstructed at the reprojected UV agree to this
+/// cosine (about 25 degrees). Below it the pixel reprojected across a
+/// geometric edge and the fresh gather wins.
+pub const SSGI_TEMPORAL_NORMAL_MIN_DOT: f32 = 0.9;
+
+/// Reactive-marker band over the velocity alpha: particle/glass coverage
+/// the velocity pass stamps with exactly 0.25 (see velocity.glsl
+/// fs_marker). Mirrors TAA_REACTIVE_MARKER_LO/HI in taa.zig (kept as local
+/// copies: taa.zig depends on options.zig which depends on this module, so
+/// a direct import would cycle; ssgi_tests.zig cross-pins the values).
+pub const SSGI_TEMPORAL_MARKER_LO: f32 = 0.15;
+pub const SSGI_TEMPORAL_MARKER_HI: f32 = 0.35;
+
+/// Temporal activity: the pass gate plus the opt-in flag. Inline mode with
+/// the flag set warns (orchestrator, WarnOnce) and stays bit-identical to
+/// the untemporal pass path — this gate is what enforces it.
+pub fn ssgiTemporalActive(config: PostProcessOptions) bool {
+    return ssgiPassActive(config) and config.ssgi_temporal_enabled;
+}
+
+/// History blend weight in [0, 1] after clamped(). Raw config outside the
+/// range clamps; the documented sweet spot is [0.85, 0.95].
+pub fn ssgiTemporalBlend(config: PostProcessOptions) f32 {
+    return std.math.clamp(config.ssgi_temporal_blend, 0.0, 1.0);
+}
+
+/// Reset conditions mirror taaShouldReset (same TaaReset shape): first
+/// frame, toggle-on, resize/recreate, camera cut, explicit reset. The
+/// camera-cut bit rides the shared taa_camera_cut snapshot flag.
+pub fn ssgiTemporalShouldReset(r: TaaReset) bool {
+    return r.first_frame or r.toggled_on or r.resized or r.camera_cut or r.explicit_reset;
+}
+
+/// History ping-pong slots driven by SsgiPass.temp_frame (same parity
+/// shape as the TAA helpers so tests pin the alternation).
+pub fn ssgiTemporalReadIndex(frame: u64) u8 {
+    return @intCast(frame & 1);
+}
+
+pub fn ssgiTemporalWriteIndex(frame: u64) u8 {
+    return 1 - ssgiTemporalReadIndex(frame);
+}
+
+/// History UV from a velocity tap: the velocity buffer stores
+/// uv_curr - uv_prev (see velocity.glsl), so prev = uv - vel. Pure.
+pub fn ssgiTemporalHistoryUv(uv: [2]f32, velocity_xy: [2]f32) [2]f32 {
+    return .{ uv[0] - velocity_xy[0], uv[1] - velocity_xy[1] };
+}
+
+/// Reactive-marker classification over the velocity alpha (same band the
+/// TAA resolve tests; non-finite input is never a marker). Pure.
+pub fn ssgiTemporalIsMarker(alpha: f32) bool {
+    if (!std.math.isFinite(alpha)) return false;
+    return alpha >= SSGI_TEMPORAL_MARKER_LO and alpha <= SSGI_TEMPORAL_MARKER_HI;
+}
+
+/// Depth rejection gate (linearized depths, meters): history survives only
+/// when the stored surface is within the same bilateral gate the denoise
+/// uses (max(0.001, radius * 0.2)), so silhouette-crossing history never
+/// blends. Pure.
+pub fn ssgiTemporalDepthOk(cur_lin: f32, hist_lin: f32, radius: f32) bool {
+    if (!std.math.isFinite(cur_lin) or !std.math.isFinite(hist_lin)) return false;
+    return @abs(cur_lin - hist_lin) < @max(0.001, radius * 0.2);
+}
+
+/// Normal rejection gate: history survives only when the current and the
+/// reprojected-location normals agree within SSGI_TEMPORAL_NORMAL_MIN_DOT
+/// (degenerate zero normals reject: there is no surface to agree on).
+/// Pure.
+pub fn ssgiTemporalNormalOk(cur_n: [3]f32, hist_n: [3]f32) bool {
+    const dot = cur_n[0] * hist_n[0] + cur_n[1] * hist_n[1] + cur_n[2] * hist_n[2];
+    if (!std.math.isFinite(dot)) return false;
+    return dot >= SSGI_TEMPORAL_NORMAL_MIN_DOT;
+}
+
+/// 3x3 variance bounds over center + 8 gather neighbors (same estimator as
+/// taaVarianceBounds, local copy for the import-cycle reason above):
+/// [mu - gamma*sigma, mu + gamma*sigma] intersected with the min/max box.
+/// Pure.
+pub fn ssgiTemporalVarianceBounds(center: [3]f32, neighbors: [8][3]f32, gamma: f32) TaaBounds {
+    var mn = center;
+    var mx = center;
+    var sum = center;
+    var sum_sq = [3]f32{ center[0] * center[0], center[1] * center[1], center[2] * center[2] };
+    for (neighbors) |n| {
+        for (0..3) |c| {
+            mn[c] = @min(mn[c], n[c]);
+            mx[c] = @max(mx[c], n[c]);
+            sum[c] += n[c];
+            sum_sq[c] += n[c] * n[c];
+        }
+    }
+    const g = @max(gamma, 0.0);
+    var v_min: [3]f32 = undefined;
+    var v_max: [3]f32 = undefined;
+    for (0..3) |c| {
+        const mu = sum[c] / 9.0;
+        const variance = @max(sum_sq[c] / 9.0 - mu * mu, 0.0);
+        const sigma = @sqrt(variance);
+        var lo = @max(mn[c], mu - g * sigma);
+        var hi = @min(mx[c], mu + g * sigma);
+        if (lo > hi) {
+            lo = mn[c];
+            hi = mx[c];
+        }
+        v_min[c] = lo;
+        v_max[c] = hi;
+    }
+    return .{ .min = v_min, .max = v_max };
+}
+
+/// History acceptance weight in [0, 1] from the variance-box divergence
+/// (same 1/(1+4d^2) falloff as taaRejectionWeight). Pure.
+pub fn ssgiTemporalRejectionWeight(history: [3]f32, box_min: [3]f32, box_max: [3]f32) f32 {
+    var max_dist: f32 = 0.0;
+    for (0..3) |c| {
+        const lo = @min(box_min[c], box_max[c]);
+        const hi = @max(box_min[c], box_max[c]);
+        const span = @max(hi - lo, 1e-4);
+        if (history[c] < lo) {
+            max_dist = @max(max_dist, (lo - history[c]) / span);
+        } else if (history[c] > hi) {
+            max_dist = @max(max_dist, (history[c] - hi) / span);
+        }
+    }
+    return 1.0 / (1.0 + max_dist * max_dist * 4.0);
+}
+
+/// Full temporal resolve mirror of the ssgi_temporal.glsl main: variance
+/// clip (full strength) then mix(current, clamped, blend * accept) where
+/// accept folds the variance divergence, the depth/normal gates, and the
+/// reactive-marker shed (markers take exactly zero history). Reset frames
+/// (history_valid=false) return current. Pure.
+pub fn ssgiTemporalResolve(
+    current: [3]f32,
+    neighbors: [8][3]f32,
+    history: [3]f32,
+    history_valid: bool,
+    blend: f32,
+    gamma: f32,
+    depth_ok: bool,
+    normal_ok: bool,
+    is_marker: bool,
+) [3]f32 {
+    if (!history_valid) return current;
+    const box = ssgiTemporalVarianceBounds(current, neighbors, gamma);
+    const reject = ssgiTemporalRejectionWeight(history, box.min, box.max);
+    var accept = reject;
+    if (!depth_ok or !normal_ok) accept = 0.0;
+    if (is_marker) accept = 0.0;
+    const b = std.math.clamp(blend, 0.0, 1.0) * accept;
+    var hc: [3]f32 = undefined;
+    for (0..3) |c| {
+        const lo = @min(box.min[c], box.max[c]);
+        const hi = @max(box.min[c], box.max[c]);
+        hc[c] = std.math.clamp(history[c], lo, hi);
+    }
+    return .{
+        current[0] + (hc[0] - current[0]) * b,
+        current[1] + (hc[1] - current[1]) * b,
+        current[2] + (hc[2] - current[2]) * b,
+    };
+}
+
+/// VRAM census helper (pure byte math): the history ping-pong pair at the
+/// half-res size, same pixel format as the gather/denoise targets. Single
+/// source of truth alongside SsgiPass.temporalTargetBytes.
+pub fn ssgiTemporalTargetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize {
+    const size = ssgiTargetSize(base_w, base_h);
+    if (size.w <= 0 or size.h <= 0) return 0;
+    const w: usize = @intCast(size.w);
+    const h: usize = @intCast(size.h);
+    return 2 * w * h * bytes_per_pixel;
 }

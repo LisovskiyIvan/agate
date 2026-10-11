@@ -153,6 +153,16 @@ test "ssgi clamps intensity, radius and steps" {
     dead.enabled = false;
     try std.testing.expect(!dead.forFrame().ssgi_enabled);
     try std.testing.expect(!(PostProcessOptions{}).ssgi_enabled);
+    // Temporal blend clamps to [0, 1]; the flag defaults off and survives
+    // forFrame like the mode enum (render-owned, not an artistic effect).
+    var tb = PostProcessOptions{ .ssgi_temporal_blend = 2.0 };
+    try std.testing.expectEqual(@as(f32, 1.0), tb.clamped().ssgi_temporal_blend);
+    tb.ssgi_temporal_blend = -1.0;
+    try std.testing.expectEqual(@as(f32, 0.0), tb.clamped().ssgi_temporal_blend);
+    try std.testing.expect(!(PostProcessOptions{}).ssgi_temporal_enabled);
+    var tframe = PostProcessOptions{ .ssgi_temporal_enabled = true };
+    tframe.enabled = false;
+    try std.testing.expect(tframe.forFrame().ssgi_temporal_enabled);
 }
 
 test "table-driven clamps map non-finite guarded floats to spec defaults" {

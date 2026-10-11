@@ -100,3 +100,127 @@ test "ssgiTargetSize is ceil-half of the effective size" {
     try testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), ssgi.ssgiTargetBytes(1281, 721, 8));
     try testing.expectEqual(@as(usize, 0), ssgi.ssgiTargetBytes(0, 0, 8));
 }
+
+test "ssgiTemporalActive needs pass mode plus the opt-in flag" {
+    // Default: temporal off in both modes (bit-identical to pre-temporal).
+    const inline_cfg = PostProcessOptions{ .ssgi_enabled = true, .ssgi_intensity = 0.5 };
+    try testing.expect(!ssgi.ssgiTemporalActive(inline_cfg));
+    var pass_cfg = inline_cfg;
+    pass_cfg.ssgi_mode = .half_res_pass;
+    try testing.expect(!ssgi.ssgiTemporalActive(pass_cfg));
+    // Flag on in pass mode: active. Flag on in inline mode: gated off
+    // (the orchestrator warns once and the pass stays bit-identical).
+    pass_cfg.ssgi_temporal_enabled = true;
+    try testing.expect(ssgi.ssgiTemporalActive(pass_cfg));
+    var inline_temporal = inline_cfg;
+    inline_temporal.ssgi_temporal_enabled = true;
+    try testing.expect(!ssgi.ssgiTemporalActive(inline_temporal));
+    // Master off or intensity floor kills temporal with the pass gate.
+    const off = PostProcessOptions{ .ssgi_enabled = false, .ssgi_intensity = 1.0, .ssgi_mode = .half_res_pass, .ssgi_temporal_enabled = true };
+    try testing.expect(!ssgi.ssgiTemporalActive(off));
+}
+
+test "ssgiTemporalBlend clamps and documents the sweet spot" {
+    try testing.expectEqual(@as(f32, 0.9), ssgi.ssgiTemporalBlend(.{}));
+    try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = -1.0 }));
+    try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = 2.0 }));
+    try testing.expectEqual(@as(f32, 0.87), ssgi.ssgiTemporalBlend(.{ .ssgi_temporal_blend = 0.87 }));
+    // The recommended window sits strictly inside (0, 1).
+    try testing.expect(ssgi.SSGI_TEMPORAL_BLEND_MIN > 0.0 and ssgi.SSGI_TEMPORAL_BLEND_MAX < 1.0);
+    try testing.expect(ssgi.SSGI_TEMPORAL_BLEND_MIN < ssgi.SSGI_TEMPORAL_BLEND_DEFAULT and ssgi.SSGI_TEMPORAL_BLEND_DEFAULT < ssgi.SSGI_TEMPORAL_BLEND_MAX);
+}
+
+test "ssgiTemporalShouldReset mirrors the TAA reset shape" {
+    try testing.expect(ssgi.ssgiTemporalShouldReset(.{ .first_frame = true }));
+    try testing.expect(ssgi.ssgiTemporalShouldReset(.{ .toggled_on = true }));
+    try testing.expect(ssgi.ssgiTemporalShouldReset(.{ .resized = true }));
+    try testing.expect(ssgi.ssgiTemporalShouldReset(.{ .camera_cut = true }));
+    try testing.expect(ssgi.ssgiTemporalShouldReset(.{ .explicit_reset = true }));
+    try testing.expect(!ssgi.ssgiTemporalShouldReset(.{}));
+}
+
+test "ssgiTemporal ping-pong alternates by frame parity" {
+    try testing.expectEqual(@as(u8, 0), ssgi.ssgiTemporalReadIndex(0));
+    try testing.expectEqual(@as(u8, 1), ssgi.ssgiTemporalWriteIndex(0));
+    try testing.expectEqual(@as(u8, 1), ssgi.ssgiTemporalReadIndex(1));
+    try testing.expectEqual(@as(u8, 0), ssgi.ssgiTemporalWriteIndex(1));
+    try testing.expect(ssgi.ssgiTemporalReadIndex(42) != ssgi.ssgiTemporalWriteIndex(42));
+}
+
+test "ssgiTemporalHistoryUv subtracts the velocity vector" {
+    // Velocity stores uv_curr - uv_prev, so prev = uv - vel.
+    const uv = ssgi.ssgiTemporalHistoryUv(.{ 0.5, 0.5 }, .{ 0.02, -0.01 });
+    try testing.expectApproxEqAbs(@as(f32, 0.48), uv[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.51), uv[1], 1e-6);
+    // Zero motion reprojects onto itself.
+    try testing.expectEqual([2]f32{ 0.25, 0.75 }, ssgi.ssgiTemporalHistoryUv(.{ 0.25, 0.75 }, .{ 0.0, 0.0 }));
+}
+
+test "ssgiTemporal marker band matches the TAA velocity classification" {
+    // The stamped particle/glass value falls inside; clear and per-object
+    // do not. Non-finite input is never a marker (fails closed).
+    try testing.expect(ssgi.ssgiTemporalIsMarker(0.25));
+    try testing.expect(ssgi.ssgiTemporalIsMarker(0.15));
+    try testing.expect(ssgi.ssgiTemporalIsMarker(0.35));
+    try testing.expect(!ssgi.ssgiTemporalIsMarker(0.0));
+    try testing.expect(!ssgi.ssgiTemporalIsMarker(0.5));
+    try testing.expect(!ssgi.ssgiTemporalIsMarker(1.0));
+    try testing.expect(!ssgi.ssgiTemporalIsMarker(std.math.nan(f32)));
+    // Cross-pin against the TAA band: one writer (velocity.glsl fs_marker
+    // stamps 0.25), two readers — they must never drift apart.
+    const taa = @import("taa.zig");
+    try testing.expectEqual(taa.TAA_REACTIVE_MARKER_LO, ssgi.SSGI_TEMPORAL_MARKER_LO);
+    try testing.expectEqual(taa.TAA_REACTIVE_MARKER_HI, ssgi.SSGI_TEMPORAL_MARKER_HI);
+}
+
+test "ssgiTemporal depth gate follows the bilateral threshold" {
+    // Same gate the denoise uses: max(0.001, radius * 0.2).
+    try testing.expect(ssgi.ssgiTemporalDepthOk(5.0, 5.05, 1.5));
+    try testing.expect(!ssgi.ssgiTemporalDepthOk(5.0, 5.5, 1.5));
+    try testing.expect(!ssgi.ssgiTemporalDepthOk(5.0, 5.0 + 0.002, 0.001));
+    try testing.expect(!ssgi.ssgiTemporalDepthOk(std.math.inf(f32), 5.0, 1.5));
+}
+
+test "ssgiTemporal normal gate needs agreeing surfaces" {
+    try testing.expect(ssgi.ssgiTemporalNormalOk(.{ 0, 1, 0 }, .{ 0, 1, 0 }));
+    try testing.expect(!ssgi.ssgiTemporalNormalOk(.{ 0, 1, 0 }, .{ 1, 0, 0 }));
+    // Degenerate (zero) normals reject: no surface to agree on.
+    try testing.expect(!ssgi.ssgiTemporalNormalOk(.{ 0, 0, 0 }, .{ 0, 1, 0 }));
+}
+
+test "ssgiTemporalResolve blends, clips, rejects and resets" {
+    const flat: [8][3]f32 = .{.{ 1.0, 0.5, 0.25 }} ** 8;
+    // Spread neighborhood so a nearby history lands inside the variance
+    // box: mean == center, sigma > 0, history within mu +/- sigma.
+    const spread: [8][3]f32 = .{
+        .{ 0.8, 0.4, 0.2 }, .{ 1.2, 0.6, 0.3 },
+        .{ 0.8, 0.4, 0.2 }, .{ 1.2, 0.6, 0.3 },
+        .{ 0.8, 0.4, 0.2 }, .{ 1.2, 0.6, 0.3 },
+        .{ 0.8, 0.4, 0.2 }, .{ 1.2, 0.6, 0.3 },
+    };
+    // Converged history near the current value blends by the weight.
+    const near = ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, spread, .{ 1.1, 0.55, 0.3 }, true, 0.9, 1.0, true, true, false);
+    for (0..3) |c| {
+        const cur = ([3]f32{ 1.0, 0.5, 0.25 })[c];
+        const hist = ([3]f32{ 1.1, 0.55, 0.3 })[c];
+        try testing.expect(near[c] > @min(cur, hist) and near[c] < @max(cur, hist));
+    }
+    // Reset frames return the current gather untouched.
+    try testing.expectEqual([3]f32{ 1.0, 0.5, 0.25 }, ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, flat, .{ 9.0, 9.0, 9.0 }, false, 0.9, 1.0, true, true, false));
+    // A diverged history clamps into the box and barely blends (the
+    // variance falloff drives the weight toward zero).
+    const far = ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, flat, .{ 9.0, 9.0, 9.0 }, true, 0.9, 1.0, true, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), far[0], 0.05);
+    // Depth/normal gates and reactive markers take exactly zero history.
+    const gated = ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, flat, .{ 1.1, 0.55, 0.3 }, true, 0.9, 1.0, false, true, false);
+    try testing.expectEqual([3]f32{ 1.0, 0.5, 0.25 }, gated);
+    const marked = ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, flat, .{ 1.1, 0.55, 0.3 }, true, 0.9, 1.0, true, true, true);
+    try testing.expectEqual([3]f32{ 1.0, 0.5, 0.25 }, marked);
+}
+
+test "ssgiTemporalTargetBytes counts the history pair" {
+    // Two half-res RGBA16F targets at 8 Bpp, same halves the pass allocates.
+    try testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), ssgi.ssgiTemporalTargetBytes(1280, 720, 8));
+    try testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), ssgi.ssgiTemporalTargetBytes(1281, 721, 8));
+    try testing.expectEqual(@as(usize, 0), ssgi.ssgiTemporalTargetBytes(0, 0, 8));
+}

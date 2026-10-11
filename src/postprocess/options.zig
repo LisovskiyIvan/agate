@@ -64,6 +64,7 @@ const clamp_table = [_]struct { name: []const u8, spec: ClampSpec }{
     .{ .name = "ssgi_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
     .{ .name = "ssgi_radius", .spec = .{ .guarded_clamp = .{ .min = ssgi_mod.SSGI_RADIUS_MIN, .max = ssgi_mod.SSGI_RADIUS_MAX, .default = 1.5 } } },
     .{ .name = "ssgi_steps", .spec = .{ .uint_clamp = .{ .min = ssgi_mod.SSGI_STEPS_MIN, .max = ssgi_mod.SSGI_STEPS_MAX } } },
+    .{ .name = "ssgi_temporal_blend", .spec = .{ .raw_clamp = .{ .min = 0.0, .max = 1.0 } } },
     .{ .name = "contact_shadows_intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = 1.0, .default = 0.5 } } },
     .{ .name = "contact_shadows_distance", .spec = .{ .guarded_floor = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_DISTANCE_MIN, .default = 0.3 } } },
     .{ .name = "contact_shadows_thickness", .spec = .{ .guarded_floor = .{ .min = contact_shadows_mod.CONTACT_SHADOWS_THICKNESS_MIN, .default = 0.05 } } },
@@ -217,6 +218,15 @@ pub const PostProcessOptions = struct {
     // distance; clamped [0.1, 8]).
     ssgi_radius: f32 = 1.5,
     ssgi_steps: u32 = 12,
+    // Temporal accumulation for the half_res_pass gather (v2.1, opt-in).
+    // Default OFF: the pass runs gather -> denoise exactly as before
+    // (bit-identical). Meaningful only with ssgi_mode == .half_res_pass;
+    // in inline mode the flag warns once (orchestrator) and is ignored.
+    ssgi_temporal_enabled: bool = false,
+    // History weight for the temporal blend (1 = full history). 0.9 is the
+    // standard compromise; the documented sweet spot is [0.85, 0.95].
+    // Clamped to [0, 1].
+    ssgi_temporal_blend: f32 = ssgi_mod.SSGI_TEMPORAL_BLEND_DEFAULT,
 
     // Screen-Space Contact Shadows & Local Ambient Occlusion (short-range sun raymarch)
     contact_shadows_enabled: bool = false,
@@ -472,6 +482,7 @@ const exempt_clamp_fields = [_][]const u8{
     "depth_pyramid_enabled",
     "ssgi_enabled",
     "ssgi_mode",
+    "ssgi_temporal_enabled",
     "contact_shadows_enabled",
     "local_tonemapping_enabled",
     "sharpen_enabled",

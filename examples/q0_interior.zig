@@ -295,6 +295,15 @@ fn setupScene() void {
     // dedicated gather + bilateral denoise instead of the inline
     // composite gather (same steps); default stays v1 inline.
     if (envFlag("AGATE_Q0_SSGI_PASS")) scene.post_process.ssgi_mode = .half_res_pass;
+    // SSGI v2.1 temporal accumulation (opt-in): AGATE_Q0_SSGI_TEMPORAL=1
+    // enables history accumulation inside the half-res pass; requires
+    // AGATE_Q0_SSGI_PASS=1 (inline mode warns once and ignores it).
+    if (envFlag("AGATE_Q0_SSGI_TEMPORAL")) {
+        if (scene.post_process.ssgi_mode != .half_res_pass) {
+            std.debug.print("q0-interior: AGATE_Q0_SSGI_TEMPORAL=1 needs AGATE_Q0_SSGI_PASS=1; temporal ignored\n", .{});
+        }
+        scene.post_process.ssgi_temporal_enabled = true;
+    }
     scene.post_process.taa_enabled = true;
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the

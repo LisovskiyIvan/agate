@@ -120,6 +120,10 @@ pub const ssgiPassActive = ssgi.ssgiPassActive;
 pub const ssgiPassParams = ssgi.ssgiPassParams;
 pub const ssgiTargetSize = ssgi.ssgiTargetSize;
 pub const ssgiTargetBytes = ssgi.ssgiTargetBytes;
+pub const ssgiTemporalActive = ssgi.ssgiTemporalActive;
+pub const ssgiTemporalBlend = ssgi.ssgiTemporalBlend;
+pub const ssgiTemporalShouldReset = ssgi.ssgiTemporalShouldReset;
+pub const ssgiTemporalTargetBytes = ssgi.ssgiTemporalTargetBytes;
 
 // --- Analytic Physical Sky (opt-in, Preetham-class) ---
 pub const sky = @import("postprocess/sky.zig");

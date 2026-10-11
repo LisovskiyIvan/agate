@@ -399,6 +399,13 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         if (ssgi_pass.width > 0 and ssgi_pass.height > 0) {
             const ssgi_bytes = ssgi_pass_mod.SsgiPass.targetBytes(ssgi_pass.width, ssgi_pass.height, ssgi_pass_mod.SsgiPass.ssgiBytesPerPixel());
             try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSGI Targets (Gather + Denoised)", @intCast(ssgi_pass.width), @intCast(ssgi_pass.height), .RGBA16F, 1, ssgi_bytes);
+            // Temporal history pair (v2.1, opt-in): counted only while
+            // allocated (the pass frees it on toggle-off, so the gate
+            // keeps the census honest the same lazy way as above).
+            if (ssgi_pass.temporalSized()) {
+                const temp_bytes = ssgi_pass_mod.SsgiPass.temporalTargetBytes(ssgi_pass.width, ssgi_pass.height, ssgi_pass_mod.SsgiPass.ssgiBytesPerPixel());
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSGI Temporal History", @intCast(ssgi_pass.width), @intCast(ssgi_pass.height), .RGBA16F, 1, temp_bytes);
+            }
         }
 
         // Shadow Atlas

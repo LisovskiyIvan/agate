@@ -5,11 +5,12 @@ const Mat4 = math.Mat4;
 const Vec3 = math.Vec3;
 const gather_shd = @import("ssgi_shader");
 const blur_shd = @import("ssgi_blur_shader");
+const temporal_shd = @import("ssgi_temporal_shader");
 const pp = @import("../postprocess.zig");
 const PostProcessOptions = pp.PostProcessOptions;
 
-// Screen-space GI v2: half-resolution jittered-disk gather + bilateral
-// (depth-aware) denoise.
+// Screen-space GI v2: half-resolution jittered-disk gather + temporal
+// accumulation (v2.1, opt-in) + bilateral (depth-aware) denoise.
 //
 // Per active frame (parent gates on postprocess.ssgiPassActive, which is
 // the master enabled + intensity floor + half_res_pass mode; MSAA
@@ -19,9 +20,16 @@ const PostProcessOptions = pp.PostProcessOptions;
 //     v1-identical footprint: `resolution` carries the full effective
 //     size). Outputs normalized bleed * coverage with NO intensity baked
 //     in; intensity scaling stays in the postprocess composite.
-//  2. Blur: 3x3 bilateral over the gather output with the full-res scene
-//     depth as the edge gate, so bleed never crosses silhouettes.
-//  3. Composite: the parent feeds the denoised view into the fullscreen
+//  2. Temporal (opt-in via ssgi_temporal_enabled, default OFF): reproject
+//     the gather output against the velocity buffer (camera-depth fallback
+//     without velocity) into the history ping-pong pair, with variance
+//     clipping + depth/normal/reactive-marker rejection. History holds the
+//     RAW accumulated signal (no intensity); OFF skips this stage and the
+//     denoise samples the gather directly (bit-identical to pre-temporal).
+//  3. Blur: 3x3 bilateral over the temporal (or raw gather) output with
+//     the full-res scene depth as the edge gate, so bleed never crosses
+//     silhouettes.
+//  4. Composite: the parent feeds the denoised view into the fullscreen
 //     postprocess shader, which samples it (bilinear upscale) and adds
 //     bleed * intensity before fog, at the v1 stack position.
 //
@@ -33,16 +41,20 @@ const PostProcessOptions = pp.PostProcessOptions;
 //       ssgi_view = self.ssgi_pass.render(.{
 //           .scene_view = ...,
 //           .depth_view = ...,
+//           .velocity_view = ..., // frame velocity (render-scale), may be empty
+//           .velocity_valid = ...,
 //           .view_proj = ...,
 //           .inv_view_proj = ...,
+//           .prev_view_proj = ..., // camera-fallback reprojection
 //           .camera_pos = ...,
 //           .config = post,
+//           .camera_cut = post.taa_camera_cut, // shared one-frame cut flag
 //           .near_z = ...,
 //           .far_z = ...,
 //           .base_w = fx_w,
 //           .base_h = fx_h,
 //       });
-//       self.stats.draw_calls += 2; // gather + denoise
+//       self.stats.draw_calls += if (postprocess.ssgiTemporalActive(post)) 3 else 2;
 //   }
 //   self.postprocess_pass.setSsgiTexture(ssgi_view);
 //
@@ -54,11 +66,9 @@ const PostProcessOptions = pp.PostProcessOptions;
 // construction. Target destruction is immediate (same as
 // GlowPass.destroyTargets, context thread only). The targets allocate
 // lazily on the first active render, so post-on with pass mode off holds
-// no SSGI VRAM.
-//
-// Temporal accumulation is explicitly OUT of scope (v2.1 item): the
-// per-pixel jitter hands the denoise to the bilateral pass (and TAA
-// downstream), same division of labor as v1.
+// no SSGI VRAM. The temporal pair additionally frees itself on the first
+// pass-active render with the flag off, so disabling temporal releases
+// its VRAM without waiting for a resize.
 pub const SsgiPass = struct {
     gather_image: sg.Image = .{},
     gather_att_view: sg.View = .{},
@@ -68,13 +78,35 @@ pub const SsgiPass = struct {
     blur_att_view: sg.View = .{},
     blur_tex_view: sg.View = .{},
 
+    temp_a_image: sg.Image = .{},
+    temp_a_att_view: sg.View = .{},
+    temp_a_tex_view: sg.View = .{},
+    temp_b_image: sg.Image = .{},
+    temp_b_att_view: sg.View = .{},
+    temp_b_tex_view: sg.View = .{},
+
+    /// Temporal history cursor: read/write slots alternate by parity (CPU
+    /// mirror: ssgiTemporalReadIndex/WriteIndex). Incremented per
+    /// temporal-active render, including reset frames (the reset output
+    /// primes the just-written slot for the next frame).
+    temp_frame: u64 = 0,
+    /// False until the first temporal-active render completes; the parent
+    /// inactivity path clears it, so a mode toggle or disable/enable
+    /// cycle always replays the reset frame.
+    temp_has_history: bool = false,
+    /// Last frame's temporal enable state; a false->true edge is the
+    /// toggle reset (mirrors the TAA toggled_on condition).
+    temp_enabled_prev: bool = false,
+
     sampler: sg.Sampler = .{},
     depth_sampler: sg.Sampler = .{},
 
     gather_pipeline: sg.Pipeline = .{},
     blur_pipeline: sg.Pipeline = .{},
+    temporal_pipeline: sg.Pipeline = .{},
     gather_shader: sg.Shader = .{},
     blur_shader: sg.Shader = .{},
+    temporal_shader: sg.Shader = .{},
 
     quad_vb: sg.Buffer = .{},
     quad_ib: sg.Buffer = .{},
@@ -105,6 +137,19 @@ pub const SsgiPass = struct {
     /// the GlowPass.targetBytes call-site shape).
     pub fn targetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize {
         return pp.ssgiTargetBytes(base_w, base_h, bytes_per_pixel);
+    }
+
+    /// VRAM census helper for the temporal history pair (pure byte math):
+    /// two half-res RGBA16F targets at `bytes_per_pixel`. Counted by the
+    /// census only while temporalSized().
+    pub fn temporalTargetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize {
+        return pp.ssgiTemporalTargetBytes(base_w, base_h, bytes_per_pixel);
+    }
+
+    /// True while the history pair is allocated. Pure handle check (no sg
+    /// calls, headless-safe); the census gate.
+    pub fn temporalSized(self: *const SsgiPass) bool {
+        return self.temp_a_image.id != 0;
     }
 
     pub fn init() SsgiPass {
@@ -180,13 +225,33 @@ pub const SsgiPass = struct {
         blur_desc.layout.attrs[blur_shd.ATTR_ssgi_blur_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
         const blur_pip = sg.makePipeline(blur_desc);
 
+        const temporal_shd_handle = sg.makeShader(temporal_shd.ssgiTemporalShaderDesc(sg.queryBackend()));
+        var temporal_desc = sg.PipelineDesc{
+            .shader = temporal_shd_handle,
+            .index_type = .UINT16,
+            .depth = .{
+                .pixel_format = .NONE,
+                .compare = .ALWAYS,
+                .write_enabled = false,
+            },
+            .cull_mode = .NONE,
+            .sample_count = 1,
+        };
+        temporal_desc.colors[0].pixel_format = ssgi_fmt;
+        temporal_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
+        temporal_desc.layout.attrs[temporal_shd.ATTR_ssgi_temporal_position] = .{ .format = .FLOAT2, .offset = 0 };
+        temporal_desc.layout.attrs[temporal_shd.ATTR_ssgi_temporal_texcoord0] = .{ .format = .FLOAT2, .offset = 2 * @sizeOf(f32) };
+        const temporal_pip = sg.makePipeline(temporal_desc);
+
         return .{
             .sampler = smp,
             .depth_sampler = depth_smp,
             .gather_pipeline = gather_pip,
             .blur_pipeline = blur_pip,
+            .temporal_pipeline = temporal_pip,
             .gather_shader = gather_shd_handle,
             .blur_shader = blur_shd_handle,
+            .temporal_shader = temporal_shd_handle,
             .quad_vb = vb,
             .quad_ib = ib,
         };
@@ -194,7 +259,9 @@ pub const SsgiPass = struct {
 
     /// (Re)allocates both half-res targets from the full EFFECTIVE base
     /// size (ceil-half per axis, the ssgiTargetSize rule). No-op on
-    /// degenerate or unchanged sizes. Context thread only.
+    /// degenerate or unchanged sizes. Destroys the temporal pair as well:
+    /// a resize is a history reset (fresh targets carry no valid history).
+    /// Context thread only.
     pub fn resize(self: *SsgiPass, base_w: i32, base_h: i32) void {
         if (base_w <= 0 or base_h <= 0) return;
         if (!sg.isvalid()) return;
@@ -265,24 +332,109 @@ pub const SsgiPass = struct {
     /// HDR resolve + scene depth); matrices and camera come from the
     /// frame; config carries the SSGI knobs (clamped inside render, so
     /// callers pass the raw frame config); base_w/h is the full
-    /// EFFECTIVE (render-scale) size, never the swapchain size.
+    /// EFFECTIVE (render-scale) size, never the swapchain size. The
+    /// temporal stage additionally consumes the frame velocity view
+    /// (render-scale, may be empty: the shader falls back to camera-depth
+    /// reprojection), the previous view-projection for that fallback, and
+    /// the shared one-frame camera-cut flag (taa_camera_cut doubles as
+    /// the SSGI history reset).
     pub const RenderArgs = struct {
         scene_view: sg.View = .{},
         depth_view: sg.View = .{},
+        velocity_view: sg.View = .{},
+        velocity_valid: bool = false,
         view_proj: Mat4 = Mat4.identity,
         inv_view_proj: Mat4 = Mat4.identity,
+        prev_view_proj: Mat4 = Mat4.identity,
         camera_pos: Vec3 = Vec3.zero,
         config: PostProcessOptions = .{},
+        camera_cut: bool = false,
         near_z: f32 = 0.1,
         far_z: f32 = 100.0,
         base_w: i32 = 0,
         base_h: i32 = 0,
     };
 
-    /// Gathers + denoises the SSGI bleed and returns the denoised
-    /// half-res view (bilinear-upsampled by the composite). Returns an
-    /// empty view when inactive so the caller falls back to the
-    /// placeholder (bit-identical composite). Costs 2 draws.
+    /// Marks the temporal history invalid without touching GPU handles
+    /// (pure bool writes, headless-safe). Called whenever the pass does
+    /// not run (inline mode, disabled, intensity floor): a mode toggle or
+    /// re-enable always replays the reset frame. Missing-handle/size
+    /// early returns leave even this untouched (fail-closed shape).
+    fn noteTemporalInactive(self: *SsgiPass) void {
+        self.temp_has_history = false;
+        self.temp_enabled_prev = false;
+    }
+
+    fn tempReadTexView(self: *const SsgiPass) sg.View {
+        return if (pp.ssgi.ssgiTemporalReadIndex(self.temp_frame) == 0) self.temp_a_tex_view else self.temp_b_tex_view;
+    }
+
+    fn tempWriteAttView(self: *const SsgiPass) sg.View {
+        return if (pp.ssgi.ssgiTemporalWriteIndex(self.temp_frame) == 0) self.temp_a_att_view else self.temp_b_att_view;
+    }
+
+    fn tempWriteTexView(self: *const SsgiPass) sg.View {
+        return if (pp.ssgi.ssgiTemporalWriteIndex(self.temp_frame) == 0) self.temp_a_tex_view else self.temp_b_tex_view;
+    }
+
+    /// Allocates the history ping-pong pair at the pass's half-res size.
+    /// Returns true when (re)created — the caller's reset trigger for the
+    /// frame. No-op (false) when already sized. Context thread only; fails
+    /// closed (false) without publishing partial state.
+    fn ensureTemporal(self: *SsgiPass, base_w: i32, base_h: i32) bool {
+        if (base_w <= 0 or base_h <= 0) return false;
+        if (!sg.isvalid()) return false;
+        if (self.temporalSized()) return false;
+        const size = pp.ssgiTargetSize(base_w, base_h);
+        const ssgi_fmt = ssgiPixelFormat();
+        var imgs: [2]sg.Image = .{ .{}, .{} };
+        var atts: [2]sg.View = .{ .{}, .{} };
+        var texs: [2]sg.View = .{ .{}, .{} };
+        for (0..2) |i| {
+            imgs[i] = sg.makeImage(.{
+                .usage = .{ .color_attachment = true },
+                .width = size.w,
+                .height = size.h,
+                .pixel_format = ssgi_fmt,
+                .sample_count = 1,
+            });
+            if (sg.queryImageState(imgs[i]) != .VALID) {
+                if (imgs[i].id != 0) sg.destroyImage(imgs[i]);
+                if (i == 1) {
+                    sg.destroyView(atts[0]);
+                    sg.destroyView(texs[0]);
+                    sg.destroyImage(imgs[0]);
+                }
+                return false;
+            }
+            atts[i] = sg.makeView(.{ .color_attachment = .{ .image = imgs[i] } });
+            texs[i] = sg.makeView(.{ .texture = .{ .image = imgs[i] } });
+            if (sg.queryViewState(atts[i]) != .VALID or sg.queryViewState(texs[i]) != .VALID) {
+                if (texs[i].id != 0) sg.destroyView(texs[i]);
+                if (atts[i].id != 0) sg.destroyView(atts[i]);
+                sg.destroyImage(imgs[i]);
+                if (i == 1) {
+                    sg.destroyView(atts[0]);
+                    sg.destroyView(texs[0]);
+                    sg.destroyImage(imgs[0]);
+                }
+                return false;
+            }
+        }
+        self.temp_a_image = imgs[0];
+        self.temp_a_att_view = atts[0];
+        self.temp_a_tex_view = texs[0];
+        self.temp_b_image = imgs[1];
+        self.temp_b_att_view = atts[1];
+        self.temp_b_tex_view = texs[1];
+        return true;
+    }
+
+    /// Gathers (+ optionally temporally accumulates) + denoises the SSGI
+    /// bleed and returns the denoised half-res view (bilinear-upsampled by
+    /// the composite). Returns an empty view when inactive so the caller
+    /// falls back to the placeholder (bit-identical composite). Costs 2
+    /// draws, 3 with temporal accumulation active.
     pub fn render(self: *SsgiPass, args: RenderArgs) sg.View {
         if (self.gather_pipeline.id == 0 or self.blur_pipeline.id == 0) return .{};
         if (args.scene_view.id == 0) return .{};
@@ -290,7 +442,10 @@ pub const SsgiPass = struct {
         if (args.base_w <= 0 or args.base_h <= 0) return .{};
 
         const cfg = args.config.clamped();
-        if (!pp.ssgiPassActive(cfg)) return .{};
+        if (!pp.ssgiPassActive(cfg)) {
+            self.noteTemporalInactive();
+            return .{};
+        }
 
         self.resize(args.base_w, args.base_h);
         if (self.width != args.base_w or self.height != args.base_h) return .{};
@@ -339,7 +494,89 @@ pub const SsgiPass = struct {
         sg.draw(0, 6, 1);
         sg.endPass();
 
-        // Stage 2: bilateral (depth-aware) denoise into the second
+        // Stage 2 (opt-in): temporal accumulation of the gather output.
+        // OFF (default): the denoise samples the gather target directly —
+        // the exact pre-temporal frame. ON: reproject + variance-clip +
+        // reject into the history write slot; the denoise samples that.
+        var denoise_src = self.gather_tex_view;
+        if (pp.ssgiTemporalActive(cfg)) {
+            if (self.temporal_pipeline.id != 0) {
+                const recreated = self.ensureTemporal(args.base_w, args.base_h);
+                if (self.temporalSized()) {
+                    const reset = pp.ssgiTemporalShouldReset(.{
+                        .first_frame = !self.temp_has_history,
+                        .toggled_on = !self.temp_enabled_prev,
+                        .resized = recreated,
+                        .camera_cut = args.camera_cut,
+                        .explicit_reset = false,
+                    });
+                    const read_view = self.tempReadTexView();
+                    const history_valid = !reset and read_view.id != 0;
+                    const velocity_live = args.velocity_valid and args.velocity_view.id != 0;
+
+                    var temporal_pass = sg.Pass{
+                        .action = .{
+                            .colors = [_]sg.ColorAttachmentAction{
+                                .{ .load_action = .DONTCARE },
+                            } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                        },
+                    };
+                    temporal_pass.attachments.colors[0] = self.tempWriteAttView();
+                    sg.beginPass(temporal_pass);
+
+                    sg.applyPipeline(self.temporal_pipeline);
+                    var temporal_bind = sg.Bindings{};
+                    temporal_bind.vertex_buffers[0] = self.quad_vb;
+                    temporal_bind.index_buffer = self.quad_ib;
+                    temporal_bind.views[temporal_shd.VIEW_gather_tex] = self.gather_tex_view;
+                    temporal_bind.views[temporal_shd.VIEW_history_tex] = if (history_valid) read_view else self.gather_tex_view;
+                    temporal_bind.views[temporal_shd.VIEW_depth_tex] = args.depth_view;
+                    // Format-correct placeholder (RGBA16F, never sampled:
+                    // the shader gates velocity on temporal_params.y, set
+                    // consistently with this bind).
+                    temporal_bind.views[temporal_shd.VIEW_velocity_tex] = if (velocity_live) args.velocity_view else self.gather_tex_view;
+                    temporal_bind.samplers[temporal_shd.SMP_smp] = self.sampler;
+                    temporal_bind.samplers[temporal_shd.SMP_depth_smp] = self.depth_sampler;
+                    temporal_bind.samplers[temporal_shd.SMP_velocity_smp] = self.depth_sampler;
+                    sg.applyBindings(temporal_bind);
+
+                    const hw: f32 = @floatFromInt(size.w);
+                    const hh: f32 = @floatFromInt(size.h);
+                    const temporal_params = temporal_shd.FsParams{
+                        .inv_view_proj = args.inv_view_proj,
+                        .view_proj = args.view_proj,
+                        .prev_view_proj = args.prev_view_proj,
+                        .resolution = .{ hw, hh, 1.0 / hw, 1.0 / hh },
+                        .full_resolution = .{ fw, fh, 1.0 / fw, 1.0 / fh },
+                        .camera_params = .{ args.near_z, args.far_z, cfg.ssgi_radius, 0.0 },
+                        .temporal_params = .{
+                            if (history_valid) 1.0 else 0.0,
+                            if (velocity_live) 1.0 else 0.0,
+                            pp.ssgiTemporalBlend(cfg),
+                            pp.ssgi.SSGI_TEMPORAL_GAMMA,
+                        },
+                    };
+                    sg.applyUniforms(temporal_shd.UB_fs_params, sg.asRange(&temporal_params));
+                    sg.draw(0, 6, 1);
+                    sg.endPass();
+
+                    // Capture the just-written slot BEFORE advancing the
+                    // cursor: the parity helpers flip with temp_frame.
+                    denoise_src = self.tempWriteTexView();
+                    self.temp_frame += 1;
+                    self.temp_has_history = true;
+                    self.temp_enabled_prev = true;
+                }
+            }
+        } else {
+            // Temporal off: release the pair so disabled temporal holds no
+            // VRAM (one-time destroy on the toggle-off frame; the census
+            // gate temporalSized() goes quiet with it).
+            self.destroyTemporal();
+            self.noteTemporalInactive();
+        }
+
+        // Stage 3: bilateral (depth-aware) denoise into the second
         // half-res target. Intensity stays in the composite.
         var blur_pass = sg.Pass{
             .action = .{
@@ -355,7 +592,7 @@ pub const SsgiPass = struct {
         var blur_bind = sg.Bindings{};
         blur_bind.vertex_buffers[0] = self.quad_vb;
         blur_bind.index_buffer = self.quad_ib;
-        blur_bind.views[blur_shd.VIEW_ssgi_tex] = self.gather_tex_view;
+        blur_bind.views[blur_shd.VIEW_ssgi_tex] = denoise_src;
         blur_bind.views[blur_shd.VIEW_depth_tex] = args.depth_view;
         blur_bind.samplers[blur_shd.SMP_smp] = self.depth_sampler;
         sg.applyBindings(blur_bind);
@@ -373,6 +610,21 @@ pub const SsgiPass = struct {
         return self.blur_tex_view;
     }
 
+    fn destroyTemporal(self: *SsgiPass) void {
+        if (self.temp_a_att_view.id != 0) sg.destroyView(self.temp_a_att_view);
+        if (self.temp_a_tex_view.id != 0) sg.destroyView(self.temp_a_tex_view);
+        if (self.temp_a_image.id != 0) sg.destroyImage(self.temp_a_image);
+        self.temp_a_image = .{};
+        self.temp_a_att_view = .{};
+        self.temp_a_tex_view = .{};
+        if (self.temp_b_att_view.id != 0) sg.destroyView(self.temp_b_att_view);
+        if (self.temp_b_tex_view.id != 0) sg.destroyView(self.temp_b_tex_view);
+        if (self.temp_b_image.id != 0) sg.destroyImage(self.temp_b_image);
+        self.temp_b_image = .{};
+        self.temp_b_att_view = .{};
+        self.temp_b_tex_view = .{};
+    }
+
     fn destroyTargets(self: *SsgiPass) void {
         if (self.gather_att_view.id != 0) sg.destroyView(self.gather_att_view);
         if (self.gather_tex_view.id != 0) sg.destroyView(self.gather_tex_view);
@@ -386,6 +638,10 @@ pub const SsgiPass = struct {
         self.blur_image = .{};
         self.blur_att_view = .{};
         self.blur_tex_view = .{};
+        self.destroyTemporal();
+        self.temp_frame = 0;
+        self.temp_has_history = false;
+        self.temp_enabled_prev = false;
         self.width = 0;
         self.height = 0;
     }
@@ -396,10 +652,13 @@ pub const SsgiPass = struct {
         sg.destroySampler(self.depth_sampler);
         sg.destroyPipeline(self.gather_pipeline);
         sg.destroyPipeline(self.blur_pipeline);
+        sg.destroyPipeline(self.temporal_pipeline);
         if (self.gather_shader.id != 0) sg.destroyShader(self.gather_shader);
         if (self.blur_shader.id != 0) sg.destroyShader(self.blur_shader);
+        if (self.temporal_shader.id != 0) sg.destroyShader(self.temporal_shader);
         self.gather_shader = .{};
         self.blur_shader = .{};
+        self.temporal_shader = .{};
         sg.destroyBuffer(self.quad_vb);
         sg.destroyBuffer(self.quad_ib);
     }

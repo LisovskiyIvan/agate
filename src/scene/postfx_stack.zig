@@ -54,6 +54,7 @@ pub const PostFXStack = struct {
 
     warn_depth_effects: msaa.WarnOnce = .{},
     warn_taa_target: msaa.WarnOnce = .{},
+    warn_ssgi_temporal: msaa.WarnOnce = .{},
 
     outline_enabled: bool = false,
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
@@ -492,23 +493,44 @@ pub const PostFXStack = struct {
         const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
         const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
 
-        // SSGI v2 (half-res pass): gather + bilateral denoise before the
-        // composite, mirroring the SSAO stage above. Runs only in pass
-        // mode (ssgiPassActive: master gate + half_res_pass); the inline
-        // v1 lane packs zeros in this mode so the effect never
-        // double-adds. Sizing is render-scale-aware: the pass derives
-        // half of the EFFECTIVE size (fx_*, never the swapchain size).
-        // MSAA suppression clears ssgi_enabled upstream, so pass mode
-        // joins the existing suppression with no extra branch here.
+        // The velocity view is valid only when this frame's pass rendered
+        // into it (params.velocity_valid, gated on the ensure result in
+        // frame_render): otherwise the zero fallback, so a failed ensure
+        // can never feed a stale-sized target to the composite. Hoisted
+        // above the SSGI block: the temporal stage reprojects against the
+        // same target (unsuppressed — on cut frames its history resets, so
+        // stale vectors are never blended).
+        const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
+            self.velocity_pass.velocityTexView()
+        else
+            sg.View{};
+
+        // SSGI v2 (half-res pass): gather + optional temporal accumulation
+        // + bilateral denoise before the composite, mirroring the SSAO
+        // stage above. Runs only in pass mode (ssgiPassActive: master gate
+        // + half_res_pass); the inline v1 lane packs zeros in this mode so
+        // the effect never double-adds. Sizing is render-scale-aware: the
+        // pass derives half of the EFFECTIVE size (fx_*, never the
+        // swapchain size). MSAA suppression clears ssgi_enabled upstream,
+        // so pass mode joins the existing suppression with no extra branch
+        // here. The temporal flag in inline mode warns once and is ignored
+        // (ssgiTemporalActive gates the pass stage itself).
         var ssgi_view: sg.View = .{};
         if (post.enabled and postprocess.ssgiPassActive(post)) {
+            if (post.ssgi_temporal_enabled and post.ssgi_mode != .half_res_pass) {
+                _ = self.warn_ssgi_temporal.warn("ssgi: ssgi_temporal_enabled needs ssgi_mode=half_res_pass; ignoring temporal", .{});
+            }
             const v = self.ssgi_pass.render(.{
                 .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
                 .depth_view = self.depthSampleView(depth_prepass),
+                .velocity_view = vel_view_in,
+                .velocity_valid = vel_view_in.id != 0,
                 .view_proj = params.view_proj,
                 .inv_view_proj = inv_view_proj,
+                .prev_view_proj = prev_vp,
                 .camera_pos = params.eye,
                 .config = post,
+                .camera_cut = post.taa_camera_cut,
                 .near_z = params.camera.getNear(),
                 .far_z = params.camera.getFar(),
                 .base_w = fx_w,
@@ -516,9 +538,10 @@ pub const PostFXStack = struct {
             });
             if (v.id != 0) {
                 ssgi_view = v;
-                params.stats.post_draw_calls += 2;
-                params.stats.draw_calls += 2;
-                params.stats.triangles += 4;
+                const ssgi_draws: u32 = if (postprocess.ssgiTemporalActive(post)) 3 else 2;
+                params.stats.post_draw_calls += ssgi_draws;
+                params.stats.draw_calls += ssgi_draws;
+                params.stats.triangles += 2 * ssgi_draws;
             }
         }
         self.postprocess_pass.setSsgiTexture(ssgi_view);
@@ -559,14 +582,9 @@ pub const PostFXStack = struct {
             post.taa_camera_cut,
         );
         if (suppress_velocity) post.motion_blur_enabled = false;
-        // The velocity view is valid only when this frame's pass rendered
-        // into it (params.velocity_valid, gated on the ensure result in
-        // frame_render): otherwise the zero fallback, so a failed ensure
-        // can never feed a stale-sized target to the composite.
-        const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
-            self.velocity_pass.velocityTexView()
-        else
-            sg.View{};
+        // Cut-frame gate over the hoisted velocity view (see above): a TAA
+        // reset or a blur-only camera cut binds the zero fallback and skips
+        // the blur gather for exactly this composite.
         const vel_view = if (suppress_velocity) sg.View{} else vel_view_in;
 
         var swap_action = sg.PassAction{};

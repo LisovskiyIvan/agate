@@ -364,6 +364,8 @@ pub fn build(b: *Build) !void {
         // include shape as the SSAO pair above.
         .{ .name = "ssgi_shader", .input = "src/shaders/ssgi.glsl", .output = "ssgi_shader.zig", .includes = true },
         .{ .name = "ssgi_blur_shader", .input = "src/shaders/ssgi_blur.glsl", .output = "ssgi_blur_shader.zig", .includes = true },
+        // SSGI v2.1 temporal accumulation (gather -> temporal -> denoise).
+        .{ .name = "ssgi_temporal_shader", .input = "src/shaders/ssgi_temporal.glsl", .output = "ssgi_temporal_shader.zig", .includes = true },
         .{ .name = "debug_shader", .input = "src/shaders/debug.glsl", .output = "debug_shader.zig" },
         .{ .name = "bloom_down_shader", .input = "src/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
         .{ .name = "bloom_up_shader", .input = "src/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },
