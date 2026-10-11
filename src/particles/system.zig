@@ -58,6 +58,11 @@ const FlowSpace = types.FlowSpace;
 const FlowWrap = types.FlowWrap;
 const SimulationMode = types.SimulationMode;
 const UpdateError = types.UpdateError;
+
+/// Per-system uid counter for `ParticleSystem.ensureUid` (same never-reuse
+/// discipline as Mesh.ensureUid, separate counter so particle churn never
+/// consumes mesh ids and a particle id can never alias a mesh id).
+var ps_uid_next: u64 = 1;
 const ComputeModeError = types.ComputeModeError;
 const GpuParticleSlot = types.GpuParticleSlot;
 const Particle = types.Particle;
@@ -124,6 +129,12 @@ pub const ParticleSystem = struct {
     thread_pool: ?*jobs.Pool = null,
     capacity: usize,
     active_count: usize = 0,
+    /// Stable per-system identity for staged-upload packets (same
+    /// never-reuse discipline as Mesh.uid): frozen into every packet at
+    /// stage time; the game-side commit rejects index/token matches whose
+    /// uid differs (freed owner address recycled at the same slot index).
+    /// Assigned lazily via ensureUid (0 = unassigned, never staged).
+    uid: u64 = 0,
     /// Stage 3: update() stages CPU data and sets these flags; the sg
     /// uploads happen in flushGpuUploads on the render side (sg is
     /// single-context — the update phase must stay free of sg.* calls).
@@ -450,6 +461,22 @@ pub const ParticleSystem = struct {
 
     pub fn stop(self: *ParticleSystem) void {
         self.is_emitting = false;
+    }
+
+    /// Lazily assigns a nonzero stable uid (0 = unassigned), stable for the
+    /// system lifetime and never reused. Idempotent. Serial-use only before
+    /// staged-upload freezes read it.
+    pub fn ensureUid(self: *ParticleSystem) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = ps_uid_next;
+        if (id == 0) {
+            id = 1;
+            ps_uid_next = 1;
+        }
+        ps_uid_next +%= 1;
+        if (ps_uid_next == 0) ps_uid_next = 1;
+        self.uid = id;
+        return id;
     }
 
     pub fn reset(self: *ParticleSystem) void {

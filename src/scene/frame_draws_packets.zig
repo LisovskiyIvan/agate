@@ -37,6 +37,7 @@ pub const MorphUpload = struct {
 };
 pub const ParticleCpuUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     sys_index: u32 = 0,
     buffer_id: u32 = 0,
     count: u32 = 0,
@@ -56,6 +57,7 @@ pub const ParticleCpuUpload = struct {
 };
 pub const ParticleGpuUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     sys_index: u32 = 0,
     buffer_id: u32 = 0,
     count: u32 = 0,
@@ -70,6 +72,7 @@ pub const ParticleGpuUpload = struct {
 };
 pub const ParticleComputeUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     sys_index: u32 = 0,
     spawn_buffer_id: u32 = 0,
     staged: usize = 0,
@@ -140,6 +143,7 @@ pub const ParticleComputeUpload = struct {
 };
 pub const TrailUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     trail_index: u32 = 0,
     vertex_buffer_id: u32 = 0,
     index_buffer_id: u32 = 0,
@@ -165,6 +169,7 @@ pub const TrailUpload = struct {
 };
 pub const SoftUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     body_index: u32 = 0,
     vertex_buffer_id: u32 = 0,
     vert_count: usize = 0,
@@ -186,6 +191,7 @@ pub const SoftUpload = struct {
 };
 pub const GreasedUpload = struct {
     token: usize = 0,
+    uid: u64 = 0,
     line_index: u32 = 0,
     vertex_buffer_id: u32 = 0,
     index_buffer_id: u32 = 0,

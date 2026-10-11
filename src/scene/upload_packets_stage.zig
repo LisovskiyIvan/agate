@@ -85,6 +85,7 @@ fn stageParticleCpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator)
         };
         slot.p_cpu_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
+            .uid = ps.ensureUid(),
             .sys_index = @intCast(i),
             .buffer_id = ps.instance_buffer.id,
             .count = @intCast(count),
@@ -119,6 +120,7 @@ fn stageParticleGpu(scene: anytype, slot: anytype, allocator: std.mem.Allocator)
         };
         slot.p_gpu_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
+            .uid = ps.ensureUid(),
             .sys_index = @intCast(i),
             .buffer_id = ps.gpu_slot_buffer.id,
             .count = @intCast(range.len),
@@ -152,6 +154,7 @@ fn stageParticleCompute(scene: anytype, slot: anytype, allocator: std.mem.Alloca
         }
         slot.p_compute_uploads.append(allocator, .{
             .token = @intFromPtr(ps),
+            .uid = ps.ensureUid(),
             .sys_index = @intCast(i),
             .spawn_buffer_id = ps.compute_spawn_buffer.id,
             .staged = staged,
@@ -216,6 +219,7 @@ fn stageTrails(scene: anytype, slot: anytype, allocator: std.mem.Allocator) void
         };
         slot.trail_uploads.append(allocator, .{
             .token = @intFromPtr(tm),
+            .uid = tm.ensureUid(),
             .trail_index = @intCast(i),
             .vertex_buffer_id = tm.mesh.vertex_buffer.id,
             .index_buffer_id = tm.mesh.index_buffer.id,
@@ -263,6 +267,7 @@ fn stageSoftbodies(scene: anytype, slot: anytype, allocator: std.mem.Allocator) 
         const bb = b.mesh.local_bounding_box;
         slot.soft_uploads.append(allocator, .{
             .token = @intFromPtr(b),
+            .uid = b.ensureUid(),
             .body_index = @intCast(i),
             .vertex_buffer_id = b.mesh.vertex_buffer.id,
             .vert_count = b.vertices.len,
@@ -310,6 +315,7 @@ fn stageGreased(scene: anytype, slot: anytype, allocator: std.mem.Allocator) voi
         }
         slot.greased_uploads.append(allocator, .{
             .token = @intFromPtr(gl),
+            .uid = gl.ensureUid(),
             .line_index = @intCast(i),
             .vertex_buffer_id = gl.mesh.vertex_buffer.id,
             .index_buffer_id = gl.mesh.index_buffer.id,

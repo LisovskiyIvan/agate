@@ -37,6 +37,11 @@ pub const TrailNode = struct {
     age: f32 = 0.0,
 };
 
+/// Per-trail uid counter for `TrailMesh.ensureUid` (same never-reuse
+/// discipline as Mesh.ensureUid, separate counter so trail churn never
+/// consumes mesh ids).
+var trail_uid_next: u64 = 1;
+
 /// Dynamic ribbon mesh following a target object, bone, or world position.
 /// Similar to Babylon.js TrailMesh: generates camera-facing billboard quad strips
 /// with customizable width tapering, lifetime fade-out, and vertex gradients.
@@ -63,6 +68,12 @@ pub const TrailMesh = struct {
     pending_index_count: usize = 0,
     pending_min_pt: Vec3 = undefined,
     pending_max_pt: Vec3 = undefined,
+    /// Stable per-trail identity for staged-upload packets (same
+    /// never-reuse discipline as Mesh.uid): frozen into every packet at
+    /// stage time; the game-side commit rejects index/token matches whose
+    /// uid differs (freed owner address recycled at the same slot index).
+    /// Assigned lazily via ensureUid (0 = unassigned, never staged).
+    uid: u64 = 0,
 
     pub fn init(scene: *Scene, name: []const u8, options: TrailOptions) !*TrailMesh {
         const allocator = scene.allocator;
@@ -398,5 +409,21 @@ pub const TrailMesh = struct {
         self.nodes.deinit(self.allocator);
         self.allocator.free(self.vertices);
         self.allocator.free(self.indices);
+    }
+
+    /// Lazily assigns a nonzero stable uid (0 = unassigned), stable for the
+    /// trail lifetime and never reused. Idempotent. Serial-use only before
+    /// staged-upload freezes read it.
+    pub fn ensureUid(self: *TrailMesh) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = trail_uid_next;
+        if (id == 0) {
+            id = 1;
+            trail_uid_next = 1;
+        }
+        trail_uid_next +%= 1;
+        if (trail_uid_next == 0) trail_uid_next = 1;
+        self.uid = id;
+        return id;
     }
 };

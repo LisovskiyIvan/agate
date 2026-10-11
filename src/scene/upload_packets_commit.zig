@@ -9,7 +9,7 @@ const gpu_retire = @import("gpu_retire.zig");
 /// Game-side commit of staged-upload outcomes (next build, under the game
 /// lock, front slot under a read lease — see buildIntoClaimedSlot). For
 /// every packet in `front` (the published frame), validates the owner by
-/// index/token(/uid) with a pointer compare first — never dereferencing a
+/// index/token/uid with a pointer compare first — never dereferencing a
 /// stale pointer — and either applies the outcome (created-handle
 /// installs, scalar publishes, pending-array frees, compute ring advance)
 /// or re-arms the owner's flags for retry when the outcome is undelivered.
@@ -57,12 +57,12 @@ pub fn restageDroppedSlot(scene: anytype, slot: anytype) void {
         if (up.dirty) m.morph_upload_needed = true;
     }
     for (slot.p_cpu_uploads.items) |up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse continue;
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse continue;
         if (up.dirty) ps.instance_dirty = true;
         if (ps.instance_buffer.id == 0) ps.instance_buffer_pending = true;
     }
     for (slot.p_gpu_uploads.items) |up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse continue;
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse continue;
         if (up.dirty) {
             ps.gpu_dirty = true;
             ps.gpu_dirty_wrapped = true;
@@ -71,23 +71,23 @@ pub fn restageDroppedSlot(scene: anytype, slot: anytype) void {
         if (ps.gpu_slot_buffer.id == 0) ps.gpu_slot_buffer_pending = true;
     }
     for (slot.p_compute_uploads.items) |up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse continue;
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse continue;
         if (ps.compute_staged > 0 or ps.compute_dt_accum != 0.0 or up.flush_pending) ps.compute_flush_pending = true;
         if (up.state_clear_pending) ps.compute_state_clear_pending = true;
         if (ps.compute_state_buffer.id == 0) ps.compute_buffers_pending = true;
     }
     for (slot.trail_uploads.items) |up| {
-        const tm = commitTrailAt(scene, up.trail_index, up.token) orelse continue;
+        const tm = commitTrailAt(scene, up.trail_index, up.token, up.uid) orelse continue;
         if (up.dirty) tm.gpu_dirty = true;
         if (tm.mesh.vertex_buffer.id == 0 or tm.mesh.index_buffer.id == 0) tm.buffers_pending = true;
     }
     for (slot.soft_uploads.items) |up| {
-        const b = commitSoftAt(scene, up.body_index, up.token) orelse continue;
+        const b = commitSoftAt(scene, up.body_index, up.token, up.uid) orelse continue;
         if (up.dirty) b.upload_pending = true;
         if (b.mesh.vertex_buffer.id == 0) b.buffers_pending = true;
     }
     for (slot.greased_uploads.items) |up| {
-        const gl = commitGreasedAt(scene, up.line_index, up.token) orelse continue;
+        const gl = commitGreasedAt(scene, up.line_index, up.token, up.uid) orelse continue;
         if (up.dirty) gl.gpu_dirty = true;
     }
     for (slot.pending_uploads.items) |up| {
@@ -114,35 +114,39 @@ fn commitMeshAt(scene: anytype, mesh_index: u32, token: usize, uid: u64) ?@TypeO
     return m;
 }
 
-fn commitParticleAt(scene: anytype, sys_index: u32, token: usize) ?@TypeOf(scene.particles.systems.items[0]) {
+fn commitParticleAt(scene: anytype, sys_index: u32, token: usize, uid: u64) ?@TypeOf(scene.particles.systems.items[0]) {
     const idx: usize = sys_index;
     if (idx >= scene.particles.systems.items.len) return null;
     const ps = scene.particles.systems.items[idx];
     if (@intFromPtr(ps) != token) return null;
+    if (uid != 0 and ps.uid != uid) return null;
     return ps;
 }
 
-fn commitTrailAt(scene: anytype, trail_index: u32, token: usize) ?@TypeOf(scene.trails.meshes.items[0]) {
+fn commitTrailAt(scene: anytype, trail_index: u32, token: usize, uid: u64) ?@TypeOf(scene.trails.meshes.items[0]) {
     const idx: usize = trail_index;
     if (idx >= scene.trails.meshes.items.len) return null;
     const tm = scene.trails.meshes.items[idx];
     if (@intFromPtr(tm) != token) return null;
+    if (uid != 0 and tm.uid != uid) return null;
     return tm;
 }
 
-fn commitSoftAt(scene: anytype, body_index: u32, token: usize) ?@TypeOf(scene.softbodies.bodies.items[0]) {
+fn commitSoftAt(scene: anytype, body_index: u32, token: usize, uid: u64) ?@TypeOf(scene.softbodies.bodies.items[0]) {
     const idx: usize = body_index;
     if (idx >= scene.softbodies.bodies.items.len) return null;
     const b = scene.softbodies.bodies.items[idx];
     if (@intFromPtr(b) != token) return null;
+    if (uid != 0 and b.uid != uid) return null;
     return b;
 }
 
-fn commitGreasedAt(scene: anytype, line_index: u32, token: usize) ?@TypeOf(scene.greased_lines.items[0]) {
+fn commitGreasedAt(scene: anytype, line_index: u32, token: usize, uid: u64) ?@TypeOf(scene.greased_lines.items[0]) {
     const idx: usize = line_index;
     if (idx >= scene.greased_lines.items.len) return null;
     const gl = scene.greased_lines.items[idx];
     if (@intFromPtr(gl) != token) return null;
+    if (uid != 0 and gl.uid != uid) return null;
     return gl;
 }
 
@@ -156,7 +160,7 @@ fn commitMorphs(scene: anytype, front: anytype) void {
 
 fn commitParticleCpu(scene: anytype, front: anytype) void {
     for (front.p_cpu_uploads.items) |*up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse {
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse {
             retireCreated(scene, up.created_buffer_id);
             up.created_buffer_id = 0;
             continue;
@@ -185,7 +189,7 @@ fn commitParticleCpu(scene: anytype, front: anytype) void {
 
 fn commitParticleGpu(scene: anytype, front: anytype) void {
     for (front.p_gpu_uploads.items) |*up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse {
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse {
             retireCreated(scene, up.created_buffer_id);
             up.created_buffer_id = 0;
             continue;
@@ -218,7 +222,7 @@ fn commitParticleGpu(scene: anytype, front: anytype) void {
 
 fn commitParticleCompute(scene: anytype, front: anytype) void {
     for (front.p_compute_uploads.items) |*up| {
-        const ps = commitParticleAt(scene, up.sys_index, up.token) orelse {
+        const ps = commitParticleAt(scene, up.sys_index, up.token, up.uid) orelse {
             retireComputeCreated(scene, up);
             // Owner gone: the count cannot be applied to any other object
             // (the next token is unrelated), so it is dropped with the
@@ -474,7 +478,7 @@ fn retireComputeCreated(scene: anytype, up: anytype) void {
 
 fn commitTrails(scene: anytype, front: anytype) void {
     for (front.trail_uploads.items) |*up| {
-        const tm = commitTrailAt(scene, up.trail_index, up.token) orelse {
+        const tm = commitTrailAt(scene, up.trail_index, up.token, up.uid) orelse {
             retireCreated(scene, up.created_vertex_buffer_id);
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
@@ -522,7 +526,7 @@ fn commitTrails(scene: anytype, front: anytype) void {
 
 fn commitSoftbodies(scene: anytype, front: anytype) void {
     for (front.soft_uploads.items) |*up| {
-        const b = commitSoftAt(scene, up.body_index, up.token) orelse {
+        const b = commitSoftAt(scene, up.body_index, up.token, up.uid) orelse {
             retireCreated(scene, up.created_vertex_buffer_id);
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
@@ -555,7 +559,7 @@ fn commitSoftbodies(scene: anytype, front: anytype) void {
 
 fn commitGreased(scene: anytype, front: anytype) void {
     for (front.greased_uploads.items) |*up| {
-        const gl = commitGreasedAt(scene, up.line_index, up.token) orelse {
+        const gl = commitGreasedAt(scene, up.line_index, up.token, up.uid) orelse {
             retireCreated(scene, up.created_vertex_buffer_id);
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;

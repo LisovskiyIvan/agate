@@ -71,6 +71,11 @@ pub const max_spheres: usize = 8;
 pub const max_frame_dt: f32 = 0.25;
 pub const max_steps_per_update: usize = 32;
 
+/// Per-body uid counter for `SoftBody.ensureUid` (same never-reuse
+/// discipline as Mesh.ensureUid, separate counter so softbody churn never
+/// consumes mesh ids).
+var soft_uid_next: u64 = 1;
+
 pub const SoftBodyError = error{
     InvalidOptions,
     TooManySoftBodies,
@@ -545,6 +550,12 @@ pub const SoftBody = struct {
     indices: []u32,
     buffers_pending: bool = false,
     upload_pending: bool = false,
+    /// Stable per-body identity for staged-upload packets (same never-reuse
+    /// discipline as Mesh.uid): frozen into every packet at stage time; the
+    /// game-side commit rejects index/token matches whose uid differs
+    /// (freed owner address recycled at the same slot index). Assigned
+    /// lazily via ensureUid (0 = unassigned, never staged).
+    uid: u64 = 0,
 
     fn deinitCpu(self: *SoftBody, allocator: std.mem.Allocator) void {
         self.cloth.deinit();
@@ -553,6 +564,22 @@ pub const SoftBody = struct {
         // Mesh + material stay owned by the scene registries (or the retire
         // queue after remove): never touched here. The name slice is owned
         // by the mesh (owns_name); the material name aliases it.
+    }
+
+    /// Lazily assigns a nonzero stable uid (0 = unassigned), stable for the
+    /// body lifetime and never reused. Idempotent. Serial-use only before
+    /// staged-upload freezes read it.
+    pub fn ensureUid(self: *SoftBody) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = soft_uid_next;
+        if (id == 0) {
+            id = 1;
+            soft_uid_next = 1;
+        }
+        soft_uid_next +%= 1;
+        if (soft_uid_next == 0) soft_uid_next = 1;
+        self.uid = id;
+        return id;
     }
 
     /// Rebuilds staging vertices from solver positions and recomputes

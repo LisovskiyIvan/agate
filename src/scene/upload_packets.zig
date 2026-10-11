@@ -55,12 +55,15 @@
 //! staged frame preparation, and are not called by the normal renderer.
 //!
 //! Identity: descriptors carry `token` (@intFromPtr of the live owner) +
-//! list index (+ uid for meshes). The COMMIT validates token/index (/uid)
-//! with a pointer compare first (never dereferencing a stale pointer):
-//! mismatch skips fail-closed (previous complete GPU state stands, the
-//! created handles retire through the queue, retry next build). Mesh-list
-//! or registry mutation between build and latch violates the app contract;
-//! the guard keeps it coherent, never corrupt.
+//! list index + `uid` (per-owner never-reused generation, all kinds). The
+//! COMMIT validates token/index/uid with a pointer compare first (never
+//! dereferencing a stale pointer): mismatch skips fail-closed (previous
+//! complete GPU state stands, the created handles retire through the queue,
+//! retry next build). The uid closes the ABA hole where a freed owner
+//! address is recycled by the allocator at the same slot index: token and
+//! index alone would alias the new owner. Mesh-list or registry mutation
+//! between build and latch violates the app contract; the guard keeps it
+//! coherent, never corrupt.
 //!
 //! OOM: any packet that fails to stage is skipped like an OOM-skipped
 //! instance segment (no partial packet: data truncated back, descriptor

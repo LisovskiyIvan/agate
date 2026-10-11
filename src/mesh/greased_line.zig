@@ -22,6 +22,11 @@ const gpu_thread = @import("../gpu_thread.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const tangents = @import("tangents.zig");
 
+/// Per-line uid counter for `GreasedLineMesh.ensureUid` (same never-reuse
+/// discipline as Mesh.ensureUid, separate counter so line churn never
+/// consumes mesh ids).
+var greased_uid_next: u64 = 1;
+
 pub const GreasedLineUVMode = enum {
     /// U coordinate ranges from 0.0 at the start to 1.0 at the end of the line.
     relative,
@@ -352,6 +357,12 @@ pub const GreasedLineMesh = struct {
     vertices: []Vertex,
     indices: []u32,
     gpu_dirty: bool = false,
+    /// Stable per-line identity for staged-upload packets (same never-reuse
+    /// discipline as Mesh.uid): frozen into every packet at stage time; the
+    /// game-side commit rejects index/token matches whose uid differs
+    /// (freed owner address recycled at the same slot index). Assigned
+    /// lazily via ensureUid (0 = unassigned, never staged).
+    uid: u64 = 0,
     /// Vertex data has never reached the GPU (or the buffers were just
     /// created): the next flush uploads both vertex and index buffers.
     /// Cleared after the first full upload; later rebuilds update vertices
@@ -451,6 +462,22 @@ pub const GreasedLineMesh = struct {
         self.allocator.free(self.vertices);
         self.allocator.free(self.indices);
         self.allocator.destroy(self);
+    }
+
+    /// Lazily assigns a nonzero stable uid (0 = unassigned), stable for the
+    /// line lifetime and never reused. Idempotent. Serial-use only before
+    /// staged-upload freezes read it.
+    pub fn ensureUid(self: *GreasedLineMesh) u64 {
+        if (self.uid != 0) return self.uid;
+        var id: u64 = greased_uid_next;
+        if (id == 0) {
+            id = 1;
+            greased_uid_next = 1;
+        }
+        greased_uid_next +%= 1;
+        if (greased_uid_next == 0) greased_uid_next = 1;
+        self.uid = id;
+        return id;
     }
 
     /// Dynamically updates the control points of the line.

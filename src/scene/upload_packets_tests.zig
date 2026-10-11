@@ -1340,3 +1340,307 @@ test "upload packets: compute dispatch count transfers exactly once, survives re
     try t.expect(!slot.p_compute_uploads.items[0].delivered);
     try t.expectEqual(@as(u64, 5), ps.compute_dispatches);
 }
+
+// --- H2 ownership ABA: stale outcomes must not install into a recycled owner ---
+//
+// Each test below simulates the audit scenario: owner A stages an upload
+// (packet freezes index + token + uid), A is freed, and a NEW owner B is
+// allocated at the SAME address and slot index (token and index alias).
+// The uid (never-reused generation) is the only discriminator: the commit
+// must reject the stale outcome, leaving B untouched. Without the uid
+// check the stale flags/handles install into the unrelated new owner.
+
+test "upload packets: stale particle-cpu outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    // Owner A at this stack address; uid frozen into a stale outcome below.
+    var storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.p_cpu_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .sys_index = 0,
+        .dirty = true,
+    });
+
+    // Free A, allocate B at the same address (same token, same index).
+    sys_mod.freeTestSystem(&storage);
+    storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&storage);
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var systems = [_]*sys_mod.ParticleSystem{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    // Rejected: B keeps clean flags (no re-arm) and no pending request.
+    try t.expect(!storage.instance_dirty);
+    try t.expect(!storage.instance_buffer_pending);
+}
+
+test "upload packets: stale particle-gpu outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.p_gpu_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .sys_index = 0,
+        .dirty = true,
+    });
+
+    sys_mod.freeTestSystem(&storage);
+    storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&storage);
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var systems = [_]*sys_mod.ParticleSystem{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    try t.expect(!storage.gpu_dirty);
+    try t.expect(!storage.gpu_dirty_wrapped);
+    try t.expect(!storage.gpu_flush_pending);
+    try t.expect(!storage.gpu_slot_buffer_pending);
+}
+
+test "upload packets: stale particle-compute outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const sys_mod = @import("../particles/system.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.p_compute_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .sys_index = 0,
+        .flush_pending = true,
+        .state_clear_pending = true,
+    });
+
+    sys_mod.freeTestSystem(&storage);
+    storage = try sys_mod.makeTestSystem(t.allocator, 4);
+    defer sys_mod.freeTestSystem(&storage);
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var systems = [_]*sys_mod.ParticleSystem{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .systems = systems[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    try t.expect(!storage.compute_flush_pending);
+    try t.expect(!storage.compute_state_clear_pending);
+    try t.expect(!storage.compute_buffers_pending);
+    try t.expectEqual(@as(u64, 0), storage.compute_dispatches);
+}
+
+test "upload packets: stale trail outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const mesh_types = @import("../mesh/types.zig");
+    const trail_mod = @import("../mesh/trail.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var verts = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
+    var idx = [_]u16{ 0, 1, 0 };
+    var mesh = @import("../mesh/mesh.zig").Mesh{ .name = "aba_trail", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    // Owner A at this stack address; freed (overwritten) below.
+    var storage = trail_mod.TrailMesh{
+        .allocator = t.allocator,
+        .scene = undefined,
+        .mesh = &mesh,
+        .options = .{},
+        .vertices = verts[0..],
+        .indices = idx[0..],
+        .pending_min_pt = .{ .x = 0, .y = 0, .z = 0 },
+        .pending_max_pt = .{ .x = 0, .y = 0, .z = 0 },
+    };
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.trail_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .trail_index = 0,
+        .dirty = true,
+    });
+
+    // Owner B recycled at the same address (same token, same index).
+    storage = trail_mod.TrailMesh{
+        .allocator = t.allocator,
+        .scene = undefined,
+        .mesh = &mesh,
+        .options = .{},
+        .vertices = verts[0..],
+        .indices = idx[0..],
+        .pending_min_pt = .{ .x = 0, .y = 0, .z = 0 },
+        .pending_max_pt = .{ .x = 0, .y = 0, .z = 0 },
+    };
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var trails = [_]*trail_mod.TrailMesh{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .trails = trails[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    try t.expect(!storage.gpu_dirty);
+    try t.expect(!storage.buffers_pending);
+}
+
+test "upload packets: stale softbody outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const mesh_types = @import("../mesh/types.zig");
+    const soft_mod = @import("../softbody.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var verts = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 4;
+    var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    var mesh = @import("../mesh/mesh.zig").Mesh{ .name = "aba_soft", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    var storage = soft_mod.SoftBody{
+        .allocator = t.allocator,
+        .cloth = undefined,
+        .mesh = &mesh,
+        .material = undefined,
+        .vertices = verts[0..],
+        .indices = indices[0..],
+    };
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.soft_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .body_index = 0,
+        .dirty = true,
+    });
+
+    storage = soft_mod.SoftBody{
+        .allocator = t.allocator,
+        .cloth = undefined,
+        .mesh = &mesh,
+        .material = undefined,
+        .vertices = verts[0..],
+        .indices = indices[0..],
+    };
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var bodies = [_]*soft_mod.SoftBody{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .bodies = bodies[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    try t.expect(!storage.upload_pending);
+    try t.expect(!storage.buffers_pending);
+}
+
+test "upload packets: stale greased-line outcome rejected on owner uid reuse (ABA)" {
+    const t = std.testing;
+    const mesh_types = @import("../mesh/types.zig");
+    const greased_mod = @import("../mesh/greased_line.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var verts = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 4;
+    var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    var mesh = @import("../mesh/mesh.zig").Mesh{ .name = "aba_greased", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
+    var storage = greased_mod.GreasedLineMesh{
+        .allocator = t.allocator,
+        .scene = undefined,
+        .mesh = &mesh,
+        .options = .{},
+        .vertices = verts[0..],
+        .indices = indices[0..],
+    };
+    const uid_a = storage.ensureUid();
+    const token = @intFromPtr(&storage);
+    try slot.greased_uploads.append(t.allocator, .{
+        .token = token,
+        .uid = uid_a,
+        .line_index = 0,
+        .dirty = true,
+    });
+
+    storage = greased_mod.GreasedLineMesh{
+        .allocator = t.allocator,
+        .scene = undefined,
+        .mesh = &mesh,
+        .options = .{},
+        .vertices = verts[0..],
+        .indices = indices[0..],
+    };
+    const uid_b = storage.ensureUid();
+    try t.expect(uid_b != uid_a);
+
+    var lines = [_]*greased_mod.GreasedLineMesh{&storage};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .lines = lines[0..] }, &retire);
+    commitSlotResults(&fake_scene, &slot);
+
+    try t.expect(!storage.gpu_dirty);
+}
