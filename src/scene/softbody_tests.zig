@@ -71,7 +71,7 @@ test "softbody mesh coupling: vertex layout matches the solver grid" {
     try std.testing.expect(body.mesh.local_bounding_box.isValid());
 }
 
-test "softbody upload flagged once per changed frame, cleared by flush" {
+test "softbody upload flagged once per changed frame, kept by headless flush" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer freeSoftbodyFixture(alloc, &scene);
@@ -86,13 +86,18 @@ test "softbody upload flagged once per changed frame, cleared by flush" {
     try std.testing.expect(body.upload_pending);
     // Staged vertices track the solver.
     for (body.vertices, body.cloth.pos) |v, p| try std.testing.expectEqual(p.toArray(), v.position);
-    // Headless flush clears the flag with no sg.* and no meter bytes.
+    // Headless flush keeps the flag with no sg.* and no meter bytes: no
+    // context exists, so nothing can be delivered — a later context-thread
+    // flush retries (greased/compute discipline).
     scene.flushPendingGpuUploads();
-    try std.testing.expect(!body.upload_pending);
+    try std.testing.expect(body.upload_pending);
     try std.testing.expectEqual(@as(u64, 0), upload_meter.peek());
-    // Zero dt steps nothing and flags nothing.
+    // Zero dt steps nothing and stages nothing new: the kept staging above
+    // is untouched, and a fresh body flags nothing.
+    const still = try scene.addSoftBodyCloth("still", .{ .width = 4, .height = 4 });
     scene.updateSoftBodies(0.0);
-    try std.testing.expect(!body.upload_pending);
+    try std.testing.expect(body.upload_pending);
+    try std.testing.expect(!still.upload_pending);
     _ = upload_meter.takeAndReset();
 }
 

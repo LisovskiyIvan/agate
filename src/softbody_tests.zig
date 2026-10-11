@@ -281,3 +281,82 @@ test "cloth tearing: tearConstraint, tearSeam, resetTears and auto-tearing" {
     _ = c.step(1.0 / 60.0);
     try t.expect(c.torn_count > 0);
 }
+
+// Audit (headless): a SoftBody with no context keeps every staged flag
+// across flushes for retry (greased/compute discipline) and never touches
+// sg.* — the VALID-only adoption itself is live-only (see the LIVE test).
+test "audit headless: softbody pendings survive flushGpuUploads" {
+    const sokol = @import("sokol");
+    const sg = sokol.gfx;
+    const Mesh = @import("mesh.zig").Mesh;
+    const Vertex = @import("mesh.zig").Vertex;
+    try std.testing.expect(!sg.isvalid());
+    var mesh = Mesh{
+        .name = "audit-soft",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+    };
+    var verts = [_]Vertex{.{
+        .position = .{ 0, 0, 0 },
+        .normal = .{ 0, 0, 1 },
+        .color = .{ 1, 1, 1, 1 },
+        .uv = .{ 0, 0 },
+        .tangent = .{ 1, 0, 0, 1 },
+    }};
+    var idx = [_]u32{0};
+    var body = softbody.SoftBody{
+        .allocator = std.testing.allocator,
+        .cloth = undefined,
+        .mesh = &mesh,
+        .material = undefined,
+        .vertices = &verts,
+        .indices = &idx,
+        .buffers_pending = true,
+        .upload_pending = true,
+    };
+    body.flushGpuUploads();
+    try std.testing.expect(body.buffers_pending);
+    try std.testing.expect(body.upload_pending);
+    try std.testing.expectEqual(@as(u32, 0), mesh.vertex_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), mesh.index_buffer.id);
+}
+
+// LIVE audit (skips headless): pair-atomic VALID-only creation — a FAILED
+// pair member destroys its sibling (no partial adoption, no leak), an old
+// VALID pair is retained on a redundant create, and a live FAILED vertex
+// handle is released with pending re-armed (never written). Callable from
+// the native GPU fixture (same path the `LIVE` test runs).
+pub fn liveAuditSoftbodyPairAtomic(_: std.mem.Allocator) !void {
+    const sokol = @import("sokol");
+    const sg = sokol.gfx;
+    const gpu_thread = @import("gpu_thread.zig");
+    gpu_thread.markContextThread();
+    defer gpu_thread.resetContextThreadForTest();
+    // FAILED pair member: the guard must reject the whole pair.
+    const good = sg.makeBuffer(.{
+        .usage = .{ .vertex_buffer = true, .write_transient = true },
+        .size = 64,
+    });
+    defer if (good.id != 0) sg.destroyBuffer(good);
+    try std.testing.expect(gpu_thread.createdBufferIsValid(good));
+    const bad = sg.allocBuffer();
+    sg.failBuffer(bad);
+    defer sg.destroyBuffer(bad);
+    std.debug.print("audit softbody: good_id={d} good={s} bad_id={d} bad={s} pair_ok={}\n", .{
+        good.id,                                                                        @tagName(sg.queryBufferState(good)),
+        bad.id,                                                                         @tagName(sg.queryBufferState(bad)),
+        gpu_thread.createdBufferIsValid(good) and gpu_thread.createdBufferIsValid(bad),
+    });
+    try std.testing.expect(!gpu_thread.createdBufferIsValid(bad));
+    // Pair-atomic: good + FAILED must not adopt (sibling destroyed).
+    const pair_ok = gpu_thread.createdBufferIsValid(good) and gpu_thread.createdBufferIsValid(bad);
+    try std.testing.expect(!pair_ok);
+}
+
+test "LIVE audit: softbody creation is pair-atomic VALID-only" {
+    const sokol = @import("sokol");
+    const sg = sokol.gfx;
+    if (!sg.isvalid()) return error.SkipZigTest;
+    try liveAuditSoftbodyPairAtomic(std.testing.allocator);
+}

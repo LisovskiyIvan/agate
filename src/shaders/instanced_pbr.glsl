@@ -57,113 +57,11 @@ void main() {
 #ifndef SHADOW_ATLAS_SIZE
 #define SHADOW_ATLAS_SIZE 2048.0
 #endif
-layout(binding = 1) uniform fs_params {
-    vec4 eye_pos;
-    vec4 light_dir;
-    vec4 light_color;
-    vec4 ambient_color;
-    vec4 base_color_factor;
-    vec4 pbr_factors; // x: metallic, y: roughness, z: occlusion_strength, w: ibl_intensity
-    vec4 emissive_factor; // xyz: emissive color, w: unused
-    vec4 shadow_params; // x: bias, y: intensity, z: normal_bias, w: filter_radius
-    vec4 shadow_splits; // x: split0, y: split1, z: split2, w: split3
-    mat4 cascade_view_proj[4]; // 4 cascade light view-projection matrices
-    vec4 cascade_debug; // x: debug_cascades, y/z/w: unused
-    vec4 light_counts; // x: num_point_lights, y: num_spot_lights, z/w: unused
-    vec4 point_pos_range[4];
-    vec4 point_color_int[4];
-    vec4 spot_pos_range[2];
-    vec4 spot_dir_inner[2];
-    vec4 spot_color_outer[2];
-    vec4 spot_intensity[2];
-    mat4 spot_view_proj[2];
-    vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: source_radius (0 = legacy 4-tap PCF, > epsilon = spot PCSS)
-    // APPENDED LAST: existing offsets above must not shift for existing bindings.
-    float alpha_cutoff; // cutout threshold; 0.0 disables the alpha test
-    float normal_scale; // normal map xy scale (glTF normalTexture.scale)
-    // APPENDED LAST (wave/ktx2): per-slot KHR_texture_transform UV maps and
-    // manual channel selection. Slot order follows the texture bindings:
-    // 0 albedo, 1 normal, 2 metallic-roughness, 3 emissive, 4 occlusion.
-    vec4 uv_matrix[5]; // per slot: rotation*scale rows [m00, m01, m10, m11]
-    vec4 uv_offset[5]; // per slot: xy offset, zw unused
-    vec4 channel_selectors; // x occlusion, y roughness, z metallic (lane index),
-                            // w: specular anti-aliasing flag (0/1 — Babylon's
-                            // SPECULARAA; see aaRoughnessFactor)
-    // APPENDED LAST (clearcoat/sheen): coat + fabric lobes (scalar/color
-    // plus optional R-mask / rgb-tint maps in pbr-layers v1, bindings 15/16).
-    // Intensity 0 disables the lobe:
-    // every added shader term scales by its intensity and the base-specular
-    // attenuation becomes exactly (1 - 0), so disabled materials render
-    // bit-identically to before. Appended last so no existing offset shifts.
-    vec4 clearcoat_factors; // x: intensity (0 = off), y: roughness, z/w: unused
-    vec4 clearcoat_color; // rgb: coat tint (white = untinted), w: unused
-    vec4 sheen_factors; // x: intensity (0 = off), y: roughness, z/w: unused
-    vec4 sheen_color; // rgb: fabric tint (white = untinted), w: unused
-    // APPENDED LAST (point shadows): 2 shadow slots x 6 cube faces
-    // (+X,-X,+Y,-Y,+Z,-Z). Zeroed by default: the shader early-outs with
-    // zero cost when no point light casts shadows.
-    mat4 point_view_proj[12];
-    vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: source_radius (0 = legacy 4-tap PCF, > epsilon = point PCSS)
-    // APPENDED LAST (multi-directional): up to 4 suns; slot 0 mirrors the
-    // primary (light_dir/light_color, the only shadow caster), slots 1..3
-    // are shadowless fills. Unused/disabled slots are zeroed (intensity 0
-    // skips in the fill loop below).
-    vec4 directional_dir[4];
-    vec4 directional_color_int[4]; // rgb: color, a: intensity
-    // APPENDED LAST (reflection probes, wave 25): per-draw probe state.
-    // x: enabled (0/1), y: probe intensity, z: probe max lod, w: unused.
-    // Zeroed when no probe applies: the shader then takes the no-probe
-    // ambient/IBL path bit-identically. Appended last so no offset shifts.
-    // (Instanced draws always upload zero here — probes skip instanced
-    // batches in v1 — but the lane must exist for layout parity with the
-    // regular/skinned PBR FsParams.)
-    vec4 probe_params;
-    // APPENDED LAST (rect area lights, wave 26, v1): up to 2 rects in
-    // creation order. area_center_int xyz = rect center, w = intensity
-    // (0 when disabled/unused — the loop below skips, so zero lights
-    // render bit-identically); area_right/area_up = half-extent vectors;
-    // area_color rgb = emitted color. Appended last so no offset shifts.
-    // No area-light shadows in v1 (unshadowed by design).
-    vec4 area_center_int[2];
-    vec4 area_right[2];
-    vec4 area_up[2];
-    vec4 area_color[2];
-    // APPENDED LAST (clustered forward lights, wave 30, v1): tile-grid
-    // descriptor for the storage-buffer tile walk below (the light data
-    // itself is never a uniform). clustered_params = (tiles_x, tiles_y,
-    // staged light count, gpu-live 0/1); clustered_viewport = (screen_w,
-    // screen_h, tile_size px, unused). Zeroed with an empty pool (and w =
-    // 0 until a live GPU upload lands), so the loop gates off
-    // bit-identically. Appended last so no offset shifts.
-    vec4 clustered_params;
-    vec4 clustered_viewport;
-    // APPENDED LAST (pbr-layers v1): anisotropy / transmission / SSS.
-    // All zeroed when unused: every new term gates on its factor (0 = off),
-    // so unlayered materials shade bit-identically. Appended last so no
-    // existing offset shifts.
-    vec4 anisotropy_factors; // x: intensity (0 = isotropic/off), y: tangent-plane rotation (rad), z/w: unused
-    vec4 transmission_factors; // x: factor (0 = off), y/z/w: unused
-    vec4 transmission_color; // rgb: throughput tint (white = untinted), w: unused
-    vec4 sss_factors; // x: strength (0 = off), y/z/w: unused
-    vec4 sss_color; // rgb: scatter tint (white = untinted), w: unused
-    // APPENDED LAST (hemispheric light model): Babylon's HemisphericLight is
-    // a light, not a flat ambient — its irradiance interpolates between
-    // `ambient_color.rgb` (groundColor) and `hemi_diffuse.rgb * w` by
-    // `0.5 + 0.5 * dot(N, hemi_dir_intensity.xyz)`. See common/hemi.glsl.
-    vec4 hemi_dir_intensity; // xyz: direction toward the light (normalized), w: intensity
-    vec4 hemi_diffuse; // rgb: diffuse color, a: unused
-    vec4 clearcoat_uv_matrix;
-    vec4 clearcoat_uv_offset;
-    vec4 sheen_uv_matrix;
-    vec4 sheen_uv_offset;
-    vec4 refraction_factors;
-    mat4 refraction_view_proj;
-    vec4 refraction_capture;
-    // APPENDED LAST (probe blending, wave C.2): secondary probe state for smooth transitions.
-    vec4 probe2_params;
-    // APPENDED LAST (box projection, wave Q.2): probe parallax bounds.
-    // xyz = probe center, w = box_extent (0 = infinite / disabled).
-    vec4 probe_box[2];
+layout(binding = 1) uniform fs_view {
+// @include "common/frame_view.glsl"
+};
+layout(binding = 5) uniform fs_mat {
+// @include "common/frame_mat.glsl"
 };
 
 layout(binding = 0) uniform texture2D albedo_tex;
@@ -269,7 +167,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 // pcss_blocker_radius, average blocker depth -> penumbra ->
 // (d_receiver - d_blocker) / d_blocker * light_size, clamped to
 // [min_penumbra, max_penumbra]; the fixed-radius Poisson PCF then runs with the
-// penumbra as its disk radius. Params ride free uniform lanes (fs_params
+// penumbra as its disk radius. Params ride free uniform lanes (fs_view
 // layout unchanged):
 //   cascade_debug.y = pcss_enabled (0.0/1.0)
 //   cascade_debug.z = pcss_light_size

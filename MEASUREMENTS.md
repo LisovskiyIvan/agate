@@ -273,3 +273,40 @@ INCONCLUSIVE, дельты −0.36/+0.59): эффект SSGI (~±0.5 мс) ле�
 порог правила. SIGNIFICANT-ветка покрыта детерминированными юнит-тестами
 (разделённые плечи → SIGNIFICANT с delta 3.0/noise 0.2/flip 3/3);
 живой SIGNIFICANT требует либо пары с эффектом ≫3 мс, либо тихую машину.
+
+## Волна 6 (11.10.2026): CPU/memory A/B перф-фиксов d6c5710 — RESULT_VALID
+
+Парный A/B-харнесс (worktree bench-before=f26b518 / bench-after=d6c5710,
+идентичный bench_perf_tmp.zig, headless, serial jobs.global=null),
+ReleaseFast. Тайминги на RAW smp_allocator (учётный wrapper — отдельный
+--mode=memory процесс), 11 пар AB/BA, 11 сэмплов in-run, калиброванные
+общие reps с warm-margin (cold probe / warmed run floor 0.45, ×2.5,
+гейт ≥100 мс), паритет чексумм всех фаз в обоих модах, DCE+чексуммы,
+std.Io.Clock.awake. Workload (только публичные API): scene 10 мешей×256
+инстансов (1 decal, цикл finish/cancel buildPreparedFrame), anim 64
+кости×3 клипа×192 канала multi-clip eval, tag 128 пиков×4096 повторов,
+physics 48 тел shape-queries×512 раундов, audio 4 noise-войса с постоянным
+cutoff (duration 1e6s — 30s-войсы протухали mid-run меряя тишину, пофикшено),
+TTF 3 глифа/1 керн-пара, macro=all. Медианы ns/rep (before→after, ×):
+
+| кейс | before | after | × |
+|---|---|---|---|
+| physics | 384209 | 79458 | ×4.84 |
+| tag | 125542 | 55959 | ×2.24 |
+| anim | 524729 | 248792 | ×2.11 |
+| macro | 1493375 | 778583 | ×1.92 |
+| audio | 238000 | 173250 | ×1.37 |
+| scene | 96041 | 96500 | ×0.995 |
+| ttf | 106500 | 106000 | ×1.005 |
+
+Процесс /usr/bin/time сырого бинаря: CPU 4.96→2.43 с (−51%), RSS
+18.42→19.25 МБ (+0.84 МБ вкл. рантайм). Memory-режим: вызовы аллокатора
+в timed-окне scene 86130→0, macro 14157→0 (остальные 0→0), запрошенные
+байты −396 МБ/−65 МБ на окно, пик live +66328 Б (индексы+scratch —
+честная цена, не экономия RSS).
+
+Честные ограничения: BENCH — throughput, не FPS приложения; scene-фикстура
+build-dominated (wall-паритет при churn→0); TTF-фикстура мала для выигрыша
+индекса (синтетика 2048 керн-пар ~70× — контекст); по ходу калибровки:
+баг штампа часов, протухание войсов, warm margin cold-probe — 3 невалидных
+прогона отброшены до VALID.

@@ -76,6 +76,10 @@ pub fn renderProbeFace(
     const probe = &scene.probes.probes[index];
     // Resolve the HDR forward set before touching the pass (see above).
     const fwd = scene.forwardFor(1, .RGBA16F);
+    // Shader-material prewarm for the probe-face shape before the pass
+    // opens, so face draws stay lookup-only (same frozen primary queue the
+    // draws below consume).
+    _ = fwd.prewarmShaderMaterials(&draws.primary, .{});
     // FAILED-state guard: nonzero ids are not logical validity (retired
     // epoch handles keep ids). Refuse the face instead of drawing into a
     // dead attachment.
@@ -158,11 +162,11 @@ pub fn renderProbeFace(
 
     var shadow_state_with = env.shadow_uniforms;
     shadow_state_with.mesh_receive_shadows = true;
-    const u_with = scene_uniforms.buildFrameUniforms(shadow_state_with, &frame_ctx);
+    const u_with = scene_uniforms.buildFrameView(shadow_state_with, &frame_ctx, math.Mat4.identity, .{ 0, 1, 1, 0 });
 
     var shadow_state_no = env.shadow_uniforms;
     shadow_state_no.mesh_receive_shadows = false;
-    const u_no = scene_uniforms.buildFrameUniforms(shadow_state_no, &frame_ctx);
+    const u_no = scene_uniforms.buildFrameView(shadow_state_no, &frame_ctx, math.Mat4.identity, .{ 0, 1, 1, 0 });
 
     frame_ctx.uniforms_with_shadows = &u_with;
     frame_ctx.uniforms_without_shadows = &u_no;
@@ -172,6 +176,7 @@ pub fn renderProbeFace(
     // The transparent sort was built for the main eye — order from the
     // probe eye is approximate (documented).
     var current_pipeline_id: u32 = 0;
+    scene_draw.resetViewUploadCache();
     const queues = &draws.primary;
     for (queues.items.items) |item| {
         scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);

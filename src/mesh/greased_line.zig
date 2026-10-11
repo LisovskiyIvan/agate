@@ -380,14 +380,24 @@ pub const GreasedLineMesh = struct {
         // and sokol allows only one update per buffer per frame
         // (VALIDATE_UPDATEBUF_ONCE). `.data` at creation is not an option:
         // this sokol rejects desc.data for .write_* (dynamic_update) buffers.
-        const vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
+        var vb = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = total_verts * @sizeOf(Vertex),
         });
-        const ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
+        var ib = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .index_buffer = true, .write_transient = true },
             .size = total_indices * @sizeOf(u32),
         });
+        // VALID-only adoption: a nonzero FAILED id must never reach the
+        // mesh (flush writes assert VALID) — release and stay deferred.
+        if (!deferred and (vb.id == 0 or ib.id == 0 or
+            sg.queryBufferState(vb) != .VALID or sg.queryBufferState(ib) != .VALID))
+        {
+            if (vb.id != 0) sg.destroyBuffer(vb);
+            if (ib.id != 0) sg.destroyBuffer(ib);
+            vb = .{};
+            ib = .{};
+        }
 
         const mesh = try allocator.create(Mesh);
         errdefer allocator.destroy(mesh);
@@ -500,6 +510,19 @@ pub const GreasedLineMesh = struct {
     /// upload (vertex + index), later rebuilds update vertices only.
     pub fn flushGpuUploads(self: *GreasedLineMesh) void {
         if (!sg.isvalid()) return; // keep dirty: retry once a context exists
+        // A live FAILED handle must never reach a write (asserts VALID):
+        // release the pair and recreate below, keeping the payload staged.
+        if ((self.mesh.vertex_buffer.id != 0 and
+            !gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer)) or
+            (self.mesh.index_buffer.id != 0 and
+                !gpu_thread.createdBufferIsValid(self.mesh.index_buffer)))
+        {
+            if (self.mesh.vertex_buffer.id != 0) sg.destroyBuffer(self.mesh.vertex_buffer);
+            self.mesh.vertex_buffer = .{};
+            if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+            self.mesh.index_buffer = .{};
+            self.gpu_needs_full_upload = true;
+        }
         if (self.mesh.vertex_buffer.id == 0) {
             if (self.vertices.len == 0) return;
             const vb = sg.makeBuffer(.{
@@ -510,18 +533,35 @@ pub const GreasedLineMesh = struct {
                 .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = self.indices.len * @sizeOf(u32),
             });
-            if (vb.id == 0 or ib.id == 0) {
-                // Partial creation (pool exhaustion): destroy what was made
-                // and retry next frame instead of leaking handles.
+            // Pair-atomic VALID-only adoption: FAILED follows the
+            // pool-exhaustion path (destroy, retry next frame).
+            if (!gpu_thread.createdBufferIsValid(vb) or !gpu_thread.createdBufferIsValid(ib)) {
+                // Partial creation (pool exhaustion) or FAILED state:
+                // destroy what was made and retry next frame instead of
+                // leaking handles.
                 if (vb.id != 0) sg.destroyBuffer(vb);
                 if (ib.id != 0) sg.destroyBuffer(ib);
                 return;
             }
-            self.mesh.vertex_buffer = vb;
-            self.mesh.index_buffer = ib;
-            self.gpu_needs_full_upload = true;
+            // Never lose an old VALID pair (see trail/softbody): creation
+            // here implies the mesh holds no live buffers, but guard the
+            // unexpected live VALID case without churn or leak.
+            const old_vb_valid = gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer);
+            const old_ib_valid = gpu_thread.createdBufferIsValid(self.mesh.index_buffer);
+            if (old_vb_valid or old_ib_valid) {
+                sg.destroyBuffer(vb);
+                sg.destroyBuffer(ib);
+            } else {
+                if (self.mesh.vertex_buffer.id != 0) sg.destroyBuffer(self.mesh.vertex_buffer);
+                if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+                self.mesh.vertex_buffer = vb;
+                self.mesh.index_buffer = ib;
+                self.gpu_needs_full_upload = true;
+            }
         }
-        if (self.vertices.len > 0 and self.mesh.vertex_buffer.id != 0) {
+        if (self.vertices.len > 0 and
+            gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer))
+        {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.mesh.vertex_buffer },
                 .src = .{ .data = sg.asRange(self.vertices) },
@@ -531,7 +571,9 @@ pub const GreasedLineMesh = struct {
                 upload_meter.record(self.vertices.len * @sizeOf(Vertex));
             }
         }
-        if (self.indices.len > 0 and self.mesh.index_buffer.id != 0) {
+        if (self.indices.len > 0 and
+            gpu_thread.createdBufferIsValid(self.mesh.index_buffer))
+        {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.mesh.index_buffer },
                 .src = .{ .data = sg.asRange(self.indices) },

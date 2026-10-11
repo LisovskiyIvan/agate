@@ -571,10 +571,12 @@ pub const SoftBody = struct {
     }
 
     /// Context thread only (called from `Scene.flushPendingGpuUploads`).
-    /// Headless-safe: with no sg context the pending flags still clear, so
-    /// tests observe the flag discipline without any `sg.*` call.
+    /// Headless-safe: with no sg context every staged flag is kept for a
+    /// later retry (greased/compute discipline) — no `sg.*` fires headless.
     pub fn flushGpuUploads(self: *SoftBody) void {
-        if (self.buffers_pending and sg.isvalid()) {
+        // Headless: keep everything staged for retry once a context exists.
+        if (!sg.isvalid()) return;
+        if (self.buffers_pending) {
             const vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
@@ -585,18 +587,50 @@ pub const SoftBody = struct {
                 .usage = .{ .index_buffer = true },
                 .data = sg.asRange(self.indices),
             });
-            if (vb.id != 0 and ib.id != 0) {
-                self.mesh.vertex_buffer = vb;
-                self.mesh.index_buffer = ib;
-                self.buffers_pending = false;
-                // Fresh buffers need full content: force the vertex upload.
-                self.upload_pending = true;
+            // Pair-atomic VALID-only adoption: a nonzero FAILED id must not
+            // reach the mesh handles (the write below asserts VALID).
+            // Anything else destroys what was made and keeps pending.
+            if (gpu_thread.createdBufferIsValid(vb) and gpu_thread.createdBufferIsValid(ib)) {
+                // Atomic replace without losing an old VALID pair: pending
+                // implies the mesh holds no live buffers, but a FAILED live
+                // handle from a pre-fix adoption is released here, never
+                // orphaned; an unexpected live VALID pair keeps serving
+                // while the fresh pair is released (no churn, no leak).
+                const old_vb_valid = gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer);
+                const old_ib_valid = gpu_thread.createdBufferIsValid(self.mesh.index_buffer);
+                if (old_vb_valid or old_ib_valid) {
+                    sg.destroyBuffer(vb);
+                    sg.destroyBuffer(ib);
+                    self.buffers_pending = false;
+                } else {
+                    if (self.mesh.vertex_buffer.id != 0) sg.destroyBuffer(self.mesh.vertex_buffer);
+                    if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+                    self.mesh.vertex_buffer = vb;
+                    self.mesh.index_buffer = ib;
+                    self.buffers_pending = false;
+                    // Fresh buffers need full content: force the vertex upload.
+                    self.upload_pending = true;
+                }
             } else {
                 if (vb.id != 0) sg.destroyBuffer(vb);
                 if (ib.id != 0) sg.destroyBuffer(ib);
             }
         }
-        if (self.vertices.len > 0 and self.mesh.vertex_buffer.id != 0) {
+        // A live FAILED vertex handle must never reach the write (asserts
+        // VALID): release it with its index pair and re-arm creation,
+        // keeping the upload staged for retry.
+        if (self.mesh.vertex_buffer.id != 0 and
+            !gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer))
+        {
+            sg.destroyBuffer(self.mesh.vertex_buffer);
+            self.mesh.vertex_buffer = .{};
+            if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+            self.mesh.index_buffer = .{};
+            self.buffers_pending = true;
+            self.upload_pending = true;
+            return;
+        }
+        if (self.vertices.len > 0 and gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer)) {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.mesh.vertex_buffer },
                 .src = .{ .data = sg.asRange(self.vertices) },

@@ -329,8 +329,10 @@ pub fn build(b: *Build) !void {
         // shaders share cluster structs, the shadow/PCF block,
         // areaLightFactor and uvApply (common/*.glsl); the three PBR
         // variants additionally share the BRDF math + channelSelect.
-        // Deliberately NOT shared: fs_params blocks (layout parity +
-        // differing probe semantics) and morph/skin vertex variants.
+        // The three PBR fs wire blocks are shared too (common/frame_view
+        // + common/frame_mat: view-global vs per-material split, wrapped
+        // per shader with its legacy view slot). Deliberately NOT shared:
+        // morph/skin vertex variants.
         .{ .name = "pbr_shader", .input = "src/shaders/pbr.glsl", .output = "pbr_shader.zig", .includes = true },
         .{ .name = "skinned_pbr_shader", .input = "src/shaders/skinned_pbr.glsl", .output = "skinned_pbr_shader.zig", .includes = true },
         .{ .name = "instanced_pbr_shader", .input = "src/shaders/instanced_pbr.glsl", .output = "instanced_pbr_shader.zig", .includes = true },
@@ -767,6 +769,8 @@ fn createShaderMaterialRegistry(
         \\    base: Base,
         \\    vs_ub: u32,
         \\    fs_ub: u32,
+        \\    fs_mat_ub: u32,
+        \\    frame_split: bool,
         \\    user_ub: ?u32,
         \\    vs_user_ub: ?u32,
         \\    params: []const Param,
@@ -866,14 +870,16 @@ fn createShaderMaterialRegistry(
             \\    .key = 0x{X},
             \\    .base = .{s},
             \\    .vs_ub = {s}_mod.UB_vs_params,
-            \\    .fs_ub = {s}_mod.UB_fs_params,
+            \\    .fs_ub = {s}_mod.UB_fs_view,
+            \\    .fs_mat_ub = {s}_mod.UB_fs_mat,
+            \\    .frame_split = true,
             \\    .user_ub = if (@hasDecl({s}_mod, "UB_sm_user_params")) {s}_mod.UB_sm_user_params else null,
             \\    .vs_user_ub = if (@hasDecl({s}_mod, "UB_sm_user_params_vs")) {s}_mod.UB_sm_user_params_vs else null,
             \\    .params = {s}_params(),
             \\    .make_shader = {s}_make_shader,
             \\}};
             \\
-        , .{ mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, prog_name, mat.name, mat.name, mat.name, mat.name, key, @tagName(mat.base), mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, mat.name });
+        , .{ mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, prog_name, mat.name, mat.name, mat.name, mat.name, key, @tagName(mat.base), mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, mat.name, mat.name });
 
         try registry_import_names.appendSlice(b.allocator, &.{ b.fmt("shader_mat_{s}", .{mat.name}), b.fmt("shader_mat_{s}_params", .{mat.name}) });
         try registry_import_modules.appendSlice(b.allocator, &.{ shader_mod, params_mod });

@@ -140,16 +140,17 @@ pub fn renderSceneView(
 
     var shadow_state_with = env.shadow_uniforms;
     shadow_state_with.mesh_receive_shadows = true;
-    const u_with = scene_uniforms.buildFrameUniforms(shadow_state_with, &frame_ctx);
+    const u_with = scene_uniforms.buildFrameView(shadow_state_with, &frame_ctx, view_env.refraction_view_proj, view_env.refraction_capture);
 
     var shadow_state_no = env.shadow_uniforms;
     shadow_state_no.mesh_receive_shadows = false;
-    const u_no = scene_uniforms.buildFrameUniforms(shadow_state_no, &frame_ctx);
+    const u_no = scene_uniforms.buildFrameView(shadow_state_no, &frame_ctx, view_env.refraction_view_proj, view_env.refraction_capture);
 
     frame_ctx.uniforms_with_shadows = &u_with;
     frame_ctx.uniforms_without_shadows = &u_no;
 
     var current_pipeline_id: u32 = 0;
+    scene_draw.resetViewUploadCache();
 
     // Opaque regular meshes first (front-to-back, early-Z).
     for (queues.items.items) |item| {

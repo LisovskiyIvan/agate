@@ -392,3 +392,99 @@ test "sub-emitter spawns into a compute child staged window" {
     try std.testing.expectEqual(@as(f32, 2.0), child.compute_staging[0].velocity_lifetime[0]);
     try std.testing.expectEqual(@as(f32, 10.0), child.compute_staging[0].velocity_lifetime[3]);
 }
+
+// LIVE audit (skips headless): ensure adopts VALID-only — partial failure
+// keeps pending with every nonzero handle VALID (never FAILED), and a
+// pre-installed FAILED state buffer is released with its view (no dangling
+// view), staged work retained, dispatch skipped. Callable from the native
+// GPU fixture (same path the `LIVE` test runs).
+pub fn liveAuditComputeValidAtomic(gpa: std.mem.Allocator) !void {
+    const gpu_thread = @import("../gpu_thread.zig");
+    gpu_thread.markContextThread();
+    defer gpu_thread.resetContextThreadForTest();
+    const sys = @import("system.zig");
+    var ps = try sys.makeComputeSystem(gpa, 4);
+    defer sys.freeTestSystem(&ps);
+    defer {
+        ps.deinitComputeGpuObjects();
+        for ([_]*sg.Buffer{ &ps.compute_state_buffer, &ps.compute_spawn_buffer, &ps.compute_draw_buffer }) |slot| {
+            if (slot.*.id != 0) sg.destroyBuffer(slot.*);
+        }
+    }
+    try ps.updateCompute(0.016);
+    std.debug.print("audit compute: staged={d} high_water={d} dt={d}\n", .{ ps.compute_staged, ps.compute_high_water, ps.compute_dt_accum });
+    ps.compute_buffers_pending = true;
+    const cm = @import("compute_mode.zig");
+    cm.ensureComputeGpu(&ps);
+    std.debug.print("audit compute: after ensure pending={} state_id={d} state={s} spawn_id={d} spawn={s} draw_id={d} draw={s} views={s}/{s}/{s} shader={s} pipeline={s}\n", .{
+        ps.compute_buffers_pending,
+        ps.compute_state_buffer.id,
+        @tagName(sg.queryBufferState(ps.compute_state_buffer)),
+        ps.compute_spawn_buffer.id,
+        @tagName(sg.queryBufferState(ps.compute_spawn_buffer)),
+        ps.compute_draw_buffer.id,
+        @tagName(sg.queryBufferState(ps.compute_draw_buffer)),
+        @tagName(sg.queryViewState(ps.compute_state_view)),
+        @tagName(sg.queryViewState(ps.compute_spawn_view)),
+        @tagName(sg.queryViewState(ps.compute_draw_view)),
+        @tagName(sg.queryShaderState(ps.compute_shader)),
+        @tagName(sg.queryPipelineState(ps.compute_pipeline)),
+    });
+    // Atomicity: pending clear implies every handle VALID; otherwise every
+    // nonzero handle is still VALID (FAILED destroyed inline, retry armed).
+    if (!ps.compute_buffers_pending) {
+        try std.testing.expect(gpu_thread.createdBufferIsValid(ps.compute_state_buffer));
+        try std.testing.expect(gpu_thread.createdBufferIsValid(ps.compute_spawn_buffer));
+        try std.testing.expect(gpu_thread.createdBufferIsValid(ps.compute_draw_buffer));
+        try std.testing.expect(gpu_thread.createdViewIsValid(ps.compute_state_view));
+        try std.testing.expect(gpu_thread.createdViewIsValid(ps.compute_spawn_view));
+        try std.testing.expect(gpu_thread.createdViewIsValid(ps.compute_draw_view));
+        try std.testing.expect(gpu_thread.createdShaderIsValid(ps.compute_shader));
+        try std.testing.expect(gpu_thread.createdPipelineIsValid(ps.compute_pipeline));
+    } else {
+        for ([_]sg.Buffer{ ps.compute_state_buffer, ps.compute_spawn_buffer, ps.compute_draw_buffer }) |b| {
+            if (b.id != 0) try std.testing.expectEqual(sg.ResourceState.VALID, sg.queryBufferState(b));
+        }
+    }
+    // Pre-fix shape: live FAILED state buffer + its view. The next ensure
+    // must release both (no dangling view) and keep pending for retry.
+    const fb = sg.allocBuffer();
+    sg.failBuffer(fb);
+    const fv = sg.allocView();
+    sg.failView(fv);
+    std.debug.print("audit compute: injected FAILED state id={d} st={s} view id={d} st={s}\n", .{
+        fb.id, @tagName(sg.queryBufferState(fb)), fv.id, @tagName(sg.queryViewState(fv)),
+    });
+    ps.compute_state_buffer = fb;
+    ps.compute_state_view = fv;
+    ps.compute_buffers_pending = false;
+    const staged_before = ps.compute_staged;
+    cm.ensureComputeGpu(&ps);
+    std.debug.print("audit compute: after FAILED-cleanup pending={} state_id={d} view_id={d} staged={d} (was {d})\n", .{
+        ps.compute_buffers_pending, ps.compute_state_buffer.id, ps.compute_state_view.id, ps.compute_staged, staged_before,
+    });
+    try std.testing.expect(ps.compute_buffers_pending);
+    try std.testing.expectEqual(@as(u32, 0), ps.compute_state_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), ps.compute_state_view.id);
+    try std.testing.expectEqual(staged_before, ps.compute_staged);
+    // Flush with incomplete creation consumes nothing and dispatches nothing
+    // on the retry path; on the recovery path (creation completes) the state
+    // is VALID again. Either way no dispatch without staged work.
+    const dispatches_before = ps.compute_dispatches;
+    cm.flushComputeUploads(&ps);
+    std.debug.print("audit compute: after flush pending={} dispatches={d} was={d} state_id={d} state={s}\n", .{
+        ps.compute_buffers_pending, ps.compute_dispatches,                                  dispatches_before,
+        ps.compute_state_buffer.id, @tagName(sg.queryBufferState(ps.compute_state_buffer)),
+    });
+    try std.testing.expectEqual(dispatches_before, ps.compute_dispatches);
+    if (ps.compute_buffers_pending) {
+        try std.testing.expectEqual(staged_before, ps.compute_staged);
+    } else {
+        try std.testing.expect(gpu_thread.createdBufferIsValid(ps.compute_state_buffer));
+    }
+}
+
+test "LIVE audit: compute ensure is VALID-atomic, FAILED releases with view" {
+    if (!sg.isvalid()) return error.SkipZigTest;
+    try liveAuditComputeValidAtomic(std.testing.allocator);
+}

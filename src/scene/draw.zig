@@ -36,13 +36,13 @@ pub const FrameContext = uniforms.FrameContext;
 /// module must not import scene.zig). Scene fills it once per frame from the
 /// consumed frame snapshot; every value below is a render-owned COPY — the
 /// draw never dereferences game-mutatable Scene fields, so update may run
-/// concurrently with render. The only mutations are the lazy shader-material
-/// pipeline cache inside `pipelines` (render thread only) and `stats`
-/// (context-owned counters).
+/// concurrently with render. The only mutations are the serial shader-material
+/// prewarm inside `pipelines` (context thread, before the pass opens) and
+/// `stats` (context-owned counters).
 pub const Environment = struct {
-    // Mutable: shader-material pipelines are created lazily on first use
-    // (ShaderMaterialCache.getOrCreate, render thread only); everything else
-    // is a read-only snapshot copy.
+    // Shared: shader-material pipelines are warmed serially before the pass
+    // opens (ShaderMaterialCache.prewarmQueues, context thread only); the
+    // draw itself is lookup-only. Everything else is a read-only snapshot copy.
     pipelines: *ForwardPipelines,
     stats: *SceneStats,
     // Fallback textures for meshes/materials without their own textures:
@@ -112,9 +112,11 @@ pub fn drawRegularItem(
     const mvp = Mat4.mul(ctx.view_proj, model);
     const rec = item.draw_record;
 
-    // Shader materials take their own path: pipeline from the lazy
-    // ShaderMaterialCache, bindings/uniforms per the registration's base
-    // template contract (identical layouts — see drawShaderMaterialItem).
+    // Shader materials take their own path: pipeline from the prewarmed
+    // ShaderMaterialCache (lookup-only here; created serially by
+    // prewarmShaderMaterials before the pass opens), bindings/uniforms per
+    // the registration's base template contract (identical layouts —
+    // see drawShaderMaterialItem).
     if (item.shader_index) |s_idx| {
         if (s_idx < shaders.len) {
             return drawShaderMaterialItem(env, item, ctx, current_pipeline_id, shaders[s_idx], mvp);
@@ -129,6 +131,9 @@ pub fn drawRegularItem(
         sg.applyPipeline(.{ .id = pip_id });
         current_pipeline_id.* = pip_id;
         env.stats.pipeline_switches += 1;
+        // Any pipeline apply invalidates uniform slots (even identical
+        // layouts), so the cached view block must be re-uploaded below.
+        resetViewUploadCache();
     }
 
     var bind = sg.Bindings{};
@@ -207,22 +212,18 @@ pub fn drawRegularItem(
         sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
     }
 
-    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
+    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx, env.refraction_view_proj, env.refraction_capture);
     const coat = resolveCoat(coats, item.coat_index);
-    const fs_params = pbr_shd.FsParams{
-        .eye_pos = f.eye_pos,
-        .light_dir = f.light_dir,
-        .light_color = f.light_color,
-        .ambient_color = f.ambient_color,
-        .hemi_dir_intensity = f.hemi_dir_intensity,
-        .hemi_diffuse = f.hemi_diffuse,
-        .base_color_factor = rec.base_color,
+    const view_ub: u32 = if (skel_bones != null) skinned_pbr_shd.UB_fs_view else pbr_shd.UB_fs_view;
+    applyCachedView(view_ub, pip_id, item.receive_shadows, f);
+    const mat = uniforms.buildFrameMaterial(.{
+        .base_color = rec.base_color,
         .pbr_factors = rec.pbr_factors,
-        .emissive_factor = rec.emissive_color,
+        .emissive_color = rec.emissive_color,
         .alpha_cutoff = rec.alpha_cutoff,
         .normal_scale = rec.normal_scale,
-        .uv_matrix = rec.uv_matrices,
-        .uv_offset = rec.uv_offsets,
+        .uv_matrices = rec.uv_matrices,
+        .uv_offsets = rec.uv_offsets,
         .channel_selectors = rec.channel_selectors,
         .clearcoat_factors = coat.clearcoat_factors,
         .clearcoat_color = coat.clearcoat_color,
@@ -238,39 +239,14 @@ pub fn drawRegularItem(
         .sheen_uv_matrix = coat.sheen_uv_matrix,
         .sheen_uv_offset = coat.sheen_uv_offset,
         .refraction_factors = coat.refraction_factors,
-        .refraction_view_proj = env.refraction_view_proj,
-        .refraction_capture = env.refraction_capture,
-        .shadow_params = f.shadow_params,
-        .shadow_splits = f.shadow_splits,
-        .cascade_view_proj = f.cascade_view_proj,
-        .cascade_debug = f.cascade_debug,
-        .light_counts = f.light_counts,
-        .point_pos_range = f.point_pos_range,
-        .point_color_int = f.point_color_int,
-        .spot_pos_range = f.spot_pos_range,
-        .spot_dir_inner = f.spot_dir_inner,
-        .spot_color_outer = f.spot_color_outer,
-        .spot_intensity = f.spot_intensity,
-        .spot_view_proj = f.spot_view_proj,
-        .spot_shadow_params = f.spot_shadow_params,
-        .point_view_proj = f.point_view_proj,
-        .point_shadow_params = f.point_shadow_params,
-        .directional_dir = f.directional_dir,
-        .directional_color_int = f.directional_color_int,
         .probe_params = prb.params,
         .probe2_params = prb.params2,
         .probe_box = prb.box,
-        .area_center_int = f.area_center_int,
-        .area_right = f.area_right,
-        .area_up = f.area_up,
-        .area_color = f.area_color,
-        .clustered_params = f.clustered_params,
-        .clustered_viewport = f.clustered_viewport,
-    };
+    });
     if (skel_bones != null) {
-        sg.applyUniforms(skinned_pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+        sg.applyUniforms(skinned_pbr_shd.UB_fs_mat, sg.asRange(&mat));
     } else {
-        sg.applyUniforms(pbr_shd.UB_fs_params, sg.asRange(&fs_params));
+        sg.applyUniforms(pbr_shd.UB_fs_mat, sg.asRange(&mat));
     }
 
     sg.draw(item.base_vertex, item.index_count, 1);
@@ -281,8 +257,9 @@ pub fn drawRegularItem(
 
 // Draws one regular queue item whose material is a .shader_material.
 //
-// The pipeline comes from the lazy ShaderMaterialCache (keyed by the
-// registration key); bindings and uniforms reuse the engine module structs
+// The pipeline comes from the prewarmed ShaderMaterialCache (keyed by the
+// registration key; warmed serially before the pass, lookup-only here);
+// bindings and uniforms reuse the engine module structs
 // (shd.* / pbr_shd.*) because hook materials are compiled from the unmodified
 // engine templates — the uniform/texture contract is layout-identical, only
 // the UB slot handles are read from the registration entry.
@@ -302,7 +279,10 @@ fn drawShaderMaterialItem(
     if (item.is_skinned) return; // see limitation note above
 
     const entry = shader_material.entry(snap.entry_index) orelse return;
-    const set = env.pipelines.shader_materials.getOrCreate(entry.key) orelse return;
+    // Lookup-only: pipelines are warmed serially before the pass opens
+    // (ForwardPipelines.prewarmShaderMaterials); creating GPU objects here
+    // would hitch mid-pass, so a miss skips the mesh.
+    const set = env.pipelines.shader_materials.lookup(entry.key) orelse return;
 
     const is_u32 = item.is_u32;
     // Sidedness of hook material comes from snapshot (sm.double_sided) without decal forcing.
@@ -312,13 +292,16 @@ fn drawShaderMaterialItem(
         sg.applyPipeline(.{ .id = pip_id });
         current_pipeline_id.* = pip_id;
         env.stats.pipeline_switches += 1;
+        // Same invalidation as the engine paths — including runtime
+        // external draws, which upload no view block at all.
+        resetViewUploadCache();
     }
 
     var bind = sg.Bindings{};
     bind.vertex_buffers[0] = item.vertex_buffer;
     bind.index_buffer = item.index_buffer;
 
-    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx);
+    const f = frameUniformsForState(env.shadow_uniforms, item.receive_shadows, ctx, Mat4.identity, .{ 0, 1, 1, 0 });
     const alpha_cutoff = item.draw_record.alpha_cutoff;
 
     if (entry.engine_template) {
@@ -374,22 +357,18 @@ fn drawShaderMaterialItem(
         sg.applyUniforms(entry.vs_ub, sg.asRange(&vs_params));
         sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
 
-        const fs_params = pbr_shd.FsParams{
-            .eye_pos = f.eye_pos,
-            .light_dir = f.light_dir,
-            .light_color = f.light_color,
-            .ambient_color = f.ambient_color,
-            .hemi_dir_intensity = f.hemi_dir_intensity,
-            .hemi_diffuse = f.hemi_diffuse,
-            .base_color_factor = snap.tint,
+        // Shared per-draw material inputs (hook materials carry engine
+        // defaults: tint, fixed PBR factors, identity UVs, neutral coat).
+        const hook_inputs: uniforms.MaterialUniformInputs = .{
+            .base_color = snap.tint,
             .pbr_factors = .{ 0.0, 0.5, 1.0, env.ibl_intensity },
-            .emissive_factor = .{ 0, 0, 0, 1 },
+            .emissive_color = .{ 0, 0, 0, 1 },
             .alpha_cutoff = alpha_cutoff,
             .normal_scale = 1.0,
             // Hook materials carry no per-slot maps: identity UVs and
             // the glTF channel conventions.
-            .uv_matrix = identityUvMatrices(),
-            .uv_offset = identityUvOffsets(),
+            .uv_matrices = identityUvMatrices(),
+            .uv_offsets = identityUvOffsets(),
             .channel_selectors = pbrChannelSelectors(null),
             // Hook materials carry no coat/fabric layers: neutral-disabled.
             .clearcoat_factors = material_mod.CoatParams.neutral.clearcoat_factors,
@@ -406,36 +385,30 @@ fn drawShaderMaterialItem(
             .sheen_uv_matrix = material_mod.CoatParams.neutral.sheen_uv_matrix,
             .sheen_uv_offset = material_mod.CoatParams.neutral.sheen_uv_offset,
             .refraction_factors = material_mod.CoatParams.neutral.refraction_factors,
-            .refraction_view_proj = Mat4.identity,
-            .refraction_capture = .{ 0, 1, 1, 0 },
-            .shadow_params = f.shadow_params,
-            .shadow_splits = f.shadow_splits,
-            .cascade_view_proj = f.cascade_view_proj,
-            .cascade_debug = f.cascade_debug,
-            .light_counts = f.light_counts,
-            .point_pos_range = f.point_pos_range,
-            .point_color_int = f.point_color_int,
-            .spot_pos_range = f.spot_pos_range,
-            .spot_dir_inner = f.spot_dir_inner,
-            .spot_color_outer = f.spot_color_outer,
-            .spot_intensity = f.spot_intensity,
-            .spot_view_proj = f.spot_view_proj,
-            .spot_shadow_params = f.spot_shadow_params,
-            .point_view_proj = f.point_view_proj,
-            .point_shadow_params = f.point_shadow_params,
-            .directional_dir = f.directional_dir,
-            .directional_color_int = f.directional_color_int,
             .probe_params = prb_hook.params,
             .probe2_params = prb_hook.params2,
             .probe_box = prb_hook.box,
-            .area_center_int = f.area_center_int,
-            .area_right = f.area_right,
-            .area_up = f.area_up,
-            .area_color = f.area_color,
-            .clustered_params = f.clustered_params,
-            .clustered_viewport = f.clustered_viewport,
         };
-        sg.applyUniforms(entry.fs_ub, sg.asRange(&fs_params));
+        if (entry.frame_split) {
+            // Split wire (static hook templates): view cached per
+            // contiguous run, material per draw. Refraction camera is the
+            // legacy hook pair (identity, disabled) — the hook branch
+            // never samples the refraction target.
+            var hook_view = f.*;
+            hook_view.refraction_view_proj = Mat4.identity;
+            hook_view.refraction_capture = .{ 0, 1, 1, 0 };
+            applyCachedView(entry.fs_ub, pip_id, item.receive_shadows, &hook_view);
+            const hook_mat = uniforms.buildFrameMaterial(hook_inputs);
+            sg.applyUniforms(entry.fs_mat_ub, sg.asRange(&hook_mat));
+        } else {
+            // Legacy wire (runtime engine_template=true, default): the
+            // pre-split 2560-byte block, whole per draw by design — public
+            // API preservation, deliberately not view-cached. The pipeline
+            // switch above already invalidated the cache, and this branch
+            // neither reads nor writes it, so no stale view can survive.
+            const legacy = uniforms.buildLegacyFsParams(f, hook_inputs, Mat4.identity, .{ 0, 1, 1, 0 });
+            sg.applyUniforms(entry.fs_ub, sg.asRange(&legacy));
+        }
     } else {
         // Runtime-registered custom source: vertex/index binds plus the
         // material texture at view slot 0 (sokol tolerates binding slots the
@@ -474,7 +447,7 @@ fn drawShaderMaterialItem(
     env.stats.triangles += item.index_count / 3;
 }
 
-threadlocal var fallback_uniforms: uniforms.FrameUniforms = undefined;
+threadlocal var fallback_view: uniforms.FrameViewUniforms = undefined;
 
 pub const ProbeDrawState = struct {
     params: [4]f32,
@@ -535,7 +508,13 @@ fn bindClusteredViews(bind: *sg.Bindings, comptime module: anytype, env: *const 
     bind.views[module.VIEW_ssbo_cluster_indices] = v.indices;
 }
 
-fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_shadows: bool, ctx: *const FrameContext) *const uniforms.FrameUniforms {
+pub fn frameUniformsForState(
+    shadow_uniforms: uniforms.ShadowState,
+    mesh_receive_shadows: bool,
+    ctx: *const FrameContext,
+    refraction_view_proj: Mat4,
+    refraction_capture: [4]f32,
+) *const uniforms.FrameViewUniforms {
     if (mesh_receive_shadows) {
         if (ctx.uniforms_with_shadows) |u| return u;
     } else {
@@ -543,8 +522,75 @@ fn frameUniformsForState(shadow_uniforms: uniforms.ShadowState, mesh_receive_sha
     }
     var state = shadow_uniforms;
     state.mesh_receive_shadows = mesh_receive_shadows;
-    fallback_uniforms = uniforms.buildFrameUniforms(state, ctx);
-    return &fallback_uniforms;
+    // Direct-draw fallback (no cached per-view variants): the refraction
+    // camera is the caller's live env pair, never a hardcoded identity —
+    // hook draws pass the explicit identity/disabled pair themselves.
+    fallback_view = uniforms.buildFrameView(state, ctx, refraction_view_proj, refraction_capture);
+    return &fallback_view;
+}
+
+// View-block upload cache (fs_params split).
+//
+// Sokol invalidates bindings AND uniform slots on applyPipeline even for
+// identical layouts (sokol_gfx.h: "bindings are not preserved across
+// sg_apply_pipeline() calls, even when the new pipeline uses the same
+// 'bindings layout'" + VALIDATE_DRAW_REQUIRED_BINDINGS_OR_UNIFORMS_MISSING),
+// so the view block must be re-uploaded on every pipeline switch — but it
+// is constant across draws that share a contiguous pipeline run, the same
+// view, and the same receive-shadow policy. The cache skips exactly those
+// redundant uploads: upload when the pipeline changed, when the shadow
+// policy flipped (the view block carries the receive gate via the
+// with/without-shadows variants), or after a view change.
+//
+// View changes reset the cache explicitly at the view boundary
+// (resetViewUploadCache in renderSceneView/renderProbeFace): the frame
+// context lives on the caller's stack, so a raw context pointer would
+// alias across sequential views and cause a false hit. Within one view
+// the context, refraction camera, and clustered slot are constant, so
+// (pipeline, shadow) is a complete key. Pure decision logic in
+// viewCacheNeed (unit-tested without GPU); the sg.* upload stays here.
+pub const ViewUploadCache = struct {
+    pipeline: u32 = 0,
+    shadow: bool = false,
+    valid: bool = false,
+
+    pub fn needUpload(self: ViewUploadCache, pip_id: u32, receive_shadows: bool) bool {
+        return !self.valid or self.pipeline != pip_id or self.shadow != receive_shadows;
+    }
+};
+
+threadlocal var view_cache: ViewUploadCache = .{};
+
+/// Invalidates the view-block cache at a view boundary (new FrameContext /
+/// refraction camera / clustered slot). Every renderSceneView/renderProbeFace
+/// call resets; the first draw of the view then always uploads.
+pub fn resetViewUploadCache() void {
+    view_cache = .{};
+}
+
+/// Pure cache decision (no GPU calls): true when the view block must be
+/// uploaded for (pip_id, receive_shadows) given the current cache.
+pub fn viewCacheNeed(pip_id: u32, receive_shadows: bool) bool {
+    return view_cache.needUpload(pip_id, receive_shadows);
+}
+
+/// Records a completed view-block upload (no GPU calls): drives the
+/// external-invalidation trace test through the real helpers without a
+/// graphics context.
+pub fn viewCacheNoteUpload(pip_id: u32, receive_shadows: bool) void {
+    viewCacheMark(pip_id, receive_shadows);
+}
+
+fn viewCacheMark(pip_id: u32, receive_shadows: bool) void {
+    view_cache = .{ .pipeline = pip_id, .shadow = receive_shadows, .valid = true };
+}
+
+/// Uploads the view block on `ub_slot` unless the cache proves it redundant
+/// for this contiguous (pipeline, shadow-policy) run. No-op without GPU.
+fn applyCachedView(ub_slot: u32, pip_id: u32, receive_shadows: bool, view: *const uniforms.FrameViewUniforms) void {
+    if (!view_cache.needUpload(pip_id, receive_shadows)) return;
+    sg.applyUniforms(ub_slot, sg.asRange(view));
+    viewCacheMark(pip_id, receive_shadows);
 }
 
 // Resolves the coat/fabric factors for a draw: the owned side-table copy by
@@ -663,6 +709,9 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         sg.applyPipeline(.{ .id = pip_id });
         current_pipeline_id.* = pip_id;
         env.stats.pipeline_switches += 1;
+        // Any pipeline apply invalidates uniform slots (even identical
+        // layouts), so the cached view block must be re-uploaded below.
+        resetViewUploadCache();
     }
 
     var bind = sg.Bindings{};
@@ -720,48 +769,17 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     };
     sg.applyUniforms(inst_pbr_shd.UB_vs_params, sg.asRange(&inst_vs));
 
-    const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx);
+    const f = frameUniformsForState(env.shadow_uniforms, batch.receive_shadows, ctx, env.refraction_view_proj, env.refraction_capture);
     const coat = resolveCoat(coats, batch.coat_index);
-    const inst_fs = inst_pbr_shd.FsParams{
-        .eye_pos = f.eye_pos,
-        .light_dir = f.light_dir,
-        .light_color = f.light_color,
-        .ambient_color = f.ambient_color,
-        .hemi_dir_intensity = f.hemi_dir_intensity,
-        .hemi_diffuse = f.hemi_diffuse,
-        .base_color_factor = rec.base_color,
+    applyCachedView(inst_pbr_shd.UB_fs_view, pip_id, batch.receive_shadows, f);
+    const inst_mat = uniforms.buildFrameMaterial(.{
+        .base_color = rec.base_color,
         .pbr_factors = rec.pbr_factors,
-        .emissive_factor = rec.emissive_color,
-        .shadow_params = f.shadow_params,
-        .shadow_splits = f.shadow_splits,
-        .cascade_view_proj = f.cascade_view_proj,
-        .cascade_debug = f.cascade_debug,
-        .light_counts = f.light_counts,
-        .point_pos_range = f.point_pos_range,
-        .point_color_int = f.point_color_int,
-        .spot_pos_range = f.spot_pos_range,
-        .spot_dir_inner = f.spot_dir_inner,
-        .spot_color_outer = f.spot_color_outer,
-        .spot_intensity = f.spot_intensity,
-        .spot_view_proj = f.spot_view_proj,
-        .spot_shadow_params = f.spot_shadow_params,
-        .point_view_proj = f.point_view_proj,
-        .point_shadow_params = f.point_shadow_params,
-        .directional_dir = f.directional_dir,
-        .directional_color_int = f.directional_color_int,
-        .probe_params = prb.params,
-        .probe2_params = prb.params2,
-        .probe_box = prb.box,
-        .area_center_int = f.area_center_int,
-        .area_right = f.area_right,
-        .area_up = f.area_up,
-        .area_color = f.area_color,
-        .clustered_params = f.clustered_params,
-        .clustered_viewport = f.clustered_viewport,
+        .emissive_color = rec.emissive_color,
         .alpha_cutoff = rec.alpha_cutoff,
         .normal_scale = rec.normal_scale,
-        .uv_matrix = rec.uv_matrices,
-        .uv_offset = rec.uv_offsets,
+        .uv_matrices = rec.uv_matrices,
+        .uv_offsets = rec.uv_offsets,
         .channel_selectors = rec.channel_selectors,
         .clearcoat_factors = coat.clearcoat_factors,
         .clearcoat_color = coat.clearcoat_color,
@@ -777,10 +795,11 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         .sheen_uv_matrix = coat.sheen_uv_matrix,
         .sheen_uv_offset = coat.sheen_uv_offset,
         .refraction_factors = coat.refraction_factors,
-        .refraction_view_proj = env.refraction_view_proj,
-        .refraction_capture = env.refraction_capture,
-    };
-    sg.applyUniforms(inst_pbr_shd.UB_fs_params, sg.asRange(&inst_fs));
+        .probe_params = prb.params,
+        .probe2_params = prb.params2,
+        .probe_box = prb.box,
+    });
+    sg.applyUniforms(inst_pbr_shd.UB_fs_mat, sg.asRange(&inst_mat));
 
     sg.draw(0, batch.index_count, batch.visible_instance_count);
     env.stats.main_draw_calls += 1;

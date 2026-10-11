@@ -115,7 +115,13 @@ pub fn gpuUploadRange(self: anytype) ?[]GpuParticleSlot {
 }
 
 pub fn flushGpuUpload(self: anytype) void {
+    // Headless: keep everything staged for retry (greased/compute
+    // discipline) — never write without a context.
+    if (!sg.isvalid()) return;
     if (self.gpu_slot_buffer.id == 0) return;
+    // Never write a FAILED handle (the validator asserts VALID): the
+    // caller re-arms creation for it — skip here without consuming.
+    if (sg.queryBufferState(self.gpu_slot_buffer) != .VALID) return;
     if (gpuUploadRange(self)) |range| {
         sg.writeBufferTransient(.{
             .dst = .{ .buffer = self.gpu_slot_buffer },

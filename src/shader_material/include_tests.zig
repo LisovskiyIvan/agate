@@ -97,6 +97,8 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/specular_aa.glsl", .text = @embedFile("../shaders/common/specular_aa.glsl") },
         .{ .name = "shaders/common/linear_output.glsl", .text = @embedFile("../shaders/common/linear_output.glsl") },
         .{ .name = "shaders/common/box_project.glsl", .text = @embedFile("../shaders/common/box_project.glsl") },
+        .{ .name = "shaders/common/frame_view.glsl", .text = @embedFile("../shaders/common/frame_view.glsl") },
+        .{ .name = "shaders/common/frame_mat.glsl", .text = @embedFile("../shaders/common/frame_mat.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{
@@ -143,19 +145,29 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return n;
 }
 
-test "drift: fs_params probe lane parity across the three forward shaders" {
-    // Every forward fs_params block carries `vec4 probe_params;` exactly
-    // once (per-draw probe state appended last; layout parity across PBR
-    // variants is load-bearing — see build.zig and lights/probe uploads).
+test "drift: fs_view/fs_mat parity across the three forward shaders" {
+    // Post-split invariant: no forward shader declares raw fs lanes
+    // anymore — each wraps the two shared chunks exactly once, and the
+    // per-draw probe lanes live exactly once in the shared material
+    // chunk (layout parity across PBR variants is load-bearing — see
+    // build.zig and lights/probe uploads).
     const shaders = [_][]const u8{
         @embedFile("../shaders/pbr.glsl"),
         @embedFile("../shaders/instanced_pbr.glsl"),
         @embedFile("../shaders/skinned_pbr.glsl"),
     };
     for (shaders) |src| {
-        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "vec4 probe_params;"));
-        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "vec4 probe_box[2];"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/frame_view.glsl\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/frame_mat.glsl\""));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "vec4 probe_params;"));
+        try std.testing.expect(std.mem.indexOf(u8, src, "uniform fs_params") == null);
     }
+    const mat = @embedFile("../shaders/common/frame_mat.glsl");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(mat, "vec4 probe_params;"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(mat, "vec4 probe_box[2];"));
+    const view = @embedFile("../shaders/common/frame_view.glsl");
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(view, "mat4 cascade_view_proj[4];"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(view, "mat4 refraction_view_proj;"));
 }
 
 test "drift: depth-only twin programs (shadow vs msaa_depth)" {

@@ -736,6 +736,10 @@ pub const RenderTarget = struct {
         // into the same image. Inspect staged records, never live materials.
         if (self.queuesSampleSelf(&draws.primary, true)) return error.FeedbackLoop;
         for (scene.particles.frame.items) |record| if (self.recordSamplesSelf(record)) return error.FeedbackLoop;
+        // Shader-material prewarm for THIS target shape: the forward set is
+        // resolved above and the frozen queues are pinned, so warm now —
+        // before the pass opens — and capture draws stay lookup-only.
+        _ = fwd_pipelines.prewarmShaderMaterials(&draws.primary, .{});
         if (!self.begin(opts.clear_color, opts.depth_clear)) return error.PassBeginFailed;
 
         // Render-owned draw environment: snapshot copies only (same shape

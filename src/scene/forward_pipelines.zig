@@ -98,28 +98,120 @@ pub const ShaderMaterialCache = struct {
     /// is full, or pipeline creation failed (the draw path skips the mesh —
     /// a material bug must not take the frame down; core pipeline failures
     /// in ForwardPipelines.init still panic loudly).
+    ///
+    /// Context-side prewarm (ShaderMaterialCache.prewarmQueues) is the only
+    /// caller that must run before a pass opens; the in-pass draw path uses
+    /// lookup-only (see drawShaderMaterialItem) so no GPU object is created
+    /// mid-pass.
     pub fn getOrCreate(self: *ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
         if (self.lookup(key)) |set| return set;
         const entry = shader_material.entryForKey(key) orelse return null;
         const slot_key = shaderMaterialKeyForShape(key, self.shape);
+        const slot = self.claimEmptySlot() orelse return null;
+        const shader = entry.make_shader(sg.queryBackend());
+        if (shader.id == 0) return null;
+        slot.shader = shader;
+        var desc = scene_pipelines.forwardDescForShape(shader, self.shape);
+        scene_pipelines.pipelineLayoutFor(switch (entry.base) {
+            .standard, .pbr => .pbr,
+        }, &desc);
+        scene_pipelines.makePipelinePair(desc, &slot.opaque_u16, &slot.opaque_u32, &slot.blend_u16, &slot.blend_u32);
+        scene_pipelines.makeCullOffPair(desc, &slot.ds_opaque_u16, &slot.ds_opaque_u32, &slot.ds_blend_u16, &slot.ds_blend_u32);
+        slot.key = slot_key;
+        if (slot.opaque_u16.id == 0) {
+            // Creation failed: release the claim (destroying any partial
+            // handles) so the dead key neither occupies a slot nor poisons
+            // later lookups — the next prewarm retries cleanly.
+            self.releaseSlot(slot);
+            return null;
+        }
+        return slot;
+    }
+
+    /// Claims an empty slot: the occupancy + overflow discipline shared with
+    /// getOrCreate, minus GPU work. Test/dummy seam — lets headless tests
+    /// exercise the real slot management with traced fills. Null (bumping
+    /// overflow_count, like getOrCreate) when full.
+    pub fn claimEmptySlot(self: *ShaderMaterialCache) ?*ShaderMaterialSet {
         for (&self.slots) |*slot| {
-            if (slot.key == 0 and slot.opaque_u16.id == 0 and slot.shader.id == 0) {
-                const shader = entry.make_shader(sg.queryBackend());
-                if (shader.id == 0) return null;
-                slot.shader = shader;
-                var desc = scene_pipelines.forwardDescForShape(shader, self.shape);
-                scene_pipelines.pipelineLayoutFor(switch (entry.base) {
-                    .standard, .pbr => .pbr,
-                }, &desc);
-                scene_pipelines.makePipelinePair(desc, &slot.opaque_u16, &slot.opaque_u32, &slot.blend_u16, &slot.blend_u32);
-                scene_pipelines.makeCullOffPair(desc, &slot.ds_opaque_u16, &slot.ds_opaque_u32, &slot.ds_blend_u16, &slot.ds_blend_u32);
-                slot.key = slot_key;
-                if (slot.opaque_u16.id == 0) return null; // creation failed
-                return slot;
-            }
+            if (slot.key == 0 and slot.opaque_u16.id == 0 and slot.shader.id == 0) return slot;
         }
         self.overflow_count += 1;
         return null;
+    }
+
+    /// Releases a claimed slot back to empty, destroying any partial GPU
+    /// handles. Local fix for the id-only weakness: a failed creation must
+    /// not leave a keyed-but-dead slot behind (lookup requires a live
+    /// opaque pipeline, so such a slot would read as a permanent miss while
+    /// still consuming capacity).
+    fn releaseSlot(self: *ShaderMaterialCache, slot: *ShaderMaterialSet) void {
+        _ = self;
+        inline for (.{
+            &slot.opaque_u16,    &slot.opaque_u32,
+            &slot.blend_u16,     &slot.blend_u32,
+            &slot.ds_opaque_u16, &slot.ds_opaque_u32,
+            &slot.ds_blend_u16,  &slot.ds_blend_u32,
+        }) |pipe| {
+            if (pipe.*.id != 0 and sg.isvalid()) sg.destroyPipeline(pipe.*);
+            pipe.* = .{};
+        }
+        if (slot.shader.id != 0 and sg.isvalid()) sg.destroyShader(slot.shader);
+        slot.shader = .{};
+        slot.key = 0;
+    }
+
+    /// Serial context-side prewarm of exactly these keys, in order.
+    /// Reuses existing entries (no GPU work); creates misses via
+    /// getOrCreate. Headless/no-context returns skipped with zero GPU
+    /// calls. `creator` is the trace-hook seam: production passes
+    /// RealCreator (getOrCreate); tests pass a dummy asserting the
+    /// outside-pass contract with counted fills.
+    pub fn prewarmKeys(self: *ShaderMaterialCache, keys: []const u64) PrewarmStats {
+        return self.prewarmKeysWith(keys, RealCreator{});
+    }
+
+    pub fn prewarmKeysWith(self: *ShaderMaterialCache, keys: []const u64, creator: anytype) PrewarmStats {
+        var stats = PrewarmStats{ .requested = keys.len };
+        if (!sg.isvalid() and !@TypeOf(creator).headlessOk()) {
+            stats.skipped = true;
+            return stats;
+        }
+        std.debug.assert(self.shape.color_format != .DEFAULT and self.shape.depth_format != .DEFAULT);
+        for (keys) |key| {
+            if (self.lookup(key) != null) {
+                stats.reused += 1;
+                continue;
+            }
+            if (creator.create(self, key) != null) stats.warmed += 1 else stats.failed += 1;
+        }
+        return stats;
+    }
+
+    /// Serial context-side prewarm from one frozen view queue: collects
+    /// ONLY eligible keys (deduplicated, first-use draw order, filtered)
+    /// and warms them. Call AFTER forwardForShape resolution, BEFORE the
+    /// first pass opens. Allocates nothing; headless-safe (skips).
+    /// `dropped` counts eligible keys beyond the 32-key prewarm window and
+    /// is added to overflow_count, preserving the full-cache skip signal
+    /// the draw path used to produce inline.
+    pub fn prewarmQueues(self: *ShaderMaterialCache, queues: *const render_queue.RenderQueues, filter: PrewarmFilter) PrewarmStats {
+        return self.prewarmQueuesWith(queues, filter, RealCreator{});
+    }
+
+    /// Trace-hook seam for prewarmQueues (same creator contract as
+    /// prewarmKeysWith): lets headless tests drive the full
+    /// collect-then-warm path with counted dummy fills.
+    pub fn prewarmQueuesWith(self: *ShaderMaterialCache, queues: *const render_queue.RenderQueues, filter: PrewarmFilter, creator: anytype) PrewarmStats {
+        var buf: [max_entries]u64 = undefined;
+        const total = collectShaderMaterialKeys(queues, filter, &buf);
+        const n = @min(total, max_entries);
+        var stats = self.prewarmKeysWith(buf[0..n], creator);
+        stats.requested = total;
+        const dropped: u32 = @intCast(total - n);
+        stats.dropped = dropped;
+        if (dropped > 0 and !stats.skipped) self.overflow_count += dropped;
+        return stats;
     }
 
     pub fn deinit(self: *ShaderMaterialCache) void {
@@ -140,6 +232,109 @@ pub const ShaderMaterialCache = struct {
         self.overflow_count = 0;
     }
 };
+
+/// Filter selecting which frozen queue items are eligible for
+/// context-side prewarm. Skinned items are always ineligible (the draw path
+/// skips them before any cache access), as are zero-index items and
+/// unregistered snapshots. Refraction capture draws opaque non-refractive
+/// geometry only, so it disables both flags; every other color pass uses
+/// the default (opaque + transparent + refractive).
+pub const PrewarmFilter = struct {
+    include_transparent: bool = true,
+    include_refractive: bool = true,
+};
+
+/// Serial prewarm accounting. `requested` counts distinct eligible keys in
+/// first-use order (`dropped` beyond the 32-key window, also added to
+/// overflow_count); `warmed`/`reused`/`failed` partition the attempts;
+/// `skipped` is headless/no-context (zero GPU calls either way).
+pub const PrewarmStats = struct {
+    requested: usize = 0,
+    warmed: u32 = 0,
+    reused: u32 = 0,
+    failed: u32 = 0,
+    dropped: u32 = 0,
+    skipped: bool = false,
+};
+
+/// Production creator for prewarmKeysWith: real GPU creation. Headless-unsafe
+/// by design (getOrCreate issues GPU calls), so prewarmKeys skips without a
+/// context before any creator runs.
+const RealCreator = struct {
+    pub fn headlessOk() bool {
+        return false;
+    }
+
+    pub fn create(_: RealCreator, cache: *ShaderMaterialCache, key: u64) ?*const ShaderMaterialSet {
+        return cache.getOrCreate(key);
+    }
+};
+
+/// Resolves the prewarm-eligible registration key for one frozen queue item,
+/// or null when the draw path would skip it before any cache access
+/// (skinned, zero-index) or when it carries no valid registration
+/// (missing/out-of-range snapshot, unregistered entry, filtered
+/// transparent/refractive). Pure (no GPU calls): reads only the frozen
+/// queue storage and the material registry, never live Scene state.
+fn prewarmKeyForItem(
+    queues: *const render_queue.RenderQueues,
+    item: *const RenderMeshItem,
+    filter: PrewarmFilter,
+) ?u64 {
+    if (item.is_skinned) return null;
+    if (item.index_count == 0) return null;
+    if (!filter.include_refractive and item.draw_record.refractive) return null;
+    const si = item.shader_index orelse return null;
+    if (si >= queues.shader_storage.items.len) return null;
+    const snap = queues.shader_storage.items[si];
+    const entry = shader_material.entry(snap.entry_index) orelse return null;
+    return entry.key;
+}
+
+/// Collects distinct prewarm-eligible registration keys from one frozen view
+/// queue in first-use (draw) order: opaque items first, then the unified
+/// transparent back-to-front order (regular entries only; instanced batches
+/// carry no shader index). Writes up to out.len keys and returns the total
+/// distinct count (exact while it fits; repeats of dropped keys past a short
+/// window may inflate it — production always passes a 32-slot window where
+/// first-use order decides the winners, matching cache capacity). Pure.
+pub fn collectShaderMaterialKeys(
+    queues: *const render_queue.RenderQueues,
+    filter: PrewarmFilter,
+    out: []u64,
+) usize {
+    var total: usize = 0;
+    for (queues.items.items) |*item| {
+        if (prewarmKeyForItem(queues, item, filter)) |key| {
+            var seen = false;
+            for (out[0..@min(total, out.len)]) |k| if (k == key) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            total += 1;
+            if (total <= out.len) out[total - 1] = key;
+        }
+    }
+    if (filter.include_transparent) {
+        for (queues.transparent_order.items) |entry| {
+            if (entry.kind != .regular) continue;
+            if (entry.index >= queues.transparent.items.len) continue;
+            const item = &queues.transparent.items[entry.index];
+            if (prewarmKeyForItem(queues, item, filter)) |key| {
+                var seen = false;
+                for (out[0..@min(total, out.len)]) |k| if (k == key) {
+                    seen = true;
+                    break;
+                };
+                if (seen) continue;
+                total += 1;
+                if (total <= out.len) out[total - 1] = key;
+            }
+        }
+    }
+    return total;
+}
 
 /// All forward-rendering GPU pipelines in one place: the opaque u16/u32
 /// pairs and their transparent blend twins for the 3 shader families, plus
@@ -356,5 +551,15 @@ pub const ForwardPipelines = struct {
     // pipeline otherwise.
     pub fn forInstancedMesh(self: *const ForwardPipelines, is_pbr: bool, transparent: bool, is_u32: bool, double_sided: bool) u32 {
         return scene_pipelines.pipelineForInstancedMesh(self, is_pbr, transparent, is_u32, double_sided);
+    }
+
+    /// Serial context-side prewarm of this set's shader-material cache from
+    /// one frozen view queue (see ShaderMaterialCache.prewarmQueues). Call
+    /// AFTER this set was resolved via forwardForShape (the cache shape is
+    /// the set's own target shape, so each shape variant warms its own
+    /// slots), BEFORE the first pass opens. Allocates nothing, reads no
+    /// live Scene state, skips headless.
+    pub fn prewarmShaderMaterials(self: *ForwardPipelines, queues: *const render_queue.RenderQueues, filter: PrewarmFilter) PrewarmStats {
+        return self.shader_materials.prewarmQueues(queues, filter);
     }
 };

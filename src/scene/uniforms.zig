@@ -46,12 +46,13 @@ pub const FrameContext = struct {
     //   clustered_viewport: x screen_w px, y screen_h px, z tile_size px, w 0.
     clustered_params: [4]f32,
     clustered_viewport: [4]f32,
-    uniforms_with_shadows: ?*const FrameUniforms = null,
-    uniforms_without_shadows: ?*const FrameUniforms = null,
+    uniforms_with_shadows: ?*const FrameViewUniforms = null,
+    uniforms_without_shadows: ?*const FrameViewUniforms = null,
 };
 
 // Fragment uniforms shared by the standard, PBR and instanced shaders:
-// identical names, types and values in all three FsParams structs.
+// identical names, types and values in the generated FsView/FsMat structs
+// (split of the legacy fs_params block, see below).
 // Material-specific factors (diffuse_color / base_color_factor /
 // pbr_factors / emissive_factor) stay with the caller.
 pub const FrameUniforms = struct {
@@ -147,7 +148,7 @@ pub const ShadowState = struct {
 
 // Packs the shared fragment uniforms once per draw. Legacy lanes are
 // bit-identical to the legacy per-shader literals. PCSS rides free lanes
-// with no fs_params layout change (no draw-path churn):
+// with no fs_view layout change (no draw-path churn):
 //   cascade_debug.yzw = (pcss_enabled, pcss_light_size, pcss_blocker_radius)
 //   light_counts.zw   = (pcss_min_penumbra, pcss_max_penumbra)
 pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUniforms {
@@ -200,8 +201,8 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
     };
 }
 
-// Value for the per-shader `alpha_cutoff` fragment uniform (appended last
-// to every fs_params block). Only cutout materials upload a live cutoff;
+// Value for the per-shader `alpha_cutoff` fragment uniform (a member of
+// the fs_mat block). Only cutout materials upload a live cutoff;
 // opaque/blend upload 0.0 so the shader alpha test never fires and their
 // rendering is bit-identical to before. Meshes without a material render
 // opaque legacy, so they upload 0.0 as well. Pure function (no GPU calls).
@@ -209,4 +210,345 @@ pub fn alphaCutoffFor(mat: ?Material) f32 {
     const m = mat orelse return 0.0;
     if (!m.isCutout()) return 0.0;
     return m.alphaCutoff();
+}
+
+// ---------------------------------------------------------------------------
+// fs_params split (view-global vs per-material/object wire blocks).
+//
+// The legacy `FrameUniforms`/`fs_params` single block (~2.3KB rebuilt and
+// uploaded per draw, ~1.15KB of which is the constant view part) is
+// partitioned into two uniform blocks with zero value change:
+//   FrameViewUniforms     -> fs_view (UB 1, ex-fs_params slot) — light/
+//     camera/cascade+spot+point matrices, clustered descriptor, hemispheric
+//     terms, refraction camera. Contains the receive-shadow gate
+//     (shadow_params/shadow_splits/cascade_*), so two variants exist per
+//     view (with/without shadows, selected from FrameContext).
+//   FrameMaterialUniforms -> fs_mat (UB 5, free in every forward shader) —
+//     material factors, UV/channel packing, coat/fabric + layer lobes,
+//     refraction MATERIAL gate, per-draw probe state.
+// Both are `extern struct` in GLSL member order so @sizeOf/@offsetOf
+// track the shdc-generated FsView/FsMat structs (asserted in
+// scene/uniform_split_tests.zig). Pure data; no GPU calls.
+// ---------------------------------------------------------------------------
+
+/// View-global wire block (fs_view). Field order mirrors
+/// shaders/common/frame_view.glsl.
+pub const FrameViewUniforms = extern struct {
+    eye_pos: [4]f32,
+    light_dir: [4]f32,
+    light_color: [4]f32,
+    ambient_color: [4]f32,
+    shadow_params: [4]f32,
+    shadow_splits: [4]f32,
+    cascade_view_proj: [4]Mat4,
+    cascade_debug: [4]f32,
+    light_counts: [4]f32,
+    point_pos_range: [4][4]f32,
+    point_color_int: [4][4]f32,
+    spot_pos_range: [2][4]f32,
+    spot_dir_inner: [2][4]f32,
+    spot_color_outer: [2][4]f32,
+    spot_intensity: [2][4]f32,
+    spot_view_proj: [2]Mat4,
+    spot_shadow_params: [2][4]f32,
+    point_view_proj: [12]Mat4,
+    point_shadow_params: [4][4]f32,
+    directional_dir: [4][4]f32,
+    directional_color_int: [4][4]f32,
+    area_center_int: [2][4]f32,
+    area_right: [2][4]f32,
+    area_up: [2][4]f32,
+    area_color: [2][4]f32,
+    clustered_params: [4]f32,
+    clustered_viewport: [4]f32,
+    hemi_dir_intensity: [4]f32,
+    hemi_diffuse: [4]f32,
+    refraction_view_proj: Mat4,
+    refraction_capture: [4]f32,
+};
+
+/// Per-material/object wire block (fs_mat). Field order mirrors
+/// shaders/common/frame_mat.glsl.
+pub const FrameMaterialUniforms = extern struct {
+    base_color_factor: [4]f32,
+    pbr_factors: [4]f32,
+    emissive_factor: [4]f32,
+    alpha_cutoff: f32,
+    normal_scale: f32,
+    // std140 pad: the scalar pair is followed by a vec4 array; shdc aligns
+    // the array to 16 bytes (explicit 8-byte gap, zeroed, never read).
+    // sokol validates the exact upload size, so the gap rides here.
+    _pad_uv: [2]f32 = .{ 0, 0 },
+    uv_matrix: [5][4]f32,
+    uv_offset: [5][4]f32,
+    channel_selectors: [4]f32,
+    clearcoat_factors: [4]f32,
+    clearcoat_color: [4]f32,
+    sheen_factors: [4]f32,
+    sheen_color: [4]f32,
+    anisotropy_factors: [4]f32,
+    transmission_factors: [4]f32,
+    transmission_color: [4]f32,
+    sss_factors: [4]f32,
+    sss_color: [4]f32,
+    clearcoat_uv_matrix: [4]f32,
+    clearcoat_uv_offset: [4]f32,
+    sheen_uv_matrix: [4]f32,
+    sheen_uv_offset: [4]f32,
+    refraction_factors: [4]f32,
+    probe_params: [4]f32,
+    probe2_params: [4]f32,
+    probe_box: [2][4]f32,
+};
+
+/// Packs the view-global block. Value-identical to the corresponding lanes
+/// of buildFrameUniforms; refraction camera rides here (per-view env).
+pub fn buildFrameView(
+    shadow: ShadowState,
+    ctx: *const FrameContext,
+    refraction_view_proj: Mat4,
+    refraction_capture: [4]f32,
+) FrameViewUniforms {
+    const f = buildFrameUniforms(shadow, ctx);
+    return .{
+        .eye_pos = f.eye_pos,
+        .light_dir = f.light_dir,
+        .light_color = f.light_color,
+        .ambient_color = f.ambient_color,
+        .shadow_params = f.shadow_params,
+        .shadow_splits = f.shadow_splits,
+        .cascade_view_proj = f.cascade_view_proj,
+        .cascade_debug = f.cascade_debug,
+        .light_counts = f.light_counts,
+        .point_pos_range = f.point_pos_range,
+        .point_color_int = f.point_color_int,
+        .spot_pos_range = f.spot_pos_range,
+        .spot_dir_inner = f.spot_dir_inner,
+        .spot_color_outer = f.spot_color_outer,
+        .spot_intensity = f.spot_intensity,
+        .spot_view_proj = f.spot_view_proj,
+        .spot_shadow_params = f.spot_shadow_params,
+        .point_view_proj = f.point_view_proj,
+        .point_shadow_params = f.point_shadow_params,
+        .directional_dir = f.directional_dir,
+        .directional_color_int = f.directional_color_int,
+        .area_center_int = f.area_center_int,
+        .area_right = f.area_right,
+        .area_up = f.area_up,
+        .area_color = f.area_color,
+        .clustered_params = f.clustered_params,
+        .clustered_viewport = f.clustered_viewport,
+        .hemi_dir_intensity = f.hemi_dir_intensity,
+        .hemi_diffuse = f.hemi_diffuse,
+        .refraction_view_proj = refraction_view_proj,
+        .refraction_capture = refraction_capture,
+    };
+}
+
+/// Material/object inputs for the per-draw block. Probe lanes are explicit
+/// (draw-resolved per object); everything else is record/coat-owned.
+pub const MaterialUniformInputs = struct {
+    base_color: [4]f32,
+    pbr_factors: [4]f32,
+    emissive_color: [4]f32,
+    alpha_cutoff: f32,
+    normal_scale: f32,
+    uv_matrices: [5][4]f32,
+    uv_offsets: [5][4]f32,
+    channel_selectors: [4]f32,
+    clearcoat_factors: [4]f32,
+    clearcoat_color: [4]f32,
+    sheen_factors: [4]f32,
+    sheen_color: [4]f32,
+    anisotropy_factors: [4]f32,
+    transmission_factors: [4]f32,
+    transmission_color: [4]f32,
+    sss_factors: [4]f32,
+    sss_color: [4]f32,
+    clearcoat_uv_matrix: [4]f32,
+    clearcoat_uv_offset: [4]f32,
+    sheen_uv_matrix: [4]f32,
+    sheen_uv_offset: [4]f32,
+    refraction_factors: [4]f32,
+    probe_params: [4]f32,
+    probe2_params: [4]f32,
+    probe_box: [2][4]f32,
+};
+
+/// Packs the per-draw block from material inputs (field-for-field copy,
+/// no value change vs the legacy per-draw FsParams lanes).
+pub fn buildFrameMaterial(in: MaterialUniformInputs) FrameMaterialUniforms {
+    return .{
+        .base_color_factor = in.base_color,
+        .pbr_factors = in.pbr_factors,
+        .emissive_factor = in.emissive_color,
+        .alpha_cutoff = in.alpha_cutoff,
+        .normal_scale = in.normal_scale,
+        .uv_matrix = in.uv_matrices,
+        .uv_offset = in.uv_offsets,
+        .channel_selectors = in.channel_selectors,
+        .clearcoat_factors = in.clearcoat_factors,
+        .clearcoat_color = in.clearcoat_color,
+        .sheen_factors = in.sheen_factors,
+        .sheen_color = in.sheen_color,
+        .anisotropy_factors = in.anisotropy_factors,
+        .transmission_factors = in.transmission_factors,
+        .transmission_color = in.transmission_color,
+        .sss_factors = in.sss_factors,
+        .sss_color = in.sss_color,
+        .clearcoat_uv_matrix = in.clearcoat_uv_matrix,
+        .clearcoat_uv_offset = in.clearcoat_uv_offset,
+        .sheen_uv_matrix = in.sheen_uv_matrix,
+        .sheen_uv_offset = in.sheen_uv_offset,
+        .refraction_factors = in.refraction_factors,
+        .probe_params = in.probe_params,
+        .probe2_params = in.probe2_params,
+        .probe_box = in.probe_box,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Legacy pre-split fs_params wire block (2560 bytes).
+//
+// FROZEN public-API preservation for runtime `engine_template = true`
+// registrations compiled against the d6c5710 templates: field order and
+// padding are byte-identical to the old generated `FsParams` (single UB 1
+// block). New engine code — static hook templates included — uses the
+// split FrameViewUniforms/FrameMaterialUniforms pair instead. Only the
+// runtime-true legacy draw path constructs this, uploaded whole per draw
+// by design (no view caching); the -78.6% wire saving does not apply to
+// it. Do not extend: any new runtime shader should set
+// RuntimeDesc.frame_split and follow the split contract.
+// ---------------------------------------------------------------------------
+
+/// Legacy wire block (fs_params @ UB 1, 2560 bytes). Field order mirrors
+/// the d6c5710 `src/shaders/pbr.glsl` fs_params block exactly.
+pub const LegacyFsParams = extern struct {
+    eye_pos: [4]f32,
+    light_dir: [4]f32,
+    light_color: [4]f32,
+    ambient_color: [4]f32,
+    base_color_factor: [4]f32,
+    pbr_factors: [4]f32,
+    emissive_factor: [4]f32,
+    shadow_params: [4]f32,
+    shadow_splits: [4]f32,
+    cascade_view_proj: [4]Mat4,
+    cascade_debug: [4]f32,
+    light_counts: [4]f32,
+    point_pos_range: [4][4]f32,
+    point_color_int: [4][4]f32,
+    spot_pos_range: [2][4]f32,
+    spot_dir_inner: [2][4]f32,
+    spot_color_outer: [2][4]f32,
+    spot_intensity: [2][4]f32,
+    spot_view_proj: [2]Mat4,
+    spot_shadow_params: [2][4]f32,
+    alpha_cutoff: f32,
+    normal_scale: f32,
+    // Same std140 array-alignment gap as the split material block.
+    _pad_legacy_uv: [2]f32 = .{ 0, 0 },
+    uv_matrix: [5][4]f32,
+    uv_offset: [5][4]f32,
+    channel_selectors: [4]f32,
+    clearcoat_factors: [4]f32,
+    clearcoat_color: [4]f32,
+    sheen_factors: [4]f32,
+    sheen_color: [4]f32,
+    point_view_proj: [12]Mat4,
+    point_shadow_params: [4][4]f32,
+    directional_dir: [4][4]f32,
+    directional_color_int: [4][4]f32,
+    probe_params: [4]f32,
+    area_center_int: [2][4]f32,
+    area_right: [2][4]f32,
+    area_up: [2][4]f32,
+    area_color: [2][4]f32,
+    clustered_params: [4]f32,
+    clustered_viewport: [4]f32,
+    anisotropy_factors: [4]f32,
+    transmission_factors: [4]f32,
+    transmission_color: [4]f32,
+    sss_factors: [4]f32,
+    sss_color: [4]f32,
+    hemi_dir_intensity: [4]f32,
+    hemi_diffuse: [4]f32,
+    clearcoat_uv_matrix: [4]f32,
+    clearcoat_uv_offset: [4]f32,
+    sheen_uv_matrix: [4]f32,
+    sheen_uv_offset: [4]f32,
+    refraction_factors: [4]f32,
+    refraction_view_proj: Mat4,
+    refraction_capture: [4]f32,
+    probe2_params: [4]f32,
+    probe_box: [2][4]f32,
+};
+
+/// Packs the legacy block from the split view + material inputs. The
+/// refraction camera is explicit (hook legacy path passes identity /
+/// disabled, mirroring the pre-split hook upload). Pure (no GPU calls).
+pub fn buildLegacyFsParams(
+    view: *const FrameViewUniforms,
+    in: MaterialUniformInputs,
+    refraction_view_proj: Mat4,
+    refraction_capture: [4]f32,
+) LegacyFsParams {
+    return .{
+        .eye_pos = view.eye_pos,
+        .light_dir = view.light_dir,
+        .light_color = view.light_color,
+        .ambient_color = view.ambient_color,
+        .base_color_factor = in.base_color,
+        .pbr_factors = in.pbr_factors,
+        .emissive_factor = in.emissive_color,
+        .shadow_params = view.shadow_params,
+        .shadow_splits = view.shadow_splits,
+        .cascade_view_proj = view.cascade_view_proj,
+        .cascade_debug = view.cascade_debug,
+        .light_counts = view.light_counts,
+        .point_pos_range = view.point_pos_range,
+        .point_color_int = view.point_color_int,
+        .spot_pos_range = view.spot_pos_range,
+        .spot_dir_inner = view.spot_dir_inner,
+        .spot_color_outer = view.spot_color_outer,
+        .spot_intensity = view.spot_intensity,
+        .spot_view_proj = view.spot_view_proj,
+        .spot_shadow_params = view.spot_shadow_params,
+        .alpha_cutoff = in.alpha_cutoff,
+        .normal_scale = in.normal_scale,
+        .uv_matrix = in.uv_matrices,
+        .uv_offset = in.uv_offsets,
+        .channel_selectors = in.channel_selectors,
+        .clearcoat_factors = in.clearcoat_factors,
+        .clearcoat_color = in.clearcoat_color,
+        .sheen_factors = in.sheen_factors,
+        .sheen_color = in.sheen_color,
+        .point_view_proj = view.point_view_proj,
+        .point_shadow_params = view.point_shadow_params,
+        .directional_dir = view.directional_dir,
+        .directional_color_int = view.directional_color_int,
+        .probe_params = in.probe_params,
+        .area_center_int = view.area_center_int,
+        .area_right = view.area_right,
+        .area_up = view.area_up,
+        .area_color = view.area_color,
+        .clustered_params = view.clustered_params,
+        .clustered_viewport = view.clustered_viewport,
+        .anisotropy_factors = in.anisotropy_factors,
+        .transmission_factors = in.transmission_factors,
+        .transmission_color = in.transmission_color,
+        .sss_factors = in.sss_factors,
+        .sss_color = in.sss_color,
+        .hemi_dir_intensity = view.hemi_dir_intensity,
+        .hemi_diffuse = view.hemi_diffuse,
+        .clearcoat_uv_matrix = in.clearcoat_uv_matrix,
+        .clearcoat_uv_offset = in.clearcoat_uv_offset,
+        .sheen_uv_matrix = in.sheen_uv_matrix,
+        .sheen_uv_offset = in.sheen_uv_offset,
+        .refraction_factors = in.refraction_factors,
+        .refraction_view_proj = refraction_view_proj,
+        .refraction_capture = refraction_capture,
+        .probe2_params = in.probe2_params,
+        .probe_box = in.probe_box,
+    };
 }

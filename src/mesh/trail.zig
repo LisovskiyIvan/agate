@@ -92,7 +92,10 @@ pub const TrailMesh = struct {
             .usage = .{ .index_buffer = true, .write_transient = true },
             .size = max_indices * @sizeOf(u16),
         });
-        const partial = !deferred and (vb.id == 0 or ib.id == 0);
+        // VALID-only adoption: a nonzero FAILED id (not just pool-exhaustion
+        // id 0) must fall back to the deferred path, never a dead live pair.
+        const partial = if (deferred) false else (vb.id == 0 or ib.id == 0 or
+            sg.queryBufferState(vb) != .VALID or sg.queryBufferState(ib) != .VALID);
         if (partial) {
             if (vb.id != 0) sg.destroyBuffer(vb);
             if (ib.id != 0) sg.destroyBuffer(ib);
@@ -302,10 +305,16 @@ pub const TrailMesh = struct {
 
     /// Uploads staged trail geometry. Runs on the sg-context thread
     /// (Scene.render start), never during the update phase.
+    /// Headless-safe: with no sg context every staged flag and payload is
+    /// kept for a later retry (greased/compute discipline).
     pub fn flushGpuUploads(self: *TrailMesh) void {
+        // Headless: keep everything staged for retry once a context exists.
+        if (!sg.isvalid()) return;
         // Deferred construction (off-context spawn): create the buffers
         // here, on the render side, then upload whatever was staged.
-        if (self.buffers_pending and sg.isvalid()) {
+        // Pair-atomic VALID-only adoption: a nonzero FAILED id must not
+        // reach the mesh (writes below assert VALID).
+        if (self.buffers_pending) {
             const vb = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.vertices.len * @sizeOf(Vertex),
@@ -314,19 +323,50 @@ pub const TrailMesh = struct {
                 .usage = .{ .index_buffer = true, .write_transient = true },
                 .size = self.indices.len * @sizeOf(u16),
             });
-            if (vb.id != 0 and ib.id != 0) {
-                self.mesh.vertex_buffer = vb;
-                self.mesh.index_buffer = ib;
-                self.buffers_pending = false;
-                if (self.pending_index_count > 0) self.gpu_dirty = true;
+            if (gpu_thread.createdBufferIsValid(vb) and gpu_thread.createdBufferIsValid(ib)) {
+                // Never lose an old VALID pair on replace: pending implies
+                // the mesh holds no live buffers; an unexpected live VALID
+                // pair keeps serving while the fresh pair is released.
+                const old_vb_valid = gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer);
+                const old_ib_valid = gpu_thread.createdBufferIsValid(self.mesh.index_buffer);
+                if (old_vb_valid or old_ib_valid) {
+                    sg.destroyBuffer(vb);
+                    sg.destroyBuffer(ib);
+                    self.buffers_pending = false;
+                } else {
+                    if (self.mesh.vertex_buffer.id != 0) sg.destroyBuffer(self.mesh.vertex_buffer);
+                    if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+                    self.mesh.vertex_buffer = vb;
+                    self.mesh.index_buffer = ib;
+                    self.buffers_pending = false;
+                    if (self.pending_index_count > 0) self.gpu_dirty = true;
+                }
             } else {
-                // Partial creation (pool exhaustion): destroy whatever was
-                // created so the retry next frame does not leak handles.
+                // Partial creation (pool exhaustion) or FAILED state:
+                // destroy whatever was created so the retry next frame
+                // does not leak handles.
                 if (vb.id != 0) sg.destroyBuffer(vb);
                 if (ib.id != 0) sg.destroyBuffer(ib);
             }
         }
-        if (self.pending_vertex_count > 0 and self.mesh.vertex_buffer.id != 0) {
+        // A live FAILED handle must never reach a write (asserts VALID):
+        // release the pair and re-arm creation, keeping the payload staged.
+        if ((self.mesh.vertex_buffer.id != 0 and
+            !gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer)) or
+            (self.mesh.index_buffer.id != 0 and
+                !gpu_thread.createdBufferIsValid(self.mesh.index_buffer)))
+        {
+            if (self.mesh.vertex_buffer.id != 0) sg.destroyBuffer(self.mesh.vertex_buffer);
+            self.mesh.vertex_buffer = .{};
+            if (self.mesh.index_buffer.id != 0) sg.destroyBuffer(self.mesh.index_buffer);
+            self.mesh.index_buffer = .{};
+            self.buffers_pending = true;
+            self.gpu_dirty = true;
+            return;
+        }
+        if (self.pending_vertex_count > 0 and
+            gpu_thread.createdBufferIsValid(self.mesh.vertex_buffer))
+        {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.mesh.vertex_buffer },
                 .src = .{ .data = sg.asRange(self.vertices[0..self.pending_vertex_count]) },
@@ -336,7 +376,9 @@ pub const TrailMesh = struct {
                 upload_meter.record(self.pending_vertex_count * @sizeOf(Vertex));
             }
         }
-        if (self.pending_index_count > 0 and self.mesh.index_buffer.id != 0) {
+        if (self.pending_index_count > 0 and
+            gpu_thread.createdBufferIsValid(self.mesh.index_buffer))
+        {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.mesh.index_buffer },
                 .src = .{ .data = sg.asRange(self.indices[0..self.pending_index_count]) },

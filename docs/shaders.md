@@ -110,7 +110,7 @@ mesh.material = .{ .shader_material = mat };
 
 Правила: чанки — чистые кодовые фрагменты БЕЗ заголовка-провенанса (иначе ломается byte-identical гарантия: раскрытие сконвертированного шейдера воспроизводит дорефакторный исходник байт-в-байт, выход shdc не меняется). Шеринг документируется в README, не в чанках. Без `#line`: ошибка shdc после директивы указывает РАСКРЫТУЮ строку (`expanded = authored + Σ(include_lines − 1)`; измерено: 13-строчный `fullscreen_vs` сдвигает на +12) — маппинг назад инспекцией.
 
-Осознанно НЕ shared (не «чинить» без ревью): `fs_params`-блоки пяти forward-шейдеров (порядок полей + probe-семантика различаются, переупорядочивание сдвигает все uniform-офсеты); morph-хелперы (`tan_xyz` только в PBR); `shadow` vs `msaa_depth` (идентичная растеризация, разные матрицы/bias); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `examples/shader_materials/` (тела хуков — мерджатся, не инклудятся).
+Осознанно НЕ shared (не «чинить» без ревью): view/material-обёртки трёх PBR-шейдеров (слоты `fs_view` различаются: pbr/instanced — 1, skinned — 2; сами чанки `frame_view`/`frame_mat` — shared); morph-хелперы (`tan_xyz` только в PBR); `shadow` vs `msaa_depth` (идентичная растеризация, разные матрицы/bias); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `examples/shader_materials/` (тела хуков — мерджатся, не инклудятся).
 
 API препасса (`shader_material/include.zig`):
 
@@ -147,14 +147,15 @@ pub fn merge(allocator: std.mem.Allocator, opts: Options) Error!Result
 pub const Base = enum { standard, pbr };
 pub const Param = struct { ... };
 pub const vs_params_ub: u32 = 0; // {mat4 mvp, mat4 model}
-pub const fs_params_ub: u32 = 1; // engine frame uniforms
+pub const fs_params_ub: u32 = 1; // engine frame VIEW uniforms (fs_view)
+pub const fs_mat_ub: u32 = 5; // engine per-material uniforms (fs_mat)
 pub const vs_morph_ub: u32 = 2;  // GPU morphs (только engine-шаблоны)
 pub const Entry = struct { ... };
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const max_runtime_entries = 16;
 pub const max_external_uniform_vec4: u32 = 2;
 pub const max_external_uniform_words: u8 = max_external_uniform_vec4 * 4;
-pub const RuntimeDesc = struct { name, make_shader, engine_template, user_ub, user_bytes, params };
+pub const RuntimeDesc = struct { name, make_shader, engine_template, frame_split, user_ub, user_bytes, params };
 pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName, UniformLimitExceeded }!u32
 pub fn entryCount() usize
 pub fn entry(index: u32) ?*const Entry
@@ -192,7 +193,7 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
 
 Осознанные дубли, которые должны эволюционировать синхронно (тесты падают при рассинхроне — это их работа):
 
-- `drift: fs_params probe lane parity` — пять forward-шейдеров держат одинаковый layout probe-полей;
+- `drift: fs_view/fs_mat parity` — три PBR-шейдера оборачивают общие чанки `frame_view`/`frame_mat` (probe-поля — только в shared material-чанке);
 - `drift: depth-only twin programs (shadow vs msaa_depth)` — одинаковые `@program`-наборы;
 - `drift: morph helper arity (standard vs PBR variants)` — арность morph-хелперов;
 - `drift: probe_mip stays excluded from the fullscreen include` — `probe_mip.glsl` не должен подхватить Y-flip;
@@ -218,7 +219,7 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
 
 - Цена sharing — ноль в рантайме: подстановка текстовая на сборке, шейдеры компилируются как раньше (byte-identical выход shdc для конвертированных шейдеров).
 - Forward-пассы несут кластерные SSBO только в glsl430-леге; на macOS GL 4.1 storage buffers недоступны (см. `./render-pipeline.md` — гейт через `sg.queryFeatures().compute` и `compute.zig`).
-- Hook-юниформы: на draw заливается ровно `user_bytes` (≤ 32 байт) — дешевле полного перезалива `fs_params`.
+- Hook-юниформы: на draw заливается ровно `user_bytes` (≤ 32 байт) — дешевле полного перезалива view-блока; сам view-блок (`fs_view`) — один раз на contiguous pipeline/shadow-прогон, материал (`fs_mat`) — на каждый draw.
 - Время сборки растёт линейно с числом hook-материалов (merge → expand → shdc на каждый); держите count сниппетов низким или выносите вариации в юниформы, а не в материалы.
 
 ## Смотрите также

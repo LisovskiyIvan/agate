@@ -324,6 +324,12 @@ pub fn render(scene: anytype) void {
         .shadow_uniforms = snap.shadow_uniforms,
         .clustered = &scene.clustered,
     };
+    // Shader-material prewarm (context thread, serial): create ONLY the
+    // eligible pipelines from the frozen prepared queues AFTER the forward
+    // set resolved above and BEFORE any pass below opens, so the draws stay
+    // lookup-only. Covers the primary queue plus every enabled secondary
+    // (PIP) view queue drawn this frame; headless-safe (skips).
+    prewarmMainShaderMaterials(env.pipelines, draws, snap);
     @import("refraction.zig").capture(scene, draws, snap, &env);
     gpu_timing.beginPass(.main);
     const depth_prepass = scene_msaa.depthPrepassActive(post_config.enabled, snap.msaa_depth_prepass, samples);
@@ -611,6 +617,24 @@ pub fn render(scene: anytype) void {
     if (scene.profiler.isRecording() and !scene.rendering_reuse) {
         scene.profiler_frame_seq +%= 1;
         scene.profiler.recordFrame(scene.profiler_frame_seq, &scene.stats);
+    }
+}
+
+/// Serial shader-material prewarm for the main pass forward set: the primary
+/// queue plus every enabled secondary view queue the multi-camera path below
+/// draws (same predicate: enabled, non-active). Single-view frames warm the
+/// primary queue only. Stats are deliberately discarded: warming is
+/// best-effort per frame (misses skip their meshes; overflow is counted in
+/// the cache) and per-frame logging would cost more than it diagnoses.
+fn prewarmMainShaderMaterials(fwd: anytype, draws: anytype, snap: anytype) void {
+    const filter = @import("forward_pipelines.zig").PrewarmFilter{};
+    _ = fwd.prewarmShaderMaterials(&draws.primary, filter);
+    if (snap.enable_multi_camera and snap.camera_count > 0) {
+        const n: usize = @min(snap.camera_count, draws.views.len);
+        for (0..n) |i| {
+            if (i == snap.active_camera_idx or !snap.cameras[i].enabled) continue;
+            _ = fwd.prewarmShaderMaterials(&draws.views[i], filter);
+        }
     }
 }
 

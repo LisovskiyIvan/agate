@@ -35,8 +35,9 @@ const std = @import("std");
 pub const user_slot_count: usize = 8;
 /// f32 words across the user uniform block (32 floats).
 pub const user_word_count: usize = user_slot_count * 4;
-/// Fixed UB bindings for the generated user uniform blocks (UB slots 0..2
-/// are used by the engine templates: vs_params, fs_params, vs_morph).
+/// Fixed UB bindings for the generated user uniform blocks (UB slots 0/1/2
+/// are used by the engine templates: vs_params, fs_view, vs_morph —
+/// fs_mat rides slot 5).
 pub const fs_params_binding: u32 = 3;
 pub const vs_params_binding: u32 = 4;
 

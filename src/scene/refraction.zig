@@ -43,6 +43,10 @@ pub fn capture(scene: anytype, draws: anytype, snap: *const snapshot.SceneFrameS
         // Resolve the forward set matching the exact target shape BEFORE opening the pass:
         // forwardForShape may recreate the twin, which must never happen mid-pass.
         const fwd = scene.forwardForShape(rt.shape());
+        // Shader-material prewarm for THIS target shape (opaque
+        // non-refractive only — exactly what the capture below draws),
+        // before the pass opens so capture draws stay lookup-only.
+        _ = fwd.prewarmShaderMaterials(&draws.primary, .{ .include_transparent = false, .include_refractive = false });
         if (!rt.begin(snap.clear_color, 1)) return;
         var capture_env = env.*;
         capture_env.pipelines = fwd;

@@ -99,3 +99,90 @@ test "local_space spawn stays relative, instances follow emitter" {
     try std.testing.expectEqual(Vec3.new(1.0, 2.0, 3.0), ps.particles[0].position);
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), ps.instances[0].pos_size[0], 1e-5);
 }
+
+// Audit (headless): every staged flag survives a headless flush for a later
+// retry — no sg.* fires, nothing is adopted, nothing is cleared or written
+// without a context (greased/compute discipline).
+test "audit headless: creation pendings survive flushGpuUploads for retry" {
+    gpu_thread.resetContextThreadForTest();
+    defer gpu_thread.resetContextThreadForTest();
+    try std.testing.expect(!sg.isvalid());
+    var ps = try makeTestSystem(std.testing.allocator, 4);
+    defer freeTestSystem(&ps);
+    ps.simulation_mode = .cpu;
+    ps.instance_buffer_pending = true;
+    ps.instance_dirty = true;
+    ps.active_count = 1;
+    ps.gpu_slot_buffer_pending = true;
+    ps.gpu_flush_pending = true;
+    ps.flushGpuUploads();
+    try std.testing.expect(ps.instance_buffer_pending);
+    try std.testing.expect(ps.instance_dirty);
+    try std.testing.expect(ps.gpu_slot_buffer_pending);
+    try std.testing.expect(ps.gpu_flush_pending);
+    try std.testing.expectEqual(@as(u32, 0), ps.instance_buffer.id);
+    try std.testing.expectEqual(@as(u32, 0), ps.gpu_slot_buffer.id);
+}
+
+// LIVE audit (skips headless): REAL nonzero FAILED is destroyed, never
+// adopted — pending stays for retry, no write ever targets FAILED.
+// Callable from the native GPU fixture (same path the `LIVE` test runs).
+pub fn liveAuditFailedInstanceRejection(gpa: std.mem.Allocator) !void {
+    gpu_thread.markContextThread();
+    defer gpu_thread.resetContextThreadForTest();
+    var ps = try makeTestSystem(gpa, 4);
+    defer freeTestSystem(&ps);
+    defer {
+        if (ps.instance_buffer.id != 0) sg.destroyBuffer(ps.instance_buffer);
+        if (ps.gpu_slot_buffer.id != 0) sg.destroyBuffer(ps.gpu_slot_buffer);
+    }
+    // The audit failure, synthesized for real: nonzero + FAILED.
+    const fb = sg.allocBuffer();
+    try std.testing.expect(fb.id != 0);
+    sg.failBuffer(fb);
+    std.debug.print("audit system: FAILED id={d} st={s}\n", .{ fb.id, @tagName(sg.queryBufferState(fb)) });
+    try std.testing.expectEqual(sg.ResourceState.FAILED, sg.queryBufferState(fb));
+    try std.testing.expect(!gpu_thread.createdBufferIsValid(fb));
+    // Failure lifetime: destroy → INVALID (the deinit-count discipline).
+    const failed_id = fb.id;
+    sg.destroyBuffer(fb);
+    try std.testing.expectEqual(sg.ResourceState.INVALID, sg.queryBufferState(.{ .id = failed_id }));
+    // Creation from zero never adopts FAILED: a live flush lands VALID or
+    // stays pending — never FAILED.
+    ps.instance_buffer_pending = true;
+    ps.flushGpuUploads();
+    std.debug.print("audit system: after create live_id={d} st={s} pending={}\n", .{
+        ps.instance_buffer.id,
+        @tagName(sg.queryBufferState(ps.instance_buffer)),
+        ps.instance_buffer_pending,
+    });
+    if (ps.instance_buffer.id != 0) {
+        try std.testing.expect(gpu_thread.createdBufferIsValid(ps.instance_buffer));
+        try std.testing.expect(!ps.instance_buffer_pending);
+    } else {
+        try std.testing.expect(ps.instance_buffer_pending);
+    }
+    // Pre-fix adoption shape (live FAILED handle): the flush must release
+    // it and re-arm creation, keeping the payload staged — never writing it
+    // (writes assert VALID).
+    const fb2 = sg.allocBuffer();
+    sg.failBuffer(fb2);
+    std.debug.print("audit system: pre-installed FAILED live id={d}\n", .{fb2.id});
+    ps.instance_buffer = fb2;
+    ps.instance_buffer_pending = false;
+    ps.instance_dirty = true;
+    ps.active_count = 1;
+    ps.flushGpuUploads();
+    std.debug.print("audit system: after FAILED flush live_id={d} pending={} dirty={}\n", .{
+        ps.instance_buffer.id, ps.instance_buffer_pending, ps.instance_dirty,
+    });
+    try std.testing.expect(ps.instance_buffer_pending);
+    try std.testing.expect(ps.instance_dirty);
+    try std.testing.expectEqual(@as(u32, 0), ps.instance_buffer.id);
+    try std.testing.expectEqual(sg.ResourceState.INVALID, sg.queryBufferState(fb2));
+}
+
+test "LIVE audit: FAILED instance creation destroys, retains pending and old VALID" {
+    if (!sg.isvalid()) return error.SkipZigTest;
+    try liveAuditFailedInstanceRejection(std.testing.allocator);
+}

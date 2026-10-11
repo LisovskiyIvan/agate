@@ -369,10 +369,19 @@ pub const ParticleSystem = struct {
 
         // CPU-phase ownership is not GPU authorization without a live context.
         const deferred = !sg.isvalid() or !gpu_thread.isOnContextThread();
-        const buf = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
+        var buf = if (deferred) sg.Buffer{} else sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = capacity * @sizeOf(ParticleInstanceData),
         });
+        // A failed makeBuffer may hand out a nonzero FAILED id (pool
+        // exhaustion is id 0 only): validity is the state query. Never
+        // adopt FAILED — release the slot and defer to the first flush.
+        var init_pending = deferred;
+        if (!deferred and !gpu_thread.createdBufferIsValid(buf)) {
+            if (buf.id != 0) sg.destroyBuffer(buf);
+            buf = .{};
+            init_pending = true;
+        }
 
         ps.* = .{
             .name = name,
@@ -383,7 +392,7 @@ pub const ParticleSystem = struct {
             .capacity = capacity,
             .active_count = 0,
             .instance_buffer = buf,
-            .instance_buffer_pending = deferred,
+            .instance_buffer_pending = init_pending,
             .prng = std.Random.DefaultPrng.init(1337),
         };
         return ps;
@@ -707,39 +716,78 @@ pub const ParticleSystem = struct {
     pub fn flushGpuUploads(self: *ParticleSystem) void {
         // Deferred construction (off-context spawn): create the instance
         // buffer here, on the render side, and upload any staged data.
+        // VALID-only adoption: a nonzero FAILED id must never reach the
+        // live handle (the write below asserts VALID) — release the slot
+        // and keep the pending flag for retry.
         if (self.instance_buffer_pending and sg.isvalid()) {
-            self.instance_buffer = sg.makeBuffer(.{
+            const created = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.capacity * @sizeOf(ParticleInstanceData),
             });
-            if (self.instance_buffer.id != 0) {
+            if (!gpu_thread.createdBufferIsValid(created)) {
+                if (created.id != 0) sg.destroyBuffer(created);
+            } else {
+                self.instance_buffer = created;
                 self.instance_buffer_pending = false;
                 if (self.active_count > 0) self.instance_dirty = true;
             }
         }
         if (self.instance_dirty) {
-            self.instance_dirty = false;
-            if (self.active_count > 0 and self.instance_buffer.id != 0) {
-                sg.writeBufferTransient(.{
-                    .dst = .{ .buffer = self.instance_buffer },
-                    .src = .{ .data = sg.asRange(self.instances[0..self.active_count]) },
-                });
-                // Dynamic upload tracking: all active_count instances.
-                upload_meter.record(self.active_count * @sizeOf(ParticleInstanceData));
+            if (!sg.isvalid()) {
+                // Headless: keep staged for retry once a context exists
+                // (greased/compute discipline) — never write without one.
+            } else if (self.instance_buffer.id != 0 and
+                !gpu_thread.createdBufferIsValid(self.instance_buffer))
+            {
+                // A live FAILED handle (pre-fix adoption) must never reach
+                // the write below: release it and re-arm creation instead.
+                sg.destroyBuffer(self.instance_buffer);
+                self.instance_buffer = .{};
+                self.instance_buffer_pending = true;
+            } else {
+                self.instance_dirty = false;
+                if (self.active_count > 0 and
+                    gpu_thread.createdBufferIsValid(self.instance_buffer))
+                {
+                    sg.writeBufferTransient(.{
+                        .dst = .{ .buffer = self.instance_buffer },
+                        .src = .{ .data = sg.asRange(self.instances[0..self.active_count]) },
+                    });
+                    // Dynamic upload tracking: all active_count instances.
+                    upload_meter.record(self.active_count * @sizeOf(ParticleInstanceData));
+                }
             }
         }
         // Deferred first-use creation (staged by update): without a valid sg
         // context the flag stays set and a later flush retries.
         if (self.gpu_slot_buffer_pending and self.gpu_slot_buffer.id == 0 and sg.isvalid()) {
-            self.gpu_slot_buffer = sg.makeBuffer(.{
+            const created_slot = sg.makeBuffer(.{
                 .usage = .{ .vertex_buffer = true, .write_transient = true },
                 .size = self.capacity * @sizeOf(GpuParticleSlot),
             });
-            if (self.gpu_slot_buffer.id != 0) self.gpu_slot_buffer_pending = false;
+            if (!gpu_thread.createdBufferIsValid(created_slot)) {
+                if (created_slot.id != 0) sg.destroyBuffer(created_slot);
+            } else {
+                self.gpu_slot_buffer = created_slot;
+                self.gpu_slot_buffer_pending = false;
+            }
         }
         if (self.gpu_flush_pending) {
-            self.gpu_flush_pending = false;
-            gpu.flushGpuUpload(self);
+            if (!sg.isvalid()) {
+                // Headless: keep staged for retry once a context exists.
+            } else if (self.gpu_slot_buffer.id != 0 and
+                !gpu_thread.createdBufferIsValid(self.gpu_slot_buffer))
+            {
+                // Never dispatch a write at a FAILED slot buffer (asserts
+                // VALID): release it and re-arm creation, keeping the flush
+                // staged.
+                sg.destroyBuffer(self.gpu_slot_buffer);
+                self.gpu_slot_buffer = .{};
+                self.gpu_slot_buffer_pending = true;
+            } else {
+                self.gpu_flush_pending = false;
+                gpu.flushGpuUpload(self);
+            }
         }
         // Stateful compute path (prepare boundary, context thread): creation,
         // spawn upload, state clear and dispatch. No-op unless the system runs

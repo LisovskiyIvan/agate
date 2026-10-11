@@ -20,9 +20,11 @@
 //! Uniform model: every shader material owns a fixed 8x vec4 (128 byte)
 //! user uniform block (see merge.zig for the GLSL side). Values are packed
 //! by a declarative Param table (name -> f32 offset). Sokol UB slots follow
-//! the engine contract: 0 = vs_params {mvp, model}, 1 = engine fs_params
-//! (frame uniforms, engine templates only), 2 = vs_morph (engine templates
-//! only), user_ub = sm_user_params (declared per material).
+//! the engine contract: 0 = vs_params {mvp, model}, 1 = engine frame block
+//! (legacy single 2560-byte fs_params, or split fs_view — see frame_split),
+//! 5 = engine fs_mat (split per-material uniforms, frame_split entries
+//! only), 2 = vs_morph (engine templates only),
+//! user_ub = sm_user_params (declared per material).
 //!
 //! GPU-free by design: pipeline creation lives in
 //! scene/forward_pipelines.zig (ShaderMaterialCache); this module only
@@ -59,9 +61,10 @@ pub const Param = struct {
 };
 
 /// Uniform slot contract constants (sokol UB slots are a shared slot pool
-/// across stages; the engine templates bind 0/1/2 explicitly).
+/// across stages; the engine templates bind 0/1/2/5 explicitly).
 pub const vs_params_ub: u32 = 0; // {mat4 mvp, mat4 model}
-pub const fs_params_ub: u32 = 1; // engine frame uniforms (engine templates)
+pub const fs_params_ub: u32 = 1; // engine frame VIEW uniforms (engine templates)
+pub const fs_mat_ub: u32 = 5; // engine per-material uniforms (engine templates)
 pub const vs_morph_ub: u32 = 2; // GPU morphs (engine templates only)
 
 /// Runtime view of one registered shader material (static or runtime).
@@ -76,6 +79,18 @@ pub const Entry = struct {
     engine_template: bool = true,
     vs_ub: u32 = vs_params_ub,
     fs_ub: u32 = fs_params_ub,
+    /// UB slot of the fs-stage per-material block (fs_mat, split from the
+    /// legacy fs_params). Only read when frame_split is set; external
+    /// (engine_template = false) shaders never read it.
+    fs_mat_ub: u32 = 5,
+    /// True when the shader follows the SPLIT frame contract (fs_view on
+    /// fs_ub + fs_mat on fs_mat_ub). False selects the LEGACY wire: the
+    /// pre-split 2560-byte fs_params block, whole per draw on fs_ub.
+    /// Static hook templates always set this (generated from the split
+    /// sources); runtime registrations default to legacy — the pre-split
+    /// public contract — unless the shader was compiled from the split
+    /// templates and opts in explicitly.
+    frame_split: bool = false,
     /// UB slot of the material's fs-stage sm_user_params block, when the
     /// snippet declares params.
     user_ub: ?u32 = null,
@@ -117,6 +132,8 @@ const static_table: [static_len]Entry = blk: {
             .engine_template = true,
             .vs_ub = e.vs_ub,
             .fs_ub = e.fs_ub,
+            .fs_mat_ub = e.fs_mat_ub,
+            .frame_split = e.frame_split,
             .user_ub = e.user_ub,
             .user_bytes = 128,
             .vs_user_ub = e.vs_user_ub,
@@ -195,10 +212,19 @@ pub const RuntimeDesc = struct {
     /// backend-specific sources; agate does not cross-compile).
     make_shader: *const fn (sg.Backend) sg.Shader,
     /// True when the custom shader follows the engine template contract
-    /// (UB 0 {mvp, model}, UB 1 engine fs_params, shadow/morph textures).
+    /// (UB 0 {mvp, model}, shadow/morph textures, plus the frame blocks).
+    /// With frame_split unset (default) the frame contract is the LEGACY
+    /// single 2560-byte fs_params block on UB 1 — the pre-split public
+    /// wire, preserved for shaders compiled from the old templates. Set
+    /// frame_split only for a shader compiled from the split templates
+    /// (fs_view on UB 1 + fs_mat on UB 5).
     /// Runtime sources usually set false: the draw path then binds only
     /// vertex/index buffers and the material texture at view slot 0.
     engine_template: bool = false,
+    /// Opt-in to the split frame contract for engine_template shaders
+    /// compiled from the split templates. Default false preserves the
+    /// legacy wire; engine_template = false shaders never read it.
+    frame_split: bool = false,
     /// UB slot that receives the user uniform bytes (when the custom
     /// shader declares a user block; see user_bytes).
     user_ub: ?u32 = null,
@@ -245,6 +271,8 @@ pub fn registerRuntime(desc: RuntimeDesc) error{ RegistryFull, DuplicateName, Un
         .engine_template = desc.engine_template,
         .vs_ub = vs_params_ub,
         .fs_ub = fs_params_ub,
+        .fs_mat_ub = fs_mat_ub,
+        .frame_split = desc.frame_split,
         .user_ub = desc.user_ub,
         .user_bytes = desc.user_bytes,
         .vs_user_ub = null,

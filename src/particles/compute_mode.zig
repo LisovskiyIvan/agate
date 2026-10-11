@@ -208,46 +208,171 @@ pub fn buildComputeParams(self: anytype) pc_shd.CsParams {
 /// slots read life <= 0 = dead in the shader).
 pub fn ensureComputeGpu(self: anytype) void {
     const cap = self.capacity;
+    // VALID-only adoption throughout: a nonzero FAILED id must never
+    // become the live handle (writes/dispatch assert VALID) — release the
+    // slot inline (context thread, legal) and keep buffers_pending for
+    // retry. Only id == 0 allocates, so an old VALID buffer is never
+    // lost on a partial failure or OOM.
     if (self.compute_state_buffer.id == 0) {
         const zeros = self.allocator.alloc(u8, cap * @sizeOf(ComputeParticleState)) catch return;
         defer self.allocator.free(zeros);
         @memset(zeros, 0);
-        self.compute_state_buffer = sg.makeBuffer(.{
+        const created = sg.makeBuffer(.{
             .usage = .{ .storage_buffer = true },
             .data = sg.Range{ .ptr = zeros.ptr, .size = zeros.len },
         });
+        if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+            if (created.id != 0) sg.destroyBuffer(created);
+        } else {
+            self.compute_state_buffer = created;
+        }
+    } else if (sg.queryBufferState(self.compute_state_buffer) != .VALID) {
+        // Pre-fix FAILED adoption: drop the dead handle with its view so
+        // no dangling view survives, re-arm pending (creation incomplete —
+        // a direct caller retries just like the flush), and return.
+        self.compute_buffers_pending = true;
+        if (self.compute_state_view.id != 0) {
+            sg.destroyView(self.compute_state_view);
+            self.compute_state_view = .{};
+        }
+        sg.destroyBuffer(self.compute_state_buffer);
+        self.compute_state_buffer = .{};
+        return;
     }
     if (self.compute_spawn_buffer.id == 0) {
-        self.compute_spawn_buffer = sg.makeBuffer(.{
+        const created = sg.makeBuffer(.{
             .usage = .{ .storage_buffer = true, .write_transient = true },
             .size = cap * @sizeOf(GpuParticleSlot),
         });
+        if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+            if (created.id != 0) sg.destroyBuffer(created);
+        } else {
+            self.compute_spawn_buffer = created;
+        }
+    } else if (sg.queryBufferState(self.compute_spawn_buffer) != .VALID) {
+        self.compute_buffers_pending = true;
+        if (self.compute_spawn_view.id != 0) {
+            sg.destroyView(self.compute_spawn_view);
+            self.compute_spawn_view = .{};
+        }
+        sg.destroyBuffer(self.compute_spawn_buffer);
+        self.compute_spawn_buffer = .{};
+        return;
     }
     if (self.compute_draw_buffer.id == 0) {
-        self.compute_draw_buffer = sg.makeBuffer(.{
+        const created = sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .storage_buffer = true },
             .size = cap * @sizeOf(ParticleInstanceData),
         });
+        if (created.id == 0 or sg.queryBufferState(created) != .VALID) {
+            if (created.id != 0) sg.destroyBuffer(created);
+        } else {
+            self.compute_draw_buffer = created;
+        }
+    } else if (sg.queryBufferState(self.compute_draw_buffer) != .VALID) {
+        self.compute_buffers_pending = true;
+        if (self.compute_draw_view.id != 0) {
+            sg.destroyView(self.compute_draw_view);
+            self.compute_draw_view = .{};
+        }
+        sg.destroyBuffer(self.compute_draw_buffer);
+        self.compute_draw_buffer = .{};
+        return;
     }
-    if (self.compute_state_view.id == 0 and self.compute_state_buffer.id != 0) {
-        self.compute_state_view = compute.makeStorageView(self.compute_state_buffer, "compute-particles-state");
+    if (self.compute_state_view.id == 0 and self.compute_state_buffer.id != 0 and
+        sg.queryBufferState(self.compute_state_buffer) == .VALID)
+    {
+        const created = compute.makeStorageView(self.compute_state_buffer, "compute-particles-state");
+        if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+            if (created.id != 0) sg.destroyView(created);
+        } else {
+            self.compute_state_view = created;
+        }
+    } else if (self.compute_state_view.id != 0 and
+        sg.queryViewState(self.compute_state_view) != .VALID)
+    {
+        self.compute_buffers_pending = true;
+        sg.destroyView(self.compute_state_view);
+        self.compute_state_view = .{};
     }
-    if (self.compute_spawn_view.id == 0 and self.compute_spawn_buffer.id != 0) {
-        self.compute_spawn_view = compute.makeStorageView(self.compute_spawn_buffer, "compute-particles-spawn");
+    if (self.compute_spawn_view.id == 0 and self.compute_spawn_buffer.id != 0 and
+        sg.queryBufferState(self.compute_spawn_buffer) == .VALID)
+    {
+        const created = compute.makeStorageView(self.compute_spawn_buffer, "compute-particles-spawn");
+        if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+            if (created.id != 0) sg.destroyView(created);
+        } else {
+            self.compute_spawn_view = created;
+        }
+    } else if (self.compute_spawn_view.id != 0 and
+        sg.queryViewState(self.compute_spawn_view) != .VALID)
+    {
+        self.compute_buffers_pending = true;
+        sg.destroyView(self.compute_spawn_view);
+        self.compute_spawn_view = .{};
     }
-    if (self.compute_draw_view.id == 0 and self.compute_draw_buffer.id != 0) {
-        self.compute_draw_view = compute.makeStorageView(self.compute_draw_buffer, "compute-particles-draw");
+    if (self.compute_draw_view.id == 0 and self.compute_draw_buffer.id != 0 and
+        sg.queryBufferState(self.compute_draw_buffer) == .VALID)
+    {
+        const created = compute.makeStorageView(self.compute_draw_buffer, "compute-particles-draw");
+        if (created.id == 0 or sg.queryViewState(created) != .VALID) {
+            if (created.id != 0) sg.destroyView(created);
+        } else {
+            self.compute_draw_view = created;
+        }
+    } else if (self.compute_draw_view.id != 0 and
+        sg.queryViewState(self.compute_draw_view) != .VALID)
+    {
+        self.compute_buffers_pending = true;
+        sg.destroyView(self.compute_draw_view);
+        self.compute_draw_view = .{};
     }
     if (self.compute_shader.id == 0) {
-        self.compute_shader = sg.makeShader(pc_shd.particleComputeShaderDesc(sg.queryBackend()));
+        const created = sg.makeShader(pc_shd.particleComputeShaderDesc(sg.queryBackend()));
+        if (created.id == 0 or sg.queryShaderState(created) != .VALID) {
+            if (created.id != 0) sg.destroyShader(created);
+        } else {
+            self.compute_shader = created;
+        }
+    } else if (sg.queryShaderState(self.compute_shader) != .VALID) {
+        self.compute_buffers_pending = true;
+        sg.destroyShader(self.compute_shader);
+        self.compute_shader = .{};
+        // A dead shader invalidates the pipeline built from it.
+        if (self.compute_pipeline.id != 0) {
+            sg.destroyPipeline(self.compute_pipeline);
+            self.compute_pipeline = .{};
+        }
+        return;
     }
-    if (self.compute_pipeline.id == 0 and self.compute_shader.id != 0) {
-        self.compute_pipeline = compute.makePipeline(self.compute_shader, "compute-particles");
+    if (self.compute_pipeline.id == 0 and self.compute_shader.id != 0 and
+        sg.queryShaderState(self.compute_shader) == .VALID)
+    {
+        const created = compute.makePipeline(self.compute_shader, "compute-particles");
+        if (created.id == 0 or sg.queryPipelineState(created) != .VALID) {
+            if (created.id != 0) sg.destroyPipeline(created);
+        } else {
+            self.compute_pipeline = created;
+        }
+    } else if (self.compute_pipeline.id != 0 and
+        sg.queryPipelineState(self.compute_pipeline) != .VALID)
+    {
+        self.compute_buffers_pending = true;
+        sg.destroyPipeline(self.compute_pipeline);
+        self.compute_pipeline = .{};
     }
     if (self.compute_state_buffer.id != 0 and self.compute_spawn_buffer.id != 0 and
         self.compute_draw_buffer.id != 0 and self.compute_state_view.id != 0 and
         self.compute_spawn_view.id != 0 and self.compute_draw_view.id != 0 and
-        self.compute_shader.id != 0 and self.compute_pipeline.id != 0)
+        self.compute_shader.id != 0 and self.compute_pipeline.id != 0 and
+        sg.queryBufferState(self.compute_state_buffer) == .VALID and
+        sg.queryBufferState(self.compute_spawn_buffer) == .VALID and
+        sg.queryBufferState(self.compute_draw_buffer) == .VALID and
+        sg.queryViewState(self.compute_state_view) == .VALID and
+        sg.queryViewState(self.compute_spawn_view) == .VALID and
+        sg.queryViewState(self.compute_draw_view) == .VALID and
+        sg.queryShaderState(self.compute_shader) == .VALID and
+        sg.queryPipelineState(self.compute_pipeline) == .VALID)
     {
         self.compute_buffers_pending = false;
     }
@@ -264,7 +389,13 @@ pub fn clearComputeState(self: anytype) void {
     sg.destroyBuffer(self.compute_state_buffer);
     self.compute_state_buffer = .{};
     ensureComputeGpu(self);
-    upload_meter.record(self.capacity * @sizeOf(ComputeParticleState));
+    // The state buffer is zero-initialized at creation: only count the
+    // upload when the recreation actually landed VALID.
+    if (self.compute_state_buffer.id != 0 and
+        sg.queryBufferState(self.compute_state_buffer) == .VALID)
+    {
+        upload_meter.record(self.capacity * @sizeOf(ComputeParticleState));
+    }
 }
 
 /// Runs the compute dispatch for the staged window. Context thread only;
@@ -303,18 +434,60 @@ pub fn flushComputeUploads(self: anytype) void {
         self.compute_flush_pending = false;
         return;
     }
-    if (self.compute_buffers_pending) ensureComputeGpu(self);
-    if (self.compute_state_buffer.id == 0) return;
+    // Recovery for pre-fix FAILED adoptions with pending already false:
+    // any live non-VALID handle re-arms creation; ensure cleans one dead
+    // handle per flush (non-spinning) and keeps pending until all VALID.
+    const need_ensure = self.compute_buffers_pending or
+        (self.compute_state_buffer.id != 0 and
+            sg.queryBufferState(self.compute_state_buffer) != .VALID) or
+        (self.compute_spawn_buffer.id != 0 and
+            sg.queryBufferState(self.compute_spawn_buffer) != .VALID) or
+        (self.compute_draw_buffer.id != 0 and
+            sg.queryBufferState(self.compute_draw_buffer) != .VALID) or
+        (self.compute_state_view.id != 0 and
+            sg.queryViewState(self.compute_state_view) != .VALID) or
+        (self.compute_spawn_view.id != 0 and
+            sg.queryViewState(self.compute_spawn_view) != .VALID) or
+        (self.compute_draw_view.id != 0 and
+            sg.queryViewState(self.compute_draw_view) != .VALID) or
+        (self.compute_shader.id != 0 and
+            sg.queryShaderState(self.compute_shader) != .VALID) or
+        (self.compute_pipeline.id != 0 and
+            sg.queryPipelineState(self.compute_pipeline) != .VALID);
+    if (need_ensure) {
+        self.compute_buffers_pending = true;
+        ensureComputeGpu(self);
+    }
+    // A live FAILED state buffer must never be written/dispatched: the
+    // ensure above already released FAILED handles, so a non-VALID id
+    // here means creation is still incomplete — keep everything staged.
+    if (self.compute_state_buffer.id == 0 or
+        sg.queryBufferState(self.compute_state_buffer) != .VALID) return;
     if (self.compute_state_clear_pending) {
         self.compute_state_clear_pending = false;
         clearComputeState(self);
+        // The clear recreates the state buffer+view inline: a FAILED
+        // recreation keeps buffers_pending set — re-check before touching
+        // the pipeline/spawn below so a dead state never dispatches.
+        if (self.compute_state_buffer.id == 0 or
+            sg.queryBufferState(self.compute_state_buffer) != .VALID) return;
     }
     // Creation incomplete (a make* failed; the pending flag stays set
-    // for a retry): keep everything staged, consume nothing.
-    if (self.compute_pipeline.id == 0) return;
+    // for a retry): keep everything staged, consume nothing. VALID-only:
+    // a nonzero FAILED pipeline/view must never dispatch.
+    if (self.compute_pipeline.id == 0 or
+        sg.queryPipelineState(self.compute_pipeline) != .VALID) return;
+    if (self.compute_state_view.id == 0 or
+        sg.queryViewState(self.compute_state_view) != .VALID) return;
+    if (self.compute_spawn_view.id == 0 or
+        sg.queryViewState(self.compute_spawn_view) != .VALID) return;
+    if (self.compute_draw_view.id == 0 or
+        sg.queryViewState(self.compute_draw_view) != .VALID) return;
     const staged = self.compute_staged;
     const will_dispatch = (self.compute_flush_pending or staged > 0) and self.compute_high_water > 0;
-    if (self.compute_spawn_buffer.id != 0) {
+    if (self.compute_spawn_buffer.id != 0 and
+        sg.queryBufferState(self.compute_spawn_buffer) == .VALID)
+    {
         if (staged > 0) {
             sg.writeBufferTransient(.{
                 .dst = .{ .buffer = self.compute_spawn_buffer },

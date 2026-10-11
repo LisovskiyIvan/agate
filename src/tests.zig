@@ -322,6 +322,7 @@ test {
     _ = @import("scene/draw_tests.zig");
     _ = @import("scene/forward_pipelines.zig");
     _ = @import("scene/forward_pipelines_tests.zig");
+    _ = @import("scene/forward_prewarm_tests.zig");
     _ = @import("scene/frame_api.zig");
     _ = @import("scene/frame_build.zig");
     _ = @import("scene/frame_draws.zig");
@@ -342,6 +343,7 @@ test {
     _ = @import("scene/ibl_tests.zig");
     _ = @import("scene/instance_staging.zig");
     _ = @import("scene/instance_staging_tests.zig");
+    _ = @import("scene/legacy_fs_tests.zig");
     _ = @import("scene/lifecycle.zig");
     _ = @import("scene/light_rig.zig");
     _ = @import("scene/light_rig_tests.zig");
@@ -411,6 +413,7 @@ test {
     _ = @import("scene/ui_capture.zig");
     _ = @import("scene/ui_frame.zig");
     _ = @import("scene/ui_frame_tests.zig");
+    _ = @import("scene/uniform_split_tests.zig");
     _ = @import("scene/uniforms.zig");
     _ = @import("scene/uniforms_tests.zig");
     _ = @import("scene/upload_packets.zig");
@@ -421,6 +424,7 @@ test {
     _ = @import("scene/upload_packets_tests.zig");
     _ = @import("scene/upload_packets_transient.zig");
     _ = @import("scene/velocity_tests.zig");
+    _ = @import("scene/view_cache_tests.zig");
     _ = @import("scene/view_render.zig");
     _ = @import("scene/viewport_clear.zig");
     _ = @import("serialization.zig");

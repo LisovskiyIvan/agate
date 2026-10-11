@@ -75,8 +75,8 @@ pub const HemisphericLight = struct {
 `0.5 + 0.5 * dot(N, direction)`; итог умножается на альбедо и
 `(1 - metallic)` (у металлов диффуза нет). Реализация —
 `shaders/common/hemi.glsl`, юниформы `hemi_dir_intensity` / `hemi_diffuse`
-(`scene/uniforms.zig`, дописаны в конец `fs_params`, чтобы не сдвинуть
-существующие оффсеты). `ground_color` по-прежнему едет в слоте
+(`scene/uniforms.zig`, едут в `fs_view`, view-глобальный блок сплита legacy
+`fs_params`). `ground_color` по-прежнему едет в слоте
 `ambient_color.rgb`. Также legacy-фолбэк солнца, когда directional
 отсутствует или выключен.
 

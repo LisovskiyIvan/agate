@@ -172,9 +172,11 @@ pub const FrameContext = struct {
     point_view_proj: [12]Mat4, point_shadow_params: [4][4]f32,
     area_center_int/area_right/area_up/area_color: [2][4]f32,
     clustered_params/clustered_viewport: [4]f32,
-    uniforms_with_shadows/without_shadows: ?*const FrameUniforms,
+    uniforms_with_shadows/without_shadows: ?*const FrameViewUniforms,
 };
-pub const FrameUniforms = struct { eye_pos, light_dir, light_color: [4]f32, ... };
+pub const FrameUniforms = struct { eye_pos, light_dir, light_color: [4]f32, ... }; // legacy single-block model (kept)
+pub const FrameViewUniforms = extern struct { eye_pos, light_dir, ... , refraction_view_proj: Mat4, refraction_capture: [4]f32 }; // fs_view wire (UB 1)
+pub const FrameMaterialUniforms = extern struct { base_color_factor, pbr_factors, ... , probe_box: [2][4]f32 }; // fs_mat wire (UB 5)
 pub const ShadowState = struct { ... };
 pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUniforms
 pub fn alphaCutoffFor(mat: ?Material) f32
