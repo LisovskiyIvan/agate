@@ -142,7 +142,7 @@ pub const FollowEntry = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    lerp_speed: f32 = 8.0,
+    inertia: f32 = 8.0,
 };
 
 pub const TargetEntry = struct {
@@ -153,7 +153,7 @@ pub const TargetEntry = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    smoothing: f32 = 8.0,
+    inertia: f32 = 8.0,
 };
 
 pub const FlyEntry = struct {

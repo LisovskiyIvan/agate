@@ -172,7 +172,7 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .fov_deg = c.fov_deg,
                 .near = c.near,
                 .far = c.far,
-                .lerp_speed = c.lerp_speed,
+                .inertia = c.inertia,
             } },
             .target => |c| .{ .target = .{
                 .name = try allocator.dupe(u8, c.name),
@@ -182,7 +182,7 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .fov_deg = c.fov_deg,
                 .near = c.near,
                 .far = c.far,
-                .smoothing = c.smoothing,
+                .inertia = c.inertia,
             } },
             .fly => |c| .{ .fly = .{
                 .name = try allocator.dupe(u8, c.name),
@@ -329,7 +329,7 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
             try w.f32le(c.fov_deg);
             try w.f32le(c.near);
             try w.f32le(c.far);
-            try w.f32le(c.lerp_speed);
+            try w.f32le(c.inertia);
         },
         .target => |*c| {
             try w.byte(4);
@@ -340,7 +340,7 @@ pub fn serializeAlloc(allocator: std.mem.Allocator, state: *const SceneState) ![
             try w.f32le(c.fov_deg);
             try w.f32le(c.near);
             try w.f32le(c.far);
-            try w.f32le(c.smoothing);
+            try w.f32le(c.inertia);
         },
         .fly => |*c| {
             try w.byte(5);

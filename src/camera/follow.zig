@@ -20,7 +20,7 @@ pub const FollowCameraOptions = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    lerp_speed: f32 = 8.0,
+    inertia: f32 = 8.0,
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 };
@@ -36,7 +36,7 @@ pub const FollowCamera = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    lerp_speed: f32 = 8.0, // 0 = instant snap
+    inertia: f32 = 8.0, // 0 = instant snap
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 
@@ -50,7 +50,7 @@ pub const FollowCamera = struct {
             .fov_deg = options.fov_deg,
             .near = options.near,
             .far = options.far,
-            .lerp_speed = options.lerp_speed,
+            .inertia = options.inertia,
             .culling_mask = options.culling_mask,
             .viewport = options.viewport,
         };
@@ -80,10 +80,10 @@ pub const FollowCamera = struct {
     pub fn update(self: *FollowCamera, dt: f32) void {
         if (self.target_mesh) |m| self.target_position = m.position;
         const desired = self.desiredPosition();
-        if (self.lerp_speed <= 0.0) {
+        if (self.inertia <= 0.0) {
             self.position = desired;
         } else {
-            const t = @min(1.0, self.lerp_speed * dt);
+            const t = @min(1.0, self.inertia * dt);
             self.position = self.position.lerp(desired, t);
         }
     }

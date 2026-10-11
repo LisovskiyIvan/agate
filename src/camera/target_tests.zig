@@ -39,11 +39,11 @@ test "TargetCamera top-down view does not degenerate" {
     try std.testing.expectApproxEqAbs(@as(f32, 300.0), p.y, 1e-2);
 }
 
-test "TargetCamera smoothing converges to the goals" {
+test "TargetCamera inertia converges to the goals" {
     var cam = TargetCamera.init("watcher", .{
         .position = Vec3.new(0.0, 0.0, 10.0),
         .target = Vec3.new(5.0, 0.0, 0.0),
-        .smoothing = 8.0,
+        .inertia = 8.0,
     });
     cam.setDesiredPosition(Vec3.new(0.0, 0.0, 5.0));
     cam.setTarget(Vec3.zero);
@@ -56,8 +56,8 @@ test "TargetCamera smoothing converges to the goals" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), cam.target.y, 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), cam.target.z, 1e-3);
 
-    // Zero smoothing snaps instantly.
-    var snap = TargetCamera.init("snap", .{ .smoothing = 0.0 });
+    // Zero inertia snaps instantly.
+    var snap = TargetCamera.init("snap", .{ .inertia = 0.0 });
     snap.setDesiredPosition(Vec3.new(1.0, 2.0, 3.0));
     snap.setTarget(Vec3.new(4.0, 5.0, 6.0));
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), snap.position.x, 1e-6);

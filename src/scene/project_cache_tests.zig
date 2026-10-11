@@ -55,11 +55,11 @@ test "project VP cache: different union variants miss" {
 }
 
 test "project VP cache: target and fly cameras" {
-    // Equal target pairs hit; tuning-only (smoothing) differences still hit.
+    // Equal target pairs hit; tuning-only (inertia) differences still hit.
     const ta: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };
     const tb: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };
     try std.testing.expect(scene_projection.camerasEqualForProjection(ta, tb));
-    const tc: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero, .smoothing = 0.0 } };
+    const tc: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero, .inertia = 0.0 } };
     try std.testing.expect(scene_projection.camerasEqualForProjection(ta, tc));
 
     // Moved target point, moved position, pending goal, and changed up miss.

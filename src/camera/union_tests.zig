@@ -120,7 +120,7 @@ test "Camera union setPosition and setLookAt" {
     var target_cam: Camera = .{ .target = TargetCamera.init("target", .{
         .position = Vec3.new(0, 0, 10),
         .target = Vec3.zero,
-        .smoothing = 0.0,
+        .inertia = 0.0,
     }) };
     target_cam.setPosition(Vec3.new(1, 2, 3));
     const p = target_cam.getPosition();

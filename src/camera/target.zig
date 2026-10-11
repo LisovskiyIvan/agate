@@ -1,6 +1,6 @@
 //! Observer camera: fixed lookAt(position, target, up), no mouse input.
 //! Motion happens only through desired goals + update(dt), which eases the
-//! current position/target towards them when smoothing > 0. Split out of
+//! current position/target towards them when inertia > 0. Split out of
 //! `camera.zig` (facade): `camera.zig` re-exports the options and camera
 //! types so the public API is unchanged. Leaf: imports `viewport` only —
 //! never the facade and never sibling camera leaves.
@@ -20,14 +20,14 @@ pub const TargetCameraOptions = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    smoothing: f32 = 8.0, // Lerp speed 1/s towards the goals; 0 = instant snap
+    inertia: f32 = 8.0, // Lerp speed 1/s towards the goals; 0 = instant snap
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 };
 
 // Observer camera: fixed lookAt(position, target, up), no mouse input.
 // Motion happens only through desired goals + update(dt), which eases the
-// current position/target towards them when smoothing > 0.
+// current position/target towards them when inertia > 0.
 pub const TargetCamera = struct {
     name: []const u8 = "TargetCamera",
     position: Vec3 = Vec3.zero,
@@ -39,7 +39,7 @@ pub const TargetCamera = struct {
     fov_deg: f32 = 60.0,
     near: f32 = 0.1,
     far: f32 = 100.0,
-    smoothing: f32 = 8.0,
+    inertia: f32 = 8.0,
     culling_mask: u32 = 0xFFFFFFFF,
     viewport: Viewport = .{},
 
@@ -52,14 +52,14 @@ pub const TargetCamera = struct {
             .fov_deg = options.fov_deg,
             .near = options.near,
             .far = options.far,
-            .smoothing = options.smoothing,
+            .inertia = options.inertia,
             .culling_mask = options.culling_mask,
             .viewport = options.viewport,
         };
     }
 
     pub fn setTarget(self: *TargetCamera, target: Vec3) void {
-        if (self.smoothing <= 0.0) {
+        if (self.inertia <= 0.0) {
             self.target = target;
             self.desired_target = null;
         } else {
@@ -68,7 +68,7 @@ pub const TargetCamera = struct {
     }
 
     pub fn setDesiredPosition(self: *TargetCamera, position: Vec3) void {
-        if (self.smoothing <= 0.0) {
+        if (self.inertia <= 0.0) {
             self.position = position;
             self.desired_position = null;
         } else {
@@ -87,13 +87,13 @@ pub const TargetCamera = struct {
     }
 
     pub fn update(self: *TargetCamera, dt: f32) void {
-        if (self.smoothing <= 0.0) {
+        if (self.inertia <= 0.0) {
             if (self.desired_position) |p| self.position = p;
             if (self.desired_target) |t| self.target = t;
             self.clearGoals();
             return;
         }
-        const t = @min(1.0, self.smoothing * dt);
+        const t = @min(1.0, self.inertia * dt);
         if (self.desired_position) |p| {
             self.position = self.position.lerp(p, t);
             if (self.position.sub(p).length() < 0.0001) {

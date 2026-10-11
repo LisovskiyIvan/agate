@@ -104,7 +104,7 @@ pub const CameraRig = struct {
                 .fov_deg = master.getFovDeg(),
                 .near = master.getNear(),
                 .far = master.getFar(),
-                .smoothing = 0.0,
+                .inertia = 0.0,
             }),
         };
     }
@@ -251,7 +251,7 @@ pub const CameraRig = struct {
                 .fov_deg = self.master_camera.getFovDeg(),
                 .near = self.master_camera.getNear(),
                 .far = self.master_camera.getFar() * 2.0,
-                .smoothing = 0.0,
+                .inertia = 0.0,
             }),
         };
         self.slots[1] = .{
@@ -273,7 +273,7 @@ pub const CameraRig = struct {
                 .fov_deg = self.master_camera.getFovDeg(),
                 .near = self.master_camera.getNear(),
                 .far = self.master_camera.getFar() * 2.0,
-                .smoothing = 0.0,
+                .inertia = 0.0,
             }),
         };
         self.slots[2] = .{
@@ -295,7 +295,7 @@ pub const CameraRig = struct {
                 .fov_deg = self.master_camera.getFovDeg(),
                 .near = self.master_camera.getNear(),
                 .far = self.master_camera.getFar() * 2.0,
-                .smoothing = 0.0,
+                .inertia = 0.0,
             }),
         };
         self.slots[3] = .{

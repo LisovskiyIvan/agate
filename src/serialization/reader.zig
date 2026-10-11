@@ -179,7 +179,7 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .fov_deg = c.fov_deg,
                 .near = c.near,
                 .far = c.far,
-                .lerp_speed = c.lerp_speed,
+                .inertia = c.inertia,
             } }, owned);
         },
         .target => |*c| {
@@ -191,7 +191,7 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
                 .fov_deg = c.fov_deg,
                 .near = c.near,
                 .far = c.far,
-                .smoothing = c.smoothing,
+                .inertia = c.inertia,
             }) }, owned);
         },
         .fly => |*c| {
@@ -363,7 +363,7 @@ fn readCamera(allocator: std.mem.Allocator, r: *Reader) !CameraEntry {
             c.fov_deg = try r.readF32();
             c.near = try r.readF32();
             c.far = try r.readF32();
-            c.lerp_speed = try r.readF32();
+            c.inertia = try r.readF32();
             return .{ .follow = c };
         },
         4 => {
@@ -376,7 +376,7 @@ fn readCamera(allocator: std.mem.Allocator, r: *Reader) !CameraEntry {
             c.fov_deg = try r.readF32();
             c.near = try r.readF32();
             c.far = try r.readF32();
-            c.smoothing = try r.readF32();
+            c.inertia = try r.readF32();
             return .{ .target = c };
         },
         5 => {

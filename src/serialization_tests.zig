@@ -263,7 +263,7 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
             try std.testing.expectEqual(c.fov_deg, o.fov_deg);
             try std.testing.expectEqual(c.near, o.near);
             try std.testing.expectEqual(c.far, o.far);
-            try std.testing.expectEqual(c.lerp_speed, o.lerp_speed);
+            try std.testing.expectEqual(c.inertia, o.inertia);
         },
         .target => |*c| {
             const o = b.camera.target;
@@ -274,7 +274,7 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
             try std.testing.expectEqual(c.fov_deg, o.fov_deg);
             try std.testing.expectEqual(c.near, o.near);
             try std.testing.expectEqual(c.far, o.far);
-            try std.testing.expectEqual(c.smoothing, o.smoothing);
+            try std.testing.expectEqual(c.inertia, o.inertia);
         },
         .fly => |*c| {
             const o = b.camera.fly;
@@ -543,7 +543,7 @@ test "serialization target camera round-trips exactly" {
         .fov_deg = 50.0,
         .near = 0.5,
         .far = 200.0,
-        .smoothing = 4.0,
+        .inertia = 4.0,
     } };
     defer original.deinit(alloc);
 
@@ -668,18 +668,18 @@ test "capture and restore target and fly cameras" {
         .fov_deg = 50.0,
         .near = 0.5,
         .far = 200.0,
-        .smoothing = 4.0,
+        .inertia = 4.0,
     }) };
 
     var state = try capture(alloc, &scene);
     try std.testing.expect(state.camera == .target);
-    try std.testing.expectEqual(@as(f32, 4.0), state.camera.target.smoothing);
+    try std.testing.expectEqual(@as(f32, 4.0), state.camera.target.inertia);
 
     restore(&scene, &state);
     try std.testing.expect(scene.active_camera != null);
     try std.testing.expect(scene.active_camera.? == .target);
     try std.testing.expectEqual(@as(f32, 50.0), scene.active_camera.?.target.fov_deg);
-    try std.testing.expectEqual(@as(f32, 4.0), scene.active_camera.?.target.smoothing);
+    try std.testing.expectEqual(@as(f32, 4.0), scene.active_camera.?.target.inertia);
 
     scene.active_camera = .{ .fly = FlyCamera.init("pilot", .{
         .position = Vec3.new(1.0, 2.0, 3.0),
