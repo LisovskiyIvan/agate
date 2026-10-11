@@ -33,6 +33,13 @@ var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
 var scene: z.Scene = undefined;
 
 var bench: bench_mod.Bench = .{};
+var ab: bench_mod.AbBench = .{};
+/// Interleaved A/B mode (wave 5, opt-in via AGATE_Q0_AB=ssgi): alternates
+/// SSGI on (arm A, scene default) / off (arm B) in blocks instead of the
+/// back-to-back phase walk. SSGI is a composite-shader bool with no
+/// target rebuild, so it is safe to toggle per block; a render_scale pair
+/// would realloc targets every block and must stay in the phase bench.
+var ab_mode: bool = false;
 var frame_limit: u32 = 0;
 var frames: u32 = 0;
 var log_errors: u32 = 0;
@@ -305,10 +312,18 @@ export fn frame() callconv(.c) void {
     const gate = frame_limit > 0;
     defer if (gate and f >= frame_limit) sapp.quit();
     if (gate) {
-        if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
-        if (bench.phase_started) {
-            scene.post_process.render_scale = bench.currentScale();
-            scene.resetTaa();
+        if (ab_mode) {
+            if (ab.beginBlock(f, frame_limit)) |ev| {
+                scene.post_process.ssgi_enabled = ev.arm == .A;
+                if (ev.index > 0) scene.resetTaa();
+                std.debug.print("q0-interior ab: block {} arm={s} ssgi={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi_enabled });
+            }
+        } else {
+            if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
+            if (bench.phase_started) {
+                scene.post_process.render_scale = bench.currentScale();
+                scene.resetTaa();
+            }
         }
     }
     // Deterministic motion under the gate: same jitter/animation frame for
@@ -335,9 +350,21 @@ export fn frame() callconv(.c) void {
     scene.render();
     // GPU sample poll must live HERE: render writes stats.gpu_frame_* at
     // its end and the next staged begin resets `stats`.
-    if (timing.isEnabled()) bench.recordSample(scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
-    if (f == 2 or bench.phase_started) {
-        bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+    if (timing.isEnabled()) {
+        if (ab_mode) {
+            ab.recordSample(f, scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
+        } else bench.recordSample(scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
+    }
+    if (ab_mode) {
+        // Every-frame note (cheap), outside the timing gate: a mid-block
+        // window settle marks the run UNSTABLE even if it settles back
+        // before the next boundary.
+        ab.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+    }
+    if (f == 2 or bench.phase_started or ab.block_started) {
+        if (ab_mode) {
+            ab.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+        } else bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
         std.debug.print("q0-interior: render target {}x{} scale={d:.2} swapchain {}x{}\n", .{
             scene.postfx.renderWidth(),      scene.postfx.renderHeight(),
             scene.post_process.render_scale, sapp.width(),
@@ -350,7 +377,13 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
-    if (timing.isEnabled()) bench_mod.Bench.printPhase(bench.report(bench.index));
+    if (timing.isEnabled()) {
+        if (ab_mode) {
+            const s = ab.finalSummary("ssgi_on", "ssgi_off");
+            ab.printBlocks();
+            bench_mod.AbBench.printSummary(s);
+        } else bench_mod.Bench.printPhase(bench.report(bench.index));
+    }
     scene.deinit();
     sg.shutdown();
     if (log_errors != 0) fail("sokol log errors: {}", .{log_errors});
@@ -361,6 +394,7 @@ export fn cleanup() callconv(.c) void {
 
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     bench.noteEvent(ev.*);
+    ab.noteEvent(ev.*);
     if (ev.*.type == .KEY_DOWN and ev.*.key_code == .ESCAPE) sapp.quit();
 }
 
@@ -369,6 +403,19 @@ pub fn main() void {
     render_scale = envF32("AGATE_Q0_RENDER_SCALE", 1.0);
     bench.phase_frames = @max(30, envU32("AGATE_Q0_PHASE_FRAMES", 180));
     if (envFlag("AGATE_Q0_PHASES_REVERSED")) bench.scales = .{ 0.66, 0.75, 1.0 };
+    // Opt-in interleaved A/B: AGATE_Q0_AB=ssgi alternates SSGI on/off in
+    // A/B blocks (default 2 settle blocks + 8 measured blocks x 60 frames
+    // = 600 frames, one full rotated A B B A B A A B cycle, when
+    // AGATE_Q0_FRAMES is unset). AGATE_Q0_AB_BLOCK overrides the block
+    // size (clamped to the bench scratch). The phase bench is bypassed in
+    // this mode; everything else keeps its meaning.
+    if (std.c.getenv("AGATE_Q0_AB")) |sel| {
+        if (std.mem.eql(u8, std.mem.span(sel), "ssgi")) ab_mode = true;
+    }
+    if (ab_mode) {
+        ab.block_frames = @min(@max(envU32("AGATE_Q0_AB_BLOCK", 60), 16), bench_mod.ab_max_block_frames);
+        if (frame_limit == 0) frame_limit = ab.block_frames * (8 + ab.settle_blocks);
+    }
     render_scale = @min(@max(render_scale, z.postprocess.min_render_scale), 1.0);
     sapp.run(.{
         .init_cb = init,

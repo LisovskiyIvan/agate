@@ -113,4 +113,18 @@ pub fn build(b: *std.Build) !void {
     const run_q0 = b.addRunArtifact(q0_exe);
     if (b.args) |args| run_q0.addArgs(args);
     b.step("run-q0", "Run the Q0 calibration interior (fill-bound A/B; AGATE_Q0_FRAMES/AGATE_Q0_TIMINGS)").dependOn(&run_q0.step);
+
+    // Harness unit tests: gpu_phase_bench verdict-rule tests (no window;
+    // live sampling/occlusion paths are covered by the windowed runs).
+    const bench_test_mod = b.createModule(.{
+        .root_source_file = b.path("gpu_phase_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+        },
+    });
+    const bench_tests = b.addTest(.{ .root_module = bench_test_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    b.step("test", "Run example harness unit tests").dependOn(&run_bench_tests.step);
 }
