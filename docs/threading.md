@@ -62,4 +62,6 @@ Kick и join выполняются на scene-update (game) потоке; во�
 - `./frame-pipeline.md` — слоты, freeze→commit, staged prepare детально.
 - `./architecture.md` — карта модулей и слоёв движка.
 
-Замеры: принадлежат интеграции в sandbox владельца (следующая волна); здесь цифр нет осознанно.
+Замеры: MEASUREMENTS.md волна 10 (12.10.2026) — матрица serial/threaded ×
+physics inline/dedicated на sandbox: INCONCLUSIVE (workload present-bound,
+шаг физики ~0.02 мс на пресете шаров); оси опт-ин, off = бит-идентично.
