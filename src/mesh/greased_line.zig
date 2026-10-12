@@ -45,12 +45,16 @@ pub const GreasedLineColorMode = enum {
 
 pub const GreasedLineOptions = struct {
     /// Single polyline path (used if `paths` is empty).
+    /// BORROWED: the mesh keeps the slice and `update`/rebuild reads it
+    /// every call — the caller must keep the point data alive.
     points: []const Vec3 = &.{},
     /// Multiple polyline paths rendered as a single unified draw call.
+    /// BORROWED: same lifetime rule as `points`.
     paths: []const []const Vec3 = &.{},
     /// Base line thickness/width in world units.
     width: f32 = 0.1,
     /// Optional per-vertex width array.
+    /// BORROWED: same lifetime rule as `points` (rebuilt every `update`).
     widths: ?[]const f32 = null,
     /// Base uniform color of the line.
     color: Color4 = Color4.white,
