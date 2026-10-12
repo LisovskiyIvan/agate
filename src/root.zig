@@ -133,6 +133,15 @@ pub const ThreadingOptions = threading.ThreadingOptions;
 /// of reproducing the ordering by hand.
 pub const runtime = @import("runtime.zig");
 pub const Runtime = runtime.Runtime;
+/// Headless CPU-only scene fixture (no sg context needed): the same minimal
+/// scene the unit suite drives the staged pipeline with (staged build /
+/// begin / finish / reuse / retire epochs are real; GPU uploads and draws
+/// degrade to their documented coherent-empty no-ops). For headless tooling
+/// only (chaos runner CI mode) — windowed apps keep `Scene.init`. Teardown
+/// mirrors the unit suite (drain retires, then deinit each owned list;
+/// see examples/chaos_runner.zig) — `Scene.deinit` assumes full-init GPU
+/// resources and must not be called on a fixture scene.
+pub const testing = @import("testing.zig");
 pub const app = @import("app.zig");
 pub const App = app.App;
 pub const handoff = @import("handoff.zig");

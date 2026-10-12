@@ -127,4 +127,24 @@ pub fn build(b: *std.Build) !void {
     const bench_tests = b.addTest(.{ .root_module = bench_test_mod });
     const run_bench_tests = b.addRunArtifact(bench_tests);
     b.step("test", "Run example harness unit tests").dependOn(&run_bench_tests.step);
+
+    // 6. Chaos Runner (deterministic seeded stress host; headless CPU-only
+    //    staged path vs windowed full GPU path — see examples/chaos_runner.zig)
+    const chaos_mod = b.createModule(.{
+        .root_source_file = b.path("chaos_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const chaos_exe = b.addExecutable(.{
+        .name = "chaos-runner",
+        .root_module = chaos_mod,
+    });
+    b.installArtifact(chaos_exe);
+    const run_chaos = b.addRunArtifact(chaos_exe);
+    if (b.args) |args| run_chaos.addArgs(args);
+    b.step("run-chaos", "Run the seeded chaos stress host (see docs/chaos.md)").dependOn(&run_chaos.step);
 }
