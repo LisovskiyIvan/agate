@@ -47,32 +47,18 @@ pub fn renderSceneView(
     const cl_count = snap.light_pack.clustered_count;
     var cl_params: [4]f32 = .{ 0, 0, 0, 0 };
     var cl_viewport: [4]f32 = .{ 0, 0, 64, 0 };
-    if (cl_count > 0 and scene.rendering_reuse) {
-        // renderReuse re-presents the SAME staged snapshot the last
-        // real frame built tiles from: keep the existing storage
-        // buffers and descriptor instead of rebuilding — a replay must
-        // stay upload-free (the reuse fixture asserts zero
-        // updateBuffer calls). Liveness is per view slot: a view whose
-        // slot never uploaded (pure reuse streak) falls back to the
-        // dummy/legacy path until the next real frame, while other
-        // views keep replaying their own slots.
-        if (scene.clustered.isLive(slot)) {
-            cl_params = .{
-                @floatFromInt(scene.clustered.tiles_x),
-                @floatFromInt(scene.clustered.tiles_y),
-                @floatFromInt(cl_count),
-                1.0,
-            };
-            cl_viewport = .{
-                @floatFromInt(snap.screen_w),
-                @floatFromInt(snap.screen_h),
-                @floatFromInt(scene_clustered.tile_size_px),
-                0.0,
-            };
-        } else {
-            scene.clustered.ensureDummyViews();
-        }
-    } else if (cl_count > 0) {
+    // Reuse replays run this same rebuild+upload: the tile storage buffers
+    // are `write_transient`, and sokol requires every bound transient
+    // buffer to be written in the binding sokol frame
+    // (VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING) — keeping the
+    // prepared frame's buffers without re-uploading binds unwritten
+    // storage views on every reuse draw. The rebuild is a deterministic
+    // replay, not new content: its inputs are the frozen slot snapshot
+    // (staged lights, view_proj, viewport), so the bytes are identical to
+    // the prepared frame's. A scratch-only re-upload would be wrong for
+    // multi-view (the shared CPU scratch holds the last rebuilt view), so
+    // each view rebuilds its own slot exactly like the prepared path.
+    if (cl_count > 0) {
         const rect = cam_snap.viewport.toPixelRect(snap.screen_w, snap.screen_h);
         const view_rect = scene_clustered.ViewRect{ .x = rect.x, .y = rect.y, .w = rect.width, .h = rect.height };
         var rebuilt_ok = true;

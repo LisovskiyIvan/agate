@@ -33,6 +33,11 @@
 //! Expected: `verdict=PASS producer_builds>0 prepared>0 log_errors=0`.
 //! Dedicated: `zig build run-runtime-worker -- --frames 120 --physics=dedicated`
 //! Expected: `verdict=PASS ... physics_kicks>0`.
+//! Exclusion: `zig build run-runtime-worker -- --frames 240 --prepare-exclusion`
+//! Expected: `verdict=PASS ... log_errors=0` (diagnostic producer
+//! exclusion around the staged begin; contention surfaces as busy/reuse
+//! frames, never as errors — this is the live gate for the reuse
+//! transient-write replay, see docs/frame-pipeline.md).
 
 const std = @import("std");
 const z = @import("agate");
@@ -61,6 +66,11 @@ var worker_running = false;
 /// `ThreadingOptions.physics` for the scene's fallen stack.
 var physics_dedicated = false;
 var physics_kicks: u64 = 0;
+/// `--prepare-exclusion`: diagnostic producer exclusion around the staged
+/// begin (context `beginPrepare` bounds the frozen begin with the phase
+/// mutex; the game tick holds it across simulate+build). Exercises the
+/// busy/reuse path and the reuse transient-write replay on a real GPU.
+var prepare_exclusion = false;
 
 /// Window size cache: the context thread writes it on init/resize, the
 /// game thread reads it for `publishFrameSnapshot` (relaxed atomics — a
@@ -134,6 +144,18 @@ fn appInitCb(_: *z.App) void {
         .intensity = 1.0,
     });
 
+    // One clustered point light: the forward draws bind its tile storage
+    // views (write_transient buffers), so the --prepare-exclusion gate
+    // exercises the reuse transient-write replay on a real GPU — without
+    // it the scene binds no transient buffer and the gate is vacuous.
+    _ = scene.addClusteredPointLight(z.Vec3.new(0.0, 4.0, 0.0), .{
+        .color = z.Color3.new(1.0, 0.85, 0.6),
+        .intensity = 2.0,
+        .radius = 9.0,
+    }) catch |err| {
+        std.debug.panic("runtime-worker: clustered light creation failed: {}", .{err});
+    };
+
     // Ring of boxes on two radii: enough draws to prove the queues flow,
     // cheap enough to stay smooth everywhere.
     var created: usize = 0;
@@ -177,6 +199,7 @@ fn appInitCb(_: *z.App) void {
     }
 
     sim.last_ns = 0;
+    if (prepare_exclusion) runtime.setProducerExclusion(true);
     worker_running = runtime.spawnWorker(gameLoop);
     std.debug.print("runtime-worker: game worker {s}\n", .{if (worker_running) "spawned (threaded staged path)" else "spawn failed (inline serial fallback)"});
 }
@@ -216,21 +239,25 @@ fn appCleanupCb(_: *z.App) void {
         m.finishes > 0 and
         prepared_frames > 0 and
         log_errors == 0 and
-        (!physics_dedicated or physics_kicks > 0);
+        (!physics_dedicated or physics_kicks > 0) and
+        // The exclusion gate only proves the reuse path when contention
+        // actually happened (busy begin or busy/reused present).
+        (!prepare_exclusion or m.begin_busy > 0 or busy_frames > 0 or reused_frames > 0);
 
     std.debug.print(
         "runtime-worker: frames={} prepared={} reused={} skipped={} busy={}\n" ++
-            "runtime-worker: producer_builds={} producer_skips={} begins={} begin_empty={} finishes={} reuses={}\n" ++
-            "runtime-worker: physics={s} physics_kicks={}\n" ++
+            "runtime-worker: producer_builds={} producer_skips={} begins={} begin_empty={} begin_busy={} finishes={} reuses={}\n" ++
+            "runtime-worker: physics={s} physics_kicks={} exclusion={}\n" ++
             "verdict={s} log_errors={}\n",
         .{
-            frame_count,      prepared_frames,
-            reused_frames,    skipped_frames,
-            busy_frames,      m.producer_builds,
-            m.producer_skips, m.begins,
-            m.begin_empty,    m.finishes,
-            m.reuses,         if (physics_dedicated) "dedicated" else "inline",
-            physics_kicks,    if (verdict_pass) "PASS" else "FAIL",
+            frame_count,                                      prepared_frames,
+            reused_frames,                                    skipped_frames,
+            busy_frames,                                      m.producer_builds,
+            m.producer_skips,                                 m.begins,
+            m.begin_empty,                                    m.begin_busy,
+            m.finishes,                                       m.reuses,
+            if (physics_dedicated) "dedicated" else "inline", physics_kicks,
+            prepare_exclusion,                                if (verdict_pass) "PASS" else "FAIL",
             log_errors,
         },
     );
@@ -272,6 +299,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) void {
             if (it.next()) |mode| physics_dedicated = std.mem.eql(u8, mode, "dedicated");
         } else if (std.mem.startsWith(u8, arg, "--physics=")) {
             physics_dedicated = std.mem.eql(u8, arg["--physics=".len..], "dedicated");
+        } else if (std.mem.eql(u8, arg, "--prepare-exclusion")) {
+            prepare_exclusion = true;
         }
     }
     if (frame_limit == 0) frame_limit = 240;

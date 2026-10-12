@@ -238,7 +238,7 @@ pub const Runtime = struct {
 | Режим | Begin | Finish/render | Когда |
 |---|---|---|---|
 | Staged lock-free (default) | без мьютекса | без мьютекса | свежий билд заморозил всё; commit — game-side |
-| Staged с исключением (`--prepare-exclusion`) | под `mutex` (`lock_wait_ns`, 0 = try) | без | диагностика тех же данных/алгоритма, не откат render-пути |
+| Staged с исключением (`--prepare-exclusion`) | под `mutex` (`lock_wait_ns`, 0 = try) | без | диагностика тех же данных/алгоритма, не откат render-пути; занятые present'ы идут в reuse — режим регулярно упражняет reuse-реплей transient-записей (см. раздел выше) |
 | Single-thread (`--no-threads`) | тот же staged-путь | render перекрывается | один поток, `rt.update` + `rt.renderFrame` |
 
 Сложность/аллокации: claim/pin/publish — O(1) под внутренним мьютексом слотов; `reset` — O(списки) без освобождения (retained capacity); slot payload растёт до high-water-mark и переиспользуется; `cpuBytes` — O(число списков).
@@ -272,6 +272,19 @@ pub const Runtime = struct {
 **Фикс.** Reuse-кадр переподаёт staged payload'ы фрот-лота в те же transient-буферы ДО любых draw'ов: `upload_packets.rewriteTransientWrites` (`upload_packets_transient.zig`: morph / particle cpu+gpu / trails / softbodies / greased) и `instance_staging.rewriteSlotInstanceBuffers` (cur в bound-буфер; парный prev — тем же payload'ом, повтор кадра = нулевая instance-моушн-семантика). Вызов из `frame_render.render()` под `if (scene.rendering_reuse)`. Write-only по контракту: без upload-meter, без delivered/outcome-мутаций, без создания буферов и без particle-compute state clear (это семантика — состояние симуляции переживает повтор).
 
 **Гейт.** `hdr-showcase --frames 400`: 0 ошибок валидации, 0 паник (было 1 + panic на baseline). Известные непокрытые corner'ы (осознанно, не в шипе): pending-mesh создания (their ids съедены commit'ом) и compute-particle state буферы (пишутся на render-time compute-пути, который reuse-кадр перепрогоняет).
+
+**Exclusion-пробой (найдено и исправлено).** Детерминированный `VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING` → `VALIDATION_FAILED` → abort в диагностическом `--prepare-exclusion`: первые кадры — `.busy` (мьютекс держит producer, consumable front ещё нет), затем первый prepared кадр, затем первый же reuse — паника уже на первом opaque draw. Lock-free threaded при этом чист: producer без мьютекса почти всегда успевает опубликовать свежий билд к каждому present (reuse редок), а под исключением каждый занятый present падает в `reuseIfConsumable`, и reuse идёт сразу же.
+
+Корень (все три — один класс: reuse биндит `write_transient`-буферы, записанные только в prepared-кадре, и не переподаёт их; H1/H2 про commit/flush пакетов не подтвердились — инструментация показала, что flush latched-слота доставил все пакеты):
+- Clustered-тайлы: `ClusteredGpuCache` создаёт tile storage-буферы с `write_transient`, каждый regular draw биндит их через storage views (`bindClusteredViews`), а reuse-ветка `renderSceneView` при живом слоте биндила те же views БЕЗ upload («upload-free» ради экономии — несовместимо с transient-семантикой).
+- UI: композит биндит canvas-буферы (`write_transient`), записанные только в `upload` prepared-кадра.
+- Physics-debug: `renderDebugPrepared` биндит line-буфер, записанный только в `uploadDebug` prepared-кадра.
+
+Фикс (только reuse-путь, prepared и lock-free побитово те же):
+- Clustered: reuse выполняет те же rebuild+upload из замороженного снимка слота (байты детерминированно те же; re-upload из общего CPU-scratch без rebuild был бы неверен для multi-view — scratch держит последний перестроенный view). Спец-ветка «без rebuild на reuse» удалена.
+- UI: `UiFrame.replayUpload` — write-only переподача committed-пакета (тот же gate, что `drawPrepared`; без метра, без мутаций), вызывается из reuse-пролога `render()` до любых draw.
+- Physics-debug: `PhysicsIntegration.replayDebugUpload` — переподача замороженных `prepared_lines` через существующий `DebugPass.upload` под retained shape-тегом (watermark впускает ровно один upload на sokol-кадр).
+- Регрессия: `UiFrame.replayUpload` контракт-тест (gate-паритет + немутабельность, headless) и `replayDebugUpload` fail-closed тест; clustered-путь headless недостижим (headless `render` выходит до main pass) — покрыт живым гейтом `run-runtime-worker -- --frames 240 --prepare-exclusion` (в сцену добавлен один clustered-источник, иначе гейт вакуален: без transient-биндов reuse нечего проверять; на неисправленном коде гейт падает тем же abort).
 
 ## Производительность
 

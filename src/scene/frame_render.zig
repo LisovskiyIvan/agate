@@ -189,6 +189,14 @@ pub fn render(scene: anytype) void {
     if (scene.rendering_reuse) {
         @import("upload_packets.zig").rewriteTransientWrites(scene, draws);
         @import("instance_staging.zig").rewriteSlotInstanceBuffers(scene, draws);
+        // Same transient-write rule, non-packet owners: the UI composite
+        // and the physics-debug lines bind `write_transient` buffers whose
+        // only upload ran in the prepared frame. Both replays are
+        // write-only against retained state (the committed UI packet; the
+        // frozen prepared lines under the retained shape tag) and stay
+        // no-ops when nothing is bound.
+        scene.ui_frame.replayUpload();
+        scene.physics.replayDebugUpload();
     }
     // Slot-owned snapshot: the whole draw below reads the front
     // slot's staged copy — never the live `frame_snapshot` — so a

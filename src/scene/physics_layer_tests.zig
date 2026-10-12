@@ -202,3 +202,42 @@ test "physics upload clears tag headless; target draw stays silent" {
     try t.expect(!integ.prepared_upload_valid);
     try t.expect(integ.debug_pass == null);
 }
+
+test "reuse replayDebugUpload is fail-closed without a live pass" {
+    // Reuse frames bind the prepared debug line buffer without a staged
+    // prepare, so the main pass would trip
+    // VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING on a visible debug
+    // draw. replayDebugUpload re-issues the frozen prepared-lines upload
+    // through the retained shape tag (the watermark admits exactly one
+    // upload per sokol frame). Headless the pass lookup misses (no GPU
+    // pass exists), so the replay is a safe no-op: the tag and the frozen
+    // lines are untouched. Live-GPU proof comes from the
+    // --prepare-exclusion live gate (see docs/frame-pipeline.md).
+    const t = std.testing;
+    var fx = try makeDebugFixture(t.allocator);
+    defer fx.integ.deinit(t.allocator);
+    defer t.allocator.destroy(fx.mesh);
+    var integ = &fx.integ;
+
+    integ.buildDebug(t.allocator, 7);
+    integ.latchDebug(t.allocator);
+    try t.expect(integ.prepared_lines.items.len > 0);
+
+    // No upload ever ran: invalid tag replays to nothing.
+    try t.expect(!integ.prepared_upload_valid);
+    integ.replayDebugUpload();
+    try t.expect(!integ.prepared_upload_valid);
+
+    // Forced-valid tag with no pass (headless): lookup misses, the tag
+    // fails closed (exactly like uploadDebug), the frozen lines are
+    // untouched.
+    integ.prepared_upload_valid = true;
+    integ.prepared_upload_samples = 1;
+    integ.prepared_upload_format = .BGRA8;
+    const n = integ.prepared_lines.items.len;
+    const x0 = integ.prepared_lines.items[0].a.x;
+    integ.replayDebugUpload();
+    try t.expect(!integ.prepared_upload_valid);
+    try t.expectEqual(n, integ.prepared_lines.items.len);
+    try t.expectEqual(x0, integ.prepared_lines.items[0].a.x);
+}

@@ -551,3 +551,50 @@ test "P6: capture binds the TTF atlas view when a font is set" {
     try t.expect(headless.has_capture);
     try t.expectEqual(@as(u32, 11), headless.font_view.id);
 }
+
+test "reuse replayUpload mirrors drawPrepared's gate and mutates nothing" {
+    // Reuse frames bind the committed canvas buffers without a staged
+    // prepare, so the composite would trip
+    // VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING on the first reuse
+    // draw. replayUpload re-issues exactly the committed packet's writes.
+    // Headless (no sg context) the replay is a safe no-op; the contract
+    // pinned here is gate parity with drawPrepared (nothing bound means
+    // nothing written) plus zero state mutation, so a reuse present can
+    // call it unconditionally. Live-GPU proof comes from the
+    // --prepare-exclusion live gate (see docs/frame-pipeline.md).
+    const t = std.testing;
+    var canvas = testCanvas(t.allocator);
+    defer freeTestCanvas(&canvas);
+    canvas.drawRect(0, 0, 10, 10, Color4.white);
+    var frame = UiFrame{};
+    defer frame.deinit(t.allocator);
+    frame.capture(t.allocator, &canvas, 800.0, 600.0);
+    // Simulate the committed state upload() would publish (a headless
+    // prepare never uploads): bound from here on.
+    frame.gpu_ready = true;
+    frame.needs_upload = false;
+    const want_verts = frame.vert_count;
+    const want_idx = frame.index_count;
+    const want_vb = frame.vertex_buffer.id;
+    const want_ib = frame.index_buffer.id;
+    const want_x0 = frame.vertices.items[0].position[0];
+    try t.expect(want_verts > 0 and want_idx > 0);
+
+    // Empty packet (drawPrepared binds nothing): no-op, nothing changes.
+    frame.vert_count = 0;
+    frame.replayUpload();
+    try t.expect(frame.has_capture and frame.gpu_ready and !frame.needs_upload);
+    try t.expectEqual(@as(usize, 0), frame.vert_count);
+
+    // Committed packet, headless: no-op; every field bit-identical after.
+    frame.vert_count = want_verts;
+    frame.replayUpload();
+    try t.expect(frame.has_capture and frame.gpu_ready and !frame.needs_upload);
+    try t.expectEqual(want_verts, frame.vert_count);
+    try t.expectEqual(want_idx, frame.index_count);
+    try t.expectEqual(want_vb, frame.vertex_buffer.id);
+    try t.expectEqual(want_ib, frame.index_buffer.id);
+    try t.expectEqual(want_verts, frame.vertices.items.len);
+    try t.expectEqual(want_idx, frame.indices.items.len);
+    try t.expectEqual(want_x0, frame.vertices.items[0].position[0]);
+}

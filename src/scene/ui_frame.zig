@@ -461,6 +461,32 @@ pub const UiFrame = struct {
         return .uploaded;
     }
 
+    /// Write-only replay of the committed packet for a reuse frame (no
+    /// staged prepare ran, so `upload` never fired this sokol frame, yet
+    /// the composite binds the same `write_transient` canvas buffers —
+    /// sokol requires every bound transient buffer to be written in the
+    /// binding frame). Same draw gate as `drawPrepared`: nothing bound
+    /// means nothing written (this also keeps zero-length payloads away
+    /// from the size validation). No meter (a replay is not a new upload,
+    /// same contract as the slot-payload rewrites) and no state change:
+    /// `needs_upload` stays consumed, the packet identity is untouched.
+    /// Safe to call on every reuse present; headless no-op.
+    pub fn replayUpload(self: *const Self) void {
+        if (!sg.isvalid()) return;
+        if (!self.has_capture or !self.gpu_ready) return;
+        const vc = @min(self.vert_count, self.vertices.items.len);
+        const ic = @min(self.index_count, self.indices.items.len);
+        if (vc == 0 or ic == 0) return;
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = self.vertex_buffer },
+            .src = .{ .data = sg.asRange(self.vertices.items[0..vc]) },
+        });
+        sg.writeBufferTransient(.{
+            .dst = .{ .buffer = self.index_buffer },
+            .src = .{ .data = sg.asRange(self.indices.items[0..ic]) },
+        });
+    }
+
     /// Upload-free draw of the committed packet. Draws nothing unless a
     /// capture was uploaded (never uploads, never records meter bytes).
     /// `isvalid`-gated: headless/tools get a safe no-op, never an assert

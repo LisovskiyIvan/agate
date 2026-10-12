@@ -317,6 +317,27 @@ pub const PhysicsIntegration = struct {
         self.prepared_upload_format = .RGBA16F;
     }
 
+    /// Write-only replay of the prepared debug upload for a reuse frame
+    /// (no staged prepare ran, so `uploadDebug` never fired this sokol
+    /// frame, yet the main pass binds the same `write_transient` line
+    /// buffer). Replays through the existing `DebugPass.upload` against
+    /// the retained tag shape: the watermark admits exactly one upload
+    /// per sokol frame, the bytes are the frozen `prepared_lines`
+    /// (never the live world), and a replay that cannot deliver clears
+    /// the tag — failing closed exactly like `uploadDebug` and the draw
+    /// gate below (nothing bound means nothing drawn). Safe to call on
+    /// every reuse present; headless no-op (staging only, no `sg.*`
+    /// without a context).
+    pub fn replayDebugUpload(self: *PhysicsIntegration) void {
+        if (!self.prepared_upload_valid) return;
+        if (self.prepared_lines.items.len == 0) return;
+        const pass = self.passForDraw(self.prepared_upload_samples, self.prepared_upload_format) orelse {
+            self.clearUploadTag();
+            return;
+        };
+        if (!pass.upload(self.prepared_lines.items)) self.clearUploadTag();
+    }
+
     /// True when the last successful upload matches the requested target
     /// shape. Pure (no `sg.*`), so headless tests pin the gate directly.
     pub fn uploadTagMatches(self: *const PhysicsIntegration, samples: i32, color_format: sg.PixelFormat) bool {
