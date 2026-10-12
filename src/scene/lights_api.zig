@@ -134,22 +134,23 @@ pub fn areaLightCount(self: anytype) usize {
 
 /// Appends a clustered forward point light at `position`; returns its
 /// index (pack order follows creation order). Hard-errors past the cap.
-/// Also retires any live tile storage buffers (uniform discipline, so
-/// stale GPU can never serve the next frame).
+/// Marks the tile mirror stale (the next context upload retires the live
+/// handles and rebuilds exact-fit, so stale GPU can never serve a newer
+/// frame — game-side turnover itself would race the context upload).
 pub fn addClusteredPointLight(self: anytype, position: Vec3, options: ClusteredPointLightOptions) error{TooManyClusteredLights}!usize {
     const idx = try self.lights.addClusteredPointLight(position, options);
-    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    self.clustered.markStale();
     return idx;
 }
 
-/// Removes clustered light `index`, retiring its tile storage buffers
-/// through the epoch retire queue (safe under update||render overlap).
+/// Removes clustered light `index`, marking the tile mirror stale (same
+/// turnover as add; safe under update||render overlap).
 /// Order-preserving: higher indices shift down. Out-of-range indices
-/// are a no-op (and never retire).
+/// are a no-op (and never stale).
 pub fn removeClusteredPointLight(self: anytype, index: usize) void {
     if (index >= self.lights.clusteredPointLightCount()) return;
     self.lights.removeClusteredPointLight(index);
-    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    self.clustered.markStale();
 }
 
 /// Live clustered-light state (position/color/intensity/radius/enabled
@@ -167,17 +168,19 @@ pub fn clusteredPointLightCount(self: anytype) usize {
 }
 
 /// Appends a clustered forward spot light at `position`; returns its index.
+/// Marks the tile mirror stale (same turnover as the point-light add).
 pub fn addClusteredSpotLight(self: anytype, position: Vec3, options: ClusteredSpotLightOptions) error{TooManyClusteredLights}!usize {
     const idx = try self.lights.addClusteredSpotLight(position, options);
-    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    self.clustered.markStale();
     return idx;
 }
 
-/// Removes clustered spot light `index`. Order-preserving: higher indices shift down.
+/// Removes clustered spot light `index` (marks stale; same turnover).
+/// Order-preserving: higher indices shift down.
 pub fn removeClusteredSpotLight(self: anytype, index: usize) void {
     if (index >= self.lights.clusteredSpotLightCount()) return;
     self.lights.removeClusteredSpotLight(index);
-    self.clustered.retireBuffers(self.allocator, &self.gpu_retire);
+    self.clustered.markStale();
 }
 
 /// Live clustered spot light state. Null when out of range.

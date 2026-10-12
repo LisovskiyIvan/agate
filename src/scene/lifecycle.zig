@@ -182,7 +182,7 @@ pub fn deinit(self: anytype) void {
     // render domain, CPU scratch only: rebuildCpuForSlot (view_render) grows
     // cpu_lights/headers/indices with render_allocator and this frees them.
     // upload/retireBuffers stay core: their allocator funds appends into the
-    // core-owned gpu_retire queue (growth retire + add/remove retire).
+    // core-owned gpu_retire queue (growth retire + stale-flag turnover).
     self.clustered.deinit(self.render_allocator);
     self.gui3d.deinit(self.allocator);
 

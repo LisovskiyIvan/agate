@@ -304,7 +304,8 @@ pub const ClusteredViewSlot = struct {
 /// SSBO slots are always valid on a live context, even on the legacy
 /// path).
 /// All `sg.*` happens on the context thread (`upload`/`deinit`);
-/// `rebuildCpu`/`retireBuffers` are sg-free (any thread, headless-safe).
+/// `rebuildCpu` is sg-free (any thread, headless-safe); `retireBuffers`
+/// is context-only, armed game-side via `markStale` (see `stale`).
 pub const ClusteredGpuCache = struct {
     // CPU scratch (rebuilt per view while any clustered light is staged;
     // shared across views: each view rebuilds then immediately uploads
@@ -320,6 +321,14 @@ pub const ClusteredGpuCache = struct {
     slots: [MAX_VIEW_SLOTS]ClusteredViewSlot = [_]ClusteredViewSlot{.{}} ** MAX_VIEW_SLOTS,
     dummy_buffer: sg.Buffer = .{},
     dummy_view: sg.View = .{},
+    /// Turnover request (game -> context): set by add/remove, consumed by
+    /// the next context `upload`. The ONLY cross-thread datum here — every
+    /// handle/flag mutation below runs context-side, so the game thread
+    /// never zeroes a handle the context may be reading (a torn
+    /// check-then-write in `upload` wrote id 0 and tripped
+    /// WRITE_BUFFER_TRANSIENT_BUFFER_ALIVE under add/remove churn; found
+    /// by the chaos runner).
+    stale: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Clamps an arbitrary view slot to the slot range (defensive: all
     /// in-tree callers already pass a valid slot; out-of-range input
@@ -460,6 +469,10 @@ pub const ClusteredGpuCache = struct {
         if (!sg.isvalid()) return false;
         self.ensureDummy();
         if (self.dummy_view.id == 0) return false;
+        // Turnover after a game-side add/remove: retire the stale handles
+        // through the queue HERE (context-side, race-free) before sizing
+        // recreates them below. Game-side zeroing is banned (see `stale`).
+        if (self.stale.swap(false, .acquire)) self.retireBuffers(allocator, retire_queue);
         const s = clampSlot(view_slot);
         if (!self.ensureSized(allocator, retire_queue, s)) return false;
         const slot = &self.slots[s];
@@ -520,19 +533,34 @@ pub const ClusteredGpuCache = struct {
         return .{ .lights = self.dummy_view, .tiles = self.dummy_view, .indices = self.dummy_view };
     }
 
-    /// Retires every allocated slot's three live storage buffers through
-    /// the epoch retire queue (sg-free: only an epoch stamp + append per
-    /// buffer, like probe removal) and zeroes the handles/views/caps plus
-    /// all liveness flags. Called on every clustered add/remove so stale
-    /// GPU can never serve a newer frame; the next context rebuild
-    /// recreates exact-fit buffers per slot on demand. Safe on any
-    /// thread, headless-safe (untouched secondary slots hold zero ids and
-    /// are skipped — only allocated buffers reach the queue).
+    /// Marks the GPU mirror stale after a game-side add/remove. Any thread,
+    /// headless-safe: only sets the atomic flag — handle turnover itself
+    /// runs on the next context `upload`, never here.
+    pub fn markStale(self: *ClusteredGpuCache) void {
+        self.stale.store(true, .release);
+    }
+
+    /// Retires every allocated slot's three live storage buffers AND their
+    /// views through the epoch retire queue (sg-free: only an epoch stamp
+    /// + append per handle, like probe removal) and zeroes the
+    /// handles/views/caps plus all liveness flags. A view dropped without
+    /// retire leaks its sokol pool slot forever (found by the chaos
+    /// runner's clustered churn: every add/remove leaked 3 views until
+    /// VIEW_POOL_EXHAUSTED). CONTEXT THREAD ONLY: the game side calls
+    /// `markStale` instead and `upload` runs this after consuming the
+    /// flag — game-side zeroing raced the context's check-then-write
+    /// (see `stale`). The next context rebuild recreates exact-fit
+    /// buffers per slot on demand. Headless-safe (untouched secondary
+    /// slots hold zero ids and are skipped — only allocated handles reach
+    /// the queue; retireView/retireBuffer both no-op on zero ids).
     pub fn retireBuffers(self: *ClusteredGpuCache, allocator: std.mem.Allocator, retire_queue: anytype) void {
         for (&self.slots) |*slot| {
             if (slot.light_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.light_buffer);
             if (slot.header_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.header_buffer);
             if (slot.index_buffer.id != 0) retire_queue.retireBuffer(allocator, slot.index_buffer);
+            if (slot.light_view.id != 0) retire_queue.retireView(allocator, slot.light_view);
+            if (slot.header_view.id != 0) retire_queue.retireView(allocator, slot.header_view);
+            if (slot.index_view.id != 0) retire_queue.retireView(allocator, slot.index_view);
             slot.light_buffer = .{};
             slot.header_buffer = .{};
             slot.index_buffer = .{};
@@ -646,15 +674,12 @@ pub const ClusteredGpuCache = struct {
         if (buffer.*.id != 0) {
             retire_queue.retireBuffer(allocator, buffer.*);
             buffer.* = .{};
-            // Drop the storage view together with its buffer: once the
-            // retire queue flushes, the stale view is dead at bind time
-            // (VALIDATE_ABND_VIEW_ALIVE) and a non-zero stale view id made
-            // `ensureViews` skip recreation while `slot.live` stayed true —
-            // every clustered draw then failed sg_apply_bindings and drew
-            // nothing (the "clustered ON + rotate camera = empty screen"
-            // bisect; samplers in the same failing bindings were
-            // collateral validation output). ensureViews recreates the
-            // view against the new buffer on the upload below.
+            // The storage view retires on the same epoch (never dropped:
+            // see retireBuffers — a zeroed-but-live view leaks its pool
+            // slot). ensureViews recreates it against the new buffer on
+            // the upload below; the stale zero here only steers that
+            // recreation (same fail-closed reasoning as before).
+            if (view.*.id != 0) retire_queue.retireView(allocator, view.*);
             view.* = .{};
             cap.* = 0;
         }

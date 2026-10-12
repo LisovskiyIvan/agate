@@ -198,7 +198,7 @@ test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
     try std.testing.expectEqual(cluster_lights.max_clustered_lights, scene.clusteredPointLightCount());
 
     // Removal is order-preserving; out-of-range is a no-op (and never
-    // retires — see the retire test below).
+    // marks stale — see the stale test below).
     scene.removeClusteredPointLight(7_000);
     try std.testing.expectEqual(cluster_lights.max_clustered_lights, scene.clusteredPointLightCount());
     scene.removeClusteredPointLight(0);
@@ -258,7 +258,7 @@ test "Scene exposes clustered spot pool: stages into FramePack, cap at 32, order
     try std.testing.expectEqual(cluster_lights.max_clustered_spots - 1, scene.clusteredSpotLightCount());
 }
 
-test "clustered removal retires live tile buffers; out-of-range never retires" {
+test "clustered removal marks stale; out-of-range never marks" {
     const alloc = std.testing.allocator;
     var scene = @import("../testing.zig").testScene(alloc);
     defer scene.lights.deinit(alloc);
@@ -274,21 +274,24 @@ test "clustered removal retires live tile buffers; out-of-range never retires" {
     scene.clustered.slots[0].header_buffer = .{ .id = 42 };
     scene.clustered.slots[0].index_buffer = .{ .id = 43 };
     scene.clustered.slots[0].live = true;
+    _ = scene.clustered.stale.swap(false, .monotonic);
 
-    // Out-of-range removal is a no-op: count unchanged, nothing retired.
+    // Out-of-range removal is a no-op: count unchanged, nothing marked,
+    // nothing retired.
     scene.removeClusteredPointLight(9);
     try std.testing.expectEqual(@as(usize, 2), scene.clusteredPointLightCount());
     try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+    try std.testing.expect(!scene.clustered.stale.load(.monotonic));
 
-    // Real removal retires all three live tile buffers (epoch-stamped
-    // appends, no sg.*) and zeroes the handles for the next rebuild.
+    // Real removal only marks stale (game side never touches handles — it
+    // raced the context upload): queue empty, handles still live for the
+    // in-flight frame; the next context upload turns them over.
     scene.removeClusteredPointLight(0);
     try std.testing.expectEqual(@as(usize, 1), scene.clusteredPointLightCount());
-    try std.testing.expectEqual(@as(usize, 3), scene.gpu_retire.retainedCount());
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].light_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].header_buffer.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.clustered.slots[0].index_buffer.id);
-    try std.testing.expect(!scene.clustered.isLive(0));
+    try std.testing.expectEqual(@as(usize, 0), scene.gpu_retire.retainedCount());
+    try std.testing.expect(scene.clustered.stale.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 41), scene.clustered.slots[0].light_buffer.id);
+    try std.testing.expect(scene.clustered.isLive(0));
 }
 
 test "saturated light mailbox keeps the newest pack" {
@@ -546,6 +549,11 @@ test "rebuildCpu is headless-safe and stages exact-fit scratch" {
             _ = buf;
             self.calls += 1;
         }
+        pub fn retireView(self: *@This(), allocator: std.mem.Allocator, view: sg.View) void {
+            _ = allocator;
+            _ = view;
+            self.calls += 1;
+        }
     };
     var fake = FakeRetire{};
     try std.testing.expect(!sg.isvalid());
@@ -569,14 +577,20 @@ test "rebuildCpu is headless-safe and stages exact-fit scratch" {
     }
 }
 
-test "retireBuffers moves live buffers into the retire queue and zeroes handles" {
+test "retireBuffers moves live buffers AND views into the retire queue and zeroes handles" {
     const alloc = std.testing.allocator;
     const FakeRetire = struct {
-        calls: u32 = 0,
+        buffers: u32 = 0,
+        views: u32 = 0,
         pub fn retireBuffer(self: *@This(), allocator: std.mem.Allocator, buf: sg.Buffer) void {
             _ = allocator;
             _ = buf;
-            self.calls += 1;
+            self.buffers += 1;
+        }
+        pub fn retireView(self: *@This(), allocator: std.mem.Allocator, view: sg.View) void {
+            _ = allocator;
+            _ = view;
+            self.views += 1;
         }
     };
     var cache = ClusteredGpuCache{};
@@ -595,10 +609,12 @@ test "retireBuffers moves live buffers into the retire queue and zeroes handles"
     cache.slots[2].live = true;
     var fake = FakeRetire{};
     cache.retireBuffers(alloc, &fake);
-    // All live storage buffers retire (views are context-owned and die
-    // with the buffers' generation; the next upload recreates them).
+    // All live storage buffers retire, and live views retire on the same
+    // epoch (a dropped-but-live view leaks its sokol pool slot forever —
+    // chaos-runner clustered churn proved it with VIEW_POOL_EXHAUSTED).
     // Untouched slots hold zero ids and are skipped by retireBuffers.
-    try std.testing.expectEqual(@as(u32, 4), fake.calls);
+    try std.testing.expectEqual(@as(u32, 4), fake.buffers);
+    try std.testing.expectEqual(@as(u32, 1), fake.views);
     try std.testing.expectEqual(@as(u32, 0), cache.slots[0].light_buffer.id);
     try std.testing.expectEqual(@as(u32, 0), cache.slots[0].header_buffer.id);
     try std.testing.expectEqual(@as(u32, 0), cache.slots[0].index_buffer.id);
@@ -606,6 +622,36 @@ test "retireBuffers moves live buffers into the retire queue and zeroes handles"
     try std.testing.expect(!cache.isLive(0));
     try std.testing.expect(!cache.isLive(2));
     try std.testing.expectEqual(@as(usize, 0), cache.slots[0].light_cap);
+}
+
+test "markStale arms turnover; headless upload leaves it armed" {
+    const alloc = std.testing.allocator;
+    var cache = ClusteredGpuCache{};
+    try std.testing.expect(!cache.stale.load(.monotonic));
+    // Game-side add/remove only sets the flag (any thread, no sg): handle
+    // turnover itself runs on the next live-context upload, never here —
+    // game-side zeroing raced the context's check-then-write in upload
+    // (WRITE_BUFFER_TRANSIENT_BUFFER_ALIVE under churn; chaos runner).
+    cache.markStale();
+    try std.testing.expect(cache.stale.load(.monotonic));
+    const FakeRetire = struct {
+        pub fn retireBuffer(self: *@This(), allocator: std.mem.Allocator, buf: sg.Buffer) void {
+            _ = self;
+            _ = allocator;
+            _ = buf;
+        }
+        pub fn retireView(self: *@This(), allocator: std.mem.Allocator, view: sg.View) void {
+            _ = self;
+            _ = allocator;
+            _ = view;
+        }
+    };
+    var fake = FakeRetire{};
+    try std.testing.expect(!sg.isvalid());
+    try std.testing.expect(!cache.upload(alloc, &fake, 0));
+    // Nothing allocated headless, nothing to turn over: still armed for
+    // the first live upload.
+    try std.testing.expect(cache.stale.load(.monotonic));
 }
 
 test "view slots clamp defensively and cover every camera" {

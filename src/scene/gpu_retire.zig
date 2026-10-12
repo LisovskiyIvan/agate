@@ -32,13 +32,14 @@ const Entry = struct {
     kind: Kind,
     mesh: ?*Mesh = null,
     buffer: sg.Buffer = .{},
+    view: sg.View = .{},
     probe: probe_layer.ProbeGpu = .{},
     ui3d: gui3d_layer.Ui3dTarget = .{},
     compute: ComputeBundle = .{},
     epoch: Epoch,
 };
 
-pub const Kind = enum { mesh, buffer, probe, ui3d, compute };
+pub const Kind = enum { mesh, buffer, view, probe, ui3d, compute };
 
 /// Staged compute creation outcome bundle to be retired safely in dependency order.
 pub const ComputeBundle = struct {
@@ -87,7 +88,12 @@ pub const GpuRetireQueue = struct {
     overflow_len: usize = 0,
     /// Bound on jointly retained entries (`pending.items.len + overflow_len`).
     pending_cap: usize = 8192,
-    /// Entries dropped by the cap (observable; each also logs).
+    /// Entries dropped by the cap (observable; each also warns). Warn, not
+    /// err: cap drops are bounded, counted backpressure by design (reuse
+    /// streak x destroy-rate piles up here, then drains on the next
+    /// successful prepare) — err would fail the test suite and every
+    /// log-error verdict gate on an expected event. The unbounded danger
+    /// (queues exhausted under OOM) keeps err below.
     capped_drops: u64 = 0,
     /// Duplicate retires skipped (same mesh pointer / buffer id already queued).
     duplicate_drops: u64 = 0,
@@ -138,7 +144,7 @@ pub const GpuRetireQueue = struct {
         }
         if (!self.admitsLocked()) {
             self.capped_drops += 1;
-            std.log.err("scene: retire queue cap {d} reached, leaking mesh '{s}' (bound skip-streak destroys; see pending_cap)", .{ self.pending_cap, mesh.name });
+            std.log.warn("scene: retire queue cap {d} reached, leaking mesh '{s}' (bound skip-streak destroys; see pending_cap)", .{ self.pending_cap, mesh.name });
             return;
         }
         self.pending.append(allocator, entry) catch {
@@ -165,7 +171,7 @@ pub const GpuRetireQueue = struct {
         }
         if (!self.admitsLocked()) {
             self.capped_drops += 1;
-            std.log.err("scene: retire queue cap {d} reached, leaking instance buffer (id {})", .{ self.pending_cap, buf.id });
+            std.log.warn("scene: retire queue cap {d} reached, leaking instance buffer (id {})", .{ self.pending_cap, buf.id });
             return;
         }
         self.pending.append(allocator, entry) catch {
@@ -174,6 +180,34 @@ pub const GpuRetireQueue = struct {
                 self.overflow_len += 1;
             } else {
                 std.log.err("scene: destroy queues exhausted, leaking instance buffer (id {})", .{buf.id});
+            }
+        };
+    }
+
+    /// Retires a storage/texture view for deferred destruction on the GPU
+    /// context thread (clustered tile-view turnover: views are dropped
+    /// game-side together with their buffers and must die on the same
+    /// epoch, never inline off-context).
+    pub fn retireView(self: *Self, allocator: std.mem.Allocator, view: sg.View) void {
+        if (view.id == 0) return;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = Entry{ .kind = .view, .view = view, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.warn("scene: retire queue cap {d} reached, leaking view (id {})", .{ self.pending_cap, view.id });
+            return;
+        }
+        self.pending.append(allocator, entry) catch {
+            if (self.overflow_len < self.overflow.len) {
+                self.overflow[self.overflow_len] = entry;
+                self.overflow_len += 1;
+            } else {
+                std.log.err("scene: destroy queues exhausted, leaking view (id {})", .{view.id});
             }
         };
     }
@@ -189,7 +223,7 @@ pub const GpuRetireQueue = struct {
         }
         if (!self.admitsLocked()) {
             self.capped_drops += 1;
-            std.log.err("scene: retire queue cap {d} reached, leaking probe target (image id {})", .{ self.pending_cap, target.image.id });
+            std.log.warn("scene: retire queue cap {d} reached, leaking probe target (image id {})", .{ self.pending_cap, target.image.id });
             return;
         }
         self.pending.append(allocator, entry) catch {
@@ -213,7 +247,7 @@ pub const GpuRetireQueue = struct {
         }
         if (!self.admitsLocked()) {
             self.capped_drops += 1;
-            std.log.err("scene: retire queue cap {d} reached, leaking ui3d target (image id {})", .{ self.pending_cap, target.image.id });
+            std.log.warn("scene: retire queue cap {d} reached, leaking ui3d target (image id {})", .{ self.pending_cap, target.image.id });
             return;
         }
         self.pending.append(allocator, entry) catch {
@@ -238,7 +272,7 @@ pub const GpuRetireQueue = struct {
         }
         if (!self.admitsLocked()) {
             self.capped_drops += 1;
-            std.log.err("scene: retire queue cap {d} reached, leaking compute bundle (state buffer id {})", .{ self.pending_cap, bundle.state_buffer.id });
+            std.log.warn("scene: retire queue cap {d} reached, leaking compute bundle (state buffer id {})", .{ self.pending_cap, bundle.state_buffer.id });
             return;
         }
         self.pending.append(allocator, entry) catch {
@@ -322,6 +356,7 @@ pub const GpuRetireQueue = struct {
         return switch (a.kind) {
             .mesh => a.mesh == b.mesh,
             .buffer => a.buffer.id == b.buffer.id,
+            .view => a.view.id == b.view.id,
             .probe => a.probe.image.id == b.probe.image.id,
             .ui3d => a.ui3d.image.id == b.ui3d.image.id,
             .compute => std.meta.eql(a.compute, b.compute),
@@ -339,6 +374,7 @@ pub const GpuRetireQueue = struct {
                         allocator.destroy(entry.mesh.?);
                     },
                     .buffer => sg.destroyBuffer(entry.buffer),
+                    .view => sg.destroyView(entry.view),
                     .probe => {
                         var target = entry.probe;
                         target.deinit();
@@ -368,6 +404,7 @@ pub const GpuRetireQueue = struct {
                             allocator.destroy(entry.mesh.?);
                         },
                         .buffer => sg.destroyBuffer(entry.buffer),
+                        .view => sg.destroyView(entry.view),
                         .probe => {
                             var target = entry.probe;
                             target.deinit();

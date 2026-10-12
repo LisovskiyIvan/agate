@@ -218,6 +218,98 @@ test "retire dedups across the overflow spillover" {
     try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
 }
 
+test "H5 retire-cap gate: drops counted per kind, retained bounded, flush drains only completed" {
+    // Chaos-wave H5 gate (see docs/chaos.md): drives GpuRetireQueue past
+    // a small pending_cap with epochs left incomplete. Cap drops are
+    // warn-level (deliberately: bounded counted backpressure, not an
+    // error), so this exercises the REAL drop branches under the suite.
+    // Fake nonzero ids are hand-removed before any flush (fake ids have
+    // no GPU resource behind them — buffer-test precedent); only real
+    // buffer-free test meshes go through flush/deinit, so no sg.* fires
+    // headless and no invalid GPU free can occur.
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var q: GpuRetireQueue = .{};
+
+    // Phase 1 — epochs: flush destroys ONLY completed epochs.
+    const e1 = q.begin();
+    const m1 = try makeMesh(alloc, "h5_first");
+    q.retireMesh(alloc, m1);
+    const m2 = try makeMesh(alloc, "h5_second");
+    q.retireMesh(alloc, m2);
+    // e1 still open: flush destroys nothing.
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
+
+    const e2 = q.begin(); // auto-completes e1
+    const m3 = try makeMesh(alloc, "h5_third");
+    q.retireMesh(alloc, m3);
+    try std.testing.expectEqual(e1 + 1, e2);
+    q.flush(alloc);
+    // m1/m2 (epoch e1, completed) destroyed headlessly; m3 (open e2) waits.
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    q.complete(e2);
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+    try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
+
+    // Phase 2 — cap: fill a small cap with mixed kinds, then overflow it
+    // once per kind and assert every drop is counted.
+    q.pending_cap = 4;
+    const e3 = q.begin();
+    const m4 = try makeMesh(alloc, "h5_cap_mesh");
+    q.retireMesh(alloc, m4);
+    q.retireBuffer(alloc, .{ .id = 9001 });
+    q.retireProbeTarget(alloc, .{ .image = .{ .id = 902 } });
+    q.retireUi3dTarget(alloc, .{ .image = .{ .id = 903 } });
+    try std.testing.expectEqual(@as(usize, 4), q.retainedCount());
+    try std.testing.expect(!q.admitsOneMore());
+    try std.testing.expectEqual(Kind.mesh, q.pending.items[0].kind);
+    try std.testing.expectEqual(Kind.buffer, q.pending.items[1].kind);
+    try std.testing.expectEqual(Kind.probe, q.pending.items[2].kind);
+    try std.testing.expectEqual(Kind.ui3d, q.pending.items[3].kind);
+    try std.testing.expectEqual(e3, q.pending.items[3].epoch);
+
+    // Past the cap: one drop per kind (mesh m5 is dropped, never queued —
+    // free it by hand to avoid a leak).
+    const m5 = try makeMesh(alloc, "h5_dropped_mesh");
+    q.retireMesh(alloc, m5);
+    m5.deinit(alloc);
+    alloc.destroy(m5);
+    q.retireBuffer(alloc, .{ .id = 9002 });
+    q.retireView(alloc, .{ .id = 9003 });
+    q.retireProbeTarget(alloc, .{ .image = .{ .id = 904 } });
+    q.retireUi3dTarget(alloc, .{ .image = .{ .id = 905 } });
+    q.retireComputeBundle(alloc, .{ .state_buffer = .{ .id = 906 } });
+    try std.testing.expectEqual(@as(u64, 6), q.cappedDropCount());
+    // Retained stays bounded by the cap despite the flood.
+    try std.testing.expectEqual(@as(usize, 4), q.retainedCount());
+    try std.testing.expect(!q.admitsOneMore());
+    // A repeat of a queued id is a duplicate, not a cap drop.
+    q.retireBuffer(alloc, .{ .id = 9001 });
+    try std.testing.expectEqual(@as(u64, 1), q.duplicateDropCount());
+    try std.testing.expectEqual(@as(u64, 6), q.cappedDropCount());
+
+    // Hand-remove the fake-id entries (descending indices), then complete
+    // + flush drains the real mesh through Mesh.deinit headlessly.
+    _ = q.pending.orderedRemove(3);
+    _ = q.pending.orderedRemove(2);
+    _ = q.pending.orderedRemove(1);
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    q.complete(e3);
+    q.flush(alloc);
+    try std.testing.expectEqual(@as(usize, 0), q.retainedCount());
+    try std.testing.expect(q.admitsOneMore());
+
+    // Deinit drains even an uncompleted epoch (m6 never completed): the
+    // testing allocator below would flag a leak otherwise.
+    _ = q.begin();
+    const m6 = try makeMesh(alloc, "h5_tail_open");
+    q.retireMesh(alloc, m6);
+    try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
+    q.deinit(alloc);
+}
+
 test "cap admission probe stops at pending_cap without dropping" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
@@ -233,9 +325,9 @@ test "cap admission probe stops at pending_cap without dropping" {
     const m2 = try makeMesh(alloc, "cap_second");
     q.retireMesh(alloc, m2);
     // At the cap: the probe reports full, nothing was dropped or logged
-    // (the drop+log path itself cannot run under the test runner's
-    // log.err policy — same precedent as the overflow-exhausted branch —
-    // so the test pins the boundary from the admission side).
+    // (the real drop branches now run at warn level and are covered by
+    // the H5 gate above — this test pins the boundary from the admission
+    // side without emitting even a warn).
     try std.testing.expect(!q.admitsOneMore());
     try std.testing.expectEqual(@as(usize, 2), q.retainedCount());
     try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
@@ -365,10 +457,9 @@ test "retireComputeBundle zero is a no-op; full bundle waits for its epoch" {
     q.flush(alloc);
     try std.testing.expectEqual(@as(usize, 1), q.retainedCount());
 
-    // Cap probe still admits around it (no drop+log path is exercised:
-    // the test runner fails on any std.log.err, same precedent as the
-    // mesh/buffer cap tests — the boundary is pinned from the admission
-    // side).
+    // Cap probe still admits around it (the real drop branches are
+    // covered by the H5 gate above; here the boundary is pinned from the
+    // admission side without emitting even a warn).
     q.pending_cap = 1;
     try std.testing.expect(!q.admitsOneMore());
     try std.testing.expectEqual(@as(u64, 0), q.cappedDropCount());
