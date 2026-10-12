@@ -61,6 +61,7 @@ Kick и join выполняются на scene-update (game) потоке; во�
 - `./runtime.md` — жизненный цикл кадра и `Runtime` целиком.
 - `./frame-pipeline.md` — слоты, freeze→commit, staged prepare детально.
 - `./architecture.md` — карта модулей и слоёв движка.
+- `./chaos.md` — хаос-раннер: seeded-стресс threaded-конвейера, H5/H7 гейты, TSan-статус.
 
 Замеры: MEASUREMENTS.md волна 10 (12.10.2026) — матрица serial/threaded ×
 physics inline/dedicated на sandbox: INCONCLUSIVE (workload present-bound,
