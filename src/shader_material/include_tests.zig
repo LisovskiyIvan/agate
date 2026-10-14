@@ -103,6 +103,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/pbr_fs_bindings.glsl", .text = @embedFile("../shaders/common/pbr_fs_bindings.glsl") },
         .{ .name = "shaders/common/pbr_shadow_consts.glsl", .text = @embedFile("../shaders/common/pbr_shadow_consts.glsl") },
         .{ .name = "shaders/common/ddgi_sample.glsl", .text = @embedFile("../shaders/common/ddgi_sample.glsl") },
+        .{ .name = "shaders/common/ssr_trace.glsl", .text = @embedFile("../shaders/common/ssr_trace.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{
@@ -118,6 +119,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         @embedFile("../shaders/pbr.glsl"),
         @embedFile("../shaders/instanced_pbr.glsl"),
         @embedFile("../shaders/skinned_pbr.glsl"),
+        @embedFile("../shaders/ssr.glsl"),
     };
     for (shaders) |src| {
         const out = try expand(alloc, src, "x.glsl", "shaders", mem.fs());
@@ -237,6 +239,27 @@ test "drift: PBR fs bindings and shadow consts live once in common" {
     const consts = @embedFile("../shaders/common/pbr_shadow_consts.glsl");
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(consts, "const vec2 POISSON_DISK[16]"));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(consts, "#define POINT_PCSS_MAX_PENUMBRA 0.01"));
+}
+
+test "drift: ssr reconstruction helpers live once in common" {
+    // Post-dedup invariant: the depth-derived world-pos/normal helpers
+    // (reconstructWorldPos/reconstructWorldNormal) are defined exactly
+    // once, in common/ssr_trace.glsl, and both the fullscreen composite
+    // (postprocess.glsl applySSR) and the half-res trace (ssr.glsl)
+    // include that chunk instead of carrying inline copies. The march
+    // loops stay per-shader on purpose: inline mixes while the trace
+    // outputs (reflection, weight), and unifying them would rephrase the
+    // v1 arithmetic — only the pure helpers are shared.
+    const composite = @embedFile("../shaders/postprocess.glsl");
+    const trace = @embedFile("../shaders/ssr.glsl");
+    const chunk = @embedFile("../shaders/common/ssr_trace.glsl");
+    for ([2][]const u8{ composite, trace }) |src| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/ssr_trace.glsl\""));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "vec3 reconstructWorldPos(vec2 uv, float depth) {"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(chunk, "vec3 reconstructWorldPos(vec2 uv, float depth) {"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(chunk, "vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {"));
 }
 
 test "drift: probe_mip stays excluded from the fullscreen include" {

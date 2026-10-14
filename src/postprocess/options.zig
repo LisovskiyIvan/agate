@@ -7,6 +7,7 @@ const color_curves = @import("color_curves.zig");
 const lut = @import("lut.zig");
 const shafts = @import("shafts.zig");
 const ssgi_mod = @import("ssgi.zig");
+const ssr_mod = @import("ssr.zig");
 const contact_shadows_mod = @import("contact_shadows.zig");
 const auto_exposure = @import("auto_exposure.zig");
 
@@ -151,6 +152,13 @@ pub const SsrOptions = struct {
     enabled: bool = true,
     intensity: f32 = 0.55,
     steps: u32 = 16,
+    /// Execution mode: .inline_ runs the v1 raymarch inside the composite
+    /// (default, bit-identical); .half_res_pass runs the dedicated
+    /// half-res trace + bilateral denoise/upscale (SsrPass) and mixes the
+    /// denoised reflection instead. An enum like shafts.resolution: no
+    /// clamp row, survives forFrame() untouched (the enabled flag still
+    /// gates both lanes).
+    mode: ssr_mod.SsrMode = .inline_,
 };
 
 /// Temporal accumulation for the SSGI half_res_pass gather (v2.1, opt-in).
@@ -607,6 +615,7 @@ const exempt_clamp_fields = [_][]const u8{
     "fog.sun_scattering",
     "ssr.enabled",
     "ssr.intensity",
+    "ssr.mode",
     "depth_pyramid_enabled",
     "ssgi.enabled",
     "ssgi.mode",

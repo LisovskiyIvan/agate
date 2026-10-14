@@ -14,6 +14,7 @@ pub const auto_exposure = @import("postprocess/auto_exposure.zig");
 pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
 pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 pub const ssgi = @import("postprocess/ssgi.zig");
+pub const ssr = @import("postprocess/ssr.zig");
 
 // --- Core Types ---
 pub const ShaftResolution = types.ShaftResolution;
@@ -115,10 +116,23 @@ pub fn fxaaParams(enabled: bool) [4]f32 {
 /// off (the shader early-outs on ssr_params.x before reading the steps
 /// lane), which keeps the composite identical to the SSR-off path. The
 /// steps count used to ride in camera_params.z and now has its own lane.
+/// In half_res_pass mode both inline lanes pack zeros (no double-add).
 pub fn ssrStepsParams(cfg: PostProcessOptions) [4]f32 {
-    if (!cfg.ssr.enabled) return .{ 0.0, 0.0, 0.0, 0.0 };
-    return .{ @floatFromInt(cfg.ssr.steps), 0.0, 0.0, 0.0 };
+    return ssr.ssrStepsParams(cfg);
 }
+
+/// Pack the composite ssr_params vec4: (enabled, intensity, thickness,
+/// max_dist). Zeros when inactive OR in pass mode (no double-add).
+pub fn ssrParams(cfg: PostProcessOptions) [4]f32 {
+    return ssr.ssrParams(cfg);
+}
+
+pub const ssrActive = ssr.ssrActive;
+pub const ssrInlineActive = ssr.ssrInlineActive;
+pub const ssrPassActive = ssr.ssrPassActive;
+pub const ssrPassParams = ssr.ssrPassParams;
+pub const ssrTargetSize = ssr.ssrTargetSize;
+pub const ssrTargetBytes = ssr.ssrTargetBytes;
 
 // --- Temporal Anti-Aliasing (TAA) ---
 pub const taaJitter = taa.taaJitter;

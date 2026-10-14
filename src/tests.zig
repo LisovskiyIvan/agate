@@ -232,6 +232,7 @@ test {
     _ = @import("passes/ssao_pass.zig");
     _ = @import("passes/ssgi_pass.zig");
     _ = @import("passes/ssgi_pass_tests.zig");
+    _ = @import("passes/ssr_pass.zig");
     _ = @import("passes/velocity/pipelines.zig");
     _ = @import("passes/velocity/pipelines_tests.zig");
     _ = @import("passes/velocity_pass.zig");
@@ -287,6 +288,8 @@ test {
     _ = @import("postprocess/sky_tests.zig");
     _ = @import("postprocess/ssgi.zig");
     _ = @import("postprocess/ssgi_tests.zig");
+    _ = @import("postprocess/ssr.zig");
+    _ = @import("postprocess/ssr_tests.zig");
     _ = @import("postprocess/taa.zig");
     _ = @import("postprocess/taa_tests.zig");
     _ = @import("postprocess/types.zig");

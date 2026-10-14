@@ -27,6 +27,7 @@ materials).
 | `pbr_fs_bindings.glsl` | 79 | same 3 (fs texture/sampler view bindings, merged slot-pool docs) |
 | `pbr_shadow_consts.glsl` | 91 | same 3 (Poisson disk, cascade offsets, PCSS budgets) |
 | `morph_helpers.glsl` | 53 | `pbr`, `skinned_pbr` vs (`morphTexel`/`morphWeight`/`applyMorphDeltas`) |
+| `ssr_trace.glsl` | 33 | `postprocess`, `ssr` fs (depth-derived world pos + surface normal for the SSR raymarch) |
 
 Rules: chunk files are pure code spans with NO provenance header (any
 header would break the byte-identical expansion guarantee — expansion

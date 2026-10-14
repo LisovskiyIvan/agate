@@ -369,6 +369,10 @@ pub fn build(b: *Build) !void {
         .{ .name = "ssgi_blur_shader", .input = "src/shaders/ssgi_blur.glsl", .output = "ssgi_blur_shader.zig", .includes = true },
         // SSGI v2.1 temporal accumulation (gather -> temporal -> denoise).
         .{ .name = "ssgi_temporal_shader", .input = "src/shaders/ssgi_temporal.glsl", .output = "ssgi_temporal_shader.zig", .includes = true },
+        // SSR v2 (half-res trace + bilateral denoise/upscale): same
+        // fullscreen-vs include shape as the SSGI pair above.
+        .{ .name = "ssr_shader", .input = "src/shaders/ssr.glsl", .output = "ssr_shader.zig", .includes = true },
+        .{ .name = "ssr_blur_shader", .input = "src/shaders/ssr_blur.glsl", .output = "ssr_blur_shader.zig", .includes = true },
         // DDGI v1 spike: probe-atlas update (fragment-based ray march over
         // the proxy uniform arrays; same fullscreen-vs include shape as
         // the SSAO/SSGI pairs above).
