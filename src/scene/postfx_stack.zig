@@ -32,6 +32,7 @@ pub const PostFXStack = struct {
     postprocess_pass: passes.PostProcessPass,
     ssao_pass: passes.SSAOPass,
     ssgi_pass: passes.SsgiPass,
+    ssr_pass: passes.SsrPass,
     bloom_pass: passes.BloomPass,
     glow_pass: passes.GlowPass,
     highlight_pass: passes.HighlightPass,
@@ -58,6 +59,7 @@ pub const PostFXStack = struct {
     warn_depth_effects: msaa.WarnOnce = .{},
     warn_taa_target: msaa.WarnOnce = .{},
     warn_ssgi_temporal: msaa.WarnOnce = .{},
+    warn_ao_temporal: msaa.WarnOnce = .{},
 
     outline_enabled: bool = false,
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
@@ -80,6 +82,7 @@ pub const PostFXStack = struct {
             .postprocess_pass = passes.PostProcessPass.init(),
             .ssao_pass = passes.SSAOPass.init(),
             .ssgi_pass = passes.SsgiPass.init(),
+            .ssr_pass = passes.SsrPass.init(),
             .bloom_pass = passes.BloomPass.init(),
             .glow_pass = passes.GlowPass.init(),
             .highlight_pass = passes.HighlightPass.init(),
@@ -95,6 +98,7 @@ pub const PostFXStack = struct {
         self.postprocess_pass.deinit();
         self.ssao_pass.deinit();
         self.ssgi_pass.deinit();
+        self.ssr_pass.deinit();
         self.bloom_pass.deinit();
         self.glow_pass.deinit();
         self.highlight_pass.deinit();
@@ -119,6 +123,7 @@ pub const PostFXStack = struct {
         _ = self.postprocess_pass.resize(size.w, size.h, self.main_samples);
         if (self.ssao_pass.width != 0) self.ssao_pass.resize(size.w, size.h);
         if (self.ssgi_pass.width != 0) self.ssgi_pass.resize(size.w, size.h);
+        if (self.ssr_pass.width != 0) self.ssr_pass.resize(size.w, size.h);
         if (self.bloom_pass.base_width != 0) self.bloom_pass.resize(size.w, size.h);
         if (self.glow_pass.base_width != 0) self.glow_pass.resize(size.w, size.h);
         if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(size.w, size.h);
@@ -281,6 +286,11 @@ pub const PostFXStack = struct {
         /// view: a failed ensure must feed the zero fallback, never a
         /// stale-sized target.
         velocity_valid: bool = false,
+        /// True when more than one camera view renders this frame: the AO
+        /// temporal history must never blend across views, so the pass
+        /// fails closed to the gather-direct path (default false keeps
+        /// every existing call site on the single-view path).
+        multi_camera: bool = false,
     };
 
     /// Effect stages plus the display pass. The display pass always runs;
@@ -331,6 +341,7 @@ pub const PostFXStack = struct {
             post.taa.enabled = false;
         }
         const taa_active = post.taa.enabled;
+        const ao_explicit_reset = self.taa_explicit_reset;
         if (!taa_active) {
             self.taa_has_history = false;
             self.taa_enabled_prev = false;
@@ -339,22 +350,58 @@ pub const PostFXStack = struct {
 
         var ssao_view = params.default_white_view;
         const ssao_active = ssao.enabled;
+        // Reprojection basis shared by the SSAO temporal stage and the
+        // SSGI/composite stages below: hoisted above the SSAO block so the
+        // AO history reprojects against the same target (unsuppressed — on
+        // cut frames its history resets, so stale vectors never blend).
+        // The velocity view is valid only when this frame's pass rendered
+        // into it (params.velocity_valid, gated on the ensure result in
+        // frame_render): otherwise the zero fallback, so a failed ensure
+        // can never feed a stale-sized target to the temporal stage.
+        const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
+        const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
+        const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
+            self.velocity_pass.velocityTexView()
+        else
+            sg.View{};
         if (post.enabled and ssao_active) {
-            self.ssao_pass.render(
-                params.camera,
-                params.aspect,
-                self.depthSampleView(),
-                ssao,
-                fx_w,
-                fx_h,
-            );
+            const msaa_active_ssao = params.main_samples > 1;
+            if (ssao.temporal.enabled and params.multi_camera) {
+                _ = self.warn_ao_temporal.warn("ssao: temporal history bypassed (multi-camera); using gather-direct", .{});
+            }
+            const ssao_res = self.ssao_pass.renderWithContext(.{
+                .camera = params.camera,
+                .aspect = params.aspect,
+                .depth_tex_view = self.depthSampleView(),
+                .config = ssao,
+                .cur_w = fx_w,
+                .cur_h = fx_h,
+                .view_proj = params.view_proj,
+                .inv_view_proj = inv_view_proj,
+                .prev_view_proj = prev_vp,
+                .velocity_view = vel_view_in,
+                .velocity_valid = vel_view_in.id != 0,
+                .camera_cut = post.taa.camera_cut or ao_explicit_reset,
+                .multi_camera = params.multi_camera,
+                .msaa_active = msaa_active_ssao,
+            });
             const out = self.ssao_pass.ssao_blur_tex_view;
             if (out.id != 0) {
                 ssao_view = out;
-                params.stats.post_draw_calls += 2;
-                params.stats.draw_calls += 2;
-                params.stats.triangles += 4;
+                // Count only draws that ran: an allocation failure or a
+                // fail-closed gate must not count a temporal draw that
+                // never happened (see SSAOPass.RenderResult).
+                const ssao_draws: u32 = 2 + (if (ssao_res.temporal_executed) @as(u32, 1) else 0);
+                params.stats.post_draw_calls += ssao_draws;
+                params.stats.draw_calls += ssao_draws;
+                params.stats.triangles += 2 * ssao_draws;
             }
+        } else {
+            // Skipped this frame (master switch off, SSAO off, or
+            // MSAA-suppressed): render() never ran, so reset history here
+            // — a re-enable always replays the reset frame instead of
+            // blending across the gap.
+            self.ssao_pass.resetTemporalHistory();
         }
 
         var depth_pyramid_view: sg.View = .{};
@@ -434,11 +481,11 @@ pub const PostFXStack = struct {
 
         var shaft_view: sg.View = .{};
         if (postprocess.shaftActive(post.enabled, post, params.shadows_enabled)) {
-            const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
+            const shaft_inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
             const v = self.volumetric_pass.render(.{
                 .depth_view = self.depthSampleView(),
                 .shadow_view = params.shaft_shadow_view,
-                .inv_view_proj = inv_view_proj,
+                .inv_view_proj = shaft_inv_view_proj,
                 .camera_pos = params.eye,
                 .sun_dir = params.sun_dir,
                 .sun_color = params.sun_color,
@@ -458,20 +505,9 @@ pub const PostFXStack = struct {
         }
         self.postprocess_pass.setShaftTexture(shaft_view);
 
-        const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
-        const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
-
-        // The velocity view is valid only when this frame's pass rendered
-        // into it (params.velocity_valid, gated on the ensure result in
-        // frame_render): otherwise the zero fallback, so a failed ensure
-        // can never feed a stale-sized target to the composite. Hoisted
-        // above the SSGI block: the temporal stage reprojects against the
-        // same target (unsuppressed — on cut frames its history resets, so
-        // stale vectors are never blended).
-        const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
-            self.velocity_pass.velocityTexView()
-        else
-            sg.View{};
+        // (inv_view_proj / prev_vp / vel_view_in are hoisted above the
+        // SSAO block: the AO temporal stage, the SSGI stage below, and
+        // the composite all reproject against the same target.)
 
         // SSGI v2 (half-res pass): gather + optional temporal accumulation
         // + bilateral denoise before the composite, mirroring the SSAO
@@ -513,6 +549,40 @@ pub const PostFXStack = struct {
             }
         }
         self.postprocess_pass.setSsgiTexture(ssgi_view);
+
+        // SSR v2 (half-res pass): trace + bilateral denoise before the
+        // composite, mirroring the SSGI stage above. The final depth-aware
+        // upscale is a 2x2 gather inside the composite (sampleSSRPass), so
+        // the pass stays at 2 draws and 2 half-res targets. Runs only in
+        // pass mode (ssrPassActive: master gate + half_res_pass); the
+        // inline v1 lanes pack zeros in this mode so the effect never
+        // double-adds.
+        // Sizing is render-scale-aware: the pass derives half of the
+        // EFFECTIVE size (fx_*, never the swapchain size). MSAA suppression
+        // clears ssr.enabled upstream, so pass mode joins the existing
+        // suppression with no extra branch here.
+        var ssr_view: sg.View = .{};
+        if (post.enabled and postprocess.ssrPassActive(post)) {
+            const v = self.ssr_pass.render(.{
+                .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
+                .depth_view = self.depthSampleView(),
+                .view_proj = params.view_proj,
+                .inv_view_proj = inv_view_proj,
+                .camera_pos = params.eye,
+                .config = post,
+                .near_z = params.camera.getNear(),
+                .far_z = params.camera.getFar(),
+                .base_w = fx_w,
+                .base_h = fx_h,
+            });
+            if (v.id != 0) {
+                ssr_view = v;
+                params.stats.post_draw_calls += 2;
+                params.stats.draw_calls += 2;
+                params.stats.triangles += 4;
+            }
+        }
+        self.postprocess_pass.setSsrTexture(ssr_view);
 
         var taa_history_view = self.postprocess_pass.offscreen_resolve_tex_view;
         var taa_history_valid = false;

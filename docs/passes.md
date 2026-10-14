@@ -171,12 +171,18 @@ pub const PostProcessPass = struct {
 pub const SSAOPass = struct {
     pub fn init() SSAOPass
     pub fn resize(self: *SSAOPass, width: i32, height: i32) void
-    pub fn render(...) sg.View // ssao.glsl + ssao_blur.glsl
+    pub fn render(self: *SSAOPass, camera: Camera, aspect: f32, depth: sg.View, config: SSAOOptions, w: i32, h: i32) void // spatial AO; temporal требует renderWithContext
+    pub fn renderWithContext(self: *SSAOPass, args: RenderArgs) RenderResult // + temporal-лейны, честная статистика
+    pub fn resetTemporalHistory(self: *SSAOPass) void // сброс истории на пропущенных кадрах
+    pub fn temporalSized(self: *const SSAOPass) bool
+    pub fn temporalDrawCount(self: *const SSAOPass) u64
     pub fn deinit(self: *SSAOPass) void
 };
 ```
 
-Что рендерит: raw AO по глубине/нормалям (`ssao.glsl`) + blur (`ssao_blur.glsl`), возврат view AO для forward/composite. Таргеты — half-res внутри; ресайз пересоздаёт. Включение: флаг SSAO сцены (конфиг — см. `./render-pipeline.md`; в `PostProcessOptions` не входит осознанно).
+Что рендерит: raw AO по глубине/нормалям (`ssao.glsl`: hemisphere-ядро по умолчанию с cosine-weighted нормализацией и стратифицированным выбором тапов; opt-in `mode = .horizon` — 4-слайсный horizon-поиск GTAO-класса за тот же бюджет тапов) + opt-in temporal (`ssao_temporal.glsl`: velocity/camera репроекция, variance-clip + depth/normal/marker rejection; история RGBA16F: R=AO, GB=oct-нормаль, A=лин. глубина; depth-гейт — против ОЖИДАЕМОЙ prev-камерной глубины, не текущей; reset на тон/переключение режима/ресайз/camera-cut; multi-camera/MSAA — fail-closed в gather-direct) + blur (`ssao_blur.glsl`), возврат view AO для forward/composite. Таргеты — half-res внутри (temporal-пара ленивая, только при включённом temporal); ресайз пересоздаёт и сбрасывает историю. `render` — исторический публичный shape (без контекста), `renderWithContext` — для оркестрации сцены (возвращает `temporal_executed`, по нему считается статистика). Включение: флаг SSAO сцены (конфиг `SSAOOptions` — см. `./render-pipeline.md`; в `PostProcessOptions` не входит осознанно).
+
+Hemisphere-нормализация теперь делит сумму окклюзии на сумму весов реально выбранных тапов, а не на прежний усиленный делитель. Это намеренно меняет картинку включённого hemisphere AO: обычные углы не уходят в чёрный. Бюджеты 4..32 распределяются по всему ядру, полный бюджет 32 сохраняет выбор тапов. Вырожденная depth-нормаль определяется относительным критерием `|dx×dy|² ≤ max(|dx|²·|dy|²·1e-8, 1e-30)` и даёт AO=1 вместо фиктивной нормали в сторону камеры. CPU-зеркала — `aoKernelIndex`, `aoKernelCos`, `aoHemisphereDenom`, `aoNormalFromGradients`; `aoHemisphereTap` принимает sampling weight пятым аргументом. Horizon-оценка и temporal lifecycle не менялись; численный temporal-гейт C.3 остаётся отдельной задачей.
 
 ### SsgiPass (`passes/ssgi_pass.zig`)
 
@@ -194,6 +200,23 @@ pub const SsgiPass = struct {
 ```
 
 Что рендерит: SSGI v2 — half-res jittered-disk gather (`ssgi.glsl`, порт v1-математики: тот же мировой диск, веса cos×falloff², luma-кэп, покрытие) + билатеральный (depth-aware) денойз (`ssgi_blur.glsl`) по `RenderArgs`. Таргеты — два half-res RGBA16F (gather + denoised) от EFFECTIVE (render-scale) размера; intensity в composite, не в пассе. Результат — в `PostProcessPass.setSsgiTexture`. Включение: `ssgiPassActive` (ssgi enabled + intensity floor + `ssgi_mode = .half_res_pass`); MSAA-подавление — через общий `ssgi_enabled`. Temporal аккумуляция — открыта как v2.1.
+
+### SsrPass (`passes/ssr_pass.zig`)
+
+```zig
+pub const SsrPass = struct {
+    pub fn ssrPixelFormat() sg.PixelFormat
+    pub fn ssrBytesPerPixel() usize
+    pub fn targetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize
+    pub fn init() SsrPass
+    pub fn resize(self: *SsrPass, base_w: i32, base_h: i32) void
+    pub const RenderArgs = struct { ... }; // scene/depth views, матрицы, камера, конфиг, near/far, effective-размер
+    pub fn render(self: *SsrPass, args: RenderArgs) sg.View
+    pub fn deinit(self: *SsrPass) void
+};
+```
+
+Что рендерит: SSR v2 — half-res trace (`ssr.glsl`, порт v1-математики: тот же floor-гейт, clip-space марш, толщина/дистанция, edge/dist/fresnel-веса; выход rgb = отражение, a = вес без intensity) + билатеральный (depth-aware) денойз (`ssr_blur.glsl`, гейт 0.05 м) по `RenderArgs`. Финальный depth-aware апскейл — 2x2 билатеральный gather в самом композите (`sampleSSRPass` в `postprocess.glsl`, а не слепой билинейный сэмпл). Таргеты — два half-res RGBA16F (trace + denoised) от EFFECTIVE (render-scale) размера; intensity в composite, не в пассе. Результат — в `PostProcessPass.setSsrTexture` (композит реконструирует full res через `intensity * weight` на стековой позиции v1). Включение: `ssrPassActive` (ssr enabled + intensity floor + `ssr.mode = .half_res_pass`); MSAA-подавление — через общий `ssr.enabled`; выключенный режим не аллоцирует таргетов и не добавляет draws. Общие хелперы реконструкции с композитом — `common/ssr_trace.glsl` (drift-тест в `shader_material/include_tests.zig`).
 
 ### DebugPass (`passes/debug_pass.zig`)
 

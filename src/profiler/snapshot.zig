@@ -20,6 +20,7 @@ const glow_pass_mod = @import("../passes/glow_pass.zig");
 const highlight_pass_mod = @import("../passes/highlight_pass.zig");
 const volumetric_pass_mod = @import("../passes/volumetric_pass.zig");
 const ssgi_pass_mod = @import("../passes/ssgi_pass.zig");
+const ssr_pass_mod = @import("../passes/ssr_pass.zig");
 const bloom_mod = @import("../postprocess/bloom.zig");
 
 const Scene = scene_mod.Scene;
@@ -349,8 +350,22 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         // SSAO Target
         const ssao = &scene.postfx.ssao_pass;
         if (ssao.width > 0 and ssao.height > 0) {
-            const ssao_bytes = @as(usize, @intCast(ssao.width)) * @as(usize, @intCast(ssao.height)) * 4 * 2; // raw + blur
+            var ssao_bytes: usize = 0;
+            for ([_]sg.Image{ ssao.ssao_raw_image, ssao.ssao_blur_image }) |img| {
+                if (sg.queryImageState(img) != .VALID) continue;
+                const d = sg.queryImageDesc(img);
+                ssao_bytes += rtImageBytes(d.width, d.height, d.num_mipmaps, d.sample_count, 4);
+            }
             try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSAO Targets (Raw + Blur)", @intCast(ssao.width), @intCast(ssao.height), .RGBA8, 1, ssao_bytes);
+            if (ssao.temporalSized()) {
+                var history_bytes: usize = 0;
+                for ([_]sg.Image{ ssao.temp_a_image, ssao.temp_b_image }) |img| {
+                    if (sg.queryImageState(img) != .VALID) continue;
+                    const d = sg.queryImageDesc(img);
+                    history_bytes += rtImageBytes(d.width, d.height, d.num_mipmaps, d.sample_count, 8);
+                }
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSAO Temporal History", @intCast(ssao.width), @intCast(ssao.height), .RGBA16F, 1, history_bytes);
+            }
         }
 
         // Glow layer targets (extract + H/V ping-pong, half res): pass-owned
@@ -406,6 +421,14 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
                 const temp_bytes = ssgi_pass_mod.SsgiPass.temporalTargetBytes(ssgi_pass.width, ssgi_pass.height, ssgi_pass_mod.SsgiPass.ssgiBytesPerPixel());
                 try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSGI Temporal History", @intCast(ssgi_pass.width), @intCast(ssgi_pass.height), .RGBA16F, 1, temp_bytes);
             }
+        }
+
+        // SSR trace + denoise stay allocated across mode switches; report
+        // actual retained VRAM, not whether the effect is enabled today.
+        const ssr_pass = &scene.postfx.ssr_pass;
+        if (ssr_pass.width > 0 and ssr_pass.height > 0) {
+            const ssr_bytes = ssr_pass_mod.SsrPass.targetBytes(ssr_pass.width, ssr_pass.height, ssr_pass_mod.SsrPass.ssrBytesPerPixel());
+            try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSR Targets (Trace + Denoised)", @intCast(ssr_pass.width), @intCast(ssr_pass.height), .RGBA16F, 1, ssr_bytes);
         }
 
         // Shadow Atlas

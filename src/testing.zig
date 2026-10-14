@@ -1,6 +1,5 @@
-//! Shared test fixtures and helpers (test-only; never compiled into the
-//! library facade — the generated tests.zig imports it like any other
-//! module).
+//! Shared test fixtures and diagnostic helpers. Exposed under `agate.testing`
+//! for headless tests/benchmarks; normal rendering does not use this module.
 //!
 //! Contents:
 //! - CPU-only `Scene`/`Mesh` fixtures for tests that exercise subsystems
@@ -18,6 +17,12 @@ const Scene = @import("scene.zig").Scene;
 const Mesh = @import("mesh.zig").Mesh;
 const Texture = @import("texture.zig").Texture;
 const CubeTexture = @import("texture.zig").CubeTexture;
+
+// Diagnostic access to the actual CPU uniform builders, without exposing
+// renderer internals on the public Scene facade or duplicating their math.
+pub const draw_uniforms = @import("scene/uniforms.zig");
+pub const draw_helpers = @import("scene/draw.zig");
+pub const draw_probes = @import("scene/probe_layer.zig");
 
 /// Minimal CPU-only Scene for subsystem tests (serialization capture/restore,
 /// material loading): only `.allocator` is dereferenced. The default textures
@@ -44,6 +49,8 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
             // Zero (not undefined): the SSGI pass default is pinned
             // structurally (no gather/blur pipelines, no targets).
             .ssgi_pass = .{},
+            // Zero (not undefined): same pin for the SSR half-res pass.
+            .ssr_pass = .{},
             .bloom_pass = undefined,
             .glow_pass = undefined,
             // Zero (not undefined): the highlight layer's bit-identical

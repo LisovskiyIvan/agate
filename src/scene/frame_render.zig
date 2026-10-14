@@ -585,6 +585,9 @@ pub fn render(scene: anytype) void {
         // Velocity composite gate: only a rendered-this-frame target feeds
         // the TAA/blur resolve; anything else binds the zero fallback.
         .velocity_valid = velocity_ok,
+        // AO temporal fail-closed gate: history must never blend across
+        // views, so multi-camera frames take the gather-direct path.
+        .multi_camera = snap.enable_multi_camera and snap.camera_count > 0,
     }, cur_w, cur_h);
     gpu_timing.endPass(.post);
 

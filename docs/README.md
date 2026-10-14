@@ -12,6 +12,7 @@
 | [architecture.md](./architecture.md) | Слои движка, модель потоков (game/context/audio/io_runner), lock-free staged prepare одной страницей, владение GPU-ресурсами, сборка, тесты и гейты, карта модулей |
 | [graphics-roadmap.md](./graphics-roadmap.md) | План качества/перфа: HDR и IBL сначала, предпосылки GI/temporal/indirect, гейты и стоп-условия |
 | [modernization-audit.md](./modernization-audit.md) | Аудит устаревших путей/API: один HDR-renderer и staged-протокол, кандидаты на удаление, зависимости и проверки |
+| [graphics-improvements.md](./graphics-improvements.md) | Half-res SSR, horizon/temporal AO, indexed opaque sort: включение, проверки и ограничения |
 
 ## Ядро и потоки
 
@@ -22,6 +23,7 @@
 | [scene.md](./scene.md) | Фасад `Scene`: registry/content, lifecycle, камеры сцены, API-фасады (sim/query/lights/profile), снимки и статистика |
 | [frame-pipeline.md](./frame-pipeline.md) | Многопоточный кадр: 3-слотовый протокол (claim→build→stage→publish, pin/lease), lock-free контракт, `host_bytes`, режимы staged/mutex/serial |
 | [render-pipeline.md](./render-pipeline.md) | Cull/сортировка/биннинг, zero-dereference draw items, инстансинг (4 фазы), фабрика пайплайнов, `FrameContext`, PostFX-цепочка, тени CSM/spot/point |
+| [scene-scaling.md](./scene-scaling.md) | Headless CPU-бенч сборки кадра (many-identical/many-distinct), протокол A/B, indexed opaque sort |
 | [scene-layers.md](./scene-layers.md) | Слои сцены (decal/gui3d/highlight/nav/particle/physics/probe/sky/trail), clustered lights, top-K выбор света, `LightRig`, параллельная анимация |
 
 ## Геометрия и материалы

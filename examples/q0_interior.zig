@@ -18,9 +18,10 @@
 //!
 //! No licensed assets yet (Q0 proper calls for them): the checker floor
 //! and solid albedo panels carry the sharpness/ghosting story for now.
-//! Run: `zig build run-q0 -- --frames 540` (or the env knobs above).
+//! Run: `AGATE_Q0_FRAMES=540 zig build run-q0` (or the env knobs above).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const z = @import("agate");
 const sokol = @import("sokol");
 const sapp = sokol.app;
@@ -42,17 +43,50 @@ var ab: bench_mod.AbBench = .{};
 /// back-to-back phase walk. SSGI is a composite-shader bool with no
 /// target rebuild, so it is safe to toggle per block; a render_scale pair
 /// would realloc targets every block and must stay in the phase bench.
+/// AGATE_Q0_AB=ddgi alternates DDGI on/off the same way; AGATE_Q0_AB=ssr
+/// alternates SSR inline_ (arm A) / half_res_pass (arm B) with identical
+/// intensity/steps (the pass targets keep their size across switches, so
+/// no realloc per block either).
+/// SSR A/B measures cost only: half-res denoise/upscale is intentionally
+/// not pixel-identical to inline tracing; no image-quality parity claim.
 var ab_mode: bool = false;
 /// Interleaved A/B target: false = SSGI (AGATE_Q0_AB=ssgi), true = DDGI
 /// (AGATE_Q0_AB=ddgi, toggles scene.ddgi.enabled per block).
 var ab_ddgi: bool = false;
+/// Interleaved A/B target: SSR inline vs half-res (AGATE_Q0_AB=ssr,
+/// toggles scene.post_process.ssr.mode per block with identical
+/// intensity/steps; TAA resets at every boundary like the other arms).
+var ab_ssr: bool = false;
+/// Frame-30 proof that requested AO history actually executed.
+var ao_temporal_requested: bool = false;
 var frame_limit: u32 = 0;
 var frames: u32 = 0;
 var log_errors: u32 = 0;
+var sokol_live_allocations: usize = 0;
 var failures: u32 = 0;
 var render_scale: f32 = 1.0;
 var camera: z.ArcRotateCamera = undefined;
 var still_camera: bool = false;
+
+extern "c" fn malloc(size: usize) ?*anyopaque;
+extern "c" fn free(ptr: ?*anyopaque) void;
+
+fn sokolAlloc(size: usize, _: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const ptr = malloc(size) orelse return null;
+    sokol_live_allocations += 1;
+    return ptr;
+}
+
+fn sokolFree(ptr: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    if (ptr != null) {
+        if (sokol_live_allocations == 0) fail("sokol free without ownership", .{}) else sokol_live_allocations -= 1;
+    }
+    free(ptr);
+}
+
+fn allocator() std.mem.Allocator {
+    return if (builtin.cpu.arch.isWasm()) std.heap.c_allocator else gpa.allocator();
+}
 
 fn fail(comptime fmt: []const u8, args: anytype) void {
     failures += 1;
@@ -62,6 +96,31 @@ fn fail(comptime fmt: []const u8, args: anytype) void {
 fn envU32(name: [*:0]const u8, fallback: u32) u32 {
     const value = std.c.getenv(name) orelse return fallback;
     return std.fmt.parseInt(u32, std.mem.span(value), 10) catch fallback;
+}
+
+/// Fixed-frame SSR wiring proof: at frame 30 (post-render) the half-res
+/// mode must own a live pass sized to the render target, while inline/off
+/// must hold no pass VRAM. Prints mode + target + post draws either way;
+/// mismatches fail the run. Headless-safe (pure handle/size reads).
+fn ssrProof() void {
+    const fx_w = scene.postfx.renderWidth();
+    const fx_h = scene.postfx.renderHeight();
+    const draws = scene.stats.post_draw_calls;
+    if (z.postprocess.ssrPassActive(scene.post_process)) {
+        if (scene.postfx.ssr_pass.width != fx_w or scene.postfx.ssr_pass.height != fx_h) {
+            fail("ssr proof: pass target {}x{} != render target {}x{}", .{ scene.postfx.ssr_pass.width, scene.postfx.ssr_pass.height, fx_w, fx_h });
+        }
+        if (scene.postfx.ssr_pass.blur_tex_view.id == 0) fail("ssr proof: pass active but denoised view dead", .{});
+        std.debug.print("q0-interior ssr-proof: mode=half_res_pass target={}x{} post_draws={}\n", .{ fx_w, fx_h, draws });
+    } else {
+        // Inline/off owns no pass VRAM — except inside the SSR A/B, where
+        // inline arms reuse the targets the half-res arms sized (same
+        // EFFECTIVE size, so resize is a no-op and nothing reallocates).
+        if (!ab_ssr and scene.postfx.ssr_pass.width != 0) {
+            fail("ssr proof: mode={s} but pass targets allocated", .{@tagName(scene.post_process.ssr.mode)});
+        }
+        std.debug.print("q0-interior ssr-proof: mode={s} no-pass post_draws={}\n", .{ @tagName(scene.post_process.ssr.mode), draws });
+    }
 }
 
 fn qLogger(tag: [*c]const u8, level: u32, item: u32, msg: [*c]const u8, line: u32, file: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
@@ -97,16 +156,16 @@ fn setupScene() void {
         .direction = z.Vec3.new(0.1, 1.0, 0.2),
         .diffuse = z.Color3.white,
         .ground_color = z.Color3.new(0.12, 0.1, 0.09),
-        .intensity = 0.18,
+        .intensity = if (envFlag("AGATE_Q0_NO_HEMI")) 0.0 else 0.18,
     });
 
     // Sun through the open front side: drives CSM + volumetric shafts.
     _ = scene.createDirectionalLight("sun", .{
         .direction = z.Vec3.new(0.25, 1.2, 1.0),
         .diffuse = z.Color3.new(1.0, 0.92, 0.8),
-        .intensity = 2.6,
+        .intensity = if (envFlag("AGATE_Q0_NO_SUN")) 0.0 else 2.6,
     }) catch @panic("q0: sun failed");
-    scene.shadows.enabled = true;
+    scene.shadows.enabled = !envFlag("AGATE_Q0_NO_SHADOWS");
 
     // Analytic physical sky (opt-in, atmosphere consistency arc):
     // AGATE_Q0_PHYS_SKY=1 derives a consistent sun color/intensity,
@@ -143,12 +202,12 @@ fn setupScene() void {
         .position = z.Vec3.new(0.6, 3.6, 0.6),
         .direction = z.Vec3.new(-0.2, -1.0, -0.4),
         .color = z.Color3.new(1.0, 0.85, 0.7),
-        .intensity = 6.0,
+        .intensity = if (envFlag("AGATE_Q0_NO_SPOT")) 0.0 else 6.0,
         .range = 12.0,
         .inner_angle_deg = 18.0,
         .outer_angle_deg = 32.0,
         .shadow = .{
-            .cast_shadows = true,
+            .cast_shadows = !envFlag("AGATE_Q0_NO_SHADOWS"),
             .source_radius = if (spot_pcss_off) 0.0 else 0.02,
         },
     }) catch @panic("q0: spot failed");
@@ -163,10 +222,10 @@ fn setupScene() void {
     _ = scene.createPointLight("q0_key_point", .{
         .position = z.Vec3.new(-1.2, 2.6, 1.2),
         .color = z.Color3.new(1.0, 0.8, 0.6),
-        .intensity = 8.0,
+        .intensity = if (envFlag("AGATE_Q0_NO_POINT")) 0.0 else 8.0,
         .range = 10.0,
         .shadow = .{
-            .cast_shadows = true,
+            .cast_shadows = !envFlag("AGATE_Q0_NO_SHADOWS"),
             .source_radius = if (point_pcss_off) 0.0 else 0.02,
         },
     }) catch @panic("q0: point failed");
@@ -178,7 +237,7 @@ fn setupScene() void {
         .up = z.Vec3.new(0.0, 0.0, 1.0),
         .color = z.Color3.new(1.0, 0.72, 0.45),
         .intensity = 9.0,
-        .is_enabled = true,
+        .is_enabled = !envFlag("AGATE_Q0_NO_AREA"),
     }) catch null;
     const panel = z.MeshBuilder.createPlane(&scene, "area_panel_quad", .{ .width = 2.8, .height = 2.0 }) catch @panic("q0: panel failed");
     panel.position = z.Vec3.new(0.0, 3.9, -0.8);
@@ -191,7 +250,7 @@ fn setupScene() void {
 
     // Room shell: floor + back/left/right walls + ceiling (open front).
     const floor = z.MeshBuilder.createGround(&scene, "floor", .{ .width = 6.0, .height = 6.0, .subdivisions = 8 }) catch @panic("q0: floor failed");
-    const checker = z.Texture.createCheckerboard(gpa.allocator(), 512, 512, 32, .{ 26, 26, 30, 255 }, .{ 208, 203, 196, 255 }) catch @panic("q0: checker failed");
+    const checker = z.Texture.createCheckerboard(allocator(), 512, 512, 32, .{ 26, 26, 30, 255 }, .{ 208, 203, 196, 255 }) catch @panic("q0: checker failed");
     const floor_mat = pbr("floor_pbr", .{ 1, 1, 1 }, 0.0, 0.55);
     floor_mat.albedo_texture = checker;
     floor_mat.roughness = 0.5;
@@ -274,13 +333,22 @@ fn setupScene() void {
     scene.post_process.enabled = true;
     scene.post_process.exposure = 1.1;
     scene.post_process.tonemapping = .agx;
-    scene.post_process.bloom.enabled = true;
+    scene.post_process.bloom.enabled = !envFlag("AGATE_Q0_NO_BLOOM");
     scene.post_process.bloom.threshold = 1.0;
     scene.post_process.bloom.intensity = 0.55;
     scene.post_process.bloom.mips = 7;
     scene.post_process.ssr.enabled = !envFlag("AGATE_Q0_NO_SSR");
     scene.post_process.ssr.intensity = 0.6;
     scene.post_process.ssr.steps = 32;
+    // SSR v2 half-res pass (opt-in): AGATE_Q0_SSR_PASS=1 runs the
+    // dedicated half-res trace + bilateral denoise (the composite
+    // reconstructs full res with a depth-aware 2x2 gather) instead of the
+    // inline fullscreen raymarch (same steps); default stays v1 inline.
+    // The SSR A/B (AGATE_Q0_AB=ssr) owns the mode per block, so it starts
+    // at the arm-A baseline here.
+    if (envFlag("AGATE_Q0_SSR_PASS")) scene.post_process.ssr.mode = .half_res_pass;
+    if (envFlag("AGATE_Q0_NO_SSR")) scene.post_process.ssr.enabled = false;
+    if (ab_ssr) scene.post_process.ssr.mode = .inline_;
     scene.post_process.depth_pyramid_enabled = true;
     scene.post_process.dof.enabled = !envFlag("AGATE_Q0_NO_DOF");
     scene.post_process.dof.focus_distance = 4.6;
@@ -291,7 +359,7 @@ fn setupScene() void {
     scene.post_process.shafts.enabled = !envFlag("AGATE_Q0_NO_SHAFTS");
     scene.post_process.shafts.intensity = 0.35;
     scene.post_process.shafts.steps = 32;
-    scene.post_process.local_tonemapping.enabled = true;
+    scene.post_process.local_tonemapping.enabled = !envFlag("AGATE_Q0_NO_LOCAL_TONEMAP");
     // SSGI v1 color bleed: the calibration scene carries it by default —
     // AGATE_Q0_NO_SSGI=1 isolates the pre-SSGI baseline.
     scene.post_process.ssgi.enabled = !envFlag("AGATE_Q0_NO_SSGI");
@@ -311,7 +379,19 @@ fn setupScene() void {
         }
         scene.post_process.ssgi.temporal.enabled = true;
     }
-    scene.post_process.taa.enabled = true;
+    if (std.c.getenv("AGATE_Q0_AO_MODE")) |mode| {
+        if (std.mem.eql(u8, std.mem.span(mode), "horizon")) scene.ssao.mode = .horizon;
+    }
+    if (envFlag("AGATE_Q0_AO_TEMPORAL")) {
+        scene.ssao.temporal.enabled = true;
+    }
+    if (envFlag("AGATE_Q0_NO_AO")) scene.ssao.enabled = false;
+    ao_temporal_requested = scene.ssao.enabled and scene.ssao.temporal.enabled;
+    std.debug.print("q0-interior: ssao mode={s} temporal={} radius={d:.2} samples={}\n", .{
+        @tagName(scene.ssao.mode), scene.ssao.temporal.enabled, scene.ssao.radius, scene.ssao.sample_count,
+    });
+    // Without TAA, AO history exercises camera-only reprojection.
+    scene.post_process.taa.enabled = !envFlag("AGATE_Q0_NO_TAA");
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the
     // documented gaps): on in the calibration scene —
@@ -347,6 +427,7 @@ export fn init() callconv(.c) void {
     sokol.time.setup();
     sg.setup(.{
         .environment = sokol.glue.environment(),
+        .allocator = .{ .alloc_fn = sokolAlloc, .free_fn = sokolFree },
         .logger = .{ .func = qLogger },
         .pipeline_pool_size = 256,
         .shader_pool_size = 128,
@@ -354,12 +435,13 @@ export fn init() callconv(.c) void {
     });
     timing.setEnabled(envFlag("AGATE_Q0_TIMINGS") or envFlag("AGATE_GPU_TIMINGS"));
     camera = z.ArcRotateCamera.init("q0_cam", .{
-        .alpha = -std.math.pi / 2.0,
+        .alpha = envF32("AGATE_Q0_CAMERA_ALPHA", -std.math.pi / 2.0),
         .beta = std.math.pi / 2.75,
         .radius = 5.4,
         .target = z.Vec3.new(0.0, 1.2, -0.4),
     });
-    scene = z.Scene.init(gpa.allocator());
+    std.debug.print("q0-interior: setup backend={s}\n", .{@tagName(sg.queryBackend())});
+    scene = z.Scene.init(allocator());
     setupScene();
 }
 
@@ -373,6 +455,8 @@ export fn frame() callconv(.c) void {
             if (ab.beginBlock(f, frame_limit)) |ev| {
                 if (ab_ddgi) {
                     scene.ddgi.enabled = ev.arm == .A;
+                } else if (ab_ssr) {
+                    scene.post_process.ssr.mode = if (ev.arm == .A) .inline_ else .half_res_pass;
                 } else {
                     scene.post_process.ssgi.enabled = ev.arm == .A;
                 }
@@ -380,7 +464,7 @@ export fn frame() callconv(.c) void {
                 // draws = previous frame's draw calls (stats reset at the
                 // next staged begin): the DDGI on/off delta is the update
                 // pass (+1 when the arm is on).
-                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi.enabled, scene.ddgi.enabled, scene.stats.draw_calls });
+                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} ssr={s} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi.enabled, scene.ddgi.enabled, @tagName(scene.post_process.ssr.mode), scene.stats.draw_calls });
             }
         } else {
             if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
@@ -426,16 +510,14 @@ export fn frame() callconv(.c) void {
             ab.recordSample(f, scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
         } else bench.recordSample(scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
     }
+    // Every rendered frame, not just printed boundaries: a window-manager
+    // resize must invalidate phase medians as well as interleaved blocks.
     if (ab_mode) {
-        // Every-frame note (cheap), outside the timing gate: a mid-block
-        // window settle marks the run UNSTABLE even if it settles back
-        // before the next boundary.
         ab.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+    } else {
+        bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
     }
     if (f == 2 or bench.phase_started or ab.block_started) {
-        if (ab_mode) {
-            ab.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
-        } else bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
         std.debug.print("q0-interior: render target {}x{} scale={d:.2} swapchain {}x{}\n", .{
             scene.postfx.renderWidth(),      scene.postfx.renderHeight(),
             scene.post_process.render_scale, sapp.width(),
@@ -444,23 +526,30 @@ export fn frame() callconv(.c) void {
     }
     if (f == 30) {
         if (scene.stats.draw_calls == 0) fail("no draw calls at frame 30", .{});
+        const ao_sized = scene.postfx.ssao_pass.temporalSized();
+        const ao_draws = scene.postfx.ssao_pass.temporalDrawCount();
+        std.debug.print("q0-interior: frame30 draws={} post_draws={} tris={} ao_temp_sized={} ao_temp_draws={}\n", .{ scene.stats.draw_calls, scene.stats.post_draw_calls, scene.stats.triangles, ao_sized, ao_draws });
+        if (ao_temporal_requested and (ao_draws == 0 or !ao_sized)) fail("AO temporal requested but never executed (draws={} sized={})", .{ ao_draws, ao_sized });
+        ssrProof();
     }
 }
 
 export fn cleanup() callconv(.c) void {
     if (timing.isEnabled()) {
         if (ab_mode) {
-            const s = ab.finalSummary(if (ab_ddgi) "ddgi_on" else "ssgi_on", if (ab_ddgi) "ddgi_off" else "ssgi_off");
+            const s = ab.finalSummary(if (ab_ddgi) "ddgi_on" else if (ab_ssr) "ssr_inline" else "ssgi_on", if (ab_ddgi) "ddgi_off" else if (ab_ssr) "ssr_halfres" else "ssgi_off");
             ab.printBlocks();
             bench_mod.AbBench.printSummary(s);
         } else bench_mod.Bench.printPhase(bench.report(bench.index));
     }
     scene.deinit();
     sg.shutdown();
+    if (sokol_live_allocations != 0) fail("sokol allocations after shutdown: {}", .{sokol_live_allocations});
     if (log_errors != 0) fail("sokol log errors: {}", .{log_errors});
+    if (!builtin.cpu.arch.isWasm() and gpa.deinit() == .leak) fail("scene allocator leaked", .{});
+    std.debug.print("q0-interior: teardown log_errors={} sokol_live_allocations={}\n", .{ log_errors, sokol_live_allocations });
     std.debug.print("q0-interior: verdict={s} failures={} frames={}\n", .{ if (failures == 0) "PASS" else "FAIL", failures, frames });
-    _ = gpa.deinit();
-    if (failures != 0) std.process.exit(1);
+    if (failures != 0 and !builtin.cpu.arch.isWasm()) std.process.exit(1);
 }
 
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
@@ -469,7 +558,7 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     if (ev.*.type == .KEY_DOWN and ev.*.key_code == .ESCAPE) sapp.quit();
 }
 
-pub fn main() void {
+pub fn startApp() void {
     frame_limit = envU32("AGATE_Q0_FRAMES", 0);
     still_camera = envFlag("AGATE_Q0_STILL");
     render_scale = envF32("AGATE_Q0_RENDER_SCALE", 1.0);
@@ -486,6 +575,14 @@ pub fn main() void {
         if (std.mem.eql(u8, std.mem.span(sel), "ddgi")) {
             ab_mode = true;
             ab_ddgi = true;
+        }
+        // SSR inline vs half-res: same intensity/steps both arms, only the
+        // execution mode toggles per block (TAA resets at every boundary
+        // in frame() like the other arms; the pass targets keep their size
+        // across switches so nothing reallocates per block).
+        if (std.mem.eql(u8, std.mem.span(sel), "ssr")) {
+            ab_mode = true;
+            ab_ssr = true;
         }
     }
     if (ab_mode) {
@@ -506,4 +603,8 @@ pub fn main() void {
         .sample_count = 1,
         .logger = .{ .func = qLogger },
     });
+}
+
+pub fn main() void {
+    startApp();
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const agate_build = @import("agate");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -17,6 +18,51 @@ pub fn build(b: *std.Build) !void {
         .wgpu = is_web,
     });
     const mod_sokol = dep_sokol.module("sokol");
+
+    if (is_web) {
+        const emsdk = agate_build.getEmsdk(dep_agate);
+        const sdk_install = agate_build.sokol.emSdkInstallStep(b, emsdk, .{});
+        b.step("install-emsdk", "Install the workspace Emscripten SDK").dependOn(sdk_install);
+        for ([_]struct { name: []const u8, source: []const u8 }{
+            .{ .name = "gpu-timing", .source = "gpu_timing_web.zig" },
+            .{ .name = "hdr-showcase", .source = "hdr_showcase_web.zig" },
+            .{ .name = "q0-interior", .source = "q0_interior_web.zig" },
+            .{ .name = "taa-quality", .source = "taa_quality_web.zig" },
+        }) |example| {
+            const lib = b.addLibrary(.{
+                .name = example.name,
+                .linkage = .static,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(example.source),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "sokol", .module = mod_sokol },
+                        .{ .name = "agate", .module = mod_agate },
+                    },
+                }),
+            });
+            const link = try agate_build.sokol.emLinkStep(b, .{
+                .target = target,
+                .optimize = optimize,
+                .lib_main = lib,
+                .emsdk = emsdk,
+                .use_webgpu = true,
+                .use_emmalloc = true,
+                .shell_file_path = agate_build.sokolShellPath(dep_agate),
+                .pre_js = if (std.mem.eql(u8, example.name, "q0-interior"))
+                    &.{b.path("q0_web_env.js")}
+                else if (std.mem.eql(u8, example.name, "taa-quality"))
+                    &.{b.path("taa_quality_web_env.js")}
+                else
+                    &.{},
+                .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sALLOW_MEMORY_GROWTH=1" },
+            });
+            b.getInstallStep().dependOn(&link.step);
+            b.step(b.fmt("web-{s}", .{example.name}), "Build a browser WebGPU example").dependOn(&link.step);
+        }
+        return;
+    }
 
     // 1. Render Target Basic (RTT)
     const rtt_mod = b.createModule(.{
@@ -147,4 +193,62 @@ pub fn build(b: *std.Build) !void {
     const run_chaos = b.addRunArtifact(chaos_exe);
     if (b.args) |args| run_chaos.addArgs(args);
     b.step("run-chaos", "Run the seeded chaos stress host (see docs/chaos.md)").dependOn(&run_chaos.step);
+
+    // 7. Scene scaling bench (headless CPU queue-build stress; no GPU/display —
+    //    see examples/scene_scaling_bench.zig)
+    const scaling_mod = b.createModule(.{
+        .root_source_file = b.path("scene_scaling_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const scaling_exe = b.addExecutable(.{
+        .name = "scene-scaling-bench",
+        .root_module = scaling_mod,
+    });
+    b.installArtifact(scaling_exe);
+    const run_scaling = b.addRunArtifact(scaling_exe);
+    if (b.args) |args| run_scaling.addArgs(args);
+    b.step("run-scene-scaling", "Run the headless scene/render-queue scaling bench (ReleaseFast, smp)").dependOn(&run_scaling.step);
+
+    // 8. Deterministic temporal-quality fixture (held same-frame captures).
+    const taa_mod = b.createModule(.{
+        .root_source_file = b.path("taa_quality.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const taa_exe = b.addExecutable(.{
+        .name = "taa-quality",
+        .root_module = taa_mod,
+    });
+    b.installArtifact(taa_exe);
+    const run_taa = b.addRunArtifact(taa_exe);
+    if (b.args) |args| run_taa.addArgs(args);
+    b.step("run-taa-quality", "Run the deterministic temporal-quality GPU fixture").dependOn(&run_taa.step);
+
+    // 9. Pure CPU uniform preparation cost (no sg.applyUniforms/GPU upload).
+    const uniform_mod = b.createModule(.{
+        .root_source_file = b.path("draw_uniform_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const uniform_exe = b.addExecutable(.{
+        .name = "draw-uniform-bench",
+        .root_module = uniform_mod,
+    });
+    b.installArtifact(uniform_exe);
+    const run_uniform = b.addRunArtifact(uniform_exe);
+    if (b.args) |args| run_uniform.addArgs(args);
+    b.step("run-draw-uniform", "Measure CPU uniform builders (ReleaseFast, checksum parity)").dependOn(&run_uniform.step);
 }
