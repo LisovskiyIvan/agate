@@ -179,6 +179,10 @@ pub const MarkerArgs = struct {
     cam_up: Vec3 = Vec3.zero,
 };
 
+/// Velocity geometry shape for pipeline selection (opaque and glass
+/// marker paths share the same three shapes).
+pub const VelocityShape = enum { rigid, instanced, skinned };
+
 // Write/read contract with the TAA resolve (taaVelocityKind in
 // postprocess/taa.zig): the stamped band value must sit strictly inside the
 // classify-reactive band and below the per-object gate, or marked pixels
@@ -205,10 +209,16 @@ pub const VelocityPass = struct {
 
     pip_rigid_u16: sg.Pipeline = .{},
     pip_rigid_u32: sg.Pipeline = .{},
+    pip_rigid_u16_ds: sg.Pipeline = .{},
+    pip_rigid_u32_ds: sg.Pipeline = .{},
     pip_inst_u16: sg.Pipeline = .{},
     pip_inst_u32: sg.Pipeline = .{},
+    pip_inst_u16_ds: sg.Pipeline = .{},
+    pip_inst_u32_ds: sg.Pipeline = .{},
     pip_skin_u16: sg.Pipeline = .{},
     pip_skin_u32: sg.Pipeline = .{},
+    pip_skin_u16_ds: sg.Pipeline = .{},
+    pip_skin_u32_ds: sg.Pipeline = .{},
     /// Reactive-marker pipelines (C.3 v2): particle billboard coverage with
     /// a constant band-alpha FS (LESS_EQUAL against the borrowed main
     /// depth). CPU layout serves .cpu AND .compute records (both ride the
@@ -225,19 +235,27 @@ pub const VelocityPass = struct {
     /// marker VS reads position only for rigid, position+joints+weights
     /// for skinned); instanced adds the single CURRENT instance buffer
     /// (no prev pairing — coverage needs no history, which also halves the
-    /// per-batch binding vs the opaque velocity path). BACK cull like the
-    /// opaque path: a single-sided pane seen from behind draws nothing in
-    /// the main pass, so the marker must draw nothing either (cull NONE
-    /// would stamp reactive on background pixels); double-sided glass is
-    /// still covered via its front faces. Single cost note: one extra
-    /// geometry pass over the transparent queue per TAA frame (vertex
-    /// work only — constant FS, no texture taps, no loops).
+    /// per-batch binding vs the opaque velocity path). Sidedness mirrors
+    /// the opaque path and the main blend twins: single-sided panes keep
+    /// BACK cull (a pane seen from behind draws nothing in the main pass,
+    /// so the marker must draw nothing either — cull NONE would stamp
+    /// reactive on background pixels); double-sided glass uses the cull-off
+    /// `_ds` twins so backfaces mark exactly the pixels the main pass
+    /// shaded. Single cost note: one extra geometry pass over the
+    /// transparent queue per TAA frame (vertex work only — constant FS, no
+    /// texture taps, no loops).
     pip_marker_glass_rigid_u16: sg.Pipeline = .{},
     pip_marker_glass_rigid_u32: sg.Pipeline = .{},
+    pip_marker_glass_rigid_u16_ds: sg.Pipeline = .{},
+    pip_marker_glass_rigid_u32_ds: sg.Pipeline = .{},
     pip_marker_glass_inst_u16: sg.Pipeline = .{},
     pip_marker_glass_inst_u32: sg.Pipeline = .{},
+    pip_marker_glass_inst_u16_ds: sg.Pipeline = .{},
+    pip_marker_glass_inst_u32_ds: sg.Pipeline = .{},
     pip_marker_glass_skin_u16: sg.Pipeline = .{},
     pip_marker_glass_skin_u32: sg.Pipeline = .{},
+    pip_marker_glass_skin_u16_ds: sg.Pipeline = .{},
+    pip_marker_glass_skin_u32_ds: sg.Pipeline = .{},
     /// Marker shader (reactive_marker + reactive_marker_gpu programs).
     marker_shader: sg.Shader = .{},
     marker_gpu_shader: sg.Shader = .{},
@@ -372,8 +390,8 @@ pub const VelocityPass = struct {
         return out;
     }
 
-    /// Builds (or rebuilds on format change) the six opaque pipelines, the
-    /// two particle reactive-marker pipelines, plus the six glass
+    /// Builds (or rebuilds on format change) the twelve opaque pipelines,
+    /// the two particle reactive-marker pipelines, plus the twelve glass
     /// reactive-marker pipelines for the borrowed main-depth format.
     /// Body lives in `velocity/pipelines.zig` (mechanical move — same build,
     /// validate, rollback, destroy, and publish ordering); this forwarder
@@ -382,7 +400,7 @@ pub const VelocityPass = struct {
         return pipelines.ensurePipelinesFor(self, depth_fmt);
     }
 
-    /// Destroys all fourteen pipelines and resets the depth format.
+    /// Destroys all twenty-six pipelines and resets the depth format.
     /// Body lives in `velocity/pipelines.zig`; same guard/reset ordering.
     fn destroyPipelines(self: *VelocityPass) void {
         pipelines.destroyPipelines(self);
@@ -486,6 +504,52 @@ pub const VelocityPass = struct {
     pub fn velocityTexView(self: *const VelocityPass) sg.View {
         if (self.tex_view.id != 0) return self.tex_view;
         return self.dummy_zero_view;
+    }
+
+    /// Opaque pipeline for a (shape, index type, sidedness) triple: a pure
+    /// handle read from the ensure-built set, no sg calls. Single-sided
+    /// (the default) returns the pre-sidedness handles; double-sided
+    /// returns the cull-off `_ds` twins so backfaces emit the velocity the
+    /// main pass shaded. Decals never reach selection (skipped upstream
+    /// despite their forced double_sided flag). An unbuilt handle fails
+    /// closed at the draw's single VALID check — never a silent fallback
+    /// to the wrong culling.
+    pub fn opaquePipeline(self: *const VelocityPass, shape: VelocityShape, is_u32: bool, double_sided: bool) sg.Pipeline {
+        return switch (shape) {
+            .rigid => if (double_sided)
+                (if (is_u32) self.pip_rigid_u32_ds else self.pip_rigid_u16_ds)
+            else
+                (if (is_u32) self.pip_rigid_u32 else self.pip_rigid_u16),
+            .instanced => if (double_sided)
+                (if (is_u32) self.pip_inst_u32_ds else self.pip_inst_u16_ds)
+            else
+                (if (is_u32) self.pip_inst_u32 else self.pip_inst_u16),
+            .skinned => if (double_sided)
+                (if (is_u32) self.pip_skin_u32_ds else self.pip_skin_u16_ds)
+            else
+                (if (is_u32) self.pip_skin_u32 else self.pip_skin_u16),
+        };
+    }
+
+    /// Glass-marker pipeline for a (shape, index type, sidedness) triple:
+    /// same contract as opaquePipeline (pure handle read, single-sided
+    /// default unchanged, double-sided cull-off twins, fail-closed on
+    /// unbuilt).
+    pub fn glassPipeline(self: *const VelocityPass, shape: VelocityShape, is_u32: bool, double_sided: bool) sg.Pipeline {
+        return switch (shape) {
+            .rigid => if (double_sided)
+                (if (is_u32) self.pip_marker_glass_rigid_u32_ds else self.pip_marker_glass_rigid_u16_ds)
+            else
+                (if (is_u32) self.pip_marker_glass_rigid_u32 else self.pip_marker_glass_rigid_u16),
+            .instanced => if (double_sided)
+                (if (is_u32) self.pip_marker_glass_inst_u32_ds else self.pip_marker_glass_inst_u16_ds)
+            else
+                (if (is_u32) self.pip_marker_glass_inst_u32 else self.pip_marker_glass_inst_u16),
+            .skinned => if (double_sided)
+                (if (is_u32) self.pip_marker_glass_skin_u32_ds else self.pip_marker_glass_skin_u16_ds)
+            else
+                (if (is_u32) self.pip_marker_glass_skin_u32 else self.pip_marker_glass_skin_u16),
+        };
     }
 
     pub fn render(
@@ -609,10 +673,16 @@ pub const VelocityPass = struct {
     ) u32 {
         if (sg.queryPipelineState(self.pip_marker_glass_rigid_u16) != .VALID) return 0;
         if (sg.queryPipelineState(self.pip_marker_glass_rigid_u32) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_rigid_u16_ds) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_rigid_u32_ds) != .VALID) return 0;
         if (sg.queryPipelineState(self.pip_marker_glass_inst_u16) != .VALID) return 0;
         if (sg.queryPipelineState(self.pip_marker_glass_inst_u32) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_inst_u16_ds) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_inst_u32_ds) != .VALID) return 0;
         if (sg.queryPipelineState(self.pip_marker_glass_skin_u16) != .VALID) return 0;
         if (sg.queryPipelineState(self.pip_marker_glass_skin_u32) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_skin_u16_ds) != .VALID) return 0;
+        if (sg.queryPipelineState(self.pip_marker_glass_skin_u32_ds) != .VALID) return 0;
         var draws: u32 = 0;
         for (queues.transparent.items) |item| {
             if (!glassMarkerDrawDecision(.{
@@ -626,7 +696,7 @@ pub const VelocityPass = struct {
             const cur_mvp = Mat4.mul(view_proj, item.model);
             if (item.is_skinned) {
                 const bones = scene_render_queue.skinAt(skins, item.skin_index) orelse continue;
-                const pip = if (item.is_u32) self.pip_marker_glass_skin_u32 else self.pip_marker_glass_skin_u16;
+                const pip = self.glassPipeline(.skinned, item.is_u32, item.double_sided);
                 if (sg.queryPipelineState(pip) != .VALID) continue;
                 sg.applyPipeline(pip);
                 var bind = sg.Bindings{};
@@ -638,7 +708,7 @@ pub const VelocityPass = struct {
                 const vs_skin = velocity_shd.VsGlassSkin{ .bones = bones.* };
                 sg.applyUniforms(velocity_shd.UB_vs_glass_skin, sg.asRange(&vs_skin));
             } else {
-                const pip = if (item.is_u32) self.pip_marker_glass_rigid_u32 else self.pip_marker_glass_rigid_u16;
+                const pip = self.glassPipeline(.rigid, item.is_u32, item.double_sided);
                 if (sg.queryPipelineState(pip) != .VALID) continue;
                 sg.applyPipeline(pip);
                 var bind = sg.Bindings{};
@@ -659,7 +729,7 @@ pub const VelocityPass = struct {
             })) continue;
             if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) continue;
             if (!gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) continue;
-            const pip = if (batch.index_type == .UINT32) self.pip_marker_glass_inst_u32 else self.pip_marker_glass_inst_u16;
+            const pip = self.glassPipeline(.instanced, batch.index_type == .UINT32, batch.double_sided);
             if (sg.queryPipelineState(pip) != .VALID) continue;
             sg.applyPipeline(pip);
             var bind = sg.Bindings{};
@@ -710,7 +780,7 @@ pub const VelocityPass = struct {
                 scene_render_queue.skinAt(prev_skins, item.skin_index) orelse bones
             else
                 bones;
-            const pip = if (item.is_u32) self.pip_skin_u32 else self.pip_skin_u16;
+            const pip = self.opaquePipeline(.skinned, item.is_u32, item.double_sided);
             if (sg.queryPipelineState(pip) != .VALID) return false;
             sg.applyPipeline(pip);
             var bind = sg.Bindings{};
@@ -737,7 +807,7 @@ pub const VelocityPass = struct {
             const alpha = velocityAlphaUniforms(item.draw_record);
             sg.applyUniforms(velocity_shd.UB_fs_alpha, sg.asRange(&alpha));
         } else {
-            const pip = if (item.is_u32) self.pip_rigid_u32 else self.pip_rigid_u16;
+            const pip = self.opaquePipeline(.rigid, item.is_u32, item.double_sided);
             if (sg.queryPipelineState(pip) != .VALID) return false;
             sg.applyPipeline(pip);
             var bind = sg.Bindings{};
@@ -787,7 +857,7 @@ pub const VelocityPass = struct {
         else
             batch.instance_buffer;
 
-        const pip = if (batch.index_type == .UINT32) self.pip_inst_u32 else self.pip_inst_u16;
+        const pip = self.opaquePipeline(.instanced, batch.index_type == .UINT32, batch.double_sided);
         if (sg.queryPipelineState(pip) != .VALID) return false;
         sg.applyPipeline(pip);
         var bind = sg.Bindings{};

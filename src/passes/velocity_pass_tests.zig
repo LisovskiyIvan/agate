@@ -15,6 +15,7 @@ const reactiveMarkerDepthState = velocity_pass.reactiveMarkerDepthState;
 const particleMarkerDrawDecision = velocity_pass.particleMarkerDrawDecision;
 const glassMarkerDrawDecision = velocity_pass.glassMarkerDrawDecision;
 const MarkerArgs = velocity_pass.MarkerArgs;
+const VelocityShape = velocity_pass.VelocityShape;
 const taa_mod = @import("../postprocess/taa.zig");
 const scene_render_queue = @import("../scene/render_queue.zig");
 const RenderQueues = scene_render_queue.RenderQueues;
@@ -193,4 +194,63 @@ test "glass marker draw decision marks exactly the velocity-less blends" {
         taa_mod.TaaVelocityKind.reactive,
         taa_mod.taaVelocityKind(taa_mod.TAA_REACTIVE_MARKER_ALPHA),
     );
+}
+
+test "sidedness selection pins every shape/index/side for opaque and glass" {
+    // Distinct fake ids per handle: the selection is a pure field read
+    // (no sg calls), so headless golds prove the full mapping.
+    var pass = VelocityPass{
+        .pip_rigid_u16 = .{ .id = 11 },
+        .pip_rigid_u32 = .{ .id = 12 },
+        .pip_rigid_u16_ds = .{ .id = 13 },
+        .pip_rigid_u32_ds = .{ .id = 14 },
+        .pip_inst_u16 = .{ .id = 21 },
+        .pip_inst_u32 = .{ .id = 22 },
+        .pip_inst_u16_ds = .{ .id = 23 },
+        .pip_inst_u32_ds = .{ .id = 24 },
+        .pip_skin_u16 = .{ .id = 31 },
+        .pip_skin_u32 = .{ .id = 32 },
+        .pip_skin_u16_ds = .{ .id = 33 },
+        .pip_skin_u32_ds = .{ .id = 34 },
+        .pip_marker_glass_rigid_u16 = .{ .id = 41 },
+        .pip_marker_glass_rigid_u32 = .{ .id = 42 },
+        .pip_marker_glass_rigid_u16_ds = .{ .id = 43 },
+        .pip_marker_glass_rigid_u32_ds = .{ .id = 44 },
+        .pip_marker_glass_inst_u16 = .{ .id = 51 },
+        .pip_marker_glass_inst_u32 = .{ .id = 52 },
+        .pip_marker_glass_inst_u16_ds = .{ .id = 53 },
+        .pip_marker_glass_inst_u32_ds = .{ .id = 54 },
+        .pip_marker_glass_skin_u16 = .{ .id = 61 },
+        .pip_marker_glass_skin_u32 = .{ .id = 62 },
+        .pip_marker_glass_skin_u16_ds = .{ .id = 63 },
+        .pip_marker_glass_skin_u32_ds = .{ .id = 64 },
+    };
+    const shapes = [_]VelocityShape{ .rigid, .instanced, .skinned };
+    // Opaque golds: single-sided returns the pre-sidedness handles.
+    const opaque_single = [_][2]u32{ .{ 11, 12 }, .{ 21, 22 }, .{ 31, 32 } };
+    const opaque_double = [_][2]u32{ .{ 13, 14 }, .{ 23, 24 }, .{ 33, 34 } };
+    // Glass golds: same shape/index grid, marker handle family.
+    const glass_single = [_][2]u32{ .{ 41, 42 }, .{ 51, 52 }, .{ 61, 62 } };
+    const glass_double = [_][2]u32{ .{ 43, 44 }, .{ 53, 54 }, .{ 63, 64 } };
+    for (shapes, 0..) |shape, si| {
+        for ([2]bool{ false, true }) |is_u32| {
+            const u: usize = if (is_u32) 1 else 0;
+            try std.testing.expectEqual(opaque_single[si][u], pass.opaquePipeline(shape, is_u32, false).id);
+            try std.testing.expectEqual(opaque_double[si][u], pass.opaquePipeline(shape, is_u32, true).id);
+            try std.testing.expectEqual(glass_single[si][u], pass.glassPipeline(shape, is_u32, false).id);
+            try std.testing.expectEqual(glass_double[si][u], pass.glassPipeline(shape, is_u32, true).id);
+        }
+    }
+
+    // Zero pass (headless init): every triple reads zero — fail-closed,
+    // never a fabricated handle.
+    const zero = VelocityPass{};
+    for (shapes) |shape| {
+        for ([2]bool{ false, true }) |is_u32| {
+            for ([2]bool{ false, true }) |ds| {
+                try std.testing.expectEqual(@as(u32, 0), zero.opaquePipeline(shape, is_u32, ds).id);
+                try std.testing.expectEqual(@as(u32, 0), zero.glassPipeline(shape, is_u32, ds).id);
+            }
+        }
+    }
 }
