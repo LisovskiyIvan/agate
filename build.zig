@@ -359,6 +359,10 @@ pub fn build(b: *Build) !void {
         .{ .name = "ui_shader", .input = "src/shaders/ui.glsl", .output = "ui_shader.zig" },
         .{ .name = "ssao_shader", .input = "src/shaders/ssao.glsl", .output = "ssao_shader.zig", .includes = true },
         .{ .name = "ssao_blur_shader", .input = "src/shaders/ssao_blur.glsl", .output = "ssao_blur_shader.zig", .includes = true },
+        // SSAO temporal accumulation (opt-in): gather -> temporal ->
+        // bilateral upsample. Same fullscreen-vs include shape as the
+        // SSAO pair above.
+        .{ .name = "ssao_temporal_shader", .input = "src/shaders/ssao_temporal.glsl", .output = "ssao_temporal_shader.zig", .includes = true },
         // SSGI v2 (half-res gather + bilateral denoise): same fullscreen-vs
         // include shape as the SSAO pair above.
         .{ .name = "ssgi_shader", .input = "src/shaders/ssgi.glsl", .output = "ssgi_shader.zig", .includes = true },
