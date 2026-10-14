@@ -9,6 +9,21 @@ const LeaseError = draws_mod.LeaseError;
 
 const testing = std.testing;
 
+test "indexed sort scratch is counted as retained frame memory" {
+    var draws = FrameDraws{};
+    defer draws.deinit(testing.allocator);
+    const before = draws.cpuBytes();
+    var scratch_bytes: usize = 0;
+    for (&draws.slots) |*slot| {
+        try slot.primary.sort_idx.ensureTotalCapacity(testing.allocator, 128);
+        try slot.views[0].sort_idx.ensureTotalCapacity(testing.allocator, 64);
+        scratch_bytes += (slot.primary.sort_idx.capacity + slot.views[0].sort_idx.capacity) * @sizeOf(u32);
+        slot.primary.reset();
+        slot.views[0].reset();
+    }
+    try testing.expectEqual(before + scratch_bytes, draws.cpuBytes());
+}
+
 test "wave26: rotation cycles 0-1-2-0 without stalling, back never equals front" {
     var draws = FrameDraws{};
     try testing.expectEqual(SLOT_COUNT, draws.slots.len);

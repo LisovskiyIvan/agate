@@ -354,6 +354,7 @@ fn queuesBytes(q: *const RenderQueues) usize {
     b += listBytes(q.skin_storage);
     b += listBytes(q.shader_storage);
     b += listBytes(q.coat_storage);
+    b += listBytes(q.sort_idx);
     b += listBytes(q.parallel_scratch.records);
     for (q.parallel_scratch.records.items) |*r| b += listBytes(r.*);
     b += listBytes(q.parallel_scratch.chunk_stats);
