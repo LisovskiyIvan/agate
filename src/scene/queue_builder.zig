@@ -12,7 +12,6 @@ const CameraSnapshot = scene_snapshot.CameraSnapshot;
 const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
 const scene_render_queue = @import("render_queue.zig");
 const RenderQueues = scene_render_queue.RenderQueues;
-const RenderMeshItem = scene_render_queue.RenderMeshItem;
 const outline_pass = @import("../passes/outline_pass.zig");
 const highlight_pass = @import("../passes/highlight_pass.zig");
 const frame_draws = @import("frame_draws.zig");
@@ -73,7 +72,9 @@ pub fn prepareViewQueues(
         .instances_prepared = instances_prepared,
     });
 
-    std.mem.sort(RenderMeshItem, queues.items.items, {}, scene_render_queue.sortRenderItems);
+    // Indexed opaque sort: same stable order, less large-item move traffic;
+    // retained scratch, with a direct-sort fallback on OOM.
+    scene_render_queue.sortOpaqueItemsIndexed(queues, scene.allocator);
     // Unified transparent order: regular + instanced groups globally
     // back-to-front by group distance (one entry per batch).
     std.mem.sort(

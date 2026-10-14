@@ -42,6 +42,7 @@ pub const coatAt = items.coatAt;
 pub const TransparentDrawEntry = items.TransparentDrawEntry;
 pub const RenderQueues = items.RenderQueues;
 pub const sortRenderItems = items.sortRenderItems;
+pub const sortOpaqueItemsIndexed = items.sortOpaqueItemsIndexed;
 pub const sortTransparentDrawOrder = items.sortTransparentDrawOrder;
 pub const materialIsTransparent = items.materialIsTransparent;
 pub const materialIsDoubleSided = items.materialIsDoubleSided;

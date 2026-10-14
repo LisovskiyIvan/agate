@@ -265,6 +265,13 @@ pub const RenderQueues = struct {
     // per-view parallel culls reuse the same memory instead of
     // allocating/freeing chunk buffers on every call.
     parallel_scratch: ParallelCullScratch = .{},
+    // Indexed-sort scratch: u32 permutation buffer for
+    // `sortOpaqueItemsIndexed`, retained across frames (grows to the
+    // largest opaque queue, never shrinks mid-run). Sorting indices
+    // (4 B) instead of whole items (~0.6 KiB) cuts the sort's memory
+    // traffic on many-thousand-mesh scenes; the in-place cycle permute
+    // then moves each item only along its permutation cycle.
+    sort_idx: std.ArrayListUnmanaged(u32) = .empty,
 
     pub fn reset(self: *RenderQueues) void {
         self.items.clearRetainingCapacity();
@@ -277,6 +284,7 @@ pub const RenderQueues = struct {
         self.prev_skin_storage.clearRetainingCapacity();
         self.shader_storage.clearRetainingCapacity();
         self.coat_storage.clearRetainingCapacity();
+        self.sort_idx.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderQueues, allocator: std.mem.Allocator) void {
@@ -291,10 +299,19 @@ pub const RenderQueues = struct {
         self.shader_storage.deinit(allocator);
         self.coat_storage.deinit(allocator);
         self.parallel_scratch.deinit(allocator);
+        self.sort_idx.deinit(allocator);
     }
 };
 
 pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
+    return lessRenderItems(&a, &b);
+}
+
+/// Reference-based ordering core shared by the direct sort above and the
+/// indexed sort below (`sortOpaqueItemsIndexed`): one source of truth, so
+/// both paths order every queue identically. Compares by value semantics
+/// without copying whole items per comparison.
+pub fn lessRenderItems(a: *const RenderMeshItem, b: *const RenderMeshItem) bool {
     if (a.is_pbr != b.is_pbr) {
         return !a.is_pbr;
     }
@@ -302,6 +319,63 @@ pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
         return a.texture_id < b.texture_id;
     }
     return a.distance_sq < b.distance_sq;
+}
+
+/// Indexed opaque-queue sort: same order as `sortRenderItems`, but the
+/// O(n log n) swaps move u32 indices (retained `sort_idx` scratch) instead
+/// of whole items, and the final in-place cycle permute moves each item
+/// along its permutation cycle. Both paths use std.mem.sort (stable
+/// block sort), so equal keys retain the original input order too.
+///
+/// OOM falls back to the direct stable sort with the same ordering.
+/// Queues with <2 items are untouched.
+pub fn sortOpaqueItemsIndexed(queues: *RenderQueues, allocator: std.mem.Allocator) void {
+    const items = queues.items.items;
+    if (items.len < 2) return;
+    queues.sort_idx.ensureTotalCapacity(allocator, items.len) catch {
+        std.mem.sort(RenderMeshItem, items, {}, sortRenderItems);
+        return;
+    };
+    queues.sort_idx.items.len = items.len;
+    for (queues.sort_idx.items, 0..) |*v, i| v.* = @intCast(i);
+    const Ctx = struct {
+        items: []const RenderMeshItem,
+        pub fn less(c: @This(), a: u32, b: u32) bool {
+            return lessRenderItems(&c.items[a], &c.items[b]);
+        }
+    };
+    std.mem.sort(u32, queues.sort_idx.items, Ctx{ .items = items }, Ctx.less);
+    permuteByIndex(RenderMeshItem, items, queues.sort_idx.items);
+}
+
+/// Applies permutation `idx` (`out[i] = old[idx[i]]`) to `items` in place
+/// with one stack temp: each element moves exactly once. Visited marks ride
+/// the high bit of the scratch (counts always fit u31) and are cleared for
+/// reuse before return.
+fn permuteByIndex(T: type, items: []T, idx: []u32) void {
+    std.debug.assert(items.len == idx.len);
+    const visited: u32 = 1 << 31;
+    for (idx, 0..) |v, i| {
+        if ((v & visited) != 0) continue;
+        const j = v & ~visited;
+        if (j == i) {
+            idx[i] = v | visited;
+            continue;
+        }
+        const tmp = items[i];
+        var cur: usize = i;
+        while (true) {
+            const nxt = idx[cur] & ~visited;
+            idx[cur] |= visited;
+            if (nxt == i) {
+                items[cur] = tmp;
+                break;
+            }
+            items[cur] = items[nxt];
+            cur = nxt;
+        }
+    }
+    for (idx) |*v| v.* &= ~visited;
 }
 
 // Unified transparent order: globally back-to-front by exact group distance
