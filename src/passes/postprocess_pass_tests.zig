@@ -72,4 +72,9 @@ test "ssrStepsParams packs the dedicated steps lane with zero spares" {
     // Disabled: zeros (the shader early-outs on ssr_params.x first).
     cfg.ssr.enabled = false;
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.ssrStepsParams(cfg));
+    // Pass mode: inline lanes zero (no double-add with the pass sample).
+    cfg.ssr.enabled = true;
+    cfg.ssr.mode = .half_res_pass;
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.ssrStepsParams(cfg));
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.ssrParams(cfg));
 }

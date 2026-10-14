@@ -71,7 +71,39 @@ test "packCompositeParams zeroes the ssr steps lane while keeping camera range w
     const params = packRepresentative(&pass, .{ .ssr = .{ .enabled = false, .steps = 24 } });
     try testing.expectEqual([4]f32{ 0.1, 100.0, 0.0, 0.0 }, params.camera_params);
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, params.ssr_params2);
-    try testing.expectEqual([4]f32{ 0.0, 0.55, 0.4, 25.0 }, params.ssr_params);
+    // Inactive inline lane packs zeros (shader gates on x; bit-identical).
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, params.ssr_params);
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, params.ssr_pass_params);
+}
+
+test "packCompositeParams splits ssr inline and pass lanes without double-add" {
+    const pass = PostProcessPass{};
+    const inline_params = packRepresentative(&pass, .{ .ssr = .{ .enabled = true, .intensity = 0.6, .steps = 32 } });
+    try testing.expectEqual([4]f32{ 1.0, 0.6, 0.4, 25.0 }, inline_params.ssr_params);
+    try testing.expectEqual([4]f32{ 32.0, 0.0, 0.0, 0.0 }, inline_params.ssr_params2);
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, inline_params.ssr_pass_params);
+    var fed = PostProcessPass{ .ssr_tex_view = .{ .id = 77 } };
+    const pass_params = fed.packCompositeParams(
+        .{ .ssr = .{ .enabled = true, .intensity = 0.6, .steps = 32, .mode = .half_res_pass } },
+        false,
+        1.0,
+        160,
+        90,
+        Mat4.identity,
+        Mat4.identity,
+        Mat4.identity,
+        Vec3.new(1.0, 2.0, 3.0),
+        Vec3.new(0.0, 1.0, 0.0),
+        Color3.new(1.0, 1.0, 1.0),
+        0.1,
+        100.0,
+        false,
+        false,
+        .BGRA8,
+    );
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params);
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params2);
+    try testing.expectEqual([4]f32{ 1.0, 0.6, 0.0, 0.0 }, pass_params.ssr_pass_params);
 }
 
 test "buildCompositeBindings falls back to placeholders for every empty optional view" {
@@ -92,6 +124,8 @@ test "buildCompositeBindings falls back to placeholders for every empty optional
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_highlight_tex].id);
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_highlight_mask_tex].id);
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_shaft_tex].id);
+    try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_ssgi_tex].id);
+    try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_ssr_tex].id);
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_lut_tex].id);
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_history_tex].id);
     // No velocity view fed: the zero mask (depth-reprojection fallback).

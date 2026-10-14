@@ -1,6 +1,5 @@
 //! Pure composite bindings and uniform packing. GPU resources remain owned by
 //! PostProcessPass; the pass is passed as anytype to avoid a leaf-to-owner import.
-const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const post_shd = @import("postprocess_shader");
@@ -16,9 +15,9 @@ pub fn isSrgbBackbuffer(fmt: sg.PixelFormat) bool {
 }
 
 pub fn outputParamsFor(backbuffer_fmt: sg.PixelFormat) [4]f32 {
-    // On WebGPU, the canvas compositor expects linear output and applies
-    // display transfer automatically; manual shader encode causes double gamma / washed out screen.
-    if (builtin.cpu.arch.isWasm()) return .{ 0.0, 0.0, 0.0, 0.0 };
+    // The attachment format owns transfer encoding on every backend.
+    // Canvas colorSpace does not make an UNORM attachment encode linear
+    // shader output; only an sRGB attachment performs that conversion.
     const x: f32 = if (isSrgbBackbuffer(backbuffer_fmt)) 0.0 else 1.0;
     return .{ x, 0.0, 0.0, 0.0 };
 }
@@ -79,6 +78,14 @@ pub fn buildCompositeBindings(
     // bit-identical to pre-SSGI-pass).
     post_bind.views[post_shd.VIEW_ssgi_tex] = if (self.ssgi_tex_view.id != 0)
         self.ssgi_tex_view
+    else
+        self.offscreen_resolve_tex_view;
+    // SSR v2 denoised reflection when the parent fed an SsrPass result;
+    // otherwise a valid placeholder the shader never samples
+    // (ssr_pass_params.x = 0 gates the branch off, so the off path is
+    // bit-identical to pre-SSR-pass).
+    post_bind.views[post_shd.VIEW_ssr_tex] = if (self.ssr_tex_view.id != 0)
+        self.ssr_tex_view
     else
         self.offscreen_resolve_tex_view;
     // LUT when the config carries a live binding; otherwise the resolved
@@ -194,18 +201,15 @@ pub fn packCompositeParams(
             config.fog.color[2],
             config.fog.sun_scattering,
         },
-        .ssr_params = .{
-            if (config.ssr.enabled) 1.0 else 0.0,
-            config.ssr.intensity,
-            // Former ssr_thickness / ssr_max_distance knobs (dropped: zero
-            // non-default setters): the historical defaults, hardcoded.
-            0.4,
-            25.0,
-        },
-        // (steps, 0, 0, 0); zeros when SSR is off, which keeps the
-        // composite identical to the SSR-off path (the shader
-        // early-outs on ssr_params.x before reading this lane).
+        .ssr_params = postprocess.ssrParams(config),
+        // (steps, 0, 0, 0); zeros when off OR in v2 pass mode, which keeps
+        // the composite identical to the SSR-off path (the inline raymarch
+        // branch never runs alongside the pass-sample branch).
         .ssr_params2 = postprocess.ssrStepsParams(config),
+        // (pass-sample active 1/0, intensity, 0, 0); zeros unless the
+        // parent fed a denoised SsrPass view this frame, which keeps
+        // the off path bit-identical.
+        .ssr_pass_params = postprocess.ssrPassParams(config, self.ssr_tex_view.id != 0),
         .params5 = .{
             if (config.sharpen.enabled) config.sharpen.intensity else 0.0,
             if (config.grain.enabled) config.grain.intensity else 0.0,

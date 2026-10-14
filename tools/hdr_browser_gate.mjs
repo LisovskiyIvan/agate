@@ -28,8 +28,13 @@
 // readback. HDR 1/4/16 separation has CPU math goldens; here the
 // highlight-fraction + cross-encode agreement is the render evidence.
 //
+// --scene q0 uses the same real-GPU runner for SSR inline/pass/off, horizon
+// AO with camera/velocity history, and exact disabled-mode RGB(A) parity.
+// It checks visible SSR contributions and +2 pass draws, not ghosting or
+// radiance quality. Build examples/web-q0-interior first; --frames >= 120.
+//
 // Usage:
-//   node hdr_browser_gate.mjs [--out <dir>] [--serve-dir <dir>]
+//   node hdr_browser_gate.mjs [--scene hdr|q0] [--out <dir>] [--serve-dir <dir>]
 //     [--chrome <path>] [--timeout-ms <n>] [--frames <n>]
 //
 // Defaults: --out a fresh $TMPDIR/opencode/hdr-browser-* directory when
@@ -45,14 +50,36 @@ import { readFile } from 'node:fs/promises';
 import { writeFileSync, mkdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, extname, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import net from 'node:net';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHROME_DEFAULT = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const SCENE = arg('--scene', 'hdr');
+const LIGHTING = SCENE === 'q0-lighting';
+const Q0 = SCENE === 'q0' || LIGHTING;
 
-const LEGS = [
+const LEGS = LIGHTING ? [
+  { name: 'combined', knobs: { 'no-ssgi': '0' }, ssrPass: false, temporal: false },
+  { name: 'no-ao', knobs: { 'no-ao': '1' }, ssrPass: false, temporal: false },
+  { name: 'hemisphere', knobs: {}, ssrPass: false, temporal: false },
+  { name: 'horizon', knobs: { 'ao-mode': 'horizon' }, ssrPass: false, temporal: false },
+  { name: 'no-local-tonemap', knobs: { 'no-local-tonemap': '1' }, ssrPass: false, temporal: false },
+  { name: 'no-bloom', knobs: { 'no-bloom': '1' }, ssrPass: false, temporal: false },
+  { name: 'no-shadows', knobs: { 'no-shadows': '1', 'no-ao': '1', 'no-local-tonemap': '1' }, ssrPass: false, temporal: false },
+  { name: 'direct', knobs: { 'no-ao': '1', 'no-local-tonemap': '1', 'no-bloom': '1' }, ssrPass: false, temporal: false },
+  { name: 'no-area', knobs: { 'no-area': '1', 'no-ao': '1', 'no-local-tonemap': '1', 'no-bloom': '1' }, ssrPass: false, temporal: false },
+  { name: 'front-view', knobs: { 'camera-alpha': String(Math.PI / 2) }, ssrPass: false, temporal: false },
+] : Q0 ? [
+  { name: 'ssr-off', knobs: { 'no-ssr': '1' }, ssrPass: false, temporal: false },
+  { name: 'ssr-inline', knobs: {}, ssrPass: false, temporal: false },
+  { name: 'ssr-half', knobs: { 'ssr-pass': '1' }, ssrPass: true, temporal: false },
+  { name: 'ao-temporal-camera', knobs: { 'ssr-pass': '1', 'ao-mode': 'horizon', 'ao-temporal': '1' }, ssrPass: true, temporal: true },
+  { name: 'ao-temporal-velocity', knobs: { 'ssr-pass': '1', 'ao-mode': 'horizon', 'ao-temporal': '1', 'no-taa': '0' }, ssrPass: true, temporal: true },
+  { name: 'disabled-defaults', knobs: { 'no-ssr': '1', 'no-ao': '1' }, ssrPass: false, temporal: false },
+  { name: 'disabled-new-modes', knobs: { 'no-ssr': '1', 'no-ao': '1', 'ssr-pass': '1', 'ao-mode': 'horizon', 'ao-temporal': '1' }, ssrPass: false, temporal: false },
+] : [
   { name: 'msaa1-unorm', msaa: 1, srgb: false, expectSamples: 1, minChecks: 1000 },
   { name: 'msaa4-unorm', msaa: 4, srgb: false, expectSamples: 4, minChecks: 700 },
   { name: 'msaa1-srgb', msaa: 1, srgb: true, expectSamples: 1, minChecks: 1000 },
@@ -67,10 +94,17 @@ const LEGS = [
 // validation error, a panic, or any other console.error still fails the leg.
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const stripAnsi = (s) => s.replace(ANSI_RE, '');
-const HDR_INFO_RE = /^\s*hdr-showcase: (setup backend=\S+|frame \d+ draws=|frames=\d+ checks=\d+ .* verdict=PASS)/;
+const HDR_INFO_RE = /^\s*hdr-showcase: (setup backend=\S+|frame \d+ draws=|frames=\d+ checks=\d+ .* verdict=PASS|render target \d+x\d+ scale=[\d.]+ swapchain \d+x\d+$)/;
+const PHASE_INFO_RE = /^\s*phase \d+: scale=[\d.]+ no samples \(occl \d+\) target=\d+x\d+ window=\d+x\d+$/;
+const Q0_INFO_RE = /^\s*q0-interior(?::| ssr-proof:)/;
 const HARD_FAIL_RE =
-  /GPU(?:Validation|Internal|OutOfMemory)Error|uncaptured(?: GPU)? error|\[(?:sg|sokol|sapp)[^\]]*\]\s*\[(?:error|panic)\]|VALIDATE_[A-Z_]+|validation (?:failed|error)|\bpanic\b|\bfatal\b|^hdr-showcase: FAIL/i;
+  /GPU(?:Validation|Internal|OutOfMemory)Error|uncaptured(?: GPU)? error|\[(?:sg|sokol|sapp)[^\]]*\]\s*\[(?:error|panic)\]|VALIDATE_[A-Z_]+|validation (?:failed|error)|\bpanic\b|\bfatal\b|^hdr-showcase: FAIL|^q0-interior FAIL/i;
 const SHELL_WARN_RE = /^\s*warning:/;
+
+export function isInformationalDiagnostic(text, q0 = false) {
+  const plain = stripAnsi(text);
+  return !HARD_FAIL_RE.test(plain) && (HDR_INFO_RE.test(plain) || PHASE_INFO_RE.test(plain) || (q0 && Q0_INFO_RE.test(plain)));
+}
 
 const VERDICT_RE =
   /hdr-showcase: frames=(\d+) checks=(\d+) failures=(\d+) log_errors=(\d+) sokol_live_allocations=(\d+) verdict=(\w+)/;
@@ -238,11 +272,14 @@ function imageStats(img) {
   return { width: img.width, height: img.height, mean, std, darkFrac: dark / n, hiFrac: hi / n, unique: uniq.size };
 }
 
-function compareCoarse(a, b) {
+export function compareCoarse(a, b) {
   if (a.width !== b.width || a.height !== b.height) return { sameSize: false };
   const n = a.width * a.height;
   const diffs = new Float32Array(n);
   let sum = 0;
+  let rgbSquared = 0;
+  let maxChannelAbs = 0;
+  let changedPixels = 0;
   for (let i = 0; i < n; i++) {
     const d = Math.abs(
       luma(a.px[i * 4], a.px[i * 4 + 1], a.px[i * 4 + 2]) -
@@ -250,6 +287,14 @@ function compareCoarse(a, b) {
     );
     diffs[i] = d;
     sum += d;
+    let changed = false;
+    for (let c = 0; c < 4; c++) {
+      const delta = Math.abs(a.px[i * 4 + c] - b.px[i * 4 + c]) / 255;
+      changed ||= delta !== 0;
+      if (c < 3) rgbSquared += delta * delta;
+      maxChannelAbs = Math.max(maxChannelAbs, delta);
+    }
+    if (changed) changedPixels++;
   }
   const sorted = Array.from(diffs).sort((x, y) => x - y);
   return {
@@ -257,6 +302,9 @@ function compareCoarse(a, b) {
     meanAbs: sum / n,
     p99Abs: sorted[Math.min(n - 1, Math.floor(n * 0.99))],
     maxAbs: sorted[n - 1],
+    changedPixels,
+    maxChannelAbs,
+    rmseRgb: Math.sqrt(rgbSquared / (n * 3)),
   };
 }
 
@@ -281,9 +329,18 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
   let shotBuf = null;
   let shotAfterFrame = null;
   let lastFrameLog = 0;
+  let q0Frame = null;
+  let q0Ssr = null;
+  let teardown = null;
   const log = (line) => transcript.push(line);
 
-  const pageUrl =
+  const q0Query = new URLSearchParams({
+    frames: String(FRAMES), still: '1', 'no-taa': '1', 'no-dof': '1',
+    'no-shafts': '1', 'no-ssgi': '1', 'no-particles': '1', 'no-glass': '1',
+    ...(LIGHTING ? { 'no-ssr': '1' } : {}),
+    ...leg.knobs,
+  }).toString();
+  const pageUrl = Q0 ? `http://127.0.0.1:${httpPort}/q0-interior.html?${q0Query}` :
     `http://127.0.0.1:${httpPort}/hdr-showcase.html` +
     `?frames=${FRAMES}&msaa=${leg.msaa}${leg.srgb ? '&srgb=1' : ''}&_=${Date.now()}`;
 
@@ -366,7 +423,7 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
         log(`[console.${type}] ${text}`);
         const plain = stripAnsi(text);
         if (HARD_FAIL_RE.test(plain)) problems.push(`console: ${text.slice(0, 300)}`);
-        else if (HDR_INFO_RE.test(plain)) { /* gate's own progress lines */ } else if (type === 'error' && !SHELL_WARN_RE.test(plain))
+        else if (isInformationalDiagnostic(plain, Q0)) { /* gate's own progress lines */ } else if (type === 'error' && !SHELL_WARN_RE.test(plain))
           problems.push(`console.error: ${text.slice(0, 300)}`);
         let m = plain.match(SETUP_RE);
         if (m)
@@ -392,6 +449,26 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
           };
           clearTimeout(timer);
           resolve();
+        }
+        if (Q0) {
+          m = plain.match(/q0-interior: setup backend=(\S+)/);
+          if (m) setup = { backend: m[1], line: plain.trim() };
+          m = plain.match(/q0-interior: frame30 draws=(\d+) post_draws=(\d+) tris=(\d+) ao_temp_sized=(\w+) ao_temp_draws=(\d+)/);
+          if (m) {
+            q0Frame = { draws: +m[1], postDraws: +m[2], temporalSized: m[4] === 'true', temporalDraws: +m[5] };
+            lastFrameLog = 30;
+            if (!shotP) shotP = takeShot().catch((e) => problems.push(`screenshot: ${e.message}`));
+          }
+          m = plain.match(/q0-interior ssr-proof: mode=(\S+) (target=(\d+)x(\d+)|no-pass)/);
+          if (m) q0Ssr = { mode: m[1], active: m[2] !== 'no-pass', width: +m[3] || 0, height: +m[4] || 0 };
+          m = plain.match(/q0-interior: teardown log_errors=(\d+) sokol_live_allocations=(\d+)/);
+          if (m) teardown = { logErrors: +m[1], allocs: +m[2] };
+          m = plain.match(/q0-interior: verdict=(\w+) failures=(\d+) frames=(\d+)/);
+          if (m) {
+            verdict = { verdict: m[1], failures: +m[2], frames: +m[3], ...teardown, line: plain.trim() };
+            clearTimeout(timer);
+            resolve();
+          }
         }
       } else if (msg.method === 'Runtime.exceptionThrown') {
         const d = msg.params.exceptionDetails || {};
@@ -460,11 +537,17 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
     if (verdict.logErrors !== 0) failures.push(`log_errors=${verdict.logErrors}`);
     if (verdict.allocs !== 0) failures.push(`sokol_live_allocations=${verdict.allocs}`);
     if (verdict.frames !== FRAMES) failures.push(`frames=${verdict.frames}, need ${FRAMES}`);
-    if (verdict.checks < leg.minChecks) failures.push(`checks=${verdict.checks} < ${leg.minChecks} (required coverage)`);
-    if (verdict.checks === 0) failures.push('checks==0 (allocation or context unavailable?)');
+    if (!Q0 && verdict.checks < leg.minChecks) failures.push(`checks=${verdict.checks} < ${leg.minChecks} (required coverage)`);
+    if (!Q0 && verdict.checks === 0) failures.push('checks==0 (allocation or context unavailable?)');
   }
-  if (!frame60) failures.push('missing frame-60 line (screenshot trigger lost)');
-  else if (frame60.samples !== leg.expectSamples)
+  if (Q0) {
+    if (!teardown) failures.push('missing teardown proof');
+    if (!q0Frame || q0Frame.draws === 0) failures.push('missing frame-30 draw proof');
+    else if (q0Frame.temporalSized !== leg.temporal || (q0Frame.temporalDraws > 0) !== leg.temporal)
+      failures.push(`AO temporal did not match request: ${JSON.stringify(q0Frame)}`);
+    if (!q0Ssr || q0Ssr.active !== leg.ssrPass) failures.push(`SSR stage did not match request: ${JSON.stringify(q0Ssr)}`);
+  } else if (!frame60) failures.push('missing frame-60 line (screenshot trigger lost)');
+  else if (!Q0 && frame60.samples !== leg.expectSamples)
     failures.push(`effective samples=${frame60.samples}, policy needs ${leg.expectSamples}`);
   if (!shotBuf) failures.push('no screenshot captured');
   const adapterText = JSON.stringify(adapter || {});
@@ -478,19 +561,20 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
     stats = imageStats(img);
     if (stats.unique < VIS.minUnique) failures.push(`flat frame: unique=${stats.unique}`);
     if (stats.std < VIS.minStd) failures.push(`empty frame: std=${stats.std.toFixed(4)}`);
-    if (stats.darkFrac < VIS.minDarkFrac) failures.push(`not a dark studio: darkFrac=${stats.darkFrac.toFixed(3)}`);
-    if (stats.hiFrac < VIS.minHiFrac) failures.push(`no HDR highlights: hiFrac=${stats.hiFrac.toFixed(4)}`);
+    if (!Q0 && stats.darkFrac < VIS.minDarkFrac) failures.push(`not a dark studio: darkFrac=${stats.darkFrac.toFixed(3)}`);
+    if (!Q0 && stats.hiFrac < VIS.minHiFrac) failures.push(`no HDR highlights: hiFrac=${stats.hiFrac.toFixed(4)}`);
     writeFileSync(join(outDir, `${leg.name}.png`), shotBuf);
   }
   writeFileSync(join(outDir, `${leg.name}.log`), transcript.join('\n') + '\n');
   const result = {
     leg: leg.name,
-    query: `?frames=${FRAMES}&msaa=${leg.msaa}${leg.srgb ? '&srgb=1' : ''}`,
+    query: Q0 ? `?${q0Query}` : `?frames=${FRAMES}&msaa=${leg.msaa}${leg.srgb ? '&srgb=1' : ''}`,
     ok: failures.length === 0,
     failures,
     setup,
     verdict,
     frame60,
+    ...(Q0 ? { q0Frame, q0Ssr, teardown } : {}),
     shotAfterFrame,
     adapter,
     stats,
@@ -500,13 +584,14 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
   return result;
 }
 
-const FRAMES = parseInt(arg('--frames', '240'), 10);
+const FRAMES = parseInt(arg('--frames', Q0 ? '120' : '240'), 10);
 
 async function main() {
-  const serveDir = arg('--serve-dir', join(HERE, '..', 'zig-out', 'web'));
+  const serveDir = arg('--serve-dir', Q0 ? join(HERE, '..', 'examples', 'zig-out', 'web') : join(HERE, '..', 'zig-out', 'web'));
   const chromePath = arg('--chrome', CHROME_DEFAULT);
   const timeoutMs = parseInt(arg('--timeout-ms', '150000'), 10);
-  if (!Number.isInteger(FRAMES) || FRAMES < 240) throw new Error('--frames must be at least 240 for complete phase coverage');
+  if (SCENE !== 'hdr' && !Q0) throw new Error('--scene must be hdr, q0 or q0-lighting');
+  if (!Number.isInteger(FRAMES) || FRAMES < (Q0 ? 120 : 240)) throw new Error('--frames must cover the finite gate (q0 >= 120, hdr >= 240)');
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('--timeout-ms must be positive');
   const scopedTmp = join(tmpdir(), 'opencode');
   const baseTmp = existsSync(scopedTmp) ? scopedTmp : tmpdir();
@@ -583,16 +668,37 @@ async function main() {
       results.push(r);
     }
 
-    // Coarse UNORM-vs-sRGB agreement (same geometry, same fixed-dt frame).
+    // HDR encode agreement or Q0 disabled-path parity and visible SSR proof.
     let xencode = null;
     try {
-      const a = decodePNG(await readFile(join(outDir, 'msaa1-unorm.png')));
-      const b = decodePNG(await readFile(join(outDir, 'msaa1-srgb.png')));
-      xencode = compareCoarse(a, b);
-      if (!xencode.sameSize || xencode.meanAbs > XENCODE.maxMeanAbs || xencode.p99Abs > XENCODE.maxP99Abs) {
-        const r = results.find((x) => x.leg === 'msaa1-srgb');
-        r.ok = false;
-        r.failures.push(`xencode mismatch: ${JSON.stringify(xencode)}`);
+      if (LIGHTING) {
+        xencode = { limits: 'Lighting isolation screenshots; inspect corners, not a radiance or aesthetic-quality verdict.' };
+      } else if (Q0) {
+        const image = async (name) => decodePNG(await readFile(join(outDir, `${name}.png`)));
+        const disabled = compareCoarse(await image('disabled-defaults'), await image('disabled-new-modes'));
+        const off = await image('ssr-off');
+        const inline = await image('ssr-inline');
+        const half = await image('ssr-half');
+        const inlineVsOff = compareCoarse(inline, off);
+        const halfVsOff = compareCoarse(half, off);
+        const halfVsInline = compareCoarse(half, inline);
+        const drawDelta = results.find((r) => r.leg === 'ssr-half').q0Frame?.postDraws - results.find((r) => r.leg === 'ssr-inline').q0Frame?.postDraws;
+        xencode = { disabled, inlineVsOff, halfVsOff, halfVsInline, drawDelta, limits: 'Screenshot smoke, not radiance/ghosting quality or pixel parity for half-res SSR.' };
+        if (!disabled.sameSize || disabled.changedPixels !== 0 || !inlineVsOff.sameSize || !halfVsOff.sameSize || inlineVsOff.changedPixels === 0 || halfVsOff.changedPixels === 0 || drawDelta !== 2) {
+          for (const r of results) {
+            r.ok = false;
+            r.failures.push(`Q0 disabled parity / visible SSR failed: ${JSON.stringify(xencode)}`);
+          }
+        }
+      } else {
+        const a = decodePNG(await readFile(join(outDir, 'msaa1-unorm.png')));
+        const b = decodePNG(await readFile(join(outDir, 'msaa1-srgb.png')));
+        xencode = compareCoarse(a, b);
+        if (!xencode.sameSize || xencode.meanAbs > XENCODE.maxMeanAbs || xencode.p99Abs > XENCODE.maxP99Abs) {
+          const r = results.find((x) => x.leg === 'msaa1-srgb');
+          r.ok = false;
+          r.failures.push(`xencode mismatch: ${JSON.stringify(xencode)}`);
+        }
       }
     } catch (e) {
       xencode = { error: e.message };
@@ -602,7 +708,7 @@ async function main() {
       }
     }
     console.log(
-      `xencode unorm-vs-srgb: ` +
+      (Q0 ? 'q0 image checks: ' : 'xencode unorm-vs-srgb: ') +
         (xencode && xencode.sameSize
           ? `meanAbs=${xencode.meanAbs.toFixed(4)} p99Abs=${xencode.p99Abs.toFixed(4)} maxAbs=${xencode.maxAbs.toFixed(4)}`
           : JSON.stringify(xencode)),
@@ -611,6 +717,7 @@ async function main() {
     const summary = {
       ok: results.every((r) => r.ok),
       frames: FRAMES,
+      scene: SCENE,
       legs: results.map((r) => ({
         leg: r.leg,
         ok: r.ok,
@@ -663,4 +770,4 @@ async function main() {
   }
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

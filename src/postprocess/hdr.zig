@@ -226,6 +226,40 @@ pub fn displayColor(c: [3]f32, exposure: f32, mode: types.TonemappingType, srgb_
     return linearToSrgb3(t);
 }
 
+/// Rec.709 weights used by the composite's local-tonemap scene taps.
+pub const local_luma_weights = [3]f32{ 0.2126, 0.7152, 0.0722 };
+
+pub fn localLuma(c: [3]f32) f32 {
+    const b = boundHdr3(c);
+    return b[0] * local_luma_weights[0] + b[1] * local_luma_weights[1] + b[2] * local_luma_weights[2];
+}
+
+/// Detail gain from the pre-exposure center and unthresholded five-tap
+/// scene mean. Exposure and bloom never enter this ratio; uniform fields
+/// stay neutral. Mirrors applyLocalTonemapping in postprocess.glsl.
+pub fn localTonemapGain(center: [3]f32, neighbors: [4][3]f32, contrast: f32) f32 {
+    const c = sanitizeFinite(contrast);
+    const l0 = localLuma(center);
+    const mean = (l0 + localLuma(neighbors[0]) + localLuma(neighbors[1]) + localLuma(neighbors[2]) + localLuma(neighbors[3])) * 0.2;
+    const numer = @max(0.18 + l0, 1e-4);
+    const denom = @max(0.18 + mean, 1e-4);
+    return std.math.clamp(std.math.pow(f32, numer / denom, c), 0.25, 4.0);
+}
+
+/// Apply the pre-exposure gain to the composed post-exposure color (with
+/// bloom/glow/highlight adds). Effectively-off intensity is exact identity.
+pub fn applyLocalTonemap(composed: [3]f32, center: [3]f32, neighbors: [4][3]f32, intensity: f32, contrast: f32) [3]f32 {
+    const t = sanitizeFinite(intensity);
+    if (t <= 0.001) return composed;
+    const g = localTonemapGain(center, neighbors, contrast);
+    const adapted = [3]f32{ composed[0] * g, composed[1] * g, composed[2] * g };
+    return .{
+        composed[0] + (adapted[0] - composed[0]) * t,
+        composed[1] + (adapted[1] - composed[1]) * t,
+        composed[2] + (adapted[2] - composed[2]) * t,
+    };
+}
+
 // Auto-exposure re-exports
 pub const auto_exposure = @import("auto_exposure.zig");
 

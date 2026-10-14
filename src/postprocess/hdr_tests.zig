@@ -103,3 +103,85 @@ test "filmic, agx, and neutral curves preserve monotonic brightness and finite b
         try std.testing.expect(super[0] <= 1.0);
     }
 }
+
+test "local tonemap: uniform fields stay neutral under any exposure and any bloom add" {
+    const contrast: f32 = 0.3;
+    const intensity: f32 = 0.5;
+    for ([_]f32{ 0.05, 0.5, 4.0 }) |level| {
+        const flat = [3]f32{ level, level, level };
+        const taps = [4][3]f32{ flat, flat, flat, flat };
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), prod.localTonemapGain(flat, taps, contrast), 1e-6);
+        for ([_]f32{ 0.25, 1.0, 4.0 }) |exposure| {
+            // Include zero bloom (below threshold) and a uniform bloom add.
+            for ([_]f32{ 0.0, 0.35 }) |bloom_add| {
+                const v = (level + bloom_add) * exposure;
+                const composed = [3]f32{ v, v, v };
+                const out = prod.applyLocalTonemap(composed, flat, taps, intensity, contrast);
+                const tol = 1e-5 * @max(1.0, @abs(v));
+                try std.testing.expectApproxEqAbs(composed[0], out[0], tol);
+                try std.testing.expectApproxEqAbs(composed[1], out[1], tol);
+                try std.testing.expectApproxEqAbs(composed[2], out[2], tol);
+            }
+        }
+    }
+}
+
+test "local tonemap: real detail shifts gain inside the [0.25, 4.0] bounds" {
+    const contrast: f32 = 0.3;
+    const hi = [3]f32{ 2.0, 2.0, 2.0 };
+    const lo = [3]f32{ 0.5, 0.5, 0.5 };
+    const hi_taps = [4][3]f32{ lo, lo, lo, lo };
+    const g_hi = prod.localTonemapGain(hi, hi_taps, contrast);
+    try std.testing.expect(g_hi > 1.0 and g_hi <= 4.0);
+    const out_hi = prod.applyLocalTonemap(hi, hi, hi_taps, 1.0, contrast);
+    try std.testing.expect(out_hi[0] > hi[0]);
+
+    const dk = [3]f32{ 0.1, 0.1, 0.1 };
+    const br_taps = [4][3]f32{ hi, hi, hi, hi };
+    const g_lo = prod.localTonemapGain(dk, br_taps, contrast);
+    try std.testing.expect(g_lo < 1.0 and g_lo >= 0.25);
+    const out_lo = prod.applyLocalTonemap(dk, dk, br_taps, 1.0, contrast);
+    try std.testing.expect(out_lo[0] < dk[0]);
+
+    // A steep contrast engages the rails; the packed default stays inside.
+    const hot = [3]f32{ 100.0, 100.0, 100.0 };
+    const black = [3]f32{ 0.0, 0.0, 0.0 };
+    const black_taps = [4][3]f32{ black, black, black, black };
+    const hot_taps = [4][3]f32{ hot, hot, hot, hot };
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), prod.localTonemapGain(hot, black_taps, 3.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), prod.localTonemapGain(black, hot_taps, 3.0), 1e-6);
+    const g_hot = prod.localTonemapGain(hot, black_taps, contrast);
+    try std.testing.expect(g_hot > 1.0 and g_hot <= 4.0);
+    const g_black = prod.localTonemapGain(black, hot_taps, contrast);
+    try std.testing.expect(g_black < 1.0 and g_black >= 0.25);
+
+    const nan_c = [3]f32{ std.math.nan(f32), 0.5, 0.5 };
+    try std.testing.expect(std.math.isFinite(prod.localTonemapGain(nan_c, hi_taps, contrast)));
+    try std.testing.expectEqual(@as(f32, 0.0), prod.localLuma(.{ std.math.nan(f32), std.math.inf(f32), -1.0 }));
+    try std.testing.expectApproxEqAbs(prod.localLuma(.{ half_max, half_max, half_max }), prod.localLuma(.{ 1e10, 1e10, 1e10 }), 1e-2);
+}
+
+test "local tonemap: effectively-off intensity is the exact identity" {
+    const contrast: f32 = 0.3;
+    const center = [3]f32{ 2.0, 2.0, 2.0 };
+    const lo = [3]f32{ 0.5, 0.5, 0.5 };
+    const taps = [4][3]f32{ lo, lo, lo, lo };
+    const composed = [3]f32{ 1.7, 0.9, 0.4 };
+    try std.testing.expect(prod.localTonemapGain(center, taps, contrast) > 1.0);
+    try std.testing.expectEqual(composed, prod.applyLocalTonemap(composed, center, taps, 0.0, contrast));
+    try std.testing.expectEqual(composed, prod.applyLocalTonemap(composed, center, taps, 0.001, contrast));
+}
+
+test "local tonemap source contract: no bloom dependency, matched pre-exposure domains" {
+    const src = @embedFile("../shaders/postprocess.glsl");
+    const fn_marker = "vec3 applyLocalTonemapping(vec3 color, vec2 uv) {";
+    const start = std.mem.indexOf(u8, src, fn_marker) orelse return error.LocalTonemapFnMissing;
+    const rest = src[start..];
+    const end_rel = std.mem.indexOf(u8, rest, "\n}\n") orelse return error.LocalTonemapFnUnterminated;
+    const body = rest[0..end_rel];
+    try std.testing.expect(std.mem.indexOf(u8, body, "bloom") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "params3") == null);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, "dot(boundRadiance(texture("));
+    try std.testing.expect(std.mem.indexOf(u8, body, "dot(color") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "0.18 + l0") != null);
+}

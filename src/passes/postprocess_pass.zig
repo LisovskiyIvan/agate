@@ -75,6 +75,11 @@ pub const PostProcessPass = struct {
     // the pass-sample branch and this binds the scene view as a harmless
     // placeholder (bit-identical composite).
     ssgi_tex_view: sg.View = .{},
+    // Optional SsrPass result (v2 denoised reflection, half res). Set via
+    // setSsrTexture(); empty by default, in which case the shader skips
+    // the pass-sample branch and this binds the scene view as a harmless
+    // placeholder (bit-identical composite).
+    ssr_tex_view: sg.View = .{},
     width: i32 = 0,
     height: i32 = 0,
     sample_count: i32 = 1,
@@ -506,6 +511,14 @@ pub const PostProcessPass = struct {
     // to pre-SSGI-pass; the v1 inline branch keys off its own lane).
     pub fn setSsgiTexture(self: *PostProcessPass, view: sg.View) void {
         self.ssgi_tex_view = view;
+    }
+
+    // Feed the SsrPass denoised reflection into the composite. Call every
+    // frame before render() once the parent owns an SsrPass; pass .{}
+    // to detach and return to the no-pass composite path (bit-identical
+    // to pre-SSR-pass; the v1 inline branch keys off its own lane).
+    pub fn setSsrTexture(self: *PostProcessPass, view: sg.View) void {
+        self.ssr_tex_view = view;
     }
 
     pub fn deinit(self: *PostProcessPass) void {

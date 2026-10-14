@@ -50,6 +50,7 @@ layout(binding = 0) uniform fs_params {
     vec4 ssgi_params; // x: enabled (1/0), y: intensity [0,1], z: radius (m), w: gather steps
     vec4 ssgi_pass_params; // x: v2 pass-sample active (1/0), y: intensity, zw: unused (0)
     vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
+    vec4 ssr_pass_params; // x: v2 pass-sample active (1/0), y: intensity, zw: unused (0)
     // APPENDED LAST (display transfer): x = manual display encode needed
     // (1 = UNORM swapchain: encode exact piecewise sRGB once at the very end;
     // 0 = sRGB target: output linear, hardware encodes). yzw unused. Packed
@@ -73,6 +74,12 @@ layout(binding = 10) uniform texture2D velocity_tex;
 // bound to the scene-view placeholder the branch never samples while
 // ssgi_pass_params.x gates it off (bit-identical off path).
 layout(binding = 11) uniform texture2D ssgi_tex;
+// SSR v2 denoised reflection (half-res RGBA16F: rgb = reflection,
+// a = blend weight, reconstructed at full res by the depth-aware 2x2
+// gather sampleSSRPass below); bound to the scene-view placeholder the
+// branch never samples while ssr_pass_params.x gates it off
+// (bit-identical off path).
+layout(binding = 12) uniform texture2D ssr_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -169,29 +176,26 @@ vec3 PBRNeutralTonemap(vec3 color) {
     return clamp(mix(color, newPeak * vec3(1.0), g), 0.0, 1.0);
 }
 
+// Compute detail gain from unthresholded, pre-exposure scene taps only.
+// Using thresholded bloom as the mean, or post-exposure color as the
+// numerator, changed flat-field lighting with bloom/exposure. Apply the
+// matched-domain gain to the composed color, including its additive layers.
 vec3 applyLocalTonemapping(vec3 color, vec2 uv) {
     if (local_tonemap_params.x < 0.5) return color;
     float intensity = local_tonemap_params.y;
     if (intensity <= 0.001) return color;
     float contrast = local_tonemap_params.z;
 
-    float local_luma;
-    if (params3.z > 0.5) {
-        vec3 bloom_sample = texture(sampler2D(bloom_tex, smp), uv).rgb;
-        local_luma = dot(bloom_sample, vec3(0.2126, 0.7152, 0.0722));
-    } else {
-        vec2 off = resolution.zw * 24.0;
-        float l0 = dot(texture(sampler2D(scene_tex, smp), uv).rgb, vec3(0.2126, 0.7152, 0.0722));
-        float l1 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-        float l2 = dot(texture(sampler2D(scene_tex, smp), uv - vec2(off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-        float l3 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(-off.x, off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-        float l4 = dot(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, -off.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-        local_luma = (l0 + l1 + l2 + l3 + l4) * 0.2;
-    }
+    vec2 off = resolution.zw * 24.0;
+    float l0 = dot(boundRadiance(texture(sampler2D(scene_tex, smp), uv).rgb), vec3(0.2126, 0.7152, 0.0722));
+    float l1 = dot(boundRadiance(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, off.y)).rgb), vec3(0.2126, 0.7152, 0.0722));
+    float l2 = dot(boundRadiance(texture(sampler2D(scene_tex, smp), uv - vec2(off.x, off.y)).rgb), vec3(0.2126, 0.7152, 0.0722));
+    float l3 = dot(boundRadiance(texture(sampler2D(scene_tex, smp), uv + vec2(-off.x, off.y)).rgb), vec3(0.2126, 0.7152, 0.0722));
+    float l4 = dot(boundRadiance(texture(sampler2D(scene_tex, smp), uv + vec2(off.x, -off.y)).rgb), vec3(0.2126, 0.7152, 0.0722));
+    float local_luma = (l0 + l1 + l2 + l3 + l4) * 0.2;
 
-    float pixel_luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     float denom = max(0.18 + local_luma, 1e-4);
-    float numer = max(0.18 + pixel_luma, 1e-4);
+    float numer = max(0.18 + l0, 1e-4);
     float scale = pow(numer / denom, contrast);
     scale = clamp(scale, 0.25, 4.0);
 
@@ -199,11 +203,9 @@ vec3 applyLocalTonemapping(vec3 color, vec2 uv) {
     return mix(color, adapted_color, intensity);
 }
 
-vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    vec4 world = inv_view_proj * clip;
-    return world.xyz / world.w;
-}
+// Depth-derived world position + surface normal, shared with the SSR
+// half-res trace pass (src/shaders/ssr.glsl).
+// @include "common/ssr_trace.glsl"
 
 vec2 reprojectClipToPrevUv(vec4 clip) {
     vec4 prev_clip = reproj_mat * clip;
@@ -224,40 +226,6 @@ vec3 projectWorldToUvDepth(vec3 world_pos) {
     if (clip.w <= 0.0001) return vec3(-1.0, -1.0, 1.0);
     vec3 ndc = clip.xyz / clip.w;
     return vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
-}
-
-vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {
-    vec2 texel = resolution.zw;
-    float d_r = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
-    float d_l = texture(sampler2D(depth_tex, depth_smp), uv - vec2(texel.x, 0.0)).r;
-    float d_u = texture(sampler2D(depth_tex, depth_smp), uv - vec2(0.0, texel.y)).r;
-    float d_d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, texel.y)).r;
-
-    vec3 p_r = reconstructWorldPos(uv + vec2(texel.x, 0.0), d_r);
-    vec3 p_l = reconstructWorldPos(uv - vec2(texel.x, 0.0), d_l);
-    vec3 p_u = reconstructWorldPos(uv - vec2(0.0, texel.y), d_u);
-    vec3 p_d = reconstructWorldPos(uv + vec2(0.0, texel.y), d_d);
-
-    // Choose the continuous side by VIEW depth, not world Z. For the
-    // perspective cameras clip.w is view depth; VP's fourth row gives its
-    // world-space axis without another reconstruction or any new uniform.
-    // CPU mirror: postprocess/depth_normal.zig depthNormalFromNeighbors.
-    vec3 view_forward = vec3(view_proj[0].w, view_proj[1].w, view_proj[2].w);
-    vec3 dr = p_r - world_pos;
-    vec3 dl = world_pos - p_l;
-    vec3 du = p_u - world_pos;
-    vec3 dd = world_pos - p_d;
-    vec3 dx = (abs(dot(dr, view_forward)) < abs(dot(dl, view_forward))) ? dr : dl;
-    vec3 dy = (abs(dot(du, view_forward)) < abs(dot(dd, view_forward))) ? du : dd;
-    vec3 n = cross(dx, dy);
-    float len_sq = dot(n, n);
-    // Test the gradient angle, not the pixel footprint in world units.
-    // The old absolute 1e-6 cutoff replaced ordinary wall normals with up,
-    // allowing SSR to paint rectangular reflection bands onto verticals.
-    // Invalid normals contribute no SSR/contact/SSGI, not a fictitious floor.
-    // CPU mirror: postprocess/depth_normal.zig depthNormalFromGradients.
-    float scale = dot(dx, dx) * dot(dy, dy);
-    return (len_sq > max(scale * 1e-8, 1e-30)) ? (n * inversesqrt(len_sq)) : vec3(0.0);
 }
 
 vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
@@ -562,6 +530,8 @@ vec3 addShaftRadiance(vec3 color, vec2 uv) {
 
 // Sample linear-radiance scene color: chromatic aberration, then the
 // depth-dependent passes (motion blur, SSR, SSAO, atmospheric fog).
+// (sampleSSRPass is defined after dofLinearize below; prototyped here.)
+vec4 sampleSSRPass(vec2 uv, float raw_depth);
 vec3 sampleScene(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
@@ -580,7 +550,7 @@ vec3 sampleScene(vec2 uv) {
 
     // Depth-dependent passes: Motion Blur, Contact Shadows, SSR, SSAO, and Atmospheric Fog
     float raw_depth = 0.0;
-    bool needs_depth = (ssr_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5 || ssgi_params.x > 0.5);
+    bool needs_depth = (ssr_params.x > 0.5 || ssr_pass_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5 || ssgi_params.x > 0.5);
     if (needs_depth) {
         raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     }
@@ -596,8 +566,22 @@ vec3 sampleScene(vec2 uv) {
     }
 
     // Screen-Space Reflections (SSR)
+    // Bit-identical inline block: in v2 pass mode ssr_params.x packs 0
+    // and this branch is skipped.
     if (ssr_params.x > 0.5) {
         color = applySSR(color, uv, raw_depth);
+    }
+
+    // Screen-Space Reflections v2 (half-res pass): the SsrPass traced +
+    // bilaterally denoised the reflection into ssr_tex (rgb = reflection,
+    // a = blend weight without intensity). The final full-res value is a
+    // depth-aware 2x2 gather of the denoised footprint (sampleSSRPass, CPU
+    // mirror: ssrUpscaleResolve) — not a blind bilinear sample — so the
+    // reconstruction never crosses silhouettes. Mix by intensity * weight
+    // at the same stack position as v1.
+    if (ssr_pass_params.x > 0.5) {
+        vec4 ssr_up = sampleSSRPass(uv, raw_depth);
+        color = mix(color, ssr_up.rgb, clamp(ssr_pass_params.y * ssr_up.a, 0.0, 1.0));
     }
 
     // SSAO Occlusion: applied to the resolved scene color so motion blur never washes out or erases AO
@@ -676,6 +660,44 @@ float dofLinearize(float d) {
     float near = camera_params.x;
     float far = camera_params.y;
     return (near * far) / max(far - d * (far - near), 0.0001);
+}
+
+// SSR v2 depth-aware upscale: the denoised half-res footprint (ssr_tex:
+// rgb = reflection, a = blend weight) is reconstructed at full res by a
+// 2x2 bilateral gather against the full-res depth — the same linearized
+// gate the blur uses (0.05 m, CPU mirror: ssr.SSR_BLUR_DEPTH_GATE), so a
+// foreground pixel never inherits a background pixel's reflection at
+// silhouettes. Half-res geometry derives from the full size with the
+// ceil-half rule (CPU mirror: ssrTargetSize), so no extra uniform is
+// needed. Returns (reflection rgb, blend weight); all-rejected
+// footprints return zeros (the caller mixes nothing). CPU mirror:
+// ssrUpscaleResolve in postprocess/ssr.zig.
+vec4 sampleSSRPass(vec2 uv, float raw_depth) {
+    vec2 half_res = floor((resolution.xy + 1.0) * 0.5);
+    vec2 half_texel = vec2(1.0) / half_res;
+    float center_lin = dofLinearize(raw_depth);
+    vec2 p = uv * half_res - vec2(0.5);
+    vec3 acc = vec3(0.0);
+    float acc_a = 0.0;
+    float wsum = 0.0;
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            vec2 c = (floor(p) + vec2(float(i), float(j)) + vec2(0.5)) * half_texel;
+            vec4 s = texture(sampler2D(ssr_tex, depth_smp), c);
+            float sd = texture(sampler2D(depth_tex, depth_smp), c).r;
+            float diff = abs(center_lin - dofLinearize(sd));
+            if (diff >= 0.05) continue;
+            vec2 delta = (c - uv) * half_res;
+            float w = exp(-dot(delta, delta) * 0.5) * (1.0 - diff / 0.05);
+            acc += s.rgb * s.a * w;
+            acc_a += s.a * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 0.0001) return vec4(0.0);
+    float wa = acc_a / wsum;
+    vec3 rgb = acc_a > 0.0001 ? acc / acc_a : vec3(0.0);
+    return vec4(rgb, wa);
 }
 
 // Parametric zone grade: per-channel lifts weighted by luminance zones.
