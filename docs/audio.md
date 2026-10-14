@@ -8,21 +8,21 @@
 
 Архитектурно это фасад `audio.zig`, реэкспортирующий листья `audio/` (свободные функции + тонкие форвардеры владельца `AudioEngine`; листья никогда не импортируют фасад — правило против циклов, задокументированное в шапке файла):
 
-| Лист | Ответственность |
-|---|---|
-| `types.zig` | общий словарь: `BusId`, `AudioConfig`, `BusConfig`, `VoiceKind`/`Voice`, лимиты |
-| `engine.zig` | владелец `AudioEngine`: поля, жизненный цикл, форвардеры во все листья |
-| `commands.zig` | очередь команд голосов (lock-free SPSC ring, кража слотов) |
-| `playback.zig` | `play`/`playClip`, one-shot хелперы, `PlayOptions`/`ClipPlayOptions`, `spatializeWith` |
-| `buses.zig` | реестр шин и DAG маршрутизации (до 128 шин) |
-| `effects.zig` | DSP фильтров шин, пул ревербераторов, окклюзия |
-| `mixer.zig` | `renderFrames` + ядра синтеза, приватное состояние `ActiveVoice` |
-| `streams.zig` | слоты стримов, `playSound*`/`playMusic*` |
-| `clip.zig` | `AudioClip` + WAV-декодирование |
-| `decode.zig` | MP3/Ogg декодеры (`DecodedAudio`, `DecodeError`) |
-| `dsp.zig` | biquad + реверберация (`BiquadFilter`, `ReverbProcessor`) |
-| `occlusion.zig` | рейкаст-окклюзия (`AudioOcclusionConfig`, `AudioOcclusionTracker`, `AudioEmitter`) |
-| `stream.zig` | `AudioStream`: SPSC ring, декодеры Ogg/MP3/WAV, gapless/crossfade |
+| Лист            | Ответственность                                                                        |
+| --------------- | -------------------------------------------------------------------------------------- |
+| `types.zig`     | общий словарь: `BusId`, `AudioConfig`, `BusConfig`, `VoiceKind`/`Voice`, лимиты        |
+| `engine.zig`    | владелец `AudioEngine`: поля, жизненный цикл, форвардеры во все листья                 |
+| `commands.zig`  | очередь команд голосов (lock-free SPSC ring, кража слотов)                             |
+| `playback.zig`  | `play`/`playClip`, one-shot хелперы, `PlayOptions`/`ClipPlayOptions`, `spatializeWith` |
+| `buses.zig`     | реестр шин и DAG маршрутизации (до 128 шин)                                            |
+| `effects.zig`   | DSP фильтров шин, пул ревербераторов, окклюзия                                         |
+| `mixer.zig`     | `renderFrames` + ядра синтеза, приватное состояние `ActiveVoice`                       |
+| `streams.zig`   | слоты стримов, `playSound*`/`playMusic*`                                               |
+| `clip.zig`      | `AudioClip` + WAV-декодирование                                                        |
+| `decode.zig`    | MP3/Ogg декодеры (`DecodedAudio`, `DecodeError`)                                       |
+| `dsp.zig`       | biquad + реверберация (`BiquadFilter`, `ReverbProcessor`)                              |
+| `occlusion.zig` | рейкаст-окклюзия (`AudioOcclusionConfig`, `AudioOcclusionTracker`, `AudioEmitter`)     |
+| `stream.zig`    | `AudioStream`: SPSC ring, декодеры Ogg/MP3/WAV, gapless/crossfade                      |
 
 `AudioEngine` — обычная структура, принадлежащая вызывающему коду (обычно полю `Scene`). Аудиопоток вызывает только `renderFrames` с буфером `[]f32` (interleaved stereo); всё управление (создание шин, запуск голосов) идёт из главного потока через очередь команд и атомики — без мьютексов в realtime-пути.
 
@@ -110,14 +110,14 @@ pub const BusAttenuation = struct {
 
 Лимиты движка (переэкспортированы и как вложенные константы `AudioEngine.max_voices` и т.д.):
 
-| Константа | Значение | Смысл |
-|---|---|---|
-| `max_voices` | 24 | одновременно звучащих процедурных голосов |
-| `max_distance` | 30.0 | дистанция полного затухания по умолчанию (м) |
-| `max_commands` | 64 | глубина очереди команд голосам (SPSC ring) |
-| `max_reverbs` | 4 | пул ревербераторов на движок |
-| `chunk_frames` / `chunk_samples` | 64 / 128 | квант рендера микшера |
-| `max_streams` | 32 | одновременно открытых стримов |
+| Константа                        | Значение | Смысл                                        |
+| -------------------------------- | -------- | -------------------------------------------- |
+| `max_voices`                     | 24       | одновременно звучащих процедурных голосов    |
+| `max_distance`                   | 30.0     | дистанция полного затухания по умолчанию (м) |
+| `max_commands`                   | 64       | глубина очереди команд голосам (SPSC ring)   |
+| `max_reverbs`                    | 4        | пул ревербераторов на движок                 |
+| `chunk_frames` / `chunk_samples` | 64 / 128 | квант рендера микшера                        |
+| `max_streams`                    | 32       | одновременно открытых стримов                |
 
 `VoiceKind` — `noise_burst | thump | blip | sample`. `Voice` — слот процедурного голоса: `active`, `kind`, `bus: ?BusId`, огибающая (`t`, `duration`, `volume`), свип частоты (`freq`, `freq_end`), свип фильтра (`cutoff`, `cutoff_end`), `pan`, `seed`/`lp`/`phase` для нойза, плюс состояние сэмпла (`clip: ?*const AudioClip` — только чтение, должен пережить голос; `sample_pos: f64`, `sample_step`, `loop`).
 
@@ -335,6 +335,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void
 ## Потоки и владение
 
 - **Владение.** `AudioEngine` — value-struct у владельца (сцены). Клипы владеют PCM (`deinit` с тем же аллокатором). `AudioStream` создаётся аллокатором (`openFile`/`openMemory`/`createStreamFrom*`) и освобождается через `deinit`/`destroyStream`; `auto_destroy`-стримы освобождаются сами. `clip` в `Voice` и `ClipPlayOptions` — заимствованный указатель, должен пережить звучание.
+- MP3-декодер имеет стабильный адрес до `deinit`: memory-callbacks `dr_mp3` хранят указатель на его состояние, поэтому инициализированный C-объект не копируется вместе с обёрткой. Входные байты `openMemory` заимствуются и должны пережить стрим; новые аллокации выполняются только при открытии, не в аудиоколбэке.
 - **Главный поток:** всё создание/конфигурирование (шины, пресеты, `play*`, `updateStreams`, `updateBusOcclusion*`). `updateStreams(dt)` обязателен каждый кадр, иначе ring опустеет и стрим захлебнётся.
 - **Аудиопоток:** только `renderFrames`. Запрещены аллокации, файловый I/O, мьютексы, вызовы декодеров. Очередь команд (`max_commands = 64`) — единственный канал «главный → аудио» для голосов; переполнение молча отбрасывает новые команды (см. краевые случаи).
 - `volume`/`pan`/`bus_id`/`loop` стрима — атомики (`std.atomic.Value`), безопасно менять из главного потока во время звучания.

@@ -227,7 +227,9 @@ const OggDecoder = struct {
 };
 
 const Mp3Decoder = struct {
-    mp3: decode.c.drmp3,
+    // Memory callbacks retain the drmp3 address in pUserData. Keep the C
+    // decoder stable when this wrapper moves into Decoder/AudioStream.
+    mp3: *decode.c.drmp3,
     channels: usize,
     sample_rate: f32,
     total_frames: usize,
@@ -238,17 +240,19 @@ const Mp3Decoder = struct {
         const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
         errdefer allocator.free(path_z);
 
-        var mp3 = std.mem.zeroes(decode.c.drmp3);
-        if (decode.c.drmp3_init_file(&mp3, path_z.ptr, null) == 0) {
+        const mp3 = allocator.create(decode.c.drmp3) catch return error.OutOfMemory;
+        errdefer allocator.destroy(mp3);
+        mp3.* = std.mem.zeroes(decode.c.drmp3);
+        if (decode.c.drmp3_init_file(mp3, path_z.ptr, null) == 0) {
             return error.InvalidMp3;
         }
-        errdefer decode.c.drmp3_uninit(&mp3);
+        errdefer decode.c.drmp3_uninit(mp3);
 
         const channels: usize = mp3.channels;
         const rate: u32 = mp3.sampleRate;
         if (channels == 0 or channels > 2 or rate == 0) return error.InvalidMp3;
 
-        const total_frames = decode.c.drmp3_get_pcm_frame_count(&mp3);
+        const total_frames = decode.c.drmp3_get_pcm_frame_count(mp3);
         const mono_scratch: []f32 = if (channels == 1)
             allocator.alloc(f32, 2048) catch return error.OutOfMemory
         else
@@ -267,17 +271,19 @@ const Mp3Decoder = struct {
     pub fn initMemory(allocator: std.mem.Allocator, bytes: []const u8) StreamError!Mp3Decoder {
         if (bytes.len == 0) return error.InvalidMp3;
 
-        var mp3 = std.mem.zeroes(decode.c.drmp3);
-        if (decode.c.drmp3_init_memory(&mp3, @ptrCast(bytes.ptr), bytes.len, null) == 0) {
+        const mp3 = allocator.create(decode.c.drmp3) catch return error.OutOfMemory;
+        errdefer allocator.destroy(mp3);
+        mp3.* = std.mem.zeroes(decode.c.drmp3);
+        if (decode.c.drmp3_init_memory(mp3, @ptrCast(bytes.ptr), bytes.len, null) == 0) {
             return error.InvalidMp3;
         }
-        errdefer decode.c.drmp3_uninit(&mp3);
+        errdefer decode.c.drmp3_uninit(mp3);
 
         const channels: usize = mp3.channels;
         const rate: u32 = mp3.sampleRate;
         if (channels == 0 or channels > 2 or rate == 0) return error.InvalidMp3;
 
-        const total_frames = decode.c.drmp3_get_pcm_frame_count(&mp3);
+        const total_frames = decode.c.drmp3_get_pcm_frame_count(mp3);
         const mono_scratch: []f32 = if (channels == 1)
             allocator.alloc(f32, 2048) catch return error.OutOfMemory
         else
@@ -300,7 +306,7 @@ const Mp3Decoder = struct {
         var got_frames: usize = 0;
         if (self.channels == 1) {
             const chunk = @min(want_frames, self.mono_scratch.len);
-            const got = decode.c.drmp3_read_pcm_frames_f32(&self.mp3, chunk, self.mono_scratch.ptr);
+            const got = decode.c.drmp3_read_pcm_frames_f32(self.mp3, chunk, self.mono_scratch.ptr);
             if (got > 0) {
                 const n: usize = @intCast(got);
                 for (0..n) |i| {
@@ -311,14 +317,14 @@ const Mp3Decoder = struct {
                 got_frames = n;
             }
         } else {
-            const got = decode.c.drmp3_read_pcm_frames_f32(&self.mp3, want_frames, dst.ptr);
+            const got = decode.c.drmp3_read_pcm_frames_f32(self.mp3, want_frames, dst.ptr);
             if (got > 0) {
                 got_frames = @intCast(got);
             }
         }
 
         if (got_frames == 0 and loop) {
-            _ = decode.c.drmp3_seek_to_pcm_frame(&self.mp3, 0);
+            _ = decode.c.drmp3_seek_to_pcm_frame(self.mp3, 0);
             return self.readFrames(dst, false);
         }
 
@@ -326,11 +332,12 @@ const Mp3Decoder = struct {
     }
 
     pub fn seekToFrame(self: *Mp3Decoder, frame: usize) void {
-        _ = decode.c.drmp3_seek_to_pcm_frame(&self.mp3, @intCast(frame));
+        _ = decode.c.drmp3_seek_to_pcm_frame(self.mp3, @intCast(frame));
     }
 
     pub fn deinit(self: *Mp3Decoder, allocator: std.mem.Allocator) void {
-        decode.c.drmp3_uninit(&self.mp3);
+        decode.c.drmp3_uninit(self.mp3);
+        allocator.destroy(self.mp3);
         if (self.path_z) |pz| allocator.free(pz);
         if (self.mono_scratch.len > 0) allocator.free(self.mono_scratch);
     }

@@ -1516,6 +1516,83 @@ test "AudioStream compressed streaming from memory with pause, resume, and stop"
     }
 }
 
+test "AudioStream MP3 memory and file refills, seek and rewind match decoded PCM" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("fixtures/tone_440_880.mp3");
+    var clip = try AudioClip.fromMp3Memory(alloc, bytes);
+    defer clip.deinit(alloc);
+    try std.testing.expect(clip.frames > 1024);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stream.mp3", .{tmp.sub_path});
+    defer alloc.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+
+    for ([_]bool{ false, true }) |from_file| {
+        const options = audio.StreamOptions{ .buffer_frames = 1024 };
+        const stream = if (from_file)
+            try audio.AudioStream.openFile(alloc, path, clip.sample_rate, options)
+        else
+            try audio.AudioStream.openMemory(alloc, bytes, .mp3, clip.sample_rate, options);
+        defer stream.deinit();
+
+        var buf: [1024]f32 = undefined;
+        var frame: usize = 0;
+        while (frame < clip.frames) {
+            stream.update(0.0);
+            @memset(&buf, 0.0);
+            const got = stream.renderToBuffer(&buf);
+            try std.testing.expect(got > 0);
+            try std.testing.expect(frame + got <= clip.frames);
+            try std.testing.expectEqualSlices(f32, clip.samples[frame * 2 .. (frame + got) * 2], buf[0 .. got * 2]);
+            frame += got;
+        }
+
+        const seek_frame = clip.frames / 2;
+        stream.seekToFrame(seek_frame);
+        stream.play();
+        @memset(&buf, 0.0);
+        const got_seek = stream.renderToBuffer(&buf);
+        try std.testing.expectEqual(@as(usize, buf.len / 2), got_seek);
+        try std.testing.expectEqualSlices(f32, clip.samples[seek_frame * 2 .. (seek_frame + got_seek) * 2], &buf);
+
+        stream.stop();
+        stream.play();
+        stream.refill();
+        @memset(&buf, 0.0);
+        const got_rewind = stream.renderToBuffer(&buf);
+        try std.testing.expectEqual(@as(usize, buf.len / 2), got_rewind);
+        try std.testing.expectEqualSlices(f32, clip.samples[0..buf.len], &buf);
+    }
+}
+
+fn openMp3StreamUnderOom(alloc: std.mem.Allocator, path: ?[]const u8) !void {
+    const options = audio.StreamOptions{ .buffer_frames = 1024 };
+    const stream = if (path) |p|
+        try audio.AudioStream.openFile(alloc, p, 44100.0, options)
+    else
+        try audio.AudioStream.openMemory(alloc, @embedFile("fixtures/tone_440_880.mp3"), .mp3, 44100.0, options);
+    defer stream.deinit();
+}
+
+test "AudioStream MP3 creation rolls back every allocation and invalid input" {
+    const alloc = std.testing.allocator;
+    try std.testing.checkAllAllocationFailures(alloc, openMp3StreamUnderOom, .{null});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stream.mp3", .{tmp.sub_path});
+    defer alloc.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = @embedFile("fixtures/tone_440_880.mp3") });
+    try std.testing.checkAllAllocationFailures(alloc, openMp3StreamUnderOom, .{path});
+
+    const garbage = "not an MP3 stream";
+    try std.testing.expectError(error.InvalidMp3, audio.AudioStream.openMemory(alloc, garbage, .mp3, 44100.0, .{}));
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = garbage });
+    try std.testing.expectError(error.InvalidMp3, audio.AudioStream.openFile(alloc, path, 44100.0, .{}));
+}
+
 test "AudioStream WAV streaming from memory and auto-stop when loop is false" {
     const alloc = std.testing.allocator;
     // 2205 frames of 440 Hz sine = 0.05s
