@@ -34,6 +34,16 @@ const sapp = sokol.app;
 
 pub const max_samples: usize = 4096;
 
+// These benches run in one sg context. Completed submission ids increase
+// within that context; keep the fence across warmup and phase/arm switches.
+// Construct a fresh bench if the host shuts down and recreates sg.
+fn acceptCompletedSample(ms: f32, submit: u32, last_submit: *u32) bool {
+    if (submit == 0 or submit <= last_submit.*) return false;
+    if (!(ms >= 0 and std.math.isFinite(ms))) return false;
+    last_submit.* = submit;
+    return true;
+}
+
 pub const Phase = struct {
     index: usize,
     scale: f32,
@@ -62,6 +72,7 @@ pub const Bench = struct {
     store: [max_samples]f32 = undefined,
     len: usize = 0,
     warmup_seen: u32 = 0,
+    last_submit: u32 = 0,
     occluded: u32 = 0,
     window_hidden: bool = false,
     target_w: i32 = 0,
@@ -95,6 +106,10 @@ pub const Bench = struct {
         self.warmup_seen = 0;
         self.len = 0;
         self.target_changes = 0;
+        // The host intentionally resizes when a phase starts. Its first
+        // realized target becomes the new baseline, not a mid-phase resize.
+        self.prev_w = 0;
+        self.prev_h = 0;
         self.phase_started = true;
         return finished;
     }
@@ -125,12 +140,18 @@ pub const Bench = struct {
     /// One completed GPU frame. `submit != 0` is availability (a valid
     /// quantized zero still counts); degenerate windows count as occluded.
     pub fn recordSample(self: *Bench, ms: f32, submit: u32) void {
-        if (self.window_hidden or sapp.width() <= 1 or sapp.height() <= 1) {
+        self.recordObservedSample(ms, submit, !self.window_hidden and sapp.width() > 1 and sapp.height() > 1);
+    }
+
+    // Explicit visibility keeps the completed-sample path testable without
+    // a window; the public entry always derives it from the live app.
+    fn recordObservedSample(self: *Bench, ms: f32, submit: u32, visible: bool) void {
+        const fresh = acceptCompletedSample(ms, submit, &self.last_submit);
+        if (!visible) {
             self.occluded += 1;
             return;
         }
-        if (submit == 0) return;
-        if (!(ms >= 0 and std.math.isFinite(ms))) return;
+        if (!fresh) return;
         if (self.warmup_seen < self.warmup) {
             self.warmup_seen += 1;
         } else if (self.len < max_samples) {
@@ -169,10 +190,10 @@ pub const Bench = struct {
             std.debug.print("phase {}: scale={d:.2} no samples (occl {}) target={}x{} window={}x{}\n", .{ p.index, p.scale, p.occluded, p.target_w, p.target_h, sapp.width(), sapp.height() });
             return;
         }
-        std.debug.print("phase {}: scale={d:.2} target={}x{} window={}x{} n={} occl={} mean={d:.3} median={d:.3} p95={d:.3} min={d:.3} max={d:.3}\n", .{
-            p.index,  p.scale,    p.target_w, p.target_h,  sapp.width(), sapp.height(),
-            p.n,      p.occluded, p.mean_ms,  p.median_ms, p.p95_ms,     p.min_ms,
-            p.max_ms,
+        std.debug.print("phase {}: scale={d:.2} target={}x{} window={}x{} n={} occl={} mean={d:.3} median={d:.3} p95={d:.3} min={d:.3} max={d:.3} target_changes={} stable={}\n", .{
+            p.index,  p.scale,          p.target_w,            p.target_h,  sapp.width(), sapp.height(),
+            p.n,      p.occluded,       p.mean_ms,             p.median_ms, p.p95_ms,     p.min_ms,
+            p.max_ms, p.target_changes, p.target_changes == 0,
         });
     }
 };
@@ -296,6 +317,7 @@ pub const AbBench = struct {
     store_b: [max_samples]f32 = undefined,
     len_a: usize = 0,
     len_b: usize = 0,
+    last_submit: u32 = 0,
     /// Arm-store offset where the open block started (for its median).
     arm_start: usize = 0,
     blocks: [ab_max_blocks]AbBlockRec = undefined,
@@ -385,9 +407,14 @@ pub const AbBench = struct {
     /// frames never sample (occluded tallies per arm — unequal occlusion
     /// is visible).
     pub fn recordSample(self: *AbBench, f: u32, ms: f32, submit: u32) void {
+        self.recordObservedSample(f, ms, submit, !self.occludedNow());
+    }
+
+    fn recordObservedSample(self: *AbBench, f: u32, ms: f32, submit: u32, visible: bool) void {
+        const fresh = acceptCompletedSample(ms, submit, &self.last_submit);
         if (self.index < self.settle_blocks) return;
         const is_b = self.armIsB(self.index);
-        if (self.occludedNow()) {
+        if (!visible) {
             if (is_b) {
                 self.occluded_b += 1;
             } else {
@@ -395,8 +422,7 @@ pub const AbBench = struct {
             }
             return;
         }
-        if (submit == 0) return;
-        if (!(ms >= 0 and std.math.isFinite(ms))) return;
+        if (!fresh) return;
         const pos = (f - 1) % self.block_frames;
         if (pos < self.skipFor(self.index)) return;
         if (is_b) {
@@ -727,6 +753,95 @@ test "ab pattern cycle is drift-balanced" {
     }
     try std.testing.expectEqual(@as(usize, 4), a);
     try std.testing.expectEqual(@as(usize, 4), b);
+}
+
+test "phase sampling deduplicates completed submissions including quantized zero" {
+    var b = Bench{ .warmup = 0 };
+    b.recordObservedSample(0, 5, true);
+    b.recordObservedSample(0, 5, true);
+    b.recordObservedSample(3, 6, true);
+    b.recordObservedSample(3, 6, true);
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqual(@as(f32, 0), b.store[0]);
+    try std.testing.expectEqual(@as(f32, 3), b.store[1]);
+}
+
+test "sample fence rejects missing invalid and older submissions without consuming a valid retry" {
+    var last: u32 = 0;
+    try std.testing.expect(!acceptCompletedSample(0, 0, &last));
+    try std.testing.expect(!acceptCompletedSample(-1, 1, &last));
+    try std.testing.expect(!acceptCompletedSample(std.math.nan(f32), 1, &last));
+    try std.testing.expect(!acceptCompletedSample(std.math.inf(f32), 1, &last));
+    try std.testing.expectEqual(@as(u32, 0), last);
+    try std.testing.expect(acceptCompletedSample(0, 1, &last));
+    try std.testing.expect(acceptCompletedSample(2, 3, &last));
+    try std.testing.expect(!acceptCompletedSample(7, 2, &last));
+    try std.testing.expectEqual(@as(u32, 3), last);
+}
+
+test "phase warmup counts unique submissions and fence survives phase switch" {
+    var b = Bench{ .warmup = 2, .phase_frames = 4 };
+    b.recordObservedSample(1, 1, true);
+    b.recordObservedSample(1, 1, true);
+    b.recordObservedSample(1, 2, true);
+    try std.testing.expectEqual(@as(usize, 0), b.len);
+    b.recordObservedSample(4, 3, true);
+    try std.testing.expectEqual(@as(usize, 1), b.len);
+    _ = b.beginPhase(5, 12);
+    b.recordObservedSample(4, 3, true);
+    try std.testing.expectEqual(@as(u32, 0), b.warmup_seen);
+    b.recordObservedSample(1, 4, true);
+    b.recordObservedSample(1, 5, true);
+    b.recordObservedSample(2, 6, true);
+    try std.testing.expectEqual(@as(usize, 1), b.len);
+}
+
+test "phase occluded samples cannot be imported on restore" {
+    var b = Bench{ .warmup = 0 };
+    b.recordObservedSample(10, 3, false);
+    b.recordObservedSample(10, 3, true);
+    b.recordObservedSample(2, 4, true);
+    try std.testing.expectEqual(@as(usize, 1), b.len);
+    try std.testing.expectEqual(@as(f32, 2), b.store[0]);
+    try std.testing.expectEqual(@as(u32, 1), b.occluded);
+}
+
+test "phase target baseline resets at intentional scale switch but catches mid-phase resize" {
+    var b = Bench{ .phase_frames = 4 };
+    b.noteTargetSize(960, 600);
+    b.noteTargetSize(1000, 600); // actual mid-phase resize
+    const finished = b.beginPhase(5, 12).?;
+    try std.testing.expectEqual(@as(u32, 1), finished.target_changes);
+    b.noteTargetSize(750, 450); // intentional new-scale target
+    b.noteTargetSize(750, 450);
+    try std.testing.expectEqual(@as(u32, 0), b.report(1).target_changes);
+    b.noteTargetSize(760, 450);
+    try std.testing.expectEqual(@as(u32, 1), b.report(1).target_changes);
+}
+
+test "ab sampling fences discarded and repeated submissions across arms" {
+    var ab = AbBench{ .block_frames = 4, .settle_blocks = 1, .transition_skip = 1 };
+    _ = ab.beginBlock(1, 16);
+    ab.recordObservedSample(4, 10, 3, true); // settle, never import later
+    _ = ab.beginBlock(5, 16);
+    ab.recordObservedSample(5, 10, 3, true);
+    ab.recordObservedSample(6, 10, 3, true);
+    try std.testing.expectEqual(@as(usize, 0), ab.len_b);
+    ab.recordObservedSample(6, 0, 4, true);
+    ab.recordObservedSample(7, 0, 4, true);
+    try std.testing.expectEqual(@as(usize, 1), ab.len_b);
+    _ = ab.beginBlock(9, 16);
+    ab.recordObservedSample(9, 3, 5, true); // transition, never import later
+    ab.recordObservedSample(10, 3, 5, true);
+    ab.recordObservedSample(11, 8, 6, false); // occluded
+    ab.recordObservedSample(12, 8, 6, true);
+    try std.testing.expectEqual(@as(usize, 1), ab.len_b);
+    _ = ab.beginBlock(13, 16);
+    ab.recordObservedSample(13, 8, 6, true);
+    ab.recordObservedSample(14, 8, 6, true);
+    try std.testing.expectEqual(@as(usize, 0), ab.len_a);
+    ab.recordObservedSample(15, 2, 7, true);
+    try std.testing.expectEqual(@as(usize, 1), ab.len_a);
 }
 
 test "ab verdict SIGNIFICANT on separated arms" {

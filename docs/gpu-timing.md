@@ -29,12 +29,12 @@ Unsupported optional feature не должна ломать создание dev
 
 После `sg.setup` вызвать `capabilities()` на context thread:
 
-| Backend | Frame scope | Shadow/main/post |
-|---|---|---|
-| Metal | `command_buffer`: `GPUEndTime - GPUStartTime` | Stage-boundary timestamp counters, если device поддерживает их |
-| WebGPU | `native_pass_span`: первый begin → последний end render/compute pass в submission | `timestamp-query`: первый begin → последний end проходов фазы |
-| Desktop GL (поддерживаемый fork path) | `pass_sum`: сумма фаз **одной submission**, lower bound | `GL_TIME_ELAPSED` |
-| Остальные / unsupported | `none`, unavailable | unavailable |
+| Backend                               | Frame scope                                                                       | Shadow/main/post                                               |
+| ------------------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Metal                                 | `command_buffer`: `GPUEndTime - GPUStartTime`                                     | Stage-boundary timestamp counters, если device поддерживает их |
+| WebGPU                                | `native_pass_span`: первый begin → последний end render/compute pass в submission | `timestamp-query`: первый begin → последний end проходов фазы  |
+| Desktop GL (поддерживаемый fork path) | `pass_sum`: сумма фаз **одной submission**, lower bound                           | `GL_TIME_ELAPSED`                                              |
+| Остальные / unsupported               | `none`, unavailable                                                               | unavailable                                                    |
 
 Capabilities описывают device support, не текущий intent и не готовность sample.
 Наличие Metal device не доказывает поддержку counters. WebGPU frame span включает
@@ -80,7 +80,7 @@ if (timing.pollPassSample(.main)) |sample| {
 `ms: f32` и `frame_index: u32`; `null` означает disabled, unsupported, not-ready или
 отсутствие валидного контекста. Индекс — **не** `Scene.frame_id`, сбрасывается при
 новом `sg.setup`; по нему отличать новый sample от повторного poll (индекс 0 —
-валиден, если sample не `null`). Задержка
+unavailable, длительность 0 мс при ненулевом индексе валидна). Задержка
 асинхронного результата переменна. Не смешивать фазовые значения разных submission
 для искусственного frame total. `pollFrameMs/pollPassMs` удалены: наличие данных —
 только по optional `Sample`, не по `ms > 0`.
@@ -95,9 +95,56 @@ unavailable) и `gpu_frame_scope` рядом с совместимыми float-�
 `SessionSummary.gpu_frame/shadow/main/post_samples`; отсутствие данных и
 повторный async poll не понижают среднее искусственными нулями.
 
+`examples/gpu_phase_bench.zig` также учитывает только уникальные completed
+submissions: повторный или более старый poll не попадает в выборку и не
+расходует warmup. Fence сохраняется через смену фазы/плеча; результаты,
+наблюдённые в settle/transition/скрытом окне, не импортируются позднее.
+После пересоздания `sg` нужен новый экземпляр bench. Это устраняет повторное
+взвешивание async-сэмплов, но не добавляет точного config-tag к ещё не
+завершившимся submission: transition discard остаётся частью протокола.
+
 `Scene.render` выставляет brackets на существующих границах фаз. Probe/3D-UI
 capture, prepare-side compute и другие unbracketed passes не автоматически
 приписываются main/shadow/post. Для draw-level атрибуции нужен внешний GPU capture.
+
+## Sandbox finite-bench: GPU-разбивка
+
+В `../sandbox` доступны `--gpu-timings` и `--bench-warmup=N` (или отдельное
+значение после флага). `AGATE_GPU_TIMINGS=1` включает тот же intent без флага.
+Обычный запуск таймеры не включает. Например:
+
+```sh
+zig build run -Doptimize=ReleaseSafe -- --graphics-demo --bench=600 --bench-warmup=60 --gpu-timings
+zig build run -Doptimize=ReleaseSafe -- --threaded --graphics-demo --bench=600 --bench-warmup=60 --gpu-timings
+```
+
+`GPU_TIMINGS` сообщает enabled/capabilities/frame scope и статус REAL,
+UNAVAILABLE или DISABLED. Четыре строки `GPU_PHASE` содержат независимые
+frame/shadow/main/post выборки: число уникальных completed submissions,
+median/p95/p99 в мс, stale/unavailable/invalid/overflow counters. REAL означает
+хотя бы один настоящий sample, не успешный perf-гейт и не поддержку всех фаз.
+Пустой канал не печатает синтетическую длительность. `measured_frames` — число
+представленных кадров после warmup, не число GPU samples.
+
+Сэмплы читаются context-side сразу после render/reuse и до следующего prepare;
+warmup продвигает valid submission fences без записи в выборку. Буферы фиксированы
+(4096 samples на канал), без per-frame allocations; summary печатается после
+остановки worker. Складывать фазовые median в «полный GPU-кадр» нельзя.
+Это разбивка трёх существующих фаз, не атрибуция отдельных bloom/AO/SSR draws.
+
+Живой baseline 13.10.2026, Apple M4/Metal, ReleaseSafe, graphics-demo, serial:
+три последовательных прогона по 600 кадров, warmup 60; по **532–534 уникальных**
+samples на канал, 6–8 повторных polls исключены. Медианы отдельных прогонов:
+frame **12.713 / 12.710 / 12.880 мс**, shadow **0.558 / 0.565 / 0.570 мс**,
+main **6.210 / 6.209 / 6.402 мс**, post **12.114 / 12.100 / 12.212 мс**.
+Это backend spans, не эксклюзивные стоимости: их сумма больше frame, что
+допустимо при GPU pipelining. Из этих чисел нельзя выводить процент стоимости
+постэффектов или ускорение FPS. Фикстура живая, не fixed-tick A/B.
+
+Дополнительно threaded 600 кадров: 539 unique samples на каждом канале, один
+stale poll; `GRAPHICS_DEMO verdict=PASS`. CLI opt-in и env gateway дали REAL,
+disabled-прогон — DISABLED с n=0; invalid/overflow=0 во всех каналах. Прогоны
+проверяют instrumentation/lifecycle, не сравнивают serial/threaded скорость.
 
 ## Владение и ограничения
 
@@ -140,16 +187,16 @@ shutdown. Итог — `verdict=PASS` и `log_errors=0`. Сам PASS unsupported
 Apple M4, macOS; эти прогоны проверяют корректность и совместимость, не сравнивают
 производительность backend-ов.
 
-| Гейт | Результат |
-|---|---|
-| Browser hdr-showcase, 4 legs × 240 кадров (`node tools/hdr_browser_gate.mjs --out DIR`; `--out` опционален — default свежий `$TMPDIR/opencode/hdr-browser-*`; `--frames >= 240`, builtin Chrome runner) | checks 1170 / 730 / 1170 / 1170 после strict-GPU + staged-гейта |
-| Metal hdr-showcase 1x / 4x / hardware-sRGB, по 240 кадров (`AGATE_HDR_FRAMES=240`, `AGATE_HDR_MSAA=4`, `AGATE_HDR_SRGB=1`) | 1170 / 730 / 1170 checks; 0 failures, errors и live SG alloc |
-| Native RTT + refraction 4x, 120 кадров | PASS, fresh-frame proof |
-| Metal gpu-timing, 270 кадров (`AGATE_GPU_TIMING_TEST_FRAMES=270`) | 268 real compute dispatches, PASS; 0 failures, errors и live SG alloc, shutdown/re-setup |
-| Agate full unit Debug / ReleaseSafe | 1418/1418 в каждом; включая cancel/repeated-build cache regressions и one-shot compute accounting |
-| Sandbox CPU / staged-GPU live gate | 29/29 CPU, 9/9 GPU legs; default, exclusion и serial используют один staged-протокол с включёнными cullers |
-| `test_hdr_targets` (real pool rollback + live ownership) | 97 checks в ReleaseSafe и ReleaseFast; image/view partial-allocation rollback, retry, owner/unregistered/foreign policy |
-| `bench-threads -- --runs 1 --frames 90` | staged / exclusion / serial: все три smoke runs прошли, новые metrics/CLI парсятся; это не controlled performance benchmark |
+| Гейт                                                                                                                                                                                                    | Результат                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Browser hdr-showcase, 4 legs × 240 кадров (`node tools/hdr_browser_gate.mjs --out DIR`; `--out` опционален — default свежий `$TMPDIR/opencode/hdr-browser-*`; `--frames >= 240`, builtin Chrome runner) | checks 1170 / 730 / 1170 / 1170 после strict-GPU + staged-гейта                                                             |
+| Metal hdr-showcase 1x / 4x / hardware-sRGB, по 240 кадров (`AGATE_HDR_FRAMES=240`, `AGATE_HDR_MSAA=4`, `AGATE_HDR_SRGB=1`)                                                                              | 1170 / 730 / 1170 checks; 0 failures, errors и live SG alloc                                                                |
+| Native RTT + refraction 4x, 120 кадров                                                                                                                                                                  | PASS, fresh-frame proof                                                                                                     |
+| Metal gpu-timing, 270 кадров (`AGATE_GPU_TIMING_TEST_FRAMES=270`)                                                                                                                                       | 268 real compute dispatches, PASS; 0 failures, errors и live SG alloc, shutdown/re-setup                                    |
+| Agate full unit Debug / ReleaseSafe                                                                                                                                                                     | 1418/1418 в каждом; включая cancel/repeated-build cache regressions и one-shot compute accounting                           |
+| Sandbox CPU / staged-GPU live gate                                                                                                                                                                      | 29/29 CPU, 9/9 GPU legs; default, exclusion и serial используют один staged-протокол с включёнными cullers                  |
+| `test_hdr_targets` (real pool rollback + live ownership)                                                                                                                                                | 97 checks в ReleaseSafe и ReleaseFast; image/view partial-allocation rollback, retry, owner/unregistered/foreign policy     |
+| `bench-threads -- --runs 1 --frames 90`                                                                                                                                                                 | staged / exclusion / serial: все три smoke runs прошли, новые metrics/CLI парсятся; это не controlled performance benchmark |
 
 Визуальное подтверждение — только скриншоты: GPU radiance readback нет,
 экраны — coarse-only. HDR-калибровка radiance 1/4/16 — CPU golden +
