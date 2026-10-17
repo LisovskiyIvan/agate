@@ -86,7 +86,11 @@
     [gpu-timing.md](./gpu-timing.md)): уникальные completed submissions,
     median/p95/p99, availability/capabilities и отдельные stale counters.
     Metal serial/threaded 600-кадровые прогоны проверены. Атрибуция отдельных
-    постэффектов остаётся открытой; backend spans не суммируются в frame total.
+    постэффектов: q0 interleaved matrix (`AGATE_Q0_AB=matrix`, frame/post/main
+    каналы) — [post-ab.md](./post-ab.md); backend spans не суммируются в frame
+    total. Замер 17.10.2026 выделил только тени (~5.2 мс frame, ~2.2 мс main)
+    и local tonemapping (~1.7 мс); остальные пост-эффекты ниже шумового пола
+    на macOS из-за динамических GPU-частот.
   - Подсчёт per-frame alloc tally в staged слотах.
 - **Профилирование кандидатов по коду:**
   - Измерение накладных расходов per-draw uniform uploads в `scene/draw.zig`:

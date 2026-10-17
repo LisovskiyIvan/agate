@@ -16,9 +16,12 @@
 //!   AGATE_Q0_FRAMES=540 AGATE_Q0_TIMINGS=1 ./zig-out/bin/q0-interior
 //!   (phases 1.0 -> 0.75 -> 0.66 x 180 frames; median is canonical)
 //!
-//! No licensed assets yet (Q0 proper calls for them): the checker floor
-//! and solid albedo panels carry the sharpness/ghosting story for now.
-//! Run: `AGATE_Q0_FRAMES=540 zig build run-q0` (or the env knobs above).
+//! Cost attribution uses the drift-balanced interleaved A/B
+//! (`AGATE_Q0_AB=matrix`, every pair in one process/window; see
+//! `docs/post-ab.md`). No licensed assets yet (Q0 proper calls for them):
+//! the checker floor and solid albedo panels carry the sharpness/ghosting
+//! story for now. Run: `AGATE_Q0_FRAMES=540 zig build run-q0` (or the env
+//! knobs above).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,26 +40,199 @@ var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
 var scene: z.Scene = undefined;
 
 var bench: bench_mod.Bench = .{};
+/// Frame + phase channels share one block schedule. Frame alone is too
+/// noisy for sub-millisecond effects (vsync/present and whole-frame drift
+/// swamp them); post/main brackets are the phase the effect actually
+/// changes. Each channel keeps its own completed-submission dedupe.
 var ab: bench_mod.AbBench = .{};
-/// Interleaved A/B mode (wave 5, opt-in via AGATE_Q0_AB=ssgi): alternates
-/// SSGI on (arm A, scene default) / off (arm B) in blocks instead of the
-/// back-to-back phase walk. SSGI is a composite-shader bool with no
-/// target rebuild, so it is safe to toggle per block; a render_scale pair
-/// would realloc targets every block and must stay in the phase bench.
-/// AGATE_Q0_AB=ddgi alternates DDGI on/off the same way; AGATE_Q0_AB=ssr
-/// alternates SSR inline_ (arm A) / half_res_pass (arm B) with identical
-/// intensity/steps (the pass targets keep their size across switches, so
-/// no realloc per block either).
-/// SSR A/B measures cost only: half-res denoise/upscale is intentionally
-/// not pixel-identical to inline tracing; no image-quality parity claim.
+var ab_post: bench_mod.AbBench = .{};
+var ab_main: bench_mod.AbBench = .{};
+
+/// Interleaved post/lighting A/B pairs (opt-in via AGATE_Q0_AB=<pair>).
+/// Each pair alternates its scene-default arm A with the reduced arm B in
+/// `AbBench`'s drift-balanced A B B A B A A B blocks, so the frame-time
+/// delta is measured inside one process against the same target.
+///
+/// Cost-attribution pairs: ssgi, ssao, bloom, fxaa, taa, fog, shadows, pcss,
+/// dof, shafts, local_tonemap, ssr_off. Mode pair `ssr` compares inline vs
+/// half-res; `ddgi` toggles the spike. `pcss` toggles local point/spot
+/// source_radius (0.02 -> 0); the sun PCSS lane is left at the scene
+/// baseline so the arm isolates local-shadow cost.
+const AbPair = enum {
+    ssgi,
+    ddgi,
+    ssr,
+    ssr_off,
+    ssao,
+    bloom,
+    fxaa,
+    taa,
+    fog,
+    shadows,
+    pcss,
+    dof,
+    shafts,
+    local_tonemap,
+
+    fn parse(raw: []const u8) ?AbPair {
+        inline for (@typeInfo(AbPair).@"enum".fields) |f| {
+            if (std.mem.eql(u8, raw, f.name)) return @enumFromInt(f.value);
+        }
+        if (std.mem.eql(u8, raw, "shadow")) return .shadows;
+        return null;
+    }
+};
+
 var ab_mode: bool = false;
-/// Interleaved A/B target: false = SSGI (AGATE_Q0_AB=ssgi), true = DDGI
-/// (AGATE_Q0_AB=ddgi, toggles scene.ddgi.enabled per block).
-var ab_ddgi: bool = false;
-/// Interleaved A/B target: SSR inline vs half-res (AGATE_Q0_AB=ssr,
-/// toggles scene.post_process.ssr.mode per block with identical
-/// intensity/steps; TAA resets at every boundary like the other arms).
-var ab_ssr: bool = false;
+var ab_pair: AbPair = .ssgi;
+/// Matrix mode (`AGATE_Q0_AB=matrix`) runs every pair in one process and
+/// one window, back to back, so GPU clock/focus state cannot masquerade as
+/// an effect delta. Each pair keeps its own drift-balanced AbBench.
+const ab_matrix_pairs = [_]AbPair{
+    .ssao,
+    .ssgi,
+    .ssr_off,
+    .bloom,
+    .fxaa,
+    .taa,
+    .shadows,
+    .pcss,
+    .dof,
+    .shafts,
+    .local_tonemap,
+    .fog,
+};
+var ab_matrix: bool = false;
+var ab_matrix_idx: usize = 0;
+var ab_pair_frame: u32 = 0;
+var ab_pair_limit: u32 = 0;
+var ab_pair_done: bool = false;
+var ab_block_frames: u32 = 60;
+/// Frame index inside the CURRENT pair (matrix mode) or the global frame
+/// (single-pair mode). AbBench samples and block positions must use this,
+/// never the global frame, or pair 2+ would look like a mid-block switch.
+var ab_record_frame: u32 = 0;
+
+fn abActive(pair: AbPair) bool {
+    return ab_mode and ab_pair == pair;
+}
+
+fn abArmName(pair: AbPair, arm: bench_mod.AbArm) []const u8 {
+    return switch (pair) {
+        .ssgi => if (arm == .A) "ssgi_on" else "ssgi_off",
+        .ddgi => if (arm == .A) "ddgi_on" else "ddgi_off",
+        .ssr => if (arm == .A) "ssr_inline" else "ssr_halfres",
+        .ssr_off => if (arm == .A) "ssr_on" else "ssr_off",
+        .ssao => if (arm == .A) "ssao_on" else "ssao_off",
+        .bloom => if (arm == .A) "bloom_on" else "bloom_off",
+        .fxaa => if (arm == .A) "fxaa_on" else "fxaa_off",
+        .taa => if (arm == .A) "taa_on" else "taa_off",
+        .fog => if (arm == .A) "fog_on" else "fog_off",
+        .shadows => if (arm == .A) "shadows_on" else "shadows_off",
+        .pcss => if (arm == .A) "local_pcss_on" else "local_pcss_off",
+        .dof => if (arm == .A) "dof_on" else "dof_off",
+        .shafts => if (arm == .A) "shafts_on" else "shafts_off",
+        .local_tonemap => if (arm == .A) "local_tonemap_on" else "local_tonemap_off",
+    };
+}
+
+/// Applies one arm on the game/context boundary, before update+render.
+/// Toggles are deliberately cheap scene/option writes (no target rebuild):
+/// AO/SSGI/SSR targets keep their sized allocations across switches, and
+/// shadows rebuild from the staged snapshot on the next frame.
+fn applyAbArm(pair: AbPair, arm: bench_mod.AbArm) void {
+    const a = arm == .A;
+    switch (pair) {
+        .ssgi => scene.post_process.ssgi.enabled = a,
+        .ddgi => scene.ddgi.enabled = a,
+        .ssr => scene.post_process.ssr.mode = if (a) .inline_ else .half_res_pass,
+        .ssr_off => scene.post_process.ssr.enabled = a,
+        .ssao => scene.ssao.enabled = a,
+        .bloom => scene.post_process.bloom.enabled = a,
+        .fxaa => scene.post_process.fxaa.enabled = a,
+        .taa => scene.post_process.taa.enabled = a,
+        .fog => scene.post_process.fog.enabled = a,
+        .shadows => scene.shadows.enabled = a,
+        .pcss => {
+            // Local PCSS only; the sun keeps the scene baseline.
+            const radius: f32 = if (a) 0.02 else 0.0;
+            for (scene.lights.point_lights.items) |pl| pl.shadow.source_radius = radius;
+            for (scene.lights.spot_lights.items) |sl| sl.shadow.source_radius = radius;
+        },
+        .dof => scene.post_process.dof.enabled = a,
+        .shafts => scene.post_process.shafts.enabled = a,
+        .local_tonemap => scene.post_process.local_tonemapping.enabled = a,
+    }
+}
+
+/// Matrix-mode baseline: the heavy q0 chain (AO horizon+temporal, SSGI
+/// half+temporal, SSR half, bloom, TAA, FXAA, shadows, DoF, shafts, local
+/// tonemap, local PCSS). Every pair starts from this same state; without
+/// the reset, a previous pair's disabled effect would leak into the next
+/// pair's arm A and turn the matrix into a cumulative test.
+fn resetAbBaseline() void {
+    scene.ssao.enabled = true;
+    scene.ssao.mode = .horizon;
+    scene.ssao.temporal.enabled = true;
+
+    scene.post_process.ssgi.enabled = true;
+    scene.post_process.ssgi.mode = .half_res_pass;
+    scene.post_process.ssgi.temporal.enabled = true;
+
+    scene.post_process.ssr.enabled = true;
+    scene.post_process.ssr.mode = .half_res_pass;
+    scene.post_process.bloom.enabled = true;
+    scene.post_process.fxaa.enabled = true;
+    scene.post_process.taa.enabled = true;
+    scene.post_process.fog.enabled = false;
+    scene.post_process.dof.enabled = true;
+    scene.post_process.shafts.enabled = true;
+    scene.post_process.local_tonemapping.enabled = true;
+    scene.shadows.enabled = true;
+
+    for (scene.lights.point_lights.items) |pl| pl.shadow.source_radius = 0.02;
+    for (scene.lights.spot_lights.items) |sl| sl.shadow.source_radius = 0.02;
+    scene.resetTaa();
+}
+
+fn beginAbPair(index: usize) void {
+    ab_matrix_idx = index;
+    ab = .{};
+    ab_post = .{};
+    ab_main = .{};
+    ab.block_frames = ab_block_frames;
+    ab_post.block_frames = ab_block_frames;
+    ab_main.block_frames = ab_block_frames;
+    ab_pair_limit = ab_block_frames * (8 + ab.settle_blocks);
+    ab_pair_frame = 0;
+    ab_pair_done = false;
+    ab_pair = ab_matrix_pairs[index];
+    resetAbBaseline();
+    applyAbArm(ab_pair, .A);
+    std.debug.print("q0-interior ab matrix: pair={s} index={}/{} block_frames={} limit={}\n", .{
+        @tagName(ab_pair), index + 1, ab_matrix_pairs.len, ab_block_frames, ab_pair_limit,
+    });
+}
+
+fn printAbResult(tag: []const u8, b: *bench_mod.AbBench, pair: AbPair) void {
+    const s = b.finalSummary(abArmName(pair, .A), abArmName(pair, .B));
+    b.printBlocks();
+    bench_mod.AbBench.printSummary(s);
+    std.debug.print("AB_{s}_RESULT pair={s} delta_median_ms={d:.3} noise_floor_ms={d:.3} verdict={s} n_a={} n_b={} dropped={} unstable={} median_a={d:.3} median_b={d:.3}\n", .{
+        tag,                 @tagName(pair), s.delta_median_ms, s.noise_floor_ms,
+        @tagName(s.verdict), s.n_a,          s.n_b,             s.dropped,
+        s.unstable,          s.median_a,     s.median_b,
+    });
+}
+
+fn finishAbPair() void {
+    if (ab_pair_done) return;
+    printAbResult("FRAME", &ab, ab_pair);
+    printAbResult("POST", &ab_post, ab_pair);
+    printAbResult("MAIN", &ab_main, ab_pair);
+    ab_pair_done = true;
+}
+
 /// Frame-30 proof that requested AO history actually executed.
 var ao_temporal_requested: bool = false;
 var frame_limit: u32 = 0;
@@ -116,7 +292,7 @@ fn ssrProof() void {
         // Inline/off owns no pass VRAM — except inside the SSR A/B, where
         // inline arms reuse the targets the half-res arms sized (same
         // EFFECTIVE size, so resize is a no-op and nothing reallocates).
-        if (!ab_ssr and scene.postfx.ssr_pass.width != 0) {
+        if (!abActive(.ssr) and scene.postfx.ssr_pass.width != 0) {
             fail("ssr proof: mode={s} but pass targets allocated", .{@tagName(scene.post_process.ssr.mode)});
         }
         std.debug.print("q0-interior ssr-proof: mode={s} no-pass post_draws={}\n", .{ @tagName(scene.post_process.ssr.mode), draws });
@@ -348,7 +524,7 @@ fn setupScene() void {
     // at the arm-A baseline here.
     if (envFlag("AGATE_Q0_SSR_PASS")) scene.post_process.ssr.mode = .half_res_pass;
     if (envFlag("AGATE_Q0_NO_SSR")) scene.post_process.ssr.enabled = false;
-    if (ab_ssr) scene.post_process.ssr.mode = .inline_;
+    if (abActive(.ssr)) scene.post_process.ssr.mode = .inline_;
     scene.post_process.depth_pyramid_enabled = true;
     scene.post_process.dof.enabled = !envFlag("AGATE_Q0_NO_DOF");
     scene.post_process.dof.focus_distance = 4.6;
@@ -405,7 +581,7 @@ fn setupScene() void {
     // irradiance, overreading by ~pi (see docs/gi.md); the atlas stays
     // raw and intensity stays live. The AB ddgi arm below needs the same
     // calibration, so it shares this gate.
-    if (envFlag("AGATE_Q0_DDGI") or ab_ddgi) {
+    if (envFlag("AGATE_Q0_DDGI") or abActive(.ddgi)) {
         scene.ddgi.enabled = true;
         scene.ddgi.origin = .{ -3.0, 0.05, -3.0 };
         scene.ddgi.extent = .{ 6.0, 3.9, 6.0 };
@@ -443,6 +619,7 @@ export fn init() callconv(.c) void {
     std.debug.print("q0-interior: setup backend={s}\n", .{@tagName(sg.queryBackend())});
     scene = z.Scene.init(allocator());
     setupScene();
+    if (ab_mode and ab_matrix) beginAbPair(0);
 }
 
 export fn frame() callconv(.c) void {
@@ -452,19 +629,41 @@ export fn frame() callconv(.c) void {
     defer if (gate and f >= frame_limit) sapp.quit();
     if (gate) {
         if (ab_mode) {
-            if (ab.beginBlock(f, frame_limit)) |ev| {
-                if (ab_ddgi) {
-                    scene.ddgi.enabled = ev.arm == .A;
-                } else if (ab_ssr) {
-                    scene.post_process.ssr.mode = if (ev.arm == .A) .inline_ else .half_res_pass;
-                } else {
-                    scene.post_process.ssgi.enabled = ev.arm == .A;
+            if (ab_matrix and ab_pair_frame >= ab_pair_limit) {
+                finishAbPair();
+                if (ab_matrix_idx + 1 >= ab_matrix_pairs.len) {
+                    sapp.quit();
+                    return;
                 }
+                beginAbPair(ab_matrix_idx + 1);
+            }
+            if (ab_matrix) ab_pair_frame += 1;
+            const block_f = if (ab_matrix) ab_pair_frame else f;
+            const block_limit = if (ab_matrix) ab_pair_limit else frame_limit;
+            ab_record_frame = block_f;
+            if (ab.beginBlock(block_f, block_limit)) |ev| {
+                _ = ab_post.beginBlock(block_f, block_limit);
+                _ = ab_main.beginBlock(block_f, block_limit);
+                applyAbArm(ab_pair, ev.arm);
                 if (ev.index > 0) scene.resetTaa();
                 // draws = previous frame's draw calls (stats reset at the
-                // next staged begin): the DDGI on/off delta is the update
-                // pass (+1 when the arm is on).
-                std.debug.print("q0-interior ab: block {} arm={s} ssgi={} ddgi={} ssr={s} draws={}\n", .{ ev.index, @tagName(ev.arm), scene.post_process.ssgi.enabled, scene.ddgi.enabled, @tagName(scene.post_process.ssr.mode), scene.stats.draw_calls });
+                // next staged begin): the delta is the effect's draw/pass
+                // footprint, not a timing claim.
+                std.debug.print("q0-interior ab: pair={s} block={} arm={s} ssgi={} ssao={} bloom={} taa={} fxaa={} fog={} shadows={} ssr={s} ddgi={} draws={}\n", .{
+                    @tagName(ab_pair),
+                    ev.index,
+                    @tagName(ev.arm),
+                    scene.post_process.ssgi.enabled,
+                    scene.ssao.enabled,
+                    scene.post_process.bloom.enabled,
+                    scene.post_process.taa.enabled,
+                    scene.post_process.fxaa.enabled,
+                    scene.post_process.fog.enabled,
+                    scene.shadows.enabled,
+                    @tagName(scene.post_process.ssr.mode),
+                    scene.ddgi.enabled,
+                    scene.stats.draw_calls,
+                });
             }
         } else {
             if (bench.beginPhase(f, frame_limit)) |finished| bench_mod.Bench.printPhase(finished);
@@ -507,13 +706,17 @@ export fn frame() callconv(.c) void {
     // its end and the next staged begin resets `stats`.
     if (timing.isEnabled()) {
         if (ab_mode) {
-            ab.recordSample(f, scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
+            ab.recordSample(ab_record_frame, scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
+            ab_post.recordSample(ab_record_frame, scene.stats.gpu_post_ms, scene.stats.gpu_post_submit);
+            ab_main.recordSample(ab_record_frame, scene.stats.gpu_main_ms, scene.stats.gpu_main_submit);
         } else bench.recordSample(scene.stats.gpu_frame_ms, scene.stats.gpu_frame_submit);
     }
     // Every rendered frame, not just printed boundaries: a window-manager
     // resize must invalidate phase medians as well as interleaved blocks.
     if (ab_mode) {
         ab.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+        ab_post.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
+        ab_main.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
     } else {
         bench.noteTargetSize(scene.postfx.renderWidth(), scene.postfx.renderHeight());
     }
@@ -537,9 +740,14 @@ export fn frame() callconv(.c) void {
 export fn cleanup() callconv(.c) void {
     if (timing.isEnabled()) {
         if (ab_mode) {
-            const s = ab.finalSummary(if (ab_ddgi) "ddgi_on" else if (ab_ssr) "ssr_inline" else "ssgi_on", if (ab_ddgi) "ddgi_off" else if (ab_ssr) "ssr_halfres" else "ssgi_off");
-            ab.printBlocks();
-            bench_mod.AbBench.printSummary(s);
+            if (ab_matrix) {
+                finishAbPair();
+            } else {
+                std.debug.print("q0-interior ab pair={s}\n", .{@tagName(ab_pair)});
+                printAbResult("FRAME", &ab, ab_pair);
+                printAbResult("POST", &ab_post, ab_pair);
+                printAbResult("MAIN", &ab_main, ab_pair);
+            }
         } else bench_mod.Bench.printPhase(bench.report(bench.index));
     }
     scene.deinit();
@@ -555,6 +763,8 @@ export fn cleanup() callconv(.c) void {
 export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     bench.noteEvent(ev.*);
     ab.noteEvent(ev.*);
+    ab_post.noteEvent(ev.*);
+    ab_main.noteEvent(ev.*);
     if (ev.*.type == .KEY_DOWN and ev.*.key_code == .ESCAPE) sapp.quit();
 }
 
@@ -564,30 +774,39 @@ pub fn startApp() void {
     render_scale = envF32("AGATE_Q0_RENDER_SCALE", 1.0);
     bench.phase_frames = @max(30, envU32("AGATE_Q0_PHASE_FRAMES", 180));
     if (envFlag("AGATE_Q0_PHASES_REVERSED")) bench.scales = .{ 0.66, 0.75, 1.0 };
-    // Opt-in interleaved A/B: AGATE_Q0_AB=ssgi alternates SSGI on/off in
-    // A/B blocks (default 2 settle blocks + 8 measured blocks x 60 frames
-    // = 600 frames, one full rotated A B B A B A A B cycle, when
-    // AGATE_Q0_FRAMES is unset). AGATE_Q0_AB_BLOCK overrides the block
-    // size (clamped to the bench scratch). The phase bench is bypassed in
-    // this mode; everything else keeps its meaning.
+    // Opt-in interleaved A/B: AGATE_Q0_AB=<pair> alternates the scene
+    // default (arm A) with the reduced/mode-B arm in drift-balanced blocks
+    // (default 2 settle blocks + 8 measured blocks x 60 frames = 600
+    // frames when AGATE_Q0_FRAMES is unset). Pairs: ssgi, ssao, bloom,
+    // fxaa, taa, fog, shadows, pcss, dof, shafts, local_tonemap, ssr_off,
+    // ssr, ddgi. AGATE_Q0_AB=matrix runs every pair in one process/window
+    // (the only comparable cross-pair ranking; per-pair A/B stays
+    // interleaved). AGATE_Q0_AB_BLOCK overrides the block size (clamped to
+    // the bench scratch). The phase bench is bypassed in this mode;
+    // everything else keeps its meaning.
     if (std.c.getenv("AGATE_Q0_AB")) |sel| {
-        if (std.mem.eql(u8, std.mem.span(sel), "ssgi")) ab_mode = true;
-        if (std.mem.eql(u8, std.mem.span(sel), "ddgi")) {
+        const raw = std.mem.span(sel);
+        if (std.mem.eql(u8, raw, "matrix")) {
             ab_mode = true;
-            ab_ddgi = true;
-        }
-        // SSR inline vs half-res: same intensity/steps both arms, only the
-        // execution mode toggles per block (TAA resets at every boundary
-        // in frame() like the other arms; the pass targets keep their size
-        // across switches so nothing reallocates per block).
-        if (std.mem.eql(u8, std.mem.span(sel), "ssr")) {
+            ab_matrix = true;
+        } else if (AbPair.parse(raw)) |pair| {
             ab_mode = true;
-            ab_ssr = true;
+            ab_pair = pair;
+        } else {
+            std.debug.print("q0-interior: unknown AGATE_Q0_AB={s}; A/B disabled\n", .{raw});
         }
     }
     if (ab_mode) {
-        ab.block_frames = @min(@max(envU32("AGATE_Q0_AB_BLOCK", 60), 16), bench_mod.ab_max_block_frames);
-        if (frame_limit == 0) frame_limit = ab.block_frames * (8 + ab.settle_blocks);
+        ab_block_frames = @min(@max(envU32("AGATE_Q0_AB_BLOCK", 60), 16), bench_mod.ab_max_block_frames);
+        ab.block_frames = ab_block_frames;
+        ab_post.block_frames = ab_block_frames;
+        ab_main.block_frames = ab_block_frames;
+        if (ab_matrix) {
+            ab_pair_limit = ab_block_frames * (8 + ab.settle_blocks);
+            if (frame_limit == 0) frame_limit = ab_pair_limit * @as(u32, @intCast(ab_matrix_pairs.len));
+        } else if (frame_limit == 0) {
+            frame_limit = ab_block_frames * (8 + ab.settle_blocks);
+        }
     }
     render_scale = @min(@max(render_scale, z.postprocess.min_render_scale), 1.0);
     sapp.run(.{
