@@ -956,7 +956,7 @@ async function runLeg(browserWsUrl, httpPort, leg, outDir, timeoutMs) {
   return result;
 }
 
-function imageStats(img) {
+export function imageStats(img) {
   const n = img.width * img.height;
   let sum = 0;
   let sum2 = 0;

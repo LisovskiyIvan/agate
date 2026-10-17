@@ -104,6 +104,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/pbr_shadow_consts.glsl", .text = @embedFile("../shaders/common/pbr_shadow_consts.glsl") },
         .{ .name = "shaders/common/ddgi_sample.glsl", .text = @embedFile("../shaders/common/ddgi_sample.glsl") },
         .{ .name = "shaders/common/ssr_trace.glsl", .text = @embedFile("../shaders/common/ssr_trace.glsl") },
+        .{ .name = "shaders/common/pbr_surface.glsl", .text = @embedFile("../shaders/common/pbr_surface.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{
@@ -269,4 +270,20 @@ test "drift: probe_mip stays excluded from the fullscreen include" {
     const probe = @embedFile("../shaders/probe_mip.glsl");
     try std.testing.expect(std.mem.indexOf(u8, probe, "1.0 - texcoord0.y") == null);
     try std.testing.expect(std.mem.indexOf(u8, probe, "@include") == null);
+}
+
+test "skinned/instanced share one PBR surface body (rigid keeps its hooks)" {
+    const chunk = @embedFile("../shaders/common/pbr_surface.glsl");
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "vec3 pbrSurfaceLighting(vec4 albedo_rgba, vec3 N_geom)") != null);
+    for ([_][]const u8{
+        @embedFile("../shaders/skinned_pbr.glsl"),
+        @embedFile("../shaders/instanced_pbr.glsl"),
+    }) |src| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "@include \"common/pbr_surface.glsl\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(src, "pbrSurfaceLighting(albedo_rgba, normalize(v_normal))"));
+        // The old duplicated tail must not reappear.
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(src, "float aa_rough = aaRoughnessFactor(N);"));
+    }
+    // The rigid shader has hook-scoped locals and intentionally keeps its copy.
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(@embedFile("../shaders/pbr.glsl"), "@include \"common/pbr_surface.glsl\""));
 }

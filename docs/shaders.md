@@ -99,8 +99,15 @@ mesh.material = .{ .shader_material = mat };
 | `uv_apply.glsl` | 3 | те же 5 |
 | `pbr_brdf.glsl` | 103 | `pbr`, `instanced_pbr`, `skinned_pbr` (3) |
 | `channel_select.glsl` | 6 | те же 3 |
+| `pbr_surface.glsl` | 521 | `skinned_pbr`, `instanced_pbr` (post-unlit surface/lights/IBL/emissive tail) |
 
 Правила: чанки — чистые кодовые фрагменты БЕЗ заголовка-провенанса (иначе ломается byte-identical гарантия: раскрытие сконвертированного шейдера воспроизводит дорефакторный исходник байт-в-байт, выход shdc не меняется). Шеринг документируется в README, не в чанках. Без `#line`: ошибка shdc после директивы указывает РАСКРЫТУЮ строку (`expanded = authored + Σ(include_lines − 1)`; измерено: 13-строчный `fullscreen_vs` сдвигает на +12) — маппинг назад инспекцией.
+
+`pbr_surface.glsl` — единственное большое тело, вынесенное из `skinned_pbr`/`instanced_pbr`;
+`pbr.glsl` сознательно оставляет свою копию, потому что его hook-сниппеты
+(`albedo`/`emissive`/`post_lighting`) видят локальные переменные main().
+Паритет трёх вариантов закреплён GPU-гейтом `examples/pbr_variant_gate.zig` +
+`tools/pbr_variant_gate.mjs` (одинаковая сцена, три ноги, baseline-режим).
 
 Осознанно НЕ shared (не «чинить» без ревью): view/material-обёртки трёх PBR-шейдеров (слоты `fs_view` различаются: pbr/instanced — 1, skinned — 2; сами чанки `frame_view`/`frame_mat` — shared); morph-хелперы (`tan_xyz` только в PBR); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `src/shader_material/snippets/` (тела хуков — мерджатся, не инклудятся).
 

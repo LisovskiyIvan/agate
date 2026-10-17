@@ -33,6 +33,21 @@
     `node tools/taa_browser_gate.mjs --classes`). Покрыты все классы движения
     движка: rigid, skinned, instanced, стекло и частицы (reactive-маркер
     в velocity pass). C.3 закрыт полностью.
+- **C.5. PBR variant parity gate + shared skinned/instanced surface body** (S):
+  `examples/pbr_variant_gate.zig` renders the SAME box, material (clearcoat +
+  sheen + anisotropy), sun/point/spot shadows, area light, clustered extra
+  and IBL in three legs (`variant=rigid|skinned|instanced`).
+  `tools/pbr_variant_gate.mjs` captures each held frame and compares the
+  variants pairwise (and against `--baseline <dir>` for before/after shader
+  refactors). Current result: all pairs and pre-refactor baseline are
+  bit-identical (`maxChannel=0`). The duplicated skinned/instanced
+  post-unlit body (521 lines) now lives in `common/pbr_surface.glsl`;
+  `pbr.glsl` keeps its hook-scoped copy. Drift test:
+  `include_tests.zig` «skinned/instanced share one PBR surface body».
+  Прогон: `zig build web-pbr-variant-gate -Dtarget=wasm32-emscripten
+  -Doptimize=ReleaseFast`, затем `node tools/pbr_variant_gate.mjs`; A/B:
+  `node tools/pbr_variant_gate.mjs --baseline <pre-dedup-dir>`.
+
 - **C.4. Render-scale + clustered point-light GPU gate** (S):
   Headless WebGPU regression gate for the scaled clustered path:
   `examples/render_scale_gate.zig` renders one unlit wall and ONE point

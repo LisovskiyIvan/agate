@@ -33,5 +33,8 @@
         "render_scale_gate.zig",
         "render_scale_gate_web.zig",
         "render_scale_gate_web_env.js",
+        "pbr_variant_gate.zig",
+        "pbr_variant_gate_web.zig",
+        "pbr_variant_gate_web_env.js",
     },
 }
