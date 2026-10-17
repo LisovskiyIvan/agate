@@ -98,6 +98,13 @@ fn mainServer(init: std.process.Init.Minimal) !void {
         const hdr = try server.receiveMessage();
         switch (hdr.tag) {
             .exit => {
+                // Flush the buffered protocol tail: the final
+                // `test_results` message can still sit in the 4 KiB writer
+                // buffer. The short beat lets the build runner poll that
+                // result before stdout closes, otherwise it reports a
+                // missing result on an otherwise green run.
+                stdout_writer.interface.flush() catch {};
+                runner_threaded_io.sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
                 return std.process.exit(0);
             },
             .query_test_metadata => {

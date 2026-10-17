@@ -290,6 +290,9 @@ test "threading: dedicated with tiny dt and worldless updates keep inline semant
 extern "c" fn fork() c_int;
 extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
+extern "c" fn close(fd: c_int) c_int;
 
 test "threading: parallel-window tripwire panics on game-thread mutation" {
     if (builtin.os.tag == .windows or builtin.cpu.arch.isWasm() or builtin.single_threaded) {
@@ -304,7 +307,14 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
     if (pid == 0) {
         // Child: minimal world, open the window, touch it. A panic here
         // kills the child abnormally (expected); reaching _exit(0) means
-        // the tripwire did NOT fire (failure).
+        // the tripwire did NOT fire (failure). Silence the expected stack
+        // trace: the --listen runner prints it as a failed command even
+        // though the parent test passes.
+        const devnull = open("/dev/null", 1); // O_WRONLY
+        if (devnull >= 0) {
+            _ = dup2(devnull, 2);
+            _ = close(devnull);
+        }
         var gpa = std.heap.DebugAllocator(.{}){};
         const alloc = gpa.allocator();
         var world = PhysicsWorld.init(alloc);
